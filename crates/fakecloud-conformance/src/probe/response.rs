@@ -232,6 +232,9 @@ pub(super) fn service_common_errors(service_name: &str) -> &'static [&'static st
             // Application status checks: the probe addresses a check by a
             // synthetic id, which AWS answers with this not-found code.
             "InvalidApplicationStatusCheckId.NotFound",
+            // IPAM internet-registry associations: the probe addresses an
+            // association by a synthetic id, which AWS answers with this code.
+            "InvalidIpamInternetRegistryAssociationId.NotFound",
             "InvalidID",
         ],
         // EKS under-declares two client errors that the real API returns for
