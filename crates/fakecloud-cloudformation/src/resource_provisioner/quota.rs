@@ -330,13 +330,29 @@ mod tests {
         })
     }
 
+    /// The deployment package CloudFormation stores for inline `Code.ZipFile`
+    /// source: a ZIP holding it, so its size is the archive's, not the
+    /// source's.
+    fn packaged_size(code: &str) -> u64 {
+        fakecloud_lambda::runtime::zip_inline_source(code, "index.handler", "python3.12")
+            .expect("package")
+            .len() as u64
+    }
+
     #[test]
     fn a_refused_function_code_update_leaves_the_function_unchanged() {
-        // 10 bytes of code storage, in the quota's gigabytes.
+        // Short sources deflate to the same size, so the update carries
+        // enough distinct text to grow the archive.
+        const BIGGER: &str = "def handler(event, context):\n    return {'ok': True, 'n': 42}\n";
+        let small = packaged_size("eight888");
+        let large = packaged_size(BIGGER);
+        assert!(large > small, "the update's package is the bigger one");
+        // Room for the first package and not the second, in the quota's
+        // gigabytes.
         let prov = enforcing(fakecloud_core::quota::FixedQuotas::default().with(
             "lambda",
             "L-2ACBD22F",
-            10.5 / (1024.0 * 1024.0 * 1024.0),
+            (small as f64 + 0.5) / (1024.0 * 1024.0 * 1024.0),
         ));
         let created = prov
             .create_resource(&make_resource(
@@ -344,20 +360,20 @@ mod tests {
                 "F",
                 function("eight888"),
             ))
-            .expect("8 bytes fit");
+            .expect("the first package fits");
         let err = prov
             .update_resource(
                 &created,
-                &make_resource("AWS::Lambda::Function", "F", function("eleven11111")),
+                &make_resource("AWS::Lambda::Function", "F", function(BIGGER)),
             )
-            .expect_err("11 bytes do not fit");
+            .expect_err("the bigger package does not fit");
         assert!(err.contains("CodeStorageExceededException"), "{err}");
         let accounts = prov.lambda_state.read();
         let func = &accounts
             .regional(&prov.account_id, &prov.region)
             .unwrap()
             .functions["sized"];
-        assert_eq!(func.code_size, 8, "$LATEST keeps its package");
+        assert_eq!(func.code_size, small as i64, "$LATEST keeps its package");
     }
 
     #[test]
