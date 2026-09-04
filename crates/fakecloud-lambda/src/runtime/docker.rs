@@ -569,6 +569,51 @@ pub(crate) fn ephemeral_storage_tmpfs_arg(size: Option<i64>) -> String {
     format!("/tmp:size={mib}m,exec")
 }
 
+/// Wrap CloudFormation's inline `Code.ZipFile` source in a real ZIP archive.
+///
+/// `AWS::Lambda::Function`'s `Code.ZipFile` is plain source text, unlike the
+/// Lambda API's `Code.ZipFile`, which is base64 of an archive. CloudFormation
+/// materialises that text into a deployment package before Lambda ever sees
+/// it, and so must we — everything downstream of `code_zip` unzips it, so
+/// handing on the bare source produces a function that creates cleanly and
+/// then dies on its first invocation inside [`extract_zip`].
+///
+/// The entry is named for the handler's module part plus the runtime's
+/// extension, which is what makes the handler resolvable: `index.handler` on
+/// `python3.12` becomes `index.py`. Real AWS only accepts inline code for the
+/// Node.js and Python runtimes; anything else gets an entry with no extension
+/// rather than a rejection, so an odd template still fails in the runtime with
+/// "handler not found" instead of on a malformed archive.
+pub fn zip_inline_source(source: &str, handler: &str, runtime: &str) -> Result<Vec<u8>, String> {
+    use std::io::Write;
+
+    let module = handler
+        .rsplit_once('.')
+        .map_or(handler, |(module, _)| module);
+    let extension = if runtime.starts_with("python") {
+        ".py"
+    } else if runtime.starts_with("nodejs") {
+        ".js"
+    } else if runtime.starts_with("ruby") {
+        ".rb"
+    } else {
+        ""
+    };
+
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default().unix_permissions(0o644);
+    writer
+        .start_file(format!("{module}{extension}"), options)
+        .map_err(|e| format!("Code.ZipFile could not be packaged: {e}"))?;
+    writer
+        .write_all(source.as_bytes())
+        .map_err(|e| format!("Code.ZipFile could not be packaged: {e}"))?;
+    Ok(writer
+        .finish()
+        .map_err(|e| format!("Code.ZipFile could not be packaged: {e}"))?
+        .into_inner())
+}
+
 /// Extract a ZIP archive to a destination directory.
 pub fn extract_zip(zip_bytes: &[u8], dest: &Path) -> Result<(), RuntimeError> {
     let cursor = std::io::Cursor::new(zip_bytes);
@@ -757,5 +802,41 @@ mod tests {
         // clamping to a 64 MiB floor that Docker still accepts.
         assert_eq!(ephemeral_storage_tmpfs_arg(Some(0)), "/tmp:size=64m,exec");
         assert_eq!(ephemeral_storage_tmpfs_arg(Some(32)), "/tmp:size=64m,exec");
+    }
+
+    /// The regression guard for inline `Code.ZipFile`: the bytes the CFN
+    /// provisioner stores have to survive the same `extract_zip` the runtime
+    /// runs on cold start. Storing the bare source passed every metadata
+    /// assertion in the suite and failed here with "Could not find EOCD".
+    #[test]
+    fn zip_inline_source_round_trips_through_extract_zip() {
+        let source = "def handler(event, context):\n    return {'ok': True}\n";
+        let bytes = zip_inline_source(source, "index.handler", "python3.12").expect("packaged");
+
+        let dir = TempDir::new().expect("temp dir");
+        extract_zip(&bytes, dir.path()).expect("the runtime must be able to unzip this");
+
+        let written = std::fs::read_to_string(dir.path().join("index.py")).expect("index.py");
+        assert_eq!(written, source);
+    }
+
+    #[test]
+    fn zip_inline_source_names_the_entry_for_the_handler_and_runtime() {
+        let cases = [
+            ("index.handler", "nodejs20.x", "index.js"),
+            ("index.handler", "python3.12", "index.py"),
+            ("src/app.handler", "python3.12", "src/app.py"),
+            // Not a runtime AWS accepts inline code for. An entry with no
+            // extension still yields a valid archive, so the failure stays in
+            // the runtime rather than becoming a corrupt package.
+            ("index.handler", "java21", "index"),
+        ];
+        for (handler, runtime, expected) in cases {
+            let bytes = zip_inline_source("x", handler, runtime).expect("packaged");
+            let mut archive =
+                zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("valid archive");
+            assert_eq!(archive.len(), 1);
+            assert_eq!(archive.by_index(0).expect("entry").name(), expected);
+        }
     }
 }
