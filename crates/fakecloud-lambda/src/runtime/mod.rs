@@ -13,7 +13,7 @@ pub(crate) mod facade;
 pub mod k8s;
 
 pub use backend::{BackendHandle, LambdaBackend, RuntimeError, StreamingInvocation, WarmInstance};
-pub use docker::{extract_zip, runtime_to_image, DockerBackend};
+pub use docker::{extract_zip, runtime_to_image, zip_inline_source, DockerBackend};
 pub use facade::LambdaRuntime;
 pub use k8s::{K8sBackend, K8sBackendError};
 

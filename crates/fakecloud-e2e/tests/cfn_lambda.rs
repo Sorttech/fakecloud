@@ -6,6 +6,7 @@
 mod helpers;
 
 use aws_sdk_cloudformation::types::{Capability, OnFailure, Parameter};
+use aws_sdk_lambda::primitives::Blob;
 use aws_sdk_s3::primitives::ByteStream;
 use helpers::TestServer;
 
@@ -208,11 +209,36 @@ async fn cfn_creates_lambda_function_from_zipfile_inline() {
         Some("Active")
     );
     assert_eq!(cfg.ephemeral_storage().map(|e| e.size()), Some(1024));
-    // Code SHA is non-empty because the inline source bytes were hashed.
+    // Code SHA is non-empty because the deployment package bytes were hashed.
     assert!(
         !cfg.code_sha256().unwrap_or_default().is_empty(),
         "code_sha256 should be populated from ZipFile bytes"
     );
+
+    // Every assertion above passed while the function was unrunnable: the
+    // provisioner stored the inline source as though it were already an
+    // archive, so the first cold start died in extract_zip with
+    // "invalid Zip archive: Could not find EOCD". Only an invoke catches it.
+    // The `{}` payload is load-bearing: an Invoke with no body reaches the
+    // Node runtime as an empty event and dies in `JSON.parse("")`, which has
+    // nothing to do with the packaging under test here.
+    let invoked = lambda
+        .invoke()
+        .function_name(&func_name)
+        .payload(Blob::new(b"{}".to_vec()))
+        .send()
+        .await
+        .expect("invoke");
+    assert!(
+        invoked.function_error().is_none(),
+        "inline ZipFile function failed to run: {:?}",
+        invoked.function_error()
+    );
+    let payload = invoked
+        .payload()
+        .map(|p| String::from_utf8_lossy(p.as_ref()).into_owned())
+        .unwrap_or_default();
+    assert_eq!(payload, r#"{"ok":true}"#);
 
     cfn.delete_stack()
         .stack_name("cfn-lambda-zip")
