@@ -21,6 +21,11 @@ pub struct S3DeliveryImpl {
     /// so callers built before the S3 store exists during startup can wire it up
     /// later via [`Self::set_s3_store`]. `None` => memory mode (no store).
     store: RwLock<Option<Arc<dyn S3Store>>>,
+    /// KMS hook used to unwrap SSE-KMS object bodies on read. Without it
+    /// `get_object` returns the stored envelope rather than the object (see
+    /// [`crate::sse::decrypt_body`]). Optional so memory-only callers and
+    /// tests can skip it; `None` means bodies are returned as stored.
+    kms_hook: RwLock<Option<Arc<dyn fakecloud_core::delivery::KmsHook>>>,
 }
 
 impl S3DeliveryImpl {
@@ -28,7 +33,14 @@ impl S3DeliveryImpl {
         Self {
             state,
             store: RwLock::new(None),
+            kms_hook: RwLock::new(None),
         }
+    }
+
+    /// Wire the KMS hook so `get_object` can unwrap SSE-KMS bodies. Set after
+    /// construction for the same startup-ordering reason as the store.
+    pub fn set_kms_hook(&self, hook: Arc<dyn fakecloud_core::delivery::KmsHook>) {
+        *self.kms_hook.write() = Some(hook);
     }
 
     /// Wire the durable S3 store after construction, so delivered objects are
@@ -101,10 +113,20 @@ impl S3Delivery for S3DeliveryImpl {
             .objects
             .get(key)
             .ok_or_else(|| format!("key {key} not found in bucket {bucket}"))?;
+        let sse_algorithm = object.sse_algorithm.clone();
         let body = state
             .read_body(&object.body)
             .map_err(|e| format!("failed to read body: {e}"))?;
-        Ok(body.to_vec())
+        // An SSE-KMS bucket stores an envelope, not the object. Unwrap it here
+        // or every consumer (Lambda code pulls especially) gets ciphertext.
+        let hook = self.kms_hook.read().clone();
+        crate::sse::decrypt_body(
+            hook.as_ref(),
+            account_id,
+            bucket,
+            sse_algorithm.as_deref(),
+            body.to_vec(),
+        )
     }
 }
 
