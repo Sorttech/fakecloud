@@ -1487,6 +1487,9 @@ async fn main() {
     let mut cloudformation_service = CloudFormationService::new(
         cloudformation_state.clone(),
         fakecloud_cloudformation::CloudFormationDeps {
+            // Lets the provisioner unwrap SSE-KMS object bodies when a resource
+            // points at an S3 object (Lambda Code.S3Bucket/S3Key and friends).
+            kms_hook: Some(kms_hook_for_services.clone()),
             sqs: sqs_state.clone(),
             sns: sns_state.clone(),
             ssm: ssm_state.clone(),
@@ -2531,6 +2534,9 @@ async fn main() {
     // RDS S3 exports go through this Arc): route its writes through the durable
     // store so delivered objects survive a restart.
     s3_delivery_for_logs.set_s3_store(s3_store.clone());
+    // Same reason as the CloudFormation deps above: Lambda pulls S3-sourced
+    // code through this hook, and an SSE-KMS bucket stores an envelope.
+    s3_delivery_for_logs.set_kms_hook(kms_hook_for_services.clone());
     let s3_store_for_inbound = s3_store.clone();
     if let Some(ref cache) = shared_body_cache {
         // Share the cache between the S3Store and S3State so read_body honors
@@ -3485,6 +3491,7 @@ async fn main() {
     // Route ELB access-log deliveries through the durable S3 store so they
     // survive a restart (S3 is rebuilt from the store on boot).
     s3_delivery_for_elbv2.set_s3_store(s3_store.clone());
+    s3_delivery_for_elbv2.set_kms_hook(kms_hook_for_services.clone());
     let elbv2_delivery_bus = Arc::new(DeliveryBus::new().with_s3(s3_delivery_for_elbv2));
     let elbv2_snapshot_store: Option<Arc<dyn fakecloud_persistence::SnapshotStore>> =
         if persistence_config.mode == fakecloud_persistence::StorageMode::Persistent {

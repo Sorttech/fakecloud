@@ -7,6 +7,10 @@ mod helpers;
 
 use aws_sdk_cloudformation::types::{Capability, OnFailure, Parameter};
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::{
+    ServerSideEncryption, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration,
+    ServerSideEncryptionRule,
+};
 use helpers::TestServer;
 
 const ROLE_TEMPLATE_FRAGMENT: &str = r#"
@@ -368,4 +372,144 @@ async fn cfn_update_lambda_function_mutates_handler_and_env() {
     );
     // RevisionId rotates whenever the configuration mutates.
     assert_ne!(cfg.revision_id().map(String::from), v1_revision);
+}
+
+/// Regression: `cdk bootstrap` gives its assets bucket default `aws:kms`
+/// encryption, so every asset is stored as a KMS envelope. The provisioner read
+/// the stored bytes straight off S3 state, skipping the unwrap the S3 API does,
+/// and handed Lambda the envelope in place of the ZIP — which surfaced at invoke
+/// time as `ZIP extraction failed: invalid Zip archive: Could not find EOCD`.
+/// The sibling test above passes an unencrypted bucket and so never caught it.
+#[tokio::test]
+async fn cfn_creates_lambda_function_from_sse_kms_s3_code() {
+    let server = TestServer::start().await;
+    let cfn = server.cloudformation_client().await;
+    let lambda = server.lambda_client().await;
+    let s3 = server.s3_client().await;
+    let kms = server.kms_client().await;
+
+    let key_id = kms
+        .create_key()
+        .send()
+        .await
+        .expect("create_key")
+        .key_metadata()
+        .expect("key metadata")
+        .key_id()
+        .to_string();
+
+    let bucket = "cfn-lambda-kms-code-bucket";
+    let key = "code/main.zip";
+    s3.create_bucket()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("create_bucket");
+    s3.put_bucket_encryption()
+        .bucket(bucket)
+        .server_side_encryption_configuration(
+            ServerSideEncryptionConfiguration::builder()
+                .rules(
+                    ServerSideEncryptionRule::builder()
+                        .apply_server_side_encryption_by_default(
+                            ServerSideEncryptionByDefault::builder()
+                                .sse_algorithm(ServerSideEncryption::AwsKms)
+                                .kms_master_key_id(&key_id)
+                                .build()
+                                .unwrap(),
+                        )
+                        .build(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .expect("put_bucket_encryption");
+
+    let code_bytes = b"def handler(event, context): return {'ok': True}".to_vec();
+    s3.put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from(code_bytes.clone()))
+        .send()
+        .await
+        .expect("put_object");
+
+    // Guard the premise: if the bucket stopped encrypting, the assertions
+    // below would pass without exercising the decrypt at all.
+    let head = s3
+        .head_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .expect("head_object");
+    assert_eq!(
+        head.server_side_encryption(),
+        Some(&ServerSideEncryption::AwsKms)
+    );
+
+    let template = template_s3_code("cfn-lambda-kms-role");
+    cfn.create_stack()
+        .stack_name("cfn-lambda-kms")
+        .template_body(template)
+        .parameters(
+            Parameter::builder()
+                .parameter_key("CodeBucket")
+                .parameter_value(bucket)
+                .build(),
+        )
+        .parameters(
+            Parameter::builder()
+                .parameter_key("CodeKey")
+                .parameter_value(key)
+                .build(),
+        )
+        .capabilities(Capability::CapabilityNamedIam)
+        .on_failure(OnFailure::Rollback)
+        .send()
+        .await
+        .expect("create_stack");
+
+    let described = cfn
+        .describe_stacks()
+        .stack_name("cfn-lambda-kms")
+        .send()
+        .await
+        .expect("describe_stacks");
+    let stack = described.stacks().first().expect("stack");
+    assert_eq!(stack.stack_status().unwrap().as_str(), "CREATE_COMPLETE");
+
+    let func_name = stack
+        .outputs()
+        .iter()
+        .find(|o| o.output_key() == Some("FuncName"))
+        .and_then(|o| o.output_value())
+        .expect("FuncName output");
+
+    let got = lambda
+        .get_function()
+        .function_name(func_name)
+        .send()
+        .await
+        .expect("get_function");
+    let cfg = got.configuration().expect("configuration");
+    // The plaintext length, not the (longer) envelope's: before the fix this
+    // was the base64 KMS blob.
+    assert_eq!(cfg.code_size(), code_bytes.len() as i64);
+    assert_eq!(
+        cfg.code_sha256(),
+        Some(sha256_b64(&code_bytes).as_str()),
+        "stored code must hash to the plaintext object, not the envelope"
+    );
+}
+
+/// Base64 SHA-256, matching the `CodeSha256` Lambda reports.
+fn sha256_b64(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
 }

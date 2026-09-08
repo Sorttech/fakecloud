@@ -922,6 +922,8 @@ fn policy_document_string(props: &serde_json::Value) -> Result<String, String> {
 
 /// Holds references to all service states so CloudFormation can provision resources.
 pub struct ResourceProvisioner {
+    /// See [`crate::service::CloudFormationDeps::kms_hook`].
+    pub kms_hook: Option<std::sync::Arc<dyn fakecloud_core::delivery::KmsHook>>,
     pub sqs_state: SharedSqsState,
     pub sns_state: SharedSnsState,
     pub ssm_state: SharedSsmState,
@@ -2977,14 +2979,25 @@ impl ResourceProvisioner {
                 .objects
                 .get(key)
                 .ok_or_else(|| format!("S3 object s3://{bucket}/{key} does not exist"))?;
-            object.body.clone()
+            (object.body.clone(), object.sse_algorithm.clone())
         };
+        let (body_ref, sse_algorithm) = body_ref;
         // `read_body` consults the body cache (which is owned by the state),
         // so re-borrow `state` after dropping the bucket borrow above.
-        state
+        let stored = state
             .read_body(&body_ref)
             .map(|b| b.to_vec())
-            .map_err(|e| format!("S3 read failed: {e}"))
+            .map_err(|e| format!("S3 read failed: {e}"))?;
+        // An SSE-KMS bucket stores an envelope, not the object. `cdk bootstrap`
+        // makes its assets bucket `aws:kms`, so skipping this hands Lambda a
+        // base64 KMS blob in place of its ZIP.
+        fakecloud_s3::sse::decrypt_body(
+            self.kms_hook.as_ref(),
+            &self.account_id,
+            bucket,
+            sse_algorithm.as_deref(),
+            stored,
+        )
     }
 
     /// Read a specific object version's bytes. Used when a CFN property
@@ -4011,6 +4024,7 @@ mod tests {
 
     fn make_provisioner() -> ResourceProvisioner {
         ResourceProvisioner {
+            kms_hook: None,
             sqs_state: Arc::new(RwLock::new(
                 fakecloud_core::multi_account::MultiAccountState::new(
                     "123456789012",

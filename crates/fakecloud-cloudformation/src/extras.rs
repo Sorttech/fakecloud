@@ -3246,6 +3246,7 @@ mod tests {
             )))
         }
         CloudFormationDeps {
+            kms_hook: None,
             sqs: shared::<SqsState>(),
             sns: shared::<SnsState>(),
             ssm: shared::<SsmState>(),
