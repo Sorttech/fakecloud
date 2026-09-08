@@ -843,3 +843,86 @@ async fn cloudformation_mappings_find_in_map_missing_no_default_validation_error
         "a rejected template must not leave a stack record behind"
     );
 }
+
+/// Regression: an `AWS::S3::Bucket` with no `BucketName` took the CFN logical
+/// id as its physical name. CDK construct ids are mixed case (`SiteE53D7754`),
+/// which is not a legal S3 bucket name — path-style reads tolerated it, but
+/// every virtual-hosted-style read 404'd, so a CloudFront distribution over the
+/// bucket served nothing. Real CloudFormation generates
+/// `<stack>-<logical-id>-<random>`, lowercased.
+#[tokio::test]
+async fn cfn_generates_a_legal_bucket_name_when_bucketname_is_omitted() {
+    let server = TestServer::start().await;
+    let cf = server.cloudformation_client().await;
+    let s3 = server.s3_client().await;
+
+    let template = r#"{
+        "Resources": {
+            "SiteE53D7754": { "Type": "AWS::S3::Bucket" }
+        },
+        "Outputs": {
+            "BucketName": { "Value": { "Ref": "SiteE53D7754" } }
+        }
+    }"#;
+
+    cf.create_stack()
+        .stack_name("cfn-bucket-naming")
+        .template_body(template)
+        .send()
+        .await
+        .expect("create_stack");
+
+    let described = cf
+        .describe_stacks()
+        .stack_name("cfn-bucket-naming")
+        .send()
+        .await
+        .expect("describe_stacks");
+    let stack = described.stacks().first().expect("stack");
+    assert_eq!(stack.stack_status().unwrap().as_str(), "CREATE_COMPLETE");
+
+    let bucket = stack
+        .outputs()
+        .iter()
+        .find(|o| o.output_key() == Some("BucketName"))
+        .and_then(|o| o.output_value())
+        .expect("BucketName output")
+        .to_string();
+
+    // The generated name must be legal S3, not the logical id verbatim.
+    assert_ne!(bucket, "SiteE53D7754");
+    assert!(
+        bucket.starts_with("cfn-bucket-naming-sitee53d7754-"),
+        "expected <stack>-<logical-id>-<random>, got {bucket}"
+    );
+    assert!(
+        bucket.len() >= 3
+            && bucket.len() <= 63
+            && bucket
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.'),
+        "not a legal bucket name: {bucket}"
+    );
+
+    s3.put_object()
+        .bucket(&bucket)
+        .key("index.html")
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(b"SHELL"))
+        .send()
+        .await
+        .expect("put_object");
+
+    // The failure that mattered: virtual-hosted-style, which is how CloudFront
+    // reaches an S3 origin. Path-style passed even with the illegal name.
+    let resp = reqwest::Client::new()
+        .get(format!("{}/index.html", server.endpoint()))
+        .header(
+            reqwest::header::HOST,
+            format!("{bucket}.s3.us-east-1.amazonaws.com"),
+        )
+        .send()
+        .await
+        .expect("virtual-hosted request sends");
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "SHELL");
+}
