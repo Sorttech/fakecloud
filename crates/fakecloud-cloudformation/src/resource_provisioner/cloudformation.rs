@@ -71,6 +71,8 @@ impl ResourceProvisioner {
         );
 
         let child_provisioner = ResourceProvisioner {
+            custom_resource_responses: self.custom_resource_responses.clone(),
+            custom_resource_response_base: self.custom_resource_response_base.clone(),
             sqs_state: self.sqs_state.clone(),
             sns_state: self.sns_state.clone(),
             ssm_state: self.ssm_state.clone(),

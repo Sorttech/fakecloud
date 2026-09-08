@@ -506,6 +506,12 @@ fn reconstruct_stack_resource(
 }
 
 pub struct CloudFormationDeps {
+    /// Signals custom-resource handlers PUT to their `ResponseURL`; shared with
+    /// the internal HTTP route that receives them.
+    pub custom_resource_responses: crate::custom_resource_response::SharedCustomResourceResponses,
+    /// Base URL a Lambda container can reach fakecloud at. `None` disables
+    /// `ResponseURL` entirely.
+    pub custom_resource_response_base: Option<String>,
     pub sqs: SharedSqsState,
     pub sns: SharedSnsState,
     pub ssm: SharedSsmState,
@@ -1069,6 +1075,8 @@ impl CloudFormationService {
         region: &str,
     ) -> ResourceProvisioner {
         ResourceProvisioner {
+            custom_resource_responses: self.deps.custom_resource_responses.clone(),
+            custom_resource_response_base: self.deps.custom_resource_response_base.clone(),
             sqs_state: self.deps.sqs.clone(),
             sns_state: self.deps.sns.clone(),
             ssm_state: self.deps.ssm.clone(),
@@ -4027,6 +4035,8 @@ mod tests {
             ),
         ));
         let deps = CloudFormationDeps {
+            custom_resource_responses: Default::default(),
+            custom_resource_response_base: None,
             sqs: Arc::new(RwLock::new(
                 fakecloud_core::multi_account::MultiAccountState::new(
                     "123456789012",
