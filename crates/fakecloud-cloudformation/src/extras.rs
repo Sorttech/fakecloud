@@ -3027,6 +3027,8 @@ pub(crate) mod tests {
             )))
         }
         CloudFormationDeps {
+            custom_resource_responses: Default::default(),
+            custom_resource_response_base: None,
             sqs: shared::<fakecloud_core::multi_account::RegionalState<SqsState>>(),
             sns: shared::<fakecloud_core::multi_account::RegionalState<SnsState>>(),
             ssm: shared::<fakecloud_core::multi_account::RegionalState<SsmState>>(),
