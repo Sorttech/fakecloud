@@ -843,3 +843,98 @@ async fn cloudformation_mappings_find_in_map_missing_no_default_validation_error
         "a rejected template must not leave a stack record behind"
     );
 }
+
+/// Regression: `CreateStack` with a `TemplateURL` pointing into an SSE-KMS
+/// bucket read the stored envelope instead of the template. The envelope is
+/// base64 ASCII, so it parsed as a template with no resources and the stack
+/// reported CREATE_COMPLETE having provisioned nothing — which is what the CDK
+/// CLI hits, since `cdk bootstrap` makes its assets bucket `aws:kms` and the
+/// CLI always uploads the template.
+#[tokio::test]
+async fn cfn_reads_a_template_url_from_an_sse_kms_bucket() {
+    let server = TestServer::start().await;
+    let cf = server.cloudformation_client().await;
+    let s3 = server.s3_client().await;
+    let kms = server.kms_client().await;
+
+    let key_id = kms
+        .create_key()
+        .send()
+        .await
+        .expect("create_key")
+        .key_metadata()
+        .expect("key metadata")
+        .key_id()
+        .to_string();
+
+    let bucket = "cfn-template-kms-bucket";
+    s3.create_bucket()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("create_bucket");
+    s3.put_bucket_encryption()
+        .bucket(bucket)
+        .server_side_encryption_configuration(
+            aws_sdk_s3::types::ServerSideEncryptionConfiguration::builder()
+                .rules(
+                    aws_sdk_s3::types::ServerSideEncryptionRule::builder()
+                        .apply_server_side_encryption_by_default(
+                            aws_sdk_s3::types::ServerSideEncryptionByDefault::builder()
+                                .sse_algorithm(aws_sdk_s3::types::ServerSideEncryption::AwsKms)
+                                .kms_master_key_id(&key_id)
+                                .build()
+                                .unwrap(),
+                        )
+                        .build(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .expect("put_bucket_encryption");
+
+    let template = r#"{"Resources":{"P":{"Type":"AWS::SSM::Parameter",
+        "Properties":{"Name":"/from-kms-template","Type":"String","Value":"hi"}}}}"#;
+    s3.put_object()
+        .bucket(bucket)
+        .key("t.json")
+        .body(aws_sdk_s3::primitives::ByteStream::from(
+            template.as_bytes().to_vec(),
+        ))
+        .send()
+        .await
+        .expect("put_object");
+
+    cf.create_stack()
+        .stack_name("cfn-template-kms")
+        .template_url(format!(
+            "https://{bucket}.s3.us-east-1.amazonaws.com/t.json"
+        ))
+        .send()
+        .await
+        .expect("create_stack");
+
+    let described = cf
+        .describe_stacks()
+        .stack_name("cfn-template-kms")
+        .send()
+        .await
+        .expect("describe_stacks");
+    let stack = described.stacks().first().expect("stack");
+    assert_eq!(stack.stack_status().unwrap().as_str(), "CREATE_COMPLETE");
+
+    // The point: CREATE_COMPLETE with zero resources is the failure mode.
+    let resources = cf
+        .describe_stack_resources()
+        .stack_name("cfn-template-kms")
+        .send()
+        .await
+        .expect("describe_stack_resources");
+    assert_eq!(
+        resources.stack_resources().len(),
+        1,
+        "template from the SSE-KMS bucket must actually provision"
+    );
+}
