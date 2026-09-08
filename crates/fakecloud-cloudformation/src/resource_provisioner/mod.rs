@@ -3246,6 +3246,41 @@ impl ResourceProvisioner {
 
     // --- Organizations ---
 
+    /// Whether a custom-resource Lambda's response says it failed, and why.
+    ///
+    /// A handler that raises does not fail the invocation: the runtime returns
+    /// 200 with an error payload (`errorMessage`/`errorType`), the same shape
+    /// `Invoke` reports via `FunctionError`. Treating that as success is how a
+    /// custom resource that did nothing still reached CREATE_COMPLETE, which is
+    /// a state real CloudFormation cannot reach — there the resource signals
+    /// FAILED, or never signals and the stack times out.
+    ///
+    /// Also honours an explicit `{"Status": "FAILED", "Reason": ...}` body, the
+    /// shape cfn-response sends, for handlers that return it rather than PUT it.
+    fn custom_resource_failure(response: &[u8]) -> Option<String> {
+        let body: serde_json::Value = serde_json::from_slice(response).ok()?;
+        if let Some(message) = body.get("errorMessage").and_then(|v| v.as_str()) {
+            let kind = body
+                .get("errorType")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unhandled");
+            return Some(format!("{kind}: {message}"));
+        }
+        if body
+            .get("Status")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.eq_ignore_ascii_case("FAILED"))
+        {
+            return Some(
+                body.get("Reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("custom resource reported FAILED")
+                    .to_string(),
+            );
+        }
+        None
+    }
+
     fn invoke_lambda_sync(&self, function_arn: &str, payload: &str) -> Result<(), String> {
         let delivery = self.delivery.clone();
         let function_arn = function_arn.to_string();
@@ -3258,7 +3293,18 @@ impl ResourceProvisioner {
                     .map_err(|e| format!("Failed to create runtime: {e}"))?;
                 rt.block_on(async {
                     match delivery.invoke_lambda(&function_arn, &payload).await {
-                        Some(Ok(_)) => {
+                        Some(Ok(response)) => {
+                            // A handler that raised still returns 200; the error
+                            // is in the body. Reporting that as success is how a
+                            // custom resource that did nothing reached
+                            // CREATE_COMPLETE.
+                            if let Some(reason) = Self::custom_resource_failure(&response) {
+                                tracing::warn!(
+                                    "Custom resource Lambda {} failed: {reason}",
+                                    function_arn
+                                );
+                                return Err(format!("Custom resource failed: {reason}"));
+                            }
                             tracing::info!(
                                 "Custom resource Lambda {} invoked successfully",
                                 function_arn
@@ -9097,5 +9143,55 @@ mod tests {
             .starts_with(&format!("{}|", app.physical_id)));
         let env_id = env.physical_id.split('|').nth(1).unwrap();
         assert_eq!(a.environments.get(env_id).unwrap().name, "prod");
+    }
+}
+
+#[cfg(test)]
+mod custom_resource_response_tests {
+    use super::ResourceProvisioner;
+
+    #[test]
+    fn a_raised_handler_is_a_failure() {
+        // What the runtime returns when the handler throws: a 200 whose body
+        // carries the error. Previously treated as success.
+        let payload = br#"{"errorMessage":"Could not connect to the endpoint URL","errorType":"EndpointConnectionError"}"#;
+        let reason = ResourceProvisioner::custom_resource_failure(payload).expect("failure");
+        assert!(reason.contains("EndpointConnectionError"), "{reason}");
+        assert!(reason.contains("Could not connect"), "{reason}");
+    }
+
+    #[test]
+    fn an_explicit_failed_status_is_a_failure() {
+        let payload = br#"{"Status":"FAILED","Reason":"bucket not empty"}"#;
+        assert_eq!(
+            ResourceProvisioner::custom_resource_failure(payload).as_deref(),
+            Some("bucket not empty")
+        );
+    }
+
+    #[test]
+    fn a_successful_response_is_not_a_failure() {
+        for payload in [
+            &br#"{"Status":"SUCCESS","PhysicalResourceId":"abc"}"#[..],
+            &br#"{"Data":{"Key":"value"}}"#[..],
+            &b"null"[..],
+            &b""[..],
+        ] {
+            assert_eq!(
+                ResourceProvisioner::custom_resource_failure(payload),
+                None,
+                "{}",
+                String::from_utf8_lossy(payload)
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_json_response_is_not_treated_as_a_failure() {
+        // Don't invent failures out of a body we cannot parse.
+        assert_eq!(
+            ResourceProvisioner::custom_resource_failure(b"not json at all"),
+            None
+        );
     }
 }

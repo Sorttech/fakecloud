@@ -369,3 +369,128 @@ async fn cfn_update_lambda_function_mutates_handler_and_env() {
     // RevisionId rotates whenever the configuration mutates.
     assert_ne!(cfg.revision_id().map(String::from), v1_revision);
 }
+
+/// Regression: a custom-resource handler that raises still returns 200 with the
+/// error in its body, and the provisioner treated that as success — the stack
+/// reached CREATE_COMPLETE with the resource having done nothing. Real
+/// CloudFormation cannot reach that state: the resource signals FAILED, or never
+/// signals and the stack times out.
+///
+/// The handler code comes from S3 rather than an inline `ZipFile` so the test
+/// exercises only the behaviour under test.
+#[tokio::test]
+async fn cfn_fails_a_stack_whose_custom_resource_handler_raises() {
+    if !docker_available() {
+        eprintln!("docker required for Lambda execution; skipping");
+        return;
+    }
+    let server = TestServer::start().await;
+    let cfn = server.cloudformation_client().await;
+    let s3 = server.s3_client().await;
+
+    let bucket = "cfn-custom-raise-code";
+    s3.create_bucket()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("create_bucket");
+    let zip_bytes = build_python_handler_zip(
+        "def handler(event, context):\n    raise RuntimeError('handler blew up')\n",
+    );
+    s3.put_object()
+        .bucket(bucket)
+        .key("cr.zip")
+        .body(ByteStream::from(zip_bytes))
+        .send()
+        .await
+        .expect("put_object");
+
+    let template = format!(
+        r#"{{
+  "Resources": {{
+    "Handler": {{
+      "Type": "AWS::Lambda::Function",
+      "Properties": {{
+        "FunctionName": "raising-custom-resource",
+        "Runtime": "python3.12",
+        "Handler": "index.handler",
+        "Timeout": 30,
+        "Role": "arn:aws:iam::123456789012:role/cr-role",
+        "Code": {{"S3Bucket": "{bucket}", "S3Key": "cr.zip"}}
+      }}
+    }},
+    "Custom": {{
+      "Type": "Custom::Thing",
+      "Properties": {{"ServiceToken": {{"Fn::GetAtt": ["Handler", "Arn"]}}}}
+    }}
+  }}
+}}"#
+    );
+
+    cfn.create_stack()
+        .stack_name("cfn-custom-raises")
+        .template_body(template)
+        .capabilities(Capability::CapabilityNamedIam)
+        .on_failure(OnFailure::DoNothing)
+        .send()
+        .await
+        .expect("create_stack");
+
+    // The custom-resource invoke is deferred off the request path, so poll for
+    // a terminal status rather than reading the in-progress one.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let (status, reason) = loop {
+        let described = cfn
+            .describe_stacks()
+            .stack_name("cfn-custom-raises")
+            .send()
+            .await
+            .expect("describe_stacks");
+        let stack = described.stacks().first().expect("stack").clone();
+        let status = stack.stack_status().unwrap().as_str().to_string();
+        if !status.ends_with("_IN_PROGRESS") {
+            break (
+                status,
+                stack.stack_status_reason().unwrap_or_default().to_string(),
+            );
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "stack never reached a terminal status"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    };
+
+    assert_ne!(
+        status, "CREATE_COMPLETE",
+        "a raising custom resource must not report success"
+    );
+    assert!(
+        reason.contains("handler blew up") || reason.contains("RuntimeError"),
+        "failure reason should name the handler's error, got: {reason}"
+    );
+}
+
+fn build_python_handler_zip(body: &str) -> Vec<u8> {
+    use std::io::Write;
+    let mut buf = Vec::new();
+    {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let opts: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        zip.start_file("index.py", opts).unwrap();
+        zip.write_all(body.as_bytes()).unwrap();
+        zip.finish().unwrap();
+    }
+    buf
+}
+
+fn docker_available() -> bool {
+    std::process::Command::new("docker")
+        .arg("info")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
