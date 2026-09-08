@@ -1,3 +1,4 @@
+pub mod custom_resource_response;
 pub mod extras;
 pub(crate) mod input_constraints;
 pub mod resource_provisioner;

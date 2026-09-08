@@ -3003,6 +3003,8 @@ pub(crate) mod tests {
             )))
         }
         CloudFormationDeps {
+            custom_resource_responses: Default::default(),
+            custom_resource_response_base: None,
             sqs: shared::<SqsState>(),
             sns: shared::<SnsState>(),
             ssm: shared::<SsmState>(),
