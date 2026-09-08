@@ -2586,6 +2586,9 @@ async fn main() {
     // RDS S3 exports go through this Arc): route its writes through the durable
     // store so delivered objects survive a restart.
     s3_delivery_for_logs.set_s3_store(s3_store.clone());
+    // Lambda pulls S3-sourced code through this delivery, and an SSE-KMS
+    // bucket stores an envelope: the hook lets it unwrap the object.
+    s3_delivery_for_logs.set_kms_hook(kms_hook_for_services.clone());
     let s3_store_for_inbound = s3_store.clone();
     if let Some(ref cache) = shared_body_cache {
         // Share the cache between the S3Store and S3State so read_body honors
@@ -3532,6 +3535,7 @@ async fn main() {
     // Route ELB access-log deliveries through the durable S3 store so they
     // survive a restart (S3 is rebuilt from the store on boot).
     s3_delivery_for_elbv2.set_s3_store(s3_store.clone());
+    s3_delivery_for_elbv2.set_kms_hook(kms_hook_for_services.clone());
     let elbv2_delivery_bus = Arc::new(DeliveryBus::new().with_s3(s3_delivery_for_elbv2));
     let elbv2_snapshot_store: Option<Arc<dyn fakecloud_persistence::SnapshotStore>> =
         if persistence_config.mode == fakecloud_persistence::StorageMode::Persistent {

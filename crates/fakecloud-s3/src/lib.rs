@@ -9,6 +9,7 @@ pub mod resource_policy;
 pub(crate) mod select;
 pub(crate) mod service;
 pub mod simulation;
+pub mod sse;
 pub(crate) mod state;
 mod xml_util;
 

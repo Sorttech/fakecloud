@@ -3057,14 +3057,25 @@ impl ResourceProvisioner {
                 .objects
                 .get(key)
                 .ok_or_else(|| format!("S3 object s3://{bucket}/{key} does not exist"))?;
-            object.body.clone()
+            (object.body.clone(), object.sse_algorithm.clone())
         };
+        let (body_ref, sse_algorithm) = body_ref;
         // `read_body` consults the body cache (which is owned by the state),
         // so re-borrow `state` after dropping the bucket borrow above.
-        state
+        let stored = state
             .read_body(&body_ref)
             .map(|b| b.to_vec())
-            .map_err(|e| format!("S3 read failed: {e}"))
+            .map_err(|e| format!("S3 read failed: {e}"))?;
+        // An SSE-KMS bucket stores an envelope, not the object. `cdk bootstrap`
+        // makes its assets bucket `aws:kms`, so skipping this hands Lambda a
+        // base64 KMS blob in place of its ZIP.
+        fakecloud_s3::sse::decrypt_body(
+            self.kms_hook.as_ref(),
+            &self.account_id,
+            bucket,
+            sse_algorithm.as_deref(),
+            stored,
+        )
     }
 
     /// Read a specific object version's bytes. Used when a CFN property
