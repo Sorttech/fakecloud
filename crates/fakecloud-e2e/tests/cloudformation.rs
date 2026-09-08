@@ -588,7 +588,11 @@ def lambda_handler(event, context):
     assert_eq!(invocation_event["ResourceType"], "Custom::MyResource");
     assert_eq!(invocation_event["LogicalResourceId"], "MyCustom");
     assert_eq!(invocation_event["ResourceProperties"]["Foo"], "bar");
-    assert_eq!(invocation_event["ResourceProperties"]["Count"], 42);
+    // The template says `"Count": 42`, but CloudFormation stringifies every
+    // scalar in ResourceProperties before the handler sees it, so the event
+    // carries "42". Handlers rely on this: cfn-response and the CDK Python
+    // handlers call string methods on these values.
+    assert_eq!(invocation_event["ResourceProperties"]["Count"], "42");
 }
 
 #[tokio::test]
