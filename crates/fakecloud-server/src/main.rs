@@ -12094,11 +12094,24 @@ async fn main() {
             "host.containers.internal".to_string(),
             "localhost".to_string(),
         ];
-        match cfn_response_tls::serve(tls_listener, app.clone(), &names) {
-            Ok(()) => tracing::info!(
-                "custom-resource ResponseURL listening on https://{host}:{} (self-signed)",
-                tls_addr.port()
-            ),
+        match cfn_response_tls::self_signed(&names) {
+            Ok((config, pem)) => {
+                // Handlers verify this certificate rather than skipping
+                // verification, so it has to reach their containers.
+                match cfn_response_tls::publish_ca_bundle(&pem) {
+                    Ok(path) => tracing::info!(
+                        "custom-resource ResponseURL listening on https://{host}:{} (certificate at {})",
+                        tls_addr.port(),
+                        path.display()
+                    ),
+                    Err(e) => tracing::warn!(
+                        "custom-resource ResponseURL listening on https://{host}:{}, but handlers \
+                         cannot verify it: {e}",
+                        tls_addr.port()
+                    ),
+                }
+                cfn_response_tls::serve(tls_listener, app.clone(), config);
+            }
             Err(e) => tracing::warn!("custom-resource ResponseURL listener failed to start: {e}"),
         }
     }
