@@ -920,6 +920,31 @@ fn policy_document_string(props: &serde_json::Value) -> Result<String, String> {
     }
 }
 
+/// Render custom-resource properties the way CloudFormation delivers them.
+///
+/// CloudFormation stringifies every scalar in `ResourceProperties` before it
+/// reaches the handler: `true` arrives as `"true"`, `3` as `"3"`. Handlers rely
+/// on it -- CDK's bucket deployment does `props.get('Prune', 'true').lower()`,
+/// which raises `'bool' object has no attribute 'lower'` against a real JSON
+/// boolean. Lists and maps keep their shape; only the leaves change.
+fn stringify_resource_properties(value: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::Bool(b) => Value::String(b.to_string()),
+        Value::Number(n) => Value::String(n.to_string()),
+        Value::Array(items) => {
+            Value::Array(items.iter().map(stringify_resource_properties).collect())
+        }
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), stringify_resource_properties(v)))
+                .collect(),
+        ),
+        // Strings pass through; null has no string form CloudFormation invents.
+        other => other.clone(),
+    }
+}
+
 /// Holds references to all service states so CloudFormation can provision resources.
 pub struct ResourceProvisioner {
     pub sqs_state: SharedSqsState,
@@ -3304,7 +3329,7 @@ impl ResourceProvisioner {
             "RequestId": request_id,
             "ResourceType": resource.resource_type,
             "LogicalResourceId": resource.logical_id,
-            "ResourceProperties": props,
+            "ResourceProperties": stringify_resource_properties(props),
         });
 
         let payload = serde_json::to_string(&event).map_err(|e| e.to_string())?;
@@ -9097,5 +9122,49 @@ mod tests {
             .starts_with(&format!("{}|", app.physical_id)));
         let env_id = env.physical_id.split('|').nth(1).unwrap();
         assert_eq!(a.environments.get(env_id).unwrap().name, "prod");
+    }
+}
+
+#[cfg(test)]
+mod resource_property_tests {
+    use super::stringify_resource_properties;
+
+    #[test]
+    fn scalars_arrive_as_strings_like_cloudformation_sends_them() {
+        let props = serde_json::json!({"Prune": true, "Retries": 3, "Name": "site"});
+        let out = stringify_resource_properties(&props);
+        assert_eq!(out["Prune"], "true");
+        assert_eq!(out["Retries"], "3");
+        assert_eq!(out["Name"], "site");
+    }
+
+    #[test]
+    fn lists_and_maps_keep_their_shape() {
+        let props = serde_json::json!({
+            "SourceObjectKeys": ["a.zip", "b.zip"],
+            "Nested": {"Enabled": false, "Count": 2},
+            "Flags": [true, 1]
+        });
+        let out = stringify_resource_properties(&props);
+        assert_eq!(
+            out["SourceObjectKeys"],
+            serde_json::json!(["a.zip", "b.zip"])
+        );
+        assert_eq!(out["Nested"]["Enabled"], "false");
+        assert_eq!(out["Nested"]["Count"], "2");
+        assert_eq!(out["Flags"], serde_json::json!(["true", "1"]));
+    }
+
+    #[test]
+    fn null_is_left_alone() {
+        // CloudFormation has no string form to invent for it.
+        let out = stringify_resource_properties(&serde_json::json!({"Absent": null}));
+        assert!(out["Absent"].is_null());
+    }
+
+    #[test]
+    fn a_float_keeps_its_value() {
+        let out = stringify_resource_properties(&serde_json::json!({"Ratio": 1.5}));
+        assert_eq!(out["Ratio"], "1.5");
     }
 }
