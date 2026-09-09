@@ -559,12 +559,26 @@ impl CloudFormationService {
         let (bucket, key) = parse_s3_url(url)?;
         let mut accounts = self.deps.s3.write();
         let state = accounts.get_or_create(account_id);
-        let body_ref = {
+        let (body_ref, sse_algorithm) = {
             let b = state.buckets.get(&bucket)?;
-            b.objects.get(&key)?.body.clone()
+            let o = b.objects.get(&key)?;
+            (o.body.clone(), o.sse_algorithm.clone())
         };
         let bytes = state.read_body(&body_ref).ok()?;
-        String::from_utf8(bytes.to_vec()).ok()
+        // An SSE-KMS bucket stores an envelope, not the object -- and
+        // `cdk bootstrap` makes its assets bucket `aws:kms`. The envelope is
+        // base64 ASCII, so it survives `from_utf8` and passes the non-empty
+        // check below, producing a "template" with no resources: the stack then
+        // reports CREATE_COMPLETE having provisioned nothing.
+        let plaintext = fakecloud_s3::sse::decrypt_body(
+            self.deps.kms_hook.as_ref(),
+            account_id,
+            &bucket,
+            sse_algorithm.as_deref(),
+            bytes.to_vec(),
+        )
+        .ok()?;
+        String::from_utf8(plaintext).ok()
     }
 
     pub(crate) fn handle_extra_action(
