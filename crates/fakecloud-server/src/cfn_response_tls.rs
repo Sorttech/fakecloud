@@ -38,19 +38,33 @@ pub fn tls_port() -> u16 {
 
 /// Build a rustls config from a freshly generated self-signed certificate
 /// covering the names a Lambda container might dial fakecloud by.
-pub fn self_signed_config(names: &[String]) -> Result<rustls::ServerConfig, String> {
+/// Generate the certificate, returning both the server config and the PEM to
+/// hand to Lambda containers so they can verify this endpoint.
+pub fn self_signed(names: &[String]) -> Result<(rustls::ServerConfig, String), String> {
     // rustls 0.23 has no implicit provider; several are vendored here, so pick
     // one explicitly. Already-installed is not an error.
     let _ = rustls::crypto::ring::default_provider().install_default();
     let certified = rcgen::generate_simple_self_signed(names.to_vec())
         .map_err(|e| format!("failed to generate a certificate: {e}"))?;
+    let pem = certified.cert.pem();
     let cert = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
     let key = rustls::pki_types::PrivateKeyDer::try_from(certified.key_pair.serialize_der())
         .map_err(|e| format!("failed to encode the private key: {e}"))?;
-    rustls::ServerConfig::builder()
+    let config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert], key)
-        .map_err(|e| format!("failed to build the TLS config: {e}"))
+        .map_err(|e| format!("failed to build the TLS config: {e}"))?;
+    Ok((config, pem))
+}
+
+/// Write the certificate where the Lambda runtime can copy it from, and tell it
+/// where that is. A fixed path, rewritten each start: the certificate is
+/// regenerated per process, so a stale one must not linger.
+pub fn publish_ca_bundle(pem: &str) -> Result<std::path::PathBuf, String> {
+    let path = std::env::temp_dir().join("fakecloud-ca.pem");
+    std::fs::write(&path, pem).map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+    std::env::set_var("FAKECLOUD_LAMBDA_CA_BUNDLE", &path);
+    Ok(path)
 }
 
 /// Claim the port up front, before the router exists.
@@ -69,8 +83,7 @@ pub async fn bind(port: u16) -> Result<(TcpListener, SocketAddr), String> {
 }
 
 /// Serve `app` over TLS on an already-bound listener, until the process ends.
-pub fn serve(listener: TcpListener, app: axum::Router, names: &[String]) -> Result<(), String> {
-    let config = self_signed_config(names)?;
+pub fn serve(listener: TcpListener, app: axum::Router, config: rustls::ServerConfig) {
     let acceptor = TlsAcceptor::from(Arc::new(config));
 
     tokio::spawn(async move {
@@ -103,7 +116,6 @@ pub fn serve(listener: TcpListener, app: axum::Router, names: &[String]) -> Resu
             });
         }
     });
-    Ok(())
 }
 
 #[cfg(test)]
@@ -119,7 +131,9 @@ mod tests {
             "host.containers.internal".to_string(),
             "localhost".to_string(),
         ];
-        assert!(self_signed_config(&names).is_ok());
+        let (_config, pem) = self_signed(&names).expect("certificate");
+        // The PEM is what a container is asked to trust, so it must be one.
+        assert!(pem.starts_with("-----BEGIN CERTIFICATE-----"), "{pem}");
     }
 
     #[test]

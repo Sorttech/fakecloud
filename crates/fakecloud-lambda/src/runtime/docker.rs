@@ -198,6 +198,7 @@ impl DockerBackend {
         }
         let container_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
+        self.copy_ca_bundle_into(&container_id).await;
         if let Err(e) = self.copy_layers_into(&container_id, layers).await {
             self.remove_container(&container_id).await;
             return Err(e);
@@ -332,6 +333,7 @@ impl DockerBackend {
             }
         }
 
+        self.copy_ca_bundle_into(&container_id).await;
         if let Err(e) = self.copy_layers_into(&container_id, layers).await {
             self.remove_container(&container_id).await;
             return Err(e);
@@ -412,6 +414,39 @@ impl DockerBackend {
     /// `bin/`) that AWS base images already wire onto the runtime's
     /// import paths, so plain extraction at the temp root produces the
     /// correct on-disk layout. Empty `layers` is a no-op.
+    /// Copy fakecloud's TLS certificate into the container so a handler can
+    /// verify the custom-resource `ResponseURL` endpoint.
+    ///
+    /// Copied rather than bind-mounted: fakecloud commonly runs in a container
+    /// while Lambda containers are its siblings on the host daemon, so a path
+    /// inside fakecloud's filesystem is not mountable into theirs. `docker cp`
+    /// streams through the CLI, which works either way.
+    ///
+    /// Best-effort: without it a handler simply cannot verify the endpoint, and
+    /// failing container startup over that would be worse.
+    async fn copy_ca_bundle_into(&self, container_id: &str) {
+        let Some(path) = ca_bundle_source_path() else {
+            return;
+        };
+        let out = tokio::process::Command::new(&self.cli)
+            .arg("cp")
+            .arg(&path)
+            .arg(format!(
+                "{container_id}:{}",
+                super::env_rewrite::CA_BUNDLE_PATH
+            ))
+            .output()
+            .await;
+        match out {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => tracing::warn!(
+                "could not copy the fakecloud CA into {container_id}: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            ),
+            Err(e) => tracing::warn!("could not copy the fakecloud CA into {container_id}: {e}"),
+        }
+    }
+
     async fn copy_layers_into(
         &self,
         container_id: &str,
@@ -689,6 +724,13 @@ fn build_local_registry_docker_config(server_port: u16) -> Option<TempDir> {
     let config = serde_json::json!({ "auths": auths });
     std::fs::write(dir.path().join("config.json"), config.to_string()).ok()?;
     Some(dir)
+}
+
+/// Path on fakecloud's own filesystem to the certificate handed to containers,
+/// set at startup once the ResponseURL listener has generated one.
+fn ca_bundle_source_path() -> Option<String> {
+    let path = std::env::var("FAKECLOUD_LAMBDA_CA_BUNDLE").ok()?;
+    std::path::Path::new(&path).exists().then_some(path)
 }
 
 #[cfg(test)]
