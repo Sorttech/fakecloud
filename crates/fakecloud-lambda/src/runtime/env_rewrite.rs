@@ -54,6 +54,14 @@ pub fn default_aws_envs(host: &str, port: u16, region: &str) -> Vec<(String, Str
         ("AWS_DEFAULT_REGION", region.to_string()),
         ("AWS_ACCESS_KEY_ID", "test".to_string()),
         ("AWS_SECRET_ACCESS_KEY", "test".to_string()),
+        // fakecloud's custom-resource ResponseURL is served with a self-signed
+        // certificate, where CloudFormation's is publicly trusted. Handlers are
+        // told to accept it rather than shipping a CA, because fakecloud often
+        // runs in a container while Lambda containers are its siblings: a CA
+        // file inside fakecloud's container cannot be mounted into theirs.
+        // Injecting a real CA is the upgrade path if that changes.
+        ("NODE_TLS_REJECT_UNAUTHORIZED", "0".to_string()),
+        ("PYTHONHTTPSVERIFY", "0".to_string()),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
@@ -148,6 +156,9 @@ mod tests {
         // none fails before it ever reaches the endpoint.
         assert!(get("AWS_ACCESS_KEY_ID").is_some());
         assert!(get("AWS_SECRET_ACCESS_KEY").is_some());
+        // The ResponseURL endpoint's certificate is self-signed.
+        assert_eq!(get("NODE_TLS_REJECT_UNAUTHORIZED").as_deref(), Some("0"));
+        assert_eq!(get("PYTHONHTTPSVERIFY").as_deref(), Some("0"));
     }
 
     #[test]

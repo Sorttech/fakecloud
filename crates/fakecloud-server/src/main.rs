@@ -15,6 +15,7 @@ use fakecloud_sdk::types;
 mod admin_elasticache_artifacts;
 mod admin_lambda_artifacts;
 mod appas_hooks;
+mod cfn_response_tls;
 mod cli;
 mod dns;
 mod dynamodb_streams_lambda_poller;
@@ -1492,9 +1493,37 @@ async fn main() {
         std::sync::Arc::new(
             fakecloud_cloudformation::custom_resource_response::CustomResourceResponses::new(),
         );
-    let custom_resource_response_base = fakecloud_core::container_net::detect_container_cli()
-        .map(|cli| fakecloud_core::container_net::HostNetworking::detect(&cli).host_alias)
-        .map(|host| format!("http://{host}:{}", bound_addr.port()));
+    // CDK's custom-resource framework calls `https.request` with no port, so the
+    // signal can only arrive over TLS on 443. Claim the port before deciding
+    // what URL to hand out: if nothing listens, sending a URL would just make
+    // every handler fail on a connection it cannot make.
+    let cfn_response_host = fakecloud_core::container_net::detect_container_cli()
+        .map(|cli| fakecloud_core::container_net::HostNetworking::detect(&cli).host_alias);
+    let cfn_response_tls_port = cfn_response_tls::tls_port();
+    let cfn_response_tls_listener = match &cfn_response_host {
+        Some(_) => match cfn_response_tls::bind(cfn_response_tls_port).await {
+            Ok((listener, addr)) => Some((listener, addr)),
+            Err(e) => {
+                tracing::warn!(
+                    "custom-resource ResponseURL disabled: {e}. Publish port {cfn_response_tls_port} \
+                     to enable custom resources that signal (CDK's do)."
+                );
+                None
+            }
+        },
+        None => None,
+    };
+    let custom_resource_response_base = match (&cfn_response_host, &cfn_response_tls_listener) {
+        (Some(host), Some((_, addr))) => {
+            Some(if addr.port() == cfn_response_tls::DEFAULT_TLS_PORT {
+                // No port: the handler ignores one anyway and assumes 443.
+                format!("https://{host}")
+            } else {
+                format!("https://{host}:{}", addr.port())
+            })
+        }
+        _ => None,
+    };
     let custom_resource_responses_for_route = custom_resource_responses.clone();
 
     let mut cloudformation_service = CloudFormationService::new(
@@ -12060,6 +12089,25 @@ async fn main() {
             upstream: cli.dns_upstream(),
         };
         tokio::spawn(dns::run(dns_cfg, cli.dns_addr()));
+    }
+    if let (Some(host), Some((tls_listener, tls_addr))) =
+        (cfn_response_host, cfn_response_tls_listener)
+    {
+        // Every name a Lambda container might dial us by; which one applies
+        // depends on the container runtime and topology.
+        let names = vec![
+            host.clone(),
+            "host.docker.internal".to_string(),
+            "host.containers.internal".to_string(),
+            "localhost".to_string(),
+        ];
+        match cfn_response_tls::serve(tls_listener, app.clone(), &names) {
+            Ok(()) => tracing::info!(
+                "custom-resource ResponseURL listening on https://{host}:{} (self-signed)",
+                tls_addr.port()
+            ),
+            Err(e) => tracing::warn!("custom-resource ResponseURL listener failed to start: {e}"),
+        }
     }
     axum::serve(
         listener,

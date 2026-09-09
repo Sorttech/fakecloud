@@ -58,7 +58,11 @@ Full control plane: `CreateStackSet`, `UpdateStackSet`, `DeleteStackSet`, `Descr
 
 ## Custom resources
 
-`AWS::CloudFormation::CustomResource` and `Custom::*` types invoke the Lambda function referenced by `ServiceToken` with the CFN custom-resource event payload (`RequestType`, `ResponseURL`, `StackId`, `RequestId`, `LogicalResourceId`, `ResourceProperties`, `OldResourceProperties` on update). The provisioner POSTs to the response URL on the function's behalf if the function doesn't, so simple custom resources work even when the user code forgets to signal.
+`AWS::CloudFormation::CustomResource` and `Custom::*` types invoke the Lambda function referenced by `ServiceToken` with the CFN custom-resource event payload (`RequestType`, `ResponseURL`, `StackId`, `RequestId`, `LogicalResourceId`, `ResourceProperties`, `OldResourceProperties` on update). Scalars in `ResourceProperties` are strings, as CloudFormation sends them: `true` arrives as `"true"`, `3` as `"3"`.
+
+A handler reports its outcome the way it does on AWS — an HTTPS PUT to `ResponseURL` — and the stack fails with the handler's own reason if it signals `FAILED`. A handler that signals nothing is treated as success, so resources written before `cfn-response` still work.
+
+**`ResponseURL` requires port 443.** CDK's custom-resource framework calls `https.request` built from the URL's hostname with no port, so Node defaults to 443 whatever the URL says. fakecloud therefore serves the response endpoint over TLS on 443, and the bundled `docker-compose.yml` publishes it. Run fakecloud without that port reachable and no `ResponseURL` is sent at all — handlers that signal cannot report, and CDK's throw on the missing field. The certificate is self-signed, and handlers are told to accept it.
 
 ## Drift detection
 
