@@ -15,5 +15,5 @@ mod xml_util;
 
 pub use cfn::apply_cfn_bucket_properties;
 pub use delivery::S3DeliveryImpl;
-pub use service::S3Service;
+pub use service::{is_valid_bucket_name, S3Service};
 pub use state::{memory_body, S3AccessPoint, S3Bucket, S3Object, S3State, SharedS3State};

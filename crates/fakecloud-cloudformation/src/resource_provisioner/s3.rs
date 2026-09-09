@@ -35,10 +35,21 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
-        let bucket_name = props
-            .get("BucketName")
-            .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id);
+        let generated;
+        let bucket_name = match props.get("BucketName").and_then(|v| v.as_str()) {
+            Some(explicit) => explicit,
+            None => {
+                generated = generated_bucket_name(
+                    self.stack_id
+                        .rsplit('/')
+                        .nth(1)
+                        .unwrap_or(&resource.logical_id),
+                    &resource.logical_id,
+                    &Uuid::new_v4().to_string().replace('-', "")[..8],
+                );
+                &generated
+            }
+        };
 
         let mut __s3_mas = self.s3_state.write();
         let state = __s3_mas.get_or_create(&self.account_id);
@@ -209,4 +220,95 @@ fn s3_policy_bucket_name(props: &serde_json::Value) -> Result<String, String> {
         .and_then(|v| v.as_str())
         .map(String::from)
         .ok_or_else(|| "Bucket is required".to_string())
+}
+
+/// Physical name for an `AWS::S3::Bucket` that declares no `BucketName`.
+///
+/// Real CloudFormation generates `<stack>-<logical-id>-<random>`, and S3 bucket
+/// names are lowercase-only. The logical id therefore cannot be used verbatim:
+/// a CDK construct id like `SiteE53D7754` is not a legal bucket name, and while
+/// path-style reads happen to tolerate it, every virtual-hosted-style read
+/// fails — which is how a CloudFront distribution over an S3 origin ends up
+/// serving 404 for a bucket that visibly holds the object.
+fn generated_bucket_name(stack_name: &str, logical_id: &str, suffix: &str) -> String {
+    fn sanitize(part: &str) -> String {
+        part.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_lowercase()
+                } else {
+                    '-'
+                }
+            })
+            .collect()
+    }
+
+    let mut name = format!(
+        "{}-{}-{}",
+        sanitize(stack_name),
+        sanitize(logical_id),
+        sanitize(suffix)
+    );
+    name.truncate(MAX_BUCKET_NAME_LEN);
+    // First and last character must be alphanumeric, and the truncation above
+    // can land on a separator.
+    let name = name.trim_matches('-');
+    if name.len() < MIN_BUCKET_NAME_LEN {
+        // Nothing usable survived (an all-symbol stack and logical id); fall
+        // back to something legal rather than emitting an invalid name.
+        return format!("cfn-bucket-{}", sanitize(suffix));
+    }
+    name.to_string()
+}
+
+/// AWS general-purpose bucket name bounds.
+const MIN_BUCKET_NAME_LEN: usize = 3;
+const MAX_BUCKET_NAME_LEN: usize = 63;
+
+#[cfg(test)]
+mod tests {
+    use super::generated_bucket_name;
+    use fakecloud_s3::is_valid_bucket_name;
+
+    #[test]
+    fn generated_name_is_a_legal_bucket_name() {
+        // The logical id CDK produces for a construct is mixed case; S3 bucket
+        // names are lowercase-only, and an illegal name breaks every
+        // virtual-hosted-style read (a CloudFront S3 origin especially).
+        let name = generated_bucket_name("SpaStack", "SiteE53D7754", "1a2b3c4d");
+        assert!(is_valid_bucket_name(&name), "{name}");
+        assert_eq!(name, "spastack-sitee53d7754-1a2b3c4d");
+    }
+
+    #[test]
+    fn generated_name_follows_the_cloudformation_shape() {
+        let name = generated_bucket_name("my-stack", "Data", "beef");
+        assert_eq!(name, "my-stack-data-beef");
+    }
+
+    #[test]
+    fn illegal_characters_are_replaced_not_dropped() {
+        let name = generated_bucket_name("My_Stack", "Bucket$Name", "0f0f");
+        assert!(is_valid_bucket_name(&name), "{name}");
+        assert_eq!(name, "my-stack-bucket-name-0f0f");
+    }
+
+    #[test]
+    fn a_long_name_is_clamped_to_the_63_character_limit() {
+        let name = generated_bucket_name(&"s".repeat(40), &"L".repeat(40), "cafe");
+        assert!(is_valid_bucket_name(&name), "{name} ({} chars)", name.len());
+        assert_eq!(name.len(), 63);
+    }
+
+    #[test]
+    fn truncation_never_leaves_a_trailing_hyphen() {
+        // Clamping can land exactly on a separator; S3 requires the last
+        // character to be alphanumeric.
+        let name = generated_bucket_name(&"s".repeat(62), "Bucket", "cafe");
+        assert!(is_valid_bucket_name(&name), "{name}");
+        assert!(
+            name.ends_with(|c: char| c.is_ascii_alphanumeric()),
+            "{name}"
+        );
+    }
 }

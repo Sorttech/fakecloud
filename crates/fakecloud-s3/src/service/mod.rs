@@ -2453,7 +2453,7 @@ pub(crate) fn is_valid_storage_class(class: &str) -> bool {
     )
 }
 
-pub(crate) fn is_valid_bucket_name(name: &str) -> bool {
+pub fn is_valid_bucket_name(name: &str) -> bool {
     // General-purpose bucket naming rules (AWS S3):
     // https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucketnamingrules.html
     if name.len() < 3 || name.len() > 63 {
