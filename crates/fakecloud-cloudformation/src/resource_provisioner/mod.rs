@@ -462,9 +462,10 @@ struct LambdaFunctionProps {
     tags: BTreeMap<String, String>,
     environment: BTreeMap<String, String>,
     architectures: Vec<String>,
-    /// Decoded `Code.ZipFile` bytes (base64 → raw). `None` when the
-    /// caller specified `Code.S3Bucket`/`Code.S3Key` or `Code.ImageUri`
-    /// instead — the create/update path resolves S3 separately.
+    /// A real ZIP archive built from the inline `Code.ZipFile` source.
+    /// `None` when the caller specified `Code.S3Bucket`/`Code.S3Key` or
+    /// `Code.ImageUri` instead — the create/update path resolves S3
+    /// separately, and those bytes are already an archive.
     code_zip: Option<Vec<u8>>,
     s3_bucket: Option<String>,
     s3_key: Option<String>,
@@ -554,13 +555,20 @@ fn parse_lambda_function_props(props: &serde_json::Value) -> Result<LambdaFuncti
     let code = props.get("Code");
     // CFN's `Code.ZipFile` is the raw source code inline (per the
     // CloudFormation user guide), not base64 like the Lambda
-    // CreateFunction API. We store it as the raw bytes — fakecloud's
-    // Lambda runtime is content-agnostic and just needs *some* deployable
-    // payload to execute.
+    // CreateFunction API. It still has to become a real deployment
+    // package here, because that is what CloudFormation hands Lambda and
+    // what everything downstream of `code_zip` expects: the runtime
+    // unzips it on cold start. Storing the bare source instead produced a
+    // function that created cleanly, reported a plausible CodeSha256 and
+    // CodeSize, and then failed its first invocation with
+    // `ZIP extraction failed: invalid Zip archive: Could not find EOCD` —
+    // which is how CDK's inline `BucketNotificationsHandler` took down
+    // every stack that attaches a notification to a bucket.
     let code_zip = code
         .and_then(|c| c.get("ZipFile"))
         .and_then(|v| v.as_str())
-        .map(|s| s.as_bytes().to_vec());
+        .map(|source| fakecloud_lambda::runtime::zip_inline_source(source, &handler, &runtime))
+        .transpose()?;
     let s3_bucket = code
         .and_then(|c| c.get("S3Bucket"))
         .and_then(|v| v.as_str())
@@ -4007,7 +4015,30 @@ fn parse_firehose_s3_destination(value: &serde_json::Value) -> Result<S3Destinat
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use parking_lot::RwLock;
+
+    /// `Code.ZipFile` is source text, and it has to leave this function as a
+    /// deployment package: everything downstream unzips `code_zip`. Asserting
+    /// the local-file-header magic is enough to catch the regression — storing
+    /// the bare source produced bytes that only failed later, in the runtime,
+    /// on the function's first invocation.
+    #[test]
+    fn inline_zipfile_is_packaged_into_a_real_archive() {
+        let cfg = parse_lambda_function_props(&serde_json::json!({
+            "Runtime": "python3.12",
+            "Handler": "index.handler",
+            "Code": {"ZipFile": "def handler(event, context):\n    return event\n"}
+        }))
+        .expect("props parse");
+
+        let bytes = cfg.code_zip.expect("inline code should produce a package");
+        assert_eq!(
+            &bytes[..4],
+            b"PK\x03\x04",
+            "Code.ZipFile must be packaged, not stored as raw source"
+        );
+    }
 
     fn make_provisioner() -> ResourceProvisioner {
         ResourceProvisioner {
