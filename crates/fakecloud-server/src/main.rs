@@ -1484,12 +1484,27 @@ async fn main() {
         } else {
             None
         };
+    // Custom-resource handlers PUT their outcome to `ResponseURL`; the URL has to
+    // be reachable from inside a Lambda container, so it uses the same host
+    // alias the Lambda runtime uses. No container backend means no handler to
+    // signal, so no URL is sent.
+    let custom_resource_responses: fakecloud_cloudformation::custom_resource_response::SharedCustomResourceResponses =
+        std::sync::Arc::new(
+            fakecloud_cloudformation::custom_resource_response::CustomResourceResponses::new(),
+        );
+    let custom_resource_response_base = fakecloud_core::container_net::detect_container_cli()
+        .map(|cli| fakecloud_core::container_net::HostNetworking::detect(&cli).host_alias)
+        .map(|host| format!("http://{host}:{}", bound_addr.port()));
+    let custom_resource_responses_for_route = custom_resource_responses.clone();
+
     let mut cloudformation_service = CloudFormationService::new(
         cloudformation_state.clone(),
         fakecloud_cloudformation::CloudFormationDeps {
             // Lets the provisioner unwrap SSE-KMS object bodies when a resource
             // points at an S3 object (Lambda Code.S3Bucket/S3Key and friends).
             kms_hook: Some(kms_hook_for_services.clone()),
+            custom_resource_responses: custom_resource_responses.clone(),
+            custom_resource_response_base: custom_resource_response_base.clone(),
             sqs: sqs_state.clone(),
             sns: sns_state.clone(),
             ssm: ssm_state.clone(),
@@ -10519,6 +10534,32 @@ async fn main() {
                         }
                         events.sort_by(|a, b| a.at.cmp(&b.at));
                         axum::Json(types::EcsEventsResponse { events })
+                    }
+                }
+            }),
+        )
+        .route(
+            "/_fakecloud/cfn/custom-resource-response/{request_id}",
+            // cfn-response PUTs the signal here. It sends no auth and expects a
+            // plain 200, so anything else makes the handler retry or throw.
+            axum::routing::put({
+                let responses = custom_resource_responses_for_route.clone();
+                move |axum::extract::Path(request_id): axum::extract::Path<String>,
+                      body: String| {
+                    let responses = responses.clone();
+                    async move {
+                        match serde_json::from_str::<serde_json::Value>(&body) {
+                            Ok(parsed) if responses.record(&request_id, &parsed) => {
+                                (axum::http::StatusCode::OK, "")
+                            }
+                            _ => {
+                                tracing::warn!(
+                                    %request_id,
+                                    "custom-resource response body was not a signal"
+                                );
+                                (axum::http::StatusCode::BAD_REQUEST, "")
+                            }
+                        }
                     }
                 }
             }),

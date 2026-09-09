@@ -511,6 +511,12 @@ pub struct CloudFormationDeps {
     /// Step Functions definition, ...). Without it those readers see the
     /// stored envelope instead of the object. `None` = no KMS wired.
     pub kms_hook: Option<std::sync::Arc<dyn fakecloud_core::delivery::KmsHook>>,
+    /// Signals custom-resource handlers PUT to their `ResponseURL`; shared with
+    /// the internal HTTP route that receives them.
+    pub custom_resource_responses: crate::custom_resource_response::SharedCustomResourceResponses,
+    /// Base URL a Lambda container can reach fakecloud at. `None` disables
+    /// `ResponseURL` entirely.
+    pub custom_resource_response_base: Option<String>,
     pub sqs: SharedSqsState,
     pub sns: SharedSnsState,
     pub ssm: SharedSsmState,
@@ -1075,6 +1081,8 @@ impl CloudFormationService {
     ) -> ResourceProvisioner {
         ResourceProvisioner {
             kms_hook: self.deps.kms_hook.clone(),
+            custom_resource_responses: self.deps.custom_resource_responses.clone(),
+            custom_resource_response_base: self.deps.custom_resource_response_base.clone(),
             sqs_state: self.deps.sqs.clone(),
             sns_state: self.deps.sns.clone(),
             ssm_state: self.deps.ssm.clone(),
@@ -4034,6 +4042,8 @@ mod tests {
         ));
         let deps = CloudFormationDeps {
             kms_hook: None,
+            custom_resource_responses: Default::default(),
+            custom_resource_response_base: None,
             sqs: Arc::new(RwLock::new(
                 fakecloud_core::multi_account::MultiAccountState::new(
                     "123456789012",
