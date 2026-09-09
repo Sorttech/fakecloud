@@ -506,6 +506,11 @@ fn reconstruct_stack_resource(
 }
 
 pub struct CloudFormationDeps {
+    /// KMS hook used to unwrap SSE-KMS object bodies when a resource's
+    /// properties point at an S3 object (Lambda `Code.S3Bucket`/`S3Key`, a
+    /// Step Functions definition, ...). Without it those readers see the
+    /// stored envelope instead of the object. `None` = no KMS wired.
+    pub kms_hook: Option<std::sync::Arc<dyn fakecloud_core::delivery::KmsHook>>,
     pub sqs: SharedSqsState,
     pub sns: SharedSnsState,
     pub ssm: SharedSsmState,
@@ -1069,6 +1074,7 @@ impl CloudFormationService {
         region: &str,
     ) -> ResourceProvisioner {
         ResourceProvisioner {
+            kms_hook: self.deps.kms_hook.clone(),
             sqs_state: self.deps.sqs.clone(),
             sns_state: self.deps.sns.clone(),
             ssm_state: self.deps.ssm.clone(),
@@ -4027,6 +4033,7 @@ mod tests {
             ),
         ));
         let deps = CloudFormationDeps {
+            kms_hook: None,
             sqs: Arc::new(RwLock::new(
                 fakecloud_core::multi_account::MultiAccountState::new(
                     "123456789012",

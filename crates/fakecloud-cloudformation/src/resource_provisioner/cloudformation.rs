@@ -71,6 +71,7 @@ impl ResourceProvisioner {
         );
 
         let child_provisioner = ResourceProvisioner {
+            kms_hook: self.kms_hook.clone(),
             sqs_state: self.sqs_state.clone(),
             sns_state: self.sns_state.clone(),
             ssm_state: self.ssm_state.clone(),

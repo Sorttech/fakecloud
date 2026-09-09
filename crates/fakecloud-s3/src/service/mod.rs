@@ -180,29 +180,24 @@ impl S3Service {
         bucket: &str,
         ciphertext: &[u8],
     ) -> Result<bytes::Bytes, AwsServiceError> {
-        let Some(hook) = &self.kms_hook else {
-            return Ok(bytes::Bytes::copy_from_slice(ciphertext));
-        };
-        // Stored envelope is base64 ASCII; non-UTF-8 bytes are pre-hook
-        // legacy snapshots, return as-is.
-        let envelope = match std::str::from_utf8(ciphertext) {
-            Ok(s) => s,
-            Err(_) => return Ok(bytes::Bytes::copy_from_slice(ciphertext)),
-        };
-        let bucket_arn = Arn::s3(bucket).to_string();
-        let mut ctx = std::collections::HashMap::new();
-        ctx.insert("aws:s3:arn".to_string(), bucket_arn);
-        match hook.decrypt(account_id, envelope, "s3.amazonaws.com", ctx) {
-            Ok(bytes) => Ok(bytes::Bytes::from(bytes)),
-            Err(err) => {
-                tracing::warn!(bucket = %bucket, error = %err, "SSE-KMS decrypt failed");
-                Err(AwsServiceError::aws_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "KMS.InternalFailureException",
-                    format!("Failed to decrypt object via KMS: {err}"),
-                ))
-            }
-        }
+        // Callers gate on `sse_algorithm == Some("aws:kms")`, so say so; the
+        // envelope handling itself is shared with the internal readers.
+        crate::sse::decrypt_body(
+            self.kms_hook.as_ref(),
+            account_id,
+            bucket,
+            Some("aws:kms"),
+            ciphertext.to_vec(),
+        )
+        .map(bytes::Bytes::from)
+        .map_err(|err| {
+            tracing::warn!(bucket = %bucket, error = %err, "SSE-KMS decrypt failed");
+            AwsServiceError::aws_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "KMS.InternalFailureException",
+                format!("Failed to decrypt object via KMS: {err}"),
+            )
+        })
     }
 }
 
