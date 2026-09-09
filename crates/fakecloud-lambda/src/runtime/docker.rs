@@ -12,7 +12,7 @@ use base64::Engine;
 use tempfile::TempDir;
 
 use super::backend::{BackendHandle, LambdaBackend, RuntimeError, WarmInstance};
-use super::env_rewrite::rewrite_localhost_envs;
+use super::env_rewrite::{default_aws_envs, region_from_function_arn, rewrite_localhost_envs};
 use crate::state::LambdaFunction;
 
 /// Docker/Podman-based Lambda execution backend.
@@ -167,6 +167,15 @@ impl DockerBackend {
             .arg(format!("fakecloud-instance={}", self.instance_id));
         self.apply_host_alias(&mut cmd);
 
+        // Defaults first: docker's last `-e` wins, so the function's own
+        // environment overrides anything it sets for itself.
+        for (key, value) in default_aws_envs(
+            &self.host_alias,
+            self.server_port,
+            region_from_function_arn(&func.function_arn),
+        ) {
+            cmd.arg("-e").arg(format!("{key}={value}"));
+        }
         for (key, value) in rewrite_localhost_envs(&func.environment, &self.host_alias) {
             cmd.arg("-e").arg(format!("{key}={value}"));
         }
@@ -254,6 +263,15 @@ impl DockerBackend {
             .arg(format!("fakecloud-instance={}", self.instance_id));
         self.apply_host_alias(&mut cmd);
 
+        // Defaults first: docker's last `-e` wins, so the function's own
+        // environment overrides anything it sets for itself.
+        for (key, value) in default_aws_envs(
+            &self.host_alias,
+            self.server_port,
+            region_from_function_arn(&func.function_arn),
+        ) {
+            cmd.arg("-e").arg(format!("{key}={value}"));
+        }
         for (key, value) in rewrite_localhost_envs(&func.environment, &self.host_alias) {
             cmd.arg("-e").arg(format!("{key}={value}"));
         }
