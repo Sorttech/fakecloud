@@ -107,12 +107,9 @@ impl DockerBackend {
         credentials: Option<&SessionCredentials>,
     ) {
         let endpoint_url = format!("http://{}:{}", self.host_alias, self.server_port);
-        let (args, child_env) = docker_env_args(function_environment(
-            func,
-            &endpoint_url,
-            &self.host_alias,
-            credentials,
-        ));
+        let env = function_environment(func, &endpoint_url, &self.host_alias, credentials);
+        let (args, child_env) =
+            docker_env_args(with_ca_trust(env, ca_bundle_source_path().is_some()));
         cmd.args(args).envs(child_env);
     }
 
@@ -201,6 +198,7 @@ impl DockerBackend {
         }
         let container_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
+        self.copy_ca_bundle_into(&container_id).await;
         if let Err(e) = self.copy_layers_into(&container_id, layers).await {
             self.remove_container(&container_id).await;
             return Err(e);
@@ -322,6 +320,7 @@ impl DockerBackend {
             }
         }
 
+        self.copy_ca_bundle_into(&container_id).await;
         if let Err(e) = self.copy_layers_into(&container_id, layers).await {
             self.remove_container(&container_id).await;
             return Err(e);
@@ -394,6 +393,36 @@ impl DockerBackend {
         Err(RuntimeError::ContainerStartFailed(
             "container did not become ready within 10 seconds".to_string(),
         ))
+    }
+
+    /// Copy fakecloud's TLS certificate into the container so a handler can
+    /// verify the custom-resource `ResponseURL` endpoint.
+    ///
+    /// Copied rather than bind-mounted: fakecloud commonly runs in a container
+    /// while Lambda containers are its siblings on the host daemon, so a path
+    /// inside fakecloud's filesystem is not mountable into theirs. `docker cp`
+    /// streams through the CLI, which works either way.
+    ///
+    /// Best-effort: without it a handler simply cannot verify the endpoint, and
+    /// failing container startup over that would be worse.
+    async fn copy_ca_bundle_into(&self, container_id: &str) {
+        let Some(path) = ca_bundle_source_path() else {
+            return;
+        };
+        let out = tokio::process::Command::new(&self.cli)
+            .arg("cp")
+            .arg(&path)
+            .arg(format!("{container_id}:{}", CA_BUNDLE_PATH))
+            .output()
+            .await;
+        match out {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => tracing::warn!(
+                "could not copy the fakecloud CA into {container_id}: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            ),
+            Err(e) => tracing::warn!("could not copy the fakecloud CA into {container_id}: {e}"),
+        }
     }
 
     /// Extract each layer ZIP into a shared temp directory and `docker cp`
@@ -654,6 +683,48 @@ fn build_local_registry_docker_config(server_port: u16) -> Option<TempDir> {
     Some(dir)
 }
 
+/// Where fakecloud's certificate is copied to inside a Lambda container.
+const CA_BUNDLE_PATH: &str = "/opt/fakecloud-ca.pem";
+
+/// The variables that make each runtime trust [`CA_BUNDLE_PATH`].
+const CA_TRUST_ENV_KEYS: [&str; 3] = ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS"];
+
+/// Point the runtimes' trust settings at fakecloud's certificate.
+///
+/// fakecloud's custom-resource ResponseURL is served with a self-signed
+/// certificate, where CloudFormation's is publicly trusted. The certificate is
+/// copied into the container (see `copy_ca_bundle_into`) and trusted here,
+/// rather than switching verification off: disabling it covered Node but
+/// silently did nothing for Python's `urllib`, whose cfn-response PUT still
+/// failed `CERTIFICATE_VERIFY_FAILED`.
+///
+/// `SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE` replace the whole trust store for the
+/// handler, not just add to it. Everything a handler talks to here is
+/// fakecloud, so that is acceptable; a handler reaching the real internet over
+/// TLS would not find its usual roots.
+///
+/// Only set when there is a certificate to copy, so a server without the TLS
+/// listener does not leave handlers pointing at a missing file. Docker-only:
+/// the Kubernetes backend copies nothing into its pods. A function that sets
+/// one of these itself keeps its value.
+fn with_ca_trust(mut env: Vec<(String, String)>, ca_present: bool) -> Vec<(String, String)> {
+    if ca_present {
+        for key in CA_TRUST_ENV_KEYS {
+            if !env.iter().any(|(k, _)| k == key) {
+                env.push((key.to_string(), CA_BUNDLE_PATH.to_string()));
+            }
+        }
+    }
+    env
+}
+
+/// Path on fakecloud's own filesystem to the certificate handed to containers,
+/// set at startup once the ResponseURL listener has generated one.
+fn ca_bundle_source_path() -> Option<String> {
+    let path = std::env::var("FAKECLOUD_LAMBDA_CA_BUNDLE").ok()?;
+    std::path::Path::new(&path).exists().then_some(path)
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
@@ -783,6 +854,42 @@ mod tests {
         // clamping to a 64 MiB floor that Docker still accepts.
         assert_eq!(ephemeral_storage_tmpfs_arg(Some(0)), "/tmp:size=64m,exec");
         assert_eq!(ephemeral_storage_tmpfs_arg(Some(32)), "/tmp:size=64m,exec");
+    }
+
+    #[test]
+    fn the_ca_is_trusted_not_skipped_when_present() {
+        let env = with_ca_trust(vec![("AWS_REGION".into(), "us-east-1".into())], true);
+        let get = |k: &str| {
+            env.iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.as_str())
+        };
+        // Trusted, not skipped: switching verification off did nothing for Python.
+        for key in CA_TRUST_ENV_KEYS {
+            assert_eq!(get(key), Some(CA_BUNDLE_PATH), "{key}");
+        }
+        assert_eq!(get("NODE_TLS_REJECT_UNAUTHORIZED"), None);
+        assert_eq!(get("PYTHONHTTPSVERIFY"), None);
+    }
+
+    #[test]
+    fn no_ca_leaves_the_trust_store_alone() {
+        // Pointing SSL_CERT_FILE at a file that was never copied would strip
+        // every root from the handler's trust store.
+        let env = with_ca_trust(vec![("AWS_REGION".into(), "us-east-1".into())], false);
+        assert!(env
+            .iter()
+            .all(|(k, _)| !CA_TRUST_ENV_KEYS.contains(&k.as_str())));
+    }
+
+    #[test]
+    fn a_function_set_trust_variable_wins() {
+        let env = with_ca_trust(vec![("SSL_CERT_FILE".into(), "/mine.pem".into())], true);
+        let values: Vec<_> = env.iter().filter(|(k, _)| k == "SSL_CERT_FILE").collect();
+        assert_eq!(
+            values,
+            vec![&("SSL_CERT_FILE".to_string(), "/mine.pem".to_string())]
+        );
     }
 
     #[test]
