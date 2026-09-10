@@ -9,6 +9,9 @@
 
 use std::collections::BTreeMap;
 
+/// Where fakecloud's certificate is copied to inside a Lambda container.
+pub const CA_BUNDLE_PATH: &str = "/opt/fakecloud-ca.pem";
+
 /// Rewrite `localhost` and `127.0.0.1` URLs in each value to use
 /// `target_host` instead. Touches only the host portion of `http(s)://`
 /// URLs; other occurrences of the word "localhost" in env values pass
@@ -54,6 +57,20 @@ pub fn default_aws_envs(host: &str, port: u16, region: &str) -> Vec<(String, Str
         ("AWS_DEFAULT_REGION", region.to_string()),
         ("AWS_ACCESS_KEY_ID", "test".to_string()),
         ("AWS_SECRET_ACCESS_KEY", "test".to_string()),
+        // fakecloud's custom-resource ResponseURL is served with a self-signed
+        // certificate, where CloudFormation's is publicly trusted. The
+        // certificate is copied into the container (see `CA_BUNDLE_PATH`) and
+        // trusted here, rather than switching verification off: disabling it
+        // covered Node but silently did nothing for Python's `urllib`, whose
+        // cfn-response PUT still failed `CERTIFICATE_VERIFY_FAILED`.
+        //
+        // These replace the whole trust store for the handler, not just add to
+        // it. Everything a handler talks to here is fakecloud, so that is
+        // acceptable; a handler reaching the real internet over TLS would not
+        // find its usual roots.
+        ("SSL_CERT_FILE", CA_BUNDLE_PATH.to_string()),
+        ("REQUESTS_CA_BUNDLE", CA_BUNDLE_PATH.to_string()),
+        ("NODE_EXTRA_CA_CERTS", CA_BUNDLE_PATH.to_string()),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
@@ -148,6 +165,13 @@ mod tests {
         // none fails before it ever reaches the endpoint.
         assert!(get("AWS_ACCESS_KEY_ID").is_some());
         assert!(get("AWS_SECRET_ACCESS_KEY").is_some());
+        // The ResponseURL certificate is trusted, not skipped: switching
+        // verification off did nothing for Python.
+        for key in ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS"] {
+            assert_eq!(get(key).as_deref(), Some(CA_BUNDLE_PATH), "{key}");
+        }
+        assert!(get("NODE_TLS_REJECT_UNAUTHORIZED").is_none());
+        assert!(get("PYTHONHTTPSVERIFY").is_none());
     }
 
     #[test]
