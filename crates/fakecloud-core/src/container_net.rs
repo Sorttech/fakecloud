@@ -293,6 +293,62 @@ pub fn resolve_sibling_host(host_alias: &str, env_value: Option<String>) -> Stri
     }
 }
 
+/// The user-defined container network fakecloud shares with the sibling
+/// containers it spawns, from `FAKECLOUD_LAMBDA_NETWORK`. Only the Lambda
+/// runtime joins it today.
+///
+/// Without it a sibling can only reach fakecloud through the host, so every
+/// port it needs must be published. That is fine for the main port, which the
+/// AWS SDK dials with whatever port the endpoint URL carries, but not for the
+/// custom-resource `ResponseURL`: CDK's Node handlers drop the port and dial
+/// 443, so the host's 443 has to be fakecloud's. On a shared network the
+/// signal never leaves it and nothing is published.
+pub fn lambda_network() -> Option<String> {
+    non_empty(std::env::var("FAKECLOUD_LAMBDA_NETWORK").ok())
+}
+
+/// The address a sibling on [`lambda_network`] reaches fakecloud at directly,
+/// bypassing the host: fakecloud's own container, resolved by the container
+/// runtime's embedded DNS. `None` when there is no shared network or fakecloud
+/// is not itself containerized, in which case callers fall back to the host
+/// alias.
+pub fn internal_self_host() -> Option<String> {
+    resolve_internal_self_host(
+        lambda_network(),
+        std::env::var("FAKECLOUD_IN_CONTAINER").ok(),
+        self_hostname(),
+    )
+}
+
+/// The container writes its own short id to `/etc/hostname`, and the embedded
+/// DNS resolves that id on a user-defined network. Verified against Docker
+/// 2026-09-10, with both plain `docker run` and `docker compose`: `/etc/hostname`
+/// held the 12-character short id and a sibling resolved it. Preferred over the
+/// container *name*, which fakecloud would have to inspect the daemon to learn.
+fn self_hostname() -> Option<String> {
+    non_empty(std::fs::read_to_string("/etc/hostname").ok()).map(|h| h.trim().to_string())
+}
+
+/// Shared, testable core of [`internal_self_host`]. All three inputs must hold:
+/// no shared network means the sibling cannot route to us at all, and no
+/// container means our hostname is the host's, which resolves for nobody.
+pub fn resolve_internal_self_host(
+    network: Option<String>,
+    in_container_env: Option<String>,
+    hostname: Option<String>,
+) -> Option<String> {
+    if network.is_none() || !in_container_mode(in_container_env) {
+        return None;
+    }
+    hostname.filter(|h| !h.trim().is_empty())
+}
+
+/// Discard an env var that is set but blank, which means "unset" everywhere
+/// here: an empty network name or hostname would build an unreachable address.
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|v| !v.trim().is_empty())
+}
+
 /// Parse the `FAKECLOUD_IN_CONTAINER` signal: `Some("1")` or a case-insensitive
 /// `Some("true")` mean fakecloud is running inside a container; anything else,
 /// including `None`, means it runs on the host. Single source of truth for the
@@ -497,6 +553,49 @@ mod tests {
             preserve_native_host_alias(add_host(), in_container && resolves).as_deref(),
             Some("host.docker.internal:172.17.0.1"),
         );
+    }
+
+    #[test]
+    fn internal_self_host_needs_a_shared_network_and_a_container() {
+        // Everything present: the sibling can dial us by our own short id.
+        assert_eq!(
+            resolve_internal_self_host(
+                Some("fakecloud-web_default".to_string()),
+                Some("1".to_string()),
+                Some("88f9d74cd29c".to_string()),
+            ),
+            Some("88f9d74cd29c".to_string())
+        );
+        // No shared network: the sibling has no route to us except the host.
+        assert_eq!(
+            resolve_internal_self_host(None, Some("1".to_string()), Some("88f9d74cd29c".into())),
+            None
+        );
+        // Not containerized: that hostname is the host's and resolves for nobody.
+        assert_eq!(
+            resolve_internal_self_host(
+                Some("fakecloud-web_default".to_string()),
+                None,
+                Some("laptop".to_string()),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn internal_self_host_rejects_a_blank_hostname() {
+        // An unreadable or empty /etc/hostname would build `https://` with no
+        // host at all, which every handler would fail on.
+        for hostname in [None, Some(String::new()), Some("  \n".to_string())] {
+            assert_eq!(
+                resolve_internal_self_host(
+                    Some("fakecloud-web_default".to_string()),
+                    Some("true".to_string()),
+                    hostname,
+                ),
+                None
+            );
+        }
     }
 
     #[test]

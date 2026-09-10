@@ -1497,8 +1497,17 @@ async fn main() {
     // signal can only arrive over TLS on 443. Claim the port before deciding
     // what URL to hand out: if nothing listens, sending a URL would just make
     // every handler fail on a connection it cannot make.
-    let cfn_response_host = fakecloud_core::container_net::detect_container_cli()
-        .map(|cli| fakecloud_core::container_net::HostNetworking::detect(&cli).host_alias);
+    //
+    // Which 443 that is depends on where the handler dials us. On a shared
+    // network (`FAKECLOUD_LAMBDA_NETWORK`) it dials our container directly, so
+    // 443 is ours alone and nothing need be published on the host. Otherwise it
+    // reaches us through the host alias, and the host's 443 has to be ours -
+    // which fails whenever anything else already holds it.
+    let cfn_response_host = fakecloud_core::container_net::detect_container_cli().map(|cli| {
+        fakecloud_core::container_net::internal_self_host().unwrap_or_else(|| {
+            fakecloud_core::container_net::HostNetworking::detect(&cli).host_alias
+        })
+    });
     let cfn_response_tls_port = cfn_response_tls::tls_port();
     let cfn_response_tls_listener = match &cfn_response_host {
         Some(_) => match cfn_response_tls::bind(cfn_response_tls_port).await {
@@ -1506,7 +1515,9 @@ async fn main() {
             Err(e) => {
                 tracing::warn!(
                     "custom-resource ResponseURL disabled: {e}. Publish port {cfn_response_tls_port} \
-                     to enable custom resources that signal (CDK's do)."
+                     on the host, or set FAKECLOUD_LAMBDA_NETWORK to fakecloud's own container \
+                     network so the port stays internal, to enable custom resources that signal \
+                     (CDK's do)."
                 );
                 None
             }

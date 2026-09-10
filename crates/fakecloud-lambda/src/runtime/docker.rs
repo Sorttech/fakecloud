@@ -32,6 +32,13 @@ pub struct DockerBackend {
     /// `--add-host <alias>:<value>` argument injected into every container
     /// `create`, or `None` when the runtime provides the alias natively.
     add_host_arg: Option<String>,
+    /// User-defined network to attach every function container to, from
+    /// `FAKECLOUD_LAMBDA_NETWORK`. `None` leaves them on the runtime's default
+    /// bridge, reaching fakecloud only through the host. Attaching them to
+    /// fakecloud's own network additionally lets them reach it directly, which
+    /// is what the custom-resource `ResponseURL` needs to avoid publishing 443
+    /// on the host. Published ports still work either way.
+    network: Option<String>,
     /// Port the main fakecloud server bound to. Used to translate AWS
     /// private-ECR URIs in `PackageType=Image` functions to fakecloud's
     /// local OCI v2 registry.
@@ -79,6 +86,7 @@ impl DockerBackend {
             instance_id,
             host_alias: net.host_alias,
             add_host_arg: net.add_host_arg,
+            network: fakecloud_core::container_net::lambda_network(),
             server_port,
             sibling_host: net.sibling_host,
             registry_host: std::env::var("FAKECLOUD_ECR_REGISTRY_HOST")
@@ -93,6 +101,14 @@ impl DockerBackend {
     fn apply_host_alias(&self, cmd: &mut tokio::process::Command) {
         if let Some(arg) = &self.add_host_arg {
             cmd.arg("--add-host").arg(arg);
+        }
+    }
+
+    /// Attach the container to fakecloud's own network when one is
+    /// configured, so it can reach fakecloud without going through the host.
+    fn apply_network(&self, cmd: &mut tokio::process::Command) {
+        if let Some(network) = &self.network {
+            cmd.arg("--network").arg(network);
         }
     }
 
@@ -166,6 +182,7 @@ impl DockerBackend {
             .arg("--label")
             .arg(format!("fakecloud-instance={}", self.instance_id));
         self.apply_host_alias(&mut cmd);
+        self.apply_network(&mut cmd);
 
         // Defaults first: docker's last `-e` wins, so the function's own
         // environment overrides anything it sets for itself.
@@ -263,6 +280,7 @@ impl DockerBackend {
             .arg("--label")
             .arg(format!("fakecloud-instance={}", self.instance_id));
         self.apply_host_alias(&mut cmd);
+        self.apply_network(&mut cmd);
 
         // Defaults first: docker's last `-e` wins, so the function's own
         // environment overrides anything it sets for itself.
