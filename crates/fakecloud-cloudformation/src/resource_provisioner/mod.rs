@@ -1178,6 +1178,11 @@ pub enum ContainerTeardownIntent {
 pub struct CustomInvokeIntent {
     pub service_token: String,
     pub payload: String,
+    /// `RequestId` to wait for a `ResponseURL` signal under, when the event
+    /// carried a `ResponseURL` at all. `None` means no endpoint was reachable,
+    /// so no handler can signal and there is nothing to wait for -- the same
+    /// condition `await_custom_resource_signal` short-circuits on.
+    pub signal_request_id: Option<String>,
 }
 
 mod acm;
@@ -3309,7 +3314,7 @@ impl ResourceProvisioner {
     ///
     /// Also honours an explicit `{"Status": "FAILED", "Reason": ...}` body, the
     /// shape cfn-response sends, for handlers that return it rather than PUT it.
-    fn custom_resource_failure(response: &[u8]) -> Option<String> {
+    pub(crate) fn custom_resource_failure(response: &[u8]) -> Option<String> {
         let body: serde_json::Value = serde_json::from_slice(response).ok()?;
         if let Some(message) = body.get("errorMessage").and_then(|v| v.as_str()) {
             let kind = body
@@ -3331,6 +3336,14 @@ impl ResourceProvisioner {
             );
         }
         None
+    }
+
+    /// The id a deferred invoke waits for its handler's signal under, or `None`
+    /// when no `ResponseURL` was attached for the handler to PUT to.
+    fn signal_request_id(&self, request_id: &str) -> Option<String> {
+        self.custom_resource_response_base
+            .as_ref()
+            .map(|_| request_id.to_string())
     }
 
     /// Add the `ResponseURL` a handler signals its outcome to.
@@ -3451,6 +3464,7 @@ impl ResourceProvisioner {
             self.pending_custom_invokes.lock().push(CustomInvokeIntent {
                 service_token: service_token.to_string(),
                 payload,
+                signal_request_id: self.signal_request_id(&request_id),
             });
         } else {
             self.invoke_lambda_sync(service_token, &payload)?;
@@ -3494,6 +3508,7 @@ impl ResourceProvisioner {
             self.pending_custom_invokes.lock().push(CustomInvokeIntent {
                 service_token,
                 payload,
+                signal_request_id: self.signal_request_id(&request_id),
             });
         } else if let Err(e) = self.invoke_lambda_sync(&service_token, &payload) {
             // Best-effort: don't fail stack deletion if Lambda invocation fails

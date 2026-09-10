@@ -17,7 +17,8 @@ use fakecloud_sqs::SharedSqsState;
 use fakecloud_ssm::SharedSsmState;
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::resource_provisioner::ResourceProvisioner;
+use crate::custom_resource_response::SharedCustomResourceResponses;
+use crate::resource_provisioner::{CustomInvokeIntent, ResourceProvisioner};
 use crate::state;
 use crate::state::{
     CloudFormationSnapshot, CloudFormationState, SharedCloudFormationState, Stack, StackResource,
@@ -607,8 +608,8 @@ pub struct CloudFormationDeps {
 pub struct CloudFormationService {
     pub(crate) state: SharedCloudFormationState,
     pub(crate) deps: CloudFormationDeps,
-    snapshot_store: Option<Arc<dyn SnapshotStore>>,
-    snapshot_lock: Arc<AsyncMutex<()>>,
+    pub(crate) snapshot_store: Option<Arc<dyn SnapshotStore>>,
+    pub(crate) snapshot_lock: Arc<AsyncMutex<()>>,
     /// Fine-grained S3 disk store. CFN bucket create/delete writes through this
     /// (the same path the real `CreateBucket`/`DeleteBucket` use) instead of
     /// only mutating the in-memory map, so a CFN-provisioned bucket survives a
@@ -987,35 +988,176 @@ impl ContainerBackingHandles {
 /// Drain a provisioner's queued custom-resource Lambda invokes (`Custom::*`),
 /// running each off the request path in a detached task so a cold image pull
 /// never blocks the client or stalls the CFN state lock. Used by the
-/// changeset/update/delete paths (where `defer_custom_invokes` is set).
+/// update/delete paths (where `defer_custom_invokes` is set).
+///
+/// Fire-and-forget: the outcome is logged and discarded. Only for callers whose
+/// stack status does not depend on it. A caller that must report the outcome
+/// (`ExecuteChangeSet`) drains the queue itself and awaits
+/// [`run_custom_invokes`] instead.
 pub(crate) fn spawn_custom_invokes(provisioner: &ResourceProvisioner) {
     let intents = std::mem::take(&mut *provisioner.pending_custom_invokes.lock());
-    if intents.is_empty() {
-        return;
-    }
-    let delivery = provisioner.delivery.clone();
+    spawn_custom_invoke_intents(&provisioner.delivery, intents);
+}
+
+/// [`spawn_custom_invokes`] over an already-drained batch.
+pub(crate) fn spawn_custom_invoke_intents(
+    delivery: &Arc<DeliveryBus>,
+    intents: Vec<CustomInvokeIntent>,
+) {
     for intent in intents {
         let delivery = delivery.clone();
         tokio::spawn(async move {
-            match delivery
-                .invoke_lambda(&intent.service_token, &intent.payload)
-                .await
-            {
-                Some(Ok(_)) => {
-                    tracing::info!(
-                        "Custom resource Lambda {} invoked successfully",
-                        intent.service_token
-                    );
-                }
-                Some(Err(e)) => {
-                    tracing::warn!(
-                        "Custom resource Lambda {} invocation failed: {e}",
-                        intent.service_token
-                    );
-                }
-                None => {}
-            }
+            let _ = invoke_custom_resource(&delivery, &intent).await;
         });
+    }
+}
+
+/// Run a drained batch of custom-resource invokes to completion, reporting the
+/// first failure.
+///
+/// The synchronous arm of `create_custom_resource` checks two things the
+/// deferred arm used to skip entirely: the invoke response, because a handler
+/// that raises still returns 200 with the error in its body, and the
+/// `ResponseURL` signal, because `cfn-response` reports FAILED out of band.
+/// Skipping both is how a changeset-provisioned custom resource that failed
+/// still produced a CREATE_COMPLETE stack.
+pub(crate) async fn run_custom_invokes(
+    delivery: &Arc<DeliveryBus>,
+    responses: &SharedCustomResourceResponses,
+    intents: Vec<CustomInvokeIntent>,
+) -> Result<(), String> {
+    for intent in intents {
+        invoke_custom_resource(delivery, &intent).await?;
+
+        // The handler PUTs its signal before returning, but the PUT can still
+        // be in flight as the invoke response comes back; wait the same 5s the
+        // synchronous arm does. `wait_for` parks the thread, so it goes to a
+        // blocking pool rather than a tokio worker.
+        let Some(request_id) = intent.signal_request_id else {
+            continue;
+        };
+        let responses = responses.clone();
+        let signal = tokio::task::spawn_blocking(move || {
+            responses.wait_for(&request_id, std::time::Duration::from_secs(5))
+        })
+        .await
+        .map_err(|e| format!("custom resource signal wait failed: {e}"))?;
+        // No signal is not a failure: a handler that never uses `cfn-response`
+        // never sends one (`await_custom_resource_signal`).
+        if let Some(signal) = signal {
+            if signal.failed() {
+                return Err(format!(
+                    "Custom resource failed: {}",
+                    signal.failure_reason()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Everything the changeset settle task needs, as an owned struct so it can
+/// move into a detached `tokio::spawn`. Mirrors `CreateStackContext`.
+pub(crate) struct ChangeSetSettleContext {
+    pub state: SharedCloudFormationState,
+    pub snapshot_store: Option<Arc<dyn SnapshotStore>>,
+    pub snapshot_lock: Arc<AsyncMutex<()>>,
+    pub delivery: Arc<DeliveryBus>,
+    pub responses: SharedCustomResourceResponses,
+    pub intents: Vec<CustomInvokeIntent>,
+    pub account_id: String,
+    pub stack_id: String,
+    pub stack_name: String,
+    pub complete: &'static str,
+    pub failed: &'static str,
+}
+
+/// Run a changeset's deferred custom-resource invokes, then flip the stack to
+/// its terminal status.
+///
+/// `ExecuteChangeSet` holds the stack at `*_IN_PROGRESS` while these are
+/// outstanding, because a custom resource's outcome is part of whether the
+/// stack succeeded -- real CloudFormation keeps the stack `CREATE_IN_PROGRESS`
+/// until every custom resource signals, and fails it when one signals FAILED.
+pub(crate) async fn settle_changeset_custom_resources(ctx: ChangeSetSettleContext) {
+    let ChangeSetSettleContext {
+        state,
+        snapshot_store,
+        snapshot_lock,
+        delivery,
+        responses,
+        intents,
+        account_id,
+        stack_id,
+        stack_name,
+        complete,
+        failed,
+    } = ctx;
+
+    let outcome = run_custom_invokes(&delivery, &responses, intents).await;
+    let (status, reason) = match &outcome {
+        Ok(()) => (complete, None),
+        Err(msg) => (failed, Some(msg.as_str())),
+    };
+
+    {
+        let mut accounts = state.write();
+        let st = accounts.get_or_create(&account_id);
+        if let Some(stack) = st.stacks.values_mut().find(|s| s.stack_id == stack_id) {
+            stack.status = status.to_string();
+            stack.status_reason = reason.map(str::to_string);
+            stack.updated_at = Some(Utc::now());
+            // A rolled-back stack publishes no outputs.
+            if reason.is_some() {
+                stack.outputs.clear();
+            }
+        }
+        record_stack_status_event_with_reason(
+            st,
+            &stack_id,
+            &stack_name,
+            "AWS::CloudFormation::Stack",
+            status,
+            reason,
+        );
+    }
+
+    save_snapshot_static(state, snapshot_store, snapshot_lock).await;
+}
+
+/// Invoke one queued handler and turn its response into a resource outcome.
+/// The async twin of `ResourceProvisioner::invoke_lambda_sync`.
+async fn invoke_custom_resource(
+    delivery: &Arc<DeliveryBus>,
+    intent: &CustomInvokeIntent,
+) -> Result<(), String> {
+    match delivery
+        .invoke_lambda(&intent.service_token, &intent.payload)
+        .await
+    {
+        Some(Ok(response)) => {
+            if let Some(reason) = ResourceProvisioner::custom_resource_failure(&response) {
+                tracing::warn!(
+                    "Custom resource Lambda {} failed: {reason}",
+                    intent.service_token
+                );
+                return Err(format!("Custom resource failed: {reason}"));
+            }
+            tracing::info!(
+                "Custom resource Lambda {} invoked successfully",
+                intent.service_token
+            );
+            Ok(())
+        }
+        Some(Err(e)) => {
+            tracing::warn!(
+                "Custom resource Lambda {} invocation failed: {e}",
+                intent.service_token
+            );
+            Err(format!("Lambda invocation failed: {e}"))
+        }
+        // No delivery configured: nothing ran, so nothing failed.
+        None => Ok(()),
     }
 }
 
@@ -3715,7 +3857,7 @@ pub(crate) fn record_event_with_reason(
 /// `CloudFormationService::save_snapshot` but takes owned handles so it can
 /// run inside the background CreateStack provisioning task (see RDS's
 /// `save_snapshot_static`).
-async fn save_snapshot_static(
+pub(crate) async fn save_snapshot_static(
     state: SharedCloudFormationState,
     store: Option<Arc<dyn SnapshotStore>>,
     lock: Arc<AsyncMutex<()>>,
