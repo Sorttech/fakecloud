@@ -5,7 +5,7 @@
 
 mod helpers;
 
-use aws_sdk_cloudformation::types::{Capability, OnFailure, Parameter};
+use aws_sdk_cloudformation::types::{Capability, ChangeSetType, OnFailure, Parameter};
 use aws_sdk_s3::primitives::ByteStream;
 use helpers::TestServer;
 
@@ -469,6 +469,282 @@ async fn cfn_fails_a_stack_whose_custom_resource_handler_raises() {
         reason.contains("handler blew up") || reason.contains("RuntimeError"),
         "failure reason should name the handler's error, got: {reason}"
     );
+}
+
+/// Regression: the same failing handler as above, provisioned through
+/// `CreateChangeSet` + `ExecuteChangeSet` -- the path `cdk deploy`,
+/// `aws cloudformation deploy` and SAM all take.
+///
+/// That path queues custom-resource invokes instead of running them
+/// (`defer_custom_invokes`), and the queue drain logged the outcome and threw
+/// it away, so every fix for reading a custom resource's outcome applied only
+/// to `CreateStack`. A handler that raised still produced CREATE_COMPLETE.
+#[tokio::test]
+async fn cfn_changeset_fails_a_stack_whose_custom_resource_handler_raises() {
+    if !docker_available() {
+        eprintln!("docker required for Lambda execution; skipping");
+        return;
+    }
+    let server = TestServer::start().await;
+    let cfn = server.cloudformation_client().await;
+    let s3 = server.s3_client().await;
+
+    let bucket = "cfn-cs-custom-raise-code";
+    s3.create_bucket()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("create_bucket");
+    s3.put_object()
+        .bucket(bucket)
+        .key("cr.zip")
+        .body(ByteStream::from(build_python_handler_zip(
+            "def handler(event, context):\n    raise RuntimeError('changeset handler blew up')\n",
+        )))
+        .send()
+        .await
+        .expect("put_object");
+
+    let template = custom_resource_template(bucket, "cs-raising-custom-resource");
+
+    let cs = cfn
+        .create_change_set()
+        .stack_name("cfn-cs-custom-raises")
+        .change_set_name("cs1")
+        .change_set_type(ChangeSetType::Create)
+        .template_body(template)
+        .capabilities(Capability::CapabilityNamedIam)
+        .send()
+        .await
+        .expect("create_change_set");
+
+    let cs_id = cs.id().expect("change set id");
+    cfn.execute_change_set()
+        .change_set_name(cs_id)
+        .send()
+        .await
+        .expect("execute_change_set");
+
+    let (status, reason) = await_terminal_status(&cfn, "cfn-cs-custom-raises").await;
+    assert_ne!(
+        status, "CREATE_COMPLETE",
+        "a raising custom resource must not report success on the changeset path"
+    );
+    assert!(
+        reason.contains("changeset handler blew up") || reason.contains("RuntimeError"),
+        "failure reason should name the handler's error, got: {reason}"
+    );
+    // The execution failed, and a rolled-back stack publishes nothing: no
+    // outputs, and no export another stack could import.
+    assert_eq!(
+        change_set_execution_status(&cfn, cs_id).await,
+        "EXECUTE_FAILED"
+    );
+    assert!(
+        stack_outputs(&cfn, "cfn-cs-custom-raises").await.is_empty(),
+        "a failed stack must not report outputs"
+    );
+    let exports = cfn.list_exports().send().await.expect("list_exports");
+    assert!(
+        exports
+            .exports()
+            .iter()
+            .all(|e| e.name() != Some("cs-raising-custom-resource-arn")),
+        "a failed stack must not export its outputs"
+    );
+}
+
+/// Regression: `ExecuteChangeSet` wrote the terminal status before the queued
+/// custom-resource invokes had run, so the stack read CREATE_COMPLETE while its
+/// handlers were still working. `cdk deploy` returns on that status, which is
+/// how `BucketDeployment` could report success with the bucket still empty.
+///
+/// Real CloudFormation holds the stack `CREATE_IN_PROGRESS` until every custom
+/// resource signals. The handler sleeps so the window is unambiguous.
+#[tokio::test]
+async fn cfn_changeset_holds_the_stack_in_progress_until_custom_resources_finish() {
+    if !docker_available() {
+        eprintln!("docker required for Lambda execution; skipping");
+        return;
+    }
+    let server = TestServer::start().await;
+    let cfn = server.cloudformation_client().await;
+    let s3 = server.s3_client().await;
+
+    let bucket = "cfn-cs-custom-slow-code";
+    s3.create_bucket()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("create_bucket");
+    s3.put_object()
+        .bucket(bucket)
+        .key("cr.zip")
+        .body(ByteStream::from(build_python_handler_zip(
+            "import time\n\n\ndef handler(event, context):\n    time.sleep(5)\n    return {}\n",
+        )))
+        .send()
+        .await
+        .expect("put_object");
+
+    let template = custom_resource_template(bucket, "cs-slow-custom-resource");
+
+    let cs = cfn
+        .create_change_set()
+        .stack_name("cfn-cs-custom-slow")
+        .change_set_name("cs1")
+        .change_set_type(ChangeSetType::Create)
+        .template_body(template)
+        .capabilities(Capability::CapabilityNamedIam)
+        .send()
+        .await
+        .expect("create_change_set");
+
+    let cs_id = cs.id().expect("change set id");
+    cfn.execute_change_set()
+        .change_set_name(cs_id)
+        .send()
+        .await
+        .expect("execute_change_set");
+
+    // The handler is still sleeping, so the stack cannot legitimately be
+    // complete yet. This is the assertion the old fire-and-forget drain failed.
+    let status = cfn
+        .describe_stacks()
+        .stack_name("cfn-cs-custom-slow")
+        .send()
+        .await
+        .expect("describe_stacks")
+        .stacks()
+        .first()
+        .expect("stack")
+        .stack_status()
+        .expect("status")
+        .as_str()
+        .to_string();
+    assert_eq!(
+        status, "CREATE_IN_PROGRESS",
+        "stack must stay in progress while its custom resource runs"
+    );
+    assert_eq!(
+        change_set_execution_status(&cfn, cs_id).await,
+        "EXECUTE_IN_PROGRESS"
+    );
+
+    let (status, reason) = await_terminal_status(&cfn, "cfn-cs-custom-slow").await;
+    assert_eq!(status, "CREATE_COMPLETE", "reason: {reason}");
+    assert_eq!(
+        change_set_execution_status(&cfn, cs_id).await,
+        "EXECUTE_COMPLETE"
+    );
+    let outputs = stack_outputs(&cfn, "cfn-cs-custom-slow").await;
+    assert!(
+        outputs
+            .iter()
+            .any(|(k, v)| k == "HandlerArn" && v.ends_with(":function:cs-slow-custom-resource")),
+        "a successful stack keeps its outputs, got: {outputs:?}"
+    );
+}
+
+/// `ExecutionStatus` of a change set, as DescribeChangeSet reports it.
+async fn change_set_execution_status(
+    cfn: &aws_sdk_cloudformation::Client,
+    change_set_id: &str,
+) -> String {
+    cfn.describe_change_set()
+        .change_set_name(change_set_id)
+        .send()
+        .await
+        .expect("describe_change_set")
+        .execution_status()
+        .expect("execution status")
+        .as_str()
+        .to_string()
+}
+
+/// A stack's outputs as `(key, value)` pairs.
+async fn stack_outputs(
+    cfn: &aws_sdk_cloudformation::Client,
+    stack_name: &str,
+) -> Vec<(String, String)> {
+    cfn.describe_stacks()
+        .stack_name(stack_name)
+        .send()
+        .await
+        .expect("describe_stacks")
+        .stacks()
+        .first()
+        .expect("stack")
+        .outputs()
+        .iter()
+        .map(|o| {
+            (
+                o.output_key().unwrap_or_default().to_string(),
+                o.output_value().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// A Lambda-backed custom resource whose handler code is the object at
+/// `s3://{bucket}/cr.zip`, exporting the handler's ARN as `{function_name}-arn`.
+fn custom_resource_template(bucket: &str, function_name: &str) -> String {
+    format!(
+        r#"{{
+  "Resources": {{
+    "Handler": {{
+      "Type": "AWS::Lambda::Function",
+      "Properties": {{
+        "FunctionName": "{function_name}",
+        "Runtime": "python3.12",
+        "Handler": "index.handler",
+        "Timeout": 30,
+        "Role": "arn:aws:iam::123456789012:role/cr-role",
+        "Code": {{"S3Bucket": "{bucket}", "S3Key": "cr.zip"}}
+      }}
+    }},
+    "Custom": {{
+      "Type": "Custom::Thing",
+      "Properties": {{"ServiceToken": {{"Fn::GetAtt": ["Handler", "Arn"]}}}}
+    }}
+  }},
+  "Outputs": {{
+    "HandlerArn": {{
+      "Value": {{"Fn::GetAtt": ["Handler", "Arn"]}},
+      "Export": {{"Name": "{function_name}-arn"}}
+    }}
+  }}
+}}"#
+    )
+}
+
+/// Poll until the stack leaves `*_IN_PROGRESS`, returning its status and reason.
+async fn await_terminal_status(
+    cfn: &aws_sdk_cloudformation::Client,
+    stack_name: &str,
+) -> (String, String) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    loop {
+        let described = cfn
+            .describe_stacks()
+            .stack_name(stack_name)
+            .send()
+            .await
+            .expect("describe_stacks");
+        let stack = described.stacks().first().expect("stack").clone();
+        let status = stack.stack_status().unwrap().as_str().to_string();
+        if !status.ends_with("_IN_PROGRESS") {
+            return (
+                status,
+                stack.stack_status_reason().unwrap_or_default().to_string(),
+            );
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "stack never reached a terminal status"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
 }
 
 fn build_python_handler_zip(body: &str) -> Vec<u8> {

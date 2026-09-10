@@ -1455,22 +1455,48 @@ impl CloudFormationService {
                     }
                     Err(_) => failed,
                 };
-                // Carry the failure reason onto the terminal event, so
-                // DescribeStackEvents explains a failed execution instead of
-                // reporting a bare ROLLBACK_COMPLETE.
-                crate::service::record_stack_status_event_with_reason(
-                    state,
-                    &sid,
-                    &stack_name_owned,
-                    "AWS::CloudFormation::Stack",
-                    final_status,
-                    update_result.as_ref().err().map(String::as_str),
-                );
+                // Custom-resource invokes were queued rather than run
+                // (`provisioner_deferred`), so their outcome is not known here
+                // -- and it is part of whether the stack succeeded. Writing
+                // `final_status` now is what let a handler that raised still
+                // produce a CREATE_COMPLETE stack and a green `cdk deploy`:
+                // every fix for reading a custom resource's outcome landed on
+                // the synchronous arm of `create_custom_resource`, which this
+                // path does not take. Hold the stack at *_IN_PROGRESS and let
+                // the settle task below flip it, as CreateStack already does.
+                //
+                // A failed execution returns before the queue is used, so its
+                // invokes are dropped, as they were before.
+                let deferred = std::mem::take(&mut *provisioner.pending_custom_invokes.lock());
+                let settle_deferred = update_result.is_ok() && !deferred.is_empty();
+
+                if settle_deferred {
+                    if let Some(stack) = state.stacks.values_mut().find(|s| s.stack_id == sid) {
+                        stack.status = in_progress.to_string();
+                        stack.status_reason = None;
+                    }
+                } else {
+                    // Carry the failure reason onto the terminal event, so
+                    // DescribeStackEvents explains a failed execution instead of
+                    // reporting a bare ROLLBACK_COMPLETE.
+                    crate::service::record_stack_status_event_with_reason(
+                        state,
+                        &sid,
+                        &stack_name_owned,
+                        "AWS::CloudFormation::Stack",
+                        final_status,
+                        update_result.as_ref().err().map(String::as_str),
+                    );
+                }
 
                 if let Some(m) = state.extras.get_mut("change_sets") {
                     if let Some(e) = m.get_mut(&cs_id) {
+                        // Still running while the custom resources settle; the
+                        // settle task records how the execution ended.
                         e["ExecutionStatus"] = json!(if update_result.is_err() {
                             "EXECUTE_FAILED"
+                        } else if settle_deferred {
+                            "EXECUTE_IN_PROGRESS"
                         } else {
                             "EXECUTE_COMPLETE"
                         });
@@ -1513,8 +1539,9 @@ impl CloudFormationService {
                 // ExecuteChangeSet, so without this their container-backed
                 // resources sit at `creating` forever and stack deletes leak
                 // containers (the #2031-#2034 create-side hardening reaching the
-                // changeset path, bug-audit 0.1/0.3/0.4). Then run any deferred
-                // custom-resource Lambda invokes (0.2).
+                // changeset path, bug-audit 0.1/0.3/0.4). Deferred
+                // custom-resource invokes (0.2) run in the settle task below,
+                // because their outcome decides the stack's terminal status.
                 {
                     let handles =
                         crate::service::ContainerBackingHandles::from_provisioner(&provisioner)
@@ -1525,7 +1552,6 @@ impl CloudFormationService {
                     handles.spawn_teardown_intents(std::mem::take(
                         &mut *provisioner.pending_container_teardowns.lock(),
                     ));
-                    crate::service::spawn_custom_invokes(&provisioner);
                 }
 
                 // Resolve the template's `Outputs` for the newly provisioned
@@ -1560,6 +1586,28 @@ impl CloudFormationService {
                         &outputs,
                         &[],
                     );
+                }
+
+                // Runs after the outputs are written, so a failing custom
+                // resource clears them rather than racing the write.
+                if settle_deferred {
+                    tokio::spawn(crate::service::settle_changeset_custom_resources(
+                        crate::service::ChangeSetSettleContext {
+                            state: self.state.clone(),
+                            snapshot_store: self.snapshot_store.clone(),
+                            snapshot_lock: self.snapshot_lock.clone(),
+                            delivery: provisioner.delivery.clone(),
+                            responses: provisioner.custom_resource_responses.clone(),
+                            intents: deferred,
+                            account_id: aid.clone(),
+                            stack_id: sid.clone(),
+                            stack_name: stack_name_owned.clone(),
+                            change_set_id: cs_id.clone(),
+                            in_progress,
+                            complete,
+                            failed,
+                        },
+                    ));
                 }
 
                 Ok(xml_response("ExecuteChangeSet", String::new(), &rid))
