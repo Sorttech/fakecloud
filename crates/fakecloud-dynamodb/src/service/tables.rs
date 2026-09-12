@@ -11,7 +11,7 @@ use fakecloud_core::validation::*;
 
 use crate::state::{
     BackupDescription, DynamoTable, ExportDescription, GlobalSecondaryIndex, ImportDescription,
-    ProvisionedThroughput,
+    ProvisionedThroughput, TableItems,
 };
 
 use super::{parse_projection, parse_vector_index, parse_vector_indexes};
@@ -1141,7 +1141,7 @@ impl DynamoDbService {
             key_schema: backup.key_schema.clone(),
             attribute_definitions: backup.attribute_definitions.clone(),
             provisioned_throughput: backup.provisioned_throughput.clone(),
-            items: backup.items.clone().into(),
+            items: TableItems::new(backup.items.clone()),
             // Left unbuilt here; the `recalculate_stats()` below builds it.
             key_index: Default::default(),
             gsi: backup.gsi.clone(),
@@ -1778,7 +1778,7 @@ impl DynamoDbService {
                 read_capacity_units: 0,
                 write_capacity_units: 0,
             },
-            items: imported_items.into(),
+            items: TableItems::new(imported_items),
             // Left unbuilt here; the `recalculate_stats()` below builds it.
             key_index: Default::default(),
             gsi: Vec::new(),

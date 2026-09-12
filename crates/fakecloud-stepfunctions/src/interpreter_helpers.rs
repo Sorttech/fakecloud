@@ -554,7 +554,7 @@ pub(crate) fn invoke_dynamodb_get_item(
 
     let item = table
         .find_item_index(&key_map)
-        .map(|idx| table.items[idx].clone());
+        .map(|idx| table.items()[idx].clone());
 
     match item {
         Some(item_map) => {

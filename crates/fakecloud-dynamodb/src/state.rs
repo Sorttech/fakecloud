@@ -179,19 +179,22 @@ struct ItemSlot {
 /// than a convention. Serialized as the bare list, so snapshots are unchanged.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct TableItems(Vec<HashMap<String, AttributeValue>>);
+pub(crate) struct TableItems(Vec<HashMap<String, AttributeValue>>);
+
+impl TableItems {
+    /// Wrap rows that are about to become a table's contents. Crate-internal:
+    /// whoever does this owns re-deriving the key index and the stats, which
+    /// is why [`DynamoTable::replace_items`] is the way to do it.
+    pub(crate) fn new(items: Vec<HashMap<String, AttributeValue>>) -> Self {
+        Self(items)
+    }
+}
 
 impl std::ops::Deref for TableItems {
     type Target = [HashMap<String, AttributeValue>];
 
     fn deref(&self) -> &Self::Target {
         &self.0
-    }
-}
-
-impl From<Vec<HashMap<String, AttributeValue>>> for TableItems {
-    fn from(items: Vec<HashMap<String, AttributeValue>>) -> Self {
-        Self(items)
     }
 }
 
@@ -261,7 +264,7 @@ pub struct DynamoTable {
     pub key_schema: Vec<KeySchemaElement>,
     pub attribute_definitions: Vec<AttributeDefinition>,
     pub provisioned_throughput: ProvisionedThroughput,
-    pub items: TableItems,
+    pub(crate) items: TableItems,
     /// Primary-key -> position in `items`, so a write does not have to scan
     /// the whole table to decide insert-vs-overwrite. Without it every write
     /// was O(table size) and a bulk load was quadratic (#2502).
@@ -271,11 +274,11 @@ pub struct DynamoTable {
     /// scans, pagination and the stream paths all still index into it -- and
     /// is only mutable through the helpers here (`put_item_at_key`,
     /// `remove_item_by_key`, `update_item_at`, `replace_items`, ...), which
-    /// keep the two in step. [`TableItems`] enforces that.
-    /// Public so out-of-crate constructors (the CloudFormation provisioner)
-    /// can build a table with `key_index: Default::default()`.
+    /// keep the two in step. `TableItems` enforces that: the vector is
+    /// private, and out-of-crate callers read the rows through
+    /// [`DynamoTable::items`] and build tables through [`DynamoTable::new`].
     #[serde(skip)]
-    pub key_index: KeyIndex,
+    pub(crate) key_index: KeyIndex,
     pub gsi: Vec<GlobalSecondaryIndex>,
     pub lsi: Vec<LocalSecondaryIndex>,
     pub tags: BTreeMap<String, String>,
@@ -493,6 +496,66 @@ pub struct ImportDescription {
 }
 
 impl DynamoTable {
+    /// A new empty table. The identity and the schema have to be given; every
+    /// other field starts at its documented default and is a public field the
+    /// caller can set afterwards. Out-of-crate callers (the CloudFormation
+    /// provisioner) build tables this way, because `items` and the key index
+    /// they have to stay in step with are not theirs to assign.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        name: String,
+        arn: String,
+        table_id: String,
+        key_schema: Vec<KeySchemaElement>,
+        attribute_definitions: Vec<AttributeDefinition>,
+        provisioned_throughput: ProvisionedThroughput,
+        billing_mode: String,
+        created_at: DateTime<Utc>,
+    ) -> Self {
+        DynamoTable {
+            name,
+            arn,
+            table_id,
+            key_schema,
+            attribute_definitions,
+            provisioned_throughput,
+            items: TableItems::default(),
+            key_index: KeyIndex::default(),
+            gsi: Vec::new(),
+            lsi: Vec::new(),
+            tags: BTreeMap::new(),
+            created_at,
+            status: "ACTIVE".to_string(),
+            item_count: 0,
+            size_bytes: 0,
+            billing_mode,
+            ttl_attribute: None,
+            ttl_enabled: false,
+            resource_policy: None,
+            pitr_enabled: false,
+            kinesis_destinations: Vec::new(),
+            contributor_insights_status: "DISABLED".to_string(),
+            contributor_insights_counters: BTreeMap::new(),
+            stream_enabled: false,
+            stream_view_type: None,
+            stream_arn: None,
+            stream_records: empty_stream_records(),
+            sse_type: None,
+            sse_kms_key_arn: None,
+            deletion_protection_enabled: false,
+            on_demand_throughput: None,
+            table_class: "STANDARD".to_string(),
+            vector_indexes: Vec::new(),
+        }
+    }
+
+    /// The table's rows, in storage order. Read-only: the key index records
+    /// positions in this vector, so mutating it is the business of the
+    /// helpers below.
+    pub fn items(&self) -> &[HashMap<String, AttributeValue>] {
+        &self.items
+    }
+
     /// Get the hash key attribute name from the key schema.
     pub fn hash_key_name(&self) -> &str {
         self.key_schema
@@ -798,7 +861,7 @@ impl DynamoTable {
     /// from the new rows. For the bulk paths (an import, a transaction
     /// revert), where a full pass is proportional to work already done.
     pub fn replace_items(&mut self, items: Vec<HashMap<String, AttributeValue>>) {
-        self.items = TableItems(items);
+        self.items = TableItems::new(items);
         self.recalculate_stats();
     }
 
@@ -820,7 +883,7 @@ impl DynamoTable {
                 kept.push(item);
             }
         }
-        self.items = TableItems(kept);
+        self.items = TableItems::new(kept);
         if !removed.is_empty() {
             self.recalculate_stats();
         }
@@ -1571,7 +1634,7 @@ mod tests {
         assert_eq!(t.find_item_index(&mk("c")), Some(2));
 
         // Behind the index's back, as a future caller might.
-        t.items = vec![mk("c")].into();
+        t.items = TableItems::new(vec![mk("c")]);
 
         // The read path answers from the rows, not from a position that is
         // now out of bounds...

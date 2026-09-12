@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::state::{DynamoTable, ProvisionedThroughput, SharedDynamoDbState};
+use crate::state::{DynamoTable, ProvisionedThroughput, SharedDynamoDbState, TableItems};
 
 /// A single DynamoDB item: attribute name -> typed AWS wire value.
 type Item = HashMap<String, Value>;
@@ -283,7 +283,7 @@ fn build_table(
         key_schema,
         attribute_definitions,
         provisioned_throughput,
-        items: items.into(),
+        items: TableItems::new(items),
         // Left unbuilt here; the `recalculate_stats()` below builds it.
         key_index: Default::default(),
         gsi: crate::parse_gsi(&shape["GlobalSecondaryIndexes"], &billing_mode),

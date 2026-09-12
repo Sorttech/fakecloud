@@ -894,7 +894,9 @@ fn apply_index_projection(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{DynamoTable, KeySchemaElement, ProvisionedThroughput, SharedDynamoDbState};
+    use crate::state::{
+        DynamoTable, KeySchemaElement, ProvisionedThroughput, SharedDynamoDbState, TableItems,
+    };
     use bytes::Bytes;
     use chrono::Utc;
     use http::{HeaderMap, Method};
@@ -949,7 +951,7 @@ mod tests {
                 read_capacity_units: 0,
                 write_capacity_units: 0,
             },
-            items: items.into(),
+            items: TableItems::new(items),
             key_index: Default::default(),
             gsi: vec![],
             lsi: vec![],
