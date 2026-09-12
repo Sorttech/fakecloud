@@ -207,12 +207,19 @@ impl<'a> IntoIterator for &'a TableItems {
 /// State of a table's primary-key index.
 ///
 /// The index is derived, not persisted, so "empty" and "not built yet" have to
-/// be distinguishable. Comparing `key_index.len()` with `items.len()` is not
-/// enough for that: a table holding two rows under one key is permanently
-/// shorter than `items`, so it would rebuild on every single write (the very
-/// cost #2502 removes), and a direct `items.push` paired with a direct
-/// `items.remove` restores the length while leaving the recorded positions
-/// wrong. Naming the three states makes both cases explicit.
+/// be distinguishable, and a table holding two rows under one key cannot be
+/// answered by a position map at all. Naming the three states makes both
+/// cases explicit -- comparing `key_index.len()` with `items.len()` told them
+/// apart badly, because a table with duplicate keys is permanently shorter
+/// than `items` and so would rebuild on every single write, the very cost
+/// #2502 removes.
+///
+/// Each built state records the number of rows it was maintained against.
+/// [`TableItems`] stops anything outside this module from pushing to or
+/// removing from the vector, but the whole field can still be reassigned
+/// (`table.items = rows.into()`), which no borrow check can catch; a row
+/// count that no longer matches means exactly that happened, and the index is
+/// rebuilt instead of trusted.
 #[derive(Debug, Clone, Default)]
 pub enum KeyIndex {
     /// Not built: restored from a snapshot, or freshly constructed with
@@ -220,8 +227,12 @@ pub enum KeyIndex {
     /// builds it.
     #[default]
     Unbuilt,
-    /// Primary key -> position in `items`, covering every addressable item.
-    Built(HashMap<String, usize>),
+    /// Primary key -> position in `items`, covering every addressable item,
+    /// plus the row count it was maintained against.
+    Built {
+        positions: HashMap<String, usize>,
+        rows: usize,
+    },
     /// `items` holds more than one row under the same primary key, so no
     /// position map can answer lookups the way the linear scan does once the
     /// first of them is removed. Such a table is only reachable by importing
@@ -229,7 +240,17 @@ pub enum KeyIndex {
     /// build that allowed it), and permanently falls back to the scan, which
     /// is exactly the pre-index behaviour. Recorded rather than re-derived so
     /// a degenerate table does not pay a full rebuild on every write.
-    Ambiguous,
+    Ambiguous { rows: usize },
+}
+
+impl KeyIndex {
+    /// The row count this index was built or maintained against, if any.
+    fn rows(&self) -> Option<usize> {
+        match self {
+            KeyIndex::Unbuilt => None,
+            KeyIndex::Built { rows, .. } | KeyIndex::Ambiguous { rows } => Some(*rows),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -560,10 +581,14 @@ impl DynamoTable {
                 }
             }
         }
+        let rows = self.items.len();
         self.key_index = if duplicate_key {
-            KeyIndex::Ambiguous
+            KeyIndex::Ambiguous { rows }
         } else {
-            KeyIndex::Built(index)
+            KeyIndex::Built {
+                positions: index,
+                rows,
+            }
         };
     }
 
@@ -573,7 +598,7 @@ impl DynamoTable {
     /// and silently turn every lookup into a miss — which would make writes
     /// duplicate rows instead of overwriting them.
     pub fn ensure_key_index(&mut self) {
-        if matches!(self.key_index, KeyIndex::Unbuilt) {
+        if self.key_index.rows() != Some(self.items.len()) {
             self.rebuild_key_index();
         }
     }
@@ -584,8 +609,8 @@ impl DynamoTable {
         let Some(k) = self.encode_key(item) else {
             return;
         };
-        if let KeyIndex::Built(index) = &mut self.key_index {
-            index.insert(k, idx);
+        if let KeyIndex::Built { positions, .. } = &mut self.key_index {
+            positions.insert(k, idx);
         }
     }
 
@@ -594,8 +619,8 @@ impl DynamoTable {
         let Some(k) = self.encode_key(item) else {
             return;
         };
-        if let KeyIndex::Built(index) = &mut self.key_index {
-            index.remove(&k);
+        if let KeyIndex::Built { positions, .. } = &mut self.key_index {
+            positions.remove(&k);
         }
     }
 
@@ -607,12 +632,25 @@ impl DynamoTable {
     /// call `ensure_key_index` first, so the fallback is a correctness
     /// backstop rather than the normal path.
     pub fn find_item_index(&self, key: &HashMap<String, AttributeValue>) -> Option<usize> {
-        let KeyIndex::Built(index) = &self.key_index else {
+        let KeyIndex::Built { positions, rows } = &self.key_index else {
             return self.find_item_index_scan(key);
         };
+        if *rows != self.items.len() {
+            // `items` was reassigned wholesale behind the index's back; the
+            // recorded positions describe rows that are no longer there.
+            return self.find_item_index_scan(key);
+        }
         // A key that cannot be encoded is missing the hash key, so it matches
-        // nothing — the same answer the scan gave.
-        index.get(&self.encode_key(key)?).copied()
+        // nothing -- the same answer the scan gave.
+        let encoded = self.encode_key(key)?;
+        let idx = positions.get(&encoded).copied()?;
+        // Costs one key encoding, so it stays O(1) and keeps a position that
+        // drifted from ever addressing the wrong row: answer from the rows
+        // themselves when the recorded one does not carry this key.
+        match self.items.get(idx) {
+            Some(item) if self.encode_key(item).as_deref() == Some(encoded.as_str()) => Some(idx),
+            _ => self.find_item_index_scan(key),
+        }
     }
 
     /// The pre-index linear scan. Retained as the fallback for a stale index
@@ -661,6 +699,10 @@ impl DynamoTable {
                 self.size_bytes += Self::estimate_item_size(&item);
                 self.item_count += 1;
                 self.items.0.push(item);
+                match &mut self.key_index {
+                    KeyIndex::Built { rows, .. } | KeyIndex::Ambiguous { rows } => *rows += 1,
+                    KeyIndex::Unbuilt => {}
+                }
                 (idx, false)
             }
         }
@@ -688,12 +730,17 @@ impl DynamoTable {
         // `Vec::remove` shifts every later element down one, so their recorded
         // positions are now stale. Repair just those rather than rebuilding the
         // whole index.
-        if let KeyIndex::Built(index) = &mut self.key_index {
-            for pos in index.values_mut() {
-                if *pos > idx {
-                    *pos -= 1;
+        match &mut self.key_index {
+            KeyIndex::Built { positions, rows } => {
+                for pos in positions.values_mut() {
+                    if *pos > idx {
+                        *pos -= 1;
+                    }
                 }
+                *rows -= 1;
             }
+            KeyIndex::Ambiguous { rows } => *rows -= 1,
+            KeyIndex::Unbuilt => {}
         }
         self.size_bytes -= Self::estimate_item_size(&removed);
         self.item_count -= 1;
@@ -706,7 +753,8 @@ impl DynamoTable {
     /// All or nothing: an UpdateExpression is applied clause by clause, so
     /// `f` can fail with some clauses already written. The item is then put
     /// back exactly as it was, so a rejected update leaves no trace -- as a
-    /// rejected UpdateItem does on AWS.
+    /// rejected UpdateItem does on AWS. That costs a copy of the row, so a
+    /// mutation that cannot fail should use [`Self::mutate_item_at`].
     ///
     /// Panics if `idx` is out of bounds.
     pub fn update_item_at<E>(
@@ -729,6 +777,21 @@ impl DynamoTable {
                 Err(err)
             }
         }
+    }
+
+    /// Mutate the item at `idx` in place with a mutation that cannot fail,
+    /// keeping the cached size and the key index in step. Same as
+    /// [`Self::update_item_at`] without the copy taken for the rollback.
+    ///
+    /// Panics if `idx` is out of bounds.
+    pub fn mutate_item_at(
+        &mut self,
+        idx: usize,
+        f: impl FnOnce(&mut HashMap<String, AttributeValue>),
+    ) {
+        let before = self.snapshot_item_at(idx);
+        f(&mut self.items.0[idx]);
+        self.sync_item_at(idx, before);
     }
 
     /// Replace every row at once, then re-derive the stats and the key index
@@ -797,16 +860,17 @@ impl DynamoTable {
         if key_after == before.key {
             return;
         }
-        if let KeyIndex::Built(index) = &mut self.key_index {
+        if let KeyIndex::Built { positions, rows } = &mut self.key_index {
+            let rows = *rows;
             if let Some(old) = &before.key {
-                index.remove(old);
+                positions.remove(old);
             }
             // A rewritten key that lands on another row leaves two rows under
             // one key, which no position map can resolve the way the scan
             // does; fall back to the scan for this table.
             if let Some(new_key) = key_after {
-                if index.insert(new_key, idx).is_some() {
-                    self.key_index = KeyIndex::Ambiguous;
+                if positions.insert(new_key, idx).is_some() {
+                    self.key_index = KeyIndex::Ambiguous { rows };
                 }
             }
         }
@@ -1236,16 +1300,18 @@ mod tests {
             json!({"BOOL": true}),
         ];
         let mut t = table_with_hash_key("pk");
+        // Seed through the scan alone, so the fixture does not depend on the
+        // index it is the oracle for: one row per equivalence class.
+        let mut rows: Vec<HashMap<String, AttributeValue>> = Vec::new();
         for v in &cases {
             let mut item = HashMap::new();
             item.insert("pk".to_string(), v.clone());
-            // Only insert if the scan says it is not already present, so the
-            // table holds one row per equivalence class.
+            t.replace_items(rows.clone());
             if t.find_item_index_scan(&item).is_none() {
-                t.put_item_at_key(item);
+                rows.push(item);
             }
         }
-        t.rebuild_key_index();
+        t.replace_items(rows);
 
         for v in &cases {
             let mut probe = HashMap::new();
@@ -1364,7 +1430,7 @@ mod tests {
             "write after restore duplicated a row"
         );
         assert!(
-            matches!(restored.key_index, KeyIndex::Built(_)),
+            matches!(restored.key_index, KeyIndex::Built { .. }),
             "index was not rebuilt"
         );
         assert_eq!(restored.find_item_index(&mk("k3")), Some(3));
@@ -1386,7 +1452,7 @@ mod tests {
         // Only reachable by a bulk assignment (an import of an export that
         // repeats a key); the write helpers never create a duplicate.
         t.replace_items(vec![mk("dup"), mk("dup"), mk("other")]);
-        assert!(matches!(t.key_index, KeyIndex::Ambiguous));
+        assert!(matches!(t.key_index, KeyIndex::Ambiguous { .. }));
 
         assert_eq!(t.find_item_index(&mk("dup")), Some(0));
         assert_eq!(t.find_item_index(&mk("other")), Some(2));
@@ -1402,7 +1468,7 @@ mod tests {
 
         // A write does not silently trigger a full rebuild on every call.
         t.put_item_at_key(mk("third"));
-        assert!(matches!(t.key_index, KeyIndex::Ambiguous));
+        assert!(matches!(t.key_index, KeyIndex::Ambiguous { .. }));
         assert_eq!(t.item_count, 3);
     }
 
@@ -1461,7 +1527,7 @@ mod tests {
         });
         assert!(rewrite.is_ok());
 
-        assert!(matches!(t.key_index, KeyIndex::Ambiguous));
+        assert!(matches!(t.key_index, KeyIndex::Ambiguous { .. }));
         assert_eq!(t.find_item_index(&mk("a")), Some(0));
         assert_eq!(
             t.find_item_index(&mk("a")),
@@ -1483,6 +1549,43 @@ mod tests {
         assert_eq!(
             DynamoTable::encode_key_value(&a),
             DynamoTable::encode_key_value(&b)
+        );
+    }
+
+    /// `TableItems` stops anything outside this module from pushing to or
+    /// removing from the row vector, but the field itself can still be
+    /// reassigned wholesale, which no borrow check catches. The recorded row
+    /// count makes that detectable: the index must be rebuilt rather than
+    /// trusted, or a lookup answers with a position that no longer exists.
+    #[test]
+    fn wholesale_reassignment_is_detected_not_trusted() {
+        let mut t = table_with_hash_key("pk");
+        let mk = |pk: &str| {
+            let mut m = HashMap::new();
+            m.insert("pk".to_string(), json!({ "S": pk }));
+            m
+        };
+        for k in ["a", "b", "c"] {
+            t.put_item_at_key(mk(k));
+        }
+        assert_eq!(t.find_item_index(&mk("c")), Some(2));
+
+        // Behind the index's back, as a future caller might.
+        t.items = vec![mk("c")].into();
+
+        // The read path answers from the rows, not from a position that is
+        // now out of bounds...
+        assert_eq!(t.find_item_index(&mk("c")), Some(0));
+        assert_eq!(t.find_item_index(&mk("a")), None);
+        // ...and the write path repairs the index instead of panicking or
+        // overwriting a row that is no longer there.
+        t.put_item_at_key(mk("c"));
+        assert_eq!(t.items.len(), 1, "the overwrite duplicated a row");
+        t.put_item_at_key(mk("d"));
+        assert_eq!(t.find_item_index(&mk("d")), Some(1));
+        assert_eq!(
+            t.find_item_index(&mk("d")),
+            t.find_item_index_scan(&mk("d"))
         );
     }
 
