@@ -83,7 +83,7 @@ impl ResourceProvisioner {
             &sans,
             &validation_method,
             props.get("DomainValidationOptions"),
-        )
+        )?
         .into_iter()
         .map(|mut dv| {
             dv.validation_status = "SUCCESS".to_string();

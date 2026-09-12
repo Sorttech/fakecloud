@@ -3683,20 +3683,45 @@ fn lowercase_first_keys(value: serde_json::Value) -> serde_json::Value {
 /// from a real ACM-issued cert.
 ///
 /// EMAIL validation addresses its challenge to the entry's `ValidationDomain`
-/// from `DomainValidationOptions`, falling back to the domain itself.
+/// from `DomainValidationOptions`, falling back to the domain itself. An entry
+/// that sets `ValidationDomain` must name a domain on the certificate and a
+/// validation domain equal to it or a superdomain of it, as ACM requires.
 fn synth_acm_domain_validation(
     domain_name: &str,
     sans: &[String],
     validation_method: &str,
     domain_validation_options: Option<&serde_json::Value>,
-) -> Vec<AcmDomainValidation> {
+) -> Result<Vec<AcmDomainValidation>, String> {
     let mut all = vec![domain_name.to_string()];
     for s in sans {
         if !all.contains(s) {
             all.push(s.clone());
         }
     }
-    all.into_iter()
+    for opt in domain_validation_options
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let Some(vd) = opt.get("ValidationDomain") else {
+            continue;
+        };
+        let domain = opt
+            .get("DomainName")
+            .and_then(|d| d.as_str())
+            .filter(|d| all.iter().any(|n| n == d))
+            .ok_or_else(|| {
+                "DomainValidationOptions entry must name a domain on the certificate".to_string()
+            })?;
+        let vd = vd.as_str().unwrap_or_default();
+        if !fakecloud_acm::validation_domain_covers(domain, vd) {
+            return Err(format!(
+                "ValidationDomain {vd:?} must be {domain} or a superdomain of it"
+            ));
+        }
+    }
+    Ok(all
+        .into_iter()
         .map(|name| AcmDomainValidation {
             validation_status: "SUCCESS".to_string(),
             validation_method: validation_method.to_string(),
@@ -3719,7 +3744,7 @@ fn synth_acm_domain_validation(
             }),
             domain_name: name,
         })
-        .collect()
+        .collect())
 }
 
 /// Convert CFN `Tags` array into the ACM crate's tag map form.
@@ -5071,13 +5096,32 @@ mod tests {
             &["api.example.com".to_string()],
             "EMAIL",
             Some(&opts),
-        );
+        )
+        .unwrap();
         assert_eq!(dvs[0].validation_domain.as_deref(), Some("example.com"));
         // A name without an entry is validated against itself.
         assert_eq!(dvs[1].validation_domain.as_deref(), Some("api.example.com"));
 
-        let dns = synth_acm_domain_validation("shop.example.com", &[], "DNS", Some(&opts));
+        let dns = synth_acm_domain_validation("shop.example.com", &[], "DNS", Some(&opts)).unwrap();
         assert!(dns[0].validation_domain.is_none());
+
+        // An empty, unrelated or off-certificate override is rejected.
+        for bad in [
+            serde_json::json!([{ "DomainName": "shop.example.com", "ValidationDomain": "" }]),
+            serde_json::json!([{ "DomainName": "shop.example.com", "ValidationDomain": "attacker.net" }]),
+            serde_json::json!([{ "DomainName": "other.example.com", "ValidationDomain": "example.com" }]),
+        ] {
+            assert!(
+                synth_acm_domain_validation("shop.example.com", &[], "EMAIL", Some(&bad)).is_err(),
+                "{bad}"
+            );
+        }
+        // A DNS-only entry (HostedZoneId, no ValidationDomain) is left alone.
+        let dns_opts =
+            serde_json::json!([{ "DomainName": "shop.example.com", "HostedZoneId": "Z1" }]);
+        assert!(
+            synth_acm_domain_validation("shop.example.com", &[], "DNS", Some(&dns_opts)).is_ok()
+        );
     }
 
     #[test]

@@ -1902,6 +1902,18 @@ fn parse_options(value: Option<&Value>) -> CertificateOptions {
     }
 }
 
+/// Whether `validation_domain` may receive the EMAIL challenge for `domain`: it
+/// must be the domain itself or a superdomain on a label boundary. A wildcard
+/// validates against its base domain.
+pub fn validation_domain_covers(domain: &str, validation_domain: &str) -> bool {
+    let base = domain.strip_prefix("*.").unwrap_or(domain);
+    !validation_domain.is_empty()
+        && (base == validation_domain
+            || base
+                .strip_suffix(validation_domain)
+                .is_some_and(|rest| rest.ends_with('.')))
+}
+
 /// Parse `DomainValidationOptions` into a domain -> validation-domain map. Each
 /// entry must name a domain on the certificate and a `ValidationDomain` equal to
 /// it or a superdomain of it; ACM rejects anything else with
@@ -1924,7 +1936,10 @@ fn parse_domain_validation_options(
     };
     let opts = opts
         .as_array()
-        .ok_or_else(|| invalid("DomainValidationOptions must be a list".to_string()))?;
+        .filter(|opts| (1..=100).contains(&opts.len()))
+        .ok_or_else(|| {
+            invalid("DomainValidationOptions must be a list of 1 to 100 entries".to_string())
+        })?;
     let names = effective_sans(domain_name, sans);
     let mut out = HashMap::new();
     for opt in opts {
@@ -1941,12 +1956,7 @@ fn parse_domain_validation_options(
                 "DomainValidationOption DomainName {domain} is not a domain on the certificate"
             )));
         }
-        let base = domain.strip_prefix("*.").unwrap_or(domain);
-        let is_superdomain = base == validation_domain
-            || base
-                .strip_suffix(validation_domain)
-                .is_some_and(|rest| rest.ends_with('.'));
-        if !is_superdomain {
+        if !validation_domain_covers(domain, validation_domain) {
             return Err(invalid(format!(
                 "ValidationDomain {validation_domain} must be {domain} or a superdomain of it"
             )));
@@ -3185,6 +3195,12 @@ mod tests {
             json!([{"DomainName": "api.example.com"}]),
             json!([{"ValidationDomain": "example.com"}]),
             json!("example.com"),
+            // The list is modeled with 1 to 100 entries.
+            json!([]),
+            json!(vec![
+                json!({"DomainName": "api.example.com", "ValidationDomain": "example.com"});
+                101
+            ]),
         ] {
             let err = svc
                 .handle(request(opts.clone()))
