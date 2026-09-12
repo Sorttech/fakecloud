@@ -274,6 +274,7 @@ pub(crate) fn infer_resource_type(resource_id: &str) -> String {
         "igw" => "internet-gateway",
         "rtb" => "route-table",
         "eipalloc" => "elastic-ip",
+        "asc" => "application-status-check",
         _ => "resource",
     };
     ty.to_string()

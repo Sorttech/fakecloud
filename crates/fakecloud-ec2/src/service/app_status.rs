@@ -23,7 +23,8 @@ use crate::service::tags::{apply_tag_specifications, tag_set_xml};
 use crate::service::Ec2Service;
 use crate::service_helpers::{
     filter_value_matches, gen_id, indexed_list, instance_not_found, invalid_parameter_value,
-    not_found, parse_tag_pairs, require, validate_enum, validate_int_range, Filter,
+    not_found, parse_tag_pairs, require, validate_enum, validate_int_range, validate_length,
+    Filter,
 };
 use crate::state::{ApplicationStatusCheck, ApplicationStatusSuppression, Ec2State, Tag};
 
@@ -124,27 +125,30 @@ fn validate_status_code_matcher(req: &AwsRequest) -> Result<(), AwsServiceError>
     let Some(raw) = str_param(req, "StatusCodeMatcher") else {
         return Ok(());
     };
+    // "Maximum length: 64 characters."
+    validate_length(&req.query_params, "StatusCodeMatcher", 0, 64)?;
     let bad = || invalid_parameter_value(format!("Invalid value '{raw}' for StatusCodeMatcher"));
+    // A status code is exactly three digits, so parsing one is the whole test.
+    let code = |s: &str| {
+        (s.len() == 3 && s.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| s.parse::<u32>().ok())
+            .flatten()
+    };
     for part in raw.split(',') {
         let part = part.trim();
-        let code = |s: &str| s.len() == 3 && s.bytes().all(|b| b.is_ascii_digit());
         match part.split_once('-') {
             Some((low, high)) => {
-                if !code(low) || !code(high) {
+                let (Some(low), Some(high)) = (code(low), code(high)) else {
                     return Err(bad());
-                }
-                let (low, high) = (
-                    low.parse::<u32>().map_err(|_| bad())?,
-                    high.parse::<u32>().map_err(|_| bad())?,
-                );
+                };
                 if low >= high {
                     return Err(invalid_parameter_value(
-                        "StatusCodeMatcher range must start below it ends",
+                        "StatusCodeMatcher range must start below where it ends",
                     ));
                 }
             }
             None => {
-                if !code(part) {
+                if code(part).is_none() {
                     return Err(bad());
                 }
             }
@@ -232,7 +236,18 @@ fn require_int_params(req: &AwsRequest, keys: &[&str]) -> Result<(), AwsServiceE
     Ok(())
 }
 
-/// The probe parameters every Create/Modify validates the same way.
+/// Require an integer parameter to be both present and parseable, so a
+/// required int is read exactly once instead of being re-parsed behind a
+/// fallback that can never fire.
+fn require_int(req: &AwsRequest, key: &str) -> Result<i64, AwsServiceError> {
+    let raw = require(&req.query_params, key)?;
+    raw.parse::<i64>()
+        .map_err(|_| invalid_parameter_value(format!("Invalid value '{raw}' for {key}")))
+}
+
+/// The optional probe parameters every Create/Modify validates the same way.
+/// `Port` is required on Create and read through `require_int` there, so it is
+/// only in this list for Modify, where it is optional.
 const PROBE_INT_PARAMS: &[&str] = &[
     "Port",
     "DeviceIndex",
@@ -357,6 +372,25 @@ fn get_check<'a>(
         .ok_or_else(|| not_found("InvalidApplicationStatusCheckId.NotFound", id))
 }
 
+/// The account's EC2 state, or `None` when it holds none yet. An account with
+/// no state cannot hold any of the ids a describe explicitly asked for, so
+/// that case is the same not-found the populated path returns; building a
+/// throwaway `Ec2State` here would seed a whole default network and AMI
+/// catalogue on every read.
+fn account_state<'a>(
+    accounts: &'a fakecloud_core::multi_account::MultiAccountState<Ec2State>,
+    account_id: &str,
+    requested: &[String],
+) -> Result<Option<&'a Ec2State>, AwsServiceError> {
+    match accounts.get(account_id) {
+        Some(state) => Ok(Some(state)),
+        None => match requested.first() {
+            Some(id) => Err(not_found("InvalidApplicationStatusCheckId.NotFound", id)),
+            None => Ok(None),
+        },
+    }
+}
+
 /// Reject an explicitly-requested check id that does not exist. AWS answers a
 /// describe naming a missing id with a hard error, not a silently-short list.
 fn ensure_checks_exist(
@@ -376,15 +410,25 @@ fn ensure_checks_exist(
     Ok(())
 }
 
-/// `DescribeApplicationStatusChecks` filters. The model documents one:
-/// `aggregation`.
-fn check_matches(c: &ApplicationStatusCheck, filters: &[Filter]) -> bool {
+/// `DescribeApplicationStatusChecks` filters. The model documents one,
+/// `aggregation`; the `tag:`/`tag-key`/`tag-value` family every EC2 describe
+/// accepts works too, now that a check's tags live in the shared tag store.
+fn check_matches(c: &ApplicationStatusCheck, tags: &[Tag], filters: &[Filter]) -> bool {
     filters.iter().all(|f| {
         let candidates: Vec<String> = match f.name.as_str() {
             "aggregation" => vec![c.aggregation.clone()],
-            // An unknown filter name matches nothing, the same way the rest of
-            // the EC2 describes treat one.
-            _ => return false,
+            "tag-key" => tags.iter().map(|t| t.key.clone()).collect(),
+            "tag-value" => tags.iter().map(|t| t.value.clone()).collect(),
+            name => match name.strip_prefix("tag:") {
+                Some(key) => tags
+                    .iter()
+                    .filter(|t| t.key == key)
+                    .map(|t| t.value.clone())
+                    .collect(),
+                // An unknown filter name matches nothing, the same way the
+                // rest of the EC2 describes treat one.
+                None => return false,
+            },
         };
         f.values
             .iter()
@@ -397,14 +441,21 @@ pub(crate) fn create_application_status_check(
     req: &AwsRequest,
 ) -> Result<AwsResponse, AwsServiceError> {
     let protocol = require(&req.query_params, "Protocol")?;
-    let port_raw = require(&req.query_params, "Port")?;
-    require_int_params(req, PROBE_INT_PARAMS)?;
+    let port = require_int(req, "Port")?;
+    require_int_params(req, &PROBE_INT_PARAMS[1..])?;
     validate_probe(req)?;
     validate_timeout_against_interval(int_param(req, "Interval"), int_param(req, "Timeout"))?;
-    let port = port_raw
-        .parse::<i64>()
-        .map_err(|_| invalid_parameter_value(format!("Invalid value '{port_raw}' for Port")))?;
     let client_token = str_param(req, "ClientToken");
+
+    // A DryRun validates the request and mints nothing. It runs ahead of the
+    // idempotency replay so that a dry run never answers with a real check.
+    if dry_run(req) {
+        return Ok(Ec2Service::respond(
+            "CreateApplicationStatusCheck",
+            &req.request_id,
+            "",
+        ));
+    }
 
     let mut accounts = svc.state.write();
     let state = accounts.get_or_create(&req.account_id);
@@ -427,16 +478,6 @@ pub(crate) fn create_application_status_check(
                 &body,
             ));
         }
-    }
-
-    // A DryRun validates the request and mints nothing. There is no
-    // pre-existing object to echo, so the result carries no check.
-    if dry_run(req) {
-        return Ok(Ec2Service::respond(
-            "CreateApplicationStatusCheck",
-            &req.request_id,
-            "",
-        ));
     }
 
     let now = now_rfc3339();
@@ -494,17 +535,22 @@ pub(crate) fn describe_application_status_checks(
         .get("IncludeAll")
         .is_some_and(|v| v.eq_ignore_ascii_case("true"));
     let accounts = svc.state.read();
-    let empty = Ec2State::new(&req.account_id, &req.region);
-    let state = accounts.get(&req.account_id).unwrap_or(&empty);
-    ensure_checks_exist(state, &ids, include_all)?;
+    let state = account_state(&accounts, &req.account_id, &ids)?;
     let items: Vec<String> = state
-        .application_status_checks
-        .values()
-        .filter(|c| ids.is_empty() || ids.contains(&c.id))
-        .filter(|c| include_all || c.deletion_time.is_none())
-        .filter(|c| check_matches(c, &filters))
-        .map(|c| check_xml(c, state.tags_for(&c.id)))
-        .collect();
+        .map(|s| {
+            ensure_checks_exist(s, &ids, include_all)?;
+            Ok::<_, AwsServiceError>(
+                s.application_status_checks
+                    .values()
+                    .filter(|c| ids.is_empty() || ids.contains(&c.id))
+                    .filter(|c| include_all || c.deletion_time.is_none())
+                    .filter(|c| check_matches(c, s.tags_for(&c.id), &filters))
+                    .map(|c| check_xml(c, s.tags_for(&c.id)))
+                    .collect(),
+            )
+        })
+        .transpose()?
+        .unwrap_or_default();
     let (page, token) =
         crate::service_helpers::paginate(&items, next_token.as_deref(), max_results);
     Ok(Ec2Service::respond(
@@ -632,9 +678,13 @@ pub(crate) fn delete_application_status_check(
     check.instance_ids.clear();
     check.tag_associations.clear();
     let rendered = check.clone();
+    // The tombstone stays describable under `IncludeAll`, but its tags go with
+    // it the way every other EC2 delete drops a resource's tags — nothing can
+    // address a tombstoned id to clean them up later.
+    let tags = state.tags.remove(&id).unwrap_or_default();
     let body = format!(
         "<applicationStatusCheck>{}</applicationStatusCheck>",
-        check_xml(&rendered, state.tags_for(&id))
+        check_xml(&rendered, &tags)
     );
     Ok(Ec2Service::respond(
         "DeleteApplicationStatusCheck",
@@ -774,32 +824,32 @@ pub(crate) fn describe_application_status_check_associations(
         })
     };
     let accounts = svc.state.read();
-    let empty = Ec2State::new(&req.account_id, &req.region);
-    let state = accounts.get(&req.account_id).unwrap_or(&empty);
-    ensure_checks_exist(state, &ids, true)?;
     let mut items = Vec::new();
-    for c in state.application_status_checks.values() {
-        if !ids.is_empty() && !ids.contains(&c.id) {
-            continue;
-        }
-        if type_matches("instance-id") {
-            for instance_id in &c.instance_ids {
-                items.push(format!(
-                    "{}{}{}",
-                    ec2_elem("applicationStatusCheckId", &c.id),
-                    ec2_elem("associationType", "instance-id"),
-                    ec2_elem("value", instance_id)
-                ));
+    if let Some(state) = account_state(&accounts, &req.account_id, &ids)? {
+        ensure_checks_exist(state, &ids, true)?;
+        for c in state.application_status_checks.values() {
+            if !ids.is_empty() && !ids.contains(&c.id) {
+                continue;
             }
-        }
-        if type_matches("tag") {
-            for (k, v) in &c.tag_associations {
-                items.push(format!(
-                    "{}{}{}",
-                    ec2_elem("applicationStatusCheckId", &c.id),
-                    ec2_elem("associationType", "tag"),
-                    format_args!("{}{}", ec2_elem("key", k), ec2_elem("value", v))
-                ));
+            if type_matches("instance-id") {
+                for instance_id in &c.instance_ids {
+                    items.push(format!(
+                        "{}{}{}",
+                        ec2_elem("applicationStatusCheckId", &c.id),
+                        ec2_elem("associationType", "instance-id"),
+                        ec2_elem("value", instance_id)
+                    ));
+                }
+            }
+            if type_matches("tag") {
+                for (k, v) in &c.tag_associations {
+                    items.push(format!(
+                        "{}{}{}",
+                        ec2_elem("applicationStatusCheckId", &c.id),
+                        ec2_elem("associationType", "tag"),
+                        format_args!("{}{}", ec2_elem("key", k), ec2_elem("value", v))
+                    ));
+                }
             }
         }
     }
@@ -826,16 +876,21 @@ pub(crate) fn describe_application_status(
     let requested = indexed_list(&req.query_params, "InstanceId");
     let filters = crate::service_helpers::parse_filters(&req.query_params);
     let accounts = svc.state.read();
-    let empty = Ec2State::new(&req.account_id, &req.region);
-    let state = accounts.get(&req.account_id).unwrap_or(&empty);
+    let mut items = Vec::new();
     // An explicitly-requested instance that does not exist is a hard error on
-    // AWS, not a silently-short list.
+    // AWS, not a silently-short list — including when the account holds no
+    // state at all.
+    let Some(state) = accounts.get(&req.account_id) else {
+        if let Some(id) = requested.first() {
+            return Err(instance_not_found(id));
+        }
+        return Ok(empty_application_status(&req.request_id));
+    };
     for id in &requested {
         if !state.instances.contains_key(id) {
             return Err(instance_not_found(id));
         }
     }
-    let mut items = Vec::new();
     let evaluated_at = Utc::now();
     let evaluated_at_str = evaluated_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     for (instance_id, instance) in &state.instances {
@@ -861,12 +916,7 @@ pub(crate) fn describe_application_status(
         let suppression = state
             .application_status_suppressions
             .get(instance_id)
-            .filter(|s| {
-                s.resume_at
-                    .as_deref()
-                    .and_then(|r| chrono::DateTime::parse_from_rfc3339(r).ok())
-                    .is_none_or(|r| r > evaluated_at)
-            });
+            .filter(|s| !suppression_expired(s, evaluated_at));
 
         // With no check associated there is nothing to report on; with
         // one, fakecloud runs no probe, so the status is the honest
@@ -945,6 +995,27 @@ pub(crate) fn describe_application_status(
     ))
 }
 
+/// The `DescribeApplicationStatus` body for an account that holds no state.
+fn empty_application_status(request_id: &str) -> AwsResponse {
+    Ec2Service::respond(
+        "DescribeApplicationStatus",
+        request_id,
+        &format!(
+            "<applicationStatusesResponseType>{}</applicationStatusesResponseType>",
+            ec2_list("instanceSet", &[])
+        ),
+    )
+}
+
+/// A suppression window that has already elapsed no longer suppresses
+/// anything; the entry is only cleared when the caller disables it.
+fn suppression_expired(s: &ApplicationStatusSuppression, now: chrono::DateTime<Utc>) -> bool {
+    s.resume_at
+        .as_deref()
+        .and_then(|r| chrono::DateTime::parse_from_rfc3339(r).ok())
+        .is_some_and(|r| r <= now)
+}
+
 /// The AZ id of the instance's subnet. An instance carries an AZ name, and the
 /// subnet it launched into is what pins that name to a zone id.
 fn availability_zone_id(state: &Ec2State, instance: &crate::state::Instance) -> String {
@@ -995,12 +1066,12 @@ fn change_suppression(
     if instance_ids.is_empty() {
         return Err(invalid_parameter_value("InstanceIds must be specified"));
     }
-    require_int_params(req, &["DurationSeconds"])?;
     let now = Utc::now();
     let suppress_at = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     // `DurationSeconds` is modeled only on Enable — Disable ends the window
-    // outright, so there is nothing to time-box.
+    // outright, so there is nothing to time-box and nothing to validate.
     let resume_at = if enable {
+        require_int_params(req, &["DurationSeconds"])?;
         match int_param(req, "DurationSeconds") {
             Some(d) if d <= 0 => {
                 return Err(invalid_parameter_value(
@@ -1039,8 +1110,9 @@ fn change_suppression(
             ));
             continue;
         }
-        // Disable reports the window it just ended, so the caller sees the
-        // times that were actually in force rather than freshly minted ones.
+        // Disable reports the window it just ended — the suppressAt that was
+        // actually in force, and `now` as the moment reporting resumes, since
+        // that is what ending the window does.
         let (entry_suppress_at, entry_resume_at) = if enable {
             state.application_status_suppressions.insert(
                 instance_id.clone(),
@@ -1052,11 +1124,26 @@ fn change_suppression(
             );
             (suppress_at.clone(), resume_at.clone())
         } else {
-            match state.application_status_suppressions.remove(&instance_id) {
-                Some(removed) => (removed.suppress_at, removed.resume_at),
-                // Nothing was suppressed, so reporting resumption now is the
-                // honest answer: status reporting is live as of this call.
-                None => (suppress_at.clone(), Some(suppress_at.clone())),
+            match state
+                .application_status_suppressions
+                .remove(&instance_id)
+                .filter(|s| !suppression_expired(s, now))
+            {
+                Some(removed) => (removed.suppress_at, Some(suppress_at.clone())),
+                // There was no window to end. That is not a success with a
+                // zero-length window invented for it — the modeled
+                // unsuccessful result carries exactly this case.
+                None => {
+                    unsuccessful.push(format!(
+                        "{}{}",
+                        ec2_elem("instanceId", &instance_id),
+                        ec2_elem(
+                            "reason",
+                            "Application status check suppression is not enabled for the instance"
+                        )
+                    ));
+                    continue;
+                }
             }
         };
         let mut entry = ec2_elem("instanceId", &instance_id);
@@ -1926,9 +2013,176 @@ mod tests {
             .unwrap(),
         );
         // The window that was in force, not one minted at the moment of
-        // deletion.
+        // deletion. Reporting resumes now, so `resumeAt` is not the future
+        // time the window would have ended on its own.
         assert_eq!(field(&disabled, "suppressAt"), suppress_at, "{disabled}");
-        assert_eq!(field(&disabled, "resumeAt"), resume_at, "{disabled}");
+        assert_ne!(field(&disabled, "resumeAt"), resume_at, "{disabled}");
+        assert!(!field(&disabled, "resumeAt").is_empty(), "{disabled}");
+
+        // Disabling again has no window to end, so it is reported as
+        // unsuccessful rather than as a zero-length window invented for it.
+        let again = body(
+            disable_application_status_check_suppression(
+                &svc,
+                &req(
+                    "DisableApplicationStatusCheckSuppression",
+                    &[("InstanceId.1", "i-5555555555555555e")],
+                ),
+            )
+            .unwrap(),
+        );
+        assert!(again.contains("<successfulResultSet/>"), "{again}");
+        assert!(
+            again.contains("suppression is not enabled for the instance"),
+            "{again}"
+        );
+
+        // `DurationSeconds` is not modeled on Disable, so a value there is not
+        // validated against the Enable rules.
+        disable_application_status_check_suppression(
+            &svc,
+            &req(
+                "DisableApplicationStatusCheckSuppression",
+                &[
+                    ("InstanceId.1", "i-5555555555555555e"),
+                    ("DurationSeconds", "not-a-number"),
+                ],
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn an_elapsed_suppression_no_longer_suppresses() {
+        let svc = Ec2Service::new();
+        seed_instance(&svc, "i-9999999999999999c", &[]);
+        {
+            let mut accounts = svc.state.write();
+            let state = accounts.get_or_create("000000000000");
+            state.application_status_suppressions.insert(
+                "i-9999999999999999c".to_string(),
+                ApplicationStatusSuppression {
+                    instance_id: "i-9999999999999999c".to_string(),
+                    suppress_at: "2020-01-01T00:00:00.000Z".to_string(),
+                    resume_at: Some("2020-01-01T00:10:00.000Z".to_string()),
+                },
+            );
+        }
+        let s = body(
+            describe_application_status(&svc, &req("DescribeApplicationStatus", &[])).unwrap(),
+        );
+        assert!(s.contains("<status>not-applicable</status>"), "{s}");
+
+        // And ending a window that already elapsed is not a success.
+        let d = body(
+            disable_application_status_check_suppression(
+                &svc,
+                &req(
+                    "DisableApplicationStatusCheckSuppression",
+                    &[("InstanceId.1", "i-9999999999999999c")],
+                ),
+            )
+            .unwrap(),
+        );
+        assert!(d.contains("<successfulResultSet/>"), "{d}");
+    }
+
+    #[test]
+    fn check_tags_carry_the_modeled_resource_type_and_go_with_the_check() {
+        let svc = Ec2Service::new();
+        let id = make_check(
+            &svc,
+            &[
+                (
+                    "TagSpecification.1.ResourceType",
+                    "application-status-check",
+                ),
+                ("TagSpecification.1.Tag.1.Key", "Name"),
+                ("TagSpecification.1.Tag.1.Value", "web-health"),
+            ],
+        );
+        let t = body(
+            crate::service::tags::describe_tags(
+                &svc,
+                &req(
+                    "DescribeTags",
+                    &[
+                        ("Filter.1.Name", "resource-type"),
+                        ("Filter.1.Value.1", "application-status-check"),
+                    ],
+                ),
+            )
+            .unwrap(),
+        );
+        assert!(t.contains(&id), "{t}");
+        assert!(
+            t.contains("<resourceType>application-status-check</resourceType>"),
+            "{t}"
+        );
+
+        // Deleting the check takes its tags with it — nothing can address a
+        // tombstoned id to clean them up afterwards.
+        delete_application_status_check(
+            &svc,
+            &req(
+                "DeleteApplicationStatusCheck",
+                &[("ApplicationStatusCheckId", &id)],
+            ),
+        )
+        .unwrap();
+        let t = body(crate::service::tags::describe_tags(&svc, &req("DescribeTags", &[])).unwrap());
+        assert!(!t.contains("web-health"), "{t}");
+    }
+
+    #[test]
+    fn checks_filter_on_their_tags() {
+        let svc = Ec2Service::new();
+        let tagged = make_check(
+            &svc,
+            &[
+                (
+                    "TagSpecification.1.ResourceType",
+                    "application-status-check",
+                ),
+                ("TagSpecification.1.Tag.1.Key", "env"),
+                ("TagSpecification.1.Tag.1.Value", "prod"),
+            ],
+        );
+        let untagged = make_check(&svc, &[]);
+        let d = body(
+            describe_application_status_checks(
+                &svc,
+                &req(
+                    "DescribeApplicationStatusChecks",
+                    &[("Filter.1.Name", "tag:env"), ("Filter.1.Value.1", "prod")],
+                ),
+            )
+            .unwrap(),
+        );
+        assert!(d.contains(&tagged), "{d}");
+        assert!(!d.contains(&untagged), "{d}");
+    }
+
+    #[test]
+    fn a_dry_run_create_never_replays_an_existing_check() {
+        let svc = Ec2Service::new();
+        make_check(&svc, &[("ClientToken", "token-dry")]);
+        let d = body(
+            create_application_status_check(
+                &svc,
+                &req(
+                    "CreateApplicationStatusCheck",
+                    &[
+                        ("Protocol", "http"),
+                        ("Port", "8080"),
+                        ("ClientToken", "token-dry"),
+                        ("DryRun", "true"),
+                    ],
+                ),
+            )
+            .unwrap(),
+        );
+        assert!(!d.contains("<applicationStatusCheck>"), "{d}");
     }
 
     #[test]
