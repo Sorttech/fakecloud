@@ -6,18 +6,30 @@
 //! by instance id or by tag, and `DescribeApplicationStatus` resolves both —
 //! so tagging an instance after the fact brings it under a tag-associated
 //! check without re-associating.
+//!
+//! `ClientToken` is an idempotency token on every mutating operation here.
+//! Only `CreateApplicationStatusCheck` can mint a duplicate on a retry, so
+//! that is the one that records the token and replays its original result;
+//! the rest converge on the same state when replayed (Modify writes the same
+//! fields, Delete tombstones an already-tombstoned check, Associate and the
+//! suppression pair are set operations).
 
 use chrono::Utc;
 
 use fakecloud_aws::ec2query::{ec2_elem, ec2_list};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
+use crate::service::tags::{apply_tag_specifications, tag_set_xml};
 use crate::service::Ec2Service;
 use crate::service_helpers::{
-    gen_id, indexed_list, invalid_parameter_value, not_found, parse_tag_pairs, require,
-    validate_enum, validate_int_range,
+    filter_value_matches, gen_id, indexed_list, instance_not_found, invalid_parameter_value,
+    not_found, parse_tag_pairs, require, validate_enum, validate_int_range, Filter,
 };
-use crate::state::{ApplicationStatusCheck, ApplicationStatusSuppression, Ec2State};
+use crate::state::{ApplicationStatusCheck, ApplicationStatusSuppression, Ec2State, Tag};
+
+/// The `ResourceType` a `TagSpecification.N` block must name to tag a check on
+/// create, and the key the shared tag store files those tags under.
+const CHECK_RESOURCE_TYPE: &str = "application-status-check";
 
 fn now_rfc3339() -> String {
     Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
@@ -50,7 +62,7 @@ fn tag_associations(req: &AwsRequest) -> Vec<(String, String)> {
 const RESULT_TYPE_TAG: &str = "EC2TAG";
 const RESULT_TYPE_INSTANCE: &str = "INSTANCE_ID";
 
-fn check_xml(c: &ApplicationStatusCheck) -> String {
+fn check_xml(c: &ApplicationStatusCheck, tags: &[Tag]) -> String {
     let mut s = String::new();
     s.push_str(&ec2_elem("applicationStatusCheckId", &c.id));
     s.push_str(&ec2_elem("aggregation", &c.aggregation));
@@ -86,6 +98,10 @@ fn check_xml(c: &ApplicationStatusCheck) -> String {
     s.push_str(&health_check_paths_xml(&c.health_check_paths));
     s.push_str(&ec2_elem("creationTime", &c.creation_time));
     s.push_str(&ec2_elem("modifyTime", &c.modify_time));
+    // `lastUpdatedAt` is the last time the check object changed, which is
+    // exactly what `modify_time` records — create and every Modify/Associate
+    // stamp it.
+    s.push_str(&ec2_elem("lastUpdatedAt", &c.modify_time));
     if let Some(d) = &c.deletion_time {
         s.push_str(&ec2_elem("deletionTime", d));
     }
@@ -94,53 +110,99 @@ fn check_xml(c: &ApplicationStatusCheck) -> String {
         .iter()
         .map(|(k, v)| format!("{}{}", ec2_elem("key", k), ec2_elem("value", v)))
         .collect();
-    if !pairs.is_empty() {
-        s.push_str(&ec2_list("targetTagAssociationSet", &pairs));
-    }
-    let tags: Vec<String> = c
-        .tags
-        .iter()
-        .map(|(k, v)| format!("{}{}", ec2_elem("key", k), ec2_elem("value", v)))
-        .collect();
-    if !tags.is_empty() {
-        s.push_str(&ec2_list("tagSet", &tags));
-    }
+    // EC2 renders an empty list as `<set/>` rather than omitting it, so SDKs
+    // see an empty list instead of a missing member.
+    s.push_str(&ec2_list("targetTagAssociationSet", &pairs));
+    s.push_str(&tag_set_xml(tags));
     s
 }
 
-/// Validate the probe settings shared by Create and Modify.
+/// Validate `StatusCodeMatcher`: a comma-separated list of individual HTTP
+/// status codes or `low-high` ranges, where the first value of a range must be
+/// less than the second.
+fn validate_status_code_matcher(req: &AwsRequest) -> Result<(), AwsServiceError> {
+    let Some(raw) = str_param(req, "StatusCodeMatcher") else {
+        return Ok(());
+    };
+    let bad = || invalid_parameter_value(format!("Invalid value '{raw}' for StatusCodeMatcher"));
+    for part in raw.split(',') {
+        let part = part.trim();
+        let code = |s: &str| s.len() == 3 && s.bytes().all(|b| b.is_ascii_digit());
+        match part.split_once('-') {
+            Some((low, high)) => {
+                if !code(low) || !code(high) {
+                    return Err(bad());
+                }
+                let (low, high) = (
+                    low.parse::<u32>().map_err(|_| bad())?,
+                    high.parse::<u32>().map_err(|_| bad())?,
+                );
+                if low >= high {
+                    return Err(invalid_parameter_value(
+                        "StatusCodeMatcher range must start below it ends",
+                    ));
+                }
+            }
+            None => {
+                if !code(part) {
+                    return Err(bad());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate the probe settings shared by Create and Modify. The bounds come
+/// from the member documentation in the EC2 model — the members are plain
+/// `Integer`s with no `@range` trait, so the documented values are the only
+/// source for them.
 fn validate_probe(req: &AwsRequest) -> Result<(), AwsServiceError> {
     validate_enum(&req.query_params, "Protocol", &["http", "https"])?;
     validate_enum(&req.query_params, "Aggregation", &["included", "excluded"])?;
     validate_enum(&req.query_params, "IpVersion", &["ipv4", "ipv6"])?;
     validate_enum(&req.query_params, "IpScope", &["private"])?;
+    // `PortNumber` and `InitializationGracePeriodSeconds` do carry `@range`.
     validate_int_range(&req.query_params, "Port", 1, 65_535)?;
-    validate_int_range(&req.query_params, "Interval", 5, 300)?;
-    validate_int_range(&req.query_params, "Timeout", 2, 120)?;
-    validate_int_range(&req.query_params, "FailureThreshold", 1, 10)?;
-    validate_int_range(&req.query_params, "SuccessThreshold", 1, 10)?;
-    // DeviceIndex names a network interface slot, so it cannot be negative.
-    // The model leaves it an unbounded Integer, but no slot below zero exists.
-    if int_param(req, "DeviceIndex").is_some_and(|v| v < 0) {
-        return Err(invalid_parameter_value("DeviceIndex must not be negative"));
-    }
-    // -1 disables the grace period, so the modeled floor is below zero.
     validate_int_range(
         &req.query_params,
         "InitializationGracePeriodSeconds",
         -1,
         600,
     )?;
-    // A probe that times out no sooner than it repeats can never report a
-    // result before the next attempt starts.
-    let interval = req
-        .query_params
-        .get("Interval")
-        .and_then(|v| v.parse::<i64>().ok());
-    let timeout = req
-        .query_params
-        .get("Timeout")
-        .and_then(|v| v.parse::<i64>().ok());
+    // "Valid value: 60." — the interval is not tunable.
+    if let Some(v) = int_param(req, "Interval") {
+        if v != 60 {
+            return Err(invalid_parameter_value("Interval must be 60"));
+        }
+    }
+    // "Valid values: 1 to 30."
+    validate_int_range(&req.query_params, "Timeout", 1, 30)?;
+    // "The value must be greater than 0." — documented with no upper bound.
+    for key in ["FailureThreshold", "SuccessThreshold"] {
+        if int_param(req, key).is_some_and(|v| v <= 0) {
+            return Err(invalid_parameter_value(format!(
+                "{key} must be greater than 0"
+            )));
+        }
+    }
+    // DeviceIndex names a network interface slot, so it cannot be negative.
+    // The model leaves it an unbounded Integer, but no slot below zero exists.
+    if int_param(req, "DeviceIndex").is_some_and(|v| v < 0) {
+        return Err(invalid_parameter_value("DeviceIndex must not be negative"));
+    }
+    validate_status_code_matcher(req)?;
+    Ok(())
+}
+
+/// A probe that times out no sooner than it repeats can never report a result
+/// before the next attempt starts. Both values are optional on the wire, so
+/// the check runs against the values the check will *hold* after the request
+/// is applied, not only against the pair that arrived together.
+fn validate_timeout_against_interval(
+    interval: Option<i64>,
+    timeout: Option<i64>,
+) -> Result<(), AwsServiceError> {
     if let (Some(i), Some(t)) = (interval, timeout) {
         if t >= i {
             return Err(invalid_parameter_value(
@@ -168,6 +230,41 @@ fn require_int_params(req: &AwsRequest, keys: &[&str]) -> Result<(), AwsServiceE
         }
     }
     Ok(())
+}
+
+/// The probe parameters every Create/Modify validates the same way.
+const PROBE_INT_PARAMS: &[&str] = &[
+    "Port",
+    "DeviceIndex",
+    "Interval",
+    "Timeout",
+    "FailureThreshold",
+    "SuccessThreshold",
+    "InitializationGracePeriodSeconds",
+];
+
+/// `MaxResults` + `NextToken` as the paginated describes read them. A
+/// `NextToken` that is not one this server minted is rejected rather than
+/// silently restarting the caller at page one.
+fn pagination(req: &AwsRequest) -> Result<(Option<usize>, Option<String>), AwsServiceError> {
+    let max_results = req
+        .query_params
+        .get("MaxResults")
+        .filter(|v| !v.is_empty())
+        .and_then(|v| v.parse::<usize>().ok());
+    let next_token = req
+        .query_params
+        .get("NextToken")
+        .filter(|v| !v.is_empty())
+        .cloned();
+    if let Some(t) = &next_token {
+        if t.parse::<usize>().is_err() {
+            return Err(invalid_parameter_value(format!(
+                "Invalid value '{t}' for NextToken"
+            )));
+        }
+    }
+    Ok((max_results, next_token))
 }
 
 /// Parse the `HealthCheckPath.N` request set: each path has one source and an
@@ -260,27 +357,80 @@ fn get_check<'a>(
         .ok_or_else(|| not_found("InvalidApplicationStatusCheckId.NotFound", id))
 }
 
+/// Reject an explicitly-requested check id that does not exist. AWS answers a
+/// describe naming a missing id with a hard error, not a silently-short list.
+fn ensure_checks_exist(
+    state: &Ec2State,
+    ids: &[String],
+    include_tombstoned: bool,
+) -> Result<(), AwsServiceError> {
+    for id in ids {
+        let known = state
+            .application_status_checks
+            .get(id)
+            .is_some_and(|c| include_tombstoned || c.deletion_time.is_none());
+        if !known {
+            return Err(not_found("InvalidApplicationStatusCheckId.NotFound", id));
+        }
+    }
+    Ok(())
+}
+
+/// `DescribeApplicationStatusChecks` filters. The model documents one:
+/// `aggregation`.
+fn check_matches(c: &ApplicationStatusCheck, filters: &[Filter]) -> bool {
+    filters.iter().all(|f| {
+        let candidates: Vec<String> = match f.name.as_str() {
+            "aggregation" => vec![c.aggregation.clone()],
+            // An unknown filter name matches nothing, the same way the rest of
+            // the EC2 describes treat one.
+            _ => return false,
+        };
+        f.values
+            .iter()
+            .any(|v| candidates.iter().any(|c| filter_value_matches(v, c)))
+    })
+}
+
 pub(crate) fn create_application_status_check(
     svc: &Ec2Service,
     req: &AwsRequest,
 ) -> Result<AwsResponse, AwsServiceError> {
     let protocol = require(&req.query_params, "Protocol")?;
-    require(&req.query_params, "Port")?;
+    let port_raw = require(&req.query_params, "Port")?;
+    require_int_params(req, PROBE_INT_PARAMS)?;
     validate_probe(req)?;
-    require_int_params(
-        req,
-        &[
-            "Port",
-            "DeviceIndex",
-            "Interval",
-            "Timeout",
-            "FailureThreshold",
-            "SuccessThreshold",
-            "InitializationGracePeriodSeconds",
-        ],
-    )?;
-    let port = int_param(req, "Port").unwrap_or(80);
+    validate_timeout_against_interval(int_param(req, "Interval"), int_param(req, "Timeout"))?;
+    let port = port_raw
+        .parse::<i64>()
+        .map_err(|_| invalid_parameter_value(format!("Invalid value '{port_raw}' for Port")))?;
+    let client_token = str_param(req, "ClientToken");
 
+    let mut accounts = svc.state.write();
+    let state = accounts.get_or_create(&req.account_id);
+
+    // Replaying a create with the same idempotency token must not mint a
+    // second check; AWS answers the retry with the original object.
+    if let Some(token) = &client_token {
+        if let Some(existing) = state
+            .application_status_checks
+            .values()
+            .find(|c| c.deletion_time.is_none() && c.client_token.as_deref() == Some(token))
+        {
+            let body = format!(
+                "<applicationStatusCheck>{}</applicationStatusCheck>",
+                check_xml(existing, state.tags_for(&existing.id))
+            );
+            return Ok(Ec2Service::respond(
+                "CreateApplicationStatusCheck",
+                &req.request_id,
+                &body,
+            ));
+        }
+    }
+
+    // A DryRun validates the request and mints nothing. There is no
+    // pre-existing object to echo, so the result carries no check.
     if dry_run(req) {
         return Ok(Ec2Service::respond(
             "CreateApplicationStatusCheck",
@@ -289,8 +439,6 @@ pub(crate) fn create_application_status_check(
         ));
     }
 
-    let mut accounts = svc.state.write();
-    let state = accounts.get_or_create(&req.account_id);
     let now = now_rfc3339();
     let check = ApplicationStatusCheck {
         id: gen_id("asc"),
@@ -310,21 +458,20 @@ pub(crate) fn create_application_status_check(
         health_check_paths: health_check_paths(req),
         instance_ids: Vec::new(),
         tag_associations: Vec::new(),
-        tags: parse_tag_pairs(&req.query_params, "TagSpecification.1.Tag")
-            .into_iter()
-            .map(|(k, v)| (k, v.unwrap_or_default()))
-            .collect(),
+        client_token,
         creation_time: now.clone(),
         modify_time: now,
         deletion_time: None,
     };
+    let id = check.id.clone();
+    // Create-time tags go to the shared EC2 tag store, so DescribeTags and
+    // CreateTags/DeleteTags see the same tags the check reports.
+    apply_tag_specifications(state, &req.query_params, &id, CHECK_RESOURCE_TYPE);
     let body = format!(
         "<applicationStatusCheck>{}</applicationStatusCheck>",
-        check_xml(&check)
+        check_xml(&check, state.tags_for(&id))
     );
-    state
-        .application_status_checks
-        .insert(check.id.clone(), check);
+    state.application_status_checks.insert(id, check);
     Ok(Ec2Service::respond(
         "CreateApplicationStatusCheck",
         &req.request_id,
@@ -338,28 +485,36 @@ pub(crate) fn describe_application_status_checks(
 ) -> Result<AwsResponse, AwsServiceError> {
     require_int_params(req, &["MaxResults"])?;
     validate_int_range(&req.query_params, "MaxResults", 5, 100)?;
+    let (max_results, next_token) = pagination(req)?;
     let ids = indexed_list(&req.query_params, "ApplicationStatusCheckId");
+    let filters = crate::service_helpers::parse_filters(&req.query_params);
     // Deleted checks are tombstoned; only `IncludeAll` surfaces them.
     let include_all = req
         .query_params
         .get("IncludeAll")
         .is_some_and(|v| v.eq_ignore_ascii_case("true"));
     let accounts = svc.state.read();
-    let items: Vec<String> = accounts
-        .get(&req.account_id)
-        .map(|s| {
-            s.application_status_checks
-                .values()
-                .filter(|c| ids.is_empty() || ids.contains(&c.id))
-                .filter(|c| include_all || c.deletion_time.is_none())
-                .map(check_xml)
-                .collect()
-        })
-        .unwrap_or_default();
+    let empty = Ec2State::new(&req.account_id, &req.region);
+    let state = accounts.get(&req.account_id).unwrap_or(&empty);
+    ensure_checks_exist(state, &ids, include_all)?;
+    let items: Vec<String> = state
+        .application_status_checks
+        .values()
+        .filter(|c| ids.is_empty() || ids.contains(&c.id))
+        .filter(|c| include_all || c.deletion_time.is_none())
+        .filter(|c| check_matches(c, &filters))
+        .map(|c| check_xml(c, state.tags_for(&c.id)))
+        .collect();
+    let (page, token) =
+        crate::service_helpers::paginate(&items, next_token.as_deref(), max_results);
     Ok(Ec2Service::respond(
         "DescribeApplicationStatusChecks",
         &req.request_id,
-        &ec2_list("applicationStatusCheckSet", &items),
+        &format!(
+            "{}{}",
+            ec2_list("applicationStatusCheckSet", &page),
+            token.map(|t| ec2_elem("nextToken", &t)).unwrap_or_default(),
+        ),
     ))
 }
 
@@ -368,30 +523,29 @@ pub(crate) fn modify_application_status_check(
     req: &AwsRequest,
 ) -> Result<AwsResponse, AwsServiceError> {
     let id = require(&req.query_params, "ApplicationStatusCheckId")?;
+    require_int_params(req, PROBE_INT_PARAMS)?;
     validate_probe(req)?;
-    require_int_params(
-        req,
-        &[
-            "Port",
-            "DeviceIndex",
-            "Interval",
-            "Timeout",
-            "FailureThreshold",
-            "SuccessThreshold",
-            "InitializationGracePeriodSeconds",
-        ],
-    )?;
     let paths = health_check_paths(req);
-    if dry_run(req) {
+    let mut accounts = svc.state.write();
+    let state = accounts.get_or_create(&req.account_id);
+    let dry = dry_run(req);
+    let check = get_check(state, &id)?;
+    // Interval and Timeout are each optional, so the invariant has to hold
+    // against the values the check ends up with, not only against a pair that
+    // arrived in the same request.
+    validate_timeout_against_interval(
+        int_param(req, "Interval").or(check.interval),
+        int_param(req, "Timeout").or(check.timeout),
+    )?;
+    // A DryRun validates the request — including that the check exists — and
+    // changes nothing.
+    if dry {
         return Ok(Ec2Service::respond(
             "ModifyApplicationStatusCheck",
             &req.request_id,
             "",
         ));
     }
-    let mut accounts = svc.state.write();
-    let state = accounts.get_or_create(&req.account_id);
-    let check = get_check(state, &id)?;
     if let Some(v) = str_param(req, "Protocol") {
         check.protocol = v;
     }
@@ -432,13 +586,18 @@ pub(crate) fn modify_application_status_check(
             *slot = Some(v);
         }
     }
+    // An omitted member and an empty list are the same bytes in an ec2Query
+    // request, so an absent `HealthCheckPath.N` set leaves the stored paths
+    // alone rather than clearing them. The same is true of every optional
+    // scalar above: ec2Query has no way to spell "unset this".
     if !paths.is_empty() {
         check.health_check_paths = paths;
     }
     check.modify_time = now_rfc3339();
+    let rendered = check.clone();
     let body = format!(
         "<applicationStatusCheck>{}</applicationStatusCheck>",
-        check_xml(check)
+        check_xml(&rendered, state.tags_for(&id))
     );
     Ok(Ec2Service::respond(
         "ModifyApplicationStatusCheck",
@@ -452,26 +611,30 @@ pub(crate) fn delete_application_status_check(
     req: &AwsRequest,
 ) -> Result<AwsResponse, AwsServiceError> {
     let id = require(&req.query_params, "ApplicationStatusCheckId")?;
-    if dry_run(req) {
+    let mut accounts = svc.state.write();
+    let state = accounts.get_or_create(&req.account_id);
+    let dry = dry_run(req);
+    // get_check already treats a tombstoned check as gone, so reaching here
+    // means the check is live.
+    let check = get_check(state, &id)?;
+    // A DryRun validates the request — including that the check exists — and
+    // changes nothing.
+    if dry {
         return Ok(Ec2Service::respond(
             "DeleteApplicationStatusCheck",
             &req.request_id,
             "",
         ));
     }
-    let mut accounts = svc.state.write();
-    let state = accounts.get_or_create(&req.account_id);
-    // get_check already treats a tombstoned check as gone, so reaching here
-    // means the check is live.
-    let check = get_check(state, &id)?;
     // AWS reports a deletion time on the returned object, so the check is
     // tombstoned rather than dropped; its associations go with it.
     check.deletion_time = Some(now_rfc3339());
     check.instance_ids.clear();
     check.tag_associations.clear();
+    let rendered = check.clone();
     let body = format!(
         "<applicationStatusCheck>{}</applicationStatusCheck>",
-        check_xml(check)
+        check_xml(&rendered, state.tags_for(&id))
     );
     Ok(Ec2Service::respond(
         "DeleteApplicationStatusCheck",
@@ -504,14 +667,17 @@ fn change_associations(
             "InstanceIds and TargetTagAssociations cannot be specified together",
         ));
     }
-    if dry_run(req) {
-        return Ok(Ec2Service::respond(action, &req.request_id, ""));
-    }
 
     let mut accounts = svc.state.write();
     let state = accounts.get_or_create(&req.account_id);
     let known_instances: Vec<String> = state.instances.keys().cloned().collect();
+    let dry = dry_run(req);
     let check = get_check(state, &id)?;
+    // A DryRun validates the request — including that the check exists — and
+    // changes nothing.
+    if dry {
+        return Ok(Ec2Service::respond(action, &req.request_id, ""));
+    }
 
     let mut successful = Vec::new();
     let mut unsuccessful = Vec::new();
@@ -593,14 +759,30 @@ pub(crate) fn describe_application_status_check_associations(
 ) -> Result<AwsResponse, AwsServiceError> {
     require_int_params(req, &["MaxResults"])?;
     validate_int_range(&req.query_params, "MaxResults", 5, 1_000)?;
+    let (max_results, next_token) = pagination(req)?;
     let ids = indexed_list(&req.query_params, "ApplicationStatusCheckId");
+    let filters = crate::service_helpers::parse_filters(&req.query_params);
+    // The model documents one filter here: `association-type`, whose values
+    // are the `AssociationTypeEnum` spellings.
+    let type_matches = |association_type: &str| {
+        filters.iter().all(|f| match f.name.as_str() {
+            "association-type" => f
+                .values
+                .iter()
+                .any(|v| filter_value_matches(v, association_type)),
+            _ => false,
+        })
+    };
     let accounts = svc.state.read();
+    let empty = Ec2State::new(&req.account_id, &req.region);
+    let state = accounts.get(&req.account_id).unwrap_or(&empty);
+    ensure_checks_exist(state, &ids, true)?;
     let mut items = Vec::new();
-    if let Some(state) = accounts.get(&req.account_id) {
-        for c in state.application_status_checks.values() {
-            if !ids.is_empty() && !ids.contains(&c.id) {
-                continue;
-            }
+    for c in state.application_status_checks.values() {
+        if !ids.is_empty() && !ids.contains(&c.id) {
+            continue;
+        }
+        if type_matches("instance-id") {
             for instance_id in &c.instance_ids {
                 items.push(format!(
                     "{}{}{}",
@@ -609,6 +791,8 @@ pub(crate) fn describe_application_status_check_associations(
                     ec2_elem("value", instance_id)
                 ));
             }
+        }
+        if type_matches("tag") {
             for (k, v) in &c.tag_associations {
                 items.push(format!(
                     "{}{}{}",
@@ -619,10 +803,16 @@ pub(crate) fn describe_application_status_check_associations(
             }
         }
     }
+    let (page, token) =
+        crate::service_helpers::paginate(&items, next_token.as_deref(), max_results);
     Ok(Ec2Service::respond(
         "DescribeApplicationStatusCheckAssociations",
         &req.request_id,
-        &ec2_list("associationSet", &items),
+        &format!(
+            "{}{}",
+            ec2_list("associationSet", &page),
+            token.map(|t| ec2_elem("nextToken", &t)).unwrap_or_default(),
+        ),
     ))
 }
 
@@ -632,90 +822,118 @@ pub(crate) fn describe_application_status(
 ) -> Result<AwsResponse, AwsServiceError> {
     require_int_params(req, &["MaxResults"])?;
     validate_int_range(&req.query_params, "MaxResults", 1, 100)?;
+    let (max_results, next_token) = pagination(req)?;
     let requested = indexed_list(&req.query_params, "InstanceId");
+    let filters = crate::service_helpers::parse_filters(&req.query_params);
     let accounts = svc.state.read();
-    let mut items = Vec::new();
-    if let Some(state) = accounts.get(&req.account_id) {
-        let now = Utc::now();
-        for instance_id in state.instances.keys() {
-            if !requested.is_empty() && !requested.contains(instance_id) {
-                continue;
-            }
-            // A check reaches this instance either by id or by one of its
-            // tags, so tagging an instance later brings it under a
-            // tag-associated check without re-associating.
-            let instance_tags = state.tags.get(instance_id);
-            let checks: Vec<&ApplicationStatusCheck> = state
-                .application_status_checks
-                .values()
-                .filter(|c| c.deletion_time.is_none())
-                .filter(|c| {
-                    c.instance_ids.contains(instance_id)
-                        || c.tag_associations.iter().any(|(k, v)| {
-                            instance_tags.is_some_and(|tags| {
-                                tags.iter().any(|t| &t.key == k && &t.value == v)
-                            })
-                        })
-                })
-                .collect();
-
-            let suppressed = state
-                .application_status_suppressions
-                .get(instance_id)
-                .is_some_and(|s| {
-                    s.resume_at
-                        .as_deref()
-                        .and_then(|r| chrono::DateTime::parse_from_rfc3339(r).ok())
-                        .is_none_or(|r| r > now)
-                });
-
-            // With no check associated there is nothing to report on; with
-            // one, fakecloud runs no probe, so the status is the honest
-            // "insufficient-data" rather than a fabricated "ok".
-            // `Aggregation=excluded` keeps a check off the instance's
-            // aggregate status while still reporting it in the detail set, so
-            // an instance whose only check is excluded has nothing to
-            // aggregate over.
-            let included = checks
-                .iter()
-                .filter(|c| c.aggregation != "excluded")
-                .count();
-            let status = if suppressed {
-                "suppressed"
-            } else if included == 0 {
-                "not-applicable"
-            } else {
-                "insufficient-data"
-            };
-            let details: Vec<String> = checks
-                .iter()
-                .map(|c| {
-                    format!(
-                        "{}{}{}",
-                        ec2_elem("applicationStatusCheckId", &c.id),
-                        ec2_elem("aggregation", &c.aggregation),
-                        ec2_elem("status", "insufficient-data")
-                    )
-                })
-                .collect();
-            let mut app_status = ec2_elem("status", status);
-            if !details.is_empty() {
-                app_status.push_str(&ec2_list("detailSet", &details));
-            }
-            items.push(format!(
-                "{}{}",
-                ec2_elem("instanceId", instance_id),
-                format_args!("<applicationStatus>{app_status}</applicationStatus>")
-            ));
+    let empty = Ec2State::new(&req.account_id, &req.region);
+    let state = accounts.get(&req.account_id).unwrap_or(&empty);
+    // An explicitly-requested instance that does not exist is a hard error on
+    // AWS, not a silently-short list.
+    for id in &requested {
+        if !state.instances.contains_key(id) {
+            return Err(instance_not_found(id));
         }
     }
-    let max_results = req
-        .query_params
-        .get("MaxResults")
-        .filter(|v| !v.is_empty())
-        .and_then(|v| v.parse::<usize>().ok());
-    let next_token = req.query_params.get("NextToken").map(String::as_str);
-    let (page, token) = crate::service_helpers::paginate(&items, next_token, max_results);
+    let mut items = Vec::new();
+    let evaluated_at = Utc::now();
+    let evaluated_at_str = evaluated_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    for (instance_id, instance) in &state.instances {
+        if !requested.is_empty() && !requested.contains(instance_id) {
+            continue;
+        }
+        // A check reaches this instance either by id or by one of its
+        // tags, so tagging an instance later brings it under a
+        // tag-associated check without re-associating.
+        let instance_tags = state.tags_for(instance_id);
+        let checks: Vec<&ApplicationStatusCheck> = state
+            .application_status_checks
+            .values()
+            .filter(|c| c.deletion_time.is_none())
+            .filter(|c| {
+                c.instance_ids.contains(instance_id)
+                    || c.tag_associations
+                        .iter()
+                        .any(|(k, v)| instance_tags.iter().any(|t| &t.key == k && &t.value == v))
+            })
+            .collect();
+
+        let suppression = state
+            .application_status_suppressions
+            .get(instance_id)
+            .filter(|s| {
+                s.resume_at
+                    .as_deref()
+                    .and_then(|r| chrono::DateTime::parse_from_rfc3339(r).ok())
+                    .is_none_or(|r| r > evaluated_at)
+            });
+
+        // With no check associated there is nothing to report on; with
+        // one, fakecloud runs no probe, so the status is the honest
+        // "insufficient-data" rather than a fabricated "ok".
+        // `Aggregation=excluded` keeps a check off the instance's
+        // aggregate status while still reporting it in the detail set, so
+        // an instance whose only check is excluded has nothing to
+        // aggregate over.
+        let included = checks
+            .iter()
+            .filter(|c| c.aggregation != "excluded")
+            .count();
+        let status = if suppression.is_some() {
+            "suppressed"
+        } else if included == 0 {
+            "not-applicable"
+        } else {
+            "insufficient-data"
+        };
+        if !status_matches(instance, state, status, &filters) {
+            continue;
+        }
+        // The status has held since whatever last changed it: the suppression
+        // window opening, or the newest association/check edit. With neither,
+        // it has held since the instance launched.
+        let status_since = match suppression {
+            Some(s) => s.suppress_at.clone(),
+            None => checks
+                .iter()
+                .map(|c| c.modify_time.clone())
+                .max()
+                .unwrap_or_else(|| instance.launch_time.clone()),
+        };
+        let details: Vec<String> = checks
+            .iter()
+            .map(|c| {
+                format!(
+                    "{}{}{}{}{}{}",
+                    ec2_elem("applicationStatusCheckId", &c.id),
+                    ec2_elem("checkUpdateTime", &c.modify_time),
+                    ec2_elem("aggregation", &c.aggregation),
+                    ec2_elem("status", "insufficient-data"),
+                    ec2_elem("statusTimeStamp", &evaluated_at_str),
+                    ec2_elem("statusSince", &c.modify_time),
+                )
+            })
+            .collect();
+        let mut app_status = ec2_elem("status", status);
+        app_status.push_str(&ec2_elem("statusTimeStamp", &evaluated_at_str));
+        app_status.push_str(&ec2_elem("statusSince", &status_since));
+        if let Some(resume_at) = suppression.and_then(|s| s.resume_at.as_deref()) {
+            app_status.push_str(&ec2_elem("resumeAt", resume_at));
+        }
+        if !details.is_empty() {
+            app_status.push_str(&ec2_list("detailSet", &details));
+        }
+        items.push(format!(
+            "{}{}{}{}{}",
+            ec2_elem("instanceId", instance_id),
+            ec2_elem("availabilityZone", &instance.az),
+            ec2_elem("availabilityZoneId", &availability_zone_id(state, instance)),
+            format_args!("<applicationStatus>{app_status}</applicationStatus>"),
+            tag_set_xml(instance_tags),
+        ));
+    }
+    let (page, token) =
+        crate::service_helpers::paginate(&items, next_token.as_deref(), max_results);
     Ok(Ec2Service::respond(
         "DescribeApplicationStatus",
         &req.request_id,
@@ -725,6 +943,46 @@ pub(crate) fn describe_application_status(
             token.map(|t| ec2_elem("nextToken", &t)).unwrap_or_default(),
         ),
     ))
+}
+
+/// The AZ id of the instance's subnet. An instance carries an AZ name, and the
+/// subnet it launched into is what pins that name to a zone id.
+fn availability_zone_id(state: &Ec2State, instance: &crate::state::Instance) -> String {
+    instance
+        .subnet_id
+        .as_ref()
+        .and_then(|id| state.subnets.get(id))
+        .map(|s| s.availability_zone_id.clone())
+        .or_else(|| {
+            state
+                .subnets
+                .values()
+                .find(|s| s.availability_zone == instance.az)
+                .map(|s| s.availability_zone_id.clone())
+        })
+        .unwrap_or_default()
+}
+
+/// `DescribeApplicationStatus` filters. The model documents two:
+/// `availability-zone-id` and `status`.
+fn status_matches(
+    instance: &crate::state::Instance,
+    state: &Ec2State,
+    status: &str,
+    filters: &[Filter],
+) -> bool {
+    filters.iter().all(|f| {
+        let candidates: Vec<String> = match f.name.as_str() {
+            "availability-zone-id" => vec![availability_zone_id(state, instance)],
+            "status" => vec![status.to_string()],
+            // An unknown filter name matches nothing, the same way the rest of
+            // the EC2 describes treat one.
+            _ => return false,
+        };
+        f.values
+            .iter()
+            .any(|v| candidates.iter().any(|c| filter_value_matches(v, c)))
+    })
 }
 
 fn change_suppression(
@@ -737,14 +995,31 @@ fn change_suppression(
     if instance_ids.is_empty() {
         return Err(invalid_parameter_value("InstanceIds must be specified"));
     }
-    let duration = int_param(req, "DurationSeconds");
-    if let Some(d) = duration {
-        if d <= 0 {
-            return Err(invalid_parameter_value(
-                "DurationSeconds must be a positive integer",
-            ));
+    require_int_params(req, &["DurationSeconds"])?;
+    let now = Utc::now();
+    let suppress_at = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    // `DurationSeconds` is modeled only on Enable — Disable ends the window
+    // outright, so there is nothing to time-box.
+    let resume_at = if enable {
+        match int_param(req, "DurationSeconds") {
+            Some(d) if d <= 0 => {
+                return Err(invalid_parameter_value(
+                    "DurationSeconds must be a positive integer",
+                ))
+            }
+            // A duration far enough out to overflow the timestamp is out of
+            // range, not a reason to tear down the connection.
+            Some(d) => Some(
+                chrono::Duration::try_seconds(d)
+                    .and_then(|d| now.checked_add_signed(d))
+                    .ok_or_else(|| invalid_parameter_value("DurationSeconds is out of range"))?
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            ),
+            None => None,
         }
-    }
+    } else {
+        None
+    };
     if dry_run(req) {
         return Ok(Ec2Service::respond(action, &req.request_id, ""));
     }
@@ -752,11 +1027,6 @@ fn change_suppression(
     let mut accounts = svc.state.write();
     let state = accounts.get_or_create(&req.account_id);
     let known: Vec<String> = state.instances.keys().cloned().collect();
-    let now = Utc::now();
-    let suppress_at = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let resume_at = duration.map(|d| {
-        (now + chrono::Duration::seconds(d)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-    });
 
     let mut successful = Vec::new();
     let mut unsuccessful = Vec::new();
@@ -769,7 +1039,9 @@ fn change_suppression(
             ));
             continue;
         }
-        if enable {
+        // Disable reports the window it just ended, so the caller sees the
+        // times that were actually in force rather than freshly minted ones.
+        let (entry_suppress_at, entry_resume_at) = if enable {
             state.application_status_suppressions.insert(
                 instance_id.clone(),
                 ApplicationStatusSuppression {
@@ -778,12 +1050,18 @@ fn change_suppression(
                     resume_at: resume_at.clone(),
                 },
             );
+            (suppress_at.clone(), resume_at.clone())
         } else {
-            state.application_status_suppressions.remove(&instance_id);
-        }
+            match state.application_status_suppressions.remove(&instance_id) {
+                Some(removed) => (removed.suppress_at, removed.resume_at),
+                // Nothing was suppressed, so reporting resumption now is the
+                // honest answer: status reporting is live as of this call.
+                None => (suppress_at.clone(), Some(suppress_at.clone())),
+            }
+        };
         let mut entry = ec2_elem("instanceId", &instance_id);
-        entry.push_str(&ec2_elem("suppressAt", &suppress_at));
-        if let Some(r) = &resume_at {
+        entry.push_str(&ec2_elem("suppressAt", &entry_suppress_at));
+        if let Some(r) = &entry_resume_at {
             entry.push_str(&ec2_elem("resumeAt", r));
         }
         successful.push(entry);
@@ -896,7 +1174,7 @@ mod tests {
         let svc = Ec2Service::new();
         let id = make_check(
             &svc,
-            &[("Path", "/healthz"), ("Interval", "30"), ("Timeout", "5")],
+            &[("Path", "/healthz"), ("Interval", "60"), ("Timeout", "5")],
         );
         assert!(id.starts_with("asc-"), "{id}");
 
@@ -1143,12 +1421,30 @@ mod tests {
             ],
             vec![("Protocol", "http"), ("Port", "80"), ("IpVersion", "ipv7")],
             vec![("Protocol", "http"), ("Port", "80"), ("Interval", "1")],
-            // A probe that times out no sooner than it repeats is rejected.
+            // "Valid values: 1 to 30." for Timeout.
+            vec![("Protocol", "http"), ("Port", "80"), ("Timeout", "31")],
+            vec![("Protocol", "http"), ("Port", "80"), ("Timeout", "0")],
+            // Thresholds are documented as "greater than 0", with no ceiling.
             vec![
                 ("Protocol", "http"),
                 ("Port", "80"),
-                ("Interval", "10"),
-                ("Timeout", "10"),
+                ("FailureThreshold", "0"),
+            ],
+            vec![
+                ("Protocol", "http"),
+                ("Port", "80"),
+                ("SuccessThreshold", "0"),
+            ],
+            // StatusCodeMatcher takes codes and low-high ranges only.
+            vec![
+                ("Protocol", "http"),
+                ("Port", "80"),
+                ("StatusCodeMatcher", "2xx"),
+            ],
+            vec![
+                ("Protocol", "http"),
+                ("Port", "80"),
+                ("StatusCodeMatcher", "399-300"),
             ],
         ] {
             let err = err_of(create_application_status_check(
@@ -1552,5 +1848,466 @@ mod tests {
             ),
         ));
         assert_eq!(err.code(), "InvalidParameterValue");
+    }
+    #[test]
+    fn suppression_duration_out_of_range_is_rejected_not_a_panic() {
+        let svc = Ec2Service::new();
+        seed_instance(&svc, "i-4444444444444444d", &[]);
+        // Both of these overflow a timestamp: the first blows past
+        // `TimeDelta`'s own range, the second fits a delta but not a date.
+        for duration in ["9223372036854775807", "9000000000000"] {
+            let err = err_of(enable_application_status_check_suppression(
+                &svc,
+                &req(
+                    "EnableApplicationStatusCheckSuppression",
+                    &[
+                        ("InstanceId.1", "i-4444444444444444d"),
+                        ("DurationSeconds", duration),
+                    ],
+                ),
+            ));
+            assert_eq!(err.code(), "InvalidParameterValue", "{duration}");
+        }
+        // A malformed duration is rejected rather than silently ignored.
+        let err = err_of(enable_application_status_check_suppression(
+            &svc,
+            &req(
+                "EnableApplicationStatusCheckSuppression",
+                &[
+                    ("InstanceId.1", "i-4444444444444444d"),
+                    ("DurationSeconds", "soon"),
+                ],
+            ),
+        ));
+        assert_eq!(err.code(), "InvalidParameterValue");
+    }
+
+    #[test]
+    fn disable_reports_the_window_it_ended() {
+        let svc = Ec2Service::new();
+        seed_instance(&svc, "i-5555555555555555e", &[]);
+        let enabled = body(
+            enable_application_status_check_suppression(
+                &svc,
+                &req(
+                    "EnableApplicationStatusCheckSuppression",
+                    &[
+                        ("InstanceId.1", "i-5555555555555555e"),
+                        ("DurationSeconds", "600"),
+                    ],
+                ),
+            )
+            .unwrap(),
+        );
+        let field = |xml: &str, tag: &str| {
+            xml.split(&format!("<{tag}>"))
+                .nth(1)
+                .unwrap_or_default()
+                .split(&format!("</{tag}>"))
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        };
+        let suppress_at = field(&enabled, "suppressAt");
+        let resume_at = field(&enabled, "resumeAt");
+        assert!(
+            !suppress_at.is_empty() && !resume_at.is_empty(),
+            "{enabled}"
+        );
+
+        let disabled = body(
+            disable_application_status_check_suppression(
+                &svc,
+                &req(
+                    "DisableApplicationStatusCheckSuppression",
+                    &[("InstanceId.1", "i-5555555555555555e")],
+                ),
+            )
+            .unwrap(),
+        );
+        // The window that was in force, not one minted at the moment of
+        // deletion.
+        assert_eq!(field(&disabled, "suppressAt"), suppress_at, "{disabled}");
+        assert_eq!(field(&disabled, "resumeAt"), resume_at, "{disabled}");
+    }
+
+    #[test]
+    fn describes_paginate_and_reject_a_foreign_token() {
+        let svc = Ec2Service::new();
+        seed_instance(&svc, "i-6666666666666666f", &[]);
+        let mut ids = Vec::new();
+        for _ in 0..7 {
+            ids.push(make_check(&svc, &[]));
+        }
+        for id in &ids {
+            associate_application_status_check(
+                &svc,
+                &req(
+                    "AssociateApplicationStatusCheck",
+                    &[
+                        ("ApplicationStatusCheckId", id),
+                        ("InstanceId.1", "i-6666666666666666f"),
+                    ],
+                ),
+            )
+            .unwrap();
+        }
+
+        let page = |action: &'static str, params: &[(&str, &str)]| match action {
+            "DescribeApplicationStatusChecks" => {
+                body(describe_application_status_checks(&svc, &req(action, params)).unwrap())
+            }
+            _ => body(
+                describe_application_status_check_associations(&svc, &req(action, params)).unwrap(),
+            ),
+        };
+        let token_of = |xml: &str| {
+            xml.split("<nextToken>").nth(1).map(|t| {
+                t.split("</nextToken>")
+                    .next()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+        };
+        let count = |xml: &str| xml.matches("<applicationStatusCheckId>").count();
+
+        for action in [
+            "DescribeApplicationStatusChecks",
+            "DescribeApplicationStatusCheckAssociations",
+        ] {
+            let first = page(action, &[("MaxResults", "5")]);
+            assert_eq!(count(&first), 5, "{action}: {first}");
+            let token = token_of(&first).unwrap_or_else(|| panic!("{action} emitted no token"));
+            let second = page(action, &[("MaxResults", "5"), ("NextToken", &token)]);
+            assert_eq!(count(&second), 2, "{action}: {second}");
+            assert!(token_of(&second).is_none(), "{action}: {second}");
+            // The two pages partition the set instead of overlapping.
+            for id in &ids {
+                assert_eq!(
+                    usize::from(first.contains(id.as_str()))
+                        + usize::from(second.contains(id.as_str())),
+                    1,
+                    "{action} lost or duplicated {id}"
+                );
+            }
+        }
+
+        // A token this server never minted is an error, not a silent restart
+        // at page one.
+        let err = err_of(describe_application_status_checks(
+            &svc,
+            &req(
+                "DescribeApplicationStatusChecks",
+                &[("NextToken", "not-a-token")],
+            ),
+        ));
+        assert_eq!(err.code(), "InvalidParameterValue");
+    }
+
+    #[test]
+    fn describes_filter_on_the_modeled_names() {
+        let svc = Ec2Service::new();
+        seed_instance(&svc, "i-7777777777777777a", &[]);
+        let included = make_check(&svc, &[]);
+        let excluded = make_check(&svc, &[("Aggregation", "excluded")]);
+
+        let d = body(
+            describe_application_status_checks(
+                &svc,
+                &req(
+                    "DescribeApplicationStatusChecks",
+                    &[
+                        ("Filter.1.Name", "aggregation"),
+                        ("Filter.1.Value.1", "excluded"),
+                    ],
+                ),
+            )
+            .unwrap(),
+        );
+        assert!(d.contains(&excluded), "{d}");
+        assert!(!d.contains(&included), "{d}");
+
+        associate_application_status_check(
+            &svc,
+            &req(
+                "AssociateApplicationStatusCheck",
+                &[
+                    ("ApplicationStatusCheckId", &included),
+                    ("InstanceId.1", "i-7777777777777777a"),
+                ],
+            ),
+        )
+        .unwrap();
+        associate_application_status_check(
+            &svc,
+            &req(
+                "AssociateApplicationStatusCheck",
+                &[
+                    ("ApplicationStatusCheckId", &excluded),
+                    ("TargetTagAssociation.1.Key", "env"),
+                    ("TargetTagAssociation.1.Value", "prod"),
+                ],
+            ),
+        )
+        .unwrap();
+        let a = body(
+            describe_application_status_check_associations(
+                &svc,
+                &req(
+                    "DescribeApplicationStatusCheckAssociations",
+                    &[
+                        ("Filter.1.Name", "association-type"),
+                        ("Filter.1.Value.1", "tag"),
+                    ],
+                ),
+            )
+            .unwrap(),
+        );
+        assert!(a.contains("<associationType>tag</associationType>"), "{a}");
+        assert!(
+            !a.contains("<associationType>instance-id</associationType>"),
+            "{a}"
+        );
+
+        // `status` and `availability-zone-id` are the two documented filters
+        // on DescribeApplicationStatus.
+        let s = body(
+            describe_application_status(
+                &svc,
+                &req(
+                    "DescribeApplicationStatus",
+                    &[("Filter.1.Name", "status"), ("Filter.1.Value.1", "ok")],
+                ),
+            )
+            .unwrap(),
+        );
+        assert!(!s.contains("i-7777777777777777a"), "{s}");
+        let s = body(
+            describe_application_status(
+                &svc,
+                &req(
+                    "DescribeApplicationStatus",
+                    &[
+                        ("Filter.1.Name", "status"),
+                        ("Filter.1.Value.1", "insufficient-data"),
+                    ],
+                ),
+            )
+            .unwrap(),
+        );
+        assert!(s.contains("i-7777777777777777a"), "{s}");
+    }
+
+    #[test]
+    fn describes_reject_an_id_that_does_not_exist() {
+        let svc = Ec2Service::new();
+        for action in [
+            "DescribeApplicationStatusChecks",
+            "DescribeApplicationStatusCheckAssociations",
+        ] {
+            let params = [("ApplicationStatusCheckId.1", "asc-doesnotexist00")];
+            let err = match action {
+                "DescribeApplicationStatusChecks" => err_of(describe_application_status_checks(
+                    &svc,
+                    &req(action, &params),
+                )),
+                _ => err_of(describe_application_status_check_associations(
+                    &svc,
+                    &req(action, &params),
+                )),
+            };
+            assert_eq!(
+                err.code(),
+                "InvalidApplicationStatusCheckId.NotFound",
+                "{action}"
+            );
+        }
+        let err = err_of(describe_application_status(
+            &svc,
+            &req(
+                "DescribeApplicationStatus",
+                &[("InstanceId.1", "i-doesnotexist00000")],
+            ),
+        ));
+        assert_eq!(err.code(), "InvalidInstanceID.NotFound");
+    }
+
+    #[test]
+    fn create_time_tags_land_in_the_shared_tag_store() {
+        let svc = Ec2Service::new();
+        let id = make_check(
+            &svc,
+            &[
+                (
+                    "TagSpecification.1.ResourceType",
+                    "application-status-check",
+                ),
+                ("TagSpecification.1.Tag.1.Key", "Name"),
+                ("TagSpecification.1.Tag.1.Value", "web-health"),
+            ],
+        );
+        let d = body(
+            describe_application_status_checks(&svc, &req("DescribeApplicationStatusChecks", &[]))
+                .unwrap(),
+        );
+        assert!(
+            d.contains("<key>Name</key><value>web-health</value>"),
+            "{d}"
+        );
+
+        // The same store CreateTags writes to, so a tag added afterwards shows
+        // up on the check.
+        crate::service::tags::create_tags(
+            &svc,
+            &req(
+                "CreateTags",
+                &[
+                    ("ResourceId.1", &id),
+                    ("Tag.1.Key", "tier"),
+                    ("Tag.1.Value", "gold"),
+                ],
+            ),
+        )
+        .unwrap();
+        let d = body(
+            describe_application_status_checks(&svc, &req("DescribeApplicationStatusChecks", &[]))
+                .unwrap(),
+        );
+        assert!(d.contains("<key>tier</key><value>gold</value>"), "{d}");
+
+        // And CreateTags on a check id that does not exist is rejected.
+        let err = err_of(crate::service::tags::create_tags(
+            &svc,
+            &req(
+                "CreateTags",
+                &[
+                    ("ResourceId.1", "asc-doesnotexist00"),
+                    ("Tag.1.Key", "tier"),
+                    ("Tag.1.Value", "gold"),
+                ],
+            ),
+        ));
+        assert_eq!(err.code(), "InvalidID");
+    }
+
+    #[test]
+    fn a_replayed_create_returns_the_original_check() {
+        let svc = Ec2Service::new();
+        let first = make_check(&svc, &[("ClientToken", "token-1")]);
+        let second = make_check(&svc, &[("ClientToken", "token-1")]);
+        assert_eq!(first, second);
+        let d = body(
+            describe_application_status_checks(&svc, &req("DescribeApplicationStatusChecks", &[]))
+                .unwrap(),
+        );
+        assert_eq!(d.matches("<applicationStatusCheckId>").count(), 1, "{d}");
+    }
+
+    #[test]
+    fn a_dry_run_validates_that_the_check_exists() {
+        let svc = Ec2Service::new();
+        let missing = "asc-doesnotexist00";
+        let err = err_of(modify_application_status_check(
+            &svc,
+            &req(
+                "ModifyApplicationStatusCheck",
+                &[("ApplicationStatusCheckId", missing), ("DryRun", "true")],
+            ),
+        ));
+        assert_eq!(err.code(), "InvalidApplicationStatusCheckId.NotFound");
+        let err = err_of(delete_application_status_check(
+            &svc,
+            &req(
+                "DeleteApplicationStatusCheck",
+                &[("ApplicationStatusCheckId", missing), ("DryRun", "true")],
+            ),
+        ));
+        assert_eq!(err.code(), "InvalidApplicationStatusCheckId.NotFound");
+        // And a dry run against a live check leaves it untouched.
+        let id = make_check(&svc, &[("Path", "/healthz")]);
+        modify_application_status_check(
+            &svc,
+            &req(
+                "ModifyApplicationStatusCheck",
+                &[
+                    ("ApplicationStatusCheckId", &id),
+                    ("Path", "/changed"),
+                    ("DryRun", "true"),
+                ],
+            ),
+        )
+        .unwrap();
+        let d = body(
+            describe_application_status_checks(&svc, &req("DescribeApplicationStatusChecks", &[]))
+                .unwrap(),
+        );
+        assert!(d.contains("<path>/healthz</path>"), "{d}");
+    }
+
+    #[test]
+    fn modify_holds_the_timeout_invariant_against_stored_values() {
+        let svc = Ec2Service::new();
+        let id = make_check(&svc, &[("Interval", "60"), ("Timeout", "5")]);
+        // Timeout alone, checked against the stored Interval.
+        let err = err_of(modify_application_status_check(
+            &svc,
+            &req(
+                "ModifyApplicationStatusCheck",
+                &[("ApplicationStatusCheckId", &id), ("Timeout", "60")],
+            ),
+        ));
+        assert_eq!(err.code(), "InvalidParameterValue");
+        let d = body(
+            describe_application_status_checks(&svc, &req("DescribeApplicationStatusChecks", &[]))
+                .unwrap(),
+        );
+        assert!(d.contains("<timeout>5</timeout>"), "{d}");
+    }
+
+    #[test]
+    fn instance_status_reports_the_modeled_instance_fields() {
+        let svc = Ec2Service::new();
+        seed_instance(&svc, "i-8888888888888888b", &[("env", "prod")]);
+        let id = make_check(&svc, &[]);
+        associate_application_status_check(
+            &svc,
+            &req(
+                "AssociateApplicationStatusCheck",
+                &[
+                    ("ApplicationStatusCheckId", &id),
+                    ("InstanceId.1", "i-8888888888888888b"),
+                ],
+            ),
+        )
+        .unwrap();
+        let s = body(
+            describe_application_status(&svc, &req("DescribeApplicationStatus", &[])).unwrap(),
+        );
+        assert!(
+            s.contains("<availabilityZone>us-east-1a</availabilityZone>"),
+            "{s}"
+        );
+        assert!(s.contains("<availabilityZoneId>"), "{s}");
+        assert!(s.contains("<key>env</key><value>prod</value>"), "{s}");
+        assert!(s.contains("<statusTimeStamp>"), "{s}");
+        assert!(s.contains("<statusSince>"), "{s}");
+        assert!(s.contains("<checkUpdateTime>"), "{s}");
+
+        enable_application_status_check_suppression(
+            &svc,
+            &req(
+                "EnableApplicationStatusCheckSuppression",
+                &[
+                    ("InstanceId.1", "i-8888888888888888b"),
+                    ("DurationSeconds", "600"),
+                ],
+            ),
+        )
+        .unwrap();
+        let s = body(
+            describe_application_status(&svc, &req("DescribeApplicationStatus", &[])).unwrap(),
+        );
+        // A suppressed instance reports when reporting resumes.
+        assert!(s.contains("<resumeAt>"), "{s}");
     }
 }

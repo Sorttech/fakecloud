@@ -606,7 +606,11 @@ pub struct ApplicationStatusCheck {
     pub instance_ids: Vec<String>,
     /// Tag key/value pairs this check is associated with.
     pub tag_associations: Vec<(String, String)>,
-    pub tags: BTreeMap<String, String>,
+    /// The `ClientToken` the check was created with, so a replayed create
+    /// returns the original check instead of minting a second one. The check's
+    /// own tags live in the shared `tags` store, keyed by its id.
+    #[serde(default)]
+    pub client_token: Option<String>,
     /// RFC 3339 timestamps, matching how the rest of the EC2 state stores
     /// times.
     pub creation_time: String,
