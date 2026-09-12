@@ -133,21 +133,25 @@ fn write_canonical_json(v: &Value, out: &mut String) {
             let mut keys: Vec<&String> = map.keys().collect();
             keys.sort_unstable();
             out.push('{');
-            for k in keys {
+            for (i, k) in keys.into_iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
                 out.push_str(&Value::String(k.clone()).to_string());
                 out.push(':');
                 if let Some(inner) = map.get(k) {
                     write_canonical_json(inner, out);
                 }
-                out.push(',');
             }
             out.push('}');
         }
         Value::Array(items) => {
             out.push('[');
-            for item in items {
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
                 write_canonical_json(item, out);
-                out.push(',');
             }
             out.push(']');
         }
@@ -156,13 +160,48 @@ fn write_canonical_json(v: &Value, out: &mut String) {
 }
 
 /// What an item contributed to a table's cached stats and key index before it
-/// was mutated in place. Opaque: produced by
-/// [`DynamoTable::snapshot_item_at`] and consumed by
-/// [`DynamoTable::sync_item_at`].
+/// was mutated in place. Produced by `DynamoTable::snapshot_item_at` and
+/// consumed by `DynamoTable::sync_item_at`.
 #[derive(Debug, Clone)]
-pub struct ItemSlot {
+struct ItemSlot {
     size: i64,
     key: Option<String>,
+}
+
+/// A table's rows, in storage order.
+///
+/// Readable like a slice (`iter`, `len`, indexing) through `Deref`, but not
+/// mutable from outside this module: the primary-key index records positions
+/// in this vector, so a push, remove or wholesale reassignment that bypassed
+/// [`DynamoTable`]'s helpers would leave the index pointing at the wrong rows
+/// -- a later write would then overwrite or delete a different item, or store
+/// a duplicate. Keeping the vector private makes that a compile error rather
+/// than a convention. Serialized as the bare list, so snapshots are unchanged.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TableItems(Vec<HashMap<String, AttributeValue>>);
+
+impl std::ops::Deref for TableItems {
+    type Target = [HashMap<String, AttributeValue>];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<Vec<HashMap<String, AttributeValue>>> for TableItems {
+    fn from(items: Vec<HashMap<String, AttributeValue>>) -> Self {
+        Self(items)
+    }
+}
+
+impl<'a> IntoIterator for &'a TableItems {
+    type Item = &'a HashMap<String, AttributeValue>;
+    type IntoIter = std::slice::Iter<'a, HashMap<String, AttributeValue>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
 }
 
 /// State of a table's primary-key index.
@@ -201,16 +240,17 @@ pub struct DynamoTable {
     pub key_schema: Vec<KeySchemaElement>,
     pub attribute_definitions: Vec<AttributeDefinition>,
     pub provisioned_throughput: ProvisionedThroughput,
-    pub items: Vec<HashMap<String, AttributeValue>>,
+    pub items: TableItems,
     /// Primary-key -> position in `items`, so a write does not have to scan
     /// the whole table to decide insert-vs-overwrite. Without it every write
     /// was O(table size) and a bulk load was quadratic (#2502).
     ///
     /// Not persisted: it is derived state, and rebuilding it on load keeps
-    /// existing snapshots readable. `items` stays the source of truth —
-    /// scans, pagination and the stream paths all still index into it — so
-    /// the two must be mutated together via `put_item_at_key` /
-    /// `remove_item_by_key`, never by touching `items` directly.
+    /// existing snapshots readable. `items` stays the source of truth --
+    /// scans, pagination and the stream paths all still index into it -- and
+    /// is only mutable through the helpers here (`put_item_at_key`,
+    /// `remove_item_by_key`, `update_item_at`, `replace_items`, ...), which
+    /// keep the two in step. [`TableItems`] enforces that.
     /// Public so out-of-crate constructors (the CloudFormation provisioner)
     /// can build a table with `key_index: Default::default()`.
     #[serde(skip)]
@@ -502,16 +542,21 @@ impl DynamoTable {
     pub fn rebuild_key_index(&mut self) {
         let mut index = HashMap::with_capacity(self.items.len());
         let mut duplicate_key = false;
-        // Iterate forward and keep the *first* position for a duplicate key so
-        // lookups agree with the old `position()` scan. Well-formed tables have
-        // no duplicates; an imported export or an older snapshot might, and
-        // those tables give up the index entirely rather than answer a lookup
-        // differently from the scan.
+        // Well-formed tables have no duplicate keys; an imported export or an
+        // older snapshot might, and those tables give up the index entirely
+        // rather than answer a lookup differently from the scan (which returns
+        // the *first* matching row, a position map cannot keep doing that once
+        // the first is removed).
         for (i, item) in self.items.iter().enumerate() {
             if let Some(k) = self.encode_key(item) {
-                if index.insert(k, i).is_some() {
-                    duplicate_key = true;
-                    break;
+                match index.entry(k) {
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(i);
+                    }
+                    std::collections::hash_map::Entry::Occupied(_) => {
+                        duplicate_key = true;
+                        break;
+                    }
                 }
             }
         }
@@ -607,7 +652,7 @@ impl DynamoTable {
                 // whole table (#2502).
                 self.size_bytes -= Self::estimate_item_size(&self.items[idx]);
                 self.size_bytes += Self::estimate_item_size(&item);
-                self.items[idx] = item;
+                self.items.0[idx] = item;
                 (idx, true)
             }
             None => {
@@ -615,7 +660,7 @@ impl DynamoTable {
                 self.index_insert_at(&item, idx);
                 self.size_bytes += Self::estimate_item_size(&item);
                 self.item_count += 1;
-                self.items.push(item);
+                self.items.0.push(item);
                 (idx, false)
             }
         }
@@ -638,7 +683,7 @@ impl DynamoTable {
     ///
     /// Panics if `idx` is out of bounds, like the `Vec::remove` it wraps.
     pub fn remove_item_at(&mut self, idx: usize) -> HashMap<String, AttributeValue> {
-        let removed = self.items.remove(idx);
+        let removed = self.items.0.remove(idx);
         self.index_remove(&removed);
         // `Vec::remove` shifts every later element down one, so their recorded
         // positions are now stale. Repair just those rather than rebuilding the
@@ -655,10 +700,74 @@ impl DynamoTable {
         removed
     }
 
+    /// Mutate the item at `idx` in place, keeping the cached size and the key
+    /// index in step.
+    ///
+    /// All or nothing: an UpdateExpression is applied clause by clause, so
+    /// `f` can fail with some clauses already written. The item is then put
+    /// back exactly as it was, so a rejected update leaves no trace -- as a
+    /// rejected UpdateItem does on AWS.
+    ///
+    /// Panics if `idx` is out of bounds.
+    pub fn update_item_at<E>(
+        &mut self,
+        idx: usize,
+        f: impl FnOnce(&mut HashMap<String, AttributeValue>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let before = self.snapshot_item_at(idx);
+        let original = self.items.0[idx].clone();
+        match f(&mut self.items.0[idx]) {
+            Ok(()) => {
+                self.sync_item_at(idx, before);
+                Ok(())
+            }
+            Err(err) => {
+                // Restoring the original leaves the size and the indexed key
+                // exactly as `before` recorded them, so there is nothing to
+                // settle.
+                self.items.0[idx] = original;
+                Err(err)
+            }
+        }
+    }
+
+    /// Replace every row at once, then re-derive the stats and the key index
+    /// from the new rows. For the bulk paths (an import, a transaction
+    /// revert), where a full pass is proportional to work already done.
+    pub fn replace_items(&mut self, items: Vec<HashMap<String, AttributeValue>>) {
+        self.items = TableItems(items);
+        self.recalculate_stats();
+    }
+
+    /// Remove every row `remove` selects, preserving the order of the rest,
+    /// and return the removed rows in their storage order. The stats and the
+    /// key index are re-derived only when something was actually removed --
+    /// the rows that stay keep their positions, so an empty sweep (the common
+    /// case for the TTL pass) leaves the index alone.
+    pub fn remove_items_where(
+        &mut self,
+        mut remove: impl FnMut(&HashMap<String, AttributeValue>) -> bool,
+    ) -> Vec<HashMap<String, AttributeValue>> {
+        let mut removed = Vec::new();
+        let mut kept = Vec::with_capacity(self.items.len());
+        for item in std::mem::take(&mut self.items.0) {
+            if remove(&item) {
+                removed.push(item);
+            } else {
+                kept.push(item);
+            }
+        }
+        self.items = TableItems(kept);
+        if !removed.is_empty() {
+            self.recalculate_stats();
+        }
+        removed
+    }
+
     /// What the item at `idx` contributed before an in-place mutation: its
     /// size, and the key it was indexed under. Pair with
     /// [`Self::sync_item_at`] around the mutation.
-    pub fn snapshot_item_at(&self, idx: usize) -> ItemSlot {
+    fn snapshot_item_at(&self, idx: usize) -> ItemSlot {
         match self.items.get(idx) {
             Some(item) => ItemSlot {
                 size: Self::estimate_item_size(item),
@@ -676,7 +785,7 @@ impl DynamoTable {
     /// key. Re-pointing the index here keeps it in step with `items`, matching
     /// what the linear scan would have answered; without it a later write
     /// would overwrite or delete the wrong row.
-    pub fn sync_item_at(&mut self, idx: usize, before: ItemSlot) {
+    fn sync_item_at(&mut self, idx: usize, before: ItemSlot) {
         let Some((size_after, key_after)) = self
             .items
             .get(idx)
@@ -950,7 +1059,7 @@ mod tests {
                 read_capacity_units: 1,
                 write_capacity_units: 1,
             },
-            items: Vec::new(),
+            items: Default::default(),
             key_index: Default::default(),
             gsi: Vec::new(),
             lsi: Vec::new(),
@@ -1031,7 +1140,7 @@ mod tests {
         let mut t = table_with_hash_key("pk");
         let mut item = HashMap::new();
         item.insert("pk".to_string(), json!({"N": "1.0"}));
-        t.items.push(item);
+        t.put_item_at_key(item);
 
         let mut lookup = HashMap::new();
         lookup.insert("pk".to_string(), json!({"N": "1"}));
@@ -1051,7 +1160,7 @@ mod tests {
         let mut t = table_with_hash_key("pk");
         let mut item = HashMap::new();
         item.insert("pk".to_string(), json!({"N": "5"}));
-        t.items.push(item);
+        t.put_item_at_key(item);
 
         let mut bad = HashMap::new();
         bad.insert("pk".to_string(), json!({"N": "abc"}));
@@ -1078,8 +1187,8 @@ mod tests {
         let mut item2 = HashMap::new();
         item2.insert("pk".to_string(), json!({"N": "42"}));
         item2.insert("flag".to_string(), json!({"BOOL": true}));
-        t.items.push(item1);
-        t.items.push(item2);
+        t.put_item_at_key(item1);
+        t.put_item_at_key(item2);
         t.recalculate_stats();
         assert_eq!(t.item_count, 2);
         assert!(t.size_bytes > 0);
@@ -1133,7 +1242,7 @@ mod tests {
             // Only insert if the scan says it is not already present, so the
             // table holds one row per equivalence class.
             if t.find_item_index_scan(&item).is_none() {
-                t.items.push(item);
+                t.put_item_at_key(item);
             }
         }
         t.rebuild_key_index();
@@ -1156,7 +1265,7 @@ mod tests {
         let mut t = table_with_hash_key("pk");
         let mut item = HashMap::new();
         item.insert("pk".to_string(), json!({"N": "5"}));
-        t.items.push(item);
+        t.put_item_at_key(item);
         t.rebuild_key_index();
 
         let mut bad = HashMap::new();
@@ -1276,8 +1385,7 @@ mod tests {
         };
         // Only reachable by a bulk assignment (an import of an export that
         // repeats a key); the write helpers never create a duplicate.
-        t.items = vec![mk("dup"), mk("dup"), mk("other")];
-        t.recalculate_stats();
+        t.replace_items(vec![mk("dup"), mk("dup"), mk("other")]);
         assert!(matches!(t.key_index, KeyIndex::Ambiguous));
 
         assert_eq!(t.find_item_index(&mk("dup")), Some(0));
@@ -1299,9 +1407,9 @@ mod tests {
     }
 
     /// An UpdateExpression can rewrite a primary-key attribute (real AWS
-    /// rejects it, fakecloud does not). `sync_item_at` must re-point the index
-    /// at the new key, or a later write finds the row under a key it no longer
-    /// has.
+    /// rejects it, fakecloud does not). `update_item_at` must re-point the
+    /// index at the new key, or a later write finds the row under a key it no
+    /// longer has.
     #[test]
     fn in_place_key_rewrite_repoints_the_index() {
         let mut t = table_with_hash_key("pk");
@@ -1313,9 +1421,11 @@ mod tests {
         t.put_item_at_key(mk("before"));
         t.put_item_at_key(mk("bystander"));
 
-        let slot = t.snapshot_item_at(0);
-        t.items[0].insert("pk".to_string(), json!({"S": "after"}));
-        t.sync_item_at(0, slot);
+        let rewrite = t.update_item_at(0, |item| {
+            item.insert("pk".to_string(), json!({"S": "after"}));
+            Ok::<(), ()>(())
+        });
+        assert!(rewrite.is_ok());
 
         assert_eq!(t.find_item_index(&mk("after")), Some(0));
         assert_eq!(t.find_item_index(&mk("before")), None);
@@ -1345,9 +1455,11 @@ mod tests {
         t.put_item_at_key(mk("a"));
         t.put_item_at_key(mk("b"));
 
-        let slot = t.snapshot_item_at(1);
-        t.items[1].insert("pk".to_string(), json!({"S": "a"}));
-        t.sync_item_at(1, slot);
+        let rewrite = t.update_item_at(1, |item| {
+            item.insert("pk".to_string(), json!({"S": "a"}));
+            Ok::<(), ()>(())
+        });
+        assert!(rewrite.is_ok());
 
         assert!(matches!(t.key_index, KeyIndex::Ambiguous));
         assert_eq!(t.find_item_index(&mk("a")), Some(0));
@@ -1384,9 +1496,11 @@ mod tests {
         item.insert("v".to_string(), json!({"S": "short"}));
         t.put_item_at_key(item);
 
-        let slot = t.snapshot_item_at(0);
-        t.items[0].insert("v".to_string(), json!({"S": "a much longer value"}));
-        t.sync_item_at(0, slot);
+        let grow = t.update_item_at(0, |item| {
+            item.insert("v".to_string(), json!({"S": "a much longer value"}));
+            Ok::<(), ()>(())
+        });
+        assert!(grow.is_ok());
 
         let incremental = t.size_bytes;
         t.recalculate_stats();

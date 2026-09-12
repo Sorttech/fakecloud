@@ -718,16 +718,13 @@ pub(crate) fn invoke_dynamodb_update_item(
 
         table.ensure_key_index();
         if let Some(idx) = table.find_item_index(&key_map) {
-            let slot_before = table.snapshot_item_at(idx);
-            apply_update_expression(
-                &mut table.items[idx],
-                update_expr,
-                &attr_values,
-                &attr_names,
-            );
             // Settles the cached size, and re-points the index if the
             // expression rewrote a key attribute.
-            table.sync_item_at(idx, slot_before);
+            let applied: Result<(), std::convert::Infallible> = table.update_item_at(idx, |item| {
+                apply_update_expression(item, update_expr, &attr_values, &attr_names);
+                Ok(())
+            });
+            let Ok(()) = applied;
         } else {
             // Create new item with key + update expression values
             let mut new_item = key_map;

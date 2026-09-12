@@ -949,7 +949,7 @@ mod tests {
                 read_capacity_units: 0,
                 write_capacity_units: 0,
             },
-            items,
+            items: items.into(),
             key_index: Default::default(),
             gsi: vec![],
             lsi: vec![],

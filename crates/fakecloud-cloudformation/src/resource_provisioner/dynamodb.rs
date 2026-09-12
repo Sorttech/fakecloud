@@ -200,7 +200,7 @@ impl ResourceProvisioner {
             key_schema,
             attribute_definitions,
             provisioned_throughput,
-            items: Vec::new(),
+            items: Default::default(),
             key_index: Default::default(),
             gsi,
             lsi,

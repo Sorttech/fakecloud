@@ -283,7 +283,7 @@ fn build_table(
         key_schema,
         attribute_definitions,
         provisioned_throughput,
-        items,
+        items: items.into(),
         // Left unbuilt here; the `recalculate_stats()` below builds it.
         key_index: Default::default(),
         gsi: crate::parse_gsi(&shape["GlobalSecondaryIndexes"], &billing_mode),
@@ -572,8 +572,7 @@ mod tests {
             let mut sentinel: Item = HashMap::new();
             sentinel.insert("Artist".to_string(), json!({ "S": "SENTINEL" }));
             sentinel.insert("SongTitle".to_string(), json!({ "S": "only" }));
-            table.items = vec![sentinel];
-            table.recalculate_stats();
+            table.replace_items(vec![sentinel]);
         }
 
         // Re-running with the same flags must skip (not error, not overwrite).

@@ -852,7 +852,7 @@ impl DynamoDbService {
                         state
                             .tables
                             .get(table_name)
-                            .map(|t| t.items.clone())
+                            .map(|t| t.items.to_vec())
                             .unwrap_or_default()
                     });
                 }
@@ -948,9 +948,10 @@ impl DynamoDbService {
                     // restored table would scan on every transactional update
                     // without this.
                     table.ensure_key_index();
-                    let old_image = table.find_item_index(&key).map(|i| table.items[i].clone());
+                    let existing_idx = table.find_item_index(&key);
+                    let old_image = existing_idx.map(|i| table.items[i].clone());
                     let is_modify = old_image.is_some();
-                    let idx = match table.find_item_index(&key) {
+                    let idx = match existing_idx {
                         Some(i) => i,
                         None => {
                             let mut new_item = HashMap::new();
@@ -960,19 +961,21 @@ impl DynamoDbService {
                             table.put_item_at_key(new_item).0
                         }
                     };
-                    let slot_before = table.snapshot_item_at(idx);
-
                     if let Some(expr) = update_expression {
-                        apply_update_expression(
-                            &mut table.items[idx],
-                            expr,
-                            &expr_attr_names,
-                            &expr_attr_values,
-                        )
-                        .map_err(|e| (op_idx, e))?;
+                        // A failure here cancels the whole transaction, and
+                        // the revert below restores every touched table.
+                        table
+                            .update_item_at(idx, |item| {
+                                apply_update_expression(
+                                    item,
+                                    expr,
+                                    &expr_attr_names,
+                                    &expr_attr_values,
+                                )
+                            })
+                            .map_err(|e| (op_idx, e))?;
                     }
                     let new_image = table.items[idx].clone();
-                    table.sync_item_at(idx, slot_before);
                     let event_name = if is_modify { "MODIFY" } else { "INSERT" };
                     if let Some(record) = crate::streams::generate_stream_record(
                         table,
@@ -1008,8 +1011,7 @@ impl DynamoDbService {
             // with `ValidationError` and leaves siblings as `None`.
             for (table_name, items) in snapshots {
                 if let Some(table) = state.tables.get_mut(&table_name) {
-                    table.items = items;
-                    table.recalculate_stats();
+                    table.replace_items(items);
                 }
             }
             let msg = err.to_string();
@@ -1738,7 +1740,7 @@ mod tests {
                 read_capacity_units: 0,
                 write_capacity_units: 0,
             },
-            items: vec![],
+            items: Default::default(),
             key_index: Default::default(),
             gsi: vec![],
             lsi: vec![],

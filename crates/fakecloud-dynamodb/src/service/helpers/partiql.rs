@@ -515,19 +515,16 @@ pub(crate) fn execute_partiql_in_state(
         let mut last_new: Option<HashMap<String, AttributeValue>> = None;
         for idx in &matched_indices {
             last_old = Some(table.items[*idx].clone());
-            let slot_before = table.snapshot_item_at(*idx);
-            let applied = apply_update_expression(
-                &mut table.items[*idx],
-                &update_expression,
-                &HashMap::new(),
-                &expression_attribute_values,
-            );
-            // Settle even when the expression failed partway: the row is
-            // already rewritten, possibly under a different key, and leaving
-            // the index pointing at the old one makes a later write address
-            // the wrong row.
-            table.sync_item_at(*idx, slot_before);
-            applied?;
+            // All or nothing per row: an expression that fails partway leaves
+            // the row as it was rather than half rewritten.
+            table.update_item_at(*idx, |item| {
+                apply_update_expression(
+                    item,
+                    &update_expression,
+                    &HashMap::new(),
+                    &expression_attribute_values,
+                )
+            })?;
             last_key = Some(extract_key(table, &table.items[*idx]));
             last_new = Some(table.items[*idx].clone());
         }

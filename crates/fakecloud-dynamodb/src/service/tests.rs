@@ -5712,11 +5712,11 @@ fn set_arithmetic_on_missing_operand_errors() {
 }
 
 /// An UpdateExpression is applied clause by clause, so one that rewrites the
-/// primary key and *then* fails leaves the row stored under its new key. The
-/// key index has to follow it, or the old key still resolves to that row and a
-/// later write clobbers it (#2502 follow-up).
+/// primary key and *then* fails would leave the row stored under its new key.
+/// UpdateItem is all or nothing on AWS, so the row must come back exactly as
+/// it was, index included (#2502 follow-up).
 #[tokio::test]
-async fn update_item_failing_after_a_key_rewrite_leaves_no_stale_index_entry() {
+async fn update_item_failing_after_a_key_rewrite_rolls_the_row_back() {
     let svc = make_service();
     create_test_table(&svc);
 
@@ -5750,20 +5750,32 @@ async fn update_item_failing_after_a_key_rewrite_leaves_no_stale_index_entry() {
         "unexpected error: {err}"
     );
 
-    // Whatever landed, the old key must not resolve to the rewritten row.
+    // The rejected update changed nothing: the row is still under its old key,
+    // carrying its old attributes, and no row was stored under the new one.
     let got = call_dynamodb(
         &svc,
         "GetItem",
         json!({"TableName": "test-table", "Key": {"pk": {"S": "old"}}}),
     )
     .await;
-    let by_old_key = got.get("Item").and_then(|i| i.get("pk")).cloned();
+    assert_eq!(
+        got["Item"],
+        json!({"pk": {"S": "old"}, "count": {"S": "not-a-number"}}),
+        "the rejected update was not rolled back: {got}"
+    );
+    let renamed = call_dynamodb(
+        &svc,
+        "GetItem",
+        json!({"TableName": "test-table", "Key": {"pk": {"S": "new"}}}),
+    )
+    .await;
     assert!(
-        by_old_key.is_none() || by_old_key == Some(json!({"S": "old"})),
-        "the old key resolved to a row carrying a different key: {got}"
+        renamed.get("Item").is_none(),
+        "the half-applied rename survived: {renamed}"
     );
 
-    // And a write to the old key must not destroy the rewritten row.
+    // And the index still addresses that row: a write to the old key
+    // overwrites it rather than appending a second row under the same key.
     call_dynamodb(
         &svc,
         "PutItem",
@@ -5775,16 +5787,69 @@ async fn update_item_failing_after_a_key_rewrite_leaves_no_stale_index_entry() {
     .await;
     let scan = call_dynamodb(&svc, "Scan", json!({"TableName": "test-table"})).await;
     let rows = scan["Items"].as_array().unwrap();
-    let keys: Vec<&str> = rows.iter().filter_map(|r| r["pk"]["S"].as_str()).collect();
+    assert_eq!(rows.len(), 1, "the overwrite duplicated the row: {scan}");
+    assert_eq!(rows[0]["pk"], json!({"S": "old"}));
+    assert_eq!(rows[0]["marker"], json!({"S": "fresh"}));
+}
+
+/// An UpdateItem on a key that does not exist registers a key-only row before
+/// applying the expression. When the expression is then rejected, that row
+/// must go with it: AWS stores nothing for a failed UpdateItem.
+#[tokio::test]
+async fn update_item_failing_on_a_missing_key_stores_nothing() {
+    let svc = make_service();
+    create_test_table(&svc);
+
+    let err = svc
+        .handle(make_request(
+            "UpdateItem",
+            json!({
+                "TableName": "test-table",
+                "Key": {"pk": {"S": "absent"}},
+                "UpdateExpression": "SET #c = #c + :one",
+                "ExpressionAttributeNames": {"#c": "count"},
+                "ExpressionAttributeValues": {":one": {"N": "1"}}
+            }),
+        ))
+        .await
+        .err()
+        .expect("arithmetic on a missing operand must be rejected");
+    assert!(!err.to_string().is_empty());
+
+    let got = call_dynamodb(
+        &svc,
+        "GetItem",
+        json!({"TableName": "test-table", "Key": {"pk": {"S": "absent"}}}),
+    )
+    .await;
     assert!(
-        keys.contains(&"old"),
-        "the fresh write went missing: {scan}"
+        got.get("Item").is_none(),
+        "a failed upsert left a key-only stub: {got}"
     );
+    let scan = call_dynamodb(&svc, "Scan", json!({"TableName": "test-table"})).await;
     assert_eq!(
-        keys.len(),
-        rows.len(),
-        "a row lost its key attribute: {scan}"
+        scan["Items"].as_array().map(|r| r.len()),
+        Some(0),
+        "a failed upsert left a row behind: {scan}"
     );
+
+    // The table still writes correctly afterwards: one row, not two.
+    call_dynamodb(
+        &svc,
+        "PutItem",
+        json!({"TableName": "test-table", "Item": {"pk": {"S": "absent"}, "v": {"S": "1"}}}),
+    )
+    .await;
+    call_dynamodb(
+        &svc,
+        "PutItem",
+        json!({"TableName": "test-table", "Item": {"pk": {"S": "absent"}, "v": {"S": "2"}}}),
+    )
+    .await;
+    let scan = call_dynamodb(&svc, "Scan", json!({"TableName": "test-table"})).await;
+    let rows = scan["Items"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "the write path duplicated a row: {scan}");
+    assert_eq!(rows[0]["v"], json!({"S": "2"}));
 }
 
 // ---------------------------------------------------------------------
