@@ -1,6 +1,6 @@
 //! ACM (Certificate Manager) JSON 1.1 service.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -501,6 +501,11 @@ impl AcmService {
                     .collect()
             })
             .unwrap_or_default();
+        let validation_domains = parse_domain_validation_options(
+            body.get("DomainValidationOptions"),
+            &domain_name,
+            &sans,
+        )?;
         let key_algorithm = body
             .get("KeyAlgorithm")
             .and_then(Value::as_str)
@@ -563,14 +568,25 @@ impl AcmService {
         let mut state = self.state.write();
         let account = account_mut(&mut state, &req.account_id);
 
-        // Idempotency: a same-token + same-DomainName + same-SANs request returns
-        // the prior cert. Real ACM keys this on a 1-hour window; fakecloud uses
-        // exact match for determinism.
+        let domain_validation =
+            synth_domain_validation(&domain_name, &sans, &validation_method, &validation_domains);
+
+        // Idempotency: a same-token + same-DomainName + same-SANs request with the
+        // same validation domains returns the prior cert. Real ACM keys this on a
+        // 1-hour window; fakecloud uses exact match for determinism.
         if let Some(token) = &idempotency_token {
+            let requested_domains: Vec<Option<&str>> = domain_validation
+                .iter()
+                .map(|d| d.validation_domain.as_deref())
+                .collect();
             if let Some(existing) = account.certificates.values().find(|c| {
                 c.idempotency_token.as_deref() == Some(token)
                     && c.domain_name == domain_name
                     && c.subject_alternative_names == effective_sans(&domain_name, &sans)
+                    && c.domain_validation
+                        .iter()
+                        .map(|d| d.validation_domain.as_deref())
+                        .eq(requested_domains.iter().copied())
             }) {
                 return Ok(AwsResponse::ok_json(
                     json!({ "CertificateArn": existing.arn }),
@@ -608,7 +624,7 @@ impl AcmService {
             not_before: now,
             not_after: now + Duration::days(395),
             validation_method: Some(validation_method.clone()),
-            domain_validation: synth_domain_validation(&domain_name, &sans, &validation_method),
+            domain_validation,
             options,
             renewal_eligibility: "INELIGIBLE".to_string(),
             managed_by,
@@ -676,15 +692,21 @@ impl AcmService {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| validation_error("CertificateArn is required"))?
             .to_string();
-        let max_items: usize = body
-            .get("MaxItems")
-            .and_then(Value::as_u64)
-            .map(|n| n as usize)
-            .unwrap_or(100);
-        if !(1..=1000).contains(&max_items) {
-            return Err(validation_error("MaxItems must be between 1 and 1000"));
-        }
-        let next_token = body.get("NextToken").and_then(Value::as_str);
+        // MaxItems defaults to 1000; a present value must be an integer in
+        // range rather than silently falling back to the default.
+        let max_items: usize = match body.get("MaxItems") {
+            None | Some(Value::Null) => 1000,
+            Some(v) => v
+                .as_u64()
+                .filter(|n| (1..=1000).contains(n))
+                .map(|n| n as usize)
+                .ok_or_else(|| validation_error("MaxItems must be between 1 and 1000"))?,
+        };
+        let next_token = match body.get("NextToken") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) if !s.is_empty() => Some(s.as_str()),
+            Some(_) => return Err(validation_error("Invalid NextToken")),
+        };
 
         let state = self.state.read();
         let cert = state
@@ -715,9 +737,10 @@ impl AcmService {
                         }
                     }
                     "EMAIL" => {
+                        let vd = email_validation_domain(d).unwrap_or(&d.domain_name);
                         challenge["EmailValidationChallenge"] = json!({
-                            "ValidationDomain": d.domain_name,
-                            "ValidationEmails": validation_emails(&d.domain_name),
+                            "ValidationDomain": vd,
+                            "ValidationEmails": validation_emails(vd),
                         });
                     }
                     _ => {}
@@ -729,10 +752,12 @@ impl AcmService {
                 if !challenge.as_object().is_some_and(|o| o.is_empty()) {
                     configuration["ValidationChallenge"] = challenge;
                 }
+                // RequestedValidationConfiguration is present only while a
+                // validation-method migration is pending, which fakecloud
+                // never starts, so only the active configuration is reported.
                 json!({
                     "DomainName": d.domain_name,
                     "ActiveValidationConfiguration": configuration,
-                    "RequestedValidationConfiguration": configuration,
                 })
             })
             .collect();
@@ -1877,6 +1902,60 @@ fn parse_options(value: Option<&Value>) -> CertificateOptions {
     }
 }
 
+/// Parse `DomainValidationOptions` into a domain -> validation-domain map. Each
+/// entry must name a domain on the certificate and a `ValidationDomain` equal to
+/// it or a superdomain of it; ACM rejects anything else with
+/// `InvalidDomainValidationOptionsException`. A certificate domain without an
+/// entry is validated against itself.
+fn parse_domain_validation_options(
+    value: Option<&Value>,
+    domain_name: &str,
+    sans: &[String],
+) -> Result<HashMap<String, String>, AwsServiceError> {
+    let invalid = |msg: String| {
+        AwsServiceError::aws_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidDomainValidationOptionsException",
+            msg,
+        )
+    };
+    let Some(opts) = value.filter(|v| !v.is_null()) else {
+        return Ok(HashMap::new());
+    };
+    let opts = opts
+        .as_array()
+        .ok_or_else(|| invalid("DomainValidationOptions must be a list".to_string()))?;
+    let names = effective_sans(domain_name, sans);
+    let mut out = HashMap::new();
+    for opt in opts {
+        let member = |field: &str| {
+            opt.get(field)
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| invalid(format!("DomainValidationOption {field} is required")))
+        };
+        let domain = member("DomainName")?;
+        let validation_domain = member("ValidationDomain")?;
+        if !names.iter().any(|n| n == domain) {
+            return Err(invalid(format!(
+                "DomainValidationOption DomainName {domain} is not a domain on the certificate"
+            )));
+        }
+        let base = domain.strip_prefix("*.").unwrap_or(domain);
+        let is_superdomain = base == validation_domain
+            || base
+                .strip_suffix(validation_domain)
+                .is_some_and(|rest| rest.ends_with('.'));
+        if !is_superdomain {
+            return Err(invalid(format!(
+                "ValidationDomain {validation_domain} must be {domain} or a superdomain of it"
+            )));
+        }
+        out.insert(domain.to_string(), validation_domain.to_string());
+    }
+    Ok(out)
+}
+
 /// Real ACM always carries the apex `DomainName` as the first entry of
 /// `SubjectAlternativeNames`; replicate that so SDK tests that read SANs
 /// don't have to special-case its absence.
@@ -1890,7 +1969,12 @@ fn effective_sans(domain: &str, extras: &[String]) -> Vec<String> {
     all
 }
 
-fn synth_domain_validation(domain: &str, sans: &[String], method: &str) -> Vec<DomainValidation> {
+fn synth_domain_validation(
+    domain: &str,
+    sans: &[String],
+    method: &str,
+    validation_domains: &HashMap<String, String>,
+) -> Vec<DomainValidation> {
     effective_sans(domain, sans)
         .iter()
         .map(|d| match method {
@@ -1905,6 +1989,7 @@ fn synth_domain_validation(domain: &str, sans: &[String], method: &str) -> Vec<D
                     resource_record_value: Some(format!("_{token}.acm-validations.aws.")),
                     http_redirect_from: None,
                     http_redirect_to: None,
+                    validation_domain: None,
                 }
             }
             "HTTP" => {
@@ -1924,6 +2009,7 @@ fn synth_domain_validation(domain: &str, sans: &[String], method: &str) -> Vec<D
                     http_redirect_to: Some(format!(
                         "https://{token}.acm-validations.aws/.well-known/pki-validation/{token}.txt"
                     )),
+                    validation_domain: None,
                 }
             }
             _ => DomainValidation {
@@ -1935,6 +2021,12 @@ fn synth_domain_validation(domain: &str, sans: &[String], method: &str) -> Vec<D
                 resource_record_value: None,
                 http_redirect_from: None,
                 http_redirect_to: None,
+                validation_domain: Some(
+                    validation_domains
+                        .get(d)
+                        .cloned()
+                        .unwrap_or_else(|| d.clone()),
+                ),
             },
         })
         .collect()
@@ -2222,7 +2314,20 @@ fn domain_validation_json(v: &DomainValidation) -> Value {
             }),
         );
     }
+    if let Some(vd) = email_validation_domain(v) {
+        let obj = out.as_object_mut().unwrap();
+        obj.insert("ValidationDomain".to_string(), json!(vd));
+        obj.insert("ValidationEmails".to_string(), json!(validation_emails(vd)));
+    }
     out
+}
+
+/// The domain an EMAIL challenge is addressed to, or `None` for DNS/HTTP.
+/// Snapshots written before the domain was tracked fall back to the domain
+/// being validated, which is what ACM uses when no override was requested.
+fn email_validation_domain(v: &DomainValidation) -> Option<&str> {
+    (v.validation_method == "EMAIL")
+        .then(|| v.validation_domain.as_deref().unwrap_or(&v.domain_name))
 }
 
 /// Encrypt a PEM-encoded PKCS#8 private key with a passphrase,
@@ -2971,6 +3076,212 @@ mod tests {
             .unwrap();
         assert_eq!(cert.status, "PENDING_VALIDATION");
         assert!(cert.issued_at.is_none());
+    }
+
+    async fn call_json(svc: &AcmService, action: &str, body: Value) -> Value {
+        let resp = svc.handle(make_req(action, body)).await.unwrap();
+        serde_json::from_slice(resp.body.expect_bytes()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn email_validation_uses_the_requested_validation_domain() {
+        let svc = AcmService::default();
+        let arn = call_json(
+            &svc,
+            "RequestCertificate",
+            json!({
+                "DomainName": "shop.example.com",
+                "SubjectAlternativeNames": ["api.example.com"],
+                "ValidationMethod": "EMAIL",
+                "DomainValidationOptions": [
+                    {"DomainName": "shop.example.com", "ValidationDomain": "example.com"}
+                ],
+            }),
+        )
+        .await["CertificateArn"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // DescribeCertificate addresses the challenge to the superdomain for the
+        // overridden name and to the domain itself for the one without an entry.
+        let desc = call_json(
+            &svc,
+            "DescribeCertificate",
+            json!({ "CertificateArn": arn }),
+        )
+        .await;
+        let dvos = desc["Certificate"]["DomainValidationOptions"]
+            .as_array()
+            .unwrap();
+        assert_eq!(dvos[0]["ValidationDomain"], "example.com");
+        assert_eq!(dvos[0]["ValidationEmails"][0], "admin@example.com");
+        assert_eq!(dvos[1]["ValidationDomain"], "api.example.com");
+        assert_eq!(dvos[1]["ValidationEmails"][0], "admin@api.example.com");
+
+        let listed = call_json(
+            &svc,
+            "ListCertificateDomainValidations",
+            json!({ "CertificateArn": arn }),
+        )
+        .await;
+        let first = &listed["DomainValidationSummaryList"][0];
+        let challenge = &first["ActiveValidationConfiguration"]["ValidationChallenge"]
+            ["EmailValidationChallenge"];
+        assert_eq!(challenge["ValidationDomain"], "example.com");
+        assert_eq!(
+            challenge["ValidationEmails"].as_array().unwrap().len(),
+            5,
+            "{challenge}"
+        );
+        // No validation-method migration is ever pending.
+        assert!(first.get("RequestedValidationConfiguration").is_none());
+
+        // DNS validation carries no email challenge fields.
+        let dns_arn = call_json(
+            &svc,
+            "RequestCertificate",
+            json!({"DomainName": "dns.example.com", "ValidationMethod": "DNS"}),
+        )
+        .await["CertificateArn"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let dns = call_json(
+            &svc,
+            "DescribeCertificate",
+            json!({ "CertificateArn": dns_arn }),
+        )
+        .await;
+        let dvo = &dns["Certificate"]["DomainValidationOptions"][0];
+        assert!(dvo.get("ValidationDomain").is_none());
+        assert!(dvo.get("ValidationEmails").is_none());
+    }
+
+    #[tokio::test]
+    async fn domain_validation_options_are_validated() {
+        let svc = AcmService::default();
+        let request = |opts: Value| {
+            make_req(
+                "RequestCertificate",
+                json!({
+                    "DomainName": "*.shop.example.com",
+                    "SubjectAlternativeNames": ["api.example.com"],
+                    "ValidationMethod": "EMAIL",
+                    "DomainValidationOptions": opts,
+                }),
+            )
+        };
+        for opts in [
+            // Not the domain or a superdomain of it.
+            json!([{"DomainName": "api.example.com", "ValidationDomain": "attacker.net"}]),
+            // A suffix match that is not on a label boundary.
+            json!([{"DomainName": "api.example.com", "ValidationDomain": "ple.com"}]),
+            // A subdomain of the requested name is not a superdomain.
+            json!([{"DomainName": "api.example.com", "ValidationDomain": "x.api.example.com"}]),
+            // A domain that is not on the certificate.
+            json!([{"DomainName": "other.example.com", "ValidationDomain": "example.com"}]),
+            // Both members are required.
+            json!([{"DomainName": "api.example.com"}]),
+            json!([{"ValidationDomain": "example.com"}]),
+            json!("example.com"),
+        ] {
+            let err = svc
+                .handle(request(opts.clone()))
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("expected rejection for {opts}"));
+            assert_eq!(
+                err.code(),
+                "InvalidDomainValidationOptionsException",
+                "{opts}"
+            );
+        }
+
+        // A wildcard validates against its base domain or any superdomain.
+        for vd in ["shop.example.com", "example.com"] {
+            svc.handle(request(
+                json!([{"DomainName": "*.shop.example.com", "ValidationDomain": vd}]),
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("{vd} should be accepted: {}", e.code()));
+        }
+    }
+
+    #[tokio::test]
+    async fn idempotent_request_distinguishes_validation_domains() {
+        let svc = AcmService::default();
+        let request = |vd: &str| {
+            json!({
+                "DomainName": "shop.example.com",
+                "ValidationMethod": "EMAIL",
+                "IdempotencyToken": "tok",
+                "DomainValidationOptions": [
+                    {"DomainName": "shop.example.com", "ValidationDomain": vd}
+                ],
+            })
+        };
+        let first = call_json(&svc, "RequestCertificate", request("example.com")).await;
+        let again = call_json(&svc, "RequestCertificate", request("example.com")).await;
+        assert_eq!(first["CertificateArn"], again["CertificateArn"]);
+
+        let changed = call_json(&svc, "RequestCertificate", request("shop.example.com")).await;
+        assert_ne!(first["CertificateArn"], changed["CertificateArn"]);
+        let desc = call_json(
+            &svc,
+            "DescribeCertificate",
+            json!({ "CertificateArn": changed["CertificateArn"] }),
+        )
+        .await;
+        assert_eq!(
+            desc["Certificate"]["DomainValidationOptions"][0]["ValidationDomain"],
+            "shop.example.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_certificate_domain_validations_validates_paging_inputs() {
+        let svc = AcmService::default();
+        let sans: Vec<String> = (0..120).map(|i| format!("d{i}.example.com")).collect();
+        let arn = call_json(
+            &svc,
+            "RequestCertificate",
+            json!({"DomainName": "example.com", "SubjectAlternativeNames": sans}),
+        )
+        .await["CertificateArn"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // MaxItems defaults to 1000, so all 121 summaries come back in one page.
+        let all = call_json(
+            &svc,
+            "ListCertificateDomainValidations",
+            json!({ "CertificateArn": arn }),
+        )
+        .await;
+        assert_eq!(
+            all["DomainValidationSummaryList"].as_array().unwrap().len(),
+            121
+        );
+        assert!(all.get("NextToken").is_none());
+
+        for body in [
+            json!({ "CertificateArn": arn, "MaxItems": -1 }),
+            json!({ "CertificateArn": arn, "MaxItems": 0 }),
+            json!({ "CertificateArn": arn, "MaxItems": 1001 }),
+            json!({ "CertificateArn": arn, "MaxItems": 2.5 }),
+            json!({ "CertificateArn": arn, "MaxItems": "10" }),
+            json!({ "CertificateArn": arn, "NextToken": 7 }),
+            json!({ "CertificateArn": arn, "NextToken": "" }),
+        ] {
+            let err = svc
+                .handle(make_req("ListCertificateDomainValidations", body.clone()))
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("expected rejection for {body}"));
+            assert_eq!(err.code(), "ValidationException", "{body}");
+        }
     }
 
     #[tokio::test]

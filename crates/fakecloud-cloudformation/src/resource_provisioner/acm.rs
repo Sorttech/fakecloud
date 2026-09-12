@@ -78,14 +78,18 @@ impl ResourceProvisioner {
         // runtime RequestCertificate path uses the async auto-issue
         // tick (DNS) or admin `/approve` endpoint (EMAIL) for parity
         // with ACM's async behaviour.
-        let domain_validation: Vec<AcmDomainValidation> =
-            synth_acm_domain_validation(&domain_name, &sans, &validation_method)
-                .into_iter()
-                .map(|mut dv| {
-                    dv.validation_status = "SUCCESS".to_string();
-                    dv
-                })
-                .collect();
+        let domain_validation: Vec<AcmDomainValidation> = synth_acm_domain_validation(
+            &domain_name,
+            &sans,
+            &validation_method,
+            props.get("DomainValidationOptions"),
+        )
+        .into_iter()
+        .map(|mut dv| {
+            dv.validation_status = "SUCCESS".to_string();
+            dv
+        })
+        .collect();
         let renewal_summary = Some(AcmRenewalSummary {
             renewal_status: "PENDING_AUTO_RENEWAL".to_string(),
             domain_validation: domain_validation.clone(),

@@ -80,12 +80,18 @@ fn require(body: &Value, field: &str) -> Result<String, AwsServiceError> {
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| validation(format!("{field} is required")))?;
-    // Every ACME ARN member is modeled @length(min: 1, max: 200). The check
-    // belongs here because the deletes are otherwise idempotent, and an
-    // over-length ARN has to be rejected rather than quietly accepted.
-    if field.ends_with("Arn") && value.chars().count() > 200 {
+    // Every ACME resource ARN member is modeled @length(min: 1, max: 200); an
+    // IAM RoleArn allows 2048. The check belongs here because the deletes are
+    // otherwise idempotent, and an over-length ARN has to be rejected rather
+    // than quietly accepted.
+    let max_len = match field {
+        "RoleArn" => Some(2048),
+        f if f.starts_with("Acme") && f.ends_with("Arn") => Some(200),
+        _ => None,
+    };
+    if let Some(max) = max_len.filter(|max| value.chars().count() > *max) {
         return Err(validation(format!(
-            "{field} must be 200 characters or fewer"
+            "{field} must be {max} characters or fewer"
         )));
     }
     Ok(value.to_string())
@@ -1296,6 +1302,41 @@ mod tests {
         )["AcmeAccount"]
             .clone();
         assert_eq!(a["Status"], "REVOKED");
+    }
+
+    #[test]
+    fn role_arn_takes_the_iam_length_limit_not_the_acme_one() {
+        let s = svc();
+        let endpoint = make_endpoint(&s);
+        let binding = |role: String| {
+            s.create_acme_external_account_binding(&req(
+                "CreateAcmeExternalAccountBinding",
+                json!({ "AcmeEndpointArn": endpoint, "RoleArn": role }),
+            ))
+        };
+        let prefix = "arn:aws:iam::123456789012:role/";
+
+        // A 300-character role ARN is valid (RoleArn allows 2048).
+        let long_role = format!("{prefix}{}", "r".repeat(300 - prefix.len()));
+        let created = json_of(binding(long_role.clone()).unwrap());
+        assert_eq!(created["ExternalAccountBinding"]["RoleArn"], long_role);
+
+        let too_long = format!("{prefix}{}", "r".repeat(2049 - prefix.len()));
+        assert_eq!(
+            binding(too_long).err().unwrap().code(),
+            "ValidationException"
+        );
+
+        // The ACME resource ARNs keep their 200-character ceiling.
+        let long_endpoint = format!("{endpoint}{}", "x".repeat(201));
+        let err = s
+            .describe_acme_endpoint(&req(
+                "DescribeAcmeEndpoint",
+                json!({ "AcmeEndpointArn": long_endpoint }),
+            ))
+            .err()
+            .unwrap();
+        assert_eq!(err.code(), "ValidationException");
     }
 
     #[test]

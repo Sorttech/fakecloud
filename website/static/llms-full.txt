@@ -576,7 +576,12 @@ Protocol: REST-XML under `/2013-04-01/` (HTTP method + URI routing)
 **Tags:** AddTagsToCertificate, RemoveTagsFromCertificate, ListTagsForCertificate
 **Account-wide:** GetAccountConfiguration, PutAccountConfiguration
 **Cert Options:** UpdateCertificateOptions (transparency-logging + export prefs)
-**Validation:** ResendValidationEmail (only for EMAIL-validated certs)
+**Validation:** ResendValidationEmail (only for EMAIL-validated certs), ListCertificateDomainValidations
+**Resource tagging:** TagResource, UntagResource, ListTagsForResource
+**ACME endpoints:** CreateAcmeEndpoint, DescribeAcmeEndpoint, ListAcmeEndpoints, UpdateAcmeEndpoint, DeleteAcmeEndpoint
+**ACME external account bindings:** CreateAcmeExternalAccountBinding, DescribeAcmeExternalAccountBinding, ListAcmeExternalAccountBindings, GetAcmeExternalAccountBindingCredentials, RevokeAcmeExternalAccountBinding, DeleteAcmeExternalAccountBinding
+**ACME domain validations:** CreateAcmeDomainValidation, DescribeAcmeDomainValidation, ListAcmeDomainValidations, UpdateAcmeDomainValidation, DeleteAcmeDomainValidation
+**ACME accounts:** DescribeAcmeAccount, ListAcmeAccounts, RevokeAcmeAccount
 
 Features: Deterministic synthesized DNS validation records. `IdempotencyToken` dedupe on token + DomainName + SANs (real ACM uses 1-hour window; fakecloud uses exact match for determinism). `RevokeCertificate` only on AMAZON_ISSUED certs. fakecloud does not run real X.509 validation — public certs land at `PENDING_VALIDATION` and stay there until renewed; `Import` flips straight to `ISSUED`.
 

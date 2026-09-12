@@ -222,6 +222,11 @@ pub struct DomainValidation {
     /// HTTP validation redirect target (`HttpRedirect.RedirectTo`).
     #[serde(default)]
     pub http_redirect_to: Option<String>,
+    /// Domain the EMAIL challenge is sent to (`DomainValidationOptions[].
+    /// ValidationDomain`): the domain itself or a superdomain of it. `None`
+    /// for DNS and HTTP validation.
+    #[serde(default)]
+    pub validation_domain: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
