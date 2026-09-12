@@ -458,8 +458,10 @@ pub(crate) fn execute_partiql_in_state(
                 "Duplicate primary key exists in table",
             ));
         }
-        table.items.push(item.clone());
-        table.recalculate_stats();
+        // Keeps items, the key index and the cached stats in step without
+        // re-summing the table -- `recalculate_stats` here made a PartiQL bulk
+        // load quadratic the same way BatchWriteItem was (#2502).
+        table.put_item_at_key(item.clone());
         Ok(PartiqlOutcome {
             response: json!({}),
             table_name: Some(table_name),
@@ -513,16 +515,19 @@ pub(crate) fn execute_partiql_in_state(
         let mut last_new: Option<HashMap<String, AttributeValue>> = None;
         for idx in &matched_indices {
             last_old = Some(table.items[*idx].clone());
-            apply_update_expression(
-                &mut table.items[*idx],
-                &update_expression,
-                &HashMap::new(),
-                &expression_attribute_values,
-            )?;
+            // All or nothing per row: an expression that fails partway leaves
+            // the row as it was rather than half rewritten.
+            table.update_item_at(*idx, |item| {
+                apply_update_expression(
+                    item,
+                    &update_expression,
+                    &HashMap::new(),
+                    &expression_attribute_values,
+                )
+            })?;
             last_key = Some(extract_key(table, &table.items[*idx]));
             last_new = Some(table.items[*idx].clone());
         }
-        table.recalculate_stats();
         Ok(PartiqlOutcome {
             response: if returns_item {
                 last_new
@@ -564,11 +569,10 @@ pub(crate) fn execute_partiql_in_state(
         let mut last_old: Option<HashMap<String, AttributeValue>> = None;
         let mut last_key: Option<HashMap<String, AttributeValue>> = None;
         for idx in indices {
-            let removed = table.items.remove(idx);
+            let removed = table.remove_item_at(idx);
             last_key = Some(extract_key(table, &removed));
             last_old = Some(removed);
         }
-        table.recalculate_stats();
         Ok(PartiqlOutcome {
             response: json!({}),
             table_name: Some(table_name),

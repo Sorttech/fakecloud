@@ -1,5 +1,4 @@
 use chrono::Utc;
-use parking_lot::RwLock;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use uuid::Uuid;

@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::state::{DynamoTable, ProvisionedThroughput, SharedDynamoDbState};
+use crate::state::{DynamoTable, ProvisionedThroughput, SharedDynamoDbState, TableItems};
 
 /// A single DynamoDB item: attribute name -> typed AWS wire value.
 type Item = HashMap<String, Value>;
@@ -283,7 +283,9 @@ fn build_table(
         key_schema,
         attribute_definitions,
         provisioned_throughput,
-        items,
+        items: TableItems::new(items),
+        // Left unbuilt here; the `recalculate_stats()` below builds it.
+        key_index: Default::default(),
         gsi: crate::parse_gsi(&shape["GlobalSecondaryIndexes"], &billing_mode),
         lsi: crate::parse_lsi(&shape["LocalSecondaryIndexes"]),
         tags: crate::parse_tags(&shape["Tags"]),
@@ -570,8 +572,7 @@ mod tests {
             let mut sentinel: Item = HashMap::new();
             sentinel.insert("Artist".to_string(), json!({ "S": "SENTINEL" }));
             sentinel.insert("SongTitle".to_string(), json!({ "S": "only" }));
-            table.items = vec![sentinel];
-            table.recalculate_stats();
+            table.replace_items(vec![sentinel]);
         }
 
         // Re-running with the same flags must skip (not error, not overwrite).

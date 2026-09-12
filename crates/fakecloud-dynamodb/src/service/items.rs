@@ -46,6 +46,7 @@ impl DynamoDbService {
             validate_item_attribute_values(&item)?;
 
             let key = extract_key(table, &item);
+            table.ensure_key_index();
             let existing_idx = table.find_item_index(&key);
 
             if let Some(cond) = condition.as_deref() {
@@ -79,14 +80,11 @@ impl DynamoDbService {
 
             let is_modify = existing_idx.is_some();
 
-            if let Some(idx) = existing_idx {
-                table.items[idx] = item.clone();
-            } else {
-                table.items.push(item.clone());
-            }
+            // Maintains item_count, size_bytes and the key index incrementally
+            // rather than re-summing the whole table (#2502).
+            table.put_item_at_key(item.clone());
 
             table.record_item_access(&item);
-            table.recalculate_stats();
 
             let event_name = if is_modify { "MODIFY" } else { "INSERT" };
             let key = extract_key(table, &item);
@@ -266,6 +264,7 @@ impl DynamoDbService {
             let condition =
                 resolve_write_condition(&body, &mut expr_attr_names, &mut expr_attr_values)?;
 
+            table.ensure_key_index();
             let existing_idx = table.find_item_index(&key);
 
             if let Some(cond) = condition.as_deref() {
@@ -309,8 +308,7 @@ impl DynamoDbService {
                     kinesis_info = Some((target, key.clone(), Some(old_item)));
                 }
 
-                table.items.remove(idx);
-                table.recalculate_stats();
+                table.remove_item_by_key(&key);
             }
 
             let return_consumed = body["ReturnConsumedCapacity"].as_str().unwrap_or("NONE");
@@ -358,6 +356,10 @@ impl DynamoDbService {
         let table = get_table_mut(&mut state.tables, table_name)?;
 
         validate_key_attributes_in_key(table, &key)?;
+        // Build the index up front: the `&self` lookup below cannot, so
+        // without this an UpdateItem-only workload against a restored table
+        // would scan forever.
+        table.ensure_key_index();
 
         let mut expr_attr_names = parse_expression_attribute_names(&body);
         let mut expr_attr_values = parse_expression_attribute_values(&body);
@@ -402,8 +404,10 @@ impl DynamoDbService {
                 for (k, v) in &key {
                     new_item.insert(k.clone(), v.clone());
                 }
-                table.items.push(new_item);
-                table.items.len() - 1
+                // Registers the row in the key index and the stats; the
+                // attribute updates below then mutate it in place through
+                // `update_item_at`, which settles the deltas.
+                table.put_item_at_key(new_item).0
             }
         };
 
@@ -432,20 +436,31 @@ impl DynamoDbService {
             None
         };
 
-        if let Some(expr) = update_expression {
-            apply_update_expression(
-                &mut table.items[idx],
-                expr,
-                &expr_attr_names,
-                &expr_attr_values,
-            )?;
-        } else if let Some(updates) = body["AttributeUpdates"].as_object() {
-            // Legacy AttributeUpdates (pre-2014 UpdateItem), still emitted by
-            // the AWS SDK for Java v1, older boto3, and the Terraform provider.
-            // Without this an UpdateItem using AttributeUpdates wrote nothing and
-            // (on a missing key) left a key-only stub item -- silent data loss
-            // (bug-audit 2026-06-20, 1.2).
-            apply_attribute_updates(&mut table.items[idx], updates)?;
+        // An UpdateExpression is applied clause by clause and can fail partway
+        // (a type error on a later operand) with earlier clauses already
+        // written -- possibly a rewritten key. `update_item_at` puts the row
+        // back as it was, so a rejected UpdateItem changes nothing, as on AWS.
+        let applied = table.update_item_at(idx, |item| {
+            if let Some(expr) = update_expression {
+                apply_update_expression(item, expr, &expr_attr_names, &expr_attr_values)
+            } else if let Some(updates) = body["AttributeUpdates"].as_object() {
+                // Legacy AttributeUpdates (pre-2014 UpdateItem), still emitted by
+                // the AWS SDK for Java v1, older boto3, and the Terraform provider.
+                // Without this an UpdateItem using AttributeUpdates wrote nothing and
+                // (on a missing key) left a key-only stub item -- silent data loss
+                // (bug-audit 2026-06-20, 1.2).
+                apply_attribute_updates(item, updates)
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(err) = applied {
+            // An upsert that fails must not leave behind the key-only row it
+            // registered above.
+            if is_insert {
+                table.remove_item_at(idx);
+            }
+            return Err(err);
         }
 
         // Compute the ReturnValues payload per AWS semantics:
@@ -508,8 +523,6 @@ impl DynamoDbService {
                 Some(new_item_for_stream),
             )
         });
-
-        table.recalculate_stats();
 
         let icm = build_item_collection_metrics(&return_icm, table, &key);
 
@@ -804,7 +817,8 @@ mod tests {
                         read_capacity_units: 0,
                         write_capacity_units: 0,
                     },
-                    items: vec![],
+                    items: Default::default(),
+                    key_index: Default::default(),
                     gsi: vec![],
                     lsi: vec![],
                     tags: BTreeMap::new(),

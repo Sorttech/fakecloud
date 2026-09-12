@@ -299,24 +299,21 @@ impl DynamoDbService {
                         serde_json::from_value(put_req["Item"].clone()).unwrap_or_default();
                     let key = extract_key(table, &item);
                     keys_for_icm.push(key.clone());
-                    if let Some(idx) = table.find_item_index(&key) {
-                        table.items[idx] = item;
-                    } else {
-                        table.items.push(item);
-                    }
+                    table.put_item_at_key(item);
                     write_count += 1;
                 } else if let Some(del_req) = request.get("DeleteRequest") {
                     let key: HashMap<String, AttributeValue> =
                         serde_json::from_value(del_req["Key"].clone()).unwrap_or_default();
                     keys_for_icm.push(key.clone());
-                    if let Some(idx) = table.find_item_index(&key) {
-                        table.items.remove(idx);
-                    }
+                    table.remove_item_by_key(&key);
                     write_count += 1;
                 }
             }
 
-            table.recalculate_stats();
+            // No `recalculate_stats()` here: `put_item_at_key` /
+            // `remove_item_by_key` keep item_count, size_bytes and the key
+            // index current. Re-summing the whole table once per batch was
+            // half of the quadratic cost in #2502.
 
             let cc = build_consumed_capacity(
                 &return_consumed,
@@ -855,7 +852,7 @@ impl DynamoDbService {
                         state
                             .tables
                             .get(table_name)
-                            .map(|t| t.items.clone())
+                            .map(|t| t.items.to_vec())
                             .unwrap_or_default()
                     });
                 }
@@ -885,12 +882,7 @@ impl DynamoDbService {
                     let key = extract_key(table, &item);
                     let old_image = table.find_item_index(&key).map(|i| table.items[i].clone());
                     let is_modify = old_image.is_some();
-                    if let Some(idx) = table.find_item_index(&key) {
-                        table.items[idx] = item.clone();
-                    } else {
-                        table.items.push(item.clone());
-                    }
-                    table.recalculate_stats();
+                    table.put_item_at_key(item.clone());
                     let event_name = if is_modify { "MODIFY" } else { "INSERT" };
                     if let Some(record) = crate::streams::generate_stream_record(
                         table,
@@ -919,10 +911,7 @@ impl DynamoDbService {
                     let table =
                         get_table_mut(&mut state.tables, table_name).map_err(|e| (op_idx, e))?;
                     let old_image = table.find_item_index(&key).map(|i| table.items[i].clone());
-                    if let Some(idx) = table.find_item_index(&key) {
-                        table.items.remove(idx);
-                    }
-                    table.recalculate_stats();
+                    table.remove_item_by_key(&key);
                     if old_image.is_some() {
                         if let Some(record) = crate::streams::generate_stream_record(
                             table,
@@ -955,31 +944,38 @@ impl DynamoDbService {
 
                     let table =
                         get_table_mut(&mut state.tables, table_name).map_err(|e| (op_idx, e))?;
-                    let old_image = table.find_item_index(&key).map(|i| table.items[i].clone());
+                    // The `&self` lookups below cannot build the index, so a
+                    // restored table would scan on every transactional update
+                    // without this.
+                    table.ensure_key_index();
+                    let existing_idx = table.find_item_index(&key);
+                    let old_image = existing_idx.map(|i| table.items[i].clone());
                     let is_modify = old_image.is_some();
-                    let idx = match table.find_item_index(&key) {
+                    let idx = match existing_idx {
                         Some(i) => i,
                         None => {
                             let mut new_item = HashMap::new();
                             for (k, v) in &key {
                                 new_item.insert(k.clone(), v.clone());
                             }
-                            table.items.push(new_item);
-                            table.items.len() - 1
+                            table.put_item_at_key(new_item).0
                         }
                     };
-
                     if let Some(expr) = update_expression {
-                        apply_update_expression(
-                            &mut table.items[idx],
-                            expr,
-                            &expr_attr_names,
-                            &expr_attr_values,
-                        )
-                        .map_err(|e| (op_idx, e))?;
+                        // A failure here cancels the whole transaction, and
+                        // the revert below restores every touched table.
+                        table
+                            .update_item_at(idx, |item| {
+                                apply_update_expression(
+                                    item,
+                                    expr,
+                                    &expr_attr_names,
+                                    &expr_attr_values,
+                                )
+                            })
+                            .map_err(|e| (op_idx, e))?;
                     }
                     let new_image = table.items[idx].clone();
-                    table.recalculate_stats();
                     let event_name = if is_modify { "MODIFY" } else { "INSERT" };
                     if let Some(record) = crate::streams::generate_stream_record(
                         table,
@@ -1015,8 +1011,7 @@ impl DynamoDbService {
             // with `ValidationError` and leaves siblings as `None`.
             for (table_name, items) in snapshots {
                 if let Some(table) = state.tables.get_mut(&table_name) {
-                    table.items = items;
-                    table.recalculate_stats();
+                    table.replace_items(items);
                 }
             }
             let msg = err.to_string();
@@ -1745,7 +1740,8 @@ mod tests {
                 read_capacity_units: 0,
                 write_capacity_units: 0,
             },
-            items: vec![],
+            items: Default::default(),
+            key_index: Default::default(),
             gsi: vec![],
             lsi: vec![],
             tags: BTreeMap::new(),
