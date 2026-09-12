@@ -2146,6 +2146,33 @@ fn search_sort_honours_the_requested_attribute() {
         vec!["a-2".to_string(), "a-1".to_string()],
         "sorting by description must not fall back to the name"
     );
+
+    // UpdatedAt is an epoch-seconds number, so it has to compare numerically.
+    // Stamp the timestamps against the name order to catch a text-only sort.
+    {
+        let mut accounts = svc.state.write();
+        let state = accounts.get_or_create("123456789012", "us-east-1");
+        state.assets.get_mut("a-1").unwrap()["UpdatedAt"] = json!(1_700_000_200.0);
+        state.assets.get_mut("a-2").unwrap()["UpdatedAt"] = json!(1_700_000_100.0);
+    }
+    assert_eq!(
+        sorted("UpdatedAt"),
+        vec!["a-2".to_string(), "a-1".to_string()]
+    );
+    let out = body_of(
+        svc.search_assets(&req(
+            "SearchAssets",
+            json!({ "Sort": { "Attribute": "UpdatedAt", "Order": "DESCENDING" } }),
+        ))
+        .unwrap(),
+    );
+    let ids: Vec<&str> = out["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["Id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["a-1", "a-2"]);
 }
 
 /// An item can be addressed by `ItemName` as well as `ItemId`, and an

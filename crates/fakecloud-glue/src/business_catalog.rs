@@ -708,17 +708,22 @@ impl GlueService {
         }
         .to_string();
         items.sort_by(|a, b| {
-            let key = |item: &Value| {
-                item.get(result_field.as_str())
+            // Timestamps like UpdatedAt serialize as epoch-second numbers, so
+            // numbers compare numerically and everything else as text.
+            let ord = match (a.get(result_field.as_str()), b.get(result_field.as_str())) {
+                (Some(Value::Number(x)), Some(Value::Number(y))) => x
+                    .as_f64()
+                    .unwrap_or_default()
+                    .total_cmp(&y.as_f64().unwrap_or_default()),
+                (x, y) => x
                     .and_then(Value::as_str)
                     .unwrap_or_default()
-                    .to_string()
+                    .cmp(y.and_then(Value::as_str).unwrap_or_default()),
             };
-            let (x, y) = (key(a), key(b));
             if descending {
-                y.cmp(&x)
+                ord.reverse()
             } else {
-                x.cmp(&y)
+                ord
             }
         });
 
