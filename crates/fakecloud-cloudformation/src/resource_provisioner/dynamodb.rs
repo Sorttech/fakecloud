@@ -193,44 +193,35 @@ impl ResourceProvisioner {
             _ => (None, None),
         };
 
-        let table = DynamoTable {
-            name: table_name.to_string(),
-            arn: arn.clone(),
-            table_id: Uuid::new_v4().to_string().replace('-', ""),
+        // The rows and the key index that has to stay in step with them are
+        // the DynamoDB crate's to manage, so a new table comes from its
+        // constructor and the declared properties are set on top.
+        let mut table = DynamoTable::new(
+            table_name.to_string(),
+            arn.clone(),
+            Uuid::new_v4().to_string().replace('-', ""),
             key_schema,
             attribute_definitions,
             provisioned_throughput,
-            items: Vec::new(),
-            gsi,
-            lsi,
-            tags,
-            created_at: Utc::now(),
-            status: "ACTIVE".to_string(),
-            item_count: 0,
-            size_bytes: 0,
             billing_mode,
-            ttl_attribute: None,
-            ttl_enabled: false,
-            resource_policy: None,
-            pitr_enabled: false,
-            kinesis_destinations: Vec::new(),
-            contributor_insights_status: "DISABLED".to_string(),
-            contributor_insights_counters: BTreeMap::new(),
-            stream_enabled,
-            stream_view_type,
-            stream_arn,
-            stream_records: Arc::new(RwLock::new(Vec::new())),
-            sse_type,
-            sse_kms_key_arn,
-            deletion_protection_enabled,
-            on_demand_throughput,
-            table_class: props
-                .get("TableClass")
-                .and_then(|v| v.as_str())
-                .unwrap_or("STANDARD")
-                .to_string(),
-            vector_indexes: Vec::new(),
-        };
+            Utc::now(),
+        );
+        table.gsi = gsi;
+        table.lsi = lsi;
+        table.tags = tags;
+        table.stream_enabled = stream_enabled;
+        table.stream_view_type = stream_view_type;
+        table.stream_arn = stream_arn;
+        table.sse_type = sse_type;
+        table.sse_kms_key_arn = sse_kms_key_arn;
+        table.deletion_protection_enabled = deletion_protection_enabled;
+        table.on_demand_throughput = on_demand_throughput;
+        table.table_class = props
+            .get("TableClass")
+            .and_then(|v| v.as_str())
+            .unwrap_or("STANDARD")
+            .to_string();
+        let table = table;
 
         state.tables.insert(table_name.to_string(), table);
         let mut result = ProvisionResult::new(arn.clone()).with("Arn", arn);
