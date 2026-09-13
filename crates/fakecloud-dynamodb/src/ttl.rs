@@ -70,25 +70,15 @@ pub fn process_ttl_expirations_at_with(
                     None => continue,
                 };
 
-                // Partition into kept vs. expired so we can emit a REMOVE
-                // record per expired item rather than silently dropping it.
-                let mut kept: Vec<HashMap<String, AttributeValue>> =
-                    Vec::with_capacity(table.items.len());
-                let mut expired: Vec<HashMap<String, AttributeValue>> = Vec::new();
-                for item in std::mem::take(&mut table.items) {
-                    if is_expired(&item, &ttl_attr, now_epoch) {
-                        expired.push(item);
-                    } else {
-                        kept.push(item);
-                    }
-                }
-                table.items = kept;
+                // Keep the expired rows so we can emit a REMOVE record per
+                // expired item rather than silently dropping it.
+                let expired =
+                    table.remove_items_where(|item| is_expired(item, &ttl_attr, now_epoch));
 
                 if expired.is_empty() {
                     continue;
                 }
                 total_expired += expired.len();
-                table.recalculate_stats();
 
                 let kinesis_target = crate::service::kinesis_target_for(table);
                 for item in expired {
@@ -209,7 +199,8 @@ mod tests {
                 read_capacity_units: 5,
                 write_capacity_units: 5,
             },
-            items: vec![],
+            items: Default::default(),
+            key_index: Default::default(),
             gsi: vec![],
             lsi: vec![],
             tags: BTreeMap::new(),
@@ -258,9 +249,7 @@ mod tests {
 
         let mut table = make_table("t1", true, Some("ttl"));
         // Item with TTL in the past
-        table
-            .items
-            .push(make_item("a", Some(json!({"N": "999999"}))));
+        table.put_item_at_key(make_item("a", Some(json!({"N": "999999"}))));
         state
             .write()
             .default_mut()
@@ -279,9 +268,7 @@ mod tests {
 
         let mut table = make_table("t1", true, Some("ttl"));
         // Item with TTL in the future
-        table
-            .items
-            .push(make_item("a", Some(json!({"N": "2000000"}))));
+        table.put_item_at_key(make_item("a", Some(json!({"N": "2000000"}))));
         state
             .write()
             .default_mut()
@@ -299,9 +286,7 @@ mod tests {
         let now = 1_000_000;
 
         let mut table = make_table("t1", false, Some("ttl"));
-        table
-            .items
-            .push(make_item("a", Some(json!({"N": "999999"}))));
+        table.put_item_at_key(make_item("a", Some(json!({"N": "999999"}))));
         state
             .write()
             .default_mut()
@@ -320,7 +305,7 @@ mod tests {
 
         let mut table = make_table("t1", true, Some("ttl"));
         // Item without the TTL attribute at all
-        table.items.push(make_item("a", None));
+        table.put_item_at_key(make_item("a", None));
         state
             .write()
             .default_mut()
@@ -339,9 +324,7 @@ mod tests {
 
         let mut table = make_table("t1", true, Some("ttl"));
         // TTL attribute is a String, not a Number
-        table
-            .items
-            .push(make_item("a", Some(json!({"S": "not-a-number"}))));
+        table.put_item_at_key(make_item("a", Some(json!({"S": "not-a-number"}))));
         state
             .write()
             .default_mut()
@@ -359,19 +342,11 @@ mod tests {
         let now = 1_000_000;
 
         let mut table = make_table("t1", true, Some("ttl"));
-        table
-            .items
-            .push(make_item("expired1", Some(json!({"N": "500000"}))));
-        table
-            .items
-            .push(make_item("future1", Some(json!({"N": "2000000"}))));
-        table
-            .items
-            .push(make_item("expired2", Some(json!({"N": "999999"}))));
-        table.items.push(make_item("no-ttl", None));
-        table
-            .items
-            .push(make_item("string-ttl", Some(json!({"S": "oops"}))));
+        table.put_item_at_key(make_item("expired1", Some(json!({"N": "500000"}))));
+        table.put_item_at_key(make_item("future1", Some(json!({"N": "2000000"}))));
+        table.put_item_at_key(make_item("expired2", Some(json!({"N": "999999"}))));
+        table.put_item_at_key(make_item("no-ttl", None));
+        table.put_item_at_key(make_item("string-ttl", Some(json!({"S": "oops"}))));
         state
             .write()
             .default_mut()
@@ -395,9 +370,7 @@ mod tests {
         table.stream_enabled = true;
         table.stream_view_type = Some("NEW_AND_OLD_IMAGES".to_string());
         table.stream_arn = Some(format!("{}/stream/2026-06-28", table.arn));
-        table
-            .items
-            .push(make_item("a", Some(json!({"N": "999999"}))));
+        table.put_item_at_key(make_item("a", Some(json!({"N": "999999"}))));
         state
             .write()
             .default_mut()
@@ -432,12 +405,8 @@ mod tests {
         let now = 1_000_000;
 
         let mut table = make_table("t1", true, Some("ttl"));
-        table
-            .items
-            .push(make_item("a", Some(json!({"N": "500000"}))));
-        table
-            .items
-            .push(make_item("b", Some(json!({"N": "2000000"}))));
+        table.put_item_at_key(make_item("a", Some(json!({"N": "500000"}))));
+        table.put_item_at_key(make_item("b", Some(json!({"N": "2000000"}))));
         table.item_count = 2;
         table.size_bytes = 100;
         state
