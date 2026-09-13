@@ -54,7 +54,7 @@ Task-definition families track revisions monotonically; `DeleteTaskDefinitions` 
 
 `RunTask` records the task synchronously and kicks off a background docker execution per spawned task:
 
-1. `docker pull <image>` (timestamps captured on the task: `pullStartedAt` / `pullStoppedAt`). As with the ECS agent's default `ECS_IMAGE_PULL_BEHAVIOR`, a failed pull falls back to the image already cached locally, and a pull the registry rate limits (`429 Too Many Requests`, common for anonymous `public.ecr.aws` pulls from a shared IP) is retried with backoff. A pull that fails with nothing cached stops the task with `TaskFailedToStart`.
+1. `docker pull <image>` (timestamps captured on the task: `pullStartedAt` / `pullStoppedAt`). A transient registry failure (rate limiting such as `429 Too Many Requests`, common for anonymous `public.ecr.aws` pulls from a shared IP; a registry 5xx; a network timeout) is retried with backoff and falls back to a copy of the image already cached locally. A refused pull (the image or tag no longer exists, or access is denied) stops the task with `TaskFailedToStart` even when a stale copy is cached, as does a transient failure with nothing cached.
 2. `docker run -d <image>` (container ID recorded on the task's container)
 3. `docker wait <id>` (blocks on container exit; exit code → `containers[].exitCode`)
 4. `docker logs <id>` (captured stdout/stderr stored on the task + exposed via the introspection endpoint)

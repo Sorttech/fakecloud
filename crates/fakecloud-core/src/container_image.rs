@@ -2,24 +2,28 @@
 //! Batch through it; Lambda `PackageType=Image` functions).
 //!
 //! A bare `docker pull` always contacts the registry, even when the image is
-//! already in the local cache, so any registry hiccup fails the launch. The
-//! common one is rate limiting: anonymous pulls from `public.ecr.aws` are
-//! capped per source IP, and a burst of task launches -- or several processes
-//! sharing one NAT address -- gets `429 Too Many Requests` back.
+//! already in the local cache, so a momentary registry failure fails the
+//! launch. The common one is rate limiting: anonymous pulls from
+//! `public.ecr.aws` are capped per source IP, and a burst of task launches --
+//! or several processes sharing one NAT address -- gets
+//! `429 Too Many Requests` back.
 //!
-//! The ECS container agent handles this the way this module does. Under its
-//! default `ECS_IMAGE_PULL_BEHAVIOR`, a failed pull falls back to the image
-//! cached on the instance, and pulls are retried with backoff before giving
-//! up. A pull that fails with nothing cached still fails, with the registry's
-//! own error.
+//! A transient failure (throttling, a registry 5xx, a network timeout) is
+//! retried with backoff, and falls back to the image already cached locally
+//! instead of failing the launch. A refusal is final: an image that no longer
+//! exists or a pull the registry denies fails at once with the registry's own
+//! error, even when a stale copy is cached. Otherwise an image deleted from
+//! ECR, or one a repository policy denies, would keep launching from the
+//! local copy -- which neither Fargate nor Lambda, having no per-host image
+//! cache, ever does.
 
 use std::path::Path;
 use std::time::Duration;
 
 use tokio::process::Command;
 
-/// Pull attempts made while the registry keeps rate limiting, before the
-/// last error is returned.
+/// Pull attempts made while the registry keeps failing transiently, before
+/// the last error is returned.
 const MAX_PULL_ATTEMPTS: u32 = 5;
 
 /// Delay before the first retry; doubles on each further retry.
@@ -30,18 +34,18 @@ const BASE_RETRY_DELAY: Duration = Duration::from_secs(1);
 pub enum PulledImage {
     /// The registry served the image.
     Pulled,
-    /// The pull failed but the image was already cached locally, so the
-    /// cached copy is used. Carries the pull's error for logging.
+    /// The pull failed transiently but the image was already cached locally,
+    /// so the cached copy is used. Carries the pull's error for logging.
     Cached { pull_error: String },
 }
 
-/// Pull `reference` with the container `cli`, falling back to a locally
-/// cached copy when the pull fails and retrying while the registry is rate
-/// limiting. `docker_config` is exported as `DOCKER_CONFIG` for the pull so
-/// registry credentials resolve.
+/// Pull `reference` with the container `cli`. A transient registry failure
+/// falls back to a locally cached copy, or is retried with backoff when
+/// nothing is cached; any other failure is returned at once. `docker_config`
+/// is exported as `DOCKER_CONFIG` for the pull so registry credentials
+/// resolve.
 ///
-/// Returns the pull's stderr as the error when the image is neither pullable
-/// nor cached.
+/// Returns the pull's stderr as the error.
 pub async fn pull_image(
     cli: &str,
     docker_config: Option<&Path>,
@@ -72,23 +76,25 @@ async fn pull_image_with(
             return Ok(PulledImage::Pulled);
         }
         let pull_error = String::from_utf8_lossy(&out.stderr).trim().to_string();
-
+        if !is_transient(&pull_error) {
+            return Err(pull_error);
+        }
         if image_cached(cli, reference).await {
             tracing::warn!(
                 image = %reference,
                 error = %pull_error,
-                "image pull failed; using the locally cached image"
+                "image pull failed transiently; using the locally cached image"
             );
             return Ok(PulledImage::Cached { pull_error });
         }
-        if attempt >= MAX_PULL_ATTEMPTS || !is_rate_limited(&pull_error) {
+        if attempt >= MAX_PULL_ATTEMPTS {
             return Err(pull_error);
         }
         tracing::info!(
             image = %reference,
             attempt,
             retry_in_ms = delay.as_millis() as u64,
-            "image pull rate limited; retrying"
+            "image pull failed transiently; retrying"
         );
         tokio::time::sleep(delay).await;
         delay *= 2;
@@ -108,14 +114,28 @@ async fn image_cached(cli: &str, reference: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Whether a pull error is the registry throttling the caller. Docker reports
-/// the status line (`429 Too Many Requests`) or the registry error code
-/// (`toomanyrequests`); ECR Public's throttle message is `Rate exceeded`.
-fn is_rate_limited(stderr: &str) -> bool {
+/// Whether a pull error is one a later attempt could succeed past: the
+/// registry throttling the caller (the `429 Too Many Requests` status line,
+/// the `toomanyrequests` error code, ECR Public's `Rate exceeded`), a
+/// registry-side 5xx, or the network timing out or dropping the connection.
+/// Not-found and access-denied responses are not transient.
+fn is_transient(stderr: &str) -> bool {
+    const MARKERS: [&str; 12] = [
+        "toomanyrequests",
+        "too many requests",
+        "rate exceeded",
+        "500 internal server error",
+        "502 bad gateway",
+        "503 service unavailable",
+        "504 gateway timeout",
+        "i/o timeout",
+        "tls handshake timeout",
+        "connection reset by peer",
+        "context deadline exceeded",
+        "request canceled while waiting for connection",
+    ];
     let lower = stderr.to_ascii_lowercase();
-    lower.contains("toomanyrequests")
-        || lower.contains("too many requests")
-        || lower.contains("rate exceeded")
+    MARKERS.iter().any(|m| lower.contains(m))
 }
 
 #[cfg(all(test, unix))]
@@ -189,7 +209,7 @@ exit 2
     }
 
     #[tokio::test]
-    async fn a_failed_pull_uses_the_cached_image() {
+    async fn a_throttled_pull_uses_the_cached_image() {
         let cli = FakeCli::new(u32::MAX, THROTTLED, true);
         let got = cli.pull().await;
         assert_eq!(
@@ -227,18 +247,58 @@ exit 2
             "Error response from daemon: manifest for alpine:nope not found: manifest unknown";
         let cli = FakeCli::new(u32::MAX, missing, false);
         assert_eq!(cli.pull().await, Err(missing.to_string()));
-        let pulls = cli.calls().iter().filter(|c| c.starts_with("pull")).count();
-        assert_eq!(pulls, 1, "only a throttled pull is worth retrying");
+        assert_eq!(
+            cli.calls(),
+            ["pull alpine:3.20"],
+            "a refused pull is neither retried nor checked against the cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_pull_fails_even_with_a_stale_cached_copy() {
+        // The image was deleted from the registry, or a policy now denies the
+        // pull. A copy cached by an earlier launch must not be used.
+        for refused in [
+            "Error response from daemon: manifest for alpine:3.20 not found: manifest unknown",
+            "Error response from daemon: pull access denied for alpine, repository does not exist or may require authorization: denied",
+        ] {
+            let cli = FakeCli::new(u32::MAX, refused, true);
+            assert_eq!(cli.pull().await, Err(refused.to_string()));
+            assert_eq!(cli.calls(), ["pull alpine:3.20"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_registry_server_error_uses_the_cached_image() {
+        let unavailable =
+            "Error response from daemon: received unexpected HTTP status: 503 Service Unavailable";
+        let cli = FakeCli::new(u32::MAX, unavailable, true);
+        assert_eq!(
+            cli.pull().await,
+            Ok(PulledImage::Cached {
+                pull_error: unavailable.to_string()
+            })
+        );
     }
 
     #[test]
-    fn rate_limit_detection_covers_each_registry_form() {
-        assert!(is_rate_limited(THROTTLED));
-        assert!(is_rate_limited(
+    fn transient_detection_separates_retryable_from_refused() {
+        assert!(is_transient(THROTTLED));
+        assert!(is_transient(
             "toomanyrequests: You have reached your pull rate limit."
         ));
-        assert!(is_rate_limited("Error: Rate exceeded"));
-        assert!(!is_rate_limited("manifest unknown"));
-        assert!(!is_rate_limited("pull access denied for foo"));
+        assert!(is_transient("Error: Rate exceeded"));
+        assert!(is_transient(
+            "received unexpected HTTP status: 502 Bad Gateway"
+        ));
+        assert!(is_transient(
+            "Get \"https://public.ecr.aws/v2/\": net/http: TLS handshake timeout"
+        ));
+        assert!(is_transient(
+            "read tcp 10.0.0.2:4431->1.2.3.4:443: read: connection reset by peer"
+        ));
+        assert!(!is_transient("manifest unknown"));
+        assert!(!is_transient("pull access denied for foo"));
+        assert!(!is_transient("unauthorized: authentication required"));
     }
 }

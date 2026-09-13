@@ -79,7 +79,7 @@ Lambda is a target for most event-producing services:
 ## Gotchas
 
 - **Requires a Docker socket.** Lambda needs access to `/var/run/docker.sock` to start and stop containers. Only use in environments you trust — Docker socket access is effectively host-level privilege.
-- **First invocation of a runtime pulls the image.** Expect a slower first run while the Lambda runtime image downloads. Subsequent invocations are fast. For `PackageType=Image` functions, a failed pull of the function's image falls back to a copy already cached locally, and a pull the registry rate limits is retried with backoff.
+- **First invocation of a runtime pulls the image.** Expect a slower first run while the Lambda runtime image downloads. Subsequent invocations are fast. For `PackageType=Image` functions, a transient failure pulling the function's image (rate limiting, a registry 5xx, a network timeout) is retried with backoff and falls back to a copy already cached locally; a deleted or access-denied image fails the start.
 - **Cold vs. warm containers.** fakecloud reuses containers between invocations for the same function. Force a cold start via `/_fakecloud/lambda/{name}/evict-container`.
 
 ## Source
