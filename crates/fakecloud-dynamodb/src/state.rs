@@ -159,13 +159,52 @@ fn write_canonical_json(v: &Value, out: &mut String) {
     }
 }
 
+/// A row's primary key as the key index stores it, which is also the table's
+/// Scan order.
+///
+/// `encoded` is the canonical key string (see [`DynamoTable::encode_key`]):
+/// two keys are equal iff DynamoDB considers them the same key. Rows order
+/// first by `partition_hash`, a stable hash of the partition-key encoding,
+/// then by `encoded`, so a partition's rows stay together and a Scan visits
+/// partitions in hash order, the way DynamoDB itself does. The order depends
+/// only on key values, never on which rows exist, so a Scan page resumes after
+/// `ExclusiveStartKey` correctly even when that row has since been deleted.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RowKey {
+    partition_hash: u64,
+    encoded: String,
+}
+
+/// FNV-1a, 64-bit. The Scan order is derived from it, so it has to be fixed:
+/// std's `DefaultHasher` is explicitly allowed to change between releases.
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Scan order over rows that may lack a key: keyed rows by [`RowKey`], and
+/// any row missing its partition key after all of them.
+fn cmp_scan_order(a: Option<&RowKey>, b: Option<&RowKey>) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Some(a), Some(b)) => a.cmp(b),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
 /// What an item contributed to a table's cached stats and key index before it
 /// was mutated in place. Produced by `DynamoTable::snapshot_item_at` and
 /// consumed by `DynamoTable::sync_item_at`.
 #[derive(Debug, Clone)]
 struct ItemSlot {
     size: i64,
-    key: Option<String>,
+    key: Option<RowKey>,
 }
 
 type Item = HashMap<String, AttributeValue>;
@@ -174,7 +213,8 @@ type Item = HashMap<String, AttributeValue>;
 ///
 /// Assigned when the row is inserted and never changed or reused while the
 /// row lives, so removing one row leaves every other row's id valid. Ids grow
-/// with insertion, which makes their order the table's storage order.
+/// with insertion, which makes their order the table's storage order. Storage
+/// order is not Scan order; see [`RowKey`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ItemId(u64);
 
@@ -184,9 +224,7 @@ pub struct ItemId(u64);
 /// is invalidated by every removal before it, so deleting from a `Vec` both
 /// shifted the tail and forced the key index to repair every shifted
 /// position: O(table size) per delete, and quadratic over a bulk delete
-/// (#2504). With stable ids a delete touches only its own row, and the id
-/// order still reproduces insertion order, which Scan pagination depends on
-/// (a page resumes after `ExclusiveStartKey` in storage order).
+/// (#2504). With stable ids a delete touches only its own row.
 ///
 /// Readable from anywhere, but only mutable from this module: the key index
 /// records ids in here, so an insert or remove that bypassed
@@ -309,9 +347,10 @@ pub enum KeyIndex {
     #[default]
     Unbuilt,
     /// Primary key -> row id in `items`, covering every addressable item,
-    /// plus the row count it was maintained against.
+    /// plus the row count it was maintained against. Ordered, because its
+    /// order is the table's Scan order.
     Built {
-        ids: HashMap<String, ItemId>,
+        ids: BTreeMap<RowKey, ItemId>,
         rows: usize,
     },
     /// `items` holds more than one row under the same primary key, so no
@@ -676,13 +715,23 @@ impl DynamoTable {
         out
     }
 
-    /// Canonical string form of an item's full primary key, or `None` if the
-    /// item is missing the hash key (or a declared range key) — such an item
-    /// is not addressable by key and is left out of the index, mirroring the
-    /// old scan, which required `item.get(hash_key).is_some()`.
-    fn encode_key(&self, item: &HashMap<String, AttributeValue>) -> Option<String> {
+    /// Canonical form of an item's full primary key, or `None` if the item is
+    /// missing the hash key — such an item is not addressable by key and is
+    /// left out of the index, mirroring the old scan, which required
+    /// `item.get(hash_key).is_some()`.
+    fn encode_key(&self, item: &HashMap<String, AttributeValue>) -> Option<RowKey> {
+        self.encode_key_with(|name| item.get(name))
+    }
+
+    /// [`Self::encode_key`] over any attribute lookup, so a row already
+    /// rendered as a JSON object can be placed in Scan order too.
+    pub(crate) fn encode_key_with<'a>(
+        &self,
+        get: impl Fn(&str) -> Option<&'a AttributeValue>,
+    ) -> Option<RowKey> {
         let hash_key = self.hash_key_name();
-        let mut out = Self::encode_key_value(item.get(hash_key)?);
+        let mut out = Self::encode_key_value(get(hash_key)?);
+        let partition_hash = fnv1a_64(out.as_bytes());
         if let Some(rk) = self.range_key_name() {
             // The range key is part of the identity when the schema declares
             // one; `values_equal(None, None)` was true in the scan, so an item
@@ -690,18 +739,81 @@ impl DynamoTable {
             // also lacks it. A distinct sentinel keeps that class separate
             // from any real value.
             out.push('\u{1f}');
-            match item.get(rk) {
+            match get(rk) {
                 Some(v) => out.push_str(&Self::encode_key_value(v)),
                 None => out.push_str("\u{0}none"),
             }
         }
-        Some(out)
+        Some(RowKey {
+            partition_hash,
+            encoded: out,
+        })
+    }
+
+    /// The rows in Scan order, starting just after the primary key `start`
+    /// (all of them when `start` is `None`). `start` need not name a row that
+    /// still exists: the order is a function of key values alone, so a page
+    /// resumes in the right place after its `ExclusiveStartKey` row was
+    /// deleted. A `start` without the partition key selects nothing.
+    ///
+    /// Walks the key index from `start` when it covers every row -- the page
+    /// then costs O(log n) plus the rows it visits, rather than a pass over
+    /// the whole table. Otherwise (index not built yet, duplicate keys, or a
+    /// row with no key) it sorts the rows itself, into the same order.
+    pub fn scan_rows_after<'a>(
+        &'a self,
+        start: Option<&HashMap<String, AttributeValue>>,
+    ) -> Box<dyn Iterator<Item = &'a HashMap<String, AttributeValue>> + 'a> {
+        use std::ops::Bound;
+        let start = match start {
+            Some(key) => match self.encode_key(key) {
+                Some(k) => Some(k),
+                None => return Box::new(std::iter::empty()),
+            },
+            None => None,
+        };
+        if let KeyIndex::Built { ids, rows } = &self.key_index {
+            if *rows == self.items.len() && ids.len() == self.items.len() {
+                let lower = match &start {
+                    Some(k) => Bound::Excluded(k),
+                    None => Bound::Unbounded,
+                };
+                return Box::new(
+                    ids.range::<RowKey, _>((lower, Bound::Unbounded))
+                        .filter_map(|(_, id)| self.items.get(*id)),
+                );
+            }
+        }
+        let mut rows: Vec<(Option<RowKey>, &HashMap<String, AttributeValue>)> = self
+            .items
+            .iter()
+            .map(|item| (self.encode_key(item), item))
+            .collect();
+        // Stable, so rows under one key (only a duplicate-key import has them)
+        // keep their storage order.
+        rows.sort_by(|a, b| cmp_scan_order(a.0.as_ref(), b.0.as_ref()));
+        Box::new(
+            rows.into_iter()
+                .filter(move |(key, _)| match (&start, key) {
+                    (Some(start), Some(key)) => key > start,
+                    _ => true,
+                })
+                .map(|(_, item)| item),
+        )
+    }
+
+    /// Sort `rows` of this table into Scan order (see [`RowKey`]).
+    pub(crate) fn sort_in_scan_order(&self, rows: &mut [&HashMap<String, AttributeValue>]) {
+        rows.sort_by_cached_key(|item| {
+            let key = self.encode_key(item);
+            (key.is_none(), key)
+        });
     }
 
     /// Rebuild `key_index` from `items`. Called after loading a snapshot (the
     /// index is not persisted) and after any bulk rewrite of `items`.
     pub fn rebuild_key_index(&mut self) {
-        let mut index = HashMap::with_capacity(self.items.len());
+        let mut index = BTreeMap::new();
         let mut duplicate_key = false;
         // Well-formed tables have no duplicate keys; an imported export or an
         // older snapshot might, and those tables give up the index entirely
@@ -711,10 +823,10 @@ impl DynamoTable {
         for (id, item) in self.items.iter_with_ids() {
             if let Some(k) = self.encode_key(item) {
                 match index.entry(k) {
-                    std::collections::hash_map::Entry::Vacant(slot) => {
+                    std::collections::btree_map::Entry::Vacant(slot) => {
                         slot.insert(id);
                     }
-                    std::collections::hash_map::Entry::Occupied(_) => {
+                    std::collections::btree_map::Entry::Occupied(_) => {
                         duplicate_key = true;
                         break;
                     }
@@ -778,7 +890,7 @@ impl DynamoTable {
         // drifted from ever addressing the wrong row: answer from the rows
         // themselves when the recorded one does not carry this key.
         match self.items.get(id) {
-            Some(item) if self.encode_key(item).as_deref() == Some(encoded.as_str()) => Some(id),
+            Some(item) if self.encode_key(item).as_ref() == Some(&encoded) => Some(id),
             _ => self.find_item_index_scan(key),
         }
     }
@@ -1151,6 +1263,16 @@ pub struct DynamoDbSnapshot {
 pub const DYNAMODB_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 
 impl DynamoDbState {
+    /// Build every table's key index. The index is not persisted, so a table
+    /// restored from a snapshot has none, and until something writes to it
+    /// each lookup is a linear scan and each Scan page sorts the whole table.
+    /// Call once after loading a snapshot.
+    pub fn build_key_indexes(&mut self) {
+        for table in self.tables.values_mut() {
+            table.ensure_key_index();
+        }
+    }
+
     pub fn new(account_id: &str, region: &str) -> Self {
         Self {
             account_id: account_id.to_string(),
@@ -1931,5 +2053,175 @@ mod tests {
         assert!(matches!(t.key_index, KeyIndex::Built { rows: 2, .. }));
         assert_eq!(t.find_item_index(&mk_pk("dup")), Some(ItemId(0)));
         assert_eq!(t.find_item_index(&mk_pk("other")), Some(ItemId(2)));
+    }
+
+    fn composite_table() -> DynamoTable {
+        let mut t = table_with_hash_key("pk");
+        t.key_schema.push(KeySchemaElement {
+            attribute_name: "sk".to_string(),
+            key_type: "RANGE".to_string(),
+        });
+        t
+    }
+
+    fn mk_pk_sk(pk: &str, sk: i64) -> HashMap<String, AttributeValue> {
+        let mut m = HashMap::new();
+        m.insert("pk".to_string(), json!({ "S": pk }));
+        m.insert("sk".to_string(), json!({ "N": sk.to_string() }));
+        m
+    }
+
+    /// The same rows, with the index forced off so `scan_rows_after` takes
+    /// its sorting fallback.
+    fn without_index(t: &DynamoTable) -> DynamoTable {
+        let mut copy = t.clone();
+        copy.key_index = KeyIndex::Unbuilt;
+        copy
+    }
+
+    fn scan_after(
+        t: &DynamoTable,
+        start: Option<&HashMap<String, AttributeValue>>,
+    ) -> Vec<HashMap<String, AttributeValue>> {
+        t.scan_rows_after(start).cloned().collect()
+    }
+
+    /// Scan order is a function of the keys alone: the index walk and the
+    /// sorting fallback agree for every start key, including keys of rows
+    /// that were deleted, keys that never existed, and a numerically-equal
+    /// spelling of a stored number.
+    #[test]
+    fn scan_order_index_walk_matches_sorting_fallback() {
+        let mut t = composite_table();
+        for pk in ["a", "b", "c", "d", "e", "f"] {
+            for sk in [3, 1, 2] {
+                t.put_item_at_key(mk_pk_sk(pk, sk));
+            }
+        }
+        t.remove_item_by_key(&mk_pk_sk("c", 2));
+        t.remove_item_by_key(&mk_pk_sk("e", 1));
+        t.remove_item_by_key(&mk_pk_sk("e", 2));
+        t.remove_item_by_key(&mk_pk_sk("e", 3));
+        assert!(matches!(t.key_index, KeyIndex::Built { .. }));
+        let fallback = without_index(&t);
+
+        let full = scan_after(&t, None);
+        assert_eq!(full, scan_after(&fallback, None));
+        assert_eq!(full.len(), t.items.len());
+
+        let mut starts: Vec<HashMap<String, AttributeValue>> = full.clone();
+        starts.push(mk_pk_sk("c", 2)); // deleted
+        starts.push(mk_pk_sk("e", 1)); // whole partition deleted
+        starts.push(mk_pk_sk("zz", 9)); // never existed
+        let mut spelled = mk_pk_sk("a", 1);
+        spelled.insert("sk".to_string(), json!({"N": "1.0"}));
+        starts.push(spelled);
+        for start in &starts {
+            let via_index = scan_after(&t, Some(start));
+            assert_eq!(via_index, scan_after(&fallback, Some(start)), "{start:?}");
+            // Exactly the rows ordered after the start key.
+            let start_key = t.encode_key(start).unwrap();
+            let expected: Vec<_> = full
+                .iter()
+                .filter(|item| t.encode_key(item).unwrap() > start_key)
+                .cloned()
+                .collect();
+            assert_eq!(via_index, expected, "{start:?}");
+        }
+    }
+
+    /// The Scan order must not depend on insertion order, or two tables
+    /// holding the same rows would page differently.
+    #[test]
+    fn scan_order_ignores_insertion_order() {
+        let mut forward = composite_table();
+        let mut backward = composite_table();
+        let keys: Vec<(String, i64)> = (0..20).map(|i| (format!("p{}", i % 7), i)).collect();
+        for (pk, sk) in &keys {
+            forward.put_item_at_key(mk_pk_sk(pk, *sk));
+        }
+        for (pk, sk) in keys.iter().rev() {
+            backward.put_item_at_key(mk_pk_sk(pk, *sk));
+        }
+        assert_eq!(scan_after(&forward, None), scan_after(&backward, None));
+        // A partition's rows stay together.
+        let order: Vec<String> = scan_after(&forward, None)
+            .iter()
+            .map(|item| item["pk"]["S"].as_str().unwrap().to_string())
+            .collect();
+        let mut seen: Vec<&String> = Vec::new();
+        for pk in &order {
+            if seen.last() != Some(&pk) {
+                assert!(!seen.contains(&pk), "partition {pk} split: {order:?}");
+                seen.push(pk);
+            }
+        }
+    }
+
+    /// A client draining a table deletes every row of a page -- including the
+    /// one its `LastEvaluatedKey` names -- before asking for the next page.
+    /// Every row must still be visited exactly once.
+    #[test]
+    fn paging_drain_that_deletes_the_start_row_visits_every_row() {
+        let mut t = composite_table();
+        for i in 0..50 {
+            t.put_item_at_key(mk_pk_sk(&format!("p{}", i % 9), i));
+        }
+        let mut seen = Vec::new();
+        let mut start: Option<HashMap<String, AttributeValue>> = None;
+        loop {
+            let page: Vec<_> = t.scan_rows_after(start.as_ref()).take(4).cloned().collect();
+            if page.is_empty() {
+                break;
+            }
+            for item in &page {
+                t.remove_item_by_key(item).unwrap();
+            }
+            start = page.last().cloned();
+            seen.extend(page);
+        }
+        assert_eq!(seen.len(), 50);
+        assert!(t.items.is_empty());
+    }
+
+    /// Rows with no partition key (only an import can produce one) are left
+    /// out of the index, so the scan sorts instead, and they come last. A
+    /// start key without the partition key selects nothing.
+    #[test]
+    fn scan_order_places_keyless_rows_last() {
+        let mut t = table_with_hash_key("pk");
+        let mut keyless = HashMap::new();
+        keyless.insert("other".to_string(), json!({"S": "x"}));
+        t.replace_items(vec![keyless.clone(), mk_pk("b"), mk_pk("a")]);
+        let rows = scan_after(&t, None);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.last(), Some(&keyless));
+        assert_eq!(scan_after(&t, Some(&rows[0])).last(), Some(&keyless));
+        assert!(scan_after(&t, Some(&keyless)).is_empty());
+    }
+
+    /// Scan order is persisted nowhere, so it has to come out the same after a
+    /// restart: the hash is fixed, not std's per-release `DefaultHasher`.
+    #[test]
+    fn scan_order_hash_is_fixed() {
+        assert_eq!(fnv1a_64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a_64(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a_64(b"foobar"), 0x8594_4171_f739_67e8);
+    }
+
+    #[test]
+    fn build_key_indexes_after_snapshot_load() {
+        let mut state = DynamoDbState::new("123456789012", "us-east-1");
+        let mut t = table_with_hash_key("pk");
+        t.put_item_at_key(mk_pk("a"));
+        state.tables.insert("t".to_string(), t);
+        let json = serde_json::to_string(&state).unwrap();
+        let mut restored: DynamoDbState = serde_json::from_str(&json).unwrap();
+        assert!(matches!(restored.tables["t"].key_index, KeyIndex::Unbuilt));
+        restored.build_key_indexes();
+        assert!(matches!(
+            restored.tables["t"].key_index,
+            KeyIndex::Built { rows: 1, .. }
+        ));
     }
 }

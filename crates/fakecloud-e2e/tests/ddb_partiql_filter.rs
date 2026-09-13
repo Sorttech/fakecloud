@@ -525,6 +525,53 @@ async fn ddb_partiql_execute_statement_paginates() {
     assert!(page2.next_token().is_none(), "last page has no NextToken");
 }
 
+// NextToken resumes a SELECT after the last row returned, by key. As an
+// offset into the result set it skipped rows whenever rows a page had already
+// returned were deleted before the next page was fetched.
+#[tokio::test]
+async fn ddb_partiql_execute_statement_pages_survive_deletes() {
+    let server = TestServer::start().await;
+    let ddb = server.dynamodb_client().await;
+    create_streamed_table(&ddb, "PagedDrain").await;
+    let all: Vec<String> = (0..12).map(|i| format!("r{i:02}")).collect();
+    for (i, pk) in all.iter().enumerate() {
+        put_row(&ddb, "PagedDrain", pk, i as i64, "x").await;
+    }
+
+    let mut delivered: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        let page = ddb
+            .execute_statement()
+            .statement("SELECT * FROM \"PagedDrain\"")
+            .limit(5)
+            .set_next_token(token.clone())
+            .send()
+            .await
+            .unwrap();
+        let pks: Vec<String> = page
+            .items()
+            .iter()
+            .map(|item| item["pk"].as_s().unwrap().clone())
+            .collect();
+        for pk in &pks {
+            ddb.execute_statement()
+                .statement(format!("DELETE FROM \"PagedDrain\" WHERE pk = '{pk}'"))
+                .send()
+                .await
+                .unwrap();
+        }
+        delivered.extend(pks);
+        token = page.next_token().map(str::to_string);
+        if token.is_none() {
+            break;
+        }
+    }
+
+    delivered.sort();
+    assert_eq!(delivered, all, "every row is returned exactly once");
+}
+
 // bug-hunt 2026-07-01, finding 2: a PartiQL SELECT whose string literal
 // contains a `<` (or other operator char) must not be split inside the quotes
 // — the operator scan skips single-quoted spans, so the equality still parses

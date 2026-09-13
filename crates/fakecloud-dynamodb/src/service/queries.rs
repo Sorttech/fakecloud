@@ -481,9 +481,14 @@ impl DynamoDbService {
             }
         }
 
-        let mut matched: Vec<&HashMap<String, AttributeValue>> = table
-            .items
-            .iter()
+        // Rows come in Scan order starting just after ExclusiveStartKey. That
+        // order depends only on key values, so the page resumes in the right
+        // place even when the start-key row was deleted between pages -- a
+        // client draining the table page by page deletes exactly that row.
+        // It used to be looked up by position among the rows, and a missing
+        // row ended the scan early with rows still unread (#2504 follow-up).
+        let candidates = table
+            .scan_rows_after(exclusive_start_key.as_ref())
             .filter(|item| {
                 // Sparse index: an index only contains items that carry every
                 // one of its key attributes. AWS never returns (or counts) an
@@ -506,23 +511,13 @@ impl DynamoDbService {
                     (h.finish() as usize) % total == seg
                 }
                 _ => true,
-            })
-            .collect();
-
-        // Apply ExclusiveStartKey: skip items up to and including the start key
-        if let Some(ref start_key) = exclusive_start_key {
-            if let Some(pos) = matched.iter().position(|item| {
-                item_matches_key(item, start_key, &hash_key_name, range_key_name.as_deref())
-            }) {
-                matched = matched.split_off(pos + 1);
-            } else {
-                // The start-key item was deleted between pages. A Scan's result
-                // order is storage/segment order, NOT sorted by the key, so we
-                // cannot resume by ordering; terminate this segment (empty page)
-                // rather than leave the full list and re-deliver from the top.
-                matched.clear();
-            }
-        }
+            });
+        // Limit caps the items examined, so only one more than that is
+        // needed to know whether another page follows.
+        let mut matched: Vec<&HashMap<String, AttributeValue>> = match limit {
+            Some(lim) => candidates.take(lim.saturating_add(1)).collect(),
+            None => candidates.collect(),
+        };
 
         // Same Limit-before-Filter ordering as Query (see comment
         // there): pagination only converges if `LastEvaluatedKey`

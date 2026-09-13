@@ -2872,6 +2872,100 @@ async fn dynamodb_scan_pagination_survives_deletes_between_pages() {
     assert!(!deleted_unseen.is_empty());
 }
 
+/// A client draining a table deletes each page's rows -- including the one
+/// its `LastEvaluatedKey` names -- before asking for the next page. That row
+/// is gone when the next Scan resumes after it, which used to end the scan
+/// with an empty page and rows still in the table.
+#[tokio::test]
+async fn dynamodb_scan_drain_deleting_each_page_visits_every_row() {
+    let server = TestServer::start().await;
+    let client = server.dynamodb_client().await;
+
+    client
+        .create_table()
+        .table_name("ScanDrainTable")
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("pk")
+                .key_type(KeyType::Hash)
+                .build()
+                .unwrap(),
+        )
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("sk")
+                .key_type(KeyType::Range)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("pk")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("sk")
+                .attribute_type(ScalarAttributeType::N)
+                .build()
+                .unwrap(),
+        )
+        .billing_mode(BillingMode::PayPerRequest)
+        .send()
+        .await
+        .unwrap();
+
+    for i in 0..40 {
+        client
+            .put_item()
+            .table_name("ScanDrainTable")
+            .item("pk", AttributeValue::S(format!("p{}", i % 6)))
+            .item("sk", AttributeValue::N(i.to_string()))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    let mut visited = 0;
+    let mut start_key: Option<HashMap<String, AttributeValue>> = None;
+    loop {
+        let resp = client
+            .scan()
+            .table_name("ScanDrainTable")
+            .limit(7)
+            .set_exclusive_start_key(start_key.clone())
+            .send()
+            .await
+            .unwrap();
+        for item in resp.items() {
+            client
+                .delete_item()
+                .table_name("ScanDrainTable")
+                .key("pk", item["pk"].clone())
+                .key("sk", item["sk"].clone())
+                .send()
+                .await
+                .unwrap();
+            visited += 1;
+        }
+        start_key = resp.last_evaluated_key().map(|m| m.to_owned());
+        if start_key.is_none() {
+            break;
+        }
+    }
+
+    assert_eq!(visited, 40, "the drain stopped before visiting every row");
+    let left = client
+        .scan()
+        .table_name("ScanDrainTable")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(left.count(), 0, "rows left behind: {:?}", left.items());
+}
+
 #[tokio::test]
 async fn dynamodb_scan_no_pagination_when_all_fit() {
     let server = TestServer::start().await;

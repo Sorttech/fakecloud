@@ -411,15 +411,17 @@ pub(crate) fn execute_partiql_in_state(
         let (table_name, rest) = parse_partiql_table_name(after_from);
         let table = get_table(&state.tables, &table_name)?;
         let rest_upper = rest.trim().to_ascii_uppercase();
-        let items: Vec<Value> = if rest_upper.starts_with("WHERE") {
+        let mut rows: Vec<&HashMap<String, AttributeValue>> = if rest_upper.starts_with("WHERE") {
             let where_clause = rest.trim()[5..].trim();
             evaluate_partiql_where(table, where_clause, parameters)?
-                .iter()
-                .map(|item| json!(item))
-                .collect()
         } else {
-            table.items.iter().map(|item| json!(item)).collect()
+            table.items.iter().collect()
         };
+        // Scan order, which ExecuteStatement's NextToken resumes by key: an
+        // order that depends on which rows exist would skip or repeat rows
+        // when some are deleted between pages.
+        table.sort_in_scan_order(&mut rows);
+        let items: Vec<Value> = rows.iter().map(|item| json!(item)).collect();
         Ok(PartiqlOutcome {
             response: json!({ "Items": items }),
             table_name: Some(table_name),

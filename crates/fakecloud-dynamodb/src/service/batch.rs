@@ -1138,9 +1138,13 @@ impl DynamoDbService {
             let region = state.region.clone();
             let outcome = execute_partiql_in_state(state, statement, &parameters)?;
             // ExecuteStatement honors Limit + NextToken on a SELECT result set
-            // (AWS paginates PartiQL SELECTs); the token is an opaque offset.
+            // (AWS paginates PartiQL SELECTs); the token is an opaque cursor.
             let response = apply_execute_statement_pagination(
                 outcome.response.clone(),
+                outcome
+                    .table_name
+                    .as_ref()
+                    .and_then(|name| state.tables.get(name)),
                 limit,
                 next_token.as_deref(),
             );
@@ -1650,11 +1654,19 @@ fn batch_single_item_select_error() -> Value {
     })
 }
 
-/// Apply `Limit` + `NextToken` to a PartiQL SELECT response. The token is an
-/// opaque base64-encoded offset into the (deterministically ordered) result
-/// set. No-op for write statements (which carry no `Items`).
+/// Apply `Limit` + `NextToken` to a PartiQL SELECT response. No-op for write
+/// statements (which carry no `Items`).
+///
+/// The SELECT result is in Scan order (see `RowKey`), and the token is an
+/// opaque base64 cursor naming the primary key of the last row returned; the
+/// next page is every row after that key. Resuming by key rather than by
+/// offset keeps a page from skipping rows when earlier ones were deleted in
+/// between (every later offset would shift down), or repeating them when rows
+/// were added. A row without a primary key (only an import can produce one)
+/// sorts after every keyed row and falls back to an offset among those.
 fn apply_execute_statement_pagination(
     mut response: Value,
+    table: Option<&DynamoTable>,
     limit: Option<i64>,
     next_token: Option<&str>,
 ) -> Value {
@@ -1663,22 +1675,54 @@ fn apply_execute_statement_pagination(
     let Some(items) = response.get("Items").and_then(Value::as_array) else {
         return response;
     };
-    let total = items.len();
-    let start = next_token
+    let row_key = |item: &Value| {
+        let (table, obj) = (table?, item.as_object()?);
+        table.encode_key_with(|name| obj.get(name))
+    };
+    let cursor: Option<Value> = next_token
         .and_then(|t| b64.decode(t).ok())
-        .and_then(|b| String::from_utf8(b).ok())
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(0)
-        .min(total);
+        .and_then(|b| serde_json::from_slice(&b).ok());
+    let total = items.len();
+    let start = match cursor {
+        Some(Value::Object(c)) => {
+            if let Some(after) = c.get("After").and_then(|k| row_key(k)) {
+                items
+                    .iter()
+                    .position(|item| match row_key(item) {
+                        Some(k) => k > after,
+                        None => true,
+                    })
+                    .unwrap_or(total)
+            } else if let Some(offset) = c.get("Offset").and_then(Value::as_u64) {
+                (offset as usize).min(total)
+            } else {
+                0
+            }
+        }
+        _ => 0,
+    };
     let end = match limit {
         Some(l) => start.saturating_add(l as usize).min(total),
         None => total,
     };
     let page: Vec<Value> = items[start..end].to_vec();
-    response["Items"] = Value::Array(page);
     if end < total {
-        response["NextToken"] = json!(b64.encode(end.to_string()));
+        let last = &items[end - 1];
+        let cursor = match (table, last.as_object()) {
+            (Some(table), Some(obj)) if row_key(last).is_some() => {
+                let mut key = serde_json::Map::new();
+                for name in std::iter::once(table.hash_key_name()).chain(table.range_key_name()) {
+                    if let Some(v) = obj.get(name) {
+                        key.insert(name.to_string(), v.clone());
+                    }
+                }
+                json!({ "After": key })
+            }
+            _ => json!({ "Offset": end }),
+        };
+        response["NextToken"] = json!(b64.encode(cursor.to_string()));
     }
+    response["Items"] = Value::Array(page);
     response
 }
 
@@ -1771,6 +1815,88 @@ mod tests {
             vector_indexes: Vec::new(),
         };
         s.tables.insert(name.to_string(), table);
+    }
+
+    /// ExecuteStatement's NextToken must resume a SELECT by key. It was an
+    /// offset into the result set, so deleting rows a page had already
+    /// returned shifted every later row down and the next page skipped rows.
+    #[tokio::test]
+    async fn execute_statement_select_pages_survive_deletes_between_pages() {
+        let state = make_state();
+        seed_table_with_stream(&state, "Widgets");
+        {
+            let mut accts = state.write();
+            let table = accts
+                .get_or_create("123456789012")
+                .tables
+                .get_mut("Widgets")
+                .unwrap();
+            for i in 0..14 {
+                let mut item = HashMap::new();
+                item.insert("pk".to_string(), json!({ "S": format!("w{i:02}") }));
+                table.put_item_at_key(item);
+            }
+        }
+        let svc = DynamoDbService::new(state.clone());
+        let all_rows: Vec<String> = (0..14).map(|i| format!("w{i:02}")).collect();
+        // Deleted ahead of the pager, on a schedule fixed up front.
+        let mut ahead = ["w13", "w02", "w09"].into_iter();
+        let mut deleted_unseen = Vec::new();
+        let mut delivered: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let mut body = json!({"Statement": "SELECT * FROM \"Widgets\"", "Limit": 3});
+            if let Some(t) = &token {
+                body["NextToken"] = json!(t);
+            }
+            let resp = response_body(
+                &svc.execute_statement(&req_for("ExecuteStatement", body))
+                    .unwrap(),
+            );
+            let page: Vec<String> = resp["Items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["pk"]["S"].as_str().unwrap().to_string())
+                .collect();
+            delivered.extend(page.iter().cloned());
+            token = resp["NextToken"].as_str().map(str::to_string);
+            if token.is_none() {
+                break;
+            }
+            let mut accts = state.write();
+            let table = accts
+                .get_or_create("123456789012")
+                .tables
+                .get_mut("Widgets")
+                .unwrap();
+            let mut delete = |pk: &str| {
+                let mut key = HashMap::new();
+                key.insert("pk".to_string(), json!({ "S": pk }));
+                table.remove_item_by_key(&key);
+            };
+            // Every row this page returned, including the one the cursor names...
+            for pk in &page {
+                delete(pk);
+            }
+            // ...and one row ahead, unless a page already returned it.
+            if let Some(pk) = ahead.next() {
+                if !delivered.iter().any(|d| d == pk) {
+                    delete(pk);
+                    deleted_unseen.push(pk.to_string());
+                }
+            }
+        }
+        let mut unique = delivered.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), delivered.len(), "repeated: {delivered:?}");
+        let expected: Vec<String> = all_rows
+            .into_iter()
+            .filter(|pk| !deleted_unseen.contains(pk))
+            .collect();
+        assert_eq!(unique, expected, "skipped a surviving row");
+        assert!(!deleted_unseen.is_empty());
     }
 
     /// 1.11/1.12: BatchGetItem must honor the per-table
