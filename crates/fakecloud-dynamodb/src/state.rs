@@ -948,10 +948,17 @@ impl DynamoTable {
             .filter(|(_, item)| remove(item))
             .map(|(id, _)| id)
             .collect();
-        doomed
+        let removed: Vec<_> = doomed
             .into_iter()
             .map(|id| self.remove_item_at(id))
-            .collect()
+            .collect();
+        // A table that fell back to the scan over duplicate keys may have just
+        // lost the duplicates. The sweep already paid a full pass, so another
+        // one to see whether the index can be trusted again costs no more.
+        if !removed.is_empty() && matches!(self.key_index, KeyIndex::Ambiguous { .. }) {
+            self.rebuild_key_index();
+        }
+        removed
     }
 
     /// What the row `id` contributed before an in-place mutation: its size,
@@ -1907,5 +1914,22 @@ mod tests {
         }
         assert!(t.items.is_empty());
         assert_eq!((t.item_count, t.size_bytes), (0, 0));
+    }
+
+    /// A table on the scan fallback over duplicate keys recovers its index
+    /// once a sweep removes the duplicates.
+    #[test]
+    fn remove_items_where_restores_index_once_duplicates_are_gone() {
+        let mut t = table_with_hash_key("pk");
+        let mut expiring = mk_pk("dup");
+        expiring.insert("ttl".to_string(), json!({"N": "1"}));
+        t.replace_items(vec![mk_pk("dup"), expiring, mk_pk("other")]);
+        assert!(matches!(t.key_index, KeyIndex::Ambiguous { .. }));
+
+        let removed = t.remove_items_where(|item| item.contains_key("ttl"));
+        assert_eq!(removed.len(), 1);
+        assert!(matches!(t.key_index, KeyIndex::Built { rows: 2, .. }));
+        assert_eq!(t.find_item_index(&mk_pk("dup")), Some(ItemId(0)));
+        assert_eq!(t.find_item_index(&mk_pk("other")), Some(ItemId(2)));
     }
 }
