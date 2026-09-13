@@ -825,6 +825,16 @@ impl DynamoDbService {
                     serde_json::from_value(op["Key"].clone()).unwrap_or_default();
                 if let Some(table) = state.tables.get(table_name) {
                     validate_key_attributes_in_key(table, &key)?;
+                    if let Some(expr) = ti
+                        .get("Update")
+                        .and_then(|u| u["UpdateExpression"].as_str())
+                    {
+                        super::reject_key_attribute_update_expression(
+                            table,
+                            expr,
+                            &parse_expression_attribute_names(op),
+                        )?;
+                    }
                 }
                 // An Update's ExpressionAttributeValues get the same value
                 // validation single UpdateItem enforces, so a malformed number
