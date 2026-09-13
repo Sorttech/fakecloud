@@ -569,7 +569,7 @@ pub struct Snapshot {
 }
 
 /// One health-check path: a source, and the destinations reachable from it.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthCheckPath {
     pub source_subnet_id: Option<String>,
     pub source_security_group_id: Option<String>,

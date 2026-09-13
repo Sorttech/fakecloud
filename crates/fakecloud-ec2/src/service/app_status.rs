@@ -19,7 +19,7 @@ use chrono::Utc;
 use fakecloud_aws::ec2query::{ec2_elem, ec2_list};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
-use crate::service::tags::{apply_tag_specifications, tag_set_xml};
+use crate::service::tags::{apply_tag_specifications, tag_set_xml, tag_specifications_for};
 use crate::service::Ec2Service;
 use crate::service_helpers::{
     filter_value_matches, gen_id, indexed_list, instance_not_found, invalid_parameter_value,
@@ -436,6 +436,26 @@ fn check_matches(c: &ApplicationStatusCheck, tags: &[Tag], filters: &[Filter]) -
     })
 }
 
+/// Everything about a check that its create request determines. Two creates
+/// carrying the same `ClientToken` have to agree on all of it to count as a
+/// retry of the same call rather than a different one.
+fn create_fields_match(a: &ApplicationStatusCheck, b: &ApplicationStatusCheck) -> bool {
+    a.aggregation == b.aggregation
+        && a.protocol == b.protocol
+        && a.port == b.port
+        && a.path == b.path
+        && a.device_index == b.device_index
+        && a.ip_version == b.ip_version
+        && a.ip_scope == b.ip_scope
+        && a.interval == b.interval
+        && a.timeout == b.timeout
+        && a.failure_threshold == b.failure_threshold
+        && a.success_threshold == b.success_threshold
+        && a.status_code_matcher == b.status_code_matcher
+        && a.initialization_grace_period_seconds == b.initialization_grace_period_seconds
+        && a.health_check_paths == b.health_check_paths
+}
+
 pub(crate) fn create_application_status_check(
     svc: &Ec2Service,
     req: &AwsRequest,
@@ -446,6 +466,7 @@ pub(crate) fn create_application_status_check(
     validate_probe(req)?;
     validate_timeout_against_interval(int_param(req, "Interval"), int_param(req, "Timeout"))?;
     let client_token = str_param(req, "ClientToken");
+    let requested_tags = tag_specifications_for(&req.query_params, CHECK_RESOURCE_TYPE);
 
     // A DryRun validates the request and mints nothing. It runs ahead of the
     // idempotency replay so that a dry run never answers with a real check.
@@ -455,29 +476,6 @@ pub(crate) fn create_application_status_check(
             &req.request_id,
             "",
         ));
-    }
-
-    let mut accounts = svc.state.write();
-    let state = accounts.get_or_create(&req.account_id);
-
-    // Replaying a create with the same idempotency token must not mint a
-    // second check; AWS answers the retry with the original object.
-    if let Some(token) = &client_token {
-        if let Some(existing) = state
-            .application_status_checks
-            .values()
-            .find(|c| c.deletion_time.is_none() && c.client_token.as_deref() == Some(token))
-        {
-            let body = format!(
-                "<applicationStatusCheck>{}</applicationStatusCheck>",
-                check_xml(existing, state.tags_for(&existing.id))
-            );
-            return Ok(Ec2Service::respond(
-                "CreateApplicationStatusCheck",
-                &req.request_id,
-                &body,
-            ));
-        }
     }
 
     let now = now_rfc3339();
@@ -504,6 +502,44 @@ pub(crate) fn create_application_status_check(
         modify_time: now,
         deletion_time: None,
     };
+
+    let mut accounts = svc.state.write();
+    let state = accounts.get_or_create(&req.account_id);
+
+    // Replaying a create with the same idempotency token must not mint a
+    // second check; AWS answers the retry with the original object. A retry
+    // that changes the parameters is not a retry, and AWS says so rather than
+    // quietly handing back an object that does not match what was asked for.
+    if let Some(token) = &check.client_token {
+        if let Some(existing) = state.application_status_checks.values().find(|c| {
+            c.deletion_time.is_none() && c.client_token.as_deref() == Some(token.as_str())
+        }) {
+            let stored_tags: std::collections::BTreeMap<String, String> = state
+                .tags_for(&existing.id)
+                .iter()
+                .map(|t| (t.key.clone(), t.value.clone()))
+                .collect();
+            if !create_fields_match(existing, &check) || stored_tags != requested_tags {
+                return Err(AwsServiceError::aws_error(
+                    http::StatusCode::BAD_REQUEST,
+                    "IdempotentParameterMismatch",
+                    format!(
+                        "The client token '{token}' was already used with different parameters"
+                    ),
+                ));
+            }
+            let body = format!(
+                "<applicationStatusCheck>{}</applicationStatusCheck>",
+                check_xml(existing, state.tags_for(&existing.id))
+            );
+            return Ok(Ec2Service::respond(
+                "CreateApplicationStatusCheck",
+                &req.request_id,
+                &body,
+            ));
+        }
+    }
+
     let id = check.id.clone();
     // Create-time tags go to the shared EC2 tag store, so DescribeTags and
     // CreateTags/DeleteTags see the same tags the check reports.
@@ -2161,6 +2197,73 @@ mod tests {
         );
         assert!(d.contains(&tagged), "{d}");
         assert!(!d.contains(&untagged), "{d}");
+    }
+
+    #[test]
+    fn a_reused_client_token_with_new_parameters_is_a_mismatch() {
+        let svc = Ec2Service::new();
+        make_check(&svc, &[("ClientToken", "token-2"), ("Path", "/healthz")]);
+        let err = err_of(create_application_status_check(
+            &svc,
+            &req(
+                "CreateApplicationStatusCheck",
+                &[
+                    ("Protocol", "http"),
+                    ("Port", "8080"),
+                    ("ClientToken", "token-2"),
+                    ("Path", "/different"),
+                ],
+            ),
+        ));
+        assert_eq!(err.code(), "IdempotentParameterMismatch");
+
+        // Tags are part of the request too.
+        let err = err_of(create_application_status_check(
+            &svc,
+            &req(
+                "CreateApplicationStatusCheck",
+                &[
+                    ("Protocol", "http"),
+                    ("Port", "8080"),
+                    ("ClientToken", "token-2"),
+                    ("Path", "/healthz"),
+                    (
+                        "TagSpecification.1.ResourceType",
+                        "application-status-check",
+                    ),
+                    ("TagSpecification.1.Tag.1.Key", "env"),
+                    ("TagSpecification.1.Tag.1.Value", "prod"),
+                ],
+            ),
+        ));
+        assert_eq!(err.code(), "IdempotentParameterMismatch");
+
+        // The unchanged retry still replays.
+        let d = body(
+            create_application_status_check(
+                &svc,
+                &req(
+                    "CreateApplicationStatusCheck",
+                    &[
+                        ("Protocol", "http"),
+                        ("Port", "8080"),
+                        ("ClientToken", "token-2"),
+                        ("Path", "/healthz"),
+                    ],
+                ),
+            )
+            .unwrap(),
+        );
+        assert!(d.contains("<path>/healthz</path>"), "{d}");
+        let all = body(
+            describe_application_status_checks(&svc, &req("DescribeApplicationStatusChecks", &[]))
+                .unwrap(),
+        );
+        assert_eq!(
+            all.matches("<applicationStatusCheckId>").count(),
+            1,
+            "{all}"
+        );
     }
 
     #[test]
