@@ -525,14 +525,19 @@ pub(crate) fn create_application_status_check(
         if let Some(existing) = state.application_status_checks.values().find(|c| {
             c.deletion_time.is_none() && c.client_token.as_deref() == Some(token.as_str())
         }) {
-            if existing.create_fingerprint.as_deref() != Some(fingerprint.as_str()) {
-                return Err(AwsServiceError::aws_error(
-                    http::StatusCode::BAD_REQUEST,
-                    "IdempotentParameterMismatch",
-                    format!(
-                        "The client token '{token}' was already used with different parameters"
-                    ),
-                ));
+            // A check that carries no recorded fingerprint offers nothing to
+            // compare against, so a retry on its token replays rather than
+            // failing on evidence that was never recorded.
+            if let Some(recorded) = existing.create_fingerprint.as_deref() {
+                if recorded != fingerprint {
+                    return Err(AwsServiceError::aws_error(
+                        http::StatusCode::BAD_REQUEST,
+                        "IdempotentParameterMismatch",
+                        format!(
+                            "The client token '{token}' was already used with different parameters"
+                        ),
+                    ));
+                }
             }
             let body = format!(
                 "<applicationStatusCheck>{}</applicationStatusCheck>",
@@ -2328,6 +2333,37 @@ mod tests {
             1,
             "{all}"
         );
+    }
+
+    #[test]
+    fn a_check_without_a_recorded_fingerprint_still_replays() {
+        let svc = Ec2Service::new();
+        let id = make_check(&svc, &[("ClientToken", "token-legacy")]);
+        // A check persisted before the fingerprint was recorded.
+        {
+            let mut accounts = svc.state.write();
+            let state = accounts.get_or_create("000000000000");
+            state
+                .application_status_checks
+                .get_mut(&id)
+                .unwrap()
+                .create_fingerprint = None;
+        }
+        let d = body(
+            create_application_status_check(
+                &svc,
+                &req(
+                    "CreateApplicationStatusCheck",
+                    &[
+                        ("Protocol", "http"),
+                        ("Port", "8080"),
+                        ("ClientToken", "token-legacy"),
+                    ],
+                ),
+            )
+            .unwrap(),
+        );
+        assert!(d.contains(&id), "{d}");
     }
 
     #[test]
