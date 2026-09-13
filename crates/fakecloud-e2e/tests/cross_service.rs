@@ -1494,3 +1494,91 @@ async fn eventbridge_sns_filter_policy_drops_non_matching() {
         serde_json::from_str(envelope["Message"].as_str().unwrap()).unwrap();
     assert_eq!(inner["source"], "payments");
 }
+
+/// ImportTable writes each row the way PutItem would: a row without a valid
+/// primary key is an import error, counted and skipped, and a row repeating an
+/// earlier row's key replaces it. Such rows used to be stored as-is, leaving
+/// rows no key lookup could address and no Scan cursor could page past.
+#[tokio::test]
+async fn dynamodb_import_table_skips_invalid_keys_and_dedupes() {
+    let server = helpers::TestServer::start().await;
+    let s3 = server.s3_client().await;
+    let ddb = server.dynamodb_client().await;
+
+    s3.create_bucket()
+        .bucket("import-validation")
+        .send()
+        .await
+        .unwrap();
+    let lines = [
+        r#"{"Item":{"pk":{"S":"a"},"v":{"S":"first"}}}"#,
+        r#"{"Item":{"pk":{"S":"b"}}}"#,
+        r#"{"Item":{"other":{"S":"no key"}}}"#,
+        r#"{"Item":{"pk":{"N":"5"}}}"#,
+        r#"{"Item":{"pk":{"S":"a"},"v":{"S":"second"}}}"#,
+    ];
+    s3.put_object()
+        .bucket("import-validation")
+        .key("data/part-0.json")
+        .body(lines.join("\n").into_bytes().into())
+        .send()
+        .await
+        .unwrap();
+
+    let resp = ddb
+        .import_table()
+        .input_format(aws_sdk_dynamodb::types::InputFormat::DynamodbJson)
+        .s3_bucket_source(
+            aws_sdk_dynamodb::types::S3BucketSource::builder()
+                .s3_bucket("import-validation")
+                .s3_key_prefix("data/")
+                .build()
+                .unwrap(),
+        )
+        .table_creation_parameters(
+            aws_sdk_dynamodb::types::TableCreationParameters::builder()
+                .table_name("ImportValidated")
+                .key_schema(
+                    aws_sdk_dynamodb::types::KeySchemaElement::builder()
+                        .attribute_name("pk")
+                        .key_type(aws_sdk_dynamodb::types::KeyType::Hash)
+                        .build()
+                        .unwrap(),
+                )
+                .attribute_definitions(
+                    aws_sdk_dynamodb::types::AttributeDefinition::builder()
+                        .attribute_name("pk")
+                        .attribute_type(aws_sdk_dynamodb::types::ScalarAttributeType::S)
+                        .build()
+                        .unwrap(),
+                )
+                .billing_mode(aws_sdk_dynamodb::types::BillingMode::PayPerRequest)
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let desc = resp.import_table_description().unwrap();
+    assert_eq!(desc.processed_item_count(), 5);
+    assert_eq!(desc.imported_item_count(), 2);
+    assert_eq!(desc.error_count(), 2);
+
+    let scan = ddb
+        .scan()
+        .table_name("ImportValidated")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(scan.count(), 2, "{:?}", scan.items());
+    let a = scan
+        .items()
+        .iter()
+        .find(|item| item["pk"].as_s().unwrap() == "a")
+        .expect("row a imported");
+    assert_eq!(
+        a["v"].as_s().unwrap(),
+        "second",
+        "a later row replaces an earlier one"
+    );
+}

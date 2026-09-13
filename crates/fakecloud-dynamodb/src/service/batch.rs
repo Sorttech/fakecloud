@@ -1465,7 +1465,7 @@ impl DynamoDbService {
                         None => continue,
                     };
                     let keys = outcome.keys.unwrap_or_default();
-                    if let Some(table) = state.tables.get(&table_name) {
+                    if let Some(table) = state.tables.get(super::resolve_table_name(&table_name)) {
                         if let Some(record) = crate::streams::generate_stream_record(
                             table,
                             &event_name,
@@ -1525,7 +1525,7 @@ impl DynamoDbService {
         // observers (DescribeStream/GetRecords) only see them once
         // the transaction has fully committed.
         for (table_name, record) in pending_stream {
-            if let Some(table) = state.tables.get_mut(&table_name) {
+            if let Some(table) = state.tables.get_mut(super::resolve_table_name(&table_name)) {
                 crate::streams::add_stream_record(table, record);
             }
         }
@@ -2742,6 +2742,43 @@ mod tests {
         let records = table.stream_records.read();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].event_name, "INSERT");
+    }
+
+    /// A statement may name its table by ARN. ExecuteStatement,
+    /// BatchExecuteStatement and ExecuteTransaction all resolve it to find
+    /// the table they append stream records to, or the write lands with no
+    /// change record.
+    #[tokio::test]
+    async fn partiql_writes_naming_the_table_by_arn_emit_stream_records() {
+        let state = make_state();
+        seed_table_with_stream(&state, "Widgets");
+        let svc = DynamoDbService::new(state.clone());
+        let arn = "arn:aws:dynamodb:us-east-1:123456789012:table/Widgets";
+
+        svc.execute_statement(&req_for(
+            "ExecuteStatement",
+            json!({"Statement": format!("INSERT INTO \"{arn}\" VALUE {{'pk': 'a'}}")}),
+        ))
+        .unwrap();
+        svc.batch_execute_statement(&req_for(
+            "BatchExecuteStatement",
+            json!({"Statements": [
+                {"Statement": format!("INSERT INTO \"{arn}\" VALUE {{'pk': 'b'}}")}
+            ]}),
+        ))
+        .unwrap();
+        svc.execute_transaction(&req_for(
+            "ExecuteTransaction",
+            json!({"TransactStatements": [
+                {"Statement": format!("INSERT INTO \"{arn}\" VALUE {{'pk': 'c'}}")}
+            ]}),
+        ))
+        .unwrap();
+
+        let accts = state.read();
+        let table = &accts.get("123456789012").unwrap().tables["Widgets"];
+        assert_eq!(table.items.len(), 3);
+        assert_eq!(table.stream_records.read().len(), 3);
     }
 
     #[tokio::test]

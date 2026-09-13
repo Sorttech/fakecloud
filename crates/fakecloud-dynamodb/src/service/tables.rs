@@ -1778,8 +1778,7 @@ impl DynamoDbService {
                 read_capacity_units: 0,
                 write_capacity_units: 0,
             },
-            items: TableItems::new(imported_items),
-            // Left unbuilt here; the `recalculate_stats()` below builds it.
+            items: TableItems::default(),
             key_index: Default::default(),
             gsi: Vec::new(),
             lsi: Vec::new(),
@@ -1808,7 +1807,19 @@ impl DynamoDbService {
             table_class: "STANDARD".to_string(),
             vector_indexes: Vec::new(),
         };
-        table.recalculate_stats();
+        // Each row is written the way a PutItem would be. A row without a
+        // valid primary key is an import error, counted and skipped rather
+        // than stored (it could never be read, updated or paged past by key),
+        // and a row repeating an earlier row's key replaces it.
+        let mut error_count = 0i64;
+        for item in imported_items {
+            if super::validate_key_in_item(&table, &item).is_err() {
+                error_count += 1;
+                continue;
+            }
+            table.put_item_at_key(item);
+        }
+        let imported_item_count = table.item_count;
         state.tables.insert(table_name.to_string(), table);
 
         let import_desc = ImportDescription {
@@ -1822,6 +1833,8 @@ impl DynamoDbService {
             end_time: now,
             processed_item_count,
             processed_size_bytes,
+            imported_item_count,
+            error_count,
         };
         state.imports.insert(import_arn.clone(), import_desc);
 
@@ -1855,7 +1868,9 @@ impl DynamoDbService {
                 "StartTime": now.timestamp() as f64,
                 "EndTime": now.timestamp() as f64,
                 "ProcessedItemCount": processed_item_count,
-                "ProcessedSizeBytes": processed_size_bytes
+                "ProcessedSizeBytes": processed_size_bytes,
+                "ImportedItemCount": imported_item_count,
+                "ErrorCount": error_count
             }
         }))
     }
@@ -1887,7 +1902,9 @@ impl DynamoDbService {
                 "StartTime": import.start_time.timestamp() as f64,
                 "EndTime": import.end_time.timestamp() as f64,
                 "ProcessedItemCount": import.processed_item_count,
-                "ProcessedSizeBytes": import.processed_size_bytes
+                "ProcessedSizeBytes": import.processed_size_bytes,
+                "ImportedItemCount": import.imported_item_count,
+                "ErrorCount": import.error_count
             }
         }))
     }

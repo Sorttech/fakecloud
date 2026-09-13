@@ -532,9 +532,21 @@ impl DynamoDbService {
             has_more = false;
             last_examined_idx = None;
         }
-        let last_examined_key = last_examined_idx
-            .and_then(|i| matched.get(i).copied())
-            .map(|item| extract_key_for_schema(item, &hash_key_name, range_key_name.as_deref()));
+        // The cursor resumes by the table's primary key, which is always in
+        // it. On an index scan AWS also includes the index's key attributes.
+        let last_examined_key =
+            last_examined_idx
+                .and_then(|i| matched.get(i).copied())
+                .map(|item| {
+                    let mut key =
+                        extract_key_for_schema(item, &hash_key_name, range_key_name.as_deref());
+                    for attr in &index_key_attrs {
+                        if let Some(v) = item.get(attr) {
+                            key.insert(attr.clone(), v.clone());
+                        }
+                    }
+                    key
+                });
 
         let scanned_count = matched.len();
 

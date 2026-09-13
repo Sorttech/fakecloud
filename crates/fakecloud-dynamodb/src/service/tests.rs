@@ -6177,3 +6177,73 @@ fn create_table_rejects_a_malformed_vector_index() {
         assert_eq!(err.code(), "ValidationException", "{bad}");
     }
 }
+
+/// A paged Scan of a GSI resumes by the table key and survives deleting each
+/// page's rows; its LastEvaluatedKey carries the index key attributes as well,
+/// as on AWS.
+#[tokio::test]
+async fn index_scan_pages_survive_deletes_and_carry_index_keys() {
+    let svc = make_service();
+    svc.create_table(&make_request(
+        "CreateTable",
+        json!({
+            "TableName": "gsi-table",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "g", "AttributeType": "S"}
+            ],
+            "GlobalSecondaryIndexes": [{
+                "IndexName": "by-g",
+                "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "ALL"}
+            }],
+            "BillingMode": "PAY_PER_REQUEST"
+        }),
+    ))
+    .unwrap();
+    let mut indexed = Vec::new();
+    for i in 0..15 {
+        let mut item = json!({"pk": {"S": format!("r{i:02}")}});
+        // Every third row is missing the index key, so it is not in the index.
+        if i % 3 != 0 {
+            item["g"] = json!({"S": format!("g{}", i % 4)});
+            indexed.push(format!("r{i:02}"));
+        }
+        call_dynamodb(
+            &svc,
+            "PutItem",
+            json!({"TableName": "gsi-table", "Item": item}),
+        )
+        .await;
+    }
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut start: Option<Value> = None;
+    loop {
+        let mut body = json!({"TableName": "gsi-table", "IndexName": "by-g", "Limit": 3});
+        if let Some(s) = &start {
+            body["ExclusiveStartKey"] = s.clone();
+        }
+        let page = call_dynamodb(&svc, "Scan", body).await;
+        for item in page["Items"].as_array().unwrap() {
+            let pk = item["pk"]["S"].as_str().unwrap().to_string();
+            call_dynamodb(
+                &svc,
+                "DeleteItem",
+                json!({"TableName": "gsi-table", "Key": {"pk": {"S": pk}}}),
+            )
+            .await;
+            seen.push(pk);
+        }
+        match page.get("LastEvaluatedKey") {
+            Some(lek) => {
+                assert!(lek.get("pk").is_some() && lek.get("g").is_some(), "{lek}");
+                start = Some(lek.clone());
+            }
+            None => break,
+        }
+    }
+    seen.sort();
+    assert_eq!(seen, indexed);
+}

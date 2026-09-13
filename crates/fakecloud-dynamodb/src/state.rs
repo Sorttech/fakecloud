@@ -162,17 +162,96 @@ fn write_canonical_json(v: &Value, out: &mut String) {
 /// A row's primary key as the key index stores it, which is also the table's
 /// Scan order.
 ///
-/// `encoded` is the canonical key string (see [`DynamoTable::encode_key`]):
-/// two keys are equal iff DynamoDB considers them the same key. Rows order
+/// Two keys are equal iff DynamoDB considers them the same key. Rows order
 /// first by `partition_hash`, a stable hash of the partition-key encoding,
-/// then by `encoded`, so a partition's rows stay together and a Scan visits
-/// partitions in hash order, the way DynamoDB itself does. The order depends
-/// only on key values, never on which rows exist, so a Scan page resumes after
-/// `ExclusiveStartKey` correctly even when that row has since been deleted.
+/// then by the partition encoding itself (only to break hash ties), then by
+/// sort-key value. So a partition's rows stay together, partitions come in
+/// hash order and rows within one come in sort-key order -- the way DynamoDB
+/// scans. The order depends only on key values, never on which rows exist, so
+/// a Scan page resumes after `ExclusiveStartKey` correctly even when that row
+/// has since been deleted.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RowKey {
     partition_hash: u64,
-    encoded: String,
+    partition: String,
+    /// `None` when the table has no sort key.
+    sort: Option<SortKeyPart>,
+}
+
+/// A sort-key value, ordered the way DynamoDB orders sort keys and equal
+/// exactly when `values_equal` says the values are.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum SortKeyPart {
+    /// The row has no sort-key attribute (only an import could produce one).
+    Missing,
+    /// A valid Number, by its canonical decimal: numerically-equal spellings
+    /// share one form, and numbers order by value.
+    Number(String),
+    /// A String, ordered by its UTF-8 bytes.
+    Str(String),
+    /// A Binary, ordered by its decoded bytes. The base64 text breaks ties,
+    /// so equality stays exact on the text, as `values_equal` has it.
+    Binary(Vec<u8>, String),
+    /// Anything else (a malformed number, a non-key type), by its canonical
+    /// encoding.
+    Other(String),
+}
+
+impl SortKeyPart {
+    fn of(v: Option<&Value>) -> Self {
+        use base64::Engine;
+        let Some(v) = v else {
+            return SortKeyPart::Missing;
+        };
+        match attribute_type_and_value(v) {
+            Some(("N", n)) => {
+                if let Some(canon) = n
+                    .as_str()
+                    .and_then(crate::service::helpers::partiql::canonical_number)
+                {
+                    return SortKeyPart::Number(canon);
+                }
+            }
+            Some(("S", Value::String(s))) => return SortKeyPart::Str(s.clone()),
+            Some(("B", Value::String(b))) => {
+                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b) {
+                    return SortKeyPart::Binary(bytes, b.clone());
+                }
+            }
+            _ => {}
+        }
+        SortKeyPart::Other(DynamoTable::encode_key_value(v))
+    }
+
+    fn rank(&self) -> u8 {
+        match self {
+            SortKeyPart::Missing => 0,
+            SortKeyPart::Number(_) => 1,
+            SortKeyPart::Str(_) => 2,
+            SortKeyPart::Binary(..) => 3,
+            SortKeyPart::Other(_) => 4,
+        }
+    }
+}
+
+impl Ord for SortKeyPart {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use SortKeyPart::*;
+        match (self, other) {
+            (Number(a), Number(b)) => {
+                crate::service::helpers::partiql::compare_number_strings(a, b)
+            }
+            (Str(a), Str(b)) | (Other(a), Other(b)) => a.cmp(b),
+            (Binary(a, at), Binary(b, bt)) => a.cmp(b).then_with(|| at.cmp(bt)),
+            _ => self.rank().cmp(&other.rank()),
+        }
+    }
+}
+
+impl PartialOrd for SortKeyPart {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 /// FNV-1a, 64-bit. The Scan order is derived from it, so it has to be fixed:
@@ -610,6 +689,14 @@ pub struct ImportDescription {
     pub end_time: DateTime<Utc>,
     pub processed_item_count: i64,
     pub processed_size_bytes: i64,
+    /// Rows written to the table: processed rows less the invalid ones, with
+    /// rows sharing a primary key counted once.
+    #[serde(default)]
+    pub imported_item_count: i64,
+    /// Rows skipped because they lack a key attribute or carry one of the
+    /// wrong type.
+    #[serde(default)]
+    pub error_count: i64,
 }
 
 impl DynamoTable {
@@ -729,24 +816,16 @@ impl DynamoTable {
         &self,
         get: impl Fn(&str) -> Option<&'a AttributeValue>,
     ) -> Option<RowKey> {
-        let hash_key = self.hash_key_name();
-        let mut out = Self::encode_key_value(get(hash_key)?);
-        let partition_hash = fnv1a_64(out.as_bytes());
-        if let Some(rk) = self.range_key_name() {
-            // The range key is part of the identity when the schema declares
-            // one; `values_equal(None, None)` was true in the scan, so an item
-            // with no range-key attribute is only equal to another item that
-            // also lacks it. A distinct sentinel keeps that class separate
-            // from any real value.
-            out.push('\u{1f}');
-            match get(rk) {
-                Some(v) => out.push_str(&Self::encode_key_value(v)),
-                None => out.push_str("\u{0}none"),
-            }
-        }
+        let partition = Self::encode_key_value(get(self.hash_key_name())?);
+        let partition_hash = fnv1a_64(partition.as_bytes());
+        // The sort key is part of the identity when the schema declares one;
+        // `values_equal(None, None)` was true in the scan, so an item with no
+        // sort-key attribute is only equal to another item that also lacks it.
+        let sort = self.range_key_name().map(|rk| SortKeyPart::of(get(rk)));
         Some(RowKey {
             partition_hash,
-            encoded: out,
+            partition,
+            sort,
         })
     }
 
@@ -2223,5 +2302,72 @@ mod tests {
             restored.tables["t"].key_index,
             KeyIndex::Built { rows: 1, .. }
         ));
+    }
+
+    /// Within a partition, a Scan returns rows in sort-key order, as DynamoDB
+    /// does: numbers by value (not as text, where 10 sorts before 2), strings
+    /// by UTF-8 bytes, binaries by decoded bytes. Numerically-equal spellings
+    /// are still one key.
+    #[test]
+    fn scan_order_within_a_partition_follows_sort_key_values() {
+        let mk = |sk: Value| {
+            let mut m = HashMap::new();
+            m.insert("pk".to_string(), json!({"S": "p"}));
+            m.insert("sk".to_string(), sk);
+            m
+        };
+        let sorted = |t: &DynamoTable| -> Vec<Value> {
+            scan_after(t, None)
+                .iter()
+                .map(|i| i["sk"].clone())
+                .collect()
+        };
+
+        let mut numbers = composite_table();
+        for n in ["10", "2", "-1", "-2", "1.5", "1e1", "0", "-0.5"] {
+            numbers.put_item_at_key(mk(json!({ "N": n })));
+        }
+        // "1e1" is the same number as "10", so it overwrote that row.
+        assert_eq!(numbers.items.len(), 7);
+        assert_eq!(
+            sorted(&numbers),
+            ["-2", "-1", "-0.5", "0", "1.5", "2", "1e1"]
+                .iter()
+                .map(|n| json!({ "N": n }))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(sorted(&numbers), sorted(&without_index(&numbers)));
+
+        let mut strings = composite_table();
+        for s in ["b", "B", "aa", "a", "\u{e9}", "z"] {
+            strings.put_item_at_key(mk(json!({ "S": s })));
+        }
+        assert_eq!(
+            sorted(&strings),
+            ["B", "a", "aa", "b", "z", "\u{e9}"]
+                .iter()
+                .map(|s| json!({ "S": s }))
+                .collect::<Vec<_>>()
+        );
+
+        let mut binaries = composite_table();
+        // 0xff, 0x00 0x01, 0x7f -- as base64 their text order differs.
+        for b in ["/w==", "AAE=", "fw=="] {
+            binaries.put_item_at_key(mk(json!({ "B": b })));
+        }
+        assert_eq!(
+            sorted(&binaries),
+            ["AAE=", "fw==", "/w=="]
+                .iter()
+                .map(|b| json!({ "B": b }))
+                .collect::<Vec<_>>()
+        );
+
+        // Paging resumes by value too: after sk=2, a start key spelled 2.0.
+        let after: Vec<Value> = scan_after(&numbers, Some(&mk(json!({"N": "2.0"}))))
+            .iter()
+            .map(|i| i["sk"].clone())
+            .collect();
+        assert_eq!(after, vec![json!({"N": "1e1"})]);
     }
 }

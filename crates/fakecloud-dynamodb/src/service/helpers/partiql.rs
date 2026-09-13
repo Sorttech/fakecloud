@@ -40,7 +40,7 @@ pub(crate) fn find_outside_quotes(hay: &str, needle: &str) -> Option<usize> {
 /// sign, then integer magnitude (by length, then lexically), then the
 /// fractional part. Falls back to `Equal` only if both sides are
 /// unparseable. Handles exponent notation and negative zero.
-fn compare_number_strings(x: &str, y: &str) -> std::cmp::Ordering {
+pub(crate) fn compare_number_strings(x: &str, y: &str) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     // A malformed Number string has no defined ordering; callers that care about
     // equality (values_equal) pre-check validity, so leaving this Equal keeps
