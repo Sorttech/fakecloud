@@ -2816,6 +2816,11 @@ async fn dynamodb_scan_pagination_survives_deletes_between_pages() {
 
     let mut delivered: Vec<String> = Vec::new();
     let mut deleted_unseen: Vec<String> = Vec::new();
+    // Rows to delete ahead of the scan, one after each page, on a schedule
+    // fixed up front. Choosing them from what the scan has returned so far
+    // would let a row the scan wrongly skipped get picked, deleted and
+    // dropped from the expectation, hiding the very bug under test.
+    let mut ahead_schedule = ["item29", "item11", "item20", "item07", "item25"].into_iter();
     let mut start_key: Option<HashMap<String, AttributeValue>> = None;
     loop {
         let resp = client
@@ -2841,14 +2846,9 @@ async fn dynamodb_scan_pagination_survives_deletes_between_pages() {
         for pk in page.iter().filter(|pk| **pk != lek_pk) {
             delete(pk.clone()).await;
         }
-        // ...and one row no page has reached yet.
-        let all: Vec<String> = (0..30).map(|i| format!("item{i:02}")).collect();
-        if let Some(ahead) = all
-            .iter()
-            .find(|pk| !delivered.contains(pk) && !deleted_unseen.contains(pk))
-            .cloned()
-        {
-            if Some(&ahead) != all.last() {
+        // ...and the next scheduled row, unless a page already returned it.
+        if let Some(ahead) = ahead_schedule.next().map(str::to_string) {
+            if !delivered.contains(&ahead) {
                 delete(ahead.clone()).await;
                 deleted_unseen.push(ahead);
             }
