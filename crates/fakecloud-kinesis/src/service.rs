@@ -503,9 +503,10 @@ impl KinesisService {
         let state = accounts.get_or_create(&request.account_id);
         let stream_name = resolve_stream_name(state, &body)?;
         // A stream cannot be deleted while a channel still draws from it; AWS
-        // requires the attached channels to be deleted first.
-        let stream_arn = state.stream_arn(request.region.as_str(), &stream_name);
-        let attached_channels = state.channels_for_stream(&stream_arn);
+        // requires the attached channels to be deleted first. The guard keys
+        // off the stream name so a caller whose credential scope names a
+        // different region than the channel's source ARNs still trips it.
+        let attached_channels = state.channels_for_stream(&stream_name);
         if !attached_channels.is_empty() {
             return Err(AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -521,6 +522,7 @@ impl KinesisService {
         if stream.is_none() {
             return Err(stream_not_found(&state.account_id, &stream_name));
         }
+        let stream_arn = state.stream_arn(request.region.as_str(), &stream_name);
         state.consumers.retain(|_, c| c.stream_arn != stream_arn);
 
         Ok(AwsResponse::ok_json(json!({})))
@@ -965,13 +967,10 @@ impl KinesisService {
 
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&request.account_id);
-        let stream_name = state
-            .stream_name_from_arn(resource_arn)
-            .ok_or_else(|| resource_not_found_arn(resource_arn))?;
-        let stream = state.streams.get_mut(&stream_name).unwrap();
+        let stored = resource_tags_mut(state, resource_arn)?;
         for (key, value) in tags {
             if let Some(value) = value.as_str() {
-                stream.tags.insert(key.clone(), value.to_string());
+                stored.insert(key.clone(), value.to_string());
             }
         }
         Ok(AwsResponse::ok_json(json!({})))
@@ -987,12 +986,9 @@ impl KinesisService {
 
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&request.account_id);
-        let stream_name = state
-            .stream_name_from_arn(resource_arn)
-            .ok_or_else(|| resource_not_found_arn(resource_arn))?;
-        let stream = state.streams.get_mut(&stream_name).unwrap();
+        let stored = resource_tags_mut(state, resource_arn)?;
         for key in tag_keys.iter().filter_map(|v| v.as_str()) {
-            stream.tags.remove(key);
+            stored.remove(key);
         }
         Ok(AwsResponse::ok_json(json!({})))
     }
@@ -1005,12 +1001,7 @@ impl KinesisService {
         let accounts = self.state.read();
         let empty = KinesisState::new(&request.account_id, &request.region);
         let state = accounts.get(&request.account_id).unwrap_or(&empty);
-        let stream_name = state
-            .stream_name_from_arn(resource_arn)
-            .ok_or_else(|| resource_not_found_arn(resource_arn))?;
-        let stream = state.streams.get(&stream_name).unwrap();
-        let tags: Vec<Value> = stream
-            .tags
+        let tags: Vec<Value> = resource_tags(state, resource_arn)?
             .iter()
             .map(|(key, value)| json!({ "Key": key, "Value": value }))
             .collect();
@@ -2133,8 +2124,9 @@ impl KinesisService {
     fn create_channel(&self, request: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let body = request.json_body();
         let channel_name = require_channel_name(&body)?;
+        // `ServiceExecutionRoleARN` is a `RoleARN`, capped at 512.
         let service_execution_role_arn =
-            require_channel_member(&body, "ServiceExecutionRoleARN", 2048)?;
+            require_channel_member(&body, "ServiceExecutionRoleARN", 512)?;
         let channel_id = uuid::Uuid::new_v4().to_string();
         let destination = parse_channel_destination(&body, channel_name, &channel_id)?;
         let encryption = parse_channel_encryption(&body["EncryptionConfiguration"])?;
@@ -2219,7 +2211,6 @@ impl KinesisService {
             .as_i64()
             .unwrap_or(MAX_LIST_CHANNELS_PAGE as i64)
             .min(MAX_LIST_CHANNELS_PAGE as i64) as usize;
-        let filters = parse_channel_stream_filters(&body["StreamFilter"])?;
         let resume_after = match body["NextToken"].as_str() {
             Some(token) => Some(decode_list_channels_token(token)?),
             None => None,
@@ -2228,6 +2219,9 @@ impl KinesisService {
         let accounts = self.state.read();
         let empty = KinesisState::new(&request.account_id, &request.region);
         let state = accounts.get(&request.account_id).unwrap_or(&empty);
+        // Filters resolve source ARNs against the account's streams, so they
+        // are parsed once the state is in hand rather than off the raw body.
+        let filters = parse_channel_stream_filters(state, &body["StreamFilter"])?;
 
         // `channels` is keyed by name, so BTreeMap iteration is already the
         // name order the cursor resumes against.

@@ -800,16 +800,32 @@ async fn kinesis_subscribe_to_shard_requires_registered_consumer() {
 // awsJson1_1 HTTP with the `X-Amz-Target` header, the same way the acm-pca
 // suite drives a service with no SDK at all.
 
-const CHANNEL_AUTH: &str =
-    "AWS4-HMAC-SHA256 Credential=test/20240101/us-east-1/kinesis/aws4_request, SignedHeaders=host, Signature=0";
+/// A credential scope naming `region`, so the server resolves the caller's
+/// region the way a real SDK client configured for it would.
+fn channel_auth(region: &str) -> String {
+    format!(
+        "AWS4-HMAC-SHA256 Credential=test/20240101/{region}/kinesis/aws4_request, \
+         SignedHeaders=host, Signature=0"
+    )
+}
 
 /// POST an awsJson1_1 Kinesis action, returning `(status, parsed_body)`.
 async fn channel_op(server: &TestServer, op: &str, body: Value) -> (u16, Value) {
+    channel_op_in_region(server, "us-east-1", op, body).await
+}
+
+/// `channel_op` under a credential scope naming `region`.
+async fn channel_op_in_region(
+    server: &TestServer,
+    region: &str,
+    op: &str,
+    body: Value,
+) -> (u16, Value) {
     let resp = reqwest::Client::new()
         .post(format!("{}/", server.endpoint()))
         .header("content-type", "application/x-amz-json-1.1")
         .header("x-amz-target", format!("Kinesis_20131202.{op}"))
-        .header("authorization", CHANNEL_AUTH)
+        .header("authorization", channel_auth(region))
         .body(body.to_string())
         .send()
         .await
@@ -938,4 +954,182 @@ async fn kinesis_channel_lifecycle() {
     .await;
     assert_eq!(status, 400, "describe deleted channel: {missing}");
     assert_eq!(missing["__type"], "ResourceNotFoundException", "{missing}");
+}
+
+#[test_action("kinesis", "TagResource", checksum = "58941b22")]
+#[test_action("kinesis", "ListTagsForResource", checksum = "0eb8b1e3")]
+#[test_action("kinesis", "UntagResource", checksum = "3c1bbd62")]
+#[tokio::test]
+async fn kinesis_channel_tags() {
+    let server = TestServer::start().await;
+    let client = server.kinesis_client().await;
+
+    client
+        .create_stream()
+        .stream_name("channel-tag-stream")
+        .shard_count(1)
+        .send()
+        .await
+        .unwrap();
+    let source_arn = stream_arn(&client, "channel-tag-stream").await;
+
+    let (status, created) = channel_op(
+        &server,
+        "CreateChannel",
+        json!({
+            "ChannelName": "tagged-channel",
+            "ServiceExecutionRoleARN": "arn:aws:iam::000000000000:role/tagged-channel",
+            "StreamConfigurationList": [{
+                "StreamARN": source_arn,
+                "RecordConfiguration": { "RecordFormatType": "JSON" },
+            }],
+            "S3DestinationConfiguration": {
+                "StorageConfiguration": {
+                    "BucketARN": "arn:aws:s3:::conf-channel-bucket",
+                    "ExpectedBucketOwner": "000000000000",
+                    "CompressionType": "ZSTD",
+                }
+            },
+            "Tags": { "team": "data" },
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "create channel: {created}");
+    let channel_arn = created["ChannelDescription"]["ChannelARN"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The tags CreateChannel accepted are readable through Tags v2, whose
+    // ResourceARN covers channels as well as streams.
+    let listed = client
+        .list_tags_for_resource()
+        .resource_arn(&channel_arn)
+        .send()
+        .await
+        .unwrap();
+    assert!(listed.tags().iter().any(|t| t.key() == "team"));
+
+    client
+        .tag_resource()
+        .resource_arn(&channel_arn)
+        .tags("env", "test")
+        .send()
+        .await
+        .unwrap();
+    client
+        .untag_resource()
+        .resource_arn(&channel_arn)
+        .tag_keys("team")
+        .send()
+        .await
+        .unwrap();
+
+    let after = client
+        .list_tags_for_resource()
+        .resource_arn(&channel_arn)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(after.tags().len(), 1, "{:?}", after.tags());
+    assert_eq!(after.tags()[0].key(), "env");
+
+    // The source stream's own tags were never touched.
+    let stream_tags = client
+        .list_tags_for_resource()
+        .resource_arn(&source_arn)
+        .send()
+        .await
+        .unwrap();
+    assert!(stream_tags.tags().is_empty(), "{:?}", stream_tags.tags());
+}
+
+#[test_action("kinesis", "ListChannels", checksum = "1fbca5f2")]
+#[test_action("kinesis", "DeleteStream", checksum = "51c62afa")]
+#[tokio::test]
+async fn kinesis_channel_resolution_is_region_tolerant() {
+    let server = TestServer::start().await;
+    let client = server.kinesis_client().await;
+
+    client
+        .create_stream()
+        .stream_name("xregion-stream")
+        .shard_count(1)
+        .send()
+        .await
+        .unwrap();
+    // The stream is stored with a us-east-1 ARN; the channel is created by a
+    // caller whose credential scope is eu-west-1, naming the same stream by
+    // its own regional ARN.
+    let source_arn = stream_arn(&client, "xregion-stream").await;
+    let foreign_arn = source_arn.replace(":us-east-1:", ":eu-west-1:");
+    assert_ne!(foreign_arn, source_arn, "{source_arn}");
+
+    let (status, created) = channel_op_in_region(
+        &server,
+        "eu-west-1",
+        "CreateChannel",
+        json!({
+            "ChannelName": "xregion-channel",
+            "ServiceExecutionRoleARN": "arn:aws:iam::000000000000:role/xregion-channel",
+            "StreamConfigurationList": [{
+                "StreamARN": foreign_arn,
+                "RecordConfiguration": { "RecordFormatType": "JSON" },
+            }],
+            "S3DestinationConfiguration": {
+                "StorageConfiguration": {
+                    "BucketARN": "arn:aws:s3:::conf-channel-bucket",
+                    "ExpectedBucketOwner": "000000000000",
+                    "CompressionType": "ZSTD",
+                }
+            },
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "create channel: {created}");
+    let channel_arn = created["ChannelDescription"]["ChannelARN"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The creating client filters by the only stream ARN it knows: its own.
+    let (status, listed) = channel_op_in_region(
+        &server,
+        "eu-west-1",
+        "ListChannels",
+        json!({ "StreamFilter": [{ "StreamARN": foreign_arn }] }),
+    )
+    .await;
+    assert_eq!(status, 200, "list channels: {listed}");
+    let summaries = listed["ChannelSummaries"].as_array().unwrap();
+    assert_eq!(summaries.len(), 1, "{listed}");
+    assert_eq!(summaries[0]["ChannelName"], "xregion-channel");
+
+    // And the in-use guard holds for that same client.
+    let (status, in_use) = channel_op_in_region(
+        &server,
+        "eu-west-1",
+        "DeleteStream",
+        json!({ "StreamARN": foreign_arn }),
+    )
+    .await;
+    assert_eq!(status, 400, "delete attached stream: {in_use}");
+    assert_eq!(in_use["__type"], "ResourceInUseException", "{in_use}");
+
+    let (status, deleted) = channel_op_in_region(
+        &server,
+        "eu-west-1",
+        "DeleteChannel",
+        json!({ "ChannelARN": channel_arn }),
+    )
+    .await;
+    assert_eq!(status, 200, "delete channel: {deleted}");
+    let (status, dropped) = channel_op_in_region(
+        &server,
+        "eu-west-1",
+        "DeleteStream",
+        json!({ "StreamARN": foreign_arn }),
+    )
+    .await;
+    assert_eq!(status, 200, "delete detached stream: {dropped}");
 }

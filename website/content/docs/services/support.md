@@ -61,16 +61,25 @@ the links pointing back at fakecloud, which serves them.
 - **`GetAttachmentUploadLinks`** records a new upload (or resumes one named by
   `uploadId`, optionally narrowed to an `uploadRange`) and returns an
   `uploadId`, the `partSizeBytes` (5 MiB), the `totalParts` derived from
-  `fileSizeBytes`, the `nextIndex` still outstanding, and one presigned `PUT`
-  `url` per part with its own `expiryDate`. Each link carries its own
-  signature, recorded in state; a link that was never issued, was tampered
-  with, or has expired is refused.
+  `fileSizeBytes`, the `nextIndex` to ask for next, and one presigned `PUT`
+  `url` per part with its own `expiryDate`. At most ten links come back per
+  call, `uploadRange.endIndex` is exclusive (`{1, 4}` is parts 1, 2 and 3) and
+  a wider range is rejected, and `nextIndex` is `null` once the last part has
+  been handed out. Re-asking for a part that already has a live link returns
+  that same link rather than rotating its signature, and re-asking never
+  extends the upload's own deadline. Each link carries its own signature,
+  recorded in state; a link that was never issued, was tampered with, or has
+  expired is refused.
 - The links are real. `PUT` the part's bytes to the URL and fakecloud stores
-  them and returns the part's `ETag`, exactly as an S3 part upload does.
+  them and returns the part's `ETag`, exactly as an S3 part upload does. Every
+  part but the last must be exactly `partSizeBytes`, and the last part the
+  remainder of `fileSizeBytes`; a wrongly sized part is rejected.
 - **`CompleteAttachmentUpload`** takes the `uploadId` and the
-  `completedUploads` list of `{partIndex, eTag}`. Every part must have been
-  uploaded and every `ETag` must match what the `PUT` returned; the parts are
-  then concatenated into a real attachment, retrievable with
+  `completedUploads` list of `{partIndex, eTag}`. It can be called one part at
+  a time or with several parts at once: each named part must have been uploaded
+  with an `ETag` matching what the `PUT` returned, and the upload stays
+  `attachment-not-ready` until every part has been completed, at which point
+  the parts are concatenated into a real attachment retrievable with
   `DescribeAttachment`. Completing twice, or completing an upload whose links
   expired, returns `UploadIdNotFound`.
 - **`DescribeAttachmentUploadStatus`** reports the recorded `uploadStatus`

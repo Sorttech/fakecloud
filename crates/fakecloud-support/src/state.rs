@@ -16,10 +16,11 @@
 //! `PUT` each part -> `CompleteAttachmentUpload`) keeps its own bookkeeping in
 //! [`AttachmentUpload`]: one record per `uploadId` holding the issued part
 //! links (each with its own signature and expiry), the bytes and `ETag`
-//! actually uploaded to each link, and the terminal upload status. Download
-//! grants minted by `GetAttachmentDownloadLink` live in `attachment_downloads`
-//! keyed by the URL signature, so the data-plane route can authorise a
-//! download without re-deriving anything.
+//! actually uploaded to each link, which parts `CompleteAttachmentUpload` has
+//! been called for (it may be called one part at a time), and the terminal
+//! upload status. Download grants minted by `GetAttachmentDownloadLink` live
+//! in `attachment_downloads` keyed by the URL signature, so the data-plane
+//! route can authorise a download without re-deriving anything.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -56,9 +57,17 @@ pub struct UploadPart {
     /// uploaded.
     #[serde(default)]
     pub etag: Option<String>,
-    /// The uploaded bytes, base64-encoded, `None` until the part is uploaded.
+    /// The uploaded bytes, base64-encoded, `None` until the part is uploaded
+    /// and again once `CompleteAttachmentUpload` assembled the attachment (the
+    /// bytes live in `attachments` from then on, so keeping a second copy here
+    /// would double the upload's cost in memory and in every snapshot).
     #[serde(default)]
     pub data: Option<String>,
+    /// Whether `CompleteAttachmentUpload` has been called for this part. The
+    /// model allows completing one part per call, so completion is recorded
+    /// per part and the attachment is assembled only once every part is in.
+    #[serde(default)]
+    pub completed: bool,
 }
 
 /// A multipart attachment upload keyed by its `uploadId`.
@@ -95,17 +104,46 @@ impl AttachmentUpload {
         self.parts.iter_mut().find(|p| p.part_index == part_index)
     }
 
-    /// How many parts have been uploaded so far.
+    /// How many parts have been uploaded so far. A part counts from the moment
+    /// its bytes arrive; the completion flag keeps it counted after the
+    /// assembled attachment released the payloads.
     pub fn completed_parts(&self) -> i64 {
-        self.parts.iter().filter(|p| p.data.is_some()).count() as i64
+        self.parts
+            .iter()
+            .filter(|p| p.data.is_some() || p.completed)
+            .count() as i64
     }
 
-    /// The lowest part index that has not been uploaded yet, or `0` when every
-    /// part is in (matching the `nextIndex` sentinel the model defaults to).
-    pub fn next_index(&self) -> i64 {
-        (1..=self.total_parts)
-            .find(|i| self.part(*i).map(|p| p.data.is_none()).unwrap_or(true))
-            .unwrap_or(0)
+    /// The lowest part index whose bytes have not arrived yet, or `None` when
+    /// every part is in. Used to pick the range to hand links out for when the
+    /// caller does not name one.
+    pub fn next_unuploaded_index(&self) -> Option<i64> {
+        (1..=self.total_parts).find(|i| {
+            self.part(*i)
+                .map(|p| p.data.is_none() && !p.completed)
+                .unwrap_or(true)
+        })
+    }
+
+    /// Whether `CompleteAttachmentUpload` has now been called for every part.
+    pub fn all_parts_completed(&self) -> bool {
+        self.total_parts > 0
+            && (1..=self.total_parts).all(|i| self.part(i).map(|p| p.completed).unwrap_or(false))
+    }
+
+    /// The exact size, in bytes, part `part_index` must have: every part but
+    /// the last is exactly `part_size_bytes` and the last carries the
+    /// remainder. `None` when the upload declared no file size, in which case
+    /// there is nothing to check a part against.
+    pub fn expected_part_len(&self, part_index: i64) -> Option<i64> {
+        if self.file_size_bytes <= 0 || self.part_size_bytes <= 0 {
+            return None;
+        }
+        if part_index < self.total_parts {
+            Some(self.part_size_bytes)
+        } else {
+            Some(self.file_size_bytes - self.part_size_bytes * (self.total_parts - 1))
+        }
     }
 }
 
@@ -271,6 +309,7 @@ mod tests {
                     expiry: expiry.into(),
                     etag: Some("\"abc\"".into()),
                     data: Some("aGk=".into()),
+                    completed: false,
                 },
                 UploadPart {
                     part_index: 2,
@@ -278,6 +317,7 @@ mod tests {
                     expiry: expiry.into(),
                     etag: None,
                     data: None,
+                    completed: false,
                 },
             ],
             attachment_id: None,
@@ -319,9 +359,10 @@ mod tests {
         let u = upload("2999-01-01T00:00:00.000Z", UPLOAD_NOT_READY);
         assert_eq!(u.completed_parts(), 1);
         // Part 1 is in, so part 2 is the next one the client should upload.
-        assert_eq!(u.next_index(), 2);
+        assert_eq!(u.next_unuploaded_index(), Some(2));
         assert_eq!(u.part(1).unwrap().signature, "sig1");
         assert!(u.part(3).is_none());
+        assert!(!u.all_parts_completed());
     }
 
     #[test]
@@ -331,6 +372,37 @@ mod tests {
         part.data = Some("eA==".into());
         part.etag = Some("\"def\"".into());
         assert_eq!(u.completed_parts(), 2);
-        assert_eq!(u.next_index(), 0);
+        assert_eq!(u.next_unuploaded_index(), None);
+    }
+
+    #[test]
+    fn completion_is_tracked_per_part() {
+        let mut u = upload("2999-01-01T00:00:00.000Z", UPLOAD_NOT_READY);
+        u.part_mut(1).unwrap().completed = true;
+        // Part 2 has not been reported yet, so the upload is not assembled.
+        assert!(!u.all_parts_completed());
+        let part = u.part_mut(2).unwrap();
+        part.data = Some("eA==".into());
+        part.completed = true;
+        assert!(u.all_parts_completed());
+        // Dropping the payloads after assembly does not lose the progress.
+        for part in &mut u.parts {
+            part.data = None;
+        }
+        assert_eq!(u.completed_parts(), 2);
+    }
+
+    #[test]
+    fn expected_part_len_splits_the_declared_size() {
+        let mut u = upload("2999-01-01T00:00:00.000Z", UPLOAD_NOT_READY);
+        u.part_size_bytes = 5;
+        u.file_size_bytes = 8;
+        // Every part but the last is exactly one part size; the last carries
+        // the remainder.
+        assert_eq!(u.expected_part_len(1), Some(5));
+        assert_eq!(u.expected_part_len(2), Some(3));
+        // An upload that declared no size has nothing to check against.
+        u.file_size_bytes = 0;
+        assert_eq!(u.expected_part_len(1), None);
     }
 }

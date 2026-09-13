@@ -295,16 +295,22 @@ impl KinesisState {
             .map(|channel| channel.channel_name.clone())
     }
 
-    /// Names of the channels that draw from `stream_arn`. A stream cannot be
-    /// deleted while any channel is attached to it.
-    pub fn channels_for_stream(&self, stream_arn: &str) -> Vec<String> {
+    /// Names of the channels that draw from the stream named `stream_name`. A
+    /// stream cannot be deleted while any channel is attached to it.
+    ///
+    /// A channel stores its sources' canonical ARNs, which carry the region
+    /// of whichever credential scope created the channel. Resolving each one
+    /// through [`KinesisState::stream_name_from_arn`], the same way
+    /// `CreateChannel` resolved the caller's ARN, keeps the attachment
+    /// visible to a caller scoped to a different region, which a raw ARN
+    /// comparison would miss.
+    pub fn channels_for_stream(&self, stream_name: &str) -> Vec<String> {
         self.channels
             .values()
             .filter(|channel| {
-                channel
-                    .streams
-                    .iter()
-                    .any(|source| source.stream_arn == stream_arn)
+                channel.streams.iter().any(|source| {
+                    self.stream_name_from_arn(&source.stream_arn).as_deref() == Some(stream_name)
+                })
             })
             .map(|channel| channel.channel_name.clone())
             .collect()
@@ -551,19 +557,60 @@ mod tests {
         assert!(restored.channels.is_empty());
     }
 
+    /// A stream carrying only the members the ARN-resolution paths read.
+    fn insert_test_stream(state: &mut KinesisState, name: &str) {
+        let stream = KinesisStream {
+            stream_name: name.to_string(),
+            stream_arn: state.stream_arn(&state.region, name),
+            stream_status: "ACTIVE".to_string(),
+            stream_creation_timestamp: Utc::now(),
+            retention_period_hours: 24,
+            stream_mode: "PROVISIONED".to_string(),
+            encryption_type: "NONE".to_string(),
+            key_id: None,
+            shard_count: 0,
+            open_shard_count: 0,
+            tags: BTreeMap::new(),
+            shards: Vec::new(),
+            next_shard_index: 0,
+            enhanced_metrics: Vec::new(),
+            warm_throughput_mibps: None,
+            max_record_size_kib: None,
+        };
+        state.streams.insert(name.to_string(), stream);
+    }
+
     #[test]
     fn channels_for_stream_lists_attached_channels() {
         let mut state = KinesisState::new("123456789012", "us-east-1");
+        insert_test_stream(&mut state, "orders");
+        insert_test_stream(&mut state, "other");
         let channel = test_channel(&state, "deliveries");
         state.channels.insert("deliveries".to_string(), channel);
 
         assert_eq!(
-            state.channels_for_stream(&state.stream_arn(&state.region, "orders")),
+            state.channels_for_stream("orders"),
             vec!["deliveries".to_string()]
         );
-        assert!(state
-            .channels_for_stream(&state.stream_arn(&state.region, "other"))
-            .is_empty());
+        assert!(state.channels_for_stream("other").is_empty());
+    }
+
+    #[test]
+    fn channels_for_stream_ignores_the_source_arns_region() {
+        // The channel was created by a caller scoped to us-east-1, so it holds
+        // a us-east-1 source ARN; a caller scoped elsewhere still resolves to
+        // the same stream name and must see the attachment.
+        let mut state = KinesisState::new("123456789012", "eu-west-1");
+        insert_test_stream(&mut state, "orders");
+        let mut channel = test_channel(&state, "deliveries");
+        channel.streams[0].stream_arn =
+            "arn:aws:kinesis:us-east-1:123456789012:stream/orders".to_string();
+        state.channels.insert("deliveries".to_string(), channel);
+
+        assert_eq!(
+            state.channels_for_stream("orders"),
+            vec!["deliveries".to_string()]
+        );
     }
 
     #[test]

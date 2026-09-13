@@ -84,6 +84,12 @@ pub const LINK_TTL_SECONDS: i64 = 3600;
 /// part size and the value the Support console uses.
 pub const DEFAULT_PART_SIZE_BYTES: i64 = 5 * 1024 * 1024;
 
+/// How many presigned upload URLs one `GetAttachmentUploadLinks` call returns
+/// at most. The model caps both the response list ("The list contains at most
+/// 10 URLs per call") and the requested range (`endIndex - startIndex` "must
+/// not exceed 10") at the same number.
+pub const MAX_UPLOAD_URLS_PER_CALL: i64 = 10;
+
 /// The `X-Amz-Credential` access-key id used when the caller presented none
 /// (unsigned requests are accepted by default). Matches AWS's documented
 /// example key so the link keeps a realistic shape.

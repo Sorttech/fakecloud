@@ -9,9 +9,11 @@
 //! `AttachmentSetIdNotFound`.
 //!
 //! Attachment uploads are the presigned flow: `GetAttachmentUploadLinks`
-//! records an upload and hands out one presigned `PUT` link per part,
-//! `CompleteAttachmentUpload` verifies the parts and their `ETag`s and
-//! assembles the attachment, `DescribeAttachmentUploadStatus` reports the
+//! records an upload and hands out presigned `PUT` links, at most ten per call,
+//! for one half-open range of parts; `CompleteAttachmentUpload` verifies the
+//! parts named in it against their uploaded `ETag`s and assembles the
+//! attachment once every part has been reported (it may be called one part at
+//! a time); `DescribeAttachmentUploadStatus` reports the
 //! recorded progress, and `GetAttachmentDownloadLink` mints a presigned `GET`
 //! link for a stored attachment. The links point back at this fakecloud and
 //! are served by [`crate::dataplane`], so they really do transfer bytes.
@@ -40,6 +42,7 @@ use crate::shared::{
     attachment_download_path, current_year, display_id, iso_in, iso_now, new_attachment_id,
     new_attachment_set_id, new_case_id, new_signature, new_upload_id, presigned_url, str_member,
     upload_part_path, DEFAULT_PART_SIZE_BYTES, EXAMPLE_ACCESS_KEY_ID, LINK_TTL_SECONDS,
+    MAX_UPLOAD_URLS_PER_CALL,
 };
 use crate::state::{
     AttachmentUpload, DownloadGrant, SharedSupportState, SupportData, UploadPart, UPLOAD_FAILED,
@@ -586,10 +589,16 @@ impl SupportService {
 
     // ---- Presigned attachment uploads / downloads -------------------------
 
-    /// Start (or resume) a multipart attachment upload and hand out one
-    /// presigned `PUT` link per part. Every link is recorded in state with its
-    /// own signature and expiry, so the data-plane route can authorise the
+    /// Start (or resume) a multipart attachment upload and hand out presigned
+    /// `PUT` links for one range of parts. Every link is recorded in state with
+    /// its own signature and expiry, so the data-plane route can authorise the
     /// `PUT` that follows.
+    ///
+    /// `uploadRange` is half-open: `startIndex` is inclusive, `endIndex` is
+    /// exclusive, and the range may cover at most [`MAX_UPLOAD_URLS_PER_CALL`]
+    /// parts, which is also the cap on a call that names no range. A caller
+    /// pages through a large file by feeding the returned `nextIndex` back as
+    /// the next `startIndex`.
     fn get_attachment_upload_links(
         &self,
         req: &AwsRequest,
@@ -619,7 +628,9 @@ impl SupportService {
             let endpoint = link_endpoint(req, d);
             let region = link_region(req, d);
 
-            let upload_id = match &requested_upload {
+            // A new upload is built but not stored until the requested range
+            // has been validated, so a rejected call leaves no orphan behind.
+            let (upload_id, new_upload) = match &requested_upload {
                 Some(id) => {
                     let existing = d
                         .attachment_uploads
@@ -631,7 +642,7 @@ impl SupportService {
                     if existing.status == UPLOAD_FAILED || existing.expiry <= now {
                         return Err(upload_expired(id));
                     }
-                    id.clone()
+                    (id.clone(), None)
                 }
                 None => {
                     let id = new_upload_id();
@@ -642,10 +653,10 @@ impl SupportService {
                     } else {
                         (file_size as u64).div_ceil(DEFAULT_PART_SIZE_BYTES as u64) as i64
                     };
-                    d.attachment_uploads.insert(
+                    (
                         id.clone(),
-                        AttachmentUpload {
-                            upload_id: id.clone(),
+                        Some(AttachmentUpload {
+                            upload_id: id,
                             file_name: file_name.clone(),
                             file_size_bytes: file_size.max(0),
                             part_size_bytes: DEFAULT_PART_SIZE_BYTES,
@@ -654,27 +665,71 @@ impl SupportService {
                             expiry: expiry.clone(),
                             parts: Vec::new(),
                             attachment_id: None,
-                        },
-                    );
-                    id
+                        }),
+                    )
                 }
             };
+
+            // Without an explicit start, resume at the first part whose bytes
+            // have not arrived; `endIndex` is exclusive and defaults to a full
+            // page of links, capped by the part count.
+            let (total_parts, default_start) = match &new_upload {
+                Some(upload) => (upload.total_parts, 1),
+                None => {
+                    let upload = &d.attachment_uploads[&upload_id];
+                    (
+                        upload.total_parts,
+                        upload.next_unuploaded_index().unwrap_or(1),
+                    )
+                }
+            };
+            let start = range_start.unwrap_or(default_start);
+            let end = range_end.unwrap_or(start + MAX_UPLOAD_URLS_PER_CALL);
+            let end = validate_upload_range(&upload_id, start, end, total_parts)?;
+            if let Some(upload) = new_upload {
+                d.attachment_uploads.insert(upload_id.clone(), upload);
+            }
 
             let upload = d
                 .attachment_uploads
                 .get_mut(&upload_id)
                 .expect("upload was just inserted or looked up");
-            let total_parts = upload.total_parts;
-            // Without an explicit range, hand out links for everything that is
-            // still outstanding.
-            let start = range_start
-                .unwrap_or_else(|| upload.next_index().max(1))
-                .clamp(1, total_parts);
-            let end = range_end.unwrap_or(total_parts).clamp(start, total_parts);
+            // A part link never outlives the upload it belongs to, so an
+            // upload's deadline cannot be pushed back by asking for links
+            // again.
+            let link_expiry = expiry.min(upload.expiry.clone());
 
             let mut upload_urls = Vec::new();
-            for part_index in start..=end {
-                let signature = new_signature();
+            for part_index in start..end {
+                // A part that already has a live link keeps it: the caller may
+                // still be uploading to the URL it was handed, and rotating the
+                // signature would break it mid-flight. Only a part with no link
+                // yet, or one whose link has expired, gets a fresh signature.
+                let reusable = upload
+                    .part(part_index)
+                    .filter(|p| p.expiry > now)
+                    .map(|p| (p.signature.clone(), p.expiry.clone()));
+                let (signature, part_expiry) = match reusable {
+                    Some(existing) => existing,
+                    None => {
+                        let signature = new_signature();
+                        match upload.part_mut(part_index) {
+                            Some(part) => {
+                                part.signature = signature.clone();
+                                part.expiry = link_expiry.clone();
+                            }
+                            None => upload.parts.push(UploadPart {
+                                part_index,
+                                signature: signature.clone(),
+                                expiry: link_expiry.clone(),
+                                etag: None,
+                                data: None,
+                                completed: false,
+                            }),
+                        }
+                        (signature, link_expiry.clone())
+                    }
+                };
                 let url = presigned_url(
                     &endpoint,
                     &upload_part_path(&account, &upload_id, part_index),
@@ -683,46 +738,40 @@ impl SupportService {
                     &signature,
                     LINK_TTL_SECONDS,
                 );
-                // Re-issuing a link for a part that already has one replaces
-                // its signature: the old link stops working, the uploaded
-                // bytes (if any) are kept so a resume does not lose them.
-                if upload.part(part_index).is_some() {
-                    let part = upload.part_mut(part_index).expect("checked above");
-                    part.signature = signature;
-                    part.expiry = expiry.clone();
-                } else {
-                    upload.parts.push(UploadPart {
-                        part_index,
-                        signature,
-                        expiry: expiry.clone(),
-                        etag: None,
-                        data: None,
-                    });
-                }
                 upload_urls.push(json!({
                     "url": url,
                     "partIndex": part_index,
-                    "expiryDate": expiry,
+                    "expiryDate": part_expiry,
                 }));
             }
             upload.parts.sort_by_key(|p| p.part_index);
-            upload.expiry = expiry.clone();
 
+            // `nextIndex` is where the caller should ask for the next page of
+            // links: the part after the last one this call covered, or null
+            // once links for every part have been returned.
+            let next_index = if end > total_parts {
+                Value::Null
+            } else {
+                json!(end)
+            };
             Ok(ok(json!({
                 "uploadId": upload_id,
                 "partSizeBytes": upload.part_size_bytes,
                 "totalParts": total_parts,
-                "nextIndex": upload.next_index(),
+                "nextIndex": next_index,
                 "uploadUrls": upload_urls,
             })))
         })
     }
 
-    /// Finalise an upload: every part must have been `PUT` to its link and the
-    /// client must echo back the `ETag` each `PUT` returned. On success the
-    /// parts are concatenated into a real attachment, retrievable with
-    /// `DescribeAttachment` / `GetAttachmentDownloadLink` and attachable to a
-    /// case through `uploadIds`.
+    /// Report one or more parts of an upload as complete. Each named part must
+    /// have been `PUT` to its link and the client must echo back the `ETag`
+    /// that `PUT` returned; the model allows one part per call or several, so
+    /// only the parts named here are validated and recorded. Once every part
+    /// has been reported the parts are concatenated into a real attachment,
+    /// retrievable with `DescribeAttachment` / `GetAttachmentDownloadLink` and
+    /// attachable to a case through `uploadIds`; until then the upload stays
+    /// `attachment-not-ready`.
     fn complete_attachment_upload(
         &self,
         req: &AwsRequest,
@@ -749,12 +798,9 @@ impl SupportService {
         let now = iso_now();
 
         self.with_account_mut(req, |d| {
-            // Clone the record so the checks below can run while the
-            // attachment map is mutated afterwards.
             let upload = d
                 .attachment_uploads
-                .get(&upload_id)
-                .cloned()
+                .get_mut(&upload_id)
                 .ok_or_else(|| upload_id_not_found(&upload_id))?;
             if upload.status == UPLOAD_READY {
                 return Err(upload_already_completed(&upload_id));
@@ -762,56 +808,73 @@ impl SupportService {
             if upload.status == UPLOAD_FAILED || upload.expiry <= now {
                 return Err(upload_expired(&upload_id));
             }
-
-            for (part_index, _) in &claimed {
-                if upload.part(*part_index).is_none() {
-                    return Err(validation_error(format!(
-                        "Upload {upload_id} has no part {part_index}."
-                    )));
-                }
+            // A call that names no part would report nothing as complete;
+            // `completedUploads` is required precisely so it says which parts
+            // this call finishes.
+            if claimed.is_empty() {
+                return Err(validation_error(format!(
+                    "completedUploads must name at least one part of upload {upload_id}."
+                )));
             }
 
-            let mut bytes: Vec<u8> = Vec::new();
-            for part_index in 1..=upload.total_parts {
-                let part = upload.part(part_index).ok_or_else(|| {
-                    validation_error(format!(
-                        "No upload link was issued for part {part_index} of upload {upload_id}."
-                    ))
+            // Validate every part named in this call before recording any of
+            // them, so a call that names a bad part changes nothing.
+            for (part_index, claimed_etag) in &claimed {
+                let part = upload.part(*part_index).ok_or_else(|| {
+                    validation_error(format!("Upload {upload_id} has no part {part_index}."))
                 })?;
-                let (Some(stored_etag), Some(data)) = (&part.etag, &part.data) else {
+                let (Some(stored_etag), Some(_)) = (&part.etag, &part.data) else {
                     return Err(validation_error(format!(
                         "Part {part_index} of upload {upload_id} was never uploaded."
                     )));
                 };
-                let claimed_etag = claimed
-                    .iter()
-                    .find(|(i, _)| *i == part_index)
-                    .map(|(_, tag)| tag.as_str())
-                    .ok_or_else(|| {
-                        validation_error(format!(
-                            "completedUploads is missing part {part_index} of upload {upload_id}."
-                        ))
-                    })?;
                 if !etags_match(stored_etag, claimed_etag) {
                     return Err(validation_error(format!(
                         "The eTag given for part {part_index} of upload {upload_id} does not match the uploaded part."
                     )));
                 }
-                let mut decoded = base64::engine::general_purpose::STANDARD
-                    .decode(data)
-                    .map_err(|err| {
-                        internal_server_error(format!(
-                            "part {part_index} of upload {upload_id} could not be decoded: {err}"
-                        ))
-                    })?;
-                bytes.append(&mut decoded);
+            }
+            for (part_index, _) in &claimed {
+                if let Some(part) = upload.part_mut(*part_index) {
+                    part.completed = true;
+                }
+            }
+
+            // The service assembles the file only after every part has been
+            // reported; until then the upload keeps accepting further calls.
+            if !upload.all_parts_completed() {
+                return Ok(ok(json!({ "uploadStatus": UPLOAD_NOT_READY })));
+            }
+
+            // Take the parts out rather than cloning them: the payloads are
+            // the whole file, and once it is assembled they are dropped so the
+            // bytes are not kept twice in memory and in every snapshot.
+            let mut parts = std::mem::take(&mut upload.parts);
+            let file_name = upload.file_name.clone();
+            let file_size_bytes = upload.file_size_bytes;
+            let total_parts = upload.total_parts;
+
+            let bytes = match assemble_parts(&upload_id, &parts, total_parts, file_size_bytes) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    // Put the parts back so the uploaded bytes are not lost and
+                    // the caller can retry.
+                    d.attachment_uploads
+                        .get_mut(&upload_id)
+                        .expect("looked up above")
+                        .parts = parts;
+                    return Err(err);
+                }
+            };
+            for part in &mut parts {
+                part.data = None;
             }
 
             let attachment_id = new_attachment_id();
             d.attachments.insert(
                 attachment_id.clone(),
                 json!({
-                    "fileName": upload.file_name,
+                    "fileName": file_name,
                     "data": base64::engine::general_purpose::STANDARD.encode(&bytes),
                 }),
             );
@@ -819,6 +882,7 @@ impl SupportService {
                 .attachment_uploads
                 .get_mut(&upload_id)
                 .expect("looked up above");
+            stored.parts = parts;
             stored.status = UPLOAD_READY.to_string();
             stored.attachment_id = Some(attachment_id);
 
@@ -839,8 +903,8 @@ impl SupportService {
                 .get(&upload_id)
                 .ok_or_else(|| upload_id_not_found(&upload_id))?;
             // An upload whose links expired before it was completed can never
-            // be completed, so report it as failed even though the sweep that
-            // records that only runs on load.
+            // be completed, so report it as failed even when the sweep that
+            // records that has not run since it expired.
             let status = if upload.status == UPLOAD_NOT_READY && upload.expiry <= now {
                 UPLOAD_FAILED
             } else {
@@ -892,6 +956,11 @@ impl SupportService {
                 &signature,
                 LINK_TTL_SECONDS,
             );
+            // Each link mints a grant keyed by its own signature, so a
+            // long-running process would otherwise accumulate dead grants
+            // until the next snapshot load swept them. Settle the expired ones
+            // (grants and uploads alike) before adding another.
+            d.reconcile();
             d.attachment_downloads.insert(
                 signature,
                 DownloadGrant {
@@ -1123,6 +1192,82 @@ fn link_region(req: &AwsRequest, d: &SupportData) -> String {
     } else {
         req.region.clone()
     }
+}
+
+/// Resolve the half-open `uploadRange` a `GetAttachmentUploadLinks` call asked
+/// for into the exclusive end index to hand links out up to. `startIndex` is
+/// inclusive and `endIndex` exclusive, the range covers at most
+/// [`MAX_UPLOAD_URLS_PER_CALL`] parts, and an end past the last part is capped
+/// there rather than refused (the file simply has fewer parts left).
+fn validate_upload_range(
+    upload_id: &str,
+    start: i64,
+    end: i64,
+    total_parts: i64,
+) -> Result<i64, AwsServiceError> {
+    if start < 1 {
+        return Err(validation_error(
+            "uploadRange.startIndex must be at least 1; part indexes start at 1.",
+        ));
+    }
+    if start > total_parts {
+        return Err(validation_error(format!(
+            "uploadRange.startIndex {start} is past the last part of upload {upload_id}, which has {total_parts} parts."
+        )));
+    }
+    if end <= start {
+        return Err(validation_error(format!(
+            "uploadRange.endIndex {end} must be greater than startIndex {start}; endIndex is exclusive."
+        )));
+    }
+    if end - start > MAX_UPLOAD_URLS_PER_CALL {
+        return Err(validation_error(format!(
+            "uploadRange size (endIndex - startIndex) must not exceed {MAX_UPLOAD_URLS_PER_CALL}."
+        )));
+    }
+    Ok(end.min(total_parts + 1))
+}
+
+/// Concatenate an upload's parts into the file they make up. Every part must
+/// still hold its bytes, and the assembled length must be the `fileSizeBytes`
+/// the upload declared (an upload that declared none has nothing to check).
+fn assemble_parts(
+    upload_id: &str,
+    parts: &[UploadPart],
+    total_parts: i64,
+    file_size_bytes: i64,
+) -> Result<Vec<u8>, AwsServiceError> {
+    let mut bytes: Vec<u8> = Vec::new();
+    for part_index in 1..=total_parts {
+        let part = parts
+            .iter()
+            .find(|p| p.part_index == part_index)
+            .ok_or_else(|| {
+                validation_error(format!(
+                    "No upload link was issued for part {part_index} of upload {upload_id}."
+                ))
+            })?;
+        let Some(data) = &part.data else {
+            return Err(validation_error(format!(
+                "Part {part_index} of upload {upload_id} was never uploaded."
+            )));
+        };
+        let mut decoded = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .map_err(|err| {
+                internal_server_error(format!(
+                    "part {part_index} of upload {upload_id} could not be decoded: {err}"
+                ))
+            })?;
+        bytes.append(&mut decoded);
+    }
+    if file_size_bytes > 0 && bytes.len() as i64 != file_size_bytes {
+        return Err(validation_error(format!(
+            "The parts of upload {upload_id} assemble to {} bytes, but the upload declared {file_size_bytes} bytes.",
+            bytes.len()
+        )));
+    }
+    Ok(bytes)
 }
 
 /// Compare an `ETag` the client echoed back against the one the data plane
@@ -1532,8 +1677,9 @@ mod tests {
         assert!(links["uploadId"].as_str().unwrap().starts_with("upload-"));
         assert_eq!(links["partSizeBytes"], 5 * 1024 * 1024);
         assert_eq!(links["totalParts"], 1);
-        // Nothing uploaded yet, so part 1 is still outstanding.
-        assert_eq!(links["nextIndex"], 1);
+        // The only part's URL was returned, so there is no next page to ask
+        // for.
+        assert!(links["nextIndex"].is_null(), "{links}");
         let url = links["uploadUrls"][0]["url"].as_str().unwrap();
         assert!(url.contains("/_fakecloud/support/attachments/uploads/000000000000/"));
         assert!(url.contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"));
@@ -1633,6 +1779,16 @@ mod tests {
         );
     }
 
+    /// The part indexes a `GetAttachmentUploadLinks` response handed out.
+    fn issued_parts(links: &Value) -> Vec<i64> {
+        links["uploadUrls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|u| u["partIndex"].as_i64().unwrap())
+            .collect()
+    }
+
     #[test]
     fn multipart_upload_splits_into_five_mib_parts() {
         let svc = service();
@@ -1644,11 +1800,29 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(links["totalParts"], 3);
-        assert_eq!(links["uploadUrls"].as_array().unwrap().len(), 3);
+        assert_eq!(issued_parts(&links), vec![1, 2, 3]);
+        assert!(links["nextIndex"].is_null(), "{links}");
 
-        // A resume asks for a sub-range of the same upload.
+        // A resume asks for a sub-range of the same upload. `endIndex` is
+        // exclusive, so 2..4 is parts 2 and 3.
         let upload_id = links["uploadId"].as_str().unwrap().to_string();
         let resumed = body_of(
+            &svc.get_attachment_upload_links(
+                &req("GetAttachmentUploadLinks", json!({})),
+                &json!({
+                    "fileName": "big.bin",
+                    "uploadId": upload_id,
+                    "uploadRange": { "startIndex": 2, "endIndex": 4 },
+                }),
+            )
+            .unwrap(),
+        );
+        assert_eq!(resumed["uploadId"], upload_id);
+        assert_eq!(issued_parts(&resumed), vec![2, 3]);
+        assert!(resumed["nextIndex"].is_null(), "{resumed}");
+
+        // A one-part range is startIndex..startIndex + 1.
+        let single = body_of(
             &svc.get_attachment_upload_links(
                 &req("GetAttachmentUploadLinks", json!({})),
                 &json!({
@@ -1659,14 +1833,184 @@ mod tests {
             )
             .unwrap(),
         );
-        assert_eq!(resumed["uploadId"], upload_id);
-        let parts: Vec<i64> = resumed["uploadUrls"]
-            .as_array()
+        assert_eq!(issued_parts(&single), vec![2]);
+        // Part 3 still has no URL from this call, so that is where the caller
+        // picks up.
+        assert_eq!(single["nextIndex"], 3, "{single}");
+    }
+
+    #[test]
+    fn upload_links_are_paged_ten_at_a_time() {
+        let svc = service();
+        // 25 parts: far more than one call may hand out.
+        let links = body_of(
+            &svc.get_attachment_upload_links(
+                &req("GetAttachmentUploadLinks", json!({})),
+                &json!({ "fileName": "huge.bin", "fileSizeBytes": 121 * 1024 * 1024 }),
+            )
+            .unwrap(),
+        );
+        assert_eq!(links["totalParts"], 25);
+        assert_eq!(issued_parts(&links), (1..=10).collect::<Vec<i64>>());
+        assert_eq!(links["nextIndex"], 11, "{links}");
+
+        // Paging with the returned nextIndex walks the rest of the file.
+        let upload_id = links["uploadId"].as_str().unwrap().to_string();
+        let mut next = links["nextIndex"].as_i64().unwrap();
+        let mut seen: Vec<i64> = (1..=10).collect();
+        while next != 0 {
+            let page = body_of(
+                &svc.get_attachment_upload_links(
+                    &req("GetAttachmentUploadLinks", json!({})),
+                    &json!({
+                        "fileName": "huge.bin",
+                        "uploadId": upload_id,
+                        "uploadRange": { "startIndex": next },
+                    }),
+                )
+                .unwrap(),
+            );
+            seen.extend(issued_parts(&page));
+            next = page["nextIndex"].as_i64().unwrap_or(0);
+        }
+        assert_eq!(seen, (1..=25).collect::<Vec<i64>>());
+    }
+
+    #[test]
+    fn upload_range_is_validated() {
+        let svc = service();
+        let links = body_of(
+            &svc.get_attachment_upload_links(
+                &req("GetAttachmentUploadLinks", json!({})),
+                &json!({ "fileName": "huge.bin", "fileSizeBytes": 121 * 1024 * 1024 }),
+            )
+            .unwrap(),
+        );
+        let upload_id = links["uploadId"].as_str().unwrap().to_string();
+        let range = |start: i64, end: i64| {
+            json!({
+                "fileName": "huge.bin",
+                "uploadId": upload_id,
+                "uploadRange": { "startIndex": start, "endIndex": end },
+            })
+        };
+
+        // More than ten URLs in one call.
+        let err = expect_err(svc.get_attachment_upload_links(
+            &req("GetAttachmentUploadLinks", json!({})),
+            &range(1, 12),
+        ));
+        assert!(format!("{err:?}").contains("must not exceed 10"), "{err:?}");
+
+        // An empty or inverted half-open range.
+        let err = expect_err(svc.get_attachment_upload_links(
+            &req("GetAttachmentUploadLinks", json!({})),
+            &range(3, 3),
+        ));
+        assert!(
+            format!("{err:?}").contains("must be greater than startIndex"),
+            "{err:?}"
+        );
+
+        // A start past the last part.
+        let err = expect_err(svc.get_attachment_upload_links(
+            &req("GetAttachmentUploadLinks", json!({})),
+            &range(26, 27),
+        ));
+        assert!(format!("{err:?}").contains("past the last part"), "{err:?}");
+
+        // Exactly ten is allowed, and an end past the last part is capped
+        // there rather than refused.
+        let ok_page = body_of(
+            &svc.get_attachment_upload_links(
+                &req("GetAttachmentUploadLinks", json!({})),
+                &range(16, 26),
+            )
+            .unwrap(),
+        );
+        assert_eq!(issued_parts(&ok_page), (16..=25).collect::<Vec<i64>>());
+        assert!(ok_page["nextIndex"].is_null(), "{ok_page}");
+        let capped = body_of(
+            &svc.get_attachment_upload_links(
+                &req("GetAttachmentUploadLinks", json!({})),
+                &range(24, 34),
+            )
+            .unwrap(),
+        );
+        assert_eq!(issued_parts(&capped), vec![24, 25]);
+    }
+
+    #[test]
+    fn reissued_links_keep_the_signature_and_the_upload_deadline() {
+        let svc = service();
+        let links = body_of(
+            &svc.get_attachment_upload_links(
+                &req("GetAttachmentUploadLinks", json!({})),
+                &json!({ "fileName": "big.bin", "fileSizeBytes": 6 * 1024 * 1024 }),
+            )
+            .unwrap(),
+        );
+        let upload_id = links["uploadId"].as_str().unwrap().to_string();
+        let first_signature = signature_of(links["uploadUrls"][0]["url"].as_str().unwrap());
+        let deadline = svc
+            .state
+            .read()
+            .get("000000000000")
             .unwrap()
-            .iter()
-            .map(|u| u["partIndex"].as_i64().unwrap())
-            .collect();
-        assert_eq!(parts, vec![2, 3]);
+            .attachment_uploads[&upload_id]
+            .expiry
+            .clone();
+
+        let again = body_of(
+            &svc.get_attachment_upload_links(
+                &req("GetAttachmentUploadLinks", json!({})),
+                &json!({ "fileName": "big.bin", "uploadId": upload_id }),
+            )
+            .unwrap(),
+        );
+        // The URL the caller may already be uploading to still works: the
+        // signature was reused rather than rotated.
+        assert_eq!(
+            signature_of(again["uploadUrls"][0]["url"].as_str().unwrap()),
+            first_signature
+        );
+        // And asking again does not push the upload's own deadline back.
+        assert_eq!(
+            svc.state
+                .read()
+                .get("000000000000")
+                .unwrap()
+                .attachment_uploads[&upload_id]
+                .expiry,
+            deadline
+        );
+
+        // A part whose link expired does get a fresh signature, but never one
+        // that outlives the upload.
+        svc.state
+            .write()
+            .get_mut("000000000000")
+            .unwrap()
+            .attachment_uploads
+            .get_mut(&upload_id)
+            .unwrap()
+            .part_mut(1)
+            .unwrap()
+            .expiry = "2000-01-01T00:00:00.000Z".to_string();
+        let rotated = body_of(
+            &svc.get_attachment_upload_links(
+                &req("GetAttachmentUploadLinks", json!({})),
+                &json!({ "fileName": "big.bin", "uploadId": upload_id }),
+            )
+            .unwrap(),
+        );
+        assert_ne!(
+            signature_of(rotated["uploadUrls"][0]["url"].as_str().unwrap()),
+            first_signature
+        );
+        let guard = svc.state.read();
+        let upload = &guard.get("000000000000").unwrap().attachment_uploads[&upload_id];
+        assert!(upload.part(1).unwrap().expiry <= upload.expiry);
     }
 
     #[test]
@@ -1752,7 +2096,10 @@ mod tests {
             &req("CompleteAttachmentUpload", json!({})),
             &json!({ "uploadId": upload_id, "completedUploads": [] }),
         ));
-        assert!(format!("{err:?}").contains("missing part 1"));
+        assert!(
+            format!("{err:?}").contains("must name at least one part"),
+            "{err:?}"
+        );
 
         // Part index that was never issued.
         let err = expect_err(svc.complete_attachment_upload(
@@ -1793,8 +2140,106 @@ mod tests {
         assert_eq!(completed["uploadStatus"], "attachment-ready");
     }
 
+    /// Upload part `part_index` of `upload_id` over its presigned link,
+    /// returning the `ETag` the data plane issued.
+    fn put_part(svc: &SupportService, links: &Value, part_index: i64, bytes: &[u8]) -> String {
+        let upload_id = links["uploadId"].as_str().unwrap();
+        let url = links["uploadUrls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|u| u["partIndex"].as_i64() == Some(part_index))
+            .expect("a link was issued for this part")["url"]
+            .as_str()
+            .unwrap();
+        match crate::dataplane::put_upload_part(
+            &svc.state,
+            "000000000000",
+            upload_id,
+            part_index,
+            &signature_of(url),
+            bytes,
+        ) {
+            crate::dataplane::PutPartOutcome::Stored(tag) => tag,
+            other => panic!("expected the part to be stored, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn completing_before_every_part_is_uploaded_is_rejected() {
+    fn completing_reports_parts_one_call_at_a_time() {
+        let svc = service();
+        // Two parts: a full 5 MiB one and a 1 MiB remainder.
+        let first = vec![b'a'; 5 * 1024 * 1024];
+        let second = vec![b'b'; 1024 * 1024];
+        let links = body_of(
+            &svc.get_attachment_upload_links(
+                &req("GetAttachmentUploadLinks", json!({})),
+                &json!({
+                    "fileName": "big.bin",
+                    "fileSizeBytes": first.len() + second.len(),
+                }),
+            )
+            .unwrap(),
+        );
+        let upload_id = links["uploadId"].as_str().unwrap().to_string();
+        let first_etag = put_part(&svc, &links, 1, &first);
+
+        // The model allows completing one part per call: reporting part 1
+        // alone succeeds and leaves the upload pending.
+        let pending = body_of(
+            &svc.complete_attachment_upload(
+                &req("CompleteAttachmentUpload", json!({})),
+                &json!({
+                    "uploadId": upload_id,
+                    "completedUploads": [{ "partIndex": 1, "eTag": first_etag }],
+                }),
+            )
+            .unwrap(),
+        );
+        assert_eq!(pending["uploadStatus"], "attachment-not-ready");
+        assert!(svc
+            .state
+            .read()
+            .get("000000000000")
+            .unwrap()
+            .attachment_uploads[&upload_id]
+            .attachment_id
+            .is_none());
+
+        // Part 2 is still uploadable, and reporting it finishes the upload.
+        let second_etag = put_part(&svc, &links, 2, &second);
+        let completed = body_of(
+            &svc.complete_attachment_upload(
+                &req("CompleteAttachmentUpload", json!({})),
+                &json!({
+                    "uploadId": upload_id,
+                    "completedUploads": [{ "partIndex": 2, "eTag": second_etag }],
+                }),
+            )
+            .unwrap(),
+        );
+        assert_eq!(completed["uploadStatus"], "attachment-ready");
+
+        let guard = svc.state.read();
+        let data = guard.get("000000000000").unwrap();
+        let upload = &data.attachment_uploads[&upload_id];
+        // The assembled file is both parts, in order.
+        let attachment_id = upload.attachment_id.clone().unwrap();
+        let stored = base64::engine::general_purpose::STANDARD
+            .decode(data.attachments[&attachment_id]["data"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(stored.len(), first.len() + second.len());
+        assert_eq!(stored[0], b'a');
+        assert_eq!(stored[stored.len() - 1], b'b');
+        // The part payloads are released once the attachment holds the bytes,
+        // so the file is not kept twice in memory or in the snapshot.
+        assert!(upload.parts.iter().all(|p| p.data.is_none()));
+        // Progress still reads as complete even though the payloads are gone.
+        assert_eq!(upload.completed_parts(), 2);
+    }
+
+    #[test]
+    fn completing_a_part_that_was_never_uploaded_is_rejected() {
         let svc = service();
         let links = body_of(
             &svc.get_attachment_upload_links(
@@ -1804,26 +2249,116 @@ mod tests {
             .unwrap(),
         );
         let upload_id = links["uploadId"].as_str().unwrap().to_string();
-        let signature = signature_of(links["uploadUrls"][0]["url"].as_str().unwrap());
-        let etag = match crate::dataplane::put_upload_part(
-            &svc.state,
-            "000000000000",
-            &upload_id,
-            1,
-            &signature,
-            b"first",
-        ) {
-            crate::dataplane::PutPartOutcome::Stored(tag) => tag,
-            other => panic!("expected the part to be stored, got {other:?}"),
-        };
         let err = expect_err(svc.complete_attachment_upload(
             &req("CompleteAttachmentUpload", json!({})),
             &json!({
                 "uploadId": upload_id,
-                "completedUploads": [{ "partIndex": 1, "eTag": etag }],
+                "completedUploads": [{ "partIndex": 2, "eTag": "\"x\"" }],
             }),
         ));
-        assert!(format!("{err:?}").contains("Part 2"));
+        assert!(format!("{err:?}").contains("was never uploaded"), "{err:?}");
+        // The rejected call recorded nothing.
+        assert!(
+            !svc.state
+                .read()
+                .get("000000000000")
+                .unwrap()
+                .attachment_uploads[&upload_id]
+                .part(2)
+                .unwrap()
+                .completed
+        );
+    }
+
+    #[test]
+    fn assembling_a_corrupt_upload_keeps_the_parts() {
+        let svc = service();
+        let (upload_id, completed_uploads) = upload_one_part(&svc, "log.txt", b"hello");
+        // Shorten the stored payload behind the data plane's back: the parts no
+        // longer add up to the declared file size.
+        svc.state
+            .write()
+            .get_mut("000000000000")
+            .unwrap()
+            .attachment_uploads
+            .get_mut(&upload_id)
+            .unwrap()
+            .part_mut(1)
+            .unwrap()
+            .data = Some(base64::engine::general_purpose::STANDARD.encode(b"hi"));
+        let err = expect_err(svc.complete_attachment_upload(
+            &req("CompleteAttachmentUpload", json!({})),
+            &json!({ "uploadId": upload_id, "completedUploads": completed_uploads }),
+        ));
+        assert!(format!("{err:?}").contains("declared 5 bytes"), "{err:?}");
+        // The failed assembly did not drop the uploaded bytes.
+        let guard = svc.state.read();
+        let upload = &guard.get("000000000000").unwrap().attachment_uploads[&upload_id];
+        assert_eq!(upload.parts.len(), 1);
+        assert!(upload.part(1).unwrap().data.is_some());
+        assert_eq!(upload.status, UPLOAD_NOT_READY);
+    }
+
+    #[test]
+    fn download_links_prune_expired_grants() {
+        let svc = service();
+        let (upload_id, completed_uploads) = upload_one_part(&svc, "log.txt", b"hello");
+        svc.complete_attachment_upload(
+            &req("CompleteAttachmentUpload", json!({})),
+            &json!({ "uploadId": upload_id, "completedUploads": completed_uploads }),
+        )
+        .unwrap();
+        let attachment_id = svc
+            .state
+            .read()
+            .get("000000000000")
+            .unwrap()
+            .attachment_uploads[&upload_id]
+            .attachment_id
+            .clone()
+            .unwrap();
+
+        let link = |svc: &SupportService| {
+            svc.get_attachment_download_link(
+                &req("GetAttachmentDownloadLink", json!({})),
+                &json!({ "attachmentId": attachment_id }),
+            )
+            .unwrap()
+        };
+        link(&svc);
+        link(&svc);
+        assert_eq!(
+            svc.state
+                .read()
+                .get("000000000000")
+                .unwrap()
+                .attachment_downloads
+                .len(),
+            2
+        );
+
+        // Age both grants out; the next link sweeps them instead of letting
+        // them pile up for the lifetime of the process.
+        for grant in svc
+            .state
+            .write()
+            .get_mut("000000000000")
+            .unwrap()
+            .attachment_downloads
+            .values_mut()
+        {
+            grant.expiry = "2000-01-01T00:00:00.000Z".to_string();
+        }
+        link(&svc);
+        assert_eq!(
+            svc.state
+                .read()
+                .get("000000000000")
+                .unwrap()
+                .attachment_downloads
+                .len(),
+            1
+        );
     }
 
     #[test]

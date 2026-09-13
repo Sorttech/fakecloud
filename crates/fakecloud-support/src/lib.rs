@@ -30,10 +30,12 @@
 //! (`AddAttachmentsToSet` mints/extends an `attachmentSetId` with an
 //! `expiryTime`; `DescribeAttachment` returns a stored attachment by id).
 //! Attachment uploads are real end to end: `GetAttachmentUploadLinks` records
-//! an upload and issues one presigned `PUT` link per 5 MiB part pointing back
-//! at this server, the [`dataplane`] routes the server mounts store the bytes
-//! and return an `ETag` per part, `CompleteAttachmentUpload` verifies every
-//! part and its `ETag` before assembling the attachment, and
+//! an upload and issues presigned `PUT` links, at most ten per call, for one
+//! half-open range of its 5 MiB parts, pointing back at this server; the
+//! [`dataplane`] routes the server mounts store each correctly sized part and
+//! return its `ETag`; `CompleteAttachmentUpload` verifies the parts named in it
+//! against those `ETag`s and assembles the attachment once every part has been
+//! reported (it may be called one part at a time); and
 //! `GetAttachmentDownloadLink` issues a presigned `GET` link that serves it
 //! back. A completed upload attaches to a case or communication through
 //! `uploadIds`.

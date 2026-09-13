@@ -12,6 +12,12 @@
 //! constant time, plus the link's own expiry. A link that was never issued, was
 //! tampered with, or has expired is refused.
 //!
+//! An authorised `PUT` still has to carry the right number of bytes: the
+//! declared `fileSizeBytes` and the upload's `partSizeBytes` fix every part's
+//! length exactly (parts 1..n-1 are one part size, part n is the remainder), so
+//! a part of any other length is refused rather than assembled into a file of
+//! the wrong size.
+//!
 //! The server crate mounts these as routes; everything that touches Support
 //! state lives here so the transport layer stays a thin shim.
 
@@ -34,6 +40,10 @@ pub enum PutPartOutcome {
     Expired,
     /// The upload was already completed; its links no longer accept bytes.
     AlreadyCompleted,
+    /// The body is not the size this part must have. Every part but the last
+    /// is exactly `partSizeBytes` and the last carries the remainder of the
+    /// declared `fileSizeBytes`. Carries `(expected, actual)`.
+    InvalidSize(i64, i64),
 }
 
 /// Result of a presigned attachment download.
@@ -85,6 +95,12 @@ pub fn put_upload_part(
     if upload.expiry <= now {
         return PutPartOutcome::Expired;
     }
+    // The part's size is fixed by the declared file size and the part size the
+    // upload was split into, so a part that is not exactly that long would
+    // assemble into a file of the wrong length. Checked before the bytes are
+    // stored, and only after the link itself is authorised so a forged link
+    // learns nothing about the upload.
+    let expected_len = upload.expected_part_len(part_index);
     let Some(part) = upload.part_mut(part_index) else {
         return PutPartOutcome::NotFound;
     };
@@ -93,6 +109,11 @@ pub fn put_upload_part(
     }
     if part.expiry <= now {
         return PutPartOutcome::Expired;
+    }
+    if let Some(expected) = expected_len {
+        if body.len() as i64 != expected {
+            return PutPartOutcome::InvalidSize(expected, body.len() as i64);
+        }
     }
     let etag = part_etag(body);
     part.data = Some(base64::engine::general_purpose::STANDARD.encode(body));
@@ -181,7 +202,38 @@ mod tests {
                     expiry: expiry.into(),
                     etag: None,
                     data: None,
+                    completed: false,
                 }],
+                attachment_id: None,
+            },
+        );
+    }
+
+    /// A two-part upload of a file one byte longer than a single part.
+    fn seed_multipart(state: &SharedSupportState, part_size: i64) {
+        let expiry = iso_in(LINK_TTL_SECONDS);
+        let mut guard = state.write();
+        let data: &mut SupportData = guard.get_or_create(ACCOUNT);
+        data.attachment_uploads.insert(
+            "upload-2".into(),
+            AttachmentUpload {
+                upload_id: "upload-2".into(),
+                file_name: "big.bin".into(),
+                file_size_bytes: part_size + 1,
+                part_size_bytes: part_size,
+                total_parts: 2,
+                status: UPLOAD_NOT_READY.into(),
+                expiry: expiry.clone(),
+                parts: (1..=2)
+                    .map(|part_index| UploadPart {
+                        part_index,
+                        signature: format!("sig-{part_index}"),
+                        expiry: expiry.clone(),
+                        etag: None,
+                        data: None,
+                        completed: false,
+                    })
+                    .collect(),
                 attachment_id: None,
             },
         );
@@ -254,6 +306,56 @@ mod tests {
         assert_eq!(
             put_upload_part(&state, ACCOUNT, "upload-1", 1, "sig-1", b"x"),
             PutPartOutcome::AlreadyCompleted
+        );
+    }
+
+    #[test]
+    fn put_rejects_a_part_of_the_wrong_size() {
+        let state = state();
+        // The seeded upload declares a 5-byte file in a single part.
+        seed_upload(&state, &iso_in(LINK_TTL_SECONDS));
+        assert_eq!(
+            put_upload_part(&state, ACCOUNT, "upload-1", 1, "sig-1", b"hi"),
+            PutPartOutcome::InvalidSize(5, 2)
+        );
+        // Nothing was stored, so the part is still outstanding.
+        assert!(
+            state.read().get(ACCOUNT).unwrap().attachment_uploads["upload-1"]
+                .part(1)
+                .unwrap()
+                .data
+                .is_none()
+        );
+
+        // A non-final part must be exactly one part size; the last part
+        // carries the remainder and nothing more.
+        seed_multipart(&state, 8);
+        assert_eq!(
+            put_upload_part(&state, ACCOUNT, "upload-2", 1, "sig-1", b"short"),
+            PutPartOutcome::InvalidSize(8, 5)
+        );
+        assert!(matches!(
+            put_upload_part(&state, ACCOUNT, "upload-2", 1, "sig-1", b"12345678"),
+            PutPartOutcome::Stored(_)
+        ));
+        assert_eq!(
+            put_upload_part(&state, ACCOUNT, "upload-2", 2, "sig-2", b"toolong"),
+            PutPartOutcome::InvalidSize(1, 7)
+        );
+        assert!(matches!(
+            put_upload_part(&state, ACCOUNT, "upload-2", 2, "sig-2", b"9"),
+            PutPartOutcome::Stored(_)
+        ));
+    }
+
+    #[test]
+    fn put_authorises_before_it_measures() {
+        let state = state();
+        seed_upload(&state, &iso_in(LINK_TTL_SECONDS));
+        // A forged link is refused without revealing the expected part size.
+        assert_eq!(
+            put_upload_part(&state, ACCOUNT, "upload-1", 1, "forged", b"hi"),
+            PutPartOutcome::Forbidden
         );
     }
 

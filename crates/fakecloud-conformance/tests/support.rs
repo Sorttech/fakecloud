@@ -57,8 +57,9 @@ async fn support_attachment_upload_round_trip() {
     let upload_id = links["uploadId"].as_str().unwrap().to_string();
     assert!(!upload_id.is_empty());
     assert_eq!(links["totalParts"], 1, "{links}");
-    // Nothing has been uploaded yet, so part 1 is still outstanding.
-    assert_eq!(links["nextIndex"], 1, "{links}");
+    // The only part's URL has been returned, so there is no next page of links
+    // to ask for.
+    assert!(links["nextIndex"].is_null(), "{links}");
     assert!(links["partSizeBytes"].as_i64().unwrap() > 0, "{links}");
     let part = &links["uploadUrls"][0];
     assert_eq!(part["partIndex"], 1, "{links}");
@@ -188,6 +189,175 @@ async fn support_attachment_upload_round_trip() {
     .await;
     assert_eq!(status, 400, "{err}");
     assert_eq!(err["__type"], "UploadIdNotFound", "{err}");
+}
+
+/// A real multipart upload: a part far larger than any default request-body
+/// limit, the model's half-open `uploadRange`, `nextIndex` paging, and one part
+/// per `CompleteAttachmentUpload` call.
+#[tokio::test]
+async fn support_multipart_attachment_upload_is_incremental() {
+    let server = TestServer::start().await;
+    let client = reqwest::Client::new();
+    // 5 MiB + 1 byte is two parts, the first of them well past the 2 MB body
+    // limit a default extractor would impose on the upload route.
+    let part_size = 5 * 1024 * 1024;
+    let first = vec![b'a'; part_size];
+    let last = vec![b'z'; 1];
+
+    let (status, links) = support(
+        &server,
+        "GetAttachmentUploadLinks",
+        json!({
+            "fileName": "big.bin",
+            "fileSizeBytes": part_size + 1,
+            "uploadRange": { "startIndex": 1, "endIndex": 2 },
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "{links}");
+    let upload_id = links["uploadId"].as_str().unwrap().to_string();
+    assert_eq!(links["totalParts"], 2, "{links}");
+    // endIndex is exclusive, so 1..2 is part 1 alone and part 2 is next.
+    assert_eq!(links["uploadUrls"].as_array().unwrap().len(), 1, "{links}");
+    assert_eq!(links["uploadUrls"][0]["partIndex"], 1, "{links}");
+    assert_eq!(links["nextIndex"], 2, "{links}");
+
+    let resp = client
+        .put(links["uploadUrls"][0]["url"].as_str().unwrap())
+        .body(first.clone())
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "5 MiB part upload failed: {}",
+        resp.status()
+    );
+    let first_etag = resp
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // One part per call is allowed: the upload stays pending until every part
+    // has been reported.
+    let (status, pending) = support(
+        &server,
+        "CompleteAttachmentUpload",
+        json!({
+            "uploadId": upload_id,
+            "completedUploads": [{ "partIndex": 1, "eTag": first_etag }],
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "{pending}");
+    assert_eq!(pending["uploadStatus"], "attachment-not-ready", "{pending}");
+
+    // Page to the rest of the links with the returned nextIndex.
+    let (status, more) = support(
+        &server,
+        "GetAttachmentUploadLinks",
+        json!({
+            "fileName": "big.bin",
+            "uploadId": upload_id,
+            "uploadRange": { "startIndex": 2 },
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "{more}");
+    assert_eq!(more["uploadUrls"][0]["partIndex"], 2, "{more}");
+    assert!(more["nextIndex"].is_null(), "{more}");
+    let last_url = more["uploadUrls"][0]["url"].as_str().unwrap().to_string();
+
+    // The last part carries the declared remainder and nothing else.
+    let resp = client
+        .put(&last_url)
+        .body(vec![b'z'; 64])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400, "an oversized part is refused");
+    let resp = client
+        .put(&last_url)
+        .body(last.clone())
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "{}", resp.status());
+    let last_etag = resp
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let (status, completed) = support(
+        &server,
+        "CompleteAttachmentUpload",
+        json!({
+            "uploadId": upload_id,
+            "completedUploads": [{ "partIndex": 2, "eTag": last_etag }],
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "{completed}");
+    assert_eq!(completed["uploadStatus"], "attachment-ready", "{completed}");
+
+    // A range wider than the ten URLs a call may return is refused.
+    let (status, err) = support(
+        &server,
+        "GetAttachmentUploadLinks",
+        json!({
+            "fileName": "big.bin",
+            "fileSizeBytes": 121 * 1024 * 1024,
+            "uploadRange": { "startIndex": 1, "endIndex": 13 },
+        }),
+    )
+    .await;
+    assert_eq!(status, 400, "{err}");
+    assert_eq!(err["__type"], "ValidationException", "{err}");
+
+    // The assembled attachment is the two parts, in order.
+    let (status, created) = support(
+        &server,
+        "CreateCase",
+        json!({
+            "subject": "conformance multipart upload",
+            "communicationBody": "big file attached",
+            "uploadIds": [upload_id],
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "{created}");
+    let (_, comms) = support(
+        &server,
+        "DescribeCommunications",
+        json!({ "caseId": created["caseId"].as_str().unwrap() }),
+    )
+    .await;
+    let attachment_id = comms["communications"][0]["attachments"][0]["attachmentId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (_, link) = support(
+        &server,
+        "GetAttachmentDownloadLink",
+        json!({ "attachmentId": attachment_id }),
+    )
+    .await;
+    let resp = client
+        .get(link["downloadUrl"]["url"].as_str().unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "{}", resp.status());
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(body.len(), first.len() + last.len());
+    assert_eq!(body[0], b'a');
+    assert_eq!(body[body.len() - 1], b'z');
 }
 
 #[tokio::test]

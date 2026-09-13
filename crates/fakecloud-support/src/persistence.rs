@@ -133,6 +133,7 @@ mod tests {
                 expiry: "2999-01-01T00:00:00.000Z".into(),
                 etag: Some("\"abc\"".into()),
                 data: Some("aGVsbG8=".into()),
+                completed: false,
             }],
             attachment_id: None,
         };

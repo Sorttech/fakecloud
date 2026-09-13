@@ -226,10 +226,66 @@ pub(crate) fn require_shard_id(body: &Value) -> Result<&str, AwsServiceError> {
 }
 
 pub(crate) fn require_resource_arn(body: &Value) -> Result<&str, AwsServiceError> {
-    body["ResourceARN"]
+    let arn = body["ResourceARN"]
         .as_str()
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| invalid_argument("ResourceARN is required"))
+        .ok_or_else(|| invalid_argument("ResourceARN is required"))?;
+    validate_string_length("ResourceARN", arn, 1, 2048)?;
+    Ok(arn)
+}
+
+/// The resource a Tags v2 `ResourceARN` names. The model constrains it to
+/// `^arn:aws.*:kinesis:.*:\d{12}:.*(stream|channel)/\S+$`, so a delivery
+/// channel is as valid a tag target as a stream.
+pub(crate) enum TaggedResource {
+    Stream(String),
+    Channel(String),
+}
+
+/// Resolve a Tags v2 `ResourceARN` to the resource it names. Both arms key off
+/// the ARN's resource segment, so a caller whose credential scope names a
+/// different region than the stored ARN still resolves the resource.
+pub(crate) fn resolve_tagged_resource(
+    state: &crate::state::KinesisState,
+    resource_arn: &str,
+) -> Result<TaggedResource, AwsServiceError> {
+    if resource_arn.contains(":channel/") {
+        return state
+            .channel_name_from_arn(resource_arn)
+            .map(TaggedResource::Channel)
+            .ok_or_else(|| resource_not_found_arn(resource_arn));
+    }
+    state
+        .stream_name_from_arn(resource_arn)
+        .map(TaggedResource::Stream)
+        .ok_or_else(|| resource_not_found_arn(resource_arn))
+}
+
+/// The tag map `resource_arn` names, for the two mutating tag operations.
+pub(crate) fn resource_tags_mut<'a>(
+    state: &'a mut crate::state::KinesisState,
+    resource_arn: &str,
+) -> Result<&'a mut std::collections::BTreeMap<String, String>, AwsServiceError> {
+    // Resolved before the mutable borrows below, and infallible from here:
+    // `resolve_tagged_resource` only names a resource it found in these very
+    // maps.
+    let resource = resolve_tagged_resource(state, resource_arn)?;
+    match resource {
+        TaggedResource::Stream(name) => Ok(&mut state.streams.get_mut(&name).unwrap().tags),
+        TaggedResource::Channel(name) => Ok(&mut state.channels.get_mut(&name).unwrap().tags),
+    }
+}
+
+/// The tag map `resource_arn` names, for `ListTagsForResource`.
+pub(crate) fn resource_tags<'a>(
+    state: &'a crate::state::KinesisState,
+    resource_arn: &str,
+) -> Result<&'a std::collections::BTreeMap<String, String>, AwsServiceError> {
+    let resource = resolve_tagged_resource(state, resource_arn)?;
+    match resource {
+        TaggedResource::Stream(name) => Ok(&state.streams[&name].tags),
+        TaggedResource::Channel(name) => Ok(&state.channels[&name].tags),
+    }
 }
 
 pub(crate) fn decode_record_data(value: &Value) -> Result<Vec<u8>, AwsServiceError> {
@@ -746,7 +802,9 @@ pub(crate) fn parse_channel_streams(
             .filter(|value| !value.is_empty())
         {
             Some(arn) => {
-                validate_string_length("GSRSchemaARN", arn, 1, 2048)?;
+                // `GSRSchemaARN` is capped at 512, not the 2048 the other ARN
+                // members share.
+                validate_string_length("GSRSchemaARN", arn, 1, 512)?;
                 Some(arn.to_string())
             }
             None => None,
@@ -1160,7 +1218,15 @@ pub(crate) struct ChannelStreamFilter {
 /// Parse the `StreamFilter` list. Parsing up front (rather than per candidate
 /// channel) means a malformed filter is rejected even when the account holds
 /// no channels to evaluate it against.
+///
+/// Each `StreamARN` is resolved against `state` the same region-tolerant way
+/// `CreateChannel` resolves a source ARN, then stored in the stream's own
+/// canonical form, which is what a channel holds. Without that, a caller
+/// whose credential scope names a different region than the stream's stored
+/// ARN filters against a string no channel can ever carry. An ARN that names
+/// no existing stream is kept verbatim: it simply matches nothing.
 pub(crate) fn parse_channel_stream_filters(
+    state: &crate::state::KinesisState,
     value: &Value,
 ) -> Result<Vec<ChannelStreamFilter>, AwsServiceError> {
     if value.is_null() {
@@ -1187,8 +1253,16 @@ pub(crate) fn parse_channel_stream_filters(
                     Some((seconds * 1000.0).round() as i64)
                 }
             };
+            let stream_arn = require_channel_member(entry, "StreamARN", 2048)?;
+            let stream_arn = state
+                .stream_name_from_arn(stream_arn)
+                .and_then(|name| state.streams.get(&name))
+                .map_or_else(
+                    || stream_arn.to_string(),
+                    |stream| stream.stream_arn.clone(),
+                );
             Ok(ChannelStreamFilter {
-                stream_arn: require_channel_member(entry, "StreamARN", 2048)?.to_string(),
+                stream_arn,
                 creation_timestamp_millis,
             })
         })

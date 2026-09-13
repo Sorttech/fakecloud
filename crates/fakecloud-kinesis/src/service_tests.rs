@@ -27,6 +27,15 @@ fn request(action: &str, body: Value) -> AwsRequest {
     }
 }
 
+/// The same request with a different credential-scope region, for the paths
+/// that must resolve ARNs region-tolerantly.
+fn request_in_region(action: &str, region: &str, body: Value) -> AwsRequest {
+    AwsRequest {
+        region: region.to_string(),
+        ..request(action, body)
+    }
+}
+
 fn test_stream(name: &str) -> KinesisStream {
     KinesisStream {
         stream_name: name.to_string(),
@@ -3079,4 +3088,264 @@ fn channel_actions_are_supported_and_mutating() {
     }
     assert!(!is_mutating_action("DescribeChannel"));
     assert!(!is_mutating_action("ListChannels"));
+}
+
+// ── Tags v2 against streams and channels ──
+
+#[test]
+fn tag_resource_round_trips_stream_tags() {
+    let (svc, _) = make_service();
+    create_stream_action(&svc, "orders", 1);
+    let arn = stream_arn_for("orders");
+
+    svc.tag_resource(&request(
+        "TagResource",
+        json!({ "ResourceARN": arn, "Tags": { "env": "test" } }),
+    ))
+    .unwrap();
+
+    let listed = json_response(
+        svc.list_tags_for_resource(&request(
+            "ListTagsForResource",
+            json!({ "ResourceARN": arn }),
+        ))
+        .unwrap(),
+    );
+    assert_eq!(listed["Tags"], json!([{ "Key": "env", "Value": "test" }]));
+
+    svc.untag_resource(&request(
+        "UntagResource",
+        json!({ "ResourceARN": arn, "TagKeys": ["env"] }),
+    ))
+    .unwrap();
+    let after = json_response(
+        svc.list_tags_for_resource(&request(
+            "ListTagsForResource",
+            json!({ "ResourceARN": arn }),
+        ))
+        .unwrap(),
+    );
+    assert_eq!(after["Tags"], json!([]));
+}
+
+#[test]
+fn tag_operations_reach_channels_by_arn() {
+    let (svc, _) = make_service();
+    create_stream_action(&svc, "orders", 1);
+    let mut body = s3_channel_body("deliveries", "orders");
+    body["Tags"] = json!({ "team": "data" });
+    let created = json_response(svc.create_channel(&request("CreateChannel", body)).unwrap());
+    let channel_arn = created["ChannelDescription"]["ChannelARN"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The tags supplied to CreateChannel are readable, not write-only.
+    let listed = json_response(
+        svc.list_tags_for_resource(&request(
+            "ListTagsForResource",
+            json!({ "ResourceARN": channel_arn }),
+        ))
+        .unwrap(),
+    );
+    assert_eq!(listed["Tags"], json!([{ "Key": "team", "Value": "data" }]));
+
+    svc.tag_resource(&request(
+        "TagResource",
+        json!({ "ResourceARN": channel_arn, "Tags": { "env": "test" } }),
+    ))
+    .unwrap();
+    svc.untag_resource(&request(
+        "UntagResource",
+        json!({ "ResourceARN": channel_arn, "TagKeys": ["team"] }),
+    ))
+    .unwrap();
+
+    let after = json_response(
+        svc.list_tags_for_resource(&request(
+            "ListTagsForResource",
+            json!({ "ResourceARN": channel_arn }),
+        ))
+        .unwrap(),
+    );
+    assert_eq!(after["Tags"], json!([{ "Key": "env", "Value": "test" }]));
+
+    // Tagging the channel left the source stream's own tags alone.
+    let stream_tags = json_response(
+        svc.list_tags_for_resource(&request(
+            "ListTagsForResource",
+            json!({ "ResourceARN": stream_arn_for("orders") }),
+        ))
+        .unwrap(),
+    );
+    assert_eq!(stream_tags["Tags"], json!([]));
+}
+
+#[test]
+fn tag_operations_resolve_channels_from_another_region() {
+    let (svc, _) = make_service();
+    create_stream_action(&svc, "orders", 1);
+    let created = create_channel_action(&svc, "deliveries", "orders");
+    let channel_id = created["ChannelDescription"]["ChannelId"].as_str().unwrap();
+    let foreign_arn = format!("arn:aws:kinesis:eu-west-1:123456789012:channel/{channel_id}");
+
+    svc.tag_resource(&request_in_region(
+        "TagResource",
+        "eu-west-1",
+        json!({ "ResourceARN": foreign_arn, "Tags": { "env": "test" } }),
+    ))
+    .unwrap();
+
+    let listed = json_response(
+        svc.list_tags_for_resource(&request(
+            "ListTagsForResource",
+            json!({ "ResourceARN": created["ChannelDescription"]["ChannelARN"] }),
+        ))
+        .unwrap(),
+    );
+    assert_eq!(listed["Tags"], json!([{ "Key": "env", "Value": "test" }]));
+}
+
+#[test]
+fn tag_operations_reject_unknown_resources() {
+    let (svc, _) = make_service();
+    for arn in [
+        "arn:aws:kinesis:us-east-1:123456789012:channel/ghost",
+        "arn:aws:kinesis:us-east-1:123456789012:stream/ghost",
+    ] {
+        let body = json!({
+            "ResourceARN": arn,
+            "Tags": { "env": "test" },
+            "TagKeys": ["env"],
+        });
+        assert_code_kinesis(
+            svc.tag_resource(&request("TagResource", body.clone())),
+            "ResourceNotFoundException",
+        );
+        assert_code_kinesis(
+            svc.untag_resource(&request("UntagResource", body.clone())),
+            "ResourceNotFoundException",
+        );
+        assert_code_kinesis(
+            svc.list_tags_for_resource(&request("ListTagsForResource", body)),
+            "ResourceNotFoundException",
+        );
+    }
+}
+
+// ── channel model bounds and region-tolerant resolution ──
+
+#[test]
+fn create_channel_enforces_the_models_arn_lengths() {
+    let (svc, _) = make_service();
+    create_stream_action(&svc, "orders", 1);
+
+    // An ARN of exactly `len` bytes, padded in the resource segment.
+    let padded = |prefix: &str, len: usize| format!("{prefix}{}", "a".repeat(len - prefix.len()));
+    let role = |len: usize| padded("arn:aws:iam::123456789012:role/", len);
+    let schema = |len: usize| padded("arn:aws:glue:us-east-1:123456789012:schema/registry/", len);
+
+    // ServiceExecutionRoleARN is a RoleARN: 512, not the 2048 other ARN
+    // members share.
+    let mut long_role = s3_channel_body("deliveries", "orders");
+    long_role["ServiceExecutionRoleARN"] = json!(role(513));
+    assert_code_kinesis(
+        svc.create_channel(&request("CreateChannel", long_role)),
+        "ValidationException",
+    );
+    let mut max_role = s3_channel_body("deliveries", "orders");
+    max_role["ServiceExecutionRoleARN"] = json!(role(512));
+    svc.create_channel(&request("CreateChannel", max_role))
+        .unwrap();
+
+    // GSRSchemaARN is capped at 512 too.
+    let mut long_schema = s3_channel_body("schemas", "orders");
+    long_schema["StreamConfigurationList"][0]["RecordConfiguration"]["GSRSchemaARN"] =
+        json!(schema(513));
+    assert_code_kinesis(
+        svc.create_channel(&request("CreateChannel", long_schema)),
+        "ValidationException",
+    );
+    let mut max_schema = s3_channel_body("schemas", "orders");
+    max_schema["StreamConfigurationList"][0]["RecordConfiguration"]["GSRSchemaARN"] =
+        json!(schema(512));
+    svc.create_channel(&request("CreateChannel", max_schema))
+        .unwrap();
+}
+
+/// A CreateChannel body whose source ARN carries `region` rather than the
+/// region the stream was created in.
+fn s3_channel_body_in_region(name: &str, stream_name: &str, region: &str) -> Value {
+    let mut body = s3_channel_body(name, stream_name);
+    body["StreamConfigurationList"][0]["StreamARN"] = json!(format!(
+        "arn:aws:kinesis:{region}:123456789012:stream/{stream_name}"
+    ));
+    body
+}
+
+#[test]
+fn list_channels_filter_matches_a_cross_region_stream_arn() {
+    let (svc, _) = make_service();
+    create_stream_action(&svc, "orders", 1);
+    // The channel is created by a eu-west-1-scoped caller naming the stream by
+    // its own regional ARN; the stored source ARN is the stream's canonical
+    // us-east-1 one.
+    svc.create_channel(&request_in_region(
+        "CreateChannel",
+        "eu-west-1",
+        s3_channel_body_in_region("deliveries", "orders", "eu-west-1"),
+    ))
+    .unwrap();
+
+    let filtered = json_response(
+        svc.list_channels(&request_in_region(
+            "ListChannels",
+            "eu-west-1",
+            json!({
+                "StreamFilter": [{
+                    "StreamARN": "arn:aws:kinesis:eu-west-1:123456789012:stream/orders",
+                }]
+            }),
+        ))
+        .unwrap(),
+    );
+    let summaries = filtered["ChannelSummaries"].as_array().unwrap();
+    assert_eq!(summaries.len(), 1, "{filtered}");
+    assert_eq!(summaries[0]["ChannelName"], "deliveries");
+
+    // A filter naming a stream that does not exist still matches nothing.
+    let unmatched = json_response(
+        svc.list_channels(&request_in_region(
+            "ListChannels",
+            "eu-west-1",
+            json!({
+                "StreamFilter": [{
+                    "StreamARN": "arn:aws:kinesis:eu-west-1:123456789012:stream/ghost",
+                }]
+            }),
+        ))
+        .unwrap(),
+    );
+    assert!(unmatched["ChannelSummaries"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn delete_stream_guard_holds_for_a_cross_region_caller() {
+    let (svc, _) = make_service();
+    create_stream_action(&svc, "orders", 1);
+    svc.create_channel(&request_in_region(
+        "CreateChannel",
+        "eu-west-1",
+        s3_channel_body_in_region("deliveries", "orders", "eu-west-1"),
+    ))
+    .unwrap();
+
+    assert_code_kinesis(
+        svc.delete_stream(&request_in_region(
+            "DeleteStream",
+            "eu-west-1",
+            json!({ "StreamARN": "arn:aws:kinesis:eu-west-1:123456789012:stream/orders" }),
+        )),
+        "ResourceInUseException",
+    );
 }
