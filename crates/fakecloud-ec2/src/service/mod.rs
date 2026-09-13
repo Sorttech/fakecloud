@@ -57,7 +57,8 @@ fn is_mutating_action(action: &str) -> bool {
     !(action.starts_with("Describe")
         || action.starts_with("Get")
         || action.starts_with("Search")
-        || action.starts_with("List"))
+        || action.starts_with("List")
+        || action.starts_with("Validate"))
 }
 
 /// Every EC2 action this build implements. The conformance audit cross-checks
@@ -120,6 +121,7 @@ pub const SUPPORTED_ACTIONS: &[&str] = &[
     "GetSecurityGroupsForVpc",
     "DescribeStaleSecurityGroups",
     "DescribeSecurityGroupReferences",
+    "ValidateSecurityGroupQuotasForInterface",
     // Route tables
     "CreateRouteTable",
     "DeleteRouteTable",
@@ -1397,6 +1399,9 @@ impl AwsService for Ec2Service {
             "DescribeStaleSecurityGroups" => sg::describe_stale_security_groups(self, &request),
             "DescribeSecurityGroupReferences" => {
                 sg::describe_security_group_references(self, &request)
+            }
+            "ValidateSecurityGroupQuotasForInterface" => {
+                sg::validate_security_group_quotas_for_interface(self, &request)
             }
             "CreateRouteTable" => routing::create_route_table(self, &request),
             "DeleteRouteTable" => routing::delete_route_table(self, &request),

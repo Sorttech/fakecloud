@@ -3,13 +3,13 @@
 
 use std::collections::HashMap;
 
-use fakecloud_aws::ec2query::{ec2_elem, ec2_list, ec2_return};
+use fakecloud_aws::ec2query::{ec2_bool, ec2_elem, ec2_list, ec2_return};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use crate::service::Ec2Service;
 use crate::service_helpers::{
-    filter_value_matches, gen_id, indexed_list, parse_filters, require, validate_max_results,
-    Filter,
+    filter_value_matches, gen_id, indexed_list, invalid_parameter_value, missing_parameter,
+    parse_filters, require, validate_max_results, Filter,
 };
 use crate::state::{Ec2State, SecurityGroup, SecurityGroupRule, SecurityGroupVpcAssociation, Tag};
 
@@ -1057,6 +1057,126 @@ pub(crate) fn describe_security_group_references(
     ))
 }
 
+// ---- quota validation ----
+
+/// Security groups that may be associated with one network interface. The
+/// published Amazon VPC default; AWS allows it to be raised to 16.
+const SECURITY_GROUPS_PER_INTERFACE: usize = 5;
+
+/// Inbound (or outbound) rules per security group. Each direction gets its own
+/// allowance, so a group at the limit in both directions is still valid.
+///
+/// AWS additionally caps the *product* of the two quotas above at 1000. That
+/// binds only once a quota increase is granted; at the published defaults the
+/// product is 5 x 60 = 300, so it can never be the reason a request is
+/// rejected here and is not modeled as a third check.
+const RULES_PER_SECURITY_GROUP: usize = 60;
+
+/// `SecurityGroupsPerInterfaceLimitExceeded` -- more groups than one network
+/// interface may carry.
+fn groups_per_interface_exceeded(requested: usize) -> AwsServiceError {
+    AwsServiceError::aws_error(
+        http::StatusCode::BAD_REQUEST,
+        "SecurityGroupsPerInterfaceLimitExceeded",
+        format!(
+            "You have exceeded the number of security groups that can be associated with a \
+             network interface: requested {requested}, limit {SECURITY_GROUPS_PER_INTERFACE}"
+        ),
+    )
+}
+
+/// `RulesPerSecurityGroupLimitExceeded` -- the rules the requested groups carry
+/// exceed a per-group or per-interface rule allowance.
+fn rules_limit_exceeded(message: String) -> AwsServiceError {
+    AwsServiceError::aws_error(
+        http::StatusCode::BAD_REQUEST,
+        "RulesPerSecurityGroupLimitExceeded",
+        message,
+    )
+}
+
+/// `ValidateSecurityGroupQuotasForInterface`: answer whether the requested set
+/// of security groups could be attached to a single network interface without
+/// breaching a VPC quota.
+///
+/// The answer is derived from the stored groups, not assumed: every id is
+/// resolved (an unknown one is `InvalidGroup.NotFound`, exactly as the rest of
+/// the security-group surface reports it), and the rule counts that feed the
+/// quota arithmetic are the groups' real ingress/egress rules. AWS returns
+/// `valid=true` or an error -- there is no "false" answer -- so each quota it
+/// documents gets its own error code and message here.
+pub(crate) fn validate_security_group_quotas_for_interface(
+    svc: &Ec2Service,
+    req: &AwsRequest,
+) -> Result<AwsResponse, AwsServiceError> {
+    let group_ids = indexed_list(&req.query_params, "SecurityGroupId");
+    // Unlike the describe ops, an empty list here is not "match everything":
+    // there is nothing to validate, and AWS requires at least one id.
+    if group_ids.is_empty() {
+        return Err(missing_parameter("SecurityGroupId"));
+    }
+    // "each ID must be unique" -- a repeat is rejected rather than silently
+    // deduplicated, which would validate a smaller set than the caller sent.
+    for (i, id) in group_ids.iter().enumerate() {
+        if group_ids[..i].contains(id) {
+            return Err(invalid_parameter_value(format!(
+                "The security group ID '{id}' may only be specified once"
+            )));
+        }
+    }
+
+    // Resolve every id against stored state and take its real rule counts. A
+    // missing group is an error, so no quota arithmetic ever runs over a group
+    // that was assumed to be empty.
+    let mut counts: Vec<(String, usize, usize)> = Vec::with_capacity(group_ids.len());
+    {
+        let accounts = svc.state.read();
+        let empty = Ec2State::new(&req.account_id, &req.region);
+        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        for id in &group_ids {
+            let sg = state
+                .security_groups
+                .get(id)
+                .ok_or_else(|| sg_not_found(id))?;
+            let egress = sg.rules.iter().filter(|r| r.is_egress).count();
+            counts.push((id.clone(), sg.rules.len() - egress, egress));
+        }
+    }
+
+    if group_ids.len() > SECURITY_GROUPS_PER_INTERFACE {
+        return Err(groups_per_interface_exceeded(group_ids.len()));
+    }
+    for (id, ingress, egress) in &counts {
+        // Each direction has its own allowance, so the busier one decides.
+        let worst = (*ingress).max(*egress);
+        if worst > RULES_PER_SECURITY_GROUP {
+            return Err(rules_limit_exceeded(format!(
+                "The security group '{id}' has {worst} rules in one direction, exceeding the \
+                 limit of {RULES_PER_SECURITY_GROUP} rules per security group"
+            )));
+        }
+    }
+    // A DryRun runs the same validation -- including the quota arithmetic, so a
+    // set that would be rejected is still rejected -- and reports nothing back,
+    // matching how the rest of EC2 treats one.
+    if req
+        .query_params
+        .get("DryRun")
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+    {
+        return Ok(Ec2Service::respond(
+            "ValidateSecurityGroupQuotasForInterface",
+            &req.request_id,
+            "",
+        ));
+    }
+    Ok(Ec2Service::respond(
+        "ValidateSecurityGroupQuotasForInterface",
+        &req.request_id,
+        &ec2_bool("valid", true),
+    ))
+}
+
 #[cfg(test)]
 mod modify_tests {
     use super::*;
@@ -1745,5 +1865,165 @@ mod modify_tests {
             ],
         )
         .contains("<groupId>sg-1</groupId>"));
+    }
+
+    // ---- ValidateSecurityGroupQuotasForInterface ----
+
+    /// Store a group carrying `ingress` inbound and `egress` outbound rules, so
+    /// the quota arithmetic runs over real stored rules.
+    fn seed_sized_group(svc: &Ec2Service, group_id: &str, ingress: usize, egress: usize) {
+        let mut rules = Vec::new();
+        for i in 0..ingress + egress {
+            let mut r = ingress_rule(&format!("sgr-{group_id}-{i}"), 22, "10.0.0.0/8");
+            r.group_id = group_id.to_string();
+            r.is_egress = i >= ingress;
+            rules.push(r);
+        }
+        let mut accounts = svc.state.write();
+        let state = accounts.get_or_create("000000000000");
+        state.security_groups.insert(
+            group_id.to_string(),
+            SecurityGroup {
+                group_id: group_id.into(),
+                group_name: group_id.into(),
+                description: "d".into(),
+                vpc_id: "vpc-1".into(),
+                rules,
+            },
+        );
+    }
+
+    fn validate_quotas(svc: &Ec2Service, query: &[(&str, &str)]) -> String {
+        let resp = validate_security_group_quotas_for_interface(
+            svc,
+            &req("ValidateSecurityGroupQuotasForInterface", query),
+        )
+        .unwrap();
+        String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap()
+    }
+
+    #[test]
+    fn validate_quotas_accepts_groups_within_the_quotas() {
+        let svc = Ec2Service::new();
+        seed_sized_group(
+            &svc,
+            "sg-a",
+            RULES_PER_SECURITY_GROUP,
+            RULES_PER_SECURITY_GROUP,
+        );
+        seed_sized_group(&svc, "sg-b", 1, 1);
+        let body = validate_quotas(
+            &svc,
+            &[("SecurityGroupId.1", "sg-a"), ("SecurityGroupId.2", "sg-b")],
+        );
+        assert!(body.contains("<valid>true</valid>"), "{body}");
+        assert!(
+            body.contains("<ValidateSecurityGroupQuotasForInterfaceResponse"),
+            "{body}"
+        );
+        assert!(body.contains("<requestId>rid</requestId>"), "{body}");
+    }
+
+    #[test]
+    fn validate_quotas_unknown_group_errors() {
+        let svc = Ec2Service::new();
+        seed_sized_group(&svc, "sg-a", 1, 1);
+        let err = crate::test_support::err_of(validate_security_group_quotas_for_interface(
+            &svc,
+            &req(
+                "ValidateSecurityGroupQuotasForInterface",
+                &[
+                    ("SecurityGroupId.1", "sg-a"),
+                    ("SecurityGroupId.2", "sg-gone"),
+                ],
+            ),
+        ));
+        assert_eq!(err.code(), "InvalidGroup.NotFound");
+    }
+
+    #[test]
+    fn validate_quotas_requires_at_least_one_group() {
+        let svc = Ec2Service::new();
+        let err = crate::test_support::err_of(validate_security_group_quotas_for_interface(
+            &svc,
+            &req("ValidateSecurityGroupQuotasForInterface", &[]),
+        ));
+        assert_eq!(err.code(), "MissingParameter");
+    }
+
+    #[test]
+    fn validate_quotas_rejects_a_repeated_group() {
+        let svc = Ec2Service::new();
+        seed_sized_group(&svc, "sg-a", 1, 1);
+        let err = crate::test_support::err_of(validate_security_group_quotas_for_interface(
+            &svc,
+            &req(
+                "ValidateSecurityGroupQuotasForInterface",
+                &[("SecurityGroupId.1", "sg-a"), ("SecurityGroupId.2", "sg-a")],
+            ),
+        ));
+        assert_eq!(err.code(), "InvalidParameterValue");
+    }
+
+    #[test]
+    fn validate_quotas_rejects_too_many_groups() {
+        let svc = Ec2Service::new();
+        let ids: Vec<String> = (0..SECURITY_GROUPS_PER_INTERFACE + 1)
+            .map(|i| format!("sg-{i}"))
+            .collect();
+        for id in &ids {
+            seed_sized_group(&svc, id, 1, 1);
+        }
+        let query: Vec<(String, String)> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (format!("SecurityGroupId.{}", i + 1), id.clone()))
+            .collect();
+        let pairs: Vec<(&str, &str)> = query
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let err = crate::test_support::err_of(validate_security_group_quotas_for_interface(
+            &svc,
+            &req("ValidateSecurityGroupQuotasForInterface", &pairs),
+        ));
+        assert_eq!(err.code(), "SecurityGroupsPerInterfaceLimitExceeded");
+    }
+
+    #[test]
+    fn validate_quotas_rejects_a_group_over_the_rule_limit() {
+        let svc = Ec2Service::new();
+        // One rule past the per-direction allowance, with the other direction
+        // empty: the directions are counted separately, not summed.
+        seed_sized_group(&svc, "sg-a", RULES_PER_SECURITY_GROUP + 1, 0);
+        let err = crate::test_support::err_of(validate_security_group_quotas_for_interface(
+            &svc,
+            &req(
+                "ValidateSecurityGroupQuotasForInterface",
+                &[("SecurityGroupId.1", "sg-a")],
+            ),
+        ));
+        assert_eq!(err.code(), "RulesPerSecurityGroupLimitExceeded");
+    }
+
+    #[test]
+    fn validate_quotas_dry_run_validates_without_answering() {
+        let svc = Ec2Service::new();
+        seed_sized_group(&svc, "sg-a", 1, 1);
+        let body = validate_quotas(&svc, &[("SecurityGroupId.1", "sg-a"), ("DryRun", "true")]);
+        assert!(
+            !body.contains("<valid>"),
+            "a dry run answers nothing: {body}"
+        );
+
+        // A dry run still reports an unknown group rather than succeeding.
+        let err = crate::test_support::err_of(validate_security_group_quotas_for_interface(
+            &svc,
+            &req(
+                "ValidateSecurityGroupQuotasForInterface",
+                &[("SecurityGroupId.1", "sg-gone"), ("DryRun", "true")],
+            ),
+        ));
+        assert_eq!(err.code(), "InvalidGroup.NotFound");
     }
 }

@@ -712,6 +712,7 @@ async fn test_send_email_rejects_when_config_set_paused() {
                 reputation_metrics_enabled: false,
                 vdm_options: None,
                 archive_arn: None,
+                message_security_options: None,
                 archiving_options_present: false,
             },
         );
@@ -4525,6 +4526,7 @@ async fn send_email_v2_rejects_when_config_set_sending_paused() {
                 reputation_metrics_enabled: false,
                 vdm_options: None,
                 archive_arn: None,
+                message_security_options: None,
                 archiving_options_present: false,
             },
         );
@@ -4799,4 +4801,473 @@ async fn test_create_email_identity_easy_dkim_key_length() {
     );
     // Easy DKIM still auto-provisions a keypair.
     assert!(id.dkim_domain_signing_private_key.is_some());
+}
+
+// --- S/MIME certificate associations ---
+
+const TEST_CERT_ARN: &str = "arn:aws:acm:us-east-1:123456789012:certificate/abc-123";
+const TEST_CERT_ARN_2: &str = "arn:aws:acm:us-east-1:123456789012:certificate/def-456";
+
+async fn create_identity(svc: &SesV2Service, name: &str) {
+    let req = make_request(
+        Method::POST,
+        "/v2/email/identities",
+        &format!(r#"{{"EmailIdentity": "{name}"}}"#),
+    );
+    let resp = svc.handle(req).await.unwrap();
+    assert_eq!(resp.status, StatusCode::OK);
+}
+
+async fn associate_certificate(svc: &SesV2Service, body: &str) -> AwsResponse {
+    svc.handle(make_request(
+        Method::POST,
+        "/v2/email/identity/certificates",
+        body,
+    ))
+    .await
+    .unwrap()
+}
+
+async fn list_certificates(svc: &SesV2Service, body: &str) -> AwsResponse {
+    svc.handle(make_request(
+        Method::POST,
+        "/v2/email/identity/certificates/list",
+        body,
+    ))
+    .await
+    .unwrap()
+}
+
+async fn disassociate_certificate(svc: &SesV2Service, body: &str) -> AwsResponse {
+    svc.handle(make_request(
+        Method::POST,
+        "/v2/email/identity/certificates/delete",
+        body,
+    ))
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn test_identity_certificate_lifecycle() {
+    let state = make_state();
+    let svc = SesV2Service::new(state.clone());
+    create_identity(&svc, "smime@example.com").await;
+
+    let resp = associate_certificate(
+        &svc,
+        &format!(
+            r#"{{"EmailIdentity": "smime@example.com", "CertificateArn": "{TEST_CERT_ARN}"}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp.status, StatusCode::OK);
+
+    // The association is persisted against the identity, defaulting the
+    // from-address to the email identity itself, and starts PROVISIONING.
+    {
+        let accts = state.read();
+        let s = accts.default_ref();
+        let certs = s.identity_certificates.get("smime@example.com").unwrap();
+        assert_eq!(certs.len(), 1);
+        assert_eq!(certs[0].from_address, "smime@example.com");
+        assert_eq!(certs[0].certificate_arn, TEST_CERT_ARN);
+        assert_eq!(certs[0].status, "PROVISIONING");
+    }
+
+    // List reports it and advances PROVISIONING -> ACTIVE.
+    let resp = list_certificates(&svc, r#"{"EmailIdentity": "smime@example.com"}"#).await;
+    assert_eq!(resp.status, StatusCode::OK);
+    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(body["Certificates"].as_array().unwrap().len(), 1);
+    assert_eq!(body["Certificates"][0]["FromAddress"], "smime@example.com");
+    assert_eq!(body["Certificates"][0]["CertificateArn"], TEST_CERT_ARN);
+    assert_eq!(body["Certificates"][0]["Status"], "ACTIVE");
+    assert!(body["NextToken"].is_null());
+
+    // Disassociate drops the stored association.
+    let resp = disassociate_certificate(&svc, r#"{"EmailIdentity": "smime@example.com"}"#).await;
+    assert_eq!(resp.status, StatusCode::OK);
+
+    let resp = list_certificates(&svc, r#"{"EmailIdentity": "smime@example.com"}"#).await;
+    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert!(body["Certificates"].as_array().unwrap().is_empty());
+    {
+        let accts = state.read();
+        let s = accts.default_ref();
+        assert!(!s.identity_certificates.contains_key("smime@example.com"));
+    }
+}
+
+#[tokio::test]
+async fn test_associate_certificate_duplicate_conflicts() {
+    let state = make_state();
+    let svc = SesV2Service::new(state.clone());
+    create_identity(&svc, "dup@example.com").await;
+
+    let body =
+        format!(r#"{{"EmailIdentity": "dup@example.com", "CertificateArn": "{TEST_CERT_ARN}"}}"#);
+    assert_eq!(
+        associate_certificate(&svc, &body).await.status,
+        StatusCode::OK
+    );
+    let resp = associate_certificate(&svc, &body).await;
+    assert_eq!(resp.status, StatusCode::CONFLICT);
+    let err: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(err["__type"], "AlreadyExistsException");
+
+    // A DEPROVISIONING association is replaced rather than rejected.
+    {
+        let mut accts = state.write();
+        let s = accts.get_or_create("123456789012");
+        s.identity_certificates.get_mut("dup@example.com").unwrap()[0].status =
+            "DEPROVISIONING".to_string();
+    }
+    let replacement =
+        format!(r#"{{"EmailIdentity": "dup@example.com", "CertificateArn": "{TEST_CERT_ARN_2}"}}"#);
+    assert_eq!(
+        associate_certificate(&svc, &replacement).await.status,
+        StatusCode::OK
+    );
+    let accts = state.read();
+    let s = accts.default_ref();
+    let certs = s.identity_certificates.get("dup@example.com").unwrap();
+    assert_eq!(certs.len(), 1);
+    assert_eq!(certs[0].certificate_arn, TEST_CERT_ARN_2);
+    assert_eq!(certs[0].status, "PROVISIONING");
+}
+
+#[tokio::test]
+async fn test_associate_certificate_unknown_identity_is_404() {
+    let state = make_state();
+    let svc = SesV2Service::new(state);
+
+    let resp = associate_certificate(
+        &svc,
+        &format!(r#"{{"EmailIdentity": "nope@example.com", "CertificateArn": "{TEST_CERT_ARN}"}}"#),
+    )
+    .await;
+    assert_eq!(resp.status, StatusCode::NOT_FOUND);
+    let err: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(err["__type"], "NotFoundException");
+}
+
+#[tokio::test]
+async fn test_associate_certificate_validates_input() {
+    let state = make_state();
+    let svc = SesV2Service::new(state);
+    create_identity(&svc, "val@example.com").await;
+    create_identity(&svc, "example.org").await;
+
+    // Missing CertificateArn.
+    let resp = associate_certificate(&svc, r#"{"EmailIdentity": "val@example.com"}"#).await;
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+    let err: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(err["__type"], "BadRequestException");
+
+    // Missing EmailIdentity.
+    let resp =
+        associate_certificate(&svc, &format!(r#"{{"CertificateArn": "{TEST_CERT_ARN}"}}"#)).await;
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+
+    // CertificateArn that isn't an ACM certificate ARN.
+    let resp = associate_certificate(
+        &svc,
+        r#"{"EmailIdentity": "val@example.com", "CertificateArn": "arn:aws:acm:us-east-1:123456789012:key/abc"}"#,
+    )
+    .await;
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+
+    // FromAddress that doesn't match an email-address identity.
+    let resp = associate_certificate(
+        &svc,
+        &format!(
+            r#"{{"EmailIdentity": "val@example.com", "FromAddress": "other@example.com", "CertificateArn": "{TEST_CERT_ARN}"}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+
+    // Domain identity without a FromAddress.
+    let resp = associate_certificate(
+        &svc,
+        &format!(r#"{{"EmailIdentity": "example.org", "CertificateArn": "{TEST_CERT_ARN}"}}"#),
+    )
+    .await;
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+
+    // Domain identity with a FromAddress in another domain.
+    let resp = associate_certificate(
+        &svc,
+        &format!(
+            r#"{{"EmailIdentity": "example.org", "FromAddress": "a@elsewhere.net", "CertificateArn": "{TEST_CERT_ARN}"}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_associate_certificate_accepts_subdomain_from_address() {
+    let state = make_state();
+    let svc = SesV2Service::new(state.clone());
+    create_identity(&svc, "example.org").await;
+
+    let resp = associate_certificate(
+        &svc,
+        &format!(
+            r#"{{"EmailIdentity": "example.org", "FromAddress": "sales@mail.example.org", "CertificateArn": "{TEST_CERT_ARN}"}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp.status, StatusCode::OK);
+
+    let accts = state.read();
+    let s = accts.default_ref();
+    let certs = s.identity_certificates.get("example.org").unwrap();
+    assert_eq!(certs[0].from_address, "sales@mail.example.org");
+}
+
+#[tokio::test]
+async fn test_disassociate_certificate_is_idempotent_but_404s_unknown_identity() {
+    let state = make_state();
+    let svc = SesV2Service::new(state);
+    create_identity(&svc, "idem@example.com").await;
+
+    // No association yet: AWS documents this as a no-op success.
+    let resp = disassociate_certificate(&svc, r#"{"EmailIdentity": "idem@example.com"}"#).await;
+    assert_eq!(resp.status, StatusCode::OK);
+
+    // Unknown identity is the only NotFoundException case.
+    let resp = disassociate_certificate(&svc, r#"{"EmailIdentity": "ghost@example.com"}"#).await;
+    assert_eq!(resp.status, StatusCode::NOT_FOUND);
+    let err: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(err["__type"], "NotFoundException");
+
+    // Missing EmailIdentity is a BadRequestException.
+    let resp = disassociate_certificate(&svc, "{}").await;
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_list_certificates_paginates() {
+    let state = make_state();
+    let svc = SesV2Service::new(state);
+    create_identity(&svc, "example.org").await;
+
+    for local in ["a", "b", "c"] {
+        let resp = associate_certificate(
+            &svc,
+            &format!(
+                r#"{{"EmailIdentity": "example.org", "FromAddress": "{local}@example.org", "CertificateArn": "{TEST_CERT_ARN}"}}"#
+            ),
+        )
+        .await;
+        assert_eq!(resp.status, StatusCode::OK);
+    }
+
+    let resp = list_certificates(&svc, r#"{"EmailIdentity": "example.org", "PageSize": 2}"#).await;
+    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(body["Certificates"].as_array().unwrap().len(), 2);
+    assert_eq!(body["Certificates"][0]["FromAddress"], "a@example.org");
+    assert_eq!(body["NextToken"], "c@example.org");
+
+    let resp = list_certificates(
+        &svc,
+        r#"{"EmailIdentity": "example.org", "PageSize": 2, "NextToken": "c@example.org"}"#,
+    )
+    .await;
+    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(body["Certificates"].as_array().unwrap().len(), 1);
+    assert_eq!(body["Certificates"][0]["FromAddress"], "c@example.org");
+    assert!(body["NextToken"].is_null());
+}
+
+#[tokio::test]
+async fn test_list_certificates_errors() {
+    let state = make_state();
+    let svc = SesV2Service::new(state);
+    create_identity(&svc, "list@example.com").await;
+
+    // Unknown identity.
+    let resp = list_certificates(&svc, r#"{"EmailIdentity": "ghost@example.com"}"#).await;
+    assert_eq!(resp.status, StatusCode::NOT_FOUND);
+    let err: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(err["__type"], "NotFoundException");
+
+    // Non-positive PageSize.
+    let resp = list_certificates(
+        &svc,
+        r#"{"EmailIdentity": "list@example.com", "PageSize": 0}"#,
+    )
+    .await;
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+
+    // Missing EmailIdentity.
+    let resp = list_certificates(&svc, "{}").await;
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_delete_identity_drops_certificate_associations() {
+    let state = make_state();
+    let svc = SesV2Service::new(state.clone());
+    create_identity(&svc, "gone@example.com").await;
+    associate_certificate(
+        &svc,
+        &format!(r#"{{"EmailIdentity": "gone@example.com", "CertificateArn": "{TEST_CERT_ARN}"}}"#),
+    )
+    .await;
+
+    let req = make_request(Method::DELETE, "/v2/email/identities/gone@example.com", "");
+    assert_eq!(svc.handle(req).await.unwrap().status, StatusCode::OK);
+
+    let accts = state.read();
+    let s = accts.default_ref();
+    assert!(!s.identity_certificates.contains_key("gone@example.com"));
+}
+
+// --- UpdateConfigurationSet ---
+
+async fn create_configuration_set(svc: &SesV2Service, body: &str) -> AwsResponse {
+    svc.handle(make_request(
+        Method::POST,
+        "/v2/email/configuration-sets",
+        body,
+    ))
+    .await
+    .unwrap()
+}
+
+async fn update_configuration_set(svc: &SesV2Service, body: &str) -> AwsResponse {
+    svc.handle(make_request(
+        Method::POST,
+        "/v2/email/update-configuration-sets",
+        body,
+    ))
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn test_update_configuration_set_message_security_options() {
+    let state = make_state();
+    let svc = SesV2Service::new(state.clone());
+
+    let resp = create_configuration_set(
+        &svc,
+        r#"{"ConfigurationSetName": "cs-security", "ReputationOptions": {"ReputationMetricsEnabled": true}}"#,
+    )
+    .await;
+    assert_eq!(resp.status, StatusCode::OK);
+
+    let resp = update_configuration_set(
+        &svc,
+        r#"{"ConfigurationSetName": "cs-security",
+            "MessageSecurityOptions": {"SigningScheme": {"SmimeScheme": {"SignatureFormat": "DETACHED"}}}}"#,
+    )
+    .await;
+    assert_eq!(resp.status, StatusCode::OK);
+
+    // Stored on the configuration set...
+    {
+        let accts = state.read();
+        let s = accts.default_ref();
+        let cs = s.configuration_sets.get("cs-security").unwrap();
+        assert_eq!(
+            cs.message_security_options.as_ref().unwrap()["SigningScheme"]["SmimeScheme"]
+                ["SignatureFormat"],
+            "DETACHED"
+        );
+        // ... and the partial update left the other attributes alone.
+        assert!(cs.reputation_metrics_enabled);
+    }
+
+    // ... and echoed by GetConfigurationSet.
+    let req = make_request(Method::GET, "/v2/email/configuration-sets/cs-security", "");
+    let resp = svc.handle(req).await.unwrap();
+    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(
+        body["MessageSecurityOptions"]["SigningScheme"]["SmimeScheme"]["SignatureFormat"],
+        "DETACHED"
+    );
+    assert_eq!(body["ReputationOptions"]["ReputationMetricsEnabled"], true);
+}
+
+#[tokio::test]
+async fn test_create_configuration_set_round_trips_message_security_options() {
+    let state = make_state();
+    let svc = SesV2Service::new(state);
+
+    let resp = create_configuration_set(
+        &svc,
+        r#"{"ConfigurationSetName": "cs-create-security",
+            "MessageSecurityOptions": {"SigningScheme": {"DefaultScheme": {}}}}"#,
+    )
+    .await;
+    assert_eq!(resp.status, StatusCode::OK);
+
+    let req = make_request(
+        Method::GET,
+        "/v2/email/configuration-sets/cs-create-security",
+        "",
+    );
+    let resp = svc.handle(req).await.unwrap();
+    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert!(body["MessageSecurityOptions"]["SigningScheme"]["DefaultScheme"].is_object());
+}
+
+#[tokio::test]
+async fn test_update_configuration_set_errors() {
+    let state = make_state();
+    let svc = SesV2Service::new(state);
+    create_configuration_set(&svc, r#"{"ConfigurationSetName": "cs-err"}"#).await;
+
+    // Unknown configuration set.
+    let resp = update_configuration_set(&svc, r#"{"ConfigurationSetName": "cs-missing"}"#).await;
+    assert_eq!(resp.status, StatusCode::NOT_FOUND);
+    let err: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(err["__type"], "NotFoundException");
+
+    // Missing name.
+    let resp = update_configuration_set(&svc, "{}").await;
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+
+    // SigningScheme is a union: two members set is invalid.
+    let resp = update_configuration_set(
+        &svc,
+        r#"{"ConfigurationSetName": "cs-err",
+            "MessageSecurityOptions": {"SigningScheme": {"DefaultScheme": {}, "SmimeScheme": {}}}}"#,
+    )
+    .await;
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+    let err: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(err["__type"], "BadRequestException");
+
+    // DETACHED is the only modeled signature format.
+    let resp = update_configuration_set(
+        &svc,
+        r#"{"ConfigurationSetName": "cs-err",
+            "MessageSecurityOptions": {"SigningScheme": {"SmimeScheme": {"SignatureFormat": "ATTACHED"}}}}"#,
+    )
+    .await;
+    assert_eq!(resp.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_update_configuration_set_route_is_not_a_configuration_set_name() {
+    // `/v2/email/update-configuration-sets` is a fixed URI, so it must not
+    // be mistaken for a configuration set named "update-configuration-sets"
+    // nor fall through to the unknown-operation handler.
+    let state = make_state();
+    let svc = SesV2Service::new(state);
+    let req = make_request(
+        Method::POST,
+        "/v2/email/update-configuration-sets",
+        r#"{"ConfigurationSetName": "nope"}"#,
+    );
+    let resp = svc.handle(req).await.unwrap();
+    assert_eq!(resp.status, StatusCode::NOT_FOUND);
+    let err: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(err["__type"], "NotFoundException");
 }

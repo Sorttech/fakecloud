@@ -8,7 +8,7 @@ use crate::state::SesState;
 
 use super::{
     event_destination_to_json, extract_string_array, parse_event_destination_definition,
-    SesV2Service,
+    validate_message_security_options, SesV2Service,
 };
 
 impl SesV2Service {
@@ -80,6 +80,21 @@ impl SesV2Service {
         // the caller sent it at all — that's what GetConfigurationSet
         // needs to mirror back.
         let archiving_options_present = body["ArchivingOptions"].is_object();
+        // MessageSecurityOptions carries the S/MIME SigningScheme union.
+        // Validate it up front so a malformed union is rejected rather
+        // than stored and echoed back on GetConfigurationSet.
+        let message_security_options = if body["MessageSecurityOptions"].is_object() {
+            if let Err(msg) = validate_message_security_options(&body["MessageSecurityOptions"]) {
+                return Ok(Self::json_error(
+                    StatusCode::BAD_REQUEST,
+                    "BadRequestException",
+                    &msg,
+                ));
+            }
+            Some(body["MessageSecurityOptions"].clone())
+        } else {
+            None
+        };
 
         state.configuration_sets.insert(
             name.clone(),
@@ -95,6 +110,7 @@ impl SesV2Service {
                 reputation_metrics_enabled,
                 vdm_options,
                 archive_arn,
+                message_security_options,
                 archiving_options_present,
             },
         );
@@ -230,6 +246,10 @@ impl SesV2Service {
             response["VdmOptions"] = vdm.clone();
         }
 
+        if let Some(ref security) = cs.message_security_options {
+            response["MessageSecurityOptions"] = security.clone();
+        }
+
         if cs.archiving_options_present || cs.archive_arn.is_some() {
             let mut archiving = serde_json::Map::new();
             if let Some(ref arn) = cs.archive_arn {
@@ -250,6 +270,65 @@ impl SesV2Service {
         }
 
         Ok(AwsResponse::json(StatusCode::OK, response.to_string()))
+    }
+
+    /// UpdateConfigurationSet performs a partial update: only the
+    /// attributes present in the request body are written, everything
+    /// else on the stored set is left alone. The configuration set is
+    /// named in the body (the URI is the fixed
+    /// `/v2/email/update-configuration-sets`), so an unknown name is a
+    /// NotFoundException rather than an unroutable path.
+    pub(super) fn update_configuration_set(
+        &self,
+        req: &AwsRequest,
+    ) -> Result<AwsResponse, AwsServiceError> {
+        let body: Value = Self::parse_body(req)?;
+        let name = match body["ConfigurationSetName"].as_str() {
+            Some(n) => n.to_string(),
+            None => {
+                return Ok(Self::json_error(
+                    StatusCode::BAD_REQUEST,
+                    "BadRequestException",
+                    "ConfigurationSetName is required",
+                ));
+            }
+        };
+        if name.is_empty() {
+            return Ok(Self::json_error(
+                StatusCode::BAD_REQUEST,
+                "BadRequestException",
+                "ConfigurationSetName must not be empty",
+            ));
+        }
+        if body["MessageSecurityOptions"].is_object() {
+            if let Err(msg) = validate_message_security_options(&body["MessageSecurityOptions"]) {
+                return Ok(Self::json_error(
+                    StatusCode::BAD_REQUEST,
+                    "BadRequestException",
+                    &msg,
+                ));
+            }
+        }
+
+        let mut accounts = self.state.write();
+        let state = accounts.get_or_create(&req.account_id);
+
+        let cs = match state.configuration_sets.get_mut(&name) {
+            Some(cs) => cs,
+            None => {
+                return Ok(Self::json_error(
+                    StatusCode::NOT_FOUND,
+                    "NotFoundException",
+                    &format!("Configuration set {} does not exist", name),
+                ));
+            }
+        };
+
+        if body["MessageSecurityOptions"].is_object() {
+            cs.message_security_options = Some(body["MessageSecurityOptions"].clone());
+        }
+
+        Ok(AwsResponse::json(StatusCode::OK, "{}"))
     }
 
     pub(super) fn delete_configuration_set(

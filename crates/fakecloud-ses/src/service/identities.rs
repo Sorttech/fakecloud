@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use crate::state::EmailIdentity;
+use crate::state::IdentityCertificate;
 use crate::state::SesState;
 
 use super::SesV2Service;
@@ -332,6 +333,9 @@ impl SesV2Service {
 
         // Remove policies for this identity
         state.identity_policies.remove(identity_name);
+
+        // Remove S/MIME certificate associations for this identity
+        state.identity_certificates.remove(identity_name);
 
         Ok(AwsResponse::json(StatusCode::OK, "{}"))
     }
@@ -731,5 +735,314 @@ impl SesV2Service {
             body["ConfigurationSetName"].as_str().map(|s| s.to_string());
 
         Ok(AwsResponse::json(StatusCode::OK, "{}"))
+    }
+
+    // --- S/MIME certificate associations ---
+
+    pub(super) fn associate_email_identity_certificate(
+        &self,
+        req: &AwsRequest,
+    ) -> Result<AwsResponse, AwsServiceError> {
+        let body: Value = Self::parse_body(req)?;
+        let identity_name = match required_body_string(&body, "EmailIdentity") {
+            Ok(name) => name,
+            Err(resp) => return Ok(*resp),
+        };
+        let certificate_arn = match required_body_string(&body, "CertificateArn") {
+            Ok(arn) => arn,
+            Err(resp) => return Ok(*resp),
+        };
+        if let Err(msg) = validate_certificate_arn(&certificate_arn) {
+            return Ok(Self::json_error(
+                StatusCode::BAD_REQUEST,
+                "BadRequestException",
+                &msg,
+            ));
+        }
+
+        let mut accounts = self.state.write();
+        let state = accounts.get_or_create(&req.account_id);
+
+        let identity = match state.identities.get(&identity_name) {
+            Some(id) => id,
+            None => {
+                return Ok(Self::json_error(
+                    StatusCode::NOT_FOUND,
+                    "NotFoundException",
+                    &format!("Identity {} does not exist", identity_name),
+                ));
+            }
+        };
+        let from_address = match certificate_from_address(identity, body["FromAddress"].as_str()) {
+            Ok(addr) => addr,
+            Err(msg) => {
+                return Ok(Self::json_error(
+                    StatusCode::BAD_REQUEST,
+                    "BadRequestException",
+                    &msg,
+                ));
+            }
+        };
+
+        let certificates = state
+            .identity_certificates
+            .entry(identity_name.clone())
+            .or_default();
+        // One association per from-address. Real SES rejects a second
+        // association unless the existing one is on its way out
+        // (DEPROVISIONING), in which case the new one replaces it.
+        if let Some(existing) = certificates
+            .iter_mut()
+            .find(|c| c.from_address.eq_ignore_ascii_case(&from_address))
+        {
+            if existing.status != "DEPROVISIONING" {
+                return Ok(Self::json_error(
+                    StatusCode::CONFLICT,
+                    "AlreadyExistsException",
+                    &format!("A certificate is already associated with {from_address}"),
+                ));
+            }
+            existing.certificate_arn = certificate_arn;
+            existing.status = "PROVISIONING".to_string();
+            existing.associated_at = Utc::now();
+        } else {
+            certificates.push(IdentityCertificate {
+                from_address,
+                status: "PROVISIONING".to_string(),
+                certificate_arn,
+                associated_at: Utc::now(),
+            });
+            certificates.sort_by(|a, b| a.from_address.cmp(&b.from_address));
+        }
+
+        Ok(AwsResponse::json(StatusCode::OK, "{}"))
+    }
+
+    pub(super) fn disassociate_email_identity_certificate(
+        &self,
+        req: &AwsRequest,
+    ) -> Result<AwsResponse, AwsServiceError> {
+        let body: Value = Self::parse_body(req)?;
+        let identity_name = match required_body_string(&body, "EmailIdentity") {
+            Ok(name) => name,
+            Err(resp) => return Ok(*resp),
+        };
+
+        let mut accounts = self.state.write();
+        let state = accounts.get_or_create(&req.account_id);
+
+        let identity = match state.identities.get(&identity_name) {
+            Some(id) => id,
+            None => {
+                return Ok(Self::json_error(
+                    StatusCode::NOT_FOUND,
+                    "NotFoundException",
+                    &format!("Identity {} does not exist", identity_name),
+                ));
+            }
+        };
+        let from_address = match certificate_from_address(identity, body["FromAddress"].as_str()) {
+            Ok(addr) => addr,
+            Err(msg) => {
+                return Ok(Self::json_error(
+                    StatusCode::BAD_REQUEST,
+                    "BadRequestException",
+                    &msg,
+                ));
+            }
+        };
+
+        // Idempotent: an identity that exists but carries no matching
+        // association succeeds without changing anything. NotFoundException
+        // is reserved for an unknown identity (handled above).
+        let mut drained = false;
+        if let Some(certificates) = state.identity_certificates.get_mut(&identity_name) {
+            certificates.retain(|c| !c.from_address.eq_ignore_ascii_case(&from_address));
+            drained = certificates.is_empty();
+        }
+        if drained {
+            state.identity_certificates.remove(&identity_name);
+        }
+
+        Ok(AwsResponse::json(StatusCode::OK, "{}"))
+    }
+
+    pub(super) fn list_email_identity_certificates(
+        &self,
+        req: &AwsRequest,
+    ) -> Result<AwsResponse, AwsServiceError> {
+        let body: Value = Self::parse_body(req)?;
+        let identity_name = match required_body_string(&body, "EmailIdentity") {
+            Ok(name) => name,
+            Err(resp) => return Ok(*resp),
+        };
+        // NextToken / PageSize travel in the body here (the op is a POST
+        // with no httpQuery bindings), unlike the GET-style listings.
+        let page_size = match body.get("PageSize") {
+            None | Some(Value::Null) => 20usize,
+            Some(v) => match v.as_i64() {
+                Some(n) if n >= 1 => n as usize,
+                _ => {
+                    return Ok(Self::json_error(
+                        StatusCode::BAD_REQUEST,
+                        "BadRequestException",
+                        "PageSize must be a positive integer",
+                    ));
+                }
+            },
+        };
+        let next_token = body["NextToken"].as_str().map(|s| s.to_string());
+
+        let mut accounts = self.state.write();
+        let state = accounts.get_or_create(&req.account_id);
+
+        if !state.identities.contains_key(&identity_name) {
+            return Ok(Self::json_error(
+                StatusCode::NOT_FOUND,
+                "NotFoundException",
+                &format!("Identity {} does not exist", identity_name),
+            ));
+        }
+
+        let mut page: Vec<Value> = Vec::new();
+        let mut next_marker: Option<String> = None;
+        if let Some(certificates) = state.identity_certificates.get_mut(&identity_name) {
+            // Auto-advance PROVISIONING -> ACTIVE on the next read, matching
+            // real SES once the certificate finishes provisioning (the same
+            // convention `mail_from_domain_status` uses).
+            for certificate in certificates.iter_mut() {
+                if certificate.status == "PROVISIONING" {
+                    certificate.status = "ACTIVE".to_string();
+                }
+            }
+            certificates.sort_by(|a, b| a.from_address.cmp(&b.from_address));
+
+            // The token is the from-address of the first item on the next
+            // page (an inclusive cursor), so a disassociation between pages
+            // still advances the listing instead of restarting it.
+            let start_idx = match next_token {
+                Some(ref token) => certificates
+                    .iter()
+                    .position(|c| c.from_address.as_str() >= token.as_str())
+                    .unwrap_or(certificates.len()),
+                None => 0,
+            };
+
+            page = certificates
+                .iter()
+                .skip(start_idx)
+                .take(page_size)
+                .map(|c| {
+                    // CertificateExpiryTime is sourced from the ACM
+                    // certificate on real SES. fakecloud's SES holds no
+                    // handle on the ACM service, so the field is omitted
+                    // rather than invented.
+                    json!({
+                        "FromAddress": c.from_address,
+                        "Status": c.status,
+                        "CertificateArn": c.certificate_arn,
+                    })
+                })
+                .collect();
+            next_marker = certificates
+                .get(start_idx.saturating_add(page_size))
+                .map(|c| c.from_address.clone());
+        }
+
+        let mut response = json!({ "Certificates": page });
+        if let Some(next) = next_marker {
+            response["NextToken"] = json!(next);
+        }
+
+        Ok(AwsResponse::json(StatusCode::OK, response.to_string()))
+    }
+}
+
+/// Read a required string member out of a REST-JSON body, or build the
+/// BadRequestException real SES answers with when it is missing or empty.
+/// The error is boxed: `AwsResponse` is large enough that returning it inline
+/// trips `clippy::result_large_err` at every call site.
+fn required_body_string(body: &Value, field: &str) -> Result<String, Box<AwsResponse>> {
+    match body[field].as_str() {
+        Some(value) if !value.is_empty() => Ok(value.to_string()),
+        Some(_) => Err(Box::new(SesV2Service::json_error(
+            StatusCode::BAD_REQUEST,
+            "BadRequestException",
+            &format!("{field} must not be empty"),
+        ))),
+        None => Err(Box::new(SesV2Service::json_error(
+            StatusCode::BAD_REQUEST,
+            "BadRequestException",
+            &format!("{field} is required"),
+        ))),
+    }
+}
+
+/// Validate a `CertificateArn` against the Smithy constraints: 20..=2048
+/// characters shaped `arn:<partition>:<service>:<region>:<account>:certificate/<id>`.
+pub(crate) fn validate_certificate_arn(arn: &str) -> Result<(), String> {
+    if !(20..=2048).contains(&arn.len()) {
+        return Err("CertificateArn length must be between 20 and 2048".to_string());
+    }
+    let parts: Vec<&str> = arn.splitn(6, ':').collect();
+    let well_formed = parts.len() == 6
+        && parts[0] == "arn"
+        && !parts[1].is_empty()
+        && !parts[2].is_empty()
+        && !parts[4].is_empty()
+        && parts[4].chars().all(|c| c.is_ascii_digit())
+        && parts[5]
+            .strip_prefix("certificate/")
+            .is_some_and(|id| !id.is_empty());
+    if !well_formed {
+        return Err(format!(
+            "CertificateArn {arn} is not a valid certificate ARN"
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve the from-address a certificate association applies to. On a
+/// domain identity `FromAddress` is required and must live in that domain
+/// (or a subdomain); on an email-address identity it is optional and must
+/// match the identity exactly when supplied.
+pub(crate) fn certificate_from_address(
+    identity: &EmailIdentity,
+    from_address: Option<&str>,
+) -> Result<String, String> {
+    if identity.identity_type == "EMAIL_ADDRESS" {
+        return match from_address {
+            None => Ok(identity.identity_name.clone()),
+            Some(addr) if addr.eq_ignore_ascii_case(&identity.identity_name) => {
+                Ok(addr.to_string())
+            }
+            Some(addr) => Err(format!(
+                "FromAddress {addr} does not match email identity {}",
+                identity.identity_name
+            )),
+        };
+    }
+
+    let addr = from_address.ok_or_else(|| {
+        format!(
+            "FromAddress is required for domain identity {}",
+            identity.identity_name
+        )
+    })?;
+    let domain = match addr.rsplit_once('@') {
+        Some((local, domain)) if !local.is_empty() && !domain.is_empty() => domain,
+        _ => {
+            return Err(format!("FromAddress {addr} is not a valid email address"));
+        }
+    };
+    let identity_domain = identity.identity_name.to_ascii_lowercase();
+    let domain = domain.to_ascii_lowercase();
+    if domain == identity_domain || domain.ends_with(&format!(".{identity_domain}")) {
+        Ok(addr.to_string())
+    } else {
+        Err(format!(
+            "FromAddress {addr} does not belong to domain identity {}",
+            identity.identity_name
+        ))
     }
 }

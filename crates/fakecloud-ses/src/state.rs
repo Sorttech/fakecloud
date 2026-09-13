@@ -80,6 +80,13 @@ pub struct ConfigurationSet {
     pub vdm_options: Option<serde_json::Value>,
     // Archiving options
     pub archive_arn: Option<String>,
+    /// `MessageSecurityOptions` (the S/MIME `SigningScheme` union) as
+    /// supplied by CreateConfigurationSet or UpdateConfigurationSet.
+    /// `None` until configured; GetConfigurationSet only reports the
+    /// block once it has been set, the same way DeliveryOptions and
+    /// TrackingOptions are only echoed when non-default.
+    #[serde(default)]
+    pub message_security_options: Option<serde_json::Value>,
     /// Tracks whether `ArchivingOptions` was set on the configuration set
     /// (via Create or PutConfigurationSetArchivingOptions). AWS surfaces
     /// the structure on GetConfigurationSet even when only `ArchiveArn`
@@ -88,6 +95,24 @@ pub struct ConfigurationSet {
     /// before the field existed.
     #[serde(default)]
     pub archiving_options_present: bool,
+}
+
+/// One S/MIME certificate association between an email identity and an
+/// ACM certificate, created by `AssociateEmailIdentityCertificate`.
+/// Real SES allows a single association per from-address.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityCertificate {
+    /// Address the certificate signs for. Always populated: for an
+    /// email-address identity it defaults to the identity itself, for a
+    /// domain identity the caller must name an address in that domain.
+    pub from_address: String,
+    /// PROVISIONING | ACTIVE | INACTIVE | DEPROVISIONING | FAILED.
+    /// Starts at PROVISIONING and advances to ACTIVE on the next read,
+    /// the same way `mail_from_domain_status` walks Pending -> Success.
+    pub status: String,
+    /// ARN of the ACM certificate, exactly as supplied by the caller.
+    pub certificate_arn: String,
+    pub associated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -488,6 +513,10 @@ pub struct SesState {
     pub event_destinations: BTreeMap<String, Vec<EventDestination>>,
     /// Identity policies: identity name → policy name → policy JSON document.
     pub identity_policies: BTreeMap<String, BTreeMap<String, String>>,
+    /// S/MIME certificate associations: identity name -> associations,
+    /// kept sorted by from-address so pagination is stable.
+    #[serde(default)]
+    pub identity_certificates: BTreeMap<String, Vec<IdentityCertificate>>,
     /// Custom verification email templates: template name → template.
     pub custom_verification_email_templates: BTreeMap<String, CustomVerificationEmailTemplate>,
     /// Dedicated IP pools: pool name → pool.
@@ -610,6 +639,7 @@ impl SesState {
             suppressed_destinations: BTreeMap::new(),
             event_destinations: BTreeMap::new(),
             identity_policies: BTreeMap::new(),
+            identity_certificates: BTreeMap::new(),
             custom_verification_email_templates: BTreeMap::new(),
             dedicated_ip_pools: BTreeMap::new(),
             dedicated_ips: BTreeMap::new(),
@@ -767,6 +797,30 @@ mod tests {
             state.event_destination_dispatches[0].destination_type,
             "firehose"
         );
+    }
+
+    #[test]
+    fn identity_certificate_round_trips_through_state() {
+        let mut state = SesState::new("123456789012", "us-east-1");
+        state.identity_certificates.insert(
+            "smime@example.com".to_string(),
+            vec![IdentityCertificate {
+                from_address: "smime@example.com".to_string(),
+                status: "PROVISIONING".to_string(),
+                certificate_arn: "arn:aws:acm:us-east-1:123456789012:certificate/abc-123"
+                    .to_string(),
+                associated_at: Utc::now(),
+            }],
+        );
+        let encoded = serde_json::to_string(&state).unwrap();
+        let decoded: SesState = serde_json::from_str(&encoded).unwrap();
+        let certs = decoded
+            .identity_certificates
+            .get("smime@example.com")
+            .unwrap();
+        assert_eq!(certs[0].status, "PROVISIONING");
+        state.reset();
+        assert!(state.identity_certificates.is_empty());
     }
 
     #[test]

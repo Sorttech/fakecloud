@@ -91,6 +91,10 @@ impl SesV2Service {
     ///   GET    /v2/email/configuration-sets              -> ListConfigurationSets
     ///   GET    /v2/email/configuration-sets/{name}       -> GetConfigurationSet
     ///   DELETE /v2/email/configuration-sets/{name}       -> DeleteConfigurationSet
+    ///   POST   /v2/email/update-configuration-sets       -> UpdateConfigurationSet
+    ///   POST   /v2/email/identity/certificates           -> AssociateEmailIdentityCertificate
+    ///   POST   /v2/email/identity/certificates/delete    -> DisassociateEmailIdentityCertificate
+    ///   POST   /v2/email/identity/certificates/list      -> ListEmailIdentityCertificates
     ///   POST   /v2/email/templates                       -> CreateEmailTemplate
     ///   GET    /v2/email/templates                       -> ListEmailTemplates
     ///   GET    /v2/email/templates/{name}                -> GetEmailTemplate
@@ -212,6 +216,10 @@ impl SesV2Service {
             "account" => resolve_account_action(method, segs),
             "identities" => resolve_identities_action(method, segs, resource),
             "configuration-sets" => resolve_configuration_sets_action(method, segs, resource),
+            "update-configuration-sets" if segs.len() == 3 && *method == Method::POST => {
+                Some(("UpdateConfigurationSet", None, None))
+            }
+            "identity" => resolve_identity_certificates_action(method, segs),
             "templates" => resolve_templates_action(method, segs, resource),
             "contact-lists" => resolve_contact_lists_action(method, segs, resource),
             "suppression" => resolve_suppression_action(method, segs),
@@ -412,7 +420,13 @@ impl fakecloud_core::service::AwsService for SesV2Service {
             "CreateConfigurationSet" => self.create_configuration_set(&req),
             "ListConfigurationSets" => self.list_configuration_sets(&req),
             "GetConfigurationSet" => self.get_configuration_set(res, &req),
+            "UpdateConfigurationSet" => self.update_configuration_set(&req),
             "DeleteConfigurationSet" => self.delete_configuration_set(res, &req),
+            "AssociateEmailIdentityCertificate" => self.associate_email_identity_certificate(&req),
+            "DisassociateEmailIdentityCertificate" => {
+                self.disassociate_email_identity_certificate(&req)
+            }
+            "ListEmailIdentityCertificates" => self.list_email_identity_certificates(&req),
             "CreateEmailTemplate" => self.create_email_template(&req),
             "ListEmailTemplates" => self.list_email_templates(&req),
             "GetEmailTemplate" => self.get_email_template(res, &req),
@@ -580,7 +594,11 @@ impl fakecloud_core::service::AwsService for SesV2Service {
             "CreateConfigurationSet",
             "ListConfigurationSets",
             "GetConfigurationSet",
+            "UpdateConfigurationSet",
             "DeleteConfigurationSet",
+            "AssociateEmailIdentityCertificate",
+            "DisassociateEmailIdentityCertificate",
+            "ListEmailIdentityCertificates",
             "CreateEmailTemplate",
             "ListEmailTemplates",
             "GetEmailTemplate",

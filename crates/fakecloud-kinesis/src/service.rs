@@ -15,18 +15,24 @@ use fakecloud_core::validation::{
 use fakecloud_persistence::SnapshotStore;
 
 use crate::state::{
-    KinesisConsumer, KinesisRecord, KinesisShard, KinesisSnapshot, KinesisState, KinesisStream,
-    SharedKinesisState, KINESIS_SNAPSHOT_SCHEMA_VERSION,
+    KinesisChannel, KinesisChannelDeadLetterQueue, KinesisChannelDestination,
+    KinesisChannelEncryption, KinesisChannelLogging, KinesisChannelPartitionField,
+    KinesisChannelS3Storage, KinesisChannelS3Table, KinesisChannelStream, KinesisConsumer,
+    KinesisRecord, KinesisShard, KinesisSnapshot, KinesisState, KinesisStream, SharedKinesisState,
+    KINESIS_SNAPSHOT_SCHEMA_VERSION,
 };
 
 const SUPPORTED_ACTIONS: &[&str] = &[
     "AddTagsToStream",
+    "CreateChannel",
     "CreateStream",
     "DecreaseStreamRetentionPeriod",
+    "DeleteChannel",
     "DeleteResourcePolicy",
     "DeleteStream",
     "DeregisterStreamConsumer",
     "DescribeAccountSettings",
+    "DescribeChannel",
     "DescribeLimits",
     "DescribeStream",
     "DescribeStreamConsumer",
@@ -37,6 +43,7 @@ const SUPPORTED_ACTIONS: &[&str] = &[
     "GetResourcePolicy",
     "GetShardIterator",
     "IncreaseStreamRetentionPeriod",
+    "ListChannels",
     "ListShards",
     "ListStreamConsumers",
     "ListStreams",
@@ -55,6 +62,7 @@ const SUPPORTED_ACTIONS: &[&str] = &[
     "TagResource",
     "UntagResource",
     "UpdateAccountSettings",
+    "UpdateChannel",
     "UpdateMaxRecordSize",
     "UpdateShardCount",
     "UpdateStreamMode",
@@ -192,6 +200,11 @@ impl AwsService for KinesisService {
             "SplitShard" => self.split_shard(&request),
             "UpdateShardCount" => self.update_shard_count(&request),
             "SubscribeToShard" => self.subscribe_to_shard(&request),
+            "CreateChannel" => self.create_channel(&request),
+            "DescribeChannel" => self.describe_channel(&request),
+            "ListChannels" => self.list_channels(&request),
+            "UpdateChannel" => self.update_channel(&request),
+            "DeleteChannel" => self.delete_channel(&request),
             _ => Err(AwsServiceError::action_not_implemented(
                 self.service_name(),
                 &request.action,
@@ -489,6 +502,22 @@ impl KinesisService {
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&request.account_id);
         let stream_name = resolve_stream_name(state, &body)?;
+        // A stream cannot be deleted while a channel still draws from it; AWS
+        // requires the attached channels to be deleted first. The guard keys
+        // off the stream name so a caller whose credential scope names a
+        // different region than the channel's source ARNs still trips it.
+        let attached_channels = state.channels_for_stream(&stream_name);
+        if !attached_channels.is_empty() {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "ResourceInUseException",
+                format!(
+                    "Stream {stream_name} has channels attached to it: {}. \
+                     Delete them before deleting the stream.",
+                    attached_channels.join(", ")
+                ),
+            ));
+        }
         let stream = state.streams.remove(&stream_name);
         if stream.is_none() {
             return Err(stream_not_found(&state.account_id, &stream_name));
@@ -938,13 +967,10 @@ impl KinesisService {
 
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&request.account_id);
-        let stream_name = state
-            .stream_name_from_arn(resource_arn)
-            .ok_or_else(|| resource_not_found_arn(resource_arn))?;
-        let stream = state.streams.get_mut(&stream_name).unwrap();
+        let stored = resource_tags_mut(state, resource_arn)?;
         for (key, value) in tags {
             if let Some(value) = value.as_str() {
-                stream.tags.insert(key.clone(), value.to_string());
+                stored.insert(key.clone(), value.to_string());
             }
         }
         Ok(AwsResponse::ok_json(json!({})))
@@ -960,12 +986,9 @@ impl KinesisService {
 
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&request.account_id);
-        let stream_name = state
-            .stream_name_from_arn(resource_arn)
-            .ok_or_else(|| resource_not_found_arn(resource_arn))?;
-        let stream = state.streams.get_mut(&stream_name).unwrap();
+        let stored = resource_tags_mut(state, resource_arn)?;
         for key in tag_keys.iter().filter_map(|v| v.as_str()) {
-            stream.tags.remove(key);
+            stored.remove(key);
         }
         Ok(AwsResponse::ok_json(json!({})))
     }
@@ -978,12 +1001,7 @@ impl KinesisService {
         let accounts = self.state.read();
         let empty = KinesisState::new(&request.account_id, &request.region);
         let state = accounts.get(&request.account_id).unwrap_or(&empty);
-        let stream_name = state
-            .stream_name_from_arn(resource_arn)
-            .ok_or_else(|| resource_not_found_arn(resource_arn))?;
-        let stream = state.streams.get(&stream_name).unwrap();
-        let tags: Vec<Value> = stream
-            .tags
+        let tags: Vec<Value> = resource_tags(state, resource_arn)?
             .iter()
             .map(|(key, value)| json!({ "Key": key, "Value": value }))
             .collect();
@@ -2097,6 +2115,223 @@ impl KinesisService {
             body: frame.into(),
             headers: http::HeaderMap::new(),
         })
+    }
+}
+
+// --- Channels ---
+
+impl KinesisService {
+    fn create_channel(&self, request: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
+        let body = request.json_body();
+        let channel_name = require_channel_name(&body)?;
+        // `ServiceExecutionRoleARN` is a `RoleARN`, capped at 512.
+        let service_execution_role_arn =
+            require_channel_member(&body, "ServiceExecutionRoleARN", 512)?;
+        let channel_id = uuid::Uuid::new_v4().to_string();
+        let destination = parse_channel_destination(&body, channel_name, &channel_id)?;
+        let encryption = parse_channel_encryption(&body["EncryptionConfiguration"])?;
+        let logging =
+            parse_channel_logging(&body["LoggingConfiguration"], channel_name, &channel_id)?;
+        let tags: std::collections::BTreeMap<String, String> = body["Tags"]
+            .as_object()
+            .map(|map| {
+                map.iter()
+                    .filter_map(|(key, value)| {
+                        value.as_str().map(|value| (key.clone(), value.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut accounts = self.state.write();
+        let state = accounts.get_or_create(&request.account_id);
+        if state.channels.contains_key(channel_name) {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "ResourceInUseException",
+                format!(
+                    "Channel {channel_name} under account {} already exists.",
+                    state.account_id
+                ),
+            ));
+        }
+        let streams = parse_channel_streams(state, &body)?;
+
+        let channel = KinesisChannel {
+            channel_name: channel_name.to_string(),
+            channel_arn: state.channel_arn(request.region.as_str(), &channel_id),
+            channel_id,
+            // Channel creation is asynchronous on AWS (CREATING then ACTIVE).
+            // Fakecloud provisions synchronously, so the channel is ACTIVE the
+            // moment CreateChannel returns.
+            channel_status: "ACTIVE".to_string(),
+            channel_creation_timestamp: Utc::now(),
+            service_execution_role_arn: service_execution_role_arn.to_string(),
+            streams,
+            destination,
+            encryption,
+            logging,
+            tags,
+        };
+        let description = channel_description_json(&channel);
+        state.channels.insert(channel_name.to_string(), channel);
+
+        Ok(AwsResponse::ok_json(json!({
+            "ChannelDescription": description,
+        })))
+    }
+
+    fn describe_channel(&self, request: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
+        let body = request.json_body();
+        let channel_arn = require_channel_arn(&body)?;
+
+        let accounts = self.state.read();
+        let empty = KinesisState::new(&request.account_id, &request.region);
+        let state = accounts.get(&request.account_id).unwrap_or(&empty);
+        let channel_name = state
+            .channel_name_from_arn(channel_arn)
+            .ok_or_else(|| resource_not_found_arn(channel_arn))?;
+        let channel = state
+            .channels
+            .get(&channel_name)
+            .ok_or_else(|| resource_not_found_arn(channel_arn))?;
+
+        Ok(AwsResponse::ok_json(json!({
+            "ChannelDescription": channel_description_json(channel),
+        })))
+    }
+
+    fn list_channels(&self, request: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
+        let body = request.json_body();
+        validate_optional_string_length("NextToken", body["NextToken"].as_str(), 1, 1048576)?;
+        validate_optional_json_range("MaxResults", &body["MaxResults"], 1, 10000)?;
+        // AWS defaults to 100 and returns at most 100 channels per page even
+        // when a larger MaxResults is accepted on the wire.
+        let max_results = body["MaxResults"]
+            .as_i64()
+            .unwrap_or(MAX_LIST_CHANNELS_PAGE as i64)
+            .min(MAX_LIST_CHANNELS_PAGE as i64) as usize;
+        let resume_after = match body["NextToken"].as_str() {
+            Some(token) => Some(decode_list_channels_token(token)?),
+            None => None,
+        };
+
+        let accounts = self.state.read();
+        let empty = KinesisState::new(&request.account_id, &request.region);
+        let state = accounts.get(&request.account_id).unwrap_or(&empty);
+        // Filters resolve source ARNs against the account's streams, so they
+        // are parsed once the state is in hand rather than off the raw body.
+        let filters = parse_channel_stream_filters(state, &body["StreamFilter"])?;
+
+        // `channels` is keyed by name, so BTreeMap iteration is already the
+        // name order the cursor resumes against.
+        let mut matched: Vec<&KinesisChannel> = state
+            .channels
+            .values()
+            .filter(|channel| {
+                filters.is_empty() || channel_matches_stream_filters(channel, &filters)
+            })
+            .filter(|channel| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|cursor| channel.channel_name.as_str() > cursor)
+            })
+            .collect();
+
+        let has_more = matched.len() > max_results;
+        matched.truncate(max_results);
+        let next_token = if has_more {
+            matched
+                .last()
+                .map(|channel| encode_list_channels_token(&channel.channel_name))
+        } else {
+            None
+        };
+
+        let mut response = json!({
+            "ChannelSummaries": matched
+                .into_iter()
+                .map(channel_summary_json)
+                .collect::<Vec<Value>>(),
+        });
+        if let Some(token) = next_token {
+            response["NextToken"] = json!(token);
+        }
+        Ok(AwsResponse::ok_json(response))
+    }
+
+    fn update_channel(&self, request: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
+        let body = request.json_body();
+        let channel_arn = require_channel_arn(&body)?;
+        let s3_update = &body["S3DestinationConfiguration"];
+        let s3_tables_update = &body["S3TablesDestinationConfiguration"];
+        if !s3_update.is_null() && !s3_tables_update.is_null() {
+            return Err(invalid_argument(
+                "Specify either S3DestinationConfiguration or \
+                 S3TablesDestinationConfiguration, but not both",
+            ));
+        }
+
+        let mut accounts = self.state.write();
+        let state = accounts.get_or_create(&request.account_id);
+        let channel_name = state
+            .channel_name_from_arn(channel_arn)
+            .ok_or_else(|| resource_not_found_arn(channel_arn))?;
+        let channel = state
+            .channels
+            .get_mut(&channel_name)
+            .ok_or_else(|| resource_not_found_arn(channel_arn))?;
+
+        // Only DataFreshnessInSeconds is updatable, and only on the
+        // destination the channel was created with.
+        let destination_type = channel.destination.destination_type();
+        if !s3_update.is_null() {
+            if destination_type != "S3" {
+                return Err(invalid_argument(
+                    "S3DestinationConfiguration cannot update a channel whose \
+                     destination is S3_TABLES",
+                ));
+            }
+            *channel.destination.data_freshness_mut() = require_channel_data_freshness(s3_update)?;
+        }
+        if !s3_tables_update.is_null() {
+            if destination_type != "S3_TABLES" {
+                return Err(invalid_argument(
+                    "S3TablesDestinationConfiguration cannot update a channel whose \
+                     destination is S3",
+                ));
+            }
+            *channel.destination.data_freshness_mut() =
+                require_channel_data_freshness(s3_tables_update)?;
+        }
+        if !body["LoggingConfiguration"].is_null() {
+            let logging = parse_channel_logging(
+                &body["LoggingConfiguration"],
+                &channel.channel_name,
+                &channel.channel_id,
+            )?;
+            channel.logging = logging;
+        }
+
+        // AWS moves the channel through UPDATING back to ACTIVE; the update is
+        // applied synchronously here, so the channel stays ACTIVE.
+        Ok(AwsResponse::ok_json(json!({
+            "ChannelDescription": channel_description_json(channel),
+        })))
+    }
+
+    fn delete_channel(&self, request: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
+        let body = request.json_body();
+        let channel_arn = require_channel_arn(&body)?;
+
+        let mut accounts = self.state.write();
+        let state = accounts.get_or_create(&request.account_id);
+        let channel_name = state
+            .channel_name_from_arn(channel_arn)
+            .ok_or_else(|| resource_not_found_arn(channel_arn))?;
+        state.channels.remove(&channel_name);
+
+        Ok(AwsResponse::ok_json(json!({})))
     }
 }
 

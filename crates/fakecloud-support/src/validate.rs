@@ -24,7 +24,7 @@ const MODEL_JSON: &str = include_str!("../model.json");
 /// The embedded model parses to exactly this many operations; a mismatch means
 /// the vendored model drifted from the implemented surface.
 #[cfg(test)]
-pub const OPERATION_COUNT: usize = 16;
+pub const OPERATION_COUNT: usize = 20;
 
 #[derive(Debug, Default)]
 struct MemberConstraint {
@@ -290,6 +290,40 @@ mod tests {
     fn refresh_requires_check_id() {
         let err = validate_input("RefreshTrustedAdvisorCheck", &json!({})).unwrap_err();
         assert!(err.contains("checkId"));
+    }
+
+    #[test]
+    fn upload_links_require_a_file_name() {
+        let err = validate_input("GetAttachmentUploadLinks", &json!({})).unwrap_err();
+        assert!(err.contains("fileName"));
+    }
+
+    #[test]
+    fn complete_upload_requires_the_completed_parts() {
+        let err = validate_input(
+            "CompleteAttachmentUpload",
+            &json!({ "uploadId": "upload-1" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("completedUploads"));
+    }
+
+    #[test]
+    fn upload_status_requires_an_upload_id() {
+        let err = validate_input("DescribeAttachmentUploadStatus", &json!({})).unwrap_err();
+        assert!(err.contains("uploadId"));
+    }
+
+    #[test]
+    fn upload_links_reject_an_out_of_range_file_size() {
+        // FileSize is modelled as 1..=157286400, so zero is refused before any
+        // handler runs.
+        let err = validate_input(
+            "GetAttachmentUploadLinks",
+            &json!({ "fileName": "log.txt", "fileSizeBytes": 0 }),
+        )
+        .unwrap_err();
+        assert!(err.contains("fileSizeBytes"));
     }
 
     #[test]

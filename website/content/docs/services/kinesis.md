@@ -4,7 +4,7 @@ description = "Data Streams, records, shard iterators, retention, tagging."
 weight = 16
 +++
 
-fakecloud implements **39 of 39** Kinesis operations at 100% Smithy conformance.
+fakecloud implements **44 of 44** Kinesis operations at 100% Smithy conformance.
 
 ## Supported features
 
@@ -18,6 +18,7 @@ fakecloud implements **39 of 39** Kinesis operations at 100% Smithy conformance.
 - **Consumers** — EnableEnhancedMonitoring, DisableEnhancedMonitoring
 - **Cross-stream** — MergeShards, SplitShard
 - **Resource policies** — PutResourcePolicy, GetResourcePolicy, DeleteResourcePolicy
+- **Delivery channels** — CreateChannel, DescribeChannel, ListChannels, UpdateChannel, DeleteChannel: a channel fans records from one or more source streams into an S3 bucket or into Apache Iceberg tables on S3 Tables, with the destination, freshness, encryption, and CloudWatch logging configuration persisted and round-tripped. A stream cannot be deleted while a channel still draws from it.
 
 ## Protocol
 
