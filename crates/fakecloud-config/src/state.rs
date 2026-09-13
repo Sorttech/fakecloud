@@ -52,7 +52,6 @@ pub struct AccountState {
     pub connectors: BTreeMap<String, Connector>,
     /// Service-linked recorders that record through a connector, keyed by name.
     #[serde(default)]
-    pub third_party_recorders: BTreeMap<String, ThirdPartyRecorder>,
     /// Configuration-item history keyed by `resource_key(type, id)`; each value
     /// is an ordered (oldest-first) list of recorded items.
     pub config_items: BTreeMap<String, Vec<ConfigurationItem>>,
@@ -106,6 +105,16 @@ pub struct ConfigurationRecorder {
     pub arn: Option<String>,
     #[serde(default)]
     pub service_principal: Option<String>,
+    /// `INTERNAL` (recorded for free) or `PAID`. Only set for a recorder linked
+    /// to a third-party connector, which is the billed kind.
+    #[serde(default)]
+    pub recording_scope: Option<String>,
+    /// The connector this recorder reads through, and the scope it reads —
+    /// both only present for a third-party service-linked recorder.
+    #[serde(default)]
+    pub connector_arn: Option<String>,
+    #[serde(default)]
+    pub scope_configuration: Option<serde_json::Value>,
     /// Whether the recorder is currently running.
     pub recording: bool,
     pub last_start_time: Option<DateTime<Utc>>,
@@ -372,18 +381,6 @@ pub struct Connector {
     pub client_identifier: String,
     /// Epoch seconds, matching how the rest of the Config state stores dates.
     pub created_time: f64,
-    #[serde(default)]
-    pub tags: Vec<(String, String)>,
-}
-
-/// A service-linked configuration recorder that records through a connector.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ThirdPartyRecorder {
-    pub arn: String,
-    pub name: String,
-    pub service_principal: String,
-    pub connector_arn: String,
-    pub scope_configuration: serde_json::Value,
 }
 
 /// On-disk snapshot envelope. Versioned so format changes fail loudly on

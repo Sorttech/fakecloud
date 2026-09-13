@@ -1496,12 +1496,47 @@ async fn config_connector_lifecycle() {
     );
     assert!(b["Connector"]["createdTime"].is_number(), "{b}");
 
-    // Put is an upsert on the tenant and client pair, not a second connector.
-    let again = make_connector(&server, "tenant-1").await;
-    assert_eq!(
-        again, arn,
-        "the same cloud account must reuse its connector"
-    );
+    // "Connectors cannot be updated" — a second Put for the same configuration
+    // is a conflict, not an upsert.
+    let (s, b) = cfg(
+        &server,
+        "PutConnector",
+        json!({
+            "ConnectorConfiguration": {
+                AZURE: { "tenantIdentifier": "tenant-1", "clientIdentifier": "client-1" }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(s, 400, "{b}");
+    assert_eq!(b["__type"], "ConflictException", "{b}");
+
+    // Create-time tags reach the shared tag store, so ListTagsForResource sees
+    // them the way it does for every other Config resource.
+    let tagged = cfg(
+        &server,
+        "PutConnector",
+        json!({
+            "ConnectorConfiguration": {
+                AZURE: { "tenantIdentifier": "tenant-tagged", "clientIdentifier": "client-1" }
+            },
+            "Tags": [{ "Key": "env", "Value": "prod" }],
+        }),
+    )
+    .await
+    .1["Arn"]
+        .as_str()
+        .expect("PutConnector returns an ARN")
+        .to_string();
+    let (s, b) = cfg(
+        &server,
+        "ListTagsForResource",
+        json!({ "ResourceArn": tagged }),
+    )
+    .await;
+    assert_eq!(s, 200, "{b}");
+    assert_eq!(b["Tags"][0]["Key"], "env", "{b}");
+    assert_eq!(b["Tags"][0]["Value"], "prod", "{b}");
 
     let (s, b) = cfg(&server, "DeleteConnector", json!({ "Arn": arn.clone() })).await;
     assert_eq!(s, 200, "{b}");
@@ -1522,17 +1557,34 @@ async fn config_list_connectors_filters_and_pages() {
     assert_eq!(b["ConnectorSummaries"].as_array().map(Vec::len), Some(2));
     assert_eq!(b["ConnectorSummaries"][0]["provider"], "AZURE");
 
-    // A tenant filter narrows to that cloud account.
+    // `provider` is the one modeled filter, and its enum value is lowercase —
+    // that is what an SDK puts on the wire.
+    let (s, b) = cfg(
+        &server,
+        "ListConnectors",
+        json!({ "Filters": [{ "filterName": "provider", "filterValues": ["AZURE"] }] }),
+    )
+    .await;
+    assert_eq!(s, 200, "{b}");
+    assert_eq!(b["ConnectorSummaries"].as_array().map(Vec::len), Some(2));
+    let (s, b) = cfg(
+        &server,
+        "ListConnectors",
+        json!({ "Filters": [{ "filterName": "provider", "filterValues": ["GCP"] }] }),
+    )
+    .await;
+    assert_eq!(s, 200, "{b}");
+    assert_eq!(b["ConnectorSummaries"].as_array().map(Vec::len), Some(0));
+
+    // A filter name outside the enum is rejected rather than silently ignored.
     let (s, b) = cfg(
         &server,
         "ListConnectors",
         json!({ "Filters": [{ "filterName": "TENANT_ID", "filterValues": ["tenant-2"] }] }),
     )
     .await;
-    assert_eq!(s, 200, "{b}");
-    let list = b["ConnectorSummaries"].as_array().unwrap();
-    assert_eq!(list.len(), 1);
-    assert_eq!(list[0]["tenantIdentifier"], "tenant-2");
+    assert_eq!(s, 400, "{b}");
+    assert_eq!(b["__type"], "ValidationException", "{b}");
 
     // Pagination carries a token while more remain.
     let (s, b) = cfg(&server, "ListConnectors", json!({ "MaxResults": 1 })).await;
@@ -1583,6 +1635,7 @@ async fn config_third_party_recorder_needs_its_connector() {
 
     let (s, b) = put(arn.clone()).await;
     assert_eq!(s, 200, "{b}");
+    let b0 = b.clone();
     assert!(b["Name"].as_str().is_some_and(|n| !n.is_empty()), "{b}");
     assert!(
         b["Arn"]
@@ -1597,7 +1650,43 @@ async fn config_third_party_recorder_needs_its_connector() {
     assert_eq!(s, 400);
     assert_eq!(b["__type"], "ValidationException", "{b}");
 
-    // Deleting the connector takes the recorder that read through it.
+    // The recorder is a real configuration recorder: the describes and the
+    // list see it, carrying the connector and scope it was created with.
+    let (s, b) = cfg(&server, "DescribeConfigurationRecorders", json!({})).await;
+    assert_eq!(s, 200, "{b}");
+    let rec = b["ConfigurationRecorders"]
+        .as_array()
+        .and_then(|r| {
+            r.iter()
+                .find(|r| r["connectorArn"].as_str() == Some(arn.as_str()))
+        })
+        .unwrap_or_else(|| panic!("the third-party recorder is not described: {b}"));
+    assert_eq!(rec["recordingScope"], "PAID", "{b}");
+    assert_eq!(
+        rec["scopeConfiguration"]["scopeType"], "SUBSCRIPTION",
+        "{b}"
+    );
+    assert_eq!(rec["servicePrincipal"], "config.amazonaws.com", "{b}");
+
+    // Re-putting the same principal against the same connector updates it
+    // rather than creating a second recorder.
+    let (s, b) = put(arn.clone()).await;
+    assert_eq!(s, 200, "{b}");
+
+    // A connector a recorder still reads through cannot be deleted — the
+    // documented order is to delete the recorder first.
+    let (s, b) = cfg(&server, "DeleteConnector", json!({ "Arn": arn.clone() })).await;
+    assert_eq!(s, 400, "{b}");
+    assert_eq!(b["__type"], "ValidationException", "{b}");
+
+    let name = b0["Name"].as_str().unwrap_or_default().to_string();
+    let (s, b) = cfg(
+        &server,
+        "DeleteServiceLinkedConfigurationRecorder",
+        json!({ "ServicePrincipal": "config.amazonaws.com" }),
+    )
+    .await;
+    assert_eq!(s, 200, "{b}: recorder {name} should be deletable");
     let (s, _) = cfg(&server, "DeleteConnector", json!({ "Arn": arn })).await;
     assert_eq!(s, 200);
 }
