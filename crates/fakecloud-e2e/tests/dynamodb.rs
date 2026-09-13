@@ -2760,6 +2760,118 @@ async fn dynamodb_scan_pagination() {
     assert_eq!(pks.len(), 5, "all items should be unique");
 }
 
+/// #2504: deletes no longer shift rows in storage, so pin the behavior a
+/// client paging a Scan while deleting relies on. Deleting rows a page already
+/// returned, and rows not reached yet, must neither re-deliver nor skip any
+/// row that is still there.
+#[tokio::test]
+async fn dynamodb_scan_pagination_survives_deletes_between_pages() {
+    let server = TestServer::start().await;
+    let client = server.dynamodb_client().await;
+
+    client
+        .create_table()
+        .table_name("ScanDeleteTable")
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("pk")
+                .key_type(KeyType::Hash)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("pk")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .billing_mode(BillingMode::PayPerRequest)
+        .send()
+        .await
+        .unwrap();
+
+    for i in 0..30 {
+        client
+            .put_item()
+            .table_name("ScanDeleteTable")
+            .item("pk", AttributeValue::S(format!("item{i:02}")))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    let delete = |pk: String| {
+        let client = client.clone();
+        async move {
+            client
+                .delete_item()
+                .table_name("ScanDeleteTable")
+                .key("pk", AttributeValue::S(pk))
+                .send()
+                .await
+                .unwrap();
+        }
+    };
+
+    let mut delivered: Vec<String> = Vec::new();
+    let mut deleted_unseen: Vec<String> = Vec::new();
+    // Rows to delete ahead of the scan, one after each page, on a schedule
+    // fixed up front. Choosing them from what the scan has returned so far
+    // would let a row the scan wrongly skipped get picked, deleted and
+    // dropped from the expectation, hiding the very bug under test.
+    let mut ahead_schedule = ["item29", "item11", "item20", "item07", "item25"].into_iter();
+    let mut start_key: Option<HashMap<String, AttributeValue>> = None;
+    loop {
+        let resp = client
+            .scan()
+            .table_name("ScanDeleteTable")
+            .limit(4)
+            .set_exclusive_start_key(start_key.clone())
+            .send()
+            .await
+            .unwrap();
+        let page: Vec<String> = resp
+            .items()
+            .iter()
+            .map(|item| item["pk"].as_s().unwrap().clone())
+            .collect();
+        delivered.extend(page.iter().cloned());
+        start_key = resp.last_evaluated_key().map(|m| m.to_owned());
+        let Some(lek) = &start_key else { break };
+        let lek_pk = lek["pk"].as_s().unwrap().clone();
+
+        // Delete every row this page returned except the one the next page
+        // resumes from...
+        for pk in page.iter().filter(|pk| **pk != lek_pk) {
+            delete(pk.clone()).await;
+        }
+        // ...and the next scheduled row, unless a page already returned it.
+        if let Some(ahead) = ahead_schedule.next().map(str::to_string) {
+            if !delivered.contains(&ahead) {
+                delete(ahead.clone()).await;
+                deleted_unseen.push(ahead);
+            }
+        }
+    }
+
+    let mut unique = delivered.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        delivered.len(),
+        "a row was delivered twice: {delivered:?}"
+    );
+
+    let expected: Vec<String> = (0..30)
+        .map(|i| format!("item{i:02}"))
+        .filter(|pk| !deleted_unseen.contains(pk))
+        .collect();
+    assert_eq!(unique, expected, "a surviving row was skipped");
+    assert!(!deleted_unseen.is_empty());
+}
+
 #[tokio::test]
 async fn dynamodb_scan_no_pagination_when_all_fit() {
     let server = TestServer::start().await;

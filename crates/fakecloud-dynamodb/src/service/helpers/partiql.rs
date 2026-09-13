@@ -506,7 +506,7 @@ pub(crate) fn execute_partiql_in_state(
             };
             find_partiql_where_indices(table, where_clause, where_params)?
         } else {
-            (0..table.items.len()).collect()
+            table.items.iter_with_ids().map(|(id, _)| id).collect()
         };
         let (update_expression, expression_attribute_values) =
             prepare_partiql_update_expression(set_clause, parameters);
@@ -564,7 +564,8 @@ pub(crate) fn execute_partiql_in_state(
         let where_clause = rest.trim()[5..].trim();
         let table = get_table_mut(&mut state.tables, &table_name)?;
         let mut indices = find_partiql_where_indices(table, where_clause, parameters)?;
-        indices.sort_unstable();
+        // Ids are stable across removals, so any order is safe; newest first
+        // keeps the reported row the first match in storage order.
         indices.reverse();
         let mut last_old: Option<HashMap<String, AttributeValue>> = None;
         let mut last_key: Option<HashMap<String, AttributeValue>> = None;
@@ -716,7 +717,7 @@ pub(crate) fn find_partiql_where_indices(
     table: &DynamoTable,
     where_clause: &str,
     parameters: &[Value],
-) -> Result<Vec<usize>, AwsServiceError> {
+) -> Result<Vec<crate::state::ItemId>, AwsServiceError> {
     // Try the full expression parser first — supports AND/OR/NOT and
     // parenthesized groups. If the clause doesn't parse cleanly we
     // fall back to the legacy AND-only path so older callers that
@@ -725,7 +726,7 @@ pub(crate) fn find_partiql_where_indices(
     let expr = parse_partiql_where_expr(where_clause, parameters);
     if let Some(expr) = expr {
         let mut indices = Vec::new();
-        for (i, item) in table.items.iter().enumerate() {
+        for (i, item) in table.items.iter_with_ids() {
             if evaluate_partiql_expr(&expr, item) {
                 indices.push(i);
             }
@@ -748,7 +749,7 @@ pub(crate) fn find_partiql_where_indices(
     }
 
     let mut indices = Vec::new();
-    for (i, item) in table.items.iter().enumerate() {
+    for (i, item) in table.items.iter_with_ids() {
         let all_match = parsed_conditions
             .iter()
             .all(|c| evaluate_partiql_cond(c, item));
