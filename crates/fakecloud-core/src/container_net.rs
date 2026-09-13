@@ -124,14 +124,24 @@ pub fn bounded_output(cli: &str, args: &[&str]) -> Option<String> {
         .stderr(std::process::Stdio::null())
         .spawn()
         .ok()?;
+    // Drain stdout while waiting. A child whose output outgrows the pipe
+    // buffer blocks on write until someone reads it, so waiting for exit
+    // first would deadlock until the deadline and then report the sweep as
+    // failed -- `docker ps -a` across a busy host is exactly that much output.
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut stdout, &mut buf);
+        buf
+    });
     if !wait_bounded(&mut child) {
         return None;
     }
-    let output = child.wait_with_output().ok()?;
-    output
-        .status
+    let status = child.wait().ok()?;
+    let buf = reader.join().ok()?;
+    status
         .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+        .then(|| String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// Run a container-CLI command for its effect only, bounded the same way.
@@ -649,6 +659,22 @@ mod bounded_cli_tests {
         assert!(
             start.elapsed() < CLI_PROBE_TIMEOUT + std::time::Duration::from_secs(5),
             "the wait must end at the bound"
+        );
+    }
+
+    /// Output larger than a pipe buffer (64 KiB on Linux) must come back
+    /// whole. Waiting for the child to exit before reading blocks it on write
+    /// forever, so this used to burn the full timeout and report failure.
+    #[test]
+    fn output_larger_than_the_pipe_buffer_still_comes_back() {
+        let start = std::time::Instant::now();
+        // 200_000 bytes: comfortably past the buffer on every supported host.
+        let out = bounded_output("sh", &["-c", "printf 'x%.0s' $(seq 1 200000)"])
+            .expect("a large but prompt call must succeed");
+        assert_eq!(out.len(), 200_000, "output was truncated");
+        assert!(
+            start.elapsed() < CLI_PROBE_TIMEOUT,
+            "a prompt call must not reach the deadline"
         );
     }
 

@@ -495,14 +495,22 @@ fn bounded_output(cli: &str, args: &[&str]) -> Option<String> {
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
+    // Drain stdout while waiting: a child that fills the pipe buffer blocks on
+    // write, so waiting for exit first would deadlock until the deadline.
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut stdout, &mut buf);
+        buf
+    });
     if !wait_bounded(&mut child) {
         return None;
     }
-    let output = child.wait_with_output().ok()?;
-    output
-        .status
+    let status = child.wait().ok()?;
+    let buf = reader.join().ok()?;
+    status
         .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+        .then(|| String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// Run a container-CLI command for its effect only, bounded the same way.
