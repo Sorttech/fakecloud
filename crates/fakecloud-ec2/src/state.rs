@@ -569,7 +569,7 @@ pub struct Snapshot {
 }
 
 /// One health-check path: a source, and the destinations reachable from it.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HealthCheckPath {
     pub source_subnet_id: Option<String>,
     pub source_security_group_id: Option<String>,
@@ -607,10 +607,16 @@ pub struct ApplicationStatusCheck {
     /// Tag key/value pairs this check is associated with.
     pub tag_associations: Vec<(String, String)>,
     /// The `ClientToken` the check was created with, so a replayed create
-    /// returns the original check instead of minting a second one. The check's
-    /// own tags live in the shared `tags` store, keyed by its id.
+    /// returns the original check instead of minting a second one, and a
+    /// fingerprint of that create request taken at the time. The fingerprint
+    /// is what a retry is compared against: the check itself keeps changing
+    /// under Modify and CreateTags, and neither should turn a legitimate
+    /// retry into a parameter mismatch. The check's own tags live in the
+    /// shared `tags` store, keyed by its id.
     #[serde(default)]
     pub client_token: Option<String>,
+    #[serde(default)]
+    pub create_fingerprint: Option<String>,
     /// RFC 3339 timestamps, matching how the rest of the EC2 state stores
     /// times.
     pub creation_time: String,

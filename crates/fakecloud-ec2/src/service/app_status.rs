@@ -436,24 +436,32 @@ fn check_matches(c: &ApplicationStatusCheck, tags: &[Tag], filters: &[Filter]) -
     })
 }
 
-/// Everything about a check that its create request determines. Two creates
-/// carrying the same `ClientToken` have to agree on all of it to count as a
-/// retry of the same call rather than a different one.
-fn create_fields_match(a: &ApplicationStatusCheck, b: &ApplicationStatusCheck) -> bool {
-    a.aggregation == b.aggregation
-        && a.protocol == b.protocol
-        && a.port == b.port
-        && a.path == b.path
-        && a.device_index == b.device_index
-        && a.ip_version == b.ip_version
-        && a.ip_scope == b.ip_scope
-        && a.interval == b.interval
-        && a.timeout == b.timeout
-        && a.failure_threshold == b.failure_threshold
-        && a.success_threshold == b.success_threshold
-        && a.status_code_matcher == b.status_code_matcher
-        && a.initialization_grace_period_seconds == b.initialization_grace_period_seconds
-        && a.health_check_paths == b.health_check_paths
+/// A stable fingerprint of everything a create request determines. It is
+/// recorded when the check is minted and never updated, so a Modify or a
+/// CreateTags landing in between cannot make a legitimate retry look like a
+/// different call.
+fn create_fingerprint(
+    c: &ApplicationStatusCheck,
+    tags: &std::collections::BTreeMap<String, String>,
+) -> String {
+    format!(
+        "{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{:?}",
+        c.aggregation,
+        c.protocol,
+        c.port,
+        c.path,
+        c.device_index,
+        c.ip_version,
+        c.ip_scope,
+        c.interval,
+        c.timeout,
+        c.failure_threshold,
+        c.success_threshold,
+        c.status_code_matcher,
+        c.initialization_grace_period_seconds,
+        serde_json::to_string(&c.health_check_paths).unwrap_or_default(),
+        tags,
+    )
 }
 
 pub(crate) fn create_application_status_check(
@@ -479,7 +487,7 @@ pub(crate) fn create_application_status_check(
     }
 
     let now = now_rfc3339();
-    let check = ApplicationStatusCheck {
+    let mut check = ApplicationStatusCheck {
         id: gen_id("asc"),
         aggregation: str_param(req, "Aggregation").unwrap_or_else(|| "included".to_string()),
         protocol,
@@ -498,10 +506,13 @@ pub(crate) fn create_application_status_check(
         instance_ids: Vec::new(),
         tag_associations: Vec::new(),
         client_token,
+        create_fingerprint: None,
         creation_time: now.clone(),
         modify_time: now,
         deletion_time: None,
     };
+    let fingerprint = create_fingerprint(&check, &requested_tags);
+    check.create_fingerprint = check.client_token.is_some().then(|| fingerprint.clone());
 
     let mut accounts = svc.state.write();
     let state = accounts.get_or_create(&req.account_id);
@@ -514,12 +525,7 @@ pub(crate) fn create_application_status_check(
         if let Some(existing) = state.application_status_checks.values().find(|c| {
             c.deletion_time.is_none() && c.client_token.as_deref() == Some(token.as_str())
         }) {
-            let stored_tags: std::collections::BTreeMap<String, String> = state
-                .tags_for(&existing.id)
-                .iter()
-                .map(|t| (t.key.clone(), t.value.clone()))
-                .collect();
-            if !create_fields_match(existing, &check) || stored_tags != requested_tags {
+            if existing.create_fingerprint.as_deref() != Some(fingerprint.as_str()) {
                 return Err(AwsServiceError::aws_error(
                     http::StatusCode::BAD_REQUEST,
                     "IdempotentParameterMismatch",
@@ -2255,6 +2261,64 @@ mod tests {
             .unwrap(),
         );
         assert!(d.contains("<path>/healthz</path>"), "{d}");
+        let all = body(
+            describe_application_status_checks(&svc, &req("DescribeApplicationStatusChecks", &[]))
+                .unwrap(),
+        );
+        assert_eq!(
+            all.matches("<applicationStatusCheckId>").count(),
+            1,
+            "{all}"
+        );
+
+        // The retry is compared against the create request, not against the
+        // check as it stands now, so editing the check in between does not
+        // turn a legitimate retry into a mismatch.
+        let id = all
+            .split("<applicationStatusCheckId>")
+            .nth(1)
+            .unwrap()
+            .split("</applicationStatusCheckId>")
+            .next()
+            .unwrap()
+            .to_string();
+        modify_application_status_check(
+            &svc,
+            &req(
+                "ModifyApplicationStatusCheck",
+                &[("ApplicationStatusCheckId", &id), ("Path", "/moved")],
+            ),
+        )
+        .unwrap();
+        crate::service::tags::create_tags(
+            &svc,
+            &req(
+                "CreateTags",
+                &[
+                    ("ResourceId.1", &id),
+                    ("Tag.1.Key", "added"),
+                    ("Tag.1.Value", "later"),
+                ],
+            ),
+        )
+        .unwrap();
+        let d = body(
+            create_application_status_check(
+                &svc,
+                &req(
+                    "CreateApplicationStatusCheck",
+                    &[
+                        ("Protocol", "http"),
+                        ("Port", "8080"),
+                        ("ClientToken", "token-2"),
+                        ("Path", "/healthz"),
+                    ],
+                ),
+            )
+            .unwrap(),
+        );
+        // It replays the check as it stands, without minting a second one.
+        assert!(d.contains("<path>/moved</path>"), "{d}");
         let all = body(
             describe_application_status_checks(&svc, &req("DescribeApplicationStatusChecks", &[]))
                 .unwrap(),
