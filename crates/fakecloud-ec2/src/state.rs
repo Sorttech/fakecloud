@@ -568,6 +568,70 @@ pub struct Snapshot {
     pub create_volume_permissions: Vec<String>,
 }
 
+/// One health-check path: a source, and the destinations reachable from it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HealthCheckPath {
+    pub source_subnet_id: Option<String>,
+    pub source_security_group_id: Option<String>,
+    /// `(SubnetId, SecurityGroupId)` per destination.
+    #[serde(default)]
+    pub destinations: Vec<(Option<String>, Option<String>)>,
+}
+
+/// An application status check: an HTTP/HTTPS probe EC2 runs against
+/// instances, associated either by instance id or by tag.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplicationStatusCheck {
+    pub id: String,
+    /// `AggregationStatusEnum` — whether this check counts toward an
+    /// instance's aggregate application status.
+    pub aggregation: String,
+    /// `NetworkProtocolEnum` (http | https).
+    pub protocol: String,
+    pub port: i64,
+    pub path: Option<String>,
+    pub device_index: Option<i64>,
+    pub ip_version: Option<String>,
+    pub ip_scope: Option<String>,
+    pub interval: Option<i64>,
+    pub timeout: Option<i64>,
+    pub failure_threshold: Option<i64>,
+    pub success_threshold: Option<i64>,
+    pub status_code_matcher: Option<String>,
+    pub initialization_grace_period_seconds: Option<i64>,
+    /// `HealthCheckPaths`: the source/destination pairs the probe traverses.
+    #[serde(default)]
+    pub health_check_paths: Vec<HealthCheckPath>,
+    /// Instance ids this check is associated with.
+    pub instance_ids: Vec<String>,
+    /// Tag key/value pairs this check is associated with.
+    pub tag_associations: Vec<(String, String)>,
+    /// The `ClientToken` the check was created with, so a replayed create
+    /// returns the original check instead of minting a second one, and a
+    /// fingerprint of that create request taken at the time. The fingerprint
+    /// is what a retry is compared against: the check itself keeps changing
+    /// under Modify and CreateTags, and neither should turn a legitimate
+    /// retry into a parameter mismatch. The check's own tags live in the
+    /// shared `tags` store, keyed by its id.
+    #[serde(default)]
+    pub client_token: Option<String>,
+    #[serde(default)]
+    pub create_fingerprint: Option<String>,
+    /// RFC 3339 timestamps, matching how the rest of the EC2 state stores
+    /// times.
+    pub creation_time: String,
+    pub modify_time: String,
+    pub deletion_time: Option<String>,
+}
+
+/// A suppression window on one instance's application status.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplicationStatusSuppression {
+    pub instance_id: String,
+    pub suppress_at: String,
+    pub resume_at: Option<String>,
+}
+
 /// An AMI (machine image).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Image {
@@ -1665,6 +1729,13 @@ pub struct Ec2State {
     pub snapshot_block_public_access: String,
     #[serde(default)]
     pub images: BTreeMap<String, Image>,
+    /// Application status checks keyed by `ApplicationStatusCheckId`.
+    #[serde(default)]
+    pub application_status_checks: BTreeMap<String, ApplicationStatusCheck>,
+    /// Instances whose application status is suppressed, with the moment the
+    /// suppression lifts (`None` = until explicitly disabled).
+    #[serde(default)]
+    pub application_status_suppressions: BTreeMap<String, ApplicationStatusSuppression>,
     /// Watermarks attached to AMIs: image_id -> watermark_key -> watermark_name.
     #[serde(default)]
     pub image_watermarks: BTreeMap<String, BTreeMap<String, String>>,

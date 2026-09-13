@@ -102,6 +102,10 @@ fn resource_exists(state: &Ec2State, id: &str) -> Option<bool> {
         "pcx" => state.vpc_peerings.contains_key(id),
         "nat" => state.nat_gateways.contains_key(id),
         "eipalloc" => state.elastic_ips.contains_key(id),
+        "asc" => state
+            .application_status_checks
+            .get(id)
+            .is_some_and(|c| c.deletion_time.is_none()),
         _ => return None,
     })
 }
@@ -270,6 +274,7 @@ pub(crate) fn infer_resource_type(resource_id: &str) -> String {
         "igw" => "internet-gateway",
         "rtb" => "route-table",
         "eipalloc" => "elastic-ip",
+        "asc" => "application-status-check",
         _ => "resource",
     };
     ty.to_string()
