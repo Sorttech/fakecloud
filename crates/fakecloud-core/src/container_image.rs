@@ -76,10 +76,10 @@ async fn pull_image_with(
             return Ok(PulledImage::Pulled);
         }
         let pull_error = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        if !is_transient(&pull_error) {
+        if !is_transient(&pull_error, reference) {
             return Err(pull_error);
         }
-        if image_cached(cli, reference).await {
+        if image_cached(cli, docker_config, reference).await {
             tracing::warn!(
                 image = %reference,
                 error = %pull_error,
@@ -102,10 +102,16 @@ async fn pull_image_with(
     }
 }
 
-/// Whether `reference` resolves to an image in the local cache.
-async fn image_cached(cli: &str, reference: &str) -> bool {
-    Command::new(cli)
-        .args(["image", "inspect", reference])
+/// Whether `reference` resolves to an image in the local cache. Runs with
+/// the same `DOCKER_CONFIG` as the pull: the config also selects the Docker
+/// context, so without it the check could consult a different daemon than
+/// the one that pulls and later runs the image.
+async fn image_cached(cli: &str, docker_config: Option<&Path>, reference: &str) -> bool {
+    let mut cmd = Command::new(cli);
+    if let Some(p) = docker_config {
+        cmd.env("DOCKER_CONFIG", p);
+    }
+    cmd.args(["image", "inspect", reference])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -120,13 +126,12 @@ async fn image_cached(cli: &str, reference: &str) -> bool {
 /// from the registry, or the network timing out or dropping the connection.
 ///
 /// A refusal (not found, access denied, unauthorized) is never transient, and
-/// is checked first so it wins over transient wording in the same message.
-/// That matters because the message quotes the image name, which the user
-/// chooses: a repository named `toomanyrequests` whose pull is refused must
-/// not be read as throttled and launch a stale cached copy. A repository
-/// name cannot contain a space, so it can only spell the one-word markers,
-/// and a refusal always carries refusal wording of its own.
-fn is_transient(stderr: &str) -> bool {
+/// wins over transient wording in the same message. Both are matched only
+/// after the image's own name is removed from the message: the name is chosen
+/// by the user and quoted in the error, so a repository spelled like either
+/// kind of marker (`toomanyrequests/app`, `acme/access-denied-page`) must not
+/// flip the classification.
+fn is_transient(stderr: &str, reference: &str) -> bool {
     const REFUSED: [&str; 6] = [
         "manifest unknown",
         "not found",
@@ -145,11 +150,64 @@ fn is_transient(stderr: &str) -> bool {
         "context deadline exceeded",
         "request canceled while waiting for connection",
     ];
-    let lower = stderr.to_ascii_lowercase();
-    if REFUSED.iter().any(|m| lower.contains(m)) {
+    let message = without_image_name(&stderr.to_ascii_lowercase(), reference);
+    if REFUSED.iter().any(|m| message.contains(m)) {
         return false;
     }
-    TRANSIENT.iter().any(|m| lower.contains(m)) || has_server_error_status(&lower)
+    TRANSIENT.iter().any(|m| message.contains(m)) || has_server_error_status(&message)
+}
+
+/// `message` (lowercase) with each way an error can quote the image blanked
+/// out: the reference as given, and every trailing path of its repository
+/// (`public.ecr.aws/acme/app`, `acme/app`, `app`) -- registries put the
+/// repository path in URLs, and Podman expands short names to
+/// `docker.io/library/<name>`. Only whole names are removed, bounded by
+/// characters a name cannot contain, so a short repository like `d` never
+/// cuts letters out of the surrounding words.
+fn without_image_name(message: &str, reference: &str) -> String {
+    let reference = reference.to_ascii_lowercase();
+    let untagged = reference.split('@').next().unwrap_or(&reference);
+    // A `:` after the last `/` starts the tag; one before it is a registry port.
+    let repository = match (untagged.rfind(':'), untagged.rfind('/')) {
+        (Some(colon), Some(slash)) if colon < slash => untagged,
+        (Some(colon), _) => &untagged[..colon],
+        (None, _) => untagged,
+    };
+    let mut names = vec![reference.as_str(), repository];
+    names.extend(
+        repository
+            .match_indices('/')
+            .map(|(i, _)| &repository[i + 1..]),
+    );
+    names.sort_by_key(|n| std::cmp::Reverse(n.len()));
+
+    let mut out = message.to_string();
+    for name in names.into_iter().filter(|n| !n.is_empty()) {
+        out = remove_whole(&out, name);
+    }
+    out
+}
+
+/// `haystack` with every occurrence of `name` that is not part of a longer
+/// name (flanked by a letter, digit, `.`, `_` or `-`) replaced by a space.
+fn remove_whole(haystack: &str, name: &str) -> String {
+    let is_name_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
+    let mut out = String::with_capacity(haystack.len());
+    let mut rest = haystack;
+    while let Some(i) = rest.find(name) {
+        let end = i + name.len();
+        let before = rest[..i].chars().next_back();
+        let after = rest[end..].chars().next();
+        if before.is_some_and(is_name_char) || after.is_some_and(is_name_char) {
+            out.push_str(&rest[..end]);
+        } else {
+            out.push_str(&rest[..i]);
+            out.push(' ');
+        }
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Whether the message carries a 5xx HTTP status. Docker and Podman quote the
@@ -231,6 +289,10 @@ exit 2
         async fn pull(&self) -> Result<PulledImage, String> {
             pull_image_with(&self.cli(), None, "alpine:3.20", Duration::from_millis(1)).await
         }
+    }
+
+    fn is_transient_for_test(stderr: &str) -> bool {
+        is_transient(stderr, "alpine:3.20")
     }
 
     const THROTTLED: &str = "Error response from daemon: unexpected status from HEAD request to https://public.ecr.aws/v2/docker/library/alpine/manifests/3.20: 429 Too Many Requests";
@@ -327,24 +389,26 @@ exit 2
 
     #[test]
     fn transient_detection_separates_retryable_from_refused() {
-        assert!(is_transient(THROTTLED));
-        assert!(is_transient(
+        assert!(is_transient_for_test(THROTTLED));
+        assert!(is_transient_for_test(
             "toomanyrequests: You have reached your pull rate limit."
         ));
-        assert!(is_transient("Error: Rate exceeded"));
-        assert!(is_transient(
+        assert!(is_transient_for_test("Error: Rate exceeded"));
+        assert!(is_transient_for_test(
             "received unexpected HTTP status: 502 Bad Gateway"
         ));
-        assert!(is_transient(
+        assert!(is_transient_for_test(
             "Get \"https://public.ecr.aws/v2/\": net/http: TLS handshake timeout"
         ));
-        assert!(is_transient(
+        assert!(is_transient_for_test(
             "read tcp 10.0.0.2:4431->1.2.3.4:443: read: connection reset by peer"
         ));
-        assert!(!is_transient("manifest unknown"));
-        assert!(!is_transient("pull access denied for foo"));
-        assert!(!is_transient("unauthorized: authentication required"));
-        assert!(!is_transient(
+        assert!(!is_transient_for_test("manifest unknown"));
+        assert!(!is_transient_for_test("pull access denied for foo"));
+        assert!(!is_transient_for_test(
+            "unauthorized: authentication required"
+        ));
+        assert!(!is_transient_for_test(
             "pull access denied for toomanyrequests, repository does not exist or may require authorization"
         ));
     }
@@ -358,7 +422,7 @@ exit 2
             "error pulling image: status: 599",
             "unexpected status from HEAD request to https://r.example/v2/a/manifests/1: 503",
         ] {
-            assert!(is_transient(msg), "{msg}");
+            assert!(is_transient_for_test(msg), "{msg}");
         }
         for msg in [
             // A registry port or a 4xx is not a server error.
@@ -366,7 +430,46 @@ exit 2
             "unexpected status code 400 Bad Request",
             "status: 5001",
         ] {
-            assert!(!is_transient(msg), "{msg}");
+            assert!(!is_transient_for_test(msg), "{msg}");
         }
+    }
+
+    #[test]
+    fn a_throttled_pull_of_a_repository_named_like_a_refusal_is_still_transient() {
+        let reference = "public.ecr.aws/acme/access-denied-page:1";
+        for msg in [
+            "Error response from daemon: unexpected status from HEAD request to https://public.ecr.aws/v2/acme/access-denied-page/manifests/1: 429 Too Many Requests",
+            "Error response from daemon: toomanyrequests: Rate exceeded for public.ecr.aws/acme/access-denied-page:1",
+        ] {
+            assert!(is_transient(msg, reference), "{msg}");
+        }
+        // Its genuine refusals are still refusals.
+        assert!(!is_transient(
+            "Error response from daemon: manifest for public.ecr.aws/acme/access-denied-page:1 not found: manifest unknown",
+            reference
+        ));
+    }
+
+    #[test]
+    fn only_whole_names_are_removed() {
+        // A one-letter repository must not cut the `d` out of `denied`.
+        assert!(!is_transient(
+            "Error response from daemon: pull access denied for d, repository does not exist",
+            "d"
+        ));
+        assert_eq!(
+            without_image_name(
+                "pull access denied for docker.io/library/alpine",
+                "alpine:3.20"
+            ),
+            "pull access denied for docker.io/library/ "
+        );
+        assert_eq!(
+            without_image_name(
+                "get https://127.0.0.1:5000/v2/team/app/manifests/v1",
+                "127.0.0.1:5000/team/app:v1"
+            ),
+            "get https://127.0.0.1:5000/v2/ /manifests/v1"
+        );
     }
 }
