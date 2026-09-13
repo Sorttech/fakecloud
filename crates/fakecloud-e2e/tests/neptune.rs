@@ -107,7 +107,19 @@ async fn neptune_full_control_plane_round_trip() {
         .send()
         .await
         .expect("describe cluster endpoints");
-    assert_eq!(described_eps.db_cluster_endpoints().len(), 1);
+    // The cluster's built-in writer and reader endpoints are reported
+    // alongside the custom one, as AWS does. Only the custom endpoint
+    // carries an identifier; a built-in has none.
+    let eps = described_eps.db_cluster_endpoints();
+    assert_eq!(eps.len(), 3, "{eps:?}");
+    let mut kinds: Vec<&str> = eps.iter().filter_map(|e| e.endpoint_type()).collect();
+    kinds.sort_unstable();
+    assert_eq!(kinds, ["CUSTOM", "READER", "WRITER"], "{eps:?}");
+    let named: Vec<&str> = eps
+        .iter()
+        .filter_map(|e| e.db_cluster_endpoint_identifier())
+        .collect();
+    assert_eq!(named, ["neptune-reader-ep"], "{eps:?}");
 
     // 5. Describe: cluster lists the instance as its writer member.
     let described = client
