@@ -293,7 +293,11 @@ exit 2
         }
 
         async fn pull(&self) -> Result<PulledImage, String> {
-            pull_image_with(&self.cli(), None, "alpine:3.20", Duration::from_millis(1)).await
+            self.pull_ref("alpine:3.20").await
+        }
+
+        async fn pull_ref(&self, reference: &str) -> Result<PulledImage, String> {
+            pull_image_with(&self.cli(), None, reference, Duration::from_millis(1)).await
         }
     }
 
@@ -389,8 +393,34 @@ exit 2
         // throttling code must not make a refused pull look transient.
         let refused = "Error response from daemon: manifest for toomanyrequests:latest not found: manifest unknown: manifest unknown";
         let cli = FakeCli::new(u32::MAX, refused, true);
-        assert_eq!(cli.pull().await, Err(refused.to_string()));
-        assert_eq!(cli.calls(), ["pull alpine:3.20"]);
+        assert_eq!(
+            cli.pull_ref("toomanyrequests:latest").await,
+            Err(refused.to_string())
+        );
+        assert_eq!(cli.calls(), ["pull toomanyrequests:latest"]);
+    }
+
+    #[tokio::test]
+    async fn a_throttled_pull_of_a_repository_named_like_a_refusal_uses_the_cache() {
+        // Only removing the image name from the message keeps `denied` in the
+        // repository from reading as a refusal; without it this pull would
+        // fail instead of falling back to the cached copy.
+        let reference = "public.ecr.aws/acme/access-denied-page:1";
+        let throttled = "Error response from daemon: unexpected status from HEAD request to https://public.ecr.aws/v2/acme/access-denied-page/manifests/1: 429 Too Many Requests";
+        let cli = FakeCli::new(u32::MAX, throttled, true);
+        assert_eq!(
+            cli.pull_ref(reference).await,
+            Ok(PulledImage::Cached {
+                pull_error: throttled.to_string()
+            })
+        );
+        assert_eq!(
+            cli.calls(),
+            [
+                format!("pull {reference}"),
+                format!("image inspect {reference}")
+            ]
+        );
     }
 
     #[test]
