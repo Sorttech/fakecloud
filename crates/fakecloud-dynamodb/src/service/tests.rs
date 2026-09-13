@@ -6177,3 +6177,189 @@ fn create_table_rejects_a_malformed_vector_index() {
         assert_eq!(err.code(), "ValidationException", "{bad}");
     }
 }
+
+/// A paged Scan of a GSI resumes by the table key and survives deleting each
+/// page's rows; its LastEvaluatedKey carries the index key attributes as well,
+/// as on AWS.
+#[tokio::test]
+async fn index_scan_pages_survive_deletes_and_carry_index_keys() {
+    let svc = make_service();
+    svc.create_table(&make_request(
+        "CreateTable",
+        json!({
+            "TableName": "gsi-table",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "g", "AttributeType": "S"}
+            ],
+            "GlobalSecondaryIndexes": [{
+                "IndexName": "by-g",
+                "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "ALL"}
+            }],
+            "BillingMode": "PAY_PER_REQUEST"
+        }),
+    ))
+    .unwrap();
+    let mut indexed = Vec::new();
+    for i in 0..15 {
+        let mut item = json!({"pk": {"S": format!("r{i:02}")}});
+        // Every third row is missing the index key, so it is not in the index.
+        if i % 3 != 0 {
+            item["g"] = json!({"S": format!("g{}", i % 4)});
+            indexed.push(format!("r{i:02}"));
+        }
+        call_dynamodb(
+            &svc,
+            "PutItem",
+            json!({"TableName": "gsi-table", "Item": item}),
+        )
+        .await;
+    }
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut page_sizes: Vec<usize> = Vec::new();
+    let mut start: Option<Value> = None;
+    loop {
+        let mut body = json!({"TableName": "gsi-table", "IndexName": "by-g", "Limit": 3});
+        if let Some(s) = &start {
+            body["ExclusiveStartKey"] = s.clone();
+        }
+        let page = call_dynamodb(&svc, "Scan", body).await;
+        page_sizes.push(page["Items"].as_array().unwrap().len());
+        for item in page["Items"].as_array().unwrap() {
+            let pk = item["pk"]["S"].as_str().unwrap().to_string();
+            call_dynamodb(
+                &svc,
+                "DeleteItem",
+                json!({"TableName": "gsi-table", "Key": {"pk": {"S": pk}}}),
+            )
+            .await;
+            seen.push(pk);
+        }
+        match page.get("LastEvaluatedKey") {
+            Some(lek) => {
+                assert!(lek.get("pk").is_some() && lek.get("g").is_some(), "{lek}");
+                start = Some(lek.clone());
+            }
+            None => break,
+        }
+    }
+    // Rows without the index key are not examined, so every full page holds
+    // Limit indexed rows: 10 of them page as 3, 3, 3, 1.
+    assert_eq!(page_sizes, vec![3, 3, 3, 1]);
+    seen.sort();
+    assert_eq!(seen, indexed);
+}
+
+/// A key attribute cannot hold an empty String or Binary. DynamoDB rejects it
+/// on writes and on key lookups alike.
+#[tokio::test]
+async fn empty_string_or_binary_key_values_are_rejected() {
+    let svc = make_service();
+    create_test_table(&svc);
+    svc.create_table(&make_request(
+        "CreateTable",
+        json!({
+            "TableName": "bin-table",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "B"}],
+            "BillingMode": "PAY_PER_REQUEST"
+        }),
+    ))
+    .unwrap();
+
+    let cases = [
+        (
+            "PutItem",
+            json!({"TableName": "test-table", "Item": {"pk": {"S": ""}}}),
+            "string",
+        ),
+        (
+            "GetItem",
+            json!({"TableName": "test-table", "Key": {"pk": {"S": ""}}}),
+            "string",
+        ),
+        (
+            "PutItem",
+            json!({"TableName": "bin-table", "Item": {"pk": {"B": ""}}}),
+            "binary",
+        ),
+        (
+            "DeleteItem",
+            json!({"TableName": "bin-table", "Key": {"pk": {"B": ""}}}),
+            "binary",
+        ),
+    ];
+    for (action, body, kind) in cases {
+        let err = svc
+            .handle(make_request(action, body.clone()))
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{action} accepted an empty key: {body}"));
+        assert_eq!(err.code(), "ValidationException");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "ValidationException: One or more parameter values are not valid. The \
+                 AttributeValue for a key attribute cannot contain an empty {kind} value. Key: pk"
+            )
+        );
+    }
+    let scan = call_dynamodb(&svc, "Scan", json!({"TableName": "test-table"})).await;
+    assert_eq!(scan["Count"], 0);
+}
+
+/// Query orders a binary sort key by its bytes, the same order Scan uses,
+/// not by the base64 text.
+#[tokio::test]
+async fn query_orders_binary_sort_keys_by_bytes() {
+    let svc = make_service();
+    svc.create_table(&make_request(
+        "CreateTable",
+        json!({
+            "TableName": "bin-sort",
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"}
+            ],
+            "AttributeDefinitions": [
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "sk", "AttributeType": "B"}
+            ],
+            "BillingMode": "PAY_PER_REQUEST"
+        }),
+    ))
+    .unwrap();
+    // 0xff, 0x00 0x01, 0x7f.
+    for b in ["/w==", "AAE=", "fw=="] {
+        call_dynamodb(
+            &svc,
+            "PutItem",
+            json!({"TableName": "bin-sort", "Item": {"pk": {"S": "p"}, "sk": {"B": b}}}),
+        )
+        .await;
+    }
+    let order = |resp: &Value| -> Vec<String> {
+        resp["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["sk"]["B"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let query = call_dynamodb(
+        &svc,
+        "Query",
+        json!({
+            "TableName": "bin-sort",
+            "KeyConditionExpression": "pk = :p",
+            "ExpressionAttributeValues": {":p": {"S": "p"}}
+        }),
+    )
+    .await;
+    assert_eq!(order(&query), ["AAE=", "fw==", "/w=="]);
+    let scan = call_dynamodb(&svc, "Scan", json!({"TableName": "bin-sort"})).await;
+    assert_eq!(order(&scan), order(&query));
+}

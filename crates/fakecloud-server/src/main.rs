@@ -2573,14 +2573,18 @@ async fn main() {
                                     fakecloud_dynamodb::DYNAMODB_SNAPSHOT_SCHEMA_VERSION,
                                 ));
                             }
-                            if let Some(accounts) = snapshot.accounts {
+                            if let Some(mut accounts) = snapshot.accounts {
                                 let account_count = accounts.account_count();
+                                for (_, state) in accounts.iter_mut() {
+                                    state.build_key_indexes();
+                                }
                                 *dynamodb_state_for_register.write() = accounts;
                                 tracing::info!(
                                     accounts = account_count,
                                     "loaded dynamodb persistence snapshot (multi-account)",
                                 );
-                            } else if let Some(single_state) = snapshot.state {
+                            } else if let Some(mut single_state) = snapshot.state {
+                                single_state.build_key_indexes();
                                 let table_count = single_state.tables.len();
                                 let account_id = single_state.account_id.clone();
                                 let mut mas = dynamodb_state_for_register.write();

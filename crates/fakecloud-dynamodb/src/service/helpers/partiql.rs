@@ -40,7 +40,7 @@ pub(crate) fn find_outside_quotes(hay: &str, needle: &str) -> Option<usize> {
 /// sign, then integer magnitude (by length, then lexically), then the
 /// fractional part. Falls back to `Equal` only if both sides are
 /// unparseable. Handles exponent notation and negative zero.
-fn compare_number_strings(x: &str, y: &str) -> std::cmp::Ordering {
+pub(crate) fn compare_number_strings(x: &str, y: &str) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     // A malformed Number string has no defined ordering; callers that care about
     // equality (values_equal) pre-check validity, so leaving this Equal keeps
@@ -333,9 +333,17 @@ pub(crate) fn compare_attribute_values(a: Option<&Value>, b: Option<&Value>) -> 
                     compare_number_strings(a_str, b_str)
                 }
                 (Some(("B", a_val)), Some(("B", b_val))) => {
+                    // Binary compares as unsigned bytes, not as its base64
+                    // text, whose order differs ("/w==" is 0xff but sorts
+                    // before "AAE=", 0x00 0x01).
+                    use base64::Engine;
                     let a_str = a_val.as_str().unwrap_or("");
                     let b_str = b_val.as_str().unwrap_or("");
-                    a_str.cmp(b_str)
+                    let decode = |s: &str| base64::engine::general_purpose::STANDARD.decode(s);
+                    match (decode(a_str), decode(b_str)) {
+                        (Ok(a_bytes), Ok(b_bytes)) => a_bytes.cmp(&b_bytes),
+                        _ => a_str.cmp(b_str),
+                    }
                 }
                 _ => std::cmp::Ordering::Equal,
             }
@@ -411,15 +419,17 @@ pub(crate) fn execute_partiql_in_state(
         let (table_name, rest) = parse_partiql_table_name(after_from);
         let table = get_table(&state.tables, &table_name)?;
         let rest_upper = rest.trim().to_ascii_uppercase();
-        let items: Vec<Value> = if rest_upper.starts_with("WHERE") {
+        let mut rows: Vec<&HashMap<String, AttributeValue>> = if rest_upper.starts_with("WHERE") {
             let where_clause = rest.trim()[5..].trim();
             evaluate_partiql_where(table, where_clause, parameters)?
-                .iter()
-                .map(|item| json!(item))
-                .collect()
         } else {
-            table.items.iter().map(|item| json!(item)).collect()
+            table.items.iter().collect()
         };
+        // Scan order, which ExecuteStatement's NextToken resumes by key: an
+        // order that depends on which rows exist would skip or repeat rows
+        // when some are deleted between pages.
+        table.sort_in_scan_order(&mut rows);
+        let items: Vec<Value> = rows.iter().map(|item| json!(item)).collect();
         Ok(PartiqlOutcome {
             response: json!({ "Items": items }),
             table_name: Some(table_name),
