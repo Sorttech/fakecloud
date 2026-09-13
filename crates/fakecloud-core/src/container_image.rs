@@ -158,9 +158,9 @@ fn is_transient(stderr: &str, reference: &str) -> bool {
 }
 
 /// `message` (lowercase) with each way an error can quote the image blanked
-/// out: the reference as given, and every trailing path of its repository
-/// (`public.ecr.aws/acme/app`, `acme/app`, `app`) -- registries put the
-/// repository path in URLs, and Podman expands short names to
+/// out: the reference as given, every trailing path of its repository
+/// (`public.ecr.aws/acme/app`, `acme/app`, `app`), and its registry host --
+/// registries put the host and repository path in URLs, and Podman expands short names to
 /// `docker.io/library/<name>`. Only whole names are removed, bounded by
 /// characters a name cannot contain, so a short repository like `d` never
 /// cuts letters out of the surrounding words.
@@ -179,6 +179,12 @@ fn without_image_name(message: &str, reference: &str) -> String {
             .match_indices('/')
             .map(|(i, _)| &repository[i + 1..]),
     );
+    // The registry host, which URLs in the error quote on its own.
+    if let Some((host, _)) = repository.split_once('/') {
+        if host.contains(['.', ':']) || host == "localhost" {
+            names.push(host);
+        }
+    }
     names.sort_by_key(|n| std::cmp::Reverse(n.len()));
 
     let mut out = message.to_string();
@@ -451,6 +457,14 @@ exit 2
     }
 
     #[test]
+    fn a_registry_host_named_like_a_refusal_does_not_hide_a_throttle() {
+        assert!(is_transient(
+            "Error response from daemon: unexpected status from HEAD request to https://denied.example/v2/app/manifests/1: 429 Too Many Requests",
+            "denied.example/app:1"
+        ));
+    }
+
+    #[test]
     fn only_whole_names_are_removed() {
         // A one-letter repository must not cut the `d` out of `denied`.
         assert!(!is_transient(
@@ -469,7 +483,7 @@ exit 2
                 "get https://127.0.0.1:5000/v2/team/app/manifests/v1",
                 "127.0.0.1:5000/team/app:v1"
             ),
-            "get https://127.0.0.1:5000/v2/ /manifests/v1"
+            "get https:// /v2/ /manifests/v1"
         );
     }
 }
