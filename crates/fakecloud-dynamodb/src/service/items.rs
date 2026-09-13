@@ -258,6 +258,10 @@ impl DynamoDbService {
             let state = accounts.get_or_create(&req.account_id);
             let region = state.region.clone();
             let table = get_table_mut(&mut state.tables, table_name)?;
+            // The same key validation GetItem and UpdateItem apply: a missing,
+            // wrong-typed or empty key attribute is a ValidationException, not a
+            // silent no-op delete.
+            validate_key_attributes_in_key(table, &key)?;
 
             let mut expr_attr_names = parse_expression_attribute_names(&body);
             let mut expr_attr_values = parse_expression_attribute_values(&body);

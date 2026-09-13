@@ -1496,7 +1496,8 @@ async fn eventbridge_sns_filter_policy_drops_non_matching() {
 }
 
 /// ImportTable writes each row the way PutItem would: a row without a valid
-/// primary key is an import error, counted and skipped, and a row repeating an
+/// primary key (missing, wrong-typed or empty) or with a malformed attribute
+/// value is an import error, counted and skipped, and a row repeating an
 /// earlier row's key replaces it. Such rows used to be stored as-is, leaving
 /// rows no key lookup could address and no Scan cursor could page past.
 #[tokio::test]
@@ -1515,6 +1516,8 @@ async fn dynamodb_import_table_skips_invalid_keys_and_dedupes() {
         r#"{"Item":{"pk":{"S":"b"}}}"#,
         r#"{"Item":{"other":{"S":"no key"}}}"#,
         r#"{"Item":{"pk":{"N":"5"}}}"#,
+        r#"{"Item":{"pk":{"S":""}}}"#,
+        r#"{"Item":{"pk":{"S":"c"},"n":{"N":"not-a-number"}}}"#,
         r#"{"Item":{"pk":{"S":"a"},"v":{"S":"second"}}}"#,
     ];
     s3.put_object()
@@ -1560,9 +1563,9 @@ async fn dynamodb_import_table_skips_invalid_keys_and_dedupes() {
         .await
         .unwrap();
     let desc = resp.import_table_description().unwrap();
-    assert_eq!(desc.processed_item_count(), 5);
+    assert_eq!(desc.processed_item_count(), 7);
     assert_eq!(desc.imported_item_count(), 2);
-    assert_eq!(desc.error_count(), 2);
+    assert_eq!(desc.error_count(), 4);
 
     let scan = ddb
         .scan()

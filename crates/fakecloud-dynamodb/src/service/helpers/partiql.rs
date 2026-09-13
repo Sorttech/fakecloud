@@ -333,9 +333,17 @@ pub(crate) fn compare_attribute_values(a: Option<&Value>, b: Option<&Value>) -> 
                     compare_number_strings(a_str, b_str)
                 }
                 (Some(("B", a_val)), Some(("B", b_val))) => {
+                    // Binary compares as unsigned bytes, not as its base64
+                    // text, whose order differs ("/w==" is 0xff but sorts
+                    // before "AAE=", 0x00 0x01).
+                    use base64::Engine;
                     let a_str = a_val.as_str().unwrap_or("");
                     let b_str = b_val.as_str().unwrap_or("");
-                    a_str.cmp(b_str)
+                    let decode = |s: &str| base64::engine::general_purpose::STANDARD.decode(s);
+                    match (decode(a_str), decode(b_str)) {
+                        (Ok(a_bytes), Ok(b_bytes)) => a_bytes.cmp(&b_bytes),
+                        _ => a_str.cmp(b_str),
+                    }
                 }
                 _ => std::cmp::Ordering::Equal,
             }

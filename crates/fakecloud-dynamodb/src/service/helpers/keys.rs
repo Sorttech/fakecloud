@@ -341,6 +341,26 @@ fn check_key_type(
             ),
         ));
     }
+    // An empty String or Binary is a valid attribute value but never a valid
+    // key: DynamoDB rejects it on every request that carries a key.
+    let empty = match expected {
+        "S" | "B" => val
+            .get(expected)
+            .and_then(Value::as_str)
+            .is_some_and(str::is_empty),
+        _ => false,
+    };
+    if empty {
+        let kind = if expected == "S" { "string" } else { "binary" };
+        return Err(AwsServiceError::aws_error(
+            StatusCode::BAD_REQUEST,
+            "ValidationException",
+            format!(
+                "One or more parameter values are not valid. The AttributeValue for a key \
+                 attribute cannot contain an empty {kind} value. Key: {name}"
+            ),
+        ));
+    }
     Ok(())
 }
 

@@ -1807,13 +1807,16 @@ impl DynamoDbService {
             table_class: "STANDARD".to_string(),
             vector_indexes: Vec::new(),
         };
-        // Each row is written the way a PutItem would be. A row without a
-        // valid primary key is an import error, counted and skipped rather
-        // than stored (it could never be read, updated or paged past by key),
-        // and a row repeating an earlier row's key replaces it.
+        // Each row is written the way a PutItem would be. A row PutItem would
+        // reject -- no valid primary key, or a malformed attribute value -- is
+        // an import error, counted and skipped rather than stored (a keyless
+        // row could never be read, updated or paged past by key), and a row
+        // repeating an earlier row's key replaces it.
         let mut error_count = 0i64;
         for item in imported_items {
-            if super::validate_key_in_item(&table, &item).is_err() {
+            if super::validate_key_in_item(&table, &item).is_err()
+                || super::validate_item_attribute_values(&item).is_err()
+            {
                 error_count += 1;
                 continue;
             }
