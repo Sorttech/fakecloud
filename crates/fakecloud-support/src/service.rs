@@ -8,17 +8,26 @@
 //! returns `AttachmentIdNotFound`, and an unknown attachment set id returns
 //! `AttachmentSetIdNotFound`.
 //!
+//! Attachment uploads are the presigned flow: `GetAttachmentUploadLinks`
+//! records an upload and hands out one presigned `PUT` link per part,
+//! `CompleteAttachmentUpload` verifies the parts and their `ETag`s and
+//! assembles the attachment, `DescribeAttachmentUploadStatus` reports the
+//! recorded progress, and `GetAttachmentDownloadLink` mints a presigned `GET`
+//! link for a stored attachment. The links point back at this fakecloud and
+//! are served by [`crate::dataplane`], so they really do transfer bytes.
+//!
 //! Honest gap: fakecloud runs no Trusted Advisor analysis engine and attaches
 //! no live support agent. `DescribeTrustedAdvisorCheckResult` /
 //! `DescribeTrustedAdvisorCheckSummaries` return well-formed all-clear result
 //! shapes (zero flagged resources) rather than fabricating findings, and no
 //! automated agent reply is generated. Cases, communications, attachment sets,
-//! severity levels, the check catalogue, and the refresh state machine are all
-//! real.
+//! attachment uploads, severity levels, the check catalogue, and the refresh
+//! state machine are all real.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use base64::Engine;
 use http::StatusCode;
 use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
@@ -28,17 +37,23 @@ use fakecloud_persistence::SnapshotStore;
 
 use crate::catalog;
 use crate::shared::{
-    current_year, display_id, iso_now, new_attachment_id, new_attachment_set_id, new_case_id,
-    str_member,
+    attachment_download_path, current_year, display_id, iso_in, iso_now, new_attachment_id,
+    new_attachment_set_id, new_case_id, new_signature, new_upload_id, presigned_url, str_member,
+    upload_part_path, DEFAULT_PART_SIZE_BYTES, EXAMPLE_ACCESS_KEY_ID, LINK_TTL_SECONDS,
 };
-use crate::state::{SharedSupportState, SupportData};
+use crate::state::{
+    AttachmentUpload, DownloadGrant, SharedSupportState, SupportData, UploadPart, UPLOAD_FAILED,
+    UPLOAD_NOT_READY, UPLOAD_READY,
+};
 
-/// Every operation name in the AWS Support Smithy model (16 operations).
+/// Every operation name in the AWS Support Smithy model (20 operations).
 pub const SUPPORT_ACTIONS: &[&str] = &[
     "AddAttachmentsToSet",
     "AddCommunicationToCase",
+    "CompleteAttachmentUpload",
     "CreateCase",
     "DescribeAttachment",
+    "DescribeAttachmentUploadStatus",
     "DescribeCases",
     "DescribeCommunications",
     "DescribeCreateCaseOptions",
@@ -49,16 +64,43 @@ pub const SUPPORT_ACTIONS: &[&str] = &[
     "DescribeTrustedAdvisorCheckResult",
     "DescribeTrustedAdvisorCheckSummaries",
     "DescribeTrustedAdvisorChecks",
+    "GetAttachmentDownloadLink",
+    "GetAttachmentUploadLinks",
     "RefreshTrustedAdvisorCheck",
+    "ResolveCase",
+];
+
+/// Operations whose Smithy shape declares `DryRunOperationException`. A
+/// `dryRun: true` request against one of these is validated and then rejected
+/// with that error instead of taking effect, which is what AWS does; the
+/// Trusted Advisor operations do not model it and ignore the member.
+const DRY_RUN_ACTIONS: &[&str] = &[
+    "AddAttachmentsToSet",
+    "AddCommunicationToCase",
+    "CompleteAttachmentUpload",
+    "CreateCase",
+    "DescribeAttachment",
+    "DescribeAttachmentUploadStatus",
+    "DescribeCases",
+    "DescribeCommunications",
+    "DescribeCreateCaseOptions",
+    "DescribeServices",
+    "DescribeSeverityLevels",
+    "DescribeSupportedLanguages",
+    "GetAttachmentDownloadLink",
+    "GetAttachmentUploadLinks",
     "ResolveCase",
 ];
 
 /// Read-only verbs; any other action mutates persisted state and triggers a
 /// snapshot after success. The inverse formulation guarantees no mutation is
-/// ever missed if a new op is added. `DescribeTrustedAdvisorCheckRefreshStatuses`
-/// advances the refresh state machine in memory but is intentionally treated as
-/// read-only (the transition is re-derived on the next read, so persisting it is
-/// not required).
+/// ever missed if a new op is added: the attachment-upload operations
+/// (`GetAttachmentUploadLinks`, `CompleteAttachmentUpload`,
+/// `GetAttachmentDownloadLink`) all record issued links or assembled
+/// attachments and are correctly classified as mutating by it.
+/// `DescribeTrustedAdvisorCheckRefreshStatuses` advances the refresh state
+/// machine in memory but is intentionally treated as read-only (the transition
+/// is re-derived on the next read, so persisting it is not required).
 fn is_mutating_action(action: &str) -> bool {
     !action.starts_with("Describe")
 }
@@ -123,8 +165,14 @@ impl AwsService for SupportService {
 
     async fn handle(&self, req: AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let action = req.action.clone();
-        if let Err(msg) = crate::validate::validate_input(&action, &req.json_body()) {
+        let body = req.json_body();
+        if let Err(msg) = crate::validate::validate_input(&action, &body) {
             return Err(validation_error(msg));
+        }
+        // A dry run is validated like any other request and then refused
+        // without touching state, so nothing is persisted for it.
+        if is_dry_run(&body) && DRY_RUN_ACTIONS.contains(&action.as_str()) {
+            return Err(dry_run_error(&action));
         }
         let result = self.dispatch(&action, &req);
         if is_mutating_action(&action)
@@ -152,6 +200,11 @@ impl SupportService {
             "ResolveCase" => self.resolve_case(req, &body),
             "AddAttachmentsToSet" => self.add_attachments_to_set(req, &body),
             "DescribeAttachment" => self.describe_attachment(req, &body),
+            // Presigned attachment uploads / downloads
+            "GetAttachmentUploadLinks" => self.get_attachment_upload_links(req, &body),
+            "CompleteAttachmentUpload" => self.complete_attachment_upload(req, &body),
+            "DescribeAttachmentUploadStatus" => self.describe_attachment_upload_status(req, &body),
+            "GetAttachmentDownloadLink" => self.get_attachment_download_link(req, &body),
             // Trusted Advisor
             "DescribeTrustedAdvisorChecks" => self.describe_ta_checks(&body),
             "DescribeTrustedAdvisorCheckResult" => self.describe_ta_check_result(&body),
@@ -195,6 +248,7 @@ impl SupportService {
             .cloned()
             .unwrap_or_else(|| json!([]));
         let attachment_set_id = str_member(body, "attachmentSetId").map(str::to_string);
+        let upload_ids = string_list(body, "uploadIds");
         let submitted_by = format!("arn:aws:iam::{account}:root");
         let now = iso_now();
 
@@ -210,6 +264,10 @@ impl SupportService {
                 }
                 None => json!([]),
             };
+            let attachments = communication_attachments(
+                &attachment_set,
+                uploads_to_attachment_details(d, &upload_ids)?,
+            );
 
             let case_id = new_case_id(&account, current_year());
             let disp = display_id(&case_id);
@@ -232,6 +290,7 @@ impl SupportService {
                 "submittedBy": submitted_by,
                 "timeCreated": now,
                 "attachmentSet": attachment_set,
+                "attachments": attachments,
             });
             d.cases.insert(case_id.clone(), case);
             d.communications.insert(case_id.clone(), vec![comm]);
@@ -387,6 +446,7 @@ impl SupportService {
             .unwrap_or_default()
             .to_string();
         let attachment_set_id = str_member(body, "attachmentSetId").map(str::to_string);
+        let upload_ids = string_list(body, "uploadIds");
         let submitted_by = format!("arn:aws:iam::{account}:root");
         let now = iso_now();
 
@@ -404,12 +464,17 @@ impl SupportService {
                 }
                 None => json!([]),
             };
+            let attachments = communication_attachments(
+                &attachment_set,
+                uploads_to_attachment_details(d, &upload_ids)?,
+            );
             let comm = json!({
                 "caseId": case_id,
                 "body": comm_body,
                 "submittedBy": submitted_by,
                 "timeCreated": now,
                 "attachmentSet": attachment_set,
+                "attachments": attachments,
             });
             d.communications
                 .entry(case_id.clone())
@@ -516,6 +581,328 @@ impl SupportService {
                 .get(&attachment_id)
                 .ok_or_else(|| attachment_id_not_found(&attachment_id))?;
             Ok(ok(json!({ "attachment": att })))
+        })
+    }
+
+    // ---- Presigned attachment uploads / downloads -------------------------
+
+    /// Start (or resume) a multipart attachment upload and hand out one
+    /// presigned `PUT` link per part. Every link is recorded in state with its
+    /// own signature and expiry, so the data-plane route can authorise the
+    /// `PUT` that follows.
+    fn get_attachment_upload_links(
+        &self,
+        req: &AwsRequest,
+        body: &Value,
+    ) -> Result<AwsResponse, AwsServiceError> {
+        let account = req.account_id.clone();
+        let file_name = str_member(body, "fileName").unwrap_or_default().to_string();
+        let file_size = body
+            .get("fileSizeBytes")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let requested_upload = str_member(body, "uploadId").map(str::to_string);
+        let range_start = body
+            .pointer("/uploadRange/startIndex")
+            .and_then(Value::as_i64);
+        let range_end = body
+            .pointer("/uploadRange/endIndex")
+            .and_then(Value::as_i64);
+        let access_key = req
+            .access_key_id
+            .clone()
+            .unwrap_or_else(|| EXAMPLE_ACCESS_KEY_ID.to_string());
+        let now = iso_now();
+        let expiry = iso_in(LINK_TTL_SECONDS);
+
+        self.with_account_mut(req, |d| {
+            let endpoint = link_endpoint(req, d);
+            let region = link_region(req, d);
+
+            let upload_id = match &requested_upload {
+                Some(id) => {
+                    let existing = d
+                        .attachment_uploads
+                        .get(id)
+                        .ok_or_else(|| upload_id_not_found(id))?;
+                    if existing.status == UPLOAD_READY {
+                        return Err(upload_already_completed(id));
+                    }
+                    if existing.status == UPLOAD_FAILED || existing.expiry <= now {
+                        return Err(upload_expired(id));
+                    }
+                    id.clone()
+                }
+                None => {
+                    let id = new_upload_id();
+                    // An undeclared size is a single-part upload; a declared
+                    // one is split into 5 MiB parts like the console does.
+                    let total_parts = if file_size <= 0 {
+                        1
+                    } else {
+                        (file_size as u64).div_ceil(DEFAULT_PART_SIZE_BYTES as u64) as i64
+                    };
+                    d.attachment_uploads.insert(
+                        id.clone(),
+                        AttachmentUpload {
+                            upload_id: id.clone(),
+                            file_name: file_name.clone(),
+                            file_size_bytes: file_size.max(0),
+                            part_size_bytes: DEFAULT_PART_SIZE_BYTES,
+                            total_parts,
+                            status: UPLOAD_NOT_READY.to_string(),
+                            expiry: expiry.clone(),
+                            parts: Vec::new(),
+                            attachment_id: None,
+                        },
+                    );
+                    id
+                }
+            };
+
+            let upload = d
+                .attachment_uploads
+                .get_mut(&upload_id)
+                .expect("upload was just inserted or looked up");
+            let total_parts = upload.total_parts;
+            // Without an explicit range, hand out links for everything that is
+            // still outstanding.
+            let start = range_start
+                .unwrap_or_else(|| upload.next_index().max(1))
+                .clamp(1, total_parts);
+            let end = range_end.unwrap_or(total_parts).clamp(start, total_parts);
+
+            let mut upload_urls = Vec::new();
+            for part_index in start..=end {
+                let signature = new_signature();
+                let url = presigned_url(
+                    &endpoint,
+                    &upload_part_path(&account, &upload_id, part_index),
+                    &region,
+                    &access_key,
+                    &signature,
+                    LINK_TTL_SECONDS,
+                );
+                // Re-issuing a link for a part that already has one replaces
+                // its signature: the old link stops working, the uploaded
+                // bytes (if any) are kept so a resume does not lose them.
+                if upload.part(part_index).is_some() {
+                    let part = upload.part_mut(part_index).expect("checked above");
+                    part.signature = signature;
+                    part.expiry = expiry.clone();
+                } else {
+                    upload.parts.push(UploadPart {
+                        part_index,
+                        signature,
+                        expiry: expiry.clone(),
+                        etag: None,
+                        data: None,
+                    });
+                }
+                upload_urls.push(json!({
+                    "url": url,
+                    "partIndex": part_index,
+                    "expiryDate": expiry,
+                }));
+            }
+            upload.parts.sort_by_key(|p| p.part_index);
+            upload.expiry = expiry.clone();
+
+            Ok(ok(json!({
+                "uploadId": upload_id,
+                "partSizeBytes": upload.part_size_bytes,
+                "totalParts": total_parts,
+                "nextIndex": upload.next_index(),
+                "uploadUrls": upload_urls,
+            })))
+        })
+    }
+
+    /// Finalise an upload: every part must have been `PUT` to its link and the
+    /// client must echo back the `ETag` each `PUT` returned. On success the
+    /// parts are concatenated into a real attachment, retrievable with
+    /// `DescribeAttachment` / `GetAttachmentDownloadLink` and attachable to a
+    /// case through `uploadIds`.
+    fn complete_attachment_upload(
+        &self,
+        req: &AwsRequest,
+        body: &Value,
+    ) -> Result<AwsResponse, AwsServiceError> {
+        let upload_id = str_member(body, "uploadId").unwrap_or_default().to_string();
+        let claimed: Vec<(i64, String)> = body
+            .get("completedUploads")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .map(|c| {
+                        (
+                            c.get("partIndex").and_then(Value::as_i64).unwrap_or(0),
+                            c.get("eTag")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let now = iso_now();
+
+        self.with_account_mut(req, |d| {
+            // Clone the record so the checks below can run while the
+            // attachment map is mutated afterwards.
+            let upload = d
+                .attachment_uploads
+                .get(&upload_id)
+                .cloned()
+                .ok_or_else(|| upload_id_not_found(&upload_id))?;
+            if upload.status == UPLOAD_READY {
+                return Err(upload_already_completed(&upload_id));
+            }
+            if upload.status == UPLOAD_FAILED || upload.expiry <= now {
+                return Err(upload_expired(&upload_id));
+            }
+
+            for (part_index, _) in &claimed {
+                if upload.part(*part_index).is_none() {
+                    return Err(validation_error(format!(
+                        "Upload {upload_id} has no part {part_index}."
+                    )));
+                }
+            }
+
+            let mut bytes: Vec<u8> = Vec::new();
+            for part_index in 1..=upload.total_parts {
+                let part = upload.part(part_index).ok_or_else(|| {
+                    validation_error(format!(
+                        "No upload link was issued for part {part_index} of upload {upload_id}."
+                    ))
+                })?;
+                let (Some(stored_etag), Some(data)) = (&part.etag, &part.data) else {
+                    return Err(validation_error(format!(
+                        "Part {part_index} of upload {upload_id} was never uploaded."
+                    )));
+                };
+                let claimed_etag = claimed
+                    .iter()
+                    .find(|(i, _)| *i == part_index)
+                    .map(|(_, tag)| tag.as_str())
+                    .ok_or_else(|| {
+                        validation_error(format!(
+                            "completedUploads is missing part {part_index} of upload {upload_id}."
+                        ))
+                    })?;
+                if !etags_match(stored_etag, claimed_etag) {
+                    return Err(validation_error(format!(
+                        "The eTag given for part {part_index} of upload {upload_id} does not match the uploaded part."
+                    )));
+                }
+                let mut decoded = base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .map_err(|err| {
+                        internal_server_error(format!(
+                            "part {part_index} of upload {upload_id} could not be decoded: {err}"
+                        ))
+                    })?;
+                bytes.append(&mut decoded);
+            }
+
+            let attachment_id = new_attachment_id();
+            d.attachments.insert(
+                attachment_id.clone(),
+                json!({
+                    "fileName": upload.file_name,
+                    "data": base64::engine::general_purpose::STANDARD.encode(&bytes),
+                }),
+            );
+            let stored = d
+                .attachment_uploads
+                .get_mut(&upload_id)
+                .expect("looked up above");
+            stored.status = UPLOAD_READY.to_string();
+            stored.attachment_id = Some(attachment_id);
+
+            Ok(ok(json!({ "uploadStatus": UPLOAD_READY })))
+        })
+    }
+
+    fn describe_attachment_upload_status(
+        &self,
+        req: &AwsRequest,
+        body: &Value,
+    ) -> Result<AwsResponse, AwsServiceError> {
+        let upload_id = str_member(body, "uploadId").unwrap_or_default().to_string();
+        let now = iso_now();
+        self.with_account_mut(req, |d| {
+            let upload = d
+                .attachment_uploads
+                .get(&upload_id)
+                .ok_or_else(|| upload_id_not_found(&upload_id))?;
+            // An upload whose links expired before it was completed can never
+            // be completed, so report it as failed even though the sweep that
+            // records that only runs on load.
+            let status = if upload.status == UPLOAD_NOT_READY && upload.expiry <= now {
+                UPLOAD_FAILED
+            } else {
+                upload.status.as_str()
+            };
+            Ok(ok(json!({
+                "uploadStatus": status,
+                "fileName": upload.file_name,
+                "uploadProgress": {
+                    "totalParts": upload.total_parts,
+                    "completedPartsCount": upload.completed_parts(),
+                },
+            })))
+        })
+    }
+
+    fn get_attachment_download_link(
+        &self,
+        req: &AwsRequest,
+        body: &Value,
+    ) -> Result<AwsResponse, AwsServiceError> {
+        let account = req.account_id.clone();
+        let attachment_id = str_member(body, "attachmentId")
+            .unwrap_or_default()
+            .to_string();
+        let access_key = req
+            .access_key_id
+            .clone()
+            .unwrap_or_else(|| EXAMPLE_ACCESS_KEY_ID.to_string());
+        let expiry = iso_in(LINK_TTL_SECONDS);
+
+        self.with_account_mut(req, |d| {
+            let file_name = d
+                .attachments
+                .get(&attachment_id)
+                .ok_or_else(|| attachment_id_not_found(&attachment_id))?
+                .get("fileName")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let endpoint = link_endpoint(req, d);
+            let region = link_region(req, d);
+            let signature = new_signature();
+            let url = presigned_url(
+                &endpoint,
+                &attachment_download_path(&account, &attachment_id),
+                &region,
+                &access_key,
+                &signature,
+                LINK_TTL_SECONDS,
+            );
+            d.attachment_downloads.insert(
+                signature,
+                DownloadGrant {
+                    attachment_id: attachment_id.clone(),
+                    expiry: expiry.clone(),
+                },
+            );
+            Ok(ok(json!({
+                "fileName": file_name,
+                "downloadUrl": { "url": url, "expiryDate": expiry },
+            })))
         })
     }
 
@@ -715,6 +1102,88 @@ fn attachment_set_summary(d: &SupportData, set: &Value) -> Value {
     json!(details)
 }
 
+/// The endpoint presigned attachment links should point at: the endpoint this
+/// server was started with, falling back to the request's own `Host` (a
+/// snapshot written before the upload flow existed carries no endpoint).
+fn link_endpoint(req: &AwsRequest, d: &SupportData) -> String {
+    if !d.endpoint.is_empty() {
+        return d.endpoint.clone();
+    }
+    req.headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .map(|host| format!("http://{host}"))
+        .unwrap_or_else(|| "http://localhost:4566".to_string())
+}
+
+/// The region to name in a presigned link's credential scope.
+fn link_region(req: &AwsRequest, d: &SupportData) -> String {
+    if !d.region.is_empty() {
+        d.region.clone()
+    } else {
+        req.region.clone()
+    }
+}
+
+/// Compare an `ETag` the client echoed back against the one the data plane
+/// issued. Clients quote it, strip the quotes, or (via XML-encoding layers in
+/// some SDKs and Terraform) send the quotes as numeric entities, so normalise
+/// all of those away before comparing.
+fn etags_match(stored: &str, claimed: &str) -> bool {
+    normalize_etag(stored) == normalize_etag(claimed)
+}
+
+fn normalize_etag(tag: &str) -> String {
+    tag.replace("&quot;", "")
+        .replace("&#34;", "")
+        .replace("&#x22;", "")
+        .replace('"', "")
+        .trim()
+        .to_ascii_lowercase()
+}
+
+/// The `attachments` member of a communication: the attachment set's entries
+/// plus anything attached through `uploadIds`. The model added `attachments`
+/// alongside the older `attachmentSet` so large, upload-based attachments have
+/// somewhere to appear; both members are populated so either client works.
+fn communication_attachments(attachment_set: &Value, upload_details: Vec<Value>) -> Value {
+    let mut all = attachment_set.as_array().cloned().unwrap_or_default();
+    all.extend(upload_details);
+    Value::Array(all)
+}
+
+/// Whether the request asked for a dry run.
+fn is_dry_run(body: &Value) -> bool {
+    body.get("dryRun").and_then(Value::as_bool).unwrap_or(false)
+}
+
+/// Resolve `uploadIds` to the attachments their completed uploads produced.
+/// Neither `CreateCase` nor `AddCommunicationToCase` models `UploadIdNotFound`,
+/// so an unknown or unfinished upload is reported as a request-validation
+/// failure, which both operations can express.
+fn uploads_to_attachment_details(
+    d: &SupportData,
+    upload_ids: &[String],
+) -> Result<Vec<Value>, AwsServiceError> {
+    let mut details = Vec::with_capacity(upload_ids.len());
+    for upload_id in upload_ids {
+        let upload = d
+            .attachment_uploads
+            .get(upload_id)
+            .ok_or_else(|| validation_error(format!("Upload {upload_id} was not found.")))?;
+        let attachment_id = upload.attachment_id.as_ref().ok_or_else(|| {
+            validation_error(format!(
+                "Upload {upload_id} has not been completed; call CompleteAttachmentUpload first."
+            ))
+        })?;
+        details.push(json!({
+            "attachmentId": attachment_id,
+            "fileName": upload.file_name,
+        }));
+    }
+    Ok(details)
+}
+
 fn string_list(body: &Value, name: &str) -> Vec<String> {
     body.get(name)
         .and_then(Value::as_array)
@@ -753,6 +1222,49 @@ fn attachment_set_id_not_found(id: &str) -> AwsServiceError {
         StatusCode::BAD_REQUEST,
         "AttachmentSetIdNotFound",
         format!("Attachment set {id} was not found."),
+    )
+}
+
+/// `UploadIdNotFound` is the only upload-lookup error the three upload
+/// operations model, so it carries every reason an upload id cannot be acted
+/// on; the message says which.
+fn upload_id_not_found(id: &str) -> AwsServiceError {
+    AwsServiceError::aws_error(
+        StatusCode::BAD_REQUEST,
+        "UploadIdNotFound",
+        format!("Upload {id} was not found."),
+    )
+}
+
+fn upload_already_completed(id: &str) -> AwsServiceError {
+    AwsServiceError::aws_error(
+        StatusCode::BAD_REQUEST,
+        "UploadIdNotFound",
+        format!("Upload {id} has already been completed."),
+    )
+}
+
+fn upload_expired(id: &str) -> AwsServiceError {
+    AwsServiceError::aws_error(
+        StatusCode::BAD_REQUEST,
+        "UploadIdNotFound",
+        format!("Upload {id} has expired."),
+    )
+}
+
+fn dry_run_error(action: &str) -> AwsServiceError {
+    AwsServiceError::aws_error(
+        StatusCode::BAD_REQUEST,
+        "DryRunOperationException",
+        format!("Request would have succeeded, but DryRun flag is set for {action}."),
+    )
+}
+
+fn internal_server_error(msg: impl Into<String>) -> AwsServiceError {
+    AwsServiceError::aws_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "InternalServerError",
+        msg.into(),
     )
 }
 
@@ -967,6 +1479,457 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(step2["statuses"][0]["status"], "success");
+    }
+
+    /// Drive the real upload data plane for `body`'s worth of bytes and return
+    /// `(uploadId, completedUploads)` ready for `CompleteAttachmentUpload`.
+    fn upload_one_part(svc: &SupportService, file_name: &str, bytes: &[u8]) -> (String, Value) {
+        let links = body_of(
+            &svc.get_attachment_upload_links(
+                &req("GetAttachmentUploadLinks", json!({})),
+                &json!({ "fileName": file_name, "fileSizeBytes": bytes.len() }),
+            )
+            .unwrap(),
+        );
+        let upload_id = links["uploadId"].as_str().unwrap().to_string();
+        let signature = signature_of(links["uploadUrls"][0]["url"].as_str().unwrap());
+        let outcome = crate::dataplane::put_upload_part(
+            &svc.state,
+            "000000000000",
+            &upload_id,
+            1,
+            &signature,
+            bytes,
+        );
+        let etag = match outcome {
+            crate::dataplane::PutPartOutcome::Stored(tag) => tag,
+            other => panic!("expected the part to be stored, got {other:?}"),
+        };
+        (upload_id, json!([{ "partIndex": 1, "eTag": etag }]))
+    }
+
+    /// Pull `X-Amz-Signature` out of a presigned URL.
+    fn signature_of(url: &str) -> String {
+        url.rsplit("X-Amz-Signature=")
+            .next()
+            .unwrap()
+            .split('&')
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn attachment_upload_round_trips_through_the_data_plane() {
+        let svc = service();
+        let links = body_of(
+            &svc.get_attachment_upload_links(
+                &req("GetAttachmentUploadLinks", json!({})),
+                &json!({ "fileName": "log.txt", "fileSizeBytes": 5 }),
+            )
+            .unwrap(),
+        );
+        assert!(links["uploadId"].as_str().unwrap().starts_with("upload-"));
+        assert_eq!(links["partSizeBytes"], 5 * 1024 * 1024);
+        assert_eq!(links["totalParts"], 1);
+        // Nothing uploaded yet, so part 1 is still outstanding.
+        assert_eq!(links["nextIndex"], 1);
+        let url = links["uploadUrls"][0]["url"].as_str().unwrap();
+        assert!(url.contains("/_fakecloud/support/attachments/uploads/000000000000/"));
+        assert!(url.contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"));
+        assert!(links["uploadUrls"][0]["expiryDate"].is_string());
+        assert_eq!(links["uploadUrls"][0]["partIndex"], 1);
+
+        // Upload the bytes over the presigned link, then complete.
+        let upload_id = links["uploadId"].as_str().unwrap().to_string();
+        let signature = signature_of(url);
+        let etag = match crate::dataplane::put_upload_part(
+            &svc.state,
+            "000000000000",
+            &upload_id,
+            1,
+            &signature,
+            b"hello",
+        ) {
+            crate::dataplane::PutPartOutcome::Stored(tag) => tag,
+            other => panic!("expected the part to be stored, got {other:?}"),
+        };
+
+        // Progress is visible before completion.
+        let status = body_of(
+            &svc.describe_attachment_upload_status(
+                &req("DescribeAttachmentUploadStatus", json!({})),
+                &json!({ "uploadId": upload_id }),
+            )
+            .unwrap(),
+        );
+        assert_eq!(status["uploadStatus"], "attachment-not-ready");
+        assert_eq!(status["fileName"], "log.txt");
+        assert_eq!(status["uploadProgress"]["totalParts"], 1);
+        assert_eq!(status["uploadProgress"]["completedPartsCount"], 1);
+
+        let completed = body_of(
+            &svc.complete_attachment_upload(
+                &req("CompleteAttachmentUpload", json!({})),
+                &json!({
+                    "uploadId": upload_id,
+                    "completedUploads": [{ "partIndex": 1, "eTag": etag }],
+                }),
+            )
+            .unwrap(),
+        );
+        assert_eq!(completed["uploadStatus"], "attachment-ready");
+
+        let status = body_of(
+            &svc.describe_attachment_upload_status(
+                &req("DescribeAttachmentUploadStatus", json!({})),
+                &json!({ "uploadId": upload_id }),
+            )
+            .unwrap(),
+        );
+        assert_eq!(status["uploadStatus"], "attachment-ready");
+
+        // The assembled attachment is retrievable and downloadable.
+        let attachment_id = svc
+            .state
+            .read()
+            .get("000000000000")
+            .unwrap()
+            .attachment_uploads[&upload_id]
+            .attachment_id
+            .clone()
+            .unwrap();
+        let described = body_of(
+            &svc.describe_attachment(
+                &req("DescribeAttachment", json!({})),
+                &json!({ "attachmentId": attachment_id }),
+            )
+            .unwrap(),
+        );
+        assert_eq!(described["attachment"]["fileName"], "log.txt");
+        assert_eq!(described["attachment"]["data"], "aGVsbG8=");
+
+        let link = body_of(
+            &svc.get_attachment_download_link(
+                &req("GetAttachmentDownloadLink", json!({})),
+                &json!({ "attachmentId": attachment_id }),
+            )
+            .unwrap(),
+        );
+        assert_eq!(link["fileName"], "log.txt");
+        let download_url = link["downloadUrl"]["url"].as_str().unwrap();
+        assert!(download_url.contains(&format!(
+            "/_fakecloud/support/attachments/downloads/000000000000/{attachment_id}"
+        )));
+        assert!(link["downloadUrl"]["expiryDate"].is_string());
+        assert_eq!(
+            crate::dataplane::fetch_attachment(
+                &svc.state,
+                "000000000000",
+                &attachment_id,
+                &signature_of(download_url),
+            ),
+            crate::dataplane::DownloadOutcome::Found("log.txt".into(), b"hello".to_vec()),
+        );
+    }
+
+    #[test]
+    fn multipart_upload_splits_into_five_mib_parts() {
+        let svc = service();
+        let links = body_of(
+            &svc.get_attachment_upload_links(
+                &req("GetAttachmentUploadLinks", json!({})),
+                &json!({ "fileName": "big.bin", "fileSizeBytes": 12 * 1024 * 1024 }),
+            )
+            .unwrap(),
+        );
+        assert_eq!(links["totalParts"], 3);
+        assert_eq!(links["uploadUrls"].as_array().unwrap().len(), 3);
+
+        // A resume asks for a sub-range of the same upload.
+        let upload_id = links["uploadId"].as_str().unwrap().to_string();
+        let resumed = body_of(
+            &svc.get_attachment_upload_links(
+                &req("GetAttachmentUploadLinks", json!({})),
+                &json!({
+                    "fileName": "big.bin",
+                    "uploadId": upload_id,
+                    "uploadRange": { "startIndex": 2, "endIndex": 3 },
+                }),
+            )
+            .unwrap(),
+        );
+        assert_eq!(resumed["uploadId"], upload_id);
+        let parts: Vec<i64> = resumed["uploadUrls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|u| u["partIndex"].as_i64().unwrap())
+            .collect();
+        assert_eq!(parts, vec![2, 3]);
+    }
+
+    #[test]
+    fn unknown_upload_id_is_upload_id_not_found() {
+        let svc = service();
+        for result in [
+            svc.get_attachment_upload_links(
+                &req("GetAttachmentUploadLinks", json!({})),
+                &json!({ "fileName": "log.txt", "uploadId": "upload-missing" }),
+            ),
+            svc.complete_attachment_upload(
+                &req("CompleteAttachmentUpload", json!({})),
+                &json!({ "uploadId": "upload-missing", "completedUploads": [] }),
+            ),
+            svc.describe_attachment_upload_status(
+                &req("DescribeAttachmentUploadStatus", json!({})),
+                &json!({ "uploadId": "upload-missing" }),
+            ),
+        ] {
+            let err = expect_err(result);
+            assert!(format!("{err:?}").contains("UploadIdNotFound"));
+        }
+    }
+
+    #[test]
+    fn completing_twice_is_rejected() {
+        let svc = service();
+        let (upload_id, completed_uploads) = upload_one_part(&svc, "log.txt", b"hello");
+        let args = json!({ "uploadId": upload_id, "completedUploads": completed_uploads });
+        svc.complete_attachment_upload(&req("CompleteAttachmentUpload", json!({})), &args)
+            .unwrap();
+        let err = expect_err(
+            svc.complete_attachment_upload(&req("CompleteAttachmentUpload", json!({})), &args),
+        );
+        let rendered = format!("{err:?}");
+        assert!(rendered.contains("UploadIdNotFound"), "{rendered}");
+        assert!(rendered.contains("already been completed"), "{rendered}");
+        // Re-issuing links for a completed upload is refused too.
+        let err = expect_err(svc.get_attachment_upload_links(
+            &req("GetAttachmentUploadLinks", json!({})),
+            &json!({ "fileName": "log.txt", "uploadId": upload_id }),
+        ));
+        assert!(format!("{err:?}").contains("UploadIdNotFound"));
+    }
+
+    #[test]
+    fn completing_an_expired_upload_is_rejected() {
+        let svc = service();
+        let (upload_id, completed_uploads) = upload_one_part(&svc, "log.txt", b"hello");
+        svc.state
+            .write()
+            .get_mut("000000000000")
+            .unwrap()
+            .attachment_uploads
+            .get_mut(&upload_id)
+            .unwrap()
+            .expiry = "2000-01-01T00:00:00.000Z".to_string();
+        let err = expect_err(svc.complete_attachment_upload(
+            &req("CompleteAttachmentUpload", json!({})),
+            &json!({ "uploadId": upload_id, "completedUploads": completed_uploads }),
+        ));
+        let rendered = format!("{err:?}");
+        assert!(rendered.contains("UploadIdNotFound"), "{rendered}");
+        assert!(rendered.contains("expired"), "{rendered}");
+        // And the status read reports it as failed rather than pending.
+        let status = body_of(
+            &svc.describe_attachment_upload_status(
+                &req("DescribeAttachmentUploadStatus", json!({})),
+                &json!({ "uploadId": upload_id }),
+            )
+            .unwrap(),
+        );
+        assert_eq!(status["uploadStatus"], "failed");
+    }
+
+    #[test]
+    fn completing_rejects_missing_parts_and_bad_etags() {
+        let svc = service();
+        let (upload_id, completed_uploads) = upload_one_part(&svc, "log.txt", b"hello");
+
+        // Part uploaded, but the client claims nothing.
+        let err = expect_err(svc.complete_attachment_upload(
+            &req("CompleteAttachmentUpload", json!({})),
+            &json!({ "uploadId": upload_id, "completedUploads": [] }),
+        ));
+        assert!(format!("{err:?}").contains("missing part 1"));
+
+        // Part index that was never issued.
+        let err = expect_err(svc.complete_attachment_upload(
+            &req("CompleteAttachmentUpload", json!({})),
+            &json!({
+                "uploadId": upload_id,
+                "completedUploads": [{ "partIndex": 9, "eTag": "\"x\"" }],
+            }),
+        ));
+        assert!(format!("{err:?}").contains("has no part 9"));
+
+        // Right part, wrong eTag.
+        let err = expect_err(svc.complete_attachment_upload(
+            &req("CompleteAttachmentUpload", json!({})),
+            &json!({
+                "uploadId": upload_id,
+                "completedUploads": [{ "partIndex": 1, "eTag": "\"deadbeef\"" }],
+            }),
+        ));
+        assert!(format!("{err:?}").contains("does not match"));
+
+        // The genuine eTag still works, including unquoted.
+        let unquoted = completed_uploads[0]["eTag"]
+            .as_str()
+            .unwrap()
+            .trim_matches('"')
+            .to_string();
+        let completed = body_of(
+            &svc.complete_attachment_upload(
+                &req("CompleteAttachmentUpload", json!({})),
+                &json!({
+                    "uploadId": upload_id,
+                    "completedUploads": [{ "partIndex": 1, "eTag": unquoted }],
+                }),
+            )
+            .unwrap(),
+        );
+        assert_eq!(completed["uploadStatus"], "attachment-ready");
+    }
+
+    #[test]
+    fn completing_before_every_part_is_uploaded_is_rejected() {
+        let svc = service();
+        let links = body_of(
+            &svc.get_attachment_upload_links(
+                &req("GetAttachmentUploadLinks", json!({})),
+                &json!({ "fileName": "big.bin", "fileSizeBytes": 6 * 1024 * 1024 }),
+            )
+            .unwrap(),
+        );
+        let upload_id = links["uploadId"].as_str().unwrap().to_string();
+        let signature = signature_of(links["uploadUrls"][0]["url"].as_str().unwrap());
+        let etag = match crate::dataplane::put_upload_part(
+            &svc.state,
+            "000000000000",
+            &upload_id,
+            1,
+            &signature,
+            b"first",
+        ) {
+            crate::dataplane::PutPartOutcome::Stored(tag) => tag,
+            other => panic!("expected the part to be stored, got {other:?}"),
+        };
+        let err = expect_err(svc.complete_attachment_upload(
+            &req("CompleteAttachmentUpload", json!({})),
+            &json!({
+                "uploadId": upload_id,
+                "completedUploads": [{ "partIndex": 1, "eTag": etag }],
+            }),
+        ));
+        assert!(format!("{err:?}").contains("Part 2"));
+    }
+
+    #[test]
+    fn download_link_for_unknown_attachment_is_attachment_id_not_found() {
+        let svc = service();
+        let err = expect_err(svc.get_attachment_download_link(
+            &req("GetAttachmentDownloadLink", json!({})),
+            &json!({ "attachmentId": "attachment-missing" }),
+        ));
+        assert!(format!("{err:?}").contains("AttachmentIdNotFound"));
+    }
+
+    #[test]
+    fn completed_uploads_attach_to_a_case() {
+        let svc = service();
+        let (upload_id, completed_uploads) = upload_one_part(&svc, "log.txt", b"hello");
+        svc.complete_attachment_upload(
+            &req("CompleteAttachmentUpload", json!({})),
+            &json!({ "uploadId": upload_id, "completedUploads": completed_uploads }),
+        )
+        .unwrap();
+
+        let created = body_of(
+            &svc.create_case(
+                &req("CreateCase", json!({})),
+                &json!({
+                    "subject": "logs attached",
+                    "communicationBody": "see attached",
+                    "uploadIds": [upload_id],
+                }),
+            )
+            .unwrap(),
+        );
+        let case_id = created["caseId"].as_str().unwrap().to_string();
+        let comms = body_of(
+            &svc.describe_communications(
+                &req("DescribeCommunications", json!({})),
+                &json!({ "caseId": case_id }),
+            )
+            .unwrap(),
+        );
+        let attachments = &comms["communications"][0]["attachments"];
+        assert_eq!(attachments.as_array().unwrap().len(), 1);
+        assert_eq!(attachments[0]["fileName"], "log.txt");
+
+        // An upload that was never completed cannot be attached.
+        let (pending, _) = upload_one_part(&svc, "pending.txt", b"x");
+        let err = expect_err(svc.add_communication_to_case(
+            &req("AddCommunicationToCase", json!({})),
+            &json!({
+                "caseId": case_id,
+                "communicationBody": "one more",
+                "uploadIds": [pending],
+            }),
+        ));
+        assert!(format!("{err:?}").contains("has not been completed"));
+    }
+
+    #[tokio::test]
+    async fn dry_run_refuses_without_touching_state() {
+        let svc = service();
+        let err = expect_err(
+            svc.handle(req(
+                "CreateCase",
+                json!({
+                    "subject": "s",
+                    "communicationBody": "b",
+                    "dryRun": true,
+                }),
+            ))
+            .await,
+        );
+        assert!(format!("{err:?}").contains("DryRunOperationException"));
+        assert!(svc
+            .state
+            .read()
+            .get("000000000000")
+            .unwrap()
+            .cases
+            .is_empty());
+
+        // Trusted Advisor does not model the exception, so dryRun is ignored.
+        let resp = svc
+            .handle(req(
+                "DescribeTrustedAdvisorChecks",
+                json!({ "language": "en", "dryRun": true }),
+            ))
+            .await
+            .unwrap();
+        assert!(resp.status.is_success());
+    }
+
+    #[test]
+    fn every_supported_action_dispatches() {
+        let svc = service();
+        for action in SUPPORT_ACTIONS {
+            let result = svc.dispatch(action, &req(action, json!({})));
+            // Every action must be routed; a missing dispatch arm surfaces as
+            // the catch-all error rather than a domain error.
+            if let Err(err) = result {
+                assert!(
+                    !matches!(err, AwsServiceError::ActionNotImplemented { .. }),
+                    "{action} has no dispatch arm"
+                );
+            }
+        }
     }
 
     #[test]

@@ -2068,6 +2068,7 @@ pub(crate) fn create_configuration_set(
             reputation_metrics_enabled: false,
             vdm_options: None,
             archive_arn: None,
+            message_security_options: None,
             archiving_options_present: false,
         },
     );

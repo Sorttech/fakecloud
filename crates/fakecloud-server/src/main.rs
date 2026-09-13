@@ -30,6 +30,7 @@ mod runtime;
 mod ses_smtp;
 mod sqs_lambda_poller;
 mod stepfunctions_delivery;
+mod support_attachments;
 use cli::Cli;
 use dynamodb_streams_lambda_poller::DynamoDbStreamsLambdaPoller;
 use introspection::{
@@ -4344,6 +4345,9 @@ async fn main() {
     if let Some(h) = support_service.snapshot_hook() {
         cfn_snapshot_hooks.insert("support", h);
     }
+    // The presigned attachment upload / download routes write uploaded parts
+    // straight into Support state, so they snapshot with the same hook.
+    let support_attachment_snapshot_hook = support_service.snapshot_hook();
     registry.register(Arc::new(support_service));
     let cloudwatch_snapshot_store: Option<Arc<dyn fakecloud_persistence::SnapshotStore>> =
         if persistence_config.mode == fakecloud_persistence::StorageMode::Persistent {
@@ -11970,6 +11974,16 @@ async fn main() {
                 ),
                 None => axum::Router::new(),
             }
+        })
+        .merge({
+            // AWS Support hands out presigned attachment upload / download
+            // links; they point back here and are served by these routes, so a
+            // client that follows the URL really transfers bytes. Authorised
+            // by the link's own `X-Amz-Signature`, never by SigV4.
+            support_attachments::router(support_attachments::SupportAttachmentRoutesContext {
+                support_state: support_state.clone(),
+                snapshot: support_attachment_snapshot_hook,
+            })
         })
         .fallback(dispatch::dispatch)
         .layer({

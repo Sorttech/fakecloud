@@ -48,8 +48,11 @@ pub(crate) fn close_shard(stream: &mut KinesisStream, shard_id: &str) {
 pub(crate) fn is_mutating_action(action: &str) -> bool {
     matches!(
         action,
-        "CreateStream"
+        "CreateChannel"
+            | "CreateStream"
+            | "DeleteChannel"
             | "DeleteStream"
+            | "UpdateChannel"
             | "PutRecord"
             | "PutRecords"
             | "AddTagsToStream"
@@ -590,6 +593,638 @@ pub(crate) fn shard_discriminator(shard_id: &str) -> u32 {
         .filter(|c| c.is_ascii_digit())
         .collect();
     digits.parse::<u64>().unwrap_or(0).min(99_999) as u32
+}
+
+// --- Channels ---
+
+/// `DataFreshnessInSeconds` when the caller omits it, and the range AWS
+/// accepts for it (5 to 15 minutes).
+pub(crate) const DEFAULT_CHANNEL_DATA_FRESHNESS_SECONDS: i64 = 300;
+pub(crate) const MIN_CHANNEL_DATA_FRESHNESS_SECONDS: i64 = 300;
+pub(crate) const MAX_CHANNEL_DATA_FRESHNESS_SECONDS: i64 = 900;
+
+/// `S3StorageConfiguration.OutputKeyTemplate` when the caller omits it.
+pub(crate) const DEFAULT_CHANNEL_OUTPUT_KEY_TEMPLATE: &str =
+    "kinesis-channel/!{channel-name}/!{channel-id}/!{yyyy}/!{MM}/!{dd}/!{HH}/\
+     !{channel-name}-!{channel-id}-!{yyyy}-!{MM}-!{dd}-!{HH}-!{mm}!{extension}";
+
+/// `CloudWatchLogs.LogStreamName` when the caller omits it.
+pub(crate) const DEFAULT_CHANNEL_LOG_STREAM_NAME: &str = "DestinationDelivery";
+
+/// `ListChannels` returns at most 100 channels per page; a larger
+/// `MaxResults` is clamped rather than rejected.
+pub(crate) const MAX_LIST_CHANNELS_PAGE: usize = 100;
+
+pub(crate) fn require_channel_name(body: &Value) -> Result<&str, AwsServiceError> {
+    let name = body["ChannelName"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| invalid_argument("ChannelName is required"))?;
+    validate_string_length("ChannelName", name, 1, 128)?;
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+    {
+        return Err(validation_exception(
+            "Value at 'channelName' failed to satisfy constraint: \
+             Member must satisfy regular expression pattern: ^[a-zA-Z0-9_.-]+$",
+        ));
+    }
+    Ok(name)
+}
+
+pub(crate) fn require_channel_arn(body: &Value) -> Result<&str, AwsServiceError> {
+    let arn = body["ChannelARN"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| invalid_argument("ChannelARN is required"))?;
+    validate_string_length("ChannelARN", arn, 1, 2048)?;
+    Ok(arn)
+}
+
+/// A required string member of a channel sub-structure.
+pub(crate) fn require_channel_member<'a>(
+    value: &'a Value,
+    field: &str,
+    max_len: usize,
+) -> Result<&'a str, AwsServiceError> {
+    let found = value[field]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| invalid_argument(format!("{field} is required")))?;
+    validate_string_length(field, found, 1, max_len)?;
+    Ok(found)
+}
+
+/// An optional enum member, defaulted when absent and rejected when it is not
+/// one of the values the Smithy model lists.
+fn channel_enum_member(
+    value: &Value,
+    field: &str,
+    allowed: &[&str],
+    default: Option<&str>,
+) -> Result<String, AwsServiceError> {
+    let found = match value[field].as_str().filter(|value| !value.is_empty()) {
+        Some(found) => found,
+        None => {
+            return default
+                .map(str::to_string)
+                .ok_or_else(|| invalid_argument(format!("{field} is required")))
+        }
+    };
+    if !allowed.contains(&found) {
+        return Err(invalid_argument(format!(
+            "{field} must be one of {}",
+            allowed.join(", ")
+        )));
+    }
+    Ok(found.to_string())
+}
+
+/// `DataFreshnessInSeconds` of an `UpdateChannel` destination update, where
+/// the member is required rather than defaulted.
+pub(crate) fn require_channel_data_freshness(value: &Value) -> Result<i32, AwsServiceError> {
+    if value["DataFreshnessInSeconds"].is_null() {
+        return Err(invalid_argument("DataFreshnessInSeconds is required"));
+    }
+    channel_data_freshness(&value["DataFreshnessInSeconds"])
+}
+
+/// `DataFreshnessInSeconds`, defaulted to 300 and range-checked.
+fn channel_data_freshness(value: &Value) -> Result<i32, AwsServiceError> {
+    validate_optional_json_range(
+        "DataFreshnessInSeconds",
+        value,
+        MIN_CHANNEL_DATA_FRESHNESS_SECONDS,
+        MAX_CHANNEL_DATA_FRESHNESS_SECONDS,
+    )?;
+    Ok(value
+        .as_i64()
+        .unwrap_or(DEFAULT_CHANNEL_DATA_FRESHNESS_SECONDS) as i32)
+}
+
+/// Parse `StreamConfigurationList`. Every `StreamARN` must name a stream that
+/// exists in this account: AWS reports an unknown source stream as
+/// `ResourceNotFoundException`.
+pub(crate) fn parse_channel_streams(
+    state: &crate::state::KinesisState,
+    body: &Value,
+) -> Result<Vec<KinesisChannelStream>, AwsServiceError> {
+    let entries = body["StreamConfigurationList"]
+        .as_array()
+        .ok_or_else(|| invalid_argument("StreamConfigurationList is required"))?;
+    if entries.is_empty() || entries.len() > 10000 {
+        return Err(validation_exception(
+            "Value at 'streamConfigurationList' failed to satisfy constraint: \
+             Member must have length between 1 and 10000",
+        ));
+    }
+
+    let mut streams = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let stream_arn = require_channel_member(entry, "StreamARN", 2048)?;
+        let stream_name = state
+            .stream_name_from_arn(stream_arn)
+            .ok_or_else(|| resource_not_found_arn(stream_arn))?;
+        let stream = state
+            .streams
+            .get(&stream_name)
+            .ok_or_else(|| resource_not_found_arn(stream_arn))?;
+
+        let record_configuration = &entry["RecordConfiguration"];
+        if !record_configuration.is_object() {
+            return Err(invalid_argument("RecordConfiguration is required"));
+        }
+        let record_format_type = channel_enum_member(
+            record_configuration,
+            "RecordFormatType",
+            &["GSR_JSON", "JSON", "STRING", "BYTE_ARRAY"],
+            None,
+        )?;
+        let gsr_schema_arn = match record_configuration["GSRSchemaARN"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+        {
+            Some(arn) => {
+                validate_string_length("GSRSchemaARN", arn, 1, 2048)?;
+                Some(arn.to_string())
+            }
+            None => None,
+        };
+
+        streams.push(KinesisChannelStream {
+            stream_arn: stream.stream_arn.clone(),
+            stream_creation_timestamp: stream.stream_creation_timestamp,
+            record_format_type,
+            gsr_schema_arn,
+        });
+    }
+    Ok(streams)
+}
+
+/// Parse the channel destination. Exactly one of the two destination shapes
+/// must be supplied.
+pub(crate) fn parse_channel_destination(
+    body: &Value,
+    channel_name: &str,
+    channel_id: &str,
+) -> Result<KinesisChannelDestination, AwsServiceError> {
+    let s3 = &body["S3DestinationConfiguration"];
+    let s3_tables = &body["S3TablesDestinationConfiguration"];
+    match (s3.is_null(), s3_tables.is_null()) {
+        (false, false) => Err(invalid_argument(
+            "Specify either S3DestinationConfiguration or \
+             S3TablesDestinationConfiguration, but not both",
+        )),
+        (true, true) => Err(invalid_argument(
+            "Either S3DestinationConfiguration or S3TablesDestinationConfiguration is required",
+        )),
+        (false, true) => {
+            let storage = parse_channel_storage(&s3["StorageConfiguration"])?;
+            let dead_letter_queue = parse_channel_dead_letter_queue(
+                &s3["DeadLetterQueueS3Configuration"],
+                // A general purpose S3 destination may omit the dead-letter
+                // queue; it then defaults to the destination bucket under an
+                // error prefix.
+                Some(&storage),
+                channel_name,
+                channel_id,
+            )?;
+            Ok(KinesisChannelDestination::S3 {
+                data_freshness_in_seconds: channel_data_freshness(&s3["DataFreshnessInSeconds"])?,
+                dead_letter_queue,
+                storage,
+            })
+        }
+        (true, false) => {
+            let dead_letter_queue = parse_channel_dead_letter_queue(
+                &s3_tables["DeadLetterQueueS3Configuration"],
+                // Required for streaming tables: there is no destination
+                // bucket to fall back to.
+                None,
+                channel_name,
+                channel_id,
+            )?;
+            Ok(KinesisChannelDestination::S3Tables {
+                data_freshness_in_seconds: channel_data_freshness(
+                    &s3_tables["DataFreshnessInSeconds"],
+                )?,
+                dead_letter_queue,
+                tables: parse_channel_tables(&s3_tables["S3TablesConfigurationList"])?,
+            })
+        }
+    }
+}
+
+fn parse_channel_storage(value: &Value) -> Result<KinesisChannelS3Storage, AwsServiceError> {
+    if !value.is_object() {
+        return Err(invalid_argument("StorageConfiguration is required"));
+    }
+    let output_key_template = match value["OutputKeyTemplate"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+    {
+        Some(template) => {
+            validate_string_length("OutputKeyTemplate", template, 1, 1024)?;
+            template.to_string()
+        }
+        None => DEFAULT_CHANNEL_OUTPUT_KEY_TEMPLATE.to_string(),
+    };
+    Ok(KinesisChannelS3Storage {
+        bucket_arn: require_channel_member(value, "BucketARN", 2048)?.to_string(),
+        expected_bucket_owner: require_expected_bucket_owner(value)?,
+        output_key_template,
+        storage_class: channel_enum_member(
+            value,
+            "StorageClass",
+            &["STANDARD", "INTELLIGENT_TIERING", "GLACIER_IR"],
+            Some("STANDARD"),
+        )?,
+        compression_type: channel_enum_member(
+            value,
+            "CompressionType",
+            &["NONE", "GZIP", "ZSTD"],
+            None,
+        )?,
+    })
+}
+
+fn require_expected_bucket_owner(value: &Value) -> Result<String, AwsServiceError> {
+    let owner = value["ExpectedBucketOwner"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| invalid_argument("ExpectedBucketOwner is required"))?;
+    validate_string_length("ExpectedBucketOwner", owner, 12, 12)?;
+    Ok(owner.to_string())
+}
+
+/// Parse `DeadLetterQueueS3Configuration`. When `fallback` is `Some` an absent
+/// configuration defaults to that bucket under the channel's error prefix;
+/// when it is `None` the configuration is required.
+fn parse_channel_dead_letter_queue(
+    value: &Value,
+    fallback: Option<&KinesisChannelS3Storage>,
+    channel_name: &str,
+    channel_id: &str,
+) -> Result<KinesisChannelDeadLetterQueue, AwsServiceError> {
+    let default_prefix = format!("kinesis-channel/errors/{channel_name}/{channel_id}/");
+    if !value.is_object() {
+        let fallback = fallback.ok_or_else(|| {
+            invalid_argument(
+                "DeadLetterQueueS3Configuration is required for streaming table destinations",
+            )
+        })?;
+        return Ok(KinesisChannelDeadLetterQueue {
+            bucket_arn: fallback.bucket_arn.clone(),
+            expected_bucket_owner: fallback.expected_bucket_owner.clone(),
+            error_output_prefix: default_prefix,
+        });
+    }
+    let error_output_prefix = match value["ErrorOutputPrefix"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+    {
+        Some(prefix) => {
+            validate_string_length("ErrorOutputPrefix", prefix, 1, 512)?;
+            prefix.to_string()
+        }
+        None => default_prefix,
+    };
+    Ok(KinesisChannelDeadLetterQueue {
+        bucket_arn: require_channel_member(value, "BucketARN", 2048)?.to_string(),
+        expected_bucket_owner: require_expected_bucket_owner(value)?,
+        error_output_prefix,
+    })
+}
+
+fn parse_channel_tables(value: &Value) -> Result<Vec<KinesisChannelS3Table>, AwsServiceError> {
+    let entries = value
+        .as_array()
+        .ok_or_else(|| invalid_argument("S3TablesConfigurationList is required"))?;
+    if entries.is_empty() || entries.len() > 10000 {
+        return Err(validation_exception(
+            "Value at 's3TablesConfigurationList' failed to satisfy constraint: \
+             Member must have length between 1 and 10000",
+        ));
+    }
+
+    let mut tables = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let partition_fields = match &entry["PartitionSpec"] {
+            Value::Null => Vec::new(),
+            spec => parse_channel_partition_fields(&spec["PartitionFields"])?,
+        };
+        tables.push(KinesisChannelS3Table {
+            table_bucket_arn: require_channel_member(entry, "TableBucketARN", 2048)?.to_string(),
+            namespace: require_channel_member(entry, "Namespace", 255)?.to_string(),
+            table_name: require_channel_member(entry, "TableName", 255)?.to_string(),
+            compression_type: channel_enum_member(
+                entry,
+                "CompressionType",
+                &["NONE", "ZSTD", "SNAPPY"],
+                None,
+            )?,
+            partition_fields,
+        });
+    }
+    Ok(tables)
+}
+
+fn parse_channel_partition_fields(
+    value: &Value,
+) -> Result<Vec<KinesisChannelPartitionField>, AwsServiceError> {
+    let entries = value
+        .as_array()
+        .ok_or_else(|| invalid_argument("PartitionFields is required"))?;
+    if entries.is_empty() || entries.len() > 10 {
+        return Err(validation_exception(
+            "Value at 'partitionFields' failed to satisfy constraint: \
+             Member must have length between 1 and 10",
+        ));
+    }
+    entries
+        .iter()
+        .map(|entry| {
+            Ok(KinesisChannelPartitionField {
+                transform: channel_enum_member(entry, "Transform", &["TIME_HOUR"], None)?,
+                source_name: require_channel_member(entry, "SourceName", 255)?.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Parse `ChannelEncryptionConfiguration`. Absent means the channel uses no
+/// customer managed key.
+pub(crate) fn parse_channel_encryption(
+    value: &Value,
+) -> Result<Option<KinesisChannelEncryption>, AwsServiceError> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(KinesisChannelEncryption {
+        encryption_type: channel_enum_member(value, "EncryptionType", &["KMS"], None)?,
+        key_id: require_channel_member(value, "KeyId", 2048)?.to_string(),
+    }))
+}
+
+/// Parse `ChannelLoggingConfiguration`. It is optional on `CreateChannel` but
+/// required in `ChannelDescription`, so an absent one resolves to logging
+/// disabled under the default log group and stream names.
+pub(crate) fn parse_channel_logging(
+    value: &Value,
+    channel_name: &str,
+    channel_id: &str,
+) -> Result<KinesisChannelLogging, AwsServiceError> {
+    let default_group = format!("/aws/kinesis/{channel_name}/{channel_id}");
+    if value.is_null() {
+        return Ok(KinesisChannelLogging {
+            enabled: false,
+            log_group_name: default_group,
+            log_stream_name: DEFAULT_CHANNEL_LOG_STREAM_NAME.to_string(),
+        });
+    }
+    let logs = &value["CloudWatchLogs"];
+    if !logs.is_object() {
+        return Err(invalid_argument("CloudWatchLogs is required"));
+    }
+    let enabled = logs["Enabled"]
+        .as_bool()
+        .ok_or_else(|| invalid_argument("Enabled is required"))?;
+    let log_group_name = match logs["LogGroupName"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+    {
+        Some(name) => {
+            validate_string_length("LogGroupName", name, 1, 512)?;
+            name.to_string()
+        }
+        None => default_group,
+    };
+    let log_stream_name = match logs["LogStreamName"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+    {
+        Some(name) => {
+            validate_string_length("LogStreamName", name, 1, 512)?;
+            name.to_string()
+        }
+        None => DEFAULT_CHANNEL_LOG_STREAM_NAME.to_string(),
+    };
+    Ok(KinesisChannelLogging {
+        enabled,
+        log_group_name,
+        log_stream_name,
+    })
+}
+
+/// Render a channel as the `ChannelDescription` returned by CreateChannel,
+/// DescribeChannel and UpdateChannel.
+pub(crate) fn channel_description_json(channel: &KinesisChannel) -> Value {
+    let streams: Vec<Value> = channel
+        .streams
+        .iter()
+        .map(|source| {
+            let mut record_configuration = json!({ "RecordFormatType": source.record_format_type });
+            if let Some(ref arn) = source.gsr_schema_arn {
+                record_configuration["GSRSchemaARN"] = json!(arn);
+            }
+            json!({
+                "StreamARN": source.stream_arn,
+                "StreamCreationTimestamp": epoch_seconds(source.stream_creation_timestamp),
+                "RecordConfiguration": record_configuration,
+            })
+        })
+        .collect();
+
+    let mut description = json!({
+        "ChannelName": channel.channel_name,
+        "ChannelARN": channel.channel_arn,
+        "ChannelId": channel.channel_id,
+        "ChannelStatus": channel.channel_status,
+        "ChannelCreationTimestamp": epoch_seconds(channel.channel_creation_timestamp),
+        "ServiceExecutionRoleARN": channel.service_execution_role_arn,
+        "StreamConfigurationList": streams,
+        "LoggingConfiguration": {
+            "CloudWatchLogs": {
+                "Enabled": channel.logging.enabled,
+                "LogGroupName": channel.logging.log_group_name,
+                "LogStreamName": channel.logging.log_stream_name,
+            }
+        },
+    });
+
+    match &channel.destination {
+        KinesisChannelDestination::S3 {
+            data_freshness_in_seconds,
+            dead_letter_queue,
+            storage,
+        } => {
+            description["S3DestinationConfiguration"] = json!({
+                "DataFreshnessInSeconds": data_freshness_in_seconds,
+                "DeadLetterQueueS3Configuration": dead_letter_queue_json(dead_letter_queue),
+                "StorageConfiguration": {
+                    "BucketARN": storage.bucket_arn,
+                    "ExpectedBucketOwner": storage.expected_bucket_owner,
+                    "OutputKeyTemplate": storage.output_key_template,
+                    "StorageClass": storage.storage_class,
+                    "CompressionType": storage.compression_type,
+                },
+            });
+        }
+        KinesisChannelDestination::S3Tables {
+            data_freshness_in_seconds,
+            dead_letter_queue,
+            tables,
+        } => {
+            let tables: Vec<Value> = tables
+                .iter()
+                .map(|table| {
+                    let mut entry = json!({
+                        "TableBucketARN": table.table_bucket_arn,
+                        "Namespace": table.namespace,
+                        "TableName": table.table_name,
+                        "CompressionType": table.compression_type,
+                    });
+                    if !table.partition_fields.is_empty() {
+                        entry["PartitionSpec"] = json!({
+                            "PartitionFields": table
+                                .partition_fields
+                                .iter()
+                                .map(|field| json!({
+                                    "Transform": field.transform,
+                                    "SourceName": field.source_name,
+                                }))
+                                .collect::<Vec<Value>>(),
+                        });
+                    }
+                    entry
+                })
+                .collect();
+            description["S3TablesDestinationConfiguration"] = json!({
+                "DataFreshnessInSeconds": data_freshness_in_seconds,
+                "DeadLetterQueueS3Configuration": dead_letter_queue_json(dead_letter_queue),
+                "S3TablesConfigurationList": tables,
+            });
+        }
+    }
+
+    if let Some(ref encryption) = channel.encryption {
+        description["EncryptionConfiguration"] = json!({
+            "EncryptionType": encryption.encryption_type,
+            "KeyId": encryption.key_id,
+        });
+    }
+    description
+}
+
+fn dead_letter_queue_json(dead_letter_queue: &KinesisChannelDeadLetterQueue) -> Value {
+    json!({
+        "BucketARN": dead_letter_queue.bucket_arn,
+        "ExpectedBucketOwner": dead_letter_queue.expected_bucket_owner,
+        "ErrorOutputPrefix": dead_letter_queue.error_output_prefix,
+    })
+}
+
+/// Render a channel as the `ChannelSummary` returned by ListChannels.
+pub(crate) fn channel_summary_json(channel: &KinesisChannel) -> Value {
+    json!({
+        "ChannelName": channel.channel_name,
+        "ChannelARN": channel.channel_arn,
+        "ChannelId": channel.channel_id,
+        "ChannelStatus": channel.channel_status,
+        "ChannelCreationTimestamp": epoch_seconds(channel.channel_creation_timestamp),
+        "ChannelDestinationType": channel.destination.destination_type(),
+        "Streams": channel
+            .streams
+            .iter()
+            .map(|source| json!({
+                "StreamARN": source.stream_arn,
+                "StreamCreationTimestamp": epoch_seconds(source.stream_creation_timestamp),
+            }))
+            .collect::<Vec<Value>>(),
+    })
+}
+
+/// Timestamps go on the wire as epoch seconds with millisecond precision,
+/// the same encoding the stream and consumer responses use.
+fn epoch_seconds(timestamp: chrono::DateTime<Utc>) -> f64 {
+    timestamp.timestamp_millis() as f64 / 1000.0
+}
+
+/// One parsed `ListChannels` `StreamFilter` entry.
+pub(crate) struct ChannelStreamFilter {
+    stream_arn: String,
+    creation_timestamp_millis: Option<i64>,
+}
+
+/// Parse the `StreamFilter` list. Parsing up front (rather than per candidate
+/// channel) means a malformed filter is rejected even when the account holds
+/// no channels to evaluate it against.
+pub(crate) fn parse_channel_stream_filters(
+    value: &Value,
+) -> Result<Vec<ChannelStreamFilter>, AwsServiceError> {
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    let entries = value
+        .as_array()
+        .ok_or_else(|| invalid_argument("StreamFilter must be a list"))?;
+    if entries.is_empty() || entries.len() > 10000 {
+        return Err(validation_exception(
+            "Value at 'streamFilter' failed to satisfy constraint: \
+             Member must have length between 1 and 10000",
+        ));
+    }
+    entries
+        .iter()
+        .map(|entry| {
+            let creation_timestamp_millis = match &entry["StreamCreationTimestamp"] {
+                Value::Null => None,
+                value => {
+                    let seconds = value.as_f64().ok_or_else(|| {
+                        invalid_argument("StreamCreationTimestamp must be an epoch timestamp")
+                    })?;
+                    Some((seconds * 1000.0).round() as i64)
+                }
+            };
+            Ok(ChannelStreamFilter {
+                stream_arn: require_channel_member(entry, "StreamARN", 2048)?.to_string(),
+                creation_timestamp_millis,
+            })
+        })
+        .collect()
+}
+
+/// A channel matches the filter list when any of its source streams matches
+/// any filter entry.
+pub(crate) fn channel_matches_stream_filters(
+    channel: &KinesisChannel,
+    filters: &[ChannelStreamFilter],
+) -> bool {
+    filters.iter().any(|filter| {
+        channel.streams.iter().any(|source| {
+            source.stream_arn == filter.stream_arn
+                && filter.creation_timestamp_millis.is_none_or(|wanted| {
+                    wanted == source.stream_creation_timestamp.timestamp_millis()
+                })
+        })
+    })
+}
+
+/// Encode a `ListChannels` continuation token. Like ListStreams, the opaque
+/// cursor wraps the last returned channel name so the next page resumes
+/// strictly after it.
+pub(crate) fn encode_list_channels_token(last_channel_name: &str) -> String {
+    base64::engine::general_purpose::STANDARD.encode(last_channel_name)
+}
+
+/// Decode a `ListChannels` continuation token. A garbage token is an
+/// `InvalidArgumentException`, matching the ListShards cursor.
+pub(crate) fn decode_list_channels_token(token: &str) -> Result<String, AwsServiceError> {
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(token)
+        .map_err(|_| invalid_argument("Invalid NextToken"))?;
+    String::from_utf8(raw).map_err(|_| invalid_argument("Invalid NextToken"))
 }
 
 #[cfg(test)]

@@ -75,6 +75,65 @@ pub(crate) fn resolve_identities_action(
     }
 }
 
+/// S/MIME certificate associations hang off the singular `identity`
+/// collection (not `identities`), and every op is a POST with the
+/// EmailIdentity in the body:
+///   POST /v2/email/identity/certificates        -> AssociateEmailIdentityCertificate
+///   POST /v2/email/identity/certificates/delete -> DisassociateEmailIdentityCertificate
+///   POST /v2/email/identity/certificates/list   -> ListEmailIdentityCertificates
+pub(crate) fn resolve_identity_certificates_action(
+    method: &Method,
+    segs: &[String],
+) -> ResolvedAction {
+    if segs.get(3).map(|s| s.as_str()) != Some("certificates") {
+        return None;
+    }
+    match (method, segs.len()) {
+        (&Method::POST, 4) => Some(("AssociateEmailIdentityCertificate", None, None)),
+        (&Method::POST, 5) if segs[4] == "delete" => {
+            Some(("DisassociateEmailIdentityCertificate", None, None))
+        }
+        (&Method::POST, 5) if segs[4] == "list" => {
+            Some(("ListEmailIdentityCertificates", None, None))
+        }
+        _ => None,
+    }
+}
+
+/// Validate a `MessageSecurityOptions` block. `SigningScheme` is a Smithy
+/// union, so at most one member may be set, and the only modeled S/MIME
+/// signature format is `DETACHED`.
+pub(crate) fn validate_message_security_options(options: &Value) -> Result<(), String> {
+    let scheme = &options["SigningScheme"];
+    if scheme.is_null() {
+        return Ok(());
+    }
+    let Some(members) = scheme.as_object() else {
+        return Err("SigningScheme must be a structure".to_string());
+    };
+    if members.len() > 1 {
+        return Err(format!(
+            "SigningScheme is a union and accepts exactly one member, got {}",
+            members.len()
+        ));
+    }
+    match members.keys().next().map(String::as_str) {
+        None => Ok(()),
+        Some("DefaultScheme") => Ok(()),
+        Some("SmimeScheme") => {
+            let signature_format = &scheme["SmimeScheme"]["SignatureFormat"];
+            match signature_format.as_str() {
+                None if signature_format.is_null() => Ok(()),
+                Some("DETACHED") => Ok(()),
+                _ => Err(format!(
+                    "SignatureFormat {signature_format} is not a valid value, expected DETACHED"
+                )),
+            }
+        }
+        Some(other) => Err(format!("{other} is not a member of SigningScheme")),
+    }
+}
+
 pub(crate) fn resolve_configuration_sets_action(
     method: &Method,
     segs: &[String],
@@ -492,6 +551,8 @@ pub(crate) fn event_destination_to_json(dest: &EventDestination) -> Value {
 
 pub(crate) fn is_mutating_action(action: &str) -> bool {
     const MUTATING_PREFIXES: &[&str] = &[
+        "Associate",
+        "Disassociate",
         "Create",
         "Update",
         "Delete",

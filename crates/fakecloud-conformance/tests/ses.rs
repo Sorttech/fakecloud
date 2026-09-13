@@ -80,8 +80,8 @@ async fn ses_identity_lifecycle() {
 
 // -- Configuration Set CRUD --
 
-#[test_action("ses", "CreateConfigurationSet", checksum = "85fe8f9d")]
-#[test_action("ses", "GetConfigurationSet", checksum = "c0be65b9")]
+#[test_action("ses", "CreateConfigurationSet", checksum = "e952eb8e")]
+#[test_action("ses", "GetConfigurationSet", checksum = "0ac4f609")]
 #[test_action("ses", "ListConfigurationSets", checksum = "31486196")]
 #[test_action("ses", "DeleteConfigurationSet", checksum = "3c50e07a")]
 #[tokio::test]
@@ -2153,4 +2153,210 @@ async fn ses_list_recommendations() {
     let resp = client.list_recommendations().send().await.unwrap();
     // Smithy ListRecommendations returns Recommendations + NextToken.
     resp.recommendations();
+}
+
+// -- S/MIME Certificate Associations --
+
+/// The repo's aws-sdk-sesv2 predates the identity-certificate operations
+/// and UpdateConfigurationSet, so they are driven over raw HTTP against
+/// the REST-JSON endpoint with the URIs from the Smithy model.
+const FAKE_AUTH: &str = "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20260411/us-east-1/ses/aws4_request, SignedHeaders=host, Signature=fake";
+
+#[test_action("ses", "AssociateEmailIdentityCertificate", checksum = "fa9865a2")]
+#[test_action("ses", "ListEmailIdentityCertificates", checksum = "34d56287")]
+#[test_action("ses", "DisassociateEmailIdentityCertificate", checksum = "eebd443a")]
+#[tokio::test]
+async fn ses_email_identity_certificate_lifecycle() {
+    let server = TestServer::start().await;
+    let client = server.sesv2_client().await;
+    let http = reqwest::Client::new();
+
+    client
+        .create_email_identity()
+        .email_identity("smime@example.com")
+        .send()
+        .await
+        .unwrap();
+
+    let certificate_arn =
+        "arn:aws:acm:us-east-1:123456789012:certificate/12345678-1234-1234-1234-123456789012";
+
+    // Associate
+    let resp = http
+        .post(format!(
+            "{}/v2/email/identity/certificates",
+            server.endpoint()
+        ))
+        .header("content-type", "application/json")
+        .header("authorization", FAKE_AUTH)
+        .body(
+            serde_json::json!({
+                "EmailIdentity": "smime@example.com",
+                "CertificateArn": certificate_arn,
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+
+    // List reports the stored association against the identity.
+    let resp = http
+        .post(format!(
+            "{}/v2/email/identity/certificates/list",
+            server.endpoint()
+        ))
+        .header("content-type", "application/json")
+        .header("authorization", FAKE_AUTH)
+        .body(serde_json::json!({"EmailIdentity": "smime@example.com"}).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let certificates = body["Certificates"].as_array().unwrap();
+    assert_eq!(certificates.len(), 1);
+    assert_eq!(
+        certificates[0]["FromAddress"].as_str().unwrap(),
+        "smime@example.com"
+    );
+    assert_eq!(
+        certificates[0]["CertificateArn"].as_str().unwrap(),
+        certificate_arn
+    );
+    assert_eq!(certificates[0]["Status"].as_str().unwrap(), "ACTIVE");
+
+    // Disassociate
+    let resp = http
+        .post(format!(
+            "{}/v2/email/identity/certificates/delete",
+            server.endpoint()
+        ))
+        .header("content-type", "application/json")
+        .header("authorization", FAKE_AUTH)
+        .body(serde_json::json!({"EmailIdentity": "smime@example.com"}).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+
+    let resp = http
+        .post(format!(
+            "{}/v2/email/identity/certificates/list",
+            server.endpoint()
+        ))
+        .header("content-type", "application/json")
+        .header("authorization", FAKE_AUTH)
+        .body(serde_json::json!({"EmailIdentity": "smime@example.com"}).to_string())
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["Certificates"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn ses_associate_email_identity_certificate_unknown_identity() {
+    let server = TestServer::start().await;
+    let http = reqwest::Client::new();
+
+    let resp = http
+        .post(format!(
+            "{}/v2/email/identity/certificates",
+            server.endpoint()
+        ))
+        .header("content-type", "application/json")
+        .header("authorization", FAKE_AUTH)
+        .body(
+            serde_json::json!({
+                "EmailIdentity": "ghost@example.com",
+                "CertificateArn": "arn:aws:acm:us-east-1:123456789012:certificate/abc",
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["__type"].as_str().unwrap(), "NotFoundException");
+}
+
+#[test_action("ses", "UpdateConfigurationSet", checksum = "b6b0c0d1")]
+#[tokio::test]
+async fn ses_update_configuration_set() {
+    let server = TestServer::start().await;
+    let client = server.sesv2_client().await;
+    let http = reqwest::Client::new();
+
+    client
+        .create_configuration_set()
+        .configuration_set_name("cs-security")
+        .send()
+        .await
+        .unwrap();
+
+    let resp = http
+        .post(format!(
+            "{}/v2/email/update-configuration-sets",
+            server.endpoint()
+        ))
+        .header("content-type", "application/json")
+        .header("authorization", FAKE_AUTH)
+        .body(
+            serde_json::json!({
+                "ConfigurationSetName": "cs-security",
+                "MessageSecurityOptions": {
+                    "SigningScheme": {"SmimeScheme": {"SignatureFormat": "DETACHED"}}
+                },
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+
+    // GetConfigurationSet echoes the stored MessageSecurityOptions, and the
+    // partial update left the sending options untouched. MessageSecurityOptions
+    // is newer than aws-sdk-sesv2 1.x, so read the raw response.
+    let get = http
+        .get(format!(
+            "{}/v2/email/configuration-sets/cs-security",
+            server.endpoint()
+        ))
+        .header("authorization", FAKE_AUTH)
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = get.json().await.unwrap();
+    assert_eq!(
+        body["MessageSecurityOptions"]["SigningScheme"]["SmimeScheme"]["SignatureFormat"]
+            .as_str()
+            .unwrap(),
+        "DETACHED"
+    );
+    assert!(body["SendingOptions"]["SendingEnabled"].as_bool().unwrap());
+}
+
+#[tokio::test]
+async fn ses_update_configuration_set_unknown_set() {
+    let server = TestServer::start().await;
+    let http = reqwest::Client::new();
+
+    let resp = http
+        .post(format!(
+            "{}/v2/email/update-configuration-sets",
+            server.endpoint()
+        ))
+        .header("content-type", "application/json")
+        .header("authorization", FAKE_AUTH)
+        .body(serde_json::json!({"ConfigurationSetName": "no-such-set"}).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["__type"].as_str().unwrap(), "NotFoundException");
 }

@@ -1851,7 +1851,7 @@ async fn create_daemon_with_arn(client: &aws_sdk_ecs::Client, name: &str) -> Str
     resp.daemon_arn().unwrap().to_string()
 }
 
-#[test_action("ecs", "CreateDaemon", checksum = "8b96e9bf")]
+#[test_action("ecs", "CreateDaemon", checksum = "2c40f5eb")]
 #[tokio::test]
 async fn ecs_create_daemon() {
     let server = TestServer::start().await;
@@ -1861,7 +1861,7 @@ async fn ecs_create_daemon() {
     assert!(arn.contains(":daemon/"));
 }
 
-#[test_action("ecs", "DescribeDaemon", checksum = "af1141c6")]
+#[test_action("ecs", "DescribeDaemon", checksum = "25f93304")]
 #[tokio::test]
 async fn ecs_describe_daemon() {
     let server = TestServer::start().await;
@@ -1877,7 +1877,7 @@ async fn ecs_describe_daemon() {
     assert!(resp.daemon().is_some());
 }
 
-#[test_action("ecs", "UpdateDaemon", checksum = "87f1f95b")]
+#[test_action("ecs", "UpdateDaemon", checksum = "2b41a668")]
 #[tokio::test]
 async fn ecs_update_daemon() {
     let server = TestServer::start().await;
@@ -1937,7 +1937,7 @@ async fn create_daemon_get_deployment(
     )
 }
 
-#[test_action("ecs", "DescribeDaemonDeployments", checksum = "d0f1127a")]
+#[test_action("ecs", "DescribeDaemonDeployments", checksum = "09589af9")]
 #[tokio::test]
 async fn ecs_describe_daemon_deployments() {
     let server = TestServer::start().await;
@@ -1969,7 +1969,7 @@ async fn ecs_list_daemon_deployments() {
     assert!(!resp.daemon_deployments().is_empty());
 }
 
-#[test_action("ecs", "DescribeDaemonRevisions", checksum = "4eb9e0f0")]
+#[test_action("ecs", "DescribeDaemonRevisions", checksum = "f3f01047")]
 #[tokio::test]
 async fn ecs_describe_daemon_revisions() {
     let server = TestServer::start().await;

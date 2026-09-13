@@ -4,7 +4,7 @@ description = "Sending, templates, DKIM, suppression, and real inbound receipt r
 weight = 14
 +++
 
-fakecloud implements **110 of 110** SES v2 operations at 100% Smithy conformance, plus SES v1 inbound receipt rule operations.
+fakecloud implements **116 of 116** SES v2 operations at 100% Smithy conformance, plus SES v1 inbound receipt rule operations.
 
 ## Supported features
 
@@ -13,7 +13,8 @@ fakecloud implements **110 of 110** SES v2 operations at 100% Smithy conformance
 - **SendEmail, SendBulkEmail** — recorded at `/_fakecloud/ses/emails`, including the stamped `DKIM-Signature` header when signing is enabled
 - **SendBounce (v1)** — synthesise an inbound bounce message; the bounce record lands in `/_fakecloud/ses/emails` and triggers configured event destinations
 - **Identities** — email identity and domain identity CRUD, real DKIM RSA-SHA256 signing with relaxed/relaxed canonicalization (public key served at `/_fakecloud/ses/identities/{name}/dkim-public-key`), mail-from, feedback attributes, signing attributes
-- **Configuration sets** — CRUD, event destinations, reputation options, sending options, tracking, suppression, VDM, archiving
+- **Configuration sets** — CRUD (including `UpdateConfigurationSet` for message security options), event destinations, reputation options, sending options, tracking, suppression, VDM, archiving
+- **Identity certificates** — AssociateEmailIdentityCertificate, DisassociateEmailIdentityCertificate, ListEmailIdentityCertificates: an ACM certificate ARN is associated with a verified identity (per from-address for domain identities), stored, and listed back with its provisioning status
 - **Templates** — email templates, custom verification templates, and `TestRenderEmailTemplate` which produces a full RFC 5322 / MIME message (Subject, From, To, CC, BCC, Reply-To, Date, Message-ID, multipart bodies, attachments) from the stored template + JSON template data
 - **Contact lists** — CRUD, contacts, subscription topics
 - **Dedicated IPs** — pools, warmup, scaling

@@ -6013,6 +6013,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -6896,11 +6897,13 @@ name = "fakecloud-support"
 version = "0.44.10"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "fakecloud-core",
  "fakecloud-persistence",
  "http 1.4.0",
+ "md-5 0.10.6",
  "parking_lot",
  "regex",
  "serde",

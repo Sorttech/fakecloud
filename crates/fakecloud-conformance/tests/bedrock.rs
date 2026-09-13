@@ -2266,8 +2266,8 @@ async fn bedrock_converse_stream() {
 // next SDK refresh.
 // ---------------------------------------------------------------------------
 
-#[test_action("bedrock", "GetAccountDataRetention", checksum = "9cbe11ec")]
-#[test_action("bedrock", "PutAccountDataRetention", checksum = "ff88323b")]
+#[test_action("bedrock", "GetAccountDataRetention", checksum = "89658316")]
+#[test_action("bedrock", "PutAccountDataRetention", checksum = "98f4d1c0")]
 #[tokio::test]
 async fn bedrock_account_data_retention() {
     let server = TestServer::start().await;

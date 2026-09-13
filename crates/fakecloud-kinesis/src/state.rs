@@ -38,6 +38,10 @@ pub struct KinesisState {
     pub iterator_counter: u64,
     pub lambda_checkpoints: BTreeMap<String, usize>,
     pub consumers: BTreeMap<String, KinesisConsumer>,
+    /// Delivery channels, keyed by channel name (unique per account+region on
+    /// AWS). Defaulted so snapshots written before channels existed still load.
+    #[serde(default)]
+    pub channels: BTreeMap<String, KinesisChannel>,
     pub resource_policies: BTreeMap<String, String>,
     pub shard_limit: i32,
     pub on_demand_stream_count_limit: i32,
@@ -93,6 +97,129 @@ pub struct ShardIteratorLease {
     pub expires_at: DateTime<Utc>,
 }
 
+/// A delivery channel (`CreateChannel`): it fans records from one or more
+/// source streams into a general purpose Amazon S3 bucket or into streaming
+/// tables on Apache Iceberg in Amazon S3 Tables.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KinesisChannel {
+    pub channel_name: String,
+    pub channel_arn: String,
+    pub channel_id: String,
+    pub channel_status: String,
+    pub channel_creation_timestamp: DateTime<Utc>,
+    pub service_execution_role_arn: String,
+    pub streams: Vec<KinesisChannelStream>,
+    pub destination: KinesisChannelDestination,
+    pub encryption: Option<KinesisChannelEncryption>,
+    pub logging: KinesisChannelLogging,
+    pub tags: BTreeMap<String, String>,
+}
+
+/// One source stream of a channel (`ChannelStreamDescription`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KinesisChannelStream {
+    pub stream_arn: String,
+    pub stream_creation_timestamp: DateTime<Utc>,
+    pub record_format_type: String,
+    pub gsr_schema_arn: Option<String>,
+}
+
+/// A channel's destination. Exactly one of the two destination shapes is
+/// supplied to `CreateChannel`, so the stored form is an enum rather than two
+/// optional structs that could both be set or both be missing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum KinesisChannelDestination {
+    /// `S3DestinationConfiguration`: a general purpose Amazon S3 bucket.
+    S3 {
+        data_freshness_in_seconds: i32,
+        dead_letter_queue: KinesisChannelDeadLetterQueue,
+        storage: KinesisChannelS3Storage,
+    },
+    /// `S3TablesDestinationConfiguration`: streaming tables on Apache Iceberg.
+    S3Tables {
+        data_freshness_in_seconds: i32,
+        dead_letter_queue: KinesisChannelDeadLetterQueue,
+        tables: Vec<KinesisChannelS3Table>,
+    },
+}
+
+impl KinesisChannelDestination {
+    /// `ChannelDestinationType` for this destination, as reported by
+    /// `ListChannels`.
+    pub fn destination_type(&self) -> &'static str {
+        match self {
+            Self::S3 { .. } => "S3",
+            Self::S3Tables { .. } => "S3_TABLES",
+        }
+    }
+
+    /// The only member `UpdateChannel` may change on either destination.
+    pub fn data_freshness_mut(&mut self) -> &mut i32 {
+        match self {
+            Self::S3 {
+                data_freshness_in_seconds,
+                ..
+            }
+            | Self::S3Tables {
+                data_freshness_in_seconds,
+                ..
+            } => data_freshness_in_seconds,
+        }
+    }
+}
+
+/// `S3StorageConfiguration`: where an S3-destination channel writes records.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KinesisChannelS3Storage {
+    pub bucket_arn: String,
+    pub expected_bucket_owner: String,
+    pub output_key_template: String,
+    pub storage_class: String,
+    pub compression_type: String,
+}
+
+/// `DeadLetterQueueS3Configuration`: where undeliverable records land.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KinesisChannelDeadLetterQueue {
+    pub bucket_arn: String,
+    pub expected_bucket_owner: String,
+    pub error_output_prefix: String,
+}
+
+/// `S3TablesConfiguration`: one streaming table of an S3 Tables destination.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KinesisChannelS3Table {
+    pub table_bucket_arn: String,
+    pub namespace: String,
+    pub table_name: String,
+    pub compression_type: String,
+    /// `PartitionSpec.PartitionFields`; empty when no spec was supplied.
+    pub partition_fields: Vec<KinesisChannelPartitionField>,
+}
+
+/// One `PartitionField` of a streaming table's `PartitionSpec`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KinesisChannelPartitionField {
+    pub transform: String,
+    pub source_name: String,
+}
+
+/// `ChannelEncryptionConfiguration`: the customer managed KMS key used for
+/// data delivered to the destination.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KinesisChannelEncryption {
+    pub encryption_type: String,
+    pub key_id: String,
+}
+
+/// `ChannelLoggingConfiguration.CloudWatchLogs`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KinesisChannelLogging {
+    pub enabled: bool,
+    pub log_group_name: String,
+    pub log_stream_name: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KinesisConsumer {
     pub consumer_name: String,
@@ -112,6 +239,7 @@ impl KinesisState {
             iterator_counter: 0,
             lambda_checkpoints: BTreeMap::new(),
             consumers: BTreeMap::new(),
+            channels: BTreeMap::new(),
             resource_policies: BTreeMap::new(),
             shard_limit: 500,
             on_demand_stream_count_limit: 50,
@@ -124,6 +252,7 @@ impl KinesisState {
         self.iterators.clear();
         self.lambda_checkpoints.clear();
         self.consumers.clear();
+        self.channels.clear();
         self.resource_policies.clear();
         self.billing_commitment_status = "DISABLED".to_string();
     }
@@ -142,6 +271,43 @@ impl KinesisState {
             "arn:aws:kinesis:{}:{}:stream/{}",
             region, self.account_id, stream_name
         )
+    }
+
+    // Like `stream_arn`, the ARN carries the request's credential-scope region.
+    // AWS puts the channel's id, not its name, in the resource segment.
+    pub fn channel_arn(&self, region: &str, channel_id: &str) -> String {
+        format!(
+            "arn:aws:kinesis:{}:{}:channel/{}",
+            region, self.account_id, channel_id
+        )
+    }
+
+    /// Resolve a `ChannelARN` to the name of an existing channel. Like
+    /// [`KinesisState::stream_name_from_arn`] the lookup keys off the ARN's
+    /// resource segment, so a caller whose credential-scope region differs
+    /// from the region the channel was created in still resolves it. The
+    /// segment is the channel id, so the match is against `channel_id`.
+    pub fn channel_name_from_arn(&self, arn: &str) -> Option<String> {
+        let (_, channel_id) = arn.rsplit_once(":channel/")?;
+        self.channels
+            .values()
+            .find(|channel| channel.channel_id == channel_id)
+            .map(|channel| channel.channel_name.clone())
+    }
+
+    /// Names of the channels that draw from `stream_arn`. A stream cannot be
+    /// deleted while any channel is attached to it.
+    pub fn channels_for_stream(&self, stream_arn: &str) -> Vec<String> {
+        self.channels
+            .values()
+            .filter(|channel| {
+                channel
+                    .streams
+                    .iter()
+                    .any(|source| source.stream_arn == stream_arn)
+            })
+            .map(|channel| channel.channel_name.clone())
+            .collect()
     }
 
     pub fn insert_iterator(
@@ -285,6 +451,119 @@ mod tests {
             state.stream_arn(&state.region, "my-stream"),
             "arn:aws:kinesis:us-east-1:123456789012:stream/my-stream"
         );
+    }
+
+    fn test_channel(state: &KinesisState, name: &str) -> KinesisChannel {
+        KinesisChannel {
+            channel_name: name.to_string(),
+            channel_arn: state.channel_arn(&state.region, "11111111-2222-3333-4444-555555555555"),
+            channel_id: "11111111-2222-3333-4444-555555555555".to_string(),
+            channel_status: "ACTIVE".to_string(),
+            channel_creation_timestamp: Utc::now(),
+            service_execution_role_arn: "arn:aws:iam::123456789012:role/channel".to_string(),
+            streams: vec![KinesisChannelStream {
+                stream_arn: state.stream_arn(&state.region, "orders"),
+                stream_creation_timestamp: Utc::now(),
+                record_format_type: "JSON".to_string(),
+                gsr_schema_arn: None,
+            }],
+            destination: KinesisChannelDestination::S3 {
+                data_freshness_in_seconds: 300,
+                dead_letter_queue: KinesisChannelDeadLetterQueue {
+                    bucket_arn: "arn:aws:s3:::channel-bucket".to_string(),
+                    expected_bucket_owner: "123456789012".to_string(),
+                    error_output_prefix: "errors/".to_string(),
+                },
+                storage: KinesisChannelS3Storage {
+                    bucket_arn: "arn:aws:s3:::channel-bucket".to_string(),
+                    expected_bucket_owner: "123456789012".to_string(),
+                    output_key_template: "kinesis-channel/!{channel-name}".to_string(),
+                    storage_class: "STANDARD".to_string(),
+                    compression_type: "ZSTD".to_string(),
+                },
+            },
+            encryption: None,
+            logging: KinesisChannelLogging {
+                enabled: false,
+                log_group_name: format!("/aws/kinesis/{name}"),
+                log_stream_name: "DestinationDelivery".to_string(),
+            },
+            tags: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn channel_arn_format() {
+        let state = KinesisState::new("123456789012", "us-east-1");
+        assert_eq!(
+            state.channel_arn(&state.region, "11111111-2222-3333-4444-555555555555"),
+            "arn:aws:kinesis:us-east-1:123456789012:channel/11111111-2222-3333-4444-555555555555"
+        );
+    }
+
+    #[test]
+    fn channel_name_from_arn_resolves_only_existing_channels() {
+        let mut state = KinesisState::new("123456789012", "us-east-1");
+        let channel = test_channel(&state, "deliveries");
+        let arn = channel.channel_arn.clone();
+        state.channels.insert("deliveries".to_string(), channel);
+
+        assert_eq!(
+            state.channel_name_from_arn(&arn),
+            Some("deliveries".to_string())
+        );
+        // Another region's ARN still resolves: the id is region-independent.
+        assert_eq!(
+            state.channel_name_from_arn(
+                "arn:aws:kinesis:eu-west-1:123456789012:channel/11111111-2222-3333-4444-555555555555"
+            ),
+            Some("deliveries".to_string())
+        );
+        assert_eq!(
+            state.channel_name_from_arn("arn:aws:kinesis:us-east-1:123456789012:channel/ghost"),
+            None
+        );
+    }
+
+    #[test]
+    fn channels_survive_snapshot_round_trip() {
+        let mut state = KinesisState::new("123456789012", "us-east-1");
+        let channel = test_channel(&state, "deliveries");
+        state.channels.insert("deliveries".to_string(), channel);
+
+        let json = serde_json::to_string(&state).unwrap();
+        let restored: KinesisState = serde_json::from_str(&json).unwrap();
+        let restored_channel = &restored.channels["deliveries"];
+        assert_eq!(restored_channel.channel_status, "ACTIVE");
+        assert_eq!(restored_channel.destination.destination_type(), "S3");
+        assert_eq!(restored_channel.streams.len(), 1);
+    }
+
+    #[test]
+    fn snapshot_without_channels_still_loads() {
+        // A snapshot written before channels existed has no `channels` key;
+        // it must still deserialize (into an empty map) rather than fail the
+        // whole restore.
+        let state = KinesisState::new("123456789012", "us-east-1");
+        let mut json = serde_json::to_value(&state).unwrap();
+        json.as_object_mut().unwrap().remove("channels");
+        let restored: KinesisState = serde_json::from_value(json).unwrap();
+        assert!(restored.channels.is_empty());
+    }
+
+    #[test]
+    fn channels_for_stream_lists_attached_channels() {
+        let mut state = KinesisState::new("123456789012", "us-east-1");
+        let channel = test_channel(&state, "deliveries");
+        state.channels.insert("deliveries".to_string(), channel);
+
+        assert_eq!(
+            state.channels_for_stream(&state.stream_arn(&state.region, "orders")),
+            vec!["deliveries".to_string()]
+        );
+        assert!(state
+            .channels_for_stream(&state.stream_arn(&state.region, "other"))
+            .is_empty());
     }
 
     #[test]

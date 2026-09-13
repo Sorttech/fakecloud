@@ -2688,7 +2688,7 @@ async fn ec2_describe_instance_attribute() {
     assert_eq!(r.instance_id(), Some(id.as_str()));
 }
 
-#[test_action("ec2", "ModifyInstanceAttribute", checksum = "fe95a738")]
+#[test_action("ec2", "ModifyInstanceAttribute", checksum = "8d3e7eae")]
 #[tokio::test]
 async fn ec2_modify_instance_attribute() {
     let s = TestServer::start().await;
@@ -5219,7 +5219,7 @@ async fn make_cr(c: &aws_sdk_ec2::Client) -> String {
         .to_string()
 }
 
-#[test_action("ec2", "CreateCapacityReservation", checksum = "f1bdd159")]
+#[test_action("ec2", "CreateCapacityReservation", checksum = "a8679b7b")]
 #[tokio::test]
 async fn ec2_create_capacity_reservation() {
     let s = TestServer::start().await;
@@ -5240,7 +5240,7 @@ async fn ec2_create_capacity_reservation() {
         .starts_with("cr-"));
 }
 
-#[test_action("ec2", "DescribeCapacityReservations", checksum = "86846084")]
+#[test_action("ec2", "DescribeCapacityReservations", checksum = "b4031fa3")]
 #[tokio::test]
 async fn ec2_describe_capacity_reservations() {
     let s = TestServer::start().await;
@@ -5286,7 +5286,7 @@ async fn ec2_modify_capacity_reservation() {
     assert_eq!(r.r#return(), Some(true));
 }
 
-#[test_action("ec2", "GetCapacityReservationUsage", checksum = "58a97958")]
+#[test_action("ec2", "GetCapacityReservationUsage", checksum = "eb553936")]
 #[tokio::test]
 async fn ec2_get_capacity_reservation_usage() {
     let s = TestServer::start().await;
@@ -5412,7 +5412,7 @@ async fn ec2_modify_instance_capacity_reservation_attributes() {
     assert_eq!(r.r#return(), Some(true));
 }
 
-#[test_action("ec2", "CreateCapacityReservationBySplitting", checksum = "6b626c96")]
+#[test_action("ec2", "CreateCapacityReservationBySplitting", checksum = "5343c12c")]
 #[tokio::test]
 async fn ec2_create_capacity_reservation_by_splitting() {
     let s = TestServer::start().await;
@@ -5428,7 +5428,7 @@ async fn ec2_create_capacity_reservation_by_splitting() {
     assert!(r.destination_capacity_reservation().is_some());
 }
 
-#[test_action("ec2", "MoveCapacityReservationInstances", checksum = "d3c04631")]
+#[test_action("ec2", "MoveCapacityReservationInstances", checksum = "816db8da")]
 #[tokio::test]
 async fn ec2_move_capacity_reservation_instances() {
     let s = TestServer::start().await;
@@ -5559,7 +5559,7 @@ async fn ec2_describe_capacity_blocks() {
     assert!(r.capacity_blocks().is_empty());
 }
 
-#[test_action("ec2", "PurchaseCapacityBlock", checksum = "c194354d")]
+#[test_action("ec2", "PurchaseCapacityBlock", checksum = "9f5f4fd5")]
 #[tokio::test]
 async fn ec2_purchase_capacity_block() {
     let s = TestServer::start().await;
@@ -5644,7 +5644,7 @@ async fn ec2_describe_capacity_reservation_topology() {
 #[test_action(
     "ec2",
     "CreateInterruptibleCapacityReservationAllocation",
-    checksum = "84e54291"
+    checksum = "58f291b4"
 )]
 #[tokio::test]
 async fn ec2_create_interruptible_capacity_reservation_allocation() {
@@ -5661,7 +5661,7 @@ async fn ec2_create_interruptible_capacity_reservation_allocation() {
 #[test_action(
     "ec2",
     "UpdateInterruptibleCapacityReservationAllocation",
-    checksum = "645c8a4d"
+    checksum = "6a191018"
 )]
 #[tokio::test]
 async fn ec2_update_interruptible_capacity_reservation_allocation() {
@@ -10734,7 +10734,7 @@ async fn ec2_attach_classic_link_vpc() {
         .unwrap();
 }
 
-#[test_action("ec2", "BundleInstance", checksum = "769d9852")]
+#[test_action("ec2", "BundleInstance", checksum = "b11a5f30")]
 #[tokio::test]
 async fn ec2_bundle_instance() {
     let s = TestServer::start().await;
@@ -10742,7 +10742,7 @@ async fn ec2_bundle_instance() {
     c.bundle_instance().instance_id("x").send().await.unwrap();
 }
 
-#[test_action("ec2", "CancelBundleTask", checksum = "17e14890")]
+#[test_action("ec2", "CancelBundleTask", checksum = "97f6e998")]
 #[tokio::test]
 async fn ec2_cancel_bundle_task() {
     let s = TestServer::start().await;
@@ -11315,7 +11315,7 @@ async fn ec2_describe_aws_network_performance_metric_subscriptions() {
         .unwrap();
 }
 
-#[test_action("ec2", "DescribeBundleTasks", checksum = "7fe1331b")]
+#[test_action("ec2", "DescribeBundleTasks", checksum = "6850d013")]
 #[tokio::test]
 async fn ec2_describe_bundle_tasks() {
     let s = TestServer::start().await;
@@ -13056,14 +13056,14 @@ async fn make_ir_association(c: &aws_sdk_ec2::Client, q: &Ec2Query) -> String {
     xml_value(&body, "ipamInternetRegistryAssociationId")
 }
 
-#[test_action("ec2", "CreateIpamInternetRegistryAssociation", checksum = "5f34bb6b")]
+#[test_action("ec2", "CreateIpamInternetRegistryAssociation", checksum = "a4a63a5d")]
 #[test_action(
     "ec2",
     "DescribeIpamInternetRegistryAssociations",
-    checksum = "3e5b69be"
+    checksum = "e794060d"
 )]
-#[test_action("ec2", "EnableIpamInternetRegistryAssociation", checksum = "5b7cab96")]
-#[test_action("ec2", "DeleteIpamInternetRegistryAssociation", checksum = "aa2e586a")]
+#[test_action("ec2", "EnableIpamInternetRegistryAssociation", checksum = "bd31da14")]
+#[test_action("ec2", "DeleteIpamInternetRegistryAssociation", checksum = "4b0b5e55")]
 #[tokio::test]
 async fn ec2_ipam_internet_registry_association_lifecycle() {
     let s = TestServer::start().await;
@@ -13442,4 +13442,117 @@ async fn ec2_ipam_route_discovery_and_protection_findings() {
         )
         .await;
     assert_eq!(status, 400);
+}
+
+// ---- security-group quota validation ----
+
+#[test_action(
+    "ec2",
+    "ValidateSecurityGroupQuotasForInterface",
+    checksum = "7bb2ccf7"
+)]
+#[tokio::test]
+async fn ec2_validate_security_group_quotas_for_interface() {
+    let s = TestServer::start().await;
+    let c = s.ec2_client().await;
+    let q = Ec2Query::new(&s);
+
+    let a = make_sg(&c).await;
+    let b = make_sg(&c).await;
+    // Rules the validation has to count, so the answer comes from real state.
+    c.authorize_security_group_ingress()
+        .group_id(&a)
+        .ip_permissions(
+            aws_sdk_ec2::types::IpPermission::builder()
+                .ip_protocol("tcp")
+                .from_port(22)
+                .to_port(22)
+                .ip_ranges(
+                    aws_sdk_ec2::types::IpRange::builder()
+                        .cidr_ip("10.0.0.0/8")
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    let body = q
+        .call(
+            "ValidateSecurityGroupQuotasForInterface",
+            &[("SecurityGroupId.1", &a), ("SecurityGroupId.2", &b)],
+        )
+        .await;
+    // ec2Query envelope: no <Result> wrapper, a lowercase <requestId>, and the
+    // output member under its Smithy xmlName.
+    assert!(
+        body.contains("<ValidateSecurityGroupQuotasForInterfaceResponse"),
+        "{body}"
+    );
+    assert!(body.contains("<requestId>"), "{body}");
+    assert!(body.contains("<valid>true</valid>"), "{body}");
+
+    // An id that does not exist is a not-found, not a false answer.
+    let (status, err) = q
+        .send(
+            "ValidateSecurityGroupQuotasForInterface",
+            &[("SecurityGroupId.1", &a), ("SecurityGroupId.2", "sg-ghost")],
+        )
+        .await;
+    assert_eq!(status, 400, "{err}");
+    assert!(body_has_code(&err, "InvalidGroup.NotFound"), "{err}");
+
+    // The same id twice is rejected rather than deduplicated.
+    let (status, _) = q
+        .send(
+            "ValidateSecurityGroupQuotasForInterface",
+            &[("SecurityGroupId.1", &a), ("SecurityGroupId.2", &a)],
+        )
+        .await;
+    assert_eq!(status, 400);
+
+    // More groups than one interface may carry.
+    let mut over = Vec::new();
+    for _ in 0..6 {
+        over.push(make_sg(&c).await);
+    }
+    let params: Vec<(String, String)> = over
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (format!("SecurityGroupId.{}", i + 1), id.clone()))
+        .collect();
+    let pairs: Vec<(&str, &str)> = params
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let (status, err) = q
+        .send("ValidateSecurityGroupQuotasForInterface", &pairs)
+        .await;
+    assert_eq!(status, 400, "{err}");
+    assert!(
+        body_has_code(&err, "SecurityGroupsPerInterfaceLimitExceeded"),
+        "{err}"
+    );
+
+    // A dry run validates the request and answers nothing.
+    let body = q
+        .call(
+            "ValidateSecurityGroupQuotasForInterface",
+            &[("SecurityGroupId.1", &a), ("DryRun", "true")],
+        )
+        .await;
+    assert!(!body.contains("<valid>"), "{body}");
+    let (status, _) = q
+        .send(
+            "ValidateSecurityGroupQuotasForInterface",
+            &[("SecurityGroupId.1", "sg-ghost"), ("DryRun", "true")],
+        )
+        .await;
+    assert_eq!(status, 400);
+}
+
+/// True when an `ec2Query` error body carries `code` in its `<Code>` element.
+fn body_has_code(body: &str, code: &str) -> bool {
+    body.contains(&format!("<Code>{code}</Code>"))
 }

@@ -162,6 +162,10 @@ impl ResourceProvisioner {
                 .and_then(|v| v.get("ArchiveArn"))
                 .and_then(|v| v.as_str())
                 .map(String::from),
+            message_security_options: props
+                .get("MessageSecurityOptions")
+                .filter(|v| v.is_object())
+                .cloned(),
             archiving_options_present: props.get("ArchivingOptions").is_some_and(|v| v.is_object()),
         };
         let mut accounts = self.ses_state.write();

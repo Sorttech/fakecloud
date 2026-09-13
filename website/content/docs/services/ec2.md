@@ -1,14 +1,14 @@
 +++
 title = "EC2"
-description = "Amazon EC2 — the full 801-operation control plane. VPCs, subnets, security groups, instances, EBS, AMIs, transit gateways, VPN, IPAM, Verified Access, and the entire networking long tail at 100% Smithy conformance."
+description = "Amazon EC2 — the full 802-operation control plane. VPCs, subnets, security groups, instances, EBS, AMIs, transit gateways, VPN, IPAM, Verified Access, and the entire networking long tail at 100% Smithy conformance."
 weight = 41
 +++
 
-fakecloud implements **801 of 801** AWS EC2 operations at 100% Smithy conformance — the complete control plane for the largest service surface in AWS. Request/response shapes, flattened `ec2Query` XML lists, field names, enum validation, and integer/length bounds are checked against AWS's own Smithy model on every commit.
+fakecloud implements **802 of 802** AWS EC2 operations at 100% Smithy conformance — the complete control plane for the largest service surface in AWS. Request/response shapes, flattened `ec2Query` XML lists, field names, enum validation, and integer/length bounds are checked against AWS's own Smithy model on every commit.
 
 ## Supported features
 
-- **Core networking** — VPCs (+ secondary CIDRs, tenancy), DHCP option sets, subnets (+ CIDR reservations), security groups (rules, references, VPC associations), route tables, internet / egress-only / NAT gateways, and elastic IPs with transfer/move flows.
+- **Core networking** — VPCs (+ secondary CIDRs, tenancy), DHCP option sets, subnets (+ CIDR reservations), security groups (rules, references, VPC associations, per-interface quota validation), route tables, internet / egress-only / NAT gateways, and elastic IPs with transfer/move flows.
 - **Compute** — `RunInstances` and the full instance lifecycle (start/stop/reboot/terminate/monitor), instance attributes, credit specifications, metadata + maintenance options, instance types, and topology. Key pairs and placement groups. **Instances are backed by real Docker/Podman containers** — `RunInstances` boots a container per instance, runs your user-data at boot, and maps start/stop/reboot/terminate onto the container lifecycle (falling back to a metadata-only control plane when no container runtime is present).
 - **Storage** — EBS volumes (+ modifications, recycle bin), snapshots (+ copy, tier, lock, fast restores, block-public-access), AMIs (register/copy/deprecate/deregistration-protection), and EBS encryption defaults.
 - **Seeded public AMI catalogue** — every account starts with a small catalogue of public Amazon-owned (Amazon Linux 2, Amazon Linux 2023 x86_64/arm64, Windows Server) and Canonical-owned (Ubuntu 22.04/24.04) AMIs, just like a real account. `DescribeImages` honours the `Owner` param (`amazon` / `aws-marketplace` / `self` / account id) and `name` filters with `*` wildcards, so the standard Terraform `data "aws_ami"` pattern (`most_recent = true`, `owners = ["amazon"]`, a `name` glob) resolves to a real image instead of returning empty — and anything that chains off it (an `aws_instance`, an ELBv2 target-group attachment) can be planned.

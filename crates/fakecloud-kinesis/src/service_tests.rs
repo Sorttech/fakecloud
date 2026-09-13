@@ -2428,3 +2428,655 @@ fn put_record_on_shardless_stream_errors_without_panic() {
     ));
     assert_code_kinesis(res, "InvalidArgumentException");
 }
+
+// ── channel operations ──
+
+fn stream_arn_for(name: &str) -> String {
+    format!("arn:aws:kinesis:us-east-1:123456789012:stream/{name}")
+}
+
+/// A minimal-but-valid CreateChannel body with a general purpose S3
+/// destination: one source stream, no dead-letter queue, no logging and no
+/// encryption, so the defaults are the thing under test.
+fn s3_channel_body(name: &str, stream_name: &str) -> Value {
+    json!({
+        "ChannelName": name,
+        "ServiceExecutionRoleARN": "arn:aws:iam::123456789012:role/channel",
+        "StreamConfigurationList": [{
+            "StreamARN": stream_arn_for(stream_name),
+            "RecordConfiguration": { "RecordFormatType": "JSON" },
+        }],
+        "S3DestinationConfiguration": {
+            "StorageConfiguration": {
+                "BucketARN": "arn:aws:s3:::channel-bucket",
+                "ExpectedBucketOwner": "123456789012",
+                "CompressionType": "ZSTD",
+            }
+        },
+    })
+}
+
+fn create_channel_action(svc: &KinesisService, name: &str, stream_name: &str) -> Value {
+    json_response(
+        svc.create_channel(&request(
+            "CreateChannel",
+            s3_channel_body(name, stream_name),
+        ))
+        .unwrap(),
+    )
+}
+
+#[test]
+fn create_channel_returns_active_description_with_defaults() {
+    let (svc, _) = make_service();
+    create_stream_action(&svc, "orders", 1);
+
+    let created = create_channel_action(&svc, "deliveries", "orders");
+    let description = &created["ChannelDescription"];
+
+    assert_eq!(description["ChannelName"], "deliveries");
+    let channel_id = description["ChannelId"].as_str().unwrap();
+    assert!(!channel_id.is_empty());
+    // AWS keys the channel ARN off the channel id, not the channel name.
+    assert_eq!(
+        description["ChannelARN"],
+        format!("arn:aws:kinesis:us-east-1:123456789012:channel/{channel_id}")
+    );
+    // Fakecloud provisions synchronously, so the channel never sits in CREATING.
+    assert_eq!(description["ChannelStatus"], "ACTIVE");
+    assert!(description["ChannelCreationTimestamp"].as_f64().unwrap() > 0.0);
+    assert_eq!(
+        description["StreamConfigurationList"][0]["StreamARN"],
+        stream_arn_for("orders")
+    );
+    assert_eq!(
+        description["StreamConfigurationList"][0]["RecordConfiguration"]["RecordFormatType"],
+        "JSON"
+    );
+
+    let s3 = &description["S3DestinationConfiguration"];
+    assert_eq!(s3["DataFreshnessInSeconds"], 300);
+    assert_eq!(s3["StorageConfiguration"]["StorageClass"], "STANDARD");
+    assert_eq!(
+        s3["StorageConfiguration"]["OutputKeyTemplate"],
+        DEFAULT_CHANNEL_OUTPUT_KEY_TEMPLATE
+    );
+    // An omitted dead-letter queue defaults to the destination bucket under
+    // the channel's error prefix.
+    let channel_id = description["ChannelId"].as_str().unwrap();
+    assert_eq!(
+        s3["DeadLetterQueueS3Configuration"]["BucketARN"],
+        "arn:aws:s3:::channel-bucket"
+    );
+    assert_eq!(
+        s3["DeadLetterQueueS3Configuration"]["ErrorOutputPrefix"],
+        format!("kinesis-channel/errors/deliveries/{channel_id}/")
+    );
+
+    let logs = &description["LoggingConfiguration"]["CloudWatchLogs"];
+    assert_eq!(logs["Enabled"], false);
+    assert_eq!(
+        logs["LogGroupName"],
+        format!("/aws/kinesis/deliveries/{channel_id}")
+    );
+    assert_eq!(logs["LogStreamName"], "DestinationDelivery");
+    assert!(description["EncryptionConfiguration"].is_null());
+}
+
+#[test]
+fn create_channel_stores_tags_and_encryption() {
+    let (svc, state) = make_service();
+    create_stream_action(&svc, "orders", 1);
+
+    let mut body = s3_channel_body("deliveries", "orders");
+    body["Tags"] = json!({ "env": "prod" });
+    body["EncryptionConfiguration"] = json!({
+        "EncryptionType": "KMS",
+        "KeyId": "arn:aws:kms:us-east-1:123456789012:key/abc",
+    });
+    body["LoggingConfiguration"] = json!({
+        "CloudWatchLogs": { "Enabled": true, "LogGroupName": "/aws/kinesis/custom" }
+    });
+    let created = json_response(svc.create_channel(&request("CreateChannel", body)).unwrap());
+
+    assert_eq!(
+        created["ChannelDescription"]["EncryptionConfiguration"]["KeyId"],
+        "arn:aws:kms:us-east-1:123456789012:key/abc"
+    );
+    let logs = &created["ChannelDescription"]["LoggingConfiguration"]["CloudWatchLogs"];
+    assert_eq!(logs["Enabled"], true);
+    assert_eq!(logs["LogGroupName"], "/aws/kinesis/custom");
+    assert_eq!(logs["LogStreamName"], "DestinationDelivery");
+
+    let guard = state.read();
+    let stored = &guard.default_ref().channels["deliveries"];
+    assert_eq!(stored.tags["env"], "prod");
+}
+
+#[test]
+fn create_channel_accepts_s3_tables_destination() {
+    let (svc, _) = make_service();
+    create_stream_action(&svc, "orders", 1);
+
+    let body = json!({
+        "ChannelName": "iceberg",
+        "ServiceExecutionRoleARN": "arn:aws:iam::123456789012:role/channel",
+        "StreamConfigurationList": [{
+            "StreamARN": stream_arn_for("orders"),
+            "RecordConfiguration": {
+                "RecordFormatType": "GSR_JSON",
+                "GSRSchemaARN": "arn:aws:glue:us-east-1:123456789012:schema/s",
+            },
+        }],
+        "S3TablesDestinationConfiguration": {
+            "DataFreshnessInSeconds": 600,
+            "DeadLetterQueueS3Configuration": {
+                "BucketARN": "arn:aws:s3:::dlq-bucket",
+                "ExpectedBucketOwner": "123456789012",
+            },
+            "S3TablesConfigurationList": [{
+                "TableBucketARN": "arn:aws:s3tables:us-east-1:123456789012:bucket/tables",
+                "Namespace": "analytics",
+                "TableName": "events",
+                "CompressionType": "SNAPPY",
+                "PartitionSpec": {
+                    "PartitionFields": [{ "Transform": "TIME_HOUR", "SourceName": "ts" }]
+                },
+            }],
+        },
+    });
+    let created = json_response(svc.create_channel(&request("CreateChannel", body)).unwrap());
+    let description = &created["ChannelDescription"];
+
+    let tables = &description["S3TablesDestinationConfiguration"];
+    assert_eq!(tables["DataFreshnessInSeconds"], 600);
+    assert_eq!(
+        tables["S3TablesConfigurationList"][0]["TableName"],
+        "events"
+    );
+    assert_eq!(
+        tables["S3TablesConfigurationList"][0]["PartitionSpec"]["PartitionFields"][0]["Transform"],
+        "TIME_HOUR"
+    );
+    assert!(description["S3DestinationConfiguration"].is_null());
+    assert_eq!(
+        description["StreamConfigurationList"][0]["RecordConfiguration"]["GSRSchemaARN"],
+        "arn:aws:glue:us-east-1:123456789012:schema/s"
+    );
+}
+
+#[test]
+fn create_channel_rejects_duplicate_name() {
+    let (svc, _) = make_service();
+    create_stream_action(&svc, "orders", 1);
+    create_channel_action(&svc, "deliveries", "orders");
+
+    let res = svc.create_channel(&request(
+        "CreateChannel",
+        s3_channel_body("deliveries", "orders"),
+    ));
+    assert_code_kinesis(res, "ResourceInUseException");
+}
+
+#[test]
+fn create_channel_requires_an_existing_source_stream() {
+    let (svc, _) = make_service();
+    let res = svc.create_channel(&request(
+        "CreateChannel",
+        s3_channel_body("deliveries", "ghost"),
+    ));
+    assert_code_kinesis(res, "ResourceNotFoundException");
+}
+
+#[test]
+fn create_channel_requires_required_members() {
+    let (svc, _) = make_service();
+    create_stream_action(&svc, "orders", 1);
+
+    let mut missing_name = s3_channel_body("deliveries", "orders");
+    missing_name["ChannelName"] = Value::Null;
+    assert_code_kinesis(
+        svc.create_channel(&request("CreateChannel", missing_name)),
+        "InvalidArgumentException",
+    );
+
+    let mut missing_role = s3_channel_body("deliveries", "orders");
+    missing_role["ServiceExecutionRoleARN"] = Value::Null;
+    assert_code_kinesis(
+        svc.create_channel(&request("CreateChannel", missing_role)),
+        "InvalidArgumentException",
+    );
+
+    let mut missing_streams = s3_channel_body("deliveries", "orders");
+    missing_streams["StreamConfigurationList"] = Value::Null;
+    assert_code_kinesis(
+        svc.create_channel(&request("CreateChannel", missing_streams)),
+        "InvalidArgumentException",
+    );
+
+    let mut empty_streams = s3_channel_body("deliveries", "orders");
+    empty_streams["StreamConfigurationList"] = json!([]);
+    assert_code_kinesis(
+        svc.create_channel(&request("CreateChannel", empty_streams)),
+        "ValidationException",
+    );
+
+    // ChannelName is ^[a-zA-Z0-9_.-]+$, so a space is a pattern violation.
+    let bad_name = s3_channel_body("deliver ies", "orders");
+    assert_code_kinesis(
+        svc.create_channel(&request("CreateChannel", bad_name)),
+        "ValidationException",
+    );
+}
+
+#[test]
+fn create_channel_requires_exactly_one_destination() {
+    let (svc, _) = make_service();
+    create_stream_action(&svc, "orders", 1);
+
+    let mut none = s3_channel_body("deliveries", "orders");
+    none["S3DestinationConfiguration"] = Value::Null;
+    assert_code_kinesis(
+        svc.create_channel(&request("CreateChannel", none)),
+        "InvalidArgumentException",
+    );
+
+    let mut both = s3_channel_body("deliveries", "orders");
+    both["S3TablesDestinationConfiguration"] = json!({
+        "DeadLetterQueueS3Configuration": {
+            "BucketARN": "arn:aws:s3:::dlq-bucket",
+            "ExpectedBucketOwner": "123456789012",
+        },
+        "S3TablesConfigurationList": [{
+            "TableBucketARN": "arn:aws:s3tables:us-east-1:123456789012:bucket/tables",
+            "Namespace": "analytics",
+            "TableName": "events",
+            "CompressionType": "ZSTD",
+        }],
+    });
+    assert_code_kinesis(
+        svc.create_channel(&request("CreateChannel", both)),
+        "InvalidArgumentException",
+    );
+}
+
+#[test]
+fn create_channel_validates_destination_members() {
+    let (svc, _) = make_service();
+    create_stream_action(&svc, "orders", 1);
+
+    let mut out_of_range = s3_channel_body("deliveries", "orders");
+    out_of_range["S3DestinationConfiguration"]["DataFreshnessInSeconds"] = json!(60);
+    assert_code_kinesis(
+        svc.create_channel(&request("CreateChannel", out_of_range)),
+        "ValidationException",
+    );
+
+    let mut missing_compression = s3_channel_body("deliveries", "orders");
+    missing_compression["S3DestinationConfiguration"]["StorageConfiguration"]["CompressionType"] =
+        Value::Null;
+    assert_code_kinesis(
+        svc.create_channel(&request("CreateChannel", missing_compression)),
+        "InvalidArgumentException",
+    );
+
+    let mut bad_storage_class = s3_channel_body("deliveries", "orders");
+    bad_storage_class["S3DestinationConfiguration"]["StorageConfiguration"]["StorageClass"] =
+        json!("DEEP_ARCHIVE");
+    assert_code_kinesis(
+        svc.create_channel(&request("CreateChannel", bad_storage_class)),
+        "InvalidArgumentException",
+    );
+
+    // A streaming table destination has no destination bucket to fall back
+    // to, so its dead-letter queue is required.
+    let mut tables_without_dlq = s3_channel_body("deliveries", "orders");
+    tables_without_dlq["S3DestinationConfiguration"] = Value::Null;
+    tables_without_dlq["S3TablesDestinationConfiguration"] = json!({
+        "S3TablesConfigurationList": [{
+            "TableBucketARN": "arn:aws:s3tables:us-east-1:123456789012:bucket/tables",
+            "Namespace": "analytics",
+            "TableName": "events",
+            "CompressionType": "ZSTD",
+        }],
+    });
+    assert_code_kinesis(
+        svc.create_channel(&request("CreateChannel", tables_without_dlq)),
+        "InvalidArgumentException",
+    );
+}
+
+#[test]
+fn describe_channel_returns_stored_description() {
+    let (svc, _) = make_service();
+    create_stream_action(&svc, "orders", 1);
+    let created = create_channel_action(&svc, "deliveries", "orders");
+    let arn = created["ChannelDescription"]["ChannelARN"]
+        .as_str()
+        .unwrap();
+
+    let described = json_response(
+        svc.describe_channel(&request("DescribeChannel", json!({ "ChannelARN": arn })))
+            .unwrap(),
+    );
+    assert_eq!(
+        described["ChannelDescription"],
+        created["ChannelDescription"]
+    );
+}
+
+#[test]
+fn describe_channel_unknown_arn_errors() {
+    let (svc, _) = make_service();
+    assert_code_kinesis(
+        svc.describe_channel(&request(
+            "DescribeChannel",
+            json!({ "ChannelARN": "arn:aws:kinesis:us-east-1:123456789012:channel/ghost" }),
+        )),
+        "ResourceNotFoundException",
+    );
+    assert_code_kinesis(
+        svc.describe_channel(&request("DescribeChannel", json!({}))),
+        "InvalidArgumentException",
+    );
+}
+
+#[test]
+fn update_channel_changes_freshness_and_logging() {
+    let (svc, _) = make_service();
+    create_stream_action(&svc, "orders", 1);
+    let created = create_channel_action(&svc, "deliveries", "orders");
+    let arn = created["ChannelDescription"]["ChannelARN"]
+        .as_str()
+        .unwrap();
+
+    let response = json_response(
+        svc.update_channel(&request(
+            "UpdateChannel",
+            json!({
+                "ChannelARN": arn,
+                "S3DestinationConfiguration": { "DataFreshnessInSeconds": 900 },
+                "LoggingConfiguration": {
+                    "CloudWatchLogs": {
+                        "Enabled": true,
+                        "LogGroupName": "/aws/kinesis/updated",
+                        "LogStreamName": "updated-stream",
+                    }
+                },
+            }),
+        ))
+        .unwrap(),
+    );
+    let updated = &response["ChannelDescription"];
+
+    assert_eq!(
+        updated["S3DestinationConfiguration"]["DataFreshnessInSeconds"],
+        900
+    );
+    let logs = &updated["LoggingConfiguration"]["CloudWatchLogs"];
+    assert_eq!(logs["Enabled"], true);
+    assert_eq!(logs["LogGroupName"], "/aws/kinesis/updated");
+    assert_eq!(logs["LogStreamName"], "updated-stream");
+    // The destination itself is untouched by the update.
+    assert_eq!(
+        updated["S3DestinationConfiguration"]["StorageConfiguration"]["BucketARN"],
+        "arn:aws:s3:::channel-bucket"
+    );
+
+    // The change is persisted, not just echoed.
+    let described = json_response(
+        svc.describe_channel(&request(
+            "DescribeChannel",
+            json!({ "ChannelARN": updated["ChannelARN"].as_str().unwrap() }),
+        ))
+        .unwrap(),
+    );
+    assert_eq!(
+        described["ChannelDescription"]["S3DestinationConfiguration"]["DataFreshnessInSeconds"],
+        900
+    );
+}
+
+#[test]
+fn update_channel_rejects_mismatched_destination_and_bad_values() {
+    let (svc, _) = make_service();
+    create_stream_action(&svc, "orders", 1);
+    let created = create_channel_action(&svc, "deliveries", "orders");
+    let arn = created["ChannelDescription"]["ChannelARN"]
+        .as_str()
+        .unwrap();
+
+    assert_code_kinesis(
+        svc.update_channel(&request(
+            "UpdateChannel",
+            json!({
+                "ChannelARN": arn,
+                "S3TablesDestinationConfiguration": { "DataFreshnessInSeconds": 600 },
+            }),
+        )),
+        "InvalidArgumentException",
+    );
+    assert_code_kinesis(
+        svc.update_channel(&request(
+            "UpdateChannel",
+            json!({
+                "ChannelARN": arn,
+                "S3DestinationConfiguration": { "DataFreshnessInSeconds": 60 },
+            }),
+        )),
+        "ValidationException",
+    );
+    assert_code_kinesis(
+        svc.update_channel(&request(
+            "UpdateChannel",
+            json!({ "ChannelARN": arn, "S3DestinationConfiguration": {} }),
+        )),
+        "InvalidArgumentException",
+    );
+    assert_code_kinesis(
+        svc.update_channel(&request(
+            "UpdateChannel",
+            json!({ "ChannelARN": "arn:aws:kinesis:us-east-1:123456789012:channel/ghost" }),
+        )),
+        "ResourceNotFoundException",
+    );
+}
+
+#[test]
+fn delete_channel_removes_it() {
+    let (svc, state) = make_service();
+    create_stream_action(&svc, "orders", 1);
+    let created = create_channel_action(&svc, "deliveries", "orders");
+    let arn = created["ChannelDescription"]["ChannelARN"]
+        .as_str()
+        .unwrap();
+
+    svc.delete_channel(&request("DeleteChannel", json!({ "ChannelARN": arn })))
+        .unwrap();
+    assert!(state.read().default_ref().channels.is_empty());
+
+    assert_code_kinesis(
+        svc.delete_channel(&request("DeleteChannel", json!({ "ChannelARN": arn }))),
+        "ResourceNotFoundException",
+    );
+}
+
+#[test]
+fn list_channels_filters_by_stream() {
+    let (svc, _) = make_service();
+    create_stream_action(&svc, "orders", 1);
+    create_stream_action(&svc, "payments", 1);
+    create_channel_action(&svc, "orders-channel", "orders");
+    create_channel_action(&svc, "payments-channel", "payments");
+
+    let all = json_response(
+        svc.list_channels(&request("ListChannels", json!({})))
+            .unwrap(),
+    );
+    assert_eq!(all["ChannelSummaries"].as_array().unwrap().len(), 2);
+    assert_eq!(all["ChannelSummaries"][0]["ChannelName"], "orders-channel");
+    assert_eq!(all["ChannelSummaries"][0]["ChannelDestinationType"], "S3");
+    assert_eq!(
+        all["ChannelSummaries"][0]["Streams"][0]["StreamARN"],
+        stream_arn_for("orders")
+    );
+
+    let filtered = json_response(
+        svc.list_channels(&request(
+            "ListChannels",
+            json!({ "StreamFilter": [{ "StreamARN": stream_arn_for("payments") }] }),
+        ))
+        .unwrap(),
+    );
+    let summaries = filtered["ChannelSummaries"].as_array().unwrap();
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0]["ChannelName"], "payments-channel");
+
+    // A filter that names no source stream of any channel matches nothing.
+    let unmatched = json_response(
+        svc.list_channels(&request(
+            "ListChannels",
+            json!({ "StreamFilter": [{ "StreamARN": stream_arn_for("ghost") }] }),
+        ))
+        .unwrap(),
+    );
+    assert!(unmatched["ChannelSummaries"].as_array().unwrap().is_empty());
+
+    // StreamCreationTimestamp, when supplied, must also match.
+    let creation = all["ChannelSummaries"][0]["Streams"][0]["StreamCreationTimestamp"]
+        .as_f64()
+        .unwrap();
+    let with_timestamp = json_response(
+        svc.list_channels(&request(
+            "ListChannels",
+            json!({
+                "StreamFilter": [{
+                    "StreamARN": stream_arn_for("orders"),
+                    "StreamCreationTimestamp": creation,
+                }]
+            }),
+        ))
+        .unwrap(),
+    );
+    assert_eq!(
+        with_timestamp["ChannelSummaries"].as_array().unwrap().len(),
+        1
+    );
+    let wrong_timestamp = json_response(
+        svc.list_channels(&request(
+            "ListChannels",
+            json!({
+                "StreamFilter": [{
+                    "StreamARN": stream_arn_for("orders"),
+                    "StreamCreationTimestamp": creation + 3600.0,
+                }]
+            }),
+        ))
+        .unwrap(),
+    );
+    assert!(wrong_timestamp["ChannelSummaries"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn list_channels_paginates() {
+    let (svc, _) = make_service();
+    create_stream_action(&svc, "orders", 1);
+    for name in ["a", "b", "c"] {
+        create_channel_action(&svc, name, "orders");
+    }
+
+    let page1 = json_response(
+        svc.list_channels(&request("ListChannels", json!({ "MaxResults": 2 })))
+            .unwrap(),
+    );
+    let names: Vec<&str> = page1["ChannelSummaries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["ChannelName"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["a", "b"]);
+    let token = page1["NextToken"].as_str().unwrap().to_string();
+
+    let page2 = json_response(
+        svc.list_channels(&request("ListChannels", json!({ "NextToken": token })))
+            .unwrap(),
+    );
+    assert_eq!(page2["ChannelSummaries"][0]["ChannelName"], "c");
+    assert_eq!(page2["ChannelSummaries"].as_array().unwrap().len(), 1);
+    assert!(
+        page2["NextToken"].is_null(),
+        "last page must not carry a cursor"
+    );
+}
+
+#[test]
+fn list_channels_rejects_bad_input() {
+    let (svc, _) = make_service();
+    assert_code_kinesis(
+        svc.list_channels(&request("ListChannels", json!({ "MaxResults": 0 }))),
+        "ValidationException",
+    );
+    assert_code_kinesis(
+        svc.list_channels(&request("ListChannels", json!({ "StreamFilter": [{}] }))),
+        "InvalidArgumentException",
+    );
+    assert_code_kinesis(
+        svc.list_channels(&request(
+            "ListChannels",
+            json!({ "NextToken": "not base64 !!" }),
+        )),
+        "InvalidArgumentException",
+    );
+}
+
+#[test]
+fn delete_stream_is_blocked_while_a_channel_is_attached() {
+    let (svc, _) = make_service();
+    create_stream_action(&svc, "orders", 1);
+    let created = create_channel_action(&svc, "deliveries", "orders");
+    let arn = created["ChannelDescription"]["ChannelARN"]
+        .as_str()
+        .unwrap();
+
+    assert_code_kinesis(
+        svc.delete_stream(&request("DeleteStream", json!({ "StreamName": "orders" }))),
+        "ResourceInUseException",
+    );
+
+    svc.delete_channel(&request("DeleteChannel", json!({ "ChannelARN": arn })))
+        .unwrap();
+    svc.delete_stream(&request("DeleteStream", json!({ "StreamName": "orders" })))
+        .unwrap();
+}
+
+#[test]
+fn channel_actions_are_supported_and_mutating() {
+    let svc = KinesisService::new(Arc::new(RwLock::new(
+        fakecloud_core::multi_account::MultiAccountState::new(
+            "123456789012",
+            "us-east-1",
+            "http://localhost:4566",
+        ),
+    )));
+    for action in [
+        "CreateChannel",
+        "DescribeChannel",
+        "ListChannels",
+        "UpdateChannel",
+        "DeleteChannel",
+    ] {
+        assert!(
+            svc.supported_actions().contains(&action),
+            "{action} missing from SUPPORTED_ACTIONS"
+        );
+    }
+    for action in ["CreateChannel", "UpdateChannel", "DeleteChannel"] {
+        assert!(is_mutating_action(action), "{action} must be snapshotted");
+    }
+    assert!(!is_mutating_action("DescribeChannel"));
+    assert!(!is_mutating_action("ListChannels"));
+}

@@ -39,8 +39,9 @@ pub fn load_into(
             supported: SUPPORT_SNAPSHOT_SCHEMA_VERSION,
         });
     }
-    // There is no timer-driven lifecycle to resume, but keep the reconcile call
-    // for symmetry with the other services (it is a no-op).
+    // Attachment uploads have a wall-clock lifecycle: reconcile sweeps any
+    // upload whose presigned links expired while the server was down to
+    // `failed`, and drops expired download grants.
     for (_account_id, account) in snapshot.accounts.iter_mut() {
         account.reconcile();
     }
@@ -109,6 +110,60 @@ mod tests {
             load_into(&MemStore(Mutex::new(None)), &state()).unwrap(),
             LoadOutcome::Empty
         );
+    }
+
+    #[test]
+    fn round_trip_restores_attachment_uploads_and_sweeps_expired_ones() {
+        use crate::state::{AttachmentUpload, UploadPart, UPLOAD_FAILED, UPLOAD_NOT_READY};
+
+        let mut accounts: MultiAccountState<SupportData> =
+            MultiAccountState::new("000000000000", "us-east-1", "http://localhost:4566");
+        let data = accounts.get_or_create("111122223333");
+        let mut upload = AttachmentUpload {
+            upload_id: "upload-live".into(),
+            file_name: "log.txt".into(),
+            file_size_bytes: 5,
+            part_size_bytes: 5 * 1024 * 1024,
+            total_parts: 1,
+            status: UPLOAD_NOT_READY.into(),
+            expiry: "2999-01-01T00:00:00.000Z".into(),
+            parts: vec![UploadPart {
+                part_index: 1,
+                signature: "sig".into(),
+                expiry: "2999-01-01T00:00:00.000Z".into(),
+                etag: Some("\"abc\"".into()),
+                data: Some("aGVsbG8=".into()),
+            }],
+            attachment_id: None,
+        };
+        data.attachment_uploads
+            .insert(upload.upload_id.clone(), upload.clone());
+        upload.upload_id = "upload-stale".into();
+        upload.expiry = "2000-01-01T00:00:00.000Z".into();
+        data.attachment_uploads
+            .insert(upload.upload_id.clone(), upload);
+
+        let snap = SupportSnapshot {
+            schema_version: SUPPORT_SNAPSHOT_SCHEMA_VERSION,
+            accounts,
+        };
+        let store = MemStore(Mutex::new(Some(serde_json::to_vec(&snap).unwrap())));
+        let restored = state();
+        assert!(matches!(
+            load_into(&store, &restored).unwrap(),
+            LoadOutcome::Loaded(_)
+        ));
+        let guard = restored.read();
+        let uploads = &guard.get("111122223333").unwrap().attachment_uploads;
+        // The live upload keeps its status and its already-uploaded bytes.
+        assert_eq!(uploads["upload-live"].status, UPLOAD_NOT_READY);
+        assert_eq!(
+            uploads["upload-live"].part(1).unwrap().data.as_deref(),
+            Some("aGVsbG8=")
+        );
+        // The one whose links expired while the server was down cannot be
+        // completed any more.
+        assert_eq!(uploads["upload-stale"].status, UPLOAD_FAILED);
     }
 
     #[test]

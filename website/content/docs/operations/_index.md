@@ -1099,6 +1099,7 @@ This is a surface listing, not an implementation manifest. For fakecloud's per-s
 
 ## [SES](@/docs/services/ses.md)
 
+- `AssociateEmailIdentityCertificate`
 - `BatchGetMetricData`
 - `CancelExportJob`
 - `CreateConfigurationSet`
@@ -1129,6 +1130,7 @@ This is a surface listing, not an implementation manifest. For fakecloud's per-s
 - `DeleteSuppressedDestination`
 - `DeleteTenant`
 - `DeleteTenantResourceAssociation`
+- `DisassociateEmailIdentityCertificate`
 - `GetAccount`
 - `GetBlacklistReports`
 - `GetConfigurationSet`
@@ -1162,6 +1164,7 @@ This is a surface listing, not an implementation manifest. For fakecloud's per-s
 - `ListDeliverabilityTestReports`
 - `ListDomainDeliverabilityCampaigns`
 - `ListEmailIdentities`
+- `ListEmailIdentityCertificates`
 - `ListEmailTemplates`
 - `ListExportJobs`
 - `ListImportJobs`
@@ -1203,6 +1206,7 @@ This is a surface listing, not an implementation manifest. For fakecloud's per-s
 - `TagResource`
 - `TestRenderEmailTemplate`
 - `UntagResource`
+- `UpdateConfigurationSet`
 - `UpdateConfigurationSetEventDestination`
 - `UpdateContact`
 - `UpdateContactList`
@@ -1376,12 +1380,15 @@ This is a surface listing, not an implementation manifest. For fakecloud's per-s
 ## [Kinesis](@/docs/services/kinesis.md)
 
 - `AddTagsToStream`
+- `CreateChannel`
 - `CreateStream`
 - `DecreaseStreamRetentionPeriod`
+- `DeleteChannel`
 - `DeleteResourcePolicy`
 - `DeleteStream`
 - `DeregisterStreamConsumer`
 - `DescribeAccountSettings`
+- `DescribeChannel`
 - `DescribeLimits`
 - `DescribeStream`
 - `DescribeStreamConsumer`
@@ -1392,6 +1399,7 @@ This is a surface listing, not an implementation manifest. For fakecloud's per-s
 - `GetResourcePolicy`
 - `GetShardIterator`
 - `IncreaseStreamRetentionPeriod`
+- `ListChannels`
 - `ListShards`
 - `ListStreamConsumers`
 - `ListStreams`
@@ -1410,6 +1418,7 @@ This is a surface listing, not an implementation manifest. For fakecloud's per-s
 - `TagResource`
 - `UntagResource`
 - `UpdateAccountSettings`
+- `UpdateChannel`
 - `UpdateMaxRecordSize`
 - `UpdateShardCount`
 - `UpdateStreamMode`
@@ -7047,8 +7056,10 @@ This is a surface listing, not an implementation manifest. For fakecloud's per-s
 
 - `AddAttachmentsToSet`
 - `AddCommunicationToCase`
+- `CompleteAttachmentUpload`
 - `CreateCase`
 - `DescribeAttachment`
+- `DescribeAttachmentUploadStatus`
 - `DescribeCases`
 - `DescribeCommunications`
 - `DescribeCreateCaseOptions`
@@ -7059,6 +7070,8 @@ This is a surface listing, not an implementation manifest. For fakecloud's per-s
 - `DescribeTrustedAdvisorCheckResult`
 - `DescribeTrustedAdvisorCheckSummaries`
 - `DescribeTrustedAdvisorChecks`
+- `GetAttachmentDownloadLink`
+- `GetAttachmentUploadLinks`
 - `RefreshTrustedAdvisorCheck`
 - `ResolveCase`
 
@@ -7930,5 +7943,6 @@ This is a surface listing, not an implementation manifest. For fakecloud's per-s
 - `UpdateInterruptibleCapacityReservationAllocation`
 - `UpdateSecurityGroupRuleDescriptionsEgress`
 - `UpdateSecurityGroupRuleDescriptionsIngress`
+- `ValidateSecurityGroupQuotasForInterface`
 - `WithdrawByoipCidr`
 
