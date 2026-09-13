@@ -853,7 +853,7 @@ impl DynamoDbService {
             "arn:aws:dynamodb:{}:{}:table/{}/backup/{:013}-{}",
             req.region.as_str(),
             state.account_id,
-            table_name,
+            table.name,
             now.timestamp_millis(),
             &uuid::Uuid::new_v4().to_string().replace('-', "")[..8]
         );
@@ -861,7 +861,7 @@ impl DynamoDbService {
         let backup = BackupDescription {
             backup_arn: backup_arn.clone(),
             backup_name: backup_name.to_string(),
-            table_name: table_name.to_string(),
+            table_name: table.name.clone(),
             table_arn: table.arn.clone(),
             backup_status: "AVAILABLE".to_string(),
             backup_type: "USER".to_string(),
@@ -1062,7 +1062,10 @@ impl DynamoDbService {
         let matched: Vec<(&str, Value)> = state
             .backups
             .values()
-            .filter(|b| table_name.is_none() || table_name == Some(b.table_name.as_str()))
+            .filter(|b| {
+                table_name.is_none()
+                    || table_name.map(super::resolve_table_name) == Some(b.table_name.as_str())
+            })
             .filter(|b| match start {
                 Some(s) => b.backup_arn.as_str() > s,
                 None => true,

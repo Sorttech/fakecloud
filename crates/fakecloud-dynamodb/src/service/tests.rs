@@ -6694,3 +6694,92 @@ async fn table_operations_and_insights_accept_a_table_arn() {
         .tables
         .is_empty());
 }
+
+/// Naming one table by name in one operation and by ARN in another is still
+/// the same item: transactions must reject touching it twice.
+#[tokio::test]
+async fn transactions_see_a_table_named_by_name_and_arn_as_one_table() {
+    let svc = make_service();
+    create_test_table(&svc);
+    call_dynamodb(
+        &svc,
+        "PutItem",
+        json!({"TableName": "test-table", "Item": {"pk": {"S": "a"}}}),
+    )
+    .await;
+
+    let err = svc
+        .handle(make_request(
+            "TransactWriteItems",
+            json!({"TransactItems": [
+                {"Put": {"TableName": "test-table", "Item": {"pk": {"S": "a"}, "v": {"S": "1"}}}},
+                {"Put": {"TableName": TEST_TABLE_ARN, "Item": {"pk": {"S": "a"}, "v": {"S": "2"}}}}
+            ]}),
+        ))
+        .await
+        .err()
+        .expect("two writes to one item must be rejected");
+    assert!(
+        err.to_string().contains("multiple operations on one item"),
+        "{err}"
+    );
+
+    let err = svc
+        .handle(make_request(
+            "TransactGetItems",
+            json!({"TransactItems": [
+                {"Get": {"TableName": "test-table", "Key": {"pk": {"S": "a"}}}},
+                {"Get": {"TableName": TEST_TABLE_ARN, "Key": {"pk": {"S": "a"}}}}
+            ]}),
+        ))
+        .await
+        .err()
+        .expect("two reads of one item must be rejected");
+    assert!(
+        err.to_string().contains("multiple operations on one item"),
+        "{err}"
+    );
+}
+
+/// A backup of a table named by ARN records the table's name, and the list
+/// filters accept either form.
+#[tokio::test]
+async fn backups_and_insights_listings_accept_a_table_arn() {
+    let svc = make_service();
+    create_test_table(&svc);
+
+    let created = call_dynamodb(
+        &svc,
+        "CreateBackup",
+        json!({"TableName": TEST_TABLE_ARN, "BackupName": "b1"}),
+    )
+    .await;
+    let details = &created["BackupDetails"];
+    let arn = details["BackupArn"].as_str().unwrap();
+    assert!(
+        arn.starts_with("arn:aws:dynamodb:us-east-1:123456789012:table/test-table/backup/"),
+        "{arn}"
+    );
+
+    for filter in ["test-table", TEST_TABLE_ARN] {
+        let listed = call_dynamodb(&svc, "ListBackups", json!({"TableName": filter})).await;
+        let summaries = listed["BackupSummaries"].as_array().unwrap();
+        assert_eq!(summaries.len(), 1, "filter {filter}: {listed}");
+        assert_eq!(summaries[0]["TableName"], "test-table");
+    }
+
+    let listed = call_dynamodb(
+        &svc,
+        "ListContributorInsights",
+        json!({"TableName": TEST_TABLE_ARN}),
+    )
+    .await;
+    assert_eq!(
+        listed["ContributorInsightsSummaries"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "{listed}"
+    );
+}

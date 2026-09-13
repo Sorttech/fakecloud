@@ -371,7 +371,10 @@ impl DynamoDbService {
         let summaries: Vec<Value> = state
             .tables
             .values()
-            .filter(|t| table_name.is_none() || table_name == Some(t.name.as_str()))
+            .filter(|t| {
+                table_name.is_none()
+                    || table_name.map(super::resolve_table_name) == Some(t.name.as_str())
+            })
             .map(|t| {
                 json!({
                     "TableName": t.name,

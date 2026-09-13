@@ -432,17 +432,19 @@ impl DynamoDbService {
             validate_key_attributes_in_key(table, &key)?;
 
             // AWS rejects a transaction that reads the same item more than once.
-            if seen_keys
-                .iter()
-                .any(|(t, k)| t == table_name && keys_equal(table, k, &key))
-            {
+            if seen_keys.iter().any(|(t, k)| {
+                t == super::resolve_table_name(table_name) && keys_equal(table, k, &key)
+            }) {
                 return Err(AwsServiceError::aws_error(
                     StatusCode::BAD_REQUEST,
                     "ValidationException",
                     "Transaction request cannot include multiple operations on one item",
                 ));
             }
-            seen_keys.push((table_name.to_string(), key.clone()));
+            seen_keys.push((
+                super::resolve_table_name(table_name).to_string(),
+                key.clone(),
+            ));
 
             match table.find_item_index(&key) {
                 Some(idx) => {
@@ -682,17 +684,16 @@ impl DynamoDbService {
                 } else {
                     serde_json::from_value(op["Key"].clone()).unwrap_or_default()
                 };
-                if seen_keys
-                    .iter()
-                    .any(|(t, k)| t == table_name && keys_equal(table, k, &key))
-                {
+                if seen_keys.iter().any(|(t, k)| {
+                    t == super::resolve_table_name(table_name) && keys_equal(table, k, &key)
+                }) {
                     return Err(AwsServiceError::aws_error(
                         StatusCode::BAD_REQUEST,
                         "ValidationException",
                         "Transaction request cannot include multiple operations on one item",
                     ));
                 }
-                seen_keys.push((table_name.to_string(), key));
+                seen_keys.push((super::resolve_table_name(table_name).to_string(), key));
             }
         }
 
