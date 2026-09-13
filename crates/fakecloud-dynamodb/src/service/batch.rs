@@ -199,13 +199,16 @@ impl DynamoDbService {
         // the whole call (AWS rejects these up-front, not after partial
         // application).
         for (table_name, requests) in &request_items {
-            let table = state.tables.get(table_name.as_str()).ok_or_else(|| {
-                AwsServiceError::aws_error(
-                    StatusCode::BAD_REQUEST,
-                    "ResourceNotFoundException",
-                    format!("Requested resource not found: Table: {table_name} not found"),
-                )
-            })?;
+            let table = state
+                .tables
+                .get(super::resolve_table_name(table_name))
+                .ok_or_else(|| {
+                    AwsServiceError::aws_error(
+                        StatusCode::BAD_REQUEST,
+                        "ResourceNotFoundException",
+                        format!("Requested resource not found: Table: {table_name} not found"),
+                    )
+                })?;
             let reqs = requests.as_array().ok_or_else(|| {
                 AwsServiceError::aws_error(
                     StatusCode::BAD_REQUEST,
@@ -275,13 +278,16 @@ impl DynamoDbService {
         }
 
         for (table_name, requests) in &request_items {
-            let table = state.tables.get_mut(table_name.as_str()).ok_or_else(|| {
-                AwsServiceError::aws_error(
-                    StatusCode::BAD_REQUEST,
-                    "ResourceNotFoundException",
-                    format!("Requested resource not found: Table: {table_name} not found"),
-                )
-            })?;
+            let table = state
+                .tables
+                .get_mut(super::resolve_table_name(table_name))
+                .ok_or_else(|| {
+                    AwsServiceError::aws_error(
+                        StatusCode::BAD_REQUEST,
+                        "ResourceNotFoundException",
+                        format!("Requested resource not found: Table: {table_name} not found"),
+                    )
+                })?;
 
             let reqs = requests.as_array().ok_or_else(|| {
                 AwsServiceError::aws_error(
@@ -621,7 +627,7 @@ impl DynamoDbService {
                 let table_name = put["TableName"].as_str().unwrap_or_default();
                 let item: HashMap<String, AttributeValue> =
                     serde_json::from_value(put["Item"].clone()).unwrap_or_default();
-                if let Some(table) = state.tables.get(table_name) {
+                if let Some(table) = state.tables.get(super::resolve_table_name(table_name)) {
                     validate_key_in_item(table, &item)?;
                 }
                 // Malformed values (bad numbers, empty/duplicate sets) are a
@@ -633,7 +639,7 @@ impl DynamoDbService {
                 let table_name = op["TableName"].as_str().unwrap_or_default();
                 let key: HashMap<String, AttributeValue> =
                     serde_json::from_value(op["Key"].clone()).unwrap_or_default();
-                if let Some(table) = state.tables.get(table_name) {
+                if let Some(table) = state.tables.get(super::resolve_table_name(table_name)) {
                     validate_key_attributes_in_key(table, &key)?;
                     if let Some(expr) = ti
                         .get("Update")
@@ -860,7 +866,10 @@ impl DynamoDbService {
         for ti in transact_items {
             for op_key in ["Put", "Delete", "Update"] {
                 if let Some(op) = ti.get(op_key) {
-                    let table_name = op["TableName"].as_str().unwrap_or_default();
+                    // Keyed by the resolved name, so a table named once by
+                    // name and once by ARN is snapshotted, and reverted, once.
+                    let table_name =
+                        super::resolve_table_name(op["TableName"].as_str().unwrap_or_default());
                     snapshots.entry(table_name.to_string()).or_insert_with(|| {
                         state
                             .tables
@@ -1023,7 +1032,7 @@ impl DynamoDbService {
             // whose CancellationReasons array marks the offending op
             // with `ValidationError` and leaves siblings as `None`.
             for (table_name, items) in snapshots {
-                if let Some(table) = state.tables.get_mut(&table_name) {
+                if let Some(table) = state.tables.get_mut(super::resolve_table_name(&table_name)) {
                     table.replace_items(items);
                 }
             }
@@ -1054,7 +1063,7 @@ impl DynamoDbService {
         // Append all pending stream records under each table's
         // stream_records lock now that the transaction has committed.
         for (table_name, record) in pending_stream {
-            if let Some(table) = state.tables.get_mut(&table_name) {
+            if let Some(table) = state.tables.get_mut(super::resolve_table_name(&table_name)) {
                 crate::streams::add_stream_record(table, record);
             }
         }

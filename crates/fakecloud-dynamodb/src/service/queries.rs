@@ -368,7 +368,7 @@ impl DynamoDbService {
         if !accessed_keys.is_empty() {
             let mut accounts = self.state.write();
             let state = accounts.get_or_create(&req.account_id);
-            if let Some(table) = state.tables.get_mut(table_name) {
+            if let Some(table) = state.tables.get_mut(super::resolve_table_name(table_name)) {
                 // Re-check insights status after acquiring write lock in case it
                 // was disabled between the read and write lock acquisitions.
                 if table.contributor_insights_status == "ENABLED" {
@@ -644,7 +644,7 @@ impl DynamoDbService {
         if !accessed_keys.is_empty() {
             let mut accounts = self.state.write();
             let state = accounts.get_or_create(&req.account_id);
-            if let Some(table) = state.tables.get_mut(table_name) {
+            if let Some(table) = state.tables.get_mut(super::resolve_table_name(table_name)) {
                 // Re-check insights status after acquiring write lock in case it
                 // was disabled between the read and write lock acquisitions.
                 if table.contributor_insights_status == "ENABLED" {

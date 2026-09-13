@@ -274,7 +274,7 @@ impl DynamoDbService {
         // ResourceInUseException with this message).
         if state
             .tables
-            .get(table_name)
+            .get(super::resolve_table_name(table_name))
             .is_some_and(|t| t.deletion_protection_enabled)
         {
             return Err(AwsServiceError::aws_error(
@@ -285,13 +285,16 @@ impl DynamoDbService {
                 ),
             ));
         }
-        let table = state.tables.remove(table_name).ok_or_else(|| {
-            AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "ResourceNotFoundException",
-                format!("Requested resource not found: Table: {table_name} not found"),
-            )
-        })?;
+        let table = state
+            .tables
+            .remove(super::resolve_table_name(table_name))
+            .ok_or_else(|| {
+                AwsServiceError::aws_error(
+                    StatusCode::BAD_REQUEST,
+                    "ResourceNotFoundException",
+                    format!("Requested resource not found: Table: {table_name} not found"),
+                )
+            })?;
 
         let table_desc = build_table_description_json(&super::TableDescriptionInput {
             arn: &table.arn,
@@ -387,13 +390,16 @@ impl DynamoDbService {
         // ARN carries the request's credential-scope region (req.region).
         let region = req.region.clone();
         let account_id = state.account_id.clone();
-        let table = state.tables.get_mut(table_name).ok_or_else(|| {
-            AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "ResourceNotFoundException",
-                format!("Requested resource not found: Table: {table_name} not found"),
-            )
-        })?;
+        let table = state
+            .tables
+            .get_mut(super::resolve_table_name(table_name))
+            .ok_or_else(|| {
+                AwsServiceError::aws_error(
+                    StatusCode::BAD_REQUEST,
+                    "ResourceNotFoundException",
+                    format!("Requested resource not found: Table: {table_name} not found"),
+                )
+            })?;
 
         if let Some(pt) = body.get("ProvisionedThroughput") {
             if let Ok(throughput) = parse_provisioned_throughput(pt) {
