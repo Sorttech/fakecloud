@@ -1144,7 +1144,7 @@ impl DynamoDbService {
                 outcome
                     .table_name
                     .as_ref()
-                    .and_then(|name| state.tables.get(name)),
+                    .and_then(|name| state.tables.get(super::resolve_table_name(name))),
                 limit,
                 next_token.as_deref(),
             );
@@ -1152,7 +1152,7 @@ impl DynamoDbService {
             let kinesis_info = if let (Some(table_name), Some(event_name)) =
                 (outcome.table_name.as_ref(), outcome.event_name.as_ref())
             {
-                if let Some(table) = state.tables.get_mut(table_name) {
+                if let Some(table) = state.tables.get_mut(super::resolve_table_name(table_name)) {
                     let keys = outcome.keys.clone().unwrap_or_default();
                     if table.stream_enabled {
                         if let Some(record) = crate::streams::generate_stream_record(
@@ -1238,12 +1238,14 @@ impl DynamoDbService {
                             outcome
                                 .table_name
                                 .as_ref()
-                                .and_then(|name| state.tables.get(name)),
+                                .and_then(|name| state.tables.get(super::resolve_table_name(name))),
                         ));
                         if let (Some(table_name), Some(event_name)) =
                             (outcome.table_name.as_ref(), outcome.event_name.as_ref())
                         {
-                            if let Some(table) = state.tables.get_mut(table_name) {
+                            if let Some(table) =
+                                state.tables.get_mut(super::resolve_table_name(table_name))
+                            {
                                 let keys = outcome.keys.clone().unwrap_or_default();
                                 if table.stream_enabled {
                                     if let Some(record) = crate::streams::generate_stream_record(
@@ -1685,7 +1687,7 @@ fn apply_execute_statement_pagination(
     let total = items.len();
     let start = match cursor {
         Some(Value::Object(c)) => {
-            if let Some(after) = c.get("After").and_then(|k| row_key(k)) {
+            if let Some(after) = c.get("After").and_then(row_key) {
                 items
                     .iter()
                     .position(|item| match row_key(item) {
@@ -1822,6 +1824,17 @@ mod tests {
     /// returned shifted every later row down and the next page skipped rows.
     #[tokio::test]
     async fn execute_statement_select_pages_survive_deletes_between_pages() {
+        select_pages_survive_deletes("Widgets").await;
+    }
+
+    /// Same, naming the table by ARN, which the statement accepts: the pager
+    /// must find the table too, or it loses the key cursor.
+    #[tokio::test]
+    async fn execute_statement_select_pages_by_table_arn_survive_deletes() {
+        select_pages_survive_deletes("arn:aws:dynamodb:us-east-1:123456789012:table/Widgets").await;
+    }
+
+    async fn select_pages_survive_deletes(table_ref: &str) {
         let state = make_state();
         seed_table_with_stream(&state, "Widgets");
         {
@@ -1845,7 +1858,8 @@ mod tests {
         let mut delivered: Vec<String> = Vec::new();
         let mut token: Option<String> = None;
         loop {
-            let mut body = json!({"Statement": "SELECT * FROM \"Widgets\"", "Limit": 3});
+            let mut body =
+                json!({"Statement": format!("SELECT * FROM \"{table_ref}\""), "Limit": 3});
             if let Some(t) = &token {
                 body["NextToken"] = json!(t);
             }
