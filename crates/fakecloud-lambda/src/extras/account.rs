@@ -29,6 +29,7 @@ const FUNCTION_SCOPED_ACTIONS: &[&str] = &[
     "ListProvisionedConcurrencyConfigs",
     "ListVersionsByFunction",
     "PutFunctionCodeSigningConfig",
+    "PutFunctionConcurrency",
     "PutFunctionEventInvokeConfig",
     "PutFunctionRecursionConfig",
     "PutFunctionScalingConfig",
@@ -52,8 +53,10 @@ impl LambdaService {
         // `ResourceNotFoundException`, and AWS raises it before touching the
         // sub-resource: reading or clearing an alias, a concurrency setting or
         // a URL config on a function that does not exist is a 404, not a
-        // silent success. Guarding once here keeps the individual handlers
-        // from each having to re-check.
+        // silent success. Guarding once here covers every operation in the
+        // list, including the ones whose handlers never checked; the handful
+        // that do check for themselves keep doing so, which costs a map lookup
+        // and keeps them correct if they are ever called off this path.
         if FUNCTION_SCOPED_ACTIONS.contains(&action) {
             let exists = self
                 .state
@@ -119,7 +122,7 @@ impl LambdaService {
             "GetFunctionUrlConfig" => self.get_function_url_config(res, aid),
             "UpdateFunctionUrlConfig" => self.update_function_url_config(res, req),
             "DeleteFunctionUrlConfig" => self.delete_function_url_config(res, aid),
-            "ListFunctionUrlConfigs" => self.list_function_url_configs(aid),
+            "ListFunctionUrlConfigs" => self.list_function_url_configs(res, aid),
 
             // Concurrency
             "PutFunctionConcurrency" => self.put_function_concurrency(res, req),

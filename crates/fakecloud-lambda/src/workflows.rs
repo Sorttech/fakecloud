@@ -7,6 +7,7 @@
 use chrono::Utc;
 use http::StatusCode;
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 use fakecloud_aws::arn::Arn;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
@@ -435,6 +436,18 @@ pub(crate) fn stop_durable_execution(
     Ok(AwsResponse::ok_json(json!({})))
 }
 
+/// The ARN shape of a durable execution, used to synthesize a parent for a
+/// callback token that was never minted here.
+fn execution_arn(region: &str, account: &str, id: &str) -> String {
+    Arn::new(
+        "lambda",
+        region,
+        account,
+        &format!("durable-execution/{id}"),
+    )
+    .to_string()
+}
+
 fn record_callback(
     state: &SharedLambdaState,
     req: &AwsRequest,
@@ -444,20 +457,20 @@ fn record_callback(
     check_len("CallbackId", callback_id, 1, 1024)?;
     let mut accts = state.write();
     let s = accts.get_or_create(&req.account_id);
-    // A callback token is minted by the service when a task suspends, so an
-    // id nobody handed out cannot be recorded against: the operation declares
-    // ResourceNotFoundException for exactly this.
+    // AWS mints a callback token when a task suspends waiting on one, and
+    // answers an id nobody handed out with ResourceNotFoundException. fakecloud
+    // runs no suspending task, so it has no honest point at which to mint a
+    // token — rejecting every id would leave these three operations permanently
+    // unsatisfiable rather than merely strict. The parent execution arn is
+    // synthesized for an unknown id instead, so the outcome is still recorded
+    // and still observable.
     let execution_arn = s
         .durable_execution_callbacks
         .get(callback_id)
         .map(|cb| cb.execution_arn.clone())
-        .ok_or_else(|| {
-            AwsServiceError::aws_error(
-                StatusCode::NOT_FOUND,
-                "ResourceNotFoundException",
-                format!("Callback not found: {callback_id}"),
-            )
-        })?;
+        .unwrap_or_else(|| {
+            execution_arn(&req.region, &req.account_id, &Uuid::new_v4().to_string())
+        });
     s.durable_execution_callbacks.insert(
         callback_id.to_string(),
         DurableExecutionCallback {
@@ -741,26 +754,36 @@ mod tests {
         assert_eq!(cbs["cb3"].outcome, "Heartbeat");
     }
 
-    /// A callback token is minted by the service when a task suspends, so an
-    /// id nobody handed out is not recordable.
+    /// fakecloud has no suspending task to mint a token from, so an unknown
+    /// callback id records the outcome against a synthesized parent execution
+    /// rather than failing — these operations would otherwise never succeed.
     #[test]
-    fn send_callback_rejects_an_unknown_token() {
+    fn send_callback_records_an_unknown_token() {
         let s = shared();
-        for outcome in [
-            send_callback_success(&s, &req(), "never-issued"),
-            send_callback_failure(&s, &req(), "never-issued"),
-            send_callback_heartbeat(&s, &req(), "never-issued"),
-        ] {
-            assert_eq!(
-                outcome.err().map(|e| e.code().to_string()).as_deref(),
-                Some("ResourceNotFoundException")
-            );
+        for (i, call) in [
+            send_callback_success(&s, &req(), "never-issued-1"),
+            send_callback_failure(&s, &req(), "never-issued-2"),
+            send_callback_heartbeat(&s, &req(), "never-issued-3"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            call.unwrap_or_else(|e| panic!("call {i} failed: {e:?}"));
         }
-        assert!(s
-            .read()
-            .default_ref()
-            .durable_execution_callbacks
-            .is_empty());
+        let accts = s.read();
+        let st = accts.get("123456789012").unwrap();
+        for (id, outcome) in [
+            ("never-issued-1", "Succeeded"),
+            ("never-issued-2", "Failed"),
+            ("never-issued-3", "Heartbeat"),
+        ] {
+            let cb = st
+                .durable_execution_callbacks
+                .get(id)
+                .unwrap_or_else(|| panic!("{id} was not recorded"));
+            assert_eq!(cb.outcome, outcome);
+            assert!(!cb.execution_arn.is_empty());
+        }
     }
 
     #[test]

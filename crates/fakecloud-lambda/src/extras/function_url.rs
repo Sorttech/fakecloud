@@ -161,20 +161,28 @@ impl LambdaService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(account_id);
-        state.function_url_configs.remove(function_name);
+        // A URL config that was never created is a not-found, the same way
+        // AWS answers it.
+        if state.function_url_configs.remove(function_name).is_none() {
+            return Err(not_found("FunctionUrlConfig", function_name));
+        }
         empty()
     }
 
     pub(super) fn list_function_url_configs(
         &self,
+        function_name: &str,
         account_id: &str,
     ) -> Result<AwsResponse, AwsServiceError> {
         let region = self.region_for(account_id);
         self.with_state_read(account_id, &region, |state| {
+            // The operation is scoped to one function; listing every config in
+            // the account leaks another function's URL to the caller.
             let configs: Vec<Value> = state
                 .function_url_configs
-                .values()
-                .map(Self::function_url_config_json)
+                .iter()
+                .filter(|(name, _)| name.as_str() == function_name)
+                .map(|(_, c)| Self::function_url_config_json(c))
                 .collect();
             ok(json!({"FunctionUrlConfigs": configs}))
         })

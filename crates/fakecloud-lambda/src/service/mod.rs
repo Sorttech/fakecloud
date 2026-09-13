@@ -1369,9 +1369,11 @@ impl AwsService for LambdaService {
         let result = match action {
             "CreateFunction" => self.create_function(&req),
             "ListFunctions" => {
-                // `MasterRegion.length 1..50`, and the shape's pattern only
-                // admits `ALL` or a region name. An unusable filter is
-                // rejected rather than silently listing everything.
+                // `MasterRegion.length 1..50`. The member selects replicas of
+                // a function mastered in another region; fakecloud replicates
+                // no functions, so every list is already the unreplicated set
+                // and the value narrows nothing. Only the modeled bound is
+                // enforced, so a malformed value is still rejected.
                 if let Some(region) = req.query_params.get("MasterRegion") {
                     let len = region.chars().count();
                     if !(1..=50).contains(&len) {

@@ -4175,3 +4175,82 @@ async fn list_filters_enforce_their_length_bounds() {
         Some("InvalidParameterValueException".to_string())
     );
 }
+
+/// A sub-resource delete for something that was never created is a not-found,
+/// the way AWS answers it. `DeleteFunctionConcurrency` is the exception: it
+/// clears a setting rather than deleting an object, and succeeds either way.
+#[tokio::test]
+async fn sub_resource_deletes_report_a_missing_config() {
+    let svc = LambdaService::new(make_state());
+    seed_function(&svc, "sub-fn").await;
+
+    let code_of = |r: Result<AwsResponse, AwsServiceError>| r.err().map(|e| e.code().to_string());
+
+    assert_eq!(
+        code_of(
+            svc.handle(make_request(
+                Method::DELETE,
+                "/2021-10-31/functions/sub-fn/url",
+                "",
+            ))
+            .await
+        ),
+        Some("ResourceNotFoundException".to_string()),
+        "DeleteFunctionUrlConfig"
+    );
+    assert_eq!(
+        code_of(
+            svc.handle(make_request(
+                Method::DELETE,
+                "/2019-09-25/functions/sub-fn/event-invoke-config",
+                "",
+            ))
+            .await
+        ),
+        Some("ResourceNotFoundException".to_string()),
+        "DeleteFunctionEventInvokeConfig"
+    );
+
+    // Clearing an unset reserved concurrency still succeeds.
+    assert!(svc
+        .handle(make_request(
+            Method::DELETE,
+            "/2017-10-31/functions/sub-fn/concurrency",
+            "",
+        ))
+        .await
+        .is_ok());
+}
+
+/// `ListFunctionUrlConfigs` is scoped to the function it names; it must not
+/// hand back another function's URL config.
+#[tokio::test]
+async fn list_function_url_configs_is_scoped_to_its_function() {
+    let svc = LambdaService::new(make_state());
+    seed_function(&svc, "fn-a").await;
+    seed_function(&svc, "fn-b").await;
+    for name in ["fn-a", "fn-b"] {
+        svc.handle(make_request(
+            Method::POST,
+            &format!("/2021-10-31/functions/{name}/url"),
+            r#"{"AuthType":"NONE"}"#,
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("CreateFunctionUrlConfig {name}: {e:?}"));
+    }
+
+    let resp = svc
+        .handle(make_request(
+            Method::GET,
+            "/2021-10-31/functions/fn-a/urls",
+            "",
+        ))
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(resp.body.expect_bytes()).to_string();
+    assert!(body.contains("fn-a"), "{body}");
+    assert!(
+        !body.contains("fn-b"),
+        "another function's config leaked: {body}"
+    );
+}

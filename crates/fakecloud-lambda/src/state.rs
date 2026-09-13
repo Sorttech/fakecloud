@@ -262,7 +262,7 @@ pub struct LambdaState {
     /// Runtime management configs keyed by `{function}:{qualifier}`.
     #[serde(default)]
     pub runtime_management: BTreeMap<String, RuntimeManagementConfig>,
-    /// Scaling configs keyed by event source mapping uuid.
+    /// Scaling configs keyed by function name and qualifier.
     #[serde(default)]
     pub scaling_configs: BTreeMap<String, FunctionScalingConfig>,
     /// Recursion configs keyed by function name.
