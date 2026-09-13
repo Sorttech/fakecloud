@@ -40,6 +40,33 @@ fn dry_run(req: &AwsRequest) -> bool {
         .is_some_and(|v| v.eq_ignore_ascii_case("true"))
 }
 
+/// Parse an RFC 3339 time bound, rejecting a malformed one rather than letting
+/// a byte comparison silently filter everything out.
+fn parse_time_bound(
+    req: &AwsRequest,
+    key: &str,
+) -> Result<Option<chrono::DateTime<Utc>>, AwsServiceError> {
+    match req.query_params.get(key).filter(|v| !v.is_empty()) {
+        Some(v) => chrono::DateTime::parse_from_rfc3339(v)
+            .map(|t| Some(t.with_timezone(&Utc)))
+            .map_err(|_| invalid_parameter_value(format!("Invalid value '{v}' for {key}"))),
+        None => Ok(None),
+    }
+}
+
+fn delta_time(d: &IpamRoutingPolicyRegistrationDelta) -> Option<chrono::DateTime<Utc>> {
+    chrono::DateTime::parse_from_rfc3339(&d.created_at)
+        .ok()
+        .map(|t| t.with_timezone(&Utc))
+}
+
+/// The prefix length of a CIDR, for comparing a ROA's MaxLength against the
+/// prefix it covers.
+fn cidr_prefix_len(cidr: &str) -> Option<i64> {
+    cidr.split_once('/')
+        .and_then(|(_, len)| len.parse::<i64>().ok())
+}
+
 fn now_rfc3339() -> String {
     Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
@@ -221,6 +248,14 @@ pub(crate) fn enable_ipam_internet_registry_association(
     let child_handle = require(&req.query_params, "ChildHandle")?;
     let parent_handle = require(&req.query_params, "ParentHandle")?;
     let parent_bpki_ta = require(&req.query_params, "ParentBpkiTa")?;
+
+    let owner = req.account_id.clone();
+    let mut accounts = svc.state.write();
+    let state = accounts.get_or_create(&req.account_id);
+    let tags = state.tags.get(&id).cloned().unwrap_or_default();
+    let a = get_association(state, &id)?;
+    // A DryRun validates the request -- including that the association exists
+    // -- and changes nothing, matching how the rest of EC2 treats one.
     if dry_run(req) {
         return Ok(Ec2Service::respond(
             "EnableIpamInternetRegistryAssociation",
@@ -228,12 +263,6 @@ pub(crate) fn enable_ipam_internet_registry_association(
             "",
         ));
     }
-
-    let owner = req.account_id.clone();
-    let mut accounts = svc.state.write();
-    let state = accounts.get_or_create(&req.account_id);
-    let tags = state.tags.get(&id).cloned().unwrap_or_default();
-    let a = get_association(state, &id)?;
     // The child request is the RPKI provisioning document the registry needs;
     // it is what the caller takes to the RIR to finish setup.
     a.child_request_xml = Some(format!(
@@ -261,6 +290,14 @@ pub(crate) fn delete_ipam_internet_registry_association(
     req: &AwsRequest,
 ) -> Result<AwsResponse, AwsServiceError> {
     let id = require(&req.query_params, "IpamInternetRegistryAssociationId")?;
+    let owner = req.account_id.clone();
+    let mut accounts = svc.state.write();
+    let state = accounts.get_or_create(&req.account_id);
+    if !state.ipam_ir_associations.contains_key(&id) {
+        return Err(association_not_found(&id));
+    }
+    // A DryRun validates the request -- including that the association exists
+    // -- and changes nothing, matching how the rest of EC2 treats one.
     if dry_run(req) {
         return Ok(Ec2Service::respond(
             "DeleteIpamInternetRegistryAssociation",
@@ -268,9 +305,6 @@ pub(crate) fn delete_ipam_internet_registry_association(
             "",
         ));
     }
-    let owner = req.account_id.clone();
-    let mut accounts = svc.state.write();
-    let state = accounts.get_or_create(&req.account_id);
     let tags = state.tags.get(&id).cloned().unwrap_or_default();
     let mut association = state
         .ipam_ir_associations
@@ -338,13 +372,27 @@ fn upsert_registration(
             })?),
             None => None,
         };
-    if dry_run(req) {
-        return Ok(Ec2Service::respond(action, &req.request_id, ""));
+    // `IpamRoutingPolicyRegistrationMaxLength` carries `@range 0..48`, and the
+    // member documents that it must not be shorter than the CIDR's own prefix
+    // length -- a ROA that authorizes less than the prefix it covers announces
+    // nothing.
+    crate::service_helpers::validate_int_range(&req.query_params, "MaxLength", 0, 48)?;
+    if let (Some(m), Some(prefix_len)) = (max_length, cidr_prefix_len(&cidr)) {
+        if m < prefix_len {
+            return Err(invalid_parameter_value(format!(
+                "MaxLength must be greater than or equal to the prefix length of {cidr}"
+            )));
+        }
     }
 
     let mut accounts = svc.state.write();
     let state = accounts.get_or_create(&req.account_id);
     let a = get_association(state, &id)?;
+    // A DryRun validates the request -- including that the association exists
+    // -- and changes nothing, matching how the rest of EC2 treats one.
+    if dry_run(req) {
+        return Ok(Ec2Service::respond(action, &req.request_id, ""));
+    }
 
     let creating = action == "CreateIpamRoutingPolicyRegistration";
     if creating && a.registrations.contains_key(&cidr) {
@@ -410,6 +458,11 @@ pub(crate) fn delete_ipam_routing_policy_registration(
 ) -> Result<AwsResponse, AwsServiceError> {
     let id = require(&req.query_params, "IpamInternetRegistryAssociationId")?;
     let cidr = require(&req.query_params, "Cidr")?;
+    let mut accounts = svc.state.write();
+    let state = accounts.get_or_create(&req.account_id);
+    let a = get_association(state, &id)?;
+    // A DryRun validates the request -- including that the association exists
+    // -- and changes nothing, matching how the rest of EC2 treats one.
     if dry_run(req) {
         return Ok(Ec2Service::respond(
             "DeleteIpamRoutingPolicyRegistration",
@@ -417,9 +470,6 @@ pub(crate) fn delete_ipam_routing_policy_registration(
             "",
         ));
     }
-    let mut accounts = svc.state.write();
-    let state = accounts.get_or_create(&req.account_id);
-    let a = get_association(state, &id)?;
     if a.registrations.remove(&cidr).is_none() {
         return Err(not_found(
             "InvalidIpamRoutingPolicyRegistration.NotFound",
@@ -446,6 +496,12 @@ pub(crate) fn batch_modify_ipam_routing_policy_registrations(
     let delta_json = require(&req.query_params, "DeltaJson")?;
     let parsed: serde_json::Value = serde_json::from_str(&delta_json)
         .map_err(|_| invalid_parameter_value("DeltaJson is not valid JSON"))?;
+
+    let mut accounts = svc.state.write();
+    let state = accounts.get_or_create(&req.account_id);
+    let a = get_association(state, &id)?;
+    // A DryRun validates the request -- including that the association exists
+    // -- and changes nothing, matching how the rest of EC2 treats one.
     if dry_run(req) {
         return Ok(Ec2Service::respond(
             "BatchModifyIpamRoutingPolicyRegistrations",
@@ -453,10 +509,6 @@ pub(crate) fn batch_modify_ipam_routing_policy_registrations(
             "",
         ));
     }
-
-    let mut accounts = svc.state.write();
-    let state = accounts.get_or_create(&req.account_id);
-    let a = get_association(state, &id)?;
     let delta_id = push_delta(a, delta_json.clone());
 
     // The document lists the registrations to add and the CIDRs to remove.
@@ -545,8 +597,8 @@ pub(crate) fn get_ipam_routing_policy_registration_deltas(
         &["forward", "reverse"],
     )?;
     let delta_id = req.query_params.get("DeltaId").filter(|v| !v.is_empty());
-    let start = req.query_params.get("StartTime").filter(|v| !v.is_empty());
-    let end = req.query_params.get("EndTime").filter(|v| !v.is_empty());
+    let start = parse_time_bound(req, "StartTime")?;
+    let end = parse_time_bound(req, "EndTime")?;
 
     let accounts = svc.state.read();
     let a = accounts
@@ -558,8 +610,11 @@ pub(crate) fn get_ipam_routing_policy_registration_deltas(
         .deltas
         .iter()
         .filter(|d| delta_id.is_none_or(|want| &d.delta_id == want))
-        .filter(|d| start.is_none_or(|s| d.created_at.as_str() >= s.as_str()))
-        .filter(|d| end.is_none_or(|e| d.created_at.as_str() <= e.as_str()))
+        // Compare instants, not strings: the stored timestamps carry
+        // milliseconds and an SDK omits them when they are zero, so a byte-wise
+        // `>=` drops every delta in the same second as the bound.
+        .filter(|d| start.is_none_or(|s| delta_time(d).is_none_or(|t| t >= s)))
+        .filter(|d| end.is_none_or(|e| delta_time(d).is_none_or(|t| t <= e)))
         .collect();
     // Deltas are stored oldest first; `reverse` reports newest first.
     if req
@@ -742,16 +797,24 @@ pub(crate) fn get_ipam_route_protection_findings(
         }
         for r in a.registrations.values() {
             let asn = r.asns.first().cloned().unwrap_or_default();
+            // `IpamRpkiStrength` is `strict | permissive`. A registration that
+            // names its origin ASNs authorizes exactly those, which is the
+            // strict posture; one with none authorizes nothing specific.
             let (status, strength) = if r.asns.is_empty() {
-                ("unknown", "none")
+                ("unknown", "permissive")
             } else {
-                ("valid", "strong")
+                ("valid", "strict")
             };
+            // A finding's `roaSet` holds `IpamRouteOriginAuthorization`, whose
+            // prefix member is `prefix`. The `cidr` spelling belongs to
+            // `IpamRouteOriginAuthorizationInfo`, the shape
+            // GetIpamRouteOriginAuthorizations returns -- emitting it here
+            // makes an SDK read the prefix as absent.
             let roas: Vec<String> = r
                 .asns
                 .iter()
                 .map(|asn| {
-                    let mut s = ec2_elem("cidr", &r.cidr) + &ec2_elem("asn", asn);
+                    let mut s = ec2_elem("asn", asn) + &ec2_elem("prefix", &r.cidr);
                     if let Some(m) = r.max_length {
                         s.push_str(&format!("<maxLength>{m}</maxLength>"));
                     }
@@ -783,4 +846,221 @@ pub(crate) fn get_ipam_route_protection_findings(
             ec2_list("routeProtectionFindingSet", &items)
         ),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{ec2_request as req, err_of};
+
+    fn body(resp: AwsResponse) -> String {
+        String::from_utf8_lossy(resp.body.expect_bytes()).to_string()
+    }
+
+    /// Register an IPAM directly so an association has something to attach to.
+    fn seed_ipam(svc: &Ec2Service) {
+        let mut accounts = svc.state.write();
+        let state = accounts.get_or_create("000000000000");
+        state.ipams.insert(
+            "ipam-1".to_string(),
+            crate::state::Ipam {
+                id: "ipam-1".to_string(),
+                public_scope_id: "ipam-scope-pub".to_string(),
+                private_scope_id: "ipam-scope-priv".to_string(),
+                tier: "advanced".to_string(),
+                description: String::new(),
+            },
+        );
+    }
+
+    fn make_association(svc: &Ec2Service) -> String {
+        seed_ipam(svc);
+        let b = body(
+            create_ipam_internet_registry_association(
+                svc,
+                &req(
+                    "CreateIpamInternetRegistryAssociation",
+                    &[
+                        ("IpamId", "ipam-1"),
+                        ("Rir", "arin"),
+                        ("OrganizationHandle", "ORG-1"),
+                    ],
+                ),
+            )
+            .unwrap(),
+        );
+        b.split("<ipamInternetRegistryAssociationId>")
+            .nth(1)
+            .unwrap()
+            .split("</ipamInternetRegistryAssociationId>")
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    fn register(svc: &Ec2Service, id: &str, cidr: &str, max_length: Option<&str>) {
+        let mut params: Vec<(&str, &str)> = vec![
+            ("IpamInternetRegistryAssociationId", id),
+            ("Cidr", cidr),
+            ("Asn.1", "64512"),
+        ];
+        if let Some(m) = max_length {
+            params.push(("MaxLength", m));
+        }
+        create_ipam_routing_policy_registration(
+            svc,
+            &req("CreateIpamRoutingPolicyRegistration", &params),
+        )
+        .unwrap();
+    }
+
+    /// A finding's `roaSet` carries `IpamRouteOriginAuthorization`, whose
+    /// prefix member is `prefix`; `cidr` belongs to a different shape and an
+    /// SDK discards it.
+    #[test]
+    fn route_protection_findings_use_the_modeled_roa_members() {
+        let svc = Ec2Service::new();
+        let id = make_association(&svc);
+        register(&svc, &id, "192.0.2.0/24", Some("24"));
+
+        let b = body(
+            get_ipam_route_protection_findings(
+                &svc,
+                &req("GetIpamRouteProtectionFindings", &[("IpamId", "ipam-1")]),
+            )
+            .unwrap(),
+        );
+        assert!(b.contains("<prefix>192.0.2.0/24</prefix>"), "{b}");
+        assert!(
+            !b.contains("<roaSet><item><cidr>"),
+            "cidr is the wrong member name here: {b}"
+        );
+        // `IpamRpkiStrength` is `strict | permissive` — nothing else.
+        assert!(b.contains("<rpkiStrength>strict</rpkiStrength>"), "{b}");
+        assert!(!b.contains("strong"), "{b}");
+    }
+
+    /// A DryRun validates the request, so it cannot report success for an
+    /// association that does not exist.
+    #[test]
+    fn a_dry_run_still_resolves_the_association() {
+        let svc = Ec2Service::new();
+        let missing = "ipam-ir-assoc-nope";
+        for r in [
+            delete_ipam_internet_registry_association(
+                &svc,
+                &req(
+                    "DeleteIpamInternetRegistryAssociation",
+                    &[
+                        ("IpamInternetRegistryAssociationId", missing),
+                        ("DryRun", "true"),
+                    ],
+                ),
+            ),
+            delete_ipam_routing_policy_registration(
+                &svc,
+                &req(
+                    "DeleteIpamRoutingPolicyRegistration",
+                    &[
+                        ("IpamInternetRegistryAssociationId", missing),
+                        ("Cidr", "192.0.2.0/24"),
+                        ("DryRun", "true"),
+                    ],
+                ),
+            ),
+        ] {
+            assert_eq!(
+                err_of(r).code(),
+                "InvalidIpamInternetRegistryAssociationId.NotFound"
+            );
+        }
+
+        // And a dry run against a live association changes nothing.
+        let id = make_association(&svc);
+        register(&svc, &id, "192.0.2.0/24", None);
+        delete_ipam_routing_policy_registration(
+            &svc,
+            &req(
+                "DeleteIpamRoutingPolicyRegistration",
+                &[
+                    ("IpamInternetRegistryAssociationId", &id),
+                    ("Cidr", "192.0.2.0/24"),
+                    ("DryRun", "true"),
+                ],
+            ),
+        )
+        .unwrap();
+        let b = body(
+            get_ipam_routing_policy_registrations(
+                &svc,
+                &req(
+                    "GetIpamRoutingPolicyRegistrations",
+                    &[("IpamInternetRegistryAssociationId", &id)],
+                ),
+            )
+            .unwrap(),
+        );
+        assert!(b.contains("192.0.2.0/24"), "{b}");
+    }
+
+    /// `MaxLength` carries `@range 0..48` and must cover at least the prefix.
+    #[test]
+    fn max_length_is_bounded_by_the_model_and_the_prefix() {
+        let svc = Ec2Service::new();
+        let id = make_association(&svc);
+        for bad in ["49", "200", "16"] {
+            let err = err_of(create_ipam_routing_policy_registration(
+                &svc,
+                &req(
+                    "CreateIpamRoutingPolicyRegistration",
+                    &[
+                        ("IpamInternetRegistryAssociationId", &id),
+                        ("Cidr", "192.0.2.0/24"),
+                        ("Asn.1", "64512"),
+                        ("MaxLength", bad),
+                    ],
+                ),
+            ));
+            assert_eq!(err.code(), "InvalidParameterValue", "MaxLength={bad}");
+        }
+        register(&svc, &id, "192.0.2.0/24", Some("32"));
+    }
+
+    /// A time bound is compared as an instant, so a delta recorded in the same
+    /// second as the bound is not silently dropped, and a malformed bound is
+    /// rejected rather than filtering everything out.
+    #[test]
+    fn delta_time_bounds_compare_instants() {
+        let svc = Ec2Service::new();
+        let id = make_association(&svc);
+        register(&svc, &id, "192.0.2.0/24", None);
+
+        // A whole-second bound at the epoch start still includes the delta.
+        let b = body(
+            get_ipam_routing_policy_registration_deltas(
+                &svc,
+                &req(
+                    "GetIpamRoutingPolicyRegistrationDeltas",
+                    &[
+                        ("IpamInternetRegistryAssociationId", &id),
+                        ("StartTime", "2000-01-01T00:00:00Z"),
+                    ],
+                ),
+            )
+            .unwrap(),
+        );
+        assert!(b.contains("<deltaId>"), "{b}");
+
+        let err = err_of(get_ipam_routing_policy_registration_deltas(
+            &svc,
+            &req(
+                "GetIpamRoutingPolicyRegistrationDeltas",
+                &[
+                    ("IpamInternetRegistryAssociationId", &id),
+                    ("StartTime", "banana"),
+                ],
+            ),
+        ));
+        assert_eq!(err.code(), "InvalidParameterValue");
+    }
 }
