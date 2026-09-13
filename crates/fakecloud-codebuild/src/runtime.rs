@@ -1049,13 +1049,23 @@ async fn finish_stopped(job: &BuildJob, guard: &BuildGuard, container: &str) {
 
 /// Create + start a detached container that stays alive (`sleep`) long enough to
 /// run the whole build, so we can `exec` the build script into it. `docker cp`
-/// / bind mounts are avoided; the image is pulled implicitly by `run`.
+/// / bind mounts are avoided; a missing image is pulled first, with retries.
 async fn start_container(
     cli: &str,
     image: &str,
     job: &BuildJob,
     keepalive_secs: u64,
 ) -> Result<String, String> {
+    // `run` pulls a missing image itself but gives up on the first throttled
+    // pull; make it available first, retrying transient registry failures.
+    tokio::time::timeout(
+        Duration::from_secs(600),
+        fakecloud_core::container_image::ensure_image(cli, None, image),
+    )
+    .await
+    .map_err(|_| "timed out pulling build image".to_string())?
+    .map_err(|e| format!("failed to pull build image: {e}"))?;
+
     let mut cmd = Command::new(cli);
     cmd.arg("run")
         .arg("-d")

@@ -1,5 +1,8 @@
-//! Image pulls for the runtimes that launch user-supplied images (ECS, and
-//! Batch through it; Lambda `PackageType=Image` functions).
+//! Image pulls for the runtimes that launch containers: ECS (and Batch
+//! through it) and Lambda `PackageType=Image` functions pull on every launch
+//! with [`pull_image`]; EC2 instances and CodeBuild builds, whose images
+//! stand in for an AMI or a curated build image, pull only when the image is
+//! missing with [`ensure_image`].
 //!
 //! A bare `docker pull` always contacts the registry, even when the image is
 //! already in the local cache, so a momentary registry failure fails the
@@ -37,6 +40,8 @@ pub enum PulledImage {
     /// The pull failed transiently but the image was already cached locally,
     /// so the cached copy is used. Carries the pull's error for logging.
     Cached { pull_error: String },
+    /// [`ensure_image`] found the image already cached and did not pull.
+    Present,
 }
 
 /// Pull `reference` with the container `cli`. A transient registry failure
@@ -52,6 +57,31 @@ pub async fn pull_image(
     reference: &str,
 ) -> Result<PulledImage, String> {
     pull_image_with(cli, docker_config, reference, BASE_RETRY_DELAY).await
+}
+
+/// Make `reference` available locally, pulling it only when it is not
+/// already cached -- what `docker run` does with its implicit pull, but with
+/// [`pull_image`]'s retry when the registry fails transiently. `docker run`
+/// gives up on the first `429 Too Many Requests`, which on a host with an
+/// empty cache fails every launch that races the first pull of an image.
+pub async fn ensure_image(
+    cli: &str,
+    docker_config: Option<&Path>,
+    reference: &str,
+) -> Result<PulledImage, String> {
+    ensure_image_with(cli, docker_config, reference, BASE_RETRY_DELAY).await
+}
+
+async fn ensure_image_with(
+    cli: &str,
+    docker_config: Option<&Path>,
+    reference: &str,
+    base_delay: Duration,
+) -> Result<PulledImage, String> {
+    if image_cached(cli, docker_config, reference).await {
+        return Ok(PulledImage::Present);
+    }
+    pull_image_with(cli, docker_config, reference, base_delay).await
 }
 
 async fn pull_image_with(
@@ -299,6 +329,10 @@ exit 2
         async fn pull_ref(&self, reference: &str) -> Result<PulledImage, String> {
             pull_image_with(&self.cli(), None, reference, Duration::from_millis(1)).await
         }
+
+        async fn ensure(&self) -> Result<PulledImage, String> {
+            ensure_image_with(&self.cli(), None, "alpine:3.20", Duration::from_millis(1)).await
+        }
     }
 
     fn is_transient_for_test(stderr: &str) -> bool {
@@ -306,6 +340,29 @@ exit 2
     }
 
     const THROTTLED: &str = "Error response from daemon: unexpected status from HEAD request to https://public.ecr.aws/v2/docker/library/alpine/manifests/3.20: 429 Too Many Requests";
+
+    #[tokio::test]
+    async fn ensure_image_uses_a_cached_image_without_contacting_the_registry() {
+        let cli = FakeCli::new(u32::MAX, THROTTLED, true);
+        assert_eq!(cli.ensure().await, Ok(PulledImage::Present));
+        assert_eq!(cli.calls(), ["image inspect alpine:3.20"]);
+    }
+
+    #[tokio::test]
+    async fn ensure_image_retries_a_throttled_first_pull() {
+        let cli = FakeCli::new(2, THROTTLED, false);
+        assert_eq!(cli.ensure().await, Ok(PulledImage::Pulled));
+        let pulls = cli.calls().iter().filter(|c| c.starts_with("pull")).count();
+        assert_eq!(pulls, 3);
+    }
+
+    #[tokio::test]
+    async fn ensure_image_fails_on_a_refused_pull() {
+        let missing =
+            "Error response from daemon: manifest for alpine:3.20 not found: manifest unknown";
+        let cli = FakeCli::new(u32::MAX, missing, false);
+        assert_eq!(cli.ensure().await, Err(missing.to_string()));
+    }
 
     #[tokio::test]
     async fn a_successful_pull_needs_no_cache_check() {

@@ -739,6 +739,13 @@ impl DockerInstances {
         args.push(image.to_string());
         args.extend(boot_command(user_data));
 
+        // `run` pulls a missing image itself but gives up on the first
+        // throttled pull; make it available first, retrying transient
+        // registry failures.
+        fakecloud_core::container_image::ensure_image(&self.cli, None, image)
+            .await
+            .map_err(RuntimeError::ContainerStartFailed)?;
+
         let output = tokio::process::Command::new(&self.cli)
             .args(&args)
             .output()
