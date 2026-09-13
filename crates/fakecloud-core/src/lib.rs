@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod auth_message;
 pub mod cfn_template;
+pub mod container_image;
 pub mod container_net;
 pub mod delivery;
 pub mod dispatch;

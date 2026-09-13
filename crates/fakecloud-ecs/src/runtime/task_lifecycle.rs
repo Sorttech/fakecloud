@@ -112,16 +112,13 @@ impl EcsRuntime {
                 self.server_port,
             );
             let pull_uri = local_pull_uri.as_deref().unwrap_or(&rp.plan.image);
-            let pull_out = self
-                .cli_command()
-                .args(["pull", pull_uri])
-                .output()
-                .await
-                .map_err(|e| RuntimeError::ImagePull(e.to_string()))?;
-            if !pull_out.status.success() {
-                let err = String::from_utf8_lossy(&pull_out.stderr).to_string();
-                return Err(RuntimeError::ImagePull(err));
-            }
+            fakecloud_core::container_image::pull_image(
+                &self.cli,
+                self.docker_config_path().as_deref(),
+                pull_uri,
+            )
+            .await
+            .map_err(RuntimeError::ImagePull)?;
             // Retag the local pull URI to the AWS URI so `docker run` finds
             // the image under the user-facing name. Digest-pinned refs
             // can't be `docker tag` targets, so we fall through and run

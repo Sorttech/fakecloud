@@ -124,21 +124,13 @@ impl DockerBackend {
         );
         let pull_uri = local_pull_uri.as_deref().unwrap_or(image);
 
-        let mut pull_cmd = tokio::process::Command::new(&self.cli);
-        if let Some(p) = self.docker_config_path() {
-            pull_cmd.env("DOCKER_CONFIG", p);
-        }
-        let pull_out = pull_cmd
-            .args(["pull", pull_uri])
-            .output()
-            .await
-            .map_err(|e| RuntimeError::ContainerStartFailed(format!("docker pull: {e}")))?;
-        if !pull_out.status.success() {
-            return Err(RuntimeError::ContainerStartFailed(format!(
-                "docker pull failed: {}",
-                String::from_utf8_lossy(&pull_out.stderr)
-            )));
-        }
+        fakecloud_core::container_image::pull_image(
+            &self.cli,
+            self.docker_config_path().as_deref(),
+            pull_uri,
+        )
+        .await
+        .map_err(|e| RuntimeError::ContainerStartFailed(format!("docker pull failed: {e}")))?;
         // Retag the local pull URI to the AWS URI so `docker create`
         // finds the image under the user-visible name. Digest-pinned
         // refs can't be `docker tag` targets, so fall through and
@@ -503,21 +495,15 @@ impl LambdaBackend for DockerBackend {
         );
         let pull_uri = local_uri.as_deref().unwrap_or(image);
 
-        let mut cmd = tokio::process::Command::new(&self.cli);
-        if let Some(p) = self.docker_config_path() {
-            cmd.env("DOCKER_CONFIG", p);
-        }
-        let out = cmd
-            .args(["pull", pull_uri])
-            .output()
-            .await
-            .map_err(|e| RuntimeError::ContainerStartFailed(format!("docker pull: {e}")))?;
-        if !out.status.success() {
-            return Err(RuntimeError::ContainerStartFailed(format!(
-                "docker pull failed for {pull_uri}: {}",
-                String::from_utf8_lossy(&out.stderr)
-            )));
-        }
+        fakecloud_core::container_image::pull_image(
+            &self.cli,
+            self.docker_config_path().as_deref(),
+            pull_uri,
+        )
+        .await
+        .map_err(|e| {
+            RuntimeError::ContainerStartFailed(format!("docker pull failed for {pull_uri}: {e}"))
+        })?;
         Ok(())
     }
 }

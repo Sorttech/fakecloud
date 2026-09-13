@@ -97,7 +97,12 @@ async fn run_job(batch: &aws_sdk_batch::Client, name: &str, command: Vec<&str>) 
     job.job_id().unwrap().to_string()
 }
 
-async fn wait_terminal(batch: &aws_sdk_batch::Client, job_id: &str) -> String {
+/// Poll `job_id` to a terminal status and assert it is `want`. On a mismatch
+/// the panic carries each job's status, `statusReason` and exit code -- for an
+/// array parent, every child's too -- so a CI failure names its cause (an
+/// image pull the registry refused, a container that exited non-zero) rather
+/// than just the wrong status.
+async fn expect_terminal(batch: &aws_sdk_batch::Client, job_id: &str, want: &str) {
     for _ in 0..120 {
         let d = batch.describe_jobs().jobs(job_id).send().await.unwrap();
         let status = d.jobs()[0]
@@ -105,11 +110,48 @@ async fn wait_terminal(batch: &aws_sdk_batch::Client, job_id: &str) -> String {
             .map(|s| s.as_str().to_string())
             .unwrap_or_default();
         if status == "SUCCEEDED" || status == "FAILED" {
-            return status;
+            if status != want {
+                panic!(
+                    "job {job_id} ended {status}, expected {want}\n{}",
+                    describe_for_diagnostics(batch, job_id).await
+                );
+            }
+            return;
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    panic!("job {job_id} never reached a terminal status");
+    panic!(
+        "job {job_id} never reached a terminal status\n{}",
+        describe_for_diagnostics(batch, job_id).await
+    );
+}
+
+async fn describe_for_diagnostics(batch: &aws_sdk_batch::Client, job_id: &str) -> String {
+    let mut ids = vec![job_id.to_string()];
+    let d = batch.describe_jobs().jobs(job_id).send().await.unwrap();
+    if let Some(size) = d.jobs()[0].array_properties().and_then(|a| a.size()) {
+        ids.extend((0..size).map(|i| format!("{job_id}:{i}")));
+    }
+    let d = batch
+        .describe_jobs()
+        .set_jobs(Some(ids))
+        .send()
+        .await
+        .unwrap();
+    d.jobs()
+        .iter()
+        .map(|j| {
+            format!(
+                "  {} status={:?} statusReason={:?} exitCode={:?} containerReason={:?}",
+                j.job_id().unwrap_or_default(),
+                j.status(),
+                j.status_reason(),
+                j.container().and_then(|c| c.exit_code()),
+                j.container().and_then(|c| c.reason()),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[tokio::test]
@@ -120,7 +162,7 @@ async fn submit_job_runs_real_container_and_succeeds() {
     let s = TestServer::start().await;
     let batch = aws_sdk_batch::Client::new(&s.aws_config().await);
     let job_id = run_job(&batch, "ok", vec!["sh", "-c", "exit 0"]).await;
-    assert_eq!(wait_terminal(&batch, &job_id).await, "SUCCEEDED");
+    expect_terminal(&batch, &job_id, "SUCCEEDED").await;
     let d = batch.describe_jobs().jobs(&job_id).send().await.unwrap();
     assert_eq!(d.jobs()[0].container().and_then(|c| c.exit_code()), Some(0));
 }
@@ -133,7 +175,7 @@ async fn submit_job_failing_container_fails_the_job() {
     let s = TestServer::start().await;
     let batch = aws_sdk_batch::Client::new(&s.aws_config().await);
     let job_id = run_job(&batch, "bad", vec!["sh", "-c", "exit 7"]).await;
-    assert_eq!(wait_terminal(&batch, &job_id).await, "FAILED");
+    expect_terminal(&batch, &job_id, "FAILED").await;
     let d = batch.describe_jobs().jobs(&job_id).send().await.unwrap();
     assert_eq!(d.jobs()[0].container().and_then(|c| c.exit_code()), Some(7));
 }
@@ -173,8 +215,8 @@ async fn depends_on_job_waits_for_its_dependency() {
         "B must wait for A, was {b_early}"
     );
 
-    assert_eq!(wait_terminal(&batch, &a).await, "SUCCEEDED");
-    assert_eq!(wait_terminal(&batch, &b).await, "SUCCEEDED");
+    expect_terminal(&batch, &a, "SUCCEEDED").await;
+    expect_terminal(&batch, &b, "SUCCEEDED").await;
 }
 
 #[tokio::test]
@@ -204,7 +246,7 @@ async fn array_job_runs_every_child_and_parent_succeeds() {
         .unwrap()
         .to_string();
 
-    assert_eq!(wait_terminal(&batch, &parent).await, "SUCCEEDED");
+    expect_terminal(&batch, &parent, "SUCCEEDED").await;
     let d = batch.describe_jobs().jobs(&parent).send().await.unwrap();
     let summary = d.jobs()[0]
         .array_properties()
@@ -238,7 +280,7 @@ async fn retry_strategy_reattempts_a_failing_job() {
         .unwrap()
         .to_string();
 
-    assert_eq!(wait_terminal(&batch, &job_id).await, "FAILED");
+    expect_terminal(&batch, &job_id, "FAILED").await;
     // Two attempts were made: one recorded retry + the final.
     let d = batch.describe_jobs().jobs(&job_id).send().await.unwrap();
     assert_eq!(d.jobs()[0].attempts().len(), 1);
@@ -270,7 +312,7 @@ async fn timeout_fails_an_overrunning_job() {
         .unwrap()
         .to_string();
 
-    assert_eq!(wait_terminal(&batch, &job_id).await, "FAILED");
+    expect_terminal(&batch, &job_id, "FAILED").await;
     let d = batch.describe_jobs().jobs(&job_id).send().await.unwrap();
     assert!(d.jobs()[0]
         .status_reason()
