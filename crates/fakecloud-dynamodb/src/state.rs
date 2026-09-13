@@ -839,7 +839,7 @@ impl DynamoTable {
     /// then costs O(log n) plus the rows it visits, rather than a pass over
     /// the whole table. Otherwise (index not built yet, duplicate keys, or a
     /// row with no key) it sorts the rows itself, into the same order.
-    pub fn scan_rows_after<'a>(
+    pub(crate) fn scan_rows_after<'a>(
         &'a self,
         start: Option<&HashMap<String, AttributeValue>>,
     ) -> Box<dyn Iterator<Item = &'a HashMap<String, AttributeValue>> + 'a> {
