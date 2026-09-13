@@ -116,18 +116,29 @@ async fn image_cached(cli: &str, reference: &str) -> bool {
 
 /// Whether a pull error is one a later attempt could succeed past: the
 /// registry throttling the caller (the `429 Too Many Requests` status line,
-/// the `toomanyrequests` error code, ECR Public's `Rate exceeded`), a
-/// registry-side 5xx, or the network timing out or dropping the connection.
-/// Not-found and access-denied responses are not transient.
+/// the `toomanyrequests` error code, ECR Public's `Rate exceeded`), any 5xx
+/// from the registry, or the network timing out or dropping the connection.
+///
+/// A refusal (not found, access denied, unauthorized) is never transient, and
+/// is checked first so it wins over transient wording in the same message.
+/// That matters because the message quotes the image name, which the user
+/// chooses: a repository named `toomanyrequests` whose pull is refused must
+/// not be read as throttled and launch a stale cached copy. A repository
+/// name cannot contain a space, so it can only spell the one-word markers,
+/// and a refusal always carries refusal wording of its own.
 fn is_transient(stderr: &str) -> bool {
-    const MARKERS: [&str; 12] = [
+    const REFUSED: [&str; 6] = [
+        "manifest unknown",
+        "not found",
+        "denied",
+        "unauthorized",
+        "forbidden",
+        "does not exist",
+    ];
+    const TRANSIENT: [&str; 8] = [
         "toomanyrequests",
         "too many requests",
         "rate exceeded",
-        "500 internal server error",
-        "502 bad gateway",
-        "503 service unavailable",
-        "504 gateway timeout",
         "i/o timeout",
         "tls handshake timeout",
         "connection reset by peer",
@@ -135,7 +146,30 @@ fn is_transient(stderr: &str) -> bool {
         "request canceled while waiting for connection",
     ];
     let lower = stderr.to_ascii_lowercase();
-    MARKERS.iter().any(|m| lower.contains(m))
+    if REFUSED.iter().any(|m| lower.contains(m)) {
+        return false;
+    }
+    TRANSIENT.iter().any(|m| lower.contains(m)) || has_server_error_status(&lower)
+}
+
+/// Whether the message carries a 5xx HTTP status. Docker and Podman quote the
+/// status as `: 503 Service Unavailable`, `status: 500`, or
+/// `status code 502`; a three-digit number in that position from 500 to 599
+/// counts, whatever reason phrase follows.
+fn has_server_error_status(message: &str) -> bool {
+    let bytes = message.as_bytes();
+    ["status code ", "status: ", "status ", ": "]
+        .iter()
+        .flat_map(|prefix| message.match_indices(prefix).map(|(i, p)| i + p.len()))
+        .any(|start| {
+            let code = &bytes[start..bytes.len().min(start + 3)];
+            code.len() == 3
+                && code[0] == b'5'
+                && code.iter().all(u8::is_ascii_digit)
+                && !bytes
+                    .get(start + 3)
+                    .is_some_and(|c| c.is_ascii_alphanumeric())
+        })
 }
 
 #[cfg(all(test, unix))]
@@ -281,6 +315,16 @@ exit 2
         );
     }
 
+    #[tokio::test]
+    async fn a_refused_pull_of_a_repository_named_like_a_marker_is_still_refused() {
+        // The message quotes the image name. A repository spelled like a
+        // throttling code must not make a refused pull look transient.
+        let refused = "Error response from daemon: manifest for toomanyrequests:latest not found: manifest unknown: manifest unknown";
+        let cli = FakeCli::new(u32::MAX, refused, true);
+        assert_eq!(cli.pull().await, Err(refused.to_string()));
+        assert_eq!(cli.calls(), ["pull alpine:3.20"]);
+    }
+
     #[test]
     fn transient_detection_separates_retryable_from_refused() {
         assert!(is_transient(THROTTLED));
@@ -300,5 +344,29 @@ exit 2
         assert!(!is_transient("manifest unknown"));
         assert!(!is_transient("pull access denied for foo"));
         assert!(!is_transient("unauthorized: authentication required"));
+        assert!(!is_transient(
+            "pull access denied for toomanyrequests, repository does not exist or may require authorization"
+        ));
+    }
+
+    #[test]
+    fn any_5xx_status_is_transient_whatever_its_reason_phrase() {
+        for msg in [
+            "received unexpected HTTP status: 500 Internal Server Error",
+            "unexpected status from GET request to https://r.example/v2/: 507 Insufficient Storage",
+            "unexpected status code 520",
+            "error pulling image: status: 599",
+            "unexpected status from HEAD request to https://r.example/v2/a/manifests/1: 503",
+        ] {
+            assert!(is_transient(msg), "{msg}");
+        }
+        for msg in [
+            // A registry port or a 4xx is not a server error.
+            "Get \"http://127.0.0.1:5000/v2/\": dial tcp 127.0.0.1:5000: connect: connection refused",
+            "unexpected status code 400 Bad Request",
+            "status: 5001",
+        ] {
+            assert!(!is_transient(msg), "{msg}");
+        }
     }
 }

@@ -129,7 +129,10 @@ async fn expect_terminal(batch: &aws_sdk_batch::Client, job_id: &str, want: &str
 async fn describe_for_diagnostics(batch: &aws_sdk_batch::Client, job_id: &str) -> String {
     let mut ids = vec![job_id.to_string()];
     let d = batch.describe_jobs().jobs(job_id).send().await.unwrap();
-    if let Some(size) = d.jobs()[0].array_properties().and_then(|a| a.size()) {
+    let Some(job) = d.jobs().first() else {
+        return format!("  {job_id} not returned by DescribeJobs");
+    };
+    if let Some(size) = job.array_properties().and_then(|a| a.size()) {
         ids.extend((0..size).map(|i| format!("{job_id}:{i}")));
     }
     let d = batch
