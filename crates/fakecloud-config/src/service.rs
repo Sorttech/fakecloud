@@ -33,6 +33,7 @@ pub const SUPPORTED_ACTIONS: &[&str] = &[
     "DeleteConfigurationAggregator",
     "DeleteConfigurationRecorder",
     "DeleteConformancePack",
+    "DeleteConnector",
     "DeleteDeliveryChannel",
     "DeleteEvaluationResults",
     "DeleteOrganizationConfigRule",
@@ -82,6 +83,7 @@ pub const SUPPORTED_ACTIONS: &[&str] = &[
     "GetComplianceSummaryByResourceType",
     "GetConformancePackComplianceDetails",
     "GetConformancePackComplianceSummary",
+    "GetConnector",
     "GetCustomRulePolicy",
     "GetDiscoveredResourceCounts",
     "GetOrganizationConfigRuleDetailedStatus",
@@ -93,6 +95,7 @@ pub const SUPPORTED_ACTIONS: &[&str] = &[
     "ListAggregateDiscoveredResources",
     "ListConfigurationRecorders",
     "ListConformancePackComplianceScores",
+    "ListConnectors",
     "ListDiscoveredResources",
     "ListResourceEvaluations",
     "ListStoredQueries",
@@ -102,6 +105,7 @@ pub const SUPPORTED_ACTIONS: &[&str] = &[
     "PutConfigurationAggregator",
     "PutConfigurationRecorder",
     "PutConformancePack",
+    "PutConnector",
     "PutDeliveryChannel",
     "PutEvaluations",
     "PutExternalEvaluation",
@@ -113,6 +117,7 @@ pub const SUPPORTED_ACTIONS: &[&str] = &[
     "PutRetentionConfiguration",
     "PutServiceLinkedConfigurationRecorder",
     "PutStoredQuery",
+    "PutThirdPartyServiceLinkedConfigurationRecorder",
     "SelectAggregateResourceConfig",
     "SelectResourceConfig",
     "StartConfigRulesEvaluation",
@@ -167,6 +172,9 @@ const MUTATING_ACTIONS: &[&str] = &[
     "StopConfigurationRecorder",
     "TagResource",
     "UntagResource",
+    "PutConnector",
+    "DeleteConnector",
+    "PutThirdPartyServiceLinkedConfigurationRecorder",
 ];
 
 pub struct ConfigService {
@@ -444,6 +452,13 @@ impl AwsService for ConfigService {
             "GetDiscoveredResourceCounts" => self.get_discovered_resource_counts(&account, &body),
             // ── Config rules ──
             "PutConfigRule" => self.put_config_rule(&account, &region, &body),
+            "PutConnector" => self.put_connector(&account, &region, &body),
+            "GetConnector" => self.get_connector(&account, &body),
+            "DeleteConnector" => self.delete_connector(&account, &body),
+            "ListConnectors" => self.list_connectors(&account, &body),
+            "PutThirdPartyServiceLinkedConfigurationRecorder" => {
+                self.put_third_party_service_linked_configuration_recorder(&account, &region, &body)
+            }
             "DescribeConfigRules" => self.describe_config_rules(&account, &body),
             "DeleteConfigRule" => self.delete_config_rule(&account, &body),
             "DescribeConfigRuleEvaluationStatus" => {
@@ -679,6 +694,9 @@ impl ConfigService {
             recording_mode: rec.get("recordingMode").cloned(),
             arn: existing.and_then(|e| e.arn.clone()),
             service_principal: existing.and_then(|e| e.service_principal.clone()),
+            recording_scope: existing.and_then(|e| e.recording_scope.clone()),
+            connector_arn: existing.and_then(|e| e.connector_arn.clone()),
+            scope_configuration: existing.and_then(|e| e.scope_configuration.clone()),
             recording: existing.map(|e| e.recording).unwrap_or(false),
             last_start_time: existing.and_then(|e| e.last_start_time),
             last_stop_time: existing.and_then(|e| e.last_stop_time),
@@ -708,6 +726,15 @@ impl ConfigService {
         }
         if let Some(sp) = &r.service_principal {
             v["servicePrincipal"] = json!(sp);
+        }
+        if let Some(scope) = &r.recording_scope {
+            v["recordingScope"] = json!(scope);
+        }
+        if let Some(c) = &r.connector_arn {
+            v["connectorArn"] = json!(c);
+        }
+        if let Some(sc) = &r.scope_configuration {
+            v["scopeConfiguration"] = sc.clone();
         }
         v
     }
@@ -885,6 +912,9 @@ impl ConfigService {
                 recording_mode: None,
                 arn: Some(arn.clone()),
                 service_principal: Some(sp),
+                recording_scope: None,
+                connector_arn: None,
+                scope_configuration: None,
                 recording: true,
                 last_start_time: Some(Utc::now()),
                 last_stop_time: None,
@@ -1455,6 +1485,261 @@ impl ConfigService {
 // ─── Config rules + evaluation ─────────────────────────────────────────────
 
 impl ConfigService {
+    // ─── Third-party cloud connectors ────────────────────────────────────
+
+    /// Put is an upsert keyed by the Azure tenant and client pair: re-putting
+    /// the same pair returns the connector the first call made rather than
+    /// minting a second one for the same cloud account.
+    fn put_connector(
+        &self,
+        account: &str,
+        region: &str,
+        body: &Value,
+    ) -> Result<AwsResponse, AwsServiceError> {
+        let azure = body
+            .get("ConnectorConfiguration")
+            .and_then(|c| c.get("azure"))
+            .filter(|v| v.is_object())
+            .ok_or_else(|| validation("ConnectorConfiguration.azure is required"))?;
+        let tenant = azure
+            .get("tenantIdentifier")
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| validation("ConnectorConfiguration.azure.tenantIdentifier is required"))?
+            .to_string();
+        let client = azure
+            .get("clientIdentifier")
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| validation("ConnectorConfiguration.azure.clientIdentifier is required"))?
+            .to_string();
+
+        bounded("tenantIdentifier", &tenant, 128)?;
+        bounded("clientIdentifier", &client, 128)?;
+        let tags = parse_create_tags(body);
+
+        let mut st = self.state.write();
+        let acc = st.account_mut(account);
+        // "Connectors cannot be updated. To update the connector configuration,
+        // you must delete all associated configuration recorders, delete the
+        // connector, and recreate it with the updated configuration." So a
+        // second Put for the same configuration is a conflict, not an upsert —
+        // which is also why create-time tags can never be rewritten here.
+        if acc
+            .connectors
+            .values()
+            .any(|c| c.tenant_identifier == tenant && c.client_identifier == client)
+        {
+            return Err(no_such(
+                "ConflictException",
+                "A connector already exists for the specified connector configuration",
+            ));
+        }
+
+        let id = short_id();
+        let connector = crate::state::Connector {
+            arn: format!("arn:aws:config:{region}:{account}:connector/{id}"),
+            name: format!("connector-{id}"),
+            provider: "AZURE".to_string(),
+            tenant_identifier: tenant,
+            client_identifier: client,
+            created_time: Utc::now().timestamp() as f64,
+        };
+        let arn = connector.arn.clone();
+        acc.connectors.insert(arn.clone(), connector);
+        // Create-time tags belong in the shared tag store, which is what
+        // TagResource/UntagResource/ListTagsForResource read.
+        if !tags.is_empty() {
+            let entry = acc.tags.entry(arn.clone()).or_default();
+            for (k, v) in tags {
+                entry.insert(k, v);
+            }
+        }
+        Ok(AwsResponse::ok_json(json!({ "Arn": arn })))
+    }
+
+    fn get_connector(&self, account: &str, body: &Value) -> Result<AwsResponse, AwsServiceError> {
+        let arn = require_str(body, "Arn")?;
+        let st = self.state.read();
+        let acc = st.account(account);
+        let c = acc
+            .and_then(|a| a.connectors.get(&arn))
+            .ok_or_else(|| connector_not_found(&arn))?;
+        Ok(AwsResponse::ok_json(json!({
+            "Connector": {
+                "name": c.name,
+                "arn": c.arn,
+                "createdTime": c.created_time,
+                "connectorConfiguration": {
+                    "azure": {
+                        "tenantIdentifier": c.tenant_identifier,
+                        "clientIdentifier": c.client_identifier,
+                    }
+                },
+            }
+        })))
+    }
+
+    fn delete_connector(
+        &self,
+        account: &str,
+        body: &Value,
+    ) -> Result<AwsResponse, AwsServiceError> {
+        let arn = require_str(body, "Arn")?;
+        let mut st = self.state.write();
+        let acc = st.account_mut(account);
+        if !acc.connectors.contains_key(&arn) {
+            return Err(connector_not_found(&arn));
+        }
+        // "To update the connector configuration, you must delete all
+        // associated configuration recorders, delete the connector, and
+        // recreate it." Silently destroying someone else's recorder is worse
+        // than refusing, and DeleteConnector declares no ConflictException, so
+        // the refusal is a ValidationException.
+        if let Some(r) = acc
+            .recorders
+            .values()
+            .find(|r| r.connector_arn.as_deref() == Some(arn.as_str()))
+        {
+            return Err(validation(format!(
+                "Connector {arn} is still used by configuration recorder {}. \
+                 Delete the configuration recorder first",
+                r.name
+            )));
+        }
+        acc.connectors.remove(&arn);
+        acc.tags.remove(&arn);
+        Ok(AwsResponse::ok_json(json!({})))
+    }
+
+    fn list_connectors(&self, account: &str, body: &Value) -> Result<AwsResponse, AwsServiceError> {
+        if let Some(max) = body.get("MaxResults").and_then(Value::as_i64) {
+            if !(0..=100).contains(&max) {
+                return Err(validation("MaxResults must be between 0 and 100"));
+            }
+        }
+        let filters = body
+            .get("Filters")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        validate_connector_filters(&filters)?;
+
+        let st = self.state.read();
+        let items: Vec<Value> = st
+            .account(account)
+            .map(|a| {
+                a.connectors
+                    .values()
+                    .filter(|c| filters.iter().all(|f| connector_matches(c, f)))
+                    .map(|c| {
+                        json!({
+                            "arn": c.arn,
+                            "name": c.name,
+                            "provider": c.provider,
+                            "tenantIdentifier": c.tenant_identifier,
+                            "createdTime": c.created_time,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(paged_response(
+            "ConnectorSummaries",
+            items,
+            body,
+            "NextToken",
+        ))
+    }
+
+    fn put_third_party_service_linked_configuration_recorder(
+        &self,
+        account: &str,
+        region: &str,
+        body: &Value,
+    ) -> Result<AwsResponse, AwsServiceError> {
+        let service_principal = require_str(body, "ServicePrincipal")?;
+        let connector_arn = require_str(body, "ConnectorArn")?;
+        let scope = body
+            .get("ScopeConfiguration")
+            .filter(|v| v.is_object())
+            .cloned()
+            .ok_or_else(|| validation("ScopeConfiguration is required"))?;
+        if scope.get("scopeType").and_then(Value::as_str).is_none() {
+            return Err(validation("ScopeConfiguration.scopeType is required"));
+        }
+        if scope.get("allRegions").and_then(Value::as_bool).is_none() {
+            return Err(validation("ScopeConfiguration.allRegions is required"));
+        }
+
+        bounded("ServicePrincipal", &service_principal, 128)?;
+        let tags = parse_create_tags(body);
+
+        let mut st = self.state.write();
+        let acc = st.account_mut(account);
+        // The operation declares no not-found, so an unknown connector is a
+        // validation failure on the ARN the caller passed.
+        if !acc.connectors.contains_key(&connector_arn) {
+            return Err(validation(format!(
+                "No connector exists with ARN {connector_arn}"
+            )));
+        }
+        // The service principal names the recorder, so it has to survive a dot
+        // without collapsing `config.amazonaws.com` and `config.eu.amazonaws.com`
+        // onto the same key.
+        let name = format!(
+            "AWSConfigurationRecorderFor{}",
+            service_principal.replace('.', "-")
+        );
+        // "Creates or updates a service-linked configuration recorder ... based
+        // on the ConnectorArn you specify" — so re-putting the same principal
+        // against the SAME connector updates it. Against a different connector
+        // it is the conflict the model documents: the principal does not
+        // support multiple configuration recorders.
+        if let Some(existing) = acc.recorders.get(&name) {
+            if existing.connector_arn.as_deref() != Some(connector_arn.as_str()) {
+                return Err(no_such(
+                    "ConflictException",
+                    format!(
+                        "A service-linked configuration recorder already exists for \
+                         service principal {service_principal}"
+                    ),
+                ));
+            }
+        }
+        let arn = format!("arn:aws:config:{region}:{account}:configuration-recorder/{name}",);
+        // A third-party recorder is a real recorder: describe, list and delete
+        // all read `recorders`, so it lives there rather than in a map of its
+        // own that nothing can see.
+        acc.recorders.insert(
+            name.clone(),
+            ConfigurationRecorder {
+                name: name.clone(),
+                role_arn: format!("arn:aws:iam::{account}:role/aws-service-role/config.amazonaws.com/AWSServiceRoleForConfigThirdParty"),
+                recording_group: None,
+                recording_mode: None,
+                arn: Some(arn.clone()),
+                service_principal: Some(service_principal),
+                // Recording through a third-party connector is the billed kind.
+                recording_scope: Some("PAID".to_string()),
+                connector_arn: Some(connector_arn),
+                scope_configuration: Some(scope),
+                recording: true,
+                last_start_time: Some(Utc::now()),
+                last_stop_time: None,
+                last_status: "SUCCESS".into(),
+                last_status_change_time: Some(Utc::now()),
+            },
+        );
+        if !tags.is_empty() {
+            let entry = acc.tags.entry(arn.clone()).or_default();
+            for (k, v) in tags {
+                entry.insert(k, v);
+            }
+        }
+        Ok(AwsResponse::ok_json(json!({ "Arn": arn, "Name": name })))
+    }
+
     fn put_config_rule(
         &self,
         account: &str,
@@ -4237,6 +4522,18 @@ impl ConfigService {
 /// into `(key, value)` pairs. Config Put ops accept Tags at create time but
 /// historically dropped them, so ListTagsForResource returned nothing until a
 /// follow-up TagResource (bug-hunt).
+/// Enforce a modeled `@length` upper bound on a required string. The lower
+/// bound is 1 on every member this is used for, which the required-field check
+/// has already established.
+fn bounded(field: &str, value: &str, max: usize) -> Result<(), AwsServiceError> {
+    if value.len() > max {
+        return Err(validation(format!(
+            "{field} must be at most {max} characters"
+        )));
+    }
+    Ok(())
+}
+
 fn parse_create_tags(body: &Value) -> Vec<(String, String)> {
     body.get("Tags")
         .and_then(Value::as_array)
@@ -4271,6 +4568,67 @@ fn region(req: &AwsRequest) -> String {
 
 fn short_id() -> String {
     fakecloud_core::ids::short_id(6)
+}
+
+/// `ValidationException` — the error the connector operations declare for a
+/// malformed or unusable input, in place of Config's older
+/// `InvalidParameterValueException`.
+fn validation(msg: impl Into<String>) -> AwsServiceError {
+    AwsServiceError::aws_error(StatusCode::BAD_REQUEST, "ValidationException", msg)
+}
+
+fn connector_not_found(arn: &str) -> AwsServiceError {
+    no_such(
+        "ResourceNotFoundException",
+        format!("No connector exists with ARN {arn}"),
+    )
+}
+
+/// `ConnectorFilterName` has exactly one member, and its `enumValue` is the
+/// lowercase string `provider` — that is what an SDK puts on the wire.
+const CONNECTOR_FILTER_PROVIDER: &str = "provider";
+
+/// Validate a `Filters` list against the model: at most five entries, each
+/// naming a supported filter, each carrying at most ten values.
+fn validate_connector_filters(filters: &[Value]) -> Result<(), AwsServiceError> {
+    if filters.len() > 5 {
+        return Err(validation("Filters accepts at most 5 entries"));
+    }
+    for f in filters {
+        let name = f
+            .get("filterName")
+            .and_then(Value::as_str)
+            .ok_or_else(|| validation("ConnectorFilter.filterName is required"))?;
+        if name != CONNECTOR_FILTER_PROVIDER {
+            return Err(validation(format!(
+                "Invalid filter name {name}. Currently, only {CONNECTOR_FILTER_PROVIDER} is supported"
+            )));
+        }
+        let values = f
+            .get("filterValues")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if values.len() > 10 {
+            return Err(validation("filterValues accepts at most 10 entries"));
+        }
+    }
+    Ok(())
+}
+
+/// Evaluate one `ConnectorFilter`. A filter with no values constrains nothing,
+/// which is how an empty filter list behaves. The name is already known to be
+/// supported by `validate_connector_filters`.
+fn connector_matches(c: &crate::state::Connector, filter: &Value) -> bool {
+    let values: Vec<&str> = filter
+        .get("filterValues")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if values.is_empty() {
+        return true;
+    }
+    values.contains(&c.provider.as_str())
 }
 
 fn invalid(msg: impl Into<String>) -> AwsServiceError {
