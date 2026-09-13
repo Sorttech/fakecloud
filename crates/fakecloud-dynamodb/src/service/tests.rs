@@ -5818,10 +5818,6 @@ async fn update_item_rejects_writing_a_key_attribute() {
             "pk",
         ),
         (
-            json!({"UpdateExpression": "SET pk.nested = :v", "ExpressionAttributeValues": {":v": {"S": "b"}}}),
-            "pk",
-        ),
-        (
             json!({"AttributeUpdates": {"sk": {"Action": "PUT", "Value": {"N": "5"}}}}),
             "sk",
         ),
@@ -5846,6 +5842,22 @@ async fn update_item_rejects_writing_a_key_attribute() {
             "{body}"
         );
     }
+
+    // A nested path under a key attribute is rejected too. Only the error
+    // code is pinned: the exact wording for this shape is not confirmed.
+    let err = svc
+        .handle(make_request(
+            "UpdateItem",
+            json!({
+                "TableName": "composite", "Key": key,
+                "UpdateExpression": "SET pk.nested = :v",
+                "ExpressionAttributeValues": {":v": {"S": "b"}}
+            }),
+        ))
+        .await
+        .err()
+        .expect("nested key write accepted");
+    assert_eq!(err.code(), "ValidationException");
 
     let scan = call_dynamodb(&svc, "Scan", json!({"TableName": "composite"})).await;
     assert_eq!(
@@ -5893,6 +5905,34 @@ async fn transact_and_partiql_updates_reject_writing_a_key_attribute() {
         .await
         .err()
         .expect("transactional key write accepted");
+    assert_eq!(err.code(), "ValidationException");
+    assert!(
+        err.to_string().contains("Cannot update attribute pk"),
+        "{err}"
+    );
+
+    // Rejected as a malformed request even when another operation's condition
+    // fails: DynamoDB validates the request before evaluating conditions.
+    let err = svc
+        .handle(make_request(
+            "TransactWriteItems",
+            json!({"TransactItems": [
+                {"ConditionCheck": {
+                    "TableName": "test-table",
+                    "Key": {"pk": {"S": "a"}},
+                    "ConditionExpression": "attribute_not_exists(pk)"
+                }},
+                {"Update": {
+                    "TableName": "test-table",
+                    "Key": {"pk": {"S": "other"}},
+                    "UpdateExpression": "SET pk = :v",
+                    "ExpressionAttributeValues": {":v": {"S": "b"}}
+                }}
+            ]}),
+        ))
+        .await
+        .err()
+        .expect("a key write with a failing condition must be a ValidationException");
     assert_eq!(err.code(), "ValidationException");
     assert!(
         err.to_string().contains("Cannot update attribute pk"),
