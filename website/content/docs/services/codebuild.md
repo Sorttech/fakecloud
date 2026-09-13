@@ -54,7 +54,10 @@ When a container runtime is available, the background build task:
 
 - **Resolves the image** from `environment.image`. A user-supplied image is used
   verbatim; an AWS-curated `aws/codebuild/*` image (not publicly pullable) maps
-  to a small runnable Ubuntu so the buildspec `commands` execute unchanged.
+  to a small runnable Ubuntu so the buildspec `commands` execute unchanged. An
+  image already in the local cache is used as is; a missing one is pulled first,
+  retrying a transient registry failure (rate limiting such as
+  `429 Too Many Requests`, a 5xx, a network timeout) with backoff.
 - **Parses the buildspec** — the inline `source.buildspec` or a
   `StartBuild.buildspecOverride` — reading `env.variables` and the
   `install` / `pre_build` / `build` / `post_build` phase `commands` and the
