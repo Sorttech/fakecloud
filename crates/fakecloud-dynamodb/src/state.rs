@@ -953,8 +953,8 @@ impl DynamoTable {
             .map(|id| self.remove_item_at(id))
             .collect();
         // A table that fell back to the scan over duplicate keys may have just
-        // lost the duplicates. The sweep already paid a full pass, so another
-        // one to see whether the index can be trusted again costs no more.
+        // lost the duplicates. The sweep already paid a full pass; one more,
+        // to see whether the index can be trusted again, keeps it O(n).
         if !removed.is_empty() && matches!(self.key_index, KeyIndex::Ambiguous { .. }) {
             self.rebuild_key_index();
         }
