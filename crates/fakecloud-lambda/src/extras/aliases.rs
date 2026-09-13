@@ -189,12 +189,19 @@ impl LambdaService {
         }
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
-        // `DeleteAlias` is idempotent on AWS — no `ResourceNotFoundException`
-        // is declared on the operation. Removing without error matches
-        // the live API.
-        state
+        // AWS answers a delete for an alias that was never created with
+        // `ResourceNotFoundException` rather than succeeding. The model
+        // declares that error here, but it declares it identically on every
+        // Lambda sub-resource delete, so the declaration alone does not settle
+        // which of them are idempotent — see the note on
+        // `delete_function_concurrency`, the one that genuinely is.
+        if state
             .aliases
-            .remove(&Self::alias_key(function_name, &alias_name));
+            .remove(&Self::alias_key(function_name, &alias_name))
+            .is_none()
+        {
+            return Err(not_found("Alias", &alias_name));
+        }
         empty()
     }
 }

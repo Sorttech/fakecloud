@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LambdaFunction {
     pub function_name: String,
     pub function_arn: String,
@@ -262,7 +262,7 @@ pub struct LambdaState {
     /// Runtime management configs keyed by `{function}:{qualifier}`.
     #[serde(default)]
     pub runtime_management: BTreeMap<String, RuntimeManagementConfig>,
-    /// Scaling configs keyed by event source mapping uuid.
+    /// Scaling configs keyed by function name and qualifier.
     #[serde(default)]
     pub scaling_configs: BTreeMap<String, FunctionScalingConfig>,
     /// Recursion configs keyed by function name.

@@ -61,6 +61,11 @@ impl LambdaService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(account_id);
+        // Unlike the sub-resource deletes above, this one clears a *setting* on
+        // the function rather than deleting an object, and AWS succeeds whether
+        // or not a reserved concurrency was ever set. The model declares
+        // ResourceNotFoundException here for the missing *function*, which the
+        // function-scoped guard already answers.
         state.function_concurrency.remove(function_name);
         empty()
     }
@@ -139,9 +144,15 @@ impl LambdaService {
         let qualifier = require_qualifier(req)?;
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
-        state
+        // A config that was never put is a not-found, the same way AWS
+        // answers it.
+        if state
             .provisioned_concurrency
-            .remove(&Self::pc_key(function_name, &qualifier));
+            .remove(&Self::pc_key(function_name, &qualifier))
+            .is_none()
+        {
+            return Err(not_found("ProvisionedConcurrencyConfig", function_name));
+        }
         empty()
     }
 

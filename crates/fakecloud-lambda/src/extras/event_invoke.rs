@@ -142,9 +142,15 @@ impl LambdaService {
         let qualifier = parse_qualifier(req);
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
-        state
+        // A config that was never put is a not-found, the same way AWS
+        // answers it.
+        if state
             .event_invoke_configs
-            .remove(&Self::ev_key(function_name, &qualifier));
+            .remove(&Self::ev_key(function_name, &qualifier))
+            .is_none()
+        {
+            return Err(not_found("EventInvokeConfig", function_name));
+        }
         empty()
     }
 
