@@ -595,7 +595,7 @@ mod tests {
             .expect("table still in state");
         assert_eq!(table.items.len(), 1);
         assert_eq!(
-            table.items[0].get("Artist"),
+            table.items.iter().next().unwrap().get("Artist"),
             Some(&json!({ "S": "SENTINEL" }))
         );
     }

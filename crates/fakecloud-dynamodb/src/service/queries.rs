@@ -72,7 +72,7 @@ impl DynamoDbService {
 
         let consistent_read = body["ConsistentRead"].as_bool().unwrap_or(false);
         let (items_to_scan, hash_key_name, range_key_name): (
-            &[HashMap<String, AttributeValue>],
+            &crate::state::TableItems,
             String,
             Option<String>,
         ) = if let Some(idx_name) = index_name {
@@ -118,7 +118,7 @@ impl DynamoDbService {
             }
         } else {
             (
-                &table.items[..],
+                &table.items,
                 table.hash_key_name().to_string(),
                 table.range_key_name().map(|s| s.to_string()),
             )

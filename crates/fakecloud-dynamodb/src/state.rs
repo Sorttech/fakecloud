@@ -168,42 +168,120 @@ struct ItemSlot {
     key: Option<String>,
 }
 
+type Item = HashMap<String, AttributeValue>;
+
+/// Identity of a row within its table.
+///
+/// Assigned when the row is inserted and never changed or reused while the
+/// row lives, so removing one row leaves every other row's id valid. Ids grow
+/// with insertion, which makes their order the table's storage order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ItemId(u64);
+
 /// A table's rows, in storage order.
 ///
-/// Readable like a slice (`iter`, `len`, indexing) through `Deref`, but not
-/// mutable from outside this module: the primary-key index records positions
-/// in this vector, so a push, remove or wholesale reassignment that bypassed
-/// [`DynamoTable`]'s helpers would leave the index pointing at the wrong rows
-/// -- a later write would then overwrite or delete a different item, or store
-/// a duplicate. Keeping the vector private makes that a compile error rather
-/// than a convention. Serialized as the bare list, so snapshots are unchanged.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(transparent)]
-pub(crate) struct TableItems(Vec<HashMap<String, AttributeValue>>);
+/// Rows are keyed by [`ItemId`] rather than stored by position. A position
+/// is invalidated by every removal before it, so deleting from a `Vec` both
+/// shifted the tail and forced the key index to repair every shifted
+/// position: O(table size) per delete, and quadratic over a bulk delete
+/// (#2504). With stable ids a delete touches only its own row, and the id
+/// order still reproduces insertion order, which Scan pagination depends on
+/// (a page resumes after `ExclusiveStartKey` in storage order).
+///
+/// Readable from anywhere, but only mutable from this module: the key index
+/// records ids in here, so an insert or remove that bypassed
+/// [`DynamoTable`]'s helpers would leave it pointing at the wrong rows.
+/// Serialized as the bare list of rows, so snapshots are unchanged; ids are
+/// reassigned in order on load.
+#[derive(Debug, Clone, Default)]
+pub struct TableItems {
+    rows: BTreeMap<ItemId, Item>,
+    next_id: u64,
+}
 
 impl TableItems {
     /// Wrap rows that are about to become a table's contents. Crate-internal:
     /// whoever does this owns re-deriving the key index and the stats, which
     /// is why [`DynamoTable::replace_items`] is the way to do it.
-    pub(crate) fn new(items: Vec<HashMap<String, AttributeValue>>) -> Self {
-        Self(items)
+    pub(crate) fn new(items: Vec<Item>) -> Self {
+        let mut out = Self::default();
+        for item in items {
+            out.push(item);
+        }
+        out
+    }
+
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// The rows in storage order.
+    pub fn iter(&self) -> std::collections::btree_map::Values<'_, ItemId, Item> {
+        self.rows.values()
+    }
+
+    /// The rows in storage order, each with its id.
+    pub fn iter_with_ids(&self) -> impl DoubleEndedIterator<Item = (ItemId, &Item)> {
+        self.rows.iter().map(|(id, item)| (*id, item))
+    }
+
+    pub fn get(&self, id: ItemId) -> Option<&Item> {
+        self.rows.get(&id)
+    }
+
+    /// A copy of the rows in storage order.
+    pub fn to_vec(&self) -> Vec<Item> {
+        self.rows.values().cloned().collect()
+    }
+
+    fn get_mut(&mut self, id: ItemId) -> Option<&mut Item> {
+        self.rows.get_mut(&id)
+    }
+
+    /// Append a row after every existing one.
+    fn push(&mut self, item: Item) -> ItemId {
+        let id = ItemId(self.next_id);
+        self.next_id += 1;
+        self.rows.insert(id, item);
+        id
+    }
+
+    fn remove(&mut self, id: ItemId) -> Option<Item> {
+        self.rows.remove(&id)
     }
 }
 
-impl std::ops::Deref for TableItems {
-    type Target = [HashMap<String, AttributeValue>];
+impl std::ops::Index<ItemId> for TableItems {
+    type Output = Item;
 
-    fn deref(&self) -> &Self::Target {
-        &self.0
+    /// Panics if no row has this id.
+    fn index(&self, id: ItemId) -> &Item {
+        &self.rows[&id]
     }
 }
 
 impl<'a> IntoIterator for &'a TableItems {
     type Item = &'a HashMap<String, AttributeValue>;
-    type IntoIter = std::slice::Iter<'a, HashMap<String, AttributeValue>>;
+    type IntoIter = std::collections::btree_map::Values<'a, ItemId, Item>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.0.iter()
+        self.rows.values()
+    }
+}
+
+impl Serialize for TableItems {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(self.rows.values())
+    }
+}
+
+impl<'de> Deserialize<'de> for TableItems {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Vec::<Item>::deserialize(d).map(Self::new)
     }
 }
 
@@ -211,7 +289,7 @@ impl<'a> IntoIterator for &'a TableItems {
 ///
 /// The index is derived, not persisted, so "empty" and "not built yet" have to
 /// be distinguishable, and a table holding two rows under one key cannot be
-/// answered by a position map at all. Naming the three states makes both
+/// answered by a key -> row map at all. Naming the three states makes both
 /// cases explicit -- comparing `key_index.len()` with `items.len()` told them
 /// apart badly, because a table with duplicate keys is permanently shorter
 /// than `items` and so would rebuild on every single write, the very cost
@@ -230,14 +308,14 @@ pub enum KeyIndex {
     /// builds it.
     #[default]
     Unbuilt,
-    /// Primary key -> position in `items`, covering every addressable item,
+    /// Primary key -> row id in `items`, covering every addressable item,
     /// plus the row count it was maintained against.
     Built {
-        positions: HashMap<String, usize>,
+        ids: HashMap<String, ItemId>,
         rows: usize,
     },
     /// `items` holds more than one row under the same primary key, so no
-    /// position map can answer lookups the way the linear scan does once the
+    /// key -> row map can answer lookups the way the linear scan does once the
     /// first of them is removed. Such a table is only reachable by importing
     /// an export that repeats a key (or by loading a snapshot written by a
     /// build that allowed it), and permanently falls back to the scan, which
@@ -265,7 +343,7 @@ pub struct DynamoTable {
     pub attribute_definitions: Vec<AttributeDefinition>,
     pub provisioned_throughput: ProvisionedThroughput,
     pub(crate) items: TableItems,
-    /// Primary-key -> position in `items`, so a write does not have to scan
+    /// Primary-key -> row id in `items`, so a write does not have to scan
     /// the whole table to decide insert-vs-overwrite. Without it every write
     /// was O(table size) and a bulk load was quadratic (#2502).
     ///
@@ -550,9 +628,8 @@ impl DynamoTable {
     }
 
     /// The table's rows, in storage order. Read-only: the key index records
-    /// positions in this vector, so mutating it is the business of the
-    /// helpers below.
-    pub fn items(&self) -> &[HashMap<String, AttributeValue>] {
+    /// row ids in here, so mutating it is the business of the helpers below.
+    pub fn items(&self) -> &TableItems {
         &self.items
     }
 
@@ -629,13 +706,13 @@ impl DynamoTable {
         // Well-formed tables have no duplicate keys; an imported export or an
         // older snapshot might, and those tables give up the index entirely
         // rather than answer a lookup differently from the scan (which returns
-        // the *first* matching row, a position map cannot keep doing that once
+        // the *first* matching row, a key -> id map cannot keep doing that once
         // the first is removed).
-        for (i, item) in self.items.iter().enumerate() {
+        for (id, item) in self.items.iter_with_ids() {
             if let Some(k) = self.encode_key(item) {
                 match index.entry(k) {
                     std::collections::hash_map::Entry::Vacant(slot) => {
-                        slot.insert(i);
+                        slot.insert(id);
                     }
                     std::collections::hash_map::Entry::Occupied(_) => {
                         duplicate_key = true;
@@ -648,10 +725,7 @@ impl DynamoTable {
         self.key_index = if duplicate_key {
             KeyIndex::Ambiguous { rows }
         } else {
-            KeyIndex::Built {
-                positions: index,
-                rows,
-            }
+            KeyIndex::Built { ids: index, rows }
         };
     }
 
@@ -666,59 +740,52 @@ impl DynamoTable {
         }
     }
 
-    /// Record `item` as living at position `idx`. No-op when the item has no
-    /// encodable key or the table has no usable index.
-    fn index_insert_at(&mut self, item: &HashMap<String, AttributeValue>, idx: usize) {
+    /// Forget that `item` lives at row `id`. An entry for the same key that
+    /// records a different row is left alone: it is not this row's to drop.
+    fn index_remove(&mut self, item: &HashMap<String, AttributeValue>, id: ItemId) {
         let Some(k) = self.encode_key(item) else {
             return;
         };
-        if let KeyIndex::Built { positions, .. } = &mut self.key_index {
-            positions.insert(k, idx);
+        if let KeyIndex::Built { ids, .. } = &mut self.key_index {
+            if ids.get(&k) == Some(&id) {
+                ids.remove(&k);
+            }
         }
     }
 
-    /// Forget `item`'s recorded position.
-    fn index_remove(&mut self, item: &HashMap<String, AttributeValue>) {
-        let Some(k) = self.encode_key(item) else {
-            return;
-        };
-        if let KeyIndex::Built { positions, .. } = &mut self.key_index {
-            positions.remove(&k);
-        }
-    }
-
-    /// Find an item index by its primary key. O(1) once the index is built.
+    /// Find an item's row id by its primary key. O(log n) once the index is
+    /// built: a hash lookup for the id, then the row itself to confirm it.
     ///
     /// Takes `&self`, so it cannot build the index; it falls back to the
     /// original linear scan in that case rather than returning a wrong answer.
     /// Every mutating path goes through the `&mut self` helpers below, which
     /// call `ensure_key_index` first, so the fallback is a correctness
     /// backstop rather than the normal path.
-    pub fn find_item_index(&self, key: &HashMap<String, AttributeValue>) -> Option<usize> {
-        let KeyIndex::Built { positions, rows } = &self.key_index else {
+    pub fn find_item_index(&self, key: &HashMap<String, AttributeValue>) -> Option<ItemId> {
+        let KeyIndex::Built { ids, rows } = &self.key_index else {
             return self.find_item_index_scan(key);
         };
         if *rows != self.items.len() {
             // `items` was reassigned wholesale behind the index's back; the
-            // recorded positions describe rows that are no longer there.
+            // recorded ids describe rows that are no longer there.
             return self.find_item_index_scan(key);
         }
         // A key that cannot be encoded is missing the hash key, so it matches
         // nothing -- the same answer the scan gave.
         let encoded = self.encode_key(key)?;
-        let idx = positions.get(&encoded).copied()?;
-        // Costs one key encoding, so it stays O(1) and keeps a position that
+        let id = ids.get(&encoded).copied()?;
+        // Costs one key encoding, so it stays cheap and keeps an id that
         // drifted from ever addressing the wrong row: answer from the rows
         // themselves when the recorded one does not carry this key.
-        match self.items.get(idx) {
-            Some(item) if self.encode_key(item).as_deref() == Some(encoded.as_str()) => Some(idx),
+        match self.items.get(id) {
+            Some(item) if self.encode_key(item).as_deref() == Some(encoded.as_str()) => Some(id),
             _ => self.find_item_index_scan(key),
         }
     }
 
     /// The pre-index linear scan. Retained as the fallback for a stale index
     /// and as the oracle the index is tested against.
-    fn find_item_index_scan(&self, key: &HashMap<String, AttributeValue>) -> Option<usize> {
+    fn find_item_index_scan(&self, key: &HashMap<String, AttributeValue>) -> Option<ItemId> {
         let hash_key = self.hash_key_name();
         let range_key = self.range_key_name();
 
@@ -729,44 +796,53 @@ impl DynamoTable {
         // even though the compare/filter path was already canonical
         // (bug-hunt 2026-07-01, DynamoDB write-path number-canon).
         use crate::service::helpers::partiql::values_equal;
-        self.items.iter().position(|item| {
-            let hash_match =
-                values_equal(item.get(hash_key), key.get(hash_key)) && item.get(hash_key).is_some();
-            if !hash_match {
-                return false;
-            }
-            match range_key {
-                Some(rk) => values_equal(item.get(rk), key.get(rk)),
-                None => true,
-            }
-        })
+        self.items
+            .iter_with_ids()
+            .find(|(_, item)| {
+                let hash_match = values_equal(item.get(hash_key), key.get(hash_key))
+                    && item.get(hash_key).is_some();
+                if !hash_match {
+                    return false;
+                }
+                match range_key {
+                    Some(rk) => values_equal(item.get(rk), key.get(rk)),
+                    None => true,
+                }
+            })
+            .map(|(id, _)| id)
     }
 
     /// Insert or overwrite the item with this key, keeping `key_index` and the
-    /// cached stats in step. Returns the index it now occupies, and whether
-    /// this replaced an existing item.
-    pub fn put_item_at_key(&mut self, item: HashMap<String, AttributeValue>) -> (usize, bool) {
+    /// cached stats in step. Returns the row id it now occupies, and whether
+    /// this replaced an existing item. An overwrite keeps the row's place in
+    /// storage order; an insert goes after every existing row.
+    pub fn put_item_at_key(&mut self, item: HashMap<String, AttributeValue>) -> (ItemId, bool) {
         self.ensure_key_index();
         match self.find_item_index(&item) {
-            Some(idx) => {
+            Some(id) => {
                 // Adjust the cached size by the delta rather than resumming the
                 // whole table (#2502).
-                self.size_bytes -= Self::estimate_item_size(&self.items[idx]);
+                self.size_bytes -= Self::estimate_item_size(&self.items[id]);
                 self.size_bytes += Self::estimate_item_size(&item);
-                self.items.0[idx] = item;
-                (idx, true)
+                *self
+                    .items
+                    .get_mut(id)
+                    .expect("row located by find_item_index") = item;
+                (id, true)
             }
             None => {
-                let idx = self.items.len();
-                self.index_insert_at(&item, idx);
                 self.size_bytes += Self::estimate_item_size(&item);
                 self.item_count += 1;
-                self.items.0.push(item);
+                let key = self.encode_key(&item);
+                let id = self.items.push(item);
+                if let (Some(k), KeyIndex::Built { ids, .. }) = (key, &mut self.key_index) {
+                    ids.insert(k, id);
+                }
                 match &mut self.key_index {
                     KeyIndex::Built { rows, .. } | KeyIndex::Ambiguous { rows } => *rows += 1,
                     KeyIndex::Unbuilt => {}
                 }
-                (idx, false)
+                (id, false)
             }
         }
     }
@@ -778,31 +854,23 @@ impl DynamoTable {
         key: &HashMap<String, AttributeValue>,
     ) -> Option<HashMap<String, AttributeValue>> {
         self.ensure_key_index();
-        let idx = self.find_item_index(key)?;
-        Some(self.remove_item_at(idx))
+        let id = self.find_item_index(key)?;
+        Some(self.remove_item_at(id))
     }
 
-    /// Remove the item at `idx`, keeping `key_index` and the cached stats in
-    /// step. For callers that already located the row by position (a PartiQL
-    /// `WHERE` sweep, say) rather than by key.
+    /// Remove the row `id`, keeping `key_index` and the cached stats in step.
+    /// For callers that already located the row by id (a PartiQL `WHERE`
+    /// sweep, say) rather than by key.
     ///
-    /// Panics if `idx` is out of bounds, like the `Vec::remove` it wraps.
-    pub fn remove_item_at(&mut self, idx: usize) -> HashMap<String, AttributeValue> {
-        let removed = self.items.0.remove(idx);
-        self.index_remove(&removed);
-        // `Vec::remove` shifts every later element down one, so their recorded
-        // positions are now stale. Repair just those rather than rebuilding the
-        // whole index.
+    /// Touches only this row: every other row keeps its id, so ids collected
+    /// before a sweep of removals all stay valid (#2504).
+    ///
+    /// Panics if no row has this id.
+    pub fn remove_item_at(&mut self, id: ItemId) -> HashMap<String, AttributeValue> {
+        let removed = self.items.remove(id).expect("remove_item_at: no such row");
+        self.index_remove(&removed, id);
         match &mut self.key_index {
-            KeyIndex::Built { positions, rows } => {
-                for pos in positions.values_mut() {
-                    if *pos > idx {
-                        *pos -= 1;
-                    }
-                }
-                *rows -= 1;
-            }
-            KeyIndex::Ambiguous { rows } => *rows -= 1,
+            KeyIndex::Built { rows, .. } | KeyIndex::Ambiguous { rows } => *rows -= 1,
             KeyIndex::Unbuilt => {}
         }
         self.size_bytes -= Self::estimate_item_size(&removed);
@@ -810,7 +878,7 @@ impl DynamoTable {
         removed
     }
 
-    /// Mutate the item at `idx` in place, keeping the cached size and the key
+    /// Mutate the row `id` in place, keeping the cached size and the key
     /// index in step.
     ///
     /// All or nothing: an UpdateExpression is applied clause by clause, so
@@ -819,42 +887,43 @@ impl DynamoTable {
     /// rejected UpdateItem does on AWS. That costs a copy of the row, so a
     /// mutation that cannot fail should use [`Self::mutate_item_at`].
     ///
-    /// Panics if `idx` is out of bounds.
+    /// Panics if no row has this id.
     pub fn update_item_at<E>(
         &mut self,
-        idx: usize,
+        id: ItemId,
         f: impl FnOnce(&mut HashMap<String, AttributeValue>) -> Result<(), E>,
     ) -> Result<(), E> {
-        let before = self.snapshot_item_at(idx);
-        let original = self.items.0[idx].clone();
-        match f(&mut self.items.0[idx]) {
+        let before = self.snapshot_item_at(id);
+        let row = self.items.get_mut(id).expect("update_item_at: no such row");
+        let original = row.clone();
+        match f(row) {
             Ok(()) => {
-                self.sync_item_at(idx, before);
+                self.sync_item_at(id, before);
                 Ok(())
             }
             Err(err) => {
                 // Restoring the original leaves the size and the indexed key
                 // exactly as `before` recorded them, so there is nothing to
                 // settle.
-                self.items.0[idx] = original;
+                *row = original;
                 Err(err)
             }
         }
     }
 
-    /// Mutate the item at `idx` in place with a mutation that cannot fail,
+    /// Mutate the row `id` in place with a mutation that cannot fail,
     /// keeping the cached size and the key index in step. Same as
     /// [`Self::update_item_at`] without the copy taken for the rollback.
     ///
-    /// Panics if `idx` is out of bounds.
+    /// Panics if no row has this id.
     pub fn mutate_item_at(
         &mut self,
-        idx: usize,
+        id: ItemId,
         f: impl FnOnce(&mut HashMap<String, AttributeValue>),
     ) {
-        let before = self.snapshot_item_at(idx);
-        f(&mut self.items.0[idx]);
-        self.sync_item_at(idx, before);
+        let before = self.snapshot_item_at(id);
+        f(self.items.get_mut(id).expect("mutate_item_at: no such row"));
+        self.sync_item_at(id, before);
     }
 
     /// Replace every row at once, then re-derive the stats and the key index
@@ -866,35 +935,30 @@ impl DynamoTable {
     }
 
     /// Remove every row `remove` selects, preserving the order of the rest,
-    /// and return the removed rows in their storage order. The stats and the
-    /// key index are re-derived only when something was actually removed --
-    /// the rows that stay keep their positions, so an empty sweep (the common
-    /// case for the TTL pass) leaves the index alone.
+    /// and return the removed rows in their storage order. One pass to select,
+    /// then each removal touches only its own row, so the survivors keep their
+    /// ids and the index and stats are settled incrementally.
     pub fn remove_items_where(
         &mut self,
         mut remove: impl FnMut(&HashMap<String, AttributeValue>) -> bool,
     ) -> Vec<HashMap<String, AttributeValue>> {
-        let mut removed = Vec::new();
-        let mut kept = Vec::with_capacity(self.items.len());
-        for item in std::mem::take(&mut self.items.0) {
-            if remove(&item) {
-                removed.push(item);
-            } else {
-                kept.push(item);
-            }
-        }
-        self.items = TableItems::new(kept);
-        if !removed.is_empty() {
-            self.recalculate_stats();
-        }
-        removed
+        let doomed: Vec<ItemId> = self
+            .items
+            .iter_with_ids()
+            .filter(|(_, item)| remove(item))
+            .map(|(id, _)| id)
+            .collect();
+        doomed
+            .into_iter()
+            .map(|id| self.remove_item_at(id))
+            .collect()
     }
 
-    /// What the item at `idx` contributed before an in-place mutation: its
-    /// size, and the key it was indexed under. Pair with
-    /// [`Self::sync_item_at`] around the mutation.
-    fn snapshot_item_at(&self, idx: usize) -> ItemSlot {
-        match self.items.get(idx) {
+    /// What the row `id` contributed before an in-place mutation: its size,
+    /// and the key it was indexed under. Pair with [`Self::sync_item_at`]
+    /// around the mutation.
+    fn snapshot_item_at(&self, id: ItemId) -> ItemSlot {
+        match self.items.get(id) {
             Some(item) => ItemSlot {
                 size: Self::estimate_item_size(item),
                 key: self.encode_key(item),
@@ -903,7 +967,7 @@ impl DynamoTable {
         }
     }
 
-    /// Settle the cached size and the key index after the item at `idx` was
+    /// Settle the cached size and the key index after the row `id` was
     /// mutated in place.
     ///
     /// An UpdateExpression can rewrite a primary-key attribute — real AWS
@@ -911,10 +975,10 @@ impl DynamoTable {
     /// key. Re-pointing the index here keeps it in step with `items`, matching
     /// what the linear scan would have answered; without it a later write
     /// would overwrite or delete the wrong row.
-    fn sync_item_at(&mut self, idx: usize, before: ItemSlot) {
+    fn sync_item_at(&mut self, id: ItemId, before: ItemSlot) {
         let Some((size_after, key_after)) = self
             .items
-            .get(idx)
+            .get(id)
             .map(|item| (Self::estimate_item_size(item), self.encode_key(item)))
         else {
             return;
@@ -923,16 +987,16 @@ impl DynamoTable {
         if key_after == before.key {
             return;
         }
-        if let KeyIndex::Built { positions, rows } = &mut self.key_index {
+        if let KeyIndex::Built { ids, rows } = &mut self.key_index {
             let rows = *rows;
             if let Some(old) = &before.key {
-                positions.remove(old);
+                ids.remove(old);
             }
             // A rewritten key that lands on another row leaves two rows under
-            // one key, which no position map can resolve the way the scan
+            // one key, which no key -> id map can resolve the way the scan
             // does; fall back to the scan for this table.
             if let Some(new_key) = key_after {
-                if positions.insert(new_key, idx).is_some() {
+                if ids.insert(new_key, id).is_some() {
                     self.key_index = KeyIndex::Ambiguous { rows };
                 }
             }
@@ -1271,7 +1335,7 @@ mod tests {
 
         let mut lookup = HashMap::new();
         lookup.insert("pk".to_string(), json!({"N": "1"}));
-        assert_eq!(t.find_item_index(&lookup), Some(0));
+        assert_eq!(t.find_item_index(&lookup), Some(ItemId(0)));
 
         // A different number still misses.
         let mut other = HashMap::new();
@@ -1421,9 +1485,9 @@ mod tests {
             t.put_item_at_key(mk(pk, sk));
         }
         assert_eq!(t.items.len(), 3);
-        assert_eq!(t.find_item_index(&mk("a", "b")), Some(0));
-        assert_eq!(t.find_item_index(&mk("a", "c")), Some(1));
-        assert_eq!(t.find_item_index(&mk("ab", "")), Some(2));
+        assert_eq!(t.find_item_index(&mk("a", "b")), Some(ItemId(0)));
+        assert_eq!(t.find_item_index(&mk("a", "c")), Some(ItemId(1)));
+        assert_eq!(t.find_item_index(&mk("ab", "")), Some(ItemId(2)));
         assert_eq!(t.find_item_index(&mk("a", "z")), None);
     }
 
@@ -1441,8 +1505,7 @@ mod tests {
         for i in 0..50 {
             t.put_item_at_key(mk(&format!("k{i}"), "xxxxx"));
         }
-        // Overwrite with a different size, and delete from the middle so the
-        // index has to repair the shifted positions.
+        // Overwrite with a different size, and delete from the middle.
         for i in (0..50).step_by(3) {
             t.put_item_at_key(mk(&format!("k{i}"), "yy"));
         }
@@ -1455,10 +1518,10 @@ mod tests {
         assert_eq!(inc_count, t.item_count, "item_count drifted");
         assert_eq!(inc_size, t.size_bytes, "size_bytes drifted");
 
-        // Every surviving row is still addressable at its true position.
-        for (i, item) in t.items.clone().iter().enumerate() {
-            assert_eq!(t.find_item_index(item), Some(i));
-            assert_eq!(t.find_item_index_scan(item), Some(i));
+        // Every surviving row is still addressable under its own id.
+        for (id, item) in t.items.clone().iter_with_ids() {
+            assert_eq!(t.find_item_index(item), Some(id));
+            assert_eq!(t.find_item_index_scan(item), Some(id));
         }
     }
 
@@ -1484,7 +1547,7 @@ mod tests {
         );
 
         // Read path works via the scan fallback...
-        assert_eq!(restored.find_item_index(&mk("k3")), Some(3));
+        assert_eq!(restored.find_item_index(&mk("k3")), Some(ItemId(3)));
         // ...and the write path repairs the index instead of duplicating.
         restored.put_item_at_key(mk("k3"));
         assert_eq!(
@@ -1496,11 +1559,11 @@ mod tests {
             matches!(restored.key_index, KeyIndex::Built { .. }),
             "index was not rebuilt"
         );
-        assert_eq!(restored.find_item_index(&mk("k3")), Some(3));
+        assert_eq!(restored.find_item_index(&mk("k3")), Some(ItemId(3)));
     }
 
-    /// A table holding two rows under one key cannot be answered by a position
-    /// map: once the first is removed the second has to surface, which is what
+    /// A table holding two rows under one key cannot be answered by a
+    /// key -> row map: once the first is removed the second has to surface, which is what
     /// the linear scan did. Such a table must fall back to the scan *and* stay
     /// fallen back, rather than paying a full rebuild on every write — the
     /// cost #2502 is about.
@@ -1517,13 +1580,13 @@ mod tests {
         t.replace_items(vec![mk("dup"), mk("dup"), mk("other")]);
         assert!(matches!(t.key_index, KeyIndex::Ambiguous { .. }));
 
-        assert_eq!(t.find_item_index(&mk("dup")), Some(0));
-        assert_eq!(t.find_item_index(&mk("other")), Some(2));
+        assert_eq!(t.find_item_index(&mk("dup")), Some(ItemId(0)));
+        assert_eq!(t.find_item_index(&mk("other")), Some(ItemId(2)));
 
         // Removing the first duplicate must surface the second, exactly as the
         // scan does.
         t.remove_item_by_key(&mk("dup"));
-        assert_eq!(t.find_item_index(&mk("dup")), Some(0));
+        assert_eq!(t.find_item_index(&mk("dup")), Some(ItemId(1)));
         assert_eq!(
             t.find_item_index(&mk("dup")),
             t.find_item_index_scan(&mk("dup"))
@@ -1550,13 +1613,13 @@ mod tests {
         t.put_item_at_key(mk("before"));
         t.put_item_at_key(mk("bystander"));
 
-        let rewrite = t.update_item_at(0, |item| {
+        let rewrite = t.update_item_at(ItemId(0), |item| {
             item.insert("pk".to_string(), json!({"S": "after"}));
             Ok::<(), ()>(())
         });
         assert!(rewrite.is_ok());
 
-        assert_eq!(t.find_item_index(&mk("after")), Some(0));
+        assert_eq!(t.find_item_index(&mk("after")), Some(ItemId(0)));
         assert_eq!(t.find_item_index(&mk("before")), None);
         assert_eq!(
             t.find_item_index(&mk("before")),
@@ -1567,8 +1630,8 @@ mod tests {
         // than clobbering the renamed one.
         t.put_item_at_key(mk("before"));
         assert_eq!(t.items.len(), 3);
-        assert_eq!(t.find_item_index(&mk("after")), Some(0));
-        assert_eq!(t.find_item_index(&mk("before")), Some(2));
+        assert_eq!(t.find_item_index(&mk("after")), Some(ItemId(0)));
+        assert_eq!(t.find_item_index(&mk("before")), Some(ItemId(2)));
     }
 
     /// A key rewrite that lands on another row leaves two rows under one key,
@@ -1584,14 +1647,14 @@ mod tests {
         t.put_item_at_key(mk("a"));
         t.put_item_at_key(mk("b"));
 
-        let rewrite = t.update_item_at(1, |item| {
+        let rewrite = t.update_item_at(ItemId(1), |item| {
             item.insert("pk".to_string(), json!({"S": "a"}));
             Ok::<(), ()>(())
         });
         assert!(rewrite.is_ok());
 
         assert!(matches!(t.key_index, KeyIndex::Ambiguous { .. }));
-        assert_eq!(t.find_item_index(&mk("a")), Some(0));
+        assert_eq!(t.find_item_index(&mk("a")), Some(ItemId(0)));
         assert_eq!(
             t.find_item_index(&mk("a")),
             t.find_item_index_scan(&mk("a"))
@@ -1619,7 +1682,7 @@ mod tests {
     /// removing from the row vector, but the field itself can still be
     /// reassigned wholesale, which no borrow check catches. The recorded row
     /// count makes that detectable: the index must be rebuilt rather than
-    /// trusted, or a lookup answers with a position that no longer exists.
+    /// trusted, or a lookup answers with a row id that no longer exists.
     #[test]
     fn wholesale_reassignment_is_detected_not_trusted() {
         let mut t = table_with_hash_key("pk");
@@ -1631,21 +1694,21 @@ mod tests {
         for k in ["a", "b", "c"] {
             t.put_item_at_key(mk(k));
         }
-        assert_eq!(t.find_item_index(&mk("c")), Some(2));
+        assert_eq!(t.find_item_index(&mk("c")), Some(ItemId(2)));
 
         // Behind the index's back, as a future caller might.
         t.items = TableItems::new(vec![mk("c")]);
 
-        // The read path answers from the rows, not from a position that is
-        // now out of bounds...
-        assert_eq!(t.find_item_index(&mk("c")), Some(0));
+        // The read path answers from the rows, not from an id that no row
+        // carries any more...
+        assert_eq!(t.find_item_index(&mk("c")), Some(ItemId(0)));
         assert_eq!(t.find_item_index(&mk("a")), None);
         // ...and the write path repairs the index instead of panicking or
         // overwriting a row that is no longer there.
         t.put_item_at_key(mk("c"));
         assert_eq!(t.items.len(), 1, "the overwrite duplicated a row");
         t.put_item_at_key(mk("d"));
-        assert_eq!(t.find_item_index(&mk("d")), Some(1));
+        assert_eq!(t.find_item_index(&mk("d")), Some(ItemId(1)));
         assert_eq!(
             t.find_item_index(&mk("d")),
             t.find_item_index_scan(&mk("d"))
@@ -1662,7 +1725,7 @@ mod tests {
         item.insert("v".to_string(), json!({"S": "short"}));
         t.put_item_at_key(item);
 
-        let grow = t.update_item_at(0, |item| {
+        let grow = t.update_item_at(ItemId(0), |item| {
             item.insert("v".to_string(), json!({"S": "a much longer value"}));
             Ok::<(), ()>(())
         });
@@ -1671,5 +1734,178 @@ mod tests {
         let incremental = t.size_bytes;
         t.recalculate_stats();
         assert_eq!(incremental, t.size_bytes);
+    }
+
+    fn mk_pk(pk: &str) -> HashMap<String, AttributeValue> {
+        let mut m = HashMap::new();
+        m.insert("pk".to_string(), json!({ "S": pk }));
+        m
+    }
+
+    fn pks(t: &DynamoTable) -> Vec<String> {
+        t.items
+            .iter()
+            .map(|item| item["pk"]["S"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// #2504: a delete must touch only its own row. Every other row keeps its
+    /// id, and the index entries of the survivors are left exactly as they
+    /// were -- no repair pass over the rest of the table, which is what made
+    /// a bulk delete quadratic.
+    #[test]
+    fn delete_leaves_every_other_row_id_and_index_entry_alone() {
+        let mut t = table_with_hash_key("pk");
+        for i in 0..10 {
+            t.put_item_at_key(mk_pk(&format!("k{i}")));
+        }
+        let ids_before: Vec<(ItemId, HashMap<String, AttributeValue>)> = t
+            .items
+            .iter_with_ids()
+            .map(|(id, item)| (id, item.clone()))
+            .collect();
+        let KeyIndex::Built { ids, .. } = t.key_index.clone() else {
+            panic!("index should be built after writes");
+        };
+
+        let removed = t.remove_item_by_key(&mk_pk("k3")).unwrap();
+        assert_eq!(removed, mk_pk("k3"));
+
+        let KeyIndex::Built { ids: after, rows } = &t.key_index else {
+            panic!("a delete must not drop the index");
+        };
+        assert_eq!(*rows, 9);
+        assert_eq!(after.len(), ids.len() - 1);
+        for (id, item) in ids_before {
+            if item == mk_pk("k3") {
+                assert!(t.items.get(id).is_none());
+                continue;
+            }
+            assert_eq!(t.items.get(id), Some(&item), "row {id:?} moved");
+            let key = t.encode_key(&item).unwrap();
+            assert_eq!(after.get(&key), ids.get(&key));
+            assert_eq!(t.find_item_index(&item), Some(id));
+        }
+    }
+
+    /// Scan pagination resumes after `ExclusiveStartKey` in storage order, so
+    /// deletes must never reorder the rows that remain, and a new row always
+    /// lands after every existing one -- including after the table's first
+    /// rows were deleted. An overwrite keeps its row's place.
+    #[test]
+    fn storage_order_survives_deletes_inserts_and_overwrites() {
+        let mut t = table_with_hash_key("pk");
+        for k in ["a", "b", "c", "d", "e"] {
+            t.put_item_at_key(mk_pk(k));
+        }
+        t.remove_item_by_key(&mk_pk("a"));
+        t.remove_item_by_key(&mk_pk("c"));
+        assert_eq!(pks(&t), ["b", "d", "e"]);
+
+        t.put_item_at_key(mk_pk("a"));
+        t.put_item_at_key(mk_pk("f"));
+        assert_eq!(pks(&t), ["b", "d", "e", "a", "f"]);
+
+        let mut overwrite = mk_pk("d");
+        overwrite.insert("v".to_string(), json!({"S": "new"}));
+        let (_, replaced) = t.put_item_at_key(overwrite);
+        assert!(replaced);
+        assert_eq!(pks(&t), ["b", "d", "e", "a", "f"]);
+
+        // A snapshot writes the rows in storage order and a restore keeps it.
+        let json = serde_json::to_string(&t).unwrap();
+        let mut restored: DynamoTable = serde_json::from_str(&json).unwrap();
+        assert_eq!(pks(&restored), ["b", "d", "e", "a", "f"]);
+        restored.put_item_at_key(mk_pk("g"));
+        restored.remove_item_by_key(&mk_pk("b"));
+        assert_eq!(pks(&restored), ["d", "e", "a", "f", "g"]);
+    }
+
+    /// Ids collected up front (a PartiQL `DELETE ... WHERE` sweep) must all
+    /// stay valid while the rows they name are removed one by one, in any
+    /// order: with ids, only a back-to-front sweep was safe.
+    #[test]
+    fn ids_collected_before_a_removal_sweep_stay_valid() {
+        let mut t = table_with_hash_key("pk");
+        for i in 0..8 {
+            t.put_item_at_key(mk_pk(&format!("k{i}")));
+        }
+        let doomed: Vec<ItemId> = t
+            .items
+            .iter_with_ids()
+            .filter(|(_, item)| {
+                let n: usize = item["pk"]["S"].as_str().unwrap()[1..].parse().unwrap();
+                n.is_multiple_of(2)
+            })
+            .map(|(id, _)| id)
+            .collect();
+        for id in doomed {
+            let removed = t.remove_item_at(id);
+            let n: usize = removed["pk"]["S"].as_str().unwrap()[1..].parse().unwrap();
+            assert!(
+                n.is_multiple_of(2),
+                "front-to-back sweep removed the wrong row"
+            );
+        }
+        assert_eq!(pks(&t), ["k1", "k3", "k5", "k7"]);
+        let (inc_count, inc_size) = (t.item_count, t.size_bytes);
+        t.recalculate_stats();
+        assert_eq!((inc_count, inc_size), (t.item_count, t.size_bytes));
+    }
+
+    /// The TTL sweep removes rows through `remove_items_where`. It must hand
+    /// back the removed rows in storage order and keep the index built and in
+    /// step, instead of rebuilding it from scratch.
+    #[test]
+    fn remove_items_where_settles_index_and_stats_incrementally() {
+        let mut t = table_with_hash_key("pk");
+        for k in ["a", "b", "c", "d"] {
+            t.put_item_at_key(mk_pk(k));
+        }
+        let survivor_ids: Vec<ItemId> = ["a", "c"]
+            .iter()
+            .map(|k| t.find_item_index(&mk_pk(k)).unwrap())
+            .collect();
+
+        let removed =
+            t.remove_items_where(|item| matches!(item["pk"]["S"].as_str(), Some("b") | Some("d")));
+        assert_eq!(removed, vec![mk_pk("b"), mk_pk("d")]);
+        assert_eq!(pks(&t), ["a", "c"]);
+        assert!(matches!(t.key_index, KeyIndex::Built { rows: 2, .. }));
+        assert_eq!(t.find_item_index(&mk_pk("a")), Some(survivor_ids[0]));
+        assert_eq!(t.find_item_index(&mk_pk("c")), Some(survivor_ids[1]));
+        assert_eq!(t.find_item_index(&mk_pk("b")), None);
+        let (inc_count, inc_size) = (t.item_count, t.size_bytes);
+        t.recalculate_stats();
+        assert_eq!((inc_count, inc_size), (t.item_count, t.size_bytes));
+    }
+
+    /// Delete every row in a scrambled order, checking after each one that the
+    /// index still agrees with the scan for every key ever written.
+    #[test]
+    fn index_agrees_with_scan_through_a_full_scrambled_delete() {
+        let mut t = table_with_hash_key("pk");
+        let n = 64;
+        for i in 0..n {
+            t.put_item_at_key(mk_pk(&format!("k{i}")));
+        }
+        for step in 0..n {
+            // 37 is coprime with 64, so this visits every key exactly once.
+            let victim = (step * 37) % n;
+            assert!(t
+                .remove_item_by_key(&mk_pk(&format!("k{victim}")))
+                .is_some());
+            for i in 0..n {
+                let probe = mk_pk(&format!("k{i}"));
+                assert_eq!(
+                    t.find_item_index(&probe),
+                    t.find_item_index_scan(&probe),
+                    "disagree on k{i} after {} deletes",
+                    step + 1
+                );
+            }
+        }
+        assert!(t.items.is_empty());
+        assert_eq!((t.item_count, t.size_bytes), (0, 0));
     }
 }
