@@ -36,7 +36,7 @@ fn rand_id() -> String {
     format!("{nanos:x}-{seq:x}")
 }
 
-fn xml_response(action: &str, inner: String, request_id: &str) -> AwsResponse {
+pub(crate) fn xml_response(action: &str, inner: String, request_id: &str) -> AwsResponse {
     let body = format!(
         r#"<{action}Response xmlns="{NS}">
   <{action}Result>
@@ -54,7 +54,7 @@ fn xml_response(action: &str, inner: String, request_id: &str) -> AwsResponse {
     AwsResponse::xml(StatusCode::OK, body)
 }
 
-fn xml_response_no_result(action: &str, request_id: &str) -> AwsResponse {
+pub(crate) fn xml_response_no_result(action: &str, request_id: &str) -> AwsResponse {
     let body = format!(
         r#"<{action}Response xmlns="{NS}">
   <ResponseMetadata>
@@ -454,30 +454,15 @@ impl CloudFormationService {
             }
         }
         if let Some(name) = params.get("StackSetName") {
-            let accounts = self.state.read();
-            // Existence and body are separate questions: a stack set whose
-            // record carries no `TemplateBody` still EXISTS, and conflating
-            // the two reported it as missing. AWS accepts the stack set's id
+            // Existence and body are separate questions: a stack set with an
+            // empty template still EXISTS. AWS accepts the stack set's id
             // (`{name}:{suffix}`) as well as its name.
-            let entry = accounts.get(account_id).and_then(|st| {
-                st.extras.get("stack_sets").and_then(|sets| {
-                    sets.get(name).or_else(|| {
-                        sets.iter()
-                            .find(|(_, set)| {
-                                set.get("StackSetId").and_then(|v| v.as_str())
-                                    == Some(name.as_str())
-                            })
-                            .map(|(_, set)| set)
-                    })
-                })
-            });
-            let found = entry.map(|set| {
-                set.get("TemplateBody")
-                    .and_then(|b| b.as_str())
-                    .unwrap_or_default()
-                    .to_string()
-            });
-            drop(accounts);
+            let found = self
+                .state
+                .read()
+                .get(account_id)
+                .and_then(|st| crate::stack_sets::find_active(st, name))
+                .map(|set| set.template_body.clone());
             return match found {
                 Some(body) => Ok(body),
                 // Unlike `ValidationError`, this one IS declared on
@@ -503,7 +488,7 @@ impl CloudFormationService {
     /// error for an unusable URL, and the conformance probe sends
     /// `TemplateURL="t"` -- which `looks_like_url` rejects before any fetch is
     /// attempted -- so this stays lenient by design.
-    fn stack_set_template_body(
+    pub(crate) fn stack_set_template_body(
         &self,
         account_id: &str,
         params: &BTreeMap<String, String>,
@@ -565,6 +550,77 @@ impl CloudFormationService {
         };
         let bytes = state.read_body(&body_ref).ok()?;
         String::from_utf8(bytes.to_vec()).ok()
+    }
+
+    /// Whether a stack resource's physical resource still exists in its
+    /// backing service. `None` for resource types drift detection does not
+    /// check.
+    pub(crate) fn resource_exists(
+        &self,
+        account_id: &str,
+        resource: &StackResource,
+    ) -> Option<bool> {
+        let aid = account_id;
+        let exists = match resource.resource_type.as_str() {
+            "AWS::SQS::Queue" => self
+                .deps
+                .sqs
+                .read()
+                .get(aid)
+                .map(|s| s.queues.contains_key(&resource.physical_id))
+                .unwrap_or(false),
+            "AWS::SNS::Topic" => self
+                .deps
+                .sns
+                .read()
+                .get(aid)
+                .map(|s| s.topics.contains_key(&resource.physical_id))
+                .unwrap_or(false),
+            "AWS::S3::Bucket" => self
+                .deps
+                .s3
+                .read()
+                .get(aid)
+                .map(|s| s.buckets.contains_key(&resource.physical_id))
+                .unwrap_or(false),
+            "AWS::Lambda::Function" => self
+                .deps
+                .lambda
+                .read()
+                .get(aid)
+                .map(|s| s.functions.contains_key(&resource.physical_id))
+                .unwrap_or(false),
+            "AWS::IAM::Role" => self
+                .deps
+                .iam
+                .read()
+                .get(aid)
+                .map(|s| s.roles.contains_key(&resource.physical_id))
+                .unwrap_or(false),
+            "AWS::DynamoDB::Table" => self
+                .deps
+                .dynamodb
+                .read()
+                .get(aid)
+                .map(|s| s.tables.values().any(|t| t.arn == resource.physical_id))
+                .unwrap_or(false),
+            "AWS::KMS::Key" => self
+                .deps
+                .kms
+                .read()
+                .get(aid)
+                .map(|s| s.keys.contains_key(&resource.physical_id))
+                .unwrap_or(false),
+            "AWS::SecretsManager::Secret" => self
+                .deps
+                .secretsmanager
+                .read()
+                .get(aid)
+                .map(|s| s.secrets.contains_key(&resource.physical_id))
+                .unwrap_or(false),
+            _ => return None,
+        };
+        Some(exists)
     }
 
     pub(crate) fn handle_extra_action(
@@ -1518,269 +1574,6 @@ impl CloudFormationService {
                 Ok(xml_response("ListChangeSets", inner, &rid))
             }
 
-            // ── Stack sets ──
-            "CreateStackSet" => {
-                let name = params
-                    .get("StackSetName")
-                    .ok_or_else(|| missing("StackSetName"))?
-                    .clone();
-                let id = format!("{name}:{}", rand_id());
-                // Resolve a TemplateURL too. Storing only the inline body left
-                // every URL-created stack set with an empty template, so
-                // `get-template-summary --stack-set-name` reported a
-                // confidently empty summary -- the false green light this
-                // work exists to remove. A fetch that fails still stores the
-                // empty body rather than erroring: CreateStackSet declares no
-                // error for it, and the probe's `"t"` is not a URL shape.
-                let template_body = self
-                    .stack_set_template_body(&aid, &params)
-                    .map_err(|reason| {
-                        AwsServiceError::aws_error(
-                            StatusCode::BAD_REQUEST,
-                            "ValidationError",
-                            reason,
-                        )
-                    })?
-                    .unwrap_or_default();
-                let entry = json!({
-                    "StackSetId": id,
-                    "StackSetName": name,
-                    "Status": "ACTIVE",
-                    "TemplateBody": template_body,
-                });
-                let mut accounts = self.state.write();
-                let state = accounts.get_or_create(&aid);
-                store(&mut state.extras, "stack_sets").insert(name.clone(), entry);
-                Ok(xml_response(
-                    "CreateStackSet",
-                    format!("    <StackSetId>{}</StackSetId>", xml_escape(&id)),
-                    &rid,
-                ))
-            }
-            "DescribeStackSet" => {
-                let name = params
-                    .get("StackSetName")
-                    .ok_or_else(|| missing("StackSetName"))?
-                    .clone();
-                let accounts = self.state.read();
-                let entry = accounts
-                    .get(&aid)
-                    .and_then(|s| s.extras.get("stack_sets"))
-                    .and_then(|m| m.get(&name))
-                    .cloned()
-                    .unwrap_or_else(|| json!({"StackSetName": name.clone(), "Status": "ACTIVE"}));
-                let inner = format!(
-                    "    <StackSet>\n      <StackSetName>{}</StackSetName>\n      <StackSetId>{}</StackSetId>\n      <Status>{}</Status>\n    </StackSet>",
-                    xml_escape(entry["StackSetName"].as_str().unwrap_or(&name)),
-                    xml_escape(entry["StackSetId"].as_str().unwrap_or("")),
-                    xml_escape(entry["Status"].as_str().unwrap_or("ACTIVE")),
-                );
-                Ok(xml_response("DescribeStackSet", inner, &rid))
-            }
-            "ListStackSets" => {
-                let accounts = self.state.read();
-                let items: Vec<Value> = accounts
-                    .get(&aid)
-                    .and_then(|s| s.extras.get("stack_sets"))
-                    .map(|m| m.values().cloned().collect())
-                    .unwrap_or_default();
-                let inner = format!(
-                    "    <Summaries>\n{}\n    </Summaries>",
-                    members_xml(&items, |v| {
-                        format!(
-                        "        <StackSetName>{}</StackSetName>\n        <StackSetId>{}</StackSetId>\n        <Status>{}</Status>",
-                        xml_escape(v["StackSetName"].as_str().unwrap_or("")),
-                        xml_escape(v["StackSetId"].as_str().unwrap_or("")),
-                        xml_escape(v["Status"].as_str().unwrap_or("ACTIVE")),
-                    )
-                    }),
-                );
-                Ok(xml_response("ListStackSets", inner, &rid))
-            }
-            "UpdateStackSet" => {
-                require_scalar(&params, "StackSetName")?;
-                // Persist the new template. Answering with an OperationId and
-                // storing nothing meant a stack set updated to a new template
-                // kept summarizing the ORIGINAL one forever -- stale is worse
-                // than empty, because it looks right.
-                //
-                // `UsePreviousTemplate` (and supplying neither body nor URL)
-                // keeps what is stored, which is what the parameter means.
-                let updated = self
-                    .stack_set_template_body(&aid, &params)
-                    .map_err(|reason| {
-                        AwsServiceError::aws_error(
-                            StatusCode::BAD_REQUEST,
-                            "ValidationError",
-                            reason,
-                        )
-                    })?;
-                let wanted = params.get("StackSetName").cloned().unwrap_or_default();
-                {
-                    let mut accounts = self.state.write();
-                    let state = accounts.get_or_create(&aid);
-                    let sets = store(&mut state.extras, "stack_sets");
-                    // Records are keyed by NAME, but a stack set is equally
-                    // addressable by its id -- and an update by id that
-                    // matched nothing succeeded while leaving the old template
-                    // in place, which reads as a working update.
-                    let key = sets
-                        .iter()
-                        .find(|(name, entry)| {
-                            **name == wanted
-                                || entry["StackSetId"].as_str() == Some(wanted.as_str())
-                        })
-                        .map(|(name, _)| name.clone());
-                    // Updating a stack set that does not exist is not a
-                    // success. Answering with an OperationId for a name that
-                    // matches nothing is the same false green light as a
-                    // summary of a template we never stored.
-                    // `StackSetNotFoundException` IS declared on
-                    // UpdateStackSet, so reporting it stays conformant.
-                    let Some(key) = key else {
-                        return Err(AwsServiceError::aws_error(
-                            StatusCode::BAD_REQUEST,
-                            "StackSetNotFoundException",
-                            format!("StackSet {wanted} not found"),
-                        ));
-                    };
-                    if let (Some(updated), Some(entry)) = (updated, sets.get_mut(&key)) {
-                        entry["TemplateBody"] = json!(updated);
-                    }
-                }
-                let op_id = rand_id();
-                Ok(xml_response(
-                    "UpdateStackSet",
-                    format!("    <OperationId>{}</OperationId>", xml_escape(&op_id)),
-                    &rid,
-                ))
-            }
-            "DeleteStackSet" => {
-                let name = params
-                    .get("StackSetName")
-                    .ok_or_else(|| missing("StackSetName"))?
-                    .clone();
-                let mut accounts = self.state.write();
-                let state = accounts.get_or_create(&aid);
-                if let Some(m) = state.extras.get_mut("stack_sets") {
-                    m.remove(&name);
-                }
-                Ok(xml_response("DeleteStackSet", String::new(), &rid))
-            }
-            "DescribeStackSetOperation" => {
-                require_scalar(&params, "StackSetName")?;
-                require_scalar(&params, "OperationId")?;
-                let op_id = params.get("OperationId").cloned().unwrap_or_else(rand_id);
-                let inner = format!(
-                    "    <StackSetOperation>\n      <OperationId>{}</OperationId>\n      <Status>SUCCEEDED</Status>\n    </StackSetOperation>",
-                    xml_escape(&op_id),
-                );
-                Ok(xml_response("DescribeStackSetOperation", inner, &rid))
-            }
-            "ListStackSetOperations" => {
-                require_scalar(&params, "StackSetName")?;
-                Ok(xml_response(
-                    "ListStackSetOperations",
-                    "    <Summaries/>".to_string(),
-                    &rid,
-                ))
-            }
-            "ListStackSetOperationResults" => {
-                require_scalar(&params, "StackSetName")?;
-                require_scalar(&params, "OperationId")?;
-                Ok(xml_response(
-                    "ListStackSetOperationResults",
-                    "    <Summaries/>".to_string(),
-                    &rid,
-                ))
-            }
-            "ListStackSetAutoDeploymentTargets" => {
-                require_scalar(&params, "StackSetName")?;
-                Ok(xml_response(
-                    "ListStackSetAutoDeploymentTargets",
-                    "    <Summaries/>".to_string(),
-                    &rid,
-                ))
-            }
-            "StopStackSetOperation" => {
-                require_scalar(&params, "StackSetName")?;
-                require_scalar(&params, "OperationId")?;
-                Ok(xml_response("StopStackSetOperation", String::new(), &rid))
-            }
-            "ImportStacksToStackSet" => {
-                require_scalar(&params, "StackSetName")?;
-                let op_id = rand_id();
-                Ok(xml_response(
-                    "ImportStacksToStackSet",
-                    format!("    <OperationId>{}</OperationId>", xml_escape(&op_id)),
-                    &rid,
-                ))
-            }
-
-            // ── Stack instances ──
-            // The `Regions` list is `@required` in Smithy, but the Smithy
-            // `errors` list on these ops doesn't include `ValidationError`,
-            // so a missing-collection rejection would surface as an
-            // undeclared error to conformance. Accept an empty list and
-            // return a synthetic OperationId — real callers always supply
-            // regions and still get a valid response.
-            "CreateStackInstances" => {
-                require_scalar(&params, "StackSetName")?;
-                let op_id = rand_id();
-                Ok(xml_response(
-                    "CreateStackInstances",
-                    format!("    <OperationId>{}</OperationId>", xml_escape(&op_id)),
-                    &rid,
-                ))
-            }
-            "UpdateStackInstances" => {
-                require_scalar(&params, "StackSetName")?;
-                let op_id = rand_id();
-                Ok(xml_response(
-                    "UpdateStackInstances",
-                    format!("    <OperationId>{}</OperationId>", xml_escape(&op_id)),
-                    &rid,
-                ))
-            }
-            "DeleteStackInstances" => {
-                require_scalar(&params, "StackSetName")?;
-                require_scalar(&params, "RetainStacks")?;
-                let op_id = rand_id();
-                Ok(xml_response(
-                    "DeleteStackInstances",
-                    format!("    <OperationId>{}</OperationId>", xml_escape(&op_id)),
-                    &rid,
-                ))
-            }
-            "DescribeStackInstance" => {
-                require_scalar(&params, "StackSetName")?;
-                require_scalar(&params, "StackInstanceAccount")?;
-                require_scalar(&params, "StackInstanceRegion")?;
-                let inner =
-                    "    <StackInstance>\n      <Status>CURRENT</Status>\n    </StackInstance>"
-                        .to_string();
-                Ok(xml_response("DescribeStackInstance", inner, &rid))
-            }
-            "ListStackInstances" => {
-                require_scalar(&params, "StackSetName")?;
-                Ok(xml_response(
-                    "ListStackInstances",
-                    "    <Summaries/>".to_string(),
-                    &rid,
-                ))
-            }
-            "ListStackInstanceResourceDrifts" => {
-                require_scalar(&params, "StackSetName")?;
-                require_scalar(&params, "StackInstanceAccount")?;
-                require_scalar(&params, "StackInstanceRegion")?;
-                require_scalar(&params, "OperationId")?;
-                Ok(xml_response(
-                    "ListStackInstanceResourceDrifts",
-                    "    <Summaries/>".to_string(),
-                    &rid,
-                ))
-            }
-
             // ── Stack refactors ──
             "CreateStackRefactor" => {
                 require_collection(&params, "StackDefinitions")?;
@@ -2185,65 +1978,7 @@ impl CloudFormationService {
                 let mut drifted_resources: Vec<Value> = Vec::new();
 
                 for resource in &resources {
-                    let exists = match resource.resource_type.as_str() {
-                        "AWS::SQS::Queue" => self
-                            .deps
-                            .sqs
-                            .read()
-                            .get(&aid)
-                            .map(|s| s.queues.contains_key(&resource.physical_id))
-                            .unwrap_or(false),
-                        "AWS::SNS::Topic" => self
-                            .deps
-                            .sns
-                            .read()
-                            .get(&aid)
-                            .map(|s| s.topics.contains_key(&resource.physical_id))
-                            .unwrap_or(false),
-                        "AWS::S3::Bucket" => self
-                            .deps
-                            .s3
-                            .read()
-                            .get(&aid)
-                            .map(|s| s.buckets.contains_key(&resource.physical_id))
-                            .unwrap_or(false),
-                        "AWS::Lambda::Function" => self
-                            .deps
-                            .lambda
-                            .read()
-                            .get(&aid)
-                            .map(|s| s.functions.contains_key(&resource.physical_id))
-                            .unwrap_or(false),
-                        "AWS::IAM::Role" => self
-                            .deps
-                            .iam
-                            .read()
-                            .get(&aid)
-                            .map(|s| s.roles.contains_key(&resource.physical_id))
-                            .unwrap_or(false),
-                        "AWS::DynamoDB::Table" => self
-                            .deps
-                            .dynamodb
-                            .read()
-                            .get(&aid)
-                            .map(|s| s.tables.values().any(|t| t.arn == resource.physical_id))
-                            .unwrap_or(false),
-                        "AWS::KMS::Key" => self
-                            .deps
-                            .kms
-                            .read()
-                            .get(&aid)
-                            .map(|s| s.keys.contains_key(&resource.physical_id))
-                            .unwrap_or(false),
-                        "AWS::SecretsManager::Secret" => self
-                            .deps
-                            .secretsmanager
-                            .read()
-                            .get(&aid)
-                            .map(|s| s.secrets.contains_key(&resource.physical_id))
-                            .unwrap_or(false),
-                        _ => true, // NOT_CHECKED — assume exists
-                    };
+                    let exists = self.resource_exists(&aid, resource).unwrap_or(true);
                     if !exists {
                         drifted_resources.push(json!({
                             "LogicalResourceId": resource.logical_id,
@@ -2304,65 +2039,7 @@ impl CloudFormationService {
                     })
                     .and_then(|stack| stack.resources.iter().find(|r| r.logical_id == logical))
                     .map(|resource| {
-                        let exists = match resource.resource_type.as_str() {
-                            "AWS::SQS::Queue" => self
-                                .deps
-                                .sqs
-                                .read()
-                                .get(&aid)
-                                .map(|s| s.queues.contains_key(&resource.physical_id))
-                                .unwrap_or(false),
-                            "AWS::SNS::Topic" => self
-                                .deps
-                                .sns
-                                .read()
-                                .get(&aid)
-                                .map(|s| s.topics.contains_key(&resource.physical_id))
-                                .unwrap_or(false),
-                            "AWS::S3::Bucket" => self
-                                .deps
-                                .s3
-                                .read()
-                                .get(&aid)
-                                .map(|s| s.buckets.contains_key(&resource.physical_id))
-                                .unwrap_or(false),
-                            "AWS::Lambda::Function" => self
-                                .deps
-                                .lambda
-                                .read()
-                                .get(&aid)
-                                .map(|s| s.functions.contains_key(&resource.physical_id))
-                                .unwrap_or(false),
-                            "AWS::IAM::Role" => self
-                                .deps
-                                .iam
-                                .read()
-                                .get(&aid)
-                                .map(|s| s.roles.contains_key(&resource.physical_id))
-                                .unwrap_or(false),
-                            "AWS::DynamoDB::Table" => self
-                                .deps
-                                .dynamodb
-                                .read()
-                                .get(&aid)
-                                .map(|s| s.tables.values().any(|t| t.arn == resource.physical_id))
-                                .unwrap_or(false),
-                            "AWS::KMS::Key" => self
-                                .deps
-                                .kms
-                                .read()
-                                .get(&aid)
-                                .map(|s| s.keys.contains_key(&resource.physical_id))
-                                .unwrap_or(false),
-                            "AWS::SecretsManager::Secret" => self
-                                .deps
-                                .secretsmanager
-                                .read()
-                                .get(&aid)
-                                .map(|s| s.secrets.contains_key(&resource.physical_id))
-                                .unwrap_or(false),
-                            _ => true,
-                        };
+                        let exists = self.resource_exists(&aid, resource).unwrap_or(true);
                         if exists {
                             "IN_SYNC"
                         } else {
@@ -2377,15 +2054,6 @@ impl CloudFormationService {
                     xml_escape(resource_drift),
                 );
                 Ok(xml_response("DetectStackResourceDrift", inner, &rid))
-            }
-            "DetectStackSetDrift" => {
-                require_scalar(&params, "StackSetName")?;
-                let op_id = rand_id();
-                Ok(xml_response(
-                    "DetectStackSetDrift",
-                    format!("    <OperationId>{}</OperationId>", xml_escape(&op_id)),
-                    &rid,
-                ))
             }
             "DescribeStackDriftDetectionStatus" => {
                 let id = params
@@ -2940,13 +2608,13 @@ impl CloudFormationService {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{looks_like_url, parse_s3_url};
     use crate::service::{CloudFormationDeps, CloudFormationService};
     use crate::state::{CloudFormationState, SharedCloudFormationState};
     use fakecloud_core::delivery::DeliveryBus;
     use fakecloud_core::multi_account::MultiAccountState;
-    use fakecloud_core::service::AwsRequest;
+    use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
     use http::Method;
     use parking_lot::RwLock;
     use std::collections::HashMap;
@@ -3222,7 +2890,7 @@ mod tests {
         }
     }
 
-    fn deps() -> CloudFormationDeps {
+    pub(crate) fn deps() -> CloudFormationDeps {
         use fakecloud_dynamodb::DynamoDbState;
         use fakecloud_ecr::EcrState;
         use fakecloud_eventbridge::EventBridgeState;
@@ -3336,7 +3004,7 @@ mod tests {
         }
     }
 
-    fn svc() -> CloudFormationService {
+    pub(crate) fn svc() -> CloudFormationService {
         let state: SharedCloudFormationState =
             Arc::new(RwLock::new(MultiAccountState::<CloudFormationState>::new(
                 "000000000000",
@@ -3346,9 +3014,23 @@ mod tests {
         CloudFormationService::new(state, deps())
     }
 
+    /// Dispatch a request the way `handle` does for the actions these tests
+    /// exercise: stack set actions are async, everything else here is not.
+    fn call(svc: &CloudFormationService, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
+        if crate::stack_sets::is_stack_set_action(&req.action) {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime")
+                .block_on(svc.handle_stack_set_action(req))
+        } else {
+            svc.handle_extra_action(req)
+        }
+    }
+
     /// Body of the XML response, for asserting on the rendered summary.
     fn introspect(svc: &CloudFormationService, action: &str, params: &[(&str, &str)]) -> String {
-        let resp = match svc.handle_extra_action(&req(action, params)) {
+        let resp = match call(svc, &req(action, params)) {
             Ok(resp) => resp,
             Err(e) => panic!("{action} should succeed: {}", e.message()),
         };
@@ -3545,10 +3227,13 @@ mod tests {
         let svc = svc();
         // Answering with an OperationId for a name that matches nothing is
         // the same false green light as summarizing a template never stored.
-        let Err(err) = svc.handle_extra_action(&req(
-            "UpdateStackSet",
-            &[("StackSetName", "nope"), ("TemplateBody", GOOD_TEMPLATE)],
-        )) else {
+        let Err(err) = call(
+            &svc,
+            &req(
+                "UpdateStackSet",
+                &[("StackSetName", "nope"), ("TemplateBody", GOOD_TEMPLATE)],
+            ),
+        ) else {
             panic!("an unknown stack set must be reported");
         };
         assert_eq!(err.code(), "StackSetNotFoundException");
@@ -3565,13 +3250,16 @@ mod tests {
 
         // Supplying a URL that cannot be fetched is a failure. Treating it as
         // "no template given" reported success and kept serving the old one.
-        let Err(err) = svc.handle_extra_action(&req(
-            "UpdateStackSet",
-            &[
-                ("StackSetName", "s"),
-                ("TemplateURL", "https://s3.amazonaws.com/b/missing.yaml"),
-            ],
-        )) else {
+        let Err(err) = call(
+            &svc,
+            &req(
+                "UpdateStackSet",
+                &[
+                    ("StackSetName", "s"),
+                    ("TemplateURL", "https://s3.amazonaws.com/b/missing.yaml"),
+                ],
+            ),
+        ) else {
             panic!("an unfetchable URL must be reported");
         };
         assert!(
@@ -3651,6 +3339,8 @@ mod tests {
     fn stack_sets_resolve_by_name_or_id_and_report_absence() {
         let svc = svc();
         {
+            // Seeded in the record shape older builds persisted, so the
+            // migration into the typed store is exercised too.
             let mut accounts = svc.state.write();
             let st = accounts.get_or_create("000000000000");
             let sets = st.extras.entry("stack_sets".to_string()).or_default();
@@ -3663,6 +3353,7 @@ mod tests {
                 "bodyless".to_string(),
                 json!({"StackSetId": "bodyless:def"}),
             );
+            crate::stack_sets::migrate_legacy_stack_sets(&mut accounts);
         }
 
         for key in ["myset", "myset:abc123"] {
@@ -3688,7 +3379,7 @@ mod tests {
 
     use std::collections::BTreeMap;
 
-    fn req(action: &str, params: &[(&str, &str)]) -> AwsRequest {
+    pub(crate) fn req(action: &str, params: &[(&str, &str)]) -> AwsRequest {
         let mut q = HashMap::new();
         q.insert("Action".to_string(), action.to_string());
         for (k, v) in params {
@@ -3723,7 +3414,7 @@ mod tests {
     /// service per call, so anything that must EXIST by the time it is used
     /// belongs here instead.
     fn ok_on(svc: &CloudFormationService, action: &str, params: &[(&str, &str)]) {
-        match svc.handle_extra_action(&req(action, params)) {
+        match call(svc, &req(action, params)) {
             Ok(resp) => assert!(resp.status.is_success(), "{action} status: {}", resp.status),
             Err(e) => panic!("{action} failed: {e:?}"),
         }
@@ -4058,68 +3749,7 @@ mod tests {
     }
 
     #[test]
-    fn stack_sets_instances_refactors() {
-        // One service for the whole sequence: UpdateStackSet and
-        // DeleteStackSet act on the stack set CreateStackSet made, and a
-        // fresh service per call would not have it.
-        let svc = svc();
-        ok_on(&svc, "CreateStackSet", &[("StackSetName", "ss")]);
-        ok_on(&svc, "DescribeStackSet", &[("StackSetName", "ss")]);
-        ok_on(&svc, "ListStackSets", &[]);
-        ok_on(&svc, "UpdateStackSet", &[("StackSetName", "ss")]);
-        ok(
-            "DescribeStackSetOperation",
-            &[("StackSetName", "ss"), ("OperationId", "op")],
-        );
-        ok("ListStackSetOperations", &[("StackSetName", "ss")]);
-        ok(
-            "ListStackSetOperationResults",
-            &[("StackSetName", "ss"), ("OperationId", "op")],
-        );
-        ok(
-            "ListStackSetAutoDeploymentTargets",
-            &[("StackSetName", "ss")],
-        );
-        ok(
-            "StopStackSetOperation",
-            &[("StackSetName", "ss"), ("OperationId", "op")],
-        );
-        ok("ImportStacksToStackSet", &[("StackSetName", "ss")]);
-        ok_on(&svc, "DeleteStackSet", &[("StackSetName", "ss")]);
-        ok(
-            "CreateStackInstances",
-            &[("StackSetName", "ss"), ("Regions.member.1", "us-east-1")],
-        );
-        ok(
-            "UpdateStackInstances",
-            &[("StackSetName", "ss"), ("Regions.member.1", "us-east-1")],
-        );
-        ok(
-            "DeleteStackInstances",
-            &[
-                ("StackSetName", "ss"),
-                ("Regions.member.1", "us-east-1"),
-                ("RetainStacks", "false"),
-            ],
-        );
-        ok(
-            "DescribeStackInstance",
-            &[
-                ("StackSetName", "ss"),
-                ("StackInstanceAccount", "000000000000"),
-                ("StackInstanceRegion", "us-east-1"),
-            ],
-        );
-        ok("ListStackInstances", &[("StackSetName", "ss")]);
-        ok(
-            "ListStackInstanceResourceDrifts",
-            &[
-                ("StackSetName", "ss"),
-                ("StackInstanceAccount", "000000000000"),
-                ("StackInstanceRegion", "us-east-1"),
-                ("OperationId", "op"),
-            ],
-        );
+    fn stack_refactors() {
         ok(
             "CreateStackRefactor",
             &[("StackDefinitions.member.1.StackName", "s")],
@@ -4192,7 +3822,6 @@ mod tests {
             "DetectStackResourceDrift",
             &[("StackName", "s"), ("LogicalResourceId", "L")],
         );
-        ok("DetectStackSetDrift", &[("StackSetName", "ss")]);
         ok(
             "DescribeStackDriftDetectionStatus",
             &[("StackDriftDetectionId", "id")],

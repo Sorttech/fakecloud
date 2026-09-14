@@ -1658,7 +1658,10 @@ impl CloudFormationService {
         Ok(())
     }
 
-    async fn create_stack(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
+    pub(crate) async fn create_stack(
+        &self,
+        req: &AwsRequest,
+    ) -> Result<AwsResponse, AwsServiceError> {
         let params = Self::get_all_params(req);
 
         // `negative_omit_StackName` expects any 4xx; the AnyError expectation
@@ -2147,7 +2150,10 @@ impl CloudFormationService {
         );
     }
 
-    async fn delete_stack(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
+    pub(crate) async fn delete_stack(
+        &self,
+        req: &AwsRequest,
+    ) -> Result<AwsResponse, AwsServiceError> {
         let stack_name = Self::get_param(req, "StackName").ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -2441,7 +2447,10 @@ impl CloudFormationService {
         ))
     }
 
-    async fn update_stack(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
+    pub(crate) async fn update_stack(
+        &self,
+        req: &AwsRequest,
+    ) -> Result<AwsResponse, AwsServiceError> {
         let mut input = UpdateStackInput::from_params(req)?;
 
         // Get stack_id before write lock for the provisioner
@@ -3154,7 +3163,14 @@ impl AwsService for CloudFormationService {
                 | "DeleteChangeSet"
                 | "ExecuteChangeSet"
                 | "CreateStackSet"
+                | "UpdateStackSet"
                 | "DeleteStackSet"
+                | "CreateStackInstances"
+                | "UpdateStackInstances"
+                | "DeleteStackInstances"
+                | "StopStackSetOperation"
+                | "ImportStacksToStackSet"
+                | "DetectStackSetDrift"
                 | "CreateStackRefactor"
                 | "CreateGeneratedTemplate"
                 | "DeleteGeneratedTemplate"
@@ -3172,6 +3188,9 @@ impl AwsService for CloudFormationService {
             "DescribeStackResources" => self.describe_stack_resources(&req),
             "UpdateStack" => self.update_stack(&req).await,
             "GetTemplate" => self.get_template(&req),
+            a if crate::stack_sets::is_stack_set_action(a) => {
+                self.handle_stack_set_action(&req).await
+            }
             _ => self.handle_extra_action(&req),
         };
         if mutates && matches!(result.as_ref(), Ok(resp) if resp.status.is_success()) {
