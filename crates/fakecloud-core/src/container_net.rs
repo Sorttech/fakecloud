@@ -158,6 +158,47 @@ pub fn bounded_status(cli: &str, args: &[String]) -> bool {
     wait_bounded(&mut child) && child.wait().map(|s| s.success()).unwrap_or(false)
 }
 
+/// True if the given PID is a live process on this host.
+///
+/// On Unix this is `kill(pid, 0)`: it returns 0 if the process exists
+/// (including zombies), or sets `errno` to `ESRCH` if not. On non-Unix
+/// platforms it conservatively returns `true`, so a caller never removes a
+/// resource it can't prove is orphaned.
+#[cfg(unix)]
+pub fn pid_alive(pid: u32) -> bool {
+    // SAFETY: `kill` with signal 0 is a liveness probe; it does not
+    // actually deliver a signal. Any PID value is safe to pass.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if rc == 0 {
+        return true;
+    }
+    // errno == EPERM means the process exists but we can't signal it —
+    // still alive from our perspective.
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+pub fn pid_alive(_pid: u32) -> bool {
+    true
+}
+
+/// Whether a container or network labelled `fakecloud-instance=<label>` was
+/// left behind by a fakecloud process that is gone. The label is
+/// `fakecloud-<pid>`; an object is orphaned only when that PID is neither the
+/// current process nor alive. Several fakecloud processes can share one
+/// daemon (parallel test servers, side-by-side installs), so an object owned
+/// by *another live* process is never an orphan. A label that doesn't parse is
+/// not treated as an orphan either -- nothing proves its owner is gone.
+pub fn owned_by_dead_process(label: &str, is_alive: impl Fn(u32) -> bool) -> bool {
+    let Some(pid) = label
+        .strip_prefix("fakecloud-")
+        .and_then(|p| p.parse::<u32>().ok())
+    else {
+        return false;
+    };
+    pid != std::process::id() && !is_alive(pid)
+}
+
 /// True when `cli` is podman or a podman-compatible binary. Matches on the
 /// filename component so absolute paths (`/opt/homebrew/bin/podman`) and
 /// wrappers (`podman-remote`) both register as podman. Docker Desktop's
@@ -605,6 +646,31 @@ mod tests {
             resolve_sibling_host(&alias, Some("1".to_string())),
             "host.containers.internal"
         );
+    }
+
+    #[test]
+    fn only_objects_of_a_dead_owner_are_orphans() {
+        let me = std::process::id();
+        let alive = |pid: u32| pid == 4242;
+        // Another live fakecloud process: never an orphan.
+        assert!(!owned_by_dead_process("fakecloud-4242", alive));
+        // Its owner is gone: an orphan.
+        assert!(owned_by_dead_process("fakecloud-777", alive));
+        // The current process, even if the probe says otherwise.
+        assert!(!owned_by_dead_process(&format!("fakecloud-{me}"), |_| {
+            false
+        }));
+        // Nothing proves an unparseable owner is gone.
+        for label in ["", "fakecloud-", "fakecloud-abc", "other-777"] {
+            assert!(!owned_by_dead_process(label, alive), "{label:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_alive_probes_real_processes() {
+        assert!(pid_alive(std::process::id()));
+        assert!(!pid_alive(u32::MAX - 1));
     }
 
     #[test]

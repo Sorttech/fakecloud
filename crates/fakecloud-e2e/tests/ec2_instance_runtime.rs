@@ -124,7 +124,19 @@ async fn run_instances_boots_real_container_with_user_data() {
     let container = container_for(&instance_id);
     assert!(!container.is_empty(), "no backing container found");
     let running = docker(&["inspect", "-f", "{{.State.Running}}", &container]);
-    assert_eq!(running, "true", "container should be running");
+    assert_eq!(
+        running,
+        "true",
+        "container should be running; state: {}; logs: {:?}",
+        docker(&[
+            "inspect",
+            "-f",
+            "status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} \
+             error={{.State.Error}} started={{.State.StartedAt}} finished={{.State.FinishedAt}}",
+            &container,
+        ]),
+        docker(&["logs", "--tail", "50", &container]),
+    );
 
     // User-data ran at boot (it executes asynchronously, so poll briefly).
     let mut marker = String::new();

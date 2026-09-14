@@ -68,20 +68,16 @@ fn reap_orphans(cli: &str, list_args: &[&str], remove_argv: impl Fn(&str) -> Vec
         return 0;
     };
 
-    let self_pid = std::process::id();
     let mut reaped = 0usize;
 
     for line in listing.lines() {
         let Some((id, label)) = line.split_once(' ') else {
             continue;
         };
-        let Some(pid_str) = label.strip_prefix("fakecloud-") else {
-            continue;
-        };
-        let Ok(pid) = pid_str.parse::<u32>() else {
-            continue;
-        };
-        if pid == self_pid || pid_alive(pid) {
+        if !fakecloud_core::container_net::owned_by_dead_process(
+            label,
+            fakecloud_core::container_net::pid_alive,
+        ) {
             continue;
         }
         let removed = fakecloud_core::container_net::bounded_status(cli, &remove_argv(id));
@@ -93,33 +89,9 @@ fn reap_orphans(cli: &str, list_args: &[&str], remove_argv: impl Fn(&str) -> Vec
     reaped
 }
 
-/// True if the given PID is a live process on this host.
-///
-/// On Unix we use `kill(pid, 0)`: it returns 0 if the process exists
-/// (including zombies), or sets `errno` to `ESRCH` if not. On non-Unix
-/// platforms we conservatively return `true` so the reaper never removes
-/// a container it can't prove is orphaned.
-#[cfg(unix)]
-pub fn pid_alive(pid: u32) -> bool {
-    // SAFETY: `kill` with signal 0 is a liveness probe; it does not
-    // actually deliver a signal. Any PID value is safe to pass.
-    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    if rc == 0 {
-        return true;
-    }
-    // errno == EPERM means the process exists but we can't signal it —
-    // still alive from our perspective.
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-#[cfg(not(unix))]
-pub fn pid_alive(_pid: u32) -> bool {
-    true
-}
-
 #[cfg(all(test, unix))]
 mod tests {
-    use super::pid_alive;
+    use fakecloud_core::container_net::pid_alive;
 
     #[test]
     fn self_is_alive() {

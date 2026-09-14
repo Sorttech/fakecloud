@@ -260,6 +260,63 @@ async fn restart_fails_in_flight_build_instead_of_zombie() {
 }
 
 #[tokio::test]
+async fn another_server_starting_does_not_kill_a_running_build() {
+    if !require_docker_or_skip("another_server_starting_does_not_kill_a_running_build") {
+        return;
+    }
+    // Two fakecloud processes share one daemon (here: parallel test servers).
+    // A server sweeps leaked build containers at startup; it must only remove
+    // those whose owning process is gone, never a live server's in-flight build.
+    let s = TestServer::start().await;
+    let cb = aws_sdk_codebuild::Client::new(&s.aws_config().await);
+    let spec =
+        "version: 0.2\nphases:\n  build:\n    commands:\n      - sleep 10\n      - echo survived\n";
+    create_project(&cb, "e2e-shared-daemon", spec).await;
+    let build_id = cb
+        .start_build()
+        .project_name("e2e-shared-daemon")
+        .send()
+        .await
+        .expect("start build")
+        .build_value()
+        .unwrap()
+        .id()
+        .unwrap()
+        .to_string();
+
+    // Wait until the build is past provisioning, i.e. its container exists.
+    for _ in 0..120 {
+        let out = cb.batch_get_builds().ids(&build_id).send().await.unwrap();
+        let phase = out
+            .builds()
+            .first()
+            .and_then(|b| b.current_phase())
+            .unwrap_or("");
+        if !matches!(phase, "" | "SUBMITTED" | "QUEUED" | "PROVISIONING") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    // A second server starts and runs its startup sweep while the build runs.
+    let other = TestServer::start().await;
+    let other_cb = aws_sdk_codebuild::Client::new(&other.aws_config().await);
+    other_cb
+        .list_projects()
+        .send()
+        .await
+        .expect("second server serves");
+
+    let build = wait_complete(&cb, &build_id).await;
+    assert_eq!(
+        build.build_status(),
+        Some(&StatusType::Succeeded),
+        "the second server's sweep must not remove this server's build container; phases: {:?}",
+        build.phases()
+    );
+}
+
+#[tokio::test]
 async fn cross_phase_shell_state_persists() {
     if !require_docker_or_skip("cross_phase_shell_state_persists") {
         return;
