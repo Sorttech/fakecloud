@@ -72,7 +72,7 @@ These data volumes default **on** under `--storage-mode=persistent` and **off** 
 
 On startup fakecloud reads `<data-path>/fakecloud.version.toml`. The file records the on-disk format version and the fakecloud version that created the directory. If the format version doesn't match the running binary, startup fails with an actionable error that points at the file.
 
-There is no automatic migration — the intent is that you either keep using the binary that wrote the directory or start from an empty data path.
+Except for the legacy CloudWatch Logs migration described below, there is no automatic migration. The intent is that you either keep using the binary that wrote the directory or start from an empty data path.
 
 ## S3 object body handling
 
@@ -81,3 +81,32 @@ Object bodies are streamed straight to disk in persistent mode, not held in RAM.
 ## Introspection buffers are not persisted
 
 The `/_fakecloud/s3/notifications` buffer — and every other `/_fakecloud/*` introspection endpoint, including `/_fakecloud/ses/emails` and `/_fakecloud/ses/inbound-emails` — is intentionally not persisted. These exist so tests can assert which events fired during the current run, not as a long-term audit log.
+
+## CloudWatch Logs event segments
+
+CloudWatch Logs stores event bodies in append-only JSON Lines segments, rotating
+at approximately 4 MiB per segment (a single event may take a segment over that
+threshold). Small metadata lives in `logs/manifest.json`. A save appends only the
+events written since the previous save, syncs the segments, and then atomically
+commits their byte lengths in the manifest; existing event bytes are never
+rewritten. After an interrupted write, uncommitted trailing bytes are ignored and
+truncated on the next append. Missing or truncated committed data produces a load
+error.
+
+Retention deletes events, matching AWS. `PutRetentionPolicy` accepts only the AWS
+values (1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827,
+2192, 2557, 2922, 3288, 3653) and removes expired events from memory; `PutLogEvents`
+rejects events older than the retention period (`expiredLogEventEndIndex`).
+Retention is enforced on every Logs mutation and by a sweep every 60 seconds, so
+idle groups expire too. Fully expired segments are deleted after the new manifest
+commits. Mixed-age segments keep a durable expiration cutoff so removing or
+extending a retention policy cannot resurrect previously deleted events; their
+remaining disk space is reclaimed once every event in the segment expires. Groups
+without a retention policy retain events indefinitely.
+
+The previous `logs/snapshot.json` format is read automatically and migrated on
+startup before serving requests. The legacy snapshot is removed only after the new
+manifest is durable. The migration is one-way: an older fakecloud binary does not
+read `logs/manifest.json` and would start with empty CloudWatch Logs state. Before
+upgrading, back up the data directory while fakecloud is stopped, and restore that
+backup if you need to downgrade. Do not edit or delete segment files manually.

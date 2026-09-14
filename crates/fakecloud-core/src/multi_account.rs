@@ -50,6 +50,20 @@ impl<T: AccountState> MultiAccountState<T> {
         }
     }
 
+    /// Project account states while preserving the container's routing defaults.
+    pub fn map<U>(&self, mut f: impl FnMut(&T) -> U) -> MultiAccountState<U> {
+        MultiAccountState {
+            default_account_id: self.default_account_id.clone(),
+            region: self.region.clone(),
+            endpoint: self.endpoint.clone(),
+            accounts: self
+                .accounts
+                .iter()
+                .map(|(k, v)| (k.clone(), f(v)))
+                .collect(),
+        }
+    }
+
     /// Get or lazily create the state for `account_id`.
     ///
     /// When a new account is created, [`AccountState::inherit_from`] is called
