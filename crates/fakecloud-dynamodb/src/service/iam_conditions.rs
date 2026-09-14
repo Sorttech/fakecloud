@@ -400,6 +400,9 @@ fn expression_names(body: &Value) -> BTreeMap<String, String> {
 /// Attributes named by a request's projections, expressions and legacy
 /// condition parameters.
 fn add_request_attributes(keys: &mut Keys, body: &Value, names: &BTreeMap<String, String>) {
+    if let Some(update) = body["UpdateExpression"].as_str() {
+        keys.attributes.extend(update_targets(update, names));
+    }
     for expr in [
         "ProjectionExpression",
         "UpdateExpression",
@@ -432,10 +435,21 @@ fn add_request_attributes(keys: &mut Keys, body: &Value, names: &BTreeMap<String
     }
 }
 
-/// The top-level attributes an update expression writes, found the way the
-/// executor applies it (`SET a.b = ...` writes `a`).
-fn update_targets(expr: &str) -> Vec<String> {
+/// The attributes an update expression may write. Each target is reported
+/// both as its first path segment (`SET a.b = ...` writes inside `a`) and as
+/// its whole text with names resolved: depending on its shape the executor
+/// can also write a top-level attribute literally named `a.b[0]`, or split a
+/// quoted `"a.b"` into a path. Reporting both can only narrow what an
+/// attribute allow-list admits.
+fn update_targets(expr: &str, names: &BTreeMap<String, String>) -> Vec<String> {
     use super::helpers::{parse_update_clauses, UpdateAction};
+    let resolve = |segment: &str| {
+        let segment = segment.trim().trim_matches('"');
+        names
+            .get(segment)
+            .cloned()
+            .unwrap_or_else(|| segment.to_string())
+    };
     let mut out = Vec::new();
     for (action, assignments) in parse_update_clauses(expr) {
         for assignment in &assignments {
@@ -448,15 +462,23 @@ fn update_targets(expr: &str) -> Vec<String> {
                 UpdateAction::Add | UpdateAction::Delete => {
                     assignment.split_whitespace().next().unwrap_or_default()
                 }
-            };
-            let target = target.trim();
-            let name = match target.strip_prefix('"') {
-                Some(rest) => rest.split('"').next().unwrap_or(rest),
-                None => target.split(['.', '[']).next().unwrap_or(target).trim(),
-            };
-            if !name.is_empty() {
-                out.push(name.to_string());
             }
+            .trim();
+            if target.is_empty() {
+                continue;
+            }
+            let unquoted = target.trim_matches('"');
+            let first = unquoted.split(['.', '[']).next().unwrap_or(unquoted);
+            out.push(resolve(first));
+            let whole = unquoted
+                .split('.')
+                .map(|segment| match segment.split_once('[') {
+                    Some((name, index)) => format!("{}[{index}", resolve(name)),
+                    None => resolve(segment),
+                })
+                .collect::<Vec<_>>()
+                .join(".");
+            out.push(whole);
         }
     }
     out
@@ -759,7 +781,8 @@ fn add_partiql_keys(
                 };
             let (update_expression, _) =
                 super::helpers::partiql::prepare_partiql_update_expression(set_clause, parameters);
-            keys.attributes.extend(update_targets(&update_expression));
+            keys.attributes
+                .extend(update_targets(&update_expression, &BTreeMap::new()));
             // Attributes the assignments read; an extra name only narrows what
             // an attribute allow-list admits.
             keys.attributes
@@ -1457,5 +1480,38 @@ mod tests {
             get(&got[0].1, "dynamodb:select"),
             Some(&["ALL_ATTRIBUTES".to_string()][..])
         );
+    }
+
+    /// Every way the executor can read an update target is reported: the
+    /// first segment and the whole path, names resolved.
+    #[test]
+    fn update_targets_report_every_reading_of_a_path() {
+        let names: BTreeMap<String, String> = [("#m".to_string(), "meta".to_string())]
+            .into_iter()
+            .collect();
+        let mut got = update_targets(
+            "SET \"a.b\" = :v, x.y[0] = :w ADD #m.c :n REMOVE z[1][2]",
+            &names,
+        );
+        got.sort();
+        got.dedup();
+        for want in ["a", "a.b", "x", "x.y[0]", "meta", "meta.c", "z", "z[1][2]"] {
+            assert!(
+                got.contains(&want.to_string()),
+                "{want} missing from {got:?}"
+            );
+        }
+    }
+
+    /// A plain placeholder target reports only the attribute it names.
+    #[test]
+    fn update_targets_resolve_placeholders_without_extra_names() {
+        let names: BTreeMap<String, String> = [("#t".to_string(), "Top".to_string())]
+            .into_iter()
+            .collect();
+        let mut got = update_targets("SET #t = :v, Wins = Wins + :one", &names);
+        got.sort();
+        got.dedup();
+        assert_eq!(got, ["Top", "Wins"]);
     }
 }
