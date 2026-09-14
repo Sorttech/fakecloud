@@ -49,7 +49,10 @@ pub(crate) const EXECUTION_TIMEOUT: Duration = Duration::from_millis(250);
 /// A safety net for a run that never returns; the compute budget above is
 /// the limit a handler is actually held to, so this is generous enough
 /// that a descheduled thread on a loaded host still reports back.
-const WALL_CLOCK_LIMIT: Duration = Duration::from_secs(10);
+const WALL_CLOCK_LIMIT: Duration = Duration::from_secs(5);
+
+/// How often the caller checks the worker's CPU time against the budget.
+const WATCHDOG_POLL: Duration = Duration::from_millis(5);
 
 /// boa loop iteration cap. Tight enough that `while(1){}` exits the VM
 /// well within the wall-clock budget on any reasonable host, loose
@@ -93,51 +96,88 @@ fn run_handler_with_limits(
 ) -> JsExecution {
     let code = code.to_owned();
     let event = event_json.to_vec();
-    let (tx, rx) = mpsc::sync_channel::<JsExecution>(1);
+    let (tx, rx) = mpsc::sync_channel::<WorkerMessage>(2);
 
     // Each call gets its own thread because boa's `Context` holds
     // `Rc`s and is `!Send`. We can't pre-spawn a worker pool without
     // marshalling the script + event via channels anyway, so a fresh
     // thread per call is the simpler shape.
-    let _ = std::thread::Builder::new()
+    let spawned = std::thread::Builder::new()
         .name("cloudfront-js".to_string())
         // Boa's bytecode VM is recursive so we want a generous stack.
         .stack_size(8 * 1024 * 1024)
         .spawn(move || {
             let clock = ComputeClock::start();
+            let _ = tx.send(WorkerMessage::Started(clock.cpu.map(|(c, _)| c)));
             let mut result = run_handler_blocking(&code, &event, &clock);
+            // Covers a run that crossed the budget between the caller's polls.
             if clock.elapsed() > compute_budget {
                 result = time_limit_exceeded(result.logs);
             }
             // If the receiver has timed out and gone away the send
             // simply errors; we don't care — the worker is being
             // abandoned.
-            let _ = tx.send(result);
+            let _ = tx.send(WorkerMessage::Done(result));
         });
+    if spawned.is_err() {
+        return worker_failed();
+    }
 
-    match rx.recv_timeout(wall_limit) {
-        Ok(mut exec) => {
-            // Floor compute_utilization at 1% on success so callers
-            // don't mistake a successful run for an unrun one.
-            if exec.error.is_none() && exec.compute_utilization == 0 {
-                exec.compute_utilization = 1;
+    // Watch the worker: stop waiting as soon as its CPU time passes the
+    // budget, so a CPU-bound handler is cut off at the budget rather than
+    // holding the caller until the wall-clock safety net. Without a thread
+    // CPU clock on this platform, elapsed time stands in for it.
+    let wall_start = Instant::now();
+    let mut worker_cpu: Option<(ThreadCpuClock, Duration)> = None;
+    loop {
+        let remaining = wall_limit.saturating_sub(wall_start.elapsed());
+        match rx.recv_timeout(remaining.min(WATCHDOG_POLL)) {
+            Ok(WorkerMessage::Started(cpu)) => {
+                worker_cpu = cpu.and_then(|c| c.read().map(|start| (c, start)));
             }
-            exec
-        }
-        Err(mpsc::RecvTimeoutError::Timeout) => time_limit_exceeded(Vec::new()),
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            // The worker thread either failed to spawn (`spawn()` errored
-            // and the sender was dropped) or panicked partway through.
-            // Surface that distinctly so a host-level problem doesn't get
-            // misdiagnosed as adversarial JS.
-            let msg = "function execution worker thread panicked or failed to spawn".to_string();
-            JsExecution {
-                output: None,
-                error: Some(msg.clone()),
-                logs: vec![format!("ERROR: {msg}")],
-                compute_utilization: 101,
+            Ok(WorkerMessage::Done(mut exec)) => {
+                // Floor compute_utilization at 1% on success so callers
+                // don't mistake a successful run for an unrun one.
+                if exec.error.is_none() && exec.compute_utilization == 0 {
+                    exec.compute_utilization = 1;
+                }
+                return exec;
             }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return worker_failed(),
         }
+        if wall_start.elapsed() >= wall_limit {
+            return time_limit_exceeded(Vec::new());
+        }
+        let used = match worker_cpu {
+            // A read fails once the thread has exited; its result is
+            // already on the way, so keep waiting for it.
+            Some((clock, start)) => clock.read().map(|now| now.saturating_sub(start)),
+            None => Some(wall_start.elapsed()),
+        };
+        if used.is_some_and(|u| u > compute_budget) {
+            return time_limit_exceeded(Vec::new());
+        }
+    }
+}
+
+/// What the worker thread reports: first the handle to its CPU clock (so
+/// the caller can watch the run), then the result.
+enum WorkerMessage {
+    Started(Option<ThreadCpuClock>),
+    Done(JsExecution),
+}
+
+/// The worker thread either failed to spawn or panicked partway through.
+/// Surfaced distinctly so a host-level problem doesn't get misdiagnosed as
+/// adversarial JS.
+fn worker_failed() -> JsExecution {
+    let msg = "function execution worker thread panicked or failed to spawn".to_string();
+    JsExecution {
+        output: None,
+        error: Some(msg.clone()),
+        logs: vec![format!("ERROR: {msg}")],
+        compute_utilization: 101,
     }
 }
 
@@ -160,43 +200,118 @@ fn time_limit_exceeded(mut logs: Vec<String>) -> JsExecution {
 /// Measures the compute a run consumed: CPU time on the current thread
 /// where the platform reports it, elapsed time otherwise.
 struct ComputeClock {
-    cpu_start: Option<Duration>,
+    cpu: Option<(ThreadCpuClock, Duration)>,
     wall_start: Instant,
 }
 
 impl ComputeClock {
     fn start() -> Self {
         Self {
-            cpu_start: thread_cpu_time(),
+            cpu: ThreadCpuClock::current().and_then(|c| c.read().map(|start| (c, start))),
             wall_start: Instant::now(),
         }
     }
 
     fn elapsed(&self) -> Duration {
-        match (self.cpu_start, thread_cpu_time()) {
-            (Some(start), Some(now)) => now.saturating_sub(start),
-            _ => self.wall_start.elapsed(),
+        match self
+            .cpu
+            .and_then(|(c, start)| c.read().map(|now| (now, start)))
+        {
+            Some((now, start)) => now.saturating_sub(start),
+            None => self.wall_start.elapsed(),
         }
     }
 }
 
-/// CPU time consumed so far by the calling thread.
-#[cfg(unix)]
-fn thread_cpu_time() -> Option<Duration> {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: `ts` is a valid, writable timespec; CLOCK_THREAD_CPUTIME_ID
-    // is supported on Linux and macOS, and a failure is reported by the
-    // return code rather than by leaving `ts` partially written.
-    let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
-    (rc == 0).then(|| Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32))
+/// A handle to one thread's CPU-time clock that any thread can read, so the
+/// caller can watch the worker while it runs. Linux exposes a per-thread
+/// clock id; macOS exposes the thread's Mach port. Elsewhere there is none
+/// and callers fall back to elapsed time.
+#[derive(Clone, Copy)]
+struct ThreadCpuClock {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    clock_id: libc::clockid_t,
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    thread: libc::mach_port_t,
 }
 
-#[cfg(not(unix))]
-fn thread_cpu_time() -> Option<Duration> {
-    None
+impl ThreadCpuClock {
+    /// The calling thread's clock.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn current() -> Option<Self> {
+        let mut clock_id: libc::clockid_t = 0;
+        // SAFETY: `clock_id` is a valid out-pointer, and `pthread_self()` is
+        // always a live thread (the caller).
+        let rc = unsafe { libc::pthread_getcpuclockid(libc::pthread_self(), &mut clock_id) };
+        (rc == 0).then_some(Self { clock_id })
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn current() -> Option<Self> {
+        // SAFETY: `pthread_self()` is always a live thread; the returned port
+        // is borrowed from the pthread (no reference to release).
+        let thread = unsafe { libc::pthread_mach_thread_np(libc::pthread_self()) };
+        (thread != 0).then_some(Self { thread })
+    }
+
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    )))]
+    fn current() -> Option<Self> {
+        None
+    }
+
+    /// CPU time the thread has consumed, or `None` once it has exited.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn read(self) -> Option<Duration> {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is a valid, writable timespec; a stale clock id (the
+        // thread exited) is reported through the return code.
+        let rc = unsafe { libc::clock_gettime(self.clock_id, &mut ts) };
+        (rc == 0).then(|| Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32))
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn read(self) -> Option<Duration> {
+        // SAFETY: an all-zero `thread_basic_info` is a valid value for this
+        // plain-integer struct.
+        let mut info: libc::thread_basic_info = unsafe { std::mem::zeroed() };
+        let mut count = libc::THREAD_BASIC_INFO_COUNT;
+        // SAFETY: `info` is large enough for THREAD_BASIC_INFO_COUNT
+        // integers, which `count` declares; a dead thread's port is reported
+        // through the return code.
+        let rc = unsafe {
+            libc::thread_info(
+                self.thread,
+                libc::THREAD_BASIC_INFO as libc::thread_flavor_t,
+                &mut info as *mut libc::thread_basic_info as libc::thread_info_t,
+                &mut count,
+            )
+        };
+        if rc != libc::KERN_SUCCESS {
+            return None;
+        }
+        let micros = |t: libc::time_value_t| t.seconds as u64 * 1_000_000 + t.microseconds as u64;
+        Some(Duration::from_micros(
+            micros(info.user_time) + micros(info.system_time),
+        ))
+    }
+
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    )))]
+    fn read(self) -> Option<Duration> {
+        None
+    }
 }
 
 fn run_handler_blocking(code: &str, event_json: &[u8], clock: &ComputeClock) -> JsExecution {
@@ -452,8 +567,10 @@ mod tests {
 
     #[test]
     fn a_run_over_its_compute_budget_reports_the_time_limit() {
+        // A zero budget is exceeded by any run: either the caller's watchdog
+        // or the worker's own final check reports it, whichever sees it first.
         let exec = run_handler_with_limits(
-            r#"function handler(e) { console.log("ran"); return e; }"#,
+            r#"function handler(e) { return e; }"#,
             b"{}",
             Duration::ZERO,
             WALL_CLOCK_LIMIT,
@@ -462,11 +579,7 @@ mod tests {
         let err = exec.error.expect("error");
         assert!(err.contains("250ms time limit"), "got {err}");
         assert!(exec.compute_utilization > 100);
-        assert!(
-            exec.logs.first().is_some_and(|l| l == "ran"),
-            "logs before the limit are kept: {:?}",
-            exec.logs
-        );
+        assert!(exec.logs.iter().any(|l| l.starts_with("ERROR: ")));
     }
 
     #[test]
@@ -496,19 +609,45 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn busy_work_accrues_compute() {
+        // Bounded by work done, not elapsed time, so a loaded host that
+        // deschedules this thread only makes it take longer.
         let clock = ComputeClock::start();
-        let wall = Instant::now();
         let mut x: u64 = 0;
-        while wall.elapsed() < Duration::from_millis(50) {
-            x = std::hint::black_box(x.wrapping_add(1));
+        for i in 0..50_000_000u64 {
+            x = std::hint::black_box(x.wrapping_add(i));
         }
+        std::hint::black_box(x);
         assert!(
-            clock.elapsed() >= Duration::from_millis(20),
-            "50ms of busy work measured {:?}",
+            clock.elapsed() >= Duration::from_millis(1),
+            "the work measured {:?}",
             clock.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_cpu_bound_handler_is_cut_off_at_its_budget() {
+        // Catastrophic regex backtracking burns CPU inside one builtin call,
+        // so boa's loop and recursion caps never trip; only the compute
+        // budget can stop it. It runs for seconds (about 6s unoptimized,
+        // doubling per extra `a`), well past half the safety net, so the
+        // caller returning quickly proves the watchdog cut it off. The
+        // abandoned worker then finishes in the background.
+        let started = Instant::now();
+        let exec = run_handler(
+            &format!(
+                r#"function handler() {{ return /^(a+)+$/.test("{}b"); }}"#,
+                "a".repeat(24)
+            ),
+            b"{}",
+        );
+        let took = started.elapsed();
+        let err = exec.error.expect("error");
+        assert!(err.contains("time limit"), "got {err}");
+        assert!(
+            took < WALL_CLOCK_LIMIT / 2,
+            "caller waited {took:?}; the budget should stop it well before the safety net"
         );
     }
 
