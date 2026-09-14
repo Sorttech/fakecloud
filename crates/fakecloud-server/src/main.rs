@@ -7232,6 +7232,9 @@ async fn main() {
                 fakecloud_eventbridge::resource_policy::EventBridgeResourcePolicyProvider::shared(
                     eb_state.clone(),
                 ),
+                fakecloud_dynamodb::resource_policy::DynamoDbResourcePolicyProvider::shared(
+                    dynamodb_state.clone(),
+                ),
             ],
         )),
         scp_resolver: Some(

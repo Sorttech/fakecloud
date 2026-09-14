@@ -42,25 +42,50 @@ const RESTORE_TARGET_ACTIONS: [&str; 7] = [
     "UpdateItem",
 ];
 
-/// Where a resource ARN built from a bare name lives: the caller's account
-/// and the request's region.
+/// Resolves the tables a request names to the ARNs to authorize.
 struct Scope<'a> {
     account: &'a str,
     region: &'a str,
+    accounts: &'a fakecloud_core::multi_account::MultiAccountState<crate::state::DynamoDbState>,
 }
 
 impl Scope<'_> {
-    /// The table ARN for a `TableName` value: kept as given when it already
-    /// is an ARN (normalized to the table itself), built from the scope
-    /// otherwise.
+    /// The ARN to authorize for a `TableName` value (a name, or a table ARN).
+    ///
+    /// When the table exists this is its own stored ARN: the handler serves
+    /// that table, looked up by name in the account, so authorizing an ARN
+    /// built from the request's region -- or taken from a caller-written ARN
+    /// -- would check a resource the request does not actually touch, and a
+    /// policy scoped to the real table's region could be sidestepped. A table
+    /// that does not exist yet (CreateTable) is authorized at the ARN it will
+    /// get: the caller's account and the request's region.
     fn table(&self, name_or_arn: &str) -> String {
-        if let Some(arn) = table_arn_of(name_or_arn) {
-            return arn;
+        let (account, name) = match table_arn_of(name_or_arn) {
+            Some(arn) => {
+                let account = arn.split(':').nth(4).unwrap_or(self.account).to_string();
+                let name = arn
+                    .rsplit("table/")
+                    .next()
+                    .unwrap_or(name_or_arn)
+                    .to_string();
+                (account, name)
+            }
+            None => (self.account.to_string(), name_or_arn.to_string()),
+        };
+        if let Some(table) = self
+            .accounts
+            .get(&account)
+            .and_then(|state| state.tables.get(&name))
+        {
+            return table.arn.clone();
         }
-        format!(
-            "arn:aws:dynamodb:{}:{}:table/{name_or_arn}",
-            self.region, self.account
-        )
+        match table_arn_of(name_or_arn) {
+            Some(arn) => arn,
+            None => format!(
+                "arn:aws:dynamodb:{}:{}:table/{name_or_arn}",
+                self.region, self.account
+            ),
+        }
     }
 
     fn index(&self, table: &str, index: &str) -> String {
@@ -96,16 +121,21 @@ fn field<'a>(body: &'a Value, name: &str) -> Option<&'a str> {
 
 /// The `dynamodb:*` authorizations a DynamoDB request needs. Empty only for
 /// an operation this service does not implement.
-pub(crate) fn actions_for(request: &AwsRequest) -> Vec<IamAction> {
+pub(crate) fn actions_for(
+    state: &crate::state::SharedDynamoDbState,
+    request: &AwsRequest,
+) -> Vec<IamAction> {
     let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
     let account = request
         .principal
         .as_ref()
         .map(|p| p.account_id.as_str())
         .unwrap_or(request.account_id.as_str());
+    let accounts = state.read();
     let scope = Scope {
         account,
         region: request.region.as_str(),
+        accounts: &accounts,
     };
     let op: &'static str = match DYNAMODB_ACTIONS
         .iter()
@@ -204,8 +234,10 @@ pub(crate) fn actions_for(request: &AwsRequest) -> Vec<IamAction> {
             out
         }
         "RestoreTableToPointInTime" => {
-            let source = field(&body, "SourceTableArn")
-                .or_else(|| field(&body, "SourceTableName"))
+            // The handler takes `SourceTableName` over `SourceTableArn`, so the
+            // table authorized has to be chosen the same way.
+            let source = field(&body, "SourceTableName")
+                .or_else(|| field(&body, "SourceTableArn"))
                 .map_or_else(|| "*".to_string(), |t| scope.table(t));
             let target = table("TargetTableName");
             let mut out = vec![action("RestoreTableToPointInTime", source)];
@@ -387,11 +419,10 @@ fn push_unique(out: &mut Vec<IamAction>, a: IamAction) {
     }
 }
 
-/// The PartiQL action a statement needs, on the table (or, for a SELECT
-/// from `"table"."index"`, the index) it names. A statement too malformed to
-/// name a table maps to `PartiQLSelect` on `*`, leaving the syntax error to
-/// the handler.
-fn partiql_action(scope: &Scope<'_>, statement: &str) -> IamAction {
+/// The PartiQL action a statement's verb needs, and the table it names --
+/// with `.index` appended for a SELECT from `"table"."index"`. `None` for a
+/// statement too malformed to name a table.
+pub(crate) fn partiql_verb_and_table(statement: &str) -> Option<(&'static str, String)> {
     let trimmed = statement.trim();
     let upper = trimmed.to_ascii_uppercase();
     let (verb, keyword) = if upper.starts_with("SELECT") {
@@ -403,28 +434,40 @@ fn partiql_action(scope: &Scope<'_>, statement: &str) -> IamAction {
     } else if upper.starts_with("DELETE") {
         ("PartiQLDelete", Some("FROM"))
     } else {
-        return action("PartiQLSelect", "*".to_string());
+        return None;
     };
     let after = match keyword {
-        Some(kw) => match find_outside_quotes(&upper, kw) {
-            Some(pos) => &trimmed[pos + kw.len()..],
-            None => return action(verb, "*".to_string()),
-        },
+        Some(kw) => &trimmed[find_outside_quotes(&upper, kw)? + kw.len()..],
         None => &trimmed["UPDATE".len()..],
     };
-    let (table, rest) = parse_partiql_table_name(after);
-    if table.is_empty() {
-        return action(verb, "*".to_string());
-    }
+    let (table, _) = parse_partiql_table_name(after);
+    (!table.is_empty()).then_some((verb, table))
+}
+
+/// The PartiQL action a statement needs, on the table (or, for a SELECT
+/// from `"table"."index"`, the index) it names. A statement too malformed to
+/// name a table maps to `PartiQLSelect` on `*`, leaving the syntax error to
+/// the handler.
+fn partiql_action(scope: &Scope<'_>, statement: &str) -> IamAction {
+    let Some((verb, table)) = partiql_verb_and_table(statement) else {
+        return action("PartiQLSelect", "*".to_string());
+    };
     if verb == "PartiQLSelect" {
-        if let Some(index_part) = rest.strip_prefix('.') {
-            let (index, _) = parse_partiql_table_name(index_part);
-            if !index.is_empty() {
-                return action(verb, scope.index(&table, &index));
-            }
+        if let Some(index) = partiql_select_index(statement) {
+            return action(verb, scope.index(&table, &index));
         }
     }
     action(verb, scope.table(&table))
+}
+
+/// The index a `SELECT ... FROM "table"."index"` reads, if any.
+pub(crate) fn partiql_select_index(statement: &str) -> Option<String> {
+    let trimmed = statement.trim();
+    let upper = trimmed.to_ascii_uppercase();
+    let from = find_outside_quotes(&upper, "FROM")?;
+    let (_, rest) = parse_partiql_table_name(&trimmed[from + "FROM".len()..]);
+    let (index, _) = parse_partiql_table_name(rest.strip_prefix('.')?);
+    (!index.is_empty()).then_some(index)
 }
 
 /// Tags on the table a resource ARN names (a table, or its index or
@@ -512,6 +555,12 @@ mod tests {
         }
     }
 
+    fn test_state() -> crate::state::SharedDynamoDbState {
+        std::sync::Arc::new(parking_lot::RwLock::new(
+            fakecloud_core::multi_account::MultiAccountState::new(ACCOUNT, "eu-west-1", ""),
+        ))
+    }
+
     fn pairs(actions: Vec<IamAction>) -> Vec<(String, String)> {
         actions
             .into_iter()
@@ -534,7 +583,7 @@ mod tests {
         let service = crate::DynamoDbService::new(state.clone());
         for op in service.supported_actions() {
             assert!(
-                !actions_for(&req(op, json!({}))).is_empty(),
+                !actions_for(&test_state(), &req(op, json!({}))).is_empty(),
                 "DynamoDB {op} has no IAM mapping"
             );
         }
@@ -557,18 +606,24 @@ mod tests {
             "DescribeTable",
         ] {
             assert_eq!(
-                pairs(actions_for(&req(op, json!({"TableName": "Orders"})))),
+                pairs(actions_for(
+                    &test_state(),
+                    &req(op, json!({"TableName": "Orders"}))
+                )),
                 one(op, TABLE)
             );
         }
         // A table ARN is authorized as given, in its own account and region.
         let foreign = "arn:aws:dynamodb:us-east-2:444455556666:table/Shared";
         assert_eq!(
-            pairs(actions_for(&req("GetItem", json!({"TableName": foreign})))),
+            pairs(actions_for(
+                &test_state(),
+                &req("GetItem", json!({"TableName": foreign}))
+            )),
             one("GetItem", foreign)
         );
         assert_eq!(
-            pairs(actions_for(&req("ListTables", json!({})))),
+            pairs(actions_for(&test_state(), &req("ListTables", json!({})))),
             one("ListTables", "*")
         );
     }
@@ -578,12 +633,18 @@ mod tests {
         let body = json!({"TableName": "Orders", "IndexName": "by-customer"});
         let index = format!("{TABLE}/index/by-customer");
         assert_eq!(
-            pairs(actions_for(&req("Query", body.clone()))),
+            pairs(actions_for(&test_state(), &req("Query", body.clone()))),
             one("Query", &index)
         );
-        assert_eq!(pairs(actions_for(&req("Scan", body))), one("Scan", &index));
         assert_eq!(
-            pairs(actions_for(&req("Scan", json!({"TableName": "Orders"})))),
+            pairs(actions_for(&test_state(), &req("Scan", body))),
+            one("Scan", &index)
+        );
+        assert_eq!(
+            pairs(actions_for(
+                &test_state(),
+                &req("Scan", json!({"TableName": "Orders"}))
+            )),
             one("Scan", TABLE)
         );
     }
@@ -593,7 +654,7 @@ mod tests {
     #[test]
     fn batches_and_transactions_authorize_every_table() {
         let batch = json!({"RequestItems": {"Orders": [], "Customers": []}});
-        let mut got = pairs(actions_for(&req("BatchWriteItem", batch)));
+        let mut got = pairs(actions_for(&test_state(), &req("BatchWriteItem", batch)));
         got.sort();
         assert_eq!(
             got,
@@ -614,7 +675,10 @@ mod tests {
             {"Update": {"TableName": "Orders"}}
         ]});
         assert_eq!(
-            pairs(actions_for(&req("TransactWriteItems", transact))),
+            pairs(actions_for(
+                &test_state(),
+                &req("TransactWriteItems", transact)
+            )),
             vec![
                 ("dynamodb:PutItem".to_string(), TABLE.to_string()),
                 (
@@ -626,10 +690,13 @@ mod tests {
             ]
         );
         assert_eq!(
-            pairs(actions_for(&req(
-                "TransactGetItems",
-                json!({"TransactItems": [{"Get": {"TableName": "Orders"}}]})
-            ))),
+            pairs(actions_for(
+                &test_state(),
+                &req(
+                    "TransactGetItems",
+                    json!({"TransactItems": [{"Get": {"TableName": "Orders"}}]})
+                )
+            )),
             one("GetItem", TABLE)
         );
     }
@@ -667,10 +734,10 @@ mod tests {
         ];
         for (statement, action_name, resource) in cases {
             assert_eq!(
-                pairs(actions_for(&req(
-                    "ExecuteStatement",
-                    json!({"Statement": statement})
-                ))),
+                pairs(actions_for(
+                    &test_state(),
+                    &req("ExecuteStatement", json!({"Statement": statement}))
+                )),
                 one(action_name, &resource),
                 "{statement}"
             );
@@ -681,7 +748,10 @@ mod tests {
             {"Statement": "DELETE FROM \"Orders\" WHERE pk = 'c'"}
         ]});
         assert_eq!(
-            pairs(actions_for(&req("BatchExecuteStatement", batch))),
+            pairs(actions_for(
+                &test_state(),
+                &req("BatchExecuteStatement", batch)
+            )),
             vec![
                 ("dynamodb:PartiQLInsert".to_string(), TABLE.to_string()),
                 ("dynamodb:PartiQLDelete".to_string(), TABLE.to_string()),
@@ -697,7 +767,7 @@ mod tests {
             "ResourcePolicy": "{}"
         });
         assert_eq!(
-            pairs(actions_for(&req("CreateTable", create))),
+            pairs(actions_for(&test_state(), &req("CreateTable", create))),
             vec![
                 ("dynamodb:CreateTable".to_string(), TABLE.to_string()),
                 ("dynamodb:TagResource".to_string(), TABLE.to_string()),
@@ -705,18 +775,21 @@ mod tests {
             ]
         );
         assert_eq!(
-            pairs(actions_for(&req(
-                "CreateTable",
-                json!({"TableName": "Orders"})
-            ))),
+            pairs(actions_for(
+                &test_state(),
+                &req("CreateTable", json!({"TableName": "Orders"}))
+            )),
             one("CreateTable", TABLE)
         );
 
         let backup = format!("{TABLE}/backup/01700000000000-abcd");
-        let restored = pairs(actions_for(&req(
-            "RestoreTableFromBackup",
-            json!({"BackupArn": backup, "TargetTableName": "Copy"}),
-        )));
+        let restored = pairs(actions_for(
+            &test_state(),
+            &req(
+                "RestoreTableFromBackup",
+                json!({"BackupArn": backup, "TargetTableName": "Copy"}),
+            ),
+        ));
         let copy = "arn:aws:dynamodb:eu-west-1:111122223333:table/Copy";
         assert_eq!(
             restored[0],
@@ -728,10 +801,13 @@ mod tests {
         assert!(restored.contains(&("dynamodb:PutItem".to_string(), copy.to_string())));
         assert!(restored.contains(&("dynamodb:BatchWriteItem".to_string(), copy.to_string())));
 
-        let pitr = pairs(actions_for(&req(
-            "RestoreTableToPointInTime",
-            json!({"SourceTableName": "Orders", "TargetTableName": "Copy"}),
-        )));
+        let pitr = pairs(actions_for(
+            &test_state(),
+            &req(
+                "RestoreTableToPointInTime",
+                json!({"SourceTableName": "Orders", "TargetTableName": "Copy"}),
+            ),
+        ));
         assert_eq!(
             pitr[0],
             (

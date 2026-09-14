@@ -418,18 +418,73 @@ pub(crate) fn execute_partiql_in_state(
         let after_from = trimmed[from_pos + 4..].trim();
         let (table_name, rest) = parse_partiql_table_name(after_from);
         let table = get_table(&state.tables, &table_name)?;
+        // `FROM "table"."index"` reads the index: only the rows that carry
+        // its key attributes, with only the attributes it projects. Ignoring
+        // the index segment read the whole base table -- and, since the rest
+        // of the statement then did not start with WHERE, skipped the WHERE
+        // clause too.
+        let (index, rest) = match rest.strip_prefix('.') {
+            Some(index_part) => {
+                let (index_name, rest) = parse_partiql_table_name(index_part);
+                let index = table
+                    .gsi
+                    .iter()
+                    .map(|g| (&g.index_name, &g.key_schema, &g.projection))
+                    .chain(
+                        table
+                            .lsi
+                            .iter()
+                            .map(|l| (&l.index_name, &l.key_schema, &l.projection)),
+                    )
+                    .find(|(name, _, _)| **name == index_name)
+                    .ok_or_else(|| {
+                        AwsServiceError::aws_error(
+                            StatusCode::BAD_REQUEST,
+                            "ValidationException",
+                            format!("The table does not have the specified index: {index_name}"),
+                        )
+                    })?;
+                let key_attrs: Vec<String> =
+                    index.1.iter().map(|k| k.attribute_name.clone()).collect();
+                (Some((key_attrs, index.2.clone())), rest)
+            }
+            None => (None, rest),
+        };
         let rest_upper = rest.trim().to_ascii_uppercase();
         let mut rows: Vec<&HashMap<String, AttributeValue>> = if rest_upper.starts_with("WHERE") {
             let where_clause = rest.trim()[5..].trim();
             evaluate_partiql_where(table, where_clause, parameters)?
-        } else {
+        } else if rest.trim().is_empty() {
             table.items.iter().collect()
+        } else {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "ValidationException",
+                format!("Statement wasn't well formed, can't be processed: {trimmed}"),
+            ));
         };
+        if let Some((key_attrs, _)) = &index {
+            rows.retain(|item| key_attrs.iter().all(|k| item.contains_key(k)));
+        }
         // Scan order, which ExecuteStatement's NextToken resumes by key: an
         // order that depends on which rows exist would skip or repeat rows
         // when some are deleted between pages.
         table.sort_in_scan_order(&mut rows);
-        let items: Vec<Value> = rows.iter().map(|item| json!(item)).collect();
+        let items: Vec<Value> = rows
+            .iter()
+            .map(|item| match &index {
+                Some((key_attrs, projection)) => {
+                    json!(crate::service::queries::apply_index_projection(
+                        (*item).clone(),
+                        projection,
+                        key_attrs,
+                        table.hash_key_name(),
+                        table.range_key_name(),
+                    ))
+                }
+                None => json!(item),
+            })
+            .collect();
         Ok(PartiqlOutcome {
             response: json!({ "Items": items }),
             table_name: Some(table_name),

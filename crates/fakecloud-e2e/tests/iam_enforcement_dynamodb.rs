@@ -525,3 +525,259 @@ async fn streams_are_authorized_against_the_stream() {
     ));
     assert!(denied(streams.list_streams().send().await));
 }
+
+fn user_arn(name: &str) -> String {
+    format!("arn:aws:iam::{ACCOUNT}:user/{name}")
+}
+
+async fn put_resource_policy(admin: &DynamoClient, arn: &str, policy: serde_json::Value) {
+    admin
+        .put_resource_policy()
+        .resource_arn(arn)
+        .policy(policy.to_string())
+        .send()
+        .await
+        .unwrap();
+}
+
+/// Within the account, a table's resource policy can grant access on its
+/// own, and an explicit Deny in it overrides an identity policy's Allow.
+#[tokio::test]
+async fn table_resource_policies_grant_and_deny() {
+    let server = start_strict().await;
+    let admin = admin(&server).await;
+    create_table(&admin, "Orders").await;
+    let granted = user_with_policy(
+        &server,
+        "granted",
+        &allow(&["sqs:ListQueues"], &["*".to_string()]),
+    )
+    .await;
+    let denied_user = user_with_policy(
+        &server,
+        "denied",
+        &allow(&["dynamodb:*"], &["*".to_string()]),
+    )
+    .await;
+    put_resource_policy(
+        &admin,
+        &table_arn("Orders"),
+        serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": user_arn("granted")},
+                    "Action": "dynamodb:GetItem",
+                    "Resource": table_arn("Orders")
+                },
+                {
+                    "Effect": "Deny",
+                    "Principal": {"AWS": user_arn("denied")},
+                    "Action": "dynamodb:GetItem",
+                    "Resource": table_arn("Orders")
+                }
+            ]
+        }),
+    )
+    .await;
+
+    let get = |client: &DynamoClient| {
+        client
+            .get_item()
+            .table_name("Orders")
+            .key("pk", AttributeValue::S("a".into()))
+            .send()
+    };
+    get(&granted)
+        .await
+        .expect("the table policy alone grants a same-account principal");
+    assert!(denied(
+        granted
+            .put_item()
+            .table_name("Orders")
+            .item("pk", AttributeValue::S("a".into()))
+            .send()
+            .await
+    ));
+    assert!(
+        denied(get(&denied_user).await),
+        "an explicit Deny in the table policy beats the identity Allow"
+    );
+    denied_user
+        .put_item()
+        .table_name("Orders")
+        .item("pk", AttributeValue::S("a".into()))
+        .send()
+        .await
+        .expect("the Deny covers GetItem only");
+}
+
+/// A stream's resource policy is its own: it grants stream reads the
+/// table's policy does not.
+#[tokio::test]
+async fn stream_resource_policies_are_separate_from_the_table() {
+    let server = start_strict().await;
+    let admin = admin(&server).await;
+    create_table(&admin, "Orders").await;
+    let stream_arn = admin
+        .describe_table()
+        .table_name("Orders")
+        .send()
+        .await
+        .unwrap()
+        .table()
+        .unwrap()
+        .latest_stream_arn()
+        .unwrap()
+        .to_string();
+    put_resource_policy(
+        &admin,
+        &stream_arn,
+        serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": {"AWS": user_arn("reader")},
+                "Action": "dynamodb:DescribeStream",
+                "Resource": stream_arn
+            }]
+        }),
+    )
+    .await;
+
+    let boot = sdk_config_with(&server, "test", "test").await;
+    let iam = IamClient::new(&boot);
+    iam.create_user().user_name("reader").send().await.unwrap();
+    let key = iam
+        .create_access_key()
+        .user_name("reader")
+        .send()
+        .await
+        .unwrap();
+    let key = key.access_key().unwrap();
+    let cfg = sdk_config_with(&server, key.access_key_id(), key.secret_access_key()).await;
+    let streams = aws_sdk_dynamodbstreams::Client::new(&cfg);
+
+    streams
+        .describe_stream()
+        .stream_arn(&stream_arn)
+        .send()
+        .await
+        .expect("the stream policy grants DescribeStream");
+    assert!(denied(
+        DynamoClient::new(&cfg)
+            .describe_table()
+            .table_name("Orders")
+            .send()
+            .await
+    ));
+}
+
+/// `dynamodb:LeadingKeys` limits a principal to its own partitions, and
+/// `dynamodb:Attributes` / `dynamodb:Select` gate which attributes it reads.
+#[tokio::test]
+async fn fine_grained_access_by_partition_and_attribute() {
+    let server = start_strict().await;
+    let admin = admin(&server).await;
+    create_table(&admin, "Orders").await;
+    for pk in ["alice", "bob"] {
+        admin
+            .put_item()
+            .table_name("Orders")
+            .item("pk", AttributeValue::S(pk.into()))
+            .item("label", AttributeValue::S(pk.into()))
+            .item("ssn", AttributeValue::S("secret".into()))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    let alice = user_with_policy(
+        &server,
+        "alice",
+        &serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:PutItem"],
+                    "Resource": table_arn("Orders"),
+                    "Condition": {"ForAllValues:StringEquals": {"dynamodb:LeadingKeys": ["alice"]}}
+                },
+                {
+                    "Effect": "Deny",
+                    "Action": ["dynamodb:GetItem", "dynamodb:Query"],
+                    "Resource": table_arn("Orders"),
+                    "Condition": {"ForAnyValue:StringEquals": {"dynamodb:Attributes": ["ssn"]}}
+                },
+                {
+                    "Effect": "Deny",
+                    "Action": ["dynamodb:GetItem", "dynamodb:Query"],
+                    "Resource": table_arn("Orders"),
+                    "Condition": {"StringNotEqualsIfExists": {"dynamodb:Select": "SPECIFIC_ATTRIBUTES"}}
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .await;
+
+    let get = |pk: &str, projection: Option<&str>| {
+        let mut req = alice
+            .get_item()
+            .table_name("Orders")
+            .key("pk", AttributeValue::S(pk.into()));
+        if let Some(p) = projection {
+            req = req.projection_expression(p);
+        }
+        req.send()
+    };
+    let item = get("alice", Some("pk, label"))
+        .await
+        .expect("own partition, allowed attributes")
+        .item()
+        .cloned()
+        .unwrap();
+    assert!(!item.contains_key("ssn"));
+    assert!(
+        denied(get("bob", Some("pk, label")).await),
+        "another partition"
+    );
+    assert!(
+        denied(get("alice", Some("pk, ssn")).await),
+        "a denied attribute"
+    );
+    assert!(
+        denied(get("alice", None).await),
+        "no projection reads every attribute"
+    );
+
+    let query = |pk: &str| {
+        alice
+            .query()
+            .table_name("Orders")
+            .key_condition_expression("pk = :p")
+            .expression_attribute_values(":p", AttributeValue::S(pk.into()))
+            .projection_expression("pk, label")
+            .send()
+    };
+    query("alice").await.expect("query own partition");
+    assert!(denied(query("bob").await));
+    alice
+        .put_item()
+        .table_name("Orders")
+        .item("pk", AttributeValue::S("alice".into()))
+        .item("label", AttributeValue::S("A".into()))
+        .send()
+        .await
+        .expect("write own partition");
+    assert!(denied(
+        alice
+            .put_item()
+            .table_name("Orders")
+            .item("pk", AttributeValue::S("bob".into()))
+            .send()
+            .await
+    ));
+}

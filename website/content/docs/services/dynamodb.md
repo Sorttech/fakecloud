@@ -8,11 +8,11 @@ fakecloud implements **57 of 57** DynamoDB operations at 100% Smithy conformance
 
 ## Supported features
 
-- **Tables** — CRUD, attributes, indexes (GSI, LSI), billing modes, tags
+- **Tables** — CRUD, attributes, indexes (GSI, LSI), billing modes, tags, resource-based policies on tables and streams (`PutResourcePolicy` / `GetResourcePolicy` / `DeleteResourcePolicy` with `ExpectedRevisionId`, `CreateTable` `ResourcePolicy`)
 - **Items** — GetItem, PutItem, UpdateItem, DeleteItem, BatchGetItem, BatchWriteItem
 - **Transactions** — TransactGetItems, TransactWriteItems with conditional checks
 - **Query and Scan** — full expression support (key conditions, filter expressions)
-- **PartiQL** — ExecuteStatement, BatchExecuteStatement, ExecuteTransaction
+- **PartiQL** — ExecuteStatement, BatchExecuteStatement, ExecuteTransaction; `SELECT ... FROM "table"."index"` reads the index (rows carrying its key, with its projected attributes)
 - **Update expressions** — SET, REMOVE, ADD, DELETE with function support (`size`, `attribute_exists`, `begins_with`, `contains`, `attribute_type`)
 - **Condition expressions** — full operator support with correct type coercion
 - **Global tables** — replica management, replica status reporting
@@ -21,7 +21,7 @@ fakecloud implements **57 of 57** DynamoDB operations at 100% Smithy conformance
 - **TTL** — expire items via `/_fakecloud/dynamodb/ttl-processor/tick`
 - **Exports and imports** — S3 exports (recorded), S3 imports (recorded)
 - **ConsumedCapacity + ItemCollectionMetrics** — every data-plane op (`GetItem`, `PutItem`, `UpdateItem`, `DeleteItem`, `Query`, `Scan`, `BatchGetItem`, `BatchWriteItem`, `TransactGetItems`, `TransactWriteItems`, PartiQL variants) returns `ConsumedCapacity` when the caller requests it via `ReturnConsumedCapacity = TOTAL` / `INDEXES`. Capacity units are synthesized from the serialized item byte size using AWS's documented 4 KB read / 1 KB write rounding, broken out per table + per index. `ItemCollectionMetrics` is emitted on writes touching tables that have a local secondary index, with `SizeEstimateRangeGB` rounded to the AWS-documented `[lower, upper]` shape
-- **IAM enforcement** — with `FAKECLOUD_IAM=strict` (or `soft`), every DynamoDB and DynamoDB Streams operation is authorized against the caller's policies using the actions and resource ARNs AWS uses: the table, index, stream, backup, export or import ARN; the batch action on every table in a batch; the per-item action on each table in a transaction; `PartiQLSelect` / `PartiQLInsert` / `PartiQLUpdate` / `PartiQLDelete` for PartiQL; `aws:ResourceTag` / `aws:RequestTag` / `aws:TagKeys` conditions on table tags. See [SigV4 verification and IAM enforcement](@/docs/reference/security.md)
+- **IAM enforcement** — with `FAKECLOUD_IAM=strict` (or `soft`), every DynamoDB and DynamoDB Streams operation is authorized against the caller's policies using the actions and resource ARNs AWS uses: the table, index, stream, backup, export or import ARN; the batch action on every table in a batch; the per-item action on each table in a transaction; `PartiQLSelect` / `PartiQLInsert` / `PartiQLUpdate` / `PartiQLDelete` for PartiQL; `aws:ResourceTag` / `aws:RequestTag` / `aws:TagKeys` conditions on table tags; fine-grained access control through `dynamodb:LeadingKeys`, `dynamodb:Attributes`, `dynamodb:Select`, `dynamodb:ReturnValues`, `dynamodb:ReturnConsumedCapacity`, `dynamodb:EnclosingOperation` and `dynamodb:FullTableScan`; and table and stream resource-based policies, whose explicit Deny wins and whose Allow grants same-account principals on its own. See [SigV4 verification and IAM enforcement](@/docs/reference/security.md)
 - **`TableName` accepts ARNs** — every operation that takes a `TableName` parameter also accepts the full `arn:aws:dynamodb:<region>:<account>:table/<name>` form, and resolves it back to the local table. The same applies to global secondary index identifiers when an ARN form is supplied. Matches the real AWS API change that landed in 2024 so cross-region / cross-account SDK call patterns work without rewriting test fixtures
 
 ## Protocol

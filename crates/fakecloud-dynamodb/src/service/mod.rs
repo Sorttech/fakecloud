@@ -3,6 +3,7 @@ mod batch;
 mod expression_corpus_tests;
 mod global_tables;
 pub(crate) mod iam;
+mod iam_conditions;
 mod items;
 mod queries;
 mod streams;
@@ -543,11 +544,19 @@ impl AwsService for DynamoDbService {
     }
 
     fn iam_actions_for(&self, request: &AwsRequest) -> Vec<fakecloud_core::auth::IamAction> {
-        iam::actions_for(request)
+        iam::actions_for(&self.state, request)
     }
 
     fn iam_action_for(&self, request: &AwsRequest) -> Option<fakecloud_core::auth::IamAction> {
-        iam::actions_for(request).into_iter().next()
+        iam::actions_for(&self.state, request).into_iter().next()
+    }
+
+    fn iam_condition_keys_for(
+        &self,
+        request: &AwsRequest,
+        action: &fakecloud_core::auth::IamAction,
+    ) -> std::collections::BTreeMap<String, Vec<String>> {
+        iam_conditions::condition_keys(&self.state, request, action)
     }
 
     fn resource_tags_for(&self, resource_arn: &str) -> Option<HashMap<String, String>> {
