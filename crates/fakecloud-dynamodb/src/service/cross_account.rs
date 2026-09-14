@@ -160,6 +160,14 @@ pub(crate) fn check_references(
     body: &Value,
     cross_account_operations: &[&str],
 ) -> Result<(), AwsServiceError> {
+    // These listings take a table only as a filter and model no not-found
+    // error: a table they cannot see just matches nothing.
+    if matches!(
+        req.action.as_str(),
+        "ListBackups" | "ListExports" | "ListImports"
+    ) {
+        return Ok(());
+    }
     let cross_account = cross_account_operations.contains(&req.action.as_str());
     for (arn, code) in referenced_arns(&req.action, body) {
         let Some((region, account)) = arn_scope(&arn) else {
@@ -272,6 +280,11 @@ mod tests {
             ),
             Err("ResourceNotFoundException".into())
         );
+        // A listing filtered by another account's or region's table is empty,
+        // not an error.
+        assert_eq!(check("ListExports", json!({"TableArn": FOREIGN})), Ok(()));
+        assert_eq!(check("ListImports", json!({"TableArn": FOREIGN})), Ok(()));
+        assert_eq!(check("ListBackups", json!({"TableName": FOREIGN})), Ok(()));
         let other_region = "arn:aws:dynamodb:eu-west-1:111122223333:table/T";
         for (action, body) in [
             ("GetItem", json!({"TableName": other_region})),

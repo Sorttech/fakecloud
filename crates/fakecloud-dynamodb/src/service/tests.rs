@@ -7414,6 +7414,27 @@ async fn other_accounts_tables_are_not_found_without_cross_account_support() {
         assert_eq!(got["__type"], code, "{action}");
     }
 
+    // A listing filtered by another account's table matches nothing.
+    for (action, body, field) in [
+        (
+            "ListExports",
+            json!({"TableArn": OWNER_ARN}),
+            "ExportSummaries",
+        ),
+        (
+            "ListBackups",
+            json!({"TableName": OWNER_ARN}),
+            "BackupSummaries",
+        ),
+    ] {
+        let (status, got) = call_as(&svc, "123456789012", action, body).await;
+        assert_eq!(status, StatusCode::OK, "{action}: {got}");
+        assert!(
+            got[field].as_array().is_none_or(|a| a.is_empty()),
+            "{action}: {got}"
+        );
+    }
+
     // Another region's table is not found, whoever owns it.
     for arn in [
         "arn:aws:dynamodb:us-west-2:123456789012:table/Shared",
