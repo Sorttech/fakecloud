@@ -6,11 +6,12 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex as AsyncMutex;
 
+use crate::persistence::{prune_expired, LogsStore, SnapshotLogsStore};
 use fakecloud_core::delivery::DeliveryBus;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_persistence::SnapshotStore;
 
-use crate::state::{LogsSnapshot, SharedLogsState, LOGS_SNAPSHOT_SCHEMA_VERSION};
+use crate::state::SharedLogsState;
 
 mod anomaly;
 mod deliveries;
@@ -89,7 +90,7 @@ fn is_read_only_action(action: &str) -> bool {
 pub struct LogsService {
     state: SharedLogsState,
     delivery_bus: Arc<DeliveryBus>,
-    snapshot_store: Option<Arc<dyn SnapshotStore>>,
+    snapshot_store: Option<Arc<dyn LogsStore>>,
     snapshot_lock: Arc<AsyncMutex<()>>,
 }
 
@@ -104,6 +105,11 @@ impl LogsService {
     }
 
     pub fn with_snapshot_store(mut self, store: Arc<dyn SnapshotStore>) -> Self {
+        self.snapshot_store = Some(Arc::new(SnapshotLogsStore(store)));
+        self
+    }
+
+    pub fn with_logs_store(mut self, store: Arc<dyn LogsStore>) -> Self {
         self.snapshot_store = Some(store);
         self
     }
@@ -117,16 +123,15 @@ impl LogsService {
         self
     }
 
-    /// Persist current state as a snapshot. Held across the
-    /// clone-serialize-write sequence to prevent stale-last writes,
-    /// with serde + file I/O offloaded to the blocking pool.
-    async fn save_snapshot(&self) {
-        save_logs_snapshot(
+    /// Persist under the shared save lock, with serialization and file I/O
+    /// offloaded to the blocking pool without cloning event history.
+    async fn save_snapshot(&self) -> std::io::Result<()> {
+        save_logs_state(
             &self.state,
             self.snapshot_store.clone(),
             &self.snapshot_lock,
         )
-        .await;
+        .await
     }
 
     /// Build a hook that persists the current Logs state when invoked, or `None`
@@ -142,42 +147,49 @@ impl LogsService {
             let store = store.clone();
             let lock = lock.clone();
             Box::pin(async move {
-                save_logs_snapshot(&state, Some(store), &lock).await;
+                if let Err(error) = save_logs_state(&state, Some(store), &lock).await {
+                    tracing::error!(%error, "failed to persist Logs state");
+                }
             })
         }))
     }
 }
 
-/// Persist the current Logs state as a snapshot. Offloads the serde + blocking
-/// file write to the Tokio blocking pool. Noop when `store` is `None` (memory
-/// mode). Shared by `LogsService::save_snapshot` and the CloudFormation
-/// provisioner's post-provision persist hook so both route through the same
-/// serialize-and-write path.
+/// Compatibility entry point for embedders using an opaque snapshot store.
+/// Offloads serialization and file I/O to the blocking pool. Without a store,
+/// only in-memory retention is applied.
 pub async fn save_logs_snapshot(
     state: &SharedLogsState,
     store: Option<Arc<dyn SnapshotStore>>,
     lock: &AsyncMutex<()>,
 ) {
-    let Some(store) = store else {
-        return;
-    };
-    let _guard = lock.lock().await;
-    let snapshot = LogsSnapshot {
-        schema_version: LOGS_SNAPSHOT_SCHEMA_VERSION,
-        accounts: Some(state.read().clone()),
-        state: None,
-    };
-    let join = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-        let bytes = serde_json::to_vec(&snapshot)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-        store.save(&bytes)
-    })
-    .await;
-    match join {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => tracing::error!(%err, "failed to write logs snapshot"),
-        Err(err) => tracing::error!(%err, "logs snapshot task panicked"),
+    let store = store.map(|s| Arc::new(SnapshotLogsStore(s)) as Arc<dyn LogsStore>);
+    if let Err(error) = save_logs_state(state, store, lock).await {
+        tracing::error!(%error, "failed to persist Logs state");
     }
+}
+
+/// Shared by API, cross-service delivery, and retention sweep writers.
+/// Serialize borrowed state on the blocking pool; do not clone event history.
+pub async fn save_logs_state(
+    state: &SharedLogsState,
+    store: Option<Arc<dyn LogsStore>>,
+    lock: &AsyncMutex<()>,
+) -> std::io::Result<()> {
+    let _guard = lock.lock().await;
+    let state = state.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut state = state.write();
+        match store {
+            Some(store) => store.save(&mut state),
+            None => {
+                prune_expired(&mut state, chrono::Utc::now().timestamp_millis());
+                Ok(())
+            }
+        }
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
 
 #[async_trait]
@@ -316,7 +328,14 @@ impl AwsService for LogsService {
             _ => Err(AwsServiceError::action_not_implemented("logs", &req.action)),
         };
         if mutates && matches!(result.as_ref(), Ok(resp) if resp.status.is_success()) {
-            self.save_snapshot().await;
+            self.save_snapshot().await.map_err(|error| {
+                tracing::error!(%error, "failed to persist Logs state");
+                AwsServiceError::aws_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "ServiceUnavailableException",
+                    "Failed to persist log data",
+                )
+            })?;
         }
         result
     }
@@ -826,5 +845,24 @@ pub(crate) mod test_helpers {
             .expect("hook present when a store is set");
         // Must not panic; exercises the closure and the snapshot save path.
         hook().await;
+    }
+    #[tokio::test]
+    async fn persistence_failure_returns_service_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let blocked = directory.path().join("not-a-directory");
+        std::fs::write(&blocked, b"occupied").unwrap();
+        let svc = make_service().with_logs_store(Arc::new(
+            crate::persistence::SegmentedLogsStore::new(blocked),
+        ));
+        let request = make_request("CreateLogGroup", serde_json::json!({"logGroupName": "g"}));
+        let error = svc
+            .handle(request)
+            .await
+            .err()
+            .expect("must not acknowledge a failed save");
+        assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            matches!(error, AwsServiceError::AwsError { code, .. } if code == "ServiceUnavailableException")
+        );
     }
 }

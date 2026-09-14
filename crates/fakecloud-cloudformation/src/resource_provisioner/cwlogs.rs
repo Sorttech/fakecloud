@@ -146,6 +146,8 @@ impl ResourceProvisioner {
         group.log_streams.insert(
             log_stream_name.clone(),
             LogStream {
+                persistence_id: uuid::Uuid::new_v4().to_string(),
+                last_sequence: 0,
                 name: log_stream_name.clone(),
                 arn,
                 creation_time: Utc::now().timestamp_millis(),

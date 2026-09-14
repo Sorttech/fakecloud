@@ -156,3 +156,82 @@ async fn persistence_subscription_filter_and_delete_survive_restart() {
         .unwrap();
     assert!(groups.log_groups().is_empty());
 }
+
+/// Retention removes stored events permanently, even when the policy is later
+/// deleted. A newly ingested late event is still accepted after policy removal.
+#[tokio::test]
+async fn segmented_retention_does_not_resurrect_expired_events() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut server = TestServer::start_persistent(tmp.path()).await;
+    let logs = server.logs_client().await;
+    logs.create_log_group()
+        .log_group_name("retained")
+        .send()
+        .await
+        .unwrap();
+    logs.create_log_stream()
+        .log_group_name("retained")
+        .log_stream_name("s")
+        .send()
+        .await
+        .unwrap();
+    let now = chrono::Utc::now().timestamp_millis();
+    let old = now - 2 * 86_400_000;
+    for (timestamp, message) in [(old, "expired"), (now, "live")] {
+        logs.put_log_events()
+            .log_group_name("retained")
+            .log_stream_name("s")
+            .log_events(
+                InputLogEvent::builder()
+                    .timestamp(timestamp)
+                    .message(message)
+                    .build()
+                    .unwrap(),
+            )
+            .send()
+            .await
+            .unwrap();
+    }
+    logs.put_retention_policy()
+        .log_group_name("retained")
+        .retention_in_days(1)
+        .send()
+        .await
+        .unwrap();
+    logs.delete_retention_policy()
+        .log_group_name("retained")
+        .send()
+        .await
+        .unwrap();
+    logs.put_log_events()
+        .log_group_name("retained")
+        .log_stream_name("s")
+        .log_events(
+            InputLogEvent::builder()
+                .timestamp(old)
+                .message("new-late")
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert!(tmp.path().join("logs/manifest.json").exists());
+    server.restart().await;
+    let response = server
+        .logs_client()
+        .await
+        .get_log_events()
+        .log_group_name("retained")
+        .log_stream_name("s")
+        .start_from_head(true)
+        .send()
+        .await
+        .unwrap();
+    let messages: Vec<_> = response
+        .events()
+        .iter()
+        .filter_map(|e| e.message())
+        .collect();
+    assert_eq!(messages, vec!["new-late", "live"]);
+}

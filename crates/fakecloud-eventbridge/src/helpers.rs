@@ -1168,6 +1168,8 @@ pub(crate) fn deliver_to_logs(
         .log_streams
         .entry(stream_name.clone())
         .or_insert_with(|| fakecloud_logs::LogStream {
+            persistence_id: uuid::Uuid::new_v4().to_string(),
+            last_sequence: 0,
             name: stream_name,
             arn: format!("{}:log-stream:events", group.arn),
             creation_time: ts_millis,
@@ -1178,7 +1180,14 @@ pub(crate) fn deliver_to_logs(
             events: Vec::new(),
         });
 
-    let next_seq = stream.events.iter().map(|e| e.seq).max().unwrap_or(0) + 1;
+    let next_seq = stream
+        .events
+        .iter()
+        .map(|e| e.seq)
+        .max()
+        .unwrap_or(0)
+        .max(stream.last_sequence)
+        + 1;
     stream.events.push(fakecloud_logs::LogEvent {
         timestamp: ts_millis,
         message: payload.to_string(),

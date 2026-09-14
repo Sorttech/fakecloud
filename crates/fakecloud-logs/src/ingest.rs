@@ -63,6 +63,8 @@ pub fn append_events(
         .log_streams
         .entry(stream_name.to_string())
         .or_insert_with(|| LogStream {
+            persistence_id: uuid::Uuid::new_v4().to_string(),
+            last_sequence: 0,
             name: stream_name.to_string(),
             arn: format!("{}:log-stream:{}", group.arn, stream_name),
             creation_time: now,
@@ -73,7 +75,13 @@ pub fn append_events(
             events: Vec::new(),
         });
 
-    let base_seq = stream.events.iter().map(|e| e.seq).max().unwrap_or(0);
+    let base_seq = stream
+        .events
+        .iter()
+        .map(|e| e.seq)
+        .max()
+        .unwrap_or(0)
+        .max(stream.last_sequence);
     for (i, e) in events.iter().enumerate() {
         if stream.first_event_timestamp.is_none() {
             stream.first_event_timestamp = Some(e.timestamp_ms);

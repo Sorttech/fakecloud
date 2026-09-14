@@ -1787,66 +1787,69 @@ async fn main() {
     // the scheduler is spawned) also means the background rule scheduler fires
     // against the restored Logs state rather than an empty one. The lock is
     // shared with LogsService (below) so the two Logs writers can't
-    // stale-overwrite each other's clone-serialize-write.
-    let logs_snapshot_store: Option<Arc<dyn fakecloud_persistence::SnapshotStore>> =
+    // interleave event appends and manifest commits.
+    let logs_snapshot_store: Option<Arc<dyn fakecloud_logs::persistence::LogsStore>> =
         if persistence_config.mode == fakecloud_persistence::StorageMode::Persistent {
-            let data_path = persistence_config
+            let directory = persistence_config
                 .data_path
                 .as_ref()
                 .expect("validated above")
-                .clone();
-            let path = data_path.join("logs").join("snapshot.json");
-            let store = fakecloud_persistence::DiskSnapshotStore::new(path);
-            match fakecloud_persistence::SnapshotStore::load(&store) {
-                Ok(Some(bytes)) => {
-                    match serde_json::from_slice::<fakecloud_logs::LogsSnapshot>(&bytes) {
-                        Ok(snapshot) => {
-                            if snapshot.schema_version
-                                > fakecloud_logs::LOGS_SNAPSHOT_SCHEMA_VERSION
-                            {
-                                fatal_exit(format_args!(
-                                    "logs persistence schema too new: on-disk={}, max supported={}",
-                                    snapshot.schema_version,
-                                    fakecloud_logs::LOGS_SNAPSHOT_SCHEMA_VERSION,
-                                ));
-                            }
-                            if let Some(accounts) = snapshot.accounts {
-                                let account_count = accounts.account_count();
-                                *logs_state.write() = accounts;
-                                tracing::info!(
-                                    accounts = account_count,
-                                    "loaded logs persistence snapshot (multi-account)"
-                                );
-                            } else if let Some(single_state) = snapshot.state {
-                                let group_count = single_state.log_groups.len();
-                                let account_id = single_state.account_id.clone();
-                                let mut mas = logs_state.write();
-                                *mas.get_or_create(&account_id) = single_state;
-                                tracing::info!(
-                                    log_groups = group_count,
-                                    "loaded logs persistence snapshot (migrated from v1)"
-                                );
-                            } else {
-                                tracing::warn!("logs persistence snapshot has neither accounts nor state; starting empty");
-                            }
-                        }
-                        Err(err) => fatal_exit(format_args!(
-                            "failed to parse logs persistence snapshot: {err}"
-                        )),
+                .join("logs");
+            let store = fakecloud_logs::persistence::SegmentedLogsStore::new(directory);
+            match fakecloud_logs::persistence::LogsStore::load(&store) {
+                Ok(Some(snapshot)) => {
+                    if snapshot.schema_version > fakecloud_logs::LOGS_SNAPSHOT_SCHEMA_VERSION {
+                        fatal_exit(format_args!(
+                            "logs persistence schema too new: {}",
+                            snapshot.schema_version
+                        ));
                     }
+                    if let Some(accounts) = snapshot.accounts {
+                        *logs_state.write() = accounts;
+                    } else if let Some(single) = snapshot.state {
+                        let account_id = single.account_id.clone();
+                        *logs_state.write().get_or_create(&account_id) = single;
+                    } else {
+                        fatal_exit(format_args!("logs persistence snapshot has no state"));
+                    }
+                    // Finish legacy migration and persist offline expiration before
+                    // accepting policy changes or starting background deliveries.
+                    if let Err(error) = fakecloud_logs::persistence::LogsStore::save(
+                        &store,
+                        &mut logs_state.write(),
+                    ) {
+                        fatal_exit(format_args!(
+                            "failed to initialize Logs persistence: {error}"
+                        ));
+                    }
+                    tracing::info!("loaded Logs persistence state");
                 }
-                Ok(None) => {
-                    tracing::info!("no logs persistence snapshot found; starting empty");
-                }
-                Err(err) => fatal_exit(format_args!(
-                    "failed to read logs persistence snapshot: {err}"
-                )),
+                Ok(None) => tracing::info!("no Logs persistence state found; starting empty"),
+                Err(error) => fatal_exit(format_args!("failed to load Logs persistence: {error}")),
             }
-            Some(Arc::new(store) as Arc<dyn fakecloud_persistence::SnapshotStore>)
+            Some(Arc::new(store))
         } else {
             None
         };
     let logs_snapshot_lock = Arc::new(tokio::sync::Mutex::new(()));
+    // Sweep idle groups too. Weak state avoids keeping a dropped server alive.
+    {
+        let state = Arc::downgrade(&logs_state);
+        let store = logs_snapshot_store.clone();
+        let lock = logs_snapshot_lock.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                let Some(state) = state.upgrade() else { break };
+                if let Err(error) =
+                    fakecloud_logs::save_logs_state(&state, store.clone(), &lock).await
+                {
+                    tracing::error!(%error, "Logs retention sweep failed");
+                }
+            }
+        });
+    }
     // Persist hook routing EventBridge -> CloudWatch Logs deliveries through the
     // Logs snapshot store, so an event delivered to a Logs target (including
     // from the background rule scheduler) survives a restart, matching every
@@ -1860,7 +1863,11 @@ async fn main() {
                 let store = store.clone();
                 let lock = lock.clone();
                 Box::pin(async move {
-                    fakecloud_logs::save_logs_snapshot(&state, Some(store), &lock).await;
+                    if let Err(error) =
+                        fakecloud_logs::save_logs_state(&state, Some(store), &lock).await
+                    {
+                        tracing::error!(%error, "failed to persist delivered Logs events");
+                    }
                 })
                     as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
             }) as fakecloud_persistence::SnapshotHook
@@ -2249,7 +2256,7 @@ async fn main() {
     let mut logs_service = LogsService::new(logs_state.clone(), delivery_for_logs)
         .with_snapshot_lock(logs_snapshot_lock);
     if let Some(store) = logs_snapshot_store {
-        logs_service = logs_service.with_snapshot_store(store);
+        logs_service = logs_service.with_logs_store(store);
     }
     if let Some(h) = logs_service.snapshot_hook() {
         cfn_snapshot_hooks.insert("logs", h);

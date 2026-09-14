@@ -74,6 +74,8 @@ impl LogsService {
         group.log_streams.insert(
             stream_name.clone(),
             LogStream {
+                persistence_id: uuid::Uuid::new_v4().to_string(),
+                last_sequence: 0,
                 name: stream_name,
                 arn,
                 creation_time: now,
@@ -453,7 +455,13 @@ impl LogsService {
         // Assign each new event a stable, monotonically-increasing per-stream
         // sequence number so a FilterLogEvents pagination cursor stays valid
         // even after the stream is re-sorted by timestamp.
-        let base_seq = stream.events.iter().map(|e| e.seq).max().unwrap_or(0);
+        let base_seq = stream
+            .events
+            .iter()
+            .map(|e| e.seq)
+            .max()
+            .unwrap_or(0)
+            .max(stream.last_sequence);
         for (i, event) in new_events.iter_mut().enumerate() {
             event.seq = base_seq + 1 + i as u64;
         }
