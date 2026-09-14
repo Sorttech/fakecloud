@@ -364,6 +364,44 @@ fn check_key_type(
     Ok(())
 }
 
+/// The error DynamoDB returns for an update that writes a primary-key
+/// attribute. The message is also what [`DynamoTable::key_attribute_update_message`]
+/// hands integrations that report DynamoDB errors their own way.
+fn key_attribute_update_error(attr: &str) -> AwsServiceError {
+    AwsServiceError::aws_error(
+        StatusCode::BAD_REQUEST,
+        "ValidationException",
+        DynamoTable::key_attribute_update_message(attr),
+    )
+}
+
+/// Reject an UpdateExpression that writes a primary-key attribute (see
+/// [`DynamoTable::key_attribute_in_update_expression`]).
+pub(crate) fn reject_key_attribute_update_expression(
+    table: &DynamoTable,
+    expr: &str,
+    expr_attr_names: &HashMap<String, String>,
+) -> Result<(), AwsServiceError> {
+    match table.key_attribute_in_update_expression(expr, expr_attr_names) {
+        Some(attr) => Err(key_attribute_update_error(&attr)),
+        None => Ok(()),
+    }
+}
+
+/// Reject a legacy `AttributeUpdates` map that writes a primary-key attribute,
+/// with the same error an UpdateExpression gets.
+pub(crate) fn reject_key_attribute_updates(
+    table: &DynamoTable,
+    updates: &serde_json::Map<String, AttributeValue>,
+) -> Result<(), AwsServiceError> {
+    for attr in std::iter::once(table.hash_key_name()).chain(table.range_key_name()) {
+        if updates.contains_key(attr) {
+            return Err(key_attribute_update_error(attr));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod attr_value_validation_tests {
     use super::*;

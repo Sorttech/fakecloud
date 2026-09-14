@@ -229,15 +229,17 @@ async fn security_group_actually_drops_and_allows_packets() {
          did not engage (check that `nft` is on PATH and the process has CAP_NET_ADMIN)"
     );
 
-    // 1) Enforced deny: with no ingress allow, A cannot reach B. If the packet
-    // still flows despite the deny rule being installed (asserted above), the most
-    // common cause is bridge netfilter being off — same-subnet traffic is then
-    // L2-switched straight past the nft `forward` chain. Surface that state in the
-    // failure so it reads as the real cause, not a vague "not dropped".
+    // 1) Enforced deny: with no ingress allow, A cannot reach B -- even though
+    // A's default security group allows all egress, B's ingress is an
+    // independent gate. If the packet still flows despite the deny rule being
+    // installed (asserted above), the most common cause is bridge netfilter
+    // being off — same-subnet traffic is then L2-switched straight past the nft
+    // `forward` hook. Surface that state in the failure so it reads as the real
+    // cause, not a vague "not dropped".
     assert!(
         !wait_ping(&ca, &b_ip, false),
         "SG with no ingress allow must DROP the packet (real enforcement); \
-         deny rule for {b_ip} IS installed, so the packet bypassed the forward chain. \
+         deny rule for {b_ip} IS installed, so the packet bypassed the forward hook. \
          bridge-nf-call-iptables={}",
         bridge_nf_call_iptables()
     );

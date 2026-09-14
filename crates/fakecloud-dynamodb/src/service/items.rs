@@ -213,7 +213,7 @@ impl DynamoDbService {
         if needs_insights {
             let mut accounts = self.state.write();
             let state = accounts.get_or_create(&req.account_id);
-            if let Some(table) = state.tables.get_mut(table_name) {
+            if let Some(table) = state.tables.get_mut(super::resolve_table_name(table_name)) {
                 table.record_key_access(&key);
             }
         }
@@ -370,6 +370,11 @@ impl DynamoDbService {
         let condition =
             resolve_write_condition(&body, &mut expr_attr_names, &mut expr_attr_values)?;
         let update_expression = body["UpdateExpression"].as_str();
+        if let Some(expr) = update_expression {
+            super::reject_key_attribute_update_expression(table, expr, &expr_attr_names)?;
+        } else if let Some(updates) = body["AttributeUpdates"].as_object() {
+            super::reject_key_attribute_updates(table, updates)?;
+        }
 
         // Validate the attribute values an UpdateExpression / AttributeUpdates
         // will write (empty or duplicate SS/BS/NS, malformed numbers) before

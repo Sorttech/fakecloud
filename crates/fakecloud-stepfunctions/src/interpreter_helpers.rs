@@ -716,10 +716,22 @@ pub(crate) fn invoke_dynamodb_update_item(
             .cloned()
             .unwrap_or_default();
 
+        // DynamoDB rejects an update that writes a key attribute; the task
+        // fails with the error Step Functions maps it to.
+        let names: HashMap<String, String> = attr_names
+            .iter()
+            .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+            .collect();
+        if let Some(attr) = table.key_attribute_in_update_expression(update_expr, &names) {
+            return Err((
+                "DynamoDB.AmazonDynamoDBException".to_string(),
+                fakecloud_dynamodb::DynamoTable::key_attribute_update_message(&attr),
+            ));
+        }
+
         table.ensure_key_index();
         if let Some(idx) = table.find_item_index(&key_map) {
-            // Settles the cached size, and re-points the index if the
-            // expression rewrote a key attribute.
+            // Settles the cached size and keeps the key index in step.
             table.mutate_item_at(idx, |item| {
                 apply_update_expression(item, update_expr, &attr_values, &attr_names);
             });
@@ -1466,6 +1478,77 @@ pub(crate) fn deliver_execution_logs(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The DynamoDB updateItem integration must refuse to write a key
+    /// attribute, as DynamoDB does, rather than move the row to another key.
+    #[test]
+    fn dynamodb_update_item_rejects_writing_a_key_attribute() {
+        let ddb: SharedDynamoDbState = std::sync::Arc::new(parking_lot::RwLock::new(
+            fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+        ));
+        {
+            let mut accounts = ddb.write();
+            let mut table = fakecloud_dynamodb::DynamoTable::new(
+                "t".to_string(),
+                "arn:aws:dynamodb:us-east-1:123456789012:table/t".to_string(),
+                "id".to_string(),
+                vec![fakecloud_dynamodb::KeySchemaElement {
+                    attribute_name: "pk".to_string(),
+                    key_type: "HASH".to_string(),
+                }],
+                vec![],
+                fakecloud_dynamodb::ProvisionedThroughput {
+                    read_capacity_units: 1,
+                    write_capacity_units: 1,
+                },
+                "PAY_PER_REQUEST".to_string(),
+                chrono::Utc::now(),
+            );
+            let mut row = HashMap::new();
+            row.insert("pk".to_string(), json!({"S": "a"}));
+            table.put_item_at_key(row);
+            accounts.default_mut().tables.insert("t".to_string(), table);
+        }
+        let state = Some(ddb.clone());
+
+        let err = invoke_dynamodb_update_item(
+            &json!({
+                "TableName": "t",
+                "Key": {"pk": {"S": "a"}},
+                "UpdateExpression": "SET #k = :v",
+                "ExpressionAttributeNames": {"#k": "pk"},
+                "ExpressionAttributeValues": {":v": {"S": "b"}}
+            }),
+            &state,
+        )
+        .expect_err("key write accepted");
+        assert_eq!(err.0, "DynamoDB.AmazonDynamoDBException");
+        assert!(err.1.contains("Cannot update attribute pk"), "{}", err.1);
+
+        let accounts = ddb.read();
+        let rows: Vec<_> = accounts.default_ref().tables["t"]
+            .items()
+            .iter()
+            .cloned()
+            .collect();
+        assert_eq!(
+            rows,
+            vec![HashMap::from([("pk".to_string(), json!({"S": "a"}))])]
+        );
+
+        // A non-key update still applies.
+        drop(accounts);
+        invoke_dynamodb_update_item(
+            &json!({
+                "TableName": "t",
+                "Key": {"pk": {"S": "a"}},
+                "UpdateExpression": "SET v = :v",
+                "ExpressionAttributeValues": {":v": {"S": "b"}}
+            }),
+            &state,
+        )
+        .unwrap();
+    }
 
     #[test]
     fn apply_parameters_resolves_intrinsic_calls() {

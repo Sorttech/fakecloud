@@ -199,13 +199,16 @@ impl DynamoDbService {
         // the whole call (AWS rejects these up-front, not after partial
         // application).
         for (table_name, requests) in &request_items {
-            let table = state.tables.get(table_name.as_str()).ok_or_else(|| {
-                AwsServiceError::aws_error(
-                    StatusCode::BAD_REQUEST,
-                    "ResourceNotFoundException",
-                    format!("Requested resource not found: Table: {table_name} not found"),
-                )
-            })?;
+            let table = state
+                .tables
+                .get(super::resolve_table_name(table_name))
+                .ok_or_else(|| {
+                    AwsServiceError::aws_error(
+                        StatusCode::BAD_REQUEST,
+                        "ResourceNotFoundException",
+                        format!("Requested resource not found: Table: {table_name} not found"),
+                    )
+                })?;
             let reqs = requests.as_array().ok_or_else(|| {
                 AwsServiceError::aws_error(
                     StatusCode::BAD_REQUEST,
@@ -275,13 +278,16 @@ impl DynamoDbService {
         }
 
         for (table_name, requests) in &request_items {
-            let table = state.tables.get_mut(table_name.as_str()).ok_or_else(|| {
-                AwsServiceError::aws_error(
-                    StatusCode::BAD_REQUEST,
-                    "ResourceNotFoundException",
-                    format!("Requested resource not found: Table: {table_name} not found"),
-                )
-            })?;
+            let table = state
+                .tables
+                .get_mut(super::resolve_table_name(table_name))
+                .ok_or_else(|| {
+                    AwsServiceError::aws_error(
+                        StatusCode::BAD_REQUEST,
+                        "ResourceNotFoundException",
+                        format!("Requested resource not found: Table: {table_name} not found"),
+                    )
+                })?;
 
             let reqs = requests.as_array().ok_or_else(|| {
                 AwsServiceError::aws_error(
@@ -426,17 +432,19 @@ impl DynamoDbService {
             validate_key_attributes_in_key(table, &key)?;
 
             // AWS rejects a transaction that reads the same item more than once.
-            if seen_keys
-                .iter()
-                .any(|(t, k)| t == table_name && keys_equal(table, k, &key))
-            {
+            if seen_keys.iter().any(|(t, k)| {
+                t == super::resolve_table_name(table_name) && keys_equal(table, k, &key)
+            }) {
                 return Err(AwsServiceError::aws_error(
                     StatusCode::BAD_REQUEST,
                     "ValidationException",
                     "Transaction request cannot include multiple operations on one item",
                 ));
             }
-            seen_keys.push((table_name.to_string(), key.clone()));
+            seen_keys.push((
+                super::resolve_table_name(table_name).to_string(),
+                key.clone(),
+            ));
 
             match table.find_item_index(&key) {
                 Some(idx) => {
@@ -606,6 +614,58 @@ impl DynamoDbService {
             }
         }
 
+        // Validate the primary key of every write BEFORE mutating anything, and
+        // before any ConditionExpression is evaluated: these are malformed
+        // requests, which DynamoDB rejects outright rather than cancelling the
+        // transaction over a condition that happened to fail first.
+        // A Put whose Item is missing a key attribute (or a Delete/Update with
+        // a malformed Key) is a structural error: real DDB returns a plain
+        // ValidationException, not a TransactionCanceledException. Previously
+        // the apply pass parsed the item with `unwrap_or_default()` and never
+        // validated it, so an item with no PK stored an orphan row and returned
+        // success (bug-hunt 2026-07-01, DynamoDB TransactWriteItems).
+        for ti in transact_items {
+            if let Some(put) = ti.get("Put") {
+                let table_name = put["TableName"].as_str().unwrap_or_default();
+                let item: HashMap<String, AttributeValue> =
+                    serde_json::from_value(put["Item"].clone()).unwrap_or_default();
+                if let Some(table) = state.tables.get(super::resolve_table_name(table_name)) {
+                    validate_key_in_item(table, &item)?;
+                }
+                // Malformed values (bad numbers, empty/duplicate sets) are a
+                // structural error surfaced as a plain ValidationException
+                // before the transaction runs — the same per-attribute
+                // validation single PutItem enforces.
+                validate_item_attribute_values(&item)?;
+            } else if let Some(op) = ti.get("Delete").or_else(|| ti.get("Update")) {
+                let table_name = op["TableName"].as_str().unwrap_or_default();
+                let key: HashMap<String, AttributeValue> =
+                    serde_json::from_value(op["Key"].clone()).unwrap_or_default();
+                if let Some(table) = state.tables.get(super::resolve_table_name(table_name)) {
+                    validate_key_attributes_in_key(table, &key)?;
+                    if let Some(expr) = ti
+                        .get("Update")
+                        .and_then(|u| u["UpdateExpression"].as_str())
+                    {
+                        super::reject_key_attribute_update_expression(
+                            table,
+                            expr,
+                            &parse_expression_attribute_names(op),
+                        )?;
+                    }
+                }
+                // An Update's ExpressionAttributeValues get the same value
+                // validation single UpdateItem enforces, so a malformed number
+                // or empty/duplicate set never reaches an item.
+                if ti.get("Update").is_some() {
+                    let expr_attr_values = parse_expression_attribute_values(op);
+                    for v in expr_attr_values.values() {
+                        validate_attribute_value(v)?;
+                    }
+                }
+            }
+        }
+
         // AWS rejects a transaction that targets the same item more than once
         // (by table + primary key) with a ValidationException; previously such
         // a transaction applied last-writer-wins and reported success. The key
@@ -624,17 +684,16 @@ impl DynamoDbService {
                 } else {
                     serde_json::from_value(op["Key"].clone()).unwrap_or_default()
                 };
-                if seen_keys
-                    .iter()
-                    .any(|(t, k)| t == table_name && keys_equal(table, k, &key))
-                {
+                if seen_keys.iter().any(|(t, k)| {
+                    t == super::resolve_table_name(table_name) && keys_equal(table, k, &key)
+                }) {
                     return Err(AwsServiceError::aws_error(
                         StatusCode::BAD_REQUEST,
                         "ValidationException",
                         "Transaction request cannot include multiple operations on one item",
                     ));
                 }
-                seen_keys.push((table_name.to_string(), key));
+                seen_keys.push((super::resolve_table_name(table_name).to_string(), key));
             }
         }
 
@@ -799,45 +858,6 @@ impl DynamoDbService {
             ));
         }
 
-        // Validate the primary key of every write BEFORE mutating anything.
-        // A Put whose Item is missing a key attribute (or a Delete/Update with
-        // a malformed Key) is a structural error: real DDB returns a plain
-        // ValidationException, not a TransactionCanceledException. Previously
-        // the apply pass parsed the item with `unwrap_or_default()` and never
-        // validated it, so an item with no PK stored an orphan row and returned
-        // success (bug-hunt 2026-07-01, DynamoDB TransactWriteItems).
-        for ti in transact_items {
-            if let Some(put) = ti.get("Put") {
-                let table_name = put["TableName"].as_str().unwrap_or_default();
-                let item: HashMap<String, AttributeValue> =
-                    serde_json::from_value(put["Item"].clone()).unwrap_or_default();
-                if let Some(table) = state.tables.get(table_name) {
-                    validate_key_in_item(table, &item)?;
-                }
-                // Malformed values (bad numbers, empty/duplicate sets) are a
-                // structural error surfaced as a plain ValidationException
-                // before the transaction runs — the same per-attribute
-                // validation single PutItem enforces.
-                validate_item_attribute_values(&item)?;
-            } else if let Some(op) = ti.get("Delete").or_else(|| ti.get("Update")) {
-                let table_name = op["TableName"].as_str().unwrap_or_default();
-                let key: HashMap<String, AttributeValue> =
-                    serde_json::from_value(op["Key"].clone()).unwrap_or_default();
-                if let Some(table) = state.tables.get(table_name) {
-                    validate_key_attributes_in_key(table, &key)?;
-                }
-                // An Update's ExpressionAttributeValues get the same value
-                // validation single UpdateItem enforces, so a malformed number
-                // or empty/duplicate set never reaches an item.
-                if ti.get("Update").is_some() {
-                    let expr_attr_values = parse_expression_attribute_values(op);
-                    for v in expr_attr_values.values() {
-                        validate_attribute_value(v)?;
-                    }
-                }
-            }
-        }
-
         // Snapshot the items vector of every referenced table so we can
         // revert on any apply-phase failure (e.g. an unparseable
         // UpdateExpression). DDB transactions are all-or-nothing — without
@@ -847,7 +867,10 @@ impl DynamoDbService {
         for ti in transact_items {
             for op_key in ["Put", "Delete", "Update"] {
                 if let Some(op) = ti.get(op_key) {
-                    let table_name = op["TableName"].as_str().unwrap_or_default();
+                    // Keyed by the resolved name, so a table named once by
+                    // name and once by ARN is snapshotted, and reverted, once.
+                    let table_name =
+                        super::resolve_table_name(op["TableName"].as_str().unwrap_or_default());
                     snapshots.entry(table_name.to_string()).or_insert_with(|| {
                         state
                             .tables
@@ -1010,7 +1033,7 @@ impl DynamoDbService {
             // whose CancellationReasons array marks the offending op
             // with `ValidationError` and leaves siblings as `None`.
             for (table_name, items) in snapshots {
-                if let Some(table) = state.tables.get_mut(&table_name) {
+                if let Some(table) = state.tables.get_mut(super::resolve_table_name(&table_name)) {
                     table.replace_items(items);
                 }
             }
@@ -1041,7 +1064,7 @@ impl DynamoDbService {
         // Append all pending stream records under each table's
         // stream_records lock now that the transaction has committed.
         for (table_name, record) in pending_stream {
-            if let Some(table) = state.tables.get_mut(&table_name) {
+            if let Some(table) = state.tables.get_mut(super::resolve_table_name(&table_name)) {
                 crate::streams::add_stream_record(table, record);
             }
         }
