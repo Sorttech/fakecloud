@@ -2240,3 +2240,246 @@ fn arn_denotes_service_matches_only_reserved_path() {
         "ecs.amazonaws.com"
     ));
 }
+
+// --- policy variables ----------------------------------------------------
+
+fn alice_request<'a>(principal: &'a Principal, action: &str, resource: &str) -> EvalRequest<'a> {
+    let mut r = req(principal, action, resource);
+    r.context.aws_username = Some("alice".to_string());
+    r.context.principal_tags = Some(std::collections::HashMap::from([(
+        "team".to_string(),
+        "blue".to_string(),
+    )]));
+    r
+}
+
+#[test]
+fn resource_variables_expand_per_principal() {
+    let alice = principal_user("arn:aws:iam::123456789012:user/alice");
+    let policy = doc(json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::home/${aws:username}/*"
+        }]
+    }));
+    assert_eq!(
+        evaluate(
+            &[policy.clone()],
+            &alice_request(&alice, "s3:GetObject", "arn:aws:s3:::home/alice/notes.txt")
+        ),
+        Decision::Allow
+    );
+    assert_eq!(
+        evaluate(
+            &[policy],
+            &alice_request(&alice, "s3:GetObject", "arn:aws:s3:::home/bob/notes.txt")
+        ),
+        Decision::ImplicitDeny
+    );
+}
+
+/// Only the 2012-10-17 policy language expands variables; older policies
+/// read `${...}` literally.
+#[test]
+fn variables_are_literal_in_older_policy_versions() {
+    let alice = principal_user("arn:aws:iam::123456789012:user/alice");
+    let policy = |version: &str| {
+        doc(json!({
+            "Version": version,
+            "Statement": [{
+                "Effect": "Allow",
+                "Action": "s3:GetObject",
+                "Resource": "arn:aws:s3:::home/${aws:username}"
+            }]
+        }))
+    };
+    assert_eq!(
+        evaluate(
+            &[policy("2008-10-17")],
+            &alice_request(&alice, "s3:GetObject", "arn:aws:s3:::home/alice")
+        ),
+        Decision::ImplicitDeny
+    );
+    assert_eq!(
+        evaluate(
+            &[policy("2008-10-17")],
+            &alice_request(&alice, "s3:GetObject", "arn:aws:s3:::home/${aws:username}")
+        ),
+        Decision::Allow
+    );
+}
+
+/// A variable with no value matches no resource, fails positive condition
+/// operators and satisfies inverted ones; a default fills it in.
+#[test]
+fn variables_without_a_value_are_null() {
+    let alice = principal_user("arn:aws:iam::123456789012:user/alice");
+    let resource = "arn:aws:s3:::bucket/x";
+    let with_condition = |effect: &str, op: &str, value: &str| {
+        doc(json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": effect,
+                "Action": "s3:GetObject",
+                "Resource": "*",
+                "Condition": {op: {"aws:username": value}}
+            }]
+        }))
+    };
+    let run = |policy: PolicyDocument| {
+        evaluate(&[policy], &alice_request(&alice, "s3:GetObject", resource))
+    };
+    // Positive operators never match a null value.
+    assert_eq!(
+        run(with_condition(
+            "Allow",
+            "StringEquals",
+            "${aws:PrincipalTag/nope}"
+        )),
+        Decision::ImplicitDeny
+    );
+    assert_eq!(
+        run(with_condition(
+            "Allow",
+            "StringLike",
+            "${aws:PrincipalTag/nope}*"
+        )),
+        Decision::ImplicitDeny
+    );
+    // Inverted operators match it, so this Deny applies.
+    assert_eq!(
+        run(with_condition(
+            "Deny",
+            "StringNotEquals",
+            "${aws:PrincipalTag/nope}"
+        )),
+        Decision::ExplicitDeny
+    );
+    // A default stands in for the missing value.
+    assert_eq!(
+        run(with_condition(
+            "Allow",
+            "StringEquals",
+            "${aws:PrincipalTag/nope, 'alice'}"
+        )),
+        Decision::Allow
+    );
+    // A present value compares normally.
+    assert_eq!(
+        run(with_condition("Allow", "StringEquals", "${aws:username}")),
+        Decision::Allow
+    );
+
+    let null_resource = doc(json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::bucket/${aws:PrincipalTag/nope}*"
+        }]
+    }));
+    assert_eq!(run(null_resource), Decision::ImplicitDeny);
+}
+
+/// `ForAllValues` holds when the service populated the key and the request
+/// carries no values for it: every one of zero values matches. A key that was
+/// never populated still fails the condition -- it may be one fakecloud does
+/// not extract, and treating it as matched would fail open.
+#[test]
+fn for_all_values_is_true_for_a_populated_key_with_no_values() {
+    let alice = principal_user("arn:aws:iam::123456789012:user/alice");
+    let resource = "arn:aws:dynamodb:us-east-1:123456789012:table/T";
+    let policy = |qualifier: &str| {
+        doc(json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Action": "dynamodb:Scan",
+                "Resource": "*",
+                "Condition": {qualifier: {"dynamodb:LeadingKeys": ["alice"]}}
+            }]
+        }))
+    };
+    let mut populated = req(&alice, "dynamodb:Scan", resource);
+    populated
+        .context
+        .service_keys
+        .insert("dynamodb:leadingkeys".to_string(), Vec::new());
+    assert_eq!(
+        evaluate(&[policy("ForAllValues:StringEquals")], &populated),
+        Decision::Allow
+    );
+    assert_eq!(
+        evaluate(&[policy("ForAnyValue:StringEquals")], &populated),
+        Decision::ImplicitDeny,
+        "ForAnyValue needs a value"
+    );
+    assert_eq!(
+        evaluate(
+            &[policy("ForAllValues:StringEquals")],
+            &req(&alice, "dynamodb:Scan", resource)
+        ),
+        Decision::ImplicitDeny,
+        "a key nothing populated is not vacuously matched"
+    );
+}
+
+/// A global key supplied as a plain context entry (the policy simulator's
+/// ContextEntries) resolves in conditions and as a policy variable.
+#[test]
+fn global_keys_fall_back_to_plain_context_entries() {
+    let alice = principal_user("arn:aws:iam::123456789012:user/alice");
+    let mut r = req(&alice, "s3:GetObject", "arn:aws:s3:::home/alice/x");
+    r.context
+        .service_keys
+        .insert("aws:username".to_string(), vec!["alice".to_string()]);
+    let policy = doc(json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::home/${aws:username}/*"
+        }]
+    }));
+    assert_eq!(evaluate(&[policy], &r), Decision::Allow);
+}
+
+/// Tag keys given as plain context entries resolve too, with the tag key part
+/// compared exactly.
+#[test]
+fn tag_keys_fall_back_to_plain_context_entries() {
+    let alice = principal_user("arn:aws:iam::123456789012:user/alice");
+    let policy = doc(json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Action": "s3:PutObject",
+            "Resource": "*",
+            "Condition": {
+                "ForAllValues:StringEquals": {"aws:TagKeys": ["team"]},
+                "StringEquals": {"aws:RequestTag/team": "red"}
+            }
+        }]
+    }));
+    let mut r = req(&alice, "s3:PutObject", "arn:aws:s3:::b/k");
+    r.context
+        .service_keys
+        .insert("aws:tagkeys".to_string(), vec!["team".to_string()]);
+    r.context
+        .service_keys
+        .insert("aws:RequestTag/team".to_string(), vec!["red".to_string()]);
+    assert_eq!(evaluate(&[policy.clone()], &r), Decision::Allow);
+
+    let mut wrong_case = req(&alice, "s3:PutObject", "arn:aws:s3:::b/k");
+    wrong_case
+        .context
+        .service_keys
+        .insert("aws:tagkeys".to_string(), vec!["team".to_string()]);
+    wrong_case
+        .context
+        .service_keys
+        .insert("aws:RequestTag/Team".to_string(), vec!["red".to_string()]);
+    assert_eq!(evaluate(&[policy], &wrong_case), Decision::ImplicitDeny);
+}

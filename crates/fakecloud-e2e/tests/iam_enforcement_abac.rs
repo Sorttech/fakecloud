@@ -571,3 +571,76 @@ async fn iam_resource_tag_denies_get_user_without_matching_tag() {
         "expected AccessDenied for dev-tagged user"
     );
 }
+
+// ======================================================================
+// Policy variables
+// ======================================================================
+
+fn s3_for(cfg: &aws_config::SdkConfig) -> S3Client {
+    S3Client::from_conf(
+        aws_sdk_s3::config::Builder::from(cfg)
+            .force_path_style(true)
+            .build(),
+    )
+}
+
+/// `${aws:username}` in a Resource and `${aws:PrincipalTag/team}` in a
+/// condition are replaced per caller, so one policy scopes each user to their
+/// own prefix and team.
+#[tokio::test]
+async fn policy_variables_scope_one_policy_per_caller() {
+    let server = start_strict().await;
+    let admin = s3_for(&sdk_config_with(&server, "test", "test").await);
+    admin.create_bucket().bucket("homes").send().await.unwrap();
+    for key in [
+        "alice/doc.txt",
+        "bob/doc.txt",
+        "blue/plan.txt",
+        "red/plan.txt",
+    ] {
+        admin
+            .put_object()
+            .bucket("homes")
+            .key(key)
+            .body(aws_sdk_s3::primitives::ByteStream::from_static(b"x"))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    let policy = serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": "s3:GetObject",
+                "Resource": "arn:aws:s3:::homes/${aws:username}/*"
+            },
+            {
+                "Effect": "Allow",
+                "Action": "s3:GetObject",
+                "Resource": "arn:aws:s3:::homes/*",
+                "Condition": {"StringLike": {"s3:ExistingObjectTag/none": "x"}}
+            },
+            {
+                "Effect": "Allow",
+                "Action": "s3:GetObject",
+                "Resource": "arn:aws:s3:::homes/${aws:PrincipalTag/team, 'no-team'}/*"
+            }
+        ]
+    })
+    .to_string();
+    let (akid, secret) = bootstrap_tagged_user(&server, "alice", &[("team", "blue")]).await;
+    attach_inline_policy(&server, "alice", "homes", &policy).await;
+    let alice = s3_for(&sdk_config_with(&server, &akid, &secret).await);
+
+    let get = |key: &'static str| alice.get_object().bucket("homes").key(key).send();
+    get("alice/doc.txt").await.expect("own username prefix");
+    get("blue/plan.txt").await.expect("own team prefix");
+    let err = get("bob/doc.txt").await.expect_err("another user's prefix");
+    assert!(format!("{err:?}").contains("AccessDenied"), "{err:?}");
+    let err = get("red/plan.txt")
+        .await
+        .expect_err("another team's prefix");
+    assert!(format!("{err:?}").contains("AccessDenied"), "{err:?}");
+}

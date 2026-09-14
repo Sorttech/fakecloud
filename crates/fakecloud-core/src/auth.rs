@@ -293,6 +293,20 @@ pub struct ConditionContext {
     pub principal_tags: Option<HashMap<String, String>>,
 }
 
+/// Whether two condition key names are the same key: the `service:name`
+/// part compares case-insensitively, and anything after the first `/` (a tag
+/// key in `aws:RequestTag/<key>`) compares exactly.
+fn same_condition_key(a: &str, b: &str) -> bool {
+    fn split(k: &str) -> (&str, &str) {
+        match k.find('/') {
+            Some(i) => (&k[..i], &k[i..]),
+            None => (k, ""),
+        }
+    }
+    let ((a_name, a_tail), (b_name, b_tail)) = (split(a), split(b));
+    a_name.eq_ignore_ascii_case(b_name) && a_tail == b_tail
+}
+
 impl ConditionContext {
     /// Resolve a condition key (e.g. `"aws:username"`) to the list of
     /// context values. Returns `None` if the key is not populated.
@@ -308,38 +322,51 @@ impl ConditionContext {
         //
         // Prefix lengths: "aws:resourcetag/" = 16, "aws:requesttag/" = 15,
         //                 "aws:principaltag/" = 17
-        if lower.starts_with("aws:resourcetag/") {
+        let tagged = if lower.starts_with("aws:resourcetag/") {
             let tag_key = &key[16..]; // preserve original case
-            return self
-                .resource_tags
-                .as_ref()
-                .and_then(|tags| tags.get(tag_key))
-                .map(|v| vec![v.clone()]);
-        }
-        if lower.starts_with("aws:requesttag/") {
+            Some(
+                self.resource_tags
+                    .as_ref()
+                    .and_then(|tags| tags.get(tag_key))
+                    .map(|v| vec![v.clone()]),
+            )
+        } else if lower.starts_with("aws:requesttag/") {
             let tag_key = &key[15..];
-            return self
-                .request_tags
-                .as_ref()
-                .and_then(|tags| tags.get(tag_key))
-                .map(|v| vec![v.clone()]);
-        }
-        if lower.starts_with("aws:principaltag/") {
+            Some(
+                self.request_tags
+                    .as_ref()
+                    .and_then(|tags| tags.get(tag_key))
+                    .map(|v| vec![v.clone()]),
+            )
+        } else if lower.starts_with("aws:principaltag/") {
             let tag_key = &key[17..];
-            return self
-                .principal_tags
-                .as_ref()
-                .and_then(|tags| tags.get(tag_key))
-                .map(|v| vec![v.clone()]);
-        }
-        if lower == "aws:tagkeys" {
-            return self
-                .request_tags
-                .as_ref()
-                .map(|tags| tags.keys().cloned().collect());
+            Some(
+                self.principal_tags
+                    .as_ref()
+                    .and_then(|tags| tags.get(tag_key))
+                    .map(|v| vec![v.clone()]),
+            )
+        } else if lower == "aws:tagkeys" {
+            Some(
+                self.request_tags
+                    .as_ref()
+                    .map(|tags| tags.keys().cloned().collect()),
+            )
+        } else {
+            None
+        };
+        if let Some(tagged) = tagged {
+            // Tag keys are case-sensitive after the prefix, so a plain entry
+            // must match the key exactly.
+            return tagged.or_else(|| {
+                self.service_keys
+                    .iter()
+                    .find(|(entry, _)| same_condition_key(entry, key))
+                    .map(|(_, vs)| vs.clone())
+            });
         }
 
-        match lower.as_str() {
+        let typed = match lower.as_str() {
             "aws:username" => self.aws_username.as_deref().and_then(one),
             "aws:userid" => self.aws_userid.as_deref().and_then(one),
             "aws:principalarn" => self.aws_principal_arn.as_deref().and_then(one),
@@ -368,21 +395,21 @@ impl ConditionContext {
             "aws:tokenissuetime" => self
                 .aws_token_issue_time
                 .map(|t| vec![t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)]),
-            _ => {
-                if let Some(vs) = self.service_keys.get(&lower) {
-                    if vs.is_empty() {
-                        None
-                    } else {
-                        Some(vs.clone())
-                    }
-                } else {
-                    self.service_keys
-                        .iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case(key))
-                        .map(|(_, vs)| vs.clone())
-                }
-            }
-        }
+            _ => None,
+        };
+        // A key with no typed value -- a service-specific key, or a global key
+        // supplied as a plain entry (a policy simulator's ContextEntries) --
+        // comes from `service_keys`. An entry with an empty value list means
+        // the key applies to the request but carries no values, which set
+        // operators distinguish from a key that was never populated.
+        typed.or_else(|| {
+            self.service_keys.get(&lower).cloned().or_else(|| {
+                self.service_keys
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                    .map(|(_, vs)| vs.clone())
+            })
+        })
     }
 }
 
