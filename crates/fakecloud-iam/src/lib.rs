@@ -8,6 +8,7 @@ pub mod pass_role;
 pub mod persistence;
 pub mod policy_evaluator;
 pub mod policy_validation;
+pub(crate) mod policy_variables;
 pub mod resource_policy;
 pub(crate) mod state;
 pub mod sts_service;
