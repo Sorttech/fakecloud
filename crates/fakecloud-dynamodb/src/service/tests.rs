@@ -7021,3 +7021,45 @@ async fn partiql_select_from_an_index_reads_the_index() {
         .unwrap();
     assert_eq!(err.code(), "ValidationException");
 }
+
+/// A PartiQL SELECT returns only the columns it names (document paths and
+/// quoted names included); `*` returns the whole item.
+#[tokio::test]
+async fn partiql_select_returns_only_the_named_columns() {
+    let svc = make_service();
+    create_test_table(&svc);
+    call_dynamodb(
+        &svc,
+        "PutItem",
+        json!({"TableName": "test-table", "Item": {
+            "pk": {"S": "a"},
+            "public": {"S": "p"},
+            "secret": {"S": "s"},
+            "a.b": {"S": "dotted"},
+            "addr": {"M": {"city": {"S": "c"}, "zip": {"S": "z"}}}
+        }}),
+    )
+    .await;
+    let got = call_dynamodb(
+        &svc,
+        "ExecuteStatement",
+        json!({"Statement": "SELECT pk, public, \"a.b\", addr.city FROM \"test-table\" WHERE pk = 'a'"}),
+    )
+    .await;
+    assert_eq!(
+        got["Items"],
+        json!([{
+            "pk": {"S": "a"},
+            "public": {"S": "p"},
+            "a.b": {"S": "dotted"},
+            "addr": {"M": {"city": {"S": "c"}}}
+        }])
+    );
+    let all = call_dynamodb(
+        &svc,
+        "ExecuteStatement",
+        json!({"Statement": "SELECT * FROM \"test-table\" WHERE pk = 'a'"}),
+    )
+    .await;
+    assert_eq!(all["Items"][0]["secret"], json!({"S": "s"}));
+}

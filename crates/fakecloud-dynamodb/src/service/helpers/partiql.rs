@@ -491,6 +491,8 @@ pub(crate) fn execute_partiql_in_state(
         // order that depends on which rows exist would skip or repeat rows
         // when some are deleted between pages.
         table.sort_in_scan_order(&mut rows);
+        // The column list: `*`, or the attributes (document paths) to return.
+        let projection = partiql_projection(trimmed["SELECT".len()..from_pos].trim());
         let items: Vec<Value> = rows
             .iter()
             .map(|item| match &index {
@@ -504,6 +506,14 @@ pub(crate) fn execute_partiql_in_state(
                     ))
                 }
                 None => json!(item),
+            })
+            .map(|item| match &projection {
+                Some(body) => {
+                    let item: HashMap<String, AttributeValue> =
+                        serde_json::from_value(item).unwrap_or_default();
+                    json!(crate::service::helpers::project_item(&item, body))
+                }
+                None => item,
             })
             .collect();
         Ok(PartiqlOutcome {
@@ -680,6 +690,57 @@ pub(crate) fn execute_partiql_in_state(
             format!("Unsupported PartiQL statement: {trimmed}"),
         ))
     }
+}
+
+/// A SELECT column list as a ProjectionExpression request fragment, or `None`
+/// for `*`. Each column is a document path whose segments may be
+/// double-quoted (`"Address"."City"`, `tags[0]`); every segment goes through
+/// an expression attribute name, so a quoted name containing a dot stays one
+/// attribute.
+fn partiql_projection(columns: &str) -> Option<Value> {
+    if columns == "*" || columns.is_empty() {
+        return None;
+    }
+    let mut names = serde_json::Map::new();
+    let mut paths = Vec::new();
+    for column in split_on_top_level_keyword(columns, ",") {
+        let mut path = String::new();
+        let mut rest = column.trim();
+        while !rest.is_empty() {
+            let (segment, after) = if let Some(quoted) = rest.strip_prefix('"') {
+                match quoted.find('"') {
+                    Some(end) => (&quoted[..end], &quoted[end + 1..]),
+                    None => (quoted, ""),
+                }
+            } else {
+                let end = rest.find(['.', '[']).unwrap_or(rest.len());
+                (rest[..end].trim(), &rest[end..])
+            };
+            let placeholder = format!("#c{}", names.len());
+            names.insert(placeholder.clone(), json!(segment));
+            path.push_str(&placeholder);
+            // List indexes stay on the segment; a dot starts the next one.
+            let mut after = after;
+            while let Some(index) = after.strip_prefix('[') {
+                let end = index.find(']').map_or(index.len(), |e| e + 1);
+                path.push('[');
+                path.push_str(&index[..end]);
+                after = &index[end..];
+            }
+            rest = match after.strip_prefix('.') {
+                Some(next) => {
+                    path.push('.');
+                    next
+                }
+                None => "",
+            };
+        }
+        paths.push(path);
+    }
+    Some(json!({
+        "ProjectionExpression": paths.join(", "),
+        "ExpressionAttributeNames": names,
+    }))
 }
 
 pub(crate) fn split_partiql_returning_clause(where_clause: &str) -> (&str, bool) {
@@ -1072,12 +1133,6 @@ pub(crate) fn partiql_where_conditions(
         .reduce(|l, r| PartiqlExpr::And(Box::new(l), Box::new(r)))
 }
 
-/// The top-level attribute a condition path starts at (`a.b[0]` -> `a`).
-fn partiql_top_level(path: &str) -> &str {
-    let end = path.find(['.', '[']).unwrap_or(path.len());
-    path[..end].trim().trim_matches('"')
-}
-
 fn partiql_cond_attribute(cond: &PartiqlCond) -> &str {
     use PartiqlCond::*;
     match cond {
@@ -1093,7 +1148,9 @@ fn partiql_cond_attribute(cond: &PartiqlCond) -> &str {
         | BeginsWith(a, _)
         | Contains(a, _)
         | AttributeExists(a)
-        | AttributeNotExists(a) => partiql_top_level(a),
+        // The executor reads the condition's attribute as one top-level name
+        // (`a.b` is an attribute literally named `a.b`), so that is the name.
+        | AttributeNotExists(a) => a.trim().trim_matches('"'),
     }
 }
 

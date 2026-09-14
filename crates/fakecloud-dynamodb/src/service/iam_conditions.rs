@@ -67,9 +67,11 @@ const EXPRESSION_WORDS: &[&str] = &[
     "size",
 ];
 
-#[derive(Default)]
 struct Keys {
-    leading: BTreeSet<String>,
+    /// `None` when the partition keys could not be determined: the key is
+    /// then omitted, so a set operator cannot treat it as an empty match.
+    /// `Some(empty)` when the request addresses no particular partition.
+    leading: Option<BTreeSet<String>>,
     attributes: BTreeSet<String>,
     select: Option<String>,
     return_values: Option<String>,
@@ -78,23 +80,43 @@ struct Keys {
     full_table_scan: Option<bool>,
 }
 
+impl Default for Keys {
+    fn default() -> Self {
+        Self {
+            leading: Some(BTreeSet::new()),
+            attributes: BTreeSet::new(),
+            select: None,
+            return_values: None,
+            return_consumed_capacity: None,
+            enclosing_operation: None,
+            full_table_scan: None,
+        }
+    }
+}
+
 impl Keys {
+    fn add_leading(&mut self, value: String) {
+        if let Some(set) = &mut self.leading {
+            set.insert(value);
+        }
+    }
+
     fn into_map(self) -> BTreeMap<String, Vec<String>> {
         let mut out = BTreeMap::new();
-        if !self.leading.is_empty() {
-            let leading: Vec<String> = self.leading.into_iter().collect();
+        // An empty list means "no values" to set operators (ForAllValues is
+        // vacuously true); an omitted key means "unknown".
+        if let Some(leading) = self.leading {
+            let leading: Vec<String> = leading.into_iter().collect();
             out.insert(
                 "dynamodb:firstpartitionkeyvalues".to_string(),
                 leading.clone(),
             );
             out.insert("dynamodb:leadingkeys".to_string(), leading);
         }
-        if !self.attributes.is_empty() {
-            out.insert(
-                "dynamodb:attributes".to_string(),
-                self.attributes.into_iter().collect(),
-            );
-        }
+        out.insert(
+            "dynamodb:attributes".to_string(),
+            self.attributes.into_iter().collect(),
+        );
         for (key, value) in [
             ("dynamodb:select", self.select),
             ("dynamodb:returnvalues", self.return_values),
@@ -173,7 +195,12 @@ fn names_table(target: &Target, table_name: Option<&str>) -> bool {
 /// string, the number's digits, or the binary's base64.
 fn scalar_string(v: &Value) -> Option<String> {
     match attribute_type_and_value(v)? {
-        ("S" | "N" | "B", Value::String(s)) => Some(s.clone()),
+        // Numbers compare by value in DynamoDB (`1.0` is key `1`), so the key
+        // is reported in canonical form.
+        ("N", Value::String(n)) => {
+            Some(super::helpers::partiql::canonical_number(n).unwrap_or_else(|| n.clone()))
+        }
+        ("S" | "B", Value::String(s)) => Some(s.clone()),
         ("BOOL", Value::Bool(b)) => Some(b.to_string()),
         _ => None,
     }
@@ -221,8 +248,9 @@ pub(crate) fn condition_keys(
         }
         "Query" => {
             if let Some(t) = &target {
-                if let Some(v) = query_partition_value(&body, &names, &t.partition_key) {
-                    keys.leading.insert(v);
+                match query_partition_value(&body, &names, &t.partition_key) {
+                    Some(v) => keys.add_leading(v),
+                    None => keys.leading = None,
                 }
                 keys.select = Some(implicit_select(&body, t.index.is_some()));
             }
@@ -348,8 +376,11 @@ pub(crate) fn condition_keys(
 }
 
 fn add_leading(keys: &mut Keys, item: &Value, partition_key: &str) {
-    if let Some(v) = item.get(partition_key).and_then(scalar_string) {
-        keys.leading.insert(v);
+    match item.get(partition_key).and_then(scalar_string) {
+        Some(v) => keys.add_leading(v),
+        // An item without its partition key is rejected by the handler, but
+        // it is never a known empty set.
+        None => keys.leading = None,
     }
 }
 
@@ -542,14 +573,14 @@ fn expression_attributes(
     out
 }
 
-/// The value a Query's key condition fixes the partition key to, split and
-/// read the way the Query handler reads it.
+/// The value a Query's key condition fixes the partition key to, found the
+/// way the handler evaluates the condition: split on top-level AND, strip
+/// one layer of enclosing parentheses, recurse.
 fn query_partition_value(
     body: &Value,
     names: &BTreeMap<String, String>,
     partition_key: &str,
 ) -> Option<String> {
-    use super::helpers::{split_on_and, strip_outer_parens};
     if let Some(cond) = body["KeyConditions"][partition_key].as_object() {
         return cond
             .get("AttributeValueList")?
@@ -558,31 +589,53 @@ fn query_partition_value(
             .and_then(scalar_string);
     }
     let text = body["KeyConditionExpression"].as_str()?;
-    let values = &body["ExpressionAttributeValues"];
-    for raw in split_on_and(text) {
-        let part = strip_outer_parens(raw.trim()).trim();
-        if part.to_ascii_lowercase().starts_with("begins_with") {
-            continue;
-        }
-        let Some((op, pos)) = ["<=", ">=", "<>", "=", "<", ">"]
+    key_condition_partition_value(
+        text,
+        names,
+        &body["ExpressionAttributeValues"],
+        partition_key,
+    )
+}
+
+fn key_condition_partition_value(
+    expr: &str,
+    names: &BTreeMap<String, String>,
+    values: &Value,
+    partition_key: &str,
+) -> Option<String> {
+    use super::helpers::{split_on_and, strip_outer_parens};
+    let trimmed = expr.trim();
+    let parts = split_on_and(trimmed);
+    if parts.len() > 1 {
+        return parts
             .iter()
-            .find_map(|cand| part.find(cand).map(|pos| (*cand, pos)))
-        else {
-            continue;
-        };
-        if op != "=" {
-            continue;
-        }
-        let left = part[..pos].trim().trim_matches('"');
-        let right = part[pos + 1..].trim();
-        let attr = if left.starts_with('#') {
-            names.get(left).map(String::as_str)
-        } else {
-            Some(left)
-        };
-        if attr == Some(partition_key) {
-            return values.get(right).and_then(scalar_string);
-        }
+            .find_map(|part| key_condition_partition_value(part, names, values, partition_key));
+    }
+    let stripped = strip_outer_parens(trimmed);
+    if stripped != trimmed {
+        return key_condition_partition_value(stripped, names, values, partition_key);
+    }
+    if trimmed.to_ascii_lowercase().starts_with("begins_with") {
+        return None;
+    }
+    let (op, pos) = ["<=", ">=", "<>", "=", "<", ">"]
+        .iter()
+        .find_map(|cand| trimmed.find(cand).map(|pos| (*cand, pos)))?;
+    if op != "=" {
+        return None;
+    }
+    let left = trimmed[..pos].trim().trim_matches('"');
+    let right = trimmed[pos + 1..].trim();
+    if !right.starts_with(':') || right.contains(char::is_whitespace) {
+        return None;
+    }
+    let attr = if left.starts_with('#') {
+        names.get(left).map(String::as_str)
+    } else {
+        Some(left)
+    };
+    if attr == Some(partition_key) {
+        return values.get(right).and_then(scalar_string);
     }
     None
 }
@@ -619,11 +672,15 @@ fn add_partiql_keys(
                 return;
             };
             let value_str = rest.trim()[value_pos + 5..].trim();
-            if let Ok(item) = parse_partiql_value_object(value_str, parameters) {
-                if let Some(v) = item.get(&target.partition_key).and_then(scalar_string) {
-                    keys.leading.insert(v);
+            match parse_partiql_value_object(value_str, parameters) {
+                Ok(item) => {
+                    match item.get(&target.partition_key).and_then(scalar_string) {
+                        Some(v) => keys.add_leading(v),
+                        None => keys.leading = None,
+                    }
+                    keys.attributes.extend(item.keys().cloned());
                 }
-                keys.attributes.extend(item.keys().cloned());
+                Err(_) => keys.leading = None,
             }
             return;
         }
@@ -688,11 +745,25 @@ fn add_partiql_keys(
     let pinned = conditions
         .as_ref()
         .and_then(|expr| partiql_pinned_values(expr, &target.partition_key));
-    if let Some(values) = &pinned {
-        keys.leading.extend(values.iter().filter_map(scalar_string));
+    match &pinned {
+        Some(values) => {
+            for value in values {
+                match scalar_string(value) {
+                    Some(v) => keys.add_leading(v),
+                    None => keys.leading = None,
+                }
+            }
+        }
+        // An UPDATE or DELETE always pins its item (the executor rejects any
+        // other WHERE); a SELECT that pins nothing reads the whole table.
+        None if verb != "PartiQLSelect" => keys.leading = None,
+        None => {}
     }
     if verb == "PartiQLSelect" {
-        keys.full_table_scan = Some(pinned.is_none());
+        // Any statement of a batch or transaction scanning the table makes the
+        // request a full table scan.
+        let scans = pinned.is_none();
+        keys.full_table_scan = Some(keys.full_table_scan.unwrap_or(false) || scans);
     }
 }
 
@@ -931,7 +1002,7 @@ mod tests {
 
         let got = keys_for(&state, "Scan", serde_json::json!({"TableName": "Games"}));
         let keys = &got[0].1;
-        assert_eq!(get(keys, "dynamodb:leadingkeys"), None);
+        assert_eq!(get(keys, "dynamodb:leadingkeys"), Some(&[][..]));
         assert_eq!(
             get(keys, "dynamodb:select"),
             Some(&["ALL_ATTRIBUTES".to_string()][..])
@@ -1103,7 +1174,7 @@ mod tests {
                 "SELECT * FROM \"Games\" WHERE UserId = 'mine' OR Top > 3",
                 Value::Null
             ),
-            (None, Some("true".to_string()))
+            (Some(vec![]), Some("true".to_string()))
         );
         assert_eq!(
             leading(
@@ -1206,5 +1277,83 @@ mod tests {
             super::super::iam::actions_for(&state, &req)[0].resource,
             "arn:aws:dynamodb:us-east-1:123456789012:table/Games"
         );
+    }
+
+    /// A key condition parenthesized as a whole still yields its partition
+    /// key, a number key is reported canonically, and a condition the
+    /// extraction cannot read leaves the key unknown (omitted) rather than an
+    /// empty set a `ForAllValues` would accept.
+    #[test]
+    fn leading_keys_are_known_values_known_empty_or_omitted() {
+        let (_svc, state) = service_with_table();
+        let got = keys_for(
+            &state,
+            "Query",
+            serde_json::json!({
+                "TableName": "Games",
+                "KeyConditionExpression": "(UserId = :u AND Title = :t)",
+                "ExpressionAttributeValues": {":u": {"S": "victim"}, ":t": {"S": "x"}}
+            }),
+        );
+        assert_eq!(
+            get(&got[0].1, "dynamodb:leadingkeys"),
+            Some(&["victim".to_string()][..])
+        );
+
+        let got = keys_for(
+            &state,
+            "Query",
+            serde_json::json!({
+                "TableName": "Games",
+                "KeyConditionExpression": "UserId = :u",
+                "ExpressionAttributeValues": {}
+            }),
+        );
+        assert_eq!(
+            get(&got[0].1, "dynamodb:leadingkeys"),
+            None,
+            "unknown is omitted"
+        );
+
+        let got = keys_for(&state, "Scan", serde_json::json!({"TableName": "Games"}));
+        assert_eq!(
+            get(&got[0].1, "dynamodb:leadingkeys"),
+            Some(&[][..]),
+            "a scan pins none"
+        );
+        assert_eq!(get(&got[0].1, "dynamodb:attributes"), Some(&[][..]));
+
+        let got = keys_for(
+            &state,
+            "ExecuteStatement",
+            serde_json::json!({"Statement": "SELECT * FROM \"Games\" WHERE UserId = 1.0"}),
+        );
+        assert_eq!(
+            get(&got[0].1, "dynamodb:leadingkeys"),
+            Some(&["1".to_string()][..])
+        );
+    }
+
+    /// One scanning statement makes a batch or transaction a full table scan,
+    /// whatever order the statements come in; dotted attribute names are
+    /// reported whole, as the executor reads them.
+    #[test]
+    fn full_table_scan_and_dotted_names_across_statements() {
+        let (_svc, state) = service_with_table();
+        let got = keys_for(
+            &state,
+            "ExecuteTransaction",
+            serde_json::json!({"TransactStatements": [
+                {"Statement": "SELECT * FROM \"Games\" WHERE Top > 3"},
+                {"Statement": "SELECT * FROM \"Games\" WHERE UserId = 'mine' AND \"a.b\" = 1"}
+            ]}),
+        );
+        let keys = &got[0].1;
+        assert_eq!(
+            get(keys, "dynamodb:fulltablescan"),
+            Some(&["true".to_string()][..])
+        );
+        let attrs = get(keys, "dynamodb:attributes").unwrap();
+        assert!(attrs.contains(&"a.b".to_string()), "{attrs:?}");
     }
 }
