@@ -1162,7 +1162,7 @@ impl DynamoDbService {
             let outcome = execute_partiql_in_state(state, statement, &parameters)?;
             // ExecuteStatement honors Limit + NextToken on a SELECT result set
             // (AWS paginates PartiQL SELECTs); the token is an opaque cursor.
-            let response = apply_execute_statement_pagination(
+            let mut response = apply_execute_statement_pagination(
                 outcome.response.clone(),
                 outcome
                     .table_name
@@ -1170,6 +1170,12 @@ impl DynamoDbService {
                     .and_then(|name| state.tables.get(super::resolve_table_name(name))),
                 limit,
                 next_token.as_deref(),
+            );
+            // Columns are projected after paging: the cursor is the last
+            // row's full primary key.
+            super::helpers::partiql::project_partiql_response(
+                &mut response,
+                outcome.projection.as_ref(),
             );
 
             let kinesis_info = if let (Some(table_name), Some(event_name)) =
@@ -1255,9 +1261,14 @@ impl DynamoDbService {
 
                 match execute_partiql_in_state(state, statement, &parameters) {
                     Ok(outcome) => {
+                        let mut projected = outcome.response.clone();
+                        super::helpers::partiql::project_partiql_response(
+                            &mut projected,
+                            outcome.projection.as_ref(),
+                        );
                         responses.push(batch_partiql_response(
                             statement,
-                            outcome.response.clone(),
+                            projected,
                             outcome
                                 .table_name
                                 .as_ref()
@@ -1478,7 +1489,12 @@ impl DynamoDbService {
 
             match execute_partiql_in_state(state, statement, &parameters) {
                 Ok(outcome) => {
-                    applied_responses.push(outcome.response);
+                    let mut projected = outcome.response;
+                    super::helpers::partiql::project_partiql_response(
+                        &mut projected,
+                        outcome.projection.as_ref(),
+                    );
+                    applied_responses.push(projected);
                     let table_name = match outcome.table_name {
                         Some(n) => n,
                         None => continue,

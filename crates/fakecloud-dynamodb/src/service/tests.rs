@@ -7063,3 +7063,75 @@ async fn partiql_select_returns_only_the_named_columns() {
     .await;
     assert_eq!(all["Items"][0]["secret"], json!({"S": "s"}));
 }
+
+/// Column projection happens after paging, so the cursor still has each
+/// row's full key: a column list without the key attributes pages through
+/// every row once. An empty or unreadable column list is rejected instead of
+/// returning more than was asked for.
+#[tokio::test]
+async fn partiql_select_columns_page_and_validate() {
+    let svc = make_service();
+    svc.create_table(&make_request(
+        "CreateTable",
+        json!({
+            "TableName": "Scores",
+            "KeySchema": [
+                {"AttributeName": "u", "KeyType": "HASH"},
+                {"AttributeName": "g", "KeyType": "RANGE"}
+            ],
+            "AttributeDefinitions": [
+                {"AttributeName": "u", "AttributeType": "S"},
+                {"AttributeName": "g", "AttributeType": "S"}
+            ],
+            "BillingMode": "PAY_PER_REQUEST"
+        }),
+    ))
+    .unwrap();
+    for g in ["a", "b", "c"] {
+        call_dynamodb(
+            &svc,
+            "PutItem",
+            json!({"TableName": "Scores", "Item": {"u": {"S": "u1"}, "g": {"S": g}, "score": {"N": g.len().to_string()}}}),
+        )
+        .await;
+    }
+    let mut seen = 0;
+    let mut token: Option<String> = None;
+    loop {
+        let mut body = json!({"Statement": "SELECT score FROM \"Scores\"", "Limit": 1});
+        if let Some(t) = &token {
+            body["NextToken"] = json!(t);
+        }
+        let page = call_dynamodb(&svc, "ExecuteStatement", body).await;
+        for item in page["Items"].as_array().unwrap() {
+            assert!(item.get("u").is_none() && item.get("g").is_none(), "{item}");
+            seen += 1;
+        }
+        token = page["NextToken"].as_str().map(str::to_string);
+        if token.is_none() {
+            break;
+        }
+    }
+    assert_eq!(seen, 3, "every row once");
+
+    for statement in [
+        "SELECT FROM \"Scores\"",
+        "SELECT tags[-1] FROM \"Scores\"",
+        "SELECT \"addr ,x FROM \"Scores\"",
+    ] {
+        assert_eq!(
+            err_code(&svc, "ExecuteStatement", json!({"Statement": statement}))
+                .await
+                .as_deref(),
+            Some("ValidationException"),
+            "{statement}"
+        );
+    }
+    // Whitespace around path separators is fine.
+    call_dynamodb(
+        &svc,
+        "ExecuteStatement",
+        json!({"Statement": "SELECT \"u\" . \"x\", score [ 0 ] FROM \"Scores\""}),
+    )
+    .await;
+}

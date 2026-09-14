@@ -35,37 +35,14 @@ use crate::state::{attribute_type_and_value, SharedDynamoDbState};
 use super::helpers::partiql::find_outside_quotes;
 
 /// Words in DynamoDB and PartiQL expressions that are never attribute names.
-const EXPRESSION_WORDS: &[&str] = &[
-    "and",
-    "or",
-    "not",
-    "between",
-    "in",
-    "set",
-    "remove",
-    "add",
-    "delete",
-    "select",
-    "from",
-    "where",
-    "value",
-    "values",
-    "into",
-    "update",
-    "insert",
-    "returning",
-    "all",
-    "old",
-    "new",
-    "modified",
-    "true",
-    "false",
-    "null",
-    "missing",
-    "is",
-    "exists",
-    "size",
-];
+/// Operator words of both DynamoDB expressions and PartiQL: never attribute
+/// names. Anything else is reported -- an extra name only narrows what an
+/// attribute allow-list admits, a missing one would widen it.
+const EXPRESSION_WORDS: &[&str] = &["and", "or", "not", "between", "in"];
+
+/// UpdateExpression clause keywords. DynamoDB reserves them, so an attribute
+/// named `set` is always written `#name` in a native expression.
+const UPDATE_CLAUSE_WORDS: &[&str] = &["set", "remove", "add", "delete"];
 
 struct Keys {
     /// `None` when the partition keys could not be determined: the key is
@@ -95,6 +72,27 @@ impl Default for Keys {
 }
 
 impl Keys {
+    /// Record a statement's or member's `Select`. Across the statements of a
+    /// batch or the members of a transaction the request reads as much as
+    /// its most permissive one, so that is the value reported.
+    fn merge_select(&mut self, select: String) {
+        fn rank(select: &str) -> u8 {
+            match select {
+                "COUNT" => 0,
+                "SPECIFIC_ATTRIBUTES" => 1,
+                "ALL_PROJECTED_ATTRIBUTES" => 2,
+                _ => 3,
+            }
+        }
+        if self
+            .select
+            .as_deref()
+            .is_none_or(|current| rank(&select) > rank(current))
+        {
+            self.select = Some(select);
+        }
+    }
+
     fn add_leading(&mut self, value: String) {
         if let Some(set) = &mut self.leading {
             set.insert(value);
@@ -240,7 +238,7 @@ pub(crate) fn condition_keys(
             add_request_attributes(&mut keys, &body, &names);
             keys.return_consumed_capacity = rcc();
             if request.action == "GetItem" {
-                keys.select = Some(implicit_select(&body, false));
+                keys.merge_select(implicit_select(&body, false));
             } else {
                 keys.return_values =
                     Some(body["ReturnValues"].as_str().unwrap_or("NONE").to_string());
@@ -252,14 +250,14 @@ pub(crate) fn condition_keys(
                     Some(v) => keys.add_leading(v),
                     None => keys.leading = None,
                 }
-                keys.select = Some(implicit_select(&body, t.index.is_some()));
+                keys.merge_select(implicit_select(&body, t.index.is_some()));
             }
             add_request_attributes(&mut keys, &body, &names);
             keys.return_consumed_capacity = rcc();
         }
         "Scan" => {
             add_request_attributes(&mut keys, &body, &names);
-            keys.select = Some(implicit_select(&body, body["IndexName"].is_string()));
+            keys.merge_select(implicit_select(&body, body["IndexName"].is_string()));
             keys.return_consumed_capacity = rcc();
         }
         "BatchGetItem" | "BatchWriteItem" => {
@@ -275,7 +273,7 @@ pub(crate) fn condition_keys(
                             add_item_attributes(&mut keys, key);
                         }
                         add_request_attributes(&mut keys, entry, &entry_names);
-                        keys.select = Some(implicit_select(entry, false));
+                        keys.merge_select(implicit_select(entry, false));
                     } else {
                         for write in entry.as_array().into_iter().flatten() {
                             let item = if write["PutRequest"].is_object() {
@@ -319,7 +317,7 @@ pub(crate) fn condition_keys(
                     add_item_attributes(&mut keys, addressed);
                     add_request_attributes(&mut keys, op, &expression_names(op));
                     if member == "Get" {
-                        keys.select = Some(implicit_select(op, false));
+                        keys.merge_select(implicit_select(op, false));
                     }
                 }
             }
@@ -432,6 +430,36 @@ fn add_request_attributes(keys: &mut Keys, body: &Value, names: &BTreeMap<String
             keys.attributes.extend(obj.keys().cloned());
         }
     }
+}
+
+/// The top-level attributes an update expression writes, found the way the
+/// executor applies it (`SET a.b = ...` writes `a`).
+fn update_targets(expr: &str) -> Vec<String> {
+    use super::helpers::{parse_update_clauses, UpdateAction};
+    let mut out = Vec::new();
+    for (action, assignments) in parse_update_clauses(expr) {
+        for assignment in &assignments {
+            let target = match action {
+                UpdateAction::Set => match assignment.split_once('=') {
+                    Some((left, _)) => left,
+                    None => continue,
+                },
+                UpdateAction::Remove => assignment.as_str(),
+                UpdateAction::Add | UpdateAction::Delete => {
+                    assignment.split_whitespace().next().unwrap_or_default()
+                }
+            };
+            let target = target.trim();
+            let name = match target.strip_prefix('"') {
+                Some(rest) => rest.split('"').next().unwrap_or(rest),
+                None => target.split(['.', '[']).next().unwrap_or(target).trim(),
+            };
+            if !name.is_empty() {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out
 }
 
 fn implicit_select(body: &Value, index: bool) -> String {
@@ -557,7 +585,9 @@ fn expression_attributes(
             }
             continue;
         }
-        let keyword = !quoted && EXPRESSION_WORDS.contains(&lower.as_str());
+        let keyword = !quoted
+            && (EXPRESSION_WORDS.contains(&lower.as_str())
+                || (!partiql && UPDATE_CLAUSE_WORDS.contains(&lower.as_str())));
         let function = matches!(tokens.get(i + 1), Some(Token::Symbol('(')));
         if !nested && !keyword && !function {
             if let Some(name) = text.strip_prefix('#').map(|_| names.get(text)) {
@@ -689,17 +719,24 @@ fn add_partiql_keys(
                 return;
             };
             let projection = trimmed["SELECT".len()..from].trim();
-            keys.attributes
-                .extend(expression_attributes(projection, &BTreeMap::new(), true));
-            keys.select = Some(if projection == "*" {
-                if target.index.is_some() {
+            match super::helpers::partiql::partiql_column_paths(projection) {
+                Ok(Some(paths)) => {
+                    for path in paths {
+                        if let Some(super::helpers::partiql::PathSegment::Name(name)) = path.first()
+                        {
+                            keys.attributes.insert(name.clone());
+                        }
+                    }
+                    keys.merge_select("SPECIFIC_ATTRIBUTES".to_string());
+                }
+                Ok(None) => keys.merge_select(if target.index.is_some() {
                     "ALL_PROJECTED_ATTRIBUTES".to_string()
                 } else {
                     "ALL_ATTRIBUTES".to_string()
-                }
-            } else {
-                "SPECIFIC_ATTRIBUTES".to_string()
-            });
+                }),
+                // The executor rejects the statement.
+                Err(_) => return,
+            }
             let (_, mut rest) = parse_partiql_table_name(trimmed[from + 4..].trim());
             if let Some(index_part) = rest.strip_prefix('.') {
                 rest = parse_partiql_table_name(index_part).1;
@@ -720,6 +757,11 @@ fn add_partiql_keys(
                     Some(wp) => (&after_set[..wp], after_set[wp + 5..].trim()),
                     None => (after_set, ""),
                 };
+            let (update_expression, _) =
+                super::helpers::partiql::prepare_partiql_update_expression(set_clause, parameters);
+            keys.attributes.extend(update_targets(&update_expression));
+            // Attributes the assignments read; an extra name only narrows what
+            // an attribute allow-list admits.
             keys.attributes
                 .extend(expression_attributes(set_clause, &BTreeMap::new(), true));
             let set_params = count_params_in_str(set_clause);
@@ -799,14 +841,14 @@ mod tests {
     }
 
     #[test]
-    fn partiql_attributes_skip_table_and_literals() {
+    fn partiql_set_clause_attributes_skip_literals() {
         let mut got = expression_attributes(
-            "SELECT name, \"Address\".city FROM \"Orders\".\"by-customer\" WHERE pk = 'a' AND qty > 3",
+            "x = y + 1, \"note\" = 'set when? size', modified = ?",
             &BTreeMap::new(),
             true,
         );
         got.sort();
-        assert_eq!(got, ["Address", "name", "pk", "qty"]);
+        assert_eq!(got, ["modified", "note", "x", "y"]);
     }
 
     #[test]
@@ -1355,5 +1397,65 @@ mod tests {
         );
         let attrs = get(keys, "dynamodb:attributes").unwrap();
         assert!(attrs.contains(&"a.b".to_string()), "{attrs:?}");
+    }
+
+    /// SELECT and SET columns are read with the executor's parsers, so names
+    /// that look like keywords, start with a digit or carry `#`/`:` are all
+    /// reported; and `Select` is the most permissive across statements.
+    #[test]
+    fn partiql_columns_and_select_follow_the_executor() {
+        let (_svc, state) = service_with_table();
+        let got = keys_for(
+            &state,
+            "ExecuteStatement",
+            serde_json::json!({
+                "Statement": "SELECT size, value, 2fa_secret, #secret, \"a:b\" FROM \"Games\" WHERE UserId = 'mine'"
+            }),
+        );
+        let attrs = get(&got[0].1, "dynamodb:attributes").unwrap().to_vec();
+        for name in ["size", "value", "2fa_secret", "#secret", "a:b", "UserId"] {
+            assert!(
+                attrs.contains(&name.to_string()),
+                "{name} missing from {attrs:?}"
+            );
+        }
+
+        let got = keys_for(
+            &state,
+            "ExecuteStatement",
+            serde_json::json!({
+                "Statement": "UPDATE \"Games\" SET modified = ?, \"new\" = 1 WHERE UserId = 'mine' AND Title = 't'",
+                "Parameters": [{"S": "x"}]
+            }),
+        );
+        let attrs = get(&got[0].1, "dynamodb:attributes").unwrap().to_vec();
+        assert!(attrs.contains(&"modified".to_string()), "{attrs:?}");
+        assert!(attrs.contains(&"new".to_string()), "{attrs:?}");
+
+        let got = keys_for(
+            &state,
+            "BatchExecuteStatement",
+            serde_json::json!({"Statements": [
+                {"Statement": "SELECT * FROM \"Games\" WHERE UserId = 'mine'"},
+                {"Statement": "SELECT UserId FROM \"Games\" WHERE UserId = 'mine'"}
+            ]}),
+        );
+        assert_eq!(
+            get(&got[0].1, "dynamodb:select"),
+            Some(&["ALL_ATTRIBUTES".to_string()][..])
+        );
+
+        let got = keys_for(
+            &state,
+            "TransactGetItems",
+            serde_json::json!({"TransactItems": [
+                {"Get": {"TableName": "Games", "Key": {"UserId": {"S": "a"}, "Title": {"S": "x"}}}},
+                {"Get": {"TableName": "Games", "Key": {"UserId": {"S": "a"}, "Title": {"S": "y"}}, "ProjectionExpression": "UserId"}}
+            ]}),
+        );
+        assert_eq!(
+            get(&got[0].1, "dynamodb:select"),
+            Some(&["ALL_ATTRIBUTES".to_string()][..])
+        );
     }
 }

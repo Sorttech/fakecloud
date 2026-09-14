@@ -492,7 +492,9 @@ pub(crate) fn execute_partiql_in_state(
         // when some are deleted between pages.
         table.sort_in_scan_order(&mut rows);
         // The column list: `*`, or the attributes (document paths) to return.
-        let projection = partiql_projection(trimmed["SELECT".len()..from_pos].trim());
+        // It is validated here and applied by the caller to the rows it
+        // returns.
+        let projection = partiql_projection(trimmed["SELECT".len()..from_pos].trim())?;
         let items: Vec<Value> = rows
             .iter()
             .map(|item| match &index {
@@ -507,14 +509,6 @@ pub(crate) fn execute_partiql_in_state(
                 }
                 None => json!(item),
             })
-            .map(|item| match &projection {
-                Some(body) => {
-                    let item: HashMap<String, AttributeValue> =
-                        serde_json::from_value(item).unwrap_or_default();
-                    json!(crate::service::helpers::project_item(&item, body))
-                }
-                None => item,
-            })
             .collect();
         Ok(PartiqlOutcome {
             response: json!({ "Items": items }),
@@ -523,6 +517,7 @@ pub(crate) fn execute_partiql_in_state(
             keys: None,
             old_image: None,
             new_image: None,
+            projection,
         })
     } else if upper.starts_with("INSERT") {
         let into_pos = find_outside_quotes(&upper, "INTO").ok_or_else(|| {
@@ -565,6 +560,7 @@ pub(crate) fn execute_partiql_in_state(
             keys: Some(key),
             old_image: None,
             new_image: Some(item),
+            projection: None,
         })
     } else if upper.starts_with("UPDATE") {
         let after_update = trimmed[6..].trim();
@@ -639,6 +635,7 @@ pub(crate) fn execute_partiql_in_state(
             keys: last_key,
             old_image: last_old,
             new_image: last_new,
+            projection: None,
         })
     } else if upper.starts_with("DELETE") {
         let from_pos = find_outside_quotes(&upper, "FROM").ok_or_else(|| {
@@ -682,6 +679,7 @@ pub(crate) fn execute_partiql_in_state(
             keys: last_key,
             old_image: last_old,
             new_image: None,
+            projection: None,
         })
     } else {
         Err(AwsServiceError::aws_error(
@@ -692,55 +690,149 @@ pub(crate) fn execute_partiql_in_state(
     }
 }
 
-/// A SELECT column list as a ProjectionExpression request fragment, or `None`
-/// for `*`. Each column is a document path whose segments may be
-/// double-quoted (`"Address"."City"`, `tags[0]`); every segment goes through
-/// an expression attribute name, so a quoted name containing a dot stays one
-/// attribute.
-fn partiql_projection(columns: &str) -> Option<Value> {
-    if columns == "*" || columns.is_empty() {
-        return None;
+fn malformed_statement() -> AwsServiceError {
+    AwsServiceError::aws_error(
+        StatusCode::BAD_REQUEST,
+        "ValidationException",
+        "Statement wasn't well formed, can't be processed: Invalid column list",
+    )
+}
+
+/// The document paths of a SELECT column list, each a list of segments: an
+/// attribute name (bare or double-quoted) or a list index. `None` for `*`.
+/// A list the parser cannot read exactly is a ValidationException -- never a
+/// shorter path, which would return more than was asked for.
+pub(crate) fn partiql_column_paths(
+    columns: &str,
+) -> Result<Option<Vec<Vec<PathSegment>>>, AwsServiceError> {
+    let columns = columns.trim();
+    if columns == "*" {
+        return Ok(None);
     }
-    let mut names = serde_json::Map::new();
+    if columns.is_empty() {
+        return Err(malformed_statement());
+    }
     let mut paths = Vec::new();
     for column in split_on_top_level_keyword(columns, ",") {
-        let mut path = String::new();
-        let mut rest = column.trim();
-        while !rest.is_empty() {
-            let (segment, after) = if let Some(quoted) = rest.strip_prefix('"') {
-                match quoted.find('"') {
-                    Some(end) => (&quoted[..end], &quoted[end + 1..]),
-                    None => (quoted, ""),
-                }
-            } else {
-                let end = rest.find(['.', '[']).unwrap_or(rest.len());
-                (rest[..end].trim(), &rest[end..])
-            };
-            let placeholder = format!("#c{}", names.len());
-            names.insert(placeholder.clone(), json!(segment));
-            path.push_str(&placeholder);
-            // List indexes stay on the segment; a dot starts the next one.
-            let mut after = after;
-            while let Some(index) = after.strip_prefix('[') {
-                let end = index.find(']').map_or(index.len(), |e| e + 1);
-                path.push('[');
-                path.push_str(&index[..end]);
-                after = &index[end..];
+        let chars: Vec<char> = column.trim().chars().collect();
+        let mut i = 0;
+        let mut path = Vec::new();
+        let skip_ws = |i: &mut usize| {
+            while *i < chars.len() && chars[*i].is_whitespace() {
+                *i += 1;
             }
-            rest = match after.strip_prefix('.') {
-                Some(next) => {
-                    path.push('.');
-                    next
+        };
+        loop {
+            skip_ws(&mut i);
+            // A name.
+            let name: String = if chars.get(i) == Some(&'"') {
+                let start = i + 1;
+                let end = (start..chars.len())
+                    .find(|&j| chars[j] == '"')
+                    .ok_or_else(malformed_statement)?;
+                i = end + 1;
+                chars[start..end].iter().collect()
+            } else {
+                let start = i;
+                while i < chars.len()
+                    && !matches!(chars[i], '.' | '[' | ']' | '"')
+                    && !chars[i].is_whitespace()
+                {
+                    i += 1;
                 }
-                None => "",
+                chars[start..i].iter().collect()
             };
+            if name.is_empty() {
+                return Err(malformed_statement());
+            }
+            path.push(PathSegment::Name(name));
+            // Any list indexes.
+            loop {
+                skip_ws(&mut i);
+                if chars.get(i) != Some(&'[') {
+                    break;
+                }
+                i += 1;
+                skip_ws(&mut i);
+                let start = i;
+                while i < chars.len() && chars[i].is_ascii_digit() {
+                    i += 1;
+                }
+                let index: usize = chars[start..i]
+                    .iter()
+                    .collect::<String>()
+                    .parse()
+                    .map_err(|_| malformed_statement())?;
+                skip_ws(&mut i);
+                if chars.get(i) != Some(&']') {
+                    return Err(malformed_statement());
+                }
+                i += 1;
+                path.push(PathSegment::Index(index));
+            }
+            skip_ws(&mut i);
+            match chars.get(i) {
+                None => break,
+                Some('.') => i += 1,
+                Some(_) => return Err(malformed_statement()),
+            }
         }
         paths.push(path);
     }
-    Some(json!({
-        "ProjectionExpression": paths.join(", "),
+    Ok(Some(paths))
+}
+
+/// One step of a document path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PathSegment {
+    Name(String),
+    Index(usize),
+}
+
+/// A SELECT column list as a ProjectionExpression request fragment, or `None`
+/// for `*`. Every name goes through an expression attribute name, so a quoted
+/// name containing a dot stays one attribute.
+fn partiql_projection(columns: &str) -> Result<Option<Value>, AwsServiceError> {
+    let Some(paths) = partiql_column_paths(columns)? else {
+        return Ok(None);
+    };
+    let mut names = serde_json::Map::new();
+    let mut rendered = Vec::new();
+    for path in paths {
+        let mut out = String::new();
+        for segment in path {
+            match segment {
+                PathSegment::Name(name) => {
+                    if !out.is_empty() {
+                        out.push('.');
+                    }
+                    let placeholder = format!("#c{}", names.len());
+                    names.insert(placeholder.clone(), json!(name));
+                    out.push_str(&placeholder);
+                }
+                PathSegment::Index(index) => out.push_str(&format!("[{index}]")),
+            }
+        }
+        rendered.push(out);
+    }
+    Ok(Some(json!({
+        "ProjectionExpression": rendered.join(", "),
         "ExpressionAttributeNames": names,
-    }))
+    })))
+}
+
+/// Apply a SELECT's column list to the `Items` of a response.
+pub(crate) fn project_partiql_response(response: &mut Value, projection: Option<&Value>) {
+    let Some(body) = projection else {
+        return;
+    };
+    if let Some(items) = response.get_mut("Items").and_then(Value::as_array_mut) {
+        for item in items.iter_mut() {
+            let row: HashMap<String, AttributeValue> =
+                serde_json::from_value(item.take()).unwrap_or_default();
+            *item = json!(crate::service::helpers::project_item(&row, body));
+        }
+    }
 }
 
 pub(crate) fn split_partiql_returning_clause(where_clause: &str) -> (&str, bool) {
@@ -766,7 +858,7 @@ pub(crate) fn split_partiql_returning_clause(where_clause: &str) -> (&str, bool)
     (where_clause, false)
 }
 
-fn prepare_partiql_update_expression(
+pub(crate) fn prepare_partiql_update_expression(
     set_clause: &str,
     parameters: &[Value],
 ) -> (String, HashMap<String, Value>) {

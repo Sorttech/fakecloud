@@ -810,6 +810,10 @@ pub(crate) struct PartiqlOutcome {
     pub keys: Option<HashMap<String, AttributeValue>>,
     pub old_image: Option<HashMap<String, AttributeValue>>,
     pub new_image: Option<HashMap<String, AttributeValue>>,
+    /// A SELECT's column list as a projection request, applied to the rows
+    /// the caller returns -- after any pagination, whose cursor needs each
+    /// row's full primary key. `None` for `*` and for writes.
+    pub projection: Option<Value>,
 }
 
 /// AST for a parsed PartiQL WHERE clause. Leaf conditions reuse
