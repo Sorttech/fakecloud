@@ -17,15 +17,36 @@ pub(crate) fn find_outside_quotes(hay: &str, needle: &str) -> Option<usize> {
     }
     let bytes = hay.as_bytes();
     let nbytes = needle.as_bytes();
+    // A keyword needle (`FROM`, `WHERE`, ...) only matches as a whole word:
+    // `somewhere` or `fromage` is an identifier that happens to contain it.
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let keyword = nbytes.iter().all(|b| b.is_ascii_alphabetic());
     let mut in_quote = false;
+    let mut in_dquote = false;
     let mut i = 0usize;
     while i < bytes.len() {
-        if bytes[i] == b'\'' {
-            in_quote = !in_quote;
-            i += 1;
-            continue;
+        match bytes[i] {
+            b'\'' if !in_dquote => {
+                in_quote = !in_quote;
+                i += 1;
+                continue;
+            }
+            // A double-quoted identifier (`"from"`) is a name, not syntax.
+            b'"' if !in_quote => {
+                in_dquote = !in_dquote;
+                i += 1;
+                continue;
+            }
+            _ => {}
         }
-        if !in_quote && i + nbytes.len() <= bytes.len() && &bytes[i..i + nbytes.len()] == nbytes {
+        if !in_quote
+            && !in_dquote
+            && i + nbytes.len() <= bytes.len()
+            && &bytes[i..i + nbytes.len()] == nbytes
+            && (!keyword
+                || ((i == 0 || !is_word(bytes[i - 1]))
+                    && (i + nbytes.len() == bytes.len() || !is_word(bytes[i + nbytes.len()]))))
+        {
             return Some(i);
         }
         i += 1;
@@ -566,16 +587,16 @@ pub(crate) fn execute_partiql_in_state(
         // before WHERE, so SET consumes parameters[0..set_count] and WHERE the
         // rest. Evaluate WHERE against the parameters that follow the SET ones.
         let set_param_count = count_params_in_str(set_clause);
-        let matched_indices = if !where_clause.is_empty() {
-            let where_params: &[Value] = if set_param_count <= parameters.len() {
-                &parameters[set_param_count..]
-            } else {
-                &[]
-            };
-            find_partiql_where_indices(table, where_clause, where_params)?
+        let where_params: &[Value] = if set_param_count <= parameters.len() {
+            &parameters[set_param_count..]
         } else {
-            table.items.iter_with_ids().map(|(id, _)| id).collect()
+            &[]
         };
+        require_partiql_key_equality(
+            table,
+            partiql_where_conditions(where_clause, where_params).as_ref(),
+        )?;
+        let matched_indices = find_partiql_where_indices(table, where_clause, where_params)?;
         let mut last_key: Option<HashMap<String, AttributeValue>> = None;
         let mut last_old: Option<HashMap<String, AttributeValue>> = None;
         let mut last_new: Option<HashMap<String, AttributeValue>> = None;
@@ -629,6 +650,10 @@ pub(crate) fn execute_partiql_in_state(
         }
         let where_clause = rest.trim()[5..].trim();
         let table = get_table_mut(&mut state.tables, &table_name)?;
+        require_partiql_key_equality(
+            table,
+            partiql_where_conditions(where_clause, parameters).as_ref(),
+        )?;
         let mut indices = find_partiql_where_indices(table, where_clause, parameters)?;
         // Ids are stable across removals, so any order is safe; newest first
         // keeps the reported row the first match in storage order.
@@ -657,7 +682,7 @@ pub(crate) fn execute_partiql_in_state(
     }
 }
 
-fn split_partiql_returning_clause(where_clause: &str) -> (&str, bool) {
+pub(crate) fn split_partiql_returning_clause(where_clause: &str) -> (&str, bool) {
     // `to_ascii_uppercase` preserves byte length and never touches non-ASCII
     // bytes, so char boundaries stay aligned between `upper` and `where_clause`.
     // Iterate real char boundaries (not raw byte indices) so a non-ASCII byte
@@ -1025,6 +1050,130 @@ fn match_where_keyword_at_start(upper: &[u8], i: usize) -> Option<(WhereTok<'sta
 /// Parse a WHERE clause into [`PartiqlExpr`]. Returns `None` when the
 /// clause has no logical operators OR fails to parse — callers fall
 /// back to the legacy AND-only evaluator in that case.
+/// A WHERE clause's conditions the way the executor reads them: the parsed
+/// expression tree, or -- for a clause that only the legacy AND-list parser
+/// understands -- that list folded into one AND. `None` when neither parser
+/// accepts the clause (the executor then rejects the statement).
+pub(crate) fn partiql_where_conditions(
+    where_clause: &str,
+    parameters: &[Value],
+) -> Option<PartiqlExpr> {
+    if let Some(expr) = parse_partiql_where_expr(where_clause, parameters) {
+        return Some(expr);
+    }
+    let conditions = split_partiql_and_clauses(where_clause);
+    let parsed = parse_partiql_conditions(&conditions, parameters);
+    if parsed.is_empty() || parsed.len() != conditions.len() {
+        return None;
+    }
+    parsed
+        .into_iter()
+        .map(PartiqlExpr::Cond)
+        .reduce(|l, r| PartiqlExpr::And(Box::new(l), Box::new(r)))
+}
+
+/// The top-level attribute a condition path starts at (`a.b[0]` -> `a`).
+fn partiql_top_level(path: &str) -> &str {
+    let end = path.find(['.', '[']).unwrap_or(path.len());
+    path[..end].trim().trim_matches('"')
+}
+
+fn partiql_cond_attribute(cond: &PartiqlCond) -> &str {
+    use PartiqlCond::*;
+    match cond {
+        Eq(a, _)
+        | Ne(a, _)
+        | Lt(a, _)
+        | Le(a, _)
+        | Gt(a, _)
+        | Ge(a, _)
+        | Between(a, _, _)
+        | In(a, _)
+        | Like(a, _)
+        | BeginsWith(a, _)
+        | Contains(a, _)
+        | AttributeExists(a)
+        | AttributeNotExists(a) => partiql_top_level(a),
+    }
+}
+
+/// Every top-level attribute a WHERE expression reads.
+pub(crate) fn partiql_expr_attributes(expr: &PartiqlExpr, out: &mut Vec<String>) {
+    match expr {
+        PartiqlExpr::Cond(c) => out.push(partiql_cond_attribute(c).to_string()),
+        PartiqlExpr::And(l, r) | PartiqlExpr::Or(l, r) => {
+            partiql_expr_attributes(l, out);
+            partiql_expr_attributes(r, out);
+        }
+        PartiqlExpr::Not(e) => partiql_expr_attributes(e, out),
+    }
+}
+
+/// The values a WHERE expression confines `attr` to, if it confines it at
+/// all: every row it selects has `attr` equal to one of them. `None` means
+/// rows with any value of `attr` can match.
+pub(crate) fn partiql_pinned_values(expr: &PartiqlExpr, attr: &str) -> Option<Vec<Value>> {
+    match expr {
+        PartiqlExpr::Cond(PartiqlCond::Eq(a, v)) if a.trim().trim_matches('"') == attr => {
+            Some(vec![v.clone()])
+        }
+        PartiqlExpr::Cond(PartiqlCond::In(a, vs)) if a.trim().trim_matches('"') == attr => {
+            Some(vs.clone())
+        }
+        PartiqlExpr::Cond(_) | PartiqlExpr::Not(_) => None,
+        PartiqlExpr::And(l, r) => match (
+            partiql_pinned_values(l, attr),
+            partiql_pinned_values(r, attr),
+        ) {
+            (Some(a), Some(b)) => Some(
+                a.into_iter()
+                    .filter(|v| b.iter().any(|w| values_equal(Some(v), Some(w))))
+                    .collect(),
+            ),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        },
+        PartiqlExpr::Or(l, r) => {
+            let mut a = partiql_pinned_values(l, attr)?;
+            a.extend(partiql_pinned_values(r, attr)?);
+            Some(a)
+        }
+    }
+}
+
+/// The single value an AND-joined WHERE expression equates `attr` to.
+fn partiql_equality_on(expr: &PartiqlExpr, attr: &str) -> bool {
+    match expr {
+        PartiqlExpr::Cond(PartiqlCond::Eq(a, _)) => a.trim().trim_matches('"') == attr,
+        PartiqlExpr::And(l, r) => partiql_equality_on(l, attr) || partiql_equality_on(r, attr),
+        _ => false,
+    }
+}
+
+/// PartiQL UPDATE and DELETE act on exactly one item, so their WHERE clause
+/// must equate every primary-key attribute to a value; DynamoDB rejects any
+/// other clause. Without this a clause on a non-key attribute rewrote or
+/// removed every matching row across partitions.
+pub(crate) fn require_partiql_key_equality(
+    table: &DynamoTable,
+    conditions: Option<&PartiqlExpr>,
+) -> Result<(), AwsServiceError> {
+    let keyed = conditions.is_some_and(|expr| {
+        std::iter::once(table.hash_key_name())
+            .chain(table.range_key_name())
+            .all(|key| partiql_equality_on(expr, key))
+    });
+    if keyed {
+        Ok(())
+    } else {
+        Err(AwsServiceError::aws_error(
+            StatusCode::BAD_REQUEST,
+            "ValidationException",
+            "Where clause does not contain a mandatory equality on all key attributes",
+        ))
+    }
+}
+
 pub(crate) fn parse_partiql_where_expr(
     where_clause: &str,
     parameters: &[Value],
@@ -1328,9 +1477,12 @@ fn parse_one_partiql_condition(
     if let Some(i) = find_outside_quotes(&upper, " IN ") {
         let attr = cond[..i].trim().trim_matches('"').to_string();
         let after = cond[i + 4..].trim();
+        // DynamoDB's PartiQL writes the list in brackets (`IN ['a', 'b']`);
+        // parentheses are accepted too.
         let inner = after
-            .strip_prefix('(')
-            .and_then(|s| s.strip_suffix(')'))?
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .or_else(|| after.strip_prefix('(').and_then(|s| s.strip_suffix(')')))?
             .trim();
         let mut vals = Vec::new();
         for raw in inner.split(',') {
@@ -1717,6 +1869,11 @@ mod quote_aware_tests {
         // The literal WHERE is skipped; the real (last) one is found.
         let s = "note = 'go WHERE you' WHERE id = 1";
         assert_eq!(find_outside_quotes(s, "WHERE"), s.rfind("WHERE"));
+        // Keywords match whole words only, and never inside a quoted name.
+        let s = "SET SOMEWHERE = 1 WHERE PK = 'A'";
+        assert_eq!(find_outside_quotes(s, "WHERE"), Some(18));
+        let s = "SELECT \"FROM\" FROM T";
+        assert_eq!(find_outside_quotes(s, "FROM"), Some(14));
     }
 
     #[test]

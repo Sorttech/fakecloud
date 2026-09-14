@@ -3026,15 +3026,18 @@ mod tests {
         .unwrap();
 
         // A non-ASCII, non-key attribute in the WHERE predicate must not panic
-        // the RETURNING scan (it simply matches nothing).
-        svc.execute_statement(&req_for(
-            "ExecuteStatement",
-            json!({
-                "Statement": "UPDATE \"Widgets\" SET \"x\" = ? WHERE \"café\" = ?",
-                "Parameters": [{ "S": "1" }, { "S": "z" }]
-            }),
-        ))
-        .unwrap();
+        // the RETURNING scan. It is not the key, so DynamoDB rejects it.
+        let err = svc
+            .execute_statement(&req_for(
+                "ExecuteStatement",
+                json!({
+                    "Statement": "UPDATE \"Widgets\" SET \"x\" = ? WHERE \"café\" = ?",
+                    "Parameters": [{ "S": "1" }, { "S": "z" }]
+                }),
+            ))
+            .err()
+            .expect("a WHERE without the key is rejected");
+        assert_eq!(err.code(), "ValidationException");
 
         // Read back through a batch single-item SELECT with tight `"pk"=?`
         // spacing (no surrounding spaces) to confirm the key-check tolerates it.
@@ -3070,11 +3073,29 @@ mod tests {
         ))
         .unwrap();
 
-        let updated = svc
+        // Without a WHERE the statement names no item, which DynamoDB rejects;
+        // the RETURNING clause is still stripped rather than parsed as part of
+        // the SET expression, so the error is the key check, not a garbled
+        // update expression.
+        let err = svc
             .execute_statement(&req_for(
                 "ExecuteStatement",
                 json!({
                     "Statement": "UPDATE \"Widgets\" SET \"flag\" = ? RETURNING ALL NEW *",
+                    "Parameters": [{ "S": "on" }]
+                }),
+            ))
+            .err()
+            .expect("an UPDATE without a key WHERE is rejected");
+        assert_eq!(
+            err.to_string(),
+            "ValidationException: Where clause does not contain a mandatory equality on all key attributes"
+        );
+        let updated = svc
+            .execute_statement(&req_for(
+                "ExecuteStatement",
+                json!({
+                    "Statement": "UPDATE \"Widgets\" SET \"flag\" = ? WHERE \"pk\" = 'a' RETURNING ALL NEW *",
                     "Parameters": [{ "S": "on" }]
                 }),
             ))

@@ -60,21 +60,19 @@ impl Scope<'_> {
     /// that does not exist yet (CreateTable) is authorized at the ARN it will
     /// get: the caller's account and the request's region.
     fn table(&self, name_or_arn: &str) -> String {
-        let (account, name) = match table_arn_of(name_or_arn) {
-            Some(arn) => {
-                let account = arn.split(':').nth(4).unwrap_or(self.account).to_string();
-                let name = arn
-                    .rsplit("table/")
-                    .next()
-                    .unwrap_or(name_or_arn)
-                    .to_string();
-                (account, name)
-            }
-            None => (self.account.to_string(), name_or_arn.to_string()),
+        // Handlers look a table up by name in the caller's own account, whatever
+        // account a table ARN names, so that is the table to authorize.
+        let name = match table_arn_of(name_or_arn) {
+            Some(arn) => arn
+                .rsplit("table/")
+                .next()
+                .unwrap_or(name_or_arn)
+                .to_string(),
+            None => name_or_arn.to_string(),
         };
         if let Some(table) = self
             .accounts
-            .get(&account)
+            .get(self.account)
             .and_then(|state| state.tables.get(&name))
         {
             return table.arn.clone();

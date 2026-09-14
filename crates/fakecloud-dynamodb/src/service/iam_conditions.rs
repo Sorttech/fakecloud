@@ -231,7 +231,7 @@ pub(crate) fn condition_keys(
         }
         "Scan" => {
             add_request_attributes(&mut keys, &body, &names);
-            keys.select = Some(implicit_select(&body, false));
+            keys.select = Some(implicit_select(&body, body["IndexName"].is_string()));
             keys.return_consumed_capacity = rcc();
         }
         "BatchGetItem" | "BatchWriteItem" => {
@@ -542,12 +542,14 @@ fn expression_attributes(
     out
 }
 
-/// The value a Query's key condition fixes the partition key to.
+/// The value a Query's key condition fixes the partition key to, split and
+/// read the way the Query handler reads it.
 fn query_partition_value(
     body: &Value,
     names: &BTreeMap<String, String>,
     partition_key: &str,
 ) -> Option<String> {
+    use super::helpers::{split_on_and, strip_outer_parens};
     if let Some(cond) = body["KeyConditions"][partition_key].as_object() {
         return cond
             .get("AttributeValueList")?
@@ -557,46 +559,39 @@ fn query_partition_value(
     }
     let text = body["KeyConditionExpression"].as_str()?;
     let values = &body["ExpressionAttributeValues"];
-    let tokens: Vec<&str> = split_equalities(text);
-    for clause in tokens {
-        let Some((left, right)) = clause.split_once('=') else {
+    for raw in split_on_and(text) {
+        let part = strip_outer_parens(raw.trim()).trim();
+        if part.to_ascii_lowercase().starts_with("begins_with") {
+            continue;
+        }
+        let Some((op, pos)) = ["<=", ">=", "<>", "=", "<", ">"]
+            .iter()
+            .find_map(|cand| part.find(cand).map(|pos| (*cand, pos)))
+        else {
             continue;
         };
-        let (left, right) = (left.trim(), right.trim());
-        let name_of = |s: &str| -> Option<String> {
-            if s.starts_with('#') {
-                names.get(s).cloned()
-            } else {
-                Some(s.to_string())
-            }
+        if op != "=" {
+            continue;
+        }
+        let left = part[..pos].trim().trim_matches('"');
+        let right = part[pos + 1..].trim();
+        let attr = if left.starts_with('#') {
+            names.get(left).map(String::as_str)
+        } else {
+            Some(left)
         };
-        for (attr, placeholder) in [(left, right), (right, left)] {
-            if placeholder.starts_with(':') && name_of(attr).as_deref() == Some(partition_key) {
-                return values.get(placeholder).and_then(scalar_string);
-            }
+        if attr == Some(partition_key) {
+            return values.get(right).and_then(scalar_string);
         }
     }
     None
 }
 
-/// The `a = b` clauses of an `AND`-joined key condition.
-fn split_equalities(text: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let upper = text.to_ascii_uppercase();
-    let mut start = 0;
-    let mut search = 0;
-    while let Some(pos) = upper[search..].find(" AND ") {
-        let abs = search + pos;
-        out.push(&text[start..abs]);
-        start = abs + 5;
-        search = start;
-    }
-    out.push(&text[start..]);
-    out.into_iter()
-        .filter(|c| c.contains('=') && !c.contains("<=") && !c.contains(">="))
-        .collect()
-}
-
+/// The PartiQL condition keys for one statement, parsed exactly the way the
+/// executor parses it -- the same clause splitting, the same `?` parameter
+/// binding, the same WHERE parser and item parser -- so a statement the
+/// executor accepts cannot be read here as touching different partitions or
+/// attributes than it does.
 fn add_partiql_keys(
     keys: &mut Keys,
     target: &Target,
@@ -604,125 +599,101 @@ fn add_partiql_keys(
     parameters: &[Value],
     verb: &str,
 ) {
-    keys.attributes
-        .extend(expression_attributes(statement, &BTreeMap::new(), true));
-    let upper = statement.to_ascii_uppercase();
-    if verb == "PartiQLInsert" {
-        // `INSERT INTO t VALUE {'pk': 'a', ...}`: the item's partition key.
-        if let Some(value) = partiql_insert_partition_value(statement, parameters, target) {
-            keys.leading.insert(value);
-        }
-        return;
-    }
-    let where_pos = find_outside_quotes(&upper, "WHERE");
-    let partition = where_pos
-        .and_then(|pos| partiql_equality_value(statement, pos, parameters, &target.partition_key));
-    if verb == "PartiQLSelect" {
-        let projection = upper
-            .find("SELECT")
-            .zip(find_outside_quotes(&upper, "FROM"))
-            .map(|(s, f)| statement[s + 6..f].trim().to_string())
-            .unwrap_or_default();
-        keys.select = Some(if projection == "*" {
-            if target.index.is_some() {
-                "ALL_PROJECTED_ATTRIBUTES".to_string()
-            } else {
-                "ALL_ATTRIBUTES".to_string()
+    use super::helpers::count_params_in_str;
+    use super::helpers::partiql::{
+        parse_partiql_table_name, parse_partiql_value_object, partiql_expr_attributes,
+        partiql_pinned_values, partiql_where_conditions, split_partiql_returning_clause,
+    };
+
+    let trimmed = statement.trim();
+    let upper = trimmed.to_ascii_uppercase();
+    let mut conditions = None;
+    match verb {
+        "PartiQLInsert" => {
+            let Some(into) = find_outside_quotes(&upper, "INTO") else {
+                return;
+            };
+            let (_, rest) = parse_partiql_table_name(trimmed[into + 4..].trim());
+            let rest_upper = rest.trim().to_ascii_uppercase();
+            let Some(value_pos) = find_outside_quotes(&rest_upper, "VALUE") else {
+                return;
+            };
+            let value_str = rest.trim()[value_pos + 5..].trim();
+            if let Ok(item) = parse_partiql_value_object(value_str, parameters) {
+                if let Some(v) = item.get(&target.partition_key).and_then(scalar_string) {
+                    keys.leading.insert(v);
+                }
+                keys.attributes.extend(item.keys().cloned());
             }
-        } else {
-            "SPECIFIC_ATTRIBUTES".to_string()
-        });
-        keys.full_table_scan = Some(partition.is_none());
-    }
-    if let Some(v) = partition {
-        keys.leading.insert(v);
-    }
-}
-
-/// The value a PartiQL `WHERE` clause (`where_pos` is where its keyword
-/// starts in `statement`) equates `partition_key` to: a string or number
-/// literal, or the `?` parameter at that position in the whole statement.
-fn partiql_equality_value(
-    statement: &str,
-    where_pos: usize,
-    parameters: &[Value],
-    partition_key: &str,
-) -> Option<String> {
-    let clause_start = where_pos + "WHERE".len();
-    let text = &statement[clause_start..];
-    let upper = text.to_ascii_uppercase();
-    // Split on AND outside string literals, remembering each clause's offset.
-    let mut clauses = Vec::new();
-    let mut in_quote = false;
-    let mut start = 0;
-    for (i, c) in text.char_indices() {
-        if c == '\'' {
-            in_quote = !in_quote;
-        } else if !in_quote && upper[i..].starts_with(" AND ") {
-            clauses.push((start, &text[start..i]));
-            start = i + " AND ".len();
+            return;
         }
+        "PartiQLSelect" => {
+            let Some(from) = find_outside_quotes(&upper, "FROM") else {
+                return;
+            };
+            let projection = trimmed["SELECT".len()..from].trim();
+            keys.attributes
+                .extend(expression_attributes(projection, &BTreeMap::new(), true));
+            keys.select = Some(if projection == "*" {
+                if target.index.is_some() {
+                    "ALL_PROJECTED_ATTRIBUTES".to_string()
+                } else {
+                    "ALL_ATTRIBUTES".to_string()
+                }
+            } else {
+                "SPECIFIC_ATTRIBUTES".to_string()
+            });
+            let (_, mut rest) = parse_partiql_table_name(trimmed[from + 4..].trim());
+            if let Some(index_part) = rest.strip_prefix('.') {
+                rest = parse_partiql_table_name(index_part).1;
+            }
+            if rest.trim().to_ascii_uppercase().starts_with("WHERE") {
+                conditions = partiql_where_conditions(rest.trim()[5..].trim(), parameters);
+            }
+        }
+        "PartiQLUpdate" => {
+            let (_, rest) = parse_partiql_table_name(trimmed[6..].trim());
+            let rest_upper = rest.trim().to_ascii_uppercase();
+            let Some(set_pos) = find_outside_quotes(&rest_upper, "SET") else {
+                return;
+            };
+            let (after_set, _) = split_partiql_returning_clause(rest.trim()[set_pos + 3..].trim());
+            let (set_clause, where_clause) =
+                match find_outside_quotes(&after_set.to_ascii_uppercase(), "WHERE") {
+                    Some(wp) => (&after_set[..wp], after_set[wp + 5..].trim()),
+                    None => (after_set, ""),
+                };
+            keys.attributes
+                .extend(expression_attributes(set_clause, &BTreeMap::new(), true));
+            let set_params = count_params_in_str(set_clause);
+            let where_params = parameters.get(set_params..).unwrap_or(&[]);
+            conditions = partiql_where_conditions(where_clause, where_params);
+        }
+        "PartiQLDelete" => {
+            let Some(from) = find_outside_quotes(&upper, "FROM") else {
+                return;
+            };
+            let (_, rest) = parse_partiql_table_name(trimmed[from + 4..].trim());
+            if rest.trim().to_ascii_uppercase().starts_with("WHERE") {
+                conditions = partiql_where_conditions(rest.trim()[5..].trim(), parameters);
+            }
+        }
+        _ => return,
     }
-    clauses.push((start, &text[start..]));
-    for (offset, clause) in clauses {
-        let Some(eq) = clause.find('=') else {
-            continue;
-        };
-        let left = &clause[..eq];
-        if left.ends_with(['<', '>', '!']) || clause[eq + 1..].starts_with('=') {
-            continue;
-        }
-        if left.trim().trim_matches('"') != partition_key {
-            continue;
-        }
-        let right = clause[eq + 1..].trim_start();
-        if let Some(literal) = right.strip_prefix('\'') {
-            return literal.split('\'').next().map(str::to_string);
-        }
-        if right.starts_with('?') {
-            let absolute = clause_start + offset + eq;
-            let index = statement[..absolute].matches('?').count();
-            return parameters.get(index).and_then(scalar_string);
-        }
-        let number: String = right
-            .chars()
-            .take_while(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | 'e' | 'E' | '+'))
-            .collect();
-        if !number.is_empty() {
-            return Some(number);
-        }
+    if let Some(expr) = &conditions {
+        let mut attrs = Vec::new();
+        partiql_expr_attributes(expr, &mut attrs);
+        keys.attributes.extend(attrs);
     }
-    None
-}
-
-fn partiql_insert_partition_value(
-    statement: &str,
-    parameters: &[Value],
-    target: &Target,
-) -> Option<String> {
-    let upper = statement.to_ascii_uppercase();
-    let value_pos = find_outside_quotes(&upper, "VALUE")?;
-    let object = &statement[value_pos + 5..];
-    let key = format!("'{}'", target.partition_key);
-    let key_pos = object.find(&key)?;
-    let after = object[key_pos + key.len()..]
-        .trim_start()
-        .strip_prefix(':')?;
-    let after = after.trim_start();
-    if let Some(literal) = after.strip_prefix('\'') {
-        return literal.split('\'').next().map(str::to_string);
+    let pinned = conditions
+        .as_ref()
+        .and_then(|expr| partiql_pinned_values(expr, &target.partition_key));
+    if let Some(values) = &pinned {
+        keys.leading.extend(values.iter().filter_map(scalar_string));
     }
-    if after.starts_with('?') {
-        let index = statement[..statement.len() - after.len()]
-            .matches('?')
-            .count();
-        return parameters.get(index).and_then(scalar_string);
+    if verb == "PartiQLSelect" {
+        keys.full_table_scan = Some(pinned.is_none());
     }
-    let number: String = after
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | 'e' | 'E' | '+'))
-        .collect();
-    (!number.is_empty()).then_some(number)
 }
 
 #[cfg(test)]
@@ -1068,6 +1039,172 @@ mod tests {
         assert_eq!(
             super::super::iam::actions_for(&state, &req)[0].resource,
             stored
+        );
+    }
+
+    /// Key conditions the Query handler accepts -- parenthesized, or with
+    /// tabs and newlines around AND -- still yield the partition key.
+    #[test]
+    fn query_partition_keys_follow_the_handler_parser() {
+        let (_svc, state) = service_with_table();
+        for expr in [
+            "(UserId = :u)",
+            "UserId = :u\nAND begins_with(Title, :t)",
+            "(UserId = :u)\tAND\t(Title = :t)",
+        ] {
+            let got = keys_for(
+                &state,
+                "Query",
+                serde_json::json!({
+                    "TableName": "Games",
+                    "KeyConditionExpression": expr,
+                    "ExpressionAttributeValues": {":u": {"S": "victim"}, ":t": {"S": "x"}}
+                }),
+            );
+            assert_eq!(
+                get(&got[0].1, "dynamodb:leadingkeys"),
+                Some(&["victim".to_string()][..]),
+                "{expr}"
+            );
+        }
+    }
+
+    /// Every partition a PartiQL WHERE clause can reach is reported: OR and
+    /// IN widen the set, an unconstrained clause is a full table scan, and a
+    /// keyword inside an identifier or a `?` inside a string literal does not
+    /// throw the parse off.
+    #[test]
+    fn partiql_where_clauses_report_every_partition_they_reach() {
+        let (_svc, state) = service_with_table();
+        let leading = |statement: &str, params: Value| {
+            let got = keys_for(
+                &state,
+                "ExecuteStatement",
+                serde_json::json!({"Statement": statement, "Parameters": params}),
+            );
+            let keys = got[0].1.clone();
+            (
+                get(&keys, "dynamodb:leadingkeys").map(|v| v.to_vec()),
+                get(&keys, "dynamodb:fulltablescan").map(|v| v[0].clone()),
+            )
+        };
+        assert_eq!(
+            leading(
+                "SELECT * FROM \"Games\" WHERE UserId = 'mine' OR UserId = 'victim'",
+                Value::Null
+            ),
+            (
+                Some(vec!["mine".to_string(), "victim".to_string()]),
+                Some("false".to_string())
+            )
+        );
+        assert_eq!(
+            leading(
+                "SELECT * FROM \"Games\" WHERE UserId = 'mine' OR Top > 3",
+                Value::Null
+            ),
+            (None, Some("true".to_string()))
+        );
+        assert_eq!(
+            leading(
+                "SELECT * FROM \"Games\" WHERE UserId IN ['victim']",
+                Value::Null
+            )
+            .0,
+            Some(vec!["victim".to_string()])
+        );
+        assert_eq!(
+            leading(
+                "SELECT * FROM \"Games\" WHERE (UserId = 'victim')",
+                Value::Null
+            )
+            .0,
+            Some(vec!["victim".to_string()])
+        );
+        assert_eq!(
+            leading(
+                "SELECT somewhere FROM \"Games\" WHERE UserId = 'victim'",
+                Value::Null
+            )
+            .0,
+            Some(vec!["victim".to_string()])
+        );
+        let got = keys_for(
+            &state,
+            "ExecuteStatement",
+            serde_json::json!({
+                "Statement": "UPDATE \"Games\" SET note = 'why?' WHERE UserId = ? AND Title = 't'",
+                "Parameters": [{"S": "victim"}]
+            }),
+        );
+        assert_eq!(
+            get(&got[0].1, "dynamodb:leadingkeys"),
+            Some(&["victim".to_string()][..])
+        );
+        assert_eq!(
+            get(&got[0].1, "dynamodb:attributes"),
+            Some(
+                &[
+                    "Title".to_string(),
+                    "UserId".to_string(),
+                    "note".to_string()
+                ][..]
+            )
+        );
+    }
+
+    /// An INSERT's partition key and attributes come from the item as the
+    /// executor parses it, not from the first `'UserId'` in the text.
+    #[test]
+    fn partiql_insert_reads_the_item() {
+        let (_svc, state) = service_with_table();
+        let value = "{'note': 'UserId', 'UserId': 'victim', 'Title': 't', 'secret': 'x'}";
+        let got = keys_for(
+            &state,
+            "ExecuteStatement",
+            serde_json::json!({"Statement": format!("INSERT INTO \"Games\" VALUE {value}")}),
+        );
+        let keys = &got[0].1;
+        assert_eq!(
+            get(keys, "dynamodb:leadingkeys"),
+            Some(&["victim".to_string()][..])
+        );
+        // Exactly the attributes the executor's item parser finds.
+        let item = super::super::helpers::partiql::parse_partiql_value_object(value, &[]).unwrap();
+        let mut expected: Vec<String> = item.keys().cloned().collect();
+        expected.sort();
+        assert_eq!(get(keys, "dynamodb:attributes"), Some(&expected[..]));
+        assert!(expected.contains(&"secret".to_string()));
+    }
+
+    /// A Scan on an index defaults to `ALL_PROJECTED_ATTRIBUTES`, like an
+    /// index Query.
+    #[test]
+    fn index_scan_default_select_is_all_projected() {
+        let (_svc, state) = service_with_table();
+        let got = keys_for(
+            &state,
+            "Scan",
+            serde_json::json!({"TableName": "Games", "IndexName": "by-top"}),
+        );
+        assert_eq!(
+            get(&got[0].1, "dynamodb:select"),
+            Some(&["ALL_PROJECTED_ATTRIBUTES".to_string()][..])
+        );
+    }
+
+    /// A table ARN naming another account still authorizes the caller's own
+    /// table: that is the table the handler serves.
+    #[test]
+    fn a_foreign_account_arn_authorizes_the_callers_table() {
+        let (_svc, state) = service_with_table();
+        let req = request(
+            "GetItem",
+            serde_json::json!({"TableName": "arn:aws:dynamodb:us-east-1:444455556666:table/Games"}),
+        );
+        assert_eq!(
+            super::super::iam::actions_for(&state, &req)[0].resource,
+            "arn:aws:dynamodb:us-east-1:123456789012:table/Games"
         );
     }
 }
