@@ -1189,12 +1189,37 @@ pub struct IpamInternetRegistryAssociation {
     /// minting a second one against the same registry.
     #[serde(default)]
     pub client_token: Option<String>,
+    /// The parameters the create that minted the association asked for, so a
+    /// retry under `client_token` that asks for something else is answered
+    /// with `IdempotentParameterMismatch` rather than this association.
+    #[serde(default)]
+    pub create_fingerprint: Option<String>,
     /// The idempotency tokens this association has already served, keyed by
     /// `{action}:{token}` so a token reused across two operations cannot
-    /// replay the other one's result. The value is the delta the original call
-    /// produced (or the association's own id, for Enable, which has no delta).
+    /// replay the other one's result.
     #[serde(default)]
-    pub client_tokens: BTreeMap<String, String>,
+    pub client_tokens: BTreeMap<String, IpamIdempotencyRecord>,
+}
+
+/// One idempotency token an association has already served.
+///
+/// `ClientToken` is an `@idempotencyToken`, so every SDK fills a fresh UUID in
+/// on every call rather than only on retries: these records are written far
+/// more often than they are read, and they are cloned with the association
+/// into every snapshot. They are therefore aged out and capped -- see
+/// `CLIENT_TOKEN_TTL_SECONDS` in the handler module.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpamIdempotencyRecord {
+    /// The delta the original call produced, or the association's own id for
+    /// Enable, which produces no delta.
+    pub result_id: String,
+    /// A fingerprint of the parameters the original call carried. A token
+    /// reused with different parameters is not a retry.
+    #[serde(default)]
+    pub fingerprint: String,
+    /// When the record was written, RFC 3339, so it can be aged out.
+    #[serde(default)]
+    pub recorded_at: String,
 }
 
 /// One CIDR's route origin authorization within an association.

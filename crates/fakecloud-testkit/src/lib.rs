@@ -481,7 +481,7 @@ fn sweep_instance_containers(cli: &str, pid: u32) {
         return;
     };
     for id in ids.split_whitespace() {
-        let _ = bounded_status(cli, &["rm".to_string(), "-f".to_string(), id.to_string()]);
+        let _ = bounded_status(cli, &["rm", "-f", id]);
     }
 }
 

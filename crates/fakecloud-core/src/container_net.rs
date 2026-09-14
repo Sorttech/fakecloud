@@ -102,7 +102,16 @@ fn probe_cli(cli: &str) -> bool {
 /// daemon forever. Its own group makes it reachable by a single signal.
 /// Detaching these from terminal job control is fine: their lifetime is managed
 /// by deadline here, not by the shell fakecloud was started from.
+///
+/// stdin is /dev/null, and has to be: a new process group is a *background*
+/// one, so a child that reads the controlling terminal -- a `sudo` or
+/// credential-helper wrapper prompting, exactly the wrapper case above -- takes
+/// SIGTTIN, which stops it rather than ending it. `try_wait` is WNOHANG without
+/// WUNTRACED, so the loop below never sees a stopped child and the call burns
+/// the whole deadline before being killed. These calls are non-interactive
+/// anyway, so an immediate EOF is the right answer for them.
 fn spawn_bounded(cmd: &mut std::process::Command) -> std::io::Result<std::process::Child> {
+    cmd.stdin(std::process::Stdio::null());
     #[cfg(unix)]
     {
         std::os::unix::process::CommandExt::process_group(cmd, 0);
@@ -110,35 +119,15 @@ fn spawn_bounded(cmd: &mut std::process::Command) -> std::io::Result<std::proces
     cmd.spawn()
 }
 
-/// How far a timed-out call's kill reaches.
-enum KillScope {
-    /// The direct child only -- the safe default for a child of unknown
-    /// provenance, which may share fakecloud's own process group.
-    Child,
-    /// The child's whole process group, valid only for a child from
-    /// [`spawn_bounded`], which put it in a group of its own.
-    Group,
-}
-
 /// Wait for `child` up to [`CLI_PROBE_TIMEOUT`], killing it on expiry. Returns
 /// whether it exited on its own. Every container-CLI call goes through this:
 /// a liveness probe answering does not promise the next call will, and an
 /// unbounded one blocks the caller rather than just that command.
 ///
-/// Kills only the direct child, so it is safe for any child. Callers in this
-/// module spawn through `spawn_bounded` and use `wait_bounded_group` instead,
-/// which takes a wrapper CLI's grandchildren down too.
-pub fn wait_bounded(child: &mut std::process::Child) -> bool {
-    wait_bounded_scoped(child, KillScope::Child)
-}
-
-/// [`wait_bounded`] for a child from [`spawn_bounded`]: the expiry kill hits the
-/// child's process group, so a wrapper CLI's grandchildren die with it.
+/// Only for a child from [`spawn_bounded`], which put it in a group of its own:
+/// the expiry kill hits that whole group, so a wrapper CLI's grandchildren die
+/// with it.
 fn wait_bounded_group(child: &mut std::process::Child) -> bool {
-    wait_bounded_scoped(child, KillScope::Group)
-}
-
-fn wait_bounded_scoped(child: &mut std::process::Child, scope: KillScope) -> bool {
     let deadline = std::time::Instant::now() + CLI_PROBE_TIMEOUT;
     loop {
         match child.try_wait() {
@@ -148,7 +137,7 @@ fn wait_bounded_scoped(child: &mut std::process::Child, scope: KillScope) -> boo
         }
         if std::time::Instant::now() >= deadline {
             // Daemon is wedged: kill the blocked call and report failure.
-            kill_expired(child, &scope);
+            kill_expired(child);
             let _ = child.wait();
             return false;
         }
@@ -156,17 +145,15 @@ fn wait_bounded_scoped(child: &mut std::process::Child, scope: KillScope) -> boo
     }
 }
 
-/// SIGKILL a timed-out child, and its process group when the caller vouches
-/// that the group is ours ([`KillScope::Group`]). The group id is the child's
-/// pid, and the child is still unreaped here, so the pid cannot have been
-/// recycled and the signal cannot stray onto an unrelated group.
+/// SIGKILL a timed-out child and its process group. [`spawn_bounded`] made the
+/// child its own group leader, so the group id is the child's pid, and the
+/// child is still unreaped here -- the pid cannot have been recycled and the
+/// signal cannot stray onto an unrelated group.
 #[cfg(unix)]
-fn kill_expired(child: &mut std::process::Child, scope: &KillScope) {
-    if matches!(scope, KillScope::Group) {
-        // SAFETY: `kill` with a negative pid targets the process group of that
-        // id; any pid value is safe to pass.
-        let _ = unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
-    }
+fn kill_expired(child: &mut std::process::Child) {
+    // SAFETY: `kill` with a negative pid targets the process group of that
+    // id; any pid value is safe to pass.
+    let _ = unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
     let _ = child.kill();
 }
 
@@ -175,7 +162,7 @@ fn kill_expired(child: &mut std::process::Child, scope: &KillScope) {
 /// wait on its stdout reader so the caller can't be held by a surviving
 /// grandchild.
 #[cfg(not(unix))]
-fn kill_expired(child: &mut std::process::Child, _scope: &KillScope) {
+fn kill_expired(child: &mut std::process::Child) {
     let _ = child.kill();
 }
 
@@ -220,7 +207,7 @@ fn run_bounded(cli: &str, args: &[&str]) -> (Option<String>, ReaderState) {
         return (None, ReaderState::Finished);
     };
     let Some(mut stdout) = child.stdout.take() else {
-        kill_expired(&mut child, &KillScope::Group);
+        kill_expired(&mut child);
         let _ = child.wait();
         return (None, ReaderState::Finished);
     };
@@ -270,7 +257,7 @@ fn run_bounded(cli: &str, args: &[&str]) -> (Option<String>, ReaderState) {
 
 /// Run a container-CLI command for its effect only, bounded the same way.
 /// Returns whether it succeeded.
-pub fn bounded_status(cli: &str, args: &[String]) -> bool {
+pub fn bounded_status(cli: &str, args: &[&str]) -> bool {
     let Ok(mut child) = spawn_bounded(
         std::process::Command::new(cli)
             .args(args)
@@ -843,13 +830,14 @@ mod bounded_cli_tests {
     #[test]
     fn a_hanging_cli_call_is_cut_off() {
         let start = std::time::Instant::now();
-        let mut child = std::process::Command::new("sleep")
-            .arg("600")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("sleep is available");
-        assert!(!wait_bounded(&mut child));
+        let mut child = spawn_bounded(
+            std::process::Command::new("sleep")
+                .arg("600")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+        )
+        .expect("sleep is available");
+        assert!(!wait_bounded_group(&mut child));
         assert!(
             start.elapsed() < CLI_PROBE_TIMEOUT + std::time::Duration::from_secs(5),
             "the wait must end at the bound"
@@ -882,6 +870,25 @@ mod bounded_cli_tests {
         );
         assert!(bounded_status("true", &[]));
         assert!(!bounded_status("false", &[]));
+    }
+
+    /// A bounded call gets an empty stdin, never fakecloud's own. The process
+    /// group `spawn_bounded` creates is a *background* one, so a child that
+    /// reads the controlling terminal -- a `sudo`/credential-helper wrapper
+    /// prompting -- is stopped by SIGTTIN, which the WNOHANG `try_wait` loop
+    /// cannot see: the call would burn the whole deadline and be killed.
+    /// `cat` with no argument reads stdin to EOF, so it returns at once with
+    /// nothing only when stdin is /dev/null.
+    #[cfg(unix)]
+    #[test]
+    fn a_bounded_call_reads_an_empty_stdin() {
+        let start = std::time::Instant::now();
+        let out = bounded_output("cat", &[]).expect("a call reading stdin must not time out");
+        assert!(out.is_empty(), "stdin must be empty, got {out:?}");
+        assert!(
+            start.elapsed() < CLI_PROBE_TIMEOUT,
+            "a call reading stdin must not reach the deadline"
+        );
     }
 
     /// The happy path must still hand back the child's output *and* collect the

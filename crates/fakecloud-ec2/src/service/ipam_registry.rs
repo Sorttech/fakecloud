@@ -13,7 +13,13 @@
 //! `ClientToken` is an idempotency token on every mutating operation here. The
 //! association records the tokens it has served, keyed by operation, so a retry
 //! replays the delta (or the association) the first call produced instead of
-//! failing on the change that call already made.
+//! failing on the change that call already made. A record carries a
+//! fingerprint of what the original call asked for, so a token reused with
+//! different parameters is answered with `IdempotentParameterMismatch` rather
+//! than a success for a change nobody made, and a timestamp, so the records do
+//! not accumulate in the association forever.
+
+use std::collections::BTreeSet;
 
 use chrono::Utc;
 
@@ -27,34 +33,51 @@ use crate::service_helpers::{
     parse_filters, require, validate_enum, validate_max_results, Filter,
 };
 use crate::state::{
-    Ec2State, IpamInternetRegistryAssociation, IpamRoutingPolicyRegistration,
-    IpamRoutingPolicyRegistrationDelta, Tag,
+    Ec2State, IpamIdempotencyRecord, IpamInternetRegistryAssociation,
+    IpamRoutingPolicyRegistration, IpamRoutingPolicyRegistrationDelta, Tag,
 };
 
 const RIRS: &[&str] = &["ripe", "apnic", "arin", "lacnic"];
 
-/// `MaxResults` and `NextToken` for the module's paginated reads.
-/// `IpamMaxResults` carries `@range 5..1000`; the token is the next offset
-/// [`paginate`] hands back.
-fn pagination(req: &AwsRequest) -> Result<(Option<usize>, Option<String>), AwsServiceError> {
+/// `MaxResults` and the raw `NextToken` for the module's paginated reads.
+/// `IpamMaxResults` carries `@range 5..1000`.
+fn page_params(req: &AwsRequest) -> Result<(Option<usize>, Option<String>), AwsServiceError> {
     validate_max_results(&req.query_params, 5, 1000)?;
-    let max_results = req
-        .query_params
-        .get("MaxResults")
-        .filter(|v| !v.is_empty())
-        .and_then(|v| v.parse::<usize>().ok());
+    // `validate_max_results` only range-checks a value it can parse, so a
+    // `MaxResults` that is not a number has to be rejected here: dropping it
+    // would leave the read unpaginated and hand back the whole set, which is
+    // the opposite of what the caller asked for. A `NextToken` that is not a
+    // cursor is rejected the same way.
+    let max_results =
+        match req.query_params.get("MaxResults").filter(|v| !v.is_empty()) {
+            Some(v) => Some(v.parse::<usize>().map_err(|_| {
+                invalid_parameter_value(format!("Invalid value '{v}' for MaxResults"))
+            })?),
+            None => None,
+        };
     let next_token = req
         .query_params
         .get("NextToken")
         .filter(|v| !v.is_empty())
         .cloned();
-    if let Some(t) = &next_token {
-        if t.parse::<usize>().is_err() {
-            return Err(invalid_parameter_value(format!(
-                "Invalid value '{t}' for NextToken"
-            )));
-        }
+    Ok((max_results, next_token))
+}
+
+/// Reject a `NextToken` that is not the offset cursor [`paginate`] hands back,
+/// rather than silently restarting the caller from the top.
+fn validate_offset_token(token: Option<&str>) -> Result<(), AwsServiceError> {
+    match token {
+        Some(t) if t.parse::<usize>().is_err() => Err(invalid_parameter_value(format!(
+            "Invalid value '{t}' for NextToken"
+        ))),
+        _ => Ok(()),
     }
+}
+
+/// `MaxResults` and `NextToken` for the reads that page by offset.
+fn pagination(req: &AwsRequest) -> Result<(Option<usize>, Option<String>), AwsServiceError> {
+    let (max_results, next_token) = page_params(req)?;
+    validate_offset_token(next_token.as_deref())?;
     Ok((max_results, next_token))
 }
 
@@ -69,12 +92,24 @@ fn paged_response(
 ) -> AwsResponse {
     let (max_results, next_token) = page;
     let (items, token) = paginate(items, next_token.as_deref(), max_results);
+    page_response(action, req, wrapper, &items, token)
+}
+
+/// One already-paged set of rendered items, plus the `nextToken` that fetches
+/// what did not fit.
+fn page_response(
+    action: &'static str,
+    req: &AwsRequest,
+    wrapper: &str,
+    page: &[String],
+    token: Option<String>,
+) -> AwsResponse {
     Ec2Service::respond(
         action,
         &req.request_id,
         &format!(
             "{}{}",
-            ec2_list(wrapper, &items),
+            ec2_list(wrapper, page),
             token.map(|t| ec2_elem("nextToken", &t)).unwrap_or_default()
         ),
     )
@@ -116,33 +151,161 @@ fn client_token(req: &AwsRequest) -> Option<String> {
         .cloned()
 }
 
+/// How long a served idempotency token keeps replaying. EC2 documents a
+/// 24-hour idempotency window for these tokens, so a record older than that
+/// can no longer serve a retry and is only weight in the snapshot.
+const CLIENT_TOKEN_TTL_SECONDS: i64 = 24 * 60 * 60;
+
+/// How many records one association keeps at most. The window alone is not a
+/// bound: `ClientToken` is an `@idempotencyToken`, so an SDK fills a fresh
+/// UUID in on every call and a tight create/delete loop would leave hundreds
+/// of thousands of live records inside the window. The oldest go first, which
+/// is the order they stop being useful in.
+const CLIENT_TOKEN_MAX_RECORDS: usize = 1000;
+
 /// Idempotency records are scoped to the operation, so a token a caller reuses
 /// across two different calls cannot replay the other one's result.
 fn token_key(action: &str, token: &str) -> String {
     format!("{action}:{token}")
 }
 
-/// The delta an earlier call under this idempotency token produced, if any. A
-/// retry replays it rather than applying the change a second time (or failing
-/// on the state the first call left behind).
+/// A fingerprint of everything a mutating request asks for, so a retry can be
+/// told apart from a token reused with different parameters. Every parameter
+/// counts except the ones that do not describe the change: the protocol's own
+/// envelope, the token itself, `DryRun` -- a dry run rehearses the same change,
+/// and one carrying a served token replays -- and the SigV4 parameters a
+/// presigned URL carries, which differ between two signings of the same call.
+///
+/// Each pair is length-prefixed, so two different parameter sets cannot
+/// flatten to the same string: a `DeltaJson` carrying `&` or `=` would
+/// otherwise be able to impersonate another request's parameters and replay
+/// its result.
+fn request_fingerprint(req: &AwsRequest) -> String {
+    let mut pairs: Vec<(&str, &str)> = req
+        .query_params
+        .iter()
+        .filter(|(k, _)| {
+            !matches!(k.as_str(), "Action" | "Version" | "ClientToken" | "DryRun")
+                && !k.starts_with("X-Amz-")
+        })
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    // `query_params` is a hash map, so its iteration order is not stable.
+    pairs.sort_unstable();
+    let mut out = String::new();
+    for (k, v) in pairs {
+        out.push_str(&format!("{}:{k}={}:{v};", k.len(), v.len()));
+    }
+    out
+}
+
+/// AWS answers a token reused with different parameters with this rather than
+/// the original result: the divergent call asked for something that was never
+/// applied, and reporting success for it sends the caller on with a wrong
+/// picture of the association.
+fn idempotent_parameter_mismatch(token: &str) -> AwsServiceError {
+    AwsServiceError::aws_error(
+        http::StatusCode::BAD_REQUEST,
+        "IdempotentParameterMismatch",
+        format!("The client token '{token}' was already used with different parameters"),
+    )
+}
+
+/// Whether a record has fallen out of the idempotency window. A record whose
+/// timestamp cannot be read cannot be aged, so it is treated as expired rather
+/// than kept forever.
+fn token_expired(record: &IpamIdempotencyRecord) -> bool {
+    match chrono::DateTime::parse_from_rfc3339(&record.recorded_at) {
+        Ok(t) => {
+            Utc::now()
+                .signed_duration_since(t.with_timezone(&Utc))
+                .num_seconds()
+                > CLIENT_TOKEN_TTL_SECONDS
+        }
+        Err(_) => true,
+    }
+}
+
+/// The record an earlier call under this idempotency token left, if the retry
+/// asks for the same thing. A retry replays it rather than applying the change
+/// a second time (or failing on the state the first call left behind); a token
+/// reused with different parameters is not a retry at all.
+fn replay_record<'a>(
+    a: &'a IpamInternetRegistryAssociation,
+    action: &str,
+    token: Option<&str>,
+    fingerprint: &str,
+) -> Result<Option<&'a IpamIdempotencyRecord>, AwsServiceError> {
+    let Some(token) = token else {
+        return Ok(None);
+    };
+    let Some(record) = a.client_tokens.get(&token_key(action, token)) else {
+        return Ok(None);
+    };
+    if token_expired(record) {
+        return Ok(None);
+    }
+    if record.fingerprint != fingerprint {
+        return Err(idempotent_parameter_mismatch(token));
+    }
+    Ok(Some(record))
+}
+
+/// The delta an earlier call under this idempotency token produced, if the
+/// retry asks for the same thing.
 fn replay_delta(
     a: &IpamInternetRegistryAssociation,
     action: &str,
     token: Option<&str>,
-) -> Option<IpamRoutingPolicyRegistrationDelta> {
-    let recorded = a.client_tokens.get(&token_key(action, token?))?;
-    a.deltas.iter().find(|d| &d.delta_id == recorded).cloned()
+    fingerprint: &str,
+) -> Result<Option<IpamRoutingPolicyRegistrationDelta>, AwsServiceError> {
+    let Some(record) = replay_record(a, action, token, fingerprint)? else {
+        return Ok(None);
+    };
+    Ok(a.deltas
+        .iter()
+        .find(|d| d.delta_id == record.result_id)
+        .cloned())
 }
 
 fn record_client_token(
     a: &mut IpamInternetRegistryAssociation,
     action: &str,
     token: Option<&str>,
+    fingerprint: &str,
     result_id: &str,
 ) {
-    if let Some(token) = token {
-        a.client_tokens
-            .insert(token_key(action, token), result_id.to_string());
+    let Some(token) = token else {
+        return;
+    };
+    prune_client_tokens(a);
+    a.client_tokens.insert(
+        token_key(action, token),
+        IpamIdempotencyRecord {
+            result_id: result_id.to_string(),
+            fingerprint: fingerprint.to_string(),
+            recorded_at: now_rfc3339(),
+        },
+    );
+}
+
+/// Drop the records that can no longer serve a retry, so what the association
+/// carries into every snapshot stays bounded: the aged-out ones first, then
+/// the oldest survivors while the association is still at the cap.
+fn prune_client_tokens(a: &mut IpamInternetRegistryAssociation) {
+    a.client_tokens.retain(|_, r| !token_expired(r));
+    while a.client_tokens.len() >= CLIENT_TOKEN_MAX_RECORDS {
+        let oldest = a
+            .client_tokens
+            .iter()
+            .min_by(|(ak, ar), (bk, br)| ar.recorded_at.cmp(&br.recorded_at).then(ak.cmp(bk)))
+            .map(|(k, _)| k.clone());
+        match oldest {
+            Some(key) => {
+                a.client_tokens.remove(&key);
+            }
+            None => break,
+        }
     }
 }
 
@@ -195,6 +358,17 @@ fn get_association<'a>(
 /// and that service only exists once `EnableIpamInternetRegistryAssociation`
 /// has been called. Publishing through an association still in
 /// `pending-enable` would make that operation decorative.
+///
+/// Only the writes that publish are gated: `CreateIpamRoutingPolicyRegistration`,
+/// `ModifyIpamRoutingPolicyRegistration`, and a batch document that adds. A
+/// removal -- `DeleteIpamRoutingPolicyRegistration`, or a batch document that
+/// only removes -- is deliberately not gated, because gating it would be a
+/// trap with no way out: an association restored from a snapshot taken before
+/// registrations were gated still carries them in `pending-enable`, and since
+/// `DeleteIpamInternetRegistryAssociation` refuses while registrations remain,
+/// gating the removal too would leave the association and its ROAs
+/// undeletable. Un-publishing is also never the operation that needs the RPKI
+/// service to exist.
 fn require_enabled(a: &IpamInternetRegistryAssociation) -> Result<(), AwsServiceError> {
     if a.state == "enable-complete" {
         return Ok(());
@@ -338,6 +512,7 @@ pub(crate) fn create_ipam_internet_registry_association(
     let organization_handle = require(&req.query_params, "OrganizationHandle")?;
     validate_enum(&req.query_params, "Rir", RIRS)?;
     let token = client_token(req);
+    let fingerprint = request_fingerprint(req);
 
     let owner = req.account_id.clone();
     let region = region_of(req);
@@ -356,13 +531,26 @@ pub(crate) fn create_ipam_internet_registry_association(
         ));
     }
     // A retry that carries the original token gets the original association
-    // back rather than a second one for the same registry.
+    // back rather than a second one for the same registry. A call that reuses
+    // the token for a different IPAM, registry or handle is not a retry, and
+    // handing it the original association would report an association it never
+    // asked for.
     if let Some(token) = &token {
         if let Some(existing) = state
             .ipam_ir_associations
             .values()
             .find(|a| a.client_token.as_deref() == Some(token.as_str()))
         {
+            // An association restored from a snapshot that recorded no
+            // fingerprint offers nothing to compare against, so a retry on its
+            // token replays rather than failing on evidence never recorded.
+            if existing
+                .create_fingerprint
+                .as_deref()
+                .is_some_and(|recorded| recorded != fingerprint)
+            {
+                return Err(idempotent_parameter_mismatch(token));
+            }
             let tags = state.tags.get(&existing.id).cloned().unwrap_or_default();
             return Ok(Ec2Service::respond(
                 "CreateIpamInternetRegistryAssociation",
@@ -389,6 +577,7 @@ pub(crate) fn create_ipam_internet_registry_association(
         child_request_xml: None,
         registrations: Default::default(),
         deltas: Vec::new(),
+        create_fingerprint: token.as_ref().map(|_| fingerprint),
         client_token: token,
         client_tokens: Default::default(),
     };
@@ -423,6 +612,7 @@ pub(crate) fn enable_ipam_internet_registry_association(
     let parent_handle = require(&req.query_params, "ParentHandle")?;
     let parent_bpki_ta = require(&req.query_params, "ParentBpkiTa")?;
     let token = client_token(req);
+    let fingerprint = request_fingerprint(req);
 
     let owner = req.account_id.clone();
     let mut accounts = svc.state.write();
@@ -439,11 +629,16 @@ pub(crate) fn enable_ipam_internet_registry_association(
         ));
     }
     // A retry under the original token reports the association the first call
-    // enabled, leaving the child request it already issued alone.
-    let replaying = token.as_deref().is_some_and(|t| {
-        a.client_tokens
-            .contains_key(&token_key("EnableIpamInternetRegistryAssociation", t))
-    });
+    // enabled, leaving the child request it already issued alone. A reuse that
+    // carries a different service URI or handle is not a retry: it asks for a
+    // child request this association never issued.
+    let replaying = replay_record(
+        a,
+        "EnableIpamInternetRegistryAssociation",
+        token.as_deref(),
+        &fingerprint,
+    )?
+    .is_some();
     if !replaying {
         // The child request is the RPKI provisioning document the registry
         // needs; it is what the caller takes to the RIR to finish setup. Every
@@ -470,6 +665,7 @@ pub(crate) fn enable_ipam_internet_registry_association(
             a,
             "EnableIpamInternetRegistryAssociation",
             token.as_deref(),
+            &fingerprint,
             &association_id,
         );
     }
@@ -574,14 +770,61 @@ pub(crate) fn describe_ipam_internet_registry_associations(
 
 // ---- routing policy registrations ----
 
-/// Which of the three registration writes is being applied. Create rejects a
-/// CIDR that is already registered and Modify one that is not; a batch `add`
-/// entry is documented to "create, update, or delete" and so accepts either.
-#[derive(Clone, Copy, PartialEq)]
+/// Which of the two single-CIDR registration writes is being applied. Create
+/// rejects a CIDR that is already registered and Modify one that is not.
+#[derive(Clone, Copy)]
 enum RegistrationWrite {
     Create,
     Modify,
-    Upsert,
+}
+
+impl RegistrationWrite {
+    /// The operation this write serves: it names the response and scopes the
+    /// idempotency records.
+    fn action(self) -> &'static str {
+        match self {
+            Self::Create => "CreateIpamRoutingPolicyRegistration",
+            Self::Modify => "ModifyIpamRoutingPolicyRegistration",
+        }
+    }
+
+    /// How the delta document spells the change.
+    fn delta_action(self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Modify => "modify",
+        }
+    }
+}
+
+/// What one request says about an optional member. Modify is a partial update,
+/// so leaving a member out and clearing it cannot be the same thing: an
+/// omitted member keeps the stored value, and a member the caller spells out
+/// as empty (ec2Query) or `null` (a delta document) removes it.
+#[derive(Clone, Debug, PartialEq)]
+enum FieldUpdate<T> {
+    Unchanged,
+    Clear,
+    Set(T),
+}
+
+impl<T: Clone> FieldUpdate<T> {
+    /// What the member becomes, given what the registration already carries.
+    fn resolve(&self, previous: Option<T>) -> Option<T> {
+        match self {
+            Self::Unchanged => previous,
+            Self::Clear => None,
+            Self::Set(v) => Some(v.clone()),
+        }
+    }
+
+    /// The value the request set, if it set one.
+    fn value(&self) -> Option<&T> {
+        match self {
+            Self::Set(v) => Some(v),
+            _ => None,
+        }
+    }
 }
 
 /// The fields one registration change carries. The single operations parse
@@ -590,9 +833,9 @@ enum RegistrationWrite {
 struct RegistrationChange {
     cidr: String,
     asns: Vec<String>,
-    permit_more_specific_announcements: Option<bool>,
-    max_length: Option<i64>,
-    description: Option<String>,
+    permit_more_specific_announcements: FieldUpdate<bool>,
+    max_length: FieldUpdate<i64>,
+    description: FieldUpdate<String>,
 }
 
 /// `IpamRoutingPolicyRegistrationMaxLength` carries `@range 0..48`, and the
@@ -603,7 +846,7 @@ fn validate_change(change: &RegistrationChange) -> Result<(), AwsServiceError> {
     if change.asns.is_empty() {
         return Err(invalid_parameter_value("Asns must not be empty"));
     }
-    let Some(m) = change.max_length else {
+    let Some(&m) = change.max_length.value() else {
         return Ok(());
     };
     if !(0..=48).contains(&m) {
@@ -628,23 +871,37 @@ fn check_write(
     cidr: &str,
     write: RegistrationWrite,
 ) -> Result<(), AwsServiceError> {
-    let registered = a.registrations.contains_key(cidr);
     match write {
-        RegistrationWrite::Create if registered => Err(invalid_parameter_value(format!(
-            "A routing policy registration already exists for {cidr}"
-        ))),
-        RegistrationWrite::Modify if !registered => Err(not_found(
-            "InvalidIpamRoutingPolicyRegistration.NotFound",
-            cidr,
-        )),
-        _ => Ok(()),
+        RegistrationWrite::Create if a.registrations.contains_key(cidr) => {
+            Err(invalid_parameter_value(format!(
+                "A routing policy registration already exists for {cidr}"
+            )))
+        }
+        RegistrationWrite::Create => Ok(()),
+        RegistrationWrite::Modify => require_registered(a, cidr),
     }
+}
+
+/// A change to a registration, and a delete of one, both need it to be there:
+/// neither has anything to act on otherwise, and reporting success would tell
+/// the caller a CIDR was changed or removed that never existed.
+fn require_registered(
+    a: &IpamInternetRegistryAssociation,
+    cidr: &str,
+) -> Result<(), AwsServiceError> {
+    if a.registrations.contains_key(cidr) {
+        return Ok(());
+    }
+    Err(not_found(
+        "InvalidIpamRoutingPolicyRegistration.NotFound",
+        cidr,
+    ))
 }
 
 /// Write one change into the association. A change that lands on a CIDR the
 /// association already carries is a partial update: the model requires only
 /// `Asns`, so a member the request leaves out keeps the value the registration
-/// already carries instead of being silently cleared.
+/// already carries, and only a member the request clears is removed.
 fn apply_write(
     a: &mut IpamInternetRegistryAssociation,
     change: &RegistrationChange,
@@ -657,20 +914,17 @@ fn apply_write(
         IpamRoutingPolicyRegistration {
             cidr: change.cidr.clone(),
             asns: change.asns.clone(),
-            permit_more_specific_announcements: change.permit_more_specific_announcements.or_else(
-                || {
-                    previous
-                        .as_ref()
-                        .and_then(|p| p.permit_more_specific_announcements)
-                },
+            permit_more_specific_announcements: change.permit_more_specific_announcements.resolve(
+                previous
+                    .as_ref()
+                    .and_then(|p| p.permit_more_specific_announcements),
             ),
             max_length: change
                 .max_length
-                .or_else(|| previous.as_ref().and_then(|p| p.max_length)),
+                .resolve(previous.as_ref().and_then(|p| p.max_length)),
             description: change
                 .description
-                .clone()
-                .or_else(|| previous.as_ref().and_then(|p| p.description.clone())),
+                .resolve(previous.as_ref().and_then(|p| p.description.clone())),
             latest_delta_id: delta_id.to_string(),
             state: if creating {
                 "create-complete".to_string()
@@ -681,29 +935,40 @@ fn apply_write(
     );
 }
 
+/// Read one optional member out of an ec2Query request. An omitted member
+/// leaves the stored value alone, because Modify is a partial update; a member
+/// spelled with an empty value (`Description=`, `MaxLength=`) clears it. A
+/// partial update needs some spelling that says "remove this", and the empty
+/// value is the one the wire offers -- EC2 already distinguishes a
+/// present-but-empty parameter from an absent one elsewhere (`DeleteTags`
+/// deletes only the empty-value tag for `Tag.N.Value=`).
+fn query_update<T>(
+    req: &AwsRequest,
+    key: &str,
+    parse: impl Fn(&str) -> Result<T, AwsServiceError>,
+) -> Result<FieldUpdate<T>, AwsServiceError> {
+    match req.query_params.get(key) {
+        None => Ok(FieldUpdate::Unchanged),
+        Some(v) if v.is_empty() => Ok(FieldUpdate::Clear),
+        Some(v) => parse(v).map(FieldUpdate::Set),
+    }
+}
+
 fn change_from_request(req: &AwsRequest) -> Result<RegistrationChange, AwsServiceError> {
     let cidr = require(&req.query_params, "Cidr")?;
-    let max_length =
-        match req.query_params.get("MaxLength").filter(|v| !v.is_empty()) {
-            Some(v) => Some(v.parse::<i64>().map_err(|_| {
-                invalid_parameter_value(format!("Invalid value '{v}' for MaxLength"))
-            })?),
-            None => None,
-        };
     Ok(RegistrationChange {
         cidr,
         asns: indexed_list(&req.query_params, "Asn"),
-        permit_more_specific_announcements: req
-            .query_params
-            .get("PermitMoreSpecificAnnouncements")
-            .filter(|v| !v.is_empty())
-            .map(|v| v.eq_ignore_ascii_case("true")),
-        max_length,
-        description: req
-            .query_params
-            .get("Description")
-            .filter(|v| !v.is_empty())
-            .cloned(),
+        permit_more_specific_announcements: query_update(
+            req,
+            "PermitMoreSpecificAnnouncements",
+            |v| Ok(v.eq_ignore_ascii_case("true")),
+        )?,
+        max_length: query_update(req, "MaxLength", |v| {
+            v.parse::<i64>()
+                .map_err(|_| invalid_parameter_value(format!("Invalid value '{v}' for MaxLength")))
+        })?,
+        description: query_update(req, "Description", |v| Ok(v.to_string()))?,
     })
 }
 
@@ -712,17 +977,14 @@ fn change_from_request(req: &AwsRequest) -> Result<RegistrationChange, AwsServic
 fn upsert_registration(
     svc: &Ec2Service,
     req: &AwsRequest,
-    action: &'static str,
+    write: RegistrationWrite,
 ) -> Result<AwsResponse, AwsServiceError> {
+    let action = write.action();
     let id = require(&req.query_params, "IpamInternetRegistryAssociationId")?;
     let change = change_from_request(req)?;
     validate_change(&change)?;
     let token = client_token(req);
-    let write = if action == "CreateIpamRoutingPolicyRegistration" {
-        RegistrationWrite::Create
-    } else {
-        RegistrationWrite::Modify
-    };
+    let fingerprint = request_fingerprint(req);
 
     let mut accounts = svc.state.write();
     let state = accounts.get_or_create(&req.account_id);
@@ -731,7 +993,7 @@ fn upsert_registration(
     // A retry replays the delta the first call produced instead of tripping
     // over the registration that call already wrote. A DryRun carrying a
     // served token replays too: it still changes nothing.
-    if let Some(delta) = replay_delta(a, action, token.as_deref()) {
+    if let Some(delta) = replay_delta(a, action, token.as_deref(), &fingerprint)? {
         return Ok(delta_response(action, req, &delta));
     }
     check_write(a, &change.cidr, write)?;
@@ -742,32 +1004,59 @@ fn upsert_registration(
         return Ok(Ec2Service::respond(action, &req.request_id, ""));
     }
 
-    let delta_json = serde_json::json!({
-        "action": if write == RegistrationWrite::Create { "create" } else { "modify" },
-        "cidr": change.cidr,
-        "asns": change.asns,
-        "maxLength": change.max_length,
-    })
-    .to_string();
-    let delta_id = push_delta(a, delta_json);
-    record_client_token(a, action, token.as_deref(), &delta_id);
+    let delta_id = push_delta(a, change_document(&change, write));
+    record_client_token(a, action, token.as_deref(), &fingerprint, &delta_id);
     apply_write(a, &change, &delta_id);
     let delta = a.deltas.last().expect("the delta was just pushed").clone();
     Ok(delta_response(action, req, &delta))
+}
+
+/// The delta document one single-CIDR change records. It spells the optional
+/// members the way a batch document spells them, so the audit trail says what
+/// the call asked for: a member left out was left alone, and a `null` one was
+/// cleared.
+fn change_document(change: &RegistrationChange, write: RegistrationWrite) -> String {
+    let mut doc = serde_json::Map::new();
+    doc.insert("action".to_string(), write.delta_action().into());
+    doc.insert("cidr".to_string(), change.cidr.clone().into());
+    doc.insert("asns".to_string(), change.asns.clone().into());
+    delta_field(&mut doc, "maxLength", &change.max_length);
+    delta_field(&mut doc, "description", &change.description);
+    delta_field(
+        &mut doc,
+        "permitMoreSpecificAnnouncements",
+        &change.permit_more_specific_announcements,
+    );
+    serde_json::Value::Object(doc).to_string()
+}
+
+/// Spell one optional member into a delta document: an unchanged member is
+/// absent from it, and a cleared one is `null`.
+fn delta_field<T: Clone + Into<serde_json::Value>>(
+    doc: &mut serde_json::Map<String, serde_json::Value>,
+    name: &str,
+    update: &FieldUpdate<T>,
+) {
+    let value = match update {
+        FieldUpdate::Unchanged => return,
+        FieldUpdate::Clear => serde_json::Value::Null,
+        FieldUpdate::Set(v) => v.clone().into(),
+    };
+    doc.insert(name.to_string(), value);
 }
 
 pub(crate) fn create_ipam_routing_policy_registration(
     svc: &Ec2Service,
     req: &AwsRequest,
 ) -> Result<AwsResponse, AwsServiceError> {
-    upsert_registration(svc, req, "CreateIpamRoutingPolicyRegistration")
+    upsert_registration(svc, req, RegistrationWrite::Create)
 }
 
 pub(crate) fn modify_ipam_routing_policy_registration(
     svc: &Ec2Service,
     req: &AwsRequest,
 ) -> Result<AwsResponse, AwsServiceError> {
-    upsert_registration(svc, req, "ModifyIpamRoutingPolicyRegistration")
+    upsert_registration(svc, req, RegistrationWrite::Modify)
 }
 
 pub(crate) fn delete_ipam_routing_policy_registration(
@@ -779,23 +1068,31 @@ pub(crate) fn delete_ipam_routing_policy_registration(
     let id = require(&req.query_params, "IpamInternetRegistryAssociationId")?;
     let cidr = require(&req.query_params, "Cidr")?;
     let token = client_token(req);
+    let fingerprint = request_fingerprint(req);
     let mut accounts = svc.state.write();
     let state = accounts.get_or_create(&req.account_id);
     let a = get_association(state, &id)?;
-    if let Some(delta) = replay_delta(a, ACTION, token.as_deref()) {
+    // A token reused for a different CIDR is not a retry: replaying the first
+    // delete's success would report a CIDR removed that is still registered,
+    // and the caller would then meet the `DependencyViolation` that CIDR
+    // raises when it deletes the association it was told was empty.
+    if let Some(delta) = replay_delta(a, ACTION, token.as_deref(), &fingerprint)? {
         return Ok(delta_response(ACTION, req, &delta));
     }
+    // Removing a registration is deliberately not gated on the association
+    // being enabled -- see [`require_enabled`].
+    //
     // A DryRun validates the request -- including that the association exists
     // and that the CIDR is registered -- and changes nothing, matching how the
     // rest of EC2 treats one.
-    check_write(a, &cidr, RegistrationWrite::Modify)?;
+    require_registered(a, &cidr)?;
     if dry_run(req) {
         return Ok(Ec2Service::respond(ACTION, &req.request_id, ""));
     }
     a.registrations.remove(&cidr);
     let delta_json = serde_json::json!({ "action": "delete", "cidr": cidr }).to_string();
     let delta_id = push_delta(a, delta_json);
-    record_client_token(a, ACTION, token.as_deref(), &delta_id);
+    record_client_token(a, ACTION, token.as_deref(), &fingerprint, &delta_id);
     let delta = a.deltas.last().expect("the delta was just pushed").clone();
     Ok(delta_response(ACTION, req, &delta))
 }
@@ -834,15 +1131,20 @@ fn batch_addition(entry: &serde_json::Value) -> Result<RegistrationChange, AwsSe
 }
 
 /// Read one optional batch-entry field, rejecting a value of the wrong type.
+/// A field the entry omits leaves the stored value alone -- an `add` for a
+/// CIDR that is already registered is a partial update -- and an explicit
+/// `null` clears it, which is the conventional way a JSON delta document says
+/// "remove this".
 fn batch_field<T>(
     entry: &serde_json::Value,
     name: &str,
     read: impl Fn(&serde_json::Value) -> Option<T>,
     expected: &str,
-) -> Result<Option<T>, AwsServiceError> {
+) -> Result<FieldUpdate<T>, AwsServiceError> {
     match entry.get(name) {
-        None | Some(serde_json::Value::Null) => Ok(None),
-        Some(v) => read(v).map(Some).ok_or_else(|| {
+        None => Ok(FieldUpdate::Unchanged),
+        Some(serde_json::Value::Null) => Ok(FieldUpdate::Clear),
+        Some(v) => read(v).map(FieldUpdate::Set).ok_or_else(|| {
             invalid_parameter_value(format!("DeltaJson '{name}' must be {expected}"))
         }),
     }
@@ -906,6 +1208,7 @@ pub(crate) fn batch_modify_ipam_routing_policy_registrations(
     let parsed: serde_json::Value = serde_json::from_str(&delta_json)
         .map_err(|_| invalid_parameter_value("DeltaJson is not valid JSON"))?;
     let token = client_token(req);
+    let fingerprint = request_fingerprint(req);
 
     // The document lists the registrations to add and the CIDRs to remove.
     // Every entry is parsed and validated before anything is written: the
@@ -926,19 +1229,30 @@ pub(crate) fn batch_modify_ipam_routing_policy_registrations(
     let mut accounts = svc.state.write();
     let state = accounts.get_or_create(&req.account_id);
     let a = get_association(state, &id)?;
-    require_enabled(a)?;
-    if let Some(delta) = replay_delta(a, ACTION, token.as_deref()) {
+    // Only a document that publishes needs the RPKI service; one that only
+    // removes registrations does not -- see [`require_enabled`].
+    if !additions.is_empty() {
+        require_enabled(a)?;
+    }
+    if let Some(delta) = replay_delta(a, ACTION, token.as_deref(), &fingerprint)? {
         return Ok(delta_response(ACTION, req, &delta));
     }
-    // Every entry goes through the same check the single operations use: an
-    // `add` entry may create or update, but a `remove` entry for a CIDR that
-    // was never registered removes nothing and must not be reported as
-    // published.
-    for change in &additions {
-        check_write(a, &change.cidr, RegistrationWrite::Upsert)?;
-    }
+    // The document is checked against the state it would itself leave, in the
+    // order it is applied below -- additions first, removals after -- so a
+    // document that adds a CIDR and removes it again is self-consistent rather
+    // than a not-found against the state it has not been applied to yet. An
+    // `add` entry may create or update, so it needs no check of its own, but a
+    // `remove` for a CIDR that neither exists nor is added by the document
+    // removes nothing and must not be reported as published.
+    let mut registered: BTreeSet<&str> = a.registrations.keys().map(String::as_str).collect();
+    registered.extend(additions.iter().map(|change| change.cidr.as_str()));
     for cidr in &removals {
-        check_write(a, cidr, RegistrationWrite::Modify)?;
+        if !registered.remove(cidr.as_str()) {
+            return Err(not_found(
+                "InvalidIpamRoutingPolicyRegistration.NotFound",
+                cidr,
+            ));
+        }
     }
     // A DryRun validates the request -- including every entry of the document
     // -- and changes nothing, matching how the rest of EC2 treats one.
@@ -946,7 +1260,7 @@ pub(crate) fn batch_modify_ipam_routing_policy_registrations(
         return Ok(Ec2Service::respond(ACTION, &req.request_id, ""));
     }
     let delta_id = push_delta(a, delta_json.clone());
-    record_client_token(a, ACTION, token.as_deref(), &delta_id);
+    record_client_token(a, ACTION, token.as_deref(), &fingerprint, &delta_id);
     for change in &additions {
         apply_write(a, change, &delta_id);
     }
@@ -988,7 +1302,7 @@ pub(crate) fn get_ipam_routing_policy_registration_deltas(
     svc: &Ec2Service,
     req: &AwsRequest,
 ) -> Result<AwsResponse, AwsServiceError> {
-    let page = pagination(req)?;
+    let (max_results, next_token) = page_params(req)?;
     let id = require(&req.query_params, "IpamInternetRegistryAssociationId")?;
     validate_enum(
         &req.query_params,
@@ -1016,21 +1330,46 @@ pub(crate) fn get_ipam_routing_policy_registration_deltas(
         .filter(|d| end.is_none_or(|e| delta_time(d).is_none_or(|t| t <= e)))
         .collect();
     // Deltas are stored oldest first; `reverse` reports newest first.
-    if req
+    let reverse = req
         .query_params
         .get("ChronologicalOrder")
         .map(String::as_str)
-        == Some("reverse")
-    {
+        == Some("reverse");
+    if reverse {
         deltas.reverse();
     }
+    // Deltas are appended, so under `reverse` an offset cursor moves: every
+    // delta recorded between two pages shifts the index of everything the
+    // first page already reported, and the second page repeats items the
+    // caller has seen. `reverse` therefore pages by the delta id the next page
+    // starts at, which does not move. Forward order is stable under appends
+    // and keeps the shared offset cursor.
+    let page_start = match next_token.as_deref() {
+        None => 0,
+        Some(t) if reverse => deltas
+            .iter()
+            .position(|d| d.delta_id == t)
+            .ok_or_else(|| invalid_parameter_value(format!("Invalid value '{t}' for NextToken")))?,
+        Some(t) => {
+            validate_offset_token(Some(t))?;
+            t.parse::<usize>().unwrap_or(0).min(deltas.len())
+        }
+    };
+    let page_end = max_results.map_or(deltas.len(), |n| (page_start + n).min(deltas.len()));
+    let token = (page_end < deltas.len()).then(|| {
+        if reverse {
+            deltas[page_end].delta_id.clone()
+        } else {
+            page_end.to_string()
+        }
+    });
     let items: Vec<String> = deltas.into_iter().map(delta_xml).collect();
-    Ok(paged_response(
+    Ok(page_response(
         "GetIpamRoutingPolicyRegistrationDeltas",
         req,
         "ipamRoutingPolicyRegistrationDeltaSet",
-        &items,
-        page,
+        &items[page_start..page_end],
+        token,
     ))
 }
 
@@ -1430,6 +1769,52 @@ mod tests {
                 ],
             ),
         )
+    }
+
+    fn deltas(svc: &Ec2Service, id: &str, params: &[(&str, &str)]) -> String {
+        let mut all: Vec<(&str, &str)> = vec![("IpamInternetRegistryAssociationId", id)];
+        all.extend_from_slice(params);
+        body(
+            get_ipam_routing_policy_registration_deltas(
+                svc,
+                &req("GetIpamRoutingPolicyRegistrationDeltas", &all),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn elements(body: &str, tag: &str) -> Vec<String> {
+        body.split(&format!("<{tag}>"))
+            .skip(1)
+            .map(|s| {
+                s.split(&format!("</{tag}>"))
+                    .next()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn with_association<T>(
+        svc: &Ec2Service,
+        id: &str,
+        f: impl FnOnce(&mut IpamInternetRegistryAssociation) -> T,
+    ) -> T {
+        let mut accounts = svc.state.write();
+        let state = accounts.get_or_create("000000000000");
+        f(state.ipam_ir_associations.get_mut(id).unwrap())
+    }
+
+    /// Push every recorded idempotency token out of the window, the way the
+    /// clock does to a record nobody retried in time.
+    fn age_client_tokens(svc: &Ec2Service, id: &str) {
+        let stale = (Utc::now() - chrono::Duration::seconds(CLIENT_TOKEN_TTL_SECONDS + 60))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        with_association(svc, id, |a| {
+            for record in a.client_tokens.values_mut() {
+                record.recorded_at = stale.clone();
+            }
+        });
     }
 
     /// A finding's `roaSet` carries `IpamRouteOriginAuthorization`, whose
@@ -2061,5 +2446,383 @@ mod tests {
             .unwrap(),
         );
         assert!(asns.contains("<asn>64512</asn>"), "{asns}");
+    }
+
+    /// A token reused with different parameters is not a retry. Replaying the
+    /// original result there reports success for a change nobody made: the
+    /// worst case is a delete of a CIDR that is still registered, which the
+    /// caller then meets again as a `DependencyViolation` on the association
+    /// it was told was empty.
+    #[test]
+    fn a_client_token_reused_with_different_parameters_is_rejected() {
+        let svc = Ec2Service::new();
+        let id = make_association(&svc);
+        register(&svc, &id, "192.0.2.0/24", None);
+        register(&svc, &id, "198.51.100.0/24", None);
+
+        let delete = |cidr: &str| {
+            delete_ipam_routing_policy_registration(
+                &svc,
+                &req(
+                    "DeleteIpamRoutingPolicyRegistration",
+                    &[
+                        ("IpamInternetRegistryAssociationId", &id),
+                        ("Cidr", cidr),
+                        ("ClientToken", "token-delete"),
+                    ],
+                ),
+            )
+        };
+        let first = body(delete("192.0.2.0/24").unwrap());
+        let err = err_of(delete("198.51.100.0/24"));
+        assert_eq!(err.code(), "IdempotentParameterMismatch");
+        let b = registrations(&svc, &id, &[]);
+        assert!(b.contains("198.51.100.0/24"), "nothing was removed: {b}");
+        // The same call under the same token still replays.
+        assert_eq!(first, body(delete("192.0.2.0/24").unwrap()));
+
+        // A create that reuses a token for a different registry handle is not
+        // a retry either.
+        let create = |handle: &str| {
+            create_ipam_internet_registry_association(
+                &svc,
+                &req(
+                    "CreateIpamInternetRegistryAssociation",
+                    &[
+                        ("IpamId", "ipam-1"),
+                        ("Rir", "arin"),
+                        ("OrganizationHandle", handle),
+                        ("ClientToken", "token-create"),
+                    ],
+                ),
+            )
+        };
+        create("ORG-1").unwrap();
+        assert_eq!(
+            err_of(create("ORG-2")).code(),
+            "IdempotentParameterMismatch"
+        );
+
+        // And so is a batch document that changed under a reused token.
+        let batch_once = |doc: &str| {
+            batch_modify_ipam_routing_policy_registrations(
+                &svc,
+                &req(
+                    "BatchModifyIpamRoutingPolicyRegistrations",
+                    &[
+                        ("IpamInternetRegistryAssociationId", &id),
+                        ("DeltaJson", doc),
+                        ("ClientToken", "token-batch"),
+                    ],
+                ),
+            )
+        };
+        batch_once(r#"{"add":[{"cidr":"203.0.113.0/24","asns":["64512"]}]}"#).unwrap();
+        let err = err_of(batch_once(r#"{"remove":["198.51.100.0/24"]}"#));
+        assert_eq!(err.code(), "IdempotentParameterMismatch");
+        let b = registrations(&svc, &id, &[]);
+        assert!(b.contains("198.51.100.0/24"), "{b}");
+    }
+
+    /// `ClientToken` is an `@idempotencyToken`, so an SDK fills a fresh one in
+    /// on every call rather than only on retries: the records have to age out
+    /// and stay capped, or a create/delete loop would leave one dead record
+    /// per call in the association and in every snapshot of it, forever.
+    #[test]
+    fn client_token_records_age_out_and_stay_bounded() {
+        let svc = Ec2Service::new();
+        let id = make_association(&svc);
+        register(&svc, &id, "192.0.2.0/24", None);
+
+        let modify = |token: &str| {
+            body(
+                modify_ipam_routing_policy_registration(
+                    &svc,
+                    &req(
+                        "ModifyIpamRoutingPolicyRegistration",
+                        &[
+                            ("IpamInternetRegistryAssociationId", &id),
+                            ("Cidr", "192.0.2.0/24"),
+                            ("Asn.1", "64512"),
+                            ("ClientToken", token),
+                        ],
+                    ),
+                )
+                .unwrap(),
+            )
+        };
+        let first = modify("token-m");
+        assert_eq!(first, modify("token-m"), "a retry in the window replays");
+
+        age_client_tokens(&svc, &id);
+        assert_ne!(
+            first,
+            modify("token-m"),
+            "an aged-out token no longer replays"
+        );
+
+        // Every call mints its own token, so the cap is what bounds the map.
+        for i in 0..CLIENT_TOKEN_MAX_RECORDS + 50 {
+            modify(&format!("token-{i}"));
+        }
+        let kept = with_association(&svc, &id, |a| a.client_tokens.len());
+        assert!(kept <= CLIENT_TOKEN_MAX_RECORDS, "{kept} records kept");
+    }
+
+    /// A batch document is checked against the state it would itself leave, so
+    /// it can remove a CIDR it adds; the removal of a CIDR the document
+    /// neither holds nor adds is still a not-found.
+    #[test]
+    fn a_batch_can_remove_a_cidr_it_adds() {
+        let svc = Ec2Service::new();
+        let id = make_association(&svc);
+
+        batch(
+            &svc,
+            &id,
+            r#"{"add":[{"cidr":"10.0.0.0/16","asns":["64512"]}],"remove":["10.0.0.0/16"]}"#,
+        )
+        .unwrap();
+        let b = registrations(&svc, &id, &[]);
+        assert!(!b.contains("10.0.0.0/16"), "{b}");
+        // The document was published, so it left the audit trail behind.
+        assert_eq!(elements(&deltas(&svc, &id, &[]), "deltaId").len(), 1);
+
+        let err = err_of(batch(
+            &svc,
+            &id,
+            r#"{"add":[{"cidr":"10.0.0.0/16","asns":["64512"]}],"remove":["203.0.113.0/24"]}"#,
+        ));
+        assert_eq!(err.code(), "InvalidIpamRoutingPolicyRegistration.NotFound");
+    }
+
+    /// Modify is a partial update, so an omitted member keeps its value --
+    /// which leaves the caller needing a spelling that says "remove this". An
+    /// empty value clears the member on the wire, and `null` clears it in a
+    /// delta document.
+    #[test]
+    fn optional_members_can_be_cleared() {
+        let svc = Ec2Service::new();
+        let id = make_association(&svc);
+        create_ipam_routing_policy_registration(
+            &svc,
+            &req(
+                "CreateIpamRoutingPolicyRegistration",
+                &[
+                    ("IpamInternetRegistryAssociationId", &id),
+                    ("Cidr", "10.0.0.0/16"),
+                    ("Asn.1", "64512"),
+                    ("MaxLength", "24"),
+                    ("Description", "prod prefix"),
+                    ("PermitMoreSpecificAnnouncements", "true"),
+                ],
+            ),
+        )
+        .unwrap();
+
+        modify_ipam_routing_policy_registration(
+            &svc,
+            &req(
+                "ModifyIpamRoutingPolicyRegistration",
+                &[
+                    ("IpamInternetRegistryAssociationId", &id),
+                    ("Cidr", "10.0.0.0/16"),
+                    ("Asn.1", "64512"),
+                    ("MaxLength", ""),
+                    ("Description", ""),
+                    ("PermitMoreSpecificAnnouncements", ""),
+                ],
+            ),
+        )
+        .unwrap();
+
+        let b = registrations(&svc, &id, &[]);
+        assert!(!b.contains("<maxLength>"), "{b}");
+        assert!(!b.contains("<description>"), "{b}");
+        assert!(!b.contains("<permitMoreSpecificAnnouncements>"), "{b}");
+        // The delta says what was asked for: a cleared member is `null`, which
+        // is how a batch document spells the same change.
+        let recorded = with_association(&svc, &id, |a| {
+            a.deltas
+                .last()
+                .expect("a delta was recorded")
+                .delta_json
+                .clone()
+        });
+        assert!(recorded.contains(r#""maxLength":null"#), "{recorded}");
+        assert!(recorded.contains(r#""description":null"#), "{recorded}");
+
+        // A batch entry clears with `null` and leaves an omitted member alone.
+        batch(
+            &svc,
+            &id,
+            r#"{"add":[{"cidr":"192.0.2.0/24","asns":["64512"],"maxLength":25,
+                        "description":"edge prefix"}]}"#,
+        )
+        .unwrap();
+        batch(
+            &svc,
+            &id,
+            r#"{"add":[{"cidr":"192.0.2.0/24","asns":["64512"],"description":null}]}"#,
+        )
+        .unwrap();
+        let b = registrations(&svc, &id, &[("Cidr", "192.0.2.0/24")]);
+        assert!(!b.contains("<description>"), "{b}");
+        assert!(b.contains("<maxLength>25</maxLength>"), "{b}");
+    }
+
+    /// Deltas are appended, so an offset into the reversed list moves under a
+    /// caller who pages: `reverse` pages by delta id instead, and the second
+    /// page cannot repeat what the first already reported.
+    #[test]
+    fn reverse_delta_pages_do_not_repeat_when_deltas_are_appended() {
+        let svc = Ec2Service::new();
+        let id = make_association(&svc);
+        for i in 0..7 {
+            register(&svc, &id, &format!("10.{i}.0.0/16"), None);
+        }
+
+        let reverse = [("ChronologicalOrder", "reverse"), ("MaxResults", "5")];
+        let first = deltas(&svc, &id, &reverse);
+        let seen = elements(&first, "deltaId");
+        assert_eq!(seen.len(), 5, "{first}");
+        let token = elements(&first, "nextToken")
+            .pop()
+            .unwrap_or_else(|| panic!("no nextToken in {first}"));
+
+        // Two more deltas land between the two pages.
+        register(&svc, &id, "10.7.0.0/16", None);
+        register(&svc, &id, "10.8.0.0/16", None);
+
+        let mut params = reverse.to_vec();
+        params.push(("NextToken", &token));
+        let second = deltas(&svc, &id, &params);
+        let rest = elements(&second, "deltaId");
+        assert_eq!(rest.len(), 2, "{second}");
+        assert!(
+            rest.iter().all(|d| !seen.contains(d)),
+            "a second page must not repeat the first: {first} {second}"
+        );
+        assert!(!second.contains("<nextToken>"), "{second}");
+
+        // A `reverse` token that names no delta is rejected rather than
+        // silently restarting the caller from the newest one.
+        let bad: Vec<(&str, &str)> = vec![
+            ("IpamInternetRegistryAssociationId", &id),
+            ("ChronologicalOrder", "reverse"),
+            ("NextToken", "ipam-delta-nope"),
+        ];
+        let err = err_of(get_ipam_routing_policy_registration_deltas(
+            &svc,
+            &req("GetIpamRoutingPolicyRegistrationDeltas", &bad),
+        ));
+        assert_eq!(err.code(), "InvalidParameterValue");
+    }
+
+    /// A `MaxResults` that is not a number is rejected the way a `NextToken`
+    /// that is not a cursor is: taking it as "no limit" would hand back the
+    /// whole set unpaginated.
+    #[test]
+    fn a_max_results_that_is_not_a_number_is_rejected() {
+        let svc = Ec2Service::new();
+        let id = make_association(&svc);
+        for i in 0..7 {
+            register(&svc, &id, &format!("10.{i}.0.0/16"), None);
+        }
+
+        let err = err_of(get_ipam_routing_policy_registrations(
+            &svc,
+            &req(
+                "GetIpamRoutingPolicyRegistrations",
+                &[
+                    ("IpamInternetRegistryAssociationId", &id),
+                    ("MaxResults", "abc"),
+                ],
+            ),
+        ));
+        assert_eq!(err.code(), "InvalidParameterValue");
+
+        let err = err_of(get_ipam_routing_policy_registration_deltas(
+            &svc,
+            &req(
+                "GetIpamRoutingPolicyRegistrationDeltas",
+                &[
+                    ("IpamInternetRegistryAssociationId", &id),
+                    ("MaxResults", "abc"),
+                ],
+            ),
+        ));
+        assert_eq!(err.code(), "InvalidParameterValue");
+
+        let err = err_of(get_ipam_routing_policy_registrations(
+            &svc,
+            &req(
+                "GetIpamRoutingPolicyRegistrations",
+                &[
+                    ("IpamInternetRegistryAssociationId", &id),
+                    ("NextToken", "abc"),
+                ],
+            ),
+        ));
+        assert_eq!(err.code(), "InvalidParameterValue");
+    }
+
+    /// Publishing needs the association's RPKI service; un-publishing does
+    /// not. An association restored from a snapshot taken before registrations
+    /// were gated still carries them in `pending-enable`, and the association
+    /// cannot be deleted while they remain -- gating removals too would strand
+    /// it and its ROAs for good.
+    #[test]
+    fn removing_a_registration_does_not_need_an_enabled_association() {
+        let svc = Ec2Service::new();
+        let id = make_association(&svc);
+        register(&svc, &id, "192.0.2.0/24", None);
+        register(&svc, &id, "198.51.100.0/24", None);
+        with_association(&svc, &id, |a| a.state = "pending-enable".to_string());
+
+        let err = err_of(create_ipam_routing_policy_registration(
+            &svc,
+            &req(
+                "CreateIpamRoutingPolicyRegistration",
+                &[
+                    ("IpamInternetRegistryAssociationId", &id),
+                    ("Cidr", "203.0.113.0/24"),
+                    ("Asn.1", "64512"),
+                ],
+            ),
+        ));
+        assert_eq!(err.code(), "IncorrectState");
+        let err = err_of(batch(
+            &svc,
+            &id,
+            r#"{"add":[{"cidr":"203.0.113.0/24","asns":["64512"]}],"remove":["192.0.2.0/24"]}"#,
+        ));
+        assert_eq!(err.code(), "IncorrectState");
+
+        // Both spellings of a removal go through, so the association can be
+        // emptied and then deleted.
+        delete_ipam_routing_policy_registration(
+            &svc,
+            &req(
+                "DeleteIpamRoutingPolicyRegistration",
+                &[
+                    ("IpamInternetRegistryAssociationId", &id),
+                    ("Cidr", "192.0.2.0/24"),
+                ],
+            ),
+        )
+        .unwrap();
+        batch(&svc, &id, r#"{"remove":["198.51.100.0/24"]}"#).unwrap();
+        let b = body(
+            delete_ipam_internet_registry_association(
+                &svc,
+                &req(
+                    "DeleteIpamInternetRegistryAssociation",
+                    &[("IpamInternetRegistryAssociationId", &id)],
+                ),
+            )
+            .unwrap(),
+        );
+        assert!(b.contains("<state>delete-complete</state>"), "{b}");
     }
 }

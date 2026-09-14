@@ -27,9 +27,7 @@ pub fn reap_stale_containers() {
         return;
     };
 
-    let reaped = reap_orphans(&cli, &["ps", "-a"], |id| {
-        vec!["rm".to_string(), "-f".to_string(), id.to_string()]
-    });
+    let reaped = reap_orphans(&cli, &["ps", "-a"], &["rm", "-f"]);
     if reaped > 0 {
         tracing::info!(count = reaped, "reaped orphaned backing containers");
     }
@@ -39,20 +37,18 @@ pub fn reap_stale_containers() {
     // so prune networks *after* containers. `network rm` is a no-op for an
     // already-gone network, so a partial container reap above doesn't wedge
     // this pass.
-    let reaped_networks = reap_orphans(&cli, &["network", "ls"], |id| {
-        vec!["network".to_string(), "rm".to_string(), id.to_string()]
-    });
+    let reaped_networks = reap_orphans(&cli, &["network", "ls"], &["network", "rm"]);
     if reaped_networks > 0 {
         tracing::info!(count = reaped_networks, "reaped orphaned backing networks");
     }
 }
 
 /// List objects carrying the `fakecloud-instance` label via
-/// `<cli> <list_args> --filter label=fakecloud-instance`, then run the
-/// `remove_argv(id)` command for every object whose owning PID is no longer
+/// `<cli> <list_args> --filter label=fakecloud-instance`, then run
+/// `<cli> <remove_args> <id>` for every object whose owning PID is no longer
 /// alive (skipping the current process and live owners). Returns the number
 /// removed. Shared by the container and network reap passes.
-fn reap_orphans(cli: &str, list_args: &[&str], remove_argv: impl Fn(&str) -> Vec<String>) -> usize {
+fn reap_orphans(cli: &str, list_args: &[&str], remove_args: &[&str]) -> usize {
     let mut args: Vec<&str> = list_args.to_vec();
     args.extend_from_slice(&[
         "--filter",
@@ -80,7 +76,9 @@ fn reap_orphans(cli: &str, list_args: &[&str], remove_argv: impl Fn(&str) -> Vec
         ) {
             continue;
         }
-        let removed = fakecloud_core::container_net::bounded_status(cli, &remove_argv(id));
+        let mut remove_argv = remove_args.to_vec();
+        remove_argv.push(id);
+        let removed = fakecloud_core::container_net::bounded_status(cli, &remove_argv);
         if removed {
             reaped += 1;
         }
