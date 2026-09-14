@@ -7135,3 +7135,312 @@ async fn partiql_select_columns_page_and_validate() {
     )
     .await;
 }
+
+// ── Cross-account table ARNs ───────────────────────────────────────────
+
+const OWNER: &str = "444455556666";
+const OWNER_ARN: &str = "arn:aws:dynamodb:us-east-1:444455556666:table/Shared";
+
+async fn call_as(
+    svc: &DynamoDbService,
+    account: &str,
+    action: &str,
+    body: Value,
+) -> (StatusCode, Value) {
+    let mut req = make_request(action, body);
+    req.account_id = account.to_string();
+    match svc.handle(req).await {
+        Ok(resp) => (
+            resp.status,
+            serde_json::from_slice(resp.body.expect_bytes()).unwrap_or(Value::Null),
+        ),
+        Err(err) => (err.status(), json!({ "__type": err.code() })),
+    }
+}
+
+/// A table named `Shared` in both the caller's account and [`OWNER`], each
+/// holding one item marking whose it is.
+async fn two_account_tables() -> DynamoDbService {
+    let svc = make_service();
+    for account in ["123456789012", OWNER] {
+        let (status, body) = call_as(
+            &svc,
+            account,
+            "CreateTable",
+            json!({
+                "TableName": "Shared",
+                "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                "BillingMode": "PAY_PER_REQUEST",
+                "StreamSpecification": {"StreamEnabled": true, "StreamViewType": "NEW_IMAGE"}
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = call_as(
+            &svc,
+            account,
+            "PutItem",
+            json!({"TableName": "Shared", "Item": {"pk": {"S": "owner"}, "who": {"S": account}}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    svc
+}
+
+fn item_count(svc: &DynamoDbService, account: &str) -> usize {
+    svc.state.read().get(account).unwrap().tables["Shared"]
+        .items
+        .len()
+}
+
+#[tokio::test]
+async fn cross_account_item_operations_act_on_the_owners_table() {
+    let svc = two_account_tables().await;
+    let (status, body) = call_as(
+        &svc,
+        "123456789012",
+        "GetItem",
+        json!({"TableName": OWNER_ARN, "Key": {"pk": {"S": "owner"}}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["Item"]["who"]["S"], OWNER);
+
+    let (status, _) = call_as(
+        &svc,
+        "123456789012",
+        "PutItem",
+        json!({"TableName": OWNER_ARN, "Item": {"pk": {"S": "written"}}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(item_count(&svc, OWNER), 2);
+    assert_eq!(item_count(&svc, "123456789012"), 1);
+
+    let (_, body) = call_as(
+        &svc,
+        "123456789012",
+        "DescribeTable",
+        json!({"TableName": OWNER_ARN}),
+    )
+    .await;
+    assert_eq!(body["Table"]["TableArn"], OWNER_ARN);
+
+    let (_, body) = call_as(
+        &svc,
+        "123456789012",
+        "Scan",
+        json!({"TableName": OWNER_ARN}),
+    )
+    .await;
+    assert_eq!(body["Count"], 2);
+
+    let (status, _) = call_as(
+        &svc,
+        "123456789012",
+        "TagResource",
+        json!({"ResourceArn": OWNER_ARN, "Tags": [{"Key": "team", "Value": "blue"}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        svc.state.read().get(OWNER).unwrap().tables["Shared"].tags["team"],
+        "blue"
+    );
+}
+
+#[tokio::test]
+async fn cross_account_batches_resolve_each_tables_account() {
+    let svc = two_account_tables().await;
+    // The same key in two accounts' tables is two different items.
+    let (status, body) = call_as(
+        &svc,
+        "123456789012",
+        "BatchWriteItem",
+        json!({"RequestItems": {
+            "Shared": [{"PutRequest": {"Item": {"pk": {"S": "k"}, "v": {"S": "mine"}}}}],
+            OWNER_ARN: [{"PutRequest": {"Item": {"pk": {"S": "k"}, "v": {"S": "theirs"}}}}]
+        }}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = call_as(
+        &svc,
+        "123456789012",
+        "BatchGetItem",
+        json!({"RequestItems": {
+            "Shared": {"Keys": [{"pk": {"S": "k"}}]},
+            OWNER_ARN: {"Keys": [{"pk": {"S": "k"}}]}
+        }}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["Responses"]["Shared"][0]["v"]["S"], "mine");
+    assert_eq!(body["Responses"][OWNER_ARN][0]["v"]["S"], "theirs");
+
+    let (status, body) = call_as(
+        &svc,
+        "123456789012",
+        "TransactGetItems",
+        json!({"TransactItems": [
+            {"Get": {"TableName": "Shared", "Key": {"pk": {"S": "k"}}}},
+            {"Get": {"TableName": OWNER_ARN, "Key": {"pk": {"S": "k"}}}}
+        ]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["Responses"][0]["Item"]["v"]["S"], "mine");
+    assert_eq!(body["Responses"][1]["Item"]["v"]["S"], "theirs");
+}
+
+#[tokio::test]
+async fn cross_account_transactions_are_atomic_across_accounts() {
+    let svc = two_account_tables().await;
+    let own_arn = "arn:aws:dynamodb:us-east-1:123456789012:table/Shared";
+    let (status, body) = call_as(
+        &svc,
+        "123456789012",
+        "TransactWriteItems",
+        json!({"TransactItems": [
+            {"Put": {"TableName": "Shared", "Item": {"pk": {"S": "t"}}}},
+            {"Put": {"TableName": OWNER_ARN, "Item": {"pk": {"S": "t"}}}}
+        ]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(item_count(&svc, "123456789012"), 2);
+    assert_eq!(item_count(&svc, OWNER), 2);
+    // The writes landed on each table's stream.
+    for account in ["123456789012", OWNER] {
+        let accounts = svc.state.read();
+        let records = accounts.get(account).unwrap().tables["Shared"]
+            .stream_records
+            .read()
+            .len();
+        assert_eq!(records, 2, "{account}");
+    }
+
+    // The same item named by name and by the caller's own ARN is one item.
+    let (status, body) = call_as(
+        &svc,
+        "123456789012",
+        "TransactWriteItems",
+        json!({"TransactItems": [
+            {"Put": {"TableName": "Shared", "Item": {"pk": {"S": "d"}}}},
+            {"Delete": {"TableName": own_arn, "Key": {"pk": {"S": "d"}}}}
+        ]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["__type"], "ValidationException");
+
+    // A failure applying a later write reverts the writes already applied
+    // in both accounts.
+    let (status, body) = call_as(
+        &svc,
+        "123456789012",
+        "TransactWriteItems",
+        json!({"TransactItems": [
+            {"Put": {"TableName": OWNER_ARN, "Item": {"pk": {"S": "r"}}}},
+            {"Put": {"TableName": "Shared", "Item": {"pk": {"S": "r"}}}},
+            {"Update": {
+                "TableName": OWNER_ARN,
+                "Key": {"pk": {"S": "r2"}},
+                "UpdateExpression": "BOGUS expression that won't parse"
+            }}
+        ]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["__type"], "TransactionCanceledException");
+    assert_eq!(item_count(&svc, "123456789012"), 2);
+    assert_eq!(item_count(&svc, OWNER), 2);
+
+    // A condition failing on the foreign table cancels the whole transaction.
+    let (status, body) = call_as(
+        &svc,
+        "123456789012",
+        "TransactWriteItems",
+        json!({"TransactItems": [
+            {"Put": {"TableName": "Shared", "Item": {"pk": {"S": "c"}}}},
+            {"ConditionCheck": {
+                "TableName": OWNER_ARN,
+                "Key": {"pk": {"S": "owner"}},
+                "ConditionExpression": "attribute_not_exists(pk)"
+            }}
+        ]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["__type"], "TransactionCanceledException");
+    assert_eq!(item_count(&svc, "123456789012"), 2);
+}
+
+#[tokio::test]
+async fn other_accounts_tables_are_not_found_without_cross_account_support() {
+    let svc = two_account_tables().await;
+    for (action, body, code) in [
+        (
+            "CreateBackup",
+            json!({"TableName": OWNER_ARN, "BackupName": "b"}),
+            "TableNotFoundException",
+        ),
+        (
+            "DescribeTimeToLive",
+            json!({"TableName": OWNER_ARN}),
+            "ResourceNotFoundException",
+        ),
+        (
+            "GetResourcePolicy",
+            json!({"ResourceArn": OWNER_ARN}),
+            "ResourceNotFoundException",
+        ),
+        (
+            "ExecuteStatement",
+            json!({"Statement": format!("SELECT * FROM \"{OWNER_ARN}\"")}),
+            "ResourceNotFoundException",
+        ),
+        (
+            "DescribeContinuousBackups",
+            json!({"TableName": OWNER_ARN}),
+            "TableNotFoundException",
+        ),
+    ] {
+        let (status, got) = call_as(&svc, "123456789012", action, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{action}: {got}");
+        assert_eq!(got["__type"], code, "{action}");
+    }
+
+    // Another region's table is not found, whoever owns it.
+    for arn in [
+        "arn:aws:dynamodb:us-west-2:123456789012:table/Shared",
+        "arn:aws:dynamodb:us-west-2:444455556666:table/Shared",
+    ] {
+        let (status, got) = call_as(
+            &svc,
+            "123456789012",
+            "GetItem",
+            json!({"TableName": arn, "Key": {"pk": {"S": "owner"}}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{arn}");
+        assert_eq!(got["__type"], "ResourceNotFoundException", "{arn}");
+    }
+
+    // A batch naming another region's table fails as a whole.
+    let (status, got) = call_as(
+        &svc,
+        "123456789012",
+        "BatchGetItem",
+        json!({"RequestItems": {
+            "Shared": {"Keys": [{"pk": {"S": "owner"}}]},
+            "arn:aws:dynamodb:eu-west-1:444455556666:table/Shared": {"Keys": [{"pk": {"S": "owner"}}]}
+        }}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(got["__type"], "ResourceNotFoundException");
+}

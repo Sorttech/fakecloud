@@ -1,4 +1,5 @@
 mod batch;
+pub(crate) mod cross_account;
 #[cfg(test)]
 mod expression_corpus_tests;
 mod global_tables;
@@ -443,7 +444,18 @@ impl AwsService for DynamoDbService {
         "dynamodb"
     }
 
-    async fn handle(&self, req: AwsRequest) -> Result<AwsResponse, AwsServiceError> {
+    async fn handle(&self, mut req: AwsRequest) -> Result<AwsResponse, AwsServiceError> {
+        // A table or stream ARN in another region, or in another account for
+        // an operation without cross-account support, is not found. A single
+        // table in another account is served in that account; batches and
+        // transactions resolve each table's account themselves.
+        {
+            let body = req.json_body();
+            cross_account::check_references(&req, &body, cross_account::CROSS_ACCOUNT_OPERATIONS)?;
+            if let Some(owner) = cross_account::single_resource_owner(&req, &body) {
+                req.account_id = owner;
+            }
+        }
         // Avoid parsing the body for ops where the action alone tells us
         // they mutate (or don't). Only PartiQL ops need statement
         // inspection.

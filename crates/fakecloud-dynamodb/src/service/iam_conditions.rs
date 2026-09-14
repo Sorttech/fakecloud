@@ -1329,18 +1329,37 @@ mod tests {
         );
     }
 
-    /// A table ARN naming another account still authorizes the caller's own
-    /// table: that is the table the handler serves.
+    /// A table ARN naming another account authorizes that account's table
+    /// for an operation with cross-account support, and is authorized as
+    /// written for one without it (which the handler answers not found).
     #[test]
-    fn a_foreign_account_arn_authorizes_the_callers_table() {
+    fn a_foreign_account_arn_authorizes_the_table_the_handler_serves() {
         let (_svc, state) = service_with_table();
-        let req = request(
-            "GetItem",
-            serde_json::json!({"TableName": "arn:aws:dynamodb:us-east-1:444455556666:table/Games"}),
-        );
+        {
+            let mut accounts = state.write();
+            let src = accounts.get("123456789012").unwrap().tables["Games"].clone();
+            let foreign = accounts.get_or_create("444455556666");
+            let mut table = src;
+            table.arn = "arn:aws:dynamodb:us-east-1:444455556666:table/Games".to_string();
+            foreign.tables.insert("Games".to_string(), table);
+        }
+        let arn = "arn:aws:dynamodb:us-east-1:444455556666:table/Games";
+        let req = request("GetItem", serde_json::json!({"TableName": arn}));
         assert_eq!(
             super::super::iam::actions_for(&state, &req)[0].resource,
-            "arn:aws:dynamodb:us-east-1:123456789012:table/Games"
+            arn
+        );
+        let req = request("DescribeTimeToLive", serde_json::json!({"TableName": arn}));
+        assert_eq!(
+            super::super::iam::actions_for(&state, &req)[0].resource,
+            arn
+        );
+        // A table the named account does not hold is authorized at its ARN.
+        let missing = "arn:aws:dynamodb:us-east-1:444455556666:table/Nope";
+        let req = request("GetItem", serde_json::json!({"TableName": missing}));
+        assert_eq!(
+            super::super::iam::actions_for(&state, &req)[0].resource,
+            missing
         );
     }
 

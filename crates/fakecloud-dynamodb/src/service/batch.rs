@@ -27,6 +27,8 @@ use super::{
     validate_key_attributes_in_key, validate_key_in_item, DynamoDbService,
 };
 
+use super::cross_account::{table_id, tables_of, tables_of_mut};
+
 impl DynamoDbService {
     pub(super) fn batch_get_item(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let body = Self::parse_body(req)?;
@@ -68,14 +70,14 @@ impl DynamoDbService {
             ));
         }
 
+        // Each table is looked up in the account that owns it: a table ARN
+        // may name another account's table.
         let accounts = self.state.read();
-        let empty_ddb = crate::state::DynamoDbState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty_ddb);
         let mut responses: HashMap<String, Vec<Value>> = HashMap::new();
         let mut consumed_capacity: Vec<Value> = Vec::new();
 
         for (table_name, params) in &request_items {
-            let table = get_table(&state.tables, table_name)?;
+            let table = get_table(tables_of(&accounts, req, table_name), table_name)?;
             let keys = params["Keys"].as_array().ok_or_else(|| {
                 AwsServiceError::aws_error(
                     StatusCode::BAD_REQUEST,
@@ -190,7 +192,6 @@ impl DynamoDbService {
         }
 
         let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
         let mut consumed_capacity: Vec<Value> = Vec::new();
         let mut item_collection_metrics: HashMap<String, Vec<Value>> = HashMap::new();
 
@@ -199,8 +200,7 @@ impl DynamoDbService {
         // the whole call (AWS rejects these up-front, not after partial
         // application).
         for (table_name, requests) in &request_items {
-            let table = state
-                .tables
+            let table = tables_of(&accounts, req, table_name)
                 .get(super::resolve_table_name(table_name))
                 .ok_or_else(|| {
                     AwsServiceError::aws_error(
@@ -278,8 +278,7 @@ impl DynamoDbService {
         }
 
         for (table_name, requests) in &request_items {
-            let table = state
-                .tables
+            let table = tables_of_mut(&mut accounts, req, table_name)
                 .get_mut(super::resolve_table_name(table_name))
                 .ok_or_else(|| {
                     AwsServiceError::aws_error(
@@ -400,12 +399,12 @@ impl DynamoDbService {
             ));
         }
 
+        // Each table is looked up in the account that owns it: a table ARN
+        // may name another account's table.
         let accounts = self.state.read();
-        let empty_ddb = crate::state::DynamoDbState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty_ddb);
         let mut responses: Vec<Value> = Vec::new();
         let mut per_table_count: HashMap<String, u32> = HashMap::new();
-        let mut seen_keys: Vec<(String, HashMap<String, AttributeValue>)> = Vec::new();
+        let mut seen_keys: Vec<((String, String), HashMap<String, AttributeValue>)> = Vec::new();
 
         for ti in transact_items {
             let get = &ti["Get"];
@@ -417,7 +416,7 @@ impl DynamoDbService {
                 )
             })?;
 
-            let table = get_table(&state.tables, table_name)?;
+            let table = get_table(tables_of(&accounts, req, table_name), table_name)?;
             // Parse the Key strictly and reject an under-specified/malformed key
             // the same way GetItem does, instead of coercing it to `{}` (which
             // matched nothing and returned a phantom miss).
@@ -432,19 +431,18 @@ impl DynamoDbService {
             validate_key_attributes_in_key(table, &key)?;
 
             // AWS rejects a transaction that reads the same item more than once.
-            if seen_keys.iter().any(|(t, k)| {
-                t == super::resolve_table_name(table_name) && keys_equal(table, k, &key)
-            }) {
+            let id = table_id(req, table_name);
+            if seen_keys
+                .iter()
+                .any(|(t, k)| *t == id && keys_equal(table, k, &key))
+            {
                 return Err(AwsServiceError::aws_error(
                     StatusCode::BAD_REQUEST,
                     "ValidationException",
                     "Transaction request cannot include multiple operations on one item",
                 ));
             }
-            seen_keys.push((
-                super::resolve_table_name(table_name).to_string(),
-                key.clone(),
-            ));
+            seen_keys.push((id, key.clone()));
 
             match table.find_item_index(&key) {
                 Some(idx) => {
@@ -599,7 +597,8 @@ impl DynamoDbService {
             }
         }
 
-        let state = accounts.get_or_create(&req.account_id);
+        // Each table is looked up, validated, snapshotted and written in the
+        // account that owns it: a table ARN may name another account's table.
 
         // Validate every referenced table exists up-front. Without this
         // check a missing TableName on a Put with no condition would fail
@@ -609,7 +608,7 @@ impl DynamoDbService {
             for op_key in ["Put", "Delete", "Update", "ConditionCheck"] {
                 if let Some(op) = ti.get(op_key) {
                     let table_name = op["TableName"].as_str().unwrap_or_default();
-                    get_table(&state.tables, table_name)?;
+                    get_table(tables_of(&accounts, req, table_name), table_name)?;
                 }
             }
         }
@@ -629,7 +628,9 @@ impl DynamoDbService {
                 let table_name = put["TableName"].as_str().unwrap_or_default();
                 let item: HashMap<String, AttributeValue> =
                     serde_json::from_value(put["Item"].clone()).unwrap_or_default();
-                if let Some(table) = state.tables.get(super::resolve_table_name(table_name)) {
+                if let Some(table) =
+                    tables_of(&accounts, req, table_name).get(super::resolve_table_name(table_name))
+                {
                     validate_key_in_item(table, &item)?;
                 }
                 // Malformed values (bad numbers, empty/duplicate sets) are a
@@ -641,7 +642,9 @@ impl DynamoDbService {
                 let table_name = op["TableName"].as_str().unwrap_or_default();
                 let key: HashMap<String, AttributeValue> =
                     serde_json::from_value(op["Key"].clone()).unwrap_or_default();
-                if let Some(table) = state.tables.get(super::resolve_table_name(table_name)) {
+                if let Some(table) =
+                    tables_of(&accounts, req, table_name).get(super::resolve_table_name(table_name))
+                {
                     validate_key_attributes_in_key(table, &key)?;
                     if let Some(expr) = ti
                         .get("Update")
@@ -671,12 +674,12 @@ impl DynamoDbService {
         // a transaction applied last-writer-wins and reported success. The key
         // is the table's primary key, extracted from a Put's Item or the
         // Key field of Update/Delete/ConditionCheck.
-        let mut seen_keys: Vec<(String, HashMap<String, AttributeValue>)> = Vec::new();
+        let mut seen_keys: Vec<((String, String), HashMap<String, AttributeValue>)> = Vec::new();
         for ti in transact_items {
             for op_key in ["Put", "Delete", "Update", "ConditionCheck"] {
                 let Some(op) = ti.get(op_key) else { continue };
                 let table_name = op["TableName"].as_str().unwrap_or_default();
-                let table = get_table(&state.tables, table_name)?;
+                let table = get_table(tables_of(&accounts, req, table_name), table_name)?;
                 let key = if op_key == "Put" {
                     let item: HashMap<String, AttributeValue> =
                         serde_json::from_value(op["Item"].clone()).unwrap_or_default();
@@ -684,16 +687,18 @@ impl DynamoDbService {
                 } else {
                     serde_json::from_value(op["Key"].clone()).unwrap_or_default()
                 };
-                if seen_keys.iter().any(|(t, k)| {
-                    t == super::resolve_table_name(table_name) && keys_equal(table, k, &key)
-                }) {
+                let id = table_id(req, table_name);
+                if seen_keys
+                    .iter()
+                    .any(|(t, k)| *t == id && keys_equal(table, k, &key))
+                {
                     return Err(AwsServiceError::aws_error(
                         StatusCode::BAD_REQUEST,
                         "ValidationException",
                         "Transaction request cannot include multiple operations on one item",
                     ));
                 }
-                seen_keys.push((super::resolve_table_name(table_name).to_string(), key));
+                seen_keys.push((id, key));
             }
         }
 
@@ -737,7 +742,7 @@ impl DynamoDbService {
                 let return_values = put["ReturnValuesOnConditionCheckFailure"].as_str();
 
                 if let Some(cond) = condition {
-                    let table = get_table(&state.tables, table_name)?;
+                    let table = get_table(tables_of(&accounts, req, table_name), table_name)?;
                     let expr_attr_names = parse_expression_attribute_names(put);
                     let expr_attr_values = parse_expression_attribute_values(put);
                     let key = extract_key(table, &item);
@@ -764,7 +769,7 @@ impl DynamoDbService {
                 let return_values = delete["ReturnValuesOnConditionCheckFailure"].as_str();
 
                 if let Some(cond) = condition {
-                    let table = get_table(&state.tables, table_name)?;
+                    let table = get_table(tables_of(&accounts, req, table_name), table_name)?;
                     let expr_attr_names = parse_expression_attribute_names(delete);
                     let expr_attr_values = parse_expression_attribute_values(delete);
                     let existing_idx = table.find_item_index(&key);
@@ -790,7 +795,7 @@ impl DynamoDbService {
                 let return_values = update["ReturnValuesOnConditionCheckFailure"].as_str();
 
                 if let Some(cond) = condition {
-                    let table = get_table(&state.tables, table_name)?;
+                    let table = get_table(tables_of(&accounts, req, table_name), table_name)?;
                     let expr_attr_names = parse_expression_attribute_names(update);
                     let expr_attr_values = parse_expression_attribute_values(update);
                     let existing_idx = table.find_item_index(&key);
@@ -815,7 +820,7 @@ impl DynamoDbService {
                 let cond = check["ConditionExpression"].as_str().unwrap_or_default();
                 let return_values = check["ReturnValuesOnConditionCheckFailure"].as_str();
 
-                let table = get_table(&state.tables, table_name)?;
+                let table = get_table(tables_of(&accounts, req, table_name), table_name)?;
                 let expr_attr_names = parse_expression_attribute_names(check);
                 let expr_attr_values = parse_expression_attribute_values(check);
                 let existing_idx = table.find_item_index(&key);
@@ -863,21 +868,23 @@ impl DynamoDbService {
         // UpdateExpression). DDB transactions are all-or-nothing — without
         // this, an UpdateExpression error after a successful Put would
         // leave the Put committed.
-        let mut snapshots: HashMap<String, Vec<HashMap<String, AttributeValue>>> = HashMap::new();
+        let mut snapshots: HashMap<(String, String), Vec<HashMap<String, AttributeValue>>> =
+            HashMap::new();
         for ti in transact_items {
             for op_key in ["Put", "Delete", "Update"] {
                 if let Some(op) = ti.get(op_key) {
-                    // Keyed by the resolved name, so a table named once by
-                    // name and once by ARN is snapshotted, and reverted, once.
-                    let table_name =
-                        super::resolve_table_name(op["TableName"].as_str().unwrap_or_default());
-                    snapshots.entry(table_name.to_string()).or_insert_with(|| {
-                        state
-                            .tables
-                            .get(table_name)
-                            .map(|t| t.items.to_vec())
-                            .unwrap_or_default()
-                    });
+                    // Keyed by owner account and resolved name, so a table
+                    // named once by name and once by ARN is snapshotted, and
+                    // reverted, once.
+                    let table_name = op["TableName"].as_str().unwrap_or_default();
+                    snapshots
+                        .entry(table_id(req, table_name))
+                        .or_insert_with(|| {
+                            tables_of(&accounts, req, table_name)
+                                .get(super::resolve_table_name(table_name))
+                                .map(|t| t.items.to_vec())
+                                .unwrap_or_default()
+                        });
                 }
             }
         }
@@ -901,7 +908,8 @@ impl DynamoDbService {
                     let item: HashMap<String, AttributeValue> =
                         serde_json::from_value(put["Item"].clone()).unwrap_or_default();
                     let table =
-                        get_table_mut(&mut state.tables, table_name).map_err(|e| (op_idx, e))?;
+                        get_table_mut(tables_of_mut(&mut accounts, req, table_name), table_name)
+                            .map_err(|e| (op_idx, e))?;
                     let key = extract_key(table, &item);
                     let old_image = table.find_item_index(&key).map(|i| table.items[i].clone());
                     let is_modify = old_image.is_some();
@@ -932,7 +940,8 @@ impl DynamoDbService {
                     let key: HashMap<String, AttributeValue> =
                         serde_json::from_value(delete["Key"].clone()).unwrap_or_default();
                     let table =
-                        get_table_mut(&mut state.tables, table_name).map_err(|e| (op_idx, e))?;
+                        get_table_mut(tables_of_mut(&mut accounts, req, table_name), table_name)
+                            .map_err(|e| (op_idx, e))?;
                     let old_image = table.find_item_index(&key).map(|i| table.items[i].clone());
                     table.remove_item_by_key(&key);
                     if old_image.is_some() {
@@ -966,7 +975,8 @@ impl DynamoDbService {
                     let expr_attr_values = parse_expression_attribute_values(update);
 
                     let table =
-                        get_table_mut(&mut state.tables, table_name).map_err(|e| (op_idx, e))?;
+                        get_table_mut(tables_of_mut(&mut accounts, req, table_name), table_name)
+                            .map_err(|e| (op_idx, e))?;
                     // The `&self` lookups below cannot build the index, so a
                     // restored table would scan on every transactional update
                     // without this.
@@ -1032,8 +1042,11 @@ impl DynamoDbService {
             // surface the failure as a TransactionCanceledException
             // whose CancellationReasons array marks the offending op
             // with `ValidationError` and leaves siblings as `None`.
-            for (table_name, items) in snapshots {
-                if let Some(table) = state.tables.get_mut(super::resolve_table_name(&table_name)) {
+            for ((account, table_name), items) in snapshots {
+                if let Some(table) = accounts
+                    .get_mut(&account)
+                    .and_then(|state| state.tables.get_mut(&table_name))
+                {
                     table.replace_items(items);
                 }
             }
@@ -1064,7 +1077,9 @@ impl DynamoDbService {
         // Append all pending stream records under each table's
         // stream_records lock now that the transaction has committed.
         for (table_name, record) in pending_stream {
-            if let Some(table) = state.tables.get_mut(super::resolve_table_name(&table_name)) {
+            if let Some(table) = tables_of_mut(&mut accounts, req, &table_name)
+                .get_mut(super::resolve_table_name(&table_name))
+            {
                 crate::streams::add_stream_record(table, record);
             }
         }
