@@ -104,6 +104,9 @@ pub(crate) struct ParsedStatement {
     /// Identity policies always parse as [`PrincipalPattern::None`];
     /// resource policies may carry a `Principal` or `NotPrincipal` key.
     pub principal: PrincipalPattern,
+    /// Whether the statement's policy is `Version: 2012-10-17`, the only
+    /// policy language that expands `${...}` policy variables.
+    pub variables: bool,
 }
 
 /// `Principal` / `NotPrincipal` pattern on a parsed statement.
@@ -225,9 +228,13 @@ impl PolicyDocument {
     /// [`PolicyDocument::parse`] and tests that build inline `serde_json!`
     /// values.
     pub fn from_value(value: &Value) -> Self {
+        let variables = value.get("Version").and_then(Value::as_str) == Some("2012-10-17");
         let statements = match value.get("Statement") {
-            Some(Value::Array(arr)) => arr.iter().filter_map(parse_statement).collect::<Vec<_>>(),
-            Some(obj @ Value::Object(_)) => parse_statement(obj).into_iter().collect(),
+            Some(Value::Array(arr)) => arr
+                .iter()
+                .filter_map(|s| parse_statement(s, variables))
+                .collect::<Vec<_>>(),
+            Some(obj @ Value::Object(_)) => parse_statement(obj, variables).into_iter().collect(),
             _ => Vec::new(),
         };
         Self { statements }
@@ -254,7 +261,7 @@ impl PolicyDocument {
             .filter(|s| matches!(s.principal, PrincipalPattern::None))
             .filter(|s| s.effect == want)
             .filter(|s| action_matches(&s.action, &request.action))
-            .filter(|s| resource_matches(&s.resource, &request.resource))
+            .filter(|s| resource_matches(s, &request.resource, &request.context))
             .filter(|s| {
                 s.condition
                     .as_ref()
@@ -264,7 +271,7 @@ impl PolicyDocument {
     }
 }
 
-fn parse_statement(value: &Value) -> Option<ParsedStatement> {
+fn parse_statement(value: &Value, variables: bool) -> Option<ParsedStatement> {
     let obj = value.as_object()?;
     let effect = match obj.get("Effect")?.as_str()? {
         "Allow" => Effect::Allow,
@@ -289,7 +296,9 @@ fn parse_statement(value: &Value) -> Option<ParsedStatement> {
     } else {
         ResourceMatch::Implicit
     };
-    let condition = obj.get("Condition").map(CompiledCondition::parse);
+    let condition = obj
+        .get("Condition")
+        .map(|c| CompiledCondition::parse(c).with_policy_variables(variables));
     let principal = if let Some(np) = obj.get("NotPrincipal") {
         PrincipalPattern::NotPrincipal(parse_principal(np))
     } else if let Some(p) = obj.get("Principal") {
@@ -303,6 +312,7 @@ fn parse_statement(value: &Value) -> Option<ParsedStatement> {
         resource,
         condition,
         principal,
+        variables,
     })
 }
 
@@ -810,7 +820,7 @@ fn evaluate_inner_scoped(
             if !action_matches(&statement.action, &request.action) {
                 continue;
             }
-            if !resource_matches(&statement.resource, &request.resource) {
+            if !resource_matches(statement, &request.resource, &request.context) {
                 continue;
             }
             if let Some(condition) = &statement.condition {
@@ -920,17 +930,27 @@ fn action_matches(action: &ActionMatch, request_action: &str) -> bool {
     }
 }
 
-fn resource_matches(resource: &ResourceMatch, request_resource: &str) -> bool {
-    match resource {
-        ResourceMatch::Resource(patterns) => patterns
-            .iter()
-            .any(|p| iam_glob_match(p, request_resource, false)),
+fn resource_matches(
+    statement: &ParsedStatement,
+    request_resource: &str,
+    ctx: &fakecloud_core::auth::ConditionContext,
+) -> bool {
+    // A pattern with a policy variable that has no value matches no
+    // resource -- in `Resource` and `NotResource` alike.
+    let pattern_matches = |p: &str| {
+        if statement.variables && crate::policy_variables::has_variables(p) {
+            crate::policy_variables::resource_pattern(p, ctx).is_some_and(|pieces| {
+                crate::policy_variables::glob(&pieces, request_resource, false)
+            })
+        } else {
+            iam_glob_match(p, request_resource, false)
+        }
+    };
+    match &statement.resource {
+        ResourceMatch::Resource(patterns) => patterns.iter().any(|p| pattern_matches(p)),
         // Empty NotResource matches nothing (see action_matches, 5.2).
         ResourceMatch::NotResource(patterns) => {
-            !patterns.is_empty()
-                && patterns
-                    .iter()
-                    .all(|p| !iam_glob_match(p, request_resource, false))
+            !patterns.is_empty() && patterns.iter().all(|p| !pattern_matches(p))
         }
         ResourceMatch::Implicit => true,
     }

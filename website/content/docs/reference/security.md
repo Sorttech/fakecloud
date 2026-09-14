@@ -79,6 +79,7 @@ The policy evaluator implements the essentials of AWS's identity-based policy ev
 - `Effect: "Allow"` / `Effect: "Deny"` with **Deny precedence** (any matching deny wins).
 - `Action` / `NotAction` with `*` and `?` wildcards. Service prefix match is case-insensitive; action names are case-sensitive (matches AWS).
 - `Resource` / `NotResource` with `*` and `?` wildcards.
+- **Policy variables** in `Version: "2012-10-17"` policies: `${aws:username}`, `${aws:userid}`, `${aws:PrincipalTag/<key>}` and any other single-valued condition key, in the resource part of `Resource` / `NotResource` ARNs and in `String*` / `Arn*` condition values. `${key, 'default'}` supplies a default; `${*}`, `${?}` and `${$}` stand for a literal `*`, `?` and `$`; a substituted value is literal (a `*` in a tag is not a wildcard). A variable with no value matches no resource, fails positive operators and satisfies inverted ones (`StringNotEquals`, `StringNotLike`, `ArnNotLike`, ...). Policies with any other `Version` read `${...}` literally, as AWS does.
 - `Condition` blocks: all 28 operators AWS defines, plus the `...IfExists` suffix and the `ForAllValues:` / `ForAnyValue:` qualifiers. See the next section for details.
 - Identity policies attached to:
   - IAM users (inline + managed + via group membership, inline and managed)
@@ -103,7 +104,7 @@ A statement with a `Condition` block only applies when every entry in the block 
 | ARN | `ArnEquals`, `ArnNotEquals`, `ArnLike`, `ArnNotLike` |
 | Existence | `Null` |
 
-Every operator supports the `...IfExists` suffix (missing key evaluates to `true`) and the `ForAllValues:` / `ForAnyValue:` set-qualifier prefixes.
+Every operator supports the `...IfExists` suffix (missing key evaluates to `true`) and the `ForAllValues:` / `ForAnyValue:` set-qualifier prefixes. As on AWS, `ForAllValues` is also `true` when the request has no value for the key (every one of zero values matches), while `ForAnyValue` then evaluates to `false`.
 
 **Supported global condition keys:**
 
