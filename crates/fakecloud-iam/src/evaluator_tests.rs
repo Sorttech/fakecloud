@@ -2445,3 +2445,41 @@ fn global_keys_fall_back_to_plain_context_entries() {
     }));
     assert_eq!(evaluate(&[policy], &r), Decision::Allow);
 }
+
+/// Tag keys given as plain context entries resolve too, with the tag key part
+/// compared exactly.
+#[test]
+fn tag_keys_fall_back_to_plain_context_entries() {
+    let alice = principal_user("arn:aws:iam::123456789012:user/alice");
+    let policy = doc(json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Action": "s3:PutObject",
+            "Resource": "*",
+            "Condition": {
+                "ForAllValues:StringEquals": {"aws:TagKeys": ["team"]},
+                "StringEquals": {"aws:RequestTag/team": "red"}
+            }
+        }]
+    }));
+    let mut r = req(&alice, "s3:PutObject", "arn:aws:s3:::b/k");
+    r.context
+        .service_keys
+        .insert("aws:tagkeys".to_string(), vec!["team".to_string()]);
+    r.context
+        .service_keys
+        .insert("aws:RequestTag/team".to_string(), vec!["red".to_string()]);
+    assert_eq!(evaluate(&[policy.clone()], &r), Decision::Allow);
+
+    let mut wrong_case = req(&alice, "s3:PutObject", "arn:aws:s3:::b/k");
+    wrong_case
+        .context
+        .service_keys
+        .insert("aws:tagkeys".to_string(), vec!["team".to_string()]);
+    wrong_case
+        .context
+        .service_keys
+        .insert("aws:RequestTag/Team".to_string(), vec!["red".to_string()]);
+    assert_eq!(evaluate(&[policy], &wrong_case), Decision::ImplicitDeny);
+}
