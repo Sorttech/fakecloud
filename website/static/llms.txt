@@ -39,7 +39,7 @@
 - **EventBridge** (57 ops): event buses, rules, targets, archives, replays, connections, API destinations, pattern matching
 - **EventBridge Scheduler** (12 ops): at/rate/cron schedules, SQS targets, DLQ routing, one-shot self-delete
 - **Lambda** (73 ops): function CRUD, real code execution via Docker across 23 runtimes, event source mappings (SQS, Kinesis, DynamoDB Streams), layers, versions, aliases, URL endpoints
-- **DynamoDB** (57 ops): tables, items, transactions, PartiQL, backups, global tables, streams
+- **DynamoDB** (57 ops): tables, items, transactions, PartiQL, backups, global tables, streams; IAM-enforced under `--iam strict` with AWS action/resource mapping (tables, indexes, streams, per-table batch and transaction checks, PartiQL actions, tag conditions)
 - **IAM** (180 ops): users, roles, groups, policies, instance profiles, OIDC/SAML providers, MFA, permission boundaries, session policies, ABAC tag conditions
 - **STS** (11 ops): AssumeRole, AssumeRoleWithWebIdentity, GetSessionToken, GetCallerIdentity, session tags, external IDs, federation
 - **SSM** (152 ops): Parameter Store (hierarchical parameters with KMS), documents, commands, maintenance windows, patch baselines

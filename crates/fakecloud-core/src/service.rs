@@ -747,6 +747,20 @@ pub trait AwsService: Send + Sync {
         None
     }
 
+    /// Every IAM authorization an incoming request needs.
+    ///
+    /// Most operations act on one resource and need one action, which is
+    /// what the default returns ([`AwsService::iam_action_for`]). Some need
+    /// several: a batch or transaction naming several resources needs the
+    /// action on each, and an operation can require more than one action
+    /// (DynamoDB's `CreateTable` with `Tags` also needs `TagResource`).
+    /// Dispatch evaluates every action returned and denies the request if
+    /// any of them is denied. An empty list means the operation has no
+    /// mapping, which strict enforcement denies.
+    fn iam_actions_for(&self, request: &AwsRequest) -> Vec<crate::auth::IamAction> {
+        self.iam_action_for(request).into_iter().collect()
+    }
+
     /// Derive service-specific IAM condition keys for an incoming request.
     ///
     /// Called right after [`AwsService::iam_action_for`] when IAM

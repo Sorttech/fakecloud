@@ -269,7 +269,7 @@ Protocol: REST (HTTP method + path-based routing, XML responses)
 
 ### DynamoDB (57 actions)
 
-Tables, items, transactions (TransactWriteItems, TransactGetItems), PartiQL (ExecuteStatement, BatchExecuteStatement), backups, global tables, streams, secondary indexes. Standard DynamoDB JSON wire format.
+Tables, items, transactions (TransactWriteItems, TransactGetItems), PartiQL (ExecuteStatement, BatchExecuteStatement), backups, global tables, streams, secondary indexes. Standard DynamoDB JSON wire format. Under `--iam strict`/`soft` every DynamoDB and DynamoDB Streams operation is authorized with the actions and resource ARNs AWS uses: table, index, stream, backup, export and import ARNs; the batch action on every table of a batch; per-item actions on each table of a transaction; `dynamodb:PartiQL*` actions for PartiQL; `aws:ResourceTag` / `aws:RequestTag` / `aws:TagKeys` conditions on table tags.
 
 Protocol: JSON (JSON body, `X-Amz-Target` header, JSON responses)
 

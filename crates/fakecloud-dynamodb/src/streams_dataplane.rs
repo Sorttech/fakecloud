@@ -46,6 +46,27 @@ impl AwsService for DynamoDbStreamsService {
         }
     }
 
+    fn iam_enforceable(&self) -> bool {
+        true
+    }
+
+    fn iam_actions_for(&self, request: &AwsRequest) -> Vec<fakecloud_core::auth::IamAction> {
+        crate::service::iam::streams_actions_for(request)
+    }
+
+    fn iam_action_for(&self, request: &AwsRequest) -> Option<fakecloud_core::auth::IamAction> {
+        crate::service::iam::streams_actions_for(request)
+            .into_iter()
+            .next()
+    }
+
+    fn resource_tags_for(
+        &self,
+        resource_arn: &str,
+    ) -> Option<std::collections::HashMap<String, String>> {
+        crate::service::iam::resource_tags(&self.state, resource_arn)
+    }
+
     fn supported_actions(&self) -> &[&str] {
         &[
             "ListStreams",

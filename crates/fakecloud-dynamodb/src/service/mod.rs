@@ -2,6 +2,7 @@ mod batch;
 #[cfg(test)]
 mod expression_corpus_tests;
 mod global_tables;
+pub(crate) mod iam;
 mod items;
 mod queries;
 mod streams;
@@ -535,6 +536,30 @@ impl AwsService for DynamoDbService {
             }
         }
         result
+    }
+
+    fn iam_enforceable(&self) -> bool {
+        true
+    }
+
+    fn iam_actions_for(&self, request: &AwsRequest) -> Vec<fakecloud_core::auth::IamAction> {
+        iam::actions_for(request)
+    }
+
+    fn iam_action_for(&self, request: &AwsRequest) -> Option<fakecloud_core::auth::IamAction> {
+        iam::actions_for(request).into_iter().next()
+    }
+
+    fn resource_tags_for(&self, resource_arn: &str) -> Option<HashMap<String, String>> {
+        iam::resource_tags(&self.state, resource_arn)
+    }
+
+    fn request_tags_from(
+        &self,
+        request: &AwsRequest,
+        action: &str,
+    ) -> Option<HashMap<String, String>> {
+        iam::request_tags(request, action)
     }
 
     fn supported_actions(&self) -> &[&str] {

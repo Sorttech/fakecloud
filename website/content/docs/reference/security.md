@@ -67,6 +67,8 @@ Opt-in enforcement covers the services most commonly subject to real IAM policie
 | **SNS** | All 34 supported actions | Topic / subscription / platform-app / endpoint ARNs |
 | **S3** | All 74 supported actions | `arn:aws:s3:::<bucket>[/<key>]` (object actions include the key; bucket actions don't) |
 | **KMS** | All 47 supported actions | `arn:aws:kms:<region>:<account>:key/<key-id>` (key-targeted actions) or `*` (account-level actions like CreateKey, ListKeys) |
+| **DynamoDB** | All 58 supported operations | `arn:aws:dynamodb:<region>:<account>:table/<name>`, with `/index/<name>` for `Query`, `Scan` and contributor insights on an index, `/backup/...`, `/export/...` and `/import/...` for those operations, `arn:aws:dynamodb::<account>:global-table/<name>` for legacy global tables, and `*` for account-level listings. Batches need the batch action on every table they name; transactions need `GetItem` / `PutItem` / `UpdateItem` / `DeleteItem` / `ConditionCheckItem` on each item's table; PartiQL statements need `PartiQLSelect` / `PartiQLInsert` / `PartiQLUpdate` / `PartiQLDelete`; `CreateTable` with `Tags` or `ResourcePolicy` also needs `TagResource` / `PutResourcePolicy`; restores also need the data-plane actions on the target table |
+| **DynamoDB Streams** | All 4 supported operations (`dynamodb:` prefix) | `arn:aws:dynamodb:<region>:<account>:table/<name>/stream/<label>`, or `*` for `ListStreams` |
 
 Other services are not enforced even with `FAKECLOUD_IAM=strict`. The startup log enumerates which services are enforced vs. skipped so you always know the current surface. If a service you need is missing, [open an issue](https://github.com/faiscadev/fakecloud/issues) — the wiring is straightforward per-service.
 
@@ -201,9 +203,9 @@ Tag-based access control via four condition key families:
 
 | Condition key | Description | Enforced services |
 |---|---|---|
-| `aws:ResourceTag/<key>` | Tags on the target resource | S3, SQS, SNS, IAM, KMS |
-| `aws:RequestTag/<key>` | Tags sent in the request (e.g. on CreateQueue, PutObject) | S3, SQS, SNS, IAM, KMS |
-| `aws:TagKeys` | List of tag keys in the request (for `ForAllValues`/`ForAnyValue`) | S3, SQS, SNS, IAM, KMS |
+| `aws:ResourceTag/<key>` | Tags on the target resource | S3, SQS, SNS, IAM, KMS, DynamoDB (a table's tags, also for its indexes and streams) |
+| `aws:RequestTag/<key>` | Tags sent in the request (e.g. on CreateQueue, PutObject) | S3, SQS, SNS, IAM, KMS, DynamoDB (`CreateTable`, `TagResource`) |
+| `aws:TagKeys` | List of tag keys in the request (for `ForAllValues`/`ForAnyValue`) | S3, SQS, SNS, IAM, KMS, DynamoDB (`CreateTable`, `TagResource`, `UntagResource`) |
 | `aws:PrincipalTag/<key>` | Tags on the calling IAM user or assumed role | All enforced services |
 
 Key semantics:
