@@ -1383,6 +1383,12 @@ pub struct DynamoDbState {
     /// `#[serde(default)]` keeps older snapshots loadable.
     #[serde(default)]
     pub lambda_stream_checkpoints: BTreeMap<String, String>,
+    /// Resource-based policies attached to DynamoDB streams, keyed by stream
+    /// ARN. A stream's policy is its own -- separate from its table's -- and
+    /// belongs to that stream: re-enabling a table's stream mints a new ARN
+    /// with no policy.
+    #[serde(default)]
+    pub stream_policies: BTreeMap<String, String>,
 }
 
 /// On-disk snapshot envelope. The payload is the full [`DynamoDbState`];
@@ -1422,6 +1428,7 @@ impl DynamoDbState {
             exports: BTreeMap::new(),
             imports: BTreeMap::new(),
             lambda_stream_checkpoints: BTreeMap::new(),
+            stream_policies: BTreeMap::new(),
         }
     }
 
@@ -1432,6 +1439,7 @@ impl DynamoDbState {
         self.exports.clear();
         self.imports.clear();
         self.lambda_stream_checkpoints.clear();
+        self.stream_policies.clear();
     }
 
     /// Last stream sequence number delivered for the given DynamoDB

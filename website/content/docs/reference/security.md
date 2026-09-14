@@ -67,6 +67,8 @@ Opt-in enforcement covers the services most commonly subject to real IAM policie
 | **SNS** | All 34 supported actions | Topic / subscription / platform-app / endpoint ARNs |
 | **S3** | All 74 supported actions | `arn:aws:s3:::<bucket>[/<key>]` (object actions include the key; bucket actions don't) |
 | **KMS** | All 47 supported actions | `arn:aws:kms:<region>:<account>:key/<key-id>` (key-targeted actions) or `*` (account-level actions like CreateKey, ListKeys) |
+| **DynamoDB** | All 58 supported operations | `arn:aws:dynamodb:<region>:<account>:table/<name>`, with `/index/<name>` for `Query`, `Scan` and contributor insights on an index, `/backup/...`, `/export/...` and `/import/...` for those operations, `arn:aws:dynamodb::<account>:global-table/<name>` for legacy global tables, and `*` for account-level listings. Batches need the batch action on every table they name; transactions need `GetItem` / `PutItem` / `UpdateItem` / `DeleteItem` / `ConditionCheckItem` on each item's table; PartiQL statements need `PartiQLSelect` / `PartiQLInsert` / `PartiQLUpdate` / `PartiQLDelete`; `CreateTable` with `Tags` or `ResourcePolicy` also needs `TagResource` / `PutResourcePolicy`; restores also need the data-plane actions on the target table |
+| **DynamoDB Streams** | All 4 supported operations (`dynamodb:` prefix) | `arn:aws:dynamodb:<region>:<account>:table/<name>/stream/<label>`, or `*` for `ListStreams` |
 
 Other services are not enforced even with `FAKECLOUD_IAM=strict`. The startup log enumerates which services are enforced vs. skipped so you always know the current surface. If a service you need is missing, [open an issue](https://github.com/faiscadev/fakecloud/issues) — the wiring is straightforward per-service.
 
@@ -133,6 +135,13 @@ Every operator supports the `...IfExists` suffix (missing key evaluates to `true
 | `lambda:FunctionArn` | `lambda:AddPermission` | Target function ARN resolved from the path |
 | `lambda:Principal` | `lambda:AddPermission` | `Principal` field from the JSON body |
 | `sqs:MessageAttribute.<Name>` | `sqs:SendMessage` | Each named `MessageAttribute`'s `StringValue` (Binary / Number attributes fall back to the data type) |
+| `dynamodb:LeadingKeys` / `dynamodb:FirstPartitionKeyValues` | `GetItem`, `PutItem`, `UpdateItem`, `DeleteItem`, `ConditionCheckItem`, `Query`, `BatchGetItem`, `BatchWriteItem`, `PartiQL*` | Partition-key values of the items addressed: the item key, a Query's partition-key equality (the index's partition key for an index query), every key or item a batch or transaction sends to the table, a PartiQL `WHERE` partition-key equality or inserted item |
+| `dynamodb:Attributes` | Item actions, `Query`, `Scan`, batches, `PartiQL*` | Top-level attribute names the request names: key / item attributes, `ProjectionExpression`, `AttributesToGet`, and every attribute an update, condition, filter or key-condition expression (or the legacy parameters) references |
+| `dynamodb:Select` | `GetItem`, `Query`, `Scan`, `BatchGetItem`, `PartiQLSelect` | `Select`, else `SPECIFIC_ATTRIBUTES` with a projection, `ALL_PROJECTED_ATTRIBUTES` for an index query, `ALL_ATTRIBUTES` otherwise |
+| `dynamodb:ReturnValues` | `PutItem`, `UpdateItem`, `DeleteItem` | `ReturnValues`, `NONE` by default |
+| `dynamodb:ReturnConsumedCapacity` | Data-plane actions | `ReturnConsumedCapacity`, `NONE` by default |
+| `dynamodb:EnclosingOperation` | Item actions inside `TransactWriteItems` / `TransactGetItems`; `PartiQL*` inside `ExecuteTransaction` | The enclosing operation's name |
+| `dynamodb:FullTableScan` | `PartiQLSelect` | `true` when the statement has no partition-key equality |
 
 New services plug in by implementing `iam_condition_keys_for` on their `AwsService` impl; the dispatcher merges the result into the shared context before the evaluator runs.
 
@@ -140,7 +149,7 @@ New services plug in by implementing `iam_condition_keys_for` on their `AwsServi
 
 ### Resource-based policies
 
-S3 bucket policies, SNS topic policies, Lambda function policies, and KMS key policies are fully wired into the evaluator. When enforcement is on and a resource has a policy attached, dispatch fetches it and hands it to the evaluator alongside the caller's identity policies; the evaluator combines the two using AWS's cross-account semantics:
+S3 bucket policies, SNS topic policies, Lambda function policies, KMS key policies, and DynamoDB table and stream policies are fully wired into the evaluator. When enforcement is on and a resource has a policy attached, dispatch fetches it and hands it to the evaluator alongside the caller's identity policies; the evaluator combines the two using AWS's cross-account semantics:
 
 - **Explicit Deny** from either the identity policy or the resource policy wins immediately.
 - **Same-account** callers (principal account ID equals the resource's owning account): the request is allowed if the identity policy **or** the resource policy grants it.
@@ -153,6 +162,7 @@ The resource's owning account is parsed from the ARN; S3 ARNs have an empty acco
 - **S3 bucket policies** are stored by `PutBucketPolicy` and updated by `DeleteBucketPolicy`. `GetBucketPolicy` returns the raw JSON.
 - **SNS topic policies** are stored in the topic's `Policy` attribute by `SetTopicAttributes` (full document) or by `AddPermission` / `RemovePermission` (incremental statements). `GetTopicAttributes` returns them.
 - **Lambda function policies** are built incrementally by `AddPermission`: fakecloud composes a canonical `{"Version":"2012-10-17","Statement":[...]}` document from `(StatementId, Action, Principal, SourceArn?, SourceAccount?)` so the existing evaluator reads it without a Lambda-specific fork. `SourceArn` becomes an `ArnLike` `Condition` on `aws:SourceArn`, and `SourceAccount` becomes a `StringEquals` `Condition` on `aws:SourceAccount` — both are already in the operator set. `GetPolicy` returns the composed document; `RemovePermission` strips the matching `Sid` and leaves an empty `Statement` array behind, matching AWS.
+- **DynamoDB table and stream policies** are attached by `PutResourcePolicy` (or `CreateTable`'s `ResourcePolicy`), read by `GetResourcePolicy` and removed by `DeleteResourcePolicy`, honoring `ExpectedRevisionId` (including `NO_POLICY`). A table's policy also governs its indexes; a stream's policy is its own and belongs to that stream ARN.
 - **IAM role trust policies** (`assume_role_policy_document`) are evaluated on every `AssumeRole`, `AssumeRoleWithSAML`, and `AssumeRoleWithWebIdentity` call before STS issues credentials. The trust policy is the *only* authorization source for role assumption — identity policies do not factor in. Caller principal, action (`sts:AssumeRole*`), `Condition` keys (`sts:ExternalId`, `sts:RoleSessionName`, `sts:SourceIdentity`, `aws:MultiFactorAuthPresent`, `aws:SourceAccount`), and federation-specific keys (`saml:aud`, `saml:iss`, `<provider>:aud`, `<provider>:sub`) are all populated. `AssumeRoleWithWebIdentity` additionally requires the JWT's `iss` to match a registered `OpenIDConnectProvider` and `aud` to be in its `client_id_list`; service-linked roles (path `/aws-service-role/<service>/...`) refuse non-service callers regardless of trust-policy contents.
 
 **Principal matching.** Resource policies use `Principal` / `NotPrincipal` keys that identity policies don't. The evaluator supports the shapes resource policies actually use in practice:
@@ -202,9 +212,9 @@ Tag-based access control via four condition key families:
 
 | Condition key | Description | Enforced services |
 |---|---|---|
-| `aws:ResourceTag/<key>` | Tags on the target resource | S3, SQS, SNS, IAM, KMS |
-| `aws:RequestTag/<key>` | Tags sent in the request (e.g. on CreateQueue, PutObject) | S3, SQS, SNS, IAM, KMS |
-| `aws:TagKeys` | List of tag keys in the request (for `ForAllValues`/`ForAnyValue`) | S3, SQS, SNS, IAM, KMS |
+| `aws:ResourceTag/<key>` | Tags on the target resource | S3, SQS, SNS, IAM, KMS, DynamoDB (a table's tags, also for its indexes and streams) |
+| `aws:RequestTag/<key>` | Tags sent in the request (e.g. on CreateQueue, PutObject) | S3, SQS, SNS, IAM, KMS, DynamoDB (`CreateTable`, `TagResource`) |
+| `aws:TagKeys` | List of tag keys in the request (for `ForAllValues`/`ForAnyValue`) | S3, SQS, SNS, IAM, KMS, DynamoDB (`CreateTable`, `TagResource`, `UntagResource`) |
 | `aws:PrincipalTag/<key>` | Tags on the calling IAM user or assumed role | All enforced services |
 
 Key semantics:

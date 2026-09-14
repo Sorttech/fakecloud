@@ -184,6 +184,16 @@ impl DynamoDbService {
             .unwrap_or("STANDARD")
             .to_string();
 
+        // A `ResourcePolicy` given at creation is attached to the table, as
+        // PutResourcePolicy would; it was accepted and dropped.
+        let create_resource_policy = match body["ResourcePolicy"].as_str() {
+            Some(policy) => {
+                validate_resource_policy_document(policy)?;
+                Some(policy.to_string())
+            }
+            None => None,
+        };
+
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
 
@@ -236,7 +246,7 @@ impl DynamoDbService {
             billing_mode: billing_mode.clone(),
             ttl_attribute: None,
             ttl_enabled: false,
-            resource_policy: None,
+            resource_policy: create_resource_policy,
             pitr_enabled: false,
             kinesis_destinations: Vec::new(),
             contributor_insights_status: "DISABLED".to_string(),
@@ -295,6 +305,11 @@ impl DynamoDbService {
                     format!("Requested resource not found: Table: {table_name} not found"),
                 )
             })?;
+        // Its streams' policies go with it.
+        let stream_prefix = format!("{}/stream/", table.arn);
+        state
+            .stream_policies
+            .retain(|arn, _| !arn.starts_with(&stream_prefix));
 
         let table_desc = build_table_description_json(&super::TableDescriptionInput {
             arn: &table.arn,
@@ -779,12 +794,14 @@ impl DynamoDbService {
         let body = Self::parse_body(req)?;
         let resource_arn = require_str(&body, "ResourceArn")?;
         let policy = require_str(&body, "Policy")?;
+        let expected = body["ExpectedRevisionId"].as_str();
+        validate_resource_policy_document(policy)?;
 
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
-        let table = find_table_by_arn_mut(&mut state.tables, resource_arn)?;
-        table.resource_policy = Some(policy.to_string());
-
+        let mut slot = resource_policy_slot(state, resource_arn)?;
+        check_expected_revision(slot.current(), expected)?;
+        slot.set(policy.to_string());
         Self::ok_json(json!({ "RevisionId": policy_revision_id(policy) }))
     }
 
@@ -795,23 +812,16 @@ impl DynamoDbService {
         let body = Self::parse_body(req)?;
         let resource_arn = require_str(&body, "ResourceArn")?;
 
-        let accounts = self.state.read();
-        let empty_ddb = crate::state::DynamoDbState::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty_ddb);
-        let table = find_table_by_arn(&state.tables, resource_arn)?;
-
-        match &table.resource_policy {
+        let mut accounts = self.state.write();
+        let state = accounts.get_or_create(&req.account_id);
+        match resource_policy_slot(state, resource_arn)?.current() {
             Some(policy) => Self::ok_json(json!({
                 "Policy": policy,
                 "RevisionId": policy_revision_id(policy)
             })),
             // DynamoDB is awsJson1.0 — client errors are HTTP 400 with the
             // error type in the body, never 404.
-            None => Err(AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "PolicyNotFoundException",
-                "No resource-based policy is attached to the resource.",
-            )),
+            None => Err(policy_not_found()),
         }
     }
 
@@ -821,13 +831,23 @@ impl DynamoDbService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let body = Self::parse_body(req)?;
         let resource_arn = require_str(&body, "ResourceArn")?;
+        let expected = body["ExpectedRevisionId"].as_str();
 
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
-        let table = find_table_by_arn_mut(&mut state.tables, resource_arn)?;
-        table.resource_policy = None;
-
-        Self::ok_json(json!({}))
+        let mut slot = resource_policy_slot(state, resource_arn)?;
+        if expected.is_some() {
+            // A conditional delete needs a policy at that revision; an
+            // unconditional one is idempotent.
+            match slot.current() {
+                Some(current) if Some(policy_revision_id(current).as_str()) == expected => {}
+                _ => return Err(policy_not_found()),
+            }
+        }
+        match slot.take() {
+            Some(removed) => Self::ok_json(json!({ "RevisionId": policy_revision_id(&removed) })),
+            None => Self::ok_json(json!({})),
+        }
     }
 
     // ── Backups ─────────────────────────────────────────────────────────
@@ -2014,4 +2034,125 @@ fn policy_revision_id(policy: &str) -> String {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     policy.hash(&mut h);
     format!("{:016x}", h.finish())
+}
+
+/// A resource-based policy document DynamoDB can attach: JSON, at most 20 KB
+/// counting whitespace.
+fn validate_resource_policy_document(policy: &str) -> Result<(), AwsServiceError> {
+    const MAX_POLICY_BYTES: usize = 20 * 1024;
+    if policy.len() > MAX_POLICY_BYTES {
+        return Err(AwsServiceError::aws_error(
+            StatusCode::BAD_REQUEST,
+            "ValidationException",
+            format!(
+                "Resource-based policy document size {} bytes exceeds the maximum of {MAX_POLICY_BYTES} bytes",
+                policy.len()
+            ),
+        ));
+    }
+    if serde_json::from_str::<Value>(policy)
+        .map(|v| !v.is_object())
+        .unwrap_or(true)
+    {
+        return Err(AwsServiceError::aws_error(
+            StatusCode::BAD_REQUEST,
+            "ValidationException",
+            "Resource-based policy document is not valid JSON",
+        ));
+    }
+    Ok(())
+}
+
+/// Where the policy for a table or stream ARN is kept: the table's own slot,
+/// or the stream's entry in the account's stream-policy map.
+enum PolicySlot<'a> {
+    Table(&'a mut Option<String>),
+    Stream(&'a mut BTreeMap<String, String>, String),
+}
+
+impl PolicySlot<'_> {
+    fn current(&self) -> Option<&str> {
+        match self {
+            PolicySlot::Table(slot) => slot.as_deref(),
+            PolicySlot::Stream(map, arn) => map.get(arn).map(String::as_str),
+        }
+    }
+
+    fn set(&mut self, policy: String) {
+        match self {
+            PolicySlot::Table(slot) => **slot = Some(policy),
+            PolicySlot::Stream(map, arn) => {
+                map.insert(arn.clone(), policy);
+            }
+        }
+    }
+
+    fn take(&mut self) -> Option<String> {
+        match self {
+            PolicySlot::Table(slot) => slot.take(),
+            PolicySlot::Stream(map, arn) => map.remove(arn.as_str()),
+        }
+    }
+}
+
+/// The policy slot a `ResourceArn` names. A stream ARN has to be its table's
+/// current stream. Any other ARN -- an index, a backup, a table or stream that
+/// does not exist -- is `ResourceNotFoundException`.
+fn resource_policy_slot<'a>(
+    state: &'a mut crate::state::DynamoDbState,
+    resource_arn: &str,
+) -> Result<PolicySlot<'a>, AwsServiceError> {
+    let not_found = || {
+        AwsServiceError::aws_error(
+            StatusCode::BAD_REQUEST,
+            "ResourceNotFoundException",
+            format!("Requested resource not found: {resource_arn}"),
+        )
+    };
+    let (table_part, stream) = match resource_arn.split_once("/stream/") {
+        Some((table_part, _)) => (table_part, true),
+        None => (resource_arn, false),
+    };
+    let (name, stream_arn) = state
+        .tables
+        .iter()
+        .find(|(_, t)| t.arn == table_part)
+        .map(|(name, t)| (name.clone(), t.stream_arn.clone()))
+        .ok_or_else(not_found)?;
+    if !stream {
+        let table = state.tables.get_mut(&name).ok_or_else(not_found)?;
+        return Ok(PolicySlot::Table(&mut table.resource_policy));
+    }
+    if stream_arn.as_deref() != Some(resource_arn) {
+        return Err(not_found());
+    }
+    Ok(PolicySlot::Stream(
+        &mut state.stream_policies,
+        resource_arn.to_string(),
+    ))
+}
+
+fn policy_not_found() -> AwsServiceError {
+    AwsServiceError::aws_error(
+        StatusCode::BAD_REQUEST,
+        "PolicyNotFoundException",
+        "No resource-based policy is attached to the resource.",
+    )
+}
+
+/// `ExpectedRevisionId` guards a policy write: `NO_POLICY` requires that no
+/// policy is attached yet, any other value that the attached policy is at
+/// that revision. A mismatch is `PolicyNotFoundException`, as on AWS.
+fn check_expected_revision(
+    current: Option<&str>,
+    expected: Option<&str>,
+) -> Result<(), AwsServiceError> {
+    match (expected, current) {
+        (None, _) => Ok(()),
+        (Some("NO_POLICY"), None) => Ok(()),
+        (Some(rev), Some(policy)) if rev != "NO_POLICY" && policy_revision_id(policy) == rev => {
+            Ok(())
+        }
+        _ => Err(policy_not_found()),
+    }
 }

@@ -862,7 +862,7 @@ fn resolve_select(body: &Value, is_index_query: bool) -> Result<bool, AwsService
 /// caller's `ProjectionExpression`. AWS retains the table's primary key
 /// plus the index key; INCLUDE adds the listed non-key attributes;
 /// KEYS_ONLY drops everything else; ALL leaves the item alone.
-fn apply_index_projection(
+pub(crate) fn apply_index_projection(
     item: HashMap<String, AttributeValue>,
     projection: &Projection,
     index_key_attrs: &[String],

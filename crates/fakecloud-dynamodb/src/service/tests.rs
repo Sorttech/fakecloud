@@ -6783,3 +6783,355 @@ async fn backups_and_insights_listings_accept_a_table_arn() {
         "{listed}"
     );
 }
+
+fn create_streamed_gsi_table(svc: &DynamoDbService, name: &str) -> Value {
+    let resp = svc
+        .create_table(&make_request(
+            "CreateTable",
+            json!({
+                "TableName": name,
+                "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                "AttributeDefinitions": [
+                    {"AttributeName": "pk", "AttributeType": "S"},
+                    {"AttributeName": "g", "AttributeType": "S"}
+                ],
+                "GlobalSecondaryIndexes": [{
+                    "IndexName": "by-g",
+                    "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "INCLUDE", "NonKeyAttributes": ["shown"]}
+                }],
+                "StreamSpecification": {"StreamEnabled": true, "StreamViewType": "NEW_IMAGE"},
+                "BillingMode": "PAY_PER_REQUEST"
+            }),
+        ))
+        .unwrap();
+    serde_json::from_slice::<Value>(resp.body.expect_bytes()).unwrap()["TableDescription"].clone()
+}
+
+async fn err_code(svc: &DynamoDbService, action: &str, body: Value) -> Option<String> {
+    svc.handle(make_request(action, body))
+        .await
+        .err()
+        .map(|e| e.code().to_string())
+}
+
+const POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::123456789012:root"},"Action":"dynamodb:GetItem","Resource":"*"}]}"#;
+
+/// PutResourcePolicy / DeleteResourcePolicy honor `ExpectedRevisionId`
+/// (`NO_POLICY` meaning "only if none is attached"), a delete reports the
+/// revision it removed and is idempotent without one, and a stream carries a
+/// policy of its own.
+#[tokio::test]
+async fn resource_policy_revisions_and_stream_policies() {
+    let svc = make_service();
+    let desc = create_streamed_gsi_table(&svc, "Orders");
+    let table_arn = desc["TableArn"].as_str().unwrap().to_string();
+    let stream_arn = desc["LatestStreamArn"].as_str().unwrap().to_string();
+
+    let put = call_dynamodb(
+        &svc,
+        "PutResourcePolicy",
+        json!({"ResourceArn": table_arn, "Policy": POLICY, "ExpectedRevisionId": "NO_POLICY"}),
+    )
+    .await;
+    let revision = put["RevisionId"].as_str().unwrap().to_string();
+    // Idempotent: the same document keeps its revision.
+    let again = call_dynamodb(
+        &svc,
+        "PutResourcePolicy",
+        json!({"ResourceArn": table_arn, "Policy": POLICY, "ExpectedRevisionId": revision}),
+    )
+    .await;
+    assert_eq!(again["RevisionId"], put["RevisionId"]);
+    assert_eq!(
+        err_code(
+            &svc,
+            "PutResourcePolicy",
+            json!({"ResourceArn": table_arn, "Policy": POLICY, "ExpectedRevisionId": "NO_POLICY"})
+        )
+        .await
+        .as_deref(),
+        Some("PolicyNotFoundException"),
+        "NO_POLICY with a policy attached"
+    );
+    assert_eq!(
+        err_code(
+            &svc,
+            "DeleteResourcePolicy",
+            json!({"ResourceArn": table_arn, "ExpectedRevisionId": "stale"})
+        )
+        .await
+        .as_deref(),
+        Some("PolicyNotFoundException")
+    );
+
+    // The stream's policy is separate from the table's.
+    let stream_policy = POLICY.replace("GetItem", "DescribeStream");
+    call_dynamodb(
+        &svc,
+        "PutResourcePolicy",
+        json!({"ResourceArn": stream_arn, "Policy": stream_policy}),
+    )
+    .await;
+    let got = call_dynamodb(
+        &svc,
+        "GetResourcePolicy",
+        json!({"ResourceArn": stream_arn}),
+    )
+    .await;
+    assert_eq!(got["Policy"], json!(stream_policy));
+    let got = call_dynamodb(&svc, "GetResourcePolicy", json!({"ResourceArn": table_arn})).await;
+    assert_eq!(got["Policy"], json!(POLICY));
+
+    let deleted = call_dynamodb(
+        &svc,
+        "DeleteResourcePolicy",
+        json!({"ResourceArn": table_arn, "ExpectedRevisionId": revision}),
+    )
+    .await;
+    assert_eq!(deleted["RevisionId"], json!(revision));
+    let deleted = call_dynamodb(
+        &svc,
+        "DeleteResourcePolicy",
+        json!({"ResourceArn": table_arn}),
+    )
+    .await;
+    assert_eq!(deleted, json!({}), "an unconditional delete is idempotent");
+
+    // Only tables and their current streams carry policies.
+    for arn in [
+        format!("{table_arn}/index/by-g"),
+        format!("{table_arn}/stream/2000-01-01T00:00:00.000"),
+    ] {
+        assert_eq!(
+            err_code(
+                &svc,
+                "PutResourcePolicy",
+                json!({"ResourceArn": arn, "Policy": POLICY})
+            )
+            .await
+            .as_deref(),
+            Some("ResourceNotFoundException"),
+            "{arn}"
+        );
+    }
+    // Not JSON, and over 20 KB, are rejected.
+    for policy in [
+        "not json".to_string(),
+        format!("{{\"a\":\"{}\"}}", "x".repeat(21 * 1024)),
+    ] {
+        assert_eq!(
+            err_code(
+                &svc,
+                "PutResourcePolicy",
+                json!({"ResourceArn": table_arn, "Policy": policy})
+            )
+            .await
+            .as_deref(),
+            Some("ValidationException")
+        );
+    }
+
+    // Deleting the table drops its streams' policies.
+    call_dynamodb(&svc, "DeleteTable", json!({"TableName": "Orders"})).await;
+    assert!(svc.state.read().default_ref().stream_policies.is_empty());
+}
+
+/// A policy given to CreateTable is attached to the new table.
+#[tokio::test]
+async fn create_table_attaches_its_resource_policy() {
+    let svc = make_service();
+    svc.create_table(&make_request(
+        "CreateTable",
+        json!({
+            "TableName": "WithPolicy",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "BillingMode": "PAY_PER_REQUEST",
+            "ResourcePolicy": POLICY
+        }),
+    ))
+    .unwrap();
+    let arn = svc.state.read().default_ref().tables["WithPolicy"]
+        .arn
+        .clone();
+    let got = call_dynamodb(&svc, "GetResourcePolicy", json!({"ResourceArn": arn})).await;
+    assert_eq!(got["Policy"], json!(POLICY));
+}
+
+/// `SELECT ... FROM "table"."index"` reads the index: only rows carrying its
+/// key, with only its projected attributes, and the WHERE clause applies. It
+/// used to read the whole base table and skip the WHERE clause.
+#[tokio::test]
+async fn partiql_select_from_an_index_reads_the_index() {
+    let svc = make_service();
+    create_streamed_gsi_table(&svc, "Orders");
+    for item in [
+        json!({"pk": {"S": "a"}, "g": {"S": "x"}, "shown": {"S": "1"}, "hidden": {"S": "h"}}),
+        json!({"pk": {"S": "b"}, "g": {"S": "y"}, "shown": {"S": "2"}}),
+        json!({"pk": {"S": "c"}, "hidden": {"S": "no index key"}}),
+    ] {
+        call_dynamodb(
+            &svc,
+            "PutItem",
+            json!({"TableName": "Orders", "Item": item}),
+        )
+        .await;
+    }
+
+    let all = call_dynamodb(
+        &svc,
+        "ExecuteStatement",
+        json!({"Statement": "SELECT * FROM \"Orders\".\"by-g\""}),
+    )
+    .await;
+    let mut pks: Vec<&str> = all["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["pk"]["S"].as_str().unwrap())
+        .collect();
+    pks.sort();
+    assert_eq!(pks, ["a", "b"], "only rows carrying the index key");
+    for item in all["Items"].as_array().unwrap() {
+        assert!(
+            item.get("hidden").is_none(),
+            "unprojected attribute: {item}"
+        );
+    }
+
+    let filtered = call_dynamodb(
+        &svc,
+        "ExecuteStatement",
+        json!({"Statement": "SELECT * FROM \"Orders\".\"by-g\" WHERE g = 'x'"}),
+    )
+    .await;
+    assert_eq!(
+        filtered["Items"],
+        json!([{"pk": {"S": "a"}, "g": {"S": "x"}, "shown": {"S": "1"}}])
+    );
+
+    let err = svc
+        .handle(make_request(
+            "ExecuteStatement",
+            json!({"Statement": "SELECT * FROM \"Orders\".\"nope\""}),
+        ))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err.code(), "ValidationException");
+}
+
+/// A PartiQL SELECT returns only the columns it names (document paths and
+/// quoted names included); `*` returns the whole item.
+#[tokio::test]
+async fn partiql_select_returns_only_the_named_columns() {
+    let svc = make_service();
+    create_test_table(&svc);
+    call_dynamodb(
+        &svc,
+        "PutItem",
+        json!({"TableName": "test-table", "Item": {
+            "pk": {"S": "a"},
+            "public": {"S": "p"},
+            "secret": {"S": "s"},
+            "a.b": {"S": "dotted"},
+            "addr": {"M": {"city": {"S": "c"}, "zip": {"S": "z"}}}
+        }}),
+    )
+    .await;
+    let got = call_dynamodb(
+        &svc,
+        "ExecuteStatement",
+        json!({"Statement": "SELECT pk, public, \"a.b\", addr.city FROM \"test-table\" WHERE pk = 'a'"}),
+    )
+    .await;
+    assert_eq!(
+        got["Items"],
+        json!([{
+            "pk": {"S": "a"},
+            "public": {"S": "p"},
+            "a.b": {"S": "dotted"},
+            "addr": {"M": {"city": {"S": "c"}}}
+        }])
+    );
+    let all = call_dynamodb(
+        &svc,
+        "ExecuteStatement",
+        json!({"Statement": "SELECT * FROM \"test-table\" WHERE pk = 'a'"}),
+    )
+    .await;
+    assert_eq!(all["Items"][0]["secret"], json!({"S": "s"}));
+}
+
+/// Column projection happens after paging, so the cursor still has each
+/// row's full key: a column list without the key attributes pages through
+/// every row once. An empty or unreadable column list is rejected instead of
+/// returning more than was asked for.
+#[tokio::test]
+async fn partiql_select_columns_page_and_validate() {
+    let svc = make_service();
+    svc.create_table(&make_request(
+        "CreateTable",
+        json!({
+            "TableName": "Scores",
+            "KeySchema": [
+                {"AttributeName": "u", "KeyType": "HASH"},
+                {"AttributeName": "g", "KeyType": "RANGE"}
+            ],
+            "AttributeDefinitions": [
+                {"AttributeName": "u", "AttributeType": "S"},
+                {"AttributeName": "g", "AttributeType": "S"}
+            ],
+            "BillingMode": "PAY_PER_REQUEST"
+        }),
+    ))
+    .unwrap();
+    for g in ["a", "b", "c"] {
+        call_dynamodb(
+            &svc,
+            "PutItem",
+            json!({"TableName": "Scores", "Item": {"u": {"S": "u1"}, "g": {"S": g}, "score": {"N": g.len().to_string()}}}),
+        )
+        .await;
+    }
+    let mut seen = 0;
+    let mut token: Option<String> = None;
+    loop {
+        let mut body = json!({"Statement": "SELECT score FROM \"Scores\"", "Limit": 1});
+        if let Some(t) = &token {
+            body["NextToken"] = json!(t);
+        }
+        let page = call_dynamodb(&svc, "ExecuteStatement", body).await;
+        for item in page["Items"].as_array().unwrap() {
+            assert!(item.get("u").is_none() && item.get("g").is_none(), "{item}");
+            seen += 1;
+        }
+        token = page["NextToken"].as_str().map(str::to_string);
+        if token.is_none() {
+            break;
+        }
+    }
+    assert_eq!(seen, 3, "every row once");
+
+    for statement in [
+        "SELECT FROM \"Scores\"",
+        "SELECT tags[-1] FROM \"Scores\"",
+        "SELECT \"addr ,x FROM \"Scores\"",
+    ] {
+        assert_eq!(
+            err_code(&svc, "ExecuteStatement", json!({"Statement": statement}))
+                .await
+                .as_deref(),
+            Some("ValidationException"),
+            "{statement}"
+        );
+    }
+    // Whitespace around path separators is fine.
+    call_dynamodb(
+        &svc,
+        "ExecuteStatement",
+        json!({"Statement": "SELECT \"u\" . \"x\", score [ 0 ] FROM \"Scores\""}),
+    )
+    .await;
+}

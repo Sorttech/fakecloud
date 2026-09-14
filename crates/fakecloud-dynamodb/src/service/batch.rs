@@ -1162,7 +1162,7 @@ impl DynamoDbService {
             let outcome = execute_partiql_in_state(state, statement, &parameters)?;
             // ExecuteStatement honors Limit + NextToken on a SELECT result set
             // (AWS paginates PartiQL SELECTs); the token is an opaque cursor.
-            let response = apply_execute_statement_pagination(
+            let mut response = apply_execute_statement_pagination(
                 outcome.response.clone(),
                 outcome
                     .table_name
@@ -1170,6 +1170,12 @@ impl DynamoDbService {
                     .and_then(|name| state.tables.get(super::resolve_table_name(name))),
                 limit,
                 next_token.as_deref(),
+            );
+            // Columns are projected after paging: the cursor is the last
+            // row's full primary key.
+            super::helpers::partiql::project_partiql_response(
+                &mut response,
+                outcome.projection.as_ref(),
             );
 
             let kinesis_info = if let (Some(table_name), Some(event_name)) =
@@ -1255,9 +1261,14 @@ impl DynamoDbService {
 
                 match execute_partiql_in_state(state, statement, &parameters) {
                     Ok(outcome) => {
+                        let mut projected = outcome.response.clone();
+                        super::helpers::partiql::project_partiql_response(
+                            &mut projected,
+                            outcome.projection.as_ref(),
+                        );
                         responses.push(batch_partiql_response(
                             statement,
-                            outcome.response.clone(),
+                            projected,
                             outcome
                                 .table_name
                                 .as_ref()
@@ -1478,7 +1489,12 @@ impl DynamoDbService {
 
             match execute_partiql_in_state(state, statement, &parameters) {
                 Ok(outcome) => {
-                    applied_responses.push(outcome.response);
+                    let mut projected = outcome.response;
+                    super::helpers::partiql::project_partiql_response(
+                        &mut projected,
+                        outcome.projection.as_ref(),
+                    );
+                    applied_responses.push(projected);
                     let table_name = match outcome.table_name {
                         Some(n) => n,
                         None => continue,
@@ -3026,15 +3042,18 @@ mod tests {
         .unwrap();
 
         // A non-ASCII, non-key attribute in the WHERE predicate must not panic
-        // the RETURNING scan (it simply matches nothing).
-        svc.execute_statement(&req_for(
-            "ExecuteStatement",
-            json!({
-                "Statement": "UPDATE \"Widgets\" SET \"x\" = ? WHERE \"café\" = ?",
-                "Parameters": [{ "S": "1" }, { "S": "z" }]
-            }),
-        ))
-        .unwrap();
+        // the RETURNING scan. It is not the key, so DynamoDB rejects it.
+        let err = svc
+            .execute_statement(&req_for(
+                "ExecuteStatement",
+                json!({
+                    "Statement": "UPDATE \"Widgets\" SET \"x\" = ? WHERE \"café\" = ?",
+                    "Parameters": [{ "S": "1" }, { "S": "z" }]
+                }),
+            ))
+            .err()
+            .expect("a WHERE without the key is rejected");
+        assert_eq!(err.code(), "ValidationException");
 
         // Read back through a batch single-item SELECT with tight `"pk"=?`
         // spacing (no surrounding spaces) to confirm the key-check tolerates it.
@@ -3070,11 +3089,29 @@ mod tests {
         ))
         .unwrap();
 
-        let updated = svc
+        // Without a WHERE the statement names no item, which DynamoDB rejects;
+        // the RETURNING clause is still stripped rather than parsed as part of
+        // the SET expression, so the error is the key check, not a garbled
+        // update expression.
+        let err = svc
             .execute_statement(&req_for(
                 "ExecuteStatement",
                 json!({
                     "Statement": "UPDATE \"Widgets\" SET \"flag\" = ? RETURNING ALL NEW *",
+                    "Parameters": [{ "S": "on" }]
+                }),
+            ))
+            .err()
+            .expect("an UPDATE without a key WHERE is rejected");
+        assert_eq!(
+            err.to_string(),
+            "ValidationException: Where clause does not contain a mandatory equality on all key attributes"
+        );
+        let updated = svc
+            .execute_statement(&req_for(
+                "ExecuteStatement",
+                json!({
+                    "Statement": "UPDATE \"Widgets\" SET \"flag\" = ? WHERE \"pk\" = 'a' RETURNING ALL NEW *",
                     "Parameters": [{ "S": "on" }]
                 }),
             ))

@@ -17,15 +17,36 @@ pub(crate) fn find_outside_quotes(hay: &str, needle: &str) -> Option<usize> {
     }
     let bytes = hay.as_bytes();
     let nbytes = needle.as_bytes();
+    // A keyword needle (`FROM`, `WHERE`, ...) only matches as a whole word:
+    // `somewhere` or `fromage` is an identifier that happens to contain it.
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let keyword = nbytes.iter().all(|b| b.is_ascii_alphabetic());
     let mut in_quote = false;
+    let mut in_dquote = false;
     let mut i = 0usize;
     while i < bytes.len() {
-        if bytes[i] == b'\'' {
-            in_quote = !in_quote;
-            i += 1;
-            continue;
+        match bytes[i] {
+            b'\'' if !in_dquote => {
+                in_quote = !in_quote;
+                i += 1;
+                continue;
+            }
+            // A double-quoted identifier (`"from"`) is a name, not syntax.
+            b'"' if !in_quote => {
+                in_dquote = !in_dquote;
+                i += 1;
+                continue;
+            }
+            _ => {}
         }
-        if !in_quote && i + nbytes.len() <= bytes.len() && &bytes[i..i + nbytes.len()] == nbytes {
+        if !in_quote
+            && !in_dquote
+            && i + nbytes.len() <= bytes.len()
+            && &bytes[i..i + nbytes.len()] == nbytes
+            && (!keyword
+                || ((i == 0 || !is_word(bytes[i - 1]))
+                    && (i + nbytes.len() == bytes.len() || !is_word(bytes[i + nbytes.len()]))))
+        {
             return Some(i);
         }
         i += 1;
@@ -418,18 +439,77 @@ pub(crate) fn execute_partiql_in_state(
         let after_from = trimmed[from_pos + 4..].trim();
         let (table_name, rest) = parse_partiql_table_name(after_from);
         let table = get_table(&state.tables, &table_name)?;
+        // `FROM "table"."index"` reads the index: only the rows that carry
+        // its key attributes, with only the attributes it projects. Ignoring
+        // the index segment read the whole base table -- and, since the rest
+        // of the statement then did not start with WHERE, skipped the WHERE
+        // clause too.
+        let (index, rest) = match rest.strip_prefix('.') {
+            Some(index_part) => {
+                let (index_name, rest) = parse_partiql_table_name(index_part);
+                let index = table
+                    .gsi
+                    .iter()
+                    .map(|g| (&g.index_name, &g.key_schema, &g.projection))
+                    .chain(
+                        table
+                            .lsi
+                            .iter()
+                            .map(|l| (&l.index_name, &l.key_schema, &l.projection)),
+                    )
+                    .find(|(name, _, _)| **name == index_name)
+                    .ok_or_else(|| {
+                        AwsServiceError::aws_error(
+                            StatusCode::BAD_REQUEST,
+                            "ValidationException",
+                            format!("The table does not have the specified index: {index_name}"),
+                        )
+                    })?;
+                let key_attrs: Vec<String> =
+                    index.1.iter().map(|k| k.attribute_name.clone()).collect();
+                (Some((key_attrs, index.2.clone())), rest)
+            }
+            None => (None, rest),
+        };
         let rest_upper = rest.trim().to_ascii_uppercase();
         let mut rows: Vec<&HashMap<String, AttributeValue>> = if rest_upper.starts_with("WHERE") {
             let where_clause = rest.trim()[5..].trim();
             evaluate_partiql_where(table, where_clause, parameters)?
-        } else {
+        } else if rest.trim().is_empty() {
             table.items.iter().collect()
+        } else {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "ValidationException",
+                format!("Statement wasn't well formed, can't be processed: {trimmed}"),
+            ));
         };
+        if let Some((key_attrs, _)) = &index {
+            rows.retain(|item| key_attrs.iter().all(|k| item.contains_key(k)));
+        }
         // Scan order, which ExecuteStatement's NextToken resumes by key: an
         // order that depends on which rows exist would skip or repeat rows
         // when some are deleted between pages.
         table.sort_in_scan_order(&mut rows);
-        let items: Vec<Value> = rows.iter().map(|item| json!(item)).collect();
+        // The column list: `*`, or the attributes (document paths) to return.
+        // It is validated here and applied by the caller to the rows it
+        // returns.
+        let projection = partiql_projection(trimmed["SELECT".len()..from_pos].trim())?;
+        let items: Vec<Value> = rows
+            .iter()
+            .map(|item| match &index {
+                Some((key_attrs, projection)) => {
+                    json!(crate::service::queries::apply_index_projection(
+                        (*item).clone(),
+                        projection,
+                        key_attrs,
+                        table.hash_key_name(),
+                        table.range_key_name(),
+                    ))
+                }
+                None => json!(item),
+            })
+            .collect();
         Ok(PartiqlOutcome {
             response: json!({ "Items": items }),
             table_name: Some(table_name),
@@ -437,6 +517,7 @@ pub(crate) fn execute_partiql_in_state(
             keys: None,
             old_image: None,
             new_image: None,
+            projection,
         })
     } else if upper.starts_with("INSERT") {
         let into_pos = find_outside_quotes(&upper, "INTO").ok_or_else(|| {
@@ -479,6 +560,7 @@ pub(crate) fn execute_partiql_in_state(
             keys: Some(key),
             old_image: None,
             new_image: Some(item),
+            projection: None,
         })
     } else if upper.starts_with("UPDATE") {
         let after_update = trimmed[6..].trim();
@@ -511,16 +593,16 @@ pub(crate) fn execute_partiql_in_state(
         // before WHERE, so SET consumes parameters[0..set_count] and WHERE the
         // rest. Evaluate WHERE against the parameters that follow the SET ones.
         let set_param_count = count_params_in_str(set_clause);
-        let matched_indices = if !where_clause.is_empty() {
-            let where_params: &[Value] = if set_param_count <= parameters.len() {
-                &parameters[set_param_count..]
-            } else {
-                &[]
-            };
-            find_partiql_where_indices(table, where_clause, where_params)?
+        let where_params: &[Value] = if set_param_count <= parameters.len() {
+            &parameters[set_param_count..]
         } else {
-            table.items.iter_with_ids().map(|(id, _)| id).collect()
+            &[]
         };
+        require_partiql_key_equality(
+            table,
+            partiql_where_conditions(where_clause, where_params).as_ref(),
+        )?;
+        let matched_indices = find_partiql_where_indices(table, where_clause, where_params)?;
         let mut last_key: Option<HashMap<String, AttributeValue>> = None;
         let mut last_old: Option<HashMap<String, AttributeValue>> = None;
         let mut last_new: Option<HashMap<String, AttributeValue>> = None;
@@ -553,6 +635,7 @@ pub(crate) fn execute_partiql_in_state(
             keys: last_key,
             old_image: last_old,
             new_image: last_new,
+            projection: None,
         })
     } else if upper.starts_with("DELETE") {
         let from_pos = find_outside_quotes(&upper, "FROM").ok_or_else(|| {
@@ -574,6 +657,10 @@ pub(crate) fn execute_partiql_in_state(
         }
         let where_clause = rest.trim()[5..].trim();
         let table = get_table_mut(&mut state.tables, &table_name)?;
+        require_partiql_key_equality(
+            table,
+            partiql_where_conditions(where_clause, parameters).as_ref(),
+        )?;
         let mut indices = find_partiql_where_indices(table, where_clause, parameters)?;
         // Ids are stable across removals, so any order is safe; newest first
         // keeps the reported row the first match in storage order.
@@ -592,6 +679,7 @@ pub(crate) fn execute_partiql_in_state(
             keys: last_key,
             old_image: last_old,
             new_image: None,
+            projection: None,
         })
     } else {
         Err(AwsServiceError::aws_error(
@@ -602,7 +690,152 @@ pub(crate) fn execute_partiql_in_state(
     }
 }
 
-fn split_partiql_returning_clause(where_clause: &str) -> (&str, bool) {
+fn malformed_statement() -> AwsServiceError {
+    AwsServiceError::aws_error(
+        StatusCode::BAD_REQUEST,
+        "ValidationException",
+        "Statement wasn't well formed, can't be processed: Invalid column list",
+    )
+}
+
+/// The document paths of a SELECT column list, each a list of segments: an
+/// attribute name (bare or double-quoted) or a list index. `None` for `*`.
+/// A list the parser cannot read exactly is a ValidationException -- never a
+/// shorter path, which would return more than was asked for.
+pub(crate) fn partiql_column_paths(
+    columns: &str,
+) -> Result<Option<Vec<Vec<PathSegment>>>, AwsServiceError> {
+    let columns = columns.trim();
+    if columns == "*" {
+        return Ok(None);
+    }
+    if columns.is_empty() {
+        return Err(malformed_statement());
+    }
+    let mut paths = Vec::new();
+    for column in split_on_top_level_keyword(columns, ",") {
+        let chars: Vec<char> = column.trim().chars().collect();
+        let mut i = 0;
+        let mut path = Vec::new();
+        let skip_ws = |i: &mut usize| {
+            while *i < chars.len() && chars[*i].is_whitespace() {
+                *i += 1;
+            }
+        };
+        loop {
+            skip_ws(&mut i);
+            // A name.
+            let name: String = if chars.get(i) == Some(&'"') {
+                let start = i + 1;
+                let end = (start..chars.len())
+                    .find(|&j| chars[j] == '"')
+                    .ok_or_else(malformed_statement)?;
+                i = end + 1;
+                chars[start..end].iter().collect()
+            } else {
+                let start = i;
+                while i < chars.len()
+                    && !matches!(chars[i], '.' | '[' | ']' | '"')
+                    && !chars[i].is_whitespace()
+                {
+                    i += 1;
+                }
+                chars[start..i].iter().collect()
+            };
+            if name.is_empty() {
+                return Err(malformed_statement());
+            }
+            path.push(PathSegment::Name(name));
+            // Any list indexes.
+            loop {
+                skip_ws(&mut i);
+                if chars.get(i) != Some(&'[') {
+                    break;
+                }
+                i += 1;
+                skip_ws(&mut i);
+                let start = i;
+                while i < chars.len() && chars[i].is_ascii_digit() {
+                    i += 1;
+                }
+                let index: usize = chars[start..i]
+                    .iter()
+                    .collect::<String>()
+                    .parse()
+                    .map_err(|_| malformed_statement())?;
+                skip_ws(&mut i);
+                if chars.get(i) != Some(&']') {
+                    return Err(malformed_statement());
+                }
+                i += 1;
+                path.push(PathSegment::Index(index));
+            }
+            skip_ws(&mut i);
+            match chars.get(i) {
+                None => break,
+                Some('.') => i += 1,
+                Some(_) => return Err(malformed_statement()),
+            }
+        }
+        paths.push(path);
+    }
+    Ok(Some(paths))
+}
+
+/// One step of a document path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PathSegment {
+    Name(String),
+    Index(usize),
+}
+
+/// A SELECT column list as a ProjectionExpression request fragment, or `None`
+/// for `*`. Every name goes through an expression attribute name, so a quoted
+/// name containing a dot stays one attribute.
+fn partiql_projection(columns: &str) -> Result<Option<Value>, AwsServiceError> {
+    let Some(paths) = partiql_column_paths(columns)? else {
+        return Ok(None);
+    };
+    let mut names = serde_json::Map::new();
+    let mut rendered = Vec::new();
+    for path in paths {
+        let mut out = String::new();
+        for segment in path {
+            match segment {
+                PathSegment::Name(name) => {
+                    if !out.is_empty() {
+                        out.push('.');
+                    }
+                    let placeholder = format!("#c{}", names.len());
+                    names.insert(placeholder.clone(), json!(name));
+                    out.push_str(&placeholder);
+                }
+                PathSegment::Index(index) => out.push_str(&format!("[{index}]")),
+            }
+        }
+        rendered.push(out);
+    }
+    Ok(Some(json!({
+        "ProjectionExpression": rendered.join(", "),
+        "ExpressionAttributeNames": names,
+    })))
+}
+
+/// Apply a SELECT's column list to the `Items` of a response.
+pub(crate) fn project_partiql_response(response: &mut Value, projection: Option<&Value>) {
+    let Some(body) = projection else {
+        return;
+    };
+    if let Some(items) = response.get_mut("Items").and_then(Value::as_array_mut) {
+        for item in items.iter_mut() {
+            let row: HashMap<String, AttributeValue> =
+                serde_json::from_value(item.take()).unwrap_or_default();
+            *item = json!(crate::service::helpers::project_item(&row, body));
+        }
+    }
+}
+
+pub(crate) fn split_partiql_returning_clause(where_clause: &str) -> (&str, bool) {
     // `to_ascii_uppercase` preserves byte length and never touches non-ASCII
     // bytes, so char boundaries stay aligned between `upper` and `where_clause`.
     // Iterate real char boundaries (not raw byte indices) so a non-ASCII byte
@@ -625,7 +858,7 @@ fn split_partiql_returning_clause(where_clause: &str) -> (&str, bool) {
     (where_clause, false)
 }
 
-fn prepare_partiql_update_expression(
+pub(crate) fn prepare_partiql_update_expression(
     set_clause: &str,
     parameters: &[Value],
 ) -> (String, HashMap<String, Value>) {
@@ -970,6 +1203,126 @@ fn match_where_keyword_at_start(upper: &[u8], i: usize) -> Option<(WhereTok<'sta
 /// Parse a WHERE clause into [`PartiqlExpr`]. Returns `None` when the
 /// clause has no logical operators OR fails to parse — callers fall
 /// back to the legacy AND-only evaluator in that case.
+/// A WHERE clause's conditions the way the executor reads them: the parsed
+/// expression tree, or -- for a clause that only the legacy AND-list parser
+/// understands -- that list folded into one AND. `None` when neither parser
+/// accepts the clause (the executor then rejects the statement).
+pub(crate) fn partiql_where_conditions(
+    where_clause: &str,
+    parameters: &[Value],
+) -> Option<PartiqlExpr> {
+    if let Some(expr) = parse_partiql_where_expr(where_clause, parameters) {
+        return Some(expr);
+    }
+    let conditions = split_partiql_and_clauses(where_clause);
+    let parsed = parse_partiql_conditions(&conditions, parameters);
+    if parsed.is_empty() || parsed.len() != conditions.len() {
+        return None;
+    }
+    parsed
+        .into_iter()
+        .map(PartiqlExpr::Cond)
+        .reduce(|l, r| PartiqlExpr::And(Box::new(l), Box::new(r)))
+}
+
+fn partiql_cond_attribute(cond: &PartiqlCond) -> &str {
+    use PartiqlCond::*;
+    match cond {
+        Eq(a, _)
+        | Ne(a, _)
+        | Lt(a, _)
+        | Le(a, _)
+        | Gt(a, _)
+        | Ge(a, _)
+        | Between(a, _, _)
+        | In(a, _)
+        | Like(a, _)
+        | BeginsWith(a, _)
+        | Contains(a, _)
+        | AttributeExists(a)
+        // The executor reads the condition's attribute as one top-level name
+        // (`a.b` is an attribute literally named `a.b`), so that is the name.
+        | AttributeNotExists(a) => a.trim().trim_matches('"'),
+    }
+}
+
+/// Every top-level attribute a WHERE expression reads.
+pub(crate) fn partiql_expr_attributes(expr: &PartiqlExpr, out: &mut Vec<String>) {
+    match expr {
+        PartiqlExpr::Cond(c) => out.push(partiql_cond_attribute(c).to_string()),
+        PartiqlExpr::And(l, r) | PartiqlExpr::Or(l, r) => {
+            partiql_expr_attributes(l, out);
+            partiql_expr_attributes(r, out);
+        }
+        PartiqlExpr::Not(e) => partiql_expr_attributes(e, out),
+    }
+}
+
+/// The values a WHERE expression confines `attr` to, if it confines it at
+/// all: every row it selects has `attr` equal to one of them. `None` means
+/// rows with any value of `attr` can match.
+pub(crate) fn partiql_pinned_values(expr: &PartiqlExpr, attr: &str) -> Option<Vec<Value>> {
+    match expr {
+        PartiqlExpr::Cond(PartiqlCond::Eq(a, v)) if a.trim().trim_matches('"') == attr => {
+            Some(vec![v.clone()])
+        }
+        PartiqlExpr::Cond(PartiqlCond::In(a, vs)) if a.trim().trim_matches('"') == attr => {
+            Some(vs.clone())
+        }
+        PartiqlExpr::Cond(_) | PartiqlExpr::Not(_) => None,
+        PartiqlExpr::And(l, r) => match (
+            partiql_pinned_values(l, attr),
+            partiql_pinned_values(r, attr),
+        ) {
+            (Some(a), Some(b)) => Some(
+                a.into_iter()
+                    .filter(|v| b.iter().any(|w| values_equal(Some(v), Some(w))))
+                    .collect(),
+            ),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        },
+        PartiqlExpr::Or(l, r) => {
+            let mut a = partiql_pinned_values(l, attr)?;
+            a.extend(partiql_pinned_values(r, attr)?);
+            Some(a)
+        }
+    }
+}
+
+/// The single value an AND-joined WHERE expression equates `attr` to.
+fn partiql_equality_on(expr: &PartiqlExpr, attr: &str) -> bool {
+    match expr {
+        PartiqlExpr::Cond(PartiqlCond::Eq(a, _)) => a.trim().trim_matches('"') == attr,
+        PartiqlExpr::And(l, r) => partiql_equality_on(l, attr) || partiql_equality_on(r, attr),
+        _ => false,
+    }
+}
+
+/// PartiQL UPDATE and DELETE act on exactly one item, so their WHERE clause
+/// must equate every primary-key attribute to a value; DynamoDB rejects any
+/// other clause. Without this a clause on a non-key attribute rewrote or
+/// removed every matching row across partitions.
+pub(crate) fn require_partiql_key_equality(
+    table: &DynamoTable,
+    conditions: Option<&PartiqlExpr>,
+) -> Result<(), AwsServiceError> {
+    let keyed = conditions.is_some_and(|expr| {
+        std::iter::once(table.hash_key_name())
+            .chain(table.range_key_name())
+            .all(|key| partiql_equality_on(expr, key))
+    });
+    if keyed {
+        Ok(())
+    } else {
+        Err(AwsServiceError::aws_error(
+            StatusCode::BAD_REQUEST,
+            "ValidationException",
+            "Where clause does not contain a mandatory equality on all key attributes",
+        ))
+    }
+}
+
 pub(crate) fn parse_partiql_where_expr(
     where_clause: &str,
     parameters: &[Value],
@@ -1273,9 +1626,12 @@ fn parse_one_partiql_condition(
     if let Some(i) = find_outside_quotes(&upper, " IN ") {
         let attr = cond[..i].trim().trim_matches('"').to_string();
         let after = cond[i + 4..].trim();
+        // DynamoDB's PartiQL writes the list in brackets (`IN ['a', 'b']`);
+        // parentheses are accepted too.
         let inner = after
-            .strip_prefix('(')
-            .and_then(|s| s.strip_suffix(')'))?
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .or_else(|| after.strip_prefix('(').and_then(|s| s.strip_suffix(')')))?
             .trim();
         let mut vals = Vec::new();
         for raw in inner.split(',') {
@@ -1662,6 +2018,11 @@ mod quote_aware_tests {
         // The literal WHERE is skipped; the real (last) one is found.
         let s = "note = 'go WHERE you' WHERE id = 1";
         assert_eq!(find_outside_quotes(s, "WHERE"), s.rfind("WHERE"));
+        // Keywords match whole words only, and never inside a quoted name.
+        let s = "SET SOMEWHERE = 1 WHERE PK = 'A'";
+        assert_eq!(find_outside_quotes(s, "WHERE"), Some(18));
+        let s = "SELECT \"FROM\" FROM T";
+        assert_eq!(find_outside_quotes(s, "FROM"), Some(14));
     }
 
     #[test]
