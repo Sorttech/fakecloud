@@ -3255,6 +3255,7 @@ This is a surface listing, not an implementation manifest. For fakecloud's per-s
 - `AddAssociation`
 - `AddTags`
 - `AssociateTrialComponent`
+- `AttachClusterNodeNetworkInterface`
 - `AttachClusterNodeVolume`
 - `BatchAddClusterNodes`
 - `BatchDeleteClusterNodes`

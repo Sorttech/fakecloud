@@ -68,6 +68,9 @@ pub(super) fn dispatch(
         }
         "ListTrialComponents" => Ok(list_trial_components(svc, ctx, meta, body)),
         "ListClusterNodes" => Ok(Some(list_cluster_nodes(svc, ctx, meta, body))),
+        "AttachClusterNodeNetworkInterface" => Ok(Some(attach_cluster_node_network_interface(
+            svc, ctx, meta, body,
+        )?)),
         "ListPipelineExecutionSteps" => Ok(list_pipeline_execution_steps(svc, ctx, meta, body)),
         "ListPipelineExecutions" => Ok(list_pipeline_executions(svc, ctx, meta, body)),
         "SendPipelineExecutionStepSuccess" => Ok(Some(send_pipeline_execution_step(
@@ -775,6 +778,141 @@ fn list_cluster_nodes(
         engine::list_entries_response(ctx, meta, body, filtered),
         false,
     )
+}
+
+/// Internal node-record member holding the node's ENI attachments as
+/// `{NetworkInterfaceId, AttachmentId}` objects. Not a `ClusterNodeDetails` /
+/// `ClusterNodeSummary` field, so every output projection drops it.
+const NETWORK_INTERFACE_ATTACHMENTS: &str = "__NetworkInterfaceAttachments";
+
+/// `AttachClusterNodeNetworkInterface` — attach an ENI to a node of a HyperPod
+/// cluster. The node (matched by logical id or instance id, scoped to the
+/// cluster by name or ARN) must exist, else `ResourceNotFound`. The attachment
+/// is persisted on the node record: re-attaching the same ENI to the same node
+/// returns the existing `AttachmentId`, and an ENI already attached to a
+/// different node is rejected with `ConflictException`.
+fn attach_cluster_node_network_interface(
+    svc: &SageMakerService,
+    ctx: &Ctx,
+    meta: &OpMeta,
+    body: &Map<String, Value>,
+) -> Result<(AwsResponse, bool), AwsServiceError> {
+    let cluster = str_member(body, "ClusterName");
+    let node_id = str_member(body, "NodeId");
+    let eni = str_member(body, "NetworkInterfaceId");
+
+    let mut g = svc.state.write();
+    let data = g.get_or_create(&ctx.account);
+
+    // Nodes carry the `ClusterName` they were added under, which may be the
+    // cluster's name or its ARN; accept either spelling of a known cluster.
+    let cluster_record = data
+        .resolve_key("Cluster", &cluster)
+        .and_then(|k| data.get_resource("Cluster", &k).cloned());
+    let mut cluster_aliases = vec![cluster.clone()];
+    if let Some(obj) = cluster_record.as_ref().and_then(Value::as_object) {
+        for member in ["ClusterName", "ClusterArn"] {
+            if let Some(v) = obj.get(member).and_then(Value::as_str) {
+                cluster_aliases.push(v.to_string());
+            }
+        }
+    }
+    let cluster_arn = cluster_record
+        .as_ref()
+        .and_then(|r| r.get("ClusterArn"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if cluster.starts_with("arn:") {
+                cluster.clone()
+            } else {
+                super::mint_arn(ctx, "cluster", &cluster)
+            }
+        });
+
+    let attachments_of = |rec: &Value| -> Vec<Value> {
+        rec.get(NETWORK_INTERFACE_ATTACHMENTS)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let entries = data.list_resource_entries(CLUSTER_NODE_FAMILY);
+    let Some(node_key) = entries
+        .iter()
+        .find(|(_k, rec)| {
+            cluster_aliases.iter().any(|c| node_in_cluster(rec, c)) && {
+                let (nlid, iid) = node_identifiers(rec);
+                Some(node_id.as_str()) == nlid || Some(node_id.as_str()) == iid
+            }
+        })
+        .map(|(k, _)| k.clone())
+    else {
+        return Err(super::not_found(format!(
+            "Node '{node_id}' does not exist in cluster '{cluster}'."
+        )));
+    };
+
+    let mut existing_attachment = None;
+    for (key, rec) in &entries {
+        let hit = attachments_of(rec)
+            .into_iter()
+            .find(|a| a.get("NetworkInterfaceId").and_then(Value::as_str) == Some(eni.as_str()));
+        if let Some(a) = hit {
+            if *key != node_key {
+                return Err(AwsServiceError::aws_error(
+                    http::StatusCode::CONFLICT,
+                    "ConflictException",
+                    format!("Network interface '{eni}' is already attached to another node."),
+                ));
+            }
+            existing_attachment = a
+                .get("AttachmentId")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
+    }
+
+    let mutated = existing_attachment.is_none();
+    let attachment_id = match existing_attachment {
+        Some(id) => id,
+        None => {
+            let seq = data.next_seq();
+            let seed = super::mint_id(
+                &ctx.account,
+                "ClusterNodeNetworkInterface",
+                &seq.to_string(),
+            )
+            .replace('-', "");
+            let attachment_id = format!("eni-attach-{}", &seed[..17]);
+            if let Some(obj) = data
+                .get_resource_mut(CLUSTER_NODE_FAMILY, &node_key)
+                .and_then(Value::as_object_mut)
+            {
+                let mut attachments = obj
+                    .get(NETWORK_INTERFACE_ATTACHMENTS)
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                attachments.push(serde_json::json!({
+                    "NetworkInterfaceId": eni,
+                    "AttachmentId": attachment_id,
+                }));
+                obj.insert(
+                    NETWORK_INTERFACE_ATTACHMENTS.to_string(),
+                    Value::Array(attachments),
+                );
+            }
+            attachment_id
+        }
+    };
+    drop(g);
+
+    let mut out = Map::new();
+    out.insert("ClusterArn".to_string(), Value::String(cluster_arn));
+    out.insert("NodeId".to_string(), Value::String(node_id));
+    out.insert("NetworkInterfaceId".to_string(), Value::String(eni));
+    out.insert("AttachmentId".to_string(), Value::String(attachment_id));
+    Ok((engine::action(ctx, meta, &out), mutated))
 }
 
 // ── Trial ⇄ trial-component association ───────────────────────────────────

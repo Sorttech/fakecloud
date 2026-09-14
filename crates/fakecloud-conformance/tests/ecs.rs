@@ -1992,7 +1992,7 @@ fn primary_eg_container() -> aws_sdk_ecs::types::ExpressGatewayContainer {
         .unwrap()
 }
 
-#[test_action("ecs", "CreateExpressGatewayService", checksum = "7b4cdec8")]
+#[test_action("ecs", "CreateExpressGatewayService", checksum = "a61aa54e")]
 #[tokio::test]
 async fn ecs_create_express_gateway_service() {
     let server = TestServer::start().await;
@@ -2010,7 +2010,7 @@ async fn ecs_create_express_gateway_service() {
     assert!(resp.service().is_some());
 }
 
-#[test_action("ecs", "DescribeExpressGatewayService", checksum = "9aa55c32")]
+#[test_action("ecs", "DescribeExpressGatewayService", checksum = "aa739a71")]
 #[tokio::test]
 async fn ecs_describe_express_gateway_service() {
     let server = TestServer::start().await;
@@ -2040,7 +2040,7 @@ async fn ecs_describe_express_gateway_service() {
     assert!(resp.service().is_some());
 }
 
-#[test_action("ecs", "UpdateExpressGatewayService", checksum = "a141e8d8")]
+#[test_action("ecs", "UpdateExpressGatewayService", checksum = "03be7c30")]
 #[tokio::test]
 async fn ecs_update_express_gateway_service() {
     let server = TestServer::start().await;
@@ -2071,7 +2071,7 @@ async fn ecs_update_express_gateway_service() {
     assert!(resp.service().is_some());
 }
 
-#[test_action("ecs", "DeleteExpressGatewayService", checksum = "04d162c4")]
+#[test_action("ecs", "DeleteExpressGatewayService", checksum = "b1113f96")]
 #[tokio::test]
 async fn ecs_delete_express_gateway_service() {
     let server = TestServer::start().await;

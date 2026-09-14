@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Regenerate crates/fakecloud-sagemaker/src/generated.rs from aws-models/sagemaker.json.
 
-Amazon SageMaker is an awsJson1.1 service with ~403 operations; hand-maintaining
+Amazon SageMaker is an awsJson1.1 service with ~404 operations; hand-maintaining
 the operation table, per-operation input constraints, output member shapes, list
 element shapes, resource families and identifier members would be error-prone, so
 they are generated directly from the Smithy model. Unlike the restJson1 IoT crate,

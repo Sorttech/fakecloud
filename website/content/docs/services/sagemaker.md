@@ -1,12 +1,12 @@
 +++
 title = "Amazon SageMaker"
-description = "Amazon SageMaker (sagemaker) on fakecloud: the full 403-operation ML control plane — models, endpoints, endpoint configs, training/processing/transform/AutoML/tuning jobs, notebook instances, pipelines, feature groups, domains, model packages — at 100% conformance. awsJson1.1."
+description = "Amazon SageMaker (sagemaker) on fakecloud: the full 404-operation ML control plane — models, endpoints, endpoint configs, training/processing/transform/AutoML/tuning jobs, notebook instances, pipelines, feature groups, domains, model packages — at 100% conformance. awsJson1.1."
 weight = 80
 +++
 
 fakecloud implements the **Amazon SageMaker control plane** (`sagemaker`, SDK id
 `SageMaker`, endpoint prefix `api.sagemaker`) as an **awsJson1.1** service. All
-**403 operations** ship with **100% conformance** against AWS's own Smithy
+**404 operations** ship with **100% conformance** against AWS's own Smithy
 model, backed by account-partitioned state that persists across restarts in
 persistent mode. SageMaker signs SigV4 with the `sagemaker` scope; every request
 is a `POST /` whose operation is selected by the `X-Amz-Target: SageMaker.<Op>`
@@ -63,6 +63,13 @@ round-trips on read / list / update:
   schedules**, **notebook instances** (+ lifecycle configs), **code
   repositories**, **workteams**, **workforces**, and the rest of the ~130
   families.
+- **HyperPod cluster nodes** — `BatchAddClusterNodes` persists nodes that
+  `ListClusterNodes` reflects; `BatchReplaceClusterNodes` /
+  `BatchDeleteClusterNodes` mutate them. `AttachClusterNodeNetworkInterface`
+  records an `eni-attach-*` attachment on an existing node (re-attaching the
+  same ENI to the same node returns the same attachment; an ENI already on
+  another node is a `ConflictException`; an unknown node is
+  `ResourceNotFound`).
 - **Tags** — ARN-keyed `AddTags` / `ListTags` / `DeleteTags`.
 
 Input validation is model-derived: `required` members, string `@length`,

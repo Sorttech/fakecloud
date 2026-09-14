@@ -417,6 +417,93 @@ async fn sagemaker_batch_cluster_nodes_round_trip() {
     assert_eq!(listed.cluster_node_summaries().len(), 1);
 }
 
+// AttachClusterNodeNetworkInterface attaches an ENI to a node added by
+// BatchAddClusterNodes. aws-sdk-sagemaker predates the operation, so it is
+// driven over the raw awsJson1.1 wire.
+#[tokio::test]
+async fn sagemaker_attach_cluster_node_network_interface() {
+    use aws_sdk_sagemaker::types::AddClusterNodeSpecification;
+
+    let server = TestServer::start().await;
+    let client = sagemaker_client(&server).await;
+
+    client
+        .batch_add_cluster_nodes()
+        .cluster_name("hp-eni")
+        .nodes_to_add(
+            AddClusterNodeSpecification::builder()
+                .instance_group_name("workers")
+                .increment_target_count_by(1)
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .expect("batch_add_cluster_nodes");
+    let listed = client
+        .list_cluster_nodes()
+        .cluster_name("hp-eni")
+        .send()
+        .await
+        .expect("list_cluster_nodes");
+    let instance_id = listed.cluster_node_summaries()[0]
+        .instance_id()
+        .expect("instance_id")
+        .to_string();
+
+    let http = reqwest::Client::new();
+    let attach = |node: String, eni: &'static str| {
+        let req = http
+            .post(server.endpoint())
+            .header("content-type", "application/x-amz-json-1.1")
+            .header(
+                "x-amz-target",
+                "SageMaker.AttachClusterNodeNetworkInterface",
+            )
+            .header(
+                "authorization",
+                "AWS4-HMAC-SHA256 Credential=test/20260101/us-east-1/sagemaker/aws4_request, \
+                 SignedHeaders=host, Signature=0",
+            )
+            .body(
+                serde_json::json!({
+                    "ClusterName": "hp-eni",
+                    "NodeId": node,
+                    "NetworkInterfaceId": eni,
+                })
+                .to_string(),
+            );
+        async move {
+            let resp = req.send().await.expect("request sent");
+            let status = resp.status();
+            let body: serde_json::Value = resp.json().await.expect("json body");
+            (status, body)
+        }
+    };
+
+    let (status, body) = attach(instance_id.clone(), "eni-0123456789abcdef0").await;
+    assert_eq!(status, 200, "attach failed: {body}");
+    assert_eq!(body["NodeId"], instance_id.as_str());
+    assert_eq!(body["NetworkInterfaceId"], "eni-0123456789abcdef0");
+    assert!(body["ClusterArn"].as_str().unwrap().contains(":cluster/"));
+    let attachment_id = body["AttachmentId"].as_str().unwrap().to_string();
+    assert!(attachment_id.starts_with("eni-attach-"), "{attachment_id}");
+
+    // Re-attaching the same ENI to the same node returns the same attachment.
+    let (status, again) = attach(instance_id, "eni-0123456789abcdef0").await;
+    assert_eq!(status, 200, "re-attach failed: {again}");
+    assert_eq!(again["AttachmentId"], attachment_id.as_str());
+
+    // An unknown node is ResourceNotFound.
+    let (status, missing) =
+        attach("i-0ffffffffffffffff".to_string(), "eni-0aaaaaaaaaaaaaaaa").await;
+    assert_eq!(status, 404, "{missing}");
+    assert!(
+        missing.to_string().contains("ResourceNotFound"),
+        "{missing}"
+    );
+}
+
 // AssociateTrialComponent makes a component visible under a scoped
 // ListTrialComponents(TrialName=…); DisassociateTrialComponent removes it.
 #[tokio::test]
