@@ -71,6 +71,11 @@ sdk-clients = [
 ]
 
 [dependencies]
+# For the bounded container-CLI helpers in `fakecloud_core::container_net`.
+# The harness sweeps leftover containers on drop and must not hang the test
+# run doing it; sharing core's helpers keeps that bound in one place instead
+# of a copy that drifts (and re-grows the leaks core has already fixed).
+fakecloud-core = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 tempfile = { workspace = true }

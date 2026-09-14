@@ -7002,6 +7002,7 @@ dependencies = [
  "aws-sdk-timestreamwrite",
  "aws-sdk-wafv2",
  "aws-types",
+ "fakecloud-core",
  "libc",
  "reqwest",
  "serde_json",

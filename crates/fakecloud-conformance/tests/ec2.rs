@@ -13040,7 +13040,9 @@ fn xml_value(body: &str, tag: &str) -> String {
     body[start..end].to_string()
 }
 
-/// An IPAM, an internet-registry association on it, and one registration.
+/// An IPAM and a freshly created internet-registry association on it. The
+/// association is still `pending-enable`, so it cannot publish registrations
+/// yet.
 async fn make_ir_association(c: &aws_sdk_ec2::Client, q: &Ec2Query) -> String {
     let ipam = make_ipam(c).await;
     let body = q
@@ -13054,6 +13056,30 @@ async fn make_ir_association(c: &aws_sdk_ec2::Client, q: &Ec2Query) -> String {
         )
         .await;
     xml_value(&body, "ipamInternetRegistryAssociationId")
+}
+
+/// Enable an association against the registry's RPKI service, which is what
+/// lets it publish Route Origin Authorizations.
+async fn enable_ir_association(q: &Ec2Query, id: &str) {
+    q.call(
+        "EnableIpamInternetRegistryAssociation",
+        &[
+            ("IpamInternetRegistryAssociationId", id),
+            ("RpkiVersion", "1"),
+            ("ServiceUri", "https://rpki.example/up-down"),
+            ("ChildHandle", "child"),
+            ("ParentHandle", "parent"),
+            ("ParentBpkiTa", "TA=="),
+        ],
+    )
+    .await;
+}
+
+/// An enabled association, ready to publish routing policy registrations.
+async fn make_enabled_ir_association(c: &aws_sdk_ec2::Client, q: &Ec2Query) -> String {
+    let id = make_ir_association(c, q).await;
+    enable_ir_association(q, &id).await;
+    id
 }
 
 #[test_action("ec2", "CreateIpamInternetRegistryAssociation", checksum = "a4a63a5d")]
@@ -13099,6 +13125,34 @@ async fn ec2_ipam_internet_registry_association_lifecycle() {
     // entity-escaped.
     assert!(body.contains("child_handle=&quot;child&quot;"), "{body}");
 
+    // The registrations have to be removed before the association goes:
+    // deleting one that still publishes ROAs would orphan them.
+    q.call(
+        "CreateIpamRoutingPolicyRegistration",
+        &[
+            ("IpamInternetRegistryAssociationId", &id),
+            ("Cidr", "192.0.2.0/24"),
+            ("Asn.1", "64512"),
+        ],
+    )
+    .await;
+    let (status, body) = q
+        .send(
+            "DeleteIpamInternetRegistryAssociation",
+            &[("IpamInternetRegistryAssociationId", &id)],
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("DependencyViolation"), "{body}");
+    q.call(
+        "DeleteIpamRoutingPolicyRegistration",
+        &[
+            ("IpamInternetRegistryAssociationId", &id),
+            ("Cidr", "192.0.2.0/24"),
+        ],
+    )
+    .await;
+
     let body = q
         .call(
             "DeleteIpamInternetRegistryAssociation",
@@ -13122,7 +13176,24 @@ async fn ec2_ipam_routing_policy_registration_lifecycle() {
     let s = TestServer::start().await;
     let c = s.ec2_client().await;
     let q = Ec2Query::new(&s);
-    let id = make_ir_association(&c, &q).await;
+    let pending = make_ir_association(&c, &q).await;
+
+    // A registration publishes through the association's RPKI service, so an
+    // association that was never enabled cannot carry one.
+    let (status, _) = q
+        .send(
+            "CreateIpamRoutingPolicyRegistration",
+            &[
+                ("IpamInternetRegistryAssociationId", &pending),
+                ("Cidr", "10.0.0.0/16"),
+                ("Asn.1", "64512"),
+            ],
+        )
+        .await;
+    assert_eq!(status, 400);
+
+    let id = pending;
+    enable_ir_association(&q, &id).await;
 
     let body = q
         .call(
@@ -13183,6 +13254,19 @@ async fn ec2_ipam_routing_policy_registration_lifecycle() {
         .await;
     assert!(body.contains("<item>64513</item>"), "{body}");
     assert!(body.contains("<state>update-complete</state>"), "{body}");
+    // Modify requires only `Asns`, so the members it leaves out survive it
+    // rather than being cleared out from under the published ROA.
+    assert!(
+        body.contains("<maxLength>24</maxLength>"),
+        "a modify that omits MaxLength must not clear it: {body}"
+    );
+    let roas = q
+        .call(
+            "GetIpamRouteOriginAuthorizations",
+            &[("IpamInternetRegistryAssociationId", &id)],
+        )
+        .await;
+    assert!(roas.contains("<maxLength>24</maxLength>"), "{roas}");
 
     // Deltas are the audit trail, and survive the registration they describe.
     let body = q
@@ -13214,12 +13298,19 @@ async fn ec2_ipam_routing_policy_registration_lifecycle() {
             ],
         )
         .await;
+    // Both deltas have to be present before their order means anything:
+    // `None < Some(_)`, so comparing the finds directly would pass vacuously
+    // on a delta that went missing.
+    let at = |body: &str, delta: &str| {
+        body.find(delta)
+            .unwrap_or_else(|| panic!("delta {delta} missing from {body}"))
+    };
     assert!(
-        forward.find(&first_delta) < forward.find(&second_delta),
+        at(&forward, &first_delta) < at(&forward, &second_delta),
         "forward is oldest first"
     );
     assert!(
-        reverse.find(&second_delta) < reverse.find(&first_delta),
+        at(&reverse, &second_delta) < at(&reverse, &first_delta),
         "reverse is newest first"
     );
 
@@ -13237,6 +13328,160 @@ async fn ec2_ipam_routing_policy_registration_lifecycle() {
         one.contains(&first_delta) && !one.contains(&second_delta),
         "{one}"
     );
+
+    // Modify is a partial update, so clearing a member needs a spelling of its
+    // own: an empty value is it, and the members the request does not name are
+    // still left alone.
+    q.call(
+        "ModifyIpamRoutingPolicyRegistration",
+        &[
+            ("IpamInternetRegistryAssociationId", &id),
+            ("Cidr", "10.0.0.0/16"),
+            ("Asn.1", "64513"),
+            ("Description", "prod prefix"),
+        ],
+    )
+    .await;
+    let body = q
+        .call(
+            "GetIpamRoutingPolicyRegistrations",
+            &[("IpamInternetRegistryAssociationId", &id)],
+        )
+        .await;
+    assert!(
+        body.contains("<description>prod prefix</description>"),
+        "{body}"
+    );
+    q.call(
+        "ModifyIpamRoutingPolicyRegistration",
+        &[
+            ("IpamInternetRegistryAssociationId", &id),
+            ("Cidr", "10.0.0.0/16"),
+            ("Asn.1", "64513"),
+            ("Description", ""),
+        ],
+    )
+    .await;
+    let body = q
+        .call(
+            "GetIpamRoutingPolicyRegistrations",
+            &[("IpamInternetRegistryAssociationId", &id)],
+        )
+        .await;
+    assert!(
+        !body.contains("<description>"),
+        "an empty Description clears it: {body}"
+    );
+    assert!(
+        body.contains("<maxLength>24</maxLength>"),
+        "and the members the request does not name survive: {body}"
+    );
+
+    // `reverse` pages by delta id. Deltas are appended, so an offset cursor
+    // shifts under a caller who pages: a delta recorded between two pages
+    // would push items the first page already reported into the second.
+    for cidr in ["192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24"] {
+        q.call(
+            "CreateIpamRoutingPolicyRegistration",
+            &[
+                ("IpamInternetRegistryAssociationId", &id),
+                ("Cidr", cidr),
+                ("Asn.1", "64512"),
+            ],
+        )
+        .await;
+    }
+    let first_page = q
+        .call(
+            "GetIpamRoutingPolicyRegistrationDeltas",
+            &[
+                ("IpamInternetRegistryAssociationId", &id),
+                ("ChronologicalOrder", "reverse"),
+                ("MaxResults", "5"),
+            ],
+        )
+        .await;
+    let seen: Vec<String> = first_page
+        .split("<deltaId>")
+        .skip(1)
+        .map(|s| s.split("</deltaId>").next().unwrap().to_string())
+        .collect();
+    assert_eq!(seen.len(), 5, "{first_page}");
+    let token = xml_value(&first_page, "nextToken");
+    // Two more deltas land between the two pages.
+    for cidr in ["172.16.0.0/16", "172.17.0.0/16"] {
+        q.call(
+            "CreateIpamRoutingPolicyRegistration",
+            &[
+                ("IpamInternetRegistryAssociationId", &id),
+                ("Cidr", cidr),
+                ("Asn.1", "64512"),
+            ],
+        )
+        .await;
+    }
+    let second_page = q
+        .call(
+            "GetIpamRoutingPolicyRegistrationDeltas",
+            &[
+                ("IpamInternetRegistryAssociationId", &id),
+                ("ChronologicalOrder", "reverse"),
+                ("MaxResults", "5"),
+                ("NextToken", &token),
+            ],
+        )
+        .await;
+    for delta in &seen {
+        assert!(
+            !second_page.contains(delta),
+            "the second page repeated {delta}: {second_page}"
+        );
+    }
+
+    // `MaxResults` that is not a number is rejected, rather than taken as "no
+    // limit" and answered with the whole set.
+    let (status, _) = q
+        .send(
+            "GetIpamRoutingPolicyRegistrationDeltas",
+            &[
+                ("IpamInternetRegistryAssociationId", &id),
+                ("MaxResults", "abc"),
+            ],
+        )
+        .await;
+    assert_eq!(status, 400);
+
+    // A client token reused with different parameters is not a retry: EC2
+    // answers it with IdempotentParameterMismatch rather than reporting a
+    // removal of a CIDR that is still registered.
+    q.call(
+        "DeleteIpamRoutingPolicyRegistration",
+        &[
+            ("IpamInternetRegistryAssociationId", &id),
+            ("Cidr", "192.0.2.0/24"),
+            ("ClientToken", "token-reused"),
+        ],
+    )
+    .await;
+    let (status, body) = q
+        .send(
+            "DeleteIpamRoutingPolicyRegistration",
+            &[
+                ("IpamInternetRegistryAssociationId", &id),
+                ("Cidr", "198.51.100.0/24"),
+                ("ClientToken", "token-reused"),
+            ],
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("IdempotentParameterMismatch"), "{body}");
+    let body = q
+        .call(
+            "GetIpamRoutingPolicyRegistrations",
+            &[("IpamInternetRegistryAssociationId", &id)],
+        )
+        .await;
+    assert!(body.contains("198.51.100.0/24"), "{body}");
 
     q.call(
         "DeleteIpamRoutingPolicyRegistration",
@@ -13265,7 +13510,7 @@ async fn ec2_batch_modify_ipam_routing_policy_registrations() {
     let s = TestServer::start().await;
     let c = s.ec2_client().await;
     let q = Ec2Query::new(&s);
-    let id = make_ir_association(&c, &q).await;
+    let id = make_enabled_ir_association(&c, &q).await;
 
     let delta = r#"{"add":[{"cidr":"192.0.2.0/24","asns":["64512"],"maxLength":25},
                             {"cidr":"198.51.100.0/24","asns":["64513"]}]}"#;
@@ -13309,6 +13554,100 @@ async fn ec2_batch_modify_ipam_routing_policy_registrations() {
     assert!(!body.contains("192.0.2.0/24"), "{body}");
     assert!(body.contains("198.51.100.0/24"), "{body}");
 
+    // A document is checked against the state it would itself leave, so it can
+    // remove a CIDR it adds: it is self-consistent, even though the CIDR is
+    // not registered when the document arrives.
+    q.call(
+        "BatchModifyIpamRoutingPolicyRegistrations",
+        &[
+            ("IpamInternetRegistryAssociationId", &id),
+            (
+                "DeltaJson",
+                r#"{"add":[{"cidr":"203.0.113.0/24","asns":["64512"]}],
+                    "remove":["203.0.113.0/24"]}"#,
+            ),
+        ],
+    )
+    .await;
+    let body = q
+        .call(
+            "GetIpamRoutingPolicyRegistrations",
+            &[("IpamInternetRegistryAssociationId", &id)],
+        )
+        .await;
+    assert!(!body.contains("203.0.113.0/24"), "{body}");
+
+    // An `add` for a CIDR the association already holds is a partial update,
+    // so `null` is what clears a member: a member the entry leaves out keeps
+    // the value the registration already carries.
+    q.call(
+        "BatchModifyIpamRoutingPolicyRegistrations",
+        &[
+            ("IpamInternetRegistryAssociationId", &id),
+            (
+                "DeltaJson",
+                r#"{"add":[{"cidr":"198.51.100.0/24","asns":["64513"],
+                            "maxLength":26,"description":"edge prefix"}]}"#,
+            ),
+        ],
+    )
+    .await;
+    let body = q
+        .call(
+            "GetIpamRoutingPolicyRegistrations",
+            &[
+                ("IpamInternetRegistryAssociationId", &id),
+                ("Cidr", "198.51.100.0/24"),
+            ],
+        )
+        .await;
+    assert!(
+        body.contains("<description>edge prefix</description>"),
+        "{body}"
+    );
+
+    q.call(
+        "BatchModifyIpamRoutingPolicyRegistrations",
+        &[
+            ("IpamInternetRegistryAssociationId", &id),
+            (
+                "DeltaJson",
+                r#"{"add":[{"cidr":"198.51.100.0/24","asns":["64513"],"description":null}]}"#,
+            ),
+        ],
+    )
+    .await;
+    let body = q
+        .call(
+            "GetIpamRoutingPolicyRegistrations",
+            &[
+                ("IpamInternetRegistryAssociationId", &id),
+                ("Cidr", "198.51.100.0/24"),
+            ],
+        )
+        .await;
+    assert!(
+        !body.contains("<description>"),
+        "a null description clears it: {body}"
+    );
+    assert!(
+        body.contains("<maxLength>26</maxLength>"),
+        "and an omitted member survives: {body}"
+    );
+
+    // Removing a CIDR the document neither holds nor adds is still a
+    // not-found: it removes nothing and must not be published as a delta.
+    let (status, _) = q
+        .send(
+            "BatchModifyIpamRoutingPolicyRegistrations",
+            &[
+                ("IpamInternetRegistryAssociationId", &id),
+                ("DeltaJson", r#"{"remove":["192.0.2.0/24"]}"#),
+            ],
+        )
+        .await;
+    assert_eq!(status, 400);
+
     // Malformed JSON is rejected rather than recorded as a delta.
     let (status, _) = q
         .send(
@@ -13334,7 +13673,7 @@ async fn ec2_ipam_registry_views_derive_from_registrations() {
     let s = TestServer::start().await;
     let c = s.ec2_client().await;
     let q = Ec2Query::new(&s);
-    let id = make_ir_association(&c, &q).await;
+    let id = make_enabled_ir_association(&c, &q).await;
 
     q.call(
         "CreateIpamRoutingPolicyRegistration",
@@ -13405,6 +13744,7 @@ async fn ec2_ipam_route_discovery_and_protection_findings() {
         )
         .await;
     let id = xml_value(&body, "ipamInternetRegistryAssociationId");
+    enable_ir_association(&q, &id).await;
     q.call(
         "CreateIpamRoutingPolicyRegistration",
         &[
