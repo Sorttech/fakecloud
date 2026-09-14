@@ -9,21 +9,26 @@
 //! - JSON.stringify the return value;
 //! - capture `console.log/error` output as execution log lines.
 //!
-//! Limits are enforced in two layers:
+//! Limits are enforced in three layers:
 //!
 //! 1. boa's loop iteration + recursion caps trip on hot loops so the
 //!    interpreter eventually returns control even under adversarial
 //!    user JS.
-//! 2. A wall-clock timeout: the actual execution runs on a dedicated
-//!    OS thread; the calling thread waits on a `mpsc::sync_channel` via
-//!    `recv_timeout`. If the JS doesn't finish in time we abandon the
-//!    worker thread (best-effort — boa's iteration limit will eventually
-//!    let it die) and return a timeout error.
+//! 2. A compute budget: real CloudFront Functions are bounded by the CPU
+//!    a request consumes (~1ms, and 2MB of memory), not by elapsed time.
+//!    The execution runs on a dedicated OS thread that measures its own
+//!    CPU time, and a run that used more than [`EXECUTION_TIMEOUT`] of it
+//!    fails with the time-limit error. Measuring CPU rather than wall
+//!    time means a host that descheduled the thread -- a loaded CI runner
+//!    -- does not fail a handler that did almost no work.
+//! 3. A wall-clock safety net: the calling thread waits on a
+//!    `mpsc::sync_channel` via `recv_timeout` for [`WALL_CLOCK_LIMIT`]. If
+//!    the JS still hasn't finished we abandon the worker thread
+//!    (best-effort -- boa's iteration limit will eventually let it die)
+//!    and return the same time-limit error.
 //!
-//! Real CloudFront Functions are bounded at ~1ms of CPU per request and
-//! 2MB of memory. We mirror that with a 250ms wall-clock budget —
-//! looser than AWS to absorb cold-start jitter on shared CI runners,
-//! still tight enough that `while(1){}` is killed in tests.
+//! The 250ms budget is looser than AWS's so ordinary handlers never trip
+//! it in a debug build, while `while(1){}` is still stopped in tests.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -34,12 +39,17 @@ use boa_engine::object::ObjectInitializer;
 use boa_engine::property::Attribute;
 use boa_engine::{js_string, Context, JsValue, NativeFunction, Source};
 
-/// Hard wall-clock cap on a single TestFunction / TestConnectionFunction
-/// invocation. AWS bounds production traffic at ~1ms of CPU; we set
-/// 250ms so CI runners with noisy neighbours don't false-alarm on
-/// well-formed handlers, while `while(1){}` is still killed well
-/// inside any reasonable test timeout.
+/// Compute budget for a single TestFunction / TestConnectionFunction
+/// invocation, measured as CPU time on the executing thread. AWS bounds
+/// production traffic at ~1ms of CPU; 250ms leaves ordinary handlers far
+/// below it even unoptimized, while a CPU-bound handler still exceeds it.
 pub(crate) const EXECUTION_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// How long the caller waits for the worker thread before abandoning it.
+/// A safety net for a run that never returns; the compute budget above is
+/// the limit a handler is actually held to, so this is generous enough
+/// that a descheduled thread on a loaded host still reports back.
+const WALL_CLOCK_LIMIT: Duration = Duration::from_secs(10);
 
 /// boa loop iteration cap. Tight enough that `while(1){}` exits the VM
 /// well within the wall-clock budget on any reasonable host, loose
@@ -69,8 +79,18 @@ pub(crate) struct JsExecution {
 }
 
 /// Run `handler(event)` defined in `code` against `event_json` on a
-/// dedicated worker thread, enforcing `EXECUTION_TIMEOUT`.
+/// dedicated worker thread, holding it to the `EXECUTION_TIMEOUT` compute
+/// budget.
 pub(crate) fn run_handler(code: &str, event_json: &[u8]) -> JsExecution {
+    run_handler_with_limits(code, event_json, EXECUTION_TIMEOUT, WALL_CLOCK_LIMIT)
+}
+
+fn run_handler_with_limits(
+    code: &str,
+    event_json: &[u8],
+    compute_budget: Duration,
+    wall_limit: Duration,
+) -> JsExecution {
     let code = code.to_owned();
     let event = event_json.to_vec();
     let (tx, rx) = mpsc::sync_channel::<JsExecution>(1);
@@ -79,20 +99,23 @@ pub(crate) fn run_handler(code: &str, event_json: &[u8]) -> JsExecution {
     // `Rc`s and is `!Send`. We can't pre-spawn a worker pool without
     // marshalling the script + event via channels anyway, so a fresh
     // thread per call is the simpler shape.
-    let started = Instant::now();
     let _ = std::thread::Builder::new()
         .name("cloudfront-js".to_string())
         // Boa's bytecode VM is recursive so we want a generous stack.
         .stack_size(8 * 1024 * 1024)
         .spawn(move || {
-            let result = run_handler_blocking(&code, &event, started);
+            let clock = ComputeClock::start();
+            let mut result = run_handler_blocking(&code, &event, &clock);
+            if clock.elapsed() > compute_budget {
+                result = time_limit_exceeded(result.logs);
+            }
             // If the receiver has timed out and gone away the send
             // simply errors; we don't care — the worker is being
             // abandoned.
             let _ = tx.send(result);
         });
 
-    match rx.recv_timeout(EXECUTION_TIMEOUT) {
+    match rx.recv_timeout(wall_limit) {
         Ok(mut exec) => {
             // Floor compute_utilization at 1% on success so callers
             // don't mistake a successful run for an unrun one.
@@ -101,18 +124,7 @@ pub(crate) fn run_handler(code: &str, event_json: &[u8]) -> JsExecution {
             }
             exec
         }
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            let msg = format!(
-                "function execution exceeded the {}ms time limit",
-                EXECUTION_TIMEOUT.as_millis()
-            );
-            JsExecution {
-                output: None,
-                error: Some(msg.clone()),
-                logs: vec![format!("ERROR: {msg}")],
-                compute_utilization: 101,
-            }
-        }
+        Err(mpsc::RecvTimeoutError::Timeout) => time_limit_exceeded(Vec::new()),
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             // The worker thread either failed to spawn (`spawn()` errored
             // and the sender was dropped) or panicked partway through.
@@ -129,7 +141,65 @@ pub(crate) fn run_handler(code: &str, event_json: &[u8]) -> JsExecution {
     }
 }
 
-fn run_handler_blocking(code: &str, event_json: &[u8], started: Instant) -> JsExecution {
+/// The error a run over its compute budget (or past the wall-clock safety
+/// net) reports, keeping whatever it logged before the limit.
+fn time_limit_exceeded(mut logs: Vec<String>) -> JsExecution {
+    let msg = format!(
+        "function execution exceeded the {}ms time limit",
+        EXECUTION_TIMEOUT.as_millis()
+    );
+    logs.push(format!("ERROR: {msg}"));
+    JsExecution {
+        output: None,
+        error: Some(msg),
+        logs,
+        compute_utilization: 101,
+    }
+}
+
+/// Measures the compute a run consumed: CPU time on the current thread
+/// where the platform reports it, elapsed time otherwise.
+struct ComputeClock {
+    cpu_start: Option<Duration>,
+    wall_start: Instant,
+}
+
+impl ComputeClock {
+    fn start() -> Self {
+        Self {
+            cpu_start: thread_cpu_time(),
+            wall_start: Instant::now(),
+        }
+    }
+
+    fn elapsed(&self) -> Duration {
+        match (self.cpu_start, thread_cpu_time()) {
+            (Some(start), Some(now)) => now.saturating_sub(start),
+            _ => self.wall_start.elapsed(),
+        }
+    }
+}
+
+/// CPU time consumed so far by the calling thread.
+#[cfg(unix)]
+fn thread_cpu_time() -> Option<Duration> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid, writable timespec; CLOCK_THREAD_CPUTIME_ID
+    // is supported on Linux and macOS, and a failure is reported by the
+    // return code rather than by leaving `ts` partially written.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    (rc == 0).then(|| Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32))
+}
+
+#[cfg(not(unix))]
+fn thread_cpu_time() -> Option<Duration> {
+    None
+}
+
+fn run_handler_blocking(code: &str, event_json: &[u8], clock: &ComputeClock) -> JsExecution {
     let logs: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
     let mut ctx = Context::default();
     ctx.runtime_limits_mut()
@@ -138,17 +208,17 @@ fn run_handler_blocking(code: &str, event_json: &[u8], started: Instant) -> JsEx
         .set_recursion_limit(RECURSION_LIMIT);
 
     if let Err(err) = install_console(&mut ctx, &logs) {
-        return error_execution(format!("failed to install console: {err}"), &logs, started);
+        return error_execution(format!("failed to install console: {err}"), &logs, clock);
     }
 
     if let Err(err) = ctx.eval(Source::from_bytes(code.as_bytes())) {
-        return error_execution(format!("{}", err), &logs, started);
+        return error_execution(format!("{}", err), &logs, clock);
     }
 
     let event_str = match std::str::from_utf8(event_json) {
         Ok(s) => s,
         Err(_) => {
-            return error_execution("EventObject is not valid UTF-8".to_string(), &logs, started);
+            return error_execution("EventObject is not valid UTF-8".to_string(), &logs, clock);
         }
     };
     // Wrap in parens so a top-level `{ ... }` object literal parses as
@@ -157,7 +227,7 @@ fn run_handler_blocking(code: &str, event_json: &[u8], started: Instant) -> JsEx
     let event = match ctx.eval(Source::from_bytes(event_src.as_bytes())) {
         Ok(v) => v,
         Err(err) => {
-            return error_execution(format!("invalid EventObject JSON: {err}"), &logs, started);
+            return error_execution(format!("invalid EventObject JSON: {err}"), &logs, clock);
         }
     };
 
@@ -167,22 +237,18 @@ fn run_handler_blocking(code: &str, event_json: &[u8], started: Instant) -> JsEx
             return error_execution(
                 format!("function handler is not defined: {err}"),
                 &logs,
-                started,
+                clock,
             );
         }
     };
     let Some(handler_fn) = handler.as_callable() else {
-        return error_execution(
-            "function handler is not callable".to_string(),
-            &logs,
-            started,
-        );
+        return error_execution("function handler is not callable".to_string(), &logs, clock);
     };
 
     let returned = match handler_fn.call(&JsValue::undefined(), &[event], &mut ctx) {
         Ok(v) => v,
         Err(err) => {
-            return error_execution(format!("{}", err), &logs, started);
+            return error_execution(format!("{}", err), &logs, clock);
         }
     };
 
@@ -192,7 +258,7 @@ fn run_handler_blocking(code: &str, event_json: &[u8], started: Instant) -> JsEx
             return error_execution(
                 format!("failed to JSON.stringify result: {err}"),
                 &logs,
-                started,
+                clock,
             );
         }
     };
@@ -201,7 +267,7 @@ fn run_handler_blocking(code: &str, event_json: &[u8], started: Instant) -> JsEx
         return error_execution(
             format!("function output exceeded {MAX_OUTPUT_BYTES} bytes"),
             &logs,
-            started,
+            clock,
         );
     }
 
@@ -210,16 +276,20 @@ fn run_handler_blocking(code: &str, event_json: &[u8], started: Instant) -> JsEx
         output: Some(stringified),
         error: None,
         logs: captured,
-        compute_utilization: utilization_pct(started.elapsed()),
+        compute_utilization: utilization_pct(clock.elapsed()),
     }
 }
 
-fn error_execution(msg: String, logs: &Rc<RefCell<Vec<String>>>, started: Instant) -> JsExecution {
+fn error_execution(
+    msg: String,
+    logs: &Rc<RefCell<Vec<String>>>,
+    clock: &ComputeClock,
+) -> JsExecution {
     let mut captured = logs.borrow().clone();
     captured.push(format!("ERROR: {msg}"));
     // Saturate past 100 on any failure so the metric alone signals the
     // run did not complete cleanly, regardless of how fast it failed.
-    let elapsed_pct = utilization_pct(started.elapsed());
+    let elapsed_pct = utilization_pct(clock.elapsed());
     let pct = elapsed_pct.max(101);
     JsExecution {
         output: None,
@@ -378,6 +448,68 @@ mod tests {
     fn errors_when_event_is_invalid_json() {
         let exec = run_handler(r#"function handler(e) { return e; }"#, b"not-json");
         assert!(exec.error.is_some());
+    }
+
+    #[test]
+    fn a_run_over_its_compute_budget_reports_the_time_limit() {
+        let exec = run_handler_with_limits(
+            r#"function handler(e) { console.log("ran"); return e; }"#,
+            b"{}",
+            Duration::ZERO,
+            WALL_CLOCK_LIMIT,
+        );
+        assert!(exec.output.is_none(), "got output {:?}", exec.output);
+        let err = exec.error.expect("error");
+        assert!(err.contains("250ms time limit"), "got {err}");
+        assert!(exec.compute_utilization > 100);
+        assert!(
+            exec.logs.first().is_some_and(|l| l == "ran"),
+            "logs before the limit are kept: {:?}",
+            exec.logs
+        );
+    }
+
+    #[test]
+    fn a_worker_that_does_not_report_back_hits_the_wall_clock_safety_net() {
+        let exec = run_handler_with_limits(
+            r#"function handler(e) { return e; }"#,
+            b"{}",
+            EXECUTION_TIMEOUT,
+            Duration::ZERO,
+        );
+        let err = exec.error.expect("error");
+        assert!(err.contains("time limit"), "got {err}");
+        assert!(exec.compute_utilization > 100);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_descheduled_thread_accrues_no_compute() {
+        // The budget is CPU time: a thread that is not running -- here
+        // sleeping, on a loaded host descheduled -- does not use it up.
+        let clock = ComputeClock::start();
+        std::thread::sleep(EXECUTION_TIMEOUT + Duration::from_millis(100));
+        assert!(
+            clock.elapsed() < EXECUTION_TIMEOUT,
+            "sleeping consumed {:?} of compute",
+            clock.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn busy_work_accrues_compute() {
+        let clock = ComputeClock::start();
+        let wall = Instant::now();
+        let mut x: u64 = 0;
+        while wall.elapsed() < Duration::from_millis(50) {
+            x = std::hint::black_box(x.wrapping_add(1));
+        }
+        assert!(
+            clock.elapsed() >= Duration::from_millis(20),
+            "50ms of busy work measured {:?}",
+            clock.elapsed()
+        );
     }
 
     #[test]

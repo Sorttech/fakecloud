@@ -4958,6 +4958,7 @@ dependencies = [
  "http-body-util",
  "hyper 1.9.0",
  "hyper-util",
+ "libc",
  "parking_lot",
  "quick-xml",
  "reqwest",
