@@ -6,10 +6,9 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::persistence::{prune_expired, LogsStore, SnapshotLogsStore};
+use crate::persistence::{prune_expired, SegmentedLogsStore};
 use fakecloud_core::delivery::DeliveryBus;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
-use fakecloud_persistence::SnapshotStore;
 
 use crate::state::SharedLogsState;
 
@@ -90,7 +89,7 @@ fn is_read_only_action(action: &str) -> bool {
 pub struct LogsService {
     state: SharedLogsState,
     delivery_bus: Arc<DeliveryBus>,
-    snapshot_store: Option<Arc<dyn LogsStore>>,
+    snapshot_store: Option<Arc<SegmentedLogsStore>>,
     snapshot_lock: Arc<AsyncMutex<()>>,
 }
 
@@ -104,12 +103,7 @@ impl LogsService {
         }
     }
 
-    pub fn with_snapshot_store(mut self, store: Arc<dyn SnapshotStore>) -> Self {
-        self.snapshot_store = Some(Arc::new(SnapshotLogsStore(store)));
-        self
-    }
-
-    pub fn with_logs_store(mut self, store: Arc<dyn LogsStore>) -> Self {
+    pub fn with_snapshot_store(mut self, store: Arc<SegmentedLogsStore>) -> Self {
         self.snapshot_store = Some(store);
         self
     }
@@ -123,15 +117,20 @@ impl LogsService {
         self
     }
 
-    /// Persist under the shared save lock, with serialization and file I/O
-    /// offloaded to the blocking pool without cloning event history.
-    async fn save_snapshot(&self) -> std::io::Result<()> {
-        save_logs_state(
+    /// Persist under the shared save lock. A failed save is logged rather than
+    /// failing the request: the mutation is already visible in memory, so an
+    /// error response would make SDK retries duplicate it. The next successful
+    /// save commits it.
+    async fn save_snapshot(&self) {
+        if let Err(error) = save_logs_state(
             &self.state,
             self.snapshot_store.clone(),
             &self.snapshot_lock,
         )
         .await
+        {
+            tracing::error!(%error, "failed to persist Logs state");
+        }
     }
 
     /// Build a hook that persists the current Logs state when invoked, or `None`
@@ -155,37 +154,23 @@ impl LogsService {
     }
 }
 
-/// Compatibility entry point for embedders using an opaque snapshot store.
-/// Offloads serialization and file I/O to the blocking pool. Without a store,
-/// only in-memory retention is applied.
-pub async fn save_logs_snapshot(
-    state: &SharedLogsState,
-    store: Option<Arc<dyn SnapshotStore>>,
-    lock: &AsyncMutex<()>,
-) {
-    let store = store.map(|s| Arc::new(SnapshotLogsStore(s)) as Arc<dyn LogsStore>);
-    if let Err(error) = save_logs_state(state, store, lock).await {
-        tracing::error!(%error, "failed to persist Logs state");
-    }
-}
-
-/// Shared by API, cross-service delivery, and retention sweep writers.
-/// Serialize borrowed state on the blocking pool; do not clone event history.
+/// Shared by API, cross-service delivery, CloudFormation, and retention sweep
+/// writers. The state write lock is held only for the memory-only prepare
+/// phase (retention plus copying not-yet-committed events); segment appends,
+/// fsyncs and the manifest write run after it is released. Without a store
+/// (memory mode) only retention is applied.
 pub async fn save_logs_state(
     state: &SharedLogsState,
-    store: Option<Arc<dyn LogsStore>>,
+    store: Option<Arc<SegmentedLogsStore>>,
     lock: &AsyncMutex<()>,
 ) -> std::io::Result<()> {
     let _guard = lock.lock().await;
     let state = state.clone();
-    tokio::task::spawn_blocking(move || {
-        let mut state = state.write();
-        match store {
-            Some(store) => store.save(&mut state),
-            None => {
-                prune_expired(&mut state, chrono::Utc::now().timestamp_millis());
-                Ok(())
-            }
+    tokio::task::spawn_blocking(move || match store {
+        Some(store) => store.save_shared(&state),
+        None => {
+            prune_expired(&mut state.write(), chrono::Utc::now().timestamp_millis());
+            Ok(())
         }
     })
     .await
@@ -328,14 +313,7 @@ impl AwsService for LogsService {
             _ => Err(AwsServiceError::action_not_implemented("logs", &req.action)),
         };
         if mutates && matches!(result.as_ref(), Ok(resp) if resp.status.is_success()) {
-            self.save_snapshot().await.map_err(|error| {
-                tracing::error!(%error, "failed to persist Logs state");
-                AwsServiceError::aws_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "ServiceUnavailableException",
-                    "Failed to persist log data",
-                )
-            })?;
+            self.save_snapshot().await;
         }
         result
     }
@@ -837,32 +815,48 @@ pub(crate) mod test_helpers {
     /// state directly.
     #[tokio::test]
     async fn snapshot_hook_fires_with_store() {
-        let store: Arc<dyn fakecloud_persistence::SnapshotStore> =
-            Arc::new(fakecloud_persistence::MemorySnapshotStore::new());
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(SegmentedLogsStore::new(directory.path().into()));
         let svc = make_service().with_snapshot_store(store);
+        // Direct call, like the CloudFormation provisioner: no save of its own.
+        create_group(&svc, "cfn-group");
         let hook = svc
             .snapshot_hook()
             .expect("hook present when a store is set");
-        // Must not panic; exercises the closure and the snapshot save path.
         hook().await;
+        let restored = SegmentedLogsStore::new(directory.path().into())
+            .load()
+            .unwrap()
+            .expect("hook committed a manifest");
+        assert!(restored
+            .accounts
+            .unwrap()
+            .get("123456789012")
+            .unwrap()
+            .log_groups
+            .contains_key("cfn-group"));
     }
+
+    /// A failed save must not fail the already-applied mutation: an error
+    /// response would make SDK retries duplicate it. The next successful save
+    /// commits it.
     #[tokio::test]
-    async fn persistence_failure_returns_service_error() {
+    async fn persistence_failure_keeps_mutation_and_retries_on_next_save() {
         let directory = tempfile::tempdir().unwrap();
-        let blocked = directory.path().join("not-a-directory");
+        let blocked = directory.path().join("logs");
         std::fs::write(&blocked, b"occupied").unwrap();
-        let svc = make_service().with_logs_store(Arc::new(
-            crate::persistence::SegmentedLogsStore::new(blocked),
-        ));
+        let svc =
+            make_service().with_snapshot_store(Arc::new(SegmentedLogsStore::new(blocked.clone())));
         let request = make_request("CreateLogGroup", serde_json::json!({"logGroupName": "g"}));
-        let error = svc
-            .handle(request)
-            .await
-            .err()
-            .expect("must not acknowledge a failed save");
-        assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(
-            matches!(error, AwsServiceError::AwsError { code, .. } if code == "ServiceUnavailableException")
-        );
+        let response = svc.handle(request).await.expect("mutation acknowledged");
+        assert!(response.status.is_success());
+
+        std::fs::remove_file(&blocked).unwrap();
+        let request = make_request("CreateLogGroup", serde_json::json!({"logGroupName": "h"}));
+        svc.handle(request).await.unwrap();
+        let restored = SegmentedLogsStore::new(blocked).load().unwrap().unwrap();
+        let accounts = restored.accounts.unwrap();
+        let groups = &accounts.get("123456789012").unwrap().log_groups;
+        assert!(groups.contains_key("g") && groups.contains_key("h"));
     }
 }

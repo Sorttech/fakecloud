@@ -344,3 +344,175 @@ fn migrates_v1_snapshot_without_sequence_or_persistence_fields() {
     assert!(rows[0].seq > 0);
     assert!(rows[1].seq > rows[0].seq);
 }
+
+#[test]
+fn prepare_releases_state_lock_before_disk_io_and_next_save_picks_up_later_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SegmentedLogsStore::new(dir.path().into());
+    let state = state();
+    put(&state, "a", 100, "prepared");
+    let pending = store.prepare(&mut state.write()).unwrap();
+    // The state lock is free while the commit is outstanding.
+    put(&state, "a", 200, "during-commit");
+    store.commit(pending).unwrap();
+    assert_eq!(
+        events(
+            &SegmentedLogsStore::new(dir.path().into())
+                .load()
+                .unwrap()
+                .unwrap(),
+            "a"
+        ),
+        vec!["prepared"]
+    );
+    store.save(&mut state.write()).unwrap();
+    assert_eq!(
+        events(
+            &SegmentedLogsStore::new(dir.path().into())
+                .load()
+                .unwrap()
+                .unwrap(),
+            "a"
+        ),
+        vec!["prepared", "during-commit"]
+    );
+}
+
+#[test]
+fn expiration_from_a_failed_save_is_not_resurrected_by_policy_removal() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SegmentedLogsStore::new(dir.path().into());
+    let state = state();
+    let now = chrono::Utc::now().timestamp_millis();
+    put(&state, "a", now - 2 * 86_400_000, "expired");
+    put(&state, "a", now, "live");
+    store.save(&mut state.write()).unwrap();
+    state
+        .write()
+        .get_mut("a")
+        .unwrap()
+        .log_groups
+        .get_mut("g")
+        .unwrap()
+        .retention_in_days = Some(1);
+    // Prune in memory, then lose the commit (e.g. disk full).
+    drop(store.prepare(&mut state.write()).unwrap());
+    state
+        .write()
+        .get_mut("a")
+        .unwrap()
+        .log_groups
+        .get_mut("g")
+        .unwrap()
+        .retention_in_days = None;
+    store.save(&mut state.write()).unwrap();
+    assert_eq!(
+        events(
+            &SegmentedLogsStore::new(dir.path().into())
+                .load()
+                .unwrap()
+                .unwrap(),
+            "a"
+        ),
+        vec!["live"]
+    );
+}
+
+/// Every manifest write is an atomic rename to a fresh inode, so an unchanged
+/// inode proves the idle save skipped the write. Several accounts make sure the
+/// skip does not depend on the account map's hash order.
+#[cfg(unix)]
+#[test]
+fn idle_save_does_not_rewrite_the_manifest() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let store = SegmentedLogsStore::new(dir.path().into());
+    let state = state();
+    for account in ["a", "b", "c", "d", "e"] {
+        put(&state, account, 100, "only");
+    }
+    store.save(&mut state.write()).unwrap();
+    let manifest = dir.path().join("manifest.json");
+    let inode = std::fs::metadata(&manifest).unwrap().ino();
+    for _ in 0..5 {
+        store.save_shared(&state).unwrap();
+        assert_eq!(std::fs::metadata(&manifest).unwrap().ino(), inode);
+    }
+    put(&state, "a", 200, "more");
+    store.save_shared(&state).unwrap();
+    assert_ne!(std::fs::metadata(&manifest).unwrap().ino(), inode);
+}
+
+#[test]
+fn leftover_legacy_snapshot_is_removed_by_the_next_process_even_when_idle() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state();
+    put(&state, "a", 100, "event");
+    SegmentedLogsStore::new(dir.path().into())
+        .save(&mut state.write())
+        .unwrap();
+    // A crash after the manifest commit but before cleanup leaves the legacy
+    // snapshot behind; the next process must still remove it on an idle save.
+    std::fs::write(dir.path().join("snapshot.json"), b"{}").unwrap();
+    SegmentedLogsStore::new(dir.path().into())
+        .load()
+        .unwrap()
+        .unwrap();
+    assert!(!dir.path().join("snapshot.json").exists());
+}
+
+#[test]
+fn legacy_migration_normalizes_stored_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state();
+    put(&state, "a", 100, "abc");
+    state
+        .write()
+        .get_mut("a")
+        .unwrap()
+        .log_groups
+        .get_mut("g")
+        .unwrap()
+        .stored_bytes = 3;
+    std::fs::write(
+        dir.path().join("snapshot.json"),
+        serde_json::to_vec(&LogsSnapshot {
+            schema_version: 2,
+            accounts: Some(state.read().clone()),
+            state: None,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let store = SegmentedLogsStore::new(dir.path().into());
+    let mut loaded = store.load().unwrap().unwrap().accounts.unwrap();
+    store.save(&mut loaded).unwrap();
+    assert_eq!(
+        loaded.get("a").unwrap().log_groups["g"].stored_bytes,
+        3 + EVENT_OVERHEAD_BYTES
+    );
+}
+
+#[test]
+fn retention_subtracts_only_pruned_bytes() {
+    let state = state();
+    let now = chrono::Utc::now().timestamp_millis();
+    put(&state, "a", now - 2 * 86_400_000, "old");
+    put(&state, "a", now, "live");
+    {
+        let mut accounts = state.write();
+        let group = accounts
+            .get_mut("a")
+            .unwrap()
+            .log_groups
+            .get_mut("g")
+            .unwrap();
+        assert_eq!(group.stored_bytes, 3 + 26 + 4 + 26);
+        group.retention_in_days = Some(1);
+    }
+    prune_expired(&mut state.write(), now);
+    let accounts = state.read();
+    let group = &accounts.get("a").unwrap().log_groups["g"];
+    assert_eq!(group.stored_bytes, 4 + 26);
+    assert_eq!(group.log_streams["s"].last_sequence, 1);
+}

@@ -4,6 +4,27 @@
 
 use super::*;
 
+/// Parse `RetentionInDays`, which templates may pass as a number or (after
+/// parameter resolution) a numeric string. Values outside the CloudWatch Logs
+/// enum set fail the resource instead of reaching state, where retention would
+/// delete stored events.
+fn retention_in_days_property(props: &serde_json::Value) -> Result<Option<i32>, String> {
+    let Some(value) = props.get("RetentionInDays") else {
+        return Ok(None);
+    };
+    let days = value
+        .as_i64()
+        .or_else(|| value.as_str().and_then(|s| s.trim().parse().ok()))
+        .ok_or_else(|| format!("Invalid RetentionInDays: {value}"))?;
+    if !fakecloud_logs::VALID_RETENTION_DAYS.contains(&days) {
+        return Err(format!(
+            "Invalid RetentionInDays {days}: must be one of {:?}",
+            fakecloud_logs::VALID_RETENTION_DAYS
+        ));
+    }
+    Ok(Some(days as i32))
+}
+
 impl ResourceProvisioner {
     pub(crate) fn create_log_group(
         &self,
@@ -15,10 +36,7 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .unwrap_or(&resource.logical_id);
 
-        let retention_in_days = props
-            .get("RetentionInDays")
-            .and_then(|v| v.as_i64())
-            .map(|v| v as i32);
+        let retention_in_days = retention_in_days_property(props)?;
 
         let mut logs_accounts = self.logs_state.write();
         let state = logs_accounts.get_or_create(&self.account_id);
@@ -65,10 +83,7 @@ impl ResourceProvisioner {
         let props = &resource.properties;
         let arn = &existing.physical_id;
 
-        let retention_in_days = props
-            .get("RetentionInDays")
-            .and_then(|v| v.as_i64())
-            .map(|v| v as i32);
+        let retention_in_days = retention_in_days_property(props)?;
         let kms_key_id = props
             .get("KmsKeyId")
             .and_then(|v| v.as_str())

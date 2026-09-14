@@ -123,13 +123,19 @@ impl LogsService {
             )
         })?;
 
-        if group.log_streams.remove(stream_name).is_none() {
+        let Some(removed) = group.log_streams.remove(stream_name) else {
             return Err(AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
                 "ResourceNotFoundException",
                 format!("The specified log stream does not exist: {stream_name}"),
             ));
-        }
+        };
+        let removed_bytes: i64 = removed
+            .events
+            .iter()
+            .map(|e| e.message.len() as i64 + crate::persistence::EVENT_OVERHEAD_BYTES)
+            .sum();
+        group.stored_bytes = group.stored_bytes.saturating_sub(removed_bytes).max(0);
 
         Ok(AwsResponse::json(StatusCode::OK, "{}"))
     }
@@ -435,6 +441,24 @@ impl LogsService {
             )
         })?;
 
+        // Events older than the group's retention are rejected, not stored and
+        // silently pruned. Batches are chronological, so the accepted events are
+        // the contiguous input range after the too-old prefix and expired events
+        // are a prefix of that range.
+        if let Some(days) = group.retention_in_days {
+            let cutoff = now.saturating_sub(i64::from(days).saturating_mul(86_400_000));
+            let expired = new_events
+                .iter()
+                .take_while(|e| e.timestamp < cutoff)
+                .count();
+            if expired > 0 {
+                let first_accepted = too_old_end_index.map_or(0, |i| i + 1);
+                new_events.drain(..expired);
+                rejected_info["expiredLogEventEndIndex"] = json!(first_accepted + expired - 1);
+                has_rejected = true;
+            }
+        }
+
         // Apply transformer if configured on the log group
         if let Some(ref tx) = group.transformer {
             for event in &mut new_events {
@@ -478,7 +502,8 @@ impl LogsService {
             {
                 stream.last_event_timestamp = Some(event.timestamp);
             }
-            group.stored_bytes += event.message.len() as i64 + 26;
+            group.stored_bytes +=
+                event.message.len() as i64 + crate::persistence::EVENT_OVERHEAD_BYTES;
         }
         stream.last_ingestion_time = Some(now);
 
@@ -2470,6 +2495,34 @@ mod tests {
         let events = body["events"].as_array().unwrap();
         assert_eq!(events.len(), 1, "expected only the fresh event");
         assert_eq!(events[0]["message"].as_str().unwrap(), "fresh");
+    }
+
+    #[test]
+    fn put_log_events_rejects_events_older_than_retention() {
+        let svc = make_service();
+        create_group(&svc, "g");
+        create_stream(&svc, "g", "s");
+        put_retention(&svc, "g", 1);
+        let now = chrono::Utc::now().timestamp_millis();
+        let req = make_request(
+            "PutLogEvents",
+            json!({
+                "logGroupName": "g",
+                "logStreamName": "s",
+                "logEvents": [
+                    {"timestamp": now - 3 * 86_400_000, "message": "expired-a"},
+                    {"timestamp": now - 2 * 86_400_000, "message": "expired-b"},
+                    {"timestamp": now, "message": "kept"},
+                ],
+            }),
+        );
+        let resp = svc.put_log_events(&req).unwrap();
+        let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        assert_eq!(body["rejectedLogEventsInfo"]["expiredLogEventEndIndex"], 1);
+        let accounts = svc.state.read();
+        let events = &accounts.default_ref().log_groups["g"].log_streams["s"].events;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].message, "kept");
     }
 
     #[test]

@@ -1164,6 +1164,13 @@ pub(crate) fn deliver_to_logs(
             log_group_class: Some("STANDARD".to_string()),
         });
 
+    // CloudWatch Logs rejects events older than the group's retention.
+    if group.retention_in_days.is_some_and(|days| {
+        ts_millis < chrono::Utc::now().timestamp_millis() - i64::from(days) * 86_400_000
+    }) {
+        return;
+    }
+
     let stream = group
         .log_streams
         .entry(stream_name.clone())
@@ -1199,6 +1206,8 @@ pub(crate) fn deliver_to_logs(
     if stream.first_event_timestamp.is_none() {
         stream.first_event_timestamp = Some(ts_millis);
     }
+    // Same per-event accounting PutLogEvents uses for `storedBytes`.
+    group.stored_bytes += payload.len() as i64 + 26;
 }
 
 /// Deliver an EventBridge event to CloudWatch Logs and persist the mutated
@@ -1480,23 +1489,6 @@ mod logs_persist_tests {
     use super::*;
     use std::sync::Arc;
 
-    /// Snapshot store that records the last bytes written, so the test can
-    /// assert the delivered LogEvent was actually persisted.
-    #[derive(Default)]
-    struct CapturingSnapshotStore {
-        last: std::sync::Mutex<Option<Vec<u8>>>,
-    }
-
-    impl fakecloud_persistence::SnapshotStore for CapturingSnapshotStore {
-        fn load(&self) -> std::io::Result<Option<Vec<u8>>> {
-            Ok(self.last.lock().unwrap().clone())
-        }
-        fn save(&self, bytes: &[u8]) -> std::io::Result<()> {
-            *self.last.lock().unwrap() = Some(bytes.to_vec());
-            Ok(())
-        }
-    }
-
     fn empty_logs_state() -> fakecloud_logs::SharedLogsState {
         Arc::new(parking_lot::RwLock::new(
             fakecloud_core::multi_account::MultiAccountState::new(
@@ -1515,19 +1507,24 @@ mod logs_persist_tests {
     #[tokio::test]
     async fn deliver_to_logs_persists_through_hook() {
         let logs_state = empty_logs_state();
-        let store: Arc<CapturingSnapshotStore> = Arc::new(CapturingSnapshotStore::default());
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(fakecloud_logs::persistence::SegmentedLogsStore::new(
+            dir.path().to_path_buf(),
+        ));
 
         // Build the same persist hook shape the server wires from main.rs.
         let hook: fakecloud_persistence::SnapshotHook = {
             let state = logs_state.clone();
-            let store_dyn: Arc<dyn fakecloud_persistence::SnapshotStore> = store.clone();
+            let store = store.clone();
             let lock = Arc::new(tokio::sync::Mutex::new(()));
             Arc::new(move || {
                 let state = state.clone();
-                let store_dyn = store_dyn.clone();
+                let store = store.clone();
                 let lock = lock.clone();
                 Box::pin(async move {
-                    fakecloud_logs::save_logs_snapshot(&state, Some(store_dyn), &lock).await;
+                    fakecloud_logs::save_logs_state(&state, Some(store), &lock)
+                        .await
+                        .unwrap();
                 })
             })
         };
@@ -1541,13 +1538,10 @@ mod logs_persist_tests {
             chrono::Utc::now(),
         );
 
-        // The persist is a detached task; poll the capturing store until it
-        // records the write (bounded so a regression fails fast).
+        // The persist is a detached task; poll the directory until the manifest
+        // commits (bounded so a regression fails fast).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            if store.last.lock().unwrap().is_some() {
-                break;
-            }
+        while !dir.path().join("manifest.json").exists() {
             assert!(
                 std::time::Instant::now() < deadline,
                 "logs persist hook never fired after a Logs-target delivery"
@@ -1555,9 +1549,11 @@ mod logs_persist_tests {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
 
-        // The persisted snapshot must round-trip and contain the delivered event.
-        let bytes = store.last.lock().unwrap().clone().unwrap();
-        let snapshot: fakecloud_logs::LogsSnapshot = serde_json::from_slice(&bytes).unwrap();
+        // A fresh store (as after a restart) must restore the delivered event.
+        let snapshot = fakecloud_logs::persistence::SegmentedLogsStore::new(dir.path().into())
+            .load()
+            .unwrap()
+            .expect("manifest committed");
         let accounts = snapshot.accounts.expect("multi-account snapshot");
         let logs = accounts.get("123456789012").expect("account present");
         let group = logs

@@ -1788,7 +1788,7 @@ async fn main() {
     // against the restored Logs state rather than an empty one. The lock is
     // shared with LogsService (below) so the two Logs writers can't
     // interleave event appends and manifest commits.
-    let logs_snapshot_store: Option<Arc<dyn fakecloud_logs::persistence::LogsStore>> =
+    let logs_snapshot_store: Option<Arc<fakecloud_logs::persistence::SegmentedLogsStore>> =
         if persistence_config.mode == fakecloud_persistence::StorageMode::Persistent {
             let directory = persistence_config
                 .data_path
@@ -1796,12 +1796,13 @@ async fn main() {
                 .expect("validated above")
                 .join("logs");
             let store = fakecloud_logs::persistence::SegmentedLogsStore::new(directory);
-            match fakecloud_logs::persistence::LogsStore::load(&store) {
+            match store.load() {
                 Ok(Some(snapshot)) => {
                     if snapshot.schema_version > fakecloud_logs::LOGS_SNAPSHOT_SCHEMA_VERSION {
                         fatal_exit(format_args!(
-                            "logs persistence schema too new: {}",
-                            snapshot.schema_version
+                            "logs persistence schema too new: on-disk={}, max supported={}",
+                            snapshot.schema_version,
+                            fakecloud_logs::LOGS_SNAPSHOT_SCHEMA_VERSION,
                         ));
                     }
                     if let Some(accounts) = snapshot.accounts {
@@ -1810,14 +1811,13 @@ async fn main() {
                         let account_id = single.account_id.clone();
                         *logs_state.write().get_or_create(&account_id) = single;
                     } else {
-                        fatal_exit(format_args!("logs persistence snapshot has no state"));
+                        tracing::warn!(
+                            "logs persistence snapshot has neither accounts nor state; starting empty"
+                        );
                     }
                     // Finish legacy migration and persist offline expiration before
                     // accepting policy changes or starting background deliveries.
-                    if let Err(error) = fakecloud_logs::persistence::LogsStore::save(
-                        &store,
-                        &mut logs_state.write(),
-                    ) {
+                    if let Err(error) = store.save(&mut logs_state.write()) {
                         fatal_exit(format_args!(
                             "failed to initialize Logs persistence: {error}"
                         ));
@@ -1832,16 +1832,16 @@ async fn main() {
             None
         };
     let logs_snapshot_lock = Arc::new(tokio::sync::Mutex::new(()));
-    // Sweep idle groups too. Weak state avoids keeping a dropped server alive.
+    // Enforce retention on idle groups too, not only on Logs mutations. An idle
+    // sweep that changes nothing skips the manifest write.
     {
-        let state = Arc::downgrade(&logs_state);
+        let state = logs_state.clone();
         let store = logs_snapshot_store.clone();
         let lock = logs_snapshot_lock.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
                 interval.tick().await;
-                let Some(state) = state.upgrade() else { break };
                 if let Err(error) =
                     fakecloud_logs::save_logs_state(&state, store.clone(), &lock).await
                 {
@@ -2256,7 +2256,7 @@ async fn main() {
     let mut logs_service = LogsService::new(logs_state.clone(), delivery_for_logs)
         .with_snapshot_lock(logs_snapshot_lock);
     if let Some(store) = logs_snapshot_store {
-        logs_service = logs_service.with_logs_store(store);
+        logs_service = logs_service.with_snapshot_store(store);
     }
     if let Some(h) = logs_service.snapshot_hook() {
         cfn_snapshot_hooks.insert("logs", h);
