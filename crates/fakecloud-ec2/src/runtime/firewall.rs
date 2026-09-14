@@ -100,84 +100,25 @@ const TABLE: &str = "inet fakecloud_ec2";
 /// (subnets and rules emitted in the order given; the caller sorts for
 /// stability) so the output can be diffed and unit-tested.
 ///
-/// Model: a single `forward` chain, default-accept, that for every instance
-/// emits its allow rules followed by a default-deny to that instance's IP.
-/// Established/related traffic is accepted up front so security groups behave
-/// statefully, like AWS. NACL deny rules are emitted per subnet before the
-/// per-instance rules (stateless, subnet-wide).
+/// Model: two base chains on the `forward` hook, both default-accept -- an
+/// `egress` chain holding every instance's egress allows followed by a
+/// default-deny from that instance, and an `ingress` chain holding every
+/// instance's ingress allows followed by a default-deny to it. A security
+/// group's egress and ingress rules are independent gates that must *both*
+/// permit a packet, as on AWS. Separate base chains give exactly that: an
+/// `accept` ends evaluation of its own chain only, and the packet still
+/// traverses the other, where a `drop` is final. In a single chain an
+/// instance's egress `accept` (the default security group allows all egress)
+/// would end evaluation before a later instance's ingress default-deny was
+/// reached, letting traffic through or not depending on which instance was
+/// emitted first.
+///
+/// Established/related traffic is accepted up front in each chain so security
+/// groups behave statefully, like AWS. NACL deny rules are emitted per subnet
+/// before the per-instance rules in the chain for their direction (stateless,
+/// subnet-wide).
 pub fn render_ruleset(subnets: &[SubnetFirewall]) -> String {
-    let mut out = String::new();
-    // `add table` first so the following `flush` doesn't error on the *first*
-    // apply (when the table doesn't exist yet) — which would fail the entire
-    // `nft -f -` load and leave enforcement silently off. `add` is idempotent;
-    // `add`+`flush`+re-add is the canonical atomic-replace idiom.
-    out.push_str(&format!("add table {TABLE}\n"));
-    out.push_str(&format!("flush table {TABLE}\n"));
-    out.push_str(&format!("table {TABLE} {{\n"));
-    out.push_str("  chain forward {\n");
-    out.push_str("    type filter hook forward priority -5; policy accept;\n");
-    // Stateful: let replies through so SG rules only need to describe the
-    // opening direction, matching AWS security-group semantics.
-    out.push_str("    ct state established,related accept\n");
-
-    for subnet in subnets {
-        out.push_str(&format!("    # subnet {}\n", subnet.network_name));
-
-        // Subnet-wide NACL denies, evaluated in ascending rule-number order so
-        // a lower-numbered `allow` shadows a higher-numbered `deny` for the
-        // same traffic (AWS first-match semantics). A deny is emitted as a drop
-        // only when no earlier-numbered allow covers the identical
-        // direction/protocol/ports/CIDR — otherwise the allow wins and the deny
-        // never fires (bug-hunt 2026-06-18 finding 1.4). NACL allows ride the
-        // default-accept policy (the SG layer below still applies; NACL and SG
-        // are independent gates, both must permit).
-        let mut ordered = subnet.nacl.clone();
-        ordered.sort_by_key(|r| r.rule_number);
-        for (i, rule) in ordered.iter().enumerate() {
-            if rule.allow {
-                continue;
-            }
-            let shadowed = ordered[..i]
-                .iter()
-                .any(|earlier| earlier.allow && nacl_same_traffic(earlier, rule));
-            if shadowed {
-                continue;
-            }
-            if let Some(line) = render_nacl_drop(rule) {
-                out.push_str(&format!("    {line}\n"));
-            }
-        }
-
-        for inst in &subnet.instances {
-            // Ingress: allow matching, then default-deny to this instance.
-            for rule in &inst.ingress {
-                out.push_str(&format!(
-                    "    {}\n",
-                    render_rule(rule, Direction::Ingress, &inst.private_ip)
-                ));
-            }
-            out.push_str(&format!(
-                "    ip daddr {} drop comment \"default-deny ingress\"\n",
-                inst.private_ip
-            ));
-
-            // Egress: allow matching, then default-deny from this instance.
-            for rule in &inst.egress {
-                out.push_str(&format!(
-                    "    {}\n",
-                    render_rule(rule, Direction::Egress, &inst.private_ip)
-                ));
-            }
-            out.push_str(&format!(
-                "    ip saddr {} drop comment \"default-deny egress\"\n",
-                inst.private_ip
-            ));
-        }
-    }
-
-    out.push_str("  }\n");
-    out.push_str("}\n");
-    out
+    render_table(TABLE, -5, "", subnets)
 }
 
 /// The bridge-family table fakecloud owns for **same-subnet L2 enforcement**.
@@ -197,25 +138,73 @@ const BRIDGE_TABLE: &str = "bridge fakecloud_ec2_l2";
 /// hold regardless of the bridge-netfilter sysctl. IPv4 matches are guarded
 /// with `ether type ip` (required in the bridge family before an `ip` match);
 /// `ct state established,related` keeps replies flowing statefully via
-/// `nf_conntrack_bridge`.
+/// `nf_conntrack_bridge`. Its chains sit at a lower (earlier) priority than the
+/// default bridge filter so the decision lands before anything else in the
+/// bridge path.
 pub fn render_bridge_ruleset(subnets: &[SubnetFirewall]) -> String {
+    render_table(BRIDGE_TABLE, -300, "ether type ip ", subnets)
+}
+
+/// Render `table` as an atomic replace with independent `egress` and `ingress`
+/// base chains on the `forward` hook (see [`render_ruleset`]). The ingress
+/// chain hooks at `priority` and the egress chain one step earlier; `guard` is
+/// prefixed to every rule that matches on an IPv4 address.
+fn render_table(table: &str, priority: i32, guard: &str, subnets: &[SubnetFirewall]) -> String {
     let mut out = String::new();
-    out.push_str(&format!("add table {BRIDGE_TABLE}\n"));
-    out.push_str(&format!("flush table {BRIDGE_TABLE}\n"));
-    out.push_str(&format!("table {BRIDGE_TABLE} {{\n"));
-    out.push_str("  chain forward {\n");
-    // Lower (earlier) priority than the default bridge filter so our decision
-    // lands before anything else in the bridge path.
-    out.push_str("    type filter hook forward priority -300; policy accept;\n");
+    // `add table` first so the following `flush` doesn't error on the *first*
+    // apply (when the table doesn't exist yet) — which would fail the entire
+    // `nft -f -` load and leave enforcement silently off. `add` is idempotent;
+    // `add`+`flush`+re-add is the canonical atomic-replace idiom.
+    out.push_str(&format!("add table {table}\n"));
+    out.push_str(&format!("flush table {table}\n"));
+    out.push_str(&format!("table {table} {{\n"));
+    for (dir, chain_priority) in [
+        (Direction::Egress, priority - 1),
+        (Direction::Ingress, priority),
+    ] {
+        render_chain(&mut out, dir, chain_priority, guard, subnets);
+    }
+    out.push_str("}\n");
+    out
+}
+
+/// One direction's base chain: stateful accept, then per subnet its NACL
+/// denies for that direction and each instance's allows followed by its
+/// default-deny.
+fn render_chain(
+    out: &mut String,
+    dir: Direction,
+    priority: i32,
+    guard: &str,
+    subnets: &[SubnetFirewall],
+) {
+    let (name, egress) = match dir {
+        Direction::Egress => ("egress", true),
+        Direction::Ingress => ("ingress", false),
+    };
+    out.push_str(&format!("  chain {name} {{\n"));
+    out.push_str(&format!(
+        "    type filter hook forward priority {priority}; policy accept;\n"
+    ));
+    // Stateful: let replies through so SG rules only need to describe the
+    // opening direction, matching AWS security-group semantics.
     out.push_str("    ct state established,related accept\n");
 
     for subnet in subnets {
         out.push_str(&format!("    # subnet {}\n", subnet.network_name));
 
+        // Subnet-wide NACL denies, evaluated in ascending rule-number order so
+        // a lower-numbered `allow` shadows a higher-numbered `deny` for the
+        // same traffic (AWS first-match semantics). A deny is emitted as a drop
+        // only when no earlier-numbered allow covers the identical
+        // direction/protocol/ports/CIDR — otherwise the allow wins and the deny
+        // never fires (bug-hunt 2026-06-18 finding 1.4). NACL allows ride the
+        // default-accept policy (the SG layer below still applies; NACL and SG
+        // are independent gates, both must permit).
         let mut ordered = subnet.nacl.clone();
         ordered.sort_by_key(|r| r.rule_number);
         for (i, rule) in ordered.iter().enumerate() {
-            if rule.allow {
+            if rule.allow || rule.egress != egress {
                 continue;
             }
             let shadowed = ordered[..i]
@@ -225,38 +214,29 @@ pub fn render_bridge_ruleset(subnets: &[SubnetFirewall]) -> String {
                 continue;
             }
             if let Some(line) = render_nacl_drop(rule) {
-                out.push_str(&format!("    ether type ip {line}\n"));
+                out.push_str(&format!("    {guard}{line}\n"));
             }
         }
 
         for inst in &subnet.instances {
-            for rule in &inst.ingress {
+            let (rules, default_deny) = match dir {
+                Direction::Egress => (&inst.egress, "saddr"),
+                Direction::Ingress => (&inst.ingress, "daddr"),
+            };
+            for rule in rules {
                 out.push_str(&format!(
-                    "    ether type ip {}\n",
-                    render_rule(rule, Direction::Ingress, &inst.private_ip)
+                    "    {guard}{}\n",
+                    render_rule(rule, dir, &inst.private_ip)
                 ));
             }
             out.push_str(&format!(
-                "    ether type ip ip daddr {} drop comment \"default-deny ingress\"\n",
-                inst.private_ip
-            ));
-
-            for rule in &inst.egress {
-                out.push_str(&format!(
-                    "    ether type ip {}\n",
-                    render_rule(rule, Direction::Egress, &inst.private_ip)
-                ));
-            }
-            out.push_str(&format!(
-                "    ether type ip ip saddr {} drop comment \"default-deny egress\"\n",
+                "    {guard}ip {default_deny} {} drop comment \"default-deny {name}\"\n",
                 inst.private_ip
             ));
         }
     }
 
     out.push_str("  }\n");
-    out.push_str("}\n");
-    out
 }
 
 #[derive(Clone, Copy)]
@@ -542,6 +522,115 @@ mod tests {
         for line in rs.lines().map(str::trim) {
             if line.starts_with("ip daddr") || line.starts_with("ip saddr") {
                 panic!("unguarded ip match in bridge family:\n{line}");
+            }
+        }
+    }
+
+    /// Evaluate a new (not established) all-protocol packet `src -> dst`
+    /// against a rendered ruleset the way nftables does: within each base
+    /// chain the first rule whose address matches decides, a `drop` anywhere
+    /// is final, and an `accept` only ends its own chain. Understands the
+    /// address matches these renderers emit (`ip saddr/daddr <ip or cidr>`,
+    /// optionally behind `ether type ip`); protocol and port clauses are not
+    /// modeled, so use all-protocol rules.
+    fn packet_passes(ruleset: &str, src: &str, dst: &str) -> bool {
+        use std::net::Ipv4Addr;
+        fn in_cidr(ip: &str, cidr: &str) -> bool {
+            let ip: Ipv4Addr = ip.parse().unwrap();
+            let (net, len) = cidr.split_once('/').unwrap_or((cidr, "32"));
+            let (net, len): (Ipv4Addr, u32) = (net.parse().unwrap(), len.parse().unwrap());
+            let mask = if len == 0 { 0 } else { u32::MAX << (32 - len) };
+            u32::from(ip) & mask == u32::from(net) & mask
+        }
+        let mut in_chain = false;
+        let mut chain_decided = false;
+        for line in ruleset.lines().map(str::trim) {
+            if line.starts_with("chain ") {
+                in_chain = true;
+                chain_decided = false;
+                continue;
+            }
+            if line == "}" {
+                in_chain = false;
+                continue;
+            }
+            if !in_chain
+                || chain_decided
+                || line.starts_with("type ")
+                || line.starts_with("ct ")
+                || line.starts_with('#')
+            {
+                continue;
+            }
+            let line = line.strip_prefix("ether type ip ").unwrap_or(line);
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            let mut matched = true;
+            let mut i = 0;
+            while i + 2 < tokens.len() && tokens[i] == "ip" {
+                let addr = if tokens[i + 1] == "saddr" { src } else { dst };
+                matched &= in_cidr(addr, tokens[i + 2]);
+                i += 3;
+            }
+            if !matched {
+                continue;
+            }
+            match tokens.get(i) {
+                Some(&"drop") => return false,
+                Some(&"accept") => chain_decided = true,
+                other => panic!("unmodeled rule {line:?} ({other:?})"),
+            }
+        }
+        true
+    }
+
+    #[test]
+    fn egress_and_ingress_are_independent_gates_whatever_the_instance_order() {
+        // The default security group: all egress allowed, no ingress. A packet
+        // from A to B passes A's egress but must still be dropped by B's
+        // ingress default-deny -- regardless of which instance is emitted
+        // first. In a single chain, A's egress accept ended evaluation before
+        // B's deny whenever A came first.
+        let anywhere = || FirewallRule {
+            protocol: "-1".into(),
+            from_port: -1,
+            to_port: -1,
+            cidr: None,
+        };
+        let a = "172.30.0.2";
+        let b = "172.30.0.3";
+        let instance = |ip: &str, ingress: Vec<FirewallRule>| InstanceFirewall {
+            private_ip: ip.into(),
+            ingress,
+            egress: vec![anywhere()],
+        };
+        let model = |instances| {
+            vec![SubnetFirewall {
+                network_name: "fakecloud-subnet-a".into(),
+                instances,
+                nacl: vec![],
+            }]
+        };
+        for render in [render_ruleset, render_bridge_ruleset] {
+            for instances in [
+                vec![instance(a, vec![]), instance(b, vec![])],
+                vec![instance(b, vec![]), instance(a, vec![])],
+            ] {
+                let rs = render(&model(instances));
+                assert!(!packet_passes(&rs, a, b), "A -> B must be dropped:\n{rs}");
+                assert!(!packet_passes(&rs, b, a), "B -> A must be dropped:\n{rs}");
+            }
+            // B allows ingress from A: now A -> B passes, B -> A still doesn't.
+            let from_a = FirewallRule {
+                cidr: Some(format!("{a}/32")),
+                ..anywhere()
+            };
+            for instances in [
+                vec![instance(a, vec![]), instance(b, vec![from_a.clone()])],
+                vec![instance(b, vec![from_a.clone()]), instance(a, vec![])],
+            ] {
+                let rs = render(&model(instances));
+                assert!(packet_passes(&rs, a, b), "A -> B must be allowed:\n{rs}");
+                assert!(!packet_passes(&rs, b, a), "B -> A must be dropped:\n{rs}");
             }
         }
     }
