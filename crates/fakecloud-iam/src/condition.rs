@@ -327,12 +327,16 @@ pub fn evaluate_entry(entry: &ParsedCondition, ctx: &ConditionContext) -> bool {
     // Missing key handling.
     let context_values = match context_values {
         Some(vs) if !vs.is_empty() => vs,
+        // The service populated the key and the request carries no values for
+        // it. `ForAllValues` is vacuously true then, as AWS documents ("every
+        // value matches" holds for none). A key that was never populated is
+        // not treated the same way: it may be one fakecloud does not extract,
+        // and granting on it would fail open.
+        Some(_) if entry.operator.qualifier == Qualifier::ForAllValues => return true,
         _ => {
-            // Key not populated. `IfExists` -> vacuously true. So is
-            // `ForAllValues`: AWS documents it as true when the request has no
-            // value for the key ("every value matches" holds for none).
-            // Otherwise this is a safe-fail to false.
-            if entry.operator.if_exists || entry.operator.qualifier == Qualifier::ForAllValues {
+            // Key not populated. `IfExists` -> vacuously true. Otherwise
+            // this is a safe-fail to false.
+            if entry.operator.if_exists {
                 return true;
             }
             if ctx.lookup(&entry.key).is_none() {

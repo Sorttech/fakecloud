@@ -2383,50 +2383,65 @@ fn variables_without_a_value_are_null() {
     assert_eq!(run(null_resource), Decision::ImplicitDeny);
 }
 
-/// `ForAllValues` holds when the request has no value for the key: every one
-/// of zero values matches. It used to fail the condition instead.
+/// `ForAllValues` holds when the service populated the key and the request
+/// carries no values for it: every one of zero values matches. A key that was
+/// never populated still fails the condition -- it may be one fakecloud does
+/// not extract, and treating it as matched would fail open.
 #[test]
-fn for_all_values_is_true_when_the_key_is_absent() {
+fn for_all_values_is_true_for_a_populated_key_with_no_values() {
     let alice = principal_user("arn:aws:iam::123456789012:user/alice");
+    let resource = "arn:aws:dynamodb:us-east-1:123456789012:table/T";
+    let policy = |qualifier: &str| {
+        doc(json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Action": "dynamodb:Scan",
+                "Resource": "*",
+                "Condition": {qualifier: {"dynamodb:LeadingKeys": ["alice"]}}
+            }]
+        }))
+    };
+    let mut populated = req(&alice, "dynamodb:Scan", resource);
+    populated
+        .context
+        .service_keys
+        .insert("dynamodb:leadingkeys".to_string(), Vec::new());
+    assert_eq!(
+        evaluate(&[policy("ForAllValues:StringEquals")], &populated),
+        Decision::Allow
+    );
+    assert_eq!(
+        evaluate(&[policy("ForAnyValue:StringEquals")], &populated),
+        Decision::ImplicitDeny,
+        "ForAnyValue needs a value"
+    );
+    assert_eq!(
+        evaluate(
+            &[policy("ForAllValues:StringEquals")],
+            &req(&alice, "dynamodb:Scan", resource)
+        ),
+        Decision::ImplicitDeny,
+        "a key nothing populated is not vacuously matched"
+    );
+}
+
+/// A global key supplied as a plain context entry (the policy simulator's
+/// ContextEntries) resolves in conditions and as a policy variable.
+#[test]
+fn global_keys_fall_back_to_plain_context_entries() {
+    let alice = principal_user("arn:aws:iam::123456789012:user/alice");
+    let mut r = req(&alice, "s3:GetObject", "arn:aws:s3:::home/alice/x");
+    r.context
+        .service_keys
+        .insert("aws:username".to_string(), vec!["alice".to_string()]);
     let policy = doc(json!({
         "Version": "2012-10-17",
         "Statement": [{
             "Effect": "Allow",
-            "Action": "dynamodb:Scan",
-            "Resource": "*",
-            "Condition": {"ForAllValues:StringEquals": {"dynamodb:LeadingKeys": ["alice"]}}
+            "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::home/${aws:username}/*"
         }]
     }));
-    assert_eq!(
-        evaluate(
-            &[policy.clone()],
-            &req(
-                &alice,
-                "dynamodb:Scan",
-                "arn:aws:dynamodb:us-east-1:123456789012:table/T"
-            )
-        ),
-        Decision::Allow
-    );
-    let for_any = doc(json!({
-        "Version": "2012-10-17",
-        "Statement": [{
-            "Effect": "Allow",
-            "Action": "dynamodb:Scan",
-            "Resource": "*",
-            "Condition": {"ForAnyValue:StringEquals": {"dynamodb:LeadingKeys": ["alice"]}}
-        }]
-    }));
-    assert_eq!(
-        evaluate(
-            &[for_any],
-            &req(
-                &alice,
-                "dynamodb:Scan",
-                "arn:aws:dynamodb:us-east-1:123456789012:table/T"
-            )
-        ),
-        Decision::ImplicitDeny,
-        "ForAnyValue still needs a value"
-    );
+    assert_eq!(evaluate(&[policy], &r), Decision::Allow);
 }

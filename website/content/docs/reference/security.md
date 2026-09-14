@@ -104,7 +104,7 @@ A statement with a `Condition` block only applies when every entry in the block 
 | ARN | `ArnEquals`, `ArnNotEquals`, `ArnLike`, `ArnNotLike` |
 | Existence | `Null` |
 
-Every operator supports the `...IfExists` suffix (missing key evaluates to `true`) and the `ForAllValues:` / `ForAnyValue:` set-qualifier prefixes. As on AWS, `ForAllValues` is also `true` when the request has no value for the key (every one of zero values matches), while `ForAnyValue` then evaluates to `false`.
+Every operator supports the `...IfExists` suffix (missing key evaluates to `true`) and the `ForAllValues:` / `ForAnyValue:` set-qualifier prefixes. As on AWS, `ForAllValues` is also `true` when the request carries no values for a key the service populates (every one of zero values matches), while `ForAnyValue` then evaluates to `false`. A key fakecloud does not extract for the request still safe-fails to `false`, so an unextracted key never grants.
 
 **Supported global condition keys:**
 

@@ -339,7 +339,7 @@ impl ConditionContext {
                 .map(|tags| tags.keys().cloned().collect());
         }
 
-        match lower.as_str() {
+        let typed = match lower.as_str() {
             "aws:username" => self.aws_username.as_deref().and_then(one),
             "aws:userid" => self.aws_userid.as_deref().and_then(one),
             "aws:principalarn" => self.aws_principal_arn.as_deref().and_then(one),
@@ -368,21 +368,21 @@ impl ConditionContext {
             "aws:tokenissuetime" => self
                 .aws_token_issue_time
                 .map(|t| vec![t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)]),
-            _ => {
-                if let Some(vs) = self.service_keys.get(&lower) {
-                    if vs.is_empty() {
-                        None
-                    } else {
-                        Some(vs.clone())
-                    }
-                } else {
-                    self.service_keys
-                        .iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case(key))
-                        .map(|(_, vs)| vs.clone())
-                }
-            }
-        }
+            _ => None,
+        };
+        // A key with no typed value -- a service-specific key, or a global key
+        // supplied as a plain entry (a policy simulator's ContextEntries) --
+        // comes from `service_keys`. An entry with an empty value list means
+        // the key applies to the request but carries no values, which set
+        // operators distinguish from a key that was never populated.
+        typed.or_else(|| {
+            self.service_keys.get(&lower).cloned().or_else(|| {
+                self.service_keys
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                    .map(|(_, vs)| vs.clone())
+            })
+        })
     }
 }
 
