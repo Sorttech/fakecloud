@@ -876,6 +876,34 @@ fn attach_cluster_node_network_interface_persists_attachment() {
     );
     assert_ne!(second["AttachmentId"], attachment_id.as_str());
 
+    // A cluster ARN resolves nodes added under its name even with no stored
+    // Cluster record.
+    let added = resp_json(
+        &run(
+            &s,
+            "BatchAddClusterNodes",
+            json!({"ClusterName": "c2", "NodesToAdd": [{"InstanceGroupName": "g1"}]}),
+        )
+        .unwrap(),
+    );
+    let c2_node = added["Successful"][0]["NodeLogicalId"].as_str().unwrap();
+    let by_arn = resp_json(
+        &run(
+            &s,
+            "AttachClusterNodeNetworkInterface",
+            json!({
+                "ClusterName": "arn:aws:sagemaker:us-east-1:000000000000:cluster/c2",
+                "NodeId": c2_node,
+                "NetworkInterfaceId": "eni-0bbbbbbbbbbbbbbbb",
+            }),
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        by_arn["ClusterArn"],
+        "arn:aws:sagemaker:us-east-1:000000000000:cluster/c2"
+    );
+
     // Unknown node, and a known node addressed through the wrong cluster.
     for (cluster, node) in [("c1", "i-00000000000000999"), ("other", nodes[0].as_str())] {
         let err = expect_err(run(

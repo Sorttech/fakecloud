@@ -810,6 +810,13 @@ fn attach_cluster_node_network_interface(
         .resolve_key("Cluster", &cluster)
         .and_then(|k| data.get_resource("Cluster", &k).cloned());
     let mut cluster_aliases = vec![cluster.clone()];
+    if let Some(name) = cluster
+        .strip_prefix("arn:")
+        .and_then(|arn| arn.rsplit_once(":cluster/"))
+        .map(|(_, name)| name)
+    {
+        cluster_aliases.push(name.to_string());
+    }
     if let Some(obj) = cluster_record.as_ref().and_then(Value::as_object) {
         for member in ["ClusterName", "ClusterArn"] {
             if let Some(v) = obj.get(member).and_then(Value::as_str) {
