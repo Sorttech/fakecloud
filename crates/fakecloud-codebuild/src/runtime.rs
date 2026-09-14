@@ -226,11 +226,12 @@ fn current_instance_label() -> String {
 /// build containers survive: `reconcile_builds` flips the persisted
 /// `IN_PROGRESS` builds to `FAILED`, but nothing reaps the containers, so the
 /// daemon slowly leaks them. Sweep every container tagged `fakecloud-codebuild`
-/// whose `fakecloud-instance` label is not the current process. Best-effort:
-/// any daemon error is ignored (the backend stays usable). Containers owned by
-/// the live process are left untouched so a concurrent build is never killed.
+/// whose owning process (its `fakecloud-instance` label) is gone. Containers
+/// owned by any *live* fakecloud process are left untouched: several can share
+/// one daemon, and removing another running server's build container fails
+/// that build mid-provisioning. Best-effort: any daemon error is ignored (the
+/// backend stays usable).
 pub async fn sweep_orphan_containers(cli: &str) {
-    let current = current_instance_label();
     let out = Command::new(cli)
         .args([
             "ps",
@@ -254,7 +255,10 @@ pub async fn sweep_orphan_containers(cli: &str) {
             continue;
         };
         let instance = parts.next().unwrap_or("");
-        if instance != current {
+        if fakecloud_core::container_net::owned_by_dead_process(
+            instance,
+            fakecloud_core::container_net::pid_alive,
+        ) {
             orphans.push(id.to_string());
         }
     }
