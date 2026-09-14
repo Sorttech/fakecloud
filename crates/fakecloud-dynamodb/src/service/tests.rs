@@ -7414,16 +7414,36 @@ async fn other_accounts_tables_are_not_found_without_cross_account_support() {
         assert_eq!(got["__type"], code, "{action}");
     }
 
-    // A listing filtered by another account's table matches nothing, even
-    // when that account holds backups and exports of it.
-    let (status, got) = call_as(
-        &svc,
-        OWNER,
-        "CreateBackup",
-        json!({"TableName": "Shared", "BackupName": "owners"}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{got}");
+    // A listing filtered by another account's or region's table matches
+    // nothing, even when both accounts hold backups of a table of that name.
+    for account in [OWNER, "123456789012"] {
+        let (status, got) = call_as(
+            &svc,
+            account,
+            "CreateBackup",
+            json!({"TableName": "Shared", "BackupName": "b"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{got}");
+    }
+    // The caller's own table still filters by name and by its own ARN.
+    for filter in [
+        "Shared",
+        "arn:aws:dynamodb:us-east-1:123456789012:table/Shared",
+    ] {
+        let (_, got) = call_as(
+            &svc,
+            "123456789012",
+            "ListBackups",
+            json!({"TableName": filter}),
+        )
+        .await;
+        assert_eq!(
+            got["BackupSummaries"].as_array().map(Vec::len),
+            Some(1),
+            "{filter}"
+        );
+    }
     for (action, body, field) in [
         (
             "ListExports",
@@ -7433,6 +7453,11 @@ async fn other_accounts_tables_are_not_found_without_cross_account_support() {
         (
             "ListBackups",
             json!({"TableName": OWNER_ARN}),
+            "BackupSummaries",
+        ),
+        (
+            "ListBackups",
+            json!({"TableName": "arn:aws:dynamodb:us-west-2:123456789012:table/Shared"}),
             "BackupSummaries",
         ),
     ] {
