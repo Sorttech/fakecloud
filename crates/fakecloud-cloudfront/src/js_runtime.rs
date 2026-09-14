@@ -85,14 +85,17 @@ pub(crate) struct JsExecution {
 /// dedicated worker thread, holding it to the `EXECUTION_TIMEOUT` compute
 /// budget.
 pub(crate) fn run_handler(code: &str, event_json: &[u8]) -> JsExecution {
-    run_handler_with_limits(code, event_json, EXECUTION_TIMEOUT, WALL_CLOCK_LIMIT)
+    run_handler_with_limits(code, event_json, EXECUTION_TIMEOUT, WALL_CLOCK_LIMIT, || {})
 }
 
+/// `before_start` runs on the worker thread before its clock starts; tests
+/// use it to stand in for a thread the host is slow to schedule.
 fn run_handler_with_limits(
     code: &str,
     event_json: &[u8],
     compute_budget: Duration,
     wall_limit: Duration,
+    before_start: fn(),
 ) -> JsExecution {
     let code = code.to_owned();
     let event = event_json.to_vec();
@@ -107,8 +110,9 @@ fn run_handler_with_limits(
         // Boa's bytecode VM is recursive so we want a generous stack.
         .stack_size(8 * 1024 * 1024)
         .spawn(move || {
+            before_start();
             let clock = ComputeClock::start();
-            let _ = tx.send(WorkerMessage::Started(clock.cpu.map(|(c, _)| c)));
+            let _ = tx.send(WorkerMessage::Started(clock.cpu));
             let mut result = run_handler_blocking(&code, &event, &clock);
             // Covers a run that crossed the budget between the caller's polls.
             if clock.elapsed() > compute_budget {
@@ -125,15 +129,21 @@ fn run_handler_with_limits(
 
     // Watch the worker: stop waiting as soon as its CPU time passes the
     // budget, so a CPU-bound handler is cut off at the budget rather than
-    // holding the caller until the wall-clock safety net. Without a thread
-    // CPU clock on this platform, elapsed time stands in for it.
+    // holding the caller until the wall-clock safety net. Until the worker
+    // reports in, nothing counts against the budget -- a thread the host is
+    // slow to schedule has used none -- and only the safety net applies.
+    // Without a thread CPU clock on this platform, time elapsed since the
+    // worker started stands in for it.
     let wall_start = Instant::now();
-    let mut worker_cpu: Option<(ThreadCpuClock, Duration)> = None;
+    let mut watch = Watch::NotStarted;
     loop {
         let remaining = wall_limit.saturating_sub(wall_start.elapsed());
         match rx.recv_timeout(remaining.min(WATCHDOG_POLL)) {
             Ok(WorkerMessage::Started(cpu)) => {
-                worker_cpu = cpu.and_then(|c| c.read().map(|start| (c, start)));
+                watch = match cpu {
+                    Some((clock, start)) => Watch::Cpu(clock, start),
+                    None => Watch::Elapsed(Instant::now()),
+                };
             }
             Ok(WorkerMessage::Done(mut exec)) => {
                 // Floor compute_utilization at 1% on success so callers
@@ -149,11 +159,12 @@ fn run_handler_with_limits(
         if wall_start.elapsed() >= wall_limit {
             return time_limit_exceeded(Vec::new());
         }
-        let used = match worker_cpu {
+        let used = match watch {
+            Watch::NotStarted => None,
             // A read fails once the thread has exited; its result is
             // already on the way, so keep waiting for it.
-            Some((clock, start)) => clock.read().map(|now| now.saturating_sub(start)),
-            None => Some(wall_start.elapsed()),
+            Watch::Cpu(clock, start) => clock.read().map(|now| now.saturating_sub(start)),
+            Watch::Elapsed(started) => Some(started.elapsed()),
         };
         if used.is_some_and(|u| u > compute_budget) {
             return time_limit_exceeded(Vec::new());
@@ -161,11 +172,22 @@ fn run_handler_with_limits(
     }
 }
 
-/// What the worker thread reports: first the handle to its CPU clock (so
-/// the caller can watch the run), then the result.
+/// What the worker thread reports: first its CPU clock and the reading it
+/// started from (so the caller measures the run from the same point as the
+/// worker's own check), then the result.
 enum WorkerMessage {
-    Started(Option<ThreadCpuClock>),
+    Started(Option<(ThreadCpuClock, Duration)>),
     Done(JsExecution),
+}
+
+/// How the caller measures the worker's compute while waiting on it.
+enum Watch {
+    /// The worker has not reported in yet; nothing counts against the budget.
+    NotStarted,
+    /// The worker's CPU clock and its reading when the run started.
+    Cpu(ThreadCpuClock, Duration),
+    /// No thread CPU clock on this platform: time since the worker started.
+    Elapsed(Instant),
 }
 
 /// The worker thread either failed to spawn or panicked partway through.
@@ -574,6 +596,7 @@ mod tests {
             b"{}",
             Duration::ZERO,
             WALL_CLOCK_LIMIT,
+            || {},
         );
         assert!(exec.output.is_none(), "got output {:?}", exec.output);
         let err = exec.error.expect("error");
@@ -589,13 +612,40 @@ mod tests {
             b"{}",
             EXECUTION_TIMEOUT,
             Duration::ZERO,
+            || {},
         );
         let err = exec.error.expect("error");
         assert!(err.contains("time limit"), "got {err}");
         assert!(exec.compute_utilization > 100);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    #[test]
+    fn a_worker_slow_to_start_is_not_charged_for_the_wait() {
+        // The host took longer than the whole budget to get the worker going;
+        // the handler itself is trivial and must still succeed.
+        let exec = run_handler_with_limits(
+            r#"function handler(e) { return e; }"#,
+            b"{}",
+            EXECUTION_TIMEOUT,
+            WALL_CLOCK_LIMIT,
+            || std::thread::sleep(EXECUTION_TIMEOUT + Duration::from_millis(150)),
+        );
+        assert!(exec.error.is_none(), "unexpected error: {:?}", exec.error);
+        assert_eq!(exec.output.as_deref(), Some("{}"));
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
     #[test]
     fn a_descheduled_thread_accrues_no_compute() {
         // The budget is CPU time: a thread that is not running -- here
