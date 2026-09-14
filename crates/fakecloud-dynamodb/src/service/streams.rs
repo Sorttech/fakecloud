@@ -58,7 +58,7 @@ impl DynamoDbService {
         // name equals the table name in AWS.
         let replicas = state
             .global_tables
-            .get(table_name)
+            .get(super::resolve_table_name(table_name))
             .map(|gt| replica_auto_scaling_list(&gt.replication_group))
             .unwrap_or_default();
 
@@ -88,7 +88,10 @@ impl DynamoDbService {
 
         // Persist the supplied autoscaling settings onto the matching replicas
         // in the global-table replication group, then reflect them on read.
-        if let Some(gt) = state.global_tables.get_mut(table_name) {
+        if let Some(gt) = state
+            .global_tables
+            .get_mut(super::resolve_table_name(table_name))
+        {
             if let Some(updates) = body["ReplicaUpdates"].as_array() {
                 for update in updates {
                     let region = update["RegionName"].as_str().unwrap_or_default();
@@ -110,7 +113,10 @@ impl DynamoDbService {
         // A table-level write-capacity autoscaling update applies to every
         // replica per AWS semantics.
         if let Some(write) = body.get("ProvisionedWriteCapacityAutoScalingUpdate") {
-            if let Some(gt) = state.global_tables.get_mut(table_name) {
+            if let Some(gt) = state
+                .global_tables
+                .get_mut(super::resolve_table_name(table_name))
+            {
                 let desc = auto_scaling_description(write);
                 for replica in gt.replication_group.iter_mut() {
                     replica.write_capacity_auto_scaling = Some(desc.clone());
@@ -120,7 +126,7 @@ impl DynamoDbService {
 
         let replicas = state
             .global_tables
-            .get(table_name)
+            .get(super::resolve_table_name(table_name))
             .map(|gt| replica_auto_scaling_list(&gt.replication_group))
             .unwrap_or_default();
 
@@ -365,7 +371,10 @@ impl DynamoDbService {
         let summaries: Vec<Value> = state
             .tables
             .values()
-            .filter(|t| table_name.is_none() || table_name == Some(t.name.as_str()))
+            .filter(|t| {
+                table_name.is_none()
+                    || table_name.map(super::resolve_table_name) == Some(t.name.as_str())
+            })
             .map(|t| {
                 json!({
                     "TableName": t.name,

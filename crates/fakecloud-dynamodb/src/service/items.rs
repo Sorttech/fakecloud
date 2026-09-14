@@ -213,7 +213,7 @@ impl DynamoDbService {
         if needs_insights {
             let mut accounts = self.state.write();
             let state = accounts.get_or_create(&req.account_id);
-            if let Some(table) = state.tables.get_mut(table_name) {
+            if let Some(table) = state.tables.get_mut(super::resolve_table_name(table_name)) {
                 table.record_key_access(&key);
             }
         }

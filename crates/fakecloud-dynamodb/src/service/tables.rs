@@ -274,7 +274,7 @@ impl DynamoDbService {
         // ResourceInUseException with this message).
         if state
             .tables
-            .get(table_name)
+            .get(super::resolve_table_name(table_name))
             .is_some_and(|t| t.deletion_protection_enabled)
         {
             return Err(AwsServiceError::aws_error(
@@ -285,13 +285,16 @@ impl DynamoDbService {
                 ),
             ));
         }
-        let table = state.tables.remove(table_name).ok_or_else(|| {
-            AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "ResourceNotFoundException",
-                format!("Requested resource not found: Table: {table_name} not found"),
-            )
-        })?;
+        let table = state
+            .tables
+            .remove(super::resolve_table_name(table_name))
+            .ok_or_else(|| {
+                AwsServiceError::aws_error(
+                    StatusCode::BAD_REQUEST,
+                    "ResourceNotFoundException",
+                    format!("Requested resource not found: Table: {table_name} not found"),
+                )
+            })?;
 
         let table_desc = build_table_description_json(&super::TableDescriptionInput {
             arn: &table.arn,
@@ -387,13 +390,16 @@ impl DynamoDbService {
         // ARN carries the request's credential-scope region (req.region).
         let region = req.region.clone();
         let account_id = state.account_id.clone();
-        let table = state.tables.get_mut(table_name).ok_or_else(|| {
-            AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "ResourceNotFoundException",
-                format!("Requested resource not found: Table: {table_name} not found"),
-            )
-        })?;
+        let table = state
+            .tables
+            .get_mut(super::resolve_table_name(table_name))
+            .ok_or_else(|| {
+                AwsServiceError::aws_error(
+                    StatusCode::BAD_REQUEST,
+                    "ResourceNotFoundException",
+                    format!("Requested resource not found: Table: {table_name} not found"),
+                )
+            })?;
 
         if let Some(pt) = body.get("ProvisionedThroughput") {
             if let Ok(throughput) = parse_provisioned_throughput(pt) {
@@ -847,7 +853,7 @@ impl DynamoDbService {
             "arn:aws:dynamodb:{}:{}:table/{}/backup/{:013}-{}",
             req.region.as_str(),
             state.account_id,
-            table_name,
+            table.name,
             now.timestamp_millis(),
             &uuid::Uuid::new_v4().to_string().replace('-', "")[..8]
         );
@@ -855,7 +861,7 @@ impl DynamoDbService {
         let backup = BackupDescription {
             backup_arn: backup_arn.clone(),
             backup_name: backup_name.to_string(),
-            table_name: table_name.to_string(),
+            table_name: table.name.clone(),
             table_arn: table.arn.clone(),
             backup_status: "AVAILABLE".to_string(),
             backup_type: "USER".to_string(),
@@ -1056,7 +1062,10 @@ impl DynamoDbService {
         let matched: Vec<(&str, Value)> = state
             .backups
             .values()
-            .filter(|b| table_name.is_none() || table_name == Some(b.table_name.as_str()))
+            .filter(|b| {
+                table_name.is_none()
+                    || table_name.map(super::resolve_table_name) == Some(b.table_name.as_str())
+            })
             .filter(|b| match start {
                 Some(s) => b.backup_arn.as_str() > s,
                 None => true,

@@ -6528,3 +6528,258 @@ async fn query_orders_binary_sort_keys_by_bytes() {
     let scan = call_dynamodb(&svc, "Scan", json!({"TableName": "bin-sort"})).await;
     assert_eq!(order(&scan), order(&query));
 }
+
+const TEST_TABLE_ARN: &str = "arn:aws:dynamodb:us-east-1:123456789012:table/test-table";
+
+/// Every operation that takes a TableName accepts the table's ARN. These
+/// paths looked the table up by the raw string, so an ARN was "not found" or,
+/// worse, silently skipped a step.
+#[tokio::test]
+async fn batch_operations_accept_a_table_arn() {
+    let svc = make_service();
+    create_test_table(&svc);
+
+    call_dynamodb(
+        &svc,
+        "BatchWriteItem",
+        json!({"RequestItems": {TEST_TABLE_ARN: [
+            {"PutRequest": {"Item": {"pk": {"S": "a"}}}},
+            {"PutRequest": {"Item": {"pk": {"S": "b"}}}}
+        ]}}),
+    )
+    .await;
+    let got = call_dynamodb(
+        &svc,
+        "BatchGetItem",
+        json!({"RequestItems": {TEST_TABLE_ARN: {"Keys": [{"pk": {"S": "a"}}, {"pk": {"S": "b"}}]}}}),
+    )
+    .await;
+    assert_eq!(
+        got["Responses"][TEST_TABLE_ARN].as_array().unwrap().len(),
+        2,
+        "{got}"
+    );
+
+    call_dynamodb(
+        &svc,
+        "BatchWriteItem",
+        json!({"RequestItems": {TEST_TABLE_ARN: [
+            {"DeleteRequest": {"Key": {"pk": {"S": "a"}}}}
+        ]}}),
+    )
+    .await;
+    let scan = call_dynamodb(&svc, "Scan", json!({"TableName": "test-table"})).await;
+    assert_eq!(scan["Items"], json!([{"pk": {"S": "b"}}]));
+}
+
+/// A transaction naming its table by ARN must still be all or nothing: the
+/// snapshot it reverts from was taken under the raw ARN, which matched no
+/// table, so a failing transaction kept the writes before the failure.
+#[tokio::test]
+async fn failed_transaction_naming_the_table_by_arn_reverts() {
+    let svc = make_service();
+    create_test_table(&svc);
+    call_dynamodb(
+        &svc,
+        "PutItem",
+        json!({"TableName": "test-table", "Item": {"pk": {"S": "kept"}, "n": {"S": "text"}}}),
+    )
+    .await;
+
+    let resp = svc
+        .handle(make_request(
+            "TransactWriteItems",
+            json!({"TransactItems": [
+                {"Put": {"TableName": TEST_TABLE_ARN, "Item": {"pk": {"S": "new"}}}},
+                {"Update": {
+                    "TableName": TEST_TABLE_ARN,
+                    "Key": {"pk": {"S": "kept"}},
+                    "UpdateExpression": "SET n = n + :one",
+                    "ExpressionAttributeValues": {":one": {"N": "1"}}
+                }}
+            ]}),
+        ))
+        .await;
+    let failed = match resp {
+        Ok(r) => r.status != StatusCode::OK,
+        Err(_) => true,
+    };
+    assert!(
+        failed,
+        "the arithmetic on a string must fail the transaction"
+    );
+
+    let scan = call_dynamodb(&svc, "Scan", json!({"TableName": "test-table"})).await;
+    assert_eq!(
+        scan["Items"],
+        json!([{"pk": {"S": "kept"}, "n": {"S": "text"}}]),
+        "the transaction's Put survived its failure"
+    );
+}
+
+/// UpdateTable and DeleteTable (including its deletion-protection check)
+/// accept the ARN, and so does contributor-insights accounting on reads.
+#[tokio::test]
+async fn table_operations_and_insights_accept_a_table_arn() {
+    let svc = make_service();
+    create_test_table(&svc);
+    call_dynamodb(
+        &svc,
+        "PutItem",
+        json!({"TableName": "test-table", "Item": {"pk": {"S": "a"}}}),
+    )
+    .await;
+
+    call_dynamodb(
+        &svc,
+        "UpdateContributorInsights",
+        json!({"TableName": "test-table", "ContributorInsightsAction": "ENABLE"}),
+    )
+    .await;
+    call_dynamodb(
+        &svc,
+        "GetItem",
+        json!({"TableName": TEST_TABLE_ARN, "Key": {"pk": {"S": "a"}}}),
+    )
+    .await;
+    call_dynamodb(&svc, "Scan", json!({"TableName": TEST_TABLE_ARN})).await;
+    call_dynamodb(
+        &svc,
+        "Query",
+        json!({
+            "TableName": TEST_TABLE_ARN,
+            "KeyConditionExpression": "pk = :p",
+            "ExpressionAttributeValues": {":p": {"S": "a"}}
+        }),
+    )
+    .await;
+    {
+        let accounts = svc.state.read();
+        let table = &accounts.get("123456789012").unwrap().tables["test-table"];
+        assert_eq!(
+            table.contributor_insights_counters.values().sum::<u64>(),
+            3,
+            "reads by ARN were not counted"
+        );
+    }
+
+    call_dynamodb(
+        &svc,
+        "UpdateTable",
+        json!({"TableName": TEST_TABLE_ARN, "DeletionProtectionEnabled": true}),
+    )
+    .await;
+    let err = svc
+        .handle(make_request(
+            "DeleteTable",
+            json!({"TableName": TEST_TABLE_ARN}),
+        ))
+        .await
+        .err()
+        .expect("deletion protection must hold when the table is named by ARN");
+    assert_eq!(err.code(), "ResourceInUseException");
+
+    call_dynamodb(
+        &svc,
+        "UpdateTable",
+        json!({"TableName": TEST_TABLE_ARN, "DeletionProtectionEnabled": false}),
+    )
+    .await;
+    call_dynamodb(&svc, "DeleteTable", json!({"TableName": TEST_TABLE_ARN})).await;
+    assert!(svc
+        .state
+        .read()
+        .get("123456789012")
+        .unwrap()
+        .tables
+        .is_empty());
+}
+
+/// Naming one table by name in one operation and by ARN in another is still
+/// the same item: transactions must reject touching it twice.
+#[tokio::test]
+async fn transactions_see_a_table_named_by_name_and_arn_as_one_table() {
+    let svc = make_service();
+    create_test_table(&svc);
+    call_dynamodb(
+        &svc,
+        "PutItem",
+        json!({"TableName": "test-table", "Item": {"pk": {"S": "a"}}}),
+    )
+    .await;
+
+    let err = svc
+        .handle(make_request(
+            "TransactWriteItems",
+            json!({"TransactItems": [
+                {"Put": {"TableName": "test-table", "Item": {"pk": {"S": "a"}, "v": {"S": "1"}}}},
+                {"Put": {"TableName": TEST_TABLE_ARN, "Item": {"pk": {"S": "a"}, "v": {"S": "2"}}}}
+            ]}),
+        ))
+        .await
+        .err()
+        .expect("two writes to one item must be rejected");
+    assert!(
+        err.to_string().contains("multiple operations on one item"),
+        "{err}"
+    );
+
+    let err = svc
+        .handle(make_request(
+            "TransactGetItems",
+            json!({"TransactItems": [
+                {"Get": {"TableName": "test-table", "Key": {"pk": {"S": "a"}}}},
+                {"Get": {"TableName": TEST_TABLE_ARN, "Key": {"pk": {"S": "a"}}}}
+            ]}),
+        ))
+        .await
+        .err()
+        .expect("two reads of one item must be rejected");
+    assert!(
+        err.to_string().contains("multiple operations on one item"),
+        "{err}"
+    );
+}
+
+/// A backup of a table named by ARN records the table's name, and the list
+/// filters accept either form.
+#[tokio::test]
+async fn backups_and_insights_listings_accept_a_table_arn() {
+    let svc = make_service();
+    create_test_table(&svc);
+
+    let created = call_dynamodb(
+        &svc,
+        "CreateBackup",
+        json!({"TableName": TEST_TABLE_ARN, "BackupName": "b1"}),
+    )
+    .await;
+    let details = &created["BackupDetails"];
+    let arn = details["BackupArn"].as_str().unwrap();
+    assert!(
+        arn.starts_with("arn:aws:dynamodb:us-east-1:123456789012:table/test-table/backup/"),
+        "{arn}"
+    );
+
+    for filter in ["test-table", TEST_TABLE_ARN] {
+        let listed = call_dynamodb(&svc, "ListBackups", json!({"TableName": filter})).await;
+        let summaries = listed["BackupSummaries"].as_array().unwrap();
+        assert_eq!(summaries.len(), 1, "filter {filter}: {listed}");
+        assert_eq!(summaries[0]["TableName"], "test-table");
+    }
+
+    let listed = call_dynamodb(
+        &svc,
+        "ListContributorInsights",
+        json!({"TableName": TEST_TABLE_ARN}),
+    )
+    .await;
+    assert_eq!(
+        listed["ContributorInsightsSummaries"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "{listed}"
+    );
+}
