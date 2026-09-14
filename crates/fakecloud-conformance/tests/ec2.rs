@@ -13040,7 +13040,9 @@ fn xml_value(body: &str, tag: &str) -> String {
     body[start..end].to_string()
 }
 
-/// An IPAM, an internet-registry association on it, and one registration.
+/// An IPAM and a freshly created internet-registry association on it. The
+/// association is still `pending-enable`, so it cannot publish registrations
+/// yet.
 async fn make_ir_association(c: &aws_sdk_ec2::Client, q: &Ec2Query) -> String {
     let ipam = make_ipam(c).await;
     let body = q
@@ -13054,6 +13056,30 @@ async fn make_ir_association(c: &aws_sdk_ec2::Client, q: &Ec2Query) -> String {
         )
         .await;
     xml_value(&body, "ipamInternetRegistryAssociationId")
+}
+
+/// Enable an association against the registry's RPKI service, which is what
+/// lets it publish Route Origin Authorizations.
+async fn enable_ir_association(q: &Ec2Query, id: &str) {
+    q.call(
+        "EnableIpamInternetRegistryAssociation",
+        &[
+            ("IpamInternetRegistryAssociationId", id),
+            ("RpkiVersion", "1"),
+            ("ServiceUri", "https://rpki.example/up-down"),
+            ("ChildHandle", "child"),
+            ("ParentHandle", "parent"),
+            ("ParentBpkiTa", "TA=="),
+        ],
+    )
+    .await;
+}
+
+/// An enabled association, ready to publish routing policy registrations.
+async fn make_enabled_ir_association(c: &aws_sdk_ec2::Client, q: &Ec2Query) -> String {
+    let id = make_ir_association(c, q).await;
+    enable_ir_association(q, &id).await;
+    id
 }
 
 #[test_action("ec2", "CreateIpamInternetRegistryAssociation", checksum = "a4a63a5d")]
@@ -13099,6 +13125,34 @@ async fn ec2_ipam_internet_registry_association_lifecycle() {
     // entity-escaped.
     assert!(body.contains("child_handle=&quot;child&quot;"), "{body}");
 
+    // The registrations have to be removed before the association goes:
+    // deleting one that still publishes ROAs would orphan them.
+    q.call(
+        "CreateIpamRoutingPolicyRegistration",
+        &[
+            ("IpamInternetRegistryAssociationId", &id),
+            ("Cidr", "192.0.2.0/24"),
+            ("Asn.1", "64512"),
+        ],
+    )
+    .await;
+    let (status, body) = q
+        .send(
+            "DeleteIpamInternetRegistryAssociation",
+            &[("IpamInternetRegistryAssociationId", &id)],
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("DependencyViolation"), "{body}");
+    q.call(
+        "DeleteIpamRoutingPolicyRegistration",
+        &[
+            ("IpamInternetRegistryAssociationId", &id),
+            ("Cidr", "192.0.2.0/24"),
+        ],
+    )
+    .await;
+
     let body = q
         .call(
             "DeleteIpamInternetRegistryAssociation",
@@ -13122,7 +13176,24 @@ async fn ec2_ipam_routing_policy_registration_lifecycle() {
     let s = TestServer::start().await;
     let c = s.ec2_client().await;
     let q = Ec2Query::new(&s);
-    let id = make_ir_association(&c, &q).await;
+    let pending = make_ir_association(&c, &q).await;
+
+    // A registration publishes through the association's RPKI service, so an
+    // association that was never enabled cannot carry one.
+    let (status, _) = q
+        .send(
+            "CreateIpamRoutingPolicyRegistration",
+            &[
+                ("IpamInternetRegistryAssociationId", &pending),
+                ("Cidr", "10.0.0.0/16"),
+                ("Asn.1", "64512"),
+            ],
+        )
+        .await;
+    assert_eq!(status, 400);
+
+    let id = pending;
+    enable_ir_association(&q, &id).await;
 
     let body = q
         .call(
@@ -13183,6 +13254,19 @@ async fn ec2_ipam_routing_policy_registration_lifecycle() {
         .await;
     assert!(body.contains("<item>64513</item>"), "{body}");
     assert!(body.contains("<state>update-complete</state>"), "{body}");
+    // Modify requires only `Asns`, so the members it leaves out survive it
+    // rather than being cleared out from under the published ROA.
+    assert!(
+        body.contains("<maxLength>24</maxLength>"),
+        "a modify that omits MaxLength must not clear it: {body}"
+    );
+    let roas = q
+        .call(
+            "GetIpamRouteOriginAuthorizations",
+            &[("IpamInternetRegistryAssociationId", &id)],
+        )
+        .await;
+    assert!(roas.contains("<maxLength>24</maxLength>"), "{roas}");
 
     // Deltas are the audit trail, and survive the registration they describe.
     let body = q
@@ -13214,12 +13298,19 @@ async fn ec2_ipam_routing_policy_registration_lifecycle() {
             ],
         )
         .await;
+    // Both deltas have to be present before their order means anything:
+    // `None < Some(_)`, so comparing the finds directly would pass vacuously
+    // on a delta that went missing.
+    let at = |body: &str, delta: &str| {
+        body.find(delta)
+            .unwrap_or_else(|| panic!("delta {delta} missing from {body}"))
+    };
     assert!(
-        forward.find(&first_delta) < forward.find(&second_delta),
+        at(&forward, &first_delta) < at(&forward, &second_delta),
         "forward is oldest first"
     );
     assert!(
-        reverse.find(&second_delta) < reverse.find(&first_delta),
+        at(&reverse, &second_delta) < at(&reverse, &first_delta),
         "reverse is newest first"
     );
 
@@ -13265,7 +13356,7 @@ async fn ec2_batch_modify_ipam_routing_policy_registrations() {
     let s = TestServer::start().await;
     let c = s.ec2_client().await;
     let q = Ec2Query::new(&s);
-    let id = make_ir_association(&c, &q).await;
+    let id = make_enabled_ir_association(&c, &q).await;
 
     let delta = r#"{"add":[{"cidr":"192.0.2.0/24","asns":["64512"],"maxLength":25},
                             {"cidr":"198.51.100.0/24","asns":["64513"]}]}"#;
@@ -13334,7 +13425,7 @@ async fn ec2_ipam_registry_views_derive_from_registrations() {
     let s = TestServer::start().await;
     let c = s.ec2_client().await;
     let q = Ec2Query::new(&s);
-    let id = make_ir_association(&c, &q).await;
+    let id = make_enabled_ir_association(&c, &q).await;
 
     q.call(
         "CreateIpamRoutingPolicyRegistration",
@@ -13405,6 +13496,7 @@ async fn ec2_ipam_route_discovery_and_protection_findings() {
         )
         .await;
     let id = xml_value(&body, "ipamInternetRegistryAssociationId");
+    enable_ir_association(&q, &id).await;
     q.call(
         "CreateIpamRoutingPolicyRegistration",
         &[

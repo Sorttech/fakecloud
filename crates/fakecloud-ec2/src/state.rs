@@ -1184,6 +1184,17 @@ pub struct IpamInternetRegistryAssociation {
     /// registration changes, so they outlive the registrations themselves.
     #[serde(default)]
     pub deltas: Vec<IpamRoutingPolicyRegistrationDelta>,
+    /// The `ClientToken` the association was created with, if any. A create
+    /// that retries under the same token replays this association instead of
+    /// minting a second one against the same registry.
+    #[serde(default)]
+    pub client_token: Option<String>,
+    /// The idempotency tokens this association has already served, keyed by
+    /// `{action}:{token}` so a token reused across two operations cannot
+    /// replay the other one's result. The value is the delta the original call
+    /// produced (or the association's own id, for Enable, which has no delta).
+    #[serde(default)]
+    pub client_tokens: BTreeMap<String, String>,
 }
 
 /// One CIDR's route origin authorization within an association.

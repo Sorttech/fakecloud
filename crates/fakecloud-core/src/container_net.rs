@@ -82,22 +82,63 @@ pub fn cli_available(cli: &str) -> bool {
 
 /// Run the bounded `<cli> info` liveness probe once (uncached).
 fn probe_cli(cli: &str) -> bool {
-    let child = std::process::Command::new(cli)
-        .arg("info")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+    let child = spawn_bounded(
+        std::process::Command::new(cli)
+            .arg("info")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    );
     let Ok(mut child) = child else {
         return false;
     };
-    wait_bounded(&mut child) && child.wait().map(|s| s.success()).unwrap_or(false)
+    wait_bounded_group(&mut child) && child.wait().map(|s| s.success()).unwrap_or(false)
+}
+
+/// Spawn a container-CLI command in a process group of its own (Unix), so a
+/// timed-out call can be torn down whole. `FAKECLOUD_CONTAINER_CLI` is
+/// routinely a wrapper -- `sh -c 'exec docker "$@"'`, a `podman-remote` shim --
+/// which makes the real command a *grandchild*: it survives `Child::kill`, goes
+/// on holding whatever pipes we handed it, and keeps running against a wedged
+/// daemon forever. Its own group makes it reachable by a single signal.
+/// Detaching these from terminal job control is fine: their lifetime is managed
+/// by deadline here, not by the shell fakecloud was started from.
+fn spawn_bounded(cmd: &mut std::process::Command) -> std::io::Result<std::process::Child> {
+    #[cfg(unix)]
+    {
+        std::os::unix::process::CommandExt::process_group(cmd, 0);
+    }
+    cmd.spawn()
+}
+
+/// How far a timed-out call's kill reaches.
+enum KillScope {
+    /// The direct child only -- the safe default for a child of unknown
+    /// provenance, which may share fakecloud's own process group.
+    Child,
+    /// The child's whole process group, valid only for a child from
+    /// [`spawn_bounded`], which put it in a group of its own.
+    Group,
 }
 
 /// Wait for `child` up to [`CLI_PROBE_TIMEOUT`], killing it on expiry. Returns
 /// whether it exited on its own. Every container-CLI call goes through this:
 /// a liveness probe answering does not promise the next call will, and an
 /// unbounded one blocks the caller rather than just that command.
+///
+/// Kills only the direct child, so it is safe for any child. Callers in this
+/// module spawn through `spawn_bounded` and use `wait_bounded_group` instead,
+/// which takes a wrapper CLI's grandchildren down too.
 pub fn wait_bounded(child: &mut std::process::Child) -> bool {
+    wait_bounded_scoped(child, KillScope::Child)
+}
+
+/// [`wait_bounded`] for a child from [`spawn_bounded`]: the expiry kill hits the
+/// child's process group, so a wrapper CLI's grandchildren die with it.
+fn wait_bounded_group(child: &mut std::process::Child) -> bool {
+    wait_bounded_scoped(child, KillScope::Group)
+}
+
+fn wait_bounded_scoped(child: &mut std::process::Child, scope: KillScope) -> bool {
     let deadline = std::time::Instant::now() + CLI_PROBE_TIMEOUT;
     loop {
         match child.try_wait() {
@@ -107,7 +148,7 @@ pub fn wait_bounded(child: &mut std::process::Child) -> bool {
         }
         if std::time::Instant::now() >= deadline {
             // Daemon is wedged: kill the blocked call and report failure.
-            let _ = child.kill();
+            kill_expired(child, &scope);
             let _ = child.wait();
             return false;
         }
@@ -115,47 +156,130 @@ pub fn wait_bounded(child: &mut std::process::Child) -> bool {
     }
 }
 
+/// SIGKILL a timed-out child, and its process group when the caller vouches
+/// that the group is ours ([`KillScope::Group`]). The group id is the child's
+/// pid, and the child is still unreaped here, so the pid cannot have been
+/// recycled and the signal cannot stray onto an unrelated group.
+#[cfg(unix)]
+fn kill_expired(child: &mut std::process::Child, scope: &KillScope) {
+    if matches!(scope, KillScope::Group) {
+        // SAFETY: `kill` with a negative pid targets the process group of that
+        // id; any pid value is safe to pass.
+        let _ = unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+    }
+    let _ = child.kill();
+}
+
+/// Windows has no process-group signal (a job object would be needed), so the
+/// direct child is as far as the kill reaches; [`run_bounded`] still bounds the
+/// wait on its stdout reader so the caller can't be held by a surviving
+/// grandchild.
+#[cfg(not(unix))]
+fn kill_expired(child: &mut std::process::Child, _scope: &KillScope) {
+    let _ = child.kill();
+}
+
+/// Whether the stdout reader thread ended before the call returned.
+#[derive(Debug)]
+enum ReaderState {
+    /// The reader returned; its thread is gone.
+    Finished,
+    /// The reader is still blocked on the pipe because a write end we could not
+    /// close is held outside the child's process group. The thread outlives the
+    /// call; the caller does not wait for it.
+    Abandoned,
+}
+
+/// Floor on how long [`run_bounded`] waits for its stdout reader once the call
+/// is over (it also gets whatever is left of the call's own budget). Both exits
+/// close every write end we control -- the child exited, or its whole process
+/// group was killed -- which ends the blocked `read_to_end` at once, so this
+/// covers scheduling only. It exists so a write end held somewhere we cannot
+/// reach costs the caller a few hundred milliseconds instead of blocking it for
+/// good, which is what an unbounded join did.
+const READER_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Run a container-CLI command and return its stdout, or `None` when it fails
 /// or outruns [`CLI_PROBE_TIMEOUT`].
 pub fn bounded_output(cli: &str, args: &[&str]) -> Option<String> {
-    let mut child = std::process::Command::new(cli)
-        .args(args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
+    run_bounded(cli, args).0
+}
+
+/// [`bounded_output`], plus whether its stdout reader finished -- so the
+/// timeout path's "no reader left behind" guarantee is unit-testable instead of
+/// only observable as a thread that never goes away.
+fn run_bounded(cli: &str, args: &[&str]) -> (Option<String>, ReaderState) {
+    let deadline = std::time::Instant::now() + CLI_PROBE_TIMEOUT;
+    let child = spawn_bounded(
+        std::process::Command::new(cli)
+            .args(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null()),
+    );
+    let Ok(mut child) = child else {
+        return (None, ReaderState::Finished);
+    };
+    let Some(mut stdout) = child.stdout.take() else {
+        kill_expired(&mut child, &KillScope::Group);
+        let _ = child.wait();
+        return (None, ReaderState::Finished);
+    };
     // Drain stdout while waiting. A child whose output outgrows the pipe
     // buffer blocks on write until someone reads it, so waiting for exit
     // first would deadlock until the deadline and then report the sweep as
     // failed -- `docker ps -a` across a busy host is exactly that much output.
-    let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
+    //
+    // The channel doubles as the reader's "I'm done" signal: the send is the
+    // last thing the thread does before dropping the pipe's read end, so a
+    // received buffer proves no reader is parked behind us. A `JoinHandle`
+    // can't say that without blocking, which on the timeout path is exactly
+    // what we must not do.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = std::io::Read::read_to_end(&mut stdout, &mut buf);
-        buf
+        let _ = tx.send(buf);
     });
-    if !wait_bounded(&mut child) {
-        return None;
-    }
-    let status = child.wait().ok()?;
-    let buf = reader.join().ok()?;
-    status
-        .success()
-        .then(|| String::from_utf8_lossy(&buf).into_owned())
+    // On expiry `wait_bounded_group` has killed the whole process group, so a
+    // wrapper CLI's grandchild releases the write end and the reader returns
+    // instead of blocking for the life of the process -- one leaked thread per
+    // call, on precisely the wedged-daemon path these bounds exist for.
+    let exited = wait_bounded_group(&mut child);
+    let status = child.wait().ok();
+    // Whatever is left of the call's own budget, and never less than the grace:
+    // a prompt call can afford to wait out a reader thread the scheduler hasn't
+    // run yet, a timed-out one gets only the grace, and either way the caller is
+    // back within CLI_PROBE_TIMEOUT plus that grace.
+    let grace = deadline
+        .saturating_duration_since(std::time::Instant::now())
+        .max(READER_DRAIN_GRACE);
+    let drained = rx.recv_timeout(grace).ok();
+    let output = match (exited, status, &drained) {
+        (true, Some(status), Some(buf)) if status.success() => {
+            Some(String::from_utf8_lossy(buf).into_owned())
+        }
+        _ => None,
+    };
+    let reader = if drained.is_some() {
+        ReaderState::Finished
+    } else {
+        ReaderState::Abandoned
+    };
+    (output, reader)
 }
 
 /// Run a container-CLI command for its effect only, bounded the same way.
 /// Returns whether it succeeded.
 pub fn bounded_status(cli: &str, args: &[String]) -> bool {
-    let Ok(mut child) = std::process::Command::new(cli)
-        .args(args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    else {
+    let Ok(mut child) = spawn_bounded(
+        std::process::Command::new(cli)
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    ) else {
         return false;
     };
-    wait_bounded(&mut child) && child.wait().map(|s| s.success()).unwrap_or(false)
+    wait_bounded_group(&mut child) && child.wait().map(|s| s.success()).unwrap_or(false)
 }
 
 /// True if the given PID is a live process on this host.
@@ -213,21 +337,25 @@ pub fn is_podman_binary(cli: &str) -> bool {
 
 /// Detect the Docker bridge gateway IP on Linux. Returns `None` if
 /// detection fails (caller falls back to the conventional `172.17.0.1`).
+///
+/// Goes through [`bounded_output`] like every other container-CLI call here:
+/// `network inspect` talks to the same daemon as the liveness probe, so a
+/// wedged one blocks it on connect forever. This runs inside runtime
+/// constructors on Linux, where an unbounded call hangs server startup outright
+/// -- the exact failure [`CLI_PROBE_TIMEOUT`] exists to prevent. On timeout the
+/// caller just takes the conventional fallback.
 pub fn detect_bridge_gateway(cli: &str) -> Option<String> {
-    let output = std::process::Command::new(cli)
-        .args([
+    let stdout = bounded_output(
+        cli,
+        &[
             "network",
             "inspect",
             "bridge",
             "--format",
             "{{range .IPAM.Config}}{{.Gateway}}{{end}}",
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let gateway = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        ],
+    )?;
+    let gateway = stdout.trim().to_string();
     if gateway.is_empty() || !gateway.contains('.') {
         return None;
     }
@@ -754,5 +882,94 @@ mod bounded_cli_tests {
         );
         assert!(bounded_status("true", &[]));
         assert!(!bounded_status("false", &[]));
+    }
+
+    /// The happy path must still hand back the child's output *and* collect the
+    /// reader, so the no-leak guarantee isn't bought by dropping output.
+    #[test]
+    fn a_prompt_cli_call_collects_its_reader() {
+        let (output, reader) = run_bounded("echo", &["abc123"]);
+        assert_eq!(output.as_deref().map(str::trim), Some("abc123"));
+        assert!(
+            matches!(reader, ReaderState::Finished),
+            "reader was {reader:?}, expected it collected"
+        );
+    }
+
+    /// The bridge-gateway probe talks to the same daemon as the liveness probe,
+    /// so it has to end at the same bound. It used to be a plain
+    /// `Command::output()`, which against a wedged daemon hung whichever runtime
+    /// constructor called it -- on Linux, every container-backed service at
+    /// server startup. Timing out is not an error here: the caller falls back to
+    /// the conventional `172.17.0.1`.
+    #[cfg(unix)]
+    #[test]
+    fn a_hanging_bridge_gateway_probe_is_cut_off() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("fc-gwtest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("hangcli");
+        std::fs::write(&script, "#!/bin/sh\nsleep 600\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let start = std::time::Instant::now();
+        let gateway = detect_bridge_gateway(script.to_str().unwrap());
+        let elapsed = start.elapsed();
+
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(gateway, None, "a wedged daemon must report no gateway");
+        assert!(
+            elapsed < CLI_PROBE_TIMEOUT + READER_DRAIN_GRACE + std::time::Duration::from_secs(5),
+            "the probe took {elapsed:?}, expected it bounded near {CLI_PROBE_TIMEOUT:?}"
+        );
+    }
+
+    /// The unavailable-CLI path keeps its shape: nothing to spawn, no gateway,
+    /// and the caller's fallback stands.
+    #[test]
+    fn a_missing_cli_reports_no_bridge_gateway() {
+        assert_eq!(
+            detect_bridge_gateway("definitely-not-a-real-cli-binary-xyz-123"),
+            None
+        );
+    }
+
+    /// A CLI that succeeds with no output -- an `inspect --format` over a bridge
+    /// with no IPAM config -- still means "no gateway", not an empty
+    /// `--add-host` value. Unchanged by the bounding; guarded so it stays that
+    /// way.
+    #[test]
+    fn an_empty_gateway_is_rejected() {
+        assert_eq!(detect_bridge_gateway("true"), None);
+    }
+
+    /// `FAKECLOUD_CONTAINER_CLI` is routinely a wrapper (`sh -c 'exec docker
+    /// "$@"'`, a `podman-remote` shim), which makes the real command a
+    /// grandchild holding the stdout pipe. Killing only the direct child left
+    /// the reader's `read_to_end` blocked forever -- a thread parked for the
+    /// life of the process, once per call, on exactly the wedged-daemon path
+    /// these bounds were added for (the server reaper calls this at startup).
+    /// The reader reporting in is the evidence: EOF on that pipe is only
+    /// possible once every write end is closed, so a collected buffer proves
+    /// the grandchildren went down with the call.
+    #[cfg(unix)]
+    #[test]
+    fn a_timed_out_wrapper_call_leaves_no_reader_behind() {
+        let start = std::time::Instant::now();
+        // A wrapper that outlives its own kill: the backgrounded sleep inherits
+        // the stdout pipe and is not the process we spawned.
+        let (output, reader) = run_bounded("sh", &["-c", "sleep 600 & sleep 600"]);
+        assert_eq!(output, None, "a wedged call must report failure");
+        assert!(
+            matches!(reader, ReaderState::Finished),
+            "reader was {reader:?}: the stdout reader must not outlive the call"
+        );
+        assert!(
+            start.elapsed()
+                < CLI_PROBE_TIMEOUT + READER_DRAIN_GRACE + std::time::Duration::from_secs(5),
+            "the call must still end at the bound, took {:?}",
+            start.elapsed()
+        );
     }
 }

@@ -36,6 +36,7 @@ use std::time::Duration;
 use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
 use aws_types::region::Region;
+use fakecloud_core::container_net::{bounded_output, bounded_status, cli_available};
 
 /// A test server that spawns fakecloud on a random port.
 pub struct TestServer {
@@ -466,6 +467,10 @@ fn graceful_kill(child: &mut Child) {
 /// support entirely (`FAKECLOUD_CONTAINER_CLI=false`). Most e2e tests
 /// never touch the lambda/rds/elasticache runtimes, so the sweep is
 /// pure overhead on the drop path for those.
+///
+/// Every CLI call goes through `fakecloud_core::container_net`'s bounded
+/// helpers: a wedged daemon blocks on connect forever, and an unbounded call
+/// here would hang the whole test run rather than the one container sweep.
 fn sweep_instance_containers(cli: &str, pid: u32) {
     if cli.is_empty() || cli == "false" {
         return;
@@ -476,71 +481,7 @@ fn sweep_instance_containers(cli: &str, pid: u32) {
         return;
     };
     for id in ids.split_whitespace() {
-        bounded_status(cli, &["rm", "-f", id]);
-    }
-}
-
-/// How long any container-CLI call in the harness may take. A healthy daemon
-/// answers immediately; a wedged one (stale `DOCKER_HOST`, Docker Desktop mid
-/// start, a broken socket) blocks on connect forever, and an unbounded call
-/// here hangs the whole test run rather than the one container sweep.
-const CLI_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Run a container-CLI command, returning its stdout, or `None` when it fails
-/// or outruns [`CLI_TIMEOUT`].
-fn bounded_output(cli: &str, args: &[&str]) -> Option<String> {
-    let mut child = Command::new(cli)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    // Drain stdout while waiting: a child that fills the pipe buffer blocks on
-    // write, so waiting for exit first would deadlock until the deadline.
-    let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = std::io::Read::read_to_end(&mut stdout, &mut buf);
-        buf
-    });
-    if !wait_bounded(&mut child) {
-        return None;
-    }
-    let status = child.wait().ok()?;
-    let buf = reader.join().ok()?;
-    status
-        .success()
-        .then(|| String::from_utf8_lossy(&buf).into_owned())
-}
-
-/// Run a container-CLI command for its effect only, bounded the same way.
-fn bounded_status(cli: &str, args: &[&str]) {
-    if let Ok(mut child) = Command::new(cli)
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        wait_bounded(&mut child);
-    }
-}
-
-/// Wait for `child` up to [`CLI_TIMEOUT`], killing it on expiry. Returns
-/// whether it exited on its own.
-fn wait_bounded(child: &mut std::process::Child) -> bool {
-    let deadline = std::time::Instant::now() + CLI_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return true,
-            Ok(None) => {}
-            Err(_) => return false,
-        }
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(25));
+        let _ = bounded_status(cli, &["rm".to_string(), "-f".to_string(), id.to_string()]);
     }
 }
 
@@ -644,6 +585,15 @@ fn find_binary() -> String {
     );
 }
 
+/// Pick the container CLI the harness tells the server to use, falling back to
+/// `docker` when neither answers (the server re-probes and disables container
+/// support itself).
+///
+/// Liveness comes from `fakecloud_core::container_net::cli_available`, which
+/// bounds the `<cli> info` probe: an unreachable or wedged daemon (stale
+/// `DOCKER_HOST`, Docker Desktop mid start, a broken socket) can leave the CLI
+/// blocked on connect *forever*, and without that bound a conformance `*_probe`
+/// that only calls `TestServer::start()` would never return.
 fn detect_container_cli() -> String {
     if cli_available("docker") {
         "docker".to_string()
@@ -652,41 +602,6 @@ fn detect_container_cli() -> String {
     } else {
         "docker".to_string()
     }
-}
-
-/// True when `<cli> info` succeeds within a bounded window. A healthy daemon
-/// answers in well under a second; an unreachable or wedged daemon (stale
-/// `DOCKER_HOST`, Docker Desktop mid start, a broken socket) can leave the CLI
-/// blocked on connect *forever*. Without this bound, `detect_container_cli`
-/// hangs the whole test harness — a conformance `*_probe` that only calls
-/// `TestServer::start()` would never return. Mirrors
-/// `fakecloud_core::container_net::cli_available` (testkit can't depend on
-/// core, so the bounded pattern is duplicated here on purpose).
-fn cli_available(cli: &str) -> bool {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, bool>>> =
-        std::sync::OnceLock::new();
-    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    if let Some(&cached) = cache.lock().unwrap().get(cli) {
-        return cached;
-    }
-    let result = probe_cli(cli);
-    cache.lock().unwrap().insert(cli.to_string(), result);
-    result
-}
-
-fn probe_cli(cli: &str) -> bool {
-    let Ok(mut child) = Command::new(cli)
-        .arg("info")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return false;
-    };
-    if !wait_bounded(&mut child) {
-        return false;
-    }
-    child.wait().map(|s| s.success()).unwrap_or(false)
 }
 
 /// Prefix that `fakecloud-server` prints before the bound port on stdout.
@@ -1057,37 +972,55 @@ mod handshake_tests {
 }
 
 #[cfg(test)]
-mod bounded_cli_tests {
+mod container_sweep_tests {
     use super::*;
+    use fakecloud_core::container_net::CLI_PROBE_TIMEOUT;
 
-    /// A container CLI that never returns must not hang the harness. `sleep`
-    /// stands in for a wedged daemon: the bound has to cut it off.
+    /// Tests that disable container support (`FAKECLOUD_CONTAINER_CLI=false`)
+    /// must not pay for a subprocess on every server drop.
     #[test]
-    fn a_hanging_cli_call_is_cut_off() {
+    fn a_disabled_cli_skips_the_sweep() {
         let start = std::time::Instant::now();
-        let mut child = Command::new("sleep")
-            .arg("600")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("sleep is available");
+        sweep_instance_containers("false", std::process::id());
+        sweep_instance_containers("", std::process::id());
         assert!(
-            !wait_bounded(&mut child),
-            "a hung call must not report success"
-        );
-        assert!(
-            start.elapsed() < CLI_TIMEOUT + Duration::from_secs(5),
-            "the wait must end at the bound, not run on"
+            start.elapsed() < Duration::from_secs(1),
+            "a disabled CLI must not spawn anything, took {:?}",
+            start.elapsed()
         );
     }
 
     #[test]
-    fn a_prompt_cli_call_returns_its_output() {
-        assert_eq!(
-            bounded_output("echo", &["container-id"])
-                .as_deref()
-                .map(str::trim),
-            Some("container-id")
+    fn a_missing_cli_leaves_the_sweep_a_no_op() {
+        // Nothing to sweep and nothing to hang on: an absent binary fails to
+        // spawn, so the sweep returns instead of panicking on the drop path.
+        sweep_instance_containers("definitely-not-a-real-cli-binary-xyz-123", 1);
+    }
+
+    /// The sweep runs from `Drop`, once per test server. A container CLI that
+    /// never returns (a wedged daemon) must end at the shared bound rather than
+    /// hang the whole test run -- the reason the harness routes every call
+    /// through `fakecloud_core::container_net`'s bounded helpers instead of
+    /// keeping its own copy.
+    #[cfg(unix)]
+    #[test]
+    fn a_hanging_cli_cannot_hang_the_sweep() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("fc-sweeptest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("hangcli");
+        std::fs::write(&script, "#!/bin/sh\nsleep 600\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let start = std::time::Instant::now();
+        sweep_instance_containers(script.to_str().unwrap(), std::process::id());
+        let elapsed = start.elapsed();
+
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            elapsed < CLI_PROBE_TIMEOUT + Duration::from_secs(5),
+            "the sweep took {elapsed:?}, expected it bounded near {CLI_PROBE_TIMEOUT:?}"
         );
     }
 }
