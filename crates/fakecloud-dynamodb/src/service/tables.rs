@@ -1082,9 +1082,12 @@ impl DynamoDbService {
         let matched: Vec<(&str, Value)> = state
             .backups
             .values()
-            .filter(|b| {
-                table_name.is_none()
-                    || table_name.map(super::resolve_table_name) == Some(b.table_name.as_str())
+            // A table ARN filter matches that exact table: another account's
+            // or region's table of the same name is not this account's.
+            .filter(|b| match table_name {
+                None => true,
+                Some(name) if name.starts_with("arn:") => b.table_arn == name,
+                Some(name) => b.table_name == name,
             })
             .filter(|b| match start {
                 Some(s) => b.backup_arn.as_str() > s,

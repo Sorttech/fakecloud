@@ -47,6 +47,8 @@ struct Scope<'a> {
     account: &'a str,
     region: &'a str,
     accounts: &'a fakecloud_core::multi_account::MultiAccountState<crate::state::DynamoDbState>,
+    /// Whether the operation may act on another account's table.
+    cross_account: bool,
 }
 
 impl Scope<'_> {
@@ -59,20 +61,31 @@ impl Scope<'_> {
     /// policy scoped to the real table's region could be sidestepped. A table
     /// that does not exist yet (CreateTable) is authorized at the ARN it will
     /// get: the caller's account and the request's region.
+    ///
+    /// The handler serves an operation with cross-account support in the
+    /// account a table ARN names, and any other operation in the caller's
+    /// account -- where it does not find another account's table at all -- so
+    /// the table looked up is the one in that account.
     fn table(&self, name_or_arn: &str) -> String {
-        // Handlers look a table up by name in the caller's own account, whatever
-        // account a table ARN names, so that is the table to authorize.
-        let name = match table_arn_of(name_or_arn) {
-            Some(arn) => arn
-                .rsplit("table/")
-                .next()
-                .unwrap_or(name_or_arn)
-                .to_string(),
-            None => name_or_arn.to_string(),
+        let (name, owner) = match table_arn_of(name_or_arn) {
+            Some(arn) => {
+                let owner = arn.split(':').nth(4).filter(|a| !a.is_empty());
+                let name = arn
+                    .rsplit("table/")
+                    .next()
+                    .unwrap_or(name_or_arn)
+                    .to_string();
+                match owner {
+                    Some(owner) if owner != self.account && !self.cross_account => return arn,
+                    Some(owner) => (name, owner.to_string()),
+                    None => (name, self.account.to_string()),
+                }
+            }
+            None => (name_or_arn.to_string(), self.account.to_string()),
         };
         if let Some(table) = self
             .accounts
-            .get(self.account)
+            .get(&owner)
             .and_then(|state| state.tables.get(&name))
         {
             return table.arn.clone();
@@ -134,6 +147,8 @@ pub(crate) fn actions_for(
         account,
         region: request.region.as_str(),
         accounts: &accounts,
+        cross_account: super::cross_account::CROSS_ACCOUNT_OPERATIONS
+            .contains(&request.action.as_str()),
     };
     let op: &'static str = match DYNAMODB_ACTIONS
         .iter()

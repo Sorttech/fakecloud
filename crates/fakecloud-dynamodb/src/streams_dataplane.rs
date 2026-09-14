@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 
+use crate::service::cross_account;
 use crate::state::{DynamoTable, SharedDynamoDbState};
 
 pub struct DynamoDbStreamsService {
@@ -32,8 +33,22 @@ impl AwsService for DynamoDbStreamsService {
         "dynamodbstreams"
     }
 
-    async fn handle(&self, req: AwsRequest) -> Result<AwsResponse, AwsServiceError> {
+    async fn handle(&self, mut req: AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
+        // A stream in another region, or in another account for ListStreams,
+        // is not found; a stream read in another account is served there.
+        cross_account::check_references(
+            &req,
+            &body,
+            cross_account::STREAMS_CROSS_ACCOUNT_OPERATIONS,
+        )?;
+        if let Some(owner) = cross_account::single_resource_owner(
+            &req,
+            &body,
+            cross_account::STREAMS_CROSS_ACCOUNT_OPERATIONS,
+        ) {
+            req.account_id = owner;
+        }
         match req.action.as_str() {
             "ListStreams" => self.list_streams(&req, &body),
             "DescribeStream" => self.describe_stream(&req, &body),
@@ -703,5 +718,75 @@ mod tests {
             .err()
             .expect("expected ResourceNotFound");
         assert!(format!("{:?}", err).contains("ResourceNotFoundException"));
+    }
+
+    /// Another account's stream is read in that account; ListStreams lists
+    /// only the caller's own streams; a stream in another region is not found.
+    #[tokio::test]
+    async fn another_accounts_stream_is_read_in_its_account() {
+        let state = make_state();
+        let arn = seed_table(&state);
+        let svc = DynamoDbStreamsService::new(state);
+        let as_other = |action: &str, body: Value| {
+            let mut r = req(action, body);
+            r.account_id = "444455556666".into();
+            r
+        };
+
+        let resp = svc
+            .handle(as_other("DescribeStream", json!({"StreamArn": arn})))
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        assert_eq!(body["StreamDescription"]["StreamArn"], arn.as_str());
+
+        let resp = svc
+            .handle(as_other(
+                "GetShardIterator",
+                json!({
+                    "StreamArn": arn,
+                    "ShardId": body["StreamDescription"]["Shards"][0]["ShardId"],
+                    "ShardIteratorType": "TRIM_HORIZON"
+                }),
+            ))
+            .await
+            .unwrap();
+        let it: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        let resp = svc
+            .handle(as_other(
+                "GetRecords",
+                json!({"ShardIterator": it["ShardIterator"]}),
+            ))
+            .await
+            .unwrap();
+        let records: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        assert_eq!(records["Records"].as_array().unwrap().len(), 1);
+
+        let resp = svc
+            .handle(as_other("ListStreams", json!({})))
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        assert!(body["Streams"].as_array().unwrap().is_empty());
+
+        let other_region = arn.replace("us-east-1", "eu-west-1");
+        let err = svc
+            .handle(as_other(
+                "DescribeStream",
+                json!({"StreamArn": other_region}),
+            ))
+            .await
+            .err()
+            .expect("another region's stream is not found");
+        assert_eq!(err.code(), "ResourceNotFoundException");
+        let err = svc
+            .handle(as_other(
+                "ListStreams",
+                json!({"TableName": "arn:aws:dynamodb:us-east-1:123456789012:table/widgets"}),
+            ))
+            .await
+            .err()
+            .expect("ListStreams has no cross-account support");
+        assert_eq!(err.code(), "ResourceNotFoundException");
     }
 }

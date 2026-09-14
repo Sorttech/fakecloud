@@ -142,6 +142,7 @@ impl Keys {
 /// The table (and index, if any) a resource ARN names, with the partition
 /// key attribute the ARN's key conditions are about.
 struct Target {
+    account: String,
     table_ref_name: String,
     partition_key: String,
     index: Option<String>,
@@ -174,19 +175,26 @@ fn target(
         None => table.hash_key_name().to_string(),
     };
     Some(Target {
+        account: account.to_string(),
         table_ref_name: name.to_string(),
         partition_key,
         index,
     })
 }
 
-/// Whether a request's `TableName` value names `target`'s table.
-fn names_table(target: &Target, table_name: Option<&str>) -> bool {
+/// Whether a request's `TableName` value names `target`'s table: the same
+/// name in the same account. A batch or transaction may name same-named
+/// tables in several accounts (one by name, others by ARN), and each table's
+/// authorization sees only the keys and attributes sent to that table.
+fn names_table(target: &Target, caller_account: &str, table_name: Option<&str>) -> bool {
     let Some(name) = table_name else {
         return false;
     };
-    let resolved = super::resolve_table_name(name);
-    resolved == target.table_ref_name
+    let owner = match super::cross_account::arn_scope(name) {
+        Some((_, account)) if !account.is_empty() => account,
+        _ => caller_account,
+    };
+    owner == target.account && super::resolve_table_name(name) == target.table_ref_name
 }
 
 /// The string an IAM condition compares for a scalar attribute value: the
@@ -213,6 +221,13 @@ pub(crate) fn condition_keys(
     let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
     let accounts = state.read();
     let target = target(&accounts, &action.resource);
+    // The account a plain table name resolves in, as `iam::actions_for`
+    // resolves it.
+    let caller_account = request
+        .principal
+        .as_ref()
+        .map(|p| p.account_id.as_str())
+        .unwrap_or(request.account_id.as_str());
     let mut keys = Keys::default();
     let rcc = || {
         Some(
@@ -263,7 +278,7 @@ pub(crate) fn condition_keys(
         "BatchGetItem" | "BatchWriteItem" => {
             if let (Some(t), Some(items)) = (&target, body["RequestItems"].as_object()) {
                 for (table_name, entry) in items {
-                    if !names_table(t, Some(table_name)) {
+                    if !names_table(t, caller_account, Some(table_name)) {
                         continue;
                     }
                     if request.action == "BatchGetItem" {
@@ -305,7 +320,7 @@ pub(crate) fn condition_keys(
             if let Some(t) = &target {
                 for item in body["TransactItems"].as_array().into_iter().flatten() {
                     let op = &item[member];
-                    if !names_table(t, op["TableName"].as_str()) {
+                    if !names_table(t, caller_account, op["TableName"].as_str()) {
                         continue;
                     }
                     let addressed = if member == "Put" {
@@ -1329,19 +1344,83 @@ mod tests {
         );
     }
 
-    /// A table ARN naming another account still authorizes the caller's own
-    /// table: that is the table the handler serves.
+    /// A table ARN naming another account authorizes that account's table
+    /// for an operation with cross-account support, and is authorized as
+    /// written for one without it (which the handler answers not found).
     #[test]
-    fn a_foreign_account_arn_authorizes_the_callers_table() {
+    fn a_foreign_account_arn_authorizes_the_table_the_handler_serves() {
         let (_svc, state) = service_with_table();
-        let req = request(
-            "GetItem",
-            serde_json::json!({"TableName": "arn:aws:dynamodb:us-east-1:444455556666:table/Games"}),
-        );
+        {
+            let mut accounts = state.write();
+            let src = accounts.get("123456789012").unwrap().tables["Games"].clone();
+            let foreign = accounts.get_or_create("444455556666");
+            let mut table = src;
+            table.arn = "arn:aws:dynamodb:us-east-1:444455556666:table/Games".to_string();
+            foreign.tables.insert("Games".to_string(), table);
+        }
+        let arn = "arn:aws:dynamodb:us-east-1:444455556666:table/Games";
+        let req = request("GetItem", serde_json::json!({"TableName": arn}));
         assert_eq!(
             super::super::iam::actions_for(&state, &req)[0].resource,
-            "arn:aws:dynamodb:us-east-1:123456789012:table/Games"
+            arn
         );
+        let req = request("DescribeTimeToLive", serde_json::json!({"TableName": arn}));
+        assert_eq!(
+            super::super::iam::actions_for(&state, &req)[0].resource,
+            arn
+        );
+        // A table the named account does not hold is authorized at its ARN.
+        let missing = "arn:aws:dynamodb:us-east-1:444455556666:table/Nope";
+        let req = request("GetItem", serde_json::json!({"TableName": missing}));
+        assert_eq!(
+            super::super::iam::actions_for(&state, &req)[0].resource,
+            missing
+        );
+    }
+
+    /// Same-named tables in two accounts named by one batch or transaction
+    /// each see only the keys sent to them.
+    #[test]
+    fn same_named_tables_in_two_accounts_keep_their_own_keys() {
+        let (_svc, state) = service_with_table();
+        let arn = "arn:aws:dynamodb:us-east-1:444455556666:table/Games";
+        {
+            let mut accounts = state.write();
+            let mut table = accounts.get("123456789012").unwrap().tables["Games"].clone();
+            table.arn = arn.to_string();
+            accounts
+                .get_or_create("444455556666")
+                .tables
+                .insert("Games".to_string(), table);
+        }
+        let own = "arn:aws:dynamodb:us-east-1:123456789012:table/Games";
+        for (action, body) in [
+            (
+                "TransactWriteItems",
+                serde_json::json!({"TransactItems": [
+                    {"Put": {"TableName": "Games", "Item": {"UserId": {"S": "mine"}, "Title": {"S": "a"}}}},
+                    {"Put": {"TableName": arn, "Item": {"UserId": {"S": "theirs"}, "Title": {"S": "a"}}}}
+                ]}),
+            ),
+            (
+                "BatchGetItem",
+                serde_json::json!({"RequestItems": {
+                    "Games": {"Keys": [{"UserId": {"S": "mine"}, "Title": {"S": "a"}}]},
+                    arn: {"Keys": [{"UserId": {"S": "theirs"}, "Title": {"S": "a"}}]}
+                }}),
+            ),
+        ] {
+            let req = request(action, body);
+            let actions = super::super::iam::actions_for(&state, &req);
+            let leading = |resource: &str| {
+                let a = actions.iter().find(|a| a.resource == resource)?;
+                condition_keys(&state, &req, a)
+                    .get("dynamodb:leadingkeys")
+                    .cloned()
+            };
+            assert_eq!(leading(own), Some(vec!["mine".to_string()]), "{action}");
+            assert_eq!(leading(arn), Some(vec!["theirs".to_string()]), "{action}");
+        }
     }
 
     /// A key condition parenthesized as a whole still yields its partition
