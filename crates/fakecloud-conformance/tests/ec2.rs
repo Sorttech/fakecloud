@@ -2625,7 +2625,7 @@ async fn ec2_describe_instance_status() {
         .any(|x| x.instance_id() == Some(id.as_str())));
 }
 
-#[test_action("ec2", "DescribeInstanceTypes", checksum = "b10abc8e")]
+#[test_action("ec2", "DescribeInstanceTypes", checksum = "3d9f9d27")]
 #[tokio::test]
 async fn ec2_describe_instance_types() {
     let s = TestServer::start().await;
@@ -2972,7 +2972,7 @@ async fn make_vol(c: &aws_sdk_ec2::Client) -> String {
         .to_string()
 }
 
-#[test_action("ec2", "CreateVolume", checksum = "01037f49")]
+#[test_action("ec2", "CreateVolume", checksum = "110701d7")]
 #[tokio::test]
 async fn ec2_create_volume() {
     let s = TestServer::start().await;
@@ -2989,7 +2989,7 @@ async fn ec2_create_volume() {
     assert_eq!(r.size(), Some(10));
 }
 
-#[test_action("ec2", "DescribeVolumes", checksum = "9dfe1d7b")]
+#[test_action("ec2", "DescribeVolumes", checksum = "7e1e5357")]
 #[tokio::test]
 async fn ec2_describe_volumes() {
     let s = TestServer::start().await;
@@ -3585,7 +3585,7 @@ async fn make_ami(c: &aws_sdk_ec2::Client) -> String {
         .to_string()
 }
 
-#[test_action("ec2", "CreateImage", checksum = "32e8dd50")]
+#[test_action("ec2", "CreateImage", checksum = "cb26117a")]
 #[tokio::test]
 async fn ec2_create_image() {
     let s = TestServer::start().await;
@@ -10820,7 +10820,7 @@ async fn ec2_copy_fpga_image() {
         .unwrap();
 }
 
-#[test_action("ec2", "CopyVolumes", checksum = "fb31e0b4")]
+#[test_action("ec2", "CopyVolumes", checksum = "66f62bba")]
 #[tokio::test]
 async fn ec2_copy_volumes() {
     let s = TestServer::start().await;

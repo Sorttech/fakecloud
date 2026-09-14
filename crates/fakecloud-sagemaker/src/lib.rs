@@ -1,6 +1,6 @@
 //! Amazon SageMaker (`sagemaker`) awsJson1.1 control-plane service for fakecloud.
 //!
-//! The full ~403-operation Amazon SageMaker Smithy model (SDK id `SageMaker`,
+//! The full ~404-operation Amazon SageMaker Smithy model (SDK id `SageMaker`,
 //! SigV4 signing name `sagemaker`, awsJson1.1 protocol). Every request is a
 //! `POST /` whose operation is selected by the `X-Amz-Target: SageMaker.<Op>`
 //! header, with all inputs carried in the JSON body (no HTTP path / label /

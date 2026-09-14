@@ -778,6 +778,186 @@ fn batch_cluster_nodes_add_and_delete_round_trip() {
     assert_eq!(listed["ClusterNodeSummaries"].as_array().unwrap().len(), 1);
 }
 
+// AttachClusterNodeNetworkInterface persists the attachment on the node: the
+// same ENI re-attached to the same node returns the same AttachmentId, an ENI
+// already attached elsewhere is a conflict, and an unknown node is not found.
+#[test]
+fn attach_cluster_node_network_interface_persists_attachment() {
+    let s = svc();
+    let created = resp_json(
+        &run(
+            &s,
+            "CreateCluster",
+            json!({"ClusterName": "c1", "InstanceGroups": []}),
+        )
+        .unwrap(),
+    );
+    let cluster_arn = created["ClusterArn"].as_str().unwrap().to_string();
+    let added = resp_json(
+        &run(
+            &s,
+            "BatchAddClusterNodes",
+            json!({
+                "ClusterName": "c1",
+                "NodesToAdd": [{"InstanceGroupName": "g1", "IncrementTargetCountBy": 2}],
+            }),
+        )
+        .unwrap(),
+    );
+    let nodes: Vec<String> = added["Successful"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["NodeLogicalId"].as_str().unwrap().to_string())
+        .collect();
+
+    // Attach by cluster ARN; the node was added under the cluster name.
+    let attached = resp_json(
+        &run(
+            &s,
+            "AttachClusterNodeNetworkInterface",
+            json!({
+                "ClusterName": cluster_arn,
+                "NodeId": nodes[0],
+                "NetworkInterfaceId": "eni-0123456789abcdef0",
+            }),
+        )
+        .unwrap(),
+    );
+    assert_eq!(attached["ClusterArn"], cluster_arn.as_str());
+    assert_eq!(attached["NodeId"], nodes[0].as_str());
+    assert_eq!(attached["NetworkInterfaceId"], "eni-0123456789abcdef0");
+    let attachment_id = attached["AttachmentId"].as_str().unwrap().to_string();
+    assert!(attachment_id.starts_with("eni-attach-"), "{attachment_id}");
+    assert_eq!(attachment_id.len(), "eni-attach-".len() + 17);
+    assert!(attachment_id["eni-attach-".len()..]
+        .chars()
+        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+
+    // Re-attaching the same ENI to the same node is idempotent.
+    let again = resp_json(
+        &run(
+            &s,
+            "AttachClusterNodeNetworkInterface",
+            json!({
+                "ClusterName": "c1",
+                "NodeId": nodes[0],
+                "NetworkInterfaceId": "eni-0123456789abcdef0",
+            }),
+        )
+        .unwrap(),
+    );
+    assert_eq!(again["AttachmentId"], attachment_id.as_str());
+
+    // The same ENI cannot also be attached to a second node.
+    let err = expect_err(run(
+        &s,
+        "AttachClusterNodeNetworkInterface",
+        json!({
+            "ClusterName": "c1",
+            "NodeId": nodes[1],
+            "NetworkInterfaceId": "eni-0123456789abcdef0",
+        }),
+    ));
+    assert_eq!(err.code(), "ConflictException");
+
+    // A different ENI on the second node gets its own attachment id.
+    let second = resp_json(
+        &run(
+            &s,
+            "AttachClusterNodeNetworkInterface",
+            json!({
+                "ClusterName": "c1",
+                "NodeId": nodes[1],
+                "NetworkInterfaceId": "eni-0fedcba9876543210",
+            }),
+        )
+        .unwrap(),
+    );
+    assert_ne!(second["AttachmentId"], attachment_id.as_str());
+
+    // A cluster ARN resolves nodes added under its name even with no stored
+    // Cluster record.
+    let added = resp_json(
+        &run(
+            &s,
+            "BatchAddClusterNodes",
+            json!({"ClusterName": "c2", "NodesToAdd": [{"InstanceGroupName": "g1"}]}),
+        )
+        .unwrap(),
+    );
+    let c2_node = added["Successful"][0]["NodeLogicalId"].as_str().unwrap();
+    let by_arn = resp_json(
+        &run(
+            &s,
+            "AttachClusterNodeNetworkInterface",
+            json!({
+                "ClusterName": "arn:aws:sagemaker:us-east-1:000000000000:cluster/c2",
+                "NodeId": c2_node,
+                "NetworkInterfaceId": "eni-0bbbbbbbbbbbbbbbb",
+            }),
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        by_arn["ClusterArn"],
+        "arn:aws:sagemaker:us-east-1:000000000000:cluster/c2"
+    );
+
+    // And the reverse: nodes added under the ARN resolve by the bare name.
+    let added = resp_json(
+        &run(
+            &s,
+            "BatchAddClusterNodes",
+            json!({
+                "ClusterName": "arn:aws:sagemaker:us-east-1:000000000000:cluster/c3",
+                "NodesToAdd": [{"InstanceGroupName": "g1"}],
+            }),
+        )
+        .unwrap(),
+    );
+    let c3_node = added["Successful"][0]["NodeLogicalId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    run(
+        &s,
+        "AttachClusterNodeNetworkInterface",
+        json!({
+            "ClusterName": "c3",
+            "NodeId": c3_node,
+            "NetworkInterfaceId": "eni-0cccccccccccccccc",
+        }),
+    )
+    .unwrap();
+
+    // A same-named cluster ARN from another account does not reach local nodes.
+    let err = expect_err(run(
+        &s,
+        "AttachClusterNodeNetworkInterface",
+        json!({
+            "ClusterName": "arn:aws:sagemaker:eu-west-1:111111111111:cluster/c2",
+            "NodeId": c2_node,
+            "NetworkInterfaceId": "eni-0dddddddddddddddd",
+        }),
+    ));
+    assert_eq!(err.code(), "ResourceNotFound");
+
+    // Unknown node, and a known node addressed through the wrong cluster.
+    for (cluster, node) in [("c1", "i-00000000000000999"), ("other", nodes[0].as_str())] {
+        let err = expect_err(run(
+            &s,
+            "AttachClusterNodeNetworkInterface",
+            json!({
+                "ClusterName": cluster,
+                "NodeId": node,
+                "NetworkInterfaceId": "eni-0aaaaaaaaaaaaaaaa",
+            }),
+        ));
+        assert_eq!(err.code(), "ResourceNotFound");
+    }
+}
+
 // BatchRebootClusterNodes reports in Successful exactly the requested ids that
 // resolve to a node in the cluster (reading real persisted state).
 #[test]

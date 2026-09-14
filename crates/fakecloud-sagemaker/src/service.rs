@@ -1,6 +1,6 @@
 //! Amazon SageMaker (`sagemaker`) awsJson1.1 dispatch.
 //!
-//! Requests are routed to one of the ~403 modelled operations by the
+//! Requests are routed to one of the ~404 modelled operations by the
 //! `X-Amz-Target: SageMaker.<Operation>` header (surfaced as
 //! [`AwsRequest::action`]). All inputs arrive in the JSON body. Input is
 //! validated against the model-derived constraints ([`crate::validate`]), then

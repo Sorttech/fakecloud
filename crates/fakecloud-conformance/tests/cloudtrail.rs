@@ -15,7 +15,7 @@ use helpers::TestServer;
 #[test_action("cloudtrail", "CreateChannel", checksum = "038a130e")]
 #[test_action("cloudtrail", "CreateDashboard", checksum = "d02fd204")]
 #[test_action("cloudtrail", "CreateEventDataStore", checksum = "85a28968")]
-#[test_action("cloudtrail", "CreateTrail", checksum = "66c8b2d1")]
+#[test_action("cloudtrail", "CreateTrail", checksum = "7d910ed8")]
 #[test_action("cloudtrail", "DeleteChannel", checksum = "c4c5291b")]
 #[test_action("cloudtrail", "DeleteDashboard", checksum = "79584041")]
 #[test_action("cloudtrail", "DeleteEventDataStore", checksum = "4472b697")]
@@ -27,7 +27,7 @@ use helpers::TestServer;
     checksum = "d717211e"
 )]
 #[test_action("cloudtrail", "DescribeQuery", checksum = "0b31facc")]
-#[test_action("cloudtrail", "DescribeTrails", checksum = "17f76359")]
+#[test_action("cloudtrail", "DescribeTrails", checksum = "3cd7b259")]
 #[test_action("cloudtrail", "DisableFederation", checksum = "c69212d4")]
 #[test_action("cloudtrail", "EnableFederation", checksum = "9e122fb1")]
 #[test_action("cloudtrail", "GenerateQuery", checksum = "df0f9127")]
@@ -40,7 +40,7 @@ use helpers::TestServer;
 #[test_action("cloudtrail", "GetInsightSelectors", checksum = "6fb75598")]
 #[test_action("cloudtrail", "GetQueryResults", checksum = "65b94755")]
 #[test_action("cloudtrail", "GetResourcePolicy", checksum = "69887b16")]
-#[test_action("cloudtrail", "GetTrail", checksum = "bf794d13")]
+#[test_action("cloudtrail", "GetTrail", checksum = "0847efe7")]
 #[test_action("cloudtrail", "GetTrailStatus", checksum = "c0e5cb6f")]
 #[test_action("cloudtrail", "ListChannels", checksum = "90f1dffe")]
 #[test_action("cloudtrail", "ListDashboards", checksum = "8b971717")]
@@ -56,7 +56,7 @@ use helpers::TestServer;
 #[test_action("cloudtrail", "LookupEvents", checksum = "8371a1f2")]
 #[test_action("cloudtrail", "PutEventConfiguration", checksum = "0c49cab9")]
 #[test_action("cloudtrail", "PutEventSelectors", checksum = "da42429f")]
-#[test_action("cloudtrail", "PutInsightSelectors", checksum = "80aee099")]
+#[test_action("cloudtrail", "PutInsightSelectors", checksum = "297b3261")]
 #[test_action("cloudtrail", "PutResourcePolicy", checksum = "d9935a52")]
 #[test_action(
     "cloudtrail",
@@ -77,7 +77,7 @@ use helpers::TestServer;
 #[test_action("cloudtrail", "UpdateChannel", checksum = "c8510015")]
 #[test_action("cloudtrail", "UpdateDashboard", checksum = "44eafd97")]
 #[test_action("cloudtrail", "UpdateEventDataStore", checksum = "27a96ae1")]
-#[test_action("cloudtrail", "UpdateTrail", checksum = "e3cf00bd")]
+#[test_action("cloudtrail", "UpdateTrail", checksum = "592e538a")]
 #[tokio::test]
 async fn cloudtrail_probe() {
     let _server = TestServer::start().await;
