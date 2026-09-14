@@ -197,6 +197,12 @@ pub struct LogGroup {
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct LogStream {
+    /// Stable disk identity; a recreated stream must never reuse old segments.
+    #[serde(default = "new_stream_generation")]
+    pub persistence_id: String,
+    /// Preserve the high-water mark even after retention removes every event.
+    #[serde(default)]
+    pub last_sequence: u64,
     pub name: String,
     pub arn: String,
     pub creation_time: i64,
@@ -483,6 +489,95 @@ pub struct LogsSnapshot {
 }
 
 pub const LOGS_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
+
+/// The only `retentionInDays` values CloudWatch Logs accepts. Retention deletes
+/// stored events, so an out-of-set value (0, negative) must never reach state.
+pub const VALID_RETENTION_DAYS: [i64; 22] = [
+    1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922,
+    3288, 3653,
+];
+
+fn new_stream_generation() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+impl LogsState {
+    pub(crate) fn metadata(&self) -> Self {
+        Self {
+            account_id: self.account_id.clone(),
+            region: self.region.clone(),
+            log_groups: self
+                .log_groups
+                .iter()
+                .map(|(k, v)| (k.clone(), v.metadata()))
+                .collect(),
+            metric_filters: self.metric_filters.clone(),
+            resource_policies: self.resource_policies.clone(),
+            destinations: self.destinations.clone(),
+            queries: self.queries.clone(),
+            export_tasks: self.export_tasks.clone(),
+            delivery_destinations: self.delivery_destinations.clone(),
+            delivery_sources: self.delivery_sources.clone(),
+            deliveries: self.deliveries.clone(),
+            query_definitions: self.query_definitions.clone(),
+            account_policies: self.account_policies.clone(),
+            anomaly_detectors: self.anomaly_detectors.clone(),
+            import_tasks: self.import_tasks.clone(),
+            integrations: self.integrations.clone(),
+            lookup_tables: self.lookup_tables.clone(),
+            scheduled_queries: self.scheduled_queries.clone(),
+            s3_table_sources: self.s3_table_sources.clone(),
+            bearer_token_auth: self.bearer_token_auth.clone(),
+            export_storage: self.export_storage.clone(),
+            anomalies: self.anomalies.clone(),
+            syslog_configurations: self.syslog_configurations.clone(),
+            storage_tier: self.storage_tier.clone(),
+            storage_tier_last_updated: self.storage_tier_last_updated,
+        }
+    }
+}
+
+impl LogGroup {
+    pub(crate) fn metadata(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            arn: self.arn.clone(),
+            creation_time: self.creation_time,
+            retention_in_days: self.retention_in_days,
+            kms_key_id: self.kms_key_id.clone(),
+            tags: self.tags.clone(),
+            log_streams: self
+                .log_streams
+                .iter()
+                .map(|(k, v)| (k.clone(), v.metadata()))
+                .collect(),
+            stored_bytes: self.stored_bytes,
+            subscription_filters: self.subscription_filters.clone(),
+            data_protection_policy: self.data_protection_policy.clone(),
+            index_policies: self.index_policies.clone(),
+            transformer: self.transformer.clone(),
+            deletion_protection: self.deletion_protection,
+            log_group_class: self.log_group_class.clone(),
+        }
+    }
+}
+
+impl LogStream {
+    pub(crate) fn metadata(&self) -> Self {
+        Self {
+            persistence_id: self.persistence_id.clone(),
+            last_sequence: self.last_sequence,
+            name: self.name.clone(),
+            arn: self.arn.clone(),
+            creation_time: self.creation_time,
+            first_event_timestamp: self.first_event_timestamp,
+            last_event_timestamp: self.last_event_timestamp,
+            last_ingestion_time: self.last_ingestion_time,
+            upload_sequence_token: self.upload_sequence_token.clone(),
+            events: Vec::new(),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
