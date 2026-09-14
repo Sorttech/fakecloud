@@ -311,3 +311,40 @@ async fn simulate_principal_policy_via_attached_aws_managed_policy() {
         "implicitDeny"
     );
 }
+
+/// A policy variable resolves from a simulator context entry, so
+/// `${aws:username}` policies can be tested with SimulateCustomPolicy.
+#[tokio::test]
+async fn simulate_custom_policy_resolves_policy_variables_from_context_entries() {
+    let server = TestServer::start().await;
+    let iam = server.iam_client().await;
+    let policy = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::home/${aws:username}/*"}]}"#;
+    let decision = |resource: &'static str| {
+        let iam = iam.clone();
+        async move {
+            iam.simulate_custom_policy()
+                .policy_input_list(policy)
+                .action_names("s3:GetObject")
+                .resource_arns(resource)
+                .context_entries(
+                    ContextEntry::builder()
+                        .context_key_name("aws:username")
+                        .context_key_values("alice")
+                        .context_key_type(ContextKeyTypeEnum::String)
+                        .build(),
+                )
+                .send()
+                .await
+                .unwrap()
+                .evaluation_results()[0]
+                .eval_decision()
+                .as_str()
+                .to_string()
+        }
+    };
+    assert_eq!(decision("arn:aws:s3:::home/alice/notes").await, "allowed");
+    assert_eq!(
+        decision("arn:aws:s3:::home/bob/notes").await,
+        "implicitDeny"
+    );
+}

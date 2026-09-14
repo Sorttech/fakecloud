@@ -278,6 +278,21 @@ impl LogsService {
                 "retentionInDays is required",
             )
         })?;
+        if !crate::state::VALID_RETENTION_DAYS.contains(&days) {
+            let allowed: Vec<String> = crate::state::VALID_RETENTION_DAYS
+                .iter()
+                .map(i64::to_string)
+                .collect();
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidParameterException",
+                format!(
+                    "1 validation error detected: Value '{days}' at 'retentionInDays' failed to \
+                     satisfy constraint: Member must satisfy enum value set: [{}]",
+                    allowed.join(", ")
+                ),
+            ));
+        }
 
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
@@ -907,6 +922,29 @@ mod tests {
             svc.state.read().default_ref().log_groups["ret"].retention_in_days,
             Some(30)
         );
+    }
+
+    /// Retention deletes stored events, so a value outside the AWS enum set
+    /// (0, negative, or one that would wrap in the i32 cast) is rejected before
+    /// it can wipe a group.
+    #[test]
+    fn put_retention_policy_rejects_values_outside_aws_set() {
+        let svc = make_service();
+        create_group(&svc, "ret");
+        for days in [0i64, -1, 2, 4_294_967_295] {
+            let req = make_request(
+                "PutRetentionPolicy",
+                json!({"logGroupName": "ret", "retentionInDays": days}),
+            );
+            let err = svc.put_retention_policy(&req).err().expect("rejected");
+            assert!(
+                matches!(&err, fakecloud_core::service::AwsServiceError::AwsError { code, .. } if code == "InvalidParameterException"),
+                "{days}"
+            );
+        }
+        assert!(svc.state.read().default_ref().log_groups["ret"]
+            .retention_in_days
+            .is_none());
     }
 
     #[test]

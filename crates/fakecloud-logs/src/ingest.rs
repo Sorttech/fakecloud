@@ -63,6 +63,8 @@ pub fn append_events(
         .log_streams
         .entry(stream_name.to_string())
         .or_insert_with(|| LogStream {
+            persistence_id: uuid::Uuid::new_v4().to_string(),
+            last_sequence: 0,
             name: stream_name.to_string(),
             arn: format!("{}:log-stream:{}", group.arn, stream_name),
             creation_time: now,
@@ -73,8 +75,22 @@ pub fn append_events(
             events: Vec::new(),
         });
 
-    let base_seq = stream.events.iter().map(|e| e.seq).max().unwrap_or(0);
-    for (i, e) in events.iter().enumerate() {
+    let base_seq = stream
+        .events
+        .iter()
+        .map(|e| e.seq)
+        .max()
+        .unwrap_or(0)
+        .max(stream.last_sequence);
+    // CloudWatch Logs rejects events older than the group's retention rather
+    // than storing them only for the next retention sweep to delete.
+    let retention_cutoff = group
+        .retention_in_days
+        .map(|days| now.saturating_sub(i64::from(days).saturating_mul(86_400_000)));
+    let accepted = events
+        .iter()
+        .filter(|e| retention_cutoff.is_none_or(|cutoff| e.timestamp_ms >= cutoff));
+    for (i, e) in accepted.enumerate() {
         if stream.first_event_timestamp.is_none() {
             stream.first_event_timestamp = Some(e.timestamp_ms);
         }
@@ -85,7 +101,7 @@ pub fn append_events(
                 .unwrap_or(e.timestamp_ms),
         );
         stream.last_ingestion_time = Some(now);
-        group.stored_bytes += e.message.len() as i64;
+        group.stored_bytes += e.message.len() as i64 + crate::persistence::EVENT_OVERHEAD_BYTES;
         stream.events.push(LogEvent {
             timestamp: e.timestamp_ms,
             message: e.message.clone(),

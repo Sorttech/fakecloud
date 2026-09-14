@@ -201,6 +201,9 @@ pub struct ParsedCondition {
     pub operator: ParsedOperatorName,
     pub key: String,
     pub values: Vec<String>,
+    /// Whether the policy's language version expands `${...}` policy
+    /// variables in `values` (`2012-10-17`).
+    pub policy_variables: bool,
 }
 
 /// A statement's fully-parsed `Condition` block. Multiple entries are
@@ -242,6 +245,7 @@ impl CompiledCondition {
                     },
                     key: format!("__unknown_operator__:{op_name}"),
                     values: Vec::new(),
+                    policy_variables: false,
                 });
                 continue;
             };
@@ -254,10 +258,20 @@ impl CompiledCondition {
                     operator,
                     key: key.clone(),
                     values,
+                    policy_variables: false,
                 });
             }
         }
         out
+    }
+
+    /// Mark whether the block's policy expands `${...}` policy variables
+    /// (only `Version: 2012-10-17` policies do).
+    pub fn with_policy_variables(mut self, enabled: bool) -> Self {
+        for entry in &mut self.entries {
+            entry.policy_variables = enabled;
+        }
+        self
     }
 
     /// Evaluate this condition block against a [`ConditionContext`].
@@ -313,6 +327,12 @@ pub fn evaluate_entry(entry: &ParsedCondition, ctx: &ConditionContext) -> bool {
     // Missing key handling.
     let context_values = match context_values {
         Some(vs) if !vs.is_empty() => vs,
+        // The service populated the key and the request carries no values for
+        // it. `ForAllValues` is vacuously true then, as AWS documents ("every
+        // value matches" holds for none). A key that was never populated is
+        // not treated the same way: it may be one fakecloud does not extract,
+        // and granting on it would fail open.
+        Some(_) if entry.operator.qualifier == Qualifier::ForAllValues => return true,
         _ => {
             // Key not populated. `IfExists` -> vacuously true. Otherwise
             // this is a safe-fail to false.
@@ -331,6 +351,25 @@ pub fn evaluate_entry(entry: &ParsedCondition, ctx: &ConditionContext) -> bool {
         }
     };
 
+    if entry.policy_variables
+        && supports_policy_variables(entry.operator.op)
+        && entry
+            .values
+            .iter()
+            .any(|v| crate::policy_variables::has_variables(v))
+    {
+        let expanded: Vec<Option<Vec<crate::policy_variables::Piece>>> = entry
+            .values
+            .iter()
+            .map(|v| crate::policy_variables::expand(v, ctx))
+            .collect();
+        let one = |cv: &String| match_expanded(entry.operator.op, &expanded, cv);
+        return match entry.operator.qualifier {
+            Qualifier::Single | Qualifier::ForAnyValue => context_values.iter().any(one),
+            Qualifier::ForAllValues => context_values.iter().all(one),
+        };
+    }
+
     match entry.operator.qualifier {
         Qualifier::Single | Qualifier::ForAnyValue => {
             // ANY context value satisfies the operator against the
@@ -346,6 +385,53 @@ pub fn evaluate_entry(entry: &ParsedCondition, ctx: &ConditionContext) -> bool {
                 .iter()
                 .all(|cv| match_values(entry.operator.op, &entry.values, cv))
         }
+    }
+}
+
+/// Policy variables are expanded only in string and ARN comparisons.
+fn supports_policy_variables(op: ConditionOperator) -> bool {
+    use ConditionOperator::*;
+    matches!(
+        op,
+        StringEquals
+            | StringNotEquals
+            | StringEqualsIgnoreCase
+            | StringNotEqualsIgnoreCase
+            | StringLike
+            | StringNotLike
+            | ArnEquals
+            | ArnLike
+            | ArnNotEquals
+            | ArnNotLike
+    )
+}
+
+/// [`match_values`] for policy values with variables expanded. A value whose
+/// variable has no value (`None`) is null: no positive operator matches it,
+/// and every inverted one does.
+fn match_expanded(
+    op: ConditionOperator,
+    values: &[Option<Vec<crate::policy_variables::Piece>>],
+    context_value: &str,
+) -> bool {
+    use crate::policy_variables::{glob as piece_glob, to_text};
+    use ConditionOperator::*;
+    let positive = |pred: &dyn Fn(&[crate::policy_variables::Piece]) -> bool| {
+        values.iter().any(|v| v.as_deref().is_some_and(pred))
+    };
+    let inverted = |pred: &dyn Fn(&[crate::policy_variables::Piece]) -> bool| {
+        values.iter().all(|v| v.as_deref().is_none_or(|p| !pred(p)))
+    };
+    match op {
+        StringEquals => positive(&|p| to_text(p) == context_value),
+        StringNotEquals => inverted(&|p| to_text(p) == context_value),
+        StringEqualsIgnoreCase => positive(&|p| to_text(p).eq_ignore_ascii_case(context_value)),
+        StringNotEqualsIgnoreCase => inverted(&|p| to_text(p).eq_ignore_ascii_case(context_value)),
+        StringLike | ArnEquals | ArnLike => positive(&|p| piece_glob(p, context_value, false)),
+        StringNotLike | ArnNotEquals | ArnNotLike => {
+            inverted(&|p| piece_glob(p, context_value, false))
+        }
+        _ => false,
     }
 }
 
