@@ -123,7 +123,61 @@ pub fn setup_provider_source() -> std::io::Result<PathBuf> {
         }
     }
     strip_godebug(&target.join("go.mod"))?;
+    download_modules(&target)?;
     Ok(target)
+}
+
+/// Attempts at `go mod download` before a shard gives up.
+const MODULE_DOWNLOAD_ATTEMPTS: u32 = 5;
+
+/// Fetch every module the provider needs before `go test` runs, retrying
+/// transient module-proxy failures.
+///
+/// The provider depends on hundreds of `aws-sdk-go-v2` service modules. When
+/// the restored Go module cache lacks some of them, `go test` fetches them
+/// itself and fails the whole shard on a single dropped proxy stream
+/// (`stream error: ... INTERNAL_ERROR; received from peer`), with no retry.
+/// `go mod download` is idempotent and a no-op for modules already in the
+/// cache, so running it up front with retries costs nothing on a warm cache.
+fn download_modules(provider_root: &Path) -> std::io::Result<()> {
+    with_retries(
+        MODULE_DOWNLOAD_ATTEMPTS,
+        std::time::Duration::from_secs(15),
+        |attempt| {
+            let status = Command::new("go")
+                .args(["mod", "download"])
+                .current_dir(provider_root)
+                .status()?;
+            if !status.success() {
+                eprintln!(
+                    "go mod download failed (attempt {attempt}/{MODULE_DOWNLOAD_ATTEMPTS}): {status}"
+                );
+            }
+            Ok(status.success())
+        },
+    )
+    .map_err(|e| std::io::Error::other(format!("go mod download: {e}")))
+}
+
+/// Run `op` until it reports success, up to `attempts` times, sleeping
+/// `backoff * attempt` between tries. An `Err` from `op` (the command could
+/// not be run at all) is returned immediately.
+fn with_retries(
+    attempts: u32,
+    backoff: std::time::Duration,
+    mut op: impl FnMut(u32) -> std::io::Result<bool>,
+) -> std::io::Result<()> {
+    for attempt in 1..=attempts {
+        if op(attempt)? {
+            return Ok(());
+        }
+        if attempt < attempts {
+            std::thread::sleep(backoff * attempt);
+        }
+    }
+    Err(std::io::Error::other(format!(
+        "still failing after {attempts} attempts"
+    )))
 }
 
 fn provider_dir() -> PathBuf {
@@ -506,3 +560,44 @@ pub const ENDPOINT_ENV_VARS: &[(&str, &str)] = &[
         "verifiedpermissions",
     ),
 ];
+
+#[cfg(test)]
+mod retry_tests {
+    use super::with_retries;
+    use std::time::Duration;
+
+    #[test]
+    fn retries_until_success() {
+        let mut calls = 0;
+        with_retries(5, Duration::ZERO, |attempt| {
+            calls += 1;
+            Ok(attempt == 3)
+        })
+        .unwrap();
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn gives_up_after_the_last_attempt() {
+        let mut calls = 0;
+        let err = with_retries(4, Duration::ZERO, |_| {
+            calls += 1;
+            Ok(false)
+        })
+        .unwrap_err();
+        assert_eq!(calls, 4);
+        assert!(err.to_string().contains("4 attempts"));
+    }
+
+    #[test]
+    fn a_command_that_cannot_run_is_not_retried() {
+        let mut calls = 0;
+        let err = with_retries(4, Duration::ZERO, |_| {
+            calls += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        })
+        .unwrap_err();
+        assert_eq!(calls, 1);
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+}
