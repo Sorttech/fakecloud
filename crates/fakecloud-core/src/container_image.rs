@@ -307,6 +307,26 @@ exit 2
             let path = dir.path().join("cli");
             std::fs::write(&path, script).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // Executing a file that another process holds open for writing
+            // fails with ETXTBSY. Tests run in parallel threads, and a child
+            // forked by another test while `fs::write` above had the script
+            // open inherits that descriptor until it execs. Run the script
+            // once, retrying until nothing holds it; after that no process can
+            // gain a writable descriptor to it again.
+            let mut attempts = 0;
+            loop {
+                match std::process::Command::new(&path).arg("probe").output() {
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 200 =>
+                    {
+                        attempts += 1;
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(e) => panic!("fake CLI did not run: {e}"),
+                    Ok(_) => break,
+                }
+            }
+            let _ = std::fs::remove_file(dir.path().join("calls.log"));
             Self { dir }
         }
 
