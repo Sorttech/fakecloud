@@ -461,7 +461,9 @@ impl CloudFormationService {
                 .state
                 .read()
                 .get(account_id)
-                .and_then(|st| crate::stack_sets::find_active(st, name))
+                .and_then(|st| {
+                    crate::stack_sets::find_active(st, name, crate::stack_sets::Scope::Own)
+                })
                 .map(|set| set.template_body.clone());
             return match found {
                 Some(body) => Ok(body),

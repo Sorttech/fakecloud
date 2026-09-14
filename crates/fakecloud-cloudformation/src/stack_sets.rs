@@ -285,26 +285,56 @@ pub(crate) fn is_stack_set_action(action: &str) -> bool {
     )
 }
 
+/// Which stack sets a caller can address. A StackSets delegated administrator
+/// acts on the management account's stack sets, but only the service-managed
+/// ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Scope {
+    Own,
+    DelegatedAdmin,
+}
+
+impl Scope {
+    fn of(params: &BTreeMap<String, String>) -> Self {
+        if params.get("CallAs").map(String::as_str) == Some("DELEGATED_ADMIN") {
+            Scope::DelegatedAdmin
+        } else {
+            Scope::Own
+        }
+    }
+
+    fn sees(self, set: &StackSet) -> bool {
+        self == Scope::Own || set.permission_model == "SERVICE_MANAGED"
+    }
+}
+
 /// Find an ACTIVE stack set by name or id.
 pub(crate) fn find_active<'a>(
     state: &'a CloudFormationState,
     name_or_id: &str,
+    scope: Scope,
 ) -> Option<&'a StackSet> {
-    state
-        .stack_sets
-        .values()
-        .find(|s| s.status == "ACTIVE" && (s.name == name_or_id || s.stack_set_id == name_or_id))
+    state.stack_sets.values().find(|s| {
+        s.status == "ACTIVE"
+            && (s.name == name_or_id || s.stack_set_id == name_or_id)
+            && scope.sees(s)
+    })
 }
 
 /// Find a stack set for a read: an active one by name or id, or a deleted one
 /// by its (unique) id. A deleted stack set's name is free for reuse, so a name
 /// never resolves to one.
-fn find_for_read<'a>(state: &'a CloudFormationState, name_or_id: &str) -> Option<&'a StackSet> {
-    find_active(state, name_or_id).or_else(|| state.stack_sets.get(name_or_id))
+fn find_for_read<'a>(
+    state: &'a CloudFormationState,
+    name_or_id: &str,
+    scope: Scope,
+) -> Option<&'a StackSet> {
+    find_active(state, name_or_id, scope)
+        .or_else(|| state.stack_sets.get(name_or_id).filter(|s| scope.sees(s)))
 }
 
-fn active_key(state: &CloudFormationState, name_or_id: &str) -> Option<String> {
-    find_active(state, name_or_id).map(|s| s.stack_set_id.clone())
+fn active_key(state: &CloudFormationState, name_or_id: &str, scope: Scope) -> Option<String> {
+    find_active(state, name_or_id, scope).map(|s| s.stack_set_id.clone())
 }
 
 // ── Errors ──
@@ -554,8 +584,12 @@ fn paginate<T>(
         .filter(|v| *v > 0)
         .unwrap_or(DEFAULT_PAGE_SIZE);
     let total = items.len();
+    if start > total {
+        return Err(validation("Invalid NextToken"));
+    }
+    let end = start.saturating_add(size);
     let page: Vec<T> = items.into_iter().skip(start).take(size).collect();
-    let next = (start + size < total).then(|| (start + size).to_string());
+    let next = (end < total).then(|| end.to_string());
     Ok((page, next))
 }
 
@@ -1246,6 +1280,11 @@ impl CloudFormationService {
             .cloned()
             .unwrap_or_else(|| "SELF_MANAGED".to_string());
         let service_managed = permission_model == "SERVICE_MANAGED";
+        if Scope::of(params) == Scope::DelegatedAdmin && !service_managed {
+            return Err(validation(
+                "A delegated administrator can only create stack sets with SERVICE_MANAGED permission model",
+            ));
+        }
         if service_managed {
             self.check_service_managed_allowed(&admin)?;
         }
@@ -1316,7 +1355,7 @@ impl CloudFormationService {
         );
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&admin);
-        if find_active(state, &name).is_some() {
+        if find_active(state, &name, Scope::Own).is_some() {
             return Err(aws_err(
                 StatusCode::CONFLICT,
                 "NameAlreadyExistsException",
@@ -1465,11 +1504,16 @@ impl CloudFormationService {
     }
 
     /// Resolve the stack set for a read, after folding in async progress.
-    fn read_stack_set(&self, admin: &str, name_or_id: &str) -> Result<StackSet, AwsServiceError> {
+    fn read_stack_set(
+        &self,
+        admin: &str,
+        name_or_id: &str,
+        scope: Scope,
+    ) -> Result<StackSet, AwsServiceError> {
         let mut accounts = self.state.write();
         let id = accounts
             .get(admin)
-            .and_then(|s| find_for_read(s, name_or_id))
+            .and_then(|s| find_for_read(s, name_or_id, scope))
             .map(|s| s.stack_set_id.clone())
             .ok_or_else(|| stack_set_not_found(name_or_id))?;
         Self::refresh_stack_set(&mut accounts, admin, &id);
@@ -1487,7 +1531,7 @@ impl CloudFormationService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let name = required(params, "StackSetName")?;
         let admin = self.stack_set_admin_account(req, params)?;
-        let set = self.read_stack_set(&admin, &name)?;
+        let set = self.read_stack_set(&admin, &name, Scope::of(params))?;
         Ok(xml_response(
             "DescribeStackSet",
             stack_set_el(&set),
@@ -1510,11 +1554,7 @@ impl CloudFormationService {
                 s.stack_sets
                     .values()
                     .filter(|set| wanted.is_none_or(|w| &set.status == w))
-                    .filter(|set| {
-                        // A delegated administrator only sees service-managed
-                        // stack sets.
-                        admin == req.account_id || set.permission_model == "SERVICE_MANAGED"
-                    })
+                    .filter(|set| Scope::of(params).sees(set))
                     .cloned()
                     .collect()
             })
@@ -1611,7 +1651,7 @@ impl CloudFormationService {
         // Build the updated definition and resolve targets against a snapshot,
         // without holding the CloudFormation lock while Organizations and S3
         // are read. The snapshot is re-validated under the lock below.
-        let snapshot = self.active_snapshot(&admin, &name)?;
+        let snapshot = self.active_snapshot(&admin, &name, Scope::of(params))?;
         Self::check_can_start_operation(&snapshot, &op_id)?;
         let mut updated = snapshot.clone();
         if let Some(body) = new_template {
@@ -1641,6 +1681,11 @@ impl CloudFormationService {
             }
         }
         let service_managed = updated.permission_model == "SERVICE_MANAGED";
+        if Scope::of(params) == Scope::DelegatedAdmin && !service_managed {
+            return Err(validation(
+                "A delegated administrator can only manage stack sets with SERVICE_MANAGED permission model",
+            ));
+        }
         if service_managed && snapshot.permission_model != "SERVICE_MANAGED" {
             self.check_service_managed_allowed(&admin)?;
         }
@@ -1757,11 +1802,16 @@ impl CloudFormationService {
     }
 
     /// A clone of the ACTIVE stack set `name`, with async progress folded in.
-    fn active_snapshot(&self, admin: &str, name: &str) -> Result<StackSet, AwsServiceError> {
+    fn active_snapshot(
+        &self,
+        admin: &str,
+        name: &str,
+        scope: Scope,
+    ) -> Result<StackSet, AwsServiceError> {
         let mut accounts = self.state.write();
         let set_id = accounts
             .get(admin)
-            .and_then(|s| active_key(s, name))
+            .and_then(|s| active_key(s, name, scope))
             .ok_or_else(|| stack_set_not_found(name))?;
         Self::refresh_stack_set(&mut accounts, admin, &set_id);
         accounts
@@ -1797,7 +1847,10 @@ impl CloudFormationService {
         let mut accounts = self.state.write();
         // DeleteStackSet declares no not-found error; deleting a stack set that
         // does not exist is a no-op.
-        let Some(set_id) = accounts.get(&admin).and_then(|s| active_key(s, &name)) else {
+        let Some(set_id) = accounts
+            .get(&admin)
+            .and_then(|s| active_key(s, &name, Scope::of(params)))
+        else {
             return Ok(xml_response_no_result("DeleteStackSet", &req.request_id));
         };
         Self::refresh_stack_set(&mut accounts, &admin, &set_id);
@@ -2180,7 +2233,7 @@ impl CloudFormationService {
         // Target resolution reads Organizations (and possibly S3) state, so it
         // runs against a snapshot of the stack set before the operation is
         // recorded under the CloudFormation lock.
-        let snapshot = self.active_snapshot(&admin, &name)?;
+        let snapshot = self.active_snapshot(&admin, &name, Scope::of(params))?;
         Self::check_overrides_declared(&snapshot, overrides.keys().cloned())?;
         let targets = self.resolve_new_targets(
             &snapshot,
@@ -2252,7 +2305,7 @@ impl CloudFormationService {
         });
         let overrides = overrides.transpose()?;
 
-        let snapshot = self.active_snapshot(&admin, &name)?;
+        let snapshot = self.active_snapshot(&admin, &name, Scope::of(params))?;
         if let Some(specs) = &overrides {
             Self::check_overrides_declared(
                 &snapshot,
@@ -2316,7 +2369,7 @@ impl CloudFormationService {
             .cloned()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-        let snapshot = self.active_snapshot(&admin, &name)?;
+        let snapshot = self.active_snapshot(&admin, &name, Scope::of(params))?;
         let targets = self.existing_instance_targets(
             &snapshot,
             &admin,
@@ -2408,9 +2461,10 @@ impl CloudFormationService {
         let mut abort: Option<&'static str> = None;
 
         for target in targets {
-            if abort.is_none()
-                && self.operation_status(admin, set_id, op_id).as_deref() == Some("STOPPING")
-            {
+            // Claiming the target marks it RUNNING under the lock, so a
+            // StopStackSetOperation that lands while it deploys cannot settle
+            // the operation as STOPPED underneath it.
+            if abort.is_none() && !self.claim_target(admin, set_id, op_id, &target) {
                 abort = Some(OPERATION_STOPPED);
             }
             let mut gate = None;
@@ -2461,13 +2515,28 @@ impl CloudFormationService {
         }
     }
 
-    fn operation_status(&self, admin: &str, set_id: &str, op_id: &str) -> Option<String> {
-        self.state
-            .read()
-            .get(admin)
-            .and_then(|s| s.stack_sets.get(set_id))
-            .and_then(|set| set.operations.iter().find(|o| o.operation_id == op_id))
-            .map(|o| o.status.clone())
+    /// Mark a target's result RUNNING before it deploys. Returns false when
+    /// the operation has been stopped, in which case the target must not run.
+    fn claim_target(&self, admin: &str, set_id: &str, op_id: &str, target: &Target) -> bool {
+        let mut accounts = self.state.write();
+        let Some(op) = accounts
+            .get_mut(admin)
+            .and_then(|s| s.stack_sets.get_mut(set_id))
+            .and_then(|set| set.operations.iter_mut().find(|o| o.operation_id == op_id))
+        else {
+            return false;
+        };
+        if op.status != "RUNNING" {
+            return false;
+        }
+        if let Some(result) = op
+            .results
+            .iter_mut()
+            .find(|r| r.account == target.account && r.region == target.region)
+        {
+            result.status = "RUNNING".to_string();
+        }
+        true
     }
 
     /// Run the account's `AWSCloudFormationStackSetAccountGate` Lambda, if it
@@ -2791,7 +2860,7 @@ impl CloudFormationService {
         let account = required(params, "StackInstanceAccount")?;
         let region = required(params, "StackInstanceRegion")?;
         let admin = self.stack_set_admin_account(req, params)?;
-        let set = self.read_stack_set(&admin, &name)?;
+        let set = self.read_stack_set(&admin, &name, Scope::of(params))?;
         let instance = set
             .instances
             .iter()
@@ -2815,7 +2884,7 @@ impl CloudFormationService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let name = required(params, "StackSetName")?;
         let admin = self.stack_set_admin_account(req, params)?;
-        let set = self.read_stack_set(&admin, &name)?;
+        let set = self.read_stack_set(&admin, &name, Scope::of(params))?;
         let mut filters: Vec<(String, String)> = Vec::new();
         for i in 1.. {
             let Some(filter_name) = params.get(&format!("Filters.member.{i}.Name")) else {
@@ -2870,7 +2939,7 @@ impl CloudFormationService {
         let name = required(params, "StackSetName")?;
         let op_id = required(params, "OperationId")?;
         let admin = self.stack_set_admin_account(req, params)?;
-        let set = self.read_stack_set(&admin, &name)?;
+        let set = self.read_stack_set(&admin, &name, Scope::of(params))?;
         let op = set
             .operations
             .iter()
@@ -2890,7 +2959,7 @@ impl CloudFormationService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let name = required(params, "StackSetName")?;
         let admin = self.stack_set_admin_account(req, params)?;
-        let set = self.read_stack_set(&admin, &name)?;
+        let set = self.read_stack_set(&admin, &name, Scope::of(params))?;
         // Most recent first.
         let ops: Vec<&StackSetOperation> = set.operations.iter().rev().collect();
         let (page, next) = paginate(ops, params)?;
@@ -2914,7 +2983,7 @@ impl CloudFormationService {
         let name = required(params, "StackSetName")?;
         let op_id = required(params, "OperationId")?;
         let admin = self.stack_set_admin_account(req, params)?;
-        let set = self.read_stack_set(&admin, &name)?;
+        let set = self.read_stack_set(&admin, &name, Scope::of(params))?;
         let op = set
             .operations
             .iter()
@@ -2959,7 +3028,7 @@ impl CloudFormationService {
         let mut accounts = self.state.write();
         let set_id = accounts
             .get(&admin)
-            .and_then(|s| find_for_read(s, &name))
+            .and_then(|s| find_for_read(s, &name, Scope::of(params)))
             .map(|s| s.stack_set_id.clone())
             .ok_or_else(|| stack_set_not_found(&name))?;
         Self::refresh_stack_set(&mut accounts, &admin, &set_id);
@@ -3069,7 +3138,7 @@ impl CloudFormationService {
         let mut accounts = self.state.write();
         let set_id = accounts
             .get(&admin)
-            .and_then(|s| active_key(s, &name))
+            .and_then(|s| active_key(s, &name, Scope::of(params)))
             .ok_or_else(|| stack_set_not_found(&name))?;
         Self::refresh_stack_set(&mut accounts, &admin, &set_id);
         let set = accounts
@@ -3220,7 +3289,7 @@ impl CloudFormationService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let name = required(params, "StackSetName")?;
         let admin = self.stack_set_admin_account(req, params)?;
-        let set = self.read_stack_set(&admin, &name)?;
+        let set = self.read_stack_set(&admin, &name, Scope::of(params))?;
         let mut by_ou: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         if set.permission_model == "SERVICE_MANAGED" {
             for instance in &set.instances {
@@ -3274,7 +3343,7 @@ impl CloudFormationService {
             let mut accounts = self.state.write();
             let set_id = accounts
                 .get(&admin)
-                .and_then(|s| active_key(s, &name))
+                .and_then(|s| active_key(s, &name, Scope::of(params)))
                 .ok_or_else(|| stack_set_not_found(&name))?;
             Self::refresh_stack_set(&mut accounts, &admin, &set_id);
             let set = accounts
@@ -3424,7 +3493,7 @@ impl CloudFormationService {
         let region = required(params, "StackInstanceRegion")?;
         let op_id = required(params, "OperationId")?;
         let admin = self.stack_set_admin_account(req, params)?;
-        let set = self.read_stack_set(&admin, &name)?;
+        let set = self.read_stack_set(&admin, &name, Scope::of(params))?;
         let op = set
             .operations
             .iter()
@@ -3554,7 +3623,7 @@ mod tests {
         svc.state
             .read()
             .get(ADMIN)
-            .and_then(|s| find_active(s, name))
+            .and_then(|s| find_active(s, name, Scope::Own))
             .cloned()
             .expect("stack set")
     }
@@ -4658,6 +4727,150 @@ mod tests {
             summary.contains("<DriftStatus>DRIFTED</DriftStatus>"),
             "{summary}"
         );
+    }
+
+    /// An account gate that stops the operation it is gating, standing in for
+    /// a StopStackSetOperation that lands while a target is deploying.
+    struct StoppingGate(std::sync::OnceLock<Arc<CloudFormationService>>);
+
+    impl LambdaDelivery for StoppingGate {
+        fn invoke_lambda(
+            &self,
+            _function_arn: &str,
+            _payload: &str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>>
+        {
+            let svc = self.0.get().cloned();
+            Box::pin(async move {
+                if let Some(svc) = svc {
+                    call(
+                        &svc,
+                        "StopStackSetOperation",
+                        &[("StackSetName", "app"), ("OperationId", "op-stop")],
+                    )
+                    .await
+                    .map_err(|e| e.message())?;
+                }
+                Ok(br#"{"Status":"SUCCEEDED"}"#.to_vec())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn stopping_an_operation_mid_deployment_cancels_the_remaining_targets() {
+        let gate = Arc::new(StoppingGate(std::sync::OnceLock::new()));
+        let mut d = deps();
+        d.delivery = Arc::new(DeliveryBus::new().with_lambda(gate.clone()));
+        let svc = Arc::new(service_with(d));
+        gate.0.set(svc.clone()).ok();
+        // Only the first target's account has a gate, so the stop lands while
+        // that target is deploying.
+        let gate_template = "Resources:\n  Gate:\n    Type: AWS::Lambda::Function\n    Properties:\n      FunctionName: AWSCloudFormationStackSetAccountGate\n      Runtime: python3.12\n      Handler: index.handler\n      Role: arn:aws:iam::111111111111:role/gate\n      Code:\n        ZipFile: \"def handler(e, c): return {}\"\n";
+        call_as(
+            &svc,
+            ACCT_B,
+            "CreateStack",
+            &[("StackName", "gate"), ("TemplateBody", gate_template)],
+        )
+        .await
+        .unwrap();
+        create_set(&svc, "app", QUEUE_TEMPLATE).await;
+        ok(
+            &svc,
+            "CreateStackInstances",
+            &[
+                ("StackSetName", "app"),
+                ("Accounts.member.1", ACCT_B),
+                ("Accounts.member.2", ACCT_C),
+                ("Regions.member.1", "us-east-1"),
+                ("OperationId", "op-stop"),
+            ],
+        )
+        .await;
+        let op = ok(
+            &svc,
+            "DescribeStackSetOperation",
+            &[("StackSetName", "app"), ("OperationId", "op-stop")],
+        )
+        .await;
+        assert_eq!(tag(&op, "Status"), "STOPPED", "{op}");
+        let results = ok(
+            &svc,
+            "ListStackSetOperationResults",
+            &[("StackSetName", "app"), ("OperationId", "op-stop")],
+        )
+        .await;
+        // The target already deploying finishes; the next one never starts.
+        assert_eq!(queue_count(&svc, ACCT_B), 1);
+        assert_eq!(queue_count(&svc, ACCT_C), 0);
+        assert!(results.contains("<Status>SUCCEEDED</Status>"), "{results}");
+        assert!(results.contains(OPERATION_STOPPED), "{results}");
+    }
+
+    #[tokio::test]
+    async fn a_delegated_administrator_cannot_touch_self_managed_stack_sets() {
+        let svc = service();
+        seed_org(&svc);
+        {
+            let mut orgs = svc.deps.organizations.write();
+            let org = orgs.as_mut().unwrap();
+            org.enable_aws_service_access(STACKSETS_PRINCIPAL);
+            org.register_delegated_administrator(ACCT_B, STACKSETS_PRINCIPAL)
+                .unwrap();
+        }
+        create_set(&svc, "mgmt-only", QUEUE_TEMPLATE).await;
+        let delegated = [("StackSetName", "mgmt-only"), ("CallAs", "DELEGATED_ADMIN")];
+        let e = call_as(&svc, ACCT_B, "DescribeStackSet", &delegated)
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), "StackSetNotFoundException");
+        let mut instances = delegated.to_vec();
+        instances.extend([
+            ("Accounts.member.1", ACCT_C),
+            ("Regions.member.1", "us-east-1"),
+        ]);
+        let e = call_as(&svc, ACCT_B, "CreateStackInstances", &instances)
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), "StackSetNotFoundException");
+        assert_eq!(queue_count(&svc, ACCT_C), 0);
+        let e = call_as(
+            &svc,
+            ACCT_B,
+            "CreateStackSet",
+            &[
+                ("StackSetName", "sneaky"),
+                ("TemplateBody", QUEUE_TEMPLATE),
+                ("CallAs", "DELEGATED_ADMIN"),
+            ],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.code(), "ValidationError");
+        let listed = call_as(
+            &svc,
+            ACCT_B,
+            "ListStackSets",
+            &[("CallAs", "DELEGATED_ADMIN")],
+        )
+        .await
+        .unwrap();
+        assert!(!listed.contains("mgmt-only"), "{listed}");
+    }
+
+    #[tokio::test]
+    async fn an_out_of_range_next_token_is_rejected() {
+        let svc = service();
+        create_set(&svc, "app", QUEUE_TEMPLATE).await;
+        let e = err(
+            &svc,
+            "ListStackSets",
+            &[("NextToken", "18446744073709551615")],
+        )
+        .await;
+        assert_eq!(e.code(), "ValidationError");
+        let page = ok(&svc, "ListStackSets", &[("MaxResults", "1")]).await;
+        assert!(!page.contains("<NextToken>"), "{page}");
     }
 
     struct Gate(&'static str);
