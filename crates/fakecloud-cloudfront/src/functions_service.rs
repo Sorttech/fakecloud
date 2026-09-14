@@ -256,7 +256,7 @@ impl CloudFrontService {
         Ok(xml_with_etag(StatusCode::OK, body, &snap.etag, None))
     }
 
-    pub(crate) fn test_function(
+    pub(crate) async fn test_function(
         &self,
         req: &AwsRequest,
         route: &Route,
@@ -269,19 +269,21 @@ impl CloudFrontService {
             .decode(parsed.event_object.trim().as_bytes())
             .map_err(|e| invalid_argument(format!("EventObject is not valid base64: {e}")))?;
 
-        let state = self.state.read();
-        let f = state
-            .accounts
-            .get(DEFAULT_ACCOUNT)
-            .and_then(|a| a.functions.get(&name).cloned())
-            .ok_or_else(|| {
-                aws_error(
-                    StatusCode::NOT_FOUND,
-                    "NoSuchFunctionExists",
-                    format!("The specified function does not exist: {name}"),
-                )
-            })?;
-        drop(state);
+        // Scoped so the lock guard is gone before the await below.
+        let f = {
+            let state = self.state.read();
+            state
+                .accounts
+                .get(DEFAULT_ACCOUNT)
+                .and_then(|a| a.functions.get(&name).cloned())
+                .ok_or_else(|| {
+                    aws_error(
+                        StatusCode::NOT_FOUND,
+                        "NoSuchFunctionExists",
+                        format!("The specified function does not exist: {name}"),
+                    )
+                })?
+        };
         if f.etag != if_match {
             return Err(precondition_failed());
         }
@@ -303,7 +305,7 @@ impl CloudFrontService {
             .unwrap_or_else(|_| source_b64.as_bytes().to_vec());
         let code = String::from_utf8(code_bytes)
             .map_err(|e| invalid_argument(format!("function code is not valid UTF-8: {e}")))?;
-        let exec = crate::js_runtime::run_handler(&code, &event_bytes);
+        let exec = crate::js_runtime::run_handler_off_runtime(code, event_bytes).await;
 
         let mut body = String::with_capacity(1024);
         body.push_str(XML_DECL);

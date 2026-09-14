@@ -524,7 +524,7 @@ impl AwsService for CloudFrontService {
             "DeleteFunction" => self.delete_function(&req, &resolved),
             "ListFunctions" => self.list_functions(&req),
             "PublishFunction" => self.publish_function(&req, &resolved),
-            "TestFunction" => self.test_function(&req, &resolved),
+            "TestFunction" => self.test_function(&req, &resolved).await,
             "CreatePublicKey" => self.create_public_key(&req),
             "GetPublicKey" => self.get_public_key(&resolved),
             "GetPublicKeyConfig" => self.get_public_key_config(&resolved),
@@ -649,7 +649,7 @@ impl AwsService for CloudFrontService {
             "DeleteConnectionFunction" => self.delete_connection_function(&req, &resolved),
             "ListConnectionFunctions" => self.list_connection_functions(&req),
             "PublishConnectionFunction" => self.publish_connection_function(&req, &resolved),
-            "TestConnectionFunction" => self.test_connection_function(&req, &resolved),
+            "TestConnectionFunction" => self.test_connection_function(&req, &resolved).await,
             other => Err(aws_error(
                 StatusCode::NOT_IMPLEMENTED,
                 "InvalidAction",

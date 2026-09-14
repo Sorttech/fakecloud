@@ -81,6 +81,17 @@ pub(crate) struct JsExecution {
     pub compute_utilization: u32,
 }
 
+/// [`run_handler`] for async request handlers. The wait for the worker
+/// blocks -- up to the compute budget, or the wall-clock safety net when the
+/// host is stalling the worker -- so it runs on tokio's blocking pool rather
+/// than holding a runtime worker thread (or, on a current-thread runtime,
+/// the whole runtime) for that long.
+pub(crate) async fn run_handler_off_runtime(code: String, event_json: Vec<u8>) -> JsExecution {
+    tokio::task::spawn_blocking(move || run_handler(&code, &event_json))
+        .await
+        .unwrap_or_else(|_| worker_failed())
+}
+
 /// Run `handler(event)` defined in `code` against `event_json` on a
 /// dedicated worker thread, holding it to the `EXECUTION_TIMEOUT` compute
 /// budget.
@@ -698,6 +709,41 @@ mod tests {
         assert!(
             took < WALL_CLOCK_LIMIT / 2,
             "caller waited {took:?}; the budget should stop it well before the safety net"
+        );
+    }
+
+    #[tokio::test]
+    async fn waiting_on_a_handler_leaves_the_runtime_free() {
+        // A current-thread runtime: if the wait blocked it, the ticker below
+        // could not run until the handler returned.
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        use std::sync::Arc;
+        let done = Arc::new(AtomicBool::new(false));
+        let ticks = Arc::new(AtomicU32::new(0));
+        let ticker = tokio::spawn({
+            let (done, ticks) = (done.clone(), ticks.clone());
+            async move {
+                while !done.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    ticks.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+        let exec = run_handler_off_runtime(
+            format!(
+                r#"function handler() {{ return /^(a+)+$/.test("{}b"); }}"#,
+                "a".repeat(24)
+            ),
+            b"{}".to_vec(),
+        )
+        .await;
+        let ticked = ticks.load(Ordering::SeqCst);
+        done.store(true, Ordering::SeqCst);
+        ticker.await.unwrap();
+        assert!(exec.error.is_some_and(|e| e.contains("time limit")));
+        assert!(
+            ticked >= 5,
+            "the runtime ticked {ticked} times while the handler ran for the budget"
         );
     }
 
