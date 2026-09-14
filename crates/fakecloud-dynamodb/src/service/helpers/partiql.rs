@@ -504,6 +504,9 @@ pub(crate) fn execute_partiql_in_state(
             (after_set, "")
         };
         let table = get_table_mut(&mut state.tables, &table_name)?;
+        let (update_expression, expression_attribute_values) =
+            prepare_partiql_update_expression(set_clause, parameters);
+        reject_key_attribute_update_expression(table, &update_expression, &HashMap::new())?;
         // Positional `?` parameters bind in textual order: the SET clause comes
         // before WHERE, so SET consumes parameters[0..set_count] and WHERE the
         // rest. Evaluate WHERE against the parameters that follow the SET ones.
@@ -518,8 +521,6 @@ pub(crate) fn execute_partiql_in_state(
         } else {
             table.items.iter_with_ids().map(|(id, _)| id).collect()
         };
-        let (update_expression, expression_attribute_values) =
-            prepare_partiql_update_expression(set_clause, parameters);
         let mut last_key: Option<HashMap<String, AttributeValue>> = None;
         let mut last_old: Option<HashMap<String, AttributeValue>> = None;
         let mut last_new: Option<HashMap<String, AttributeValue>> = None;

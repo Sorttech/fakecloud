@@ -606,6 +606,58 @@ impl DynamoDbService {
             }
         }
 
+        // Validate the primary key of every write BEFORE mutating anything, and
+        // before any ConditionExpression is evaluated: these are malformed
+        // requests, which DynamoDB rejects outright rather than cancelling the
+        // transaction over a condition that happened to fail first.
+        // A Put whose Item is missing a key attribute (or a Delete/Update with
+        // a malformed Key) is a structural error: real DDB returns a plain
+        // ValidationException, not a TransactionCanceledException. Previously
+        // the apply pass parsed the item with `unwrap_or_default()` and never
+        // validated it, so an item with no PK stored an orphan row and returned
+        // success (bug-hunt 2026-07-01, DynamoDB TransactWriteItems).
+        for ti in transact_items {
+            if let Some(put) = ti.get("Put") {
+                let table_name = put["TableName"].as_str().unwrap_or_default();
+                let item: HashMap<String, AttributeValue> =
+                    serde_json::from_value(put["Item"].clone()).unwrap_or_default();
+                if let Some(table) = state.tables.get(table_name) {
+                    validate_key_in_item(table, &item)?;
+                }
+                // Malformed values (bad numbers, empty/duplicate sets) are a
+                // structural error surfaced as a plain ValidationException
+                // before the transaction runs — the same per-attribute
+                // validation single PutItem enforces.
+                validate_item_attribute_values(&item)?;
+            } else if let Some(op) = ti.get("Delete").or_else(|| ti.get("Update")) {
+                let table_name = op["TableName"].as_str().unwrap_or_default();
+                let key: HashMap<String, AttributeValue> =
+                    serde_json::from_value(op["Key"].clone()).unwrap_or_default();
+                if let Some(table) = state.tables.get(table_name) {
+                    validate_key_attributes_in_key(table, &key)?;
+                    if let Some(expr) = ti
+                        .get("Update")
+                        .and_then(|u| u["UpdateExpression"].as_str())
+                    {
+                        super::reject_key_attribute_update_expression(
+                            table,
+                            expr,
+                            &parse_expression_attribute_names(op),
+                        )?;
+                    }
+                }
+                // An Update's ExpressionAttributeValues get the same value
+                // validation single UpdateItem enforces, so a malformed number
+                // or empty/duplicate set never reaches an item.
+                if ti.get("Update").is_some() {
+                    let expr_attr_values = parse_expression_attribute_values(op);
+                    for v in expr_attr_values.values() {
+                        validate_attribute_value(v)?;
+                    }
+                }
+            }
+        }
+
         // AWS rejects a transaction that targets the same item more than once
         // (by table + primary key) with a ValidationException; previously such
         // a transaction applied last-writer-wins and reported success. The key
@@ -797,45 +849,6 @@ impl DynamoDbService {
                 StatusCode::BAD_REQUEST,
                 serde_json::to_vec(&error_body).unwrap(),
             ));
-        }
-
-        // Validate the primary key of every write BEFORE mutating anything.
-        // A Put whose Item is missing a key attribute (or a Delete/Update with
-        // a malformed Key) is a structural error: real DDB returns a plain
-        // ValidationException, not a TransactionCanceledException. Previously
-        // the apply pass parsed the item with `unwrap_or_default()` and never
-        // validated it, so an item with no PK stored an orphan row and returned
-        // success (bug-hunt 2026-07-01, DynamoDB TransactWriteItems).
-        for ti in transact_items {
-            if let Some(put) = ti.get("Put") {
-                let table_name = put["TableName"].as_str().unwrap_or_default();
-                let item: HashMap<String, AttributeValue> =
-                    serde_json::from_value(put["Item"].clone()).unwrap_or_default();
-                if let Some(table) = state.tables.get(table_name) {
-                    validate_key_in_item(table, &item)?;
-                }
-                // Malformed values (bad numbers, empty/duplicate sets) are a
-                // structural error surfaced as a plain ValidationException
-                // before the transaction runs — the same per-attribute
-                // validation single PutItem enforces.
-                validate_item_attribute_values(&item)?;
-            } else if let Some(op) = ti.get("Delete").or_else(|| ti.get("Update")) {
-                let table_name = op["TableName"].as_str().unwrap_or_default();
-                let key: HashMap<String, AttributeValue> =
-                    serde_json::from_value(op["Key"].clone()).unwrap_or_default();
-                if let Some(table) = state.tables.get(table_name) {
-                    validate_key_attributes_in_key(table, &key)?;
-                }
-                // An Update's ExpressionAttributeValues get the same value
-                // validation single UpdateItem enforces, so a malformed number
-                // or empty/duplicate set never reaches an item.
-                if ti.get("Update").is_some() {
-                    let expr_attr_values = parse_expression_attribute_values(op);
-                    for v in expr_attr_values.values() {
-                        validate_attribute_value(v)?;
-                    }
-                }
-            }
         }
 
         // Snapshot the items vector of every referenced table so we can

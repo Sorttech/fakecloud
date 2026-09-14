@@ -2966,6 +2966,76 @@ async fn dynamodb_scan_drain_deleting_each_page_visits_every_row() {
     assert_eq!(left.count(), 0, "rows left behind: {:?}", left.items());
 }
 
+/// DynamoDB rejects an UpdateItem that writes a primary-key attribute, and
+/// the row is left as it was.
+#[tokio::test]
+async fn dynamodb_update_item_rejects_writing_a_key_attribute() {
+    let server = TestServer::start().await;
+    let client = server.dynamodb_client().await;
+
+    client
+        .create_table()
+        .table_name("KeyUpdateTable")
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("pk")
+                .key_type(KeyType::Hash)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("pk")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .billing_mode(BillingMode::PayPerRequest)
+        .send()
+        .await
+        .unwrap();
+    client
+        .put_item()
+        .table_name("KeyUpdateTable")
+        .item("pk", AttributeValue::S("a".into()))
+        .item("v", AttributeValue::S("x".into()))
+        .send()
+        .await
+        .unwrap();
+
+    let err = client
+        .update_item()
+        .table_name("KeyUpdateTable")
+        .key("pk", AttributeValue::S("a".into()))
+        .update_expression("SET #k = :k, v = :v")
+        .expression_attribute_names("#k", "pk")
+        .expression_attribute_values(":k", AttributeValue::S("b".into()))
+        .expression_attribute_values(":v", AttributeValue::S("y".into()))
+        .send()
+        .await
+        .expect_err("writing the partition key must be rejected");
+    let service_err = err.into_service_error();
+    assert_eq!(service_err.meta().code(), Some("ValidationException"));
+    assert_eq!(
+        service_err.meta().message(),
+        Some(
+            "One or more parameter values were invalid: Cannot update attribute pk. \
+             This attribute is part of the key"
+        )
+    );
+
+    let scan = client
+        .scan()
+        .table_name("KeyUpdateTable")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(scan.count(), 1);
+    let row = &scan.items()[0];
+    assert_eq!(row["pk"].as_s().unwrap(), "a");
+    assert_eq!(row["v"].as_s().unwrap(), "x");
+}
+
 #[tokio::test]
 async fn dynamodb_scan_no_pagination_when_all_fit() {
     let server = TestServer::start().await;

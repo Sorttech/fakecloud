@@ -254,6 +254,20 @@ impl PartialOrd for SortKeyPart {
     }
 }
 
+/// The top-level attribute a document path starts at: `#a.b[2]` -> `#a`, and
+/// a double-quoted PartiQL name up to its closing quote.
+fn top_level_attribute(path: &str) -> &str {
+    let path = path.trim();
+    if let Some(rest) = path.strip_prefix('"') {
+        return match rest.find('"') {
+            Some(end) => &path[..end + 2],
+            None => path,
+        };
+    }
+    let end = path.find(['.', '[']).unwrap_or(path.len());
+    path[..end].trim()
+}
+
 /// FNV-1a, 64-bit. The Scan order is derived from it, so it has to be fixed:
 /// std's `DefaultHasher` is explicitly allowed to change between releases.
 fn fnv1a_64(bytes: &[u8]) -> u64 {
@@ -759,6 +773,51 @@ impl DynamoTable {
         &self.items
     }
 
+    /// The first primary-key attribute an UpdateExpression writes, if any.
+    ///
+    /// DynamoDB refuses any SET, REMOVE, ADD or DELETE that targets a key
+    /// attribute, whatever the value: a row's key is its identity, not data.
+    /// Accepting one would move the row to another key -- onto a row already
+    /// there, or off any key at all -- leaving rows no key lookup can address
+    /// and no Scan cursor can resume after.
+    pub fn key_attribute_in_update_expression(
+        &self,
+        expr: &str,
+        expr_attr_names: &HashMap<String, String>,
+    ) -> Option<String> {
+        use crate::service::helpers::{parse_update_clauses, resolve_attr_name, UpdateAction};
+        let key_attrs: Vec<&str> = std::iter::once(self.hash_key_name())
+            .chain(self.range_key_name())
+            .collect();
+        for (action, assignments) in parse_update_clauses(expr) {
+            for assignment in &assignments {
+                let target = match action {
+                    UpdateAction::Set => match assignment.split_once('=') {
+                        Some((left, _)) => left,
+                        None => continue,
+                    },
+                    UpdateAction::Remove => assignment.as_str(),
+                    UpdateAction::Add | UpdateAction::Delete => {
+                        assignment.split_whitespace().next().unwrap_or_default()
+                    }
+                };
+                let attr = resolve_attr_name(top_level_attribute(target), expr_attr_names);
+                if key_attrs.contains(&attr.as_str()) {
+                    return Some(attr);
+                }
+            }
+        }
+        None
+    }
+
+    /// DynamoDB's message for an update that writes key attribute `attr`.
+    pub fn key_attribute_update_message(attr: &str) -> String {
+        format!(
+            "One or more parameter values were invalid: Cannot update attribute {attr}. \
+             This attribute is part of the key"
+        )
+    }
+
     /// Get the hash key attribute name from the key schema.
     pub fn hash_key_name(&self) -> &str {
         self.key_schema
@@ -1168,9 +1227,10 @@ impl DynamoTable {
     /// Settle the cached size and the key index after the row `id` was
     /// mutated in place.
     ///
-    /// An UpdateExpression can rewrite a primary-key attribute — real AWS
-    /// rejects that, fakecloud does not — which moves the row to a different
-    /// key. Re-pointing the index here keeps it in step with `items`, matching
+    /// Every update path rejects writing a primary-key attribute, as DynamoDB
+    /// does (see [`Self::key_attribute_in_update_expression`]), but a mutation
+    /// handed to [`Self::update_item_at`] / [`Self::mutate_item_at`] can still
+    /// move a row to a different key. Re-pointing the index here keeps it in step with `items`, matching
     /// what the linear scan would have answered; without it a later write
     /// would overwrite or delete the wrong row.
     fn sync_item_at(&mut self, id: ItemId, before: ItemSlot) {
@@ -1806,8 +1866,9 @@ mod tests {
         assert_eq!(t.item_count, 3);
     }
 
-    /// An UpdateExpression can rewrite a primary-key attribute (real AWS
-    /// rejects it, fakecloud does not). `update_item_at` must re-point the
+    /// A mutation handed to `update_item_at` can rewrite a primary-key
+    /// attribute (the request paths reject that first, as DynamoDB does, but
+    /// the helper does not rely on it). `update_item_at` must re-point the
     /// index at the new key, or a later write finds the row under a key it no
     /// longer has.
     #[test]
