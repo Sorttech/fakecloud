@@ -452,7 +452,11 @@ impl AwsService for DynamoDbService {
         {
             let body = req.json_body();
             cross_account::check_references(&req, &body, cross_account::CROSS_ACCOUNT_OPERATIONS)?;
-            if let Some(owner) = cross_account::single_resource_owner(&req, &body) {
+            if let Some(owner) = cross_account::single_resource_owner(
+                &req,
+                &body,
+                cross_account::CROSS_ACCOUNT_OPERATIONS,
+            ) {
                 req.account_id = owner;
             }
         }

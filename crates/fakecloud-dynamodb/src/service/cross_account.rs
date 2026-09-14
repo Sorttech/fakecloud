@@ -186,11 +186,20 @@ pub(crate) fn check_references(
     Ok(())
 }
 
-/// The account that owns the single table (or stream) an operation acts on,
-/// when that is not the caller's: the request is then served in that account.
-/// `None` for the caller's own resources and for batches and transactions,
-/// which resolve each table's account separately.
-pub(crate) fn single_resource_owner(req: &AwsRequest, body: &Value) -> Option<String> {
+/// The account that owns the single table (or stream) an operation with
+/// cross-account support acts on, when that is not the caller's: the request
+/// is then served in that account. `None` for the caller's own resources, for
+/// batches and transactions (which resolve each table's account separately),
+/// and for every operation without cross-account support, which is always
+/// served in the caller's account.
+pub(crate) fn single_resource_owner(
+    req: &AwsRequest,
+    body: &Value,
+    cross_account_operations: &[&str],
+) -> Option<String> {
+    if !cross_account_operations.contains(&req.action.as_str()) {
+        return None;
+    }
     let reference = match req.action.as_str() {
         "BatchGetItem" | "BatchWriteItem" | "TransactGetItems" | "TransactWriteItems" => {
             return None
@@ -310,7 +319,7 @@ mod tests {
     fn a_single_foreign_resource_names_its_owner() {
         let owner = |action: &str, body: Value| {
             let req = request(action, body.clone());
-            single_resource_owner(&req, &body)
+            single_resource_owner(&req, &body, CROSS_ACCOUNT_OPERATIONS)
         };
         assert_eq!(
             owner("GetItem", json!({"TableName": FOREIGN})).as_deref(),
@@ -328,16 +337,21 @@ mod tests {
             owner("TagResource", json!({"ResourceArn": FOREIGN})).as_deref(),
             Some("444455556666")
         );
+        let body = json!({"ShardIterator": format!("{FOREIGN}/stream/x|shard|0")});
+        let req = request("GetRecords", body.clone());
         assert_eq!(
-            owner(
-                "GetRecords",
-                json!({"ShardIterator": format!("{FOREIGN}/stream/x|shard|0")})
-            )
-            .as_deref(),
+            single_resource_owner(&req, &body, STREAMS_CROSS_ACCOUNT_OPERATIONS).as_deref(),
             Some("444455556666")
         );
         assert_eq!(
             owner("BatchGetItem", json!({"RequestItems": {FOREIGN: {}}})),
+            None
+        );
+        // An operation without cross-account support stays in the caller's
+        // account, whatever table its filter names.
+        assert_eq!(owner("ListBackups", json!({"TableName": FOREIGN})), None);
+        assert_eq!(
+            owner("DescribeTimeToLive", json!({"TableName": FOREIGN})),
             None
         );
     }

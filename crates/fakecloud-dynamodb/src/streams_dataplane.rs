@@ -42,7 +42,11 @@ impl AwsService for DynamoDbStreamsService {
             &body,
             cross_account::STREAMS_CROSS_ACCOUNT_OPERATIONS,
         )?;
-        if let Some(owner) = cross_account::single_resource_owner(&req, &body) {
+        if let Some(owner) = cross_account::single_resource_owner(
+            &req,
+            &body,
+            cross_account::STREAMS_CROSS_ACCOUNT_OPERATIONS,
+        ) {
             req.account_id = owner;
         }
         match req.action.as_str() {

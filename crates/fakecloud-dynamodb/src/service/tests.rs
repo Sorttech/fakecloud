@@ -7414,7 +7414,16 @@ async fn other_accounts_tables_are_not_found_without_cross_account_support() {
         assert_eq!(got["__type"], code, "{action}");
     }
 
-    // A listing filtered by another account's table matches nothing.
+    // A listing filtered by another account's table matches nothing, even
+    // when that account holds backups and exports of it.
+    let (status, got) = call_as(
+        &svc,
+        OWNER,
+        "CreateBackup",
+        json!({"TableName": "Shared", "BackupName": "owners"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
     for (action, body, field) in [
         (
             "ListExports",
