@@ -809,13 +809,18 @@ fn attach_cluster_node_network_interface(
     let cluster_record = data
         .resolve_key("Cluster", &cluster)
         .and_then(|k| data.get_resource("Cluster", &k).cloned());
+    // A bare name and this account/region's cluster ARN are interchangeable; an
+    // ARN from another account or region only ever matches itself.
+    let local_arn_prefix = super::mint_arn(ctx, "cluster", "");
+    let local_name = if cluster.starts_with("arn:") {
+        cluster.strip_prefix(local_arn_prefix.as_str())
+    } else {
+        Some(cluster.as_str())
+    };
     let mut cluster_aliases = vec![cluster.clone()];
-    if let Some(name) = cluster
-        .strip_prefix("arn:")
-        .and_then(|arn| arn.rsplit_once(":cluster/"))
-        .map(|(_, name)| name)
-    {
+    if let Some(name) = local_name.filter(|n| !n.is_empty()) {
         cluster_aliases.push(name.to_string());
+        cluster_aliases.push(super::mint_arn(ctx, "cluster", name));
     }
     if let Some(obj) = cluster_record.as_ref().and_then(Value::as_object) {
         for member in ["ClusterName", "ClusterArn"] {
