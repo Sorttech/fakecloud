@@ -2093,12 +2093,31 @@ impl CloudFormationService {
                 })?;
             let filter_accounts = self.target_accounts_list(admin, dt)?;
             let filter = self.account_filter_type(dt, &filter_accounts)?;
+            // An OU covers every OU nested below it, so an instance deployed
+            // through a child OU is reached through its parent or the root,
+            // and one deployed through a parent is reached through a child.
+            // The OU recorded on the instance still counts, for an account
+            // that has since moved out.
+            let accounts_in_ous: BTreeSet<String> = self
+                .deps
+                .organizations
+                .read()
+                .as_ref()
+                .map(|org| {
+                    dt.organizational_unit_ids
+                        .iter()
+                        .flat_map(|ou| accounts_under(org, ou))
+                        .map(|(account, _)| account)
+                        .collect()
+                })
+                .unwrap_or_default();
             for region in regions {
                 for instance in set.instances.iter().filter(|i| &i.region == region) {
-                    let in_ou = instance
-                        .organizational_unit_id
-                        .as_ref()
-                        .is_some_and(|ou| dt.organizational_unit_ids.contains(ou));
+                    let in_ou = accounts_in_ous.contains(&instance.account)
+                        || instance
+                            .organizational_unit_id
+                            .as_ref()
+                            .is_some_and(|ou| dt.organizational_unit_ids.contains(ou));
                     let listed = filter_accounts.contains(&instance.account);
                     let keep = match filter.as_str() {
                         "INTERSECTION" => in_ou && listed,
@@ -3460,10 +3479,17 @@ impl CloudFormationService {
         op.ended_at = Some(Utc::now());
 
         let mut accounts = self.state.write();
+        Self::refresh_stack_set(&mut accounts, &admin, &set.stack_set_id);
         if let Some(stored) = accounts
             .get_mut(&admin)
             .and_then(|s| s.stack_sets.get_mut(&set.stack_set_id))
         {
+            // Re-validate against what is stored now: another operation may
+            // have started, or used this OperationId, while resources were
+            // being checked. (DetectStackSetDrift does not model
+            // StaleRequestException, and a drift result stays valid after an
+            // operation that has already finished.)
+            Self::check_can_start_operation(stored, &op_id)?;
             for instance in &mut stored.instances {
                 if let Some((_, _, status)) = instance_drift
                     .iter()
@@ -4486,6 +4512,26 @@ mod tests {
             .collect();
         assert_eq!(eu.len(), 1);
         assert_eq!(eu[0].account, ACCT_C);
+
+        // Instances deployed through a nested OU are reached through a parent.
+        ok(
+            &svc,
+            "DeleteStackInstances",
+            &[
+                ("StackSetName", "org"),
+                (
+                    "DeploymentTargets.OrganizationalUnitIds.member.1",
+                    &workloads,
+                ),
+                ("Regions.member.1", "eu-west-1"),
+                ("RetainStacks", "false"),
+            ],
+        )
+        .await;
+        assert!(stored_set(&svc, "org")
+            .instances
+            .iter()
+            .all(|i| i.region != "eu-west-1"));
 
         let e = err(
             &svc,
