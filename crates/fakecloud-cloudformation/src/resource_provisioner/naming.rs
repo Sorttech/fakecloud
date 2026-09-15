@@ -254,25 +254,38 @@ fn generate_with_suffix(stack_id: &str, logical_id: &str, rule: NameRule, suffix
     }
 }
 
-/// Whether `segment` is a name an older build gave an unnamed resource: the
-/// bare logical id, `{LogicalId}-{8 hex}`, or a `cfn-`-prefixed name carrying
-/// the logical id (`cfn-cs-MySet`, `cfn-db-4f3a9c1e`, ...).
-fn is_legacy_name(segment: &str, logical_id: &str) -> bool {
-    if segment.eq_ignore_ascii_case(logical_id) {
+/// Whether `name` is one an older build gave an unnamed resource: the bare
+/// logical id, `{LogicalId}-{8 hex}`, `cfn-{kind}-{LogicalId}`, or
+/// `cfn-[{kind}-]{logicalid}-{8 alphanumerics}`.
+fn is_legacy_name(name: &str, logical_id: &str) -> bool {
+    if name.eq_ignore_ascii_case(logical_id) {
         return true;
     }
-    let hex8 = |s: &str| s.len() == 8 && s.bytes().all(|b| b.is_ascii_hexdigit());
-    if let Some((head, tail)) = segment.rsplit_once('-') {
-        if head.eq_ignore_ascii_case(logical_id) && hex8(tail) {
+    let is_id8 = |s: &str, hex: bool| {
+        s.len() == 8
+            && s.bytes().all(|b| {
+                if hex {
+                    b.is_ascii_hexdigit()
+                } else {
+                    b.is_ascii_alphanumeric()
+                }
+            })
+    };
+    if let Some((head, tail)) = name.rsplit_once('-') {
+        if head == logical_id && is_id8(tail, true) {
             return true;
         }
     }
-    segment
-        .get(..4)
-        .is_some_and(|head| head.eq_ignore_ascii_case("cfn-"))
-        && segment
-            .split('-')
-            .any(|token| token.eq_ignore_ascii_case(logical_id))
+    let tokens: Vec<&str> = name.split('-').collect();
+    match tokens.as_slice() {
+        ["cfn", logical, id] | ["cfn", _, logical, id]
+            if *logical == logical_id.to_lowercase() && is_id8(id, false) =>
+        {
+            true
+        }
+        ["cfn", _kind, logical] => *logical == logical_id,
+        _ => false,
+    }
 }
 
 impl ResourceProvisioner {
@@ -330,10 +343,16 @@ impl ResourceProvisioner {
                 return Some(format!("{prefix}{suffix}"));
             }
         }
-        physical
-            .split(['/', ':', '|'])
-            .find(|segment| is_legacy_name(segment, &existing.logical_id))
-            .map(str::to_string)
+        // Only the part of the physical id that holds the name: the last path
+        // segment, without a `:revision` or `|detail`.
+        let last = physical.rsplit('/').next().unwrap_or(physical);
+        let last = last.split('|').next().unwrap_or(last);
+        let name = match last.rsplit_once(':') {
+            Some((name, revision)) if revision.bytes().all(|b| b.is_ascii_digit()) => name,
+            _ => last,
+        };
+        let name = name.rsplit(':').next().unwrap_or(name);
+        is_legacy_name(name, &existing.logical_id).then(|| name.to_string())
     }
 
     /// `physical_name` for a resource type whose name must fit `max_len`
@@ -441,10 +460,11 @@ mod tests {
         assert!(is_legacy_name("MySet", "MySet"));
         assert!(is_legacy_name("cfn-cs-MySet", "MySet"));
         assert!(is_legacy_name("cfn-db-4f3a9c1e", "Db"));
-        assert!(is_legacy_name("cfn-cluster-db-4f3a9c1e", "Db"));
+        assert!(is_legacy_name("cfn-cluster-db-x9k2m4pq", "Db"));
         assert!(is_legacy_name("Flow-1a2b3c4d", "Flow"));
         assert!(!is_legacy_name("orders", "MySet"));
         assert!(!is_legacy_name("Flow-notahexx", "Flow"));
+        assert!(!is_legacy_name("cfn-x-other-Batch", "Batch"));
     }
 
     #[test]

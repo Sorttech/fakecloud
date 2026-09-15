@@ -2089,12 +2089,17 @@ impl ResourceProvisioner {
                 policy = existing.update_replace_policy.as_deref().unwrap_or(""),
                 "CloudFormation: UpdateReplacePolicy retains the old physical resource on replacement; not deleting it"
             );
-        } else {
-            self.delete_resource(existing)?;
+            // The old resource stays, holding its name, so the replacement
+            // generates a new one rather than overwriting what was retained.
+            let created = self.create_resource(new_def)?;
+            return Ok(Some(ProvisionResult {
+                physical_id: created.physical_id,
+                attributes: created.attributes,
+            }));
         }
-        // This path stands in for updates AWS applies in place, so an unnamed
-        // resource keeps the name it has rather than being renamed on every
-        // property change.
+        self.delete_resource(existing)?;
+        // The old resource is gone, so an unnamed resource keeps its name, as
+        // the in-place update this often stands in for would.
         let created = self.with_existing_name(existing, || self.create_resource(new_def))?;
         Ok(Some(ProvisionResult {
             physical_id: created.physical_id,
@@ -9293,8 +9298,8 @@ mod tests {
             .expect("subnet group is updatable");
         assert_eq!(updated.physical_id, group.physical_id);
 
-        // Retaining the old resource on replacement does not rename an update
-        // this path applies in place either.
+        // A retained old resource keeps its name, so the replacement gets a
+        // new one instead of overwriting it.
         let retained = StackResource {
             update_replace_policy: Some("Retain".to_string()),
             ..group.clone()
@@ -9313,7 +9318,17 @@ mod tests {
             )
             .expect("update succeeds")
             .expect("subnet group is updatable");
-        assert_eq!(updated.physical_id, group.physical_id);
+        assert_ne!(updated.physical_id, group.physical_id);
+        assert!(updated.physical_id.starts_with("test-subnets-"));
+        {
+            let rds = prov.rds_state.read();
+            let groups = &rds.get("123456789012").unwrap().subnet_groups;
+            assert!(
+                groups.contains_key(&group.physical_id),
+                "retained group kept"
+            );
+            assert!(groups.contains_key(&updated.physical_id));
+        }
 
         // A resource created before names were generated keeps its
         // logical-id name the same way.
