@@ -2756,6 +2756,19 @@ impl CloudFormationService {
                     // the tolerance before the next target deploys.
                     let outcome = match (&outcome, &id) {
                         (Outcome::Running, Some(stack_id)) => {
+                            // Record the stack first, so the instance points
+                            // at it while it provisions and across a restart.
+                            self.record_outcome(
+                                admin,
+                                set_id,
+                                op_id,
+                                &target,
+                                &action,
+                                &Outcome::Running,
+                                None,
+                                id.clone(),
+                                applied.clone(),
+                            );
                             self.await_stack(&target.account, stack_id).await
                         }
                         _ => outcome,
@@ -3140,6 +3153,11 @@ impl CloudFormationService {
                 } else if !matches!(outcome, Outcome::Cancelled(_)) {
                     let instance = &mut set.instances[idx];
                     apply_to_instance(instance, outcome);
+                    // A stack that could not be deleted leaves the instance
+                    // INOPERABLE, as in AWS.
+                    if matches!(outcome, Outcome::Failed(_)) {
+                        instance.status = "INOPERABLE".to_string();
+                    }
                     instance.last_operation_id = Some(op_id.to_string());
                 }
             }
@@ -5821,6 +5839,51 @@ mod tests {
         assert_eq!(e.code(), "InvalidOperationException");
     }
 
+    #[tokio::test]
+    async fn a_stack_that_cannot_be_deleted_leaves_its_instance_inoperable() {
+        let svc = service();
+        create_set(&svc, "app", QUEUE_TEMPLATE).await;
+        ok(
+            &svc,
+            "CreateStackInstances",
+            &[
+                ("StackSetName", "app"),
+                ("Accounts.member.1", ACCT_B),
+                ("Regions.member.1", "us-east-1"),
+            ],
+        )
+        .await;
+        let stack_id = stored_set(&svc, "app").instances[0]
+            .stack_id
+            .clone()
+            .unwrap();
+        call_as(
+            &svc,
+            ACCT_B,
+            "UpdateTerminationProtection",
+            &[
+                ("StackName", &stack_id),
+                ("EnableTerminationProtection", "true"),
+            ],
+        )
+        .await
+        .unwrap();
+        ok(
+            &svc,
+            "DeleteStackInstances",
+            &[
+                ("StackSetName", "app"),
+                ("Accounts.member.1", ACCT_B),
+                ("Regions.member.1", "us-east-1"),
+                ("RetainStacks", "false"),
+            ],
+        )
+        .await;
+        let instance = stored_set(&svc, "app").instances[0].clone();
+        assert_eq!(instance.status, "INOPERABLE");
+        assert_eq!(instance.detailed_status, "FAILED");
+    }
+
     struct FailingLambda;
 
     impl LambdaDelivery for FailingLambda {
@@ -5870,6 +5933,8 @@ mod tests {
         };
         assert_eq!(tag(&op, "Status"), "FAILED", "{op}");
         let set = stored_set(&svc, "custom");
+        let first = set.instances.iter().find(|i| i.account == ACCT_B).unwrap();
+        assert!(first.stack_id.is_some(), "{set:?}");
         let second = set.instances.iter().find(|i| i.account == ACCT_C).unwrap();
         assert_eq!(second.detailed_status, "CANCELLED", "{set:?}");
         assert!(second.stack_id.is_none());
