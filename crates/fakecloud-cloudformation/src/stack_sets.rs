@@ -219,8 +219,23 @@ const OPERATION_INTERRUPTED: &str = "The operation was interrupted by a restart"
 /// every later operation on their stack set.
 pub fn restore_stack_sets(accounts: &mut MultiAccountState<CloudFormationState>) {
     migrate_legacy_stack_sets(accounts);
-    for (_, state) in accounts.iter_mut() {
-        for set in state.stack_sets.values_mut() {
+    let sets: Vec<(String, String)> = accounts
+        .iter()
+        .flat_map(|(account, state)| {
+            state
+                .stack_sets
+                .keys()
+                .map(move |id| (account.to_string(), id.clone()))
+        })
+        .collect();
+    for (account, set_id) in sets {
+        // A stack that finished after the last snapshot of its stack set
+        // counts as finished, not as interrupted.
+        CloudFormationService::refresh_stack_set(accounts, &account, &set_id);
+        if let Some(set) = accounts
+            .get_mut(&account)
+            .and_then(|s| s.stack_sets.get_mut(&set_id))
+        {
             settle_interrupted_operations(set);
         }
     }
@@ -1157,6 +1172,43 @@ fn order_targets(
     targets
 }
 
+/// Show the instances an operation is about to deploy as `OUTDATED` /
+/// `PENDING` from the moment it is recorded, creating the records of new
+/// ones, so they are listable while the deployment runs.
+fn mark_instances_pending(set: &mut StackSet, targets: &[Target], op_id: &str, create: bool) {
+    for target in targets {
+        let position = set
+            .instances
+            .iter()
+            .position(|i| i.account == target.account && i.region == target.region);
+        let idx = match position {
+            Some(idx) => idx,
+            None if create => {
+                set.instances.push(StackInstance {
+                    account: target.account.clone(),
+                    region: target.region.clone(),
+                    stack_id: None,
+                    status: "OUTDATED".to_string(),
+                    detailed_status: "PENDING".to_string(),
+                    status_reason: None,
+                    parameter_overrides: BTreeMap::new(),
+                    organizational_unit_id: target.ou.clone(),
+                    drift_status: "NOT_CHECKED".to_string(),
+                    last_drift_check_timestamp: None,
+                    last_operation_id: None,
+                });
+                set.instances.len() - 1
+            }
+            None => continue,
+        };
+        let instance = &mut set.instances[idx];
+        instance.status = "OUTDATED".to_string();
+        instance.detailed_status = "PENDING".to_string();
+        instance.status_reason = None;
+        instance.last_operation_id = Some(op_id.to_string());
+    }
+}
+
 /// A PENDING result for every target an operation will act on.
 fn pending_results(targets: &[Target]) -> Vec<OperationResult> {
     targets
@@ -1830,6 +1882,7 @@ impl CloudFormationService {
         let mut op = Self::new_operation(&updated, &op_id, "UPDATE", preferences, record, None);
         op.results = pending_results(&targets);
         updated.operations.push(op);
+        mark_instances_pending(&mut updated, &targets, &op_id, false);
         let spec = DeploySpec::of(&updated);
         let set_id = updated.stack_set_id.clone();
         {
@@ -2314,6 +2367,11 @@ impl CloudFormationService {
         // with nothing left to run and settle it.
         op.results = pending_results(targets);
         set.operations.push(op);
+        match action {
+            "CREATE" => mark_instances_pending(set, targets, op_id, true),
+            "UPDATE" => mark_instances_pending(set, targets, op_id, false),
+            _ => {}
+        }
         Ok(DeploySpec::of(set))
     }
 
@@ -3213,13 +3271,30 @@ impl CloudFormationService {
         // Targets not yet started are cancelled; ones already deploying run to
         // completion, and the operation settles as STOPPED once they do.
         op.status = "STOPPING".to_string();
+        let mut cancelled = Vec::new();
         for result in &mut op.results {
             if result.status == "PENDING" {
                 result.status = "CANCELLED".to_string();
                 result.status_reason = Some(OPERATION_STOPPED.to_string());
+                cancelled.push((result.account.clone(), result.region.clone()));
             }
         }
         settle_operation(op);
+        if let Some(set) = accounts
+            .get_mut(&admin)
+            .and_then(|s| s.stack_sets.get_mut(&set_id))
+        {
+            for instance in &mut set.instances {
+                if instance.last_operation_id.as_deref() == Some(op_id.as_str())
+                    && instance.detailed_status == "PENDING"
+                    && cancelled
+                        .iter()
+                        .any(|(a, r)| *a == instance.account && *r == instance.region)
+                {
+                    apply_to_instance(instance, &Outcome::Cancelled(OPERATION_STOPPED.to_string()));
+                }
+            }
+        }
         Ok(xml_response(
             "StopStackSetOperation",
             String::new(),
@@ -5275,6 +5350,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_stack_that_finished_before_a_restart_is_not_counted_as_interrupted() {
+        let svc = service();
+        create_set(&svc, "app", QUEUE_TEMPLATE).await;
+        ok(
+            &svc,
+            "CreateStackInstances",
+            &[
+                ("StackSetName", "app"),
+                ("Accounts.member.1", ACCT_B),
+                ("Regions.member.1", "us-east-1"),
+                ("OperationId", "op-async"),
+            ],
+        )
+        .await;
+        {
+            // As persisted while the stack was still provisioning; the stack
+            // itself finished before the restart.
+            let mut accounts = svc.state.write();
+            let set = accounts
+                .get_or_create(ADMIN)
+                .stack_sets
+                .values_mut()
+                .next()
+                .unwrap();
+            set.instances[0].detailed_status = "RUNNING".to_string();
+            let op = set.operations.last_mut().unwrap();
+            op.status = "RUNNING".to_string();
+            op.results[0].status = "RUNNING".to_string();
+            restore_stack_sets(&mut accounts);
+        }
+        let op = ok(
+            &svc,
+            "DescribeStackSetOperation",
+            &[("StackSetName", "app"), ("OperationId", "op-async")],
+        )
+        .await;
+        assert_eq!(tag(&op, "Status"), "SUCCEEDED", "{op}");
+        assert_eq!(stored_set(&svc, "app").instances[0].status, "CURRENT");
+    }
+
+    #[tokio::test]
     async fn operations_interrupted_by_a_restart_are_settled_on_load() {
         let svc = service();
         create_set(&svc, "app", QUEUE_TEMPLATE).await;
@@ -5361,6 +5477,24 @@ mod tests {
         assert_eq!(tag(&op, "Status"), "RUNNING", "{op}");
         let e = err(&svc, "DeleteStackSet", &[("StackSetName", "app")]).await;
         assert_eq!(e.code(), "OperationInProgressException");
+        // The instance it will create is already listed, pending.
+        let describe = [
+            ("StackSetName", "app"),
+            ("StackInstanceAccount", ACCT_B),
+            ("StackInstanceRegion", "us-east-1"),
+        ];
+        let instance = ok(&svc, "DescribeStackInstance", &describe).await;
+        assert_eq!(tag(&instance, "Status"), "OUTDATED", "{instance}");
+        assert_eq!(tag(&instance, "DetailedStatus"), "PENDING", "{instance}");
+        // Stopped before it started: the pending instance is cancelled.
+        ok(
+            &svc,
+            "StopStackSetOperation",
+            &[("StackSetName", "app"), ("OperationId", "queued")],
+        )
+        .await;
+        let instance = ok(&svc, "DescribeStackInstance", &describe).await;
+        assert_eq!(tag(&instance, "DetailedStatus"), "CANCELLED", "{instance}");
     }
 
     struct Gate(&'static str);
