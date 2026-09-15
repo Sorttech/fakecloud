@@ -254,6 +254,27 @@ fn generate_with_suffix(stack_id: &str, logical_id: &str, rule: NameRule, suffix
     }
 }
 
+/// Whether `segment` is a name an older build gave an unnamed resource: the
+/// bare logical id, `{LogicalId}-{8 hex}`, or a `cfn-`-prefixed name carrying
+/// the logical id (`cfn-cs-MySet`, `cfn-db-4f3a9c1e`, ...).
+fn is_legacy_name(segment: &str, logical_id: &str) -> bool {
+    if segment.eq_ignore_ascii_case(logical_id) {
+        return true;
+    }
+    let hex8 = |s: &str| s.len() == 8 && s.bytes().all(|b| b.is_ascii_hexdigit());
+    if let Some((head, tail)) = segment.rsplit_once('-') {
+        if head.eq_ignore_ascii_case(logical_id) && hex8(tail) {
+            return true;
+        }
+    }
+    segment
+        .get(..4)
+        .is_some_and(|head| head.eq_ignore_ascii_case("cfn-"))
+        && segment
+            .split('-')
+            .any(|token| token.eq_ignore_ascii_case(logical_id))
+}
+
 impl ResourceProvisioner {
     /// The name CloudFormation gives `resource` when its template leaves the
     /// name property out.
@@ -311,7 +332,7 @@ impl ResourceProvisioner {
         }
         physical
             .split(['/', ':', '|'])
-            .find(|segment| segment.eq_ignore_ascii_case(&existing.logical_id))
+            .find(|segment| is_legacy_name(segment, &existing.logical_id))
             .map(str::to_string)
     }
 
@@ -413,6 +434,17 @@ mod tests {
             name_rule("AWS::SQS::Queue"),
         );
         assert!(name.starts_with("Resource-"), "{name}");
+    }
+
+    #[test]
+    fn names_from_older_builds_are_recognized() {
+        assert!(is_legacy_name("MySet", "MySet"));
+        assert!(is_legacy_name("cfn-cs-MySet", "MySet"));
+        assert!(is_legacy_name("cfn-db-4f3a9c1e", "Db"));
+        assert!(is_legacy_name("cfn-cluster-db-4f3a9c1e", "Db"));
+        assert!(is_legacy_name("Flow-1a2b3c4d", "Flow"));
+        assert!(!is_legacy_name("orders", "MySet"));
+        assert!(!is_legacy_name("Flow-notahexx", "Flow"));
     }
 
     #[test]

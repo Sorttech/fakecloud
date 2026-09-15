@@ -2089,17 +2089,12 @@ impl ResourceProvisioner {
                 policy = existing.update_replace_policy.as_deref().unwrap_or(""),
                 "CloudFormation: UpdateReplacePolicy retains the old physical resource on replacement; not deleting it"
             );
-            // The retained resource keeps its name, so the new one needs
-            // another.
-            let created = self.create_resource(new_def)?;
-            return Ok(Some(ProvisionResult {
-                physical_id: created.physical_id,
-                attributes: created.attributes,
-            }));
+        } else {
+            self.delete_resource(existing)?;
         }
-        self.delete_resource(existing)?;
-        // Re-created in place of the old resource, an unnamed resource keeps
-        // the old one's name, as an in-place update would.
+        // This path stands in for updates AWS applies in place, so an unnamed
+        // resource keeps the name it has rather than being renamed on every
+        // property change.
         let created = self.with_existing_name(existing, || self.create_resource(new_def))?;
         Ok(Some(ProvisionResult {
             physical_id: created.physical_id,
@@ -9290,6 +9285,28 @@ mod tests {
                     "Subnets",
                     serde_json::json!({
                         "DBSubnetGroupDescription": "second",
+                        "SubnetIds": ["subnet-1", "subnet-2"]
+                    }),
+                ),
+            )
+            .expect("update succeeds")
+            .expect("subnet group is updatable");
+        assert_eq!(updated.physical_id, group.physical_id);
+
+        // Retaining the old resource on replacement does not rename an update
+        // this path applies in place either.
+        let retained = StackResource {
+            update_replace_policy: Some("Retain".to_string()),
+            ..group.clone()
+        };
+        let updated = prov
+            .update_resource(
+                &retained,
+                &make_resource(
+                    "AWS::RDS::DBSubnetGroup",
+                    "Subnets",
+                    serde_json::json!({
+                        "DBSubnetGroupDescription": "third",
                         "SubnetIds": ["subnet-1", "subnet-2"]
                     }),
                 ),
