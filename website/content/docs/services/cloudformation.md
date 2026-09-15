@@ -6,7 +6,7 @@ weight = 13
 
 fakecloud implements **90 of 90** CloudFormation operations at 100% Smithy conformance.
 
-**Status: full API.** Stack lifecycle (create/update/delete with real events), nested stacks, SAM transform, change sets, stack sets + instances, drift detection CRUD, custom resources backed by Lambda, cross-stack exports/imports, and a broad resource-provisioner library that creates real backing state in the other fakecloud services.
+**Status: full API.** Stack lifecycle (create/update/delete with real events), nested stacks, SAM transform, change sets, stack sets whose instances provision real stacks across accounts and regions, drift detection, custom resources backed by Lambda, cross-stack exports/imports, and a broad resource-provisioner library that creates real backing state in the other fakecloud services.
 
 ## Protocol
 
@@ -46,7 +46,20 @@ The structural check is deliberately no stricter than the deploy path: it never 
 
 ## Stack sets
 
-Full control plane: `CreateStackSet`, `UpdateStackSet`, `DeleteStackSet`, `DescribeStackSet`, `ListStackSets`, plus instance management (`CreateStackInstances`, `UpdateStackInstances`, `DeleteStackInstances`, `DescribeStackInstance`, `ListStackInstances`) and operation tracking (`DescribeStackSetOperation`, `ListStackSetOperations`, `ListStackSetOperationResults`, `StopStackSetOperation`). Self-managed and service-managed permission models both round-trip.
+`CreateStackSet`, `UpdateStackSet`, `DeleteStackSet`, `DescribeStackSet`, `ListStackSets`, `CreateStackInstances`, `UpdateStackInstances`, `DeleteStackInstances`, `DescribeStackInstance`, `ListStackInstances`, `ImportStacksToStackSet`, `ListStackSetAutoDeploymentTargets`, and operation tracking via `DescribeStackSetOperation`, `ListStackSetOperations`, `ListStackSetOperationResults`, `StopStackSetOperation`.
+
+Stack instances are **real stacks**. `CreateStackInstances` creates a `StackSet-<name>-<uuid>` stack in every target account and region through the same path `CreateStack` uses, so the template's resources exist in the target account's backing services (a queue shows up in that account's `ListQueues`) and the stack is visible to `DescribeStacks` there. The stack ID carries the target region and account.
+
+- **Parameters** - the stack set's `Parameters` apply to every instance; `ParameterOverrides` on `CreateStackInstances` / `UpdateStackInstances` override them per instance. `UsePreviousValue` keeps an override, and leaving a parameter out of the list reverts it to the stack set's value. Overriding a parameter the template does not declare is a `ValidationError`.
+- **Updates** - `UpdateStackSet` stores the new template, parameters, capabilities and tags, then updates every instance's stack (or only the instances named by `Accounts`/`DeploymentTargets` + `Regions`, leaving the rest `OUTDATED`). `UpdateStackInstances` redeploys just the named instances.
+- **Deletes** - `DeleteStackInstances` deletes each instance's stack and its resources, or with `RetainStacks=true` leaves the stack in place and only removes the instance. A stack that cannot be deleted (termination protection, say) leaves its instance `INOPERABLE`. `DeleteStackSet` refuses a stack set that still has instances (`StackSetNotEmptyException`); a deleted stack set stays listable as `DELETED` and describable by its ID, and its name is free for reuse.
+- **Operations** - as in AWS, a mutating call returns its `OperationId` straight away and the deployment runs in the background; poll `DescribeStackSetOperation` until it leaves `RUNNING`. Every operation records a per-target result (`Account`, `Region`, `Status`, `StatusReason`, `AccountGateResult`). Targets deploy in `RegionOrder` then request order. A failing target counts against `FailureToleranceCount` / `FailureTolerancePercentage` per region; once the tolerance is exceeded the remaining targets are `CANCELLED` and the operation ends `FAILED`. Stacks that provision asynchronously (templates with custom resources) leave the operation `RUNNING` until they settle; `StopStackSetOperation` cancels the targets that have not started. A second operation while one is running is `OperationInProgressException`, and a reused `OperationId` is `OperationIdAlreadyExistsException`. An operation cut short by a restart is settled as `FAILED` when state is loaded, so it does not block the stack set.
+- **Account gate** - when a target account has a Lambda named `AWSCloudFormationStackSetAccountGate`, it is invoked before deploying and the deployment only proceeds if it returns `{"Status": "SUCCEEDED"}`. Without the function the gate is `SKIPPED`.
+- **Service-managed** - `PermissionModel=SERVICE_MANAGED` needs an organization with StackSets trusted access (`ActivateOrganizationsAccess`, or Organizations `EnableAWSServiceAccess` for `member.org.stacksets.cloudformation.amazonaws.com`). `DeploymentTargets.OrganizationalUnitIds` resolve to the accounts in those OUs and every OU nested below them, never the management account; `AccountFilterType` (`INTERSECTION`, `DIFFERENCE`, `UNION`, `NONE`) combines them with `DeploymentTargets.Accounts` or an `AccountsUrl` file in S3. Suspended accounts are recorded as `SKIPPED_SUSPENDED_ACCOUNT`. `CallAs=DELEGATED_ADMIN` works from an account registered as a StackSets delegated administrator and acts on the management account's stack sets.
+- **Import** - `ImportStacksToStackSet` adopts existing stacks (by `StackIds` or a `StackIdsUrl` file) as instances without redeploying them. A stack already managed by a stack set is refused, and a stack whose template differs from the stack set's is recorded as `FAILED_IMPORT`. `CreateStackSet` with `StackId` starts a stack set from a stack's template and parameters.
+- **Drift** - `DetectStackSetDrift` checks each instance's stack resources against the live backing services, sets each instance's `DriftStatus`, and reports the counts in `StackSetDriftDetectionDetails`; `ListStackInstanceResourceDrifts` lists the per-resource results for an operation.
+
+Execution roles (`AdministrationRoleARN`, `ExecutionRoleName`) are recorded and reported, with the AWS defaults for self-managed stack sets, but not required to exist in the target account.
 
 ## Nested stacks
 
@@ -62,7 +75,7 @@ Full control plane: `CreateStackSet`, `UpdateStackSet`, `DeleteStackSet`, `Descr
 
 ## Drift detection
 
-`DetectStackDrift`, `DetectStackResourceDrift`, `DescribeStackDriftDetectionStatus`, `DetectStackSetDrift`. Detection runs synchronously and reports `IN_SYNC` for every resource — fakecloud is the source of truth for the backing state, so real drift never occurs. The detection IDs, statuses, and timestamps round-trip through the API for tooling that polls them.
+`DetectStackDrift`, `DetectStackResourceDrift`, `DescribeStackDriftDetectionStatus`, `DescribeStackResourceDrifts`, and `DetectStackSetDrift` (see stack sets). Detection runs synchronously and checks whether each resource's physical resource still exists in its backing service: a resource deleted outside CloudFormation reports `DELETED` and the stack `DRIFTED`. Existence is checked for SQS queues, SNS topics, S3 buckets, Lambda functions, IAM roles, DynamoDB tables, KMS keys and Secrets Manager secrets; other types are assumed in sync, and property-level differences are not compared.
 
 ## Type registry, hooks, publishing
 
@@ -169,7 +182,8 @@ aws --endpoint-url http://localhost:4566 cloudformation list-exports
 ## Gotchas
 
 - **Not every resource type provisions something.** Types in the provisioner list above create real backing state. Anything else (the remaining `AWS::EC2::*` types such as `NatGateway` / `Route`, etc.) is recorded but has no underlying resource, so a follow-up call against that service will 404.
-- **Drift always reports IN_SYNC.** fakecloud is the source of truth for backing state, so real drift never occurs. The drift API still round-trips IDs and statuses for tooling that polls them.
+- **Drift only detects deleted resources.** A resource removed outside CloudFormation reports `DELETED`; property changes made outside CloudFormation are not compared.
+- **Unnamed resources are named after their logical ID.** Two stacks from one template in the same account (such as stack instances of one stack set in two regions) collide on resources that take a name, unless the template names them per stack, for example `QueueName: !Sub "${AWS::StackName}-queue"`.
 - **SAM expansion runs at create time.** A re-uploaded template still requires `Capabilities=[CAPABILITY_AUTO_EXPAND]` on operations that touch transforms.
 
 ## Source

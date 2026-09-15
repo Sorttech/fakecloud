@@ -105,6 +105,10 @@ pub struct CloudFormationState {
     /// blocks deleting a stack whose exports still appear here.
     #[serde(default)]
     pub imports: BTreeMap<String, Vec<String>>,
+    /// Stack sets administered from this account, keyed by `StackSetId`.
+    /// Deleted stack sets stay here with status `DELETED`.
+    #[serde(default)]
+    pub stack_sets: BTreeMap<String, crate::stack_sets::StackSet>,
 }
 
 impl CloudFormationState {
@@ -119,6 +123,7 @@ impl CloudFormationState {
             orgs_access_enabled: false,
             exports: BTreeMap::new(),
             imports: BTreeMap::new(),
+            stack_sets: BTreeMap::new(),
         }
     }
 
@@ -130,6 +135,7 @@ impl CloudFormationState {
         self.orgs_access_enabled = false;
         self.exports.clear();
         self.imports.clear();
+        self.stack_sets.clear();
     }
 }
 

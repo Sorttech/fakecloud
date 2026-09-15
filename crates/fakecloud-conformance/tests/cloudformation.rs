@@ -251,6 +251,43 @@ async fn cloudformation_get_template() {
 
 const CFN_AUTH: &str = "AWS4-HMAC-SHA256 Credential=test/20240101/us-east-1/cloudformation/aws4_request, SignedHeaders=host, Signature=0";
 
+/// Text of the first `<name>` element in an XML response.
+fn xml_tag(xml: &str, name: &str) -> String {
+    xml.split(&format!("<{name}>"))
+        .nth(1)
+        .and_then(|rest| rest.split(&format!("</{name}>")).next())
+        .unwrap_or_else(|| panic!("no <{name}> in {xml}"))
+        .to_string()
+}
+
+/// Start a stack set operation on `ss1` and wait for it to succeed,
+/// returning its OperationId.
+async fn start_operation(server: &TestServer, action: &str, params: &[(&str, &str)]) -> String {
+    let resp = cfn_post(server, action, params).await;
+    assert!(resp.status().is_success(), "{action}: {}", resp.status());
+    let op_id = xml_tag(&resp.text().await.unwrap(), "OperationId");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let op = cfn_post(
+            server,
+            "DescribeStackSetOperation",
+            &[("StackSetName", "ss1"), ("OperationId", &op_id)],
+        )
+        .await
+        .text()
+        .await
+        .unwrap();
+        match xml_tag(&op, "Status").as_str() {
+            "RUNNING" | "STOPPING" => {
+                assert!(std::time::Instant::now() < deadline, "{action} stuck: {op}");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            "SUCCEEDED" => return op_id,
+            _ => panic!("{action} did not succeed: {op}"),
+        }
+    }
+}
+
 fn pct(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for &b in s.as_bytes() {
@@ -436,144 +473,117 @@ async fn cloudformation_closure_routes_exist() {
             .is_success()
     );
 
-    // Stack sets
-    assert!(
-        cfn_post(&server, "CreateStackSet", &[("StackSetName", "ss1")])
-            .await
-            .status()
-            .is_success()
-    );
-    assert!(
-        cfn_post(&server, "DescribeStackSet", &[("StackSetName", "ss1")])
-            .await
-            .status()
-            .is_success()
-    );
-    assert!(cfn_post(&server, "ListStackSets", &[])
+    // Stack sets and their instances, as one lifecycle: every operation below
+    // acts on state an earlier call created. Operations deploy in the
+    // background, so each is awaited before the next starts.
+    let stack_set_template = r#"{"Resources":{"Q":{"Type":"AWS::SQS::Queue","Properties":{"QueueName":{"Fn::Sub":"${AWS::StackName}-q"}}}}}"#;
+    for (action, params) in [
+        (
+            "CreateStackSet",
+            vec![
+                ("StackSetName", "ss1"),
+                ("TemplateBody", stack_set_template),
+            ],
+        ),
+        ("DescribeStackSet", vec![("StackSetName", "ss1")]),
+        ("ListStackSets", vec![]),
+    ] {
+        let resp = cfn_post(&server, action, &params).await;
+        assert!(resp.status().is_success(), "{action}: {}", resp.status());
+    }
+    let instance_target = [
+        ("StackSetName", "ss1"),
+        ("Accounts.member.1", "111111111111"),
+        ("Regions.member.1", "us-east-1"),
+    ];
+    let create_op = start_operation(&server, "CreateStackInstances", &instance_target).await;
+    let instance = cfn_post(
+        &server,
+        "DescribeStackInstance",
+        &[
+            ("StackSetName", "ss1"),
+            ("StackInstanceAccount", "111111111111"),
+            ("StackInstanceRegion", "us-east-1"),
+        ],
+    )
+    .await
+    .text()
+    .await
+    .unwrap();
+    assert_eq!(xml_tag(&instance, "Status"), "CURRENT", "{instance}");
+    for (action, params) in [
+        ("ListStackInstances", vec![("StackSetName", "ss1")]),
+        ("ListStackSetOperations", vec![("StackSetName", "ss1")]),
+        (
+            "ListStackSetOperationResults",
+            vec![("StackSetName", "ss1"), ("OperationId", create_op.as_str())],
+        ),
+        (
+            "ListStackSetAutoDeploymentTargets",
+            vec![("StackSetName", "ss1")],
+        ),
+    ] {
+        let resp = cfn_post(&server, action, &params).await;
+        assert!(resp.status().is_success(), "{action}: {}", resp.status());
+    }
+    start_operation(&server, "UpdateStackSet", &[("StackSetName", "ss1")]).await;
+    start_operation(&server, "UpdateStackInstances", &instance_target).await;
+    let drift_op =
+        start_operation(&server, "DetectStackSetDrift", &[("StackSetName", "ss1")]).await;
+    assert!(cfn_post(
+        &server,
+        "ListStackInstanceResourceDrifts",
+        &[
+            ("StackSetName", "ss1"),
+            ("StackInstanceAccount", "111111111111"),
+            ("StackInstanceRegion", "us-east-1"),
+            ("OperationId", &drift_op),
+        ],
+    )
+    .await
+    .status()
+    .is_success());
+    // Every operation has finished, so there is nothing left to stop.
+    assert_eq!(
+        cfn_post(
+            &server,
+            "StopStackSetOperation",
+            &[("StackSetName", "ss1"), ("OperationId", &create_op)],
+        )
         .await
         .status()
-        .is_success());
-    assert!(
-        cfn_post(&server, "UpdateStackSet", &[("StackSetName", "ss1")])
-            .await
-            .status()
-            .is_success()
+        .as_u16(),
+        400
     );
-    assert!(cfn_post(
-        &server,
-        "DescribeStackSetOperation",
-        &[("StackSetName", "ss1"), ("OperationId", "op1")]
-    )
-    .await
-    .status()
-    .is_success());
-    assert!(cfn_post(
-        &server,
-        "ListStackSetOperations",
-        &[("StackSetName", "ss1")]
-    )
-    .await
-    .status()
-    .is_success());
-    assert!(cfn_post(
-        &server,
-        "ListStackSetOperationResults",
-        &[("StackSetName", "ss1"), ("OperationId", "op1")]
-    )
-    .await
-    .status()
-    .is_success());
-    assert!(cfn_post(
-        &server,
-        "ListStackSetAutoDeploymentTargets",
-        &[("StackSetName", "ss1")]
-    )
-    .await
-    .status()
-    .is_success());
-    assert!(cfn_post(
-        &server,
-        "StopStackSetOperation",
-        &[("StackSetName", "ss1"), ("OperationId", "op1")]
-    )
-    .await
-    .status()
-    .is_success());
-    assert!(cfn_post(
+    let mut delete_instances = instance_target.to_vec();
+    delete_instances.push(("RetainStacks", "true"));
+    start_operation(&server, "DeleteStackInstances", &delete_instances).await;
+    let listed = cfn_post(&server, "ListStackInstances", &[("StackSetName", "ss1")])
+        .await
+        .text()
+        .await
+        .unwrap();
+    assert!(!listed.contains("<member>"), "{listed}");
+    // The retained stack imports straight back in as an instance.
+    let retained_stack_id = xml_tag(&instance, "StackId");
+    start_operation(
         &server,
         "ImportStacksToStackSet",
-        &[("StackSetName", "ss1")]
+        &[
+            ("StackSetName", "ss1"),
+            ("StackIds.member.1", &retained_stack_id),
+        ],
     )
-    .await
-    .status()
-    .is_success());
+    .await;
+    let mut delete_again = instance_target.to_vec();
+    delete_again.push(("RetainStacks", "false"));
+    start_operation(&server, "DeleteStackInstances", &delete_again).await;
     assert!(
         cfn_post(&server, "DeleteStackSet", &[("StackSetName", "ss1")])
             .await
             .status()
             .is_success()
     );
-
-    // Stack instances
-    assert!(cfn_post(
-        &server,
-        "CreateStackInstances",
-        &[("StackSetName", "ss1"), ("Regions.member.1", "us-east-1"),],
-    )
-    .await
-    .status()
-    .is_success());
-    assert!(cfn_post(
-        &server,
-        "UpdateStackInstances",
-        &[("StackSetName", "ss1"), ("Regions.member.1", "us-east-1"),],
-    )
-    .await
-    .status()
-    .is_success());
-    assert!(cfn_post(
-        &server,
-        "DeleteStackInstances",
-        &[
-            ("StackSetName", "ss1"),
-            ("Regions.member.1", "us-east-1"),
-            ("RetainStacks", "false"),
-        ],
-    )
-    .await
-    .status()
-    .is_success());
-    assert!(cfn_post(
-        &server,
-        "DescribeStackInstance",
-        &[
-            ("StackSetName", "ss1"),
-            ("StackInstanceAccount", "000000000000"),
-            ("StackInstanceRegion", "us-east-1"),
-        ],
-    )
-    .await
-    .status()
-    .is_success());
-    assert!(
-        cfn_post(&server, "ListStackInstances", &[("StackSetName", "ss1")])
-            .await
-            .status()
-            .is_success()
-    );
-    assert!(cfn_post(
-        &server,
-        "ListStackInstanceResourceDrifts",
-        &[
-            ("StackSetName", "ss1"),
-            ("StackInstanceAccount", "000000000000"),
-            ("StackInstanceRegion", "us-east-1"),
-            ("OperationId", "op1"),
-        ],
-    )
-    .await
-    .status()
-    .is_success());
 
     // Refactors
     assert!(cfn_post(
@@ -817,12 +827,6 @@ async fn cloudformation_closure_routes_exist() {
     .await
     .status()
     .is_success());
-    assert!(
-        cfn_post(&server, "DetectStackSetDrift", &[("StackSetName", "ss1")])
-            .await
-            .status()
-            .is_success()
-    );
     assert!(cfn_post(
         &server,
         "DescribeStackDriftDetectionStatus",
