@@ -276,7 +276,15 @@ fn settle_interrupted_operations(set: &mut StackSet) {
             };
             apply_to_instance(instance, &outcome);
         }
-        op.status = settled_status(op).to_string();
+        // Whatever the tolerance, an operation that never got to finish did
+        // not succeed.
+        op.status = if op.status == "STOPPING" {
+            "STOPPED"
+        } else {
+            "FAILED"
+        }
+        .to_string();
+        op.status_reason = Some(OPERATION_INTERRUPTED.to_string());
         op.ended_at = Some(Utc::now());
     }
 }
@@ -1876,7 +1884,7 @@ impl CloudFormationService {
             )?;
             (targets, explicit_regions.clone())
         } else {
-            let suspended = self.suspended_accounts();
+            let suspended = self.suspended_accounts_for(&updated);
             let targets = updated
                 .instances
                 .iter()
@@ -2133,7 +2141,12 @@ impl CloudFormationService {
 
     /// Organization member accounts that are not ACTIVE. Existing instances in
     /// them are skipped again rather than failed.
-    fn suspended_accounts(&self) -> BTreeSet<String> {
+    fn suspended_accounts_for(&self, set: &StackSet) -> BTreeSet<String> {
+        // Only service-managed stack sets deploy through the organization;
+        // a self-managed one targets accounts directly.
+        if set.permission_model != "SERVICE_MANAGED" {
+            return BTreeSet::new();
+        }
         self.deps
             .organizations
             .read()
@@ -2224,7 +2237,7 @@ impl CloudFormationService {
                 "Only one of Accounts or DeploymentTargets can be specified",
             ));
         }
-        let suspended = self.suspended_accounts();
+        let suspended = self.suspended_accounts_for(set);
         let mut targets = Vec::new();
         let mut push = |instance: &StackInstance| {
             if !targets
@@ -2685,7 +2698,9 @@ impl CloudFormationService {
             let mut overrides = None;
             let outcome = if let Some(reason) = abort {
                 Outcome::Cancelled(reason.to_string())
-            } else if target.suspended {
+            } else if target.suspended && !matches!(action, TargetAction::Delete { .. }) {
+                // A suspended account is skipped for deployments, but its
+                // instance can still be removed.
                 Outcome::SkippedSuspended
             } else {
                 let g = self.account_gate(&target.account, &target.region).await;
@@ -5279,6 +5294,25 @@ mod tests {
         assert_eq!(tag(&op, "Status"), "SUCCEEDED", "{op}");
         assert_eq!(skipped(&svc), "SKIPPED_SUSPENDED_ACCOUNT");
         assert_eq!(queue_count(&svc, ACCT_B), 1);
+
+        // The suspended account's instance still deletes, so the stack set
+        // can be emptied and deleted.
+        ok(
+            &svc,
+            "DeleteStackInstances",
+            &[
+                ("StackSetName", "org"),
+                (
+                    "DeploymentTargets.OrganizationalUnitIds.member.1",
+                    &workloads,
+                ),
+                ("Regions.member.1", "us-east-1"),
+                ("RetainStacks", "true"),
+            ],
+        )
+        .await;
+        assert!(stored_set(&svc, "org").instances.is_empty());
+        ok(&svc, "DeleteStackSet", &[("StackSetName", "org")]).await;
     }
 
     #[tokio::test]
@@ -5447,6 +5481,42 @@ mod tests {
         .await;
         assert_eq!(tag(&op, "Status"), "SUCCEEDED", "{op}");
         assert_eq!(stored_set(&svc, "app").instances[0].status, "CURRENT");
+    }
+
+    #[tokio::test]
+    async fn an_operation_that_never_started_before_a_restart_is_not_a_success() {
+        let svc = service();
+        create_set(&svc, "app", QUEUE_TEMPLATE).await;
+        let snapshot = stored_set(&svc, "app");
+        let targets = vec![Target {
+            account: ACCT_B.to_string(),
+            region: "us-east-1".to_string(),
+            ou: None,
+            suspended: false,
+        }];
+        svc.start_instance_operation(
+            ADMIN,
+            &snapshot,
+            &targets,
+            "never-ran",
+            "CREATE",
+            OperationPreferences {
+                failure_tolerance_count: Some(5),
+                ..OperationPreferences::default()
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        restore_stack_sets(&mut svc.state.write());
+        let op = ok(
+            &svc,
+            "DescribeStackSetOperation",
+            &[("StackSetName", "app"), ("OperationId", "never-ran")],
+        )
+        .await;
+        assert_eq!(tag(&op, "Status"), "FAILED", "{op}");
+        assert!(op.contains(OPERATION_INTERRUPTED), "{op}");
     }
 
     #[tokio::test]
