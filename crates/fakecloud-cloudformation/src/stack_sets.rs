@@ -1313,7 +1313,7 @@ impl CloudFormationService {
                 (stack.template.clone(), params)
             }
             None => (
-                self.stack_set_template_body(&admin, params)
+                self.stack_set_template_body(&req.account_id, params)
                     .map_err(validation)?
                     .unwrap_or_default(),
                 BTreeMap::new(),
@@ -1400,7 +1400,9 @@ impl CloudFormationService {
         let enabled = parse_bool(params, "AutoDeployment.Enabled")?;
         let retain = parse_bool(params, "AutoDeployment.RetainStacksOnAccountRemoval")?;
         if enabled.is_none() && retain.is_none() {
-            return Ok(previous.cloned());
+            // Auto-deployment only exists for service-managed stack sets, so a
+            // switch to SELF_MANAGED drops it.
+            return Ok(previous.filter(|_| service_managed).cloned());
         }
         if !service_managed {
             return Err(validation(
@@ -1636,7 +1638,7 @@ impl CloudFormationService {
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         // Resolved before the state lock: a TemplateURL read takes the S3 lock.
         let new_template = self
-            .stack_set_template_body(&admin, params)
+            .stack_set_template_body(&req.account_id, params)
             .map_err(validation)?;
         let use_previous_template = parse_bool(params, "UsePreviousTemplate")?.unwrap_or(false);
         if use_previous_template && new_template.is_some() {
@@ -1731,7 +1733,7 @@ impl CloudFormationService {
         let (targets, regions) = if targeted {
             let targets = self.existing_instance_targets(
                 &updated,
-                &admin,
+                &req.account_id,
                 &explicit_accounts,
                 deployment_targets.as_ref(),
                 &explicit_regions,
@@ -1739,6 +1741,7 @@ impl CloudFormationService {
             )?;
             (targets, explicit_regions.clone())
         } else {
+            let suspended = self.suspended_accounts();
             let targets = updated
                 .instances
                 .iter()
@@ -1746,7 +1749,7 @@ impl CloudFormationService {
                     account: i.account.clone(),
                     region: i.region.clone(),
                     ou: i.organizational_unit_id.clone(),
-                    suspended: false,
+                    suspended: suspended.contains(&i.account),
                 })
                 .collect();
             (targets, stack_set_regions(&updated))
@@ -1886,7 +1889,7 @@ impl CloudFormationService {
     fn resolve_new_targets(
         &self,
         set: &StackSet,
-        admin: &str,
+        caller: &str,
         accounts: &[String],
         deployment_targets: Option<&DeploymentTargets>,
         regions: &[String],
@@ -1911,7 +1914,7 @@ impl CloudFormationService {
                 .ok_or_else(|| {
                     validation("DeploymentTargets.OrganizationalUnitIds is required for SERVICE_MANAGED stack sets")
                 })?;
-            let filter_accounts = self.target_accounts_list(admin, dt)?;
+            let filter_accounts = self.target_accounts_list(caller, dt)?;
             let filter = self.account_filter_type(dt, &filter_accounts)?;
             let orgs = self.deps.organizations.read();
             let org = orgs
@@ -1955,7 +1958,7 @@ impl CloudFormationService {
                             "OrganizationalUnitIds are only supported for stack sets with SERVICE_MANAGED permission model",
                         ));
                     }
-                    self.target_accounts_list(admin, dt)?
+                    self.target_accounts_list(caller, dt)?
                 }
                 None => accounts.to_vec(),
             };
@@ -1977,7 +1980,8 @@ impl CloudFormationService {
             }
         }
         let mut targets = Vec::new();
-        for region in regions {
+        let mut seen_regions = BTreeSet::new();
+        for region in regions.iter().filter(|r| seen_regions.insert(*r)) {
             for (account, ou, suspended) in &resolved {
                 targets.push(Target {
                     account: account.clone(),
@@ -1990,11 +1994,28 @@ impl CloudFormationService {
         Ok(targets)
     }
 
+    /// Organization member accounts that are not ACTIVE. Existing instances in
+    /// them are skipped again rather than failed.
+    fn suspended_accounts(&self) -> BTreeSet<String> {
+        self.deps
+            .organizations
+            .read()
+            .as_ref()
+            .map(|org| {
+                org.accounts
+                    .values()
+                    .filter(|a| a.status != "ACTIVE")
+                    .map(|a| a.id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// `DeploymentTargets.Accounts` plus the accounts listed in
     /// `DeploymentTargets.AccountsUrl`, validated.
     fn target_accounts_list(
         &self,
-        admin: &str,
+        caller: &str,
         dt: &DeploymentTargets,
     ) -> Result<Vec<String>, AwsServiceError> {
         let mut list = dt.accounts.clone();
@@ -2005,7 +2026,7 @@ impl CloudFormationService {
                 )));
             }
             let body = self
-                .resolve_template_url(admin, url)
+                .resolve_template_url(caller, url)
                 .map_err(|_| validation(format!("Unable to read the accounts file at {url}")))?;
             list.extend(
                 body.split([',', '\n', '\r'])
@@ -2052,7 +2073,7 @@ impl CloudFormationService {
     fn existing_instance_targets(
         &self,
         set: &StackSet,
-        admin: &str,
+        caller: &str,
         accounts: &[String],
         deployment_targets: Option<&DeploymentTargets>,
         regions: &[String],
@@ -2066,6 +2087,7 @@ impl CloudFormationService {
                 "Only one of Accounts or DeploymentTargets can be specified",
             ));
         }
+        let suspended = self.suspended_accounts();
         let mut targets = Vec::new();
         let mut push = |instance: &StackInstance| {
             if !targets
@@ -2076,7 +2098,7 @@ impl CloudFormationService {
                     account: instance.account.clone(),
                     region: instance.region.clone(),
                     ou: instance.organizational_unit_id.clone(),
-                    suspended: false,
+                    suspended: suspended.contains(&instance.account),
                 });
             }
         };
@@ -2091,7 +2113,7 @@ impl CloudFormationService {
                 .ok_or_else(|| {
                     validation("DeploymentTargets.OrganizationalUnitIds is required for SERVICE_MANAGED stack sets")
                 })?;
-            let filter_accounts = self.target_accounts_list(admin, dt)?;
+            let filter_accounts = self.target_accounts_list(caller, dt)?;
             let filter = self.account_filter_type(dt, &filter_accounts)?;
             // An OU covers every OU nested below it, so an instance deployed
             // through a child OU is reached through its parent or the root,
@@ -2138,7 +2160,7 @@ impl CloudFormationService {
                             "OrganizationalUnitIds are only supported for stack sets with SERVICE_MANAGED permission model",
                         ));
                     }
-                    self.target_accounts_list(admin, dt)?
+                    self.target_accounts_list(caller, dt)?
                 }
                 None => accounts.to_vec(),
             };
@@ -2256,7 +2278,7 @@ impl CloudFormationService {
         Self::check_overrides_declared(&snapshot, overrides.keys().cloned())?;
         let targets = self.resolve_new_targets(
             &snapshot,
-            &admin,
+            &req.account_id,
             &accounts,
             deployment_targets.as_ref(),
             &regions,
@@ -2335,7 +2357,7 @@ impl CloudFormationService {
         }
         let targets = self.existing_instance_targets(
             &snapshot,
-            &admin,
+            &req.account_id,
             &accounts,
             deployment_targets.as_ref(),
             &regions,
@@ -2391,7 +2413,7 @@ impl CloudFormationService {
         let snapshot = self.active_snapshot(&admin, &name, Scope::of(params))?;
         let targets = self.existing_instance_targets(
             &snapshot,
-            &admin,
+            &req.account_id,
             &accounts,
             deployment_targets.as_ref(),
             &regions,
@@ -2690,35 +2712,10 @@ impl CloudFormationService {
                     (outcome, id, Some(overrides.clone()))
                 }
                 None => {
-                    let stack_name = format!(
-                        "StackSet-{}-{}",
-                        spec.name.replace(':', "-"),
-                        uuid::Uuid::new_v4()
-                    );
-                    let mut stack_params = spec.stack_params(overrides);
-                    stack_params.push(("StackName".to_string(), stack_name.clone()));
-                    let request = synthetic_request(
-                        &target.account,
-                        &target.region,
-                        "CreateStack",
-                        &req.request_id,
-                        stack_params,
-                    );
-                    if let Err(e) = self.create_stack(&request).await {
-                        return (Outcome::Failed(e.message()), None, Some(overrides.clone()));
-                    }
-                    match self.stack_status(&target.account, &stack_name) {
-                        Some((stack_id, status, reason)) => (
-                            stack_outcome("CREATE", &status, reason.as_deref()),
-                            Some(stack_id),
-                            Some(overrides.clone()),
-                        ),
-                        None => (
-                            Outcome::Failed(format!("Stack {stack_name} was not created")),
-                            None,
-                            Some(overrides.clone()),
-                        ),
-                    }
+                    let (outcome, id) = self
+                        .create_instance_stack(req, spec, target, overrides)
+                        .await;
+                    (outcome, id, Some(overrides.clone()))
                 }
             },
             TargetAction::Update { overrides } => {
@@ -2739,18 +2736,64 @@ impl CloudFormationService {
                         .collect(),
                 };
                 let Some((stack_id, _, _)) = live_stack else {
-                    let missing = existing.and_then(|i| i.stack_id).unwrap_or_default();
-                    return (
-                        Outcome::Failed(format!("Stack [{missing}] does not exist")),
-                        None,
-                        Some(resolved),
-                    );
+                    // An instance that never got a stack (skipped, cancelled,
+                    // or its create failed) is deployed now. One whose stack
+                    // was deleted out from under it fails, as in AWS.
+                    return match existing.and_then(|i| i.stack_id) {
+                        Some(missing) => (
+                            Outcome::Failed(format!("Stack [{missing}] does not exist")),
+                            None,
+                            Some(resolved),
+                        ),
+                        None => {
+                            let (outcome, id) = self
+                                .create_instance_stack(req, spec, target, &resolved)
+                                .await;
+                            (outcome, id, Some(resolved))
+                        }
+                    };
                 };
                 let (outcome, id) = self
                     .update_instance_stack(req, spec, target, &stack_id, &resolved)
                     .await;
                 (outcome, id, Some(resolved))
             }
+        }
+    }
+
+    async fn create_instance_stack(
+        &self,
+        req: &AwsRequest,
+        spec: &DeploySpec,
+        target: &Target,
+        overrides: &BTreeMap<String, String>,
+    ) -> (Outcome, Option<String>) {
+        let stack_name = format!(
+            "StackSet-{}-{}",
+            spec.name.replace(':', "-"),
+            uuid::Uuid::new_v4()
+        );
+        let mut stack_params = spec.stack_params(overrides);
+        stack_params.push(("StackName".to_string(), stack_name.clone()));
+        let request = synthetic_request(
+            &target.account,
+            &target.region,
+            "CreateStack",
+            &req.request_id,
+            stack_params,
+        );
+        if let Err(e) = self.create_stack(&request).await {
+            return (Outcome::Failed(e.message()), None);
+        }
+        match self.stack_status(&target.account, &stack_name) {
+            Some((stack_id, status, reason)) => (
+                stack_outcome("CREATE", &status, reason.as_deref()),
+                Some(stack_id),
+            ),
+            None => (
+                Outcome::Failed(format!("Stack {stack_name} was not created")),
+                None,
+            ),
         }
     }
 
@@ -3111,7 +3154,7 @@ impl CloudFormationService {
                 )));
             }
             let body = self
-                .resolve_template_url(&admin, url)
+                .resolve_template_url(&req.account_id, url)
                 .map_err(|_| validation(format!("Unable to read the stack ids file at {url}")))?;
             stack_ids = body
                 .split([',', '\n', '\r'])
@@ -4917,6 +4960,217 @@ mod tests {
         assert_eq!(e.code(), "ValidationError");
         let page = ok(&svc, "ListStackSets", &[("MaxResults", "1")]).await;
         assert!(!page.contains("<NextToken>"), "{page}");
+    }
+
+    #[tokio::test]
+    async fn a_stack_set_update_deploys_instances_that_never_got_a_stack() {
+        let broken = "Resources:\n  Q:\n    Type: AWS::SQS::Queue\n    Properties:\n      QueueName:\n        Fn::ImportValue: missing-export\n";
+        let svc = service();
+        create_set(&svc, "fixme", broken).await;
+        ok(
+            &svc,
+            "CreateStackInstances",
+            &[
+                ("StackSetName", "fixme"),
+                ("Accounts.member.1", ACCT_B),
+                ("Regions.member.1", "us-east-1"),
+                ("Regions.member.2", "us-west-2"),
+            ],
+        )
+        .await;
+        assert!(stored_set(&svc, "fixme")
+            .instances
+            .iter()
+            .all(|i| i.stack_id.is_none()));
+
+        let xml = ok(
+            &svc,
+            "UpdateStackSet",
+            &[("StackSetName", "fixme"), ("TemplateBody", QUEUE_TEMPLATE)],
+        )
+        .await;
+        let op = ok(
+            &svc,
+            "DescribeStackSetOperation",
+            &[
+                ("StackSetName", "fixme"),
+                ("OperationId", &tag(&xml, "OperationId")),
+            ],
+        )
+        .await;
+        assert_eq!(tag(&op, "Status"), "SUCCEEDED", "{op}");
+        let set = stored_set(&svc, "fixme");
+        assert!(set
+            .instances
+            .iter()
+            .all(|i| i.status == "CURRENT" && i.stack_id.is_some()));
+        assert_eq!(queue_count(&svc, ACCT_B), 2);
+    }
+
+    #[tokio::test]
+    async fn suspended_accounts_are_skipped_on_create_and_update() {
+        let svc = service();
+        let (workloads, _) = seed_org(&svc);
+        svc.deps
+            .organizations
+            .write()
+            .as_mut()
+            .unwrap()
+            .close_account(ACCT_C)
+            .unwrap();
+        ok(&svc, "ActivateOrganizationsAccess", &[]).await;
+        ok(
+            &svc,
+            "CreateStackSet",
+            &[
+                ("StackSetName", "org"),
+                ("TemplateBody", QUEUE_TEMPLATE),
+                ("PermissionModel", "SERVICE_MANAGED"),
+            ],
+        )
+        .await;
+        ok(
+            &svc,
+            "CreateStackInstances",
+            &[
+                ("StackSetName", "org"),
+                (
+                    "DeploymentTargets.OrganizationalUnitIds.member.1",
+                    &workloads,
+                ),
+                ("Regions.member.1", "us-east-1"),
+            ],
+        )
+        .await;
+        let skipped = |svc: &CloudFormationService| {
+            stored_set(svc, "org")
+                .instances
+                .into_iter()
+                .find(|i| i.account == ACCT_C)
+                .unwrap()
+                .detailed_status
+        };
+        assert_eq!(skipped(&svc), "SKIPPED_SUSPENDED_ACCOUNT");
+        assert_eq!(queue_count(&svc, ACCT_C), 0);
+
+        let xml = ok(
+            &svc,
+            "UpdateStackSet",
+            &[("StackSetName", "org"), ("TemplateBody", QUEUE_TEMPLATE)],
+        )
+        .await;
+        let op = ok(
+            &svc,
+            "DescribeStackSetOperation",
+            &[
+                ("StackSetName", "org"),
+                ("OperationId", &tag(&xml, "OperationId")),
+            ],
+        )
+        .await;
+        assert_eq!(tag(&op, "Status"), "SUCCEEDED", "{op}");
+        assert_eq!(skipped(&svc), "SKIPPED_SUSPENDED_ACCOUNT");
+        assert_eq!(queue_count(&svc, ACCT_B), 1);
+    }
+
+    #[tokio::test]
+    async fn a_region_listed_twice_deploys_once() {
+        let svc = service();
+        create_set(&svc, "app", QUEUE_TEMPLATE).await;
+        let xml = ok(
+            &svc,
+            "CreateStackInstances",
+            &[
+                ("StackSetName", "app"),
+                ("Accounts.member.1", ACCT_B),
+                ("Regions.member.1", "us-east-1"),
+                ("Regions.member.2", "us-east-1"),
+            ],
+        )
+        .await;
+        let op = ok(
+            &svc,
+            "DescribeStackSetOperation",
+            &[
+                ("StackSetName", "app"),
+                ("OperationId", &tag(&xml, "OperationId")),
+            ],
+        )
+        .await;
+        assert_eq!(tag(&op, "Status"), "SUCCEEDED", "{op}");
+        assert_eq!(stored_set(&svc, "app").instances.len(), 1);
+        assert_eq!(queue_count(&svc, ACCT_B), 1);
+    }
+
+    #[tokio::test]
+    async fn a_delegated_administrator_reads_template_urls_from_its_own_account() {
+        let svc = service();
+        seed_org(&svc);
+        {
+            let mut orgs = svc.deps.organizations.write();
+            let org = orgs.as_mut().unwrap();
+            org.enable_aws_service_access(STACKSETS_PRINCIPAL);
+            org.register_delegated_administrator(ACCT_B, STACKSETS_PRINCIPAL)
+                .unwrap();
+        }
+        {
+            let mut s3 = svc.deps.s3.write();
+            let state = s3.get_or_create(ACCT_B);
+            let mut bucket = fakecloud_s3::S3Bucket::new("templates", "us-east-1", ACCT_B);
+            bucket.objects.insert(
+                "set.yaml".to_string(),
+                fakecloud_s3::S3Object {
+                    key: "set.yaml".to_string(),
+                    body: fakecloud_s3::memory_body(bytes::Bytes::from_static(
+                        QUEUE_TEMPLATE.as_bytes(),
+                    )),
+                    size: QUEUE_TEMPLATE.len() as u64,
+                    ..Default::default()
+                },
+            );
+            state.buckets.insert("templates".to_string(), bucket);
+        }
+        call_as(
+            &svc,
+            ACCT_B,
+            "CreateStackSet",
+            &[
+                ("StackSetName", "from-url"),
+                ("TemplateURL", "https://templates.s3.amazonaws.com/set.yaml"),
+                ("PermissionModel", "SERVICE_MANAGED"),
+                ("CallAs", "DELEGATED_ADMIN"),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(stored_set(&svc, "from-url").template_body, QUEUE_TEMPLATE);
+    }
+
+    #[tokio::test]
+    async fn switching_to_self_managed_drops_auto_deployment() {
+        let svc = service();
+        seed_org(&svc);
+        ok(&svc, "ActivateOrganizationsAccess", &[]).await;
+        ok(
+            &svc,
+            "CreateStackSet",
+            &[
+                ("StackSetName", "org"),
+                ("TemplateBody", QUEUE_TEMPLATE),
+                ("PermissionModel", "SERVICE_MANAGED"),
+                ("AutoDeployment.Enabled", "true"),
+            ],
+        )
+        .await;
+        ok(
+            &svc,
+            "UpdateStackSet",
+            &[("StackSetName", "org"), ("PermissionModel", "SELF_MANAGED")],
+        )
+        .await;
+        let described = ok(&svc, "DescribeStackSet", &[("StackSetName", "org")]).await;
+        assert!(!described.contains("<AutoDeployment>"), "{described}");
+        assert!(described.contains("<PermissionModel>SELF_MANAGED</PermissionModel>"));
     }
 
     struct Gate(&'static str);
