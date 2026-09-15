@@ -211,10 +211,54 @@ pub struct InstanceResourceDrift {
     pub timestamp: DateTime<Utc>,
 }
 
+const OPERATION_INTERRUPTED: &str = "The operation was interrupted by a restart";
+
+/// Bring persisted stack sets into a loadable state: migrate records from
+/// older builds, and settle operations that were still deploying when the
+/// process stopped. Nothing resumes those, so left RUNNING they would block
+/// every later operation on their stack set.
+pub fn restore_stack_sets(accounts: &mut MultiAccountState<CloudFormationState>) {
+    migrate_legacy_stack_sets(accounts);
+    for (_, state) in accounts.iter_mut() {
+        for set in state.stack_sets.values_mut() {
+            settle_interrupted_operations(set);
+        }
+    }
+}
+
+fn settle_interrupted_operations(set: &mut StackSet) {
+    for op in &mut set.operations {
+        if !matches!(op.status.as_str(), "RUNNING" | "STOPPING") {
+            continue;
+        }
+        for result in &mut op.results {
+            let status = match result.status.as_str() {
+                "PENDING" => "CANCELLED",
+                "RUNNING" => "FAILED",
+                _ => continue,
+            };
+            result.status = status.to_string();
+            result.status_reason = Some(OPERATION_INTERRUPTED.to_string());
+        }
+        for instance in &mut set.instances {
+            if instance.last_operation_id.as_deref() == Some(op.operation_id.as_str())
+                && matches!(instance.detailed_status.as_str(), "RUNNING" | "PENDING")
+            {
+                apply_to_instance(
+                    instance,
+                    &Outcome::Failed(OPERATION_INTERRUPTED.to_string()),
+                );
+            }
+        }
+        op.status = settled_status(op).to_string();
+        op.ended_at = Some(Utc::now());
+    }
+}
+
 /// Move stack sets persisted by older builds, which kept a
 /// `{StackSetId, StackSetName, Status, TemplateBody}` JSON record in the
 /// generic `extras` store, into the typed store.
-pub fn migrate_legacy_stack_sets(accounts: &mut MultiAccountState<CloudFormationState>) {
+fn migrate_legacy_stack_sets(accounts: &mut MultiAccountState<CloudFormationState>) {
     for (account_id, state) in accounts.iter_mut() {
         let Some(legacy) = state.extras.remove("stack_sets") else {
             continue;
@@ -1787,7 +1831,7 @@ impl CloudFormationService {
                 .insert(set_id.clone(), updated);
         }
 
-        self.run_operation(
+        self.launch_operation(
             req,
             &admin,
             &set_id,
@@ -2295,7 +2339,7 @@ impl CloudFormationService {
             None,
         )?;
         let set_id = snapshot.stack_set_id.clone();
-        self.run_operation(
+        self.launch_operation(
             req,
             &admin,
             &set_id,
@@ -2375,7 +2419,7 @@ impl CloudFormationService {
             None,
         )?;
         let set_id = snapshot.stack_set_id.clone();
-        self.run_operation(
+        self.launch_operation(
             req,
             &admin,
             &set_id,
@@ -2431,7 +2475,7 @@ impl CloudFormationService {
             Some(retain_stacks),
         )?;
         let set_id = snapshot.stack_set_id.clone();
-        self.run_operation(
+        self.launch_operation(
             req,
             &admin,
             &set_id,
@@ -2448,12 +2492,58 @@ impl CloudFormationService {
         ))
     }
 
+    /// Start a recorded operation's deployment.
+    ///
+    /// On the server (a multi-thread runtime) it runs as a detached task and
+    /// the call returns the OperationId straight away, as AWS does: callers
+    /// poll DescribeStackSetOperation. That also means a client that gives up
+    /// on its request (a read timeout behind a slow account gate or a
+    /// container-backed stack) cannot abandon the operation half way and leave
+    /// the stack set blocked behind it. Current-thread runtimes (unit tests)
+    /// run it inline.
+    #[allow(clippy::too_many_arguments)]
+    async fn launch_operation(
+        &self,
+        req: &AwsRequest,
+        admin: &str,
+        set_id: &str,
+        op_id: &str,
+        spec: &DeploySpec,
+        targets: Vec<Target>,
+        action: TargetAction,
+    ) {
+        let multi_thread = matches!(
+            tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()),
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+        );
+        if !multi_thread {
+            self.run_operation(&req.request_id, admin, set_id, op_id, spec, targets, action)
+                .await;
+            return;
+        }
+        let svc = self.clone();
+        let (request_id, admin, set_id, op_id, spec) = (
+            req.request_id.clone(),
+            admin.to_string(),
+            set_id.to_string(),
+            op_id.to_string(),
+            spec.clone(),
+        );
+        tokio::spawn(async move {
+            svc.run_operation(&request_id, &admin, &set_id, &op_id, &spec, targets, action)
+                .await;
+            // The request that started the operation has long since persisted
+            // its snapshot; persist the finished operation too.
+            svc.save_snapshot().await;
+        });
+    }
+
     /// Run an operation's targets in order, recording each outcome as it
     /// lands, honoring the failure tolerance and StopStackSetOperation.
     #[allow(clippy::too_many_arguments)]
     async fn run_operation(
         &self,
-        req: &AwsRequest,
+        request_id: &str,
         admin: &str,
         set_id: &str,
         op_id: &str,
@@ -2522,7 +2612,7 @@ impl CloudFormationService {
                 gate = Some(g);
                 if passed {
                     let (outcome, id, applied) = self
-                        .apply_target(req, admin, set_id, spec, &target, &action)
+                        .apply_target(request_id, admin, set_id, spec, &target, &action)
                         .await;
                     stack_id = id;
                     overrides = applied;
@@ -2664,7 +2754,7 @@ impl CloudFormationService {
     /// the overrides the instance now carries.
     async fn apply_target(
         &self,
-        req: &AwsRequest,
+        request_id: &str,
         admin: &str,
         set_id: &str,
         spec: &DeploySpec,
@@ -2690,7 +2780,7 @@ impl CloudFormationService {
                     &target.account,
                     &target.region,
                     "DeleteStack",
-                    &req.request_id,
+                    request_id,
                     vec![("StackName".to_string(), stack_id.clone())],
                 );
                 if let Err(e) = self.delete_stack(&request).await {
@@ -2707,13 +2797,13 @@ impl CloudFormationService {
             TargetAction::Create { overrides } => match live_stack {
                 Some((stack_id, _, _)) => {
                     let (outcome, id) = self
-                        .update_instance_stack(req, spec, target, &stack_id, overrides)
+                        .update_instance_stack(request_id, spec, target, &stack_id, overrides)
                         .await;
                     (outcome, id, Some(overrides.clone()))
                 }
                 None => {
                     let (outcome, id) = self
-                        .create_instance_stack(req, spec, target, overrides)
+                        .create_instance_stack(request_id, spec, target, overrides)
                         .await;
                     (outcome, id, Some(overrides.clone()))
                 }
@@ -2747,14 +2837,14 @@ impl CloudFormationService {
                         ),
                         None => {
                             let (outcome, id) = self
-                                .create_instance_stack(req, spec, target, &resolved)
+                                .create_instance_stack(request_id, spec, target, &resolved)
                                 .await;
                             (outcome, id, Some(resolved))
                         }
                     };
                 };
                 let (outcome, id) = self
-                    .update_instance_stack(req, spec, target, &stack_id, &resolved)
+                    .update_instance_stack(request_id, spec, target, &stack_id, &resolved)
                     .await;
                 (outcome, id, Some(resolved))
             }
@@ -2763,7 +2853,7 @@ impl CloudFormationService {
 
     async fn create_instance_stack(
         &self,
-        req: &AwsRequest,
+        request_id: &str,
         spec: &DeploySpec,
         target: &Target,
         overrides: &BTreeMap<String, String>,
@@ -2779,7 +2869,7 @@ impl CloudFormationService {
             &target.account,
             &target.region,
             "CreateStack",
-            &req.request_id,
+            request_id,
             stack_params,
         );
         if let Err(e) = self.create_stack(&request).await {
@@ -2799,7 +2889,7 @@ impl CloudFormationService {
 
     async fn update_instance_stack(
         &self,
-        req: &AwsRequest,
+        request_id: &str,
         spec: &DeploySpec,
         target: &Target,
         stack_id: &str,
@@ -2811,7 +2901,7 @@ impl CloudFormationService {
             &target.account,
             &target.region,
             "UpdateStack",
-            &req.request_id,
+            request_id,
             stack_params,
         );
         if let Err(e) = self.update_stack(&request).await {
@@ -2844,6 +2934,16 @@ impl CloudFormationService {
         else {
             return;
         };
+        // Once the operation has settled (stopped, and settled by a read
+        // while this loop was still going) a newer operation may own the
+        // instances; a late outcome must not write over them.
+        if !set
+            .operations
+            .iter()
+            .any(|o| o.operation_id == op_id && matches!(o.status.as_str(), "RUNNING" | "STOPPING"))
+        {
+            return;
+        }
         if let Some(result) = set
             .operations
             .iter_mut()
@@ -5171,6 +5271,60 @@ mod tests {
         let described = ok(&svc, "DescribeStackSet", &[("StackSetName", "org")]).await;
         assert!(!described.contains("<AutoDeployment>"), "{described}");
         assert!(described.contains("<PermissionModel>SELF_MANAGED</PermissionModel>"));
+    }
+
+    #[tokio::test]
+    async fn operations_interrupted_by_a_restart_are_settled_on_load() {
+        let svc = service();
+        create_set(&svc, "app", QUEUE_TEMPLATE).await;
+        {
+            let mut accounts = svc.state.write();
+            let set = accounts
+                .get_or_create(ADMIN)
+                .stack_sets
+                .values_mut()
+                .next()
+                .unwrap();
+            let mut op = CloudFormationService::new_operation(
+                &set.clone(),
+                "cut-short",
+                "CREATE",
+                OperationPreferences::default(),
+                None,
+                None,
+            );
+            for (account, status) in [(ACCT_B, "RUNNING"), (ACCT_C, "PENDING")] {
+                op.results.push(OperationResult {
+                    account: account.to_string(),
+                    region: "us-east-1".to_string(),
+                    status: status.to_string(),
+                    status_reason: None,
+                    organizational_unit_id: None,
+                    account_gate_status: None,
+                    account_gate_reason: None,
+                });
+            }
+            set.operations.push(op);
+            restore_stack_sets(&mut accounts);
+        }
+        let op = ok(
+            &svc,
+            "DescribeStackSetOperation",
+            &[("StackSetName", "app"), ("OperationId", "cut-short")],
+        )
+        .await;
+        assert_eq!(tag(&op, "Status"), "FAILED", "{op}");
+        // The stack set accepts new operations again.
+        ok(
+            &svc,
+            "CreateStackInstances",
+            &[
+                ("StackSetName", "app"),
+                ("Accounts.member.1", ACCT_B),
+                ("Regions.member.1", "us-east-1"),
+            ],
+        )
+        .await;
     }
 
     struct Gate(&'static str);

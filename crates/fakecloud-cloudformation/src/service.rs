@@ -505,6 +505,7 @@ fn reconstruct_stack_resource(
     }
 }
 
+#[derive(Clone)]
 pub struct CloudFormationDeps {
     pub sqs: SharedSqsState,
     pub sns: SharedSnsState,
@@ -593,6 +594,7 @@ pub struct CloudFormationDeps {
     pub kafka_runtime: Option<Arc<fakecloud_kafka::KafkaRuntime>>,
 }
 
+#[derive(Clone)]
 pub struct CloudFormationService {
     pub(crate) state: SharedCloudFormationState,
     pub(crate) deps: CloudFormationDeps,
@@ -1039,7 +1041,7 @@ impl CloudFormationService {
         self
     }
 
-    async fn save_snapshot(&self) {
+    pub(crate) async fn save_snapshot(&self) {
         let Some(store) = self.snapshot_store.clone() else {
             return;
         };

@@ -260,6 +260,34 @@ fn xml_tag(xml: &str, name: &str) -> String {
         .to_string()
 }
 
+/// Start a stack set operation on `ss1` and wait for it to succeed,
+/// returning its OperationId.
+async fn start_operation(server: &TestServer, action: &str, params: &[(&str, &str)]) -> String {
+    let resp = cfn_post(server, action, params).await;
+    assert!(resp.status().is_success(), "{action}: {}", resp.status());
+    let op_id = xml_tag(&resp.text().await.unwrap(), "OperationId");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let op = cfn_post(
+            server,
+            "DescribeStackSetOperation",
+            &[("StackSetName", "ss1"), ("OperationId", &op_id)],
+        )
+        .await
+        .text()
+        .await
+        .unwrap();
+        match xml_tag(&op, "Status").as_str() {
+            "RUNNING" | "STOPPING" => {
+                assert!(std::time::Instant::now() < deadline, "{action} stuck: {op}");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            "SUCCEEDED" => return op_id,
+            _ => panic!("{action} did not succeed: {op}"),
+        }
+    }
+}
+
 fn pct(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for &b in s.as_bytes() {
@@ -446,7 +474,8 @@ async fn cloudformation_closure_routes_exist() {
     );
 
     // Stack sets and their instances, as one lifecycle: every operation below
-    // acts on state an earlier call created.
+    // acts on state an earlier call created. Operations deploy in the
+    // background, so each is awaited before the next starts.
     let stack_set_template = r#"{"Resources":{"Q":{"Type":"AWS::SQS::Queue","Properties":{"QueueName":{"Fn::Sub":"${AWS::StackName}-q"}}}}}"#;
     for (action, params) in [
         (
@@ -467,24 +496,7 @@ async fn cloudformation_closure_routes_exist() {
         ("Accounts.member.1", "111111111111"),
         ("Regions.member.1", "us-east-1"),
     ];
-    let create_op = xml_tag(
-        &cfn_post(&server, "CreateStackInstances", &instance_target)
-            .await
-            .text()
-            .await
-            .unwrap(),
-        "OperationId",
-    );
-    let described = cfn_post(
-        &server,
-        "DescribeStackSetOperation",
-        &[("StackSetName", "ss1"), ("OperationId", &create_op)],
-    )
-    .await
-    .text()
-    .await
-    .unwrap();
-    assert_eq!(xml_tag(&described, "Status"), "SUCCEEDED", "{described}");
+    let create_op = start_operation(&server, "CreateStackInstances", &instance_target).await;
     let instance = cfn_post(
         &server,
         "DescribeStackInstance",
@@ -510,20 +522,14 @@ async fn cloudformation_closure_routes_exist() {
             "ListStackSetAutoDeploymentTargets",
             vec![("StackSetName", "ss1")],
         ),
-        ("UpdateStackSet", vec![("StackSetName", "ss1")]),
-        ("UpdateStackInstances", instance_target.to_vec()),
     ] {
         let resp = cfn_post(&server, action, &params).await;
         assert!(resp.status().is_success(), "{action}: {}", resp.status());
     }
-    let drift_op = xml_tag(
-        &cfn_post(&server, "DetectStackSetDrift", &[("StackSetName", "ss1")])
-            .await
-            .text()
-            .await
-            .unwrap(),
-        "OperationId",
-    );
+    start_operation(&server, "UpdateStackSet", &[("StackSetName", "ss1")]).await;
+    start_operation(&server, "UpdateStackInstances", &instance_target).await;
+    let drift_op =
+        start_operation(&server, "DetectStackSetDrift", &[("StackSetName", "ss1")]).await;
     assert!(cfn_post(
         &server,
         "ListStackInstanceResourceDrifts",
@@ -551,35 +557,27 @@ async fn cloudformation_closure_routes_exist() {
     );
     let mut delete_instances = instance_target.to_vec();
     delete_instances.push(("RetainStacks", "true"));
-    assert!(cfn_post(&server, "DeleteStackInstances", &delete_instances)
-        .await
-        .status()
-        .is_success());
-    // The retained stack imports straight back in as an instance.
+    start_operation(&server, "DeleteStackInstances", &delete_instances).await;
     let listed = cfn_post(&server, "ListStackInstances", &[("StackSetName", "ss1")])
         .await
         .text()
         .await
         .unwrap();
     assert!(!listed.contains("<member>"), "{listed}");
+    // The retained stack imports straight back in as an instance.
     let retained_stack_id = xml_tag(&instance, "StackId");
-    assert!(cfn_post(
+    start_operation(
         &server,
         "ImportStacksToStackSet",
         &[
             ("StackSetName", "ss1"),
-            ("StackIds.member.1", &retained_stack_id)
+            ("StackIds.member.1", &retained_stack_id),
         ],
     )
-    .await
-    .status()
-    .is_success());
+    .await;
     let mut delete_again = instance_target.to_vec();
     delete_again.push(("RetainStacks", "false"));
-    assert!(cfn_post(&server, "DeleteStackInstances", &delete_again)
-        .await
-        .status()
-        .is_success());
+    start_operation(&server, "DeleteStackInstances", &delete_again).await;
     assert!(
         cfn_post(&server, "DeleteStackSet", &[("StackSetName", "ss1")])
             .await

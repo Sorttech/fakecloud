@@ -1452,7 +1452,7 @@ async fn main() {
                                 ));
                             }
                             if let Some(mut accounts) = snapshot.accounts {
-                                fakecloud_cloudformation::migrate_legacy_stack_sets(&mut accounts);
+                                fakecloud_cloudformation::restore_stack_sets(&mut accounts);
                                 let account_count = accounts.account_count();
                                 *cloudformation_state.write() = accounts;
                                 tracing::info!(
@@ -1464,7 +1464,7 @@ async fn main() {
                                 let account_id = single_state.account_id.clone();
                                 let mut mas = cloudformation_state.write();
                                 *mas.get_or_create(&account_id) = single_state;
-                                fakecloud_cloudformation::migrate_legacy_stack_sets(&mut mas);
+                                fakecloud_cloudformation::restore_stack_sets(&mut mas);
                                 tracing::info!(
                                     stacks = stack_count,
                                     "loaded cloudformation persistence snapshot (migrated from v1)"

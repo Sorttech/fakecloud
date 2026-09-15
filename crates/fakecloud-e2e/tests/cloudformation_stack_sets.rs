@@ -50,20 +50,39 @@ async fn stack_set_queues(sqs: &aws_sdk_sqs::Client) -> Vec<String> {
         .collect()
 }
 
+/// Operations deploy in the background, as in AWS: poll until this one
+/// finishes and return its final status.
 async fn operation_status(
     cfn: &aws_sdk_cloudformation::Client,
     operation_id: &str,
 ) -> StackSetOperationStatus {
-    cfn.describe_stack_set_operation()
-        .stack_set_name("regional")
-        .operation_id(operation_id)
-        .send()
-        .await
-        .unwrap()
-        .stack_set_operation()
-        .and_then(|op| op.status())
-        .cloned()
-        .expect("operation status")
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let status = cfn
+            .describe_stack_set_operation()
+            .stack_set_name("regional")
+            .operation_id(operation_id)
+            .send()
+            .await
+            .unwrap()
+            .stack_set_operation()
+            .and_then(|op| op.status())
+            .cloned()
+            .expect("operation status");
+        if !matches!(
+            status,
+            StackSetOperationStatus::Running
+                | StackSetOperationStatus::Queued
+                | StackSetOperationStatus::Stopping
+        ) {
+            return status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "operation {operation_id} still {status:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 #[tokio::test]
@@ -270,13 +289,18 @@ async fn stack_set_update_redeploys_instances() {
         .send()
         .await
         .unwrap();
-    cfn.create_stack_instances()
+    let create = cfn
+        .create_stack_instances()
         .stack_set_name("regional")
         .accounts(DEFAULT_ACCOUNT)
         .regions("us-east-1")
         .send()
         .await
         .unwrap();
+    assert_eq!(
+        operation_status(&cfn, create.operation_id().unwrap()).await,
+        StackSetOperationStatus::Succeeded
+    );
 
     let update = cfn
         .update_stack_set()

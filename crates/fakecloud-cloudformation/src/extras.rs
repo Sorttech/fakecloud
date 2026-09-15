@@ -3355,7 +3355,7 @@ pub(crate) mod tests {
                 "bodyless".to_string(),
                 json!({"StackSetId": "bodyless:def"}),
             );
-            crate::stack_sets::migrate_legacy_stack_sets(&mut accounts);
+            crate::stack_sets::restore_stack_sets(&mut accounts);
         }
 
         for key in ["myset", "myset:abc123"] {
