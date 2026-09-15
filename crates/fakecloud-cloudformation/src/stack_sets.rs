@@ -255,15 +255,26 @@ fn settle_interrupted_operations(set: &mut StackSet) {
             result.status = status.to_string();
             result.status_reason = Some(OPERATION_INTERRUPTED.to_string());
         }
+        // An instance ends up as its result did: cancelled if its target
+        // never started, failed if it was deploying.
         for instance in &mut set.instances {
-            if instance.last_operation_id.as_deref() == Some(op.operation_id.as_str())
-                && matches!(instance.detailed_status.as_str(), "RUNNING" | "PENDING")
+            if instance.last_operation_id.as_deref() != Some(op.operation_id.as_str())
+                || !matches!(instance.detailed_status.as_str(), "RUNNING" | "PENDING")
             {
-                apply_to_instance(
-                    instance,
-                    &Outcome::Failed(OPERATION_INTERRUPTED.to_string()),
-                );
+                continue;
             }
+            let cancelled = op.results.iter().any(|r| {
+                r.account == instance.account
+                    && r.region == instance.region
+                    && r.status == "CANCELLED"
+            });
+            let reason = OPERATION_INTERRUPTED.to_string();
+            let outcome = if cancelled {
+                Outcome::Cancelled(reason)
+            } else {
+                Outcome::Failed(reason)
+            };
+            apply_to_instance(instance, &outcome);
         }
         op.status = settled_status(op).to_string();
         op.ended_at = Some(Utc::now());
@@ -354,7 +365,7 @@ pub(crate) enum Scope {
 }
 
 impl Scope {
-    fn of(params: &BTreeMap<String, String>) -> Self {
+    pub(crate) fn of(params: &BTreeMap<String, String>) -> Self {
         if params.get("CallAs").map(String::as_str) == Some("DELEGATED_ADMIN") {
             Scope::DelegatedAdmin
         } else {
@@ -1326,8 +1337,16 @@ impl CloudFormationService {
         req: &AwsRequest,
         params: &BTreeMap<String, String>,
     ) -> Result<String, AwsServiceError> {
+        self.stack_set_admin_account_of(&req.account_id, params)
+    }
+
+    pub(crate) fn stack_set_admin_account_of(
+        &self,
+        caller: &str,
+        params: &BTreeMap<String, String>,
+    ) -> Result<String, AwsServiceError> {
         match params.get("CallAs").map(String::as_str) {
-            None | Some("SELF") => Ok(req.account_id.clone()),
+            None | Some("SELF") => Ok(caller.to_string()),
             Some("DELEGATED_ADMIN") => {
                 let orgs = self.deps.organizations.read();
                 let org = orgs.as_ref().ok_or_else(|| {
@@ -1336,11 +1355,11 @@ impl CloudFormationService {
                 let registered = org
                     .delegated_administrators
                     .get(STACKSETS_PRINCIPAL)
-                    .is_some_and(|admins| admins.contains_key(&req.account_id));
+                    .is_some_and(|admins| admins.contains_key(caller));
                 if !registered {
                     return Err(validation(format!(
                         "Account {} is not registered as a delegated administrator for {STACKSETS_PRINCIPAL}",
-                        req.account_id
+                        caller
                     )));
                 }
                 Ok(org.management_account_id.clone())
@@ -1522,8 +1541,12 @@ impl CloudFormationService {
             ));
         }
         let enabled = enabled.or(previous.map(|p| p.enabled)).unwrap_or(false);
+        // Retention only means something while auto-deployment is on, so
+        // turning it off does not carry the previous setting along.
         let retain = retain
-            .or(previous.map(|p| p.retain_stacks_on_account_removal))
+            .or(previous
+                .filter(|_| enabled)
+                .map(|p| p.retain_stacks_on_account_removal))
             .unwrap_or(false);
         if retain && !enabled {
             return Err(validation(
@@ -4805,6 +4828,15 @@ mod tests {
             listed.contains("<StackSetName>delegated</StackSetName>"),
             "{listed}"
         );
+        let summary = call_as(
+            &svc,
+            ACCT_B,
+            "GetTemplateSummary",
+            &[("StackSetName", "delegated"), ("CallAs", "DELEGATED_ADMIN")],
+        )
+        .await
+        .unwrap();
+        assert!(summary.contains("AWS::SQS::Queue"), "{summary}");
 
         // An account that is not registered cannot.
         let e = call_as(
@@ -5347,6 +5379,33 @@ mod tests {
         let described = ok(&svc, "DescribeStackSet", &[("StackSetName", "org")]).await;
         assert!(!described.contains("<AutoDeployment>"), "{described}");
         assert!(described.contains("<PermissionModel>SELF_MANAGED</PermissionModel>"));
+        ok(
+            &svc,
+            "CreateStackSet",
+            &[
+                ("StackSetName", "retained"),
+                ("TemplateBody", QUEUE_TEMPLATE),
+                ("PermissionModel", "SERVICE_MANAGED"),
+                ("AutoDeployment.Enabled", "true"),
+                ("AutoDeployment.RetainStacksOnAccountRemoval", "true"),
+            ],
+        )
+        .await;
+        // Turning auto-deployment off on its own works.
+        ok(
+            &svc,
+            "UpdateStackSet",
+            &[
+                ("StackSetName", "retained"),
+                ("AutoDeployment.Enabled", "false"),
+            ],
+        )
+        .await;
+        let described = ok(&svc, "DescribeStackSet", &[("StackSetName", "retained")]).await;
+        assert!(
+            described.contains("<Enabled>false</Enabled>"),
+            "{described}"
+        );
     }
 
     #[tokio::test]
@@ -5411,6 +5470,19 @@ mod tests {
                 None,
             );
             for (account, status) in [(ACCT_B, "RUNNING"), (ACCT_C, "PENDING")] {
+                set.instances.push(StackInstance {
+                    account: account.to_string(),
+                    region: "us-east-1".to_string(),
+                    stack_id: None,
+                    status: "OUTDATED".to_string(),
+                    detailed_status: "PENDING".to_string(),
+                    status_reason: None,
+                    parameter_overrides: BTreeMap::new(),
+                    organizational_unit_id: None,
+                    drift_status: "NOT_CHECKED".to_string(),
+                    last_drift_check_timestamp: None,
+                    last_operation_id: Some("cut-short".to_string()),
+                });
                 op.results.push(OperationResult {
                     account: account.to_string(),
                     region: "us-east-1".to_string(),
@@ -5431,6 +5503,18 @@ mod tests {
         )
         .await;
         assert_eq!(tag(&op, "Status"), "FAILED", "{op}");
+        // Each instance matches its result: deploying failed, waiting cancelled.
+        let set = stored_set(&svc, "app");
+        let detailed = |account: &str| {
+            set.instances
+                .iter()
+                .find(|i| i.account == account)
+                .unwrap()
+                .detailed_status
+                .clone()
+        };
+        assert_eq!(detailed(ACCT_B), "FAILED");
+        assert_eq!(detailed(ACCT_C), "CANCELLED");
         // The stack set accepts new operations again.
         ok(
             &svc,

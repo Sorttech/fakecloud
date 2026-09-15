@@ -457,14 +457,23 @@ impl CloudFormationService {
             // Existence and body are separate questions: a stack set with an
             // empty template still EXISTS. AWS accepts the stack set's id
             // (`{name}:{suffix}`) as well as its name.
+            // `CallAs=DELEGATED_ADMIN` reads the management account's
+            // service-managed stack sets, as the stack set APIs do. A caller
+            // that is not a delegated administrator finds nothing:
+            // GetTemplateSummary declares no error for that but this one.
             let found = self
-                .state
-                .read()
-                .get(account_id)
-                .and_then(|st| {
-                    crate::stack_sets::find_active(st, name, crate::stack_sets::Scope::Own)
-                })
-                .map(|set| set.template_body.clone());
+                .stack_set_admin_account_of(account_id, params)
+                .ok()
+                .and_then(|admin| {
+                    self.state.read().get(&admin).and_then(|st| {
+                        crate::stack_sets::find_active(
+                            st,
+                            name,
+                            crate::stack_sets::Scope::of(params),
+                        )
+                        .map(|set| set.template_body.clone())
+                    })
+                });
             return match found {
                 Some(body) => Ok(body),
                 // Unlike `ValidationError`, this one IS declared on
