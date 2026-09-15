@@ -9398,6 +9398,27 @@ mod tests {
             "{}",
             queue.physical_id
         );
+        // A long stack name truncates a FIFO name, and it is still recovered.
+        let mut long = make_provisioner();
+        long.stack_id = format!(
+            "arn:aws:cloudformation:us-east-1:123456789012:stack/{}/0000",
+            "s".repeat(90)
+        );
+        let long_queue = long
+            .create_resource(&make_resource(
+                "AWS::SQS::Queue",
+                "Orders",
+                serde_json::json!({"FifoQueue": true}),
+            ))
+            .expect("create truncated FIFO queue");
+        let name = long_queue.physical_id.rsplit('/').next().unwrap();
+        assert_eq!(name.len(), 80, "{name}");
+        assert_eq!(
+            long.existing_name(&long_queue)
+                .map(|n| format!("{n}.fifo"))
+                .as_deref(),
+            Some(name)
+        );
         assert_eq!(
             prov.with_existing_name(&queue, || prov.physical_name_ending(
                 &make_resource("AWS::SQS::Queue", "Orders", serde_json::json!({})),

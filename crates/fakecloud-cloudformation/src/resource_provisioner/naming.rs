@@ -147,7 +147,12 @@ pub(crate) fn name_rule(resource_type: &str) -> NameRule {
         "AWS::Athena::WorkGroup" => NameRule::new(128),
         "AWS::Athena::DataCatalog" => NameRule::new(129),
         "AWS::CloudWatch::Alarm" | "AWS::CloudWatch::Dashboard" => NameRule::new(255),
-        "AWS::CloudFront::PublicKey" => NameRule::new(128),
+        "AWS::CloudFront::PublicKey" | "AWS::CloudFront::CloudFrontOriginAccessIdentity" => {
+            NameRule::new(128)
+        }
+        // Caller references.
+        "AWS::Route53::HostedZone" => NameRule::new(128),
+        "AWS::Route53::HealthCheck" => NameRule::new(64),
         "AWS::MSK::Configuration" => NameRule::new(64),
         "AWS::MSK::Replicator" => NameRule::new(128),
         "AWS::Glue::Database" => NameRule::new(255).lower(),
@@ -239,6 +244,8 @@ fn generate_with_suffix(stack_id: &str, logical_id: &str, rule: NameRule, suffix
             // does not accept either.
             let stack = stack.replace('-', &sep.to_string());
             let (stack, logical) = fit(&stack, logical_id, budget);
+            // A cut right after a `-` in the stack name would double it.
+            let stack = stack.trim_end_matches(sep);
             format!("{stack}{sep}{logical}{sep}{suffix}")
         }
         None => {
@@ -327,7 +334,6 @@ impl ResourceProvisioner {
     /// logical id, which is recognized too.
     pub(crate) fn existing_name(&self, existing: &StackResource) -> Option<String> {
         let rule = name_rule(&existing.resource_type);
-        let prefix = generate_with_suffix(&self.stack_id, &existing.logical_id, rule, "");
         let physical = &existing.physical_id;
         let is_suffix_char = |c: char| {
             if rule.lowercase {
@@ -336,11 +342,25 @@ impl ResourceProvisioner {
                 c.is_ascii_uppercase() || c.is_ascii_digit()
             }
         };
-        for (start, _) in physical.match_indices(&prefix) {
-            let rest = &physical[start + prefix.len()..];
-            let suffix: String = rest.chars().take_while(|c| is_suffix_char(*c)).collect();
-            if suffix.len() == SUFFIX_LEN {
-                return Some(format!("{prefix}{suffix}"));
+        // A FIFO queue or topic was generated with room left for `.fifo`.
+        let mut rules = vec![rule];
+        if matches!(
+            existing.resource_type.as_str(),
+            "AWS::SQS::Queue" | "AWS::SNS::Topic"
+        ) {
+            rules.push(NameRule {
+                max_len: rule.max_len - ".fifo".len(),
+                ..rule
+            });
+        }
+        for rule in rules {
+            let prefix = generate_with_suffix(&self.stack_id, &existing.logical_id, rule, "");
+            for (start, _) in physical.match_indices(&prefix) {
+                let rest = &physical[start + prefix.len()..];
+                let suffix: String = rest.chars().take_while(|c| is_suffix_char(*c)).collect();
+                if suffix.len() == SUFFIX_LEN {
+                    return Some(format!("{prefix}{suffix}"));
+                }
             }
         }
         // Only the part of the physical id that holds the name: the last path
@@ -429,6 +449,20 @@ mod tests {
         );
         assert_eq!(name.len(), 32, "{name}");
         assert!(name.starts_with("my-app-LLLLLLLLL"), "{name}");
+    }
+
+    #[test]
+    fn a_cut_after_a_hyphen_does_not_double_it() {
+        // 32-char limit: budget 17 split 8/9, and "my-apps-" is cut after "-".
+        let stack = STACK.replace("my-app", "my-apps-production");
+        let name = generate_with_suffix(
+            &stack,
+            "LoadBalancerMain",
+            name_rule("AWS::ElasticLoadBalancingV2::LoadBalancer"),
+            "ABCDEFGHIJKLM",
+        );
+        assert!(!name.contains("--"), "{name}");
+        assert!(name.len() <= 32, "{name}");
     }
 
     #[test]
