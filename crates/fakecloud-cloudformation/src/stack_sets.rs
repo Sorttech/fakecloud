@@ -1157,6 +1157,22 @@ fn order_targets(
     targets
 }
 
+/// A PENDING result for every target an operation will act on.
+fn pending_results(targets: &[Target]) -> Vec<OperationResult> {
+    targets
+        .iter()
+        .map(|t| OperationResult {
+            account: t.account.clone(),
+            region: t.region.clone(),
+            status: "PENDING".to_string(),
+            status_reason: None,
+            organizational_unit_id: t.ou.clone(),
+            account_gate_status: None,
+            account_gate_reason: None,
+        })
+        .collect()
+}
+
 fn synthetic_request(
     account: &str,
     region: &str,
@@ -1811,7 +1827,8 @@ impl CloudFormationService {
         let targets = order_targets(targets, &regions, &preferences);
         let record =
             targeted.then(|| targets_record(&explicit_accounts, deployment_targets.as_ref()));
-        let op = Self::new_operation(&updated, &op_id, "UPDATE", preferences, record, None);
+        let mut op = Self::new_operation(&updated, &op_id, "UPDATE", preferences, record, None);
+        op.results = pending_results(&targets);
         updated.operations.push(op);
         let spec = DeploySpec::of(&updated);
         let set_id = updated.stack_set_id.clone();
@@ -2268,6 +2285,7 @@ impl CloudFormationService {
         &self,
         admin: &str,
         snapshot: &StackSet,
+        targets: &[Target],
         op_id: &str,
         action: &str,
         preferences: OperationPreferences,
@@ -2283,7 +2301,7 @@ impl CloudFormationService {
             .ok_or_else(|| stack_set_not_found(&snapshot.name))?;
         Self::check_not_stale(set, snapshot)?;
         Self::check_can_start_operation(set, op_id)?;
-        let op = Self::new_operation(
+        let mut op = Self::new_operation(
             set,
             op_id,
             action,
@@ -2291,6 +2309,10 @@ impl CloudFormationService {
             deployment_targets,
             retain_stacks,
         );
+        // Seeded in the same locked step that records the operation: a read
+        // before the deployment task starts must not see a RUNNING operation
+        // with nothing left to run and settle it.
+        op.results = pending_results(targets);
         set.operations.push(op);
         Ok(DeploySpec::of(set))
     }
@@ -2332,6 +2354,7 @@ impl CloudFormationService {
         let spec = self.start_instance_operation(
             &admin,
             &snapshot,
+            &targets,
             &op_id,
             "CREATE",
             preferences,
@@ -2412,6 +2435,7 @@ impl CloudFormationService {
         let spec = self.start_instance_operation(
             &admin,
             &snapshot,
+            &targets,
             &op_id,
             "UPDATE",
             preferences,
@@ -2468,6 +2492,7 @@ impl CloudFormationService {
         let spec = self.start_instance_operation(
             &admin,
             &snapshot,
+            &targets,
             &op_id,
             "DELETE",
             preferences,
@@ -2551,30 +2576,6 @@ impl CloudFormationService {
         targets: Vec<Target>,
         action: TargetAction,
     ) {
-        // Seed a PENDING result per target so the operation reports every
-        // target it will act on from the start.
-        {
-            let mut accounts = self.state.write();
-            if let Some(op) = accounts
-                .get_mut(admin)
-                .and_then(|s| s.stack_sets.get_mut(set_id))
-                .and_then(|set| set.operations.iter_mut().find(|o| o.operation_id == op_id))
-            {
-                op.results = targets
-                    .iter()
-                    .map(|t| OperationResult {
-                        account: t.account.clone(),
-                        region: t.region.clone(),
-                        status: "PENDING".to_string(),
-                        status_reason: None,
-                        organizational_unit_id: t.ou.clone(),
-                        account_gate_status: None,
-                        account_gate_reason: None,
-                    })
-                    .collect();
-            }
-        }
-
         let prefs = {
             let accounts = self.state.read();
             accounts
@@ -5325,6 +5326,41 @@ mod tests {
             ],
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn a_read_before_deployment_starts_does_not_settle_the_operation() {
+        let svc = service();
+        create_set(&svc, "app", QUEUE_TEMPLATE).await;
+        let snapshot = stored_set(&svc, "app");
+        let targets = vec![Target {
+            account: ACCT_B.to_string(),
+            region: "us-east-1".to_string(),
+            ou: None,
+            suspended: false,
+        }];
+        // Record the operation exactly as CreateStackInstances does, without
+        // running it yet, as when the deployment task has not been scheduled.
+        svc.start_instance_operation(
+            ADMIN,
+            &snapshot,
+            &targets,
+            "queued",
+            "CREATE",
+            OperationPreferences::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let op = ok(
+            &svc,
+            "DescribeStackSetOperation",
+            &[("StackSetName", "app"), ("OperationId", "queued")],
+        )
+        .await;
+        assert_eq!(tag(&op, "Status"), "RUNNING", "{op}");
+        let e = err(&svc, "DeleteStackSet", &[("StackSetName", "app")]).await;
+        assert_eq!(e.code(), "OperationInProgressException");
     }
 
     struct Gate(&'static str);
