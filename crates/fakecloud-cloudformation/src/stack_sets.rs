@@ -5651,6 +5651,34 @@ mod tests {
         assert_eq!(tag(&instance, "DetailedStatus"), "CANCELLED", "{instance}");
     }
 
+    #[tokio::test]
+    async fn an_untouched_iam_role_is_in_sync() {
+        let template = "Resources:\n  R:\n    Type: AWS::IAM::Role\n    Properties:\n      RoleName:\n        Fn::Sub: \"${AWS::StackName}-role\"\n      AssumeRolePolicyDocument:\n        Version: \"2012-10-17\"\n        Statement: []\n";
+        let svc = service();
+        create_set(&svc, "roles", template).await;
+        ok(
+            &svc,
+            "CreateStackInstances",
+            &[
+                ("StackSetName", "roles"),
+                ("Accounts.member.1", ACCT_B),
+                ("Regions.member.1", "us-east-1"),
+            ],
+        )
+        .await;
+        let xml = ok(&svc, "DetectStackSetDrift", &[("StackSetName", "roles")]).await;
+        let op = ok(
+            &svc,
+            "DescribeStackSetOperation",
+            &[
+                ("StackSetName", "roles"),
+                ("OperationId", &tag(&xml, "OperationId")),
+            ],
+        )
+        .await;
+        assert_eq!(tag(&op, "DriftStatus"), "IN_SYNC", "{op}");
+    }
+
     struct Gate(&'static str);
 
     impl LambdaDelivery for Gate {

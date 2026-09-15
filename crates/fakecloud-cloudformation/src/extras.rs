@@ -606,7 +606,8 @@ impl CloudFormationService {
                 .iam
                 .read()
                 .get(aid)
-                .map(|s| s.roles.contains_key(&resource.physical_id))
+                // CloudFormation records a role by its ARN; IAM keys roles by name.
+                .map(|s| s.roles.values().any(|r| r.arn == resource.physical_id))
                 .unwrap_or(false),
             "AWS::DynamoDB::Table" => self
                 .deps
