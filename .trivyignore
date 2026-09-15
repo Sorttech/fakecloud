@@ -1,21 +1,17 @@
-# Go stdlib HIGH vulnerabilities present ONLY in the bundled static Docker CLI
-# (/usr/local/bin/docker, from the docker-cli build stage), which as of
-# DOCKER_CLI_VERSION 29.7.2 is compiled with go1.26.5. Both are fixed upstream
-# only in go1.26.6 / 1.27.0-rc.3, and no Docker static release ships a
-# go>=1.26.6 toolchain yet (latest 29.7.2 is still on go1.26.5), so the CLI
-# version cannot be bumped past it.
+# Intentionally empty of CVE entries.
 #
-# Not exploitable in fakecloud's usage: fakecloud shells out to the docker CLI
-# purely for container lifecycle (run/exec/cp/rm). It never processes untrusted
-# Punycode/IDNA hostnames (CVE-2026-39821) or parses untrusted DNS wire messages
-# (CVE-2026-46600) through the CLI. Our own binary is Rust.
+# This file must exist: the Docker workflow's Trivy step passes
+# `trivyignores: .trivyignore`, and trivy-action fails hard with
+# "cannot find ignorefile '.trivyignore'" when it is missing.
 #
-# REMOVE these entries once a Docker static release built with go>=1.26.6 exists
-# and DOCKER_CLI_VERSION in the Dockerfile is bumped to it.
+# The only recurring source of HIGH findings in the image is the bundled
+# static Docker CLI (/usr/local/bin/docker), whose binary bakes in the Go
+# stdlib — a stale Docker release therefore carries stale-toolchain CVEs.
+# DOCKER_CLI_VERSION 29.8.0 ships go1.26.8 and scans clean on both
+# linux/amd64 and linux/arm64, so nothing needs suppressing today.
 #
-# CVE-2026-39821 — golang.org/x/net/idna: privilege escalation via incorrect
-#   Punycode label processing.
-# CVE-2026-46600 — golang.org/x/net/dns/dnsmessage: denial of service via
-#   invalid DNS record parsing.
-CVE-2026-39821
-CVE-2026-46600
+# When a new Go stdlib advisory lands, prefer bumping DOCKER_CLI_VERSION in
+# the Dockerfile to a static release built with the fixed toolchain. Only add
+# an entry here when no such release exists yet, and say why the CVE is not
+# reachable through fakecloud's usage (it shells out to the CLI purely for
+# container lifecycle: run/exec/cp/rm; fakecloud's own binary is Rust).
