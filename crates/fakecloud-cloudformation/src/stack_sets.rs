@@ -1228,6 +1228,28 @@ fn mark_instances_pending(set: &mut StackSet, targets: &[Target], op_id: &str, c
     }
 }
 
+/// The overrides an instance carries after an update: explicit values, plus
+/// `UsePreviousValue` entries carried over from the instance. `None` keeps the
+/// instance's overrides as they are.
+fn resolve_update_overrides(
+    specs: Option<&[OverrideSpec]>,
+    existing: Option<&StackInstance>,
+) -> BTreeMap<String, String> {
+    let previous = existing
+        .map(|i| i.parameter_overrides.clone())
+        .unwrap_or_default();
+    match specs {
+        None => previous,
+        Some(specs) => specs
+            .iter()
+            .filter_map(|s| match s {
+                OverrideSpec::Value(k, v) => Some((k.clone(), v.clone())),
+                OverrideSpec::UsePrevious(k) => previous.get(k).map(|v| (k.clone(), v.clone())),
+            })
+            .collect(),
+    }
+}
+
 /// A PENDING result for every target an operation will act on.
 fn pending_results(targets: &[Target]) -> Vec<OperationResult> {
     targets
@@ -1716,6 +1738,22 @@ impl CloudFormationService {
 
     /// Reject a new operation on a stack set that already has one running, and
     /// a caller-supplied operation id that was used before.
+    /// `check_can_start_operation` for DetectStackSetDrift, which models no
+    /// OperationIdAlreadyExistsException: a reused id is an invalid operation.
+    fn check_can_start_drift(set: &StackSet, op_id: &str) -> Result<(), AwsServiceError> {
+        Self::check_can_start_operation(set, op_id).map_err(|e| {
+            if e.code() == "OperationIdAlreadyExistsException" {
+                aws_err(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidOperationException",
+                    e.message(),
+                )
+            } else {
+                e
+            }
+        })
+    }
+
     fn check_can_start_operation(set: &StackSet, op_id: &str) -> Result<(), AwsServiceError> {
         if set
             .operations
@@ -2720,6 +2758,18 @@ impl CloudFormationService {
                     )
                 }
             };
+            // A target that did not deploy still takes on the overrides it was
+            // asked for, so a later redeploy uses them.
+            if overrides.is_none() {
+                overrides = match &action {
+                    TargetAction::Create { overrides } => Some(overrides.clone()),
+                    TargetAction::Update { overrides } => Some(resolve_update_overrides(
+                        overrides.as_deref(),
+                        self.instance_stack(admin, set_id, &target).as_ref(),
+                    )),
+                    TargetAction::Delete { .. } => None,
+                };
+            }
             if matches!(outcome, Outcome::Failed(_)) {
                 let failures = region_failures.entry(target.region.clone()).or_default();
                 *failures += 1;
@@ -2906,22 +2956,7 @@ impl CloudFormationService {
                 }
             },
             TargetAction::Update { overrides } => {
-                let previous = existing
-                    .as_ref()
-                    .map(|i| i.parameter_overrides.clone())
-                    .unwrap_or_default();
-                let resolved = match overrides {
-                    None => previous,
-                    Some(specs) => specs
-                        .iter()
-                        .filter_map(|s| match s {
-                            OverrideSpec::Value(k, v) => Some((k.clone(), v.clone())),
-                            OverrideSpec::UsePrevious(k) => {
-                                previous.get(k).map(|v| (k.clone(), v.clone()))
-                            }
-                        })
-                        .collect(),
-                };
+                let resolved = resolve_update_overrides(overrides.as_deref(), existing.as_ref());
                 let Some((stack_id, _, _)) = live_stack else {
                     // An instance that never got a stack (skipped, cancelled,
                     // or its create failed) is deployed now. One whose stack
@@ -3627,7 +3662,7 @@ impl CloudFormationService {
                 .and_then(|s| s.stack_sets.get(&set_id))
                 .cloned()
                 .ok_or_else(|| stack_set_not_found(&name))?;
-            Self::check_can_start_operation(&set, &op_id)?;
+            Self::check_can_start_drift(&set, &op_id)?;
             set
         };
 
@@ -3711,7 +3746,7 @@ impl CloudFormationService {
             .filter(|(_, _, s)| s == "UNKNOWN")
             .count();
         let details = DriftDetectionDetails {
-            drift_status: if set.instances.is_empty() {
+            drift_status: if drifted + in_sync == 0 {
                 "NOT_CHECKED".to_string()
             } else if drifted > 0 {
                 "DRIFTED".to_string()
@@ -3746,7 +3781,7 @@ impl CloudFormationService {
             // being checked. (DetectStackSetDrift does not model
             // StaleRequestException, and a drift result stays valid after an
             // operation that has already finished.)
-            Self::check_can_start_operation(stored, &op_id)?;
+            Self::check_can_start_drift(stored, &op_id)?;
             for instance in &mut stored.instances {
                 if let Some((_, _, status)) = instance_drift
                     .iter()
@@ -5677,6 +5712,78 @@ mod tests {
         )
         .await;
         assert_eq!(tag(&op, "DriftStatus"), "IN_SYNC", "{op}");
+    }
+
+    #[tokio::test]
+    async fn a_target_that_does_not_deploy_keeps_its_requested_overrides() {
+        let svc = service();
+        let (workloads, _) = seed_org(&svc);
+        svc.deps
+            .organizations
+            .write()
+            .as_mut()
+            .unwrap()
+            .close_account(ACCT_C)
+            .unwrap();
+        ok(&svc, "ActivateOrganizationsAccess", &[]).await;
+        ok(
+            &svc,
+            "CreateStackSet",
+            &[
+                ("StackSetName", "org"),
+                ("TemplateBody", QUEUE_TEMPLATE),
+                ("PermissionModel", "SERVICE_MANAGED"),
+            ],
+        )
+        .await;
+        ok(
+            &svc,
+            "CreateStackInstances",
+            &[
+                ("StackSetName", "org"),
+                (
+                    "DeploymentTargets.OrganizationalUnitIds.member.1",
+                    &workloads,
+                ),
+                ("Regions.member.1", "us-east-1"),
+                ("ParameterOverrides.member.1.ParameterKey", "Env"),
+                ("ParameterOverrides.member.1.ParameterValue", "prod"),
+            ],
+        )
+        .await;
+        let skipped = stored_set(&svc, "org")
+            .instances
+            .into_iter()
+            .find(|i| i.account == ACCT_C)
+            .unwrap();
+        assert_eq!(skipped.detailed_status, "SKIPPED_SUSPENDED_ACCOUNT");
+        assert_eq!(
+            skipped.parameter_overrides.get("Env").map(String::as_str),
+            Some("prod")
+        );
+    }
+
+    #[tokio::test]
+    async fn drift_detection_reports_model_declared_errors_and_unchecked_sets() {
+        let broken = "Resources:\n  Q:\n    Type: AWS::SQS::Queue\n    Properties:\n      QueueName:\n        Fn::ImportValue: missing-export\n";
+        let svc = service();
+        create_set(&svc, "nostacks", broken).await;
+        ok(
+            &svc,
+            "CreateStackInstances",
+            &[
+                ("StackSetName", "nostacks"),
+                ("Accounts.member.1", ACCT_B),
+                ("Regions.member.1", "us-east-1"),
+            ],
+        )
+        .await;
+        let params = [("StackSetName", "nostacks"), ("OperationId", "drift-1")];
+        ok(&svc, "DetectStackSetDrift", &params).await;
+        let described = ok(&svc, "DescribeStackSet", &[("StackSetName", "nostacks")]).await;
+        assert_eq!(tag(&described, "DriftStatus"), "NOT_CHECKED", "{described}");
+        let e = err(&svc, "DetectStackSetDrift", &params).await;
+        assert_eq!(e.code(), "InvalidOperationException");
     }
 
     struct Gate(&'static str);
