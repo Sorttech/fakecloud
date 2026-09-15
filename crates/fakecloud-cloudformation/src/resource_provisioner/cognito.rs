@@ -13,10 +13,11 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
+        let generated_name = self.physical_name(resource);
         let pool_name = props
             .get("PoolName")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id)
+            .unwrap_or(&generated_name)
             .to_string();
 
         let pool_id = format!(
@@ -235,10 +236,11 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "UserPoolId is required".to_string())?
             .to_string();
+        let generated_name = self.physical_name(resource);
         let client_name = props
             .get("ClientName")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id)
+            .unwrap_or(&generated_name)
             .to_string();
 
         let mut accounts = self.cognito_state.write();
@@ -499,10 +501,11 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
+        let generated_name = self.physical_name(resource);
         let identity_pool_name = props
             .get("IdentityPoolName")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id)
+            .unwrap_or(&generated_name)
             .to_string();
         let allow_unauth = props
             .get("AllowUnauthenticatedIdentities")

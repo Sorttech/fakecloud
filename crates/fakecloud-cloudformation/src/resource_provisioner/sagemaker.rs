@@ -66,7 +66,7 @@ impl ResourceProvisioner {
             .get(key_prop)
             .and_then(Value::as_str)
             .map(str::to_string)
-            .unwrap_or_else(|| resource.logical_id.clone());
+            .unwrap_or_else(|| self.physical_name(resource));
         let region = &self.region;
         let account = &self.account_id;
         let arn = format!("arn:aws:sagemaker:{region}:{account}:{arn_path}/{name}");

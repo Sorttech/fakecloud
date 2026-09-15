@@ -98,10 +98,19 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
+        // An unnamed FIFO topic still needs the `.fifo` ending SNS requires.
+        let fifo_requested = props
+            .get("FifoTopic")
+            .is_some_and(|v| v.as_bool() == Some(true) || v.as_str() == Some("true"));
+        let generated_name = if fifo_requested {
+            self.physical_name_ending(resource, ".fifo")
+        } else {
+            self.physical_name(resource)
+        };
         let topic_name = props
             .get("TopicName")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id);
+            .unwrap_or(&generated_name);
 
         let mut __sns_mas = self.sns_state.write();
         let state = __sns_mas.get_or_create(&self.account_id);

@@ -27,7 +27,7 @@ impl ResourceProvisioner {
             .get("DatabaseName")
             .and_then(Value::as_str)
             .map(str::to_string)
-            .unwrap_or_else(|| resource.logical_id.clone());
+            .unwrap_or_else(|| self.physical_name(resource));
         let region = &self.region;
         let account = &self.account_id;
         let arn = database_arn(region, account, &name);
@@ -151,7 +151,7 @@ impl ResourceProvisioner {
             .get("TableName")
             .and_then(Value::as_str)
             .map(str::to_string)
-            .unwrap_or_else(|| resource.logical_id.clone());
+            .unwrap_or_else(|| self.physical_name(resource));
         let region = &self.region;
         let account = &self.account_id;
         let arn = table_arn(region, account, &database, &table);

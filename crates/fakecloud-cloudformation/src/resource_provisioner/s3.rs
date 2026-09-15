@@ -35,10 +35,11 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
+        let generated_name = self.physical_name(resource);
         let bucket_name = props
             .get("BucketName")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id);
+            .unwrap_or(&generated_name);
 
         let mut __s3_mas = self.s3_state.write();
         let state = __s3_mas.get_or_create(&self.account_id);

@@ -76,20 +76,14 @@ fn props_to_query(props: &Value) -> HashMap<String, String> {
     params
 }
 
-/// Derive a stable cluster identifier from the template (or synthesize one when
-/// the property is omitted, as CloudFormation does).
-fn cluster_identifier(props: &Value, key: &str, logical_id: &str) -> String {
+/// The cluster identifier from the template, or the name CloudFormation
+/// generates when the property is omitted.
+fn cluster_identifier(props: &Value, key: &str, generated: impl FnOnce() -> String) -> String {
     props
         .get(key)
         .and_then(|v| v.as_str())
         .map(String::from)
-        .unwrap_or_else(|| {
-            format!(
-                "cfn-{}-{}",
-                logical_id.to_lowercase(),
-                fakecloud_core::ids::short_id(8).to_lowercase()
-            )
-        })
+        .unwrap_or_else(generated)
 }
 
 impl ResourceProvisioner {
@@ -100,7 +94,7 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
-        let id = cluster_identifier(props, "ClusterIdentifier", &resource.logical_id);
+        let id = cluster_identifier(props, "ClusterIdentifier", || self.physical_name(resource));
         let mut params = props_to_query(props);
         params.insert("ClusterIdentifier".to_string(), id.clone());
 
@@ -198,7 +192,9 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
-        let id = cluster_identifier(props, "DBClusterIdentifier", &resource.logical_id);
+        let id = cluster_identifier(props, "DBClusterIdentifier", || {
+            self.physical_name(resource)
+        });
         let mut params = props_to_query(props);
         params.insert("DBClusterIdentifier".to_string(), id.clone());
         // `AWS::DocDB::DBCluster` has no Engine property (always docdb); the
@@ -299,7 +295,9 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
-        let id = cluster_identifier(props, "DBClusterIdentifier", &resource.logical_id);
+        let id = cluster_identifier(props, "DBClusterIdentifier", || {
+            self.physical_name(resource)
+        });
         let mut params = props_to_query(props);
         params.insert("DBClusterIdentifier".to_string(), id.clone());
         // `AWS::Neptune::DBCluster` has no Engine property (always neptune); the

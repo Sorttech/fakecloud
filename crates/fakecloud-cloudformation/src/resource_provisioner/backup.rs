@@ -27,7 +27,7 @@ impl ResourceProvisioner {
             .get("BackupVaultName")
             .and_then(Value::as_str)
             .map(str::to_string)
-            .unwrap_or_else(|| resource.logical_id.clone());
+            .unwrap_or_else(|| self.physical_name(resource));
         let arn = vault_arn(&self.region, &self.account_id, &name);
         let encryption = props
             .get("EncryptionKeyArn")
@@ -152,10 +152,11 @@ impl ResourceProvisioner {
             .get("BackupPlan")
             .filter(|v| v.is_object())
             .ok_or("AWS::Backup::BackupPlan requires BackupPlan")?;
+        let generated_name = self.physical_name(resource);
         let plan_name = plan_src
             .get("BackupPlanName")
             .and_then(Value::as_str)
-            .unwrap_or(&resource.logical_id)
+            .unwrap_or(&generated_name)
             .to_string();
 
         // The CFN `BackupPlan` carries its rules under `BackupPlanRule`; the API
@@ -225,11 +226,11 @@ impl ResourceProvisioner {
             .get("BackupPlan")
             .filter(|v| v.is_object())
             .ok_or("AWS::Backup::BackupPlan requires BackupPlan")?;
+        // Leaving BackupPlanName out of an update keeps the plan's name.
         let plan_name = plan_src
             .get("BackupPlanName")
             .and_then(Value::as_str)
-            .unwrap_or(&resource.logical_id)
-            .to_string();
+            .map(str::to_string);
         let plan = normalize_backup_plan(plan_src);
         let advanced = plan_src
             .get("AdvancedBackupSettings")
@@ -251,6 +252,13 @@ impl ResourceProvisioner {
             record.plan = plan;
             record.advanced_backup_settings = advanced;
             record.version_id = version.clone();
+            let plan_name = plan_name.unwrap_or_else(|| {
+                record
+                    .versions
+                    .last()
+                    .map(|v| v.plan_name.clone())
+                    .unwrap_or_default()
+            });
             record.versions.push(PlanVersion {
                 version_id: version.clone(),
                 creation_date: now,

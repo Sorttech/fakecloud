@@ -71,7 +71,7 @@ impl ResourceProvisioner {
         let props = &resource.properties;
         let name = prop_str(props, "LaunchConfigurationName")
             .map(String::from)
-            .unwrap_or_else(|| resource.logical_id.clone());
+            .unwrap_or_else(|| self.physical_name(resource));
         let image_id = prop_str(props, "ImageId")
             .ok_or("AWS::AutoScaling::LaunchConfiguration requires ImageId")?
             .to_string();
@@ -117,7 +117,7 @@ impl ResourceProvisioner {
         let props = &resource.properties;
         let name = prop_str(props, "AutoScalingGroupName")
             .map(String::from)
-            .unwrap_or_else(|| resource.logical_id.clone());
+            .unwrap_or_else(|| self.physical_name(resource));
         let min_size = prop_i64(props, "MinSize").unwrap_or(0);
         let max_size = prop_i64(props, "MaxSize").unwrap_or(min_size);
         let desired = prop_i64(props, "DesiredCapacity").unwrap_or(min_size);

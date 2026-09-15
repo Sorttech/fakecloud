@@ -3925,9 +3925,9 @@ mod tests {
     const ADMIN: &str = "000000000000";
     const ACCT_B: &str = "111111111111";
     const ACCT_C: &str = "222222222222";
-    // Unnamed resources are named after their logical id, so the queue is named
-    // after its stack to keep instances in one account apart.
-    const QUEUE_TEMPLATE: &str = "Parameters:\n  Env:\n    Type: String\n    Default: dev\nResources:\n  Q:\n    Type: AWS::SQS::Queue\n    Properties:\n      QueueName:\n        Fn::Sub: \"${AWS::StackName}-q\"\n";
+    // The queue is unnamed: CloudFormation generates a distinct name per stack,
+    // so instances in one account (one per region) do not collide.
+    const QUEUE_TEMPLATE: &str = "Parameters:\n  Env:\n    Type: String\n    Default: dev\nResources:\n  Q:\n    Type: AWS::SQS::Queue\n";
     const TOPIC_TEMPLATE: &str = "Parameters:\n  Env:\n    Type: String\n    Default: dev\nResources:\n  T:\n    Type: AWS::SNS::Topic\n";
 
     fn service_with(deps: CloudFormationDeps) -> CloudFormationService {

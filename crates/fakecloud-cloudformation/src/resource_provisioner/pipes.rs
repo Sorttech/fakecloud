@@ -52,7 +52,7 @@ impl ResourceProvisioner {
             .get("Name")
             .and_then(Value::as_str)
             .map(String::from)
-            .unwrap_or_else(|| resource.logical_id.clone());
+            .unwrap_or_else(|| self.physical_name(resource));
         // Apply the same validation the direct CreatePipe handler enforces, so a
         // CFN-created pipe can't slip past name/ARN constraints the API rejects.
         fakecloud_pipes::validate_pipe_name(&name).map_err(|e| e.message())?;

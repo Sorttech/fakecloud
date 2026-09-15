@@ -101,7 +101,7 @@ impl ResourceProvisioner {
             .get("Name")
             .and_then(|v| v.as_str())
             .map(String::from)
-            .unwrap_or_else(|| format!("cfn-cs-{}", resource.logical_id));
+            .unwrap_or_else(|| self.physical_name(resource));
         let sending_enabled = props
             .get("SendingOptions")
             .and_then(|v| v.get("SendingEnabled"))
@@ -200,7 +200,7 @@ impl ResourceProvisioner {
             .get("Name")
             .and_then(|v| v.as_str())
             .map(String::from)
-            .unwrap_or_else(|| format!("cfn-ed-{}", resource.logical_id));
+            .unwrap_or_else(|| self.physical_name(resource));
         let enabled = dest_props
             .get("Enabled")
             .and_then(|v| v.as_bool())
@@ -353,7 +353,7 @@ impl ResourceProvisioner {
             .get("TemplateName")
             .and_then(|v| v.as_str())
             .map(String::from)
-            .unwrap_or_else(|| format!("cfn-tpl-{}", resource.logical_id));
+            .unwrap_or_else(|| self.physical_name(resource));
         let tpl = SesEmailTemplate {
             template_name: template_name.clone(),
             subject: template_block
@@ -392,7 +392,7 @@ impl ResourceProvisioner {
             .get("ContactListName")
             .and_then(|v| v.as_str())
             .map(String::from)
-            .unwrap_or_else(|| format!("cfn-cl-{}", resource.logical_id));
+            .unwrap_or_else(|| self.physical_name(resource));
         let description = props
             .get("Description")
             .and_then(|v| v.as_str())
@@ -428,7 +428,7 @@ impl ResourceProvisioner {
             .get("PoolName")
             .and_then(|v| v.as_str())
             .map(String::from)
-            .unwrap_or_else(|| format!("cfn-pool-{}", resource.logical_id));
+            .unwrap_or_else(|| self.physical_name(resource));
         let scaling_mode = props
             .get("ScalingMode")
             .and_then(|v| v.as_str())
@@ -460,7 +460,7 @@ impl ResourceProvisioner {
             .get("RuleSetName")
             .and_then(|v| v.as_str())
             .map(String::from)
-            .unwrap_or_else(|| format!("cfn-rs-{}", resource.logical_id));
+            .unwrap_or_else(|| self.physical_name(resource));
         let rs = SesReceiptRuleSet {
             name: name.clone(),
             rules: Vec::new(),
@@ -497,7 +497,7 @@ impl ResourceProvisioner {
             .get("Name")
             .and_then(|v| v.as_str())
             .map(String::from)
-            .unwrap_or_else(|| format!("cfn-rule-{}", resource.logical_id));
+            .unwrap_or_else(|| self.physical_name(resource));
         let enabled = rule_block
             .get("Enabled")
             .and_then(|v| v.as_bool())
@@ -581,7 +581,7 @@ impl ResourceProvisioner {
             .get("Name")
             .and_then(|v| v.as_str())
             .map(String::from)
-            .unwrap_or_else(|| format!("cfn-filter-{}", resource.logical_id));
+            .unwrap_or_else(|| self.physical_name(resource));
         let ip_block = filter_block
             .get("IpFilter")
             .and_then(|v| v.as_object())

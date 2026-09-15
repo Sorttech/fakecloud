@@ -46,10 +46,11 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
+        let generated_name = self.physical_name(resource);
         let name = props
             .get("Name")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id)
+            .unwrap_or(&generated_name)
             .to_string();
         let parent_id = props
             .get("ParentId")
@@ -226,10 +227,11 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
+        let generated_name = self.physical_name(resource);
         let name = props
             .get("Name")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id)
+            .unwrap_or(&generated_name)
             .to_string();
         let description = props
             .get("Description")
@@ -368,11 +370,11 @@ impl ResourceProvisioner {
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
         let id = existing.physical_id.clone();
+        // Leaving Name out of an update keeps the OU's name.
         let name = props
             .get("Name")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id)
-            .to_string();
+            .map(str::to_string);
 
         let mut org_lock = self.organizations_state.write();
         let org = org_lock
@@ -384,7 +386,10 @@ impl ResourceProvisioner {
             .ok_or_else(|| format!("Organizational unit {id} not yet provisioned"))?;
         // Name is the only in-place-mutable OU property; id/arn/parent_id and
         // the OU's policy attachments are preserved.
-        ou.name = name.clone();
+        if let Some(name) = name {
+            ou.name = name;
+        }
+        let name = ou.name.clone();
         let arn = ou.arn.clone();
 
         Ok(ProvisionResult::new(id.clone())
@@ -467,11 +472,11 @@ impl ResourceProvisioner {
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
         let id = existing.physical_id.clone();
+        // Leaving Name out of an update keeps the policy's name.
         let name = props
             .get("Name")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id)
-            .to_string();
+            .map(str::to_string);
         let description = props
             .get("Description")
             .and_then(|v| v.as_str())
@@ -501,16 +506,18 @@ impl ResourceProvisioner {
         let org = org_lock
             .as_mut()
             .ok_or_else(|| "Organization not yet created".to_string())?;
-        let arn = {
+        let (arn, name) = {
             let policy = org
                 .policies
                 .get_mut(&id)
                 .ok_or_else(|| format!("Policy {id} not yet provisioned"))?;
             // Name/Description/Content update in place; id/arn/type preserved.
-            policy.name = name.clone();
+            if let Some(name) = name {
+                policy.name = name;
+            }
             policy.description = description;
             policy.content = content;
-            policy.arn.clone()
+            (policy.arn.clone(), policy.name.clone())
         };
         // Reconcile attachments to the desired TargetIds: detach from all
         // targets, then attach to the requested set (preserves the policy id).

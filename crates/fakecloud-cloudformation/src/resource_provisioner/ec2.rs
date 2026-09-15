@@ -246,7 +246,8 @@ impl ResourceProvisioner {
         let mut params = HashMap::new();
         let desc = prop_str(props, "GroupDescription").unwrap_or("Managed by CloudFormation");
         params.insert("GroupDescription".to_string(), desc.to_string());
-        let name = prop_str(props, "GroupName").unwrap_or(&resource.logical_id);
+        let generated_name = self.physical_name(resource);
+        let name = prop_str(props, "GroupName").unwrap_or(&generated_name);
         params.insert("GroupName".to_string(), name.to_string());
         if let Some(vpc) = prop_str(props, "VpcId") {
             params.insert("VpcId".to_string(), vpc.to_string());

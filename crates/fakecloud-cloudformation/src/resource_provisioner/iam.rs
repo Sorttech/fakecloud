@@ -29,10 +29,11 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
+        let generated_name = self.physical_name(resource);
         let role_name = props
             .get("RoleName")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id);
+            .unwrap_or(&generated_name);
 
         let assume_role_policy = props
             .get("AssumeRolePolicyDocument")
@@ -229,10 +230,11 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
+        let generated_name = self.physical_name(resource);
         let policy_name = props
             .get("PolicyName")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id);
+            .unwrap_or(&generated_name);
 
         let policy_document = props
             .get("PolicyDocument")
@@ -352,10 +354,11 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
+        let generated_name = self.physical_name(resource);
         let user_name = props
             .get("UserName")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id)
+            .unwrap_or(&generated_name)
             .to_string();
         let path = props
             .get("Path")
@@ -535,10 +538,11 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
+        let generated_name = self.physical_name(resource);
         let group_name = props
             .get("GroupName")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id)
+            .unwrap_or(&generated_name)
             .to_string();
         let path = props
             .get("Path")
@@ -666,10 +670,11 @@ impl ResourceProvisioner {
         // Same shape as AWS::IAM::Policy minus the inline-attach knobs;
         // ManagedPolicy is a standalone policy, attached separately.
         let props = &resource.properties;
+        let generated_name = self.physical_name(resource);
         let policy_name = props
             .get("ManagedPolicyName")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id)
+            .unwrap_or(&generated_name)
             .to_string();
         let policy_document = props
             .get("PolicyDocument")
@@ -894,10 +899,11 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
+        let generated_name = self.physical_name(resource);
         let name = props
             .get("InstanceProfileName")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id)
+            .unwrap_or(&generated_name)
             .to_string();
         let path = props
             .get("Path")
@@ -1042,10 +1048,7 @@ impl ResourceProvisioner {
             .get("Name")
             .and_then(|v| v.as_str())
             .map(String::from)
-            .unwrap_or_else(|| {
-                let suffix = Uuid::new_v4().simple().to_string();
-                format!("{}-{}", resource.logical_id, &suffix[..8])
-            });
+            .unwrap_or_else(|| self.physical_name(resource));
         let saml_metadata_document = props
             .get("SamlMetadataDocument")
             .and_then(|v| v.as_str())

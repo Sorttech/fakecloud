@@ -29,7 +29,7 @@ impl ResourceProvisioner {
             .or_else(|| props.get("Name"))
             .and_then(Value::as_str)
             .map(str::to_string)
-            .unwrap_or_else(|| resource.logical_id.clone());
+            .unwrap_or_else(|| self.physical_name(resource));
 
         // Build the camelCase PipelineDeclaration the service stores. Action
         // `Configuration` maps are provider-defined free-form keys AWS preserves

@@ -54,14 +54,8 @@ impl ResourceProvisioner {
         let parsed = crate::template::parse_template(&template_body, &child_parameters)
             .map_err(|e| format!("Failed to parse nested template: {e}"))?;
 
-        let child_stack_name = format!(
-            "{}-Nested-{}",
-            resource.logical_id,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        );
+        // AWS names a nested stack `{ParentStack}-{LogicalId}-{SUFFIX}`.
+        let child_stack_name = self.physical_name(resource);
         let child_stack_id = format!(
             "arn:aws:cloudformation:{}:{}:stack/{}/{}",
             self.region,
@@ -155,6 +149,7 @@ impl ResourceProvisioner {
             region: self.region.clone(),
             stack_id: child_stack_id.clone(),
             strict_unknown_types: self.strict_unknown_types,
+            reused_names: Default::default(),
         };
 
         let child_resources = crate::service::provision_stack_resources(

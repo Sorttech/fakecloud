@@ -1159,6 +1159,7 @@ impl CloudFormationService {
             // CreateStack + changeset/update/delete accept unmodeled types; only
             // the Cloud Control bridge flips this on to reject them.
             strict_unknown_types: false,
+            reused_names: Default::default(),
         }
     }
 

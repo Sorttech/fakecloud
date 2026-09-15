@@ -31,10 +31,11 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
+        let generated_name = self.physical_name(resource);
         let log_group_name = props
             .get("LogGroupName")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id);
+            .unwrap_or(&generated_name);
 
         let retention_in_days = retention_in_days_property(props)?;
 
@@ -137,10 +138,11 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .map(parse_log_group_name)
             .ok_or_else(|| "LogGroupName is required".to_string())?;
+        let generated_name = self.physical_name(resource);
         let log_stream_name = props
             .get("LogStreamName")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id)
+            .unwrap_or(&generated_name)
             .to_string();
 
         let mut logs_accounts = self.logs_state.write();
@@ -200,10 +202,11 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .map(parse_log_group_name)
             .ok_or_else(|| "LogGroupName is required".to_string())?;
+        let generated_name = self.physical_name(resource);
         let filter_name = props
             .get("FilterName")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id)
+            .unwrap_or(&generated_name)
             .to_string();
         let filter_pattern = props
             .get("FilterPattern")
@@ -295,10 +298,11 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .map(parse_log_group_name)
             .ok_or_else(|| "LogGroupName is required".to_string())?;
+        let generated_name = self.physical_name(resource);
         let filter_name = props
             .get("FilterName")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id)
+            .unwrap_or(&generated_name)
             .to_string();
         let filter_pattern = props
             .get("FilterPattern")

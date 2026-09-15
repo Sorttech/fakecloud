@@ -105,9 +105,18 @@ async fn cfn_provisions_elastic_beanstalk_resources() {
 
     // --- Ref resolution (verified against the AWS resource specs) ---
     assert_eq!(output(stack, "AppRef"), "cfn-eb-app");
-    // VersionLabel/TemplateName were omitted, so they default to the logical id.
-    assert_eq!(output(stack, "VersionRef"), "MyVersion");
-    assert_eq!(output(stack, "TemplateRef"), "MyTemplate");
+    // VersionLabel/TemplateName were omitted, so CloudFormation generates
+    // `{StackName}-{LogicalId}-{SUFFIX}` names for them.
+    let version_label = output(stack, "VersionRef").to_string();
+    let template_name = output(stack, "TemplateRef").to_string();
+    assert!(
+        version_label.starts_with("eb-stack-MyVersion-"),
+        "{version_label}"
+    );
+    assert!(
+        template_name.starts_with("eb-stack-MyTemplate-"),
+        "{template_name}"
+    );
     assert_eq!(output(stack, "EnvRef"), "cfn-eb-env");
 
     // --- Environment EndpointURL GetAtt ---
@@ -142,15 +151,15 @@ async fn cfn_provisions_elastic_beanstalk_resources() {
         versions
             .application_versions()
             .iter()
-            .any(|v| v.version_label() == Some("MyVersion")),
-        "expected version MyVersion"
+            .any(|v| v.version_label() == Some(version_label.as_str())),
+        "expected version {version_label}"
     );
 
     // --- The ConfigurationTemplate exists (and copied the option setting) ---
     let settings = eb
         .describe_configuration_settings()
         .application_name("cfn-eb-app")
-        .template_name("MyTemplate")
+        .template_name(&template_name)
         .send()
         .await
         .expect("DescribeConfigurationSettings");
@@ -159,7 +168,7 @@ async fn cfn_provisions_elastic_beanstalk_resources() {
         .first()
         .expect("configuration settings present");
     assert_eq!(cfg.application_name(), Some("cfn-eb-app"));
-    assert_eq!(cfg.template_name(), Some("MyTemplate"));
+    assert_eq!(cfg.template_name(), Some(template_name.as_str()));
     assert!(
         cfg.option_settings().iter().any(|o| {
             o.namespace() == Some("aws:autoscaling:launchconfiguration")

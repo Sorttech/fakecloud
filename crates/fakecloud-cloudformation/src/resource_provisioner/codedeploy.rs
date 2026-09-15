@@ -28,7 +28,7 @@ impl ResourceProvisioner {
             .get("ApplicationName")
             .and_then(Value::as_str)
             .map(str::to_string)
-            .unwrap_or_else(|| resource.logical_id.clone());
+            .unwrap_or_else(|| self.physical_name(resource));
         let compute = props
             .get("ComputePlatform")
             .and_then(Value::as_str)
@@ -96,7 +96,7 @@ impl ResourceProvisioner {
             .get("DeploymentGroupName")
             .and_then(Value::as_str)
             .map(str::to_string)
-            .unwrap_or_else(|| resource.logical_id.clone());
+            .unwrap_or_else(|| self.physical_name(resource));
         let service_role = props
             .get("ServiceRoleArn")
             .and_then(Value::as_str)

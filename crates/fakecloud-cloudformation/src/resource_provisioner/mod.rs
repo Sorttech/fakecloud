@@ -1049,6 +1049,9 @@ pub struct ResourceProvisioner {
     /// templates (SAM/CDK output routinely includes types fakecloud does not
     /// model).
     pub strict_unknown_types: bool,
+    /// Names to give resources re-created in place of an existing one, keyed
+    /// by logical id (see `ResourceProvisioner::with_existing_name`).
+    pub reused_names: Arc<parking_lot::Mutex<BTreeMap<String, String>>>,
 }
 
 /// A container-backed resource the synchronous provisioning pass inserted as a
@@ -1183,6 +1186,7 @@ mod lambda;
 mod logs;
 mod mq;
 mod mwaa;
+pub(crate) mod naming;
 mod opensearch;
 mod organizations;
 mod pipes;
@@ -2063,10 +2067,9 @@ impl ResourceProvisioner {
     /// Mirroring CloudFormation replacement semantics, this tears down the
     /// old backing resource and re-provisions it from the new definition
     /// through the exact same write-through path `create_resource` uses, so
-    /// the stored resource reflects the update. For name-keyed services the
-    /// physical id is derived from an unchanged `Name`/`Id` property and stays
-    /// stable (an effectively in-place update); for others it is regenerated,
-    /// matching replacement. Genuinely-unmodeled types (no backing state) have
+    /// the stored resource reflects the update. A resource whose name the
+    /// template sets keeps that name; an unnamed one keeps the name it was
+    /// generated, so the update stays effectively in place. Genuinely-unmodeled types (no backing state) have
     /// a no-op delete and a create that records `physical_id == logical_id`;
     /// they still yield `Some(..)` here so the caller records a
     /// `ResourceChange` rather than a silent no-op.
@@ -2086,10 +2089,18 @@ impl ResourceProvisioner {
                 policy = existing.update_replace_policy.as_deref().unwrap_or(""),
                 "CloudFormation: UpdateReplacePolicy retains the old physical resource on replacement; not deleting it"
             );
-        } else {
-            self.delete_resource(existing)?;
+            // The old resource stays, holding its name, so the replacement
+            // generates a new one rather than overwriting what was retained.
+            let created = self.create_resource(new_def)?;
+            return Ok(Some(ProvisionResult {
+                physical_id: created.physical_id,
+                attributes: created.attributes,
+            }));
         }
-        let created = self.create_resource(new_def)?;
+        self.delete_resource(existing)?;
+        // The old resource is gone, so an unnamed resource keeps its name, as
+        // the in-place update this often stands in for would.
+        let created = self.with_existing_name(existing, || self.create_resource(new_def))?;
         Ok(Some(ProvisionResult {
             physical_id: created.physical_id,
             attributes: created.attributes,
@@ -4270,6 +4281,7 @@ mod tests {
             region: "us-east-1".to_string(),
             stack_id: "arn:aws:cloudformation:us-east-1:123456789012:stack/test/00000000-0000-0000-0000-000000000000".to_string(),
             strict_unknown_types: false,
+            reused_names: Default::default(),
         }
     }
 
@@ -9175,5 +9187,244 @@ mod tests {
             .starts_with(&format!("{}|", app.physical_id)));
         let env_id = env.physical_id.split('|').nth(1).unwrap();
         assert_eq!(a.environments.get(env_id).unwrap().name, "prod");
+    }
+
+    #[test]
+    fn unnamed_resources_get_generated_names_that_updates_keep() {
+        let prov = make_provisioner();
+
+        let repo = prov
+            .create_resource(&make_resource(
+                "AWS::CodeCommit::Repository",
+                "Repo",
+                serde_json::json!({}),
+            ))
+            .expect("create repository");
+        assert!(
+            repo.physical_id.starts_with("test-Repo-"),
+            "{}",
+            repo.physical_id
+        );
+        let updated = prov
+            .update_resource(
+                &repo,
+                &make_resource(
+                    "AWS::CodeCommit::Repository",
+                    "Repo",
+                    serde_json::json!({"RepositoryDescription": "now described"}),
+                ),
+            )
+            .expect("update succeeds")
+            .expect("repository is updatable");
+        assert_eq!(updated.physical_id, repo.physical_id);
+
+        let alarm_props = |threshold: u32| {
+            serde_json::json!({
+                "ComparisonOperator": "GreaterThanThreshold",
+                "EvaluationPeriods": 1,
+                "MetricName": "CPUUtilization",
+                "Namespace": "AWS/EC2",
+                "Period": 60,
+                "Statistic": "Average",
+                "Threshold": threshold
+            })
+        };
+        let alarm = prov
+            .create_resource(&make_resource(
+                "AWS::CloudWatch::Alarm",
+                "HighCpu",
+                alarm_props(80),
+            ))
+            .expect("create alarm");
+        assert!(
+            alarm.physical_id.starts_with("test-HighCpu-"),
+            "{}",
+            alarm.physical_id
+        );
+        // An alarm without AlarmName is not renamed (and so not a replacement)
+        // by an update that still leaves it out.
+        let updated = prov
+            .update_resource(
+                &alarm,
+                &make_resource("AWS::CloudWatch::Alarm", "HighCpu", alarm_props(90)),
+            )
+            .expect("update does not require replacement")
+            .expect("alarm is updatable");
+        assert_eq!(updated.physical_id, alarm.physical_id);
+    }
+
+    #[test]
+    fn a_resource_created_twice_never_reuses_a_name() {
+        let prov = make_provisioner();
+        let def = make_resource("AWS::SQS::Queue", "Jobs", serde_json::json!({}));
+        let first = prov.create_resource(&def).expect("first queue");
+        // A replacement recreates the resource in the same stack.
+        let second = prov.create_resource(&def).expect("replacement queue");
+        assert_ne!(first.physical_id, second.physical_id);
+    }
+
+    #[test]
+    fn a_reprovisioned_unnamed_resource_keeps_its_name() {
+        let prov = make_provisioner();
+        // No dedicated update arm: an update re-provisions the resource.
+        let group = prov
+            .create_resource(&make_resource(
+                "AWS::RDS::DBSubnetGroup",
+                "Subnets",
+                serde_json::json!({
+                    "DBSubnetGroupDescription": "first",
+                    "SubnetIds": ["subnet-1", "subnet-2"]
+                }),
+            ))
+            .expect("create subnet group");
+        assert!(
+            group.physical_id.starts_with("test-subnets-"),
+            "{}",
+            group.physical_id
+        );
+        let updated = prov
+            .update_resource(
+                &group,
+                &make_resource(
+                    "AWS::RDS::DBSubnetGroup",
+                    "Subnets",
+                    serde_json::json!({
+                        "DBSubnetGroupDescription": "second",
+                        "SubnetIds": ["subnet-1", "subnet-2"]
+                    }),
+                ),
+            )
+            .expect("update succeeds")
+            .expect("subnet group is updatable");
+        assert_eq!(updated.physical_id, group.physical_id);
+
+        // A retained old resource keeps its name, so the replacement gets a
+        // new one instead of overwriting it.
+        let retained = StackResource {
+            update_replace_policy: Some("Retain".to_string()),
+            ..group.clone()
+        };
+        let updated = prov
+            .update_resource(
+                &retained,
+                &make_resource(
+                    "AWS::RDS::DBSubnetGroup",
+                    "Subnets",
+                    serde_json::json!({
+                        "DBSubnetGroupDescription": "third",
+                        "SubnetIds": ["subnet-1", "subnet-2"]
+                    }),
+                ),
+            )
+            .expect("update succeeds")
+            .expect("subnet group is updatable");
+        assert_ne!(updated.physical_id, group.physical_id);
+        assert!(updated.physical_id.starts_with("test-subnets-"));
+        {
+            let rds = prov.rds_state.read();
+            let groups = &rds.get("123456789012").unwrap().subnet_groups;
+            assert!(
+                groups.contains_key(&group.physical_id),
+                "retained group kept"
+            );
+            assert!(groups.contains_key(&updated.physical_id));
+        }
+
+        // A resource created before names were generated keeps its
+        // logical-id name the same way.
+        let legacy = StackResource {
+            physical_id: "Subnets".to_string(),
+            ..group.clone()
+        };
+        assert_eq!(prov.existing_name(&legacy).as_deref(), Some("Subnets"));
+    }
+
+    #[test]
+    fn an_unnamed_task_definition_update_registers_the_next_revision() {
+        let prov = make_provisioner();
+        let def = |image: &str| {
+            make_resource(
+                "AWS::ECS::TaskDefinition",
+                "Task",
+                serde_json::json!({
+                    "ContainerDefinitions": [{"Name": "app", "Image": image, "Memory": 256}]
+                }),
+            )
+        };
+        let first = prov.create_resource(&def("nginx:1")).expect("register");
+        let updated = prov
+            .update_resource(&first, &def("nginx:2"))
+            .expect("update succeeds")
+            .expect("task definitions are updatable");
+        let family = |arn: &str| {
+            arn.rsplit('/')
+                .next()
+                .and_then(|f| f.rsplit_once(':'))
+                .map(|(family, rev)| (family.to_string(), rev.to_string()))
+                .unwrap()
+        };
+        let (family_1, rev_1) = family(&first.physical_id);
+        let (family_2, rev_2) = family(&updated.physical_id);
+        assert!(family_1.starts_with("test-Task-"), "{family_1}");
+        assert_eq!(family_1, family_2);
+        assert_eq!(rev_1, "1");
+        assert_eq!(rev_2, "2");
+    }
+
+    #[test]
+    fn unnamed_fifo_topics_and_queues_keep_the_fifo_ending() {
+        let prov = make_provisioner();
+        let topic = prov
+            .create_resource(&make_resource(
+                "AWS::SNS::Topic",
+                "Orders",
+                serde_json::json!({"FifoTopic": true}),
+            ))
+            .expect("create FIFO topic");
+        assert!(
+            topic.physical_id.ends_with(".fifo"),
+            "{}",
+            topic.physical_id
+        );
+        let queue = prov
+            .create_resource(&make_resource(
+                "AWS::SQS::Queue",
+                "Orders",
+                serde_json::json!({"FifoQueue": true}),
+            ))
+            .expect("create FIFO queue");
+        assert!(
+            queue.physical_id.ends_with(".fifo"),
+            "{}",
+            queue.physical_id
+        );
+        // A long stack name truncates a FIFO name, and it is still recovered.
+        let mut long = make_provisioner();
+        long.stack_id = format!(
+            "arn:aws:cloudformation:us-east-1:123456789012:stack/{}/0000",
+            "s".repeat(90)
+        );
+        let long_queue = long
+            .create_resource(&make_resource(
+                "AWS::SQS::Queue",
+                "Orders",
+                serde_json::json!({"FifoQueue": true}),
+            ))
+            .expect("create truncated FIFO queue");
+        let name = long_queue.physical_id.rsplit('/').next().unwrap();
+        assert_eq!(name.len(), 80, "{name}");
+        assert_eq!(
+            long.existing_name(&long_queue)
+                .map(|n| format!("{n}.fifo"))
+                .as_deref(),
+            Some(name)
+        );
+        assert_eq!(
+            prov.with_existing_name(&queue, || prov.physical_name_ending(
+                &make_resource("AWS::SQS::Queue", "Orders", serde_json::json!({})),
+                ".fifo"
+            )),
+            queue.physical_id.rsplit('/').next().unwrap()
+        );
     }
 }

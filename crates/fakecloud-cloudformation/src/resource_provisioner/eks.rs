@@ -59,10 +59,11 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
+        let generated_name = self.physical_name(resource);
         let name = props
             .get("Name")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id)
+            .unwrap_or(&generated_name)
             .to_string();
         let role_arn = props
             .get("RoleArn")
@@ -274,10 +275,11 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .ok_or("ClusterName is required")?
             .to_string();
+        let generated_name = self.physical_name(resource);
         let name = props
             .get("NodegroupName")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id)
+            .unwrap_or(&generated_name)
             .to_string();
         let node_role = props
             .get("NodeRole")
@@ -413,10 +415,11 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .ok_or("ClusterName is required")?
             .to_string();
+        let generated_name = self.physical_name(resource);
         let name = props
             .get("FargateProfileName")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id)
+            .unwrap_or(&generated_name)
             .to_string();
         let pod_execution_role_arn = props
             .get("PodExecutionRoleArn")

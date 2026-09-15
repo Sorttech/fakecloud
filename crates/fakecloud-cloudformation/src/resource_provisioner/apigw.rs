@@ -991,21 +991,11 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
-        let generate_distinct_id = props
-            .get("GenerateDistinctId")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
         let name = props
             .get("Name")
             .and_then(|v| v.as_str())
             .map(String::from)
-            .unwrap_or_else(|| {
-                if generate_distinct_id {
-                    format!("cfn-key-{}-{}", resource.logical_id, apigw_make_id())
-                } else {
-                    format!("cfn-key-{}", resource.logical_id)
-                }
-            });
+            .unwrap_or_else(|| self.physical_name(resource));
         let value = props
             .get("Value")
             .and_then(|v| v.as_str())

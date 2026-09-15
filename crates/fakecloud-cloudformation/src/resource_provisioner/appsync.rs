@@ -192,7 +192,7 @@ impl ResourceProvisioner {
             .get("Name")
             .and_then(Value::as_str)
             .map(str::to_string)
-            .unwrap_or_else(|| resource.logical_id.clone());
+            .unwrap_or_else(|| self.physical_name(resource));
         let region = &self.region;
         let account = &self.account_id;
         let arn = format!("arn:aws:appsync:{region}:{account}:apis/{api_id}/datasources/{name}");

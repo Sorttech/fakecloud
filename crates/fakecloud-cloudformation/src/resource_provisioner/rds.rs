@@ -13,10 +13,11 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
+        let generated_name = self.physical_name(resource);
         let name = props
             .get("DBSubnetGroupName")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id)
+            .unwrap_or(&generated_name)
             .to_string();
         let description = props
             .get("DBSubnetGroupDescription")
@@ -61,10 +62,11 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
+        let generated_name = self.physical_name(resource);
         let name = props
             .get("DBParameterGroupName")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id)
+            .unwrap_or(&generated_name)
             .to_string();
         let family = props
             .get("Family")
@@ -115,11 +117,12 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
+        let generated_name = self.physical_name(resource);
         let name = props
             .get("DBClusterParameterGroupName")
             .or_else(|| props.get("Name"))
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id)
+            .unwrap_or(&generated_name)
             .to_string();
         let family = props
             .get("Family")
@@ -164,10 +167,11 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
+        let generated_name = self.physical_name(resource);
         let name = props
             .get("OptionGroupName")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id)
+            .unwrap_or(&generated_name)
             .to_string();
         let engine_name = props
             .get("EngineName")
@@ -215,10 +219,11 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
+        let generated_name = self.physical_name(resource);
         let name = props
             .get("SubscriptionName")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id)
+            .unwrap_or(&generated_name)
             .to_string();
         let sns_topic_arn = props
             .get("SnsTopicArn")
@@ -251,10 +256,11 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
+        let generated_name = self.physical_name(resource);
         let name = props
             .get("DBSecurityGroupName")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id)
+            .unwrap_or(&generated_name)
             .to_string();
         let description = props
             .get("GroupDescription")
@@ -286,10 +292,11 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
+        let generated_name = self.physical_name(resource);
         let name = props
             .get("DBProxyName")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id)
+            .unwrap_or(&generated_name)
             .to_string();
         let engine_family = props
             .get("EngineFamily")
@@ -334,13 +341,7 @@ impl ResourceProvisioner {
             .get("DBInstanceIdentifier")
             .and_then(|v| v.as_str())
             .map(String::from)
-            .unwrap_or_else(|| {
-                format!(
-                    "cfn-{}-{}",
-                    resource.logical_id.to_lowercase(),
-                    fakecloud_core::ids::short_id(8).to_lowercase()
-                )
-            });
+            .unwrap_or_else(|| self.physical_name(resource));
         let class = props
             .get("DBInstanceClass")
             .and_then(|v| v.as_str())
@@ -804,13 +805,7 @@ impl ResourceProvisioner {
             .get("DBClusterIdentifier")
             .and_then(|v| v.as_str())
             .map(String::from)
-            .unwrap_or_else(|| {
-                format!(
-                    "cfn-cluster-{}-{}",
-                    resource.logical_id.to_lowercase(),
-                    fakecloud_core::ids::short_id(8).to_lowercase()
-                )
-            });
+            .unwrap_or_else(|| self.physical_name(resource));
         let engine = props
             .get("Engine")
             .and_then(|v| v.as_str())

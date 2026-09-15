@@ -30,7 +30,7 @@ impl ResourceProvisioner {
             .get("Name")
             .and_then(Value::as_str)
             .map(str::to_string)
-            .unwrap_or_else(|| resource.logical_id.clone());
+            .unwrap_or_else(|| self.physical_name(resource));
         let id = fakecloud_core::ids::short_id(7);
         let arn = application_arn(&self.region, &self.account_id, &id);
 
@@ -79,7 +79,7 @@ impl ResourceProvisioner {
             .get("Name")
             .and_then(Value::as_str)
             .map(str::to_string)
-            .unwrap_or_else(|| resource.logical_id.clone());
+            .unwrap_or_else(|| self.physical_name(resource));
         let id = fakecloud_core::ids::short_id(7);
         let arn = environment_arn(&self.region, &self.account_id, &app_id, &id);
 
@@ -154,7 +154,7 @@ impl ResourceProvisioner {
             .get("Name")
             .and_then(Value::as_str)
             .map(str::to_string)
-            .unwrap_or_else(|| resource.logical_id.clone());
+            .unwrap_or_else(|| self.physical_name(resource));
         let location_uri = props
             .get("LocationUri")
             .and_then(Value::as_str)

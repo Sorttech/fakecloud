@@ -276,10 +276,11 @@ impl ResourceProvisioner {
             .map(|s| resource_id_from(s).to_string())
             .ok_or("ServiceId is required")?;
         // CFN uses `InstanceId`; it defaults to the logical id when omitted.
+        let generated_name = self.physical_name(resource);
         let instance_id = props
             .get("InstanceId")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id)
+            .unwrap_or(&generated_name)
             .to_string();
         let attributes: BTreeMap<String, String> = props
             .get("InstanceAttributes")
