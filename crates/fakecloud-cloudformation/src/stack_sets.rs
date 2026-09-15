@@ -39,6 +39,8 @@ const DEFAULT_EXECUTION_ROLE: &str = "AWSCloudFormationStackSetExecutionRole";
 /// ImportStacksToStackSet accepts at most this many stacks per call.
 const MAX_IMPORT_STACKS: usize = 10;
 const DEFAULT_PAGE_SIZE: usize = 100;
+/// How long an operation waits on one background-provisioning stack.
+const STACK_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(3600);
 
 const TOLERANCE_EXCEEDED: &str = "Cancelled since failure tolerance has exceeded";
 const OPERATION_STOPPED: &str = "Cancelled since the operation was stopped";
@@ -2749,6 +2751,15 @@ impl CloudFormationService {
                     let (outcome, id, applied) = self
                         .apply_target(request_id, admin, set_id, spec, &target, &action)
                         .await;
+                    // A stack still provisioning in the background (custom
+                    // resources) is waited on, so its failure counts against
+                    // the tolerance before the next target deploys.
+                    let outcome = match (&outcome, &id) {
+                        (Outcome::Running, Some(stack_id)) => {
+                            self.await_stack(&target.account, stack_id).await
+                        }
+                        _ => outcome,
+                    };
                     stack_id = id;
                     overrides = applied;
                     outcome
@@ -2790,6 +2801,30 @@ impl CloudFormationService {
             .and_then(|set| set.operations.iter_mut().find(|o| o.operation_id == op_id))
         {
             settle_operation(op);
+        }
+    }
+
+    /// Wait for a stack that provisions in the background to reach a terminal
+    /// status. Gives up after `STACK_WAIT_LIMIT`, leaving the target RUNNING
+    /// for a later read of the stack set to settle.
+    async fn await_stack(&self, account: &str, stack_id: &str) -> Outcome {
+        let deadline = tokio::time::Instant::now() + STACK_WAIT_LIMIT;
+        loop {
+            let outcome = match self.stack_status(account, stack_id) {
+                Some((_, status, reason)) => {
+                    let action = if status.starts_with("UPDATE") {
+                        "UPDATE"
+                    } else {
+                        "CREATE"
+                    };
+                    stack_outcome(action, &status, reason.as_deref())
+                }
+                None => Outcome::Failed(format!("Stack [{stack_id}] does not exist")),
+            };
+            if outcome != Outcome::Running || tokio::time::Instant::now() >= deadline {
+                return outcome;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
     }
 
@@ -5784,6 +5819,60 @@ mod tests {
         assert_eq!(tag(&described, "DriftStatus"), "NOT_CHECKED", "{described}");
         let e = err(&svc, "DetectStackSetDrift", &params).await;
         assert_eq!(e.code(), "InvalidOperationException");
+    }
+
+    struct FailingLambda;
+
+    impl LambdaDelivery for FailingLambda {
+        fn invoke_lambda(
+            &self,
+            _function_arn: &str,
+            _payload: &str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>>
+        {
+            Box::pin(async { Err("custom resource handler failed".to_string()) })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_background_stack_failure_counts_against_the_tolerance() {
+        let mut d = deps();
+        d.delivery = Arc::new(DeliveryBus::new().with_lambda(Arc::new(FailingLambda)));
+        let svc = service_with(d);
+        // A custom resource provisions in the background on the server.
+        let template = "Resources:\n  C:\n    Type: Custom::Thing\n    Properties:\n      ServiceToken: arn:aws:lambda:us-east-1:111111111111:function:handler\n";
+        create_set(&svc, "custom", template).await;
+        ok(
+            &svc,
+            "CreateStackInstances",
+            &[
+                ("StackSetName", "custom"),
+                ("Accounts.member.1", ACCT_B),
+                ("Accounts.member.2", ACCT_C),
+                ("Regions.member.1", "us-east-1"),
+                ("OperationId", "op-custom"),
+            ],
+        )
+        .await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let op = loop {
+            let op = ok(
+                &svc,
+                "DescribeStackSetOperation",
+                &[("StackSetName", "custom"), ("OperationId", "op-custom")],
+            )
+            .await;
+            if tag(&op, "Status") != "RUNNING" {
+                break op;
+            }
+            assert!(std::time::Instant::now() < deadline, "{op}");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert_eq!(tag(&op, "Status"), "FAILED", "{op}");
+        let set = stored_set(&svc, "custom");
+        let second = set.instances.iter().find(|i| i.account == ACCT_C).unwrap();
+        assert_eq!(second.detailed_status, "CANCELLED", "{set:?}");
+        assert!(second.stack_id.is_none());
     }
 
     struct Gate(&'static str);
