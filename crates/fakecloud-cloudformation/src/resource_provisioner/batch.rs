@@ -59,7 +59,7 @@ impl ResourceProvisioner {
         let props = &resource.properties;
         let name = prop_str(props, "ComputeEnvironmentName")
             .map(String::from)
-            .unwrap_or_else(|| resource.logical_id.clone());
+            .unwrap_or_else(|| self.physical_name(resource));
         let arn = self.batch_arn("compute-environment", &name);
         let uuid = Uuid::new_v4().to_string();
         let mut stored = Map::new();
@@ -113,7 +113,7 @@ impl ResourceProvisioner {
         let props = &resource.properties;
         let name = prop_str(props, "JobQueueName")
             .map(String::from)
-            .unwrap_or_else(|| resource.logical_id.clone());
+            .unwrap_or_else(|| self.physical_name(resource));
         let arn = self.batch_arn("job-queue", &name);
         let mut stored = Map::new();
         stored.insert("jobQueueName".into(), json!(name));
@@ -152,7 +152,7 @@ impl ResourceProvisioner {
         let props = &resource.properties;
         let name = prop_str(props, "JobDefinitionName")
             .map(String::from)
-            .unwrap_or_else(|| resource.logical_id.clone());
+            .unwrap_or_else(|| self.physical_name(resource));
         let arn;
         {
             let mut state = self.batch_state.write();
@@ -219,7 +219,7 @@ impl ResourceProvisioner {
         let props = &resource.properties;
         let name = prop_str(props, "Name")
             .map(String::from)
-            .unwrap_or_else(|| resource.logical_id.clone());
+            .unwrap_or_else(|| self.physical_name(resource));
         let arn = format!(
             "arn:aws:batch:{}:{}:scheduling-policy/{name}",
             self.region, self.account_id

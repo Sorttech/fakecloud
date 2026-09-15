@@ -18,7 +18,7 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let caller_reference = format!("cfn-{}", resource.logical_id);
+        let caller_reference = self.physical_name(resource);
 
         let id = format!("E{}", fakecloud_core::ids::short_id(13).to_uppercase());
         let etag = format!("E{}", fakecloud_core::ids::short_id(7).to_uppercase());
@@ -504,7 +504,7 @@ impl ResourceProvisioner {
             .unwrap_or("")
             .to_string();
         let caller_reference = if caller_reference.is_empty() {
-            format!("cfn-{}", resource.logical_id)
+            self.physical_name(resource)
         } else {
             caller_reference
         };

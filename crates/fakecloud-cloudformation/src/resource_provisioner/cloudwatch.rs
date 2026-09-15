@@ -73,10 +73,11 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
+        let generated_name = self.physical_name(resource);
         let alarm_name = props
             .get("AlarmName")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id)
+            .unwrap_or(&generated_name)
             .to_string();
         let alarm_description = props
             .get("AlarmDescription")
@@ -219,10 +220,7 @@ impl ResourceProvisioner {
             .get("DashboardName")
             .and_then(|v| v.as_str())
             .map(String::from)
-            .unwrap_or_else(|| {
-                let suffix = Uuid::new_v4().simple().to_string();
-                format!("{}-{}", resource.logical_id, &suffix[..8])
-            });
+            .unwrap_or_else(|| self.physical_name(resource));
         // CFN passes DashboardBody as a JSON string (Fn::Sub friendly).
         let body = props
             .get("DashboardBody")
@@ -272,7 +270,7 @@ impl ResourceProvisioner {
         let new_alarm_name = props
             .get("AlarmName")
             .and_then(|v| v.as_str())
-            .unwrap_or(&new_def.logical_id);
+            .unwrap_or(&existing.physical_id);
         if new_alarm_name != existing.physical_id {
             return Err(
                 "AWS::CloudWatch::Alarm updates that change AlarmName require replacement"

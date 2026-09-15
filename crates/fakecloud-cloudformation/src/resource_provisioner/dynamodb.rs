@@ -28,10 +28,11 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
+        let generated_name = self.physical_name(resource);
         let table_name = props
             .get("TableName")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id);
+            .unwrap_or(&generated_name);
 
         let mut key_schema = Vec::new();
         if let Some(ks) = props.get("KeySchema").and_then(|v| v.as_array()) {

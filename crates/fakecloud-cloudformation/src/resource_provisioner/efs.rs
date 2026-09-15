@@ -76,13 +76,14 @@ impl ResourceProvisioner {
             .and_then(Value::as_bool)
             .unwrap_or(false);
 
+        let generated_name = self.physical_name(resource);
         let mut fs = Map::new();
         fs.insert("OwnerId".into(), json!(self.account_id));
         // CloudFormation does not expose a CreationToken; synthesize one so the
         // stored description carries the same field the direct API always sets.
         fs.insert(
             "CreationToken".into(),
-            json!(efs_str(props, "CreationToken").unwrap_or(&resource.logical_id)),
+            json!(efs_str(props, "CreationToken").unwrap_or(&generated_name)),
         );
         fs.insert("FileSystemId".into(), json!(fsid));
         fs.insert("FileSystemArn".into(), json!(arn));

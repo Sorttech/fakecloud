@@ -26,7 +26,7 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
-        let name = cc_str(props, "RepositoryName").unwrap_or_else(|| resource.logical_id.clone());
+        let name = cc_str(props, "RepositoryName").unwrap_or_else(|| self.physical_name(resource));
         let account = self.account_id.clone();
         let region = self.region.clone();
         let arn = format!("arn:aws:codecommit:{region}:{account}:{name}");
@@ -101,8 +101,7 @@ impl ResourceProvisioner {
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
         let old_name = existing.physical_id.clone();
-        let new_name =
-            cc_str(props, "RepositoryName").unwrap_or_else(|| existing.logical_id.clone());
+        let new_name = cc_str(props, "RepositoryName").unwrap_or_else(|| old_name.clone());
 
         // RepositoryName is replacement-required on the CFN resource -- a rename
         // re-provisions the repository from scratch.

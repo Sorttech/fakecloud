@@ -40,21 +40,7 @@ impl ResourceProvisioner {
             .get("FunctionName")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
-            .unwrap_or_else(|| {
-                format!(
-                    "{}-{}-{}",
-                    self.stack_id
-                        .rsplit('/')
-                        .nth(1)
-                        .unwrap_or(&resource.logical_id),
-                    resource.logical_id,
-                    Uuid::new_v4()
-                        .to_string()
-                        .split('-')
-                        .next()
-                        .unwrap_or("rand")
-                )
-            });
+            .unwrap_or_else(|| self.physical_name(resource));
 
         let cfg = parse_lambda_function_props(props)?;
         let function_arn = format!(
@@ -472,10 +458,11 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
+        let generated_name = self.physical_name(resource);
         let layer_name = props
             .get("LayerName")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id)
+            .unwrap_or(&generated_name)
             .to_string();
         let description = props
             .get("Description")

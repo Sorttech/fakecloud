@@ -69,7 +69,7 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
-        let name = eb_str(props, "ApplicationName").unwrap_or_else(|| resource.logical_id.clone());
+        let name = eb_str(props, "ApplicationName").unwrap_or_else(|| self.physical_name(resource));
         let arn = application_arn(&self.region, &self.account_id, &name);
         let now = Utc::now();
 
@@ -106,8 +106,7 @@ impl ResourceProvisioner {
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
         let old_name = existing.physical_id.clone();
-        let new_name =
-            eb_str(props, "ApplicationName").unwrap_or_else(|| existing.logical_id.clone());
+        let new_name = eb_str(props, "ApplicationName").unwrap_or_else(|| old_name.clone());
 
         // ApplicationName is create-only on the CFN resource -- a rename
         // re-provisions the application from scratch.
@@ -197,7 +196,7 @@ impl ResourceProvisioner {
         let app_name = eb_str(props, "ApplicationName").ok_or_else(|| {
             "AWS::ElasticBeanstalk::ApplicationVersion requires ApplicationName".to_string()
         })?;
-        let label = eb_str(props, "VersionLabel").unwrap_or_else(|| resource.logical_id.clone());
+        let label = eb_str(props, "VersionLabel").unwrap_or_else(|| self.physical_name(resource));
         let arn = application_version_arn(&self.region, &self.account_id, &app_name, &label);
         let now = Utc::now();
         let (bucket, key) = eb_source_bundle(props);
@@ -250,8 +249,7 @@ impl ResourceProvisioner {
         let new_app = eb_str(props, "ApplicationName").ok_or_else(|| {
             "AWS::ElasticBeanstalk::ApplicationVersion requires ApplicationName".to_string()
         })?;
-        let new_label =
-            eb_str(props, "VersionLabel").unwrap_or_else(|| existing.logical_id.clone());
+        let new_label = eb_str(props, "VersionLabel").unwrap_or_else(|| old_label.clone());
 
         // ApplicationName, VersionLabel and SourceBundle are all create-only on
         // the CFN resource -- any change re-provisions the version.
@@ -293,7 +291,7 @@ impl ResourceProvisioner {
             "AWS::ElasticBeanstalk::Environment requires ApplicationName".to_string()
         })?;
         let env_name =
-            eb_str(props, "EnvironmentName").unwrap_or_else(|| resource.logical_id.clone());
+            eb_str(props, "EnvironmentName").unwrap_or_else(|| self.physical_name(resource));
         let cname_prefix = eb_str(props, "CNAMEPrefix").unwrap_or_else(|| env_name.clone());
         let (tier_name, tier_type, tier_version) = eb_tier(props);
         let is_worker = tier_name.eq_ignore_ascii_case("Worker");
@@ -396,8 +394,7 @@ impl ResourceProvisioner {
         let props = &resource.properties;
         let old_name = existing.physical_id.clone();
         let old_app = captured_application_name(existing);
-        let new_name =
-            eb_str(props, "EnvironmentName").unwrap_or_else(|| existing.logical_id.clone());
+        let new_name = eb_str(props, "EnvironmentName").unwrap_or_else(|| old_name.clone());
 
         // EnvironmentName and ApplicationName are create-only -- a change to
         // either re-provisions the environment.
@@ -504,7 +501,7 @@ impl ResourceProvisioner {
             "AWS::ElasticBeanstalk::ConfigurationTemplate requires ApplicationName".to_string()
         })?;
         let template_name =
-            eb_str(props, "TemplateName").unwrap_or_else(|| resource.logical_id.clone());
+            eb_str(props, "TemplateName").unwrap_or_else(|| self.physical_name(resource));
         let arn =
             configuration_template_arn(&self.region, &self.account_id, &app_name, &template_name);
         let now = Utc::now();
@@ -599,8 +596,7 @@ impl ResourceProvisioner {
         let new_app = eb_str(props, "ApplicationName").ok_or_else(|| {
             "AWS::ElasticBeanstalk::ConfigurationTemplate requires ApplicationName".to_string()
         })?;
-        let new_template =
-            eb_str(props, "TemplateName").unwrap_or_else(|| existing.logical_id.clone());
+        let new_template = eb_str(props, "TemplateName").unwrap_or_else(|| old_template.clone());
 
         // ApplicationName, TemplateName and SolutionStackName are create-only --
         // a change to any re-provisions the template.

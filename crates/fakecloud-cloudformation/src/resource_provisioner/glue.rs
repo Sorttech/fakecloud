@@ -14,10 +14,11 @@ impl ResourceProvisioner {
         let input = props
             .get("DatabaseInput")
             .ok_or("DatabaseInput is required")?;
+        let generated_name = self.physical_name(resource);
         let name = input
             .get("Name")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id)
+            .unwrap_or(&generated_name)
             .to_string();
         let description = input
             .get("Description")

@@ -196,7 +196,7 @@ impl super::ResourceProvisioner {
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
         let body = json!({
-            "name": msk_str(props, "Name").unwrap_or_else(|| resource.logical_id.clone()),
+            "name": msk_str(props, "Name").unwrap_or_else(|| self.physical_name(resource)),
             "description": msk_str(props, "Description").unwrap_or_default(),
             "serverProperties": msk_str(props, "ServerProperties").unwrap_or_default(),
             "kafkaVersions": props.get("KafkaVersionsList").cloned().unwrap_or(json!(null)),
@@ -476,7 +476,7 @@ impl super::ResourceProvisioner {
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
         let mut body = json!({
-            "replicatorName": msk_str(props, "ReplicatorName").unwrap_or_else(|| resource.logical_id.clone()),
+            "replicatorName": msk_str(props, "ReplicatorName").unwrap_or_else(|| self.physical_name(resource)),
             "description": msk_str(props, "Description").unwrap_or_default(),
             "serviceExecutionRoleArn": msk_str(props, "ServiceExecutionRoleArn").unwrap_or_default(),
             "kafkaClusters": pascal_to_camel(props.get("KafkaClusters").unwrap_or(&json!([]))),

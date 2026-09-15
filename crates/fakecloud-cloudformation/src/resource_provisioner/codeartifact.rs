@@ -27,7 +27,7 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
-        let name = ca_str(props, "DomainName").unwrap_or_else(|| resource.logical_id.clone());
+        let name = ca_str(props, "DomainName").unwrap_or_else(|| self.physical_name(resource));
         let owner = self.account_id.clone();
         let region = self.region.clone();
         let arn = format!("arn:aws:codeartifact:{region}:{owner}:domain/{name}");
@@ -90,7 +90,7 @@ impl ResourceProvisioner {
         let old_name = ca_suffix(&existing.physical_id, "domain/")
             .ok_or_else(|| "corrupt CodeArtifact domain physical id".to_string())?
             .to_string();
-        let new_name = ca_str(props, "DomainName").unwrap_or_else(|| existing.logical_id.clone());
+        let new_name = ca_str(props, "DomainName").unwrap_or_else(|| old_name.clone());
         let new_enc = ca_str(props, "EncryptionKey");
 
         // DomainName and EncryptionKey are both replacement-required on the CFN
@@ -183,7 +183,7 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
-        let repo = ca_str(props, "RepositoryName").unwrap_or_else(|| resource.logical_id.clone());
+        let repo = ca_str(props, "RepositoryName").unwrap_or_else(|| self.physical_name(resource));
         let domain = ca_str(props, "DomainName")
             .ok_or_else(|| "AWS::CodeArtifact::Repository requires DomainName".to_string())?;
         let owner = ca_str(props, "DomainOwner").unwrap_or_else(|| self.account_id.clone());
@@ -253,8 +253,7 @@ impl ResourceProvisioner {
             .ok_or_else(|| "corrupt CodeArtifact repository key".to_string())?;
         let old_owner = ca_arn_account(&existing.physical_id).unwrap_or(&self.account_id);
 
-        let new_repo =
-            ca_str(props, "RepositoryName").unwrap_or_else(|| existing.logical_id.clone());
+        let new_repo = ca_str(props, "RepositoryName").unwrap_or_else(|| old_repo.to_string());
         let new_domain = ca_str(props, "DomainName")
             .ok_or_else(|| "AWS::CodeArtifact::Repository requires DomainName".to_string())?;
         let new_owner = ca_str(props, "DomainOwner").unwrap_or_else(|| self.account_id.clone());

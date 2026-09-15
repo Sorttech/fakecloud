@@ -31,7 +31,7 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
-        let name = mq_str(props, "BrokerName").unwrap_or_else(|| resource.logical_id.clone());
+        let name = mq_str(props, "BrokerName").unwrap_or_else(|| self.physical_name(resource));
         let region = self.region.clone();
         let account = self.account_id.clone();
 
@@ -104,7 +104,7 @@ impl ResourceProvisioner {
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
         let id = existing.physical_id.clone();
-        let new_name = mq_str(props, "BrokerName").unwrap_or_else(|| existing.logical_id.clone());
+        let new_name = mq_str(props, "BrokerName");
         let new_engine = mq_str(props, "EngineType")
             .unwrap_or_else(|| "ACTIVEMQ".to_string())
             .to_uppercase();
@@ -129,6 +129,8 @@ impl ResourceProvisioner {
                     .to_string(),
             )
         };
+        // Leaving BrokerName out of an update keeps the broker's name.
+        let new_name = new_name.unwrap_or_else(|| old_name.clone());
         // BrokerName, EngineType, and DeploymentMode are replacement-required.
         if new_name != old_name || new_engine != old_engine || new_deployment != old_deployment {
             self.delete_mq_broker(&id);
@@ -289,7 +291,7 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
-        let name = mq_str(props, "Name").unwrap_or_else(|| resource.logical_id.clone());
+        let name = mq_str(props, "Name").unwrap_or_else(|| self.physical_name(resource));
         let engine = mq_str(props, "EngineType")
             .unwrap_or_else(|| "ACTIVEMQ".to_string())
             .to_uppercase();

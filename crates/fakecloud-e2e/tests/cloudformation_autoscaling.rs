@@ -126,7 +126,11 @@ async fn cfn_asg_honors_launch_template() {
     let g = groups
         .auto_scaling_groups()
         .iter()
-        .find(|g| g.auto_scaling_group_name() == Some("ASG"))
+        // No AutoScalingGroupName, so the name is generated from the stack.
+        .find(|g| {
+            g.auto_scaling_group_name()
+                .is_some_and(|n| n.starts_with("asg-lt-stack-ASG-"))
+        })
         .expect("CFN ASG exists");
     let lt = g
         .launch_template()

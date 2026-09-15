@@ -13,10 +13,11 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
+        let generated_name = self.physical_name(resource);
         let cluster_name = props
             .get("ClusterName")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id)
+            .unwrap_or(&generated_name)
             .to_string();
         let cluster_arn = format!(
             "arn:aws:ecs:{}:{}:cluster/{}",
@@ -72,10 +73,11 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
+        let generated_name = self.physical_name(resource);
         let family = props
             .get("Family")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id)
+            .unwrap_or(&generated_name)
             .to_string();
         // ECS DescribeTaskDefinition emits camelCase keys; CFN ships PascalCase.
         // Recursively lower the leading char so SDKs deserialize cleanly.
@@ -222,10 +224,11 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
+        let generated_name = self.physical_name(resource);
         let service_name = props
             .get("ServiceName")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id)
+            .unwrap_or(&generated_name)
             .to_string();
         // Cluster: default to "default" if missing; accept name or ARN.
         let cluster_name = props
@@ -462,10 +465,11 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
+        let generated_name = self.physical_name(resource);
         let name = props
             .get("Name")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id)
+            .unwrap_or(&generated_name)
             .to_string();
         let arn = format!(
             "arn:aws:ecs:{}:{}:capacity-provider/{}",

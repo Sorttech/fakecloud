@@ -10,10 +10,11 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
+        let generated_name = self.physical_name(resource);
         let name = props
             .get("CacheParameterGroupName")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id)
+            .unwrap_or(&generated_name)
             .to_string();
         let family = props
             .get("CacheParameterGroupFamily")
@@ -60,10 +61,11 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
+        let generated_name = self.physical_name(resource);
         let name = props
             .get("CacheSubnetGroupName")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id)
+            .unwrap_or(&generated_name)
             .to_string();
         let description = props
             .get("Description")
@@ -108,10 +110,11 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
+        let generated_name = self.physical_name(resource);
         let name = props
             .get("CacheSecurityGroupName")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id)
+            .unwrap_or(&generated_name)
             .to_string();
         let description = props
             .get("Description")
@@ -147,10 +150,11 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
+        let generated_name = self.physical_name(resource);
         let user_id = props
             .get("UserId")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id)
+            .unwrap_or(&generated_name)
             .to_string();
         let user_name = props
             .get("UserName")
@@ -239,10 +243,11 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
+        let generated_name = self.physical_name(resource);
         let user_group_id = props
             .get("UserGroupId")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id)
+            .unwrap_or(&generated_name)
             .to_string();
         let engine = props
             .get("Engine")
@@ -322,7 +327,7 @@ impl ResourceProvisioner {
             .get("ClusterName")
             .and_then(|v| v.as_str())
             .map(String::from)
-            .unwrap_or_else(|| format!("cfn-cc-{}", resource.logical_id.to_lowercase()));
+            .unwrap_or_else(|| self.physical_name(resource));
         let cache_node_type = props
             .get("CacheNodeType")
             .and_then(|v| v.as_str())
@@ -652,7 +657,7 @@ impl ResourceProvisioner {
             .get("ReplicationGroupId")
             .and_then(|v| v.as_str())
             .map(String::from)
-            .unwrap_or_else(|| format!("cfn-rg-{}", resource.logical_id.to_lowercase()));
+            .unwrap_or_else(|| self.physical_name(resource));
         let description = props
             .get("ReplicationGroupDescription")
             .and_then(|v| v.as_str())

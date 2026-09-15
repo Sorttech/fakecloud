@@ -1183,6 +1183,7 @@ mod lambda;
 mod logs;
 mod mq;
 mod mwaa;
+pub(crate) mod naming;
 mod opensearch;
 mod organizations;
 mod pipes;
@@ -9175,5 +9176,79 @@ mod tests {
             .starts_with(&format!("{}|", app.physical_id)));
         let env_id = env.physical_id.split('|').nth(1).unwrap();
         assert_eq!(a.environments.get(env_id).unwrap().name, "prod");
+    }
+
+    #[test]
+    fn unnamed_resources_get_generated_names_that_updates_keep() {
+        let prov = make_provisioner();
+
+        let repo = prov
+            .create_resource(&make_resource(
+                "AWS::CodeCommit::Repository",
+                "Repo",
+                serde_json::json!({}),
+            ))
+            .expect("create repository");
+        assert!(
+            repo.physical_id.starts_with("test-Repo-"),
+            "{}",
+            repo.physical_id
+        );
+        let updated = prov
+            .update_resource(
+                &repo,
+                &make_resource(
+                    "AWS::CodeCommit::Repository",
+                    "Repo",
+                    serde_json::json!({"RepositoryDescription": "now described"}),
+                ),
+            )
+            .expect("update succeeds")
+            .expect("repository is updatable");
+        assert_eq!(updated.physical_id, repo.physical_id);
+
+        let alarm_props = |threshold: u32| {
+            serde_json::json!({
+                "ComparisonOperator": "GreaterThanThreshold",
+                "EvaluationPeriods": 1,
+                "MetricName": "CPUUtilization",
+                "Namespace": "AWS/EC2",
+                "Period": 60,
+                "Statistic": "Average",
+                "Threshold": threshold
+            })
+        };
+        let alarm = prov
+            .create_resource(&make_resource(
+                "AWS::CloudWatch::Alarm",
+                "HighCpu",
+                alarm_props(80),
+            ))
+            .expect("create alarm");
+        assert!(
+            alarm.physical_id.starts_with("test-HighCpu-"),
+            "{}",
+            alarm.physical_id
+        );
+        // An alarm without AlarmName is not renamed (and so not a replacement)
+        // by an update that still leaves it out.
+        let updated = prov
+            .update_resource(
+                &alarm,
+                &make_resource("AWS::CloudWatch::Alarm", "HighCpu", alarm_props(90)),
+            )
+            .expect("update does not require replacement")
+            .expect("alarm is updatable");
+        assert_eq!(updated.physical_id, alarm.physical_id);
+    }
+
+    #[test]
+    fn a_resource_created_twice_never_reuses_a_name() {
+        let prov = make_provisioner();
+        let def = make_resource("AWS::SQS::Queue", "Jobs", serde_json::json!({}));
+        let first = prov.create_resource(&def).expect("first queue");
+        // A replacement recreates the resource in the same stack.
+        let second = prov.create_resource(&def).expect("replacement queue");
+        assert_ne!(first.physical_id, second.physical_id);
     }
 }

@@ -17,10 +17,7 @@ impl ResourceProvisioner {
             .get("StateMachineName")
             .and_then(|v| v.as_str())
             .map(String::from)
-            .unwrap_or_else(|| {
-                let suffix = Uuid::new_v4().simple().to_string();
-                format!("{}-{}", resource.logical_id, &suffix[..8])
-            });
+            .unwrap_or_else(|| self.physical_name(resource));
         let role_arn = props
             .get("RoleArn")
             .and_then(|v| v.as_str())

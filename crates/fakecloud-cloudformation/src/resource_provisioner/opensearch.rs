@@ -40,7 +40,7 @@ impl ResourceProvisioner {
             .get("DomainName")
             .and_then(Value::as_str)
             .map(str::to_string)
-            .unwrap_or_else(|| resource.logical_id.clone());
+            .unwrap_or_else(|| self.physical_name(resource));
         let region = &self.region;
         let account = &self.account_id;
         let arn = domain_arn(region, account, &name);

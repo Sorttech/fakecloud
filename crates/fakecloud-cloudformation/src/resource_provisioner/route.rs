@@ -57,7 +57,7 @@ impl ResourceProvisioner {
         let zone = StoredHostedZone {
             id: id.clone(),
             name: normalized_name,
-            caller_reference: format!("cfn-{}", resource.logical_id),
+            caller_reference: self.physical_name(resource),
             comment,
             private_zone,
             features: Some(HostedZoneFeatures::default()),
@@ -321,7 +321,7 @@ impl ResourceProvisioner {
         let id = Uuid::new_v4().to_string();
         let hc = StoredHealthCheck {
             id: id.clone(),
-            caller_reference: format!("cfn-{}", resource.logical_id),
+            caller_reference: self.physical_name(resource),
             version: 1,
             config: cfg,
             created_time: Utc::now(),

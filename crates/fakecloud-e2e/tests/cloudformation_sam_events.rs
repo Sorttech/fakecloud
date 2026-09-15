@@ -76,7 +76,8 @@ async fn sam_function_expands_policies_and_events() {
     let role = roles
         .roles()
         .iter()
-        .find(|r| r.role_name() == "WorkerRole")
+        // The synthesized role has no RoleName, so it is named after the stack.
+        .find(|r| r.role_name().starts_with("sam-events-WorkerRole-"))
         .expect("WorkerRole synthesized from Policies");
     let attached = iam
         .list_attached_role_policies()
@@ -110,7 +111,11 @@ async fn sam_function_expands_policies_and_events() {
     let rule = rules
         .rules()
         .iter()
-        .find(|r| r.name() == Some("WorkerTickRule"))
+        // Unnamed, so named after the stack like any generated resource.
+        .find(|r| {
+            r.name()
+                .is_some_and(|n| n.starts_with("sam-events-WorkerTickRule-"))
+        })
         .expect("WorkerTickRule synthesized from Schedule event");
     let targets = events
         .list_targets_by_rule()

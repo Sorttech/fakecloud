@@ -75,10 +75,19 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
+        // An unnamed FIFO queue still needs the `.fifo` ending SQS requires.
+        let fifo_requested = props
+            .get("FifoQueue")
+            .is_some_and(|v| v.as_bool() == Some(true) || v.as_str() == Some("true"));
+        let generated_name = if fifo_requested {
+            self.physical_name_ending(resource, ".fifo")
+        } else {
+            self.physical_name(resource)
+        };
         let queue_name = props
             .get("QueueName")
             .and_then(|v| v.as_str())
-            .unwrap_or(&resource.logical_id);
+            .unwrap_or(&generated_name);
 
         let mut __sqs_mas = self.sqs_state.write();
         let state = __sqs_mas.get_or_create(&self.account_id);
