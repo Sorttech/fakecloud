@@ -646,13 +646,14 @@ impl ResourceProvisioner {
     /// new ARN tells CFN's update path that the resource was replaced.
     pub(super) fn update_ecs_task_definition(
         &self,
-        _existing: &StackResource,
+        existing: &StackResource,
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         // Delegating to create_ecs_task_definition is safe because each
         // call bumps the revision counter — semantically the right
-        // behaviour for ECS.
-        self.create_ecs_task_definition(resource)
+        // behaviour for ECS. An unnamed family keeps its generated name, so
+        // the update registers the family's next revision.
+        self.with_existing_name(existing, || self.create_ecs_task_definition(resource))
     }
 
     /// In-place update for AWS::ECS::CapacityProvider. Name is immutable;

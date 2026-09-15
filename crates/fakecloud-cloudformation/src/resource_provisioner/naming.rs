@@ -14,6 +14,7 @@
 //! current name rather than generating another.
 
 use super::ResourceProvisioner;
+use crate::state::StackResource;
 use crate::template::ResourceDefinition;
 
 const SUFFIX_LEN: usize = 13;
@@ -257,11 +258,61 @@ impl ResourceProvisioner {
     /// The name CloudFormation gives `resource` when its template leaves the
     /// name property out.
     pub(crate) fn physical_name(&self, resource: &ResourceDefinition) -> String {
+        if let Some(name) = self.reused_names.lock().get(&resource.logical_id) {
+            return name.clone();
+        }
         generate(
             &self.stack_id,
             &resource.logical_id,
             name_rule(&resource.resource_type),
         )
+    }
+
+    /// Run `create` with `existing`'s name reserved for a resource it
+    /// generates a name for, so a resource re-created in place of `existing`
+    /// (an update fakecloud applies by re-provisioning) keeps its name.
+    pub(crate) fn with_existing_name<T>(
+        &self,
+        existing: &StackResource,
+        create: impl FnOnce() -> T,
+    ) -> T {
+        let Some(name) = self.existing_name(existing) else {
+            return create();
+        };
+        self.reused_names
+            .lock()
+            .insert(existing.logical_id.clone(), name);
+        let out = create();
+        self.reused_names.lock().remove(&existing.logical_id);
+        out
+    }
+
+    /// The name `existing` was given when its template left the name out,
+    /// recovered from its physical id (a name, an ARN, a URL, `name:revision`).
+    /// Resources created before names were generated were named after their
+    /// logical id, which is recognized too.
+    pub(crate) fn existing_name(&self, existing: &StackResource) -> Option<String> {
+        let rule = name_rule(&existing.resource_type);
+        let prefix = generate_with_suffix(&self.stack_id, &existing.logical_id, rule, "");
+        let physical = &existing.physical_id;
+        let is_suffix_char = |c: char| {
+            if rule.lowercase {
+                c.is_ascii_lowercase() || c.is_ascii_digit()
+            } else {
+                c.is_ascii_uppercase() || c.is_ascii_digit()
+            }
+        };
+        for (start, _) in physical.match_indices(&prefix) {
+            let rest = &physical[start + prefix.len()..];
+            let suffix: String = rest.chars().take_while(|c| is_suffix_char(*c)).collect();
+            if suffix.len() == SUFFIX_LEN {
+                return Some(format!("{prefix}{suffix}"));
+            }
+        }
+        physical
+            .split(['/', ':', '|'])
+            .find(|segment| segment.eq_ignore_ascii_case(&existing.logical_id))
+            .map(str::to_string)
     }
 
     /// `physical_name` for a resource type whose name must fit `max_len`
@@ -271,6 +322,14 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
         ending: &str,
     ) -> String {
+        if let Some(name) = self.reused_names.lock().get(&resource.logical_id) {
+            // Recovered names stop short of the ending.
+            return if name.ends_with(ending) {
+                name.clone()
+            } else {
+                format!("{name}{ending}")
+            };
+        }
         let mut rule = name_rule(&resource.resource_type);
         rule.max_len = rule.max_len.saturating_sub(ending.len());
         format!(

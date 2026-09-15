@@ -149,6 +149,7 @@ impl ResourceProvisioner {
             region: self.region.clone(),
             stack_id: child_stack_id.clone(),
             strict_unknown_types: self.strict_unknown_types,
+            reused_names: Default::default(),
         };
 
         let child_resources = crate::service::provision_stack_resources(
