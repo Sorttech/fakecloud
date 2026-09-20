@@ -59,18 +59,14 @@ const PSEUDO_REFS: &[&str] = &[
 
 type Mappings = BTreeMap<String, BTreeMap<String, BTreeMap<String, Value>>>;
 
-/// Map an AWS region to its IAM/ARN partition. China regions land on
-/// `aws-cn`, GovCloud on `aws-us-gov`, everything else on `aws`. Used
-/// by both `AWS::Partition` resolution and the URL-suffix derivation
-/// below so partition decisions stay consistent.
+/// Map an AWS region to its IAM/ARN partition, for `AWS::Partition` and the
+/// URL-suffix derivation below. One lookup for the whole workspace, so a
+/// template resolving `AWS::Partition` gets the partition the services
+/// actually mint their ARNs in (this used to know only cn- and us-gov-, so an
+/// `Fn::Sub` over `AWS::Partition` in an isolated region built an ARN that
+/// matched nothing).
 pub(crate) fn partition_for_region(region: &str) -> &'static str {
-    if region.starts_with("cn-") {
-        "aws-cn"
-    } else if region.starts_with("us-gov-") {
-        "aws-us-gov"
-    } else {
-        "aws"
-    }
+    fakecloud_aws::arn::partition_for(region)
 }
 
 /// Map an AWS region to its DNS URL suffix. China regions use

@@ -520,6 +520,13 @@ impl ResourceProvisioner {
         // mistake) fails the create instead of storing a value the next
         // UpdateStack cannot re-submit.
         validate_cfn_iam_instance_profile(&iam_instance_profile_arn, &iam_instance_profile_name)?;
+        // A `Ref` to an AWS::IAM::InstanceProfile is the profile name; resolve
+        // it to the ARN IAM stored so a non-default Path survives.
+        let iam_instance_profile_arn = iam_instance_profile_arn.or_else(|| {
+            iam_instance_profile_name
+                .as_deref()
+                .and_then(|n| self.resolve_instance_profile_arn(n))
+        });
 
         let spec = fakecloud_ec2::cfn_provision::CfnInstanceSpec {
             image_id: prop_str(props, "ImageId").map(String::from),
@@ -667,6 +674,21 @@ impl ResourceProvisioner {
         Ok(ProvisionResult::new(instance_id).merge_attributes(existing.attributes.clone()))
     }
 
+    /// The ARN of a profile this stack's IAM state knows by name. `Ref` on an
+    /// `AWS::IAM::InstanceProfile` resolves to the profile *name*, and only IAM
+    /// knows the Path that name's ARN carries, so resolving here is what keeps
+    /// a pathed profile's ARN (and the id derived from it) the same on the
+    /// instance as in `GetInstanceProfile`. `None` for a profile IAM does not
+    /// hold, which stays a name-addressed association as before.
+    fn resolve_instance_profile_arn(&self, name: &str) -> Option<String> {
+        let accounts = self.iam_state.read();
+        let state = accounts.get(&self.account_id)?;
+        state
+            .instance_profiles
+            .get(name)
+            .map(|profile| profile.arn.clone())
+    }
+
     /// Bring the instance's IAM instance-profile association in line with the
     /// template. AWS updates `IamInstanceProfile` in place ("some interruption",
     /// no replacement), so this replaces an existing association, associates
@@ -675,7 +697,14 @@ impl ResourceProvisioner {
     fn sync_ec2_instance_profile(&self, props: &Value, instance_id: &str) -> Result<(), String> {
         let (arn, name) = cfn_iam_instance_profile(props);
         validate_cfn_iam_instance_profile(&arn, &name)?;
+        // Prefer an ARN: the template's own, else the one IAM stored for that
+        // name (which carries the Path). A name IAM does not hold stays a
+        // name-addressed association, as before.
         let wanted = arn
+            .or_else(|| {
+                name.as_deref()
+                    .and_then(|n| self.resolve_instance_profile_arn(n))
+            })
             .map(|a| ("IamInstanceProfile.Arn", a))
             .or_else(|| name.map(|n| ("IamInstanceProfile.Name", n)));
 

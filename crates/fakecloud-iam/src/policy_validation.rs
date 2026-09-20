@@ -32,7 +32,17 @@ const CONDITION_OPERATORS: &[&str] = &[
 ];
 
 /// Valid AWS partitions for resource ARN validation.
-const VALID_PARTITIONS: &[&str] = &["aws", "aws-cn", "aws-us-gov", "aws-iso", "aws-iso-b"];
+const VALID_PARTITIONS: &[&str] = &[
+    "aws",
+    "aws-cn",
+    "aws-us-gov",
+    "aws-iso",
+    "aws-iso-b",
+    // The isolated partitions fakecloud itself mints ARNs in; rejecting them
+    // here made a policy fail on an ARN the emulator had just handed out.
+    "aws-iso-e",
+    "aws-iso-f",
+];
 
 /// Valid IAM resource path prefixes.
 const IAM_RESOURCE_PREFIXES: &[&str] = &[

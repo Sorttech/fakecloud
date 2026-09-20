@@ -81,6 +81,24 @@ impl ImdsContext {
 
     /// Partition derived from the role ARN, so the instance-profile ARN matches
     /// the partition of the credentials' assumed-role principal.
+    /// The ARN of an instance profile in IAM that carries this instance's role,
+    /// preferring one named after the role. `None` when IAM holds none.
+    fn instance_profile_arn_for_role(&self) -> Option<String> {
+        let role = self.role_name();
+        let accounts = self.iam.read();
+        let state = accounts.get(&self.account_id)?;
+        let carrying: Vec<_> = state
+            .instance_profiles
+            .values()
+            .filter(|p| p.roles.iter().any(|r| r == role))
+            .collect();
+        carrying
+            .iter()
+            .find(|p| p.instance_profile_name == role)
+            .or_else(|| carrying.first())
+            .map(|p| p.arn.clone())
+    }
+
     fn partition(&self) -> &str {
         partition_of(&self.role_arn)
     }
@@ -240,12 +258,18 @@ fn security_credentials(ctx: &ImdsContext, role: &str) -> Response {
 /// `iam/info` -- the instance profile association.
 fn iam_info(ctx: &ImdsContext) -> Response {
     let creds = ctx.credentials();
-    let profile_arn = format!(
-        "arn:{}:iam::{}:instance-profile/{}",
-        ctx.partition(),
-        ctx.account_id,
-        ctx.role_name()
-    );
+    // Prefer the ARN of a real instance profile carrying this role, so the id
+    // below matches what GetInstanceProfile and DescribeInstances report for
+    // it (the profile's Path is part of its ARN, and only IAM knows it). Fall
+    // back to a profile named after the role when IAM holds none.
+    let profile_arn = ctx.instance_profile_arn_for_role().unwrap_or_else(|| {
+        format!(
+            "arn:{}:iam::{}:instance-profile/{}",
+            ctx.partition(),
+            ctx.account_id,
+            ctx.role_name()
+        )
+    });
     Json(serde_json::json!({
         "Code": "Success",
         "LastUpdated": creds.issued_at_iso8601(),
@@ -330,6 +354,45 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["InstanceProfileArn"], arn);
         assert_eq!(json["InstanceProfileId"], id);
+    }
+
+    #[test]
+    fn iam_info_prefers_a_real_instance_profile_carrying_the_role() {
+        // The synthesized ARN assumes a profile named after the role on the
+        // default path. When IAM holds the real profile, its ARN (Path and
+        // all) is what IAM and DescribeInstances report, so use that one.
+        let c = ctx("us-east-1", "arn:aws:iam::123456789012:role/app-role");
+        let real_arn = {
+            let mut accounts = c.iam.write();
+            let state = accounts.get_or_create("123456789012");
+            let arn = "arn:aws:iam::123456789012:instance-profile/svc/app-profile".to_string();
+            state.instance_profiles.insert(
+                "app-profile".to_string(),
+                fakecloud_iam::IamInstanceProfile {
+                    instance_profile_name: "app-profile".to_string(),
+                    instance_profile_id: fakecloud_aws::arn::unique_id_for("AIPA", &arn),
+                    arn: arn.clone(),
+                    path: "/svc/".to_string(),
+                    created_at: chrono::Utc::now(),
+                    roles: vec!["app-role".to_string()],
+                    tags: Vec::new(),
+                },
+            );
+            arn
+        };
+
+        let body = iam_info(&c).into_body();
+        let bytes = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(axum::body::to_bytes(body, usize::MAX))
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["InstanceProfileArn"], real_arn);
+        assert_eq!(
+            json["InstanceProfileId"],
+            fakecloud_aws::arn::unique_id_for("AIPA", &real_arn)
+        );
     }
 
     #[test]
