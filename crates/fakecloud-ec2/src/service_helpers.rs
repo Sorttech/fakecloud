@@ -26,6 +26,15 @@ pub fn gen_id(prefix: &str) -> String {
     format!("{prefix}-{}", &hex[..17])
 }
 
+/// Generate an AWS unique id: a 4-char prefix (`AIPA`, `AIDA`, `AROA`, ...)
+/// followed by 17 uppercase alphanumerics, with no separator — the shape IAM
+/// mints instance-profile, user and role ids in. `gen_id`'s `<prefix>-<lower
+/// hex>` form is the EC2 *resource* id shape and is wrong for this family.
+pub fn aws_unique_id(prefix: &str) -> String {
+    let hex = uuid::Uuid::new_v4().simple().to_string().to_uppercase();
+    format!("{prefix}{}", &hex[..17])
+}
+
 /// `InvalidParameterValue` — the catch-all 400 for bad EC2 input.
 pub fn invalid_parameter_value(message: impl Into<String>) -> AwsServiceError {
     AwsServiceError::aws_error(
@@ -88,6 +97,40 @@ pub fn incorrect_instance_state(id: &str, current: &str) -> AwsServiceError {
 /// request (e.g. associating a second IAM instance profile with an instance).
 pub fn incorrect_state(message: impl Into<String>) -> AwsServiceError {
     AwsServiceError::aws_error(StatusCode::BAD_REQUEST, "IncorrectState", message.into())
+}
+
+/// `InvalidIamInstanceProfileArn.Malformed` (HTTP 400) — the supplied IAM
+/// instance-profile ARN is not a well-formed instance-profile ARN.
+pub fn malformed_instance_profile_arn(arn: &str) -> AwsServiceError {
+    AwsServiceError::aws_error(
+        StatusCode::BAD_REQUEST,
+        "InvalidIamInstanceProfileArn.Malformed",
+        format!("The IAM instance profile ARN '{arn}' is malformed"),
+    )
+}
+
+/// Whether `arn` is a well-formed IAM instance-profile ARN:
+/// `arn:<partition>:iam::<account>:instance-profile/<path><name>`.
+pub fn is_instance_profile_arn(arn: &str) -> bool {
+    let parts: Vec<&str> = arn.splitn(6, ':').collect();
+    parts.len() == 6
+        && parts[0] == "arn"
+        && !parts[1].is_empty()
+        && parts[2] == "iam"
+        && parts[3].is_empty()
+        && parts[5]
+            .strip_prefix("instance-profile/")
+            .is_some_and(|rest| !rest.is_empty() && !rest.ends_with('/'))
+}
+
+/// Whether `name` is a legal IAM instance-profile name: `[\w+=,.@-]{1,128}`,
+/// the pattern the IAM API documents for the `InstanceProfileName` member.
+pub fn is_instance_profile_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_+=,.@-".contains(c))
 }
 
 /// `InvalidAssociationID.NotFound` (HTTP 400) — the requested association id

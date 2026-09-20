@@ -365,7 +365,7 @@ pub(crate) async fn run_instances(
         .map(|v| v == "true")
         .unwrap_or(false);
     let metadata_options = parse_metadata_options(&req.query_params);
-    let iam_profile_arn = super::rest::iam_profile_arn(req);
+    let iam_profile_arn = super::rest::iam_profile_arn(req)?;
     let az = format!(
         "{}a",
         if req.region.is_empty() {
@@ -1172,6 +1172,16 @@ async fn change_state(
                 state_xml("previousState", prev_code, &prev_name),
             ));
         }
+        // AWS detaches the IAM instance profile when an instance terminates:
+        // the record leaves DescribeIamInstanceProfileAssociations and the
+        // instance stops reporting <iamInstanceProfile>. Without this the
+        // stale record also makes a later AssociateIamInstanceProfile on that
+        // id fail forever with IncorrectState.
+        if new_code == 48 {
+            state
+                .iam_instance_profile_associations
+                .retain(|_, a| !affected.contains(&a.instance_id));
+        }
     }
 
     // Drive the backing container's lifecycle in the background so the response
@@ -1458,6 +1468,7 @@ pub(crate) fn describe_instances(
                 &arch_for(state, &i.image_id),
                 &sg_names,
                 bdm_by_instance.get(&i.instance_id).unwrap_or(&no_bdm),
+                profile_by_instance.get(i.instance_id.as_str()).copied(),
             )
         })
         .collect();
@@ -1523,6 +1534,7 @@ fn inst_match(
     architecture: &str,
     sg_names: &HashMap<String, String>,
     block_devices: &[&crate::state::VolumeAttachment],
+    iam_assoc: Option<&IamInstanceProfileAssociation>,
 ) -> bool {
     use crate::service_helpers::filter_value_matches;
     filters.iter().all(|f| {
@@ -1585,6 +1597,16 @@ fn inst_match(
             "block-device-mapping.delete-on-termination" => block_devices
                 .iter()
                 .map(|a| a.delete_on_termination.to_string())
+                .collect(),
+            // The IAM instance profile lives in the association map, so these
+            // read from the same record the instance renders.
+            "iam-instance-profile.arn" => iam_assoc
+                .map(|a| a.iam_instance_profile_arn.clone())
+                .into_iter()
+                .collect(),
+            "iam-instance-profile.id" => iam_assoc
+                .map(|a| a.iam_instance_profile_id.clone())
+                .into_iter()
                 .collect(),
             "tag-key" => tags.iter().map(|t| t.key.clone()).collect(),
             "tag-value" => tags.iter().map(|t| t.value.clone()).collect(),
@@ -1649,6 +1671,8 @@ pub(crate) fn describe_instance_status(
                 &arch_for(state, &i.image_id),
                 &sg_names,
                 bdm_by_instance.get(&i.instance_id).unwrap_or(&no_bdm),
+                // DescribeInstanceStatus takes no iam-instance-profile filter.
+                None,
             )
         })
         .collect();
@@ -2995,6 +3019,114 @@ mod modify_tests {
             ),
             "got: {out}"
         );
+    }
+
+    #[tokio::test]
+    async fn terminate_instances_drops_the_iam_instance_profile_association() {
+        // AWS detaches the profile on terminate. A stale record kept rendering
+        // <iamInstanceProfile> on a terminated instance and made a later
+        // Associate on that id fail forever with IncorrectState.
+        let svc = Ec2Service::new();
+        seed_instance(&svc, "i-gone");
+        seed_instance(&svc, "i-stays");
+        for id in ["i-gone", "i-stays"] {
+            super::super::rest::associate_iam_instance_profile(
+                &svc,
+                &req(
+                    "AssociateIamInstanceProfile",
+                    &[
+                        ("InstanceId", id),
+                        ("IamInstanceProfile.Name", "web-profile"),
+                    ],
+                ),
+            )
+            .unwrap();
+        }
+
+        terminate_instances(
+            &svc,
+            &req("TerminateInstances", &[("InstanceId.1", "i-gone")]),
+        )
+        .await
+        .unwrap();
+
+        let described = body(
+            super::super::rest::describe_iam_instance_profile_associations(
+                &svc,
+                &req("DescribeIamInstanceProfileAssociations", &[]),
+            )
+            .unwrap(),
+        );
+        assert!(
+            !described.contains("<instanceId>i-gone</instanceId>"),
+            "{described}"
+        );
+        assert!(
+            described.contains("<instanceId>i-stays</instanceId>"),
+            "{described}"
+        );
+
+        let out = body(
+            describe_instances(
+                &svc,
+                &req("DescribeInstances", &[("InstanceId.1", "i-gone")]),
+            )
+            .unwrap(),
+        );
+        assert!(!out.contains("<iamInstanceProfile>"), "{out}");
+    }
+
+    #[test]
+    fn describe_instances_filters_on_iam_instance_profile() {
+        let svc = Ec2Service::new();
+        seed_instance(&svc, "i-a");
+        seed_instance(&svc, "i-b");
+        super::super::rest::associate_iam_instance_profile(
+            &svc,
+            &req(
+                "AssociateIamInstanceProfile",
+                &[
+                    ("InstanceId", "i-a"),
+                    ("IamInstanceProfile.Name", "web-profile"),
+                ],
+            ),
+        )
+        .unwrap();
+
+        let out = body(
+            describe_instances(
+                &svc,
+                &req(
+                    "DescribeInstances",
+                    &[
+                        ("Filter.1.Name", "iam-instance-profile.arn"),
+                        (
+                            "Filter.1.Value.1",
+                            "arn:aws:iam::000000000000:instance-profile/web-profile",
+                        ),
+                    ],
+                ),
+            )
+            .unwrap(),
+        );
+        assert!(out.contains("<instanceId>i-a</instanceId>"), "{out}");
+        assert!(!out.contains("<instanceId>i-b</instanceId>"), "{out}");
+
+        // An instance with no profile matches neither filter name.
+        let out = body(
+            describe_instances(
+                &svc,
+                &req(
+                    "DescribeInstances",
+                    &[
+                        ("Filter.1.Name", "iam-instance-profile.id"),
+                        ("Filter.1.Value.1", "AIPANOTHERE000000000"),
+                    ],
+                ),
+            )
+            .unwrap(),
+        );
+        assert!(!out.contains("<instanceId>"), "{out}");
     }
 
     #[test]

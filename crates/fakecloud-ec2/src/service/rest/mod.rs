@@ -16,9 +16,11 @@ pub(crate) use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceErro
 
 pub(crate) use crate::service::Ec2Service;
 pub(crate) use crate::service_helpers::{
-    association_not_found, gen_id, incorrect_state, indexed_list, instance_not_found,
-    missing_parameter, require, require_struct, validate_enum, validate_int_range, validate_length,
-    validate_max_results,
+    association_not_found, aws_unique_id, filter_value_matches, gen_id, incorrect_instance_state,
+    incorrect_state, indexed_list, instance_not_found, invalid_parameter_value,
+    is_instance_profile_arn, is_instance_profile_name, malformed_instance_profile_arn,
+    missing_parameter, parse_filters, require, require_struct, validate_enum, validate_int_range,
+    validate_length, validate_max_results, Filter,
 };
 pub(crate) use crate::state::{
     AccountVpcEncryptionControl, ByoipCidr, CapacityManagerDataExport, Ec2State,
@@ -110,15 +112,37 @@ pub(crate) fn associate_enclave_certificate_iam_role(
 /// takes either; we synthesize the ARN from the name so the association
 /// round-trips. `None` when the request carries neither (optional on
 /// RunInstances, required on Associate/Replace).
-pub(crate) fn iam_profile_arn(req: &AwsRequest) -> Option<String> {
-    req.query_params
+pub(crate) fn iam_profile_arn(req: &AwsRequest) -> Result<Option<String>, AwsServiceError> {
+    // An empty `Arn=` / `Name=` is the same as the member being absent: the
+    // SDKs serialize `IamInstanceProfileSpecification::builder().name("")` as
+    // a present-but-empty parameter, and storing that would leave an
+    // association whose ARN renders as `<arn></arn>` on every instance.
+    if let Some(arn) = req
+        .query_params
         .get("IamInstanceProfile.Arn")
-        .cloned()
-        .or_else(|| {
-            req.query_params
-                .get("IamInstanceProfile.Name")
-                .map(|n| format!("arn:aws:iam::{}:instance-profile/{n}", req.account_id))
-        })
+        .filter(|v| !v.is_empty())
+    {
+        if !is_instance_profile_arn(arn) {
+            return Err(malformed_instance_profile_arn(arn));
+        }
+        return Ok(Some(arn.clone()));
+    }
+    if let Some(name) = req
+        .query_params
+        .get("IamInstanceProfile.Name")
+        .filter(|v| !v.is_empty())
+    {
+        if !is_instance_profile_name(name) {
+            return Err(invalid_parameter_value(format!(
+                "Invalid IAM Instance Profile name: {name}"
+            )));
+        }
+        return Ok(Some(format!(
+            "arn:aws:iam::{}:instance-profile/{name}",
+            req.account_id
+        )));
+    }
+    Ok(None)
 }
 
 /// A fresh, `associated` IAM instance-profile association with newly minted
@@ -133,7 +157,7 @@ pub(crate) fn new_iam_profile_association(
         association_id: gen_id("iip-assoc"),
         instance_id,
         iam_instance_profile_arn: profile_arn,
-        iam_instance_profile_id: gen_id("AIPA"),
+        iam_instance_profile_id: aws_unique_id("AIPA"),
         state: "associated".to_string(),
     }
 }
@@ -177,12 +201,19 @@ pub(crate) fn associate_iam_instance_profile(
     req: &AwsRequest,
 ) -> Result<AwsResponse, AwsServiceError> {
     let instance_id = require(&req.query_params, "InstanceId")?;
-    let arn = iam_profile_arn(req).ok_or_else(|| missing_parameter("IamInstanceProfile"))?;
+    let arn = iam_profile_arn(req)?.ok_or_else(|| missing_parameter("IamInstanceProfile"))?;
     let assoc = {
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(&req.account_id);
-        if !state.instances.contains_key(&instance_id) {
-            return Err(instance_not_found(&instance_id));
+        let inst = state
+            .instances
+            .get(&instance_id)
+            .ok_or_else(|| instance_not_found(&instance_id))?;
+        // AWS: "Associates an IAM instance profile with a running or stopped
+        // instance." A shutting-down (32) or terminated (48) instance is
+        // rejected with IncorrectInstanceState.
+        if inst.state_code == 32 || inst.state_code == 48 {
+            return Err(incorrect_instance_state(&instance_id, &inst.state_name));
         }
         // AWS (AssociateIamInstanceProfile docs): "You cannot associate more
         // than one IAM instance profile with an instance". The error code is
@@ -739,19 +770,52 @@ pub(crate) fn describe_host_reservations(
     ))
 }
 
+/// Match one association against the `Filter.N` names AWS documents for
+/// DescribeIamInstanceProfileAssociations (`instance-id`, `state`). An unknown
+/// filter name matches nothing, as elsewhere in this crate.
+fn iam_assoc_match(a: &IamInstanceProfileAssociation, filters: &[Filter]) -> bool {
+    filters.iter().all(|f| {
+        let candidates: Vec<&str> = match f.name.as_str() {
+            "instance-id" => vec![a.instance_id.as_str()],
+            "state" => vec![a.state.as_str()],
+            _ => return false,
+        };
+        f.values
+            .iter()
+            .any(|v| candidates.iter().any(|c| filter_value_matches(v, c)))
+    })
+}
+
 pub(crate) fn describe_iam_instance_profile_associations(
     svc: &Ec2Service,
     req: &AwsRequest,
 ) -> Result<AwsResponse, AwsServiceError> {
     validate_max_results(&req.query_params, 5, 1000)?;
     let wanted = indexed_list(&req.query_params, "AssociationId");
+    let filters = parse_filters(&req.query_params);
     let accounts = svc.state.read();
     let empty = Ec2State::new(&req.account_id, &req.region);
     let state = accounts.get(&req.account_id).unwrap_or(&empty);
-    let items: Vec<String> = state
+    // An explicitly-named association that does not exist is a hard error on
+    // AWS, not an empty set — the same contract Replace/Disassociate now hold.
+    for id in &wanted {
+        if !state.iam_instance_profile_associations.contains_key(id) {
+            return Err(association_not_found(id));
+        }
+    }
+    // The terraform AWS provider reads an instance's profile by filtering on
+    // `instance-id` and taking the first item, so honoring `Filter.N` is what
+    // keeps it from picking up another instance's association.
+    let mut matching: Vec<&IamInstanceProfileAssociation> = state
         .iam_instance_profile_associations
         .values()
         .filter(|a| wanted.is_empty() || wanted.contains(&a.association_id))
+        .filter(|a| iam_assoc_match(a, &filters))
+        .collect();
+    // The backing map is unordered; sort so repeated describes agree.
+    matching.sort_by(|a, b| a.association_id.cmp(&b.association_id));
+    let items: Vec<String> = matching
+        .into_iter()
         .map(|a| iam_profile_assoc_xml(a, &a.state))
         .collect();
     Ok(Ec2Service::respond(
@@ -1820,7 +1884,7 @@ pub(crate) fn replace_iam_instance_profile_association(
     req: &AwsRequest,
 ) -> Result<AwsResponse, AwsServiceError> {
     let assoc_id = require(&req.query_params, "AssociationId")?;
-    let arn = iam_profile_arn(req).ok_or_else(|| missing_parameter("IamInstanceProfile"))?;
+    let arn = iam_profile_arn(req)?.ok_or_else(|| missing_parameter("IamInstanceProfile"))?;
     let assoc = {
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(&req.account_id);
@@ -2798,6 +2862,196 @@ mod tests {
         assert_eq!(err.code(), "MissingParameter");
         let described = describe_associations(&svc);
         assert!(!described.contains("iip-assoc-"), "{described}");
+    }
+
+    #[test]
+    fn describe_iam_instance_profile_associations_filters_by_instance() {
+        // The terraform provider reads an instance's profile by filtering on
+        // `instance-id`; ignoring Filter.N handed it another instance's
+        // association, which Replace would then retarget.
+        let svc = Ec2Service::new();
+        seed_instance(&svc, "i-a");
+        seed_instance(&svc, "i-b");
+        associate_profile(&svc, "i-a", "a-role");
+        associate_profile(&svc, "i-b", "b-role");
+
+        let out = body(
+            describe_iam_instance_profile_associations(
+                &svc,
+                &req(
+                    "DescribeIamInstanceProfileAssociations",
+                    &[
+                        ("Filter.1.Name", "instance-id"),
+                        ("Filter.1.Value.1", "i-b"),
+                    ],
+                ),
+            )
+            .unwrap(),
+        );
+        assert!(out.contains("<instanceId>i-b</instanceId>"), "{out}");
+        assert!(!out.contains("<instanceId>i-a</instanceId>"), "{out}");
+        assert!(!out.contains("a-role"), "{out}");
+
+        // `state` is the other documented filter.
+        let out = body(
+            describe_iam_instance_profile_associations(
+                &svc,
+                &req(
+                    "DescribeIamInstanceProfileAssociations",
+                    &[
+                        ("Filter.1.Name", "state"),
+                        ("Filter.1.Value.1", "disassociated"),
+                    ],
+                ),
+            )
+            .unwrap(),
+        );
+        assert!(!out.contains("iip-assoc-"), "{out}");
+    }
+
+    #[test]
+    fn describe_iam_instance_profile_associations_rejects_unknown_id() {
+        // Same fabricated-success class the mutating handlers dropped: an
+        // explicitly-named association that does not exist is an error, not an
+        // empty set.
+        let svc = Ec2Service::new();
+        let err = err_of(describe_iam_instance_profile_associations(
+            &svc,
+            &req(
+                "DescribeIamInstanceProfileAssociations",
+                &[("AssociationId.1", "iip-assoc-missing")],
+            ),
+        ));
+        assert_eq!(err.code(), "InvalidAssociationID.NotFound");
+    }
+
+    #[test]
+    fn associate_iam_instance_profile_rejects_empty_profile() {
+        // `IamInstanceProfileSpecification::builder().name("")` serializes as a
+        // present-but-empty parameter; it must read as absent, not store an
+        // association whose ARN renders as an empty <arn> on the instance.
+        let svc = Ec2Service::new();
+        seed_instance(&svc, "i-123");
+        for param in ["IamInstanceProfile.Name", "IamInstanceProfile.Arn"] {
+            let err = err_of(associate_iam_instance_profile(
+                &svc,
+                &req(
+                    "AssociateIamInstanceProfile",
+                    &[("InstanceId", "i-123"), (param, "")],
+                ),
+            ));
+            assert_eq!(err.code(), "MissingParameter", "{param}");
+        }
+        let described = describe_associations(&svc);
+        assert!(!described.contains("iip-assoc-"), "{described}");
+    }
+
+    #[test]
+    fn associate_iam_instance_profile_validates_the_profile_reference() {
+        // A name outside `[\w+=,.@-]{1,128}` and an ARN that is not an
+        // instance-profile ARN are both rejected instead of being fabricated
+        // into a stored association.
+        let svc = Ec2Service::new();
+        seed_instance(&svc, "i-123");
+        let err = err_of(associate_iam_instance_profile(
+            &svc,
+            &req(
+                "AssociateIamInstanceProfile",
+                &[
+                    ("InstanceId", "i-123"),
+                    ("IamInstanceProfile.Name", "not a/valid name"),
+                ],
+            ),
+        ));
+        assert_eq!(err.code(), "InvalidParameterValue");
+        let err = err_of(associate_iam_instance_profile(
+            &svc,
+            &req(
+                "AssociateIamInstanceProfile",
+                &[
+                    ("InstanceId", "i-123"),
+                    (
+                        "IamInstanceProfile.Arn",
+                        "arn:aws:iam::000000000000:role/web",
+                    ),
+                ],
+            ),
+        ));
+        assert_eq!(err.code(), "InvalidIamInstanceProfileArn.Malformed");
+        let described = describe_associations(&svc);
+        assert!(!described.contains("iip-assoc-"), "{described}");
+
+        // A well-formed ARN is taken verbatim.
+        let out = body(
+            associate_iam_instance_profile(
+                &svc,
+                &req(
+                    "AssociateIamInstanceProfile",
+                    &[
+                        ("InstanceId", "i-123"),
+                        (
+                            "IamInstanceProfile.Arn",
+                            "arn:aws:iam::000000000000:instance-profile/team/web",
+                        ),
+                    ],
+                ),
+            )
+            .unwrap(),
+        );
+        assert!(
+            out.contains("<arn>arn:aws:iam::000000000000:instance-profile/team/web</arn>"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn associate_iam_instance_profile_rejects_a_terminated_instance() {
+        // AWS associates a profile with a running or stopped instance only.
+        let svc = Ec2Service::new();
+        seed_instance(&svc, "i-dead");
+        {
+            let mut accounts = svc.state.write();
+            let state = accounts.get_or_create("000000000000");
+            let inst = state.instances.get_mut("i-dead").unwrap();
+            inst.state_code = 48;
+            inst.state_name = "terminated".into();
+        }
+        let err = err_of(associate_iam_instance_profile(
+            &svc,
+            &req(
+                "AssociateIamInstanceProfile",
+                &[
+                    ("InstanceId", "i-dead"),
+                    ("IamInstanceProfile.Name", "web-role"),
+                ],
+            ),
+        ));
+        assert_eq!(err.code(), "IncorrectInstanceState");
+    }
+
+    #[test]
+    fn iam_instance_profile_id_uses_the_aws_unique_id_shape() {
+        // AWS unique ids are a 4-char prefix plus 17 uppercase alphanumerics
+        // with no separator, the same shape fakecloud's IAM service mints for
+        // InstanceProfileId. EC2's `gen_id` resource shape (`AIPA-<lower hex>`)
+        // is wrong, and this PR makes the value user-visible on every
+        // DescribeInstances.
+        let svc = Ec2Service::new();
+        seed_instance(&svc, "i-123");
+        let out = associate_profile(&svc, "i-123", "web-role");
+        let id = out
+            .split("<id>")
+            .nth(1)
+            .and_then(|s| s.split("</id>").next())
+            .expect("profile id");
+        assert_eq!(id.len(), 21, "{id}");
+        assert!(id.starts_with("AIPA"), "{id}");
+        assert!(
+            id[4..]
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()),
+            "{id}"
+        );
     }
 
     #[test]

@@ -514,25 +514,7 @@ impl ResourceProvisioner {
                 }
             });
 
-        // IamInstanceProfile can be a string (profile name / ARN) or an object
-        // with `Arn` / `Name` (the CFN property shape).
-        let iam_profile = props.get("IamInstanceProfile");
-        let (iam_instance_profile_arn, iam_instance_profile_name) = match iam_profile {
-            Some(serde_json::Value::String(s)) => {
-                // A bare string is the profile name (or an ARN); classify by
-                // prefix so both round-trip.
-                if s.starts_with("arn:") {
-                    (Some(s.clone()), None)
-                } else {
-                    (None, Some(s.clone()))
-                }
-            }
-            Some(serde_json::Value::Object(o)) => (
-                o.get("Arn").and_then(|v| v.as_str()).map(String::from),
-                o.get("Name").and_then(|v| v.as_str()).map(String::from),
-            ),
-            _ => (None, None),
-        };
+        let (iam_instance_profile_arn, iam_instance_profile_name) = cfn_iam_instance_profile(props);
 
         let spec = fakecloud_ec2::cfn_provision::CfnInstanceSpec {
             image_id: prop_str(props, "ImageId").map(String::from),
@@ -673,9 +655,57 @@ impl ResourceProvisioner {
             }
         }
 
+        self.sync_ec2_instance_profile(props, &instance_id)?;
+
         // The identity attributes (private ip, AZ, public ip) do not change on
         // an in-place modify; carry the ones captured at create time forward.
         Ok(ProvisionResult::new(instance_id).merge_attributes(existing.attributes.clone()))
+    }
+
+    /// Bring the instance's IAM instance-profile association in line with the
+    /// template. AWS updates `IamInstanceProfile` in place ("some interruption",
+    /// no replacement), so this replaces an existing association, associates
+    /// when the instance has none, and disassociates when the template dropped
+    /// the property.
+    fn sync_ec2_instance_profile(&self, props: &Value, instance_id: &str) -> Result<(), String> {
+        let (arn, name) = cfn_iam_instance_profile(props);
+        let wanted = arn
+            .map(|a| ("IamInstanceProfile.Arn", a))
+            .or_else(|| name.map(|n| ("IamInstanceProfile.Name", n)));
+
+        let mut lookup = HashMap::new();
+        lookup.insert("Filter.1.Name".to_string(), "instance-id".to_string());
+        lookup.insert("Filter.1.Value.1".to_string(), instance_id.to_string());
+        let existing = self.ec2_dispatch("DescribeIamInstanceProfileAssociations", lookup)?;
+        let existing_id = existing
+            .split("<associationId>")
+            .nth(1)
+            .and_then(|s| s.split("</associationId>").next())
+            .map(str::to_string);
+
+        match (wanted, existing_id) {
+            (None, None) => Ok(()),
+            (None, Some(id)) => {
+                let mut params = HashMap::new();
+                params.insert("AssociationId".to_string(), id);
+                self.ec2_dispatch("DisassociateIamInstanceProfile", params)?;
+                Ok(())
+            }
+            (Some((key, value)), Some(id)) => {
+                let mut params = HashMap::new();
+                params.insert("AssociationId".to_string(), id);
+                params.insert(key.to_string(), value);
+                self.ec2_dispatch("ReplaceIamInstanceProfileAssociation", params)?;
+                Ok(())
+            }
+            (Some((key, value)), None) => {
+                let mut params = HashMap::new();
+                params.insert("InstanceId".to_string(), instance_id.to_string());
+                params.insert(key.to_string(), value);
+                self.ec2_dispatch("AssociateIamInstanceProfile", params)?;
+                Ok(())
+            }
+        }
     }
 
     /// Delete an EC2 resource by its physical id, routing through the real
@@ -712,5 +742,27 @@ impl ResourceProvisioner {
             | ("AWS::EC2::RouteTable", "RouteTableId") => Some(resource.physical_id.clone()),
             _ => resource.attributes.get(attribute).cloned(),
         }
+    }
+}
+
+/// `IamInstanceProfile` as CloudFormation writes it: either a bare string
+/// (profile name, or an ARN) or an object with `Arn` / `Name`. Returns
+/// `(arn, name)`.
+fn cfn_iam_instance_profile(props: &Value) -> (Option<String>, Option<String>) {
+    match props.get("IamInstanceProfile") {
+        Some(Value::String(s)) => {
+            // A bare string is the profile name (or an ARN); classify by prefix
+            // so both round-trip.
+            if s.starts_with("arn:") {
+                (Some(s.clone()), None)
+            } else {
+                (None, Some(s.clone()))
+            }
+        }
+        Some(Value::Object(o)) => (
+            o.get("Arn").and_then(|v| v.as_str()).map(String::from),
+            o.get("Name").and_then(|v| v.as_str()).map(String::from),
+        ),
+        _ => (None, None),
     }
 }
