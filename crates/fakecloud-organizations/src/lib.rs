@@ -3,7 +3,7 @@ pub mod resolver;
 pub(crate) mod service;
 pub(crate) mod state;
 
-pub use service::OrganizationsService;
+pub use service::{OrgChangeHook, OrgChangeHooks, OrganizationsService};
 pub use state::{
     MemberAccount, OrganizationState, OrganizationalUnit, OrganizationsSnapshot, Policy,
     ResponsibilityTransfer, SharedOrganizationsState, FEATURE_SET_ALL,

@@ -1918,3 +1918,120 @@ async fn invite_responsibility_transfer_rejects_bad_type() {
     );
     assert_eq!(err.code(), "InvalidInputException");
 }
+
+#[tokio::test]
+async fn a_mutation_that_changes_no_membership_notifies_nobody() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let state: SharedOrganizationsState = Arc::new(parking_lot::RwLock::new(None));
+    let hooks = OrgChangeHooks::new();
+    let fired = Arc::new(AtomicUsize::new(0));
+    {
+        let fired = fired.clone();
+        hooks.register(Arc::new(move || {
+            let fired = fired.clone();
+            Box::pin(async move {
+                fired.fetch_add(1, Ordering::SeqCst);
+            })
+        }));
+    }
+    // No organization at all: nothing to tell anyone about.
+    hooks.fire_if_membership_changed(&state).await;
+    assert_eq!(fired.load(Ordering::SeqCst), 0);
+
+    *state.write() = Some(OrganizationState::bootstrap("000000000000"));
+    hooks.fire_if_membership_changed(&state).await;
+    assert_eq!(fired.load(Ordering::SeqCst), 1);
+
+    // A tag is not a membership change.
+    state
+        .write()
+        .as_mut()
+        .unwrap()
+        .set_resource_tags("000000000000", &[("Env".to_string(), "dev".to_string())]);
+    hooks.fire_if_membership_changed(&state).await;
+    assert_eq!(fired.load(Ordering::SeqCst), 1);
+
+    // An account joining is.
+    state
+        .write()
+        .as_mut()
+        .unwrap()
+        .enroll_account_if_missing("111111111111");
+    hooks.fire_if_membership_changed(&state).await;
+    assert_eq!(fired.load(Ordering::SeqCst), 2);
+
+    // So is moving it, and so is an OU appearing for it to move into.
+    let (root, ou) = {
+        let mut guard = state.write();
+        let org = guard.as_mut().unwrap();
+        let root = org.root_id.clone();
+        let ou = org.create_ou(&root, "workloads").unwrap().id;
+        (root, ou)
+    };
+    hooks.fire_if_membership_changed(&state).await;
+    assert_eq!(fired.load(Ordering::SeqCst), 3);
+    state
+        .write()
+        .as_mut()
+        .unwrap()
+        .move_account("111111111111", &root, &ou)
+        .unwrap();
+    hooks.fire_if_membership_changed(&state).await;
+    assert_eq!(fired.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test]
+async fn a_membership_change_is_announced_even_after_a_reversal_races_it() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let state: SharedOrganizationsState = Arc::new(parking_lot::RwLock::new(Some(
+        OrganizationState::bootstrap("000000000000"),
+    )));
+    let hooks = OrgChangeHooks::new();
+    let fired = Arc::new(AtomicUsize::new(0));
+    {
+        let fired = fired.clone();
+        hooks.register(Arc::new(move || {
+            let fired = fired.clone();
+            Box::pin(async move {
+                fired.fetch_add(1, Ordering::SeqCst);
+            })
+        }));
+    }
+    let (root, ou) = {
+        let mut guard = state.write();
+        let org = guard.as_mut().unwrap();
+        org.enroll_account_if_missing("111111111111");
+        let root = org.root_id.clone();
+        let ou = org.create_ou(&root, "workloads").unwrap().id;
+        (root, ou)
+    };
+    hooks.fire_if_membership_changed(&state).await;
+    let base = fired.load(Ordering::SeqCst);
+
+    // Move out and straight back: the organization ends where it started,
+    // so what was recorded must describe that state, not the one in
+    // between — otherwise the next real move looks like no change.
+    {
+        let mut guard = state.write();
+        let org = guard.as_mut().unwrap();
+        org.move_account("111111111111", &root, &ou).unwrap();
+    }
+    hooks.fire_if_membership_changed(&state).await;
+    {
+        let mut guard = state.write();
+        let org = guard.as_mut().unwrap();
+        org.move_account("111111111111", &ou, &root).unwrap();
+    }
+    hooks.fire_if_membership_changed(&state).await;
+    let after_round_trip = fired.load(Ordering::SeqCst);
+    assert_eq!(after_round_trip, base + 2);
+
+    // The same move again is a real change and has to be announced.
+    {
+        let mut guard = state.write();
+        let org = guard.as_mut().unwrap();
+        org.move_account("111111111111", &root, &ou).unwrap();
+    }
+    hooks.fire_if_membership_changed(&state).await;
+    assert_eq!(fired.load(Ordering::SeqCst), after_round_trip + 1);
+}
