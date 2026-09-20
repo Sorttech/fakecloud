@@ -951,13 +951,16 @@ impl ResourceProvisioner {
             }
         }
         let arn = format!(
-            "arn:aws:iam::{}:instance-profile{}{}",
-            state.account_id, path, name
+            "arn:{}:iam::{}:instance-profile{}{}",
+            fakecloud_aws::arn::partition_for(&self.region),
+            state.account_id,
+            path,
+            name
         );
-        let id = format!(
-            "AIPA{}",
-            &Uuid::new_v4().to_string().replace('-', "").to_uppercase()[..16]
-        );
+        // Derived from the ARN, like the IAM service's own CreateInstanceProfile
+        // and the id EC2 renders on instances, so all three agree on one
+        // InstanceProfileId for one profile.
+        let id = fakecloud_aws::arn::unique_id_for("AIPA", &arn);
         state.instance_profiles.insert(
             name.clone(),
             IamInstanceProfile {

@@ -94,7 +94,9 @@ pub fn incorrect_state(message: impl Into<String>) -> AwsServiceError {
 /// profile's own id, so every association with the same profile reports the
 /// same value; EC2 cannot read IAM's store (`fakecloud-ec2` does not depend on
 /// `fakecloud-iam`), so both services derive it from the profile ARN through
-/// the same shared helper instead of minting it independently.
+/// the same shared helper instead of minting it independently. That holds
+/// whenever the two agree on the ARN: every profile addressed by ARN, and
+/// every name-addressed profile on the default path.
 pub fn instance_profile_id_for(arn: &str) -> String {
     fakecloud_aws::arn::unique_id_for("AIPA", arn)
 }

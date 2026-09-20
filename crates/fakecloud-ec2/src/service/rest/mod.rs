@@ -139,7 +139,10 @@ pub(crate) fn iam_profile_arn(req: &AwsRequest) -> Result<Option<String>, AwsSer
         }
         // IAM mints the profile ARN in the region's partition, so a name-based
         // association has to synthesize the same one or the ARNs never compare
-        // equal in cn-* / us-gov-* / us-iso*.
+        // equal outside the default partition. The one case this cannot match
+        // is a profile created under a non-default path: its IAM ARN carries
+        // that path, and EC2 has no way to resolve a bare name to it (this
+        // crate does not depend on fakecloud-iam). Pass the ARN for those.
         return Ok(Some(format!(
             "arn:{}:iam::{}:instance-profile/{name}",
             fakecloud_aws::arn::partition_for(&req.region),

@@ -240,14 +240,20 @@ fn security_credentials(ctx: &ImdsContext, role: &str) -> Response {
 /// `iam/info` -- the instance profile association.
 fn iam_info(ctx: &ImdsContext) -> Response {
     let creds = ctx.credentials();
+    let profile_arn = format!(
+        "arn:{}:iam::{}:instance-profile/{}",
+        ctx.partition(),
+        ctx.account_id,
+        ctx.role_name()
+    );
     Json(serde_json::json!({
         "Code": "Success",
         "LastUpdated": creds.issued_at_iso8601(),
-        "InstanceProfileArn": format!(
-            "arn:{}:iam::{}:instance-profile/{}",
-            ctx.partition(), ctx.account_id, ctx.role_name()
-        ),
-        "InstanceProfileId": "AIPAFAKECLOUDINSTPROF0",
+        "InstanceProfileArn": profile_arn,
+        // Derived from the ARN, so IMDS, IAM and DescribeInstances all report
+        // one InstanceProfileId for one profile (and its 21-character AWS
+        // shape, which the old constant was not).
+        "InstanceProfileId": fakecloud_aws::arn::unique_id_for("AIPA", &profile_arn),
     }))
     .into_response()
 }
@@ -304,6 +310,26 @@ mod tests {
     fn availability_zone_appends_a() {
         assert_eq!(ctx("us-east-1", "x").availability_zone(), "us-east-1a");
         assert_eq!(ctx("eu-west-2", "x").availability_zone(), "eu-west-2a");
+    }
+
+    #[test]
+    fn iam_info_profile_id_is_derived_from_the_profile_arn() {
+        // It was a 22-character constant, so it matched neither AWS's shape nor
+        // the id IAM and DescribeInstances report for the same profile.
+        let c = ctx("us-east-1", "arn:aws:iam::123456789012:role/app-role");
+        let arn = "arn:aws:iam::123456789012:instance-profile/app-role";
+        let id = fakecloud_aws::arn::unique_id_for("AIPA", arn);
+        assert_eq!(id.len(), 21, "{id}");
+
+        let body = iam_info(&c).into_body();
+        let bytes = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(axum::body::to_bytes(body, usize::MAX))
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["InstanceProfileArn"], arn);
+        assert_eq!(json["InstanceProfileId"], id);
     }
 
     #[test]
