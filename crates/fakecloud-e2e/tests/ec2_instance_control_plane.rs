@@ -769,3 +769,70 @@ async fn describe_instances_reports_iam_instance_profile_round_trip() {
         "profile must be gone after disassociate"
     );
 }
+
+#[tokio::test]
+async fn instance_reports_the_iam_profile_id_that_iam_assigned() {
+    // EC2 renders IamInstanceProfile.Id on the instance and filters on it, and
+    // IAM reports InstanceProfileId for the same profile. They have to be the
+    // same value: EC2 cannot read IAM's store, so both derive it from the
+    // profile ARN rather than minting one each.
+    let s = TestServer::start().await;
+    let ec2 = s.ec2_client().await;
+    let iam = s.iam_client().await;
+
+    let created = iam
+        .create_instance_profile()
+        .instance_profile_name("shared-profile")
+        .send()
+        .await
+        .unwrap();
+    let profile = created.instance_profile().expect("instance profile");
+    let iam_id = profile.instance_profile_id().to_string();
+    let iam_arn = profile.arn().to_string();
+
+    let id = run(&ec2, 1, 1).await.remove(0);
+    ec2.associate_iam_instance_profile()
+        .instance_id(&id)
+        .iam_instance_profile(
+            aws_sdk_ec2::types::IamInstanceProfileSpecification::builder()
+                .arn(&iam_arn)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    let desc = ec2
+        .describe_instances()
+        .instance_ids(&id)
+        .send()
+        .await
+        .unwrap();
+    let rendered = desc.reservations()[0].instances()[0]
+        .iam_instance_profile()
+        .expect("profile on instance");
+    assert_eq!(rendered.arn(), Some(iam_arn.as_str()));
+    assert_eq!(
+        rendered.id(),
+        Some(iam_id.as_str()),
+        "EC2 and IAM must report one id for one profile"
+    );
+
+    // And the filter over that id selects the instance.
+    let filtered = ec2
+        .describe_instances()
+        .filters(
+            aws_sdk_ec2::types::Filter::builder()
+                .name("iam-instance-profile.id")
+                .values(&iam_id)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert!(filtered
+        .reservations()
+        .iter()
+        .flat_map(|r| r.instances())
+        .any(|i| i.instance_id() == Some(id.as_str())));
+}

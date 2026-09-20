@@ -146,13 +146,16 @@ async fn postgres_pod_exec_readiness_query_and_dump() {
     // Require the query itself to succeed, the only signal that outlives that
     // restart.
     let mut query = None;
+    // Keep the last failure so a real regression (renamed container, bad auth,
+    // missing binary) reports its own error instead of a bare timeout.
+    let mut last_err = "no attempt completed".to_string();
     for _ in 0..60 {
-        if let Ok(out) = c
+        match c
             .exec(name, Some("db"), &["pg_isready", "-U", "postgres"])
             .await
         {
-            if out.success() {
-                if let Ok(q) = c
+            Ok(out) if out.success() => {
+                match c
                     .exec(
                         name,
                         Some("db"),
@@ -160,16 +163,21 @@ async fn postgres_pod_exec_readiness_query_and_dump() {
                     )
                     .await
                 {
-                    if q.success() {
+                    Ok(q) if q.success() => {
                         query = Some(q);
                         break;
                     }
+                    Ok(q) => last_err = format!("psql failed: {}", q.stderr),
+                    Err(e) => last_err = format!("psql exec failed: {e}"),
                 }
             }
+            Ok(out) => last_err = format!("pg_isready not ready: {}", out.stderr),
+            Err(e) => last_err = format!("pg_isready exec failed: {e}"),
         }
         tokio::time::sleep(Duration::from_millis(1000)).await;
     }
-    let q = query.expect("postgres did not become ready (pg_isready + psql SELECT 1)");
+    let q = query
+        .unwrap_or_else(|| panic!("postgres did not become ready in 60s; last error: {last_err}"));
     assert!(q.stdout_str().contains('1'));
 
     // The dump path RDS uses: pg_dump via exec produces a non-empty dump.

@@ -7,8 +7,8 @@ use fakecloud_core::validation::*;
 use crate::state::IamInstanceProfile;
 
 use super::{
-    empty_response, generate_id, paginated_tags_response, parse_tag_keys, parse_tags,
-    partition_for_region, tags_xml, url_encode, validate_tags, validate_untag_keys, IamService,
+    empty_response, paginated_tags_response, parse_tag_keys, parse_tags, partition_for_region,
+    tags_xml, url_encode, validate_tags, validate_untag_keys, IamService,
 };
 use fakecloud_core::query::required_param;
 
@@ -39,15 +39,19 @@ impl IamService {
         }
 
         let partition = partition_for_region(&req.region);
+        let arn = format!(
+            "arn:{}:iam::{}:instance-profile{}{}",
+            partition,
+            state.account_id,
+            if path == "/" { "/" } else { &path },
+            name
+        );
         let ip = IamInstanceProfile {
-            instance_profile_id: format!("AIPA{}", generate_id()),
-            arn: format!(
-                "arn:{}:iam::{}:instance-profile{}{}",
-                partition,
-                state.account_id,
-                if path == "/" { "/" } else { &path },
-                name
-            ),
+            // Derived from the ARN, not minted randomly, so EC2 reports the
+            // same InstanceProfileId on instances this profile is attached to
+            // (it resolves the profile by ARN and cannot read this store).
+            instance_profile_id: fakecloud_aws::arn::unique_id_for("AIPA", &arn),
+            arn,
             instance_profile_name: name.clone(),
             path,
             created_at: Utc::now(),

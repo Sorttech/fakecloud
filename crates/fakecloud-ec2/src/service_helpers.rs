@@ -90,28 +90,13 @@ pub fn incorrect_state(message: impl Into<String>) -> AwsServiceError {
     AwsServiceError::aws_error(StatusCode::BAD_REQUEST, "IncorrectState", message.into())
 }
 
-/// The `InstanceProfileId` reported for an instance profile, derived from its
-/// ARN so every association with the same profile reports the same id (AWS
-/// reports the profile's own id, which two instances on one profile share).
-/// EC2 cannot read IAM's store — `fakecloud-ec2` does not depend on
-/// `fakecloud-iam` — so the id is a stable function of the ARN rather than the
-/// value IAM minted; the shape is AWS's (`AIPA` + 17 uppercase alphanumerics).
+/// The `InstanceProfileId` reported for an instance profile. AWS reports the
+/// profile's own id, so every association with the same profile reports the
+/// same value; EC2 cannot read IAM's store (`fakecloud-ec2` does not depend on
+/// `fakecloud-iam`), so both services derive it from the profile ARN through
+/// the same shared helper instead of minting it independently.
 pub fn instance_profile_id_for(arn: &str) -> String {
-    // FNV-1a over the ARN, rendered in base36 and padded, so the id is stable
-    // across restarts and processes (a random or hash-map-seeded value is not).
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in arn.as_bytes() {
-        hash ^= u64::from(*b);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-    let mut suffix = String::with_capacity(17);
-    for i in 0..17 {
-        // Stir between characters so all 17 vary with the whole hash.
-        let shifted = hash.rotate_left((i * 5) as u32);
-        suffix.push(ALPHABET[(shifted % ALPHABET.len() as u64) as usize] as char);
-    }
-    format!("AIPA{suffix}")
+    fakecloud_aws::arn::unique_id_for("AIPA", arn)
 }
 
 /// `InvalidIamInstanceProfileArn.Malformed` (HTTP 400) — the supplied IAM
