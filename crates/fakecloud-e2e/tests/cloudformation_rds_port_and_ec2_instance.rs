@@ -139,6 +139,23 @@ const PROFILE_TEMPLATE: &str = r#"{
   }
 }"#;
 
+async fn instance_association_id(ec2: &aws_sdk_ec2::Client, id: &str) -> Option<String> {
+    ec2.describe_iam_instance_profile_associations()
+        .filters(
+            aws_sdk_ec2::types::Filter::builder()
+                .name("instance-id")
+                .values(id)
+                .build(),
+        )
+        .send()
+        .await
+        .expect("describe_iam_instance_profile_associations")
+        .iam_instance_profile_associations()
+        .first()
+        .and_then(|a| a.association_id())
+        .map(str::to_string)
+}
+
 async fn instance_profile_arn(ec2: &aws_sdk_ec2::Client, id: &str) -> Option<String> {
     ec2.describe_instances()
         .instance_ids(id)
@@ -185,6 +202,28 @@ async fn cfn_update_swaps_the_ec2_instance_profile_in_place() {
         Some("arn:aws:iam::123456789012:instance-profile/web-profile")
     );
 
+    let before = instance_association_id(&ec2, &id)
+        .await
+        .expect("association");
+
+    // An update that leaves IamInstanceProfile alone must not retire the
+    // association: AWS only touches it when the profile itself changes.
+    cfn.update_stack()
+        .stack_name("profile-update-stack")
+        .template_body(
+            PROFILE_TEMPLATE
+                .replace("PROFILE", "web-profile")
+                .replace("t3.micro", "t3.small"),
+        )
+        .capabilities(Capability::CapabilityIam)
+        .send()
+        .await
+        .expect("update_stack");
+    assert_eq!(
+        instance_association_id(&ec2, &id).await.as_deref(),
+        Some(&*before)
+    );
+
     cfn.update_stack()
         .stack_name("profile-update-stack")
         .template_body(PROFILE_TEMPLATE.replace("PROFILE", "admin-profile"))
@@ -207,4 +246,30 @@ async fn cfn_update_swaps_the_ec2_instance_profile_in_place() {
         instance_profile_arn(&ec2, &id).await.as_deref(),
         Some("arn:aws:iam::123456789012:instance-profile/admin-profile")
     );
+}
+
+#[tokio::test]
+async fn cfn_rejects_an_instance_profile_that_is_not_an_instance_profile() {
+    // `{"Fn::GetAtt": ["Role", "Arn"]}` resolves to a role ARN, a common
+    // template mistake. Storing it made the stack un-updatable later, because
+    // the value could not be re-submitted through the validating handler.
+    let server = TestServer::start().await;
+    let cfn = server.cloudformation_client().await;
+
+    cfn.create_stack()
+        .stack_name("bad-profile-stack")
+        .template_body(PROFILE_TEMPLATE.replace("PROFILE", "arn:aws:iam::123456789012:role/web"))
+        .capabilities(Capability::CapabilityIam)
+        .send()
+        .await
+        .expect("create_stack");
+
+    let described = cfn
+        .describe_stacks()
+        .stack_name("bad-profile-stack")
+        .send()
+        .await
+        .expect("describe_stacks");
+    let stack = described.stacks().first().expect("stack present");
+    assert_eq!(stack.stack_status().unwrap().as_str(), "CREATE_FAILED");
 }

@@ -515,6 +515,11 @@ impl ResourceProvisioner {
             });
 
         let (iam_instance_profile_arn, iam_instance_profile_name) = cfn_iam_instance_profile(props);
+        // Validate here, the way Associate/Replace do, so a template that
+        // resolves IamInstanceProfile to a role ARN (a common Fn::GetAtt
+        // mistake) fails the create instead of storing a value the next
+        // UpdateStack cannot re-submit.
+        validate_cfn_iam_instance_profile(&iam_instance_profile_arn, &iam_instance_profile_name)?;
 
         let spec = fakecloud_ec2::cfn_provision::CfnInstanceSpec {
             image_id: prop_str(props, "ImageId").map(String::from),
@@ -669,6 +674,7 @@ impl ResourceProvisioner {
     /// the property.
     fn sync_ec2_instance_profile(&self, props: &Value, instance_id: &str) -> Result<(), String> {
         let (arn, name) = cfn_iam_instance_profile(props);
+        validate_cfn_iam_instance_profile(&arn, &name)?;
         let wanted = arn
             .map(|a| ("IamInstanceProfile.Arn", a))
             .or_else(|| name.map(|n| ("IamInstanceProfile.Name", n)));
@@ -677,11 +683,8 @@ impl ResourceProvisioner {
         lookup.insert("Filter.1.Name".to_string(), "instance-id".to_string());
         lookup.insert("Filter.1.Value.1".to_string(), instance_id.to_string());
         let existing = self.ec2_dispatch("DescribeIamInstanceProfileAssociations", lookup)?;
-        let existing_id = existing
-            .split("<associationId>")
-            .nth(1)
-            .and_then(|s| s.split("</associationId>").next())
-            .map(str::to_string);
+        let existing_id = xml_elem(&existing, "associationId");
+        let existing_arn = xml_elem(&existing, "arn");
 
         match (wanted, existing_id) {
             (None, None) => Ok(()),
@@ -692,6 +695,18 @@ impl ResourceProvisioner {
                 Ok(())
             }
             (Some((key, value)), Some(id)) => {
+                // An in-place update runs for any changed property, so only
+                // replace when the profile itself changed. Replacing anyway
+                // would retire the association id on an unrelated edit (an
+                // InstanceType bump, a new tag), which AWS leaves alone.
+                let unchanged = existing_arn.as_deref().is_some_and(|arn| {
+                    arn == value
+                        || (key == "IamInstanceProfile.Name"
+                            && arn.rsplit('/').next() == Some(value.as_str()))
+                });
+                if unchanged {
+                    return Ok(());
+                }
                 let mut params = HashMap::new();
                 params.insert("AssociationId".to_string(), id);
                 params.insert(key.to_string(), value);
@@ -765,4 +780,23 @@ fn cfn_iam_instance_profile(props: &Value) -> (Option<String>, Option<String>) {
         ),
         _ => (None, None),
     }
+}
+
+/// Reject an `IamInstanceProfile` the EC2 handlers would reject, so a bad
+/// template value fails the stack operation rather than being stored.
+fn validate_cfn_iam_instance_profile(
+    arn: &Option<String>,
+    name: &Option<String>,
+) -> Result<(), String> {
+    if let Some(arn) = arn {
+        if !fakecloud_ec2::service_helpers::is_instance_profile_arn(arn) {
+            return Err(format!("The IAM instance profile ARN '{arn}' is malformed"));
+        }
+    }
+    if let Some(name) = name {
+        if !fakecloud_ec2::service_helpers::is_instance_profile_name(name) {
+            return Err(format!("Invalid IAM Instance Profile name: {name}"));
+        }
+    }
+    Ok(())
 }

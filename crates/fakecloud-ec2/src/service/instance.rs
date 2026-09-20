@@ -925,7 +925,10 @@ pub(crate) fn cfn_create_instance(
         if spec.iam_instance_profile_arn.is_some() || spec.iam_instance_profile_name.is_some() {
             let arn = spec.iam_instance_profile_arn.clone().unwrap_or_else(|| {
                 let name = spec.iam_instance_profile_name.clone().unwrap_or_default();
-                format!("arn:aws:iam::{account_id}:instance-profile/{name}")
+                format!(
+                    "arn:{}:iam::{account_id}:instance-profile/{name}",
+                    fakecloud_aws::arn::partition_for(region)
+                )
             });
             let assoc = super::rest::new_iam_profile_association(id.clone(), arn);
             state

@@ -16,8 +16,8 @@ pub(crate) use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceErro
 
 pub(crate) use crate::service::Ec2Service;
 pub(crate) use crate::service_helpers::{
-    association_not_found, aws_unique_id, filter_value_matches, gen_id, incorrect_instance_state,
-    incorrect_state, indexed_list, instance_not_found, invalid_parameter_value,
+    association_not_found, filter_value_matches, gen_id, incorrect_instance_state, incorrect_state,
+    indexed_list, instance_not_found, instance_profile_id_for, invalid_parameter_value,
     is_instance_profile_arn, is_instance_profile_name, malformed_instance_profile_arn,
     missing_parameter, parse_filters, require, require_struct, validate_enum, validate_int_range,
     validate_length, validate_max_results, Filter,
@@ -137,8 +137,12 @@ pub(crate) fn iam_profile_arn(req: &AwsRequest) -> Result<Option<String>, AwsSer
                 "Invalid IAM Instance Profile name: {name}"
             )));
         }
+        // IAM mints the profile ARN in the region's partition, so a name-based
+        // association has to synthesize the same one or the ARNs never compare
+        // equal in cn-* / us-gov-* / us-iso*.
         return Ok(Some(format!(
-            "arn:aws:iam::{}:instance-profile/{name}",
+            "arn:{}:iam::{}:instance-profile/{name}",
+            fakecloud_aws::arn::partition_for(&req.region),
             req.account_id
         )));
     }
@@ -156,8 +160,8 @@ pub(crate) fn new_iam_profile_association(
     IamInstanceProfileAssociation {
         association_id: gen_id("iip-assoc"),
         instance_id,
+        iam_instance_profile_id: instance_profile_id_for(&profile_arn),
         iam_instance_profile_arn: profile_arn,
-        iam_instance_profile_id: aws_unique_id("AIPA"),
         state: "associated".to_string(),
     }
 }
@@ -806,16 +810,13 @@ pub(crate) fn describe_iam_instance_profile_associations(
     // The terraform AWS provider reads an instance's profile by filtering on
     // `instance-id` and taking the first item, so honoring `Filter.N` is what
     // keeps it from picking up another instance's association.
-    let mut matching: Vec<&IamInstanceProfileAssociation> = state
+    // The backing map is a BTreeMap keyed by association id, so iterating it
+    // already yields a stable order.
+    let items: Vec<String> = state
         .iam_instance_profile_associations
         .values()
         .filter(|a| wanted.is_empty() || wanted.contains(&a.association_id))
         .filter(|a| iam_assoc_match(a, &filters))
-        .collect();
-    // The backing map is unordered; sort so repeated describes agree.
-    matching.sort_by(|a, b| a.association_id.cmp(&b.association_id));
-    let items: Vec<String> = matching
-        .into_iter()
         .map(|a| iam_profile_assoc_xml(a, &a.state))
         .collect();
     Ok(Ec2Service::respond(
@@ -3000,6 +3001,50 @@ mod tests {
         );
         assert!(
             out.contains("<arn>arn:aws:iam::000000000000:instance-profile/team/web</arn>"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn instance_profile_id_is_shared_by_every_association_with_that_profile() {
+        // AWS reports the *profile's* InstanceProfileId, so two instances on
+        // one profile report the same id and re-pointing at the same profile
+        // keeps it. A per-association random id made the new
+        // `iam-instance-profile.id` filter unable to select both.
+        let svc = Ec2Service::new();
+        seed_instance(&svc, "i-a");
+        seed_instance(&svc, "i-b");
+        let id_of = |xml: &str| {
+            xml.split("<id>")
+                .nth(1)
+                .and_then(|s| s.split("</id>").next())
+                .expect("profile id")
+                .to_string()
+        };
+        seed_instance(&svc, "i-c");
+        let a = id_of(&associate_profile(&svc, "i-a", "web-role"));
+        let b = id_of(&associate_profile(&svc, "i-b", "web-role"));
+        assert_eq!(a, b);
+        assert_ne!(a, id_of(&associate_profile(&svc, "i-c", "other-role")));
+    }
+
+    #[test]
+    fn name_based_profile_arn_uses_the_regions_partition() {
+        // IAM mints the profile ARN in the region's partition; synthesizing
+        // `arn:aws:` in cn-* / us-gov-* would never compare equal to it.
+        let svc = Ec2Service::new();
+        seed_instance(&svc, "i-123");
+        let mut r = req(
+            "AssociateIamInstanceProfile",
+            &[
+                ("InstanceId", "i-123"),
+                ("IamInstanceProfile.Name", "web-role"),
+            ],
+        );
+        r.region = "cn-north-1".to_string();
+        let out = body(associate_iam_instance_profile(&svc, &r).unwrap());
+        assert!(
+            out.contains("<arn>arn:aws-cn:iam::000000000000:instance-profile/web-role</arn>"),
             "{out}"
         );
     }
