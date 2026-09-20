@@ -138,32 +138,38 @@ async fn postgres_pod_exec_readiness_query_and_dump() {
         .await
         .expect("pg pod Running");
 
-    // Readiness via exec pg_isready (API-server path, no pod-IP routing).
-    let mut ready = false;
+    // Readiness via exec (API-server path, no pod-IP routing). `pg_isready`
+    // alone is not enough: the postgres image runs a temporary server on its
+    // own socket while initdb runs, then stops it and starts the real one, so
+    // pg_isready can answer yes and the very next command still fails with
+    // `connection to server on socket ... failed: No such file or directory`.
+    // Require the query itself to succeed, the only signal that outlives that
+    // restart.
+    let mut query = None;
     for _ in 0..60 {
         if let Ok(out) = c
             .exec(name, Some("db"), &["pg_isready", "-U", "postgres"])
             .await
         {
             if out.success() {
-                ready = true;
-                break;
+                if let Ok(q) = c
+                    .exec(
+                        name,
+                        Some("db"),
+                        &["psql", "-U", "postgres", "-tAc", "SELECT 1"],
+                    )
+                    .await
+                {
+                    if q.success() {
+                        query = Some(q);
+                        break;
+                    }
+                }
             }
         }
         tokio::time::sleep(Duration::from_millis(1000)).await;
     }
-    assert!(ready, "postgres did not become ready via pg_isready");
-
-    // A query through exec psql.
-    let q = c
-        .exec(
-            name,
-            Some("db"),
-            &["psql", "-U", "postgres", "-tAc", "SELECT 1"],
-        )
-        .await
-        .expect("psql query");
-    assert!(q.success(), "psql failed: {}", q.stderr);
+    let q = query.expect("postgres did not become ready (pg_isready + psql SELECT 1)");
     assert!(q.stdout_str().contains('1'));
 
     // The dump path RDS uses: pg_dump via exec produces a non-empty dump.
