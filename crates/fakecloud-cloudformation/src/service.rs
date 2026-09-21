@@ -613,6 +613,95 @@ pub struct CloudFormationService {
     /// call would trigger. Empty by default (memory mode, or no services
     /// wired); the server populates it via `with_snapshot_hooks`.
     pub(crate) snapshot_hooks: BTreeMap<&'static str, SnapshotHook>,
+    /// Serializes StackSets auto-deployment (see
+    /// `reconcile_auto_deployments`): one reconciliation runs at a time, and a
+    /// trigger that arrives while one is in flight sets `pending` so it is
+    /// served by a further pass instead of being dropped. Both flags live
+    /// under one lock, so a trigger can never land between the running pass
+    /// reading `pending` and releasing `running`.
+    pub(crate) auto_deployment_gate: Arc<parking_lot::Mutex<AutoDeploymentGate>>,
+    /// Stack sets (by admin account and id) that already have a task waiting
+    /// for them to go idle, so a burst of organization changes against a busy
+    /// stack set cannot pile up one poller per change.
+    pub(crate) auto_deployment_retries: Arc<parking_lot::Mutex<BTreeSet<(String, String)>>>,
+}
+
+#[derive(Default)]
+pub(crate) struct AutoDeploymentGate {
+    pub(crate) running: bool,
+    pub(crate) pending: bool,
+}
+
+/// Holds the right to run a reconciliation, releasing it on drop so a
+/// cancelled request (a client that hung up mid-mutation) cannot leave
+/// auto-deployment permanently marked as running.
+pub(crate) struct AutoDeploymentClaim {
+    service: CloudFormationService,
+    released: bool,
+}
+
+impl AutoDeploymentClaim {
+    /// Claim the right to reconcile, or record that another pass is owed and
+    /// return `None` because one is already running. The claim covers every
+    /// trigger up to this moment, so it takes the pending flag with it.
+    pub(crate) fn take(service: &CloudFormationService) -> Option<Self> {
+        let mut guard = service.auto_deployment_gate.lock();
+        if guard.running {
+            guard.pending = true;
+            return None;
+        }
+        guard.running = true;
+        guard.pending = false;
+        drop(guard);
+        Some(Self {
+            service: service.clone(),
+            released: false,
+        })
+    }
+
+    /// Decide, under one lock, whether the pass that just finished owes
+    /// another: either the claim keeps the run (a trigger landed while it was
+    /// working) or it releases it. Taking both decisions together is what
+    /// stops a trigger slipping between "nothing pending" and "not running",
+    /// which would strand the reconciliation it asked for. The flag is left
+    /// set for the next lap to consume, so a claim dropped before that lap
+    /// runs (a cancelled request) still leaves the trigger recorded.
+    pub(crate) fn another_pass_owed(&mut self) -> bool {
+        let mut guard = self.service.auto_deployment_gate.lock();
+        if guard.pending {
+            return true;
+        }
+        guard.running = false;
+        drop(guard);
+        self.released = true;
+        false
+    }
+}
+
+impl Drop for AutoDeploymentClaim {
+    fn drop(&mut self) {
+        // Released: the reconciliation ran to the end and found nothing more
+        // owed, so there is nothing to carry on.
+        if self.released {
+            return;
+        }
+        self.service.auto_deployment_gate.lock().running = false;
+        // A pass that panicked would panic again: carrying it on would spin
+        // on the same failure forever. Let it surface as the panic it is.
+        if std::thread::panicking() {
+            return;
+        }
+        // Otherwise the claim is being dropped mid-run: the request that was
+        // reconciling was cancelled (a client that hung up). Releasing the
+        // gate is not enough — the pass it was serving, and any trigger that
+        // arrived during it, would go unserved with nobody left to notice —
+        // so the work carries on in a task of its own, which no request can
+        // cancel.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let service = self.service.clone();
+            handle.spawn(async move { service.reconcile_auto_deployments().await });
+        }
+    }
 }
 
 /// Everything the async CreateStack provisioning task needs to provision
@@ -1019,6 +1108,8 @@ impl CloudFormationService {
             snapshot_lock: Arc::new(AsyncMutex::new(())),
             s3_store: Arc::new(fakecloud_persistence::s3::MemoryS3Store::new()),
             snapshot_hooks: BTreeMap::new(),
+            auto_deployment_gate: Arc::new(parking_lot::Mutex::new(AutoDeploymentGate::default())),
+            auto_deployment_retries: Arc::new(parking_lot::Mutex::new(BTreeSet::new())),
         }
     }
 

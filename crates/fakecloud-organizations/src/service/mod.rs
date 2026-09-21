@@ -1,3 +1,5 @@
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -100,10 +102,142 @@ pub static ORGANIZATIONS_ACTIONS: &[&str] = &[
     "ListOutboundResponsibilityTransfers",
 ];
 
+/// Called after a mutation that may have changed which accounts the
+/// organization contains, or where they sit in the OU tree. Observers
+/// re-read the organization themselves and reconcile against it, so the hook
+/// carries no payload and is safe to fire more often than strictly needed.
+pub type OrgChangeHook = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+/// The set of observers notified of organization changes.
+///
+/// CloudFormation registers one to run StackSets auto-deployment: an account
+/// joining (or leaving) an OU a service-managed stack set targets has to gain
+/// (or lose) that stack set's instances. The registry is a shared handle so
+/// the server can build Organizations first and install the CloudFormation
+/// observer once that service exists.
+#[derive(Clone, Default)]
+pub struct OrgChangeHooks {
+    hooks: Arc<parking_lot::RwLock<Vec<OrgChangeHook>>>,
+    /// Fingerprint of the organization the observers were last told about, so
+    /// a mutation that changed nothing they care about costs nothing.
+    seen: Arc<parking_lot::Mutex<Option<u64>>>,
+}
+
+/// Everything an observer reacts to: which accounts exist, where they sit and
+/// whether they are active, and the shape of the OU tree they sit in.
+fn membership_fingerprint(org: &OrganizationState) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    org.org_id.hash(&mut hasher);
+    org.management_account_id.hash(&mut hasher);
+    for account in org.accounts.values() {
+        account.id.hash(&mut hasher);
+        account.parent_id.hash(&mut hasher);
+        account.status.hash(&mut hasher);
+    }
+    for ou in org.ous.values() {
+        ou.id.hash(&mut hasher);
+        ou.parent_id.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+impl OrgChangeHooks {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register(&self, hook: OrgChangeHook) {
+        self.hooks.write().push(hook);
+    }
+
+    /// Fire only when the organization's membership actually differs from
+    /// what the observers were last told. Most mutations (a tag, a policy, a
+    /// handshake that is still open) leave it untouched, and a stack set
+    /// reconciliation is far too heavy to run on each of those.
+    pub async fn fire_if_membership_changed(&self, state: &SharedOrganizationsState) {
+        // Read the organization under the same lock that records it. Reading
+        // first would let two concurrent mutations record a fingerprint for a
+        // state the organization has already left, after which the change
+        // that takes it back there looks like no change at all and is never
+        // announced.
+        let (previous, claimed) = {
+            let mut seen = self.seen.lock();
+            let fingerprint = state.read().as_ref().map(membership_fingerprint);
+            if *seen == fingerprint {
+                return;
+            }
+            let previous = *seen;
+            // Claim it up front, so a mutation racing this one does not
+            // announce the same state twice.
+            *seen = fingerprint;
+            (previous, fingerprint)
+        };
+        let claim = FingerprintClaim {
+            seen: self.seen.clone(),
+            previous,
+            claimed,
+            announced: false,
+        };
+        self.fire().await;
+        claim.announced();
+    }
+
+    /// Run every registered observer to completion. Awaited by the mutation
+    /// that triggered it, so a caller that has just moved an account sees the
+    /// resulting deployment already done when the call returns. A registry
+    /// with no observers costs one lock.
+    pub async fn fire(&self) {
+        let hooks: Vec<OrgChangeHook> = self.hooks.read().clone();
+        for hook in hooks {
+            hook().await;
+        }
+    }
+}
+
+/// Holds a fingerprint claimed for announcement. If the caller is cancelled
+/// before the observers have run, it puts back what was there so the change
+/// is announced again rather than being remembered as already handled.
+struct FingerprintClaim {
+    seen: Arc<parking_lot::Mutex<Option<u64>>>,
+    previous: Option<u64>,
+    claimed: Option<u64>,
+    announced: bool,
+}
+
+impl FingerprintClaim {
+    fn announced(mut self) {
+        self.announced = true;
+    }
+}
+
+impl Drop for FingerprintClaim {
+    fn drop(&mut self) {
+        if self.announced {
+            return;
+        }
+        let mut seen = self.seen.lock();
+        // Only roll back what is still ours: a later change has its own
+        // claim and must keep it.
+        if *seen == self.claimed {
+            *seen = self.previous;
+        }
+    }
+}
+
+impl std::fmt::Debug for OrgChangeHooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OrgChangeHooks")
+            .field("observers", &self.hooks.read().len())
+            .finish()
+    }
+}
+
 pub struct OrganizationsService {
     state: SharedOrganizationsState,
     pub(crate) snapshot_store: Option<Arc<dyn SnapshotStore>>,
     pub(crate) snapshot_lock: Arc<AsyncMutex<()>>,
+    pub(crate) change_hooks: OrgChangeHooks,
 }
 
 mod accounts;
@@ -124,12 +258,24 @@ impl OrganizationsService {
             state,
             snapshot_store: None,
             snapshot_lock: Arc::new(AsyncMutex::new(())),
+            change_hooks: OrgChangeHooks::new(),
         }
     }
 
     pub fn with_snapshot_store(mut self, store: Arc<dyn SnapshotStore>) -> Self {
         self.snapshot_store = Some(store);
         self
+    }
+
+    /// Share a change-hook registry with the server, which installs observers
+    /// into it after the services that react to organization changes exist.
+    pub fn with_change_hooks(mut self, hooks: OrgChangeHooks) -> Self {
+        self.change_hooks = hooks;
+        self
+    }
+
+    pub fn change_hooks(&self) -> OrgChangeHooks {
+        self.change_hooks.clone()
     }
 
     pub fn shared() -> (Arc<Self>, SharedOrganizationsState) {
@@ -351,6 +497,15 @@ impl AwsService for OrganizationsService {
         };
         if mutates && matches!(result.as_ref(), Ok(resp) if resp.status.is_success()) {
             self.save_snapshot().await;
+            // Any successful mutation can have moved an account between OUs,
+            // added one to the organization or taken one out. Observers
+            // reconcile against the organization rather than against a diff,
+            // so this cannot miss a placement change (StackSets
+            // auto-deployment depends on seeing all of them), and the ones
+            // that changed nothing they care about are filtered out here.
+            self.change_hooks
+                .fire_if_membership_changed(&self.state)
+                .await;
         }
         result
     }

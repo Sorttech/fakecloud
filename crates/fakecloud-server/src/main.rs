@@ -2379,19 +2379,46 @@ async fn main() {
         } else {
             None
         };
-    let mut organizations_inner = OrganizationsService::new(organizations_state.clone());
+    // Observers of organization membership changes. Installed further down,
+    // once the services that react to them exist (CloudFormation StackSets
+    // auto-deployment); Organizations fires whatever is registered by then.
+    let org_change_hooks = fakecloud_organizations::OrgChangeHooks::new();
+    let mut organizations_inner = OrganizationsService::new(organizations_state.clone())
+        .with_change_hooks(org_change_hooks.clone());
     if let Some(store) = organizations_snapshot_store.clone() {
         organizations_inner = organizations_inner.with_snapshot_store(store);
     }
-    if let Some(h) = organizations_inner.snapshot_hook() {
-        cfn_snapshot_hooks.insert("organizations", h);
+    // The CloudFormation provisioner mutates Organizations state directly
+    // (an `AWS::Organizations::Account` resource, say) instead of going
+    // through the service, so this hook is its only notification: persist the
+    // change, then let StackSets auto-deployment react to the membership the
+    // stack just changed.
+    {
+        let persist = organizations_inner.snapshot_hook();
+        let changed = org_change_hooks.clone();
+        let orgs_state = organizations_state.clone();
+        cfn_snapshot_hooks.insert(
+            "organizations",
+            Arc::new(move || {
+                let persist = persist.clone();
+                let changed = changed.clone();
+                let orgs_state = orgs_state.clone();
+                Box::pin(async move {
+                    if let Some(persist) = &persist {
+                        persist().await;
+                    }
+                    // Every stack operation runs this hook, so it has to be
+                    // free unless the stack really did change membership.
+                    changed.fire_if_membership_changed(&orgs_state).await;
+                })
+            }),
+        );
     }
-    // Re-arm CreateAccount completion ticks for requests restored as IN_PROGRESS.
-    organizations_inner.rearm_in_progress_account_creations();
     // Hook shared with the create-admin admin endpoint, which auto-enrolls an
     // account into the org directly and must persist that through to disk.
     let organizations_persist_hook = organizations_inner.snapshot_hook();
-    registry.register(Arc::new(organizations_inner));
+    let organizations_service = Arc::new(organizations_inner);
+    registry.register(organizations_service.clone());
     // EC2 (ec2Query protocol). Instances are backed by the optional container
     // runtime (Docker/Podman); persistence is wired in later batches. We keep a
     // clone of the shared state so the introspection router can expose
@@ -6861,6 +6888,20 @@ async fn main() {
     // provisioners one resource at a time via this service.
     let cloudformation_arc = Arc::new(cloudformation_service);
     registry.register(cloudformation_arc.clone());
+    // StackSets auto-deployment: an account added to (or removed from) an OU a
+    // service-managed stack set targets gains (or loses) its stack instances.
+    {
+        let cfn = cloudformation_arc.clone();
+        org_change_hooks.register(Arc::new(move || {
+            let cfn = cfn.clone();
+            Box::pin(async move { cfn.reconcile_auto_deployments().await })
+        }));
+    }
+    // Re-arm CreateAccount completion ticks for requests restored as
+    // IN_PROGRESS. Done here, after the observers are registered: the tick
+    // fires a second or two later and enrolls the account, which is a
+    // membership change auto-deployment has to see.
+    organizations_service.rearm_in_progress_account_creations();
 
     // Cloud Control API (cloudcontrolapi): uniform CRUD+L over every CFN
     // resource type, delegating to the CloudFormation provisioner bridge.
@@ -11601,11 +11642,17 @@ async fn main() {
                 let iam = iam_state.clone();
                 let orgs = organizations_state.clone();
                 let persist = organizations_persist_hook.clone();
+                let changed = org_change_hooks.clone();
                 move |axum::Json(body): axum::Json<types::CreateAdminRequest>| {
                     let iam = iam.clone();
                     let orgs = orgs.clone();
                     let persist = persist.clone();
+                    let changed = changed.clone();
                     async move {
+                        let was_member = orgs
+                            .read()
+                            .as_ref()
+                            .is_some_and(|org| org.accounts.contains_key(&body.account_id));
                         let resp = reset::create_admin_in_account(
                             &iam,
                             &orgs,
@@ -11616,6 +11663,11 @@ async fn main() {
                         // persist that mutation through to disk.
                         if let Some(hook) = &persist {
                             hook().await;
+                        }
+                        // ...and an account that just joined the root OU can
+                        // be a stack set's auto-deployment target.
+                        if !was_member {
+                            changed.fire_if_membership_changed(&orgs).await;
                         }
                         axum::Json(resp)
                     }

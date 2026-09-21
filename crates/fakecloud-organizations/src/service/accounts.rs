@@ -134,6 +134,7 @@ impl OrganizationsService {
         let state = self.state.clone();
         let store = self.snapshot_store.clone();
         let lock = self.snapshot_lock.clone();
+        let hooks = self.change_hooks.clone();
         let delay = {
             let mut rng = rand::thread_rng();
             let span = CREATE_ACCOUNT_MAX_DELAY.saturating_sub(CREATE_ACCOUNT_MIN_DELAY);
@@ -158,6 +159,9 @@ impl OrganizationsService {
             };
             if completed {
                 super::save_organizations_snapshot(&state, store, &lock).await;
+                // The account only joins the organization here, so this is
+                // where StackSets auto-deployment gets to see it.
+                hooks.fire_if_membership_changed(&state).await;
             }
         });
     }
