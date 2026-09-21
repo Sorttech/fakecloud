@@ -79,10 +79,12 @@ impl ImdsContext {
         format!("{}a", self.region)
     }
 
-    /// Partition derived from the role ARN, so the instance-profile ARN matches
-    /// the partition of the credentials' assumed-role principal.
-    /// The ARN of an instance profile in IAM that carries this instance's role,
-    /// preferring one named after the role. `None` when IAM holds none.
+    /// The ARN of the instance profile in IAM that carries this instance's
+    /// role. AWS lets many profiles carry one role, and IMDS has no view of
+    /// the EC2 association, so this answers only when the choice is
+    /// unambiguous: a profile named after the role, or the single profile
+    /// carrying it. `None` otherwise, leaving the caller its synthesized ARN
+    /// rather than naming an arbitrary profile.
     fn instance_profile_arn_for_role(&self) -> Option<String> {
         let role = self.role_name();
         let accounts = self.iam.read();
@@ -95,10 +97,12 @@ impl ImdsContext {
         carrying
             .iter()
             .find(|p| p.instance_profile_name == role)
-            .or_else(|| carrying.first())
+            .or(carrying.first().filter(|_| carrying.len() == 1))
             .map(|p| p.arn.clone())
     }
 
+    /// Partition derived from the role ARN, so the instance-profile ARN matches
+    /// the partition of the credentials' assumed-role principal.
     fn partition(&self) -> &str {
         partition_of(&self.role_arn)
     }

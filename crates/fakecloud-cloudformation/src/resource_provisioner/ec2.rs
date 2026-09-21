@@ -700,6 +700,11 @@ impl ResourceProvisioner {
         // Prefer an ARN: the template's own, else the one IAM stored for that
         // name (which carries the Path). A name IAM does not hold stays a
         // name-addressed association, as before.
+        // Whether the template addressed the profile by name. Kept because the
+        // "unchanged" test below has to compare on the name in that case: the
+        // stored association may hold a path-less ARN synthesized before IAM
+        // had the profile, which names the same profile the template does.
+        let by_name = arn.is_none() && name.is_some();
         let wanted = arn
             .or_else(|| {
                 name.as_deref()
@@ -728,10 +733,9 @@ impl ResourceProvisioner {
                 // replace when the profile itself changed. Replacing anyway
                 // would retire the association id on an unrelated edit (an
                 // InstanceType bump, a new tag), which AWS leaves alone.
+                let profile_name = |arn: &str| arn.rsplit('/').next().unwrap_or(arn).to_string();
                 let unchanged = existing_arn.as_deref().is_some_and(|arn| {
-                    arn == value
-                        || (key == "IamInstanceProfile.Name"
-                            && arn.rsplit('/').next() == Some(value.as_str()))
+                    arn == value || (by_name && profile_name(arn) == profile_name(&value))
                 });
                 if unchanged {
                     return Ok(());

@@ -773,10 +773,10 @@ impl CloudFormationService {
                     .or_insert_with(|| stack_name.clone());
                 full_params
                     .entry("AWS::Partition".to_string())
-                    .or_insert_with(|| "aws".to_string());
+                    .or_insert_with(|| template::partition_for_region(&req.region).to_string());
                 full_params
                     .entry("AWS::URLSuffix".to_string())
-                    .or_insert_with(|| "amazonaws.com".to_string());
+                    .or_insert_with(|| template::url_suffix_for_region(&req.region).to_string());
                 if let Some((sid, _)) = &stack_lookup {
                     full_params
                         .entry("AWS::StackId".to_string())
@@ -1328,10 +1328,10 @@ impl CloudFormationService {
                     .or_insert_with(|| stack_name.clone());
                 cs_params
                     .entry("AWS::Partition".to_string())
-                    .or_insert_with(|| "aws".to_string());
+                    .or_insert_with(|| template::partition_for_region(&req.region).to_string());
                 cs_params
                     .entry("AWS::URLSuffix".to_string())
-                    .or_insert_with(|| "amazonaws.com".to_string());
+                    .or_insert_with(|| template::url_suffix_for_region(&req.region).to_string());
 
                 // An empty body (a CREATE change set with no resources, or a
                 // probe with a placeholder template) parses to an empty

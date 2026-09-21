@@ -70,19 +70,43 @@ pub(crate) fn partition_for_region(region: &str) -> &'static str {
 }
 
 /// Map an AWS region to its DNS URL suffix. China regions use
-/// `amazonaws.com.cn`; every other partition (commercial + GovCloud)
-/// uses `amazonaws.com`, matching the real CFN `AWS::URLSuffix`.
+/// `amazonaws.com.cn`, each isolated partition its own suffix, and commercial
+/// plus GovCloud `amazonaws.com`, matching the real CFN `AWS::URLSuffix`.
+/// Derived from the same partition lookup as `AWS::Partition`, so the two
+/// pseudo-parameters never disagree about which partition a region is in.
 pub(crate) fn url_suffix_for_region(region: &str) -> &'static str {
-    if region.starts_with("cn-") {
-        "amazonaws.com.cn"
-    } else {
-        "amazonaws.com"
+    match partition_for_region(region) {
+        "aws-cn" => "amazonaws.com.cn",
+        "aws-iso" => "c2s.ic.gov",
+        "aws-iso-b" => "sc2s.sgov.gov",
+        "aws-iso-e" => "cloud.adc-e.uk",
+        "aws-iso-f" => "csp.hci.ic.gov",
+        _ => "amazonaws.com",
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partition_and_url_suffix_agree_on_the_partition() {
+        // AWS::Partition knew only cn-/us-gov-, so an isolated region got
+        // `aws` next to a suffix that matched nothing. Both now come from one
+        // lookup.
+        for (region, partition, suffix) in [
+            ("us-east-1", "aws", "amazonaws.com"),
+            ("cn-north-1", "aws-cn", "amazonaws.com.cn"),
+            ("us-gov-west-1", "aws-us-gov", "amazonaws.com"),
+            ("us-iso-east-1", "aws-iso", "c2s.ic.gov"),
+            ("us-isob-east-1", "aws-iso-b", "sc2s.sgov.gov"),
+            ("us-isof-south-1", "aws-iso-f", "csp.hci.ic.gov"),
+            ("eu-isoe-west-1", "aws-iso-e", "cloud.adc-e.uk"),
+        ] {
+            assert_eq!(partition_for_region(region), partition, "{region}");
+            assert_eq!(url_suffix_for_region(region), suffix, "{region}");
+        }
+    }
 
     #[test]
     fn parse_json_template() {
