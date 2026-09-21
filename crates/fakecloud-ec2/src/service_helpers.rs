@@ -84,6 +84,67 @@ pub fn incorrect_instance_state(id: &str, current: &str) -> AwsServiceError {
     )
 }
 
+/// `IncorrectState` (HTTP 400) — the resource is in the wrong state for the
+/// request (e.g. associating a second IAM instance profile with an instance).
+pub fn incorrect_state(message: impl Into<String>) -> AwsServiceError {
+    AwsServiceError::aws_error(StatusCode::BAD_REQUEST, "IncorrectState", message.into())
+}
+
+/// The `InstanceProfileId` reported for an instance profile. AWS reports the
+/// profile's own id, so every association with the same profile reports the
+/// same value; EC2 cannot read IAM's store (`fakecloud-ec2` does not depend on
+/// `fakecloud-iam`), so both services derive it from the profile ARN through
+/// the same shared helper instead of minting it independently. That holds
+/// whenever the two agree on the ARN: every profile addressed by ARN, and
+/// every name-addressed profile on the default path.
+pub fn instance_profile_id_for(arn: &str) -> String {
+    fakecloud_aws::arn::unique_id_for("AIPA", arn)
+}
+
+/// `InvalidIamInstanceProfileArn.Malformed` (HTTP 400) — the supplied IAM
+/// instance-profile ARN is not a well-formed instance-profile ARN.
+pub fn malformed_instance_profile_arn(arn: &str) -> AwsServiceError {
+    AwsServiceError::aws_error(
+        StatusCode::BAD_REQUEST,
+        "InvalidIamInstanceProfileArn.Malformed",
+        format!("The IAM instance profile ARN '{arn}' is malformed"),
+    )
+}
+
+/// Whether `arn` is a well-formed IAM instance-profile ARN:
+/// `arn:<partition>:iam::<account>:instance-profile/<path><name>`.
+pub fn is_instance_profile_arn(arn: &str) -> bool {
+    let parts: Vec<&str> = arn.splitn(6, ':').collect();
+    parts.len() == 6
+        && parts[0] == "arn"
+        && !parts[1].is_empty()
+        && parts[2] == "iam"
+        && parts[3].is_empty()
+        && parts[5]
+            .strip_prefix("instance-profile/")
+            .is_some_and(|rest| !rest.is_empty() && !rest.ends_with('/'))
+}
+
+/// Whether `name` is a legal IAM instance-profile name: `[\w+=,.@-]{1,128}`,
+/// the pattern the IAM API documents for the `InstanceProfileName` member.
+pub fn is_instance_profile_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_+=,.@-".contains(c))
+}
+
+/// `InvalidAssociationID.NotFound` (HTTP 400) — the requested association id
+/// does not exist.
+pub fn association_not_found(id: &str) -> AwsServiceError {
+    AwsServiceError::aws_error(
+        StatusCode::BAD_REQUEST,
+        "InvalidAssociationID.NotFound",
+        format!("The association ID '{id}' does not exist"),
+    )
+}
+
 /// Match an EC2 filter value against a candidate, honoring the `*` (any run)
 /// and `?` (any single char) wildcards AWS supports in filter values. A value
 /// with no wildcard is an exact match.

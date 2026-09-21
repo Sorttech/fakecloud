@@ -514,25 +514,19 @@ impl ResourceProvisioner {
                 }
             });
 
-        // IamInstanceProfile can be a string (profile name / ARN) or an object
-        // with `Arn` / `Name` (the CFN property shape).
-        let iam_profile = props.get("IamInstanceProfile");
-        let (iam_instance_profile_arn, iam_instance_profile_name) = match iam_profile {
-            Some(serde_json::Value::String(s)) => {
-                // A bare string is the profile name (or an ARN); classify by
-                // prefix so both round-trip.
-                if s.starts_with("arn:") {
-                    (Some(s.clone()), None)
-                } else {
-                    (None, Some(s.clone()))
-                }
-            }
-            Some(serde_json::Value::Object(o)) => (
-                o.get("Arn").and_then(|v| v.as_str()).map(String::from),
-                o.get("Name").and_then(|v| v.as_str()).map(String::from),
-            ),
-            _ => (None, None),
-        };
+        let (iam_instance_profile_arn, iam_instance_profile_name) = cfn_iam_instance_profile(props);
+        // Validate here, the way Associate/Replace do, so a template that
+        // resolves IamInstanceProfile to a role ARN (a common Fn::GetAtt
+        // mistake) fails the create instead of storing a value the next
+        // UpdateStack cannot re-submit.
+        validate_cfn_iam_instance_profile(&iam_instance_profile_arn, &iam_instance_profile_name)?;
+        // A `Ref` to an AWS::IAM::InstanceProfile is the profile name; resolve
+        // it to the ARN IAM stored so a non-default Path survives.
+        let iam_instance_profile_arn = iam_instance_profile_arn.or_else(|| {
+            iam_instance_profile_name
+                .as_deref()
+                .and_then(|n| self.resolve_instance_profile_arn(n))
+        });
 
         let spec = fakecloud_ec2::cfn_provision::CfnInstanceSpec {
             image_id: prop_str(props, "ImageId").map(String::from),
@@ -673,9 +667,93 @@ impl ResourceProvisioner {
             }
         }
 
+        self.sync_ec2_instance_profile(props, &instance_id)?;
+
         // The identity attributes (private ip, AZ, public ip) do not change on
         // an in-place modify; carry the ones captured at create time forward.
         Ok(ProvisionResult::new(instance_id).merge_attributes(existing.attributes.clone()))
+    }
+
+    /// The ARN of a profile this stack's IAM state knows by name. `Ref` on an
+    /// `AWS::IAM::InstanceProfile` resolves to the profile *name*, and only IAM
+    /// knows the Path that name's ARN carries, so resolving here is what keeps
+    /// a pathed profile's ARN (and the id derived from it) the same on the
+    /// instance as in `GetInstanceProfile`. `None` for a profile IAM does not
+    /// hold, which stays a name-addressed association as before.
+    fn resolve_instance_profile_arn(&self, name: &str) -> Option<String> {
+        let accounts = self.iam_state.read();
+        let state = accounts.get(&self.account_id)?;
+        state
+            .instance_profiles
+            .get(name)
+            .map(|profile| profile.arn.clone())
+    }
+
+    /// Bring the instance's IAM instance-profile association in line with the
+    /// template. AWS updates `IamInstanceProfile` in place ("some interruption",
+    /// no replacement), so this replaces an existing association, associates
+    /// when the instance has none, and disassociates when the template dropped
+    /// the property.
+    fn sync_ec2_instance_profile(&self, props: &Value, instance_id: &str) -> Result<(), String> {
+        let (arn, name) = cfn_iam_instance_profile(props);
+        validate_cfn_iam_instance_profile(&arn, &name)?;
+        // Prefer an ARN: the template's own, else the one IAM stored for that
+        // name (which carries the Path). A name IAM does not hold stays a
+        // name-addressed association, as before.
+        // Whether the template addressed the profile by name. Kept because the
+        // "unchanged" test below has to compare on the name in that case: the
+        // stored association may hold a path-less ARN synthesized before IAM
+        // had the profile, which names the same profile the template does.
+        let by_name = arn.is_none() && name.is_some();
+        let wanted = arn
+            .or_else(|| {
+                name.as_deref()
+                    .and_then(|n| self.resolve_instance_profile_arn(n))
+            })
+            .map(|a| ("IamInstanceProfile.Arn", a))
+            .or_else(|| name.map(|n| ("IamInstanceProfile.Name", n)));
+
+        let mut lookup = HashMap::new();
+        lookup.insert("Filter.1.Name".to_string(), "instance-id".to_string());
+        lookup.insert("Filter.1.Value.1".to_string(), instance_id.to_string());
+        let existing = self.ec2_dispatch("DescribeIamInstanceProfileAssociations", lookup)?;
+        let existing_id = xml_elem(&existing, "associationId");
+        let existing_arn = xml_elem(&existing, "arn");
+
+        match (wanted, existing_id) {
+            (None, None) => Ok(()),
+            (None, Some(id)) => {
+                let mut params = HashMap::new();
+                params.insert("AssociationId".to_string(), id);
+                self.ec2_dispatch("DisassociateIamInstanceProfile", params)?;
+                Ok(())
+            }
+            (Some((key, value)), Some(id)) => {
+                // An in-place update runs for any changed property, so only
+                // replace when the profile itself changed. Replacing anyway
+                // would retire the association id on an unrelated edit (an
+                // InstanceType bump, a new tag), which AWS leaves alone.
+                let profile_name = |arn: &str| arn.rsplit('/').next().unwrap_or(arn).to_string();
+                let unchanged = existing_arn.as_deref().is_some_and(|arn| {
+                    arn == value || (by_name && profile_name(arn) == profile_name(&value))
+                });
+                if unchanged {
+                    return Ok(());
+                }
+                let mut params = HashMap::new();
+                params.insert("AssociationId".to_string(), id);
+                params.insert(key.to_string(), value);
+                self.ec2_dispatch("ReplaceIamInstanceProfileAssociation", params)?;
+                Ok(())
+            }
+            (Some((key, value)), None) => {
+                let mut params = HashMap::new();
+                params.insert("InstanceId".to_string(), instance_id.to_string());
+                params.insert(key.to_string(), value);
+                self.ec2_dispatch("AssociateIamInstanceProfile", params)?;
+                Ok(())
+            }
+        }
     }
 
     /// Delete an EC2 resource by its physical id, routing through the real
@@ -713,4 +791,45 @@ impl ResourceProvisioner {
             _ => resource.attributes.get(attribute).cloned(),
         }
     }
+}
+
+/// `IamInstanceProfile` as CloudFormation writes it: either a bare string
+/// (profile name, or an ARN) or an object with `Arn` / `Name`. Returns
+/// `(arn, name)`.
+fn cfn_iam_instance_profile(props: &Value) -> (Option<String>, Option<String>) {
+    match props.get("IamInstanceProfile") {
+        Some(Value::String(s)) => {
+            // A bare string is the profile name (or an ARN); classify by prefix
+            // so both round-trip.
+            if s.starts_with("arn:") {
+                (Some(s.clone()), None)
+            } else {
+                (None, Some(s.clone()))
+            }
+        }
+        Some(Value::Object(o)) => (
+            o.get("Arn").and_then(|v| v.as_str()).map(String::from),
+            o.get("Name").and_then(|v| v.as_str()).map(String::from),
+        ),
+        _ => (None, None),
+    }
+}
+
+/// Reject an `IamInstanceProfile` the EC2 handlers would reject, so a bad
+/// template value fails the stack operation rather than being stored.
+fn validate_cfn_iam_instance_profile(
+    arn: &Option<String>,
+    name: &Option<String>,
+) -> Result<(), String> {
+    if let Some(arn) = arn {
+        if !fakecloud_ec2::service_helpers::is_instance_profile_arn(arn) {
+            return Err(format!("The IAM instance profile ARN '{arn}' is malformed"));
+        }
+    }
+    if let Some(name) = name {
+        if !fakecloud_ec2::service_helpers::is_instance_profile_name(name) {
+            return Err(format!("Invalid IAM Instance Profile name: {name}"));
+        }
+    }
+    Ok(())
 }

@@ -65,7 +65,8 @@ impl ResourceProvisioner {
             &Uuid::new_v4().to_string().replace('-', "").to_uppercase()[..16]
         );
         let arn = format!(
-            "arn:aws:iam::{}:role{}{}",
+            "arn:{}:iam::{}:role{}{}",
+            fakecloud_aws::arn::partition_for(&self.region),
             state.account_id,
             if path == "/" { "/" } else { path },
             role_name
@@ -256,7 +257,8 @@ impl ResourceProvisioner {
             &Uuid::new_v4().to_string().replace('-', "").to_uppercase()[..16]
         );
         let arn = format!(
-            "arn:aws:iam::{}:policy{}{}",
+            "arn:{}:iam::{}:policy{}{}",
+            fakecloud_aws::arn::partition_for(&self.region),
             state.account_id,
             if path == "/" { "/" } else { path },
             policy_name
@@ -377,8 +379,11 @@ impl ResourceProvisioner {
             return Err(format!("User {user_name} already exists"));
         }
         let arn = format!(
-            "arn:aws:iam::{}:user{}{}",
-            state.account_id, path, user_name
+            "arn:{}:iam::{}:user{}{}",
+            fakecloud_aws::arn::partition_for(&self.region),
+            state.account_id,
+            path,
+            user_name
         );
         let user_id = format!(
             "AIDA{}",
@@ -556,8 +561,11 @@ impl ResourceProvisioner {
             return Err(format!("Group {group_name} already exists"));
         }
         let arn = format!(
-            "arn:aws:iam::{}:group{}{}",
-            state.account_id, path, group_name
+            "arn:{}:iam::{}:group{}{}",
+            fakecloud_aws::arn::partition_for(&self.region),
+            state.account_id,
+            path,
+            group_name
         );
         let group_id = format!(
             "AGPA{}",
@@ -700,7 +708,8 @@ impl ResourceProvisioner {
         let mut accounts = self.iam_state.write();
         let state = accounts.get_or_create(&self.account_id);
         let arn = format!(
-            "arn:aws:iam::{}:policy{}{}",
+            "arn:{}:iam::{}:policy{}{}",
+            fakecloud_aws::arn::partition_for(&self.region),
             state.account_id,
             if path == "/" { "/" } else { path.as_str() },
             policy_name
@@ -921,8 +930,8 @@ impl ResourceProvisioner {
                 arr.iter()
                     .filter_map(|r| r.as_str())
                     .map(|s| {
-                        if let Some(rest) = s.strip_prefix("arn:aws:iam::") {
-                            rest.split(":role/")
+                        if s.starts_with("arn:") {
+                            s.split(":role/")
                                 .nth(1)
                                 .map(|name| name.to_string())
                                 .unwrap_or_else(|| s.to_string())
@@ -951,13 +960,16 @@ impl ResourceProvisioner {
             }
         }
         let arn = format!(
-            "arn:aws:iam::{}:instance-profile{}{}",
-            state.account_id, path, name
+            "arn:{}:iam::{}:instance-profile{}{}",
+            fakecloud_aws::arn::partition_for(&self.region),
+            state.account_id,
+            path,
+            name
         );
-        let id = format!(
-            "AIPA{}",
-            &Uuid::new_v4().to_string().replace('-', "").to_uppercase()[..16]
-        );
+        // Derived from the ARN, like the IAM service's own CreateInstanceProfile
+        // and the id EC2 renders on instances, so all three agree on one
+        // InstanceProfileId for one profile.
+        let id = fakecloud_aws::arn::unique_id_for("AIPA", &arn);
         state.instance_profiles.insert(
             name.clone(),
             IamInstanceProfile {
@@ -1015,8 +1027,10 @@ impl ResourceProvisioner {
             .trim_start_matches("http://")
             .to_string();
         let arn = format!(
-            "arn:aws:iam::{}:oidc-provider/{}",
-            self.account_id, url_path
+            "arn:{}:iam::{}:oidc-provider/{}",
+            fakecloud_aws::arn::partition_for(&self.region),
+            self.account_id,
+            url_path
         );
         let provider = OidcProvider {
             arn: arn.clone(),

@@ -138,32 +138,46 @@ async fn postgres_pod_exec_readiness_query_and_dump() {
         .await
         .expect("pg pod Running");
 
-    // Readiness via exec pg_isready (API-server path, no pod-IP routing).
-    let mut ready = false;
+    // Readiness via exec (API-server path, no pod-IP routing). `pg_isready`
+    // alone is not enough: the postgres image runs a temporary server on its
+    // own socket while initdb runs, then stops it and starts the real one, so
+    // pg_isready can answer yes and the very next command still fails with
+    // `connection to server on socket ... failed: No such file or directory`.
+    // Require the query itself to succeed, the only signal that outlives that
+    // restart.
+    let mut query = None;
+    // Keep the last failure so a real regression (renamed container, bad auth,
+    // missing binary) reports its own error instead of a bare timeout.
+    let mut last_err = "no attempt completed".to_string();
     for _ in 0..60 {
-        if let Ok(out) = c
+        match c
             .exec(name, Some("db"), &["pg_isready", "-U", "postgres"])
             .await
         {
-            if out.success() {
-                ready = true;
-                break;
+            Ok(out) if out.success() => {
+                match c
+                    .exec(
+                        name,
+                        Some("db"),
+                        &["psql", "-U", "postgres", "-tAc", "SELECT 1"],
+                    )
+                    .await
+                {
+                    Ok(q) if q.success() => {
+                        query = Some(q);
+                        break;
+                    }
+                    Ok(q) => last_err = format!("psql failed: {}", q.stderr),
+                    Err(e) => last_err = format!("psql exec failed: {e}"),
+                }
             }
+            Ok(out) => last_err = format!("pg_isready not ready: {}", out.stderr),
+            Err(e) => last_err = format!("pg_isready exec failed: {e}"),
         }
         tokio::time::sleep(Duration::from_millis(1000)).await;
     }
-    assert!(ready, "postgres did not become ready via pg_isready");
-
-    // A query through exec psql.
-    let q = c
-        .exec(
-            name,
-            Some("db"),
-            &["psql", "-U", "postgres", "-tAc", "SELECT 1"],
-        )
-        .await
-        .expect("psql query");
-    assert!(q.success(), "psql failed: {}", q.stderr);
+    let q = query
+        .unwrap_or_else(|| panic!("postgres did not become ready in 60s; last error: {last_err}"));
     assert!(q.stdout_str().contains('1'));
 
     // The dump path RDS uses: pg_dump via exec produces a non-empty dump.

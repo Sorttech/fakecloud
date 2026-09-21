@@ -2,21 +2,9 @@ use super::*;
 
 /// Get the AWS partition from a region string.
 pub(crate) fn partition_for_region(region: &str) -> &str {
-    if region.starts_with("cn-") {
-        "aws-cn"
-    } else if region.starts_with("us-gov-") {
-        "aws-us-gov"
-    } else if region.starts_with("us-iso-") {
-        "aws-iso"
-    } else if region.starts_with("us-isob-") {
-        "aws-iso-b"
-    } else if region.starts_with("us-isof-") {
-        "aws-iso-f"
-    } else if region.starts_with("eu-isoe-") {
-        "aws-iso-e"
-    } else {
-        "aws"
-    }
+    // One lookup for the whole workspace: an ARN synthesized here has to match
+    // one synthesized by another service for the same resource.
+    fakecloud_aws::arn::partition_for(region)
 }
 
 /// Actions on the IAM service that mutate state. Kept in sync with the

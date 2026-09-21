@@ -974,6 +974,22 @@ impl Ec2Service {
             "ModifySubnetAttribute" => subnet::modify_subnet_attribute(self, request),
             "AuthorizeSecurityGroupIngress" => sg::authorize_security_group_ingress(self, request),
             "AuthorizeSecurityGroupEgress" => sg::authorize_security_group_egress(self, request),
+            // What an in-place UpdateStack on an AWS::EC2::Instance re-applies:
+            // mutable attributes, the template's tags, and the IAM instance
+            // profile. Without these arms the provisioner's update path fails
+            // the whole stack update with `action_not_implemented`.
+            "ModifyInstanceAttribute" => instance::modify_instance_attribute(self, request),
+            "CreateTags" => tags::create_tags(self, request),
+            "AssociateIamInstanceProfile" => rest::associate_iam_instance_profile(self, request),
+            "ReplaceIamInstanceProfileAssociation" => {
+                rest::replace_iam_instance_profile_association(self, request)
+            }
+            "DisassociateIamInstanceProfile" => {
+                rest::disassociate_iam_instance_profile(self, request)
+            }
+            "DescribeIamInstanceProfileAssociations" => {
+                rest::describe_iam_instance_profile_associations(self, request)
+            }
             other => Err(AwsServiceError::action_not_implemented("ec2", other)),
         }
     }

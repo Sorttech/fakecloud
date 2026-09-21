@@ -79,6 +79,28 @@ impl ImdsContext {
         format!("{}a", self.region)
     }
 
+    /// The ARN of the instance profile in IAM that carries this instance's
+    /// role. AWS lets many profiles carry one role, and IMDS has no view of
+    /// the EC2 association, so this answers only when the choice is
+    /// unambiguous: a profile named after the role, or the single profile
+    /// carrying it. `None` otherwise, leaving the caller its synthesized ARN
+    /// rather than naming an arbitrary profile.
+    fn instance_profile_arn_for_role(&self) -> Option<String> {
+        let role = self.role_name();
+        let accounts = self.iam.read();
+        let state = accounts.get(&self.account_id)?;
+        let carrying: Vec<_> = state
+            .instance_profiles
+            .values()
+            .filter(|p| p.roles.iter().any(|r| r == role))
+            .collect();
+        carrying
+            .iter()
+            .find(|p| p.instance_profile_name == role)
+            .or(carrying.first().filter(|_| carrying.len() == 1))
+            .map(|p| p.arn.clone())
+    }
+
     /// Partition derived from the role ARN, so the instance-profile ARN matches
     /// the partition of the credentials' assumed-role principal.
     fn partition(&self) -> &str {
@@ -240,14 +262,26 @@ fn security_credentials(ctx: &ImdsContext, role: &str) -> Response {
 /// `iam/info` -- the instance profile association.
 fn iam_info(ctx: &ImdsContext) -> Response {
     let creds = ctx.credentials();
+    // Prefer the ARN of a real instance profile carrying this role, so the id
+    // below matches what GetInstanceProfile and DescribeInstances report for
+    // it (the profile's Path is part of its ARN, and only IAM knows it). Fall
+    // back to a profile named after the role when IAM holds none.
+    let profile_arn = ctx.instance_profile_arn_for_role().unwrap_or_else(|| {
+        format!(
+            "arn:{}:iam::{}:instance-profile/{}",
+            ctx.partition(),
+            ctx.account_id,
+            ctx.role_name()
+        )
+    });
     Json(serde_json::json!({
         "Code": "Success",
         "LastUpdated": creds.issued_at_iso8601(),
-        "InstanceProfileArn": format!(
-            "arn:{}:iam::{}:instance-profile/{}",
-            ctx.partition(), ctx.account_id, ctx.role_name()
-        ),
-        "InstanceProfileId": "AIPAFAKECLOUDINSTPROF0",
+        "InstanceProfileArn": profile_arn,
+        // Derived from the ARN, so IMDS, IAM and DescribeInstances all report
+        // one InstanceProfileId for one profile (and its 21-character AWS
+        // shape, which the old constant was not).
+        "InstanceProfileId": fakecloud_aws::arn::unique_id_for("AIPA", &profile_arn),
     }))
     .into_response()
 }
@@ -304,6 +338,65 @@ mod tests {
     fn availability_zone_appends_a() {
         assert_eq!(ctx("us-east-1", "x").availability_zone(), "us-east-1a");
         assert_eq!(ctx("eu-west-2", "x").availability_zone(), "eu-west-2a");
+    }
+
+    #[test]
+    fn iam_info_profile_id_is_derived_from_the_profile_arn() {
+        // It was a 22-character constant, so it matched neither AWS's shape nor
+        // the id IAM and DescribeInstances report for the same profile.
+        let c = ctx("us-east-1", "arn:aws:iam::123456789012:role/app-role");
+        let arn = "arn:aws:iam::123456789012:instance-profile/app-role";
+        let id = fakecloud_aws::arn::unique_id_for("AIPA", arn);
+        assert_eq!(id.len(), 21, "{id}");
+
+        let body = iam_info(&c).into_body();
+        let bytes = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(axum::body::to_bytes(body, usize::MAX))
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["InstanceProfileArn"], arn);
+        assert_eq!(json["InstanceProfileId"], id);
+    }
+
+    #[test]
+    fn iam_info_prefers_a_real_instance_profile_carrying_the_role() {
+        // The synthesized ARN assumes a profile named after the role on the
+        // default path. When IAM holds the real profile, its ARN (Path and
+        // all) is what IAM and DescribeInstances report, so use that one.
+        let c = ctx("us-east-1", "arn:aws:iam::123456789012:role/app-role");
+        let real_arn = {
+            let mut accounts = c.iam.write();
+            let state = accounts.get_or_create("123456789012");
+            let arn = "arn:aws:iam::123456789012:instance-profile/svc/app-profile".to_string();
+            state.instance_profiles.insert(
+                "app-profile".to_string(),
+                fakecloud_iam::IamInstanceProfile {
+                    instance_profile_name: "app-profile".to_string(),
+                    instance_profile_id: fakecloud_aws::arn::unique_id_for("AIPA", &arn),
+                    arn: arn.clone(),
+                    path: "/svc/".to_string(),
+                    created_at: chrono::Utc::now(),
+                    roles: vec!["app-role".to_string()],
+                    tags: Vec::new(),
+                },
+            );
+            arn
+        };
+
+        let body = iam_info(&c).into_body();
+        let bytes = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(axum::body::to_bytes(body, usize::MAX))
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["InstanceProfileArn"], real_arn);
+        assert_eq!(
+            json["InstanceProfileId"],
+            fakecloud_aws::arn::unique_id_for("AIPA", &real_arn)
+        );
     }
 
     #[test]

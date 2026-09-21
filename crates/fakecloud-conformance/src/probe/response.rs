@@ -235,6 +235,16 @@ pub(super) fn service_common_errors(service_name: &str) -> &'static [&'static st
             // IPAM internet-registry associations: the probe addresses an
             // association by a synthetic id, which AWS answers with this code.
             "InvalidIpamInternetRegistryAssociationId.NotFound",
+            // IAM instance-profile associations: Replace/Disassociate address
+            // an association by the probe's synthetic id, which AWS answers
+            // with this code. `IncorrectState` is the code AWS returns when the
+            // resource is in the wrong state for the request (associating a
+            // second IAM instance profile with an instance, for one).
+            "InvalidAssociationID.NotFound",
+            "IncorrectState",
+            // A synthetic `IamInstanceProfile.Arn` is not a well-formed
+            // instance-profile ARN, which AWS rejects with this code.
+            "InvalidIamInstanceProfileArn.Malformed",
             "InvalidID",
         ],
         // EKS under-declares two client errors that the real API returns for
