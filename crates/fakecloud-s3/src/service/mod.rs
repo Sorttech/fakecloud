@@ -502,11 +502,6 @@ impl AwsService for S3Service {
                         .get(b_name)
                         .and_then(|b| b.cors_config.clone())
                 };
-                let origin_present = req
-                    .headers
-                    .get("origin")
-                    .and_then(|v| v.to_str().ok())
-                    .is_some_and(|o| !o.is_empty());
                 if let Some(ref config) = cors_config {
                     let origin = req
                         .headers
@@ -532,13 +527,7 @@ impl AwsService for S3Service {
                                 .parse()
                                 .unwrap_or_else(|_| http::HeaderValue::from_static("")),
                         );
-                        // Only a request that actually carried an `Origin` was
-                        // CORS-evaluated; an `Origin`-less OPTIONS can still
-                        // match a `*` rule, and that answer is the same for
-                        // everyone, so it needs no `Vary`.
-                        if origin_present {
-                            headers.insert("vary", http::HeaderValue::from_static(CORS_VARY));
-                        }
+                        headers.insert("vary", http::HeaderValue::from_static(CORS_VARY));
                         headers.insert(
                             "access-control-allow-methods",
                             rule.allowed_methods
@@ -579,15 +568,15 @@ impl AwsService for S3Service {
                         });
                     }
                 }
-                // A rejected preflight still carries `Vary` when the bucket has
-                // a CORS config AND the request carried an `Origin` to evaluate:
-                // the 403 is then origin-dependent, and a cache that keyed it
-                // without `Origin` would replay it to the allowed origin and
-                // break a legitimate cross-origin request. With no CORS config,
-                // or no `Origin` to evaluate, the answer is origin-independent
-                // and gets no `Vary` — matching S3, which emits CORS headers
-                // only for a request it actually evaluated CORS on.
-                let headers = if cors_config.is_some() && origin_present {
+                // A rejected preflight carries `Vary` whenever the bucket has a
+                // CORS config, `Origin` or not. On such a bucket the preflight
+                // outcome is origin-dependent by construction — the same OPTIONS
+                // is a 403 for one origin and a 200 for another — so a cache
+                // that keyed this 403 without `Origin` would replay it to the
+                // allowed origin's preflight and break a legitimate
+                // cross-origin request. Only a bucket with no CORS config at
+                // all answers identically for everyone and needs no `Vary`.
+                let headers = if cors_config.is_some() {
                     vec![("vary".to_string(), CORS_VARY.to_string())]
                 } else {
                     Vec::new()
@@ -601,11 +590,15 @@ impl AwsService for S3Service {
             }
         }
 
-        // Capture origin for CORS response headers
+        // Capture origin for CORS response headers. An empty `Origin:` is
+        // treated as absent — the request carries nothing to evaluate CORS
+        // against, and letting `""` through would match a `*` rule and stamp
+        // CORS headers onto a request no browser would have sent that way.
         let origin_header = req
             .headers
             .get("origin")
             .and_then(|v| v.to_str().ok())
+            .filter(|o| !o.is_empty())
             .map(|s| s.to_string());
 
         // Bucket-scoped sub-resource query params. If a request targets one
@@ -3168,9 +3161,11 @@ pub(crate) fn origin_matches(origin: &str, pattern: &str) -> bool {
 
 /// Find the matching CORS rule for a given origin and HTTP method.
 ///
-/// Methods compare case-insensitively: the stored config is whatever the client
-/// wrote, and a lowercase `<AllowedMethod>get</AllowedMethod>` should still
-/// allow a `GET` rather than silently denying every request for that rule.
+/// Methods compare case-insensitively purely defensively. `PutBucketCors`
+/// already rejects anything but the canonical uppercase verbs, so a config
+/// written through the API cannot contain `<AllowedMethod>get</AllowedMethod>`;
+/// the loose compare only covers a config restored from a persisted snapshot,
+/// which never passes through that validation.
 pub(crate) fn find_cors_rule<'a>(
     rules: &'a [CorsRule],
     origin: &str,

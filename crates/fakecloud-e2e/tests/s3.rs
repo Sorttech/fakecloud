@@ -1704,8 +1704,10 @@ async fn s3_cors_preflight_and_response_headers() {
         "Origin, Access-Control-Request-Headers, Access-Control-Request-Method"
     );
 
-    // A preflight with no Origin is not CORS-evaluated, so it gets no Vary
-    // either, matching the actual-request path.
+    // On a CORS-configured bucket the preflight outcome is origin-dependent by
+    // construction — 403 here, 200 for the allowed origin — so even an
+    // Origin-less preflight carries Vary, or a cache could replay this 403 to
+    // the allowed origin's preflight.
     let resp = http
         .request(
             reqwest::Method::OPTIONS,
@@ -1716,7 +1718,10 @@ async fn s3_cors_preflight_and_response_headers() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 403);
-    assert!(resp.headers().get("vary").is_none());
+    assert_eq!(
+        resp.headers().get("vary").unwrap(),
+        "Origin, Access-Control-Request-Headers, Access-Control-Request-Method"
+    );
 
     // A bucket with no CORS config at all answers preflights identically for
     // every origin, so that 403 carries no Vary.

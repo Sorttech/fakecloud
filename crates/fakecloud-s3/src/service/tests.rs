@@ -343,8 +343,9 @@ fn find_cors_rule_matches_method_case_insensitively() {
         </CORSRule>
     </CORSConfiguration>"#;
     let rules = parse_cors_config(xml);
-    // A lowercase AllowedMethod still allows the request; fakecloud does not
-    // normalize the stored config, so the comparison has to.
+    // `PutBucketCors` rejects a lowercase AllowedMethod, so this shape only
+    // reaches the matcher from a persisted snapshot that skipped validation.
+    // It should still allow the request rather than silently denying the rule.
     assert!(find_cors_rule(&rules, "https://example.com", "GET").is_some());
     // A method outside AllowedMethods is still denied, and a disallowed origin
     // is denied regardless of method.
