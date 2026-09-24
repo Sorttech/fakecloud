@@ -538,6 +538,77 @@ async fn persistence_batch_delete_marker_survives_restart() {
 }
 
 #[tokio::test]
+async fn persistence_preserved_null_version_survives_delete_marker() {
+    // An object written before versioning was enabled becomes the "null"
+    // version when a delete marker is stacked on top. Its on-disk sidecar has
+    // to record that version id, otherwise the loader files it as the current
+    // object and the marker hides it for good.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut server = TestServer::start_persistent(tmp.path()).await;
+    let client = server.s3_client().await;
+
+    client
+        .create_bucket()
+        .bucket("preserve-null")
+        .send()
+        .await
+        .unwrap();
+    client
+        .put_object()
+        .bucket("preserve-null")
+        .key("doc.txt")
+        .body(ByteStream::from_static(b"pre-versioning"))
+        .send()
+        .await
+        .unwrap();
+    client
+        .put_bucket_versioning()
+        .bucket("preserve-null")
+        .versioning_configuration(
+            VersioningConfiguration::builder()
+                .status(BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    client
+        .delete_object()
+        .bucket("preserve-null")
+        .key("doc.txt")
+        .send()
+        .await
+        .unwrap();
+
+    server.restart().await;
+    let client = server.s3_client().await;
+
+    let list = client
+        .list_object_versions()
+        .bucket("preserve-null")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(list.delete_markers().len(), 1, "marker survives");
+    assert_eq!(
+        list.versions().len(),
+        1,
+        "the pre-versioning object survives as the null version"
+    );
+
+    let got = client
+        .get_object()
+        .bucket("preserve-null")
+        .key("doc.txt")
+        .version_id("null")
+        .send()
+        .await
+        .expect("the null version is still readable after the restart");
+    let bytes = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(bytes.as_ref(), b"pre-versioning");
+}
+
+#[tokio::test]
 async fn persistence_bucket_subresources_round_trip() {
     let tmp = tempfile::tempdir().unwrap();
     let mut server = TestServer::start_persistent(tmp.path()).await;

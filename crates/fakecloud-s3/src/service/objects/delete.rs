@@ -2,6 +2,31 @@
 
 use super::*;
 
+/// The object a no-`versionId` DELETE would destroy, for object-lock
+/// purposes. A never-versioned bucket removes the current object; a
+/// suspended bucket replaces the null version (which may sit in the version
+/// history behind a newer enabled-era version); an enabled bucket only
+/// stacks a delete marker and destroys nothing.
+fn lock_target<'a>(
+    b: &'a crate::state::S3Bucket,
+    key: &str,
+    versioning_configured: bool,
+    versioning_enabled: bool,
+) -> Option<&'a S3Object> {
+    let is_null = |o: &S3Object| o.version_id.is_none() || o.version_id.as_deref() == Some("null");
+    let target = if !versioning_configured {
+        b.objects.get(key)
+    } else if !versioning_enabled {
+        b.object_versions
+            .get(key)
+            .and_then(|versions| versions.iter().find(|o| is_null(o)))
+            .or_else(|| b.objects.get(key).filter(|o| is_null(o)))
+    } else {
+        None
+    };
+    target.filter(|o| !o.is_delete_marker)
+}
+
 impl S3Service {
     pub(crate) fn delete_object(
         &self,
@@ -203,27 +228,19 @@ impl S3Service {
             });
         }
 
-        // Object lock only bites when the delete overwrites data in place:
-        // a never-versioned bucket removes the object outright, and a
-        // suspended one replaces the null version with the marker. A
-        // suspended bucket whose current object is a real (enabled-era)
-        // version keeps that version, so the lock must not reject there.
-        let current_is_null_version = b
-            .objects
-            .get(key)
-            .map(|o| o.version_id.is_none() || o.version_id.as_deref() == Some("null"))
-            .unwrap_or(false);
-        if !versioning_configured || (!versioning_enabled && current_is_null_version) {
-            if let Some(existing) = b.objects.get(key) {
-                if !existing.is_delete_marker {
-                    if let Some(code) = check_object_lock_for_overwrite(existing, req) {
-                        return Err(AwsServiceError::aws_error(
-                            StatusCode::FORBIDDEN,
-                            code,
-                            "Access Denied",
-                        ));
-                    }
-                }
+        // Object lock only bites on what this delete actually destroys: a
+        // never-versioned bucket loses the current object, and a suspended
+        // one loses the null version the marker replaces (which is not
+        // necessarily the current object -- an enabled-era version can be
+        // current while an older null version sits in the history). An
+        // Enabled bucket destroys nothing, so nothing is checked there.
+        if let Some(target) = lock_target(b, key, versioning_configured, versioning_enabled) {
+            if let Some(code) = check_object_lock_for_overwrite(target, req) {
+                return Err(AwsServiceError::aws_error(
+                    StatusCode::FORBIDDEN,
+                    code,
+                    "Access Denied",
+                ));
             }
         }
 
@@ -239,6 +256,14 @@ impl S3Service {
                     if preserved.version_id.is_none() {
                         preserved.version_id = Some("null".to_string());
                     }
+                    // Rewrite the on-disk sidecar too: the loader routes a
+                    // "null" slot whose meta has no version id into the
+                    // current-object map, where the delete marker below then
+                    // hides it, losing the version after a restart.
+                    let preserved_meta = object_meta_snapshot(&preserved);
+                    self.store
+                        .put_object_meta(bucket, key, Some("null"), &preserved_meta)
+                        .map_err(crate::service::persistence_error)?;
                     b.object_versions
                         .entry(key.to_string())
                         .or_default()
@@ -542,17 +567,10 @@ impl S3Service {
                 // bucket untouched, and the preserve step below would
                 // otherwise have already written a version-history entry for
                 // a request that ends in AccessDenied.
-                let current_is_null_version = b
-                    .objects
-                    .get(key)
-                    .map(|o| o.version_id.is_none() || o.version_id.as_deref() == Some("null"))
-                    .unwrap_or(false);
-                if !versioning_enabled && current_is_null_version {
-                    let lock_denied = b
-                        .objects
-                        .get(key)
-                        .filter(|existing| !existing.is_delete_marker)
-                        .and_then(|existing| check_object_lock_for_overwrite(existing, req));
+                {
+                    let lock_denied =
+                        lock_target(b, key, versioning_configured, versioning_enabled)
+                            .and_then(|target| check_object_lock_for_overwrite(target, req));
                     if let Some(code) = lock_denied {
                         error_xml.push_str(&format!(
                             "<Error><Key>{}</Key><Code>{}</Code><Message>Access Denied</Message></Error>",
@@ -571,6 +589,16 @@ impl S3Service {
                         let mut preserved = existing.clone();
                         if preserved.version_id.is_none() {
                             preserved.version_id = Some("null".to_string());
+                        }
+                        // See delete_object: the sidecar needs the "null"
+                        // version id or the loader drops this version.
+                        let preserved_meta = object_meta_snapshot(&preserved);
+                        if let Err(e) =
+                            self.store
+                                .put_object_meta(bucket, key, Some("null"), &preserved_meta)
+                        {
+                            persist_error = Some(crate::service::persistence_error(e));
+                            break;
                         }
                         b.object_versions
                             .entry(key.to_string())
