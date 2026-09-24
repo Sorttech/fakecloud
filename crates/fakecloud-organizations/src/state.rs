@@ -176,12 +176,19 @@ impl OrganizationsRegistry {
         // id, so decoding the address as if it spelled one would resolve
         // to an account that does not exist and let an invitation open for
         // a member already enrolled.
-        if let Some(account) = self
-            .orgs
-            .get(within)
-            .and_then(|org| org.accounts.values().find(|a| a.email == target))
-        {
-            return Some(account.id.clone());
+        // Scoped to ONE organization on purpose: resolving an address
+        // against every organization would let the caller read a foreign
+        // account id back out of the "already a member" error. The
+        // boolean matcher may look wider, because it only ever confirms
+        // an account the caller already named.
+        if target_kind == "EMAIL" {
+            if let Some(account) = self
+                .orgs
+                .get(within)
+                .and_then(|org| org.accounts.values().find(|a| a.email == target))
+            {
+                return Some(account.id.clone());
+            }
         }
         target_account_id(target_kind, target)
     }
@@ -208,6 +215,17 @@ impl OrganizationsRegistry {
         self.next_account_id_besides(&[])
     }
 
+    /// The account registered with `email`, if any organization has one.
+    /// Used to decide whether an address names a real account or should
+    /// fall back to the synthetic `<account-id>@example.com` decode.
+    pub fn account_registered_with(&self, email: &str) -> Option<String> {
+        self.orgs
+            .values()
+            .flat_map(|org| org.accounts.values())
+            .find(|account| account.email == email)
+            .map(|account| account.id.clone())
+    }
+
     /// Does `target` (as declared by `target_kind`) name `account_id`?
     ///
     /// This is the single answer used by every party gate -- handshakes,
@@ -227,13 +245,14 @@ impl OrganizationsRegistry {
         target: &str,
         account_id: &str,
     ) -> bool {
-        if target_kind == "EMAIL"
-            && self
-                .org_of_account(account_id)
-                .and_then(|org| org.accounts.get(account_id))
-                .is_some_and(|account| account.email == target)
-        {
-            return true;
+        if target_kind == "EMAIL" {
+            // A registered address names its own account and nothing else.
+            // Allowing the synthetic decode as well let one address name
+            // two accounts, so an account other than the intended target
+            // could read and accept the invitation.
+            if let Some(registered) = self.account_registered_with(target) {
+                return registered == account_id;
+            }
         }
         target_account_id(target_kind, target).as_deref() == Some(account_id)
     }
@@ -422,7 +441,11 @@ impl OrganizationState {
     pub fn bootstrap(management_account_id: &str) -> Self {
         let now = Utc::now();
         let org_id = format!("o-{}", random_id(10));
-        let root_id = format!("r-{}", random_id(4));
+        // AWS root ids are 4-32 chars. Four was fine while only one
+        // organization could exist; across a registry it collides at
+        // 1/65536, which would let one organization's root id validate as
+        // a target in another.
+        let root_id = format!("r-{}", random_id(12));
         let org_arn = format!(
             "arn:aws:organizations::{}:organization/{}",
             management_account_id, org_id
@@ -784,14 +807,17 @@ impl OrganizationState {
         // The kind is the caller's declared `Target.Type`, so this agrees
         // with the cross-organization guard in the service layer rather
         // than re-deriving a different answer from the string's shape.
-        let resolved = self::target_account_id(target_kind, target_account_id).or_else(|| {
-            // ...and against the address this organization's members are
-            // actually registered with.
-            self.accounts
-                .values()
-                .find(|account| account.email == target_account_id)
-                .map(|account| account.id.clone())
-        });
+        // Same order as `OrganizationsRegistry::resolve_target_account`:
+        // a registered address names its own account, and the synthetic
+        // decode is only a fallback. The reverse order resolved to an
+        // account nobody owns, so the already-a-member and
+        // duplicate-handshake guards below both missed.
+        let resolved = self
+            .accounts
+            .values()
+            .find(|account| target_kind == "EMAIL" && account.email == target_account_id)
+            .map(|account| account.id.clone())
+            .or_else(|| self::target_account_id(target_kind, target_account_id));
         if let Some(target) = &resolved {
             if self.accounts.contains_key(target) {
                 return Err(OrgError::AccountAlreadyMember(target.clone()));

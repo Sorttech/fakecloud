@@ -777,6 +777,58 @@ async fn describe_effective_policy_rejects_a_target_in_another_organization() {
     .expect("the caller's own account is a valid target");
 }
 
+/// An address names exactly one account. `CreateAccount` stores the
+/// caller's own email, so an account can be registered with an address
+/// that *looks* like the synthetic form of a different id -- and then
+/// both resolutions were accepted, letting the account the address only
+/// spells read and accept an invitation meant for its real owner.
+#[tokio::test]
+async fn a_registered_address_names_its_own_account_and_no_other() {
+    let (svc, state) = OrganizationsService::shared();
+    create_org_with_root(&svc).await;
+    // A member registered with an address that spells another id.
+    let created = body_value(
+        svc.handle(req_with(
+            "111111111111",
+            "CreateAccount",
+            json!({ "Email": "222222222222@example.com", "AccountName": "decoy" }),
+        ))
+        .await
+        .unwrap(),
+    );
+    let owner = created["CreateAccountStatus"]["AccountId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(owner, "222222222222");
+    state
+        .write()
+        .org_of_account_mut("111111111111")
+        .unwrap()
+        .complete_create_account(created["CreateAccountStatus"]["Id"].as_str().unwrap());
+
+    // Inviting that address now names a member already enrolled.
+    let err = expect_err(
+        svc.handle(req_with(
+            "111111111111",
+            "InviteAccountToOrganization",
+            json!({ "Target": { "Type": "EMAIL", "Id": "222222222222@example.com" } }),
+        ))
+        .await,
+    );
+    assert_eq!(err.code(), "HandshakeConstraintViolationException");
+
+    // And the account the address merely spells is not its owner.
+    assert!(state
+        .read()
+        .account_matches_target("EMAIL", "222222222222@example.com", &owner));
+    assert!(!state.read().account_matches_target(
+        "EMAIL",
+        "222222222222@example.com",
+        "222222222222"
+    ));
+}
+
 /// Deleting one organization leaves every other one standing.
 #[tokio::test]
 async fn deleting_one_organization_leaves_the_others() {
