@@ -875,7 +875,19 @@ impl OrganizationState {
         status.completed_timestamp = Some(Utc::now());
         status.failure_reason = Some(reason.to_string());
         status.pending_email = None;
-        Some(status.clone())
+        let snapshot = status.clone();
+        // `CreateAccount` applies create-time tags to the reserved id
+        // straight away, on the old assumption that every request ends in
+        // SUCCEEDED. A failed request's id never becomes an account, so
+        // those tags would otherwise linger on an id `ListAccounts` does
+        // not know and AWS answers for with `TargetNotFoundException`.
+        if let Some(account_id) = &snapshot.account_id {
+            self.resource_tags.remove(account_id);
+        }
+        if let Some(gov_id) = &snapshot.gov_cloud_account_id {
+            self.resource_tags.remove(gov_id);
+        }
+        Some(snapshot)
     }
 
     /// Issue a new pending invitation handshake to `target_account_id`.

@@ -1129,6 +1129,100 @@ async fn describe_resource_policy_allows_a_delegated_administrator() {
     .expect("a delegated administrator may read the resource policy");
 }
 
+/// Re-accepting an already-accepted handshake is a terminal-transition
+/// error, not a membership one. The membership gates are necessarily
+/// satisfied once the accept succeeded, so checking them first made a
+/// client retrying after a timeout read a join that had worked as a
+/// hard constraint failure -- and disagreed with Decline/Cancel, which
+/// answered correctly.
+#[tokio::test]
+async fn re_accepting_a_handshake_reports_the_transition_error() {
+    let (svc, _state) = OrganizationsService::shared();
+    create_org_with_root(&svc).await;
+    let invited = body_json(
+        &svc.handle(req_with(
+            "111111111111",
+            "InviteAccountToOrganization",
+            json!({ "Target": { "Type": "ACCOUNT", "Id": "222222222222" } }),
+        ))
+        .await
+        .unwrap(),
+    );
+    let handshake_id = invited["Handshake"]["Id"].as_str().unwrap().to_string();
+    svc.handle(req_with(
+        "222222222222",
+        "AcceptHandshake",
+        json!({ "HandshakeId": handshake_id }),
+    ))
+    .await
+    .unwrap();
+
+    for action in ["AcceptHandshake", "DeclineHandshake"] {
+        let err = expect_err(
+            svc.handle(req_with(
+                "222222222222",
+                action,
+                json!({ "HandshakeId": handshake_id }),
+            ))
+            .await,
+        );
+        assert_eq!(
+            err.code(),
+            "InvalidHandshakeTransitionException",
+            "{action} on a terminal handshake"
+        );
+    }
+}
+
+/// A `CreateAccount` that ends FAILED leaves no tags behind on the id it
+/// reserved: create-time tags are applied straight away, but that id
+/// never becomes an account, and AWS answers `TargetNotFoundException`
+/// for an id that is not a real resource.
+#[tokio::test]
+async fn a_failed_create_account_drops_the_tags_it_reserved() {
+    let (svc, state) = OrganizationsService::shared();
+    create_org_with_root(&svc).await;
+    let created = body_value(
+        svc.handle(req_with(
+            "111111111111",
+            "CreateAccount",
+            json!({
+                "Email": "222222222222@example.com",
+                "AccountName": "doomed",
+                "Tags": [{ "Key": "env", "Value": "prod" }],
+            }),
+        ))
+        .await
+        .unwrap(),
+    );
+    let account_id = created["CreateAccountStatus"]["AccountId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // Tagged synchronously, against the reserved id.
+    assert!(!state
+        .read()
+        .sole()
+        .unwrap()
+        .list_resource_tags(&account_id)
+        .is_empty());
+
+    state.write().sole_mut().unwrap().fail_create_account(
+        created["CreateAccountStatus"]["Id"].as_str().unwrap(),
+        "EMAIL_ALREADY_EXISTS",
+    );
+
+    assert!(
+        state
+            .read()
+            .sole()
+            .unwrap()
+            .list_resource_tags(&account_id)
+            .is_empty(),
+        "a failed request's reserved id keeps no tags"
+    );
+}
+
 /// Deleting one organization leaves every other one standing.
 #[tokio::test]
 async fn deleting_one_organization_leaves_the_others() {

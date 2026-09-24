@@ -47,6 +47,20 @@ impl OrganizationsService {
             (org.org_id.clone(), handshake)
         };
 
+        // Terminal state FIRST. The membership gates below are
+        // necessarily satisfied by a handshake that was already accepted
+        // -- the caller is a member by then -- so checking them first
+        // reported a re-accept as a constraint violation instead of the
+        // modeled transition error, and a client retrying after a
+        // timeout read a join that had succeeded as a hard failure.
+        // Decline and Cancel already answered correctly, so the paths
+        // also disagreed with each other.
+        if !matches!(handshake.state.as_str(), "OPEN" | "REQUESTED") {
+            return Err(org_error_to_aws(
+                crate::state::OrgError::HandshakeAlreadyResolved(handshake.state.clone()),
+            ));
+        }
+
         // AcceptHandshake / DeclineHandshake belong to the *target*
         // account; CancelHandshake belongs to the *source* (management)
         // account. Enforce party-correctness so test harnesses catch
