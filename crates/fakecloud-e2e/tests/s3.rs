@@ -1609,7 +1609,26 @@ async fn s3_cors_preflight_and_response_headers() {
     assert!(resp.headers().get("vary").is_none());
     assert!(resp.headers().get("access-control-allow-origin").is_none());
 
-    // OPTIONS from non-matching origin should fail
+    // Error responses are CORS-evaluated too. A 404 is heuristically cacheable,
+    // so an ACAO-less 404 stored without an Origin key would be replayed to
+    // every origin.
+    let resp = http
+        .get(format!("{}/cors-bucket/missing.txt", server.endpoint()))
+        .header("Origin", "https://example.com")
+        .header("Authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20240101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=fake")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    assert_eq!(
+        resp.headers().get("vary").unwrap(),
+        "Origin, Access-Control-Request-Headers, Access-Control-Request-Method",
+        "error responses must send Vary too"
+    );
+
+    // OPTIONS from non-matching origin should fail, but the 403 is itself
+    // origin-dependent, so it must not be cached and replayed to the allowed
+    // origin.
     let resp = http
         .request(
             reqwest::Method::OPTIONS,
@@ -1621,6 +1640,31 @@ async fn s3_cors_preflight_and_response_headers() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 403);
+    assert_eq!(
+        resp.headers().get("vary").unwrap(),
+        "Origin, Access-Control-Request-Headers, Access-Control-Request-Method",
+        "rejected preflight must send Vary"
+    );
+
+    // A bucket with no CORS config at all answers preflights identically for
+    // every origin, so that 403 carries no Vary.
+    s3.create_bucket()
+        .bucket("no-cors-bucket")
+        .send()
+        .await
+        .unwrap();
+    let resp = http
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{}/no-cors-bucket/file.txt", server.endpoint()),
+        )
+        .header("Origin", "https://example.com")
+        .header("Access-Control-Request-Method", "GET")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    assert!(resp.headers().get("vary").is_none());
 }
 // ---- S3 Object Lock Tests ----
 

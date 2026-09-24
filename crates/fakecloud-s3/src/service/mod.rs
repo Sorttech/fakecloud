@@ -57,6 +57,29 @@ use notifications::{
 /// allowance to another.
 const CORS_VARY: &str = "Origin, Access-Control-Request-Headers, Access-Control-Request-Method";
 
+/// Attach [`CORS_VARY`] to whatever a CORS-evaluated request produced — success
+/// or error alike.
+///
+/// Errors matter as much as successes here: a 404 `NoSuchKey` is heuristically
+/// cacheable, so an `Access-Control-Allow-Origin`-less 404 stored under a key
+/// that ignores `Origin` gets replayed to every origin, which is the exact
+/// replay this header exists to prevent.
+fn apply_cors_vary(result: &mut Result<AwsResponse, AwsServiceError>) {
+    match result {
+        Ok(resp) => {
+            resp.headers
+                .insert("vary", http::HeaderValue::from_static(CORS_VARY));
+        }
+        Err(AwsServiceError::AwsError { headers, .. }) => {
+            if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("vary")) {
+                headers.push(("vary".to_string(), CORS_VARY.to_string()));
+            }
+        }
+        // Other variants render without per-error headers.
+        Err(_) => {}
+    }
+}
+
 pub struct S3Service {
     state: SharedS3State,
     delivery: Arc<DeliveryBus>,
@@ -506,10 +529,23 @@ impl AwsService for S3Service {
                         });
                     }
                 }
-                return Err(AwsServiceError::aws_error(
+                // A rejected preflight still carries `Vary` when the bucket has
+                // a CORS config: the 403 is origin-dependent, and a cache that
+                // keyed it without `Origin` would replay it to the allowed
+                // origin and break a legitimate cross-origin request. With no
+                // CORS config at all the answer is origin-independent, so it
+                // gets no `Vary` — matching S3, which only emits CORS headers
+                // for a bucket it actually evaluated CORS on.
+                let headers = if cors_config.is_some() {
+                    vec![("vary".to_string(), CORS_VARY.to_string())]
+                } else {
+                    Vec::new()
+                };
+                return Err(AwsServiceError::aws_error_with_headers(
                     StatusCode::FORBIDDEN,
                     "CORSResponse",
                     "CORS is not enabled for this bucket",
+                    headers,
                 ));
             }
         }
@@ -844,6 +880,7 @@ impl AwsService for S3Service {
                         &result,
                         Err(e) if e.code() == "NoSuchKey"
                     );
+                    let mut return_website_error = None;
                     if is_not_found {
                         let website_config = {
                             let accounts = self.state.read();
@@ -866,11 +903,16 @@ impl AwsService for S3Service {
                                 })
                                 .or_else(|| extract_xml_value(config, "Key"))
                             {
-                                return self.serve_website_error(account_id, &req, b, &error_key);
+                                // Fall through to the shared tail (CORS headers,
+                                // access logging) rather than returning early,
+                                // so a website error document is treated like
+                                // any other response.
+                                return_website_error =
+                                    Some(self.serve_website_error(account_id, &req, b, &error_key));
                             }
                         }
                     }
-                    result
+                    return_website_error.unwrap_or(result)
                 }
             }
             (&Method::DELETE, Some(b), Some(k)) => {
@@ -946,10 +988,7 @@ impl AwsService for S3Service {
                 // rule or not: a disallowed origin gets no ACAO, and that
                 // ACAO-less response must not be cached and replayed to an
                 // allowed origin.
-                if let Ok(ref mut resp) = result {
-                    resp.headers
-                        .insert("vary", http::HeaderValue::from_static(CORS_VARY));
-                }
+                apply_cors_vary(&mut result);
                 let rules = parse_cors_config(config);
                 if let Some(rule) = find_cors_rule(&rules, origin, None) {
                     if let Ok(ref mut resp) = result {
