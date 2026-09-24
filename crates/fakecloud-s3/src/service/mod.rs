@@ -3427,23 +3427,26 @@ pub(crate) fn find_cors_rule<'a>(
     if origin.is_empty() || method.is_empty() {
         return None;
     }
-    // First rule matching origin + method wins, as on S3 — then that rule has
-    // to cover the requested headers. Folding headers into the selection
-    // instead would let a later, narrower rule rescue a request the first
-    // match denies, so a bucket's effective policy would depend on which
-    // headers the client happened to declare. That fails open; this does not.
-    let rule = rules.iter().find(|rule| {
+    // A rule matches the request as a whole — origin, method, and every
+    // requested header — and the first such rule wins, as on S3.
+    //
+    // Selecting on origin+method alone and then testing headers against that
+    // one rule looks more conservative but is simply wrong: given a broad rule
+    // followed by a narrower one that explicitly allows `content-type`, it
+    // denies the request the bucket owner wrote that second rule to permit.
+    // Refusing what the config plainly allows is not a safer failure, just a
+    // broken one.
+    rules.iter().find(|rule| {
         let origin_ok = rule
             .allowed_origins
             .iter()
             .any(|o| origin_matches(origin, o));
         let method_ok = rule.allowed_methods.iter().any(|am| am == method);
-        origin_ok && method_ok
-    })?;
-    requested_headers
-        .iter()
-        .all(|h| rule.allowed_headers.iter().any(|ah| header_matches(h, ah)))
-        .then_some(rule)
+        let headers_ok = requested_headers
+            .iter()
+            .all(|h| rule.allowed_headers.iter().any(|ah| header_matches(h, ah)));
+        origin_ok && method_ok && headers_ok
+    })
 }
 
 /// Check if an object is locked (retention or legal hold) and should block mutation.

@@ -513,11 +513,11 @@ fn wildcard_matchers_handle_more_than_one_star() {
 }
 
 #[test]
-fn find_cors_rule_settles_on_the_first_origin_method_match() {
-    // S3 takes the first rule matching origin + method, then checks the
-    // requested headers against *that* rule. Folding headers into the selection
-    // would let the narrower second rule rescue a request the first one denies,
-    // making the effective policy depend on which headers a client declares.
+fn find_cors_rule_matches_the_request_as_a_whole() {
+    // A rule matches on origin, method AND requested headers together, first
+    // match winning. A broad rule that allows no headers must not shadow a
+    // later one written specifically to permit `content-type` — denying there
+    // would refuse exactly what the bucket owner configured.
     let xml = "<CORSConfiguration>\
         <CORSRule>\
             <AllowedOrigin>*</AllowedOrigin>\
@@ -531,11 +531,20 @@ fn find_cors_rule_settles_on_the_first_origin_method_match() {
     </CORSConfiguration>";
     let rules = parse_cors_config(xml);
     let requested = ["content-type".to_string()];
-    // The first rule matches origin+method and allows no headers, so the
-    // preflight is denied rather than falling through to the second rule.
-    assert!(find_cors_rule(&rules, "https://app.example.com", "PUT", &requested).is_none());
-    // With no headers declared, that same first rule approves it.
-    assert!(find_cors_rule(&rules, "https://app.example.com", "PUT", &[]).is_some());
+    let matched = find_cors_rule(&rules, "https://app.example.com", "PUT", &requested)
+        .expect("the second rule allows this header");
+    assert_eq!(matched.allowed_headers, vec!["content-type"]);
+    // With no headers declared, the broad first rule wins.
+    let matched = find_cors_rule(&rules, "https://app.example.com", "PUT", &[]).unwrap();
+    assert_eq!(matched.allowed_origins, vec!["*"]);
+    // A header no rule covers is still denied.
+    assert!(find_cors_rule(
+        &rules,
+        "https://app.example.com",
+        "PUT",
+        &["authorization".to_string()]
+    )
+    .is_none());
 }
 
 #[test]

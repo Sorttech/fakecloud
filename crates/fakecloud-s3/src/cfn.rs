@@ -131,7 +131,17 @@ pub fn apply_cfn_bucket_properties(
     // bucket serving `Access-Control-Allow-Origin` after the template said it
     // should not. An absent property still leaves existing state untouched,
     // matching CFN update semantics for everything else here.
-    if obj.contains_key("CorsConfiguration") {
+    // Only an explicitly empty `CorsRules: []` clears. `build_cors_xml` also
+    // returns `None` when `CorsRules` is absent or not an array, and treating
+    // those as "clear" would delete a live CORS config because an intrinsic
+    // resolved to the wrong shape — every preflight then failing with nothing
+    // in the stack output to say why.
+    let clears_cors = obj
+        .get("CorsConfiguration")
+        .and_then(|c| c.get("CorsRules"))
+        .and_then(Value::as_array)
+        .is_some_and(|rules| rules.is_empty());
+    if cors_xml.is_some() || clears_cors {
         match cors_xml {
             Some(xml) => {
                 // The exact string validated above, before any subresource was

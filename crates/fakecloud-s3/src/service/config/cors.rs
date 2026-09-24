@@ -38,25 +38,47 @@ pub(crate) fn validate_cors_xml(body_str: &str) -> Result<(), (&'static str, Str
         return Err(("MalformedXML", MALFORMED_XML.to_string()));
     }
 
+    // Scanned per rule rather than across the whole document: an
+    // `<AllowedMethod>` or `<MaxAgeSeconds>` sitting outside any `<CORSRule>`
+    // feeds no rule, and `parse_cors_config` ignores it, so rejecting the body
+    // over it would refuse a config whose live semantics are fine.
+    let rule_bodies: Vec<&str> = {
+        let mut bodies = Vec::new();
+        let mut rest = scannable.as_str();
+        while let Some(start) = rest.find("<CORSRule>") {
+            let after = &rest[start + 10..];
+            match after.find("</CORSRule>") {
+                Some(end) => {
+                    bodies.push(&after[..end]);
+                    rest = &after[end + 11..];
+                }
+                None => break,
+            }
+        }
+        bodies
+    };
+
     // Validate HTTP methods
     let valid_methods = ["GET", "PUT", "POST", "DELETE", "HEAD"];
-    let mut remaining = scannable.as_str();
-    while let Some(start) = remaining.find("<AllowedMethod>") {
-        let after = &remaining[start + 15..];
-        if let Some(end) = after.find("</AllowedMethod>") {
-            let method = after[..end].trim();
-            // An empty element has no name to report, so it falls through to
-            // the required-member check below and gets `MalformedXML` like
-            // every other empty required element, rather than an
-            // "Unsupported method is " with nothing after it.
-            if !method.is_empty() && !valid_methods.contains(&method) {
-                return Err(("InvalidRequest", format!("Found unsupported HTTP method in CORS config. Unsupported method is {method}")));
+    for rule_body in &rule_bodies {
+        let mut remaining = *rule_body;
+        while let Some(start) = remaining.find("<AllowedMethod>") {
+            let after = &remaining[start + 15..];
+            if let Some(end) = after.find("</AllowedMethod>") {
+                let method = after[..end].trim();
+                // An empty element has no name to report, so it falls through to
+                // the required-member check below and gets `MalformedXML` like
+                // every other empty required element, rather than an
+                // "Unsupported method is " with nothing after it.
+                if !method.is_empty() && !valid_methods.contains(&method) {
+                    return Err(("InvalidRequest", format!("Found unsupported HTTP method in CORS config. Unsupported method is {method}")));
+                }
+                remaining = &after[end + 16..];
+            } else {
+                // Opening tag without a matching closer is malformed
+                // XML; reject instead of saving a half-parsed config.
+                return Err(("MalformedXML", MALFORMED_XML.to_string()));
             }
-            remaining = &after[end + 16..];
-        } else {
-            // Opening tag without a matching closer is malformed
-            // XML; reject instead of saving a half-parsed config.
-            return Err(("MalformedXML", MALFORMED_XML.to_string()));
         }
     }
 
@@ -98,22 +120,45 @@ pub(crate) fn validate_cors_xml(body_str: &str) -> Result<(), (&'static str, Str
         if let Some(bad) = rule.expose_headers.iter().find(|v| v.contains('*')) {
             return Err(("InvalidRequest", format!("ExposeHeader \"{bad}\" contains wildcard. We currently do not support wildcard for ExposeHeader.")));
         }
+
+        // These values are echoed into response headers, and `set_cors_header`
+        // silently drops one that will not parse. A control character here
+        // would strip the header from every response with no error anywhere —
+        // the same silently-CORS-dead outcome the rest of this function exists
+        // to prevent.
+        for (label, values) in [
+            ("AllowedHeader", &rule.allowed_headers),
+            ("ExposeHeader", &rule.expose_headers),
+            ("AllowedOrigin", &rule.allowed_origins),
+        ] {
+            if let Some(bad) = values
+                .iter()
+                .find(|v| v.parse::<http::HeaderValue>().is_err())
+            {
+                return Err((
+                    "InvalidRequest",
+                    format!("{label} \"{bad}\" is not a valid header value."),
+                ));
+            }
+        }
     }
 
     // A non-numeric `MaxAgeSeconds` parses to `None`, so the config would
     // round-trip looking healthy while every preflight silently shipped
     // without `Access-Control-Max-Age` and browsers re-preflighted each
     // request. Reject it instead, as S3 does.
-    let mut remaining = scannable.as_str();
-    while let Some(start) = remaining.find("<MaxAgeSeconds>") {
-        let after = &remaining[start + 15..];
-        let Some(end) = after.find("</MaxAgeSeconds>") else {
-            return Err(("MalformedXML", MALFORMED_XML.to_string()));
-        };
-        if after[..end].trim().parse::<u32>().is_err() {
-            return Err(("MalformedXML", MALFORMED_XML.to_string()));
+    for rule_body in &rule_bodies {
+        let mut remaining = *rule_body;
+        while let Some(start) = remaining.find("<MaxAgeSeconds>") {
+            let after = &remaining[start + 15..];
+            let Some(end) = after.find("</MaxAgeSeconds>") else {
+                return Err(("MalformedXML", MALFORMED_XML.to_string()));
+            };
+            if after[..end].trim().parse::<u32>().is_err() {
+                return Err(("MalformedXML", MALFORMED_XML.to_string()));
+            }
+            remaining = &after[end + 16..];
         }
-        remaining = &after[end + 16..];
     }
 
     Ok(())
