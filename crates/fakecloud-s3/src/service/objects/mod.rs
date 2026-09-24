@@ -149,3 +149,121 @@ fn full_body_response(
         }
     }
 }
+
+#[cfg(test)]
+mod null_version_tests {
+    use super::{null_version_to_preserve, record_preserved_null, replace_null_version};
+    use crate::state::{S3Bucket, S3Object};
+
+    fn bucket() -> S3Bucket {
+        S3Bucket::new("b", "us-east-1", "123456789012")
+    }
+
+    fn object(version_id: Option<&str>, etag: &str, is_delete_marker: bool) -> S3Object {
+        S3Object {
+            key: "k".to_string(),
+            version_id: version_id.map(|v| v.to_string()),
+            etag: etag.to_string(),
+            is_delete_marker,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn preserves_a_pre_versioning_object_tagged_null() {
+        let mut b = bucket();
+        b.objects.insert("k".to_string(), object(None, "e1", false));
+        let preserved = null_version_to_preserve(&b, "k").expect("current object is the null slot");
+        assert_eq!(preserved.version_id.as_deref(), Some("null"));
+        assert_eq!(preserved.etag, "e1");
+    }
+
+    #[test]
+    fn preserves_an_object_written_while_suspended() {
+        // A suspended write tags its object "null", so "has no version id" is
+        // the wrong test for the null slot.
+        let mut b = bucket();
+        b.objects
+            .insert("k".to_string(), object(Some("null"), "e1", false));
+        assert!(null_version_to_preserve(&b, "k").is_some());
+    }
+
+    #[test]
+    fn preserves_nothing_when_the_history_already_holds_a_null() {
+        let mut b = bucket();
+        b.objects.insert("k".to_string(), object(None, "e1", false));
+        b.object_versions
+            .insert("k".to_string(), vec![object(Some("null"), "e0", false)]);
+        assert!(null_version_to_preserve(&b, "k").is_none());
+    }
+
+    #[test]
+    fn preserves_nothing_for_a_real_version() {
+        let mut b = bucket();
+        b.objects
+            .insert("k".to_string(), object(Some("v1"), "e1", false));
+        assert!(null_version_to_preserve(&b, "k").is_none());
+    }
+
+    #[test]
+    fn recording_pushes_the_version_and_retags_the_current_object() {
+        // The retag keeps memory agreeing with the sidecar, which the caller
+        // rewrote to carry the "null" id: without it GetObject reports no
+        // version while ListObjectVersions shows one, and a failure on the
+        // write that follows freezes that disagreement.
+        let mut b = bucket();
+        b.objects.insert("k".to_string(), object(None, "e1", false));
+        let preserved = null_version_to_preserve(&b, "k").unwrap();
+        record_preserved_null(&mut b, "k", preserved);
+
+        assert_eq!(
+            b.objects.get("k").unwrap().version_id.as_deref(),
+            Some("null")
+        );
+        let versions = b.object_versions.get("k").expect("history entry");
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version_id.as_deref(), Some("null"));
+        assert_eq!(versions[0].etag, "e1");
+    }
+
+    #[test]
+    fn recording_leaves_a_real_current_version_alone() {
+        let mut b = bucket();
+        b.objects
+            .insert("k".to_string(), object(Some("v2"), "e2", false));
+        record_preserved_null(&mut b, "k", object(Some("null"), "e1", false));
+        assert_eq!(
+            b.objects.get("k").unwrap().version_id.as_deref(),
+            Some("v2")
+        );
+    }
+
+    #[test]
+    fn replacing_drops_the_previous_null_including_a_marker() {
+        let mut b = bucket();
+        b.object_versions.insert(
+            "k".to_string(),
+            vec![
+                object(Some("v1"), "e1", false),
+                object(Some("null"), "", true),
+            ],
+        );
+        let fresh = object(Some("null"), "e3", false);
+        replace_null_version(&mut b, "k", &fresh);
+
+        let versions = b.object_versions.get("k").unwrap();
+        assert_eq!(versions.len(), 2, "v1 plus the new null: {versions:?}");
+        assert_eq!(versions[0].version_id.as_deref(), Some("v1"));
+        assert_eq!(versions[1].etag, "e3");
+        assert!(!versions[1].is_delete_marker);
+    }
+
+    #[test]
+    fn replacing_without_history_touches_nothing() {
+        // A key whose null object lives only in `objects` needs no history
+        // entry -- listings read the current object directly.
+        let mut b = bucket();
+        replace_null_version(&mut b, "k", &object(Some("null"), "e1", false));
+        assert!(b.object_versions.get("k").is_none());
+    }
+}
