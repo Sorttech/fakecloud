@@ -60,17 +60,25 @@ fn is_transfer_party(
 /// `AccountId` (exactly 12 digits), so an email-targeted transfer -- whose
 /// target is recorded as the address the source named -- carries only
 /// the email until the address resolves to an account id.
-fn target_participant(t: &ResponsibilityTransfer) -> Value {
+fn target_participant(
+    registry: &crate::state::OrganizationsRegistry,
+    t: &ResponsibilityTransfer,
+) -> Value {
     let mut party = json!({
         "ManagementAccountEmail": t.target_management_account_email,
     });
     let stored = &t.target_management_account_id;
     let is_account_id = stored.len() == 12 && stored.chars().all(|c| c.is_ascii_digit());
+    // Resolve exactly as the party gate does, or the account that can
+    // accept and act on the transfer is not the one the payload names.
+    // These ops are party-gated already, so the anti-oracle scoping that
+    // applies to invitation-time resolution is not needed here.
     let resolved = if is_account_id {
         Some(stored.clone())
     } else {
-        // An address fakecloud minted still names an account.
-        crate::state::target_account_id("EMAIL", stored)
+        registry
+            .account_registered_with(stored)
+            .or_else(|| crate::state::target_account_id("EMAIL", stored))
     };
     if let Some(id) = resolved {
         party["ManagementAccountId"] = json!(id);
@@ -78,7 +86,10 @@ fn target_participant(t: &ResponsibilityTransfer) -> Value {
     party
 }
 
-fn transfer_payload(t: &ResponsibilityTransfer) -> Value {
+fn transfer_payload(
+    registry: &crate::state::OrganizationsRegistry,
+    t: &ResponsibilityTransfer,
+) -> Value {
     let mut obj = json!({
         "Arn": t.arn,
         "Name": t.name,
@@ -89,7 +100,7 @@ fn transfer_payload(t: &ResponsibilityTransfer) -> Value {
             "ManagementAccountId": t.source_management_account_id,
             "ManagementAccountEmail": t.source_management_account_email,
         },
-        "Target": target_participant(t),
+        "Target": target_participant(registry, t),
         "StartTimestamp": t.start_timestamp.timestamp() as f64,
     });
     if let Some(end) = t.end_timestamp {
@@ -227,11 +238,20 @@ impl OrganizationsService {
                 .keys()
                 .any(|id| registry.account_matches_target(target_kind, &target_id, id))
         });
-        if target_is_own_org {
+        // A member of ANOTHER organization that is not its management
+        // account cannot take over billing either; AWS reports both as
+        // handshake constraint violations. A standalone account is still
+        // allowed -- it may create an organization before accepting, and
+        // AWS likewise invites an owner it has not seen yet.
+        let target_is_non_management_member = registry
+            .org_of_account(&target_account_id)
+            .is_some_and(|org| org.management_account_id != target_account_id);
+        if target_is_own_org || target_is_non_management_member {
             return Err(AwsServiceError::aws_error_with_fields(
                 StatusCode::BAD_REQUEST,
                 "HandshakeConstraintViolationException",
-                "An organization cannot transfer responsibility to itself.",
+                "A responsibility transfer targets another organization's \
+                 management account.",
                 vec![(
                     "Reason".to_string(),
                     "SOURCE_AND_TARGET_CANNOT_MATCH".to_string(),
@@ -311,7 +331,7 @@ impl OrganizationsService {
             .filter(|t| is_transfer_party(&guard, t, &req.account_id))
             .ok_or_else(|| transfer_not_found(&id))?;
         Ok(AwsResponse::ok_json(
-            json!({ "ResponsibilityTransfer": transfer_payload(transfer) }),
+            json!({ "ResponsibilityTransfer": transfer_payload(&guard, transfer) }),
         ))
     }
 
@@ -331,7 +351,7 @@ impl OrganizationsService {
         transfer.name = name;
         let snapshot = transfer.clone();
         Ok(AwsResponse::ok_json(
-            json!({ "ResponsibilityTransfer": transfer_payload(&snapshot) }),
+            json!({ "ResponsibilityTransfer": transfer_payload(&guard, &snapshot) }),
         ))
     }
 
@@ -388,7 +408,7 @@ impl OrganizationsService {
             }
         }
         Ok(AwsResponse::ok_json(
-            json!({ "ResponsibilityTransfer": transfer_payload(&snapshot) }),
+            json!({ "ResponsibilityTransfer": transfer_payload(&guard, &snapshot) }),
         ))
     }
 
@@ -458,7 +478,10 @@ impl OrganizationsService {
             }
         }
         rows.sort_by(|a, b| a.id.cmp(&b.id));
-        let filtered: Vec<Value> = rows.into_iter().map(transfer_payload).collect();
+        let filtered: Vec<Value> = rows
+            .into_iter()
+            .map(|t| transfer_payload(&guard, t))
+            .collect();
         let (page, token) = paginate_checked(&filtered, next_token.as_deref(), max_results)
             .map_err(|_| invalid_input("Invalid NextToken"))?;
         let mut out = json!({ "ResponsibilityTransfers": page });

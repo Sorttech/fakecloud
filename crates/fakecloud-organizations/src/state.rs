@@ -757,12 +757,15 @@ impl OrganizationState {
                 "arn:aws-us-gov:organizations::{}:account/{}/{}",
                 self.management_account_id, self.org_id, gov_id
             );
+            // Its OWN address: sharing the commercial account's would make
+            // one address name two accounts, and every target resolution
+            // would then pick whichever id sorted first.
             self.accounts.insert(
                 gov_id.clone(),
                 MemberAccount {
                     id: gov_id.clone(),
                     arn: gov_arn,
-                    email,
+                    email: format!("{gov_id}@example.com"),
                     name: account_name,
                     status: "ACTIVE".to_string(),
                     joined_method: "CREATED".to_string(),

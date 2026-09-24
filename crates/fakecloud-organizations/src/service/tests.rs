@@ -603,8 +603,34 @@ async fn a_responsibility_transfer_cannot_target_its_own_organization() {
         assert_eq!(err.code(), "HandshakeConstraintViolationException");
     }
 
-    // An account elsewhere -- or nowhere -- is recorded verbatim, with no
-    // lookup that could report what exists in another organization.
+    // Nor a member of ANOTHER organization that is not its management
+    // account -- it cannot take over billing for one.
+    svc.handle(req_with("222222222222", "CreateOrganization", json!({})))
+        .await
+        .unwrap();
+    state
+        .write()
+        .org_of_account_mut("222222222222")
+        .unwrap()
+        .enroll_account_if_missing("222222220001");
+    let err = expect_err(
+        svc.handle(req_with(
+            "111111111111",
+            "InviteOrganizationToTransferResponsibility",
+            json!({
+                "Type": "BILLING",
+                "SourceName": "handover",
+                "StartTimestamp": 1893456000.0,
+                "Target": {"Id": "222222220001", "Type": "ACCOUNT"},
+            }),
+        ))
+        .await,
+    );
+    assert_eq!(err.code(), "HandshakeConstraintViolationException");
+
+    // A standalone account is still allowed: it may create an
+    // organization before accepting, as AWS invites an owner it has not
+    // seen yet.
     svc.handle(req_with(
         "111111111111",
         "InviteOrganizationToTransferResponsibility",
