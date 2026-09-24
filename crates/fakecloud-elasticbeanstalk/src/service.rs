@@ -16,8 +16,9 @@ use fakecloud_persistence::{SnapshotHook, SnapshotStore};
 use crate::state::{
     environment_status as est, AccountState, Application, ApplicationVersion,
     ConfigurationTemplate, CustomPlatform, ElasticBeanstalkSnapshot, Environment, Event,
-    MaxAgeRule, MaxCountRule, OptionSetting, ResourceLifecycleConfig, ResourceTag, SharedEbState,
-    SourceBuildInformation, ELASTICBEANSTALK_SNAPSHOT_SCHEMA_VERSION,
+    ImageBuildConfiguration, ImageSource, MaxAgeRule, MaxCountRule, OptionSetting,
+    ResourceLifecycleConfig, ResourceTag, SharedEbState, SourceBuildInformation,
+    ELASTICBEANSTALK_SNAPSHOT_SCHEMA_VERSION,
 };
 
 const NS: &str = "http://elasticbeanstalk.amazonaws.com/docs/2010-12-01/";
@@ -782,6 +783,9 @@ impl ElasticBeanstalkService {
         let bucket = optional_query_param(req, "SourceBundle.S3Bucket");
         let key = optional_query_param(req, "SourceBundle.S3Key");
         let source_build = parse_source_build_information(req);
+        let image_source = parse_image_source(req);
+        let image_build_configuration = parse_image_build_configuration(req);
+        let process = optional_query_param(req, "Process").map(|v| v == "true");
         let now = Utc::now();
 
         let mut guard = self.state.write();
@@ -826,6 +830,9 @@ impl ElasticBeanstalkService {
             source_bundle_key: key,
             source_build_information: source_build,
             build_arn: None,
+            image_source,
+            image_build_configuration,
+            process,
             date_created: now,
             date_updated: now,
             status: "Processed".to_string(),
@@ -2286,14 +2293,44 @@ fn render_application_version(v: &ApplicationVersion) -> String {
             )
         })
         .unwrap_or_default();
+    let image_source = v
+        .image_source
+        .as_ref()
+        .map(|i| format!("<ImageSource>{}</ImageSource>", opt_el("Uri", &i.uri)))
+        .unwrap_or_default();
+    let image_build = v
+        .image_build_configuration
+        .as_ref()
+        .map(|b| {
+            format!(
+                "<ImageBuildConfiguration>{}{}{}{}{}{}{}</ImageBuildConfiguration>",
+                opt_el("Type", &b.build_type),
+                opt_el("DockerfileLocation", &b.dockerfile_location),
+                opt_el("Buildpack", &b.buildpack),
+                opt_el("Architecture", &b.architecture),
+                opt_el("CodeBuildServiceRole", &b.code_build_service_role),
+                opt_el("ComputeType", &b.compute_type),
+                b.timeout_in_minutes
+                    .map(|t| el("TimeoutInMinutes", &t.to_string()))
+                    .unwrap_or_default(),
+            )
+        })
+        .unwrap_or_default();
+    let process = v
+        .process
+        .map(|p| el("Process", if p { "true" } else { "false" }))
+        .unwrap_or_default();
     format!(
-        "{}{}{}{}{}{}{}{}",
+        "{}{}{}{}{}{}{}{}{}{}{}",
         el("ApplicationVersionArn", &v.arn),
         el("ApplicationName", &v.application_name),
         opt_el("Description", &v.description),
         el("VersionLabel", &v.version_label),
         source_build,
         source_bundle,
+        image_source,
+        image_build,
+        process,
         el("DateCreated", &iso(v.date_created)),
         el("DateUpdated", &iso(v.date_updated)) + &el("Status", &v.status),
     )
@@ -2528,6 +2565,47 @@ fn parse_tier(req: &AwsRequest) -> (String, String, String) {
     let type_ = optional_query_param(req, "Tier.Type").unwrap_or_else(|| "Standard".to_string());
     let version = optional_query_param(req, "Tier.Version").unwrap_or_else(|| "1.0".to_string());
     (name, type_, version)
+}
+
+/// `ImageConfiguration.Source` on a create request: a pre-built image the
+/// caller pushed to a registry themselves.
+fn parse_image_source(req: &AwsRequest) -> Option<ImageSource> {
+    let uri = optional_query_param(req, "ImageConfiguration.Source.Uri");
+    uri.map(|uri| ImageSource { uri: Some(uri) })
+}
+
+/// `ImageConfiguration.Build` on a create request: how Elastic Beanstalk should
+/// build the image from the source bundle.
+fn parse_image_build_configuration(req: &AwsRequest) -> Option<ImageBuildConfiguration> {
+    let build_type = optional_query_param(req, "ImageConfiguration.Build.Type");
+    let dockerfile_location =
+        optional_query_param(req, "ImageConfiguration.Build.DockerfileLocation");
+    let buildpack = optional_query_param(req, "ImageConfiguration.Build.Buildpack");
+    let architecture = optional_query_param(req, "ImageConfiguration.Build.Architecture");
+    let code_build_service_role =
+        optional_query_param(req, "ImageConfiguration.Build.CodeBuildServiceRole");
+    let compute_type = optional_query_param(req, "ImageConfiguration.Build.ComputeType");
+    let timeout_in_minutes = optional_query_param(req, "ImageConfiguration.Build.TimeoutInMinutes")
+        .and_then(|v| v.parse::<i64>().ok());
+    if build_type.is_none()
+        && dockerfile_location.is_none()
+        && buildpack.is_none()
+        && architecture.is_none()
+        && code_build_service_role.is_none()
+        && compute_type.is_none()
+        && timeout_in_minutes.is_none()
+    {
+        return None;
+    }
+    Some(ImageBuildConfiguration {
+        build_type,
+        dockerfile_location,
+        buildpack,
+        architecture,
+        code_build_service_role,
+        compute_type,
+        timeout_in_minutes,
+    })
 }
 
 fn parse_source_build_information(req: &AwsRequest) -> Option<SourceBuildInformation> {

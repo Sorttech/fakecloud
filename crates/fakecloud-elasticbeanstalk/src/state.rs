@@ -169,10 +169,40 @@ pub struct ApplicationVersion {
     pub source_build_information: Option<SourceBuildInformation>,
     #[serde(default)]
     pub build_arn: Option<String>,
+    /// Set when the version deploys a pre-built container image
+    /// (`ImageConfiguration.Source` on the create request).
+    #[serde(default)]
+    pub image_source: Option<ImageSource>,
+    /// Set when Elastic Beanstalk builds the image from the source bundle
+    /// (`ImageConfiguration.Build` on the create request).
+    #[serde(default)]
+    pub image_build_configuration: Option<ImageBuildConfiguration>,
+    /// Whether the version was created with pre-processing requested.
+    #[serde(default)]
+    pub process: Option<bool>,
     pub date_created: DateTime<Utc>,
     pub date_updated: DateTime<Utc>,
     /// `Processed` | `Unprocessed` | `Failed` | `Processing` | `Building`.
     pub status: String,
+}
+
+/// The location of a container image the caller built and pushed themselves.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageSource {
+    pub uri: Option<String>,
+}
+
+/// How Elastic Beanstalk builds the container image for an application version.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageBuildConfiguration {
+    /// `docker` | `buildpack`.
+    pub build_type: Option<String>,
+    pub dockerfile_location: Option<String>,
+    pub buildpack: Option<String>,
+    pub architecture: Option<String>,
+    pub code_build_service_role: Option<String>,
+    pub compute_type: Option<String>,
+    pub timeout_in_minutes: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

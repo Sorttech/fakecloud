@@ -55,6 +55,8 @@ enum CliCommand {
     },
     /// Run Level 2 audit: check handwritten test coverage
     Audit,
+    /// Check that each crate's vendored `model.json` still matches `aws-models/`
+    VendoredModels,
     /// Check conformance results against baseline (fails if coverage drops)
     Check {
         /// Path to conformance-baseline.json
@@ -81,6 +83,88 @@ enum CliCommand {
     },
 }
 
+/// A handful of service crates `include_str!` their own copy of the Smithy
+/// model for model-driven input validation, because `cargo publish` only
+/// packages files under the crate root and cannot reach `aws-models/`. Those
+/// copies go stale silently every time the weekly refresh lands, so check them.
+fn cmd_vendored_models(project_root: &std::path::Path, models_dir: &std::path::Path) -> bool {
+    let crates_dir = project_root.join("crates");
+    let Ok(entries) = std::fs::read_dir(&crates_dir) else {
+        eprintln!("cannot read {}", crates_dir.display());
+        return false;
+    };
+    let mut vendored: Vec<(String, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let copy = entry.path().join("model.json");
+        if !copy.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let service = name.strip_prefix("fakecloud-").unwrap_or(&name).to_string();
+        vendored.push((service, copy));
+    }
+    vendored.sort();
+
+    println!("=== Vendored Smithy models ===");
+    let mut stale = Vec::new();
+    for (service, copy) in &vendored {
+        let source = if models_dir.is_absolute() {
+            models_dir.join(format!("{service}.json"))
+        } else {
+            project_root
+                .join(models_dir)
+                .join(format!("{service}.json"))
+        };
+        let a = match std::fs::read(copy) {
+            Ok(a) => a,
+            Err(e) => {
+                println!("  [x] {service}: cannot read {} ({e})", copy.display());
+                stale.push(service.clone());
+                continue;
+            }
+        };
+        // A crate whose directory suffix is not its model's file name (the
+        // `elbv2` / `elasticloadbalancingv2` shape) lands here: name the
+        // mismatch rather than reporting a stale copy.
+        let b = match std::fs::read(&source) {
+            Ok(b) => b,
+            Err(e) => {
+                println!(
+                    "  [x] {service}: no model at {} ({e}) -- does the crate suffix match the aws-models file name?",
+                    source.display()
+                );
+                stale.push(service.clone());
+                continue;
+            }
+        };
+        if a == b {
+            println!("  [ok] {service}");
+        } else {
+            println!(
+                "  [x] {service}: {} differs from {}",
+                copy.display(),
+                source.display()
+            );
+            stale.push(service.clone());
+        }
+    }
+
+    if stale.is_empty() {
+        println!(
+            "\nPASS: all {} vendored models match aws-models",
+            vendored.len()
+        );
+        return true;
+    }
+    println!(
+        "\nFAIL: {} vendored model(s) stale: {}",
+        stale.len(),
+        stale.join(", ")
+    );
+    println!("Fix with: cp aws-models/<service>.json crates/fakecloud-<service>/model.json");
+    false
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -98,6 +182,14 @@ fn main() {
                 .join("..");
             let pass = fakecloud_conformance::audit::run_audit(&project_root);
             if !pass {
+                std::process::exit(1);
+            }
+        }
+        CliCommand::VendoredModels => {
+            let project_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("..");
+            if !cmd_vendored_models(&project_root, &cli.models_dir) {
                 std::process::exit(1);
             }
         }

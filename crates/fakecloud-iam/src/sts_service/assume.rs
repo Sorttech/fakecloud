@@ -91,7 +91,7 @@ impl StsService {
         let _mfa_token = token_code;
 
         let partition = partition_for_region(&req.region);
-        let creds = StsCredentials::generate();
+        let creds = StsCredentials::generate_with_minimum(minimum_session_token_size(req)?);
 
         let mut accounts = self.state.write();
 
@@ -385,7 +385,7 @@ impl StsService {
         let expiration = format_expiration(expiration_at);
 
         let partition = partition_for_region(&req.region);
-        let creds = StsCredentials::generate();
+        let creds = StsCredentials::generate_with_minimum(minimum_session_token_size(req)?);
 
         let mut accounts = self.state.write();
         let caller_state = accounts.get_or_create(&req.account_id);
@@ -720,7 +720,7 @@ impl StsService {
         let saml_claims = extract_saml_claims(saml_assertion);
 
         let partition = partition_for_region(&req.region);
-        let creds = StsCredentials::generate();
+        let creds = StsCredentials::generate_with_minimum(minimum_session_token_size(req)?);
 
         let mut accounts = self.state.write();
         let caller_state = accounts.get_or_create(&req.account_id);
@@ -1019,7 +1019,7 @@ impl StsService {
         };
         let expiration_at = Utc::now() + chrono::Duration::seconds(effective_duration);
         let expiration = format_expiration(expiration_at);
-        let creds = StsCredentials::generate();
+        let creds = StsCredentials::generate_with_minimum(minimum_session_token_size(req)?);
 
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&target_account);

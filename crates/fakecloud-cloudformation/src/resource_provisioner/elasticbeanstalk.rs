@@ -223,6 +223,12 @@ impl ResourceProvisioner {
                 source_bundle_key: key,
                 source_build_information: eb_source_build_information(props),
                 build_arn: None,
+                // AWS::ElasticBeanstalk::ApplicationVersion carries only
+                // ApplicationName / Description / SourceBundle, so a
+                // CloudFormation-provisioned version has no image configuration.
+                image_source: None,
+                image_build_configuration: None,
+                process: None,
                 date_created: now,
                 date_updated: now,
                 status: "Processed".to_string(),

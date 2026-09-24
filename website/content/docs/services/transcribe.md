@@ -1,11 +1,11 @@
 +++
 title = "Amazon Transcribe"
-description = "Amazon Transcribe on fakecloud: the full 43-operation control plane -- transcription, medical-transcription, call-analytics and medical-scribe jobs, custom and medical vocabularies, vocabulary filters, custom language models, call-analytics categories, and tagging -- with account-partitioned persistence. Speech recognition itself is a documented gap."
+description = "Amazon Transcribe on fakecloud: the full 44-operation control plane -- transcription, medical-transcription, call-analytics and medical-scribe jobs, custom and medical vocabularies, vocabulary filters, custom language models, call-analytics categories, and tagging -- with account-partitioned persistence. Speech recognition itself is a documented gap."
 weight = 73
 +++
 
 fakecloud implements **Amazon Transcribe** (`transcribe`), the automatic
-speech-recognition (ASR) service. All **43 operations** from the AWS Smithy
+speech-recognition (ASR) service. All **44 operations** from the AWS Smithy
 model ship now, backed by account-partitioned state that persists across
 restarts in persistent mode. The wire protocol is awsJson1.1 (x-amz-target
 `Transcribe.<Op>`), signing as `transcribe`.
@@ -70,9 +70,13 @@ text, that is out of scope.
 - **Vocabulary filters** (`CreateVocabularyFilter`, `GetVocabularyFilter`,
   `UpdateVocabularyFilter`, `ListVocabularyFilters`, `DeleteVocabularyFilter`).
 - **Custom language models** (`CreateLanguageModel`, `DescribeLanguageModel`,
-  `ListLanguageModels`, `DeleteLanguageModel`). A new model is `IN_PROGRESS` and
-  settles to `COMPLETED` on the next read, carrying its `InputDataConfig`,
-  `BaseModelName`, and `LanguageCode`.
+  `ListLanguageModels`, `UpdateLanguageModel`, `DeleteLanguageModel`). A new
+  model is `IN_PROGRESS` and settles to `COMPLETED` on the next read, carrying
+  its `InputDataConfig`, `BaseModelName`, and `LanguageCode`.
+  `UpdateLanguageModel` re-encrypts the artifacts in place — it repoints
+  `EncryptionConfiguration` and the `DataAccessRoleArn` without retraining — and
+  returns `ConflictException` while the model is still `IN_PROGRESS`, matching
+  AWS's refusal to update a model that is still training.
 - **Tagging** (`TagResource`, `UntagResource`, `ListTagsForResource`), keyed by
   the resource ARN (`arn:aws:transcribe:<region>:<account>:<type>/<name>`).
   Tagging a resource that does not exist returns `NotFoundException`.

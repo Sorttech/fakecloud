@@ -41,6 +41,8 @@ impl StsService {
         )?;
         let _token_code = req.query_params.get("TokenCode").cloned();
 
+        let minimum_token_size = minimum_session_token_size(req)?;
+
         // Compute expiration from DurationSeconds (default 43200s / 12 hours)
         let expiration_at = compute_expiration_at(req, DEFAULT_SESSION_TOKEN_DURATION)?;
         let expiration = format_expiration(expiration_at);
@@ -72,7 +74,7 @@ impl StsService {
                 )
             };
 
-        let creds = StsCredentials::generate();
+        let creds = StsCredentials::generate_with_minimum(minimum_token_size);
         state.credential_identities.insert(
             creds.access_key_id.clone(),
             CredentialIdentity {

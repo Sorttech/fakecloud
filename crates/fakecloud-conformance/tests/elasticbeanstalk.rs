@@ -125,7 +125,7 @@ async fn delete_application() {
         .unwrap();
 }
 
-#[test_action("elasticbeanstalk", "CreateApplicationVersion", checksum = "f40ed5e6")]
+#[test_action("elasticbeanstalk", "CreateApplicationVersion", checksum = "5d884c1b")]
 #[tokio::test]
 async fn create_application_version() {
     let s = server_with_app("ver-app").await;
@@ -149,7 +149,7 @@ async fn create_application_version() {
     );
 }
 
-#[test_action("elasticbeanstalk", "UpdateApplicationVersion", checksum = "564e6df6")]
+#[test_action("elasticbeanstalk", "UpdateApplicationVersion", checksum = "2a062f3c")]
 #[tokio::test]
 async fn update_application_version() {
     let s = server_with_app("uver-app").await;
@@ -177,7 +177,7 @@ async fn update_application_version() {
 #[test_action(
     "elasticbeanstalk",
     "DescribeApplicationVersions",
-    checksum = "cd11440a"
+    checksum = "77b4666f"
 )]
 #[tokio::test]
 async fn describe_application_versions() {
@@ -286,7 +286,7 @@ async fn describe_environments() {
 #[test_action(
     "elasticbeanstalk",
     "DescribeEnvironmentResources",
-    checksum = "0103ac40"
+    checksum = "06f12bda"
 )]
 #[tokio::test]
 async fn describe_environment_resources() {
@@ -849,4 +849,76 @@ async fn update_tags_for_resource() {
         .resource_tags()
         .iter()
         .any(|t| t.key() == Some("env") && t.value() == Some("prod")));
+}
+
+// ---------------------------------------------------------------------------
+// ImageConfiguration (and the ImageSource / ImageBuildConfiguration / Process
+// members it feeds on read) is newer than the vendored aws-sdk-elasticbeanstalk,
+// so exercise it via a raw awsQuery POST.
+// ---------------------------------------------------------------------------
+
+const EB_RAW_AUTH: &str = "AWS4-HMAC-SHA256 Credential=test/20240101/us-east-1/elasticbeanstalk/aws4_request, SignedHeaders=host, Signature=0";
+
+async fn eb_raw(server: &TestServer, body: &str) -> String {
+    let resp = reqwest::Client::new()
+        .post(server.endpoint())
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header("Authorization", EB_RAW_AUTH)
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "raw elasticbeanstalk query returned {}",
+        resp.status()
+    );
+    resp.text().await.unwrap()
+}
+
+#[tokio::test]
+async fn application_version_round_trips_its_image_configuration() {
+    let s = server_with_app("img-app").await;
+
+    // A version built from the source bundle carries its build settings back.
+    eb_raw(
+        &s,
+        "Action=CreateApplicationVersion&Version=2010-12-01&ApplicationName=img-app\
+         &VersionLabel=built&Process=true\
+         &ImageConfiguration.Build.Type=docker\
+         &ImageConfiguration.Build.DockerfileLocation=Dockerfile\
+         &ImageConfiguration.Build.TimeoutInMinutes=30",
+    )
+    .await;
+    // A version deploying a pre-built image carries its URI back.
+    eb_raw(
+        &s,
+        "Action=CreateApplicationVersion&Version=2010-12-01&ApplicationName=img-app\
+         &VersionLabel=prebuilt\
+         &ImageConfiguration.Source.Uri=111122223333.dkr.ecr.us-east-1.amazonaws.com/repo%3Alatest",
+    )
+    .await;
+
+    let xml = eb_raw(
+        &s,
+        "Action=DescribeApplicationVersions&Version=2010-12-01&ApplicationName=img-app",
+    )
+    .await;
+    assert!(
+        xml.contains("<Type>docker</Type>")
+            && xml.contains("<DockerfileLocation>Dockerfile</DockerfileLocation>"),
+        "build configuration should describe back: {xml}"
+    );
+    assert!(
+        xml.contains("<TimeoutInMinutes>30</TimeoutInMinutes>"),
+        "build timeout should describe back: {xml}"
+    );
+    assert!(
+        xml.contains("<Process>true</Process>"),
+        "Process should describe back: {xml}"
+    );
+    assert!(
+        xml.contains("<Uri>111122223333.dkr.ecr.us-east-1.amazonaws.com/repo:latest</Uri>"),
+        "image source should describe back: {xml}"
+    );
 }

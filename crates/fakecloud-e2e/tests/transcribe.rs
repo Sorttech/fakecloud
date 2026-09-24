@@ -163,3 +163,223 @@ async fn transcription_job_and_vocabulary_lifecycle() {
         .await;
     assert!(gone.is_err(), "deleted job should not be found");
 }
+
+/// UpdateLanguageModel is newer than the typed aws-sdk-transcribe client, so
+/// drive it over raw awsJson1.1 (x-amz-target `Transcribe.<Op>`), the same wire
+/// format the SDK uses.
+#[tokio::test]
+async fn update_language_model_re_encrypts_a_settled_model() {
+    let server = TestServer::start().await;
+    let tx = transcribe_client(&server).await;
+
+    tx.create_language_model()
+        .model_name("e2e-clm")
+        .language_code(aws_sdk_transcribe::types::ClmLanguageCode::EnUs)
+        .base_model_name(aws_sdk_transcribe::types::BaseModelName::WideBand)
+        .input_data_config(
+            aws_sdk_transcribe::types::InputDataConfig::builder()
+                .s3_uri("s3://training/data/")
+                .data_access_role_arn("arn:aws:iam::000000000000:role/old")
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .expect("create language model");
+
+    let auth = "AWS4-HMAC-SHA256 Credential=test/20240101/us-east-1/transcribe/aws4_request, SignedHeaders=host, Signature=0";
+    let call = |op: &str, body: String| {
+        let url = server.endpoint().to_string();
+        let target = format!("Transcribe.{op}");
+        async move {
+            reqwest::Client::new()
+                .post(url)
+                .header("Authorization", auth)
+                .header("Content-Type", "application/x-amz-json-1.1")
+                .header("X-Amz-Target", target)
+                .body(body)
+                .send()
+                .await
+                .expect("request")
+        }
+    };
+
+    // Training has not settled yet, so AWS rejects the update with a conflict.
+    let resp = call(
+        "UpdateLanguageModel",
+        r#"{"ModelName":"e2e-clm","DataAccessRoleArn":"arn:aws:iam::000000000000:role/new"}"#
+            .to_string(),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        409,
+        "updating an IN_PROGRESS model should conflict"
+    );
+    let err: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        err["__type"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Conflict"),
+        "expected ConflictException: {err}"
+    );
+
+    // DescribeLanguageModel settles the model to COMPLETED.
+    let described = tx
+        .describe_language_model()
+        .model_name("e2e-clm")
+        .send()
+        .await
+        .expect("describe language model");
+    assert_eq!(
+        described.language_model().and_then(|m| m.model_status()),
+        Some(&aws_sdk_transcribe::types::ModelStatus::Completed)
+    );
+
+    // The update now succeeds and re-points both the KMS key and the role.
+    let resp = call(
+        "UpdateLanguageModel",
+        r#"{"ModelName":"e2e-clm","DataAccessRoleArn":"arn:aws:iam::000000000000:role/new","EncryptionConfiguration":{"KmsKeyId":"alias/clm"}}"#
+            .to_string(),
+    )
+    .await;
+    assert!(resp.status().is_success(), "update: {}", resp.status());
+    let updated: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(updated["ModelName"], "e2e-clm");
+    assert_eq!(updated["ModelStatus"], "COMPLETED");
+    assert!(
+        updated["LastModifiedTime"].is_number(),
+        "update returns a last-modified timestamp: {updated}"
+    );
+
+    // The new role and key are readable back through DescribeLanguageModel.
+    let resp = call(
+        "DescribeLanguageModel",
+        r#"{"ModelName":"e2e-clm"}"#.to_string(),
+    )
+    .await;
+    let described: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        described["LanguageModel"]["InputDataConfig"]["DataAccessRoleArn"],
+        "arn:aws:iam::000000000000:role/new"
+    );
+    assert_eq!(
+        described["LanguageModel"]["EncryptionConfiguration"]["KmsKeyId"],
+        "alias/clm"
+    );
+    assert_eq!(
+        described["LanguageModel"]["InputDataConfig"]["S3Uri"], "s3://training/data/",
+        "the update leaves the training data in place"
+    );
+
+    // An unknown model is a not-found, not a silent no-op.
+    let resp = call(
+        "UpdateLanguageModel",
+        r#"{"ModelName":"missing-clm"}"#.to_string(),
+    )
+    .await;
+    assert_eq!(resp.status(), 404);
+    let err: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        err["__type"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("NotFound"),
+        "expected NotFoundException: {err}"
+    );
+}
+
+/// `EncryptionConfiguration` joined the vocabulary create/update requests and
+/// the `GetVocabulary` read shape in a model refresh, ahead of the typed
+/// aws-sdk-transcribe client, so drive those over raw awsJson1.1.
+#[tokio::test]
+async fn vocabulary_round_trips_its_encryption_configuration() {
+    let server = TestServer::start().await;
+
+    let auth = "AWS4-HMAC-SHA256 Credential=test/20240101/us-east-1/transcribe/aws4_request, SignedHeaders=host, Signature=0";
+    let call = |op: &str, body: String| {
+        let url = server.endpoint().to_string();
+        let target = format!("Transcribe.{op}");
+        async move {
+            reqwest::Client::new()
+                .post(url)
+                .header("Authorization", auth)
+                .header("Content-Type", "application/x-amz-json-1.1")
+                .header("X-Amz-Target", target)
+                .body(body)
+                .send()
+                .await
+                .expect("request")
+        }
+    };
+
+    let resp = call(
+        "CreateVocabulary",
+        r#"{"VocabularyName":"enc-vocab","LanguageCode":"en-US","Phrases":["Amazon"],"DataAccessRoleArn":"arn:aws:iam::000000000000:role/vocab","EncryptionConfiguration":{"KmsKeyId":"alias/vocab"}}"#
+            .to_string(),
+    )
+    .await;
+    assert!(resp.status().is_success(), "create: {}", resp.status());
+
+    let resp = call(
+        "GetVocabulary",
+        r#"{"VocabularyName":"enc-vocab"}"#.to_string(),
+    )
+    .await;
+    let got: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        got["DataAccessRoleArn"], "arn:aws:iam::000000000000:role/vocab",
+        "vocabulary: {got}"
+    );
+    assert_eq!(
+        got["EncryptionConfiguration"]["KmsKeyId"], "alias/vocab",
+        "vocabulary: {got}"
+    );
+
+    // An update repoints the key.
+    let resp = call(
+        "UpdateVocabulary",
+        r#"{"VocabularyName":"enc-vocab","LanguageCode":"en-US","Phrases":["Amazon"],"EncryptionConfiguration":{"KmsKeyId":"alias/rotated"}}"#
+            .to_string(),
+    )
+    .await;
+    assert!(resp.status().is_success(), "update: {}", resp.status());
+    let resp = call(
+        "GetVocabulary",
+        r#"{"VocabularyName":"enc-vocab"}"#.to_string(),
+    )
+    .await;
+    let got: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        got["EncryptionConfiguration"]["KmsKeyId"], "alias/rotated",
+        "vocabulary: {got}"
+    );
+
+    // Vocabulary filters carry the same pair.
+    let resp = call(
+        "CreateVocabularyFilter",
+        r#"{"VocabularyFilterName":"enc-filter","LanguageCode":"en-US","Words":["nope"],"DataAccessRoleArn":"arn:aws:iam::000000000000:role/filter","EncryptionConfiguration":{"KmsKeyId":"alias/filter"}}"#
+            .to_string(),
+    )
+    .await;
+    assert!(
+        resp.status().is_success(),
+        "create filter: {}",
+        resp.status()
+    );
+    let resp = call(
+        "GetVocabularyFilter",
+        r#"{"VocabularyFilterName":"enc-filter"}"#.to_string(),
+    )
+    .await;
+    let got: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        got["DataAccessRoleArn"], "arn:aws:iam::000000000000:role/filter",
+        "filter: {got}"
+    );
+    assert_eq!(
+        got["EncryptionConfiguration"]["KmsKeyId"], "alias/filter",
+        "filter: {got}"
+    );
+}

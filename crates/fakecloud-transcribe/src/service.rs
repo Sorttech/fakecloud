@@ -23,7 +23,7 @@ use crate::shared::{
 };
 use crate::state::{SharedTranscribeState, TranscribeData};
 
-/// Every operation name in the Amazon Transcribe Smithy model (43 operations).
+/// Every operation name in the Amazon Transcribe Smithy model (44 operations).
 pub const TRANSCRIBE_ACTIONS: &[&str] = &[
     "CreateCallAnalyticsCategory",
     "CreateLanguageModel",
@@ -65,6 +65,7 @@ pub const TRANSCRIBE_ACTIONS: &[&str] = &[
     "TagResource",
     "UntagResource",
     "UpdateCallAnalyticsCategory",
+    "UpdateLanguageModel",
     "UpdateMedicalVocabulary",
     "UpdateVocabulary",
     "UpdateVocabularyFilter",
@@ -206,6 +207,7 @@ impl TranscribeService {
             // Custom language models
             "CreateLanguageModel" => self.create_language_model(req, &body),
             "DescribeLanguageModel" => self.describe_language_model(req, &body),
+            "UpdateLanguageModel" => self.update_language_model(req, &body),
             "ListLanguageModels" => self.list_language_models(req, &body),
             "DeleteLanguageModel" => self.delete_language_model(req, &body),
             // Tagging
@@ -239,6 +241,17 @@ fn ok(value: Value) -> Result<AwsResponse, AwsServiceError> {
 }
 
 // ---- small member helpers -------------------------------------------------
+
+/// Members the caller supplies on create/update that the resource's read shape
+/// carries back. Stored on the resource so a `Get*` returns what was set.
+const ENCRYPTION_MEMBERS: &[&str] = &["DataAccessRoleArn", "EncryptionConfiguration"];
+
+/// Copy `names` from `body` onto an already-built resource object.
+fn carry_over(body: &Value, resource: &mut Value, names: &[&str]) {
+    if let Some(obj) = resource.as_object_mut() {
+        copy_members(body, obj, names);
+    }
+}
 
 /// Copy each named member from `body` into `obj` when present and non-null.
 fn copy_members(body: &Value, obj: &mut Map<String, Value>, names: &[&str]) {
@@ -1136,13 +1149,14 @@ impl TranscribeService {
             }
             let now = now_epoch();
             let dl = download_uri(&region, &account, "vocabulary", &name);
-            let obj = json!({
+            let mut obj = json!({
                 "VocabularyName": name,
                 "LanguageCode": lang,
                 "VocabularyState": "PENDING",
                 "LastModifiedTime": now,
                 "DownloadUri": dl,
             });
+            carry_over(body, &mut obj, ENCRYPTION_MEMBERS);
             d.vocabularies.insert(name.clone(), obj.clone());
             let arn = resource_arn(&region, &account, "vocabulary", &name);
             d.store_tags(&arn, body);
@@ -1191,13 +1205,14 @@ impl TranscribeService {
             }
             let now = now_epoch();
             let dl = download_uri(&region, &account, "vocabulary", &name);
-            let obj = json!({
+            let mut obj = json!({
                 "VocabularyName": name,
                 "LanguageCode": lang,
                 "VocabularyState": "PENDING",
                 "LastModifiedTime": now,
                 "DownloadUri": dl,
             });
+            carry_over(body, &mut obj, ENCRYPTION_MEMBERS);
             d.vocabularies.insert(name.clone(), obj);
             ok(json!({
                 "VocabularyName": name,
@@ -1429,12 +1444,13 @@ impl TranscribeService {
             }
             let now = now_epoch();
             let dl = download_uri(&region, &account, "vocabulary-filter", &name);
-            let obj = json!({
+            let mut obj = json!({
                 "VocabularyFilterName": name,
                 "LanguageCode": lang,
                 "LastModifiedTime": now,
                 "DownloadUri": dl,
             });
+            carry_over(body, &mut obj, ENCRYPTION_MEMBERS);
             d.vocabulary_filters.insert(name.clone(), obj);
             let arn = resource_arn(&region, &account, "vocabulary-filter", &name);
             d.store_tags(&arn, body);
@@ -1479,12 +1495,13 @@ impl TranscribeService {
             let lang = existing.get("LanguageCode").cloned().unwrap_or(Value::Null);
             let now = now_epoch();
             let dl = download_uri(&region, &account, "vocabulary-filter", &name);
-            let obj = json!({
+            let mut obj = json!({
                 "VocabularyFilterName": name,
                 "LanguageCode": lang,
                 "LastModifiedTime": now,
                 "DownloadUri": dl,
             });
+            carry_over(body, &mut obj, ENCRYPTION_MEMBERS);
             d.vocabulary_filters.insert(name.clone(), obj.clone());
             ok(json!({
                 "VocabularyFilterName": name,
@@ -1560,7 +1577,16 @@ impl TranscribeService {
             model.insert("LastModifiedTime".into(), json!(now));
             model.insert("ModelStatus".into(), json!("IN_PROGRESS"));
             model.insert("UpgradeAvailability".into(), json!(false));
-            copy_members(body, &mut model, &["LanguageCode", "BaseModelName", "InputDataConfig"]);
+            copy_members(
+                body,
+                &mut model,
+                &[
+                    "LanguageCode",
+                    "BaseModelName",
+                    "InputDataConfig",
+                    "EncryptionConfiguration",
+                ],
+            );
             d.language_models.insert(name.clone(), Value::Object(model.clone()));
             let arn = resource_arn(&region, &account, "language-model", &name);
             d.store_tags(&arn, body);
@@ -1607,6 +1633,53 @@ impl TranscribeService {
             );
             let out: Vec<Value> = models.into_iter().cloned().collect();
             ok(json!({ "Models": out }))
+        })
+    }
+
+    fn update_language_model(
+        &self,
+        req: &AwsRequest,
+        body: &Value,
+    ) -> Result<AwsResponse, AwsServiceError> {
+        let name = str_member(body, "ModelName")
+            .unwrap_or_default()
+            .to_string();
+        let encryption = body.get("EncryptionConfiguration").cloned();
+        let role = str_member(body, "DataAccessRoleArn").map(str::to_string);
+        // No `reconcile()` here: settling is what a *read* does in this crate, so
+        // a model that has not been described yet is still training, and AWS
+        // rejects an update while the model is IN_PROGRESS.
+        self.with_account_mut(req, |d| {
+            let Some(model) = d.language_models.get_mut(&name) else {
+                return Err(not_found("The requested model couldn't be found. Check the model name and try your request again."));
+            };
+            let Some(obj) = model.as_object_mut() else {
+                return Err(not_found("The requested model couldn't be found. Check the model name and try your request again."));
+            };
+            if obj.get("ModelStatus").and_then(Value::as_str) == Some("IN_PROGRESS") {
+                return Err(conflict("Your custom language model must not be in the IN_PROGRESS state when you call this operation. Use DescribeLanguageModel to check the current state of your model."));
+            }
+            // Re-encryption happens in place: the artifacts keep their identity,
+            // only the key and the access role used to reach it change.
+            if let Some(enc) = encryption {
+                obj.insert("EncryptionConfiguration".into(), enc);
+            }
+            if let Some(role) = role {
+                let input = obj
+                    .entry("InputDataConfig")
+                    .or_insert_with(|| Value::Object(Map::new()));
+                if let Some(input) = input.as_object_mut() {
+                    input.insert("DataAccessRoleArn".into(), json!(role));
+                }
+            }
+            let now = now_epoch();
+            obj.insert("LastModifiedTime".into(), json!(now));
+            let status = obj.get("ModelStatus").cloned().unwrap_or(Value::Null);
+            ok(json!({
+                "ModelName": name,
+                "ModelStatus": status,
+                "LastModifiedTime": now,
+            }))
         })
     }
 

@@ -19593,6 +19593,7 @@ pub static OPS: &[OpMeta] = &[
                 "ModelCard",
                 "PipelineVersion",
                 "Job",
+                "HubContent",
             ],
         }],
         omembers: &[("PropertyNameSuggestions", K::List)],
@@ -35277,6 +35278,7 @@ pub static OPS: &[OpMeta] = &[
                     "ModelCard",
                     "PipelineVersion",
                     "Job",
+                    "HubContent",
                 ],
             },
             Rule {
@@ -35364,6 +35366,7 @@ pub static OPS: &[OpMeta] = &[
             ("ModelCard", K::Struct),
             ("Model", K::Struct),
             ("Job", K::Struct),
+            ("HubContent", K::Struct),
         ],
         list_scalar: false,
         req_out: &[],

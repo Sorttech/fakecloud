@@ -1544,6 +1544,15 @@ impl CodeDeployService {
             "InvalidFileExistsBehaviorException",
             "The specified fileExistsBehavior value is invalid.",
         )?;
+        // CreateDeployment declares no deploymentMode-specific error, so an
+        // unmodelled value is reported as InvalidInputException.
+        opt_enum(
+            &b,
+            "deploymentMode",
+            validate::DEPLOYMENT_MODE,
+            "InvalidInputException",
+            "The specified deploymentMode value is invalid.",
+        )?;
         if let Some(rev) = b.get("revision").filter(|v| !v.is_null()) {
             validate_revision(rev)?;
         }
@@ -1625,6 +1634,7 @@ impl CodeDeployService {
             ("description", "description"),
             ("autoRollbackConfiguration", "autoRollbackConfiguration"),
             ("fileExistsBehavior", "fileExistsBehavior"),
+            ("deploymentMode", "deploymentMode"),
             ("targetInstances", "targetInstances"),
             ("overrideAlarmConfiguration", "overrideAlarmConfiguration"),
         ] {
@@ -3358,6 +3368,46 @@ mod tests {
             got["deploymentInfo"]["overrideAlarmConfiguration"]["alarms"][0]["name"],
             "cpu-high"
         );
+    }
+
+    // CreateDeployment carries deploymentMode into the stored deployment, and
+    // rejects a value the model does not declare.
+    #[test]
+    fn create_deployment_carries_deployment_mode() {
+        let s = svc();
+        make_app_and_group(&s, "app", "dg");
+        let id = body_of(
+            s.create_deployment(&req(
+                "CreateDeployment",
+                json!({
+                    "applicationName": "app",
+                    "deploymentGroupName": "dg",
+                    "deploymentMode": "RESTART"
+                }),
+            ))
+            .unwrap(),
+        )["deploymentId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let got = body_of(
+            s.get_deployment(&req("GetDeployment", json!({ "deploymentId": id })))
+                .unwrap(),
+        );
+        assert_eq!(got["deploymentInfo"]["deploymentMode"], "RESTART");
+
+        let rejected = s.create_deployment(&req(
+            "CreateDeployment",
+            json!({
+                "applicationName": "app",
+                "deploymentGroupName": "dg",
+                "deploymentMode": "TURBO"
+            }),
+        ));
+        match rejected {
+            Err(err) => assert_eq!(err.code(), "InvalidInputException"),
+            Ok(_) => panic!("an unmodelled deploymentMode should be rejected"),
+        }
     }
 
     // T2.7: deleting a resource purges its tag entry, so a same-named
