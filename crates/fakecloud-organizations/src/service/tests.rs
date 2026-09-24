@@ -613,20 +613,27 @@ async fn a_responsibility_transfer_cannot_target_its_own_organization() {
         .org_of_account_mut("222222222222")
         .unwrap()
         .enroll_account_if_missing("222222220001");
-    let err = expect_err(
-        svc.handle(req_with(
-            "111111111111",
-            "InviteOrganizationToTransferResponsibility",
-            json!({
-                "Type": "BILLING",
-                "SourceName": "handover",
-                "StartTimestamp": 1893456000.0,
-                "Target": {"Id": "222222220001", "Type": "ACCOUNT"},
-            }),
-        ))
-        .await,
-    );
-    assert_eq!(err.code(), "HandshakeConstraintViolationException");
+    // Both spellings of that member are refused: resolving only the
+    // ACCOUNT form left the EMAIL form as a way around the check.
+    for target in [
+        json!({"Id": "222222220001", "Type": "ACCOUNT"}),
+        json!({"Id": "222222220001@example.com", "Type": "EMAIL"}),
+    ] {
+        let err = expect_err(
+            svc.handle(req_with(
+                "111111111111",
+                "InviteOrganizationToTransferResponsibility",
+                json!({
+                    "Type": "BILLING",
+                    "SourceName": "handover",
+                    "StartTimestamp": 1893456000.0,
+                    "Target": target,
+                }),
+            ))
+            .await,
+        );
+        assert_eq!(err.code(), "HandshakeConstraintViolationException");
+    }
 
     // A standalone account is still allowed: it may create an
     // organization before accepting, as AWS invites an owner it has not

@@ -69,15 +69,19 @@ fn target_participant(
     });
     let stored = &t.target_management_account_id;
     let is_account_id = stored.len() == 12 && stored.chars().all(|c| c.is_ascii_digit());
-    // Resolve exactly as the party gate does, or the account that can
-    // accept and act on the transfer is not the one the payload names.
-    // These ops are party-gated already, so the anti-oracle scoping that
-    // applies to invitation-time resolution is not needed here.
     let resolved = if is_account_id {
         Some(stored.clone())
     } else {
+        // Scoped to the organization that holds the transfer: this value
+        // is RETURNED, so a registry-wide lookup would hand the source a
+        // 12-digit id from an organization it has no relationship with --
+        // the oracle `resolve_target_account` is scoped to avoid. The
+        // synthetic form leaks nothing, since it only decodes an id the
+        // caller already spelled out.
         registry
-            .account_registered_with(stored)
+            .org_of_account(&t.source_management_account_id)
+            .and_then(|org| org.accounts.values().find(|a| a.email == *stored))
+            .map(|account| account.id.clone())
             .or_else(|| crate::state::target_account_id("EMAIL", stored))
     };
     if let Some(id) = resolved {
@@ -233,19 +237,31 @@ impl OrganizationsService {
         // plain member of the SAME organization be named, which opened --
         // and let that member accept -- a "cross-organization" transfer
         // whose two ends were one organization.
-        let target_is_own_org = registry.org_by_id(&source_org_id).is_some_and(|org| {
-            org.accounts
-                .keys()
-                .any(|id| registry.account_matches_target(target_kind, &target_id, id))
-        });
+        // Resolve once, the same way every party gate does. Asking
+        // `org_of_account` about the raw string answered `None` for every
+        // EMAIL target, so the non-management check below never fired and
+        // an address spelling a plain member of another organization got
+        // through. This scan drives a rejection only -- it never hands an
+        // id back -- so it is not the oracle the id-returning resolvers
+        // are scoped to avoid.
+        let resolved_target = registry
+            .iter()
+            .flat_map(|org| org.accounts.keys())
+            .find(|id| registry.account_matches_target(target_kind, &target_id, id))
+            .cloned();
+        let target_org = resolved_target
+            .as_deref()
+            .and_then(|id| registry.org_of_account(id));
+        let target_is_own_org = target_org.is_some_and(|org| org.org_id == source_org_id);
         // A member of ANOTHER organization that is not its management
         // account cannot take over billing either; AWS reports both as
         // handshake constraint violations. A standalone account is still
         // allowed -- it may create an organization before accepting, and
         // AWS likewise invites an owner it has not seen yet.
-        let target_is_non_management_member = registry
-            .org_of_account(&target_account_id)
-            .is_some_and(|org| org.management_account_id != target_account_id);
+        let target_is_non_management_member = match (&resolved_target, target_org) {
+            (Some(id), Some(org)) => org.management_account_id != *id,
+            _ => false,
+        };
         if target_is_own_org || target_is_non_management_member {
             return Err(AwsServiceError::aws_error_with_fields(
                 StatusCode::BAD_REQUEST,
