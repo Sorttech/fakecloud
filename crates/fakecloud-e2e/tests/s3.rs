@@ -735,6 +735,752 @@ async fn s3_notification_delivery_to_sqs() {
     assert_eq!(event["Records"][0]["s3"]["bucket"]["name"], "notif-bucket");
     assert_eq!(event["Records"][0]["s3"]["object"]["key"], "test.txt");
 }
+
+/// Helper: create a queue wired to a bucket's notification config for every
+/// object event, returning the queue URL.
+async fn wire_bucket_to_queue(
+    server: &TestServer,
+    sqs: &aws_sdk_sqs::Client,
+    bucket: &str,
+    queue_name: &str,
+) -> String {
+    let queue = sqs
+        .create_queue()
+        .queue_name(queue_name)
+        .send()
+        .await
+        .unwrap();
+    let queue_url = queue.queue_url().unwrap().to_string();
+    let attrs = sqs
+        .get_queue_attributes()
+        .queue_url(&queue_url)
+        .attribute_names(aws_sdk_sqs::types::QueueAttributeName::QueueArn)
+        .send()
+        .await
+        .unwrap();
+    let queue_arn = attrs
+        .attributes()
+        .unwrap()
+        .get(&aws_sdk_sqs::types::QueueAttributeName::QueueArn)
+        .unwrap()
+        .clone();
+    let notif_config = format!(
+        r#"{{"QueueConfigurations":[{{"Id":"all-events","QueueArn":"{queue_arn}","Events":["s3:ObjectCreated:*","s3:ObjectRemoved:*"]}}]}}"#
+    );
+    let output = server
+        .aws_cli(&[
+            "s3api",
+            "put-bucket-notification-configuration",
+            "--bucket",
+            bucket,
+            "--notification-configuration",
+            &notif_config,
+        ])
+        .await;
+    assert!(
+        output.success(),
+        "Failed to set notification: {}",
+        output.stderr_text()
+    );
+    queue_url
+}
+
+/// Drain up to `max` notification records from the queue.
+async fn drain_records(
+    sqs: &aws_sdk_sqs::Client,
+    queue_url: &str,
+    max: usize,
+) -> Vec<serde_json::Value> {
+    let mut records = Vec::new();
+    for _ in 0..max {
+        let msgs = sqs
+            .receive_message()
+            .queue_url(queue_url)
+            .wait_time_seconds(2)
+            .max_number_of_messages(10)
+            .send()
+            .await
+            .unwrap();
+        if msgs.messages().is_empty() {
+            break;
+        }
+        for m in msgs.messages() {
+            let event: serde_json::Value = serde_json::from_str(m.body().unwrap()).unwrap();
+            for r in event["Records"].as_array().unwrap() {
+                records.push(r.clone());
+            }
+            sqs.delete_message()
+                .queue_url(queue_url)
+                .receipt_handle(m.receipt_handle().unwrap())
+                .send()
+                .await
+                .unwrap();
+        }
+        if records.len() >= max {
+            break;
+        }
+    }
+    records
+}
+
+#[tokio::test]
+async fn s3_notification_carries_version_id_on_versioned_bucket() {
+    // Regression for #2544: events from a versioning-enabled bucket must
+    // carry s3.object.versionId, matching the AWS notification content
+    // structure. Also covers the delete-marker and permanent-delete events,
+    // whose versionId identifies the version AWS acted on.
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+    let sqs = server.sqs_client().await;
+
+    s3.create_bucket().bucket("ver-notif").send().await.unwrap();
+    s3.put_bucket_versioning()
+        .bucket("ver-notif")
+        .versioning_configuration(
+            aws_sdk_s3::types::VersioningConfiguration::builder()
+                .status(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    let queue_url = wire_bucket_to_queue(&server, &sqs, "ver-notif", "ver-events").await;
+
+    let put = s3
+        .put_object()
+        .bucket("ver-notif")
+        .key("doc.txt")
+        .body(ByteStream::from_static(b"v1"))
+        .send()
+        .await
+        .unwrap();
+    let put_version = put.version_id().unwrap().to_string();
+
+    let records = drain_records(&sqs, &queue_url, 1).await;
+    assert_eq!(records.len(), 1, "expected the put event");
+    let created = &records[0];
+    assert_eq!(created["eventName"], "ObjectCreated:Put");
+    assert_eq!(
+        created["s3"]["object"]["versionId"], put_version,
+        "versionId must match the version the put created"
+    );
+    assert_eq!(created["s3"]["configurationId"], "all-events");
+    assert_eq!(created["s3"]["s3SchemaVersion"], "1.0");
+    assert!(
+        created["s3"]["object"]["sequencer"].is_string(),
+        "sequencer must be present: {created}"
+    );
+
+    // Deleting without a version id creates a delete marker; the event
+    // carries the marker's version id.
+    let del = s3
+        .delete_object()
+        .bucket("ver-notif")
+        .key("doc.txt")
+        .send()
+        .await
+        .unwrap();
+    let marker_version = del.version_id().unwrap().to_string();
+    let records = drain_records(&sqs, &queue_url, 1).await;
+    assert_eq!(records.len(), 1, "expected the delete-marker event");
+    assert_eq!(records[0]["eventName"], "ObjectRemoved:DeleteMarkerCreated");
+    assert_eq!(records[0]["s3"]["object"]["versionId"], marker_version);
+    // ObjectRemoved records carry no size/eTag on AWS.
+    assert!(records[0]["s3"]["object"].get("size").is_none());
+    assert!(records[0]["s3"]["object"].get("eTag").is_none());
+
+    // Permanently deleting a specific version fires ObjectRemoved:Delete
+    // with that version id.
+    s3.delete_object()
+        .bucket("ver-notif")
+        .key("doc.txt")
+        .version_id(&put_version)
+        .send()
+        .await
+        .unwrap();
+    let records = drain_records(&sqs, &queue_url, 1).await;
+    assert_eq!(records.len(), 1, "expected the version-delete event");
+    assert_eq!(records[0]["eventName"], "ObjectRemoved:Delete");
+    assert_eq!(records[0]["s3"]["object"]["versionId"], put_version);
+}
+
+#[tokio::test]
+async fn s3_notification_unversioned_bucket_has_no_version_id() {
+    // AWS omits versionId entirely when the bucket is not versioning-enabled.
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+    let sqs = server.sqs_client().await;
+
+    s3.create_bucket()
+        .bucket("unver-notif")
+        .send()
+        .await
+        .unwrap();
+    let queue_url = wire_bucket_to_queue(&server, &sqs, "unver-notif", "unver-events").await;
+
+    s3.put_object()
+        .bucket("unver-notif")
+        .key("my file.txt")
+        .body(ByteStream::from_static(b"x"))
+        .send()
+        .await
+        .unwrap();
+
+    let records = drain_records(&sqs, &queue_url, 1).await;
+    assert_eq!(records.len(), 1);
+    assert!(
+        records[0]["s3"]["object"].get("versionId").is_none(),
+        "unversioned bucket must not report a versionId: {}",
+        records[0]
+    );
+    // Keys are URL-encoded on the wire, as on AWS.
+    assert_eq!(records[0]["s3"]["object"]["key"], "my+file.txt");
+}
+
+#[tokio::test]
+async fn s3_delete_of_missing_key_emits_no_notification() {
+    // A DELETE of a key that was never uploaded is a no-op 204 on AWS and
+    // fires no event -- single delete must agree with the batch endpoint.
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+    let sqs = server.sqs_client().await;
+
+    s3.create_bucket()
+        .bucket("noop-notif")
+        .send()
+        .await
+        .unwrap();
+    let queue_url = wire_bucket_to_queue(&server, &sqs, "noop-notif", "noop-events").await;
+
+    s3.delete_object()
+        .bucket("noop-notif")
+        .key("never-existed.txt")
+        .send()
+        .await
+        .unwrap();
+
+    let records = drain_records(&sqs, &queue_url, 1).await;
+    assert!(
+        records.is_empty(),
+        "deleting a missing key must not emit an event: {records:?}"
+    );
+}
+
+#[tokio::test]
+async fn s3_version_targeted_delete_on_unversioned_bucket_has_no_version_id() {
+    // `--version-id null` against a bucket that never had versioning still
+    // removes the object, but AWS reports no versionId on the record.
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+    let sqs = server.sqs_client().await;
+
+    s3.create_bucket()
+        .bucket("nullver-notif")
+        .send()
+        .await
+        .unwrap();
+    let queue_url = wire_bucket_to_queue(&server, &sqs, "nullver-notif", "nullver-events").await;
+
+    s3.put_object()
+        .bucket("nullver-notif")
+        .key("obj.txt")
+        .body(ByteStream::from_static(b"x"))
+        .send()
+        .await
+        .unwrap();
+    let created = drain_records(&sqs, &queue_url, 1).await;
+    assert_eq!(created.len(), 1);
+
+    s3.delete_object()
+        .bucket("nullver-notif")
+        .key("obj.txt")
+        .version_id("null")
+        .send()
+        .await
+        .unwrap();
+
+    let removed = drain_records(&sqs, &queue_url, 1).await;
+    assert_eq!(removed.len(), 1, "expected the delete event");
+    assert_eq!(removed[0]["eventName"], "ObjectRemoved:Delete");
+    assert!(
+        removed[0]["s3"]["object"].get("versionId").is_none(),
+        "unversioned bucket must not report a versionId: {}",
+        removed[0]
+    );
+}
+
+#[tokio::test]
+async fn s3_suspended_bucket_version_delete_still_reports_version_id() {
+    // Suspending versioning does not erase the version ids of objects written
+    // while it was enabled, so deleting one of those versions must still
+    // report it -- gating on the bucket's *current* status would drop it.
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+    let sqs = server.sqs_client().await;
+
+    s3.create_bucket()
+        .bucket("susp-notif")
+        .send()
+        .await
+        .unwrap();
+    s3.put_bucket_versioning()
+        .bucket("susp-notif")
+        .versioning_configuration(
+            aws_sdk_s3::types::VersioningConfiguration::builder()
+                .status(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let queue_url = wire_bucket_to_queue(&server, &sqs, "susp-notif", "susp-events").await;
+
+    let put = s3
+        .put_object()
+        .bucket("susp-notif")
+        .key("doc.txt")
+        .body(ByteStream::from_static(b"v1"))
+        .send()
+        .await
+        .unwrap();
+    let version = put.version_id().unwrap().to_string();
+    let created = drain_records(&sqs, &queue_url, 1).await;
+    assert_eq!(created.len(), 1);
+
+    s3.put_bucket_versioning()
+        .bucket("susp-notif")
+        .versioning_configuration(
+            aws_sdk_s3::types::VersioningConfiguration::builder()
+                .status(aws_sdk_s3::types::BucketVersioningStatus::Suspended)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    s3.delete_object()
+        .bucket("susp-notif")
+        .key("doc.txt")
+        .version_id(&version)
+        .send()
+        .await
+        .unwrap();
+
+    let removed = drain_records(&sqs, &queue_url, 1).await;
+    assert_eq!(removed.len(), 1, "expected the version-delete event");
+    assert_eq!(removed[0]["eventName"], "ObjectRemoved:Delete");
+    assert_eq!(
+        removed[0]["s3"]["object"]["versionId"], version,
+        "a version written while versioning was enabled keeps its id after suspension"
+    );
+}
+
+#[tokio::test]
+async fn s3_null_version_delete_on_versioned_bucket_reports_null() {
+    // An object written before versioning was turned on is addressable as the
+    // "null" version afterwards, and AWS reports versionId "null" when it is
+    // deleted -- the absence of a stored id is not the same as no versioning.
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+    let sqs = server.sqs_client().await;
+
+    s3.create_bucket()
+        .bucket("nullid-notif")
+        .send()
+        .await
+        .unwrap();
+    let queue_url = wire_bucket_to_queue(&server, &sqs, "nullid-notif", "nullid-events").await;
+
+    s3.put_object()
+        .bucket("nullid-notif")
+        .key("pre.txt")
+        .body(ByteStream::from_static(b"pre"))
+        .send()
+        .await
+        .unwrap();
+    let created = drain_records(&sqs, &queue_url, 1).await;
+    assert_eq!(created.len(), 1);
+    assert!(created[0]["s3"]["object"].get("versionId").is_none());
+
+    s3.put_bucket_versioning()
+        .bucket("nullid-notif")
+        .versioning_configuration(
+            aws_sdk_s3::types::VersioningConfiguration::builder()
+                .status(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    s3.delete_object()
+        .bucket("nullid-notif")
+        .key("pre.txt")
+        .version_id("null")
+        .send()
+        .await
+        .unwrap();
+
+    let removed = drain_records(&sqs, &queue_url, 1).await;
+    assert_eq!(removed.len(), 1, "expected the null-version delete event");
+    assert_eq!(removed[0]["eventName"], "ObjectRemoved:Delete");
+    assert_eq!(
+        removed[0]["s3"]["object"]["versionId"], "null",
+        "the pre-versioning object is the null version once versioning is on"
+    );
+}
+
+#[tokio::test]
+async fn s3_suspended_bucket_delete_creates_null_delete_marker() {
+    // On a suspended bucket AWS stacks a delete marker with version id
+    // "null" and leaves the prior versions listable, rather than hard-removing
+    // the current object the way a never-versioned bucket does.
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+    let sqs = server.sqs_client().await;
+
+    s3.create_bucket()
+        .bucket("susp-marker")
+        .send()
+        .await
+        .unwrap();
+    s3.put_bucket_versioning()
+        .bucket("susp-marker")
+        .versioning_configuration(
+            aws_sdk_s3::types::VersioningConfiguration::builder()
+                .status(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let queue_url = wire_bucket_to_queue(&server, &sqs, "susp-marker", "susp-marker-events").await;
+
+    let put = s3
+        .put_object()
+        .bucket("susp-marker")
+        .key("doc.txt")
+        .body(ByteStream::from_static(b"v1"))
+        .send()
+        .await
+        .unwrap();
+    let version = put.version_id().unwrap().to_string();
+    let created = drain_records(&sqs, &queue_url, 1).await;
+    assert_eq!(created.len(), 1);
+
+    s3.put_bucket_versioning()
+        .bucket("susp-marker")
+        .versioning_configuration(
+            aws_sdk_s3::types::VersioningConfiguration::builder()
+                .status(aws_sdk_s3::types::BucketVersioningStatus::Suspended)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    let del = s3
+        .delete_object()
+        .bucket("susp-marker")
+        .key("doc.txt")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.delete_marker(), Some(true));
+    assert_eq!(del.version_id(), Some("null"));
+
+    let removed = drain_records(&sqs, &queue_url, 1).await;
+    assert_eq!(removed.len(), 1);
+    assert_eq!(removed[0]["eventName"], "ObjectRemoved:DeleteMarkerCreated");
+    assert_eq!(removed[0]["s3"]["object"]["versionId"], "null");
+
+    // The pre-suspension version survives and is still readable by id.
+    let got = s3
+        .get_object()
+        .bucket("susp-marker")
+        .key("doc.txt")
+        .version_id(&version)
+        .send()
+        .await
+        .expect("the enabled-era version must survive the suspended delete");
+    let bytes = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(bytes.as_ref(), b"v1");
+}
+
+/// Put COMPLIANCE retention on one version of a key via the CLI.
+async fn lock_version(server: &TestServer, bucket: &str, key: &str, version_id: &str) {
+    let retain_until = chrono::Utc::now() + chrono::Duration::days(1);
+    let output = server
+        .aws_cli(&[
+            "s3api",
+            "put-object-retention",
+            "--bucket",
+            bucket,
+            "--key",
+            key,
+            "--version-id",
+            version_id,
+            "--retention",
+            &format!(
+                r#"{{"Mode":"COMPLIANCE","RetainUntilDate":"{}"}}"#,
+                retain_until.format("%Y-%m-%dT%H:%M:%SZ")
+            ),
+        ])
+        .await;
+    assert!(
+        output.success(),
+        "failed to set retention: {}",
+        output.stderr_text()
+    );
+}
+
+async fn set_versioning(s3: &aws_sdk_s3::Client, bucket: &str, enabled: bool) {
+    let status = if enabled {
+        aws_sdk_s3::types::BucketVersioningStatus::Enabled
+    } else {
+        aws_sdk_s3::types::BucketVersioningStatus::Suspended
+    };
+    s3.put_bucket_versioning()
+        .bucket(bucket)
+        .versioning_configuration(
+            aws_sdk_s3::types::VersioningConfiguration::builder()
+                .status(status)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn s3_suspended_delete_respects_lock_on_the_null_version_it_replaces() {
+    // On a suspended bucket the delete marker takes over the null version,
+    // destroying it -- so a locked null version must block the delete even
+    // when the *current* version is a newer, unlocked one.
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+
+    let output = server
+        .aws_cli(&[
+            "s3api",
+            "create-bucket",
+            "--bucket",
+            "susp-lock",
+            "--object-lock-enabled-for-bucket",
+        ])
+        .await;
+    assert!(output.success(), "{}", output.stderr_text());
+
+    // A null version, locked, written while versioning is suspended.
+    set_versioning(&s3, "susp-lock", false).await;
+    s3.put_object()
+        .bucket("susp-lock")
+        .key("doc.txt")
+        .body(ByteStream::from_static(b"null-version"))
+        .send()
+        .await
+        .unwrap();
+    lock_version(&server, "susp-lock", "doc.txt", "null").await;
+
+    // A newer, unlocked version becomes current.
+    set_versioning(&s3, "susp-lock", true).await;
+    s3.put_object()
+        .bucket("susp-lock")
+        .key("doc.txt")
+        .body(ByteStream::from_static(b"v2"))
+        .send()
+        .await
+        .unwrap();
+    set_versioning(&s3, "susp-lock", false).await;
+
+    let err = s3
+        .delete_object()
+        .bucket("susp-lock")
+        .key("doc.txt")
+        .send()
+        .await
+        .expect_err("the locked null version must block the suspended delete");
+    assert!(
+        format!("{err:?}").contains("AccessDenied"),
+        "expected AccessDenied, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn s3_suspended_delete_allowed_when_only_a_newer_version_is_locked() {
+    // The mirror image: a locked enabled-era version that the marker does NOT
+    // touch must not block the delete.
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+
+    let output = server
+        .aws_cli(&[
+            "s3api",
+            "create-bucket",
+            "--bucket",
+            "susp-lock-ok",
+            "--object-lock-enabled-for-bucket",
+        ])
+        .await;
+    assert!(output.success(), "{}", output.stderr_text());
+
+    let put = s3
+        .put_object()
+        .bucket("susp-lock-ok")
+        .key("doc.txt")
+        .body(ByteStream::from_static(b"v1"))
+        .send()
+        .await
+        .unwrap();
+    let version = put.version_id().unwrap().to_string();
+    lock_version(&server, "susp-lock-ok", "doc.txt", &version).await;
+
+    set_versioning(&s3, "susp-lock-ok", false).await;
+
+    let del = s3
+        .delete_object()
+        .bucket("susp-lock-ok")
+        .key("doc.txt")
+        .send()
+        .await
+        .expect("a marker that destroys no locked data must be allowed");
+    assert_eq!(del.delete_marker(), Some(true));
+    assert_eq!(del.version_id(), Some("null"));
+
+    // The locked version is untouched.
+    let got = s3
+        .get_object()
+        .bucket("susp-lock-ok")
+        .key("doc.txt")
+        .version_id(&version)
+        .send()
+        .await
+        .expect("the locked version survives");
+    let bytes = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(bytes.as_ref(), b"v1");
+}
+
+#[tokio::test]
+async fn s3_suspended_delete_checks_live_null_behind_a_history_marker() {
+    // A null-id delete marker can sit in the version history while a live null
+    // object is current (suspended puts do not append to the history). The
+    // lock check must look past the marker at the object the delete destroys.
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+
+    let output = server
+        .aws_cli(&[
+            "s3api",
+            "create-bucket",
+            "--bucket",
+            "susp-marker-lock",
+            "--object-lock-enabled-for-bucket",
+        ])
+        .await;
+    assert!(output.success(), "{}", output.stderr_text());
+    set_versioning(&s3, "susp-marker-lock", false).await;
+
+    s3.put_object()
+        .bucket("susp-marker-lock")
+        .key("doc.txt")
+        .body(ByteStream::from_static(b"A"))
+        .send()
+        .await
+        .unwrap();
+    // Stacks a null delete marker into the history.
+    s3.delete_object()
+        .bucket("susp-marker-lock")
+        .key("doc.txt")
+        .send()
+        .await
+        .unwrap();
+    // A fresh live null object becomes current, behind that marker.
+    s3.put_object()
+        .bucket("susp-marker-lock")
+        .key("doc.txt")
+        .body(ByteStream::from_static(b"B"))
+        .send()
+        .await
+        .unwrap();
+    lock_version(&server, "susp-marker-lock", "doc.txt", "null").await;
+
+    let err = s3
+        .delete_object()
+        .bucket("susp-marker-lock")
+        .key("doc.txt")
+        .send()
+        .await
+        .expect_err("the locked live null object must block the delete");
+    assert!(
+        format!("{err:?}").contains("AccessDenied"),
+        "expected AccessDenied, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn s3_delete_objects_batch_emits_notifications() {
+    // DeleteObjects used to be a silent hole in the event stream: it removed
+    // objects without firing any notification.
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+    let sqs = server.sqs_client().await;
+
+    s3.create_bucket()
+        .bucket("batch-notif")
+        .send()
+        .await
+        .unwrap();
+    let queue_url = wire_bucket_to_queue(&server, &sqs, "batch-notif", "batch-events").await;
+
+    for key in ["a.txt", "b.txt"] {
+        s3.put_object()
+            .bucket("batch-notif")
+            .key(key)
+            .body(ByteStream::from_static(b"x"))
+            .send()
+            .await
+            .unwrap();
+    }
+    // Drain the two create events.
+    let created = drain_records(&sqs, &queue_url, 2).await;
+    assert_eq!(created.len(), 2);
+
+    s3.delete_objects()
+        .bucket("batch-notif")
+        .delete(
+            aws_sdk_s3::types::Delete::builder()
+                .objects(
+                    aws_sdk_s3::types::ObjectIdentifier::builder()
+                        .key("a.txt")
+                        .build()
+                        .unwrap(),
+                )
+                .objects(
+                    aws_sdk_s3::types::ObjectIdentifier::builder()
+                        .key("b.txt")
+                        .build()
+                        .unwrap(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    let removed = drain_records(&sqs, &queue_url, 2).await;
+    assert_eq!(removed.len(), 2, "expected one event per deleted object");
+    let mut keys: Vec<String> = removed
+        .iter()
+        .map(|r| r["s3"]["object"]["key"].as_str().unwrap().to_string())
+        .collect();
+    keys.sort();
+    assert_eq!(keys, vec!["a.txt", "b.txt"]);
+    for r in &removed {
+        assert_eq!(r["eventName"], "ObjectRemoved:Delete");
+    }
+}
 // ---- S3 CORS Tests ----
 
 #[tokio::test]

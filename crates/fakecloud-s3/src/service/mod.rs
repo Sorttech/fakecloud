@@ -2564,18 +2564,30 @@ pub(crate) fn resolve_object<'a>(
     if let Some(vid) = version_id {
         // "null" version ID refers to an object with no version_id (pre-versioning)
         if vid == "null" {
-            // Check versions for a pre-versioning object (version_id == None or Some("null"))
+            let is_null =
+                |o: &S3Object| o.version_id.is_none() || o.version_id.as_deref() == Some("null");
+            // A live null object wins over a stale null delete marker left in
+            // the history: a suspended-bucket put replaces the null version
+            // without touching the history, so both can be present and the
+            // object is the one the caller means (and the one the lock paths
+            // act on). A marker is only returned when it is the only null.
             if let Some(versions) = b.object_versions.get(key) {
-                if let Some(obj) = versions
-                    .iter()
-                    .find(|o| o.version_id.is_none() || o.version_id.as_deref() == Some("null"))
-                {
+                if let Some(obj) = versions.iter().find(|o| is_null(o) && !o.is_delete_marker) {
                     return Ok(obj);
                 }
             }
-            // Also check current object if it has no version_id
             if let Some(obj) = b.objects.get(key) {
-                if obj.version_id.is_none() || obj.version_id.as_deref() == Some("null") {
+                if is_null(obj) && !obj.is_delete_marker {
+                    return Ok(obj);
+                }
+            }
+            if let Some(versions) = b.object_versions.get(key) {
+                if let Some(obj) = versions.iter().find(|o| is_null(o)) {
+                    return Ok(obj);
+                }
+            }
+            if let Some(obj) = b.objects.get(key) {
+                if is_null(obj) {
                     return Ok(obj);
                 }
             }

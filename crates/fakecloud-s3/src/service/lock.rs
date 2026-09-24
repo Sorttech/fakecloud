@@ -10,6 +10,18 @@ use super::{
     xml_escape, S3Service,
 };
 
+/// Whether `obj` is the version the request addressed. `"null"` addresses the
+/// version written before versioning was enabled, which carries no id -- the
+/// same rule the delete paths use. Delete markers never match: AWS rejects
+/// lock operations on them, and writing lock metadata against one would
+/// overwrite the live null object's sidecar (both map to the same slot).
+fn version_matches(obj: &crate::state::S3Object, vid: &str) -> bool {
+    if obj.is_delete_marker {
+        return false;
+    }
+    obj.version_id.as_deref() == Some(vid) || (vid == "null" && obj.version_id.is_none())
+}
+
 impl S3Service {
     pub(super) fn put_object_retention(
         &self,
@@ -57,7 +69,7 @@ impl S3Service {
             let mut found = false;
             if let Some(versions) = b.object_versions.get_mut(key) {
                 for obj in versions.iter_mut() {
-                    if obj.version_id.as_deref() == Some(vid) {
+                    if version_matches(obj, vid) {
                         obj.lock_mode = mode.clone();
                         obj.lock_retain_until = retain_until;
                         found = true;
@@ -66,7 +78,7 @@ impl S3Service {
                 }
             }
             if let Some(obj) = b.objects.get_mut(key) {
-                if obj.version_id.as_deref() == Some(vid) {
+                if version_matches(obj, vid) {
                     obj.lock_mode = mode;
                     obj.lock_retain_until = retain_until;
                     found = true;
@@ -84,7 +96,7 @@ impl S3Service {
                 let vid = vid.clone();
                 if let Some(versions) = b.object_versions.get_mut(key) {
                     for v in versions.iter_mut() {
-                        if v.version_id.as_deref() == Some(&vid) {
+                        if version_matches(v, &vid) {
                             v.lock_mode = mode.clone();
                             v.lock_retain_until = retain_until;
                             break;
@@ -102,12 +114,9 @@ impl S3Service {
                 let versioned = b2
                     .object_versions
                     .get(key)
-                    .and_then(|vs| vs.iter().find(|o| o.version_id.as_deref() == Some(vid)));
-                let target = versioned.or_else(|| {
-                    b2.objects
-                        .get(key)
-                        .filter(|o| o.version_id.as_deref() == Some(vid))
-                });
+                    .and_then(|vs| vs.iter().find(|o| version_matches(o, vid)));
+                let target =
+                    versioned.or_else(|| b2.objects.get(key).filter(|o| version_matches(o, vid)));
                 if let Some(obj) = target {
                     let meta = object_meta_snapshot(obj);
                     self.store
@@ -190,7 +199,7 @@ impl S3Service {
             let mut found = false;
             if let Some(versions) = b.object_versions.get_mut(key) {
                 for obj in versions.iter_mut() {
-                    if obj.version_id.as_deref() == Some(vid) {
+                    if version_matches(obj, vid) {
                         obj.lock_legal_hold = status.clone();
                         found = true;
                         break;
@@ -198,7 +207,7 @@ impl S3Service {
                 }
             }
             if let Some(obj) = b.objects.get_mut(key) {
-                if obj.version_id.as_deref() == Some(vid) {
+                if version_matches(obj, vid) {
                     obj.lock_legal_hold = status;
                     found = true;
                 }
@@ -214,7 +223,7 @@ impl S3Service {
                 let vid = vid.clone();
                 if let Some(versions) = b.object_versions.get_mut(key) {
                     for v in versions.iter_mut() {
-                        if v.version_id.as_deref() == Some(&vid) {
+                        if version_matches(v, &vid) {
                             v.lock_legal_hold = status.clone();
                             break;
                         }
@@ -228,12 +237,9 @@ impl S3Service {
                 let versioned = b2
                     .object_versions
                     .get(key)
-                    .and_then(|vs| vs.iter().find(|o| o.version_id.as_deref() == Some(vid)));
-                let target = versioned.or_else(|| {
-                    b2.objects
-                        .get(key)
-                        .filter(|o| o.version_id.as_deref() == Some(vid))
-                });
+                    .and_then(|vs| vs.iter().find(|o| version_matches(o, vid)));
+                let target =
+                    versioned.or_else(|| b2.objects.get(key).filter(|o| version_matches(o, vid)));
                 if let Some(obj) = target {
                     let meta = object_meta_snapshot(obj);
                     self.store

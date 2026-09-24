@@ -889,10 +889,12 @@ impl S3Service {
                 &super::notifications::ObjectEvent {
                     event_name: "ObjectCreated:CompleteMultipartUpload",
                     bucket_name: &bucket_name,
+                    requester_account: account_id,
                     key: &obj_key,
                     size: obj_size,
                     etag: &obj_etag,
                     region: &region,
+                    version_id: version_id.as_deref(),
                 },
                 Some(&self.state),
             );
