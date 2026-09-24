@@ -493,6 +493,22 @@ impl AwsService for S3Service {
         // Handle OPTIONS preflight requests (CORS)
         if req.method == Method::OPTIONS {
             if let Some(b_name) = bucket {
+                // S3 validates the request before evaluating CORS at all: a
+                // preflight with no `Origin` carries nothing to evaluate and is
+                // a malformed request, distinct from the 403 a disallowed
+                // origin gets. Empty counts as absent, as on every other path.
+                if !req
+                    .headers
+                    .get("origin")
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|o| !o.is_empty())
+                {
+                    return Err(AwsServiceError::aws_error(
+                        StatusCode::BAD_REQUEST,
+                        "InvalidRequest",
+                        "Insufficient information. Origin request header needed.",
+                    ));
+                }
                 let cors_config = {
                     let accounts = self.state.read();
                     let _empty_s3 = crate::state::S3State::new(&req.account_id, &req.region);
@@ -503,16 +519,13 @@ impl AwsService for S3Service {
                         .and_then(|b| b.cors_config.clone())
                 };
                 if let Some(ref config) = cors_config {
-                    // Empty is treated as absent, same as the actual-request
-                    // path. A preflight with no `Origin` has nothing to
-                    // evaluate and is rejected below rather than matched: `""`
-                    // satisfies a `*` rule, which would otherwise approve a
-                    // preflight no browser would have sent that way.
+                    // Non-empty: the guard above already rejected a preflight
+                    // without one, so this can never be the `""` that would
+                    // satisfy a `*` rule.
                     let origin = req
                         .headers
                         .get("origin")
                         .and_then(|v| v.to_str().ok())
-                        .filter(|o| !o.is_empty())
                         .unwrap_or("");
                     let request_method = req
                         .headers
@@ -520,10 +533,7 @@ impl AwsService for S3Service {
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or("");
                     let rules = parse_cors_config(config);
-                    if let Some(rule) = (!origin.is_empty())
-                        .then(|| find_cors_rule(&rules, origin, request_method))
-                        .flatten()
-                    {
+                    if let Some(rule) = find_cors_rule(&rules, origin, request_method) {
                         let mut headers = HeaderMap::new();
                         let matched_origin = if rule.allowed_origins.contains(&"*".to_string()) {
                             "*"
@@ -577,14 +587,14 @@ impl AwsService for S3Service {
                         });
                     }
                 }
-                // A rejected preflight carries `Vary` whenever the bucket has a
-                // CORS config, `Origin` or not. On such a bucket the preflight
-                // outcome is origin-dependent by construction — the same OPTIONS
-                // is a 403 for one origin and a 200 for another — so a cache
-                // that keyed this 403 without `Origin` would replay it to the
-                // allowed origin's preflight and break a legitimate
-                // cross-origin request. Only a bucket with no CORS config at
-                // all answers identically for everyone and needs no `Vary`.
+                // A rejected preflight still carries `Vary` when the bucket has
+                // a CORS config: the same OPTIONS is a 403 for this origin and
+                // a 200 for an allowed one, so a cache that keyed this 403
+                // without `Origin` would replay it to the allowed origin's
+                // preflight and break a legitimate cross-origin request. A
+                // bucket with no CORS config answers identically for everyone
+                // and needs no `Vary`. (Reaching here means an `Origin` was
+                // present — the guard above rejects a preflight without one.)
                 let headers = if cors_config.is_some() {
                     vec![("vary".to_string(), CORS_VARY.to_string())]
                 } else {
@@ -3135,10 +3145,21 @@ pub(crate) fn parse_cors_config(xml: &str) -> Vec<CorsRule> {
         let after = &remaining[start + 10..];
         if let Some(end) = after.find("</CORSRule>") {
             let block = &after[..end];
-            let allowed_origins = extract_all_xml_values(block, "AllowedOrigin");
-            let allowed_methods = extract_all_xml_values(block, "AllowedMethod");
-            let allowed_headers = extract_all_xml_values(block, "AllowedHeader");
-            let expose_headers = extract_all_xml_values(block, "ExposeHeader");
+            // Values are trimmed: `extract_all_xml_values` keeps the raw text,
+            // so a pretty-printed config stores "\n  GET\n". `put_bucket_cors`
+            // trims before validating and therefore accepts it, and an
+            // untrimmed value matches no method, no origin, and parses to no
+            // header — the bucket would go silently CORS-dead.
+            let trimmed = |tag| {
+                extract_all_xml_values(block, tag)
+                    .into_iter()
+                    .map(|v| v.trim().to_string())
+                    .collect::<Vec<_>>()
+            };
+            let allowed_origins = trimmed("AllowedOrigin");
+            let allowed_methods = trimmed("AllowedMethod");
+            let allowed_headers = trimmed("AllowedHeader");
+            let expose_headers = trimmed("ExposeHeader");
             let max_age_seconds =
                 extract_xml_value(block, "MaxAgeSeconds").and_then(|s| s.parse().ok());
             rules.push(CorsRule {
@@ -3170,11 +3191,12 @@ pub(crate) fn origin_matches(origin: &str, pattern: &str) -> bool {
 
 /// Find the matching CORS rule for a given origin and HTTP method.
 ///
-/// Methods compare case-insensitively purely defensively. `PutBucketCors`
-/// already rejects anything but the canonical uppercase verbs, so a config
-/// written through the API cannot contain `<AllowedMethod>get</AllowedMethod>`;
-/// the loose compare only covers a config restored from a persisted snapshot,
-/// which never passes through that validation.
+/// Methods compare case-insensitively. `PutBucketCors` validates each
+/// `<AllowedMethod>` against the canonical uppercase verbs *after trimming*,
+/// so a config whose stored text differs from what was validated — the
+/// pretty-printed `<AllowedMethod>\n  GET\n</AllowedMethod>` that
+/// [`parse_cors_config`] now trims — must still match rather than silently
+/// denying every request for that rule.
 pub(crate) fn find_cors_rule<'a>(
     rules: &'a [CorsRule],
     origin: &str,

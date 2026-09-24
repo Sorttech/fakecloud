@@ -335,6 +335,32 @@ fn test_parse_cors_config() {
 }
 
 #[test]
+fn parse_cors_config_trims_pretty_printed_values() {
+    // `put_bucket_cors` trims before validating, so a pretty-printed config is
+    // accepted and stored with its surrounding whitespace. If the parser kept
+    // it, no method and no origin would ever match and the bucket would go
+    // silently CORS-dead.
+    let xml = "<CORSConfiguration>
+        <CORSRule>
+            <AllowedOrigin>
+                https://example.com
+            </AllowedOrigin>
+            <AllowedMethod>
+                GET
+            </AllowedMethod>
+            <ExposeHeader>
+                x-amz-request-id
+            </ExposeHeader>
+        </CORSRule>
+    </CORSConfiguration>";
+    let rules = parse_cors_config(xml);
+    assert_eq!(rules[0].allowed_origins, vec!["https://example.com"]);
+    assert_eq!(rules[0].allowed_methods, vec!["GET"]);
+    assert_eq!(rules[0].expose_headers, vec!["x-amz-request-id"]);
+    assert!(find_cors_rule(&rules, "https://example.com", "GET").is_some());
+}
+
+#[test]
 fn find_cors_rule_matches_method_case_insensitively() {
     let xml = r#"<CORSConfiguration>
         <CORSRule>

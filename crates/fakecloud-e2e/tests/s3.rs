@@ -1704,10 +1704,9 @@ async fn s3_cors_preflight_and_response_headers() {
         "Origin, Access-Control-Request-Headers, Access-Control-Request-Method"
     );
 
-    // On a CORS-configured bucket the preflight outcome is origin-dependent by
-    // construction — 403 here, 200 for the allowed origin — so even an
-    // Origin-less preflight carries Vary, or a cache could replay this 403 to
-    // the allowed origin's preflight.
+    // A preflight with no Origin carries nothing to evaluate. S3 rejects it as
+    // a malformed request (400), distinct from the 403 a disallowed origin
+    // gets, and it is not CORS-evaluated so it gets no Vary.
     let resp = http
         .request(
             reqwest::Method::OPTIONS,
@@ -1717,14 +1716,12 @@ async fn s3_cors_preflight_and_response_headers() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 403);
-    assert_eq!(
-        resp.headers().get("vary").unwrap(),
-        "Origin, Access-Control-Request-Headers, Access-Control-Request-Method"
-    );
+    assert_eq!(resp.status(), 400);
+    assert!(resp.text().await.unwrap().contains("Origin request header"));
 
-    // Same with a wildcard rule: "" must not satisfy AllowedOrigin `*`, or an
-    // Origin-less OPTIONS would come back as an approved preflight.
+    // Same with a wildcard rule: an absent Origin must not satisfy
+    // AllowedOrigin `*`, or an Origin-less OPTIONS would come back as an
+    // approved preflight.
     s3.create_bucket()
         .bucket("wild-cors-bucket")
         .send()
@@ -1750,7 +1747,7 @@ async fn s3_cors_preflight_and_response_headers() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 403);
+    assert_eq!(resp.status(), 400);
     assert!(resp.headers().get("access-control-allow-origin").is_none());
 
     // A rule with no AllowedMethod matches nothing at request time, so it is
