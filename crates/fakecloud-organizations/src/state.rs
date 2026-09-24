@@ -197,7 +197,7 @@ impl OrganizationsRegistry {
             if let Some(account) = self.orgs.get(within).and_then(|org| {
                 org.accounts
                     .values()
-                    .find(|a| a.email == target && !is_gov_cloud(a))
+                    .find(|a| a.email == target && !is_gov_cloud(a) && a.status != "SUSPENDED")
             }) {
                 return Some(account.id.clone());
             }
@@ -247,9 +247,16 @@ impl OrganizationsRegistry {
     /// resolution is authorization-relevant -- it decides who may accept
     /// an `EMAIL`-targeted invitation -- so a duplicate would make that
     /// answer depend on id ordering.
-    /// Like [`Self::email_in_use`], ignoring one in-flight request --
-    /// its own reservation must not count against it.
+    /// Like [`Self::email_in_use`], for the in-flight request
+    /// `request_id`: its own reservation must not count against it, and
+    /// only requests made BEFORE it do. Counting every other in-flight
+    /// request made whichever tick fired first fail itself, so the
+    /// caller that asked first was the one refused.
     pub fn email_in_use_besides(&self, email: &str, request_id: &str) -> bool {
+        let mine = self
+            .orgs
+            .values()
+            .find_map(|org| org.create_account_requests.get(request_id));
         self.orgs
             .values()
             .flat_map(|org| org.accounts.values())
@@ -259,6 +266,10 @@ impl OrganizationsRegistry {
                     id != request_id
                         && req.state == "IN_PROGRESS"
                         && req.pending_email.as_deref() == Some(email)
+                        && mine.is_some_and(|m| {
+                            (req.requested_timestamp, id.as_str())
+                                < (m.requested_timestamp, request_id)
+                        })
                 })
             })
     }
@@ -887,6 +898,7 @@ impl OrganizationState {
                 target_kind == "EMAIL"
                     && account.email == target_account_id
                     && !is_gov_cloud(account)
+                    && account.status != "SUSPENDED"
             })
             .map(|account| account.id.clone())
             .or_else(|| self::target_account_id(target_kind, target_account_id));

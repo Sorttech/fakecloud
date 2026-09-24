@@ -170,6 +170,7 @@ impl OrganizationsService {
         };
         tokio::spawn(async move {
             tokio::time::sleep(delay).await;
+            let mut failed = false;
             let completed = {
                 let mut guard = state.write();
                 // An address already in use fails the request rather than
@@ -186,6 +187,7 @@ impl OrganizationsService {
                 match guard.org_of_create_account_request_mut(&request_id) {
                     Some(org) if taken => {
                         org.fail_create_account(&request_id, "EMAIL_ALREADY_EXISTS");
+                        failed = true;
                         false
                     }
                     Some(org) => {
@@ -195,8 +197,14 @@ impl OrganizationsService {
                     None => false,
                 }
             };
-            if completed {
+            if completed || failed {
+                // FAILED is durable too: the request was persisted as
+                // IN_PROGRESS, so a restart would otherwise re-arm it and
+                // a poller would watch it go FAILED -> IN_PROGRESS ->
+                // FAILED.
                 super::save_organizations_snapshot(&state, store, &lock).await;
+            }
+            if completed {
                 // The account only joins the organization here, so this is
                 // where StackSets auto-deployment gets to see it.
                 hooks.fire_if_membership_changed(&state).await;

@@ -140,6 +140,27 @@ impl OrganizationsService {
         } else {
             None
         };
+        // The same "the world moved while this sat open" re-check the
+        // INVITE path gets: a transfer target that has since become a
+        // plain member of some organization has no billing responsibility
+        // to take over, which is what the invite guard rejects up front.
+        if new_state == "ACCEPTED" && handshake.action == "TRANSFER_RESPONSIBILITY" {
+            let became_plain_member = guard
+                .org_of_account(&req.account_id)
+                .is_some_and(|org| org.management_account_id != req.account_id);
+            if became_plain_member {
+                return Err(AwsServiceError::aws_error_with_fields(
+                    StatusCode::BAD_REQUEST,
+                    "HandshakeConstraintViolationException",
+                    "A responsibility transfer targets another organization's \
+                     management account.",
+                    vec![(
+                        "Reason".to_string(),
+                        "SOURCE_AND_TARGET_CANNOT_MATCH".to_string(),
+                    )],
+                ));
+            }
+        }
         let org = guard
             .org_by_id_mut(&org_id)
             .expect("handshake lookup resolved this organization");

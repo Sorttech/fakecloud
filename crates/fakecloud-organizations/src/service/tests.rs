@@ -979,6 +979,51 @@ async fn accepting_after_joining_the_inviting_organization_errors() {
     assert_eq!(err.code(), "HandshakeConstraintViolationException");
 }
 
+/// Closing an account releases its address everywhere. `CloseAccount`
+/// only suspends, so a resolver that still matched the closed record
+/// would let the address be re-used by `CreateAccount` while making it
+/// permanently un-invitable.
+#[tokio::test]
+async fn a_closed_account_releases_its_address() {
+    let (svc, state) = OrganizationsService::shared();
+    create_org_with_root(&svc).await;
+    let created = body_value(
+        svc.handle(req_with(
+            "111111111111",
+            "CreateAccount",
+            json!({ "Email": "alice@corp.com", "AccountName": "alice" }),
+        ))
+        .await
+        .unwrap(),
+    );
+    let account_id = {
+        let mut guard = state.write();
+        let org = guard.sole_mut().unwrap();
+        org.complete_create_account(created["CreateAccountStatus"]["Id"].as_str().unwrap());
+        let id = created["CreateAccountStatus"]["AccountId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        org.close_account(&id).unwrap();
+        id
+    };
+
+    // The address is free again...
+    assert!(!state.read().email_in_use("alice@corp.com"));
+    // ...and no longer resolves to the closed account, so inviting it is
+    // not refused as "already a member".
+    assert!(!state
+        .read()
+        .account_matches_target("EMAIL", "alice@corp.com", &account_id));
+    svc.handle(req_with(
+        "111111111111",
+        "InviteAccountToOrganization",
+        json!({ "Target": { "Type": "EMAIL", "Id": "alice@corp.com" } }),
+    ))
+    .await
+    .expect("a closed account's address can be invited again");
+}
+
 /// Deleting one organization leaves every other one standing.
 #[tokio::test]
 async fn deleting_one_organization_leaves_the_others() {
