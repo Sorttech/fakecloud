@@ -1011,6 +1011,72 @@ async fn s3_version_targeted_delete_on_unversioned_bucket_has_no_version_id() {
 }
 
 #[tokio::test]
+async fn s3_suspended_bucket_version_delete_still_reports_version_id() {
+    // Suspending versioning does not erase the version ids of objects written
+    // while it was enabled, so deleting one of those versions must still
+    // report it -- gating on the bucket's *current* status would drop it.
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+    let sqs = server.sqs_client().await;
+
+    s3.create_bucket()
+        .bucket("susp-notif")
+        .send()
+        .await
+        .unwrap();
+    s3.put_bucket_versioning()
+        .bucket("susp-notif")
+        .versioning_configuration(
+            aws_sdk_s3::types::VersioningConfiguration::builder()
+                .status(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let queue_url = wire_bucket_to_queue(&server, &sqs, "susp-notif", "susp-events").await;
+
+    let put = s3
+        .put_object()
+        .bucket("susp-notif")
+        .key("doc.txt")
+        .body(ByteStream::from_static(b"v1"))
+        .send()
+        .await
+        .unwrap();
+    let version = put.version_id().unwrap().to_string();
+    let created = drain_records(&sqs, &queue_url, 1).await;
+    assert_eq!(created.len(), 1);
+
+    s3.put_bucket_versioning()
+        .bucket("susp-notif")
+        .versioning_configuration(
+            aws_sdk_s3::types::VersioningConfiguration::builder()
+                .status(aws_sdk_s3::types::BucketVersioningStatus::Suspended)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    s3.delete_object()
+        .bucket("susp-notif")
+        .key("doc.txt")
+        .version_id(&version)
+        .send()
+        .await
+        .unwrap();
+
+    let removed = drain_records(&sqs, &queue_url, 1).await;
+    assert_eq!(removed.len(), 1, "expected the version-delete event");
+    assert_eq!(removed[0]["eventName"], "ObjectRemoved:Delete");
+    assert_eq!(
+        removed[0]["s3"]["object"]["versionId"], version,
+        "a version written while versioning was enabled keeps its id after suspension"
+    );
+}
+
+#[tokio::test]
 async fn s3_delete_objects_batch_emits_notifications() {
     // DeleteObjects used to be a silent hole in the event stream: it removed
     // objects without firing any notification.

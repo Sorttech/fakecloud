@@ -102,6 +102,13 @@ impl S3Service {
 
             let mut is_dm = false;
             let mut removed_version = false;
+            // The version id to report on the notification: the one the
+            // removed object actually carried. An object stored before any
+            // versioning was configured has none, and AWS then reports no
+            // versionId -- whereas a real version still has one after
+            // versioning is Suspended, so the bucket's current status is the
+            // wrong thing to gate on.
+            let mut removed_vid: Option<String> = None;
             if let Some(versions) = b.object_versions.get_mut(key) {
                 let vid_matches = |o: &S3Object| {
                     o.version_id.as_deref() == Some(vid.as_str())
@@ -110,6 +117,10 @@ impl S3Service {
                 is_dm = versions
                     .iter()
                     .any(|o| vid_matches(o) && o.is_delete_marker);
+                removed_vid = versions
+                    .iter()
+                    .find(|o| vid_matches(o))
+                    .and_then(|o| o.version_id.clone());
                 let len_before = versions.len();
                 versions.retain(|o| !vid_matches(o));
                 let removed = len_before != versions.len();
@@ -136,6 +147,7 @@ impl S3Service {
                 if matches {
                     is_dm = obj.is_delete_marker;
                     removed_version = true;
+                    removed_vid = obj.version_id.clone();
                     b.objects.remove(key);
                 }
             }
@@ -168,10 +180,7 @@ impl S3Service {
                             size: 0,
                             etag: "",
                             region: &region,
-                            // AWS reports versionId only on a
-                            // versioning-enabled bucket, even when the
-                            // request targeted the "null" version.
-                            version_id: versioning_enabled.then_some(vid.as_str()),
+                            version_id: removed_vid.as_deref(),
                         },
                         Some(&self.state),
                     );
@@ -424,8 +433,19 @@ impl S3Service {
                 // target a vid match still report Deleted while leaving
                 // the object in place.
                 let mut removed_version = false;
+                // Report the version id the removed object actually carried
+                // (see the single-object path): a Suspended bucket still holds
+                // real versions, while a never-versioned object has none.
+                let mut removed_vid: Option<String> = None;
                 if let Some(versions) = b.object_versions.get_mut(key) {
                     let len_before = versions.len();
+                    removed_vid = versions
+                        .iter()
+                        .find(|o| {
+                            o.version_id.as_deref() == Some(vid)
+                                || (vid == "null" && o.version_id.is_none())
+                        })
+                        .and_then(|o| o.version_id.clone());
                     versions.retain(|o| {
                         !(o.version_id.as_deref() == Some(vid)
                             || (vid == "null" && o.version_id.is_none()))
@@ -448,6 +468,7 @@ impl S3Service {
                         || (vid == "null" && obj.version_id.is_none());
                     if matches {
                         removed_version = true;
+                        removed_vid = obj.version_id.clone();
                         b.objects.remove(key);
                     }
                 }
@@ -460,7 +481,7 @@ impl S3Service {
                     pending_events.push((
                         "ObjectRemoved:Delete",
                         key.to_string(),
-                        versioning_enabled.then(|| vid.to_string()),
+                        removed_vid.clone(),
                     ));
                 }
                 if !quiet {
