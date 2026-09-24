@@ -497,28 +497,21 @@ impl AwsService for S3Service {
                 // preflight with no `Origin` carries nothing to evaluate and is
                 // a malformed request, distinct from the 403 a disallowed
                 // origin gets. Empty counts as absent, as on every other path.
-                let header_present = |name| {
-                    req.headers
-                        .get(name)
-                        .and_then(|v| v.to_str().ok())
-                        .is_some_and(|v: &str| !v.trim().is_empty())
-                };
-                if !header_present("origin") {
+                // Only the missing-`Origin` case is a documented 400. A
+                // preflight that carries `Origin` but no request-method is an
+                // ordinary non-allowed preflight and falls through to the 403
+                // below, whose message now distinguishes an unconfigured
+                // bucket from a non-matching rule.
+                if !req
+                    .headers
+                    .get("origin")
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|o| !o.trim().is_empty())
+                {
                     return Err(AwsServiceError::aws_error(
                         StatusCode::BAD_REQUEST,
                         "InvalidRequest",
                         "Insufficient information. Origin request header needed.",
-                    ));
-                }
-                // Both halves of a preflight are required information. Without
-                // this, a missing request-method fell through to the denial
-                // below and reported "CORS is not enabled for this bucket" on a
-                // bucket whose CORS is enabled and whose origin is allowed.
-                if !header_present("access-control-request-method") {
-                    return Err(AwsServiceError::aws_error(
-                        StatusCode::BAD_REQUEST,
-                        "InvalidRequest",
-                        "Insufficient information. Access-Control-Request-Method request header needed.",
                     ));
                 }
                 let cors_config = {
@@ -549,17 +542,18 @@ impl AwsService for S3Service {
                     // Every header the preflight declares must be covered by
                     // the rule, or S3 denies it — the denial message, the
                     // `Vary` value and the docs all say this is evaluated.
+                    // `get_all`: the field may be sent as several lines, and
+                    // now that it gates approval, an unread second line would
+                    // approve headers the rule never allowed.
                     let requested_headers: Vec<String> = req
                         .headers
-                        .get("access-control-request-headers")
-                        .and_then(|v| v.to_str().ok())
-                        .map(|v| {
-                            v.split(',')
-                                .map(|h| h.trim().to_string())
-                                .filter(|h| !h.is_empty())
-                                .collect()
-                        })
-                        .unwrap_or_default();
+                        .get_all("access-control-request-headers")
+                        .iter()
+                        .filter_map(|v| v.to_str().ok())
+                        .flat_map(|v| v.split(','))
+                        .map(|h| h.trim().to_string())
+                        .filter(|h| !h.is_empty())
+                        .collect();
                     let rules = parse_cors_config(config);
                     if let Some(rule) =
                         find_cors_rule(&rules, origin, request_method, &requested_headers)
@@ -584,19 +578,19 @@ impl AwsService for S3Service {
                                 .parse()
                                 .unwrap_or_else(|_| http::HeaderValue::from_static("")),
                         );
-                        if !rule.allowed_headers.is_empty() {
-                            let ah = if rule.allowed_headers.contains(&"*".to_string()) {
-                                req.headers
-                                    .get("access-control-request-headers")
-                                    .and_then(|v| v.to_str().ok())
-                                    .unwrap_or("*")
-                                    .to_string()
-                            } else {
-                                rule.allowed_headers.join(", ")
-                            };
+                        // Echo the headers the preflight actually asked for —
+                        // reaching here means every one of them is covered by
+                        // the rule. Echoing `rule.allowed_headers` instead
+                        // would emit patterns like `x-amz-*`, which browsers
+                        // compare literally and would reject. With no
+                        // `Access-Control-Request-Headers` there is nothing to
+                        // allow, so the header is omitted, as on S3.
+                        if !requested_headers.is_empty() {
                             headers.insert(
                                 "access-control-allow-headers",
-                                ah.parse()
+                                requested_headers
+                                    .join(", ")
+                                    .parse()
                                     .unwrap_or_else(|_| http::HeaderValue::from_static("")),
                             );
                         }
@@ -3232,6 +3226,21 @@ pub(crate) fn parse_cors_config(xml: &str) -> Vec<CorsRule> {
     rules
 }
 
+/// Match a requested header name against an `AllowedHeader` pattern.
+///
+/// AWS permits one `*` per `AllowedHeader`, and `x-amz-*` is a common config.
+/// Header names are case-insensitive.
+pub(crate) fn header_matches(header: &str, pattern: &str) -> bool {
+    match pattern.split_once('*') {
+        Some((prefix, suffix)) => {
+            header.len() >= prefix.len() + suffix.len()
+                && header[..prefix.len()].eq_ignore_ascii_case(prefix)
+                && header[header.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+        }
+        None => header.eq_ignore_ascii_case(pattern),
+    }
+}
+
 /// Match an origin against a CORS allowed origin pattern (supports "*" wildcard).
 pub(crate) fn origin_matches(origin: &str, pattern: &str) -> bool {
     if pattern == "*" {
@@ -3269,11 +3278,9 @@ pub(crate) fn find_cors_rule<'a>(
             .allowed_methods
             .iter()
             .any(|am| am.eq_ignore_ascii_case(method));
-        let headers_ok = requested_headers.iter().all(|h| {
-            rule.allowed_headers
-                .iter()
-                .any(|ah| ah == "*" || ah.eq_ignore_ascii_case(h))
-        });
+        let headers_ok = requested_headers
+            .iter()
+            .all(|h| rule.allowed_headers.iter().any(|ah| header_matches(h, ah)));
         origin_ok && method_ok && headers_ok
     })
 }

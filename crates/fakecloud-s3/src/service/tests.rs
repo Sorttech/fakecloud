@@ -415,6 +415,18 @@ fn find_cors_rule_checks_requested_headers() {
 }
 
 #[test]
+fn test_header_matches() {
+    // AWS permits one `*` per AllowedHeader; names are case-insensitive.
+    assert!(header_matches("x-amz-meta-foo", "x-amz-*"));
+    assert!(header_matches("X-Amz-Meta-Foo", "x-amz-*"));
+    assert!(header_matches("authorization", "*"));
+    assert!(header_matches("content-type", "Content-Type"));
+    assert!(!header_matches("authorization", "x-amz-*"));
+    // A prefix shorter than the pattern must not match by wrapping.
+    assert!(!header_matches("x-amz", "x-amz-*"));
+}
+
+#[test]
 fn test_origin_matches() {
     assert!(origin_matches("https://example.com", "https://example.com"));
     assert!(origin_matches("https://example.com", "*"));

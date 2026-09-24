@@ -1766,8 +1766,40 @@ async fn s3_cors_preflight_and_response_headers() {
     // on a stretch of the message that has none.
     assert!(resp.text().await.unwrap().contains("are not whitelisted"));
 
-    // The other half of a preflight is required too, and must not be reported
-    // as "CORS is not enabled" on a bucket whose CORS is enabled.
+    // An AllowedHeader wildcard covers the headers it spans: AWS permits one
+    // `*` per entry, and `x-amz-*` is a common config.
+    let output = server
+        .aws_cli(&[
+            "s3api",
+            "put-bucket-cors",
+            "--bucket",
+            "hdr-cors-bucket",
+            "--cors-configuration",
+            r#"{"CORSRules":[{"AllowedOrigins":["https://example.com"],"AllowedMethods":["PUT"],"AllowedHeaders":["x-amz-*"]}]}"#,
+        ])
+        .await;
+    assert!(output.success(), "{}", output.stderr_text());
+    let resp = http
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{}/hdr-cors-bucket/file.txt", server.endpoint()),
+        )
+        .header("Origin", "https://example.com")
+        .header("Access-Control-Request-Method", "PUT")
+        .header("Access-Control-Request-Headers", "x-amz-meta-foo")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "x-amz-* must cover x-amz-meta-foo");
+    // The echo carries what was asked for, never the literal pattern, which a
+    // browser would compare literally and reject.
+    assert_eq!(
+        resp.headers().get("access-control-allow-headers").unwrap(),
+        "x-amz-meta-foo"
+    );
+
+    // A preflight carrying Origin but no request-method is an ordinary
+    // non-allowed preflight, not a malformed request.
     let resp = http
         .request(
             reqwest::Method::OPTIONS,
@@ -1777,12 +1809,8 @@ async fn s3_cors_preflight_and_response_headers() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 400);
-    assert!(resp
-        .text()
-        .await
-        .unwrap()
-        .contains("Access-Control-Request-Method request header"));
+    assert_eq!(resp.status(), 403);
+    assert!(resp.text().await.unwrap().contains("are not whitelisted"));
 
     // Same with a wildcard rule: an absent Origin must not satisfy
     // AllowedOrigin `*`, or an Origin-less OPTIONS would come back as an
