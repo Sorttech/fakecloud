@@ -1077,6 +1077,61 @@ async fn s3_suspended_bucket_version_delete_still_reports_version_id() {
 }
 
 #[tokio::test]
+async fn s3_null_version_delete_on_versioned_bucket_reports_null() {
+    // An object written before versioning was turned on is addressable as the
+    // "null" version afterwards, and AWS reports versionId "null" when it is
+    // deleted -- the absence of a stored id is not the same as no versioning.
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+    let sqs = server.sqs_client().await;
+
+    s3.create_bucket()
+        .bucket("nullid-notif")
+        .send()
+        .await
+        .unwrap();
+    let queue_url = wire_bucket_to_queue(&server, &sqs, "nullid-notif", "nullid-events").await;
+
+    s3.put_object()
+        .bucket("nullid-notif")
+        .key("pre.txt")
+        .body(ByteStream::from_static(b"pre"))
+        .send()
+        .await
+        .unwrap();
+    let created = drain_records(&sqs, &queue_url, 1).await;
+    assert_eq!(created.len(), 1);
+    assert!(created[0]["s3"]["object"].get("versionId").is_none());
+
+    s3.put_bucket_versioning()
+        .bucket("nullid-notif")
+        .versioning_configuration(
+            aws_sdk_s3::types::VersioningConfiguration::builder()
+                .status(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    s3.delete_object()
+        .bucket("nullid-notif")
+        .key("pre.txt")
+        .version_id("null")
+        .send()
+        .await
+        .unwrap();
+
+    let removed = drain_records(&sqs, &queue_url, 1).await;
+    assert_eq!(removed.len(), 1, "expected the null-version delete event");
+    assert_eq!(removed[0]["eventName"], "ObjectRemoved:Delete");
+    assert_eq!(
+        removed[0]["s3"]["object"]["versionId"], "null",
+        "the pre-versioning object is the null version once versioning is on"
+    );
+}
+
+#[tokio::test]
 async fn s3_delete_objects_batch_emits_notifications() {
     // DeleteObjects used to be a silent hole in the event stream: it removed
     // objects without firing any notification.

@@ -41,6 +41,10 @@ impl S3Service {
 
         let mut resp_headers = HeaderMap::new();
         let versioning_enabled = b.versioning.as_deref() == Some("Enabled");
+        // Enabled *or* Suspended: once a bucket has been versioned, even its
+        // pre-versioning object is addressable as the "null" version and AWS
+        // reports that id on the event.
+        let versioning_configured = b.versioning.is_some();
 
         // Delete a specific version
         if let Some(ref vid) = version_id_param {
@@ -150,6 +154,11 @@ impl S3Service {
                     removed_vid = obj.version_id.clone();
                     b.objects.remove(key);
                 }
+            }
+            // A matched object with no stored version id is the "null"
+            // version; report it as such once the bucket has been versioned.
+            if removed_version && removed_vid.is_none() && versioning_configured {
+                removed_vid = Some("null".to_string());
             }
             if let Ok(hv) = vid.parse() {
                 resp_headers.insert("x-amz-version-id", hv);
@@ -363,6 +372,7 @@ impl S3Service {
             .unwrap_or(false);
 
         let versioning_enabled = b.versioning.as_deref() == Some("Enabled");
+        let versioning_configured = b.versioning.is_some();
         let mut deleted_xml = String::new();
         let mut error_xml = String::new();
         // (event name, key, version id) for every object this batch actually
@@ -475,6 +485,9 @@ impl S3Service {
                 if let Err(e) = self.store.delete_object(bucket, key, Some(vid.as_str())) {
                     persist_error = Some(crate::service::persistence_error(e));
                     break;
+                }
+                if removed_version && removed_vid.is_none() && versioning_configured {
+                    removed_vid = Some("null".to_string());
                 }
                 // Only a version that actually existed produces an event.
                 if removed_version {
