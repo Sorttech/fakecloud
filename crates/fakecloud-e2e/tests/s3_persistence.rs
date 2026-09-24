@@ -690,6 +690,90 @@ async fn persistence_preserved_null_version_survives_new_version() {
 }
 
 #[tokio::test]
+async fn persistence_null_version_preserved_after_suspend_then_reenable() {
+    // Enabled -> v1, Suspended -> null current, Enabled -> v2. The history is
+    // not empty at the last put, so a guard keyed on "history is empty" would
+    // skip preserving the null version and lose it.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut server = TestServer::start_persistent(tmp.path()).await;
+    let client = server.s3_client().await;
+
+    let set_versioning = |status: BucketVersioningStatus| {
+        let client = client.clone();
+        async move {
+            client
+                .put_bucket_versioning()
+                .bucket("suspend-cycle")
+                .versioning_configuration(VersioningConfiguration::builder().status(status).build())
+                .send()
+                .await
+                .unwrap();
+        }
+    };
+
+    client
+        .create_bucket()
+        .bucket("suspend-cycle")
+        .send()
+        .await
+        .unwrap();
+    set_versioning(BucketVersioningStatus::Enabled).await;
+    client
+        .put_object()
+        .bucket("suspend-cycle")
+        .key("doc.txt")
+        .body(ByteStream::from_static(b"v1"))
+        .send()
+        .await
+        .unwrap();
+
+    set_versioning(BucketVersioningStatus::Suspended).await;
+    client
+        .put_object()
+        .bucket("suspend-cycle")
+        .key("doc.txt")
+        .body(ByteStream::from_static(b"null-body"))
+        .send()
+        .await
+        .unwrap();
+
+    set_versioning(BucketVersioningStatus::Enabled).await;
+    client
+        .put_object()
+        .bucket("suspend-cycle")
+        .key("doc.txt")
+        .body(ByteStream::from_static(b"v2"))
+        .send()
+        .await
+        .unwrap();
+
+    let got = client
+        .get_object()
+        .bucket("suspend-cycle")
+        .key("doc.txt")
+        .version_id("null")
+        .send()
+        .await
+        .expect("null version must exist before the restart");
+    let bytes = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(bytes.as_ref(), b"null-body");
+
+    server.restart().await;
+    let client = server.s3_client().await;
+
+    let got = client
+        .get_object()
+        .bucket("suspend-cycle")
+        .key("doc.txt")
+        .version_id("null")
+        .send()
+        .await
+        .expect("null version must survive the restart");
+    let bytes = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(bytes.as_ref(), b"null-body");
+}
+
+#[tokio::test]
 async fn persistence_bucket_subresources_round_trip() {
     let tmp = tempfile::tempdir().unwrap();
     let mut server = TestServer::start_persistent(tmp.path()).await;
