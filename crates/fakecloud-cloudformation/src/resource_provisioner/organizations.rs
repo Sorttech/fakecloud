@@ -165,6 +165,13 @@ impl ResourceProvisioner {
             .unwrap_or_default();
 
         let mut org_lock = self.organizations_state.write();
+        // Authorize FIRST, as the API paths do: the address checks below
+        // span the registry, so running them before resolving the stack
+        // account's own organization would report whether an address is
+        // registered in an organization this stack has nothing to do with.
+        if org_lock.org_of_account(&self.account_id).is_none() {
+            return Err("Organization not yet created".to_string());
+        }
         // Same address-uniqueness rule the API enforces: resolution by
         // address decides who may accept an EMAIL-targeted handshake, so
         // two accounts sharing one would make that answer depend on id
