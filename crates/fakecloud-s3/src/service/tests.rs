@@ -469,6 +469,41 @@ fn test_header_matches() {
 }
 
 #[test]
+fn wildcard_matchers_handle_more_than_one_star() {
+    // `PutBucketCors` rejects multi-wildcard values, but a config stored by an
+    // earlier build or restored from a snapshot never passed that check, so the
+    // matchers must still evaluate it correctly instead of silently matching
+    // nothing and leaving the bucket CORS-dead.
+    assert!(origin_matches(
+        "https://a.b.example.com",
+        "https://*.*.example.com"
+    ));
+    assert!(!origin_matches(
+        "https://a.example.com",
+        "https://*.*.example.com"
+    ));
+    assert!(header_matches("x-amz-meta-foo", "x-*-meta-*"));
+    assert!(!header_matches("x-amz-meta-foo", "x-*-other-*"));
+
+    // Segments must not overlap: the tail cannot reuse bytes the head consumed.
+    assert!(!origin_matches("ab", "a*b*c"));
+    assert!(origin_matches("abc", "a*b*c"));
+
+    // A bare wildcard still matches anything, including empty.
+    assert!(origin_matches("", "*"));
+    assert!(origin_matches("https://example.com", "*"));
+    // An exact pattern still requires the whole value.
+    assert!(!origin_matches(
+        "https://example.com.evil",
+        "https://example.com"
+    ));
+    assert!(!origin_matches(
+        "https://example.com.evil",
+        "https://*.example.com"
+    ));
+}
+
+#[test]
 fn test_origin_matches() {
     assert!(origin_matches("https://example.com", "https://example.com"));
     assert!(origin_matches("https://example.com", "*"));

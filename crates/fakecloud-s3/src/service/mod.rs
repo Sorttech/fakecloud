@@ -3288,13 +3288,74 @@ pub(crate) fn parse_cors_config(xml: &str) -> Vec<CorsRule> {
 /// AWS permits one `*` per `AllowedHeader`, and `x-amz-*` is a common config.
 /// Header names are case-insensitive.
 pub(crate) fn header_matches(header: &str, pattern: &str) -> bool {
-    match pattern.split_once('*') {
-        Some((prefix, suffix)) => {
-            header.len() >= prefix.len() + suffix.len()
-                && header[..prefix.len()].eq_ignore_ascii_case(prefix)
-                && header[header.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+    wildcard_matches(header, pattern, false)
+}
+
+/// Match `value` against a `*`-wildcard pattern.
+///
+/// `PutBucketCors` rejects a value with more than one `*`, but a config stored
+/// by an earlier build or restored from a snapshot never passes that check, so
+/// the matcher handles any number rather than depending on an invariant it
+/// cannot enforce. A leading/trailing `*` matches an empty run, and segments
+/// must appear in order without overlapping.
+fn wildcard_matches(value: &str, pattern: &str, case_sensitive: bool) -> bool {
+    let eq = |a: &str, b: &str| {
+        if case_sensitive {
+            a == b
+        } else {
+            a.eq_ignore_ascii_case(b)
         }
-        None => header.eq_ignore_ascii_case(pattern),
+    };
+    let mut segments = pattern.split('*');
+    let Some(prefix) = segments.next() else {
+        return false;
+    };
+    // No wildcard at all: the whole value has to match.
+    let Some(mut rest) = value.strip_prefix_matching(prefix, &eq) else {
+        return false;
+    };
+    if !pattern.contains('*') {
+        return rest.is_empty();
+    }
+    let segments: Vec<&str> = segments.collect();
+    let (last, middles) = segments.split_last().expect("pattern contains a wildcard");
+    for seg in middles {
+        match rest.find_matching(seg, &eq) {
+            Some(at) => rest = &rest[at + seg.len()..],
+            None => return false,
+        }
+    }
+    // The final segment anchors to the end, and must not overlap what the
+    // earlier segments already consumed.
+    rest.len() >= last.len() && eq(&rest[rest.len() - last.len()..], last)
+}
+
+/// Helpers keeping [`wildcard_matches`] readable. Both operate on ASCII, which
+/// every caller guarantees: header values come from `HeaderValue::to_str`.
+trait AsciiMatch {
+    fn strip_prefix_matching<'a>(
+        &'a self,
+        p: &str,
+        eq: &dyn Fn(&str, &str) -> bool,
+    ) -> Option<&'a str>;
+    fn find_matching(&self, needle: &str, eq: &dyn Fn(&str, &str) -> bool) -> Option<usize>;
+}
+
+impl AsciiMatch for str {
+    fn strip_prefix_matching<'a>(
+        &'a self,
+        p: &str,
+        eq: &dyn Fn(&str, &str) -> bool,
+    ) -> Option<&'a str> {
+        (self.len() >= p.len() && eq(&self[..p.len()], p)).then(|| &self[p.len()..])
+    }
+
+    fn find_matching(&self, needle: &str, eq: &dyn Fn(&str, &str) -> bool) -> Option<usize> {
+        if needle.is_empty() {
+            return Some(0);
+        }
+        (0..=self.len().saturating_sub(needle.len()))
+            .find(|&i| self.is_char_boundary(i) && eq(&self[i..i + needle.len()], needle))
     }
 }
 
@@ -3305,14 +3366,7 @@ pub(crate) fn header_matches(header: &str, pattern: &str) -> bool {
 /// silently fails, leaving the bucket CORS-dead. Origins compare
 /// case-sensitively, unlike header names.
 pub(crate) fn origin_matches(origin: &str, pattern: &str) -> bool {
-    match pattern.split_once('*') {
-        Some((prefix, suffix)) => {
-            origin.len() >= prefix.len() + suffix.len()
-                && origin.starts_with(prefix)
-                && origin.ends_with(suffix)
-        }
-        None => origin == pattern,
-    }
+    wildcard_matches(origin, pattern, true)
 }
 
 /// Find the matching CORS rule for a given origin and HTTP method.

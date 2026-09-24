@@ -973,10 +973,18 @@ pub async fn dispatch(
                 ) {
                     // `Vary` combines, so two entries for it must both survive
                     // (S3 adds its CORS value to an error that may carry its
-                    // own). Everything else replaces, so a service can still
-                    // override a header this builder already set.
+                    // own) — but an identical value is not worth repeating.
+                    // Everything else replaces, so a service can still override
+                    // a header this builder already set.
                     if name == http::header::VARY {
-                        resp.headers_mut().append(name, val);
+                        let already = resp
+                            .headers()
+                            .get_all(&name)
+                            .iter()
+                            .any(|existing| existing == val);
+                        if !already {
+                            resp.headers_mut().append(name, val);
+                        }
                     } else {
                         resp.headers_mut().insert(name, val);
                     }
