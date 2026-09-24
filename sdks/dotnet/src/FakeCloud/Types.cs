@@ -1120,6 +1120,8 @@ public sealed record OrganizationsAccountsResponse(
     string? MasterAccountId,
     IReadOnlyList<OrganizationsSummary>? Organizations = null);
 
+/// <param name="OrganizationId">The organization holding the transfer;
+/// the listing spans every organization in the process.</param>
 public sealed record OrganizationsResponsibilityTransfer(
     string? Id,
     string? Arn,
@@ -1134,8 +1136,6 @@ public sealed record OrganizationsResponsibilityTransfer(
     string? StartTimestamp,
     string? EndTimestamp,
     string? ActiveHandshakeId,
-    /// <summary>The organization holding the transfer; the listing spans
-    /// every organization in the process.</summary>
     string? OrganizationId = null);
 
 public sealed record OrganizationsResponsibilityTransfersResponse(

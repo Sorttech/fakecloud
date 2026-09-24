@@ -2470,13 +2470,13 @@ async fn the_target_organization_sees_its_inbound_responsibility_transfer() {
     assert_eq!(ids, ["111111111111"]);
 }
 
-/// Both parties can read a transfer, but only the source management
-/// account -- the one that created it -- can rename or withdraw it. The
-/// target answers by accepting or declining the riding handshake, and
-/// gets a clear AccessDenied rather than a "not found" it cannot
+/// Both parties can read a transfer and either can end the arrangement,
+/// but only the source -- the one that named it -- can rename it. A
+/// stranger gets "not found"; the target gets a clear AccessDenied on
+/// the source-only operation rather than a not-found it cannot
 /// distinguish from a bad id.
 #[tokio::test]
-async fn only_the_source_can_terminate_a_responsibility_transfer() {
+async fn only_the_source_can_rename_a_responsibility_transfer() {
     let (svc, _state) = OrganizationsService::shared();
     create_org_with_root(&svc).await;
     svc.handle(req_with("222222222222", "CreateOrganization", json!({})))
@@ -2511,12 +2511,13 @@ async fn only_the_source_can_terminate_a_responsibility_transfer() {
         .unwrap()
         .to_string();
 
-    // The target is a party, so not "not found" -- but it may not mutate.
+    // The target is a party, so not "not found" -- but renaming is the
+    // source's alone.
     let err = expect_err(
         svc.handle(req_with(
             "222222222222",
-            "TerminateResponsibilityTransfer",
-            json!({ "Id": transfer_id }),
+            "UpdateResponsibilityTransfer",
+            json!({ "Id": transfer_id, "Name": "renamed" }),
         ))
         .await,
     );
@@ -2533,14 +2534,14 @@ async fn only_the_source_can_terminate_a_responsibility_transfer() {
     );
     assert_eq!(err.code(), "ResponsibilityTransferNotFoundException");
 
-    // The source can.
+    // Either party can end the arrangement.
     svc.handle(req_with(
-        "111111111111",
+        "222222222222",
         "TerminateResponsibilityTransfer",
         json!({ "Id": transfer_id }),
     ))
     .await
-    .expect("the source management account withdraws its own transfer");
+    .expect("the target management account can end the arrangement too");
 }
 
 #[tokio::test]

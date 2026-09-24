@@ -463,13 +463,17 @@ impl OrganizationsService {
     }
 }
 
-/// Check `Target.Id` against the declared `Target.Type`.
+/// Check `Target.Id` against the declared `Target.Type`. AWS accepts
+/// `ACCOUNT` and `EMAIL` only.
 ///
 /// An `ACCOUNT` target must be a 12-digit account id. An `EMAIL` target
-/// must be an address, and must additionally name an account fakecloud
-/// can resolve — an address it has never minted identifies no account,
-/// so the invitation could never be accepted and would sit OPEN
-/// forever rather than failing where the caller can see it.
+/// must be an address, and any address is accepted — inviting the
+/// account owner's real address is AWS's primary flow. fakecloud can
+/// only resolve one it minted itself (`<account-id>@example.com`) back
+/// to an account, so an external address yields a handshake its source
+/// can read and cancel but that no caller can prove it is the target
+/// of; it stays OPEN until it expires, mirroring AWS before the owner
+/// acts on the emailed link.
 pub(super) fn validate_invite_target(kind: &str, id: &str) -> Result<(), AwsServiceError> {
     match kind {
         "ACCOUNT" => {

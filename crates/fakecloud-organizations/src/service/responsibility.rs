@@ -82,16 +82,22 @@ impl OrganizationsService {
     /// organization that stores it.
     ///
     /// A transfer is an arrangement between two management accounts, and
-    /// both can read it -- but only the source, which created it, can
-    /// rename or withdraw it; the target answers by accepting or
-    /// declining the riding handshake. Resolving through the caller's own
-    /// organization instead reported "not found" to the target, which is
-    /// indistinguishable from a bad id.
-    fn source_org_of_transfer(
+    /// both can read it. `source_only` says whether this particular
+    /// mutation is the source's alone: renaming is, because the source
+    /// chose the name; ending the arrangement is not, because once it is
+    /// accepted the riding handshake is gone and the target would
+    /// otherwise have no way out of an arrangement it is actively
+    /// carrying.
+    ///
+    /// Resolving through the caller's own organization instead reported
+    /// "not found" to the target, which is indistinguishable from a bad
+    /// id.
+    fn party_org_of_transfer(
         &self,
         guard: &parking_lot::RwLockWriteGuard<'_, crate::state::OrganizationsRegistry>,
         id: &str,
         caller: &str,
+        source_only: bool,
     ) -> Result<String, AwsServiceError> {
         let org = guard
             .org_of_responsibility_transfer(id)
@@ -104,11 +110,11 @@ impl OrganizationsService {
         if !is_transfer_party(transfer, caller) {
             return Err(transfer_not_found(id));
         }
-        if transfer.source_management_account_id != caller {
+        if source_only && transfer.source_management_account_id != caller {
             return Err(AwsServiceError::aws_error(
                 StatusCode::FORBIDDEN,
                 "AccessDeniedException",
-                "Only the source management account can modify a responsibility transfer.",
+                "Only the source management account can rename a responsibility transfer.",
             ));
         }
         Ok(org.org_id.clone())
@@ -243,7 +249,7 @@ impl OrganizationsService {
         let id = required_str(&body, "Id")?.to_string();
         let name = required_str(&body, "Name")?.to_string();
         let mut guard = self.state.write();
-        let org_id = self.source_org_of_transfer(&guard, &id, &req.account_id)?;
+        let org_id = self.party_org_of_transfer(&guard, &id, &req.account_id, true)?;
         let transfer = guard
             .org_by_id_mut(&org_id)
             .and_then(|org| org.responsibility_transfers.get_mut(&id))
@@ -266,7 +272,8 @@ impl OrganizationsService {
             .and_then(json_to_datetime)
             .unwrap_or_else(Utc::now);
         let mut guard = self.state.write();
-        let org_id = self.source_org_of_transfer(&guard, &id, &req.account_id)?;
+        // Either party can end the arrangement.
+        let org_id = self.party_org_of_transfer(&guard, &id, &req.account_id, false)?;
         let org = guard.org_by_id_mut(&org_id).expect("resolved just above");
         let transfer = org
             .responsibility_transfers

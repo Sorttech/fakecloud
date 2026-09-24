@@ -650,6 +650,13 @@ impl OrganizationState {
             }
         }
         for h in self.handshakes.values() {
+            // Only another membership INVITE collides. A
+            // TRANSFER_RESPONSIBILITY handshake to the same account is a
+            // different arrangement entirely, and AWS keeps the two
+            // handshake actions independent.
+            if h.action != "INVITE" {
+                continue;
+            }
             let same_target = h.target_account_id == target_account_id
                 || (resolved.is_some()
                     && self::target_account_id(&h.target_kind, &h.target_account_id) == resolved);
