@@ -1024,6 +1024,56 @@ async fn a_closed_account_releases_its_address() {
     .expect("a closed account's address can be invited again");
 }
 
+/// A `<account-id>@example.com` address belongs to the id it spells.
+/// fakecloud mints those for the accounts it creates, so letting an
+/// unrelated account register one put two live accounts on one address
+/// -- and resolution by address decides who may accept an
+/// EMAIL-targeted handshake.
+#[tokio::test]
+async fn a_synthetic_address_is_reserved_for_the_account_it_spells() {
+    let (svc, state) = OrganizationsService::shared();
+    create_org_with_root(&svc).await;
+
+    // `CreateAccount` cannot take another id's synthetic address.
+    let created = body_value(
+        svc.handle(req_with(
+            "111111111111",
+            "CreateAccount",
+            json!({ "Email": "222222222222@example.com", "AccountName": "decoy" }),
+        ))
+        .await
+        .expect("accepted, then failed asynchronously"),
+    );
+    let request_id = created["CreateAccountStatus"]["Id"].as_str().unwrap();
+    let minted = created["CreateAccountStatus"]["AccountId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        crate::state::OrganizationsRegistry::email_reserved_for_other(
+            "222222222222@example.com",
+            &minted
+        ),
+        "the address spells an id other than the one being created"
+    );
+    state
+        .write()
+        .sole_mut()
+        .unwrap()
+        .fail_create_account(request_id, "EMAIL_ALREADY_EXISTS");
+
+    // ...and the account it spells keeps it when it creates its own
+    // organization.
+    svc.handle(req_with("222222222222", "CreateOrganization", json!({})))
+        .await
+        .expect("its own synthetic address is free");
+    assert!(state.read().account_matches_target(
+        "EMAIL",
+        "222222222222@example.com",
+        "222222222222"
+    ));
+}
+
 /// Deleting one organization leaves every other one standing.
 #[tokio::test]
 async fn deleting_one_organization_leaves_the_others() {

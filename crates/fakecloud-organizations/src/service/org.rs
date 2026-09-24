@@ -34,6 +34,21 @@ impl OrganizationsService {
                 "The AWS account is already a member of an organization.",
             ));
         }
+        // The management account registers its own synthetic address, so
+        // that address must not already be taken -- otherwise two live
+        // accounts share one and resolution by address, which decides who
+        // may accept an EMAIL-targeted handshake, answers by org ordering.
+        let management_email = format!("{}@example.com", req.account_id);
+        if guard.email_in_use(&management_email) {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "ConstraintViolationException",
+                format!(
+                    "The email address {management_email} is already associated \
+                     with another account."
+                ),
+            ));
+        }
         let mut org = OrganizationState::bootstrap(&req.account_id);
         // A CONSOLIDATED_BILLING org has no policy management; reflect the
         // requested feature set and drop the auto-enabled SCP type.

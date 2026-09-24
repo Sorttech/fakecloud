@@ -60,10 +60,7 @@ fn is_transfer_party(
 /// `AccountId` (exactly 12 digits), so an email-targeted transfer -- whose
 /// target is recorded as the address the source named -- carries only
 /// the email until the address resolves to an account id.
-fn target_participant(
-    registry: &crate::state::OrganizationsRegistry,
-    t: &ResponsibilityTransfer,
-) -> Value {
+fn target_participant(t: &ResponsibilityTransfer) -> Value {
     let mut party = json!({
         "ManagementAccountEmail": t.target_management_account_email,
     });
@@ -81,7 +78,6 @@ fn target_participant(
         // leaks nothing: it decodes only an id the caller already spelled
         // out. A real address therefore reports no
         // `ManagementAccountId`, which the Smithy shape allows.
-        let _ = registry;
         crate::state::target_account_id("EMAIL", stored)
     };
     if let Some(id) = resolved {
@@ -90,10 +86,7 @@ fn target_participant(
     party
 }
 
-fn transfer_payload(
-    registry: &crate::state::OrganizationsRegistry,
-    t: &ResponsibilityTransfer,
-) -> Value {
+fn transfer_payload(t: &ResponsibilityTransfer) -> Value {
     let mut obj = json!({
         "Arn": t.arn,
         "Name": t.name,
@@ -104,7 +97,7 @@ fn transfer_payload(
             "ManagementAccountId": t.source_management_account_id,
             "ManagementAccountEmail": t.source_management_account_email,
         },
-        "Target": target_participant(registry, t),
+        "Target": target_participant(t),
         "StartTimestamp": t.start_timestamp.timestamp() as f64,
     });
     if let Some(end) = t.end_timestamp {
@@ -359,7 +352,7 @@ impl OrganizationsService {
             .filter(|t| is_transfer_party(&guard, t, &req.account_id))
             .ok_or_else(|| transfer_not_found(&id))?;
         Ok(AwsResponse::ok_json(
-            json!({ "ResponsibilityTransfer": transfer_payload(&guard, transfer) }),
+            json!({ "ResponsibilityTransfer": transfer_payload(transfer) }),
         ))
     }
 
@@ -379,7 +372,7 @@ impl OrganizationsService {
         transfer.name = name;
         let snapshot = transfer.clone();
         Ok(AwsResponse::ok_json(
-            json!({ "ResponsibilityTransfer": transfer_payload(&guard, &snapshot) }),
+            json!({ "ResponsibilityTransfer": transfer_payload(&snapshot) }),
         ))
     }
 
@@ -436,7 +429,7 @@ impl OrganizationsService {
             }
         }
         Ok(AwsResponse::ok_json(
-            json!({ "ResponsibilityTransfer": transfer_payload(&guard, &snapshot) }),
+            json!({ "ResponsibilityTransfer": transfer_payload(&snapshot) }),
         ))
     }
 
@@ -507,10 +500,7 @@ impl OrganizationsService {
             }
         }
         rows.sort_by(|a, b| a.id.cmp(&b.id));
-        let filtered: Vec<Value> = rows
-            .into_iter()
-            .map(|t| transfer_payload(&guard, t))
-            .collect();
+        let filtered: Vec<Value> = rows.into_iter().map(transfer_payload).collect();
         let (page, token) = paginate_checked(&filtered, next_token.as_deref(), max_results)
             .map_err(|_| invalid_input("Invalid NextToken"))?;
         let mut out = json!({ "ResponsibilityTransfers": page });

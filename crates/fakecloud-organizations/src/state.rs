@@ -128,7 +128,6 @@ impl OrganizationsRegistry {
     /// The organization holding `CreateAccount` request `request_id`.
     /// Request ids are globally unique, so the background completion
     /// tick finds its own request without carrying the org id.
-    /// The organization holding `CreateAccount` request `request_id`.
     pub fn org_of_create_account_request(&self, request_id: &str) -> Option<&OrganizationState> {
         self.orgs
             .values()
@@ -242,11 +241,6 @@ impl OrganizationsRegistry {
             .map(|account| account.id.clone())
     }
 
-    /// True when any account already uses `email`. AWS requires an
-    /// address to be unused (`EMAIL_ALREADY_EXISTS`), and this
-    /// resolution is authorization-relevant -- it decides who may accept
-    /// an `EMAIL`-targeted invitation -- so a duplicate would make that
-    /// answer depend on id ordering.
     /// Like [`Self::email_in_use`], for the in-flight request
     /// `request_id`: its own reservation must not count against it, and
     /// only requests made BEFORE it do. Counting every other in-flight
@@ -274,6 +268,27 @@ impl OrganizationsRegistry {
             })
     }
 
+    /// True when `email` is the synthetic `<account-id>@example.com`
+    /// form of an account OTHER than `for_account`.
+    ///
+    /// fakecloud mints those addresses for the accounts it creates, so
+    /// they are reserved for the id they spell whether or not that
+    /// account exists yet. Letting an unrelated account register one
+    /// meant two live accounts shared an address -- through
+    /// `CreateAccount`, or through `CreateOrganization`, whose
+    /// management account takes its own synthetic address -- and
+    /// `account_registered_with` then answered with whichever
+    /// organization sorted first, which decides who may accept an
+    /// EMAIL-targeted handshake.
+    pub fn email_reserved_for_other(email: &str, for_account: &str) -> bool {
+        target_account_id("EMAIL", email).is_some_and(|spelled| spelled != for_account)
+    }
+
+    /// True when any account already uses `email`. AWS requires an
+    /// address to be unused (`EMAIL_ALREADY_EXISTS`), and this
+    /// resolution is authorization-relevant -- it decides who may accept
+    /// an `EMAIL`-targeted invitation -- so a duplicate would make that
+    /// answer depend on id ordering.
     pub fn email_in_use(&self, email: &str) -> bool {
         self.orgs
             .values()

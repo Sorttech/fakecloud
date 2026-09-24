@@ -181,7 +181,20 @@ impl OrganizationsService {
                     .org_of_create_account_request(&request_id)
                     .and_then(|org| org.create_account_requests.get(&request_id))
                     .and_then(|req| req.pending_email.clone())
-                    .is_some_and(|email| guard.email_in_use_besides(&email, &request_id));
+                    .is_some_and(|email| {
+                        // The address must be free, and must not be the
+                        // synthetic form reserved for a different id.
+                        let spelled_for_other = guard
+                            .org_of_create_account_request(&request_id)
+                            .and_then(|org| org.create_account_requests.get(&request_id))
+                            .and_then(|req| req.account_id.clone())
+                            .is_some_and(|mine| {
+                                crate::state::OrganizationsRegistry::email_reserved_for_other(
+                                    &email, &mine,
+                                )
+                            });
+                        spelled_for_other || guard.email_in_use_besides(&email, &request_id)
+                    });
                 // Request ids are globally unique, so the owning
                 // organization is whichever one holds this request.
                 match guard.org_of_create_account_request_mut(&request_id) {
