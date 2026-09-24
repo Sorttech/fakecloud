@@ -24,11 +24,24 @@ impl S3Service {
             ));
         }
 
+        // `parse_cors_config` stops at the first `<CORSRule>` it cannot close,
+        // returning only the rules it managed to parse. Requiring the counts to
+        // agree turns an unterminated rule into `MalformedXML` instead of a
+        // stored config whose tail was silently dropped.
+        let parsed = parse_cors_config(&body_str);
+        if parsed.len() != rule_count {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "MalformedXML",
+                "The XML you provided was not well-formed or did not validate against our published schema",
+            ));
+        }
+
         // `AllowedMethods` and `AllowedOrigins` are both required members of
         // `CORSRule`. A rule missing either matches nothing at request time, so
         // accepting one would leave the bucket silently CORS-dead rather than
         // telling the caller their config is wrong — AWS rejects it outright.
-        for rule in parse_cors_config(&body_str) {
+        for rule in parsed {
             if rule.allowed_methods.is_empty() || rule.allowed_origins.is_empty() {
                 return Err(AwsServiceError::aws_error(
                     StatusCode::BAD_REQUEST,

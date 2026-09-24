@@ -497,16 +497,28 @@ impl AwsService for S3Service {
                 // preflight with no `Origin` carries nothing to evaluate and is
                 // a malformed request, distinct from the 403 a disallowed
                 // origin gets. Empty counts as absent, as on every other path.
-                if !req
-                    .headers
-                    .get("origin")
-                    .and_then(|v| v.to_str().ok())
-                    .is_some_and(|o| !o.is_empty())
-                {
+                let header_present = |name| {
+                    req.headers
+                        .get(name)
+                        .and_then(|v| v.to_str().ok())
+                        .is_some_and(|v: &str| !v.is_empty())
+                };
+                if !header_present("origin") {
                     return Err(AwsServiceError::aws_error(
                         StatusCode::BAD_REQUEST,
                         "InvalidRequest",
                         "Insufficient information. Origin request header needed.",
+                    ));
+                }
+                // Both halves of a preflight are required information. Without
+                // this, a missing request-method fell through to the denial
+                // below and reported "CORS is not enabled for this bucket" on a
+                // bucket whose CORS is enabled and whose origin is allowed.
+                if !header_present("access-control-request-method") {
+                    return Err(AwsServiceError::aws_error(
+                        StatusCode::BAD_REQUEST,
+                        "InvalidRequest",
+                        "Insufficient information. Access-Control-Request-Method request header needed.",
                     ));
                 }
                 let cors_config = {
@@ -603,7 +615,13 @@ impl AwsService for S3Service {
                 return Err(AwsServiceError::aws_error_with_headers(
                     StatusCode::FORBIDDEN,
                     "CORSResponse",
-                    "CORS is not enabled for this bucket",
+                    // Reached both when the bucket has no CORS config and when
+                    // it has one that does not allow this origin/method, so the
+                    // message cannot claim CORS is disabled.
+                    "This CORS request is not allowed. This is usually because the evaluation \
+                     of Origin, request method / Access-Control-Request-Method or \
+                     Access-Control-Request-Headers are not whitelisted by the resource's \
+                     CORS spec.",
                     headers,
                 ));
             }

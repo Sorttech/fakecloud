@@ -1719,6 +1719,24 @@ async fn s3_cors_preflight_and_response_headers() {
     assert_eq!(resp.status(), 400);
     assert!(resp.text().await.unwrap().contains("Origin request header"));
 
+    // The other half of a preflight is required too, and must not be reported
+    // as "CORS is not enabled" on a bucket whose CORS is enabled.
+    let resp = http
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{}/cors-bucket/file.txt", server.endpoint()),
+        )
+        .header("Origin", "https://example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    assert!(resp
+        .text()
+        .await
+        .unwrap()
+        .contains("Access-Control-Request-Method request header"));
+
     // Same with a wildcard rule: an absent Origin must not satisfy
     // AllowedOrigin `*`, or an Origin-less OPTIONS would come back as an
     // approved preflight.
@@ -1770,6 +1788,23 @@ async fn s3_cors_preflight_and_response_headers() {
         resp.text().await.unwrap().contains("MalformedXML"),
         "a CORS rule with no AllowedMethod must be rejected as MalformedXML"
     );
+
+    // An unterminated <CORSRule> parses to nothing, so accepting it would store
+    // a config that matches no request at all.
+    let resp = http
+        .put(format!("{}/wild-cors-bucket?cors", server.endpoint()))
+        .header("Authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20240101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=fake")
+        .body(
+            "<CORSConfiguration><CORSRule>\
+             <AllowedOrigin>https://a.example</AllowedOrigin>\
+             <AllowedMethod>GET</AllowedMethod>\
+             </CORSConfiguration>",
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    assert!(resp.text().await.unwrap().contains("MalformedXML"));
 
     // A bucket with no CORS config at all answers preflights identically for
     // every origin, so that 403 carries no Vary.
