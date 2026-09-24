@@ -59,14 +59,6 @@ use notifications::{
 /// (and no `Access-Control-Allow-Origin`) either way.
 const CORS_VARY: &str = "Origin, Access-Control-Request-Headers, Access-Control-Request-Method";
 
-/// Set a CORS response header on whatever a CORS-evaluated request produced —
-/// success or error alike.
-///
-/// Errors matter as much as successes: real S3 answers a 404 `NoSuchKey` for an
-/// allowed origin *with* `Access-Control-Allow-Origin`, so `fetch(…, {mode:
-/// 'cors'})` sees a 404 it can handle rather than an opaque CORS network error.
-/// And a 404 is heuristically cacheable, so it needs `Vary` for the same reason
-/// a 200 does.
 /// Read a header that gates CORS approval, as a single trimmed value.
 ///
 /// Returns `None` when the header is absent, blank, unreadable, or sent on more
@@ -80,6 +72,14 @@ fn single_cors_header<'a>(headers: &'a http::HeaderMap, name: &str) -> Option<&'
     }
 }
 
+/// Set a CORS response header on whatever a CORS-evaluated request produced —
+/// success or error alike.
+///
+/// Errors matter as much as successes: real S3 answers a 404 `NoSuchKey` for an
+/// allowed origin *with* `Access-Control-Allow-Origin`, so `fetch(…, {mode:
+/// 'cors'})` sees a 404 it can handle rather than an opaque CORS network error.
+/// And a 404 is heuristically cacheable, so it needs `Vary` for the same reason
+/// a 200 does.
 fn set_cors_header(
     result: &mut Result<AwsResponse, AwsServiceError>,
     name: &'static str,

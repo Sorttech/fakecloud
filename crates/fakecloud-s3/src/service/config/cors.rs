@@ -28,7 +28,12 @@ pub(crate) fn validate_cors_xml(body_str: &str) -> Result<(), (&'static str, Str
     // returning only the rules it managed to parse. Requiring the counts to
     // agree turns an unterminated rule into `MalformedXML` instead of a
     // stored config whose tail was silently dropped.
-    let parsed = parse_cors_config(&scannable);
+    // The raw body, not `scannable`: `parse_cors_config` strips comments
+    // itself, and at request time it strips the stored raw body exactly once.
+    // Handing it pre-stripped text would strip twice here and once there, so a
+    // body whose stripping synthesizes a new `<!--` out of overlapping
+    // delimiters would validate against different markup than it later runs on.
+    let parsed = parse_cors_config(body_str);
     if parsed.len() != rule_count {
         return Err(("MalformedXML", MALFORMED_XML.to_string()));
     }
