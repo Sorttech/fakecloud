@@ -124,6 +124,8 @@ Response shape:
 
 `accounts` spans **every** organization in the process, each entry carrying its own `organizationId`, and `organizations` lists one entry per organization. The flat `managementAccountId`/`masterAccountId` are set only when exactly one organization exists, so a caller written against the single-organization shape keeps working; with several, read `organizations` (or each account's `organizationId`) rather than getting one arbitrary organization's answer.
 
+Note that this overloads `null` on those two fields: before multi-organization support it meant "no organization has been created yet", and it now also means "more than one exists, so there is no single answer". Test `organizations` instead -- it is empty only when no organization exists.
+
 The first-party SDKs wrap this:
 
 - Rust: `fakecloud_sdk::FakeCloud::new(url).organizations().get_accounts()`

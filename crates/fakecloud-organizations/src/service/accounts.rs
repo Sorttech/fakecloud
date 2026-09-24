@@ -388,9 +388,14 @@ impl OrganizationsService {
         // here rather than quietly opening a handshake that could never be
         // accepted. A target that is already OUR member falls through to
         // `invite_account`, which reports it as such.
-        // Applies to an EMAIL target too, once it resolves to an account
-        // fakecloud knows -- otherwise the invite would open a handshake
-        // that could never be accepted.
+        // Applies to an EMAIL target once it resolves, but resolution here
+        // is deliberately scoped to the caller's own organization:
+        // resolving registry-wide would let the caller read a foreign
+        // account id back out of the error below. An address registered
+        // in ANOTHER organization therefore slips past this guard and is
+        // caught at accept time instead, which costs a handshake that
+        // sits OPEN until it expires -- the price of not answering "whose
+        // account is this?" to anyone who asks.
         if let Some(target) = guard.resolve_target_account(kind, &id, &org_id) {
             if guard.claimed_by_other_org(&target, &org_id).is_some() {
                 return Err(org_error_to_aws(

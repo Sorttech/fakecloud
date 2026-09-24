@@ -234,11 +234,21 @@ impl OrganizationsRegistry {
     /// invitation it could then neither read nor act on.
     ///
     /// An `ACCOUNT` target names the id directly. An `EMAIL` target
-    /// matches either the synthetic `<account-id>@example.com` form
-    /// fakecloud mints, or the address `account_id` is actually
-    /// registered with. The lookup is of the CALLER's own account, never
-    /// a scan of other organizations, so it answers nothing about who
-    /// else exists.
+    /// resolves to the account REGISTERED with that address if any
+    /// organization has one, and otherwise decodes the synthetic
+    /// `<account-id>@example.com` form fakecloud mints. That precedence
+    /// is what keeps one address naming one account: accepting both
+    /// readings let an invitation be accepted by an account it was never
+    /// addressed to. The consequence is that registering an address
+    /// elsewhere takes over its synthetic reading, so an invitation open
+    /// to the spelled-out id stops matching -- rare, and the safe
+    /// direction to fail.
+    ///
+    /// The registered lookup spans organizations, which is safe here
+    /// because this only ever CONFIRMS an account the caller already
+    /// named; it never hands one back. Resolvers that return an id --
+    /// `resolve_target_account` -- stay scoped to one organization so
+    /// they cannot be read as an oracle.
     pub fn account_matches_target(
         &self,
         target_kind: &str,

@@ -554,6 +554,10 @@ pub(crate) fn organizations_accounts_snapshot(
     // single organization to point at; with several, a caller has to read
     // `organizations` (or each account's `organizationId`) instead of
     // silently getting one arbitrary organization's answer.
+    //
+    // That overloads `null`, which used to mean "no organization exists".
+    // `organizations` is the unambiguous signal -- empty means none --
+    // and the docs say so.
     let single = match organizations.as_slice() {
         [only] => Some(only.management_account_id.clone()),
         _ => None,
