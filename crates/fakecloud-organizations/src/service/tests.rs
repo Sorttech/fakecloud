@@ -877,37 +877,68 @@ async fn a_registered_address_names_its_own_account_and_no_other() {
     ));
 }
 
-/// AWS requires an account's address to be unused. fakecloud must
-/// enforce it too: resolution by address decides who may accept an
-/// EMAIL-targeted invitation, so a duplicate would make that answer
-/// depend on which id happened to sort first.
+/// AWS requires an account's address to be unused, and reports a
+/// duplicate ASYNCHRONOUSLY: `CreateAccount` models no synchronous error
+/// for it, so a polling client (Terraform's `aws_organizations_account`)
+/// must still get a request id back. The request then lands in FAILED
+/// with `EMAIL_ALREADY_EXISTS`.
 #[tokio::test]
-async fn create_account_rejects_an_address_already_in_use() {
-    let (svc, _state) = OrganizationsService::shared();
+async fn create_account_fails_asynchronously_on_a_duplicate_address() {
+    let (svc, state) = OrganizationsService::shared();
     create_org_with_root(&svc).await;
-    svc.handle(req_with(
-        "111111111111",
-        "CreateAccount",
-        json!({ "Email": "ops@corp.com", "AccountName": "ops" }),
-    ))
-    .await
-    .unwrap();
-
-    // Same organization, and a different one, both refused.
-    svc.handle(req_with("222222222222", "CreateOrganization", json!({})))
+    let first = body_value(
+        svc.handle(req_with(
+            "111111111111",
+            "CreateAccount",
+            json!({ "Email": "ops@corp.com", "AccountName": "ops" }),
+        ))
         .await
+        .unwrap(),
+    );
+    state
+        .write()
+        .sole_mut()
+        .unwrap()
+        .complete_create_account(first["CreateAccountStatus"]["Id"].as_str().unwrap());
+
+    // The duplicate is accepted, with a request id to poll.
+    let second = body_value(
+        svc.handle(req_with(
+            "111111111111",
+            "CreateAccount",
+            json!({ "Email": "ops@corp.com", "AccountName": "dupe" }),
+        ))
+        .await
+        .expect("a duplicate address is not a synchronous error"),
+    );
+    assert_eq!(second["CreateAccountStatus"]["State"], "IN_PROGRESS");
+    let request_id = second["CreateAccountStatus"]["Id"].as_str().unwrap();
+
+    // ...and resolves to FAILED rather than a second account on one
+    // address, which would make resolution depend on id ordering.
+    let described = body_value(
+        svc.handle(req_with(
+            "111111111111",
+            "DescribeCreateAccountStatus",
+            json!({ "CreateAccountRequestId": request_id }),
+        ))
+        .await
+        .unwrap(),
+    );
+    assert_eq!(described["CreateAccountStatus"]["State"], "IN_PROGRESS");
+
+    // Drive the tick the server would run in the background.
+    let failed = state
+        .write()
+        .sole_mut()
+        .unwrap()
+        .fail_create_account(request_id, "EMAIL_ALREADY_EXISTS")
         .unwrap();
-    for caller in ["111111111111", "222222222222"] {
-        let err = expect_err(
-            svc.handle(req_with(
-                caller,
-                "CreateAccount",
-                json!({ "Email": "ops@corp.com", "AccountName": "dupe" }),
-            ))
-            .await,
-        );
-        assert_eq!(err.code(), "InvalidInputException");
-    }
+    assert_eq!(failed.state, "FAILED");
+    assert_eq!(
+        failed.failure_reason.as_deref(),
+        Some("EMAIL_ALREADY_EXISTS")
+    );
 }
 
 /// Accepting an invitation you have since satisfied another way is not a

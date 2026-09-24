@@ -330,7 +330,10 @@ impl OrganizationsService {
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let guard = self.state.read();
-        let org = self.require_member(&guard, &req.account_id)?;
+        // Management-only, like `PutResourcePolicy` and
+        // `DeleteResourcePolicy`: the document can carry cross-account
+        // grants, and AWS restricts the read the same way.
+        let org = self.management_org(&guard, &req.account_id)?;
         let content = org.resource_policy.clone().ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,

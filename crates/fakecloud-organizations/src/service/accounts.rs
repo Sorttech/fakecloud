@@ -75,13 +75,6 @@ impl OrganizationsService {
             .management_org_mut(&mut guard, &req.account_id)?
             .org_id
             .clone();
-        // AWS requires the address to be unused. fakecloud must enforce it
-        // too: resolution by address decides who may accept an
-        // EMAIL-targeted invitation, so a duplicate would make that
-        // answer depend on id ordering.
-        if guard.email_in_use(&email) {
-            return Err(email_already_exists(&email));
-        }
         // Mint from the registry: an account id names one account
         // process-wide, so a per-organization check could hand out an id
         // another organization already owns.
@@ -124,9 +117,6 @@ impl OrganizationsService {
             .management_org_mut(&mut guard, &req.account_id)?
             .org_id
             .clone();
-        if guard.email_in_use(&email) {
-            return Err(email_already_exists(&email));
-        }
         // The GovCloud "paired" id is a 12-digit account id in the
         // GovCloud partition; we mint one alongside the commercial id
         // so callers see both, matching the real AWS response. Both come
@@ -182,9 +172,22 @@ impl OrganizationsService {
             tokio::time::sleep(delay).await;
             let completed = {
                 let mut guard = state.write();
+                // An address already in use fails the request rather than
+                // the call: `CreateAccount` models no synchronous error for
+                // it, and clients hand back a request id to poll. AWS
+                // reports it as FAILED with EMAIL_ALREADY_EXISTS.
+                let taken = guard
+                    .org_of_create_account_request(&request_id)
+                    .and_then(|org| org.create_account_requests.get(&request_id))
+                    .and_then(|req| req.pending_email.clone())
+                    .is_some_and(|email| guard.email_in_use_besides(&email, &request_id));
                 // Request ids are globally unique, so the owning
                 // organization is whichever one holds this request.
                 match guard.org_of_create_account_request_mut(&request_id) {
+                    Some(org) if taken => {
+                        org.fail_create_account(&request_id, "EMAIL_ALREADY_EXISTS");
+                        false
+                    }
                     Some(org) => {
                         org.complete_create_account(&request_id);
                         true
@@ -551,13 +554,4 @@ pub(super) fn validate_invite_target(kind: &str, id: &str) -> Result<(), AwsServ
             "Target.Type must be one of [ACCOUNT, EMAIL], got {other}"
         ))),
     }
-}
-
-/// AWS's answer for a `CreateAccount` address that is already in use.
-fn email_already_exists(email: &str) -> AwsServiceError {
-    AwsServiceError::aws_error(
-        StatusCode::BAD_REQUEST,
-        "InvalidInputException",
-        format!("The email address {email} is already associated with an account."),
-    )
 }

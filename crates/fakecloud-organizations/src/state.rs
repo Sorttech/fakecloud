@@ -128,6 +128,13 @@ impl OrganizationsRegistry {
     /// The organization holding `CreateAccount` request `request_id`.
     /// Request ids are globally unique, so the background completion
     /// tick finds its own request without carrying the org id.
+    /// The organization holding `CreateAccount` request `request_id`.
+    pub fn org_of_create_account_request(&self, request_id: &str) -> Option<&OrganizationState> {
+        self.orgs
+            .values()
+            .find(|org| org.create_account_requests.contains_key(request_id))
+    }
+
     pub fn org_of_create_account_request_mut(
         &mut self,
         request_id: &str,
@@ -229,7 +236,9 @@ impl OrganizationsRegistry {
             .flat_map(|org| org.accounts.values())
             // A GovCloud mirror shares its commercial twin's address by
             // design; the commercial account is the one an address names.
-            .find(|account| account.email == email && !is_gov_cloud(account))
+            .find(|account| {
+                account.email == email && !is_gov_cloud(account) && account.status != "SUSPENDED"
+            })
             .map(|account| account.id.clone())
     }
 
@@ -238,11 +247,31 @@ impl OrganizationsRegistry {
     /// resolution is authorization-relevant -- it decides who may accept
     /// an `EMAIL`-targeted invitation -- so a duplicate would make that
     /// answer depend on id ordering.
+    /// Like [`Self::email_in_use`], ignoring one in-flight request --
+    /// its own reservation must not count against it.
+    pub fn email_in_use_besides(&self, email: &str, request_id: &str) -> bool {
+        self.orgs
+            .values()
+            .flat_map(|org| org.accounts.values())
+            .any(|account| account.email == email && account.status != "SUSPENDED")
+            || self.orgs.values().any(|org| {
+                org.create_account_requests.iter().any(|(id, req)| {
+                    id != request_id
+                        && req.state == "IN_PROGRESS"
+                        && req.pending_email.as_deref() == Some(email)
+                })
+            })
+    }
+
     pub fn email_in_use(&self, email: &str) -> bool {
         self.orgs
             .values()
             .flat_map(|org| org.accounts.values())
-            .any(|account| account.email == email)
+            // A closed account keeps its record but releases its address:
+            // `CloseAccount` (and the CloudFormation delete that calls it)
+            // only suspends, so counting those would make a deleted stack
+            // impossible to re-deploy.
+            .any(|account| account.email == email && account.status != "SUSPENDED")
             || self.orgs.values().any(|org| {
                 org.create_account_requests.values().any(|req| {
                     req.state == "IN_PROGRESS" && req.pending_email.as_deref() == Some(email)
@@ -924,6 +953,7 @@ impl OrganizationState {
         id: &str,
         new_state: &str,
         enrolling_account: Option<&str>,
+        enrolling_email: Option<String>,
     ) -> Result<Handshake, OrgError> {
         let handshake = self
             .handshakes
@@ -957,9 +987,12 @@ impl OrganizationState {
                 "arn:aws:organizations::{}:account/{}/{}",
                 self.management_account_id, self.org_id, target
             );
-            let email = snapshot
-                .target_email
+            // The caller supplies the address: an account's address must
+            // be unique across the whole registry, which this organization
+            // cannot see on its own.
+            let email = enrolling_email
                 .clone()
+                .or_else(|| snapshot.target_email.clone())
                 .unwrap_or_else(|| format!("{target}@example.com"));
             self.accounts.insert(
                 target.clone(),
@@ -2426,7 +2459,7 @@ mod tests {
             .unwrap();
         assert!(!org.accounts.contains_key("444444444444"));
         let resolved = org
-            .resolve_handshake(&h.id, "ACCEPTED", Some("444444444444"))
+            .resolve_handshake(&h.id, "ACCEPTED", Some("444444444444"), None)
             .unwrap();
         assert_eq!(resolved.state, "ACCEPTED");
         let acct = org.accounts.get("444444444444").unwrap();
@@ -2439,7 +2472,9 @@ mod tests {
         let h = org
             .invite_account("111111111111", "ACCOUNT", "555555555555", None, None)
             .unwrap();
-        let resolved = org.resolve_handshake(&h.id, "DECLINED", None).unwrap();
+        let resolved = org
+            .resolve_handshake(&h.id, "DECLINED", None, None)
+            .unwrap();
         assert_eq!(resolved.state, "DECLINED");
         assert!(!org.accounts.contains_key("555555555555"));
     }
@@ -2450,9 +2485,11 @@ mod tests {
         let h = org
             .invite_account("111111111111", "ACCOUNT", "666666666666", None, None)
             .unwrap();
-        org.resolve_handshake(&h.id, "ACCEPTED", Some("666666666666"))
+        org.resolve_handshake(&h.id, "ACCEPTED", Some("666666666666"), None)
             .unwrap();
-        let err = org.resolve_handshake(&h.id, "DECLINED", None).unwrap_err();
+        let err = org
+            .resolve_handshake(&h.id, "DECLINED", None, None)
+            .unwrap_err();
         assert!(matches!(err, OrgError::HandshakeAlreadyResolved(_)));
     }
 }

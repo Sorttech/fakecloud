@@ -117,11 +117,39 @@ impl OrganizationsService {
                 ));
             }
         }
+        // An account's address must be unique registry-wide, so pick one
+        // that is free before enrolling: the address the invitation named
+        // may have been registered by somebody else while it sat open.
+        // The invitee did nothing wrong, so fall back to its own synthetic
+        // address rather than refusing the accept.
+        let enrolling_email = if new_state == "ACCEPTED" && handshake.action == "INVITE" {
+            let named = handshake
+                .target_email
+                .clone()
+                .unwrap_or_else(|| format!("{}@example.com", req.account_id));
+            let synthetic = format!("{}@example.com", req.account_id);
+            match (guard.email_in_use(&named), guard.email_in_use(&synthetic)) {
+                (false, _) => Some(named),
+                (true, false) => Some(synthetic),
+                (true, true) => {
+                    return Err(org_error_to_aws(
+                        crate::state::OrgError::AccountAlreadyMember(req.account_id.clone()),
+                    ))
+                }
+            }
+        } else {
+            None
+        };
         let org = guard
             .org_by_id_mut(&org_id)
             .expect("handshake lookup resolved this organization");
         let updated = org
-            .resolve_handshake(&id, new_state, Some(req.account_id.as_str()))
+            .resolve_handshake(
+                &id,
+                new_state,
+                Some(req.account_id.as_str()),
+                enrolling_email,
+            )
             .map_err(org_error_to_aws)?;
         Ok(AwsResponse::ok_json(
             json!({ "Handshake": handshake_payload(&updated) }),
