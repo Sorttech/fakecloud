@@ -893,6 +893,7 @@ impl S3Service {
                     size: obj_size,
                     etag: &obj_etag,
                     region: &region,
+                    version_id: version_id.as_deref(),
                 },
                 Some(&self.state),
             );

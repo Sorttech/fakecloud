@@ -549,7 +549,10 @@ impl S3Service {
 
         let synth_req = AwsRequest {
             service: "s3".to_string(),
-            action: "PutObject".to_string(),
+            // PutObject's handler reads the action to decide which
+            // ObjectCreated event to fire; a browser form upload is
+            // ObjectCreated:Post on real S3.
+            action: "PostObject".to_string(),
             region: req.region.clone(),
             account_id: account_id.to_string(),
             request_id: req.request_id.clone(),

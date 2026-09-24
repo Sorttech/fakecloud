@@ -101,6 +101,7 @@ impl S3Service {
             }
 
             let mut is_dm = false;
+            let mut removed_version = false;
             if let Some(versions) = b.object_versions.get_mut(key) {
                 let vid_matches = |o: &S3Object| {
                     o.version_id.as_deref() == Some(vid.as_str())
@@ -112,6 +113,7 @@ impl S3Service {
                 let len_before = versions.len();
                 versions.retain(|o| !vid_matches(o));
                 let removed = len_before != versions.len();
+                removed_version = removed;
                 // Only update current object if we actually removed a version
                 if removed {
                     if let Some(latest) = versions.last() {
@@ -133,6 +135,7 @@ impl S3Service {
                     || (vid == "null" && obj.version_id.is_none());
                 if matches {
                     is_dm = obj.is_delete_marker;
+                    removed_version = true;
                     b.objects.remove(key);
                 }
             }
@@ -145,6 +148,32 @@ impl S3Service {
             self.store
                 .delete_object(bucket, key, Some(vid.as_str()))
                 .map_err(crate::service::persistence_error)?;
+
+            // Permanently deleting a version fires ObjectRemoved:Delete
+            // carrying that version id, exactly as on real S3.
+            let notification_config = b.notification_config.clone();
+            let bucket_name = bucket.to_string();
+            let obj_key = key.to_string();
+            let region = region.clone();
+            drop(accts);
+            if removed_version {
+                if let Some(ref config) = notification_config {
+                    deliver_notifications(
+                        &self.delivery,
+                        config,
+                        &crate::service::notifications::ObjectEvent {
+                            event_name: "ObjectRemoved:Delete",
+                            bucket_name: &bucket_name,
+                            key: &obj_key,
+                            size: 0,
+                            etag: "",
+                            region: &region,
+                            version_id: Some(vid.as_str()),
+                        },
+                        Some(&self.state),
+                    );
+                }
+            }
             return Ok(AwsResponse {
                 status: StatusCode::NO_CONTENT,
                 content_type: "application/xml".to_string(),
@@ -223,6 +252,7 @@ impl S3Service {
                         size: 0,
                         etag: "",
                         region: &region,
+                        version_id: Some(dm_id.as_str()),
                     },
                     Some(&self.state),
                 );
@@ -259,6 +289,7 @@ impl S3Service {
                     size: 0,
                     etag: "",
                     region: &region,
+                    version_id: None,
                 },
                 Some(&self.state),
             );
@@ -317,6 +348,10 @@ impl S3Service {
         let versioning_enabled = b.versioning.as_deref() == Some("Enabled");
         let mut deleted_xml = String::new();
         let mut error_xml = String::new();
+        // (event name, key, version id) for every object this batch actually
+        // removed. Real S3 fires one notification per deleted object, so the
+        // batch endpoint must not be a silent hole in the event stream.
+        let mut pending_events: Vec<(&'static str, String, Option<String>)> = Vec::new();
         for entry in &entries {
             let key = &entry.key;
             if let Some(ref vid) = entry.version_id {
@@ -376,11 +411,14 @@ impl S3Service {
                 // slot — otherwise unversioned-bucket batch deletes that
                 // target a vid match still report Deleted while leaving
                 // the object in place.
+                let mut removed_version = false;
                 if let Some(versions) = b.object_versions.get_mut(key) {
+                    let len_before = versions.len();
                     versions.retain(|o| {
                         !(o.version_id.as_deref() == Some(vid)
                             || (vid == "null" && o.version_id.is_none()))
                     });
+                    removed_version = versions.len() != len_before;
                     if let Some(latest) = versions.last() {
                         if latest.is_delete_marker {
                             b.objects.remove(key);
@@ -397,12 +435,21 @@ impl S3Service {
                     let matches = obj.version_id.as_deref() == Some(vid.as_str())
                         || (vid == "null" && obj.version_id.is_none());
                     if matches {
+                        removed_version = true;
                         b.objects.remove(key);
                     }
                 }
                 self.store
                     .delete_object(bucket, key, Some(vid.as_str()))
                     .map_err(crate::service::persistence_error)?;
+                // Only a version that actually existed produces an event.
+                if removed_version {
+                    pending_events.push((
+                        "ObjectRemoved:Delete",
+                        key.to_string(),
+                        Some(vid.to_string()),
+                    ));
+                }
                 if !quiet {
                     deleted_xml.push_str(&format!(
                         "<Deleted><Key>{}</Key><VersionId>{}</VersionId></Deleted>",
@@ -437,6 +484,11 @@ impl S3Service {
                 self.store
                     .delete_object(bucket, key, None)
                     .map_err(crate::service::persistence_error)?;
+                pending_events.push((
+                    "ObjectRemoved:DeleteMarkerCreated",
+                    key.to_string(),
+                    Some(dm_id.clone()),
+                ));
                 if !quiet {
                     deleted_xml.push_str(&format!(
                         "<Deleted><Key>{}</Key><DeleteMarker>true</DeleteMarker><DeleteMarkerVersionId>{}</DeleteMarkerVersionId></Deleted>",
@@ -462,10 +514,13 @@ impl S3Service {
                     ));
                     continue;
                 }
-                b.objects.remove(key);
+                let existed = b.objects.remove(key).is_some();
                 self.store
                     .delete_object(bucket, key, None)
                     .map_err(crate::service::persistence_error)?;
+                if existed {
+                    pending_events.push(("ObjectRemoved:Delete", key.to_string(), None));
+                }
                 if !quiet {
                     deleted_xml.push_str(&format!(
                         "<Deleted><Key>{}</Key></Deleted>",
@@ -482,6 +537,31 @@ impl S3Service {
              {error_xml}\
              </DeleteResult>"
         );
+
+        // Deliver after releasing the write lock: delivery re-enters the S3
+        // service to read bucket state.
+        let notification_config = b.notification_config.clone();
+        let region = state.region.clone();
+        drop(accts);
+        if let Some(ref config) = notification_config {
+            for (event_name, key, version_id) in &pending_events {
+                deliver_notifications(
+                    &self.delivery,
+                    config,
+                    &crate::service::notifications::ObjectEvent {
+                        event_name,
+                        bucket_name: bucket,
+                        key,
+                        size: 0,
+                        etag: "",
+                        region: &region,
+                        version_id: version_id.as_deref(),
+                    },
+                    Some(&self.state),
+                );
+            }
+        }
+
         Ok(s3_xml(StatusCode::OK, body))
     }
 }

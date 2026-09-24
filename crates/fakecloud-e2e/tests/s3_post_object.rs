@@ -546,3 +546,98 @@ async fn success_action_redirect_returns_303() {
         .await
         .expect("redirect upload should still be stored");
 }
+
+#[tokio::test]
+async fn post_object_fires_object_created_post_notification() {
+    // A browser form upload is ObjectCreated:Post on real S3, not
+    // ObjectCreated:Put -- rules filtered on s3:ObjectCreated:Post must fire.
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+    let sqs = server.sqs_client().await;
+
+    s3.create_bucket()
+        .bucket("post-notif-bucket")
+        .send()
+        .await
+        .expect("create bucket");
+
+    let queue = sqs
+        .create_queue()
+        .queue_name("post-events")
+        .send()
+        .await
+        .expect("create queue");
+    let queue_url = queue.queue_url().unwrap().to_string();
+    let attrs = sqs
+        .get_queue_attributes()
+        .queue_url(&queue_url)
+        .attribute_names(aws_sdk_sqs::types::QueueAttributeName::QueueArn)
+        .send()
+        .await
+        .expect("queue attributes");
+    let queue_arn = attrs
+        .attributes()
+        .unwrap()
+        .get(&aws_sdk_sqs::types::QueueAttributeName::QueueArn)
+        .unwrap()
+        .clone();
+    let notif_config = format!(
+        r#"{{"QueueConfigurations":[{{"QueueArn":"{queue_arn}","Events":["s3:ObjectCreated:Post"]}}]}}"#
+    );
+    let output = server
+        .aws_cli(&[
+            "s3api",
+            "put-bucket-notification-configuration",
+            "--bucket",
+            "post-notif-bucket",
+            "--notification-configuration",
+            &notif_config,
+        ])
+        .await;
+    assert!(
+        output.success(),
+        "failed to set notification: {}",
+        output.stderr_text()
+    );
+
+    let policy = build_policy(
+        "post-notif-bucket",
+        "uploads/",
+        "test",
+        "us-east-1",
+        1_000_000,
+    );
+    let form = post_form(
+        &policy,
+        "uploads/form.txt",
+        "0".repeat(64).as_str(),
+        b"posted".to_vec(),
+    );
+    let resp = reqwest::Client::new()
+        .post(format!("{}/post-notif-bucket", server.endpoint()))
+        .multipart(form)
+        .send()
+        .await
+        .expect("POST Object request should succeed at the transport level");
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+
+    let msgs = sqs
+        .receive_message()
+        .queue_url(&queue_url)
+        .wait_time_seconds(2)
+        .max_number_of_messages(1)
+        .send()
+        .await
+        .expect("receive");
+    let messages = msgs.messages();
+    assert!(
+        !messages.is_empty(),
+        "POST Object should fire an s3:ObjectCreated:Post notification"
+    );
+    let event: serde_json::Value = serde_json::from_str(messages[0].body().unwrap()).unwrap();
+    assert_eq!(event["Records"][0]["eventName"], "ObjectCreated:Post");
+    assert_eq!(
+        event["Records"][0]["s3"]["object"]["key"],
+        "uploads/form.txt"
+    );
+}

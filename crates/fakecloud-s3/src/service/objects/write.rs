@@ -672,18 +672,27 @@ impl S3Service {
         let bucket_name = bucket.to_string();
         let obj_key = key.to_string();
 
-        // Deliver S3 event notifications
+        // Deliver S3 event notifications. A browser form upload reaches this
+        // handler through POST Object, which AWS reports as ObjectCreated:Post.
+        // S3 routes on method + path rather than `action`, so POST Object's
+        // synthesized PutObject request is the only caller that sets it.
+        let event_name = if req.action == "PostObject" {
+            "ObjectCreated:Post"
+        } else {
+            "ObjectCreated:Put"
+        };
         if let Some(ref config) = notification_config {
             deliver_notifications(
                 &self.delivery,
                 config,
                 &crate::service::notifications::ObjectEvent {
-                    event_name: "ObjectCreated:Put",
+                    event_name,
                     bucket_name: &bucket_name,
                     key: &obj_key,
                     size: obj_size,
                     etag: &obj_etag,
                     region: &region,
+                    version_id: version_id.as_deref(),
                 },
                 Some(&self.state),
             );
@@ -1273,6 +1282,7 @@ impl S3Service {
                     size: copy_size,
                     etag: &copy_etag,
                     region: &region,
+                    version_id: version_id.as_deref(),
                 },
                 Some(&self.state),
             );

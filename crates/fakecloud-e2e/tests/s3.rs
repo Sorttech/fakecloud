@@ -735,6 +735,272 @@ async fn s3_notification_delivery_to_sqs() {
     assert_eq!(event["Records"][0]["s3"]["bucket"]["name"], "notif-bucket");
     assert_eq!(event["Records"][0]["s3"]["object"]["key"], "test.txt");
 }
+
+/// Helper: create a queue wired to a bucket's notification config for every
+/// object event, returning the queue URL.
+async fn wire_bucket_to_queue(
+    server: &TestServer,
+    sqs: &aws_sdk_sqs::Client,
+    bucket: &str,
+    queue_name: &str,
+) -> String {
+    let queue = sqs
+        .create_queue()
+        .queue_name(queue_name)
+        .send()
+        .await
+        .unwrap();
+    let queue_url = queue.queue_url().unwrap().to_string();
+    let attrs = sqs
+        .get_queue_attributes()
+        .queue_url(&queue_url)
+        .attribute_names(aws_sdk_sqs::types::QueueAttributeName::QueueArn)
+        .send()
+        .await
+        .unwrap();
+    let queue_arn = attrs
+        .attributes()
+        .unwrap()
+        .get(&aws_sdk_sqs::types::QueueAttributeName::QueueArn)
+        .unwrap()
+        .clone();
+    let notif_config = format!(
+        r#"{{"QueueConfigurations":[{{"Id":"all-events","QueueArn":"{queue_arn}","Events":["s3:ObjectCreated:*","s3:ObjectRemoved:*"]}}]}}"#
+    );
+    let output = server
+        .aws_cli(&[
+            "s3api",
+            "put-bucket-notification-configuration",
+            "--bucket",
+            bucket,
+            "--notification-configuration",
+            &notif_config,
+        ])
+        .await;
+    assert!(
+        output.success(),
+        "Failed to set notification: {}",
+        output.stderr_text()
+    );
+    queue_url
+}
+
+/// Drain up to `max` notification records from the queue.
+async fn drain_records(
+    sqs: &aws_sdk_sqs::Client,
+    queue_url: &str,
+    max: usize,
+) -> Vec<serde_json::Value> {
+    let mut records = Vec::new();
+    for _ in 0..max {
+        let msgs = sqs
+            .receive_message()
+            .queue_url(queue_url)
+            .wait_time_seconds(2)
+            .max_number_of_messages(10)
+            .send()
+            .await
+            .unwrap();
+        if msgs.messages().is_empty() {
+            break;
+        }
+        for m in msgs.messages() {
+            let event: serde_json::Value = serde_json::from_str(m.body().unwrap()).unwrap();
+            for r in event["Records"].as_array().unwrap() {
+                records.push(r.clone());
+            }
+            sqs.delete_message()
+                .queue_url(queue_url)
+                .receipt_handle(m.receipt_handle().unwrap())
+                .send()
+                .await
+                .unwrap();
+        }
+        if records.len() >= max {
+            break;
+        }
+    }
+    records
+}
+
+#[tokio::test]
+async fn s3_notification_carries_version_id_on_versioned_bucket() {
+    // Regression for #2544: events from a versioning-enabled bucket must
+    // carry s3.object.versionId, matching the AWS notification content
+    // structure. Also covers the delete-marker and permanent-delete events,
+    // whose versionId identifies the version AWS acted on.
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+    let sqs = server.sqs_client().await;
+
+    s3.create_bucket().bucket("ver-notif").send().await.unwrap();
+    s3.put_bucket_versioning()
+        .bucket("ver-notif")
+        .versioning_configuration(
+            aws_sdk_s3::types::VersioningConfiguration::builder()
+                .status(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    let queue_url = wire_bucket_to_queue(&server, &sqs, "ver-notif", "ver-events").await;
+
+    let put = s3
+        .put_object()
+        .bucket("ver-notif")
+        .key("doc.txt")
+        .body(ByteStream::from_static(b"v1"))
+        .send()
+        .await
+        .unwrap();
+    let put_version = put.version_id().unwrap().to_string();
+
+    let records = drain_records(&sqs, &queue_url, 1).await;
+    assert_eq!(records.len(), 1, "expected the put event");
+    let created = &records[0];
+    assert_eq!(created["eventName"], "ObjectCreated:Put");
+    assert_eq!(
+        created["s3"]["object"]["versionId"], put_version,
+        "versionId must match the version the put created"
+    );
+    assert_eq!(created["s3"]["configurationId"], "all-events");
+    assert_eq!(created["s3"]["s3SchemaVersion"], "1.0");
+    assert!(
+        created["s3"]["object"]["sequencer"].is_string(),
+        "sequencer must be present: {created}"
+    );
+
+    // Deleting without a version id creates a delete marker; the event
+    // carries the marker's version id.
+    let del = s3
+        .delete_object()
+        .bucket("ver-notif")
+        .key("doc.txt")
+        .send()
+        .await
+        .unwrap();
+    let marker_version = del.version_id().unwrap().to_string();
+    let records = drain_records(&sqs, &queue_url, 1).await;
+    assert_eq!(records.len(), 1, "expected the delete-marker event");
+    assert_eq!(records[0]["eventName"], "ObjectRemoved:DeleteMarkerCreated");
+    assert_eq!(records[0]["s3"]["object"]["versionId"], marker_version);
+    // ObjectRemoved records carry no size/eTag on AWS.
+    assert!(records[0]["s3"]["object"].get("size").is_none());
+    assert!(records[0]["s3"]["object"].get("eTag").is_none());
+
+    // Permanently deleting a specific version fires ObjectRemoved:Delete
+    // with that version id.
+    s3.delete_object()
+        .bucket("ver-notif")
+        .key("doc.txt")
+        .version_id(&put_version)
+        .send()
+        .await
+        .unwrap();
+    let records = drain_records(&sqs, &queue_url, 1).await;
+    assert_eq!(records.len(), 1, "expected the version-delete event");
+    assert_eq!(records[0]["eventName"], "ObjectRemoved:Delete");
+    assert_eq!(records[0]["s3"]["object"]["versionId"], put_version);
+}
+
+#[tokio::test]
+async fn s3_notification_unversioned_bucket_has_no_version_id() {
+    // AWS omits versionId entirely when the bucket is not versioning-enabled.
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+    let sqs = server.sqs_client().await;
+
+    s3.create_bucket()
+        .bucket("unver-notif")
+        .send()
+        .await
+        .unwrap();
+    let queue_url = wire_bucket_to_queue(&server, &sqs, "unver-notif", "unver-events").await;
+
+    s3.put_object()
+        .bucket("unver-notif")
+        .key("my file.txt")
+        .body(ByteStream::from_static(b"x"))
+        .send()
+        .await
+        .unwrap();
+
+    let records = drain_records(&sqs, &queue_url, 1).await;
+    assert_eq!(records.len(), 1);
+    assert!(
+        records[0]["s3"]["object"].get("versionId").is_none(),
+        "unversioned bucket must not report a versionId: {}",
+        records[0]
+    );
+    // Keys are URL-encoded on the wire, as on AWS.
+    assert_eq!(records[0]["s3"]["object"]["key"], "my+file.txt");
+}
+
+#[tokio::test]
+async fn s3_delete_objects_batch_emits_notifications() {
+    // DeleteObjects used to be a silent hole in the event stream: it removed
+    // objects without firing any notification.
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+    let sqs = server.sqs_client().await;
+
+    s3.create_bucket()
+        .bucket("batch-notif")
+        .send()
+        .await
+        .unwrap();
+    let queue_url = wire_bucket_to_queue(&server, &sqs, "batch-notif", "batch-events").await;
+
+    for key in ["a.txt", "b.txt"] {
+        s3.put_object()
+            .bucket("batch-notif")
+            .key(key)
+            .body(ByteStream::from_static(b"x"))
+            .send()
+            .await
+            .unwrap();
+    }
+    // Drain the two create events.
+    let created = drain_records(&sqs, &queue_url, 2).await;
+    assert_eq!(created.len(), 2);
+
+    s3.delete_objects()
+        .bucket("batch-notif")
+        .delete(
+            aws_sdk_s3::types::Delete::builder()
+                .objects(
+                    aws_sdk_s3::types::ObjectIdentifier::builder()
+                        .key("a.txt")
+                        .build()
+                        .unwrap(),
+                )
+                .objects(
+                    aws_sdk_s3::types::ObjectIdentifier::builder()
+                        .key("b.txt")
+                        .build()
+                        .unwrap(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    let removed = drain_records(&sqs, &queue_url, 2).await;
+    assert_eq!(removed.len(), 2, "expected one event per deleted object");
+    let mut keys: Vec<String> = removed
+        .iter()
+        .map(|r| r["s3"]["object"]["key"].as_str().unwrap().to_string())
+        .collect();
+    keys.sort();
+    assert_eq!(keys, vec!["a.txt", "b.txt"]);
+    for r in &removed {
+        assert_eq!(r["eventName"], "ObjectRemoved:Delete");
+    }
+}
 // ---- S3 CORS Tests ----
 
 #[tokio::test]
