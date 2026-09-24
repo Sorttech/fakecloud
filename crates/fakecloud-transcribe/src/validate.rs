@@ -301,6 +301,7 @@ mod tests {
         // Every op in the model is represented (even those with no members).
         assert!(constraints().contains_key("StartTranscriptionJob"));
         assert!(constraints().contains_key("ListVocabularies"));
-        assert_eq!(constraints().len(), 43);
+        assert!(constraints().contains_key("UpdateLanguageModel"));
+        assert_eq!(constraints().len(), 44);
     }
 }
