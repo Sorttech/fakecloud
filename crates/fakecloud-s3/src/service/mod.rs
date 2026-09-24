@@ -3245,16 +3245,21 @@ pub(crate) fn header_matches(header: &str, pattern: &str) -> bool {
     }
 }
 
-/// Match an origin against a CORS allowed origin pattern (supports "*" wildcard).
+/// Match an origin against a CORS allowed origin pattern.
+///
+/// AWS permits one `*` anywhere in `AllowedOrigin`, and its own documentation
+/// uses `https://*.example.com` — a pattern that a leading-`*`-only matcher
+/// silently fails, leaving the bucket CORS-dead. Origins compare
+/// case-sensitively, unlike header names.
 pub(crate) fn origin_matches(origin: &str, pattern: &str) -> bool {
-    if pattern == "*" {
-        return true;
+    match pattern.split_once('*') {
+        Some((prefix, suffix)) => {
+            origin.len() >= prefix.len() + suffix.len()
+                && origin.starts_with(prefix)
+                && origin.ends_with(suffix)
+        }
+        None => origin == pattern,
     }
-    // Simple wildcard: *.example.com
-    if let Some(suffix) = pattern.strip_prefix('*') {
-        return origin.ends_with(suffix);
-    }
-    origin == pattern
 }
 
 /// Find the matching CORS rule for a given origin and HTTP method.

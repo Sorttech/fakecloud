@@ -432,6 +432,25 @@ fn test_origin_matches() {
     assert!(origin_matches("https://example.com", "*"));
     assert!(origin_matches("https://foo.example.com", "*.example.com"));
     assert!(!origin_matches("https://evil.com", "https://example.com"));
+    // AWS's own documented form puts the wildcard mid-pattern; a
+    // leading-`*`-only matcher would leave such a bucket CORS-dead.
+    assert!(origin_matches(
+        "https://app.example.com",
+        "https://*.example.com"
+    ));
+    assert!(!origin_matches(
+        "http://app.example.com",
+        "https://*.example.com"
+    ));
+    assert!(!origin_matches(
+        "https://app.evil.com",
+        "https://*.example.com"
+    ));
+    // Origins are case-sensitive, unlike header names.
+    assert!(!origin_matches(
+        "https://EXAMPLE.com",
+        "https://example.com"
+    ));
 }
 
 /// Regression: resolve_object with versionId="null" must match objects

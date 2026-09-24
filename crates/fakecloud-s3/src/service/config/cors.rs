@@ -83,6 +83,24 @@ impl S3Service {
                     "The XML you provided was not well-formed or did not validate against our published schema",
                 ));
             }
+
+            // AWS allows at most one `*` per AllowedOrigin / AllowedHeader.
+            // Both are deny gates at request time, and the matchers read only
+            // the first `*`, so a second one would be treated as a literal and
+            // quietly make the rule match nothing. Reject at write time, where
+            // the caller can still see which value is wrong.
+            for (label, values) in [
+                ("AllowedOrigin", &rule.allowed_origins),
+                ("AllowedHeader", &rule.allowed_headers),
+            ] {
+                if let Some(bad) = values.iter().find(|v| v.matches('*').count() > 1) {
+                    return Err(AwsServiceError::aws_error(
+                        StatusCode::BAD_REQUEST,
+                        "InvalidRequest",
+                        format!("{label} \"{bad}\" can not have more than one wildcard."),
+                    ));
+                }
+            }
         }
 
         let mut accts = self.state.write();

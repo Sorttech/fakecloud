@@ -1889,6 +1889,57 @@ async fn s3_cors_preflight_and_response_headers() {
         "a CORS rule with no AllowedMethod must be rejected as MalformedXML"
     );
 
+    // AWS's own documented wildcard form puts the `*` mid-pattern.
+    s3.create_bucket()
+        .bucket("sub-cors-bucket")
+        .send()
+        .await
+        .unwrap();
+    let output = server
+        .aws_cli(&[
+            "s3api",
+            "put-bucket-cors",
+            "--bucket",
+            "sub-cors-bucket",
+            "--cors-configuration",
+            r#"{"CORSRules":[{"AllowedOrigins":["https://*.example.com"],"AllowedMethods":["GET"]}]}"#,
+        ])
+        .await;
+    assert!(output.success(), "{}", output.stderr_text());
+    let resp = http
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{}/sub-cors-bucket/file.txt", server.endpoint()),
+        )
+        .header("Origin", "https://app.example.com")
+        .header("Access-Control-Request-Method", "GET")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "https://*.example.com must match");
+    assert_eq!(
+        resp.headers().get("access-control-allow-origin").unwrap(),
+        "https://app.example.com"
+    );
+
+    // AWS allows at most one wildcard per value, and the matchers only read the
+    // first, so a second one is rejected at write time.
+    let resp = http
+        .put(format!("{}/sub-cors-bucket?cors", server.endpoint()))
+        .header("Authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20240101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=fake")
+        .body(
+            "<CORSConfiguration><CORSRule>\
+             <AllowedOrigin>https://a.example</AllowedOrigin>\
+             <AllowedMethod>GET</AllowedMethod>\
+             <AllowedHeader>x-*-*</AllowedHeader>\
+             </CORSRule></CORSConfiguration>",
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    assert!(resp.text().await.unwrap().contains("more than one wildcard"));
+
     // An empty AllowedOrigin parses to "" and matches no real request, so it is
     // as CORS-dead as omitting the tag and is rejected the same way.
     let resp = http
