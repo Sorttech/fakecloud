@@ -1362,6 +1362,63 @@ async fn s3_suspended_delete_allowed_when_only_a_newer_version_is_locked() {
 }
 
 #[tokio::test]
+async fn s3_suspended_delete_checks_live_null_behind_a_history_marker() {
+    // A null-id delete marker can sit in the version history while a live null
+    // object is current (suspended puts do not append to the history). The
+    // lock check must look past the marker at the object the delete destroys.
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+
+    let output = server
+        .aws_cli(&[
+            "s3api",
+            "create-bucket",
+            "--bucket",
+            "susp-marker-lock",
+            "--object-lock-enabled-for-bucket",
+        ])
+        .await;
+    assert!(output.success(), "{}", output.stderr_text());
+    set_versioning(&s3, "susp-marker-lock", false).await;
+
+    s3.put_object()
+        .bucket("susp-marker-lock")
+        .key("doc.txt")
+        .body(ByteStream::from_static(b"A"))
+        .send()
+        .await
+        .unwrap();
+    // Stacks a null delete marker into the history.
+    s3.delete_object()
+        .bucket("susp-marker-lock")
+        .key("doc.txt")
+        .send()
+        .await
+        .unwrap();
+    // A fresh live null object becomes current, behind that marker.
+    s3.put_object()
+        .bucket("susp-marker-lock")
+        .key("doc.txt")
+        .body(ByteStream::from_static(b"B"))
+        .send()
+        .await
+        .unwrap();
+    lock_version(&server, "susp-marker-lock", "doc.txt", "null").await;
+
+    let err = s3
+        .delete_object()
+        .bucket("susp-marker-lock")
+        .key("doc.txt")
+        .send()
+        .await
+        .expect_err("the locked live null object must block the delete");
+    assert!(
+        format!("{err:?}").contains("AccessDenied"),
+        "expected AccessDenied, got: {err:?}"
+    );
+}
+
+#[tokio::test]
 async fn s3_delete_objects_batch_emits_notifications() {
     // DeleteObjects used to be a silent hole in the event stream: it removed
     // objects without firing any notification.

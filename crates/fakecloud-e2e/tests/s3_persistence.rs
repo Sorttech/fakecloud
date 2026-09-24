@@ -609,6 +609,87 @@ async fn persistence_preserved_null_version_survives_delete_marker() {
 }
 
 #[tokio::test]
+async fn persistence_preserved_null_version_survives_new_version() {
+    // Same sidecar rule as the delete-marker case, on the put path: writing a
+    // new version over a pre-versioning object must record the null version id
+    // on disk or the loader drops that version on restart.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut server = TestServer::start_persistent(tmp.path()).await;
+    let client = server.s3_client().await;
+
+    client
+        .create_bucket()
+        .bucket("preserve-null-put")
+        .send()
+        .await
+        .unwrap();
+    client
+        .put_object()
+        .bucket("preserve-null-put")
+        .key("doc.txt")
+        .body(ByteStream::from_static(b"pre-versioning"))
+        .send()
+        .await
+        .unwrap();
+    client
+        .put_bucket_versioning()
+        .bucket("preserve-null-put")
+        .versioning_configuration(
+            VersioningConfiguration::builder()
+                .status(BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    client
+        .put_object()
+        .bucket("preserve-null-put")
+        .key("doc.txt")
+        .body(ByteStream::from_static(b"v2"))
+        .send()
+        .await
+        .unwrap();
+
+    server.restart().await;
+    let client = server.s3_client().await;
+
+    let list = client
+        .list_object_versions()
+        .bucket("preserve-null-put")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        list.versions().len(),
+        2,
+        "the null version and v2 both survive: {:?}",
+        list.versions()
+    );
+
+    let got = client
+        .get_object()
+        .bucket("preserve-null-put")
+        .key("doc.txt")
+        .version_id("null")
+        .send()
+        .await
+        .expect("the null version is still readable after the restart");
+    let bytes = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(bytes.as_ref(), b"pre-versioning");
+
+    let current = client
+        .get_object()
+        .bucket("preserve-null-put")
+        .key("doc.txt")
+        .send()
+        .await
+        .unwrap();
+    let bytes = current.body.collect().await.unwrap().into_bytes();
+    assert_eq!(bytes.as_ref(), b"v2", "v2 is still current");
+}
+
+#[tokio::test]
 async fn persistence_bucket_subresources_round_trip() {
     let tmp = tempfile::tempdir().unwrap();
     let mut server = TestServer::start_persistent(tmp.path()).await;

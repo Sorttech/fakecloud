@@ -14,17 +14,21 @@ fn lock_target<'a>(
     versioning_enabled: bool,
 ) -> Option<&'a S3Object> {
     let is_null = |o: &S3Object| o.version_id.is_none() || o.version_id.as_deref() == Some("null");
-    let target = if !versioning_configured {
-        b.objects.get(key)
+    // A null-id delete marker in the history carries no data and no lock, but
+    // a live null object can still be current behind it (suspended puts do not
+    // append to the history), so fall through to the current object rather
+    // than treating the marker as "nothing to check".
+    let live_null = |o: &&S3Object| is_null(o) && !o.is_delete_marker;
+    if !versioning_configured {
+        b.objects.get(key).filter(|o| !o.is_delete_marker)
     } else if !versioning_enabled {
         b.object_versions
             .get(key)
-            .and_then(|versions| versions.iter().find(|o| is_null(o)))
-            .or_else(|| b.objects.get(key).filter(|o| is_null(o)))
+            .and_then(|versions| versions.iter().find(live_null))
+            .or_else(|| b.objects.get(key).filter(live_null))
     } else {
         None
-    };
-    target.filter(|o| !o.is_delete_marker)
+    }
 }
 
 impl S3Service {

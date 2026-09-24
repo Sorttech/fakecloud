@@ -12,8 +12,13 @@ use super::{
 
 /// Whether `obj` is the version the request addressed. `"null"` addresses the
 /// version written before versioning was enabled, which carries no id -- the
-/// same rule the delete paths use.
+/// same rule the delete paths use. Delete markers never match: AWS rejects
+/// lock operations on them, and writing lock metadata against one would
+/// overwrite the live null object's sidecar (both map to the same slot).
 fn version_matches(obj: &crate::state::S3Object, vid: &str) -> bool {
+    if obj.is_delete_marker {
+        return false;
+    }
     obj.version_id.as_deref() == Some(vid) || (vid == "null" && obj.version_id.is_none())
 }
 

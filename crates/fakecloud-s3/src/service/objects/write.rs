@@ -578,6 +578,7 @@ impl S3Service {
                 }
             }
 
+            let mut preserved_null_meta = None;
             if versioning_enabled {
                 let versions = b.object_versions.entry(key.to_string()).or_default();
                 // If the existing current object is a pre-versioning object (no version_id)
@@ -585,11 +586,31 @@ impl S3Service {
                 if versions.is_empty() {
                     if let Some(existing) = b.objects.get(key) {
                         if existing.version_id.is_none() {
-                            versions.push(existing.clone());
+                            let mut preserved = existing.clone();
+                            preserved.version_id = Some("null".to_string());
+                            // The loader files a "null" slot whose sidecar has
+                            // no version id as the CURRENT object, which the
+                            // new version then replaces -- so the sidecar has
+                            // to record the id or this version is lost on a
+                            // restart.
+                            preserved_null_meta =
+                                Some(crate::persistence::object_meta_snapshot(&preserved));
+                            b.object_versions
+                                .entry(key.to_string())
+                                .or_default()
+                                .push(preserved);
                         }
                     }
                 }
-                versions.push(obj.clone());
+                b.object_versions
+                    .entry(key.to_string())
+                    .or_default()
+                    .push(obj.clone());
+            }
+            if let Some(meta) = preserved_null_meta {
+                self.store
+                    .put_object_meta(bucket, key, Some("null"), &meta)
+                    .map_err(crate::service::persistence_error)?;
             }
             b.objects.insert(key.to_string(), obj);
 
