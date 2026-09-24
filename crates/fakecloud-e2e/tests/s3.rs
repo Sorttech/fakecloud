@@ -1711,31 +1711,49 @@ async fn s3_cors_preflight_and_response_headers() {
         "Origin, Access-Control-Request-Headers, Access-Control-Request-Method"
     );
 
+    // Its own key: `file.txt` was deleted above, and asserting CORS headers on
+    // a 404 would keep passing even if the 200 path broke.
+    s3.put_object()
+        .bucket("cors-bucket")
+        .key("dup-origin.txt")
+        .body(ByteStream::from_static(b"dup"))
+        .send()
+        .await
+        .unwrap();
+
     // A proxy duplicating the same Origin is still one origin, so the request
     // is served normally rather than failing closed.
     let resp = http
-        .get(format!("{}/cors-bucket/file.txt", server.endpoint()))
+        .get(format!("{}/cors-bucket/dup-origin.txt", server.endpoint()))
         .header("Origin", "https://example.com")
         .header("Origin", "https://example.com")
         .header("Authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20240101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=fake")
         .send()
         .await
         .unwrap();
+    assert_eq!(resp.status(), 200);
     assert_eq!(
         resp.headers().get("access-control-allow-origin").unwrap(),
         "https://example.com"
     );
 
-    // Two *different* origins are not one origin to allow, so no ACAO.
+    // Two *different* origins are not one origin to allow, so no ACAO — but the
+    // response still varies by Origin, or a cache would replay this ACAO-less
+    // body to a legitimate origin.
     let resp = http
-        .get(format!("{}/cors-bucket/file.txt", server.endpoint()))
+        .get(format!("{}/cors-bucket/dup-origin.txt", server.endpoint()))
         .header("Origin", "https://example.com")
         .header("Origin", "https://evil.example")
         .header("Authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20240101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=fake")
         .send()
         .await
         .unwrap();
+    assert_eq!(resp.status(), 200);
     assert!(resp.headers().get("access-control-allow-origin").is_none());
+    assert_eq!(
+        resp.headers().get("vary").unwrap(),
+        "Origin, Access-Control-Request-Headers, Access-Control-Request-Method"
+    );
 
     // A preflight with no Origin carries nothing to evaluate. S3 rejects it as
     // a malformed request (400), distinct from the 403 a disallowed origin

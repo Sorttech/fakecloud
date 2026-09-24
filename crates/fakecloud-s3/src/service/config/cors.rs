@@ -121,11 +121,13 @@ pub(crate) fn validate_cors_xml(body_str: &str) -> Result<(), (&'static str, Str
             return Err(("InvalidRequest", format!("ExposeHeader \"{bad}\" contains wildcard. We currently do not support wildcard for ExposeHeader.")));
         }
 
-        // These values are echoed into response headers, and `set_cors_header`
-        // silently drops one that will not parse. A control character here
-        // would strip the header from every response with no error anywhere —
-        // the same silently-CORS-dead outcome the rest of this function exists
-        // to prevent.
+        // `ExposeHeader` and `AllowedOrigin` are echoed into response headers,
+        // and `set_cors_header` silently drops a value that will not parse, so
+        // a control character would strip the header from every response with
+        // no error anywhere. `AllowedHeader` is only ever matched against, not
+        // echoed — the allow-headers echo comes from the request — but a value
+        // that cannot be a header name matches nothing, so it is rejected here
+        // too rather than left to fail silently at request time.
         for (label, values) in [
             ("AllowedHeader", &rule.allowed_headers),
             ("ExposeHeader", &rule.expose_headers),

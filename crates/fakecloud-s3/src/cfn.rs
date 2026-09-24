@@ -975,6 +975,93 @@ mod tests {
     }
 
     #[test]
+    fn cors_max_age_renders_an_integral_float_as_an_integer() {
+        let mut b = bucket();
+        apply_cfn_bucket_properties(
+            &mut b,
+            &json!({
+                "CorsConfiguration": {
+                    "CorsRules": [{
+                        "AllowedMethods": ["GET"],
+                        "AllowedOrigins": ["*"],
+                        "MaxAge": 3600.0
+                    }]
+                }
+            }),
+            &store(),
+        )
+        .expect("an integral float is a valid max-age");
+        // `3600.0` would fail validation and take the whole bucket resource
+        // down with it, including unrelated properties.
+        assert!(b
+            .cors_config
+            .unwrap()
+            .contains("<MaxAgeSeconds>3600</MaxAgeSeconds>"));
+    }
+
+    #[test]
+    fn cors_invalid_rule_is_rejected_before_anything_is_persisted() {
+        let mut b = bucket();
+        let err = apply_cfn_bucket_properties(
+            &mut b,
+            &json!({
+                "VersioningConfiguration": {"Status": "Enabled"},
+                // No AllowedMethods: matches nothing at request time.
+                "CorsConfiguration": {"CorsRules": [{"AllowedOrigins": ["*"]}]}
+            }),
+            &store(),
+        )
+        .expect_err("a rule that can never match must not deploy");
+        assert!(err.contains("MalformedXML"), "{err}");
+        // Validation runs before any property is applied, so nothing is left
+        // half-written.
+        assert!(b.cors_config.is_none());
+        assert!(b.versioning.is_none());
+    }
+
+    #[test]
+    fn empty_cors_rules_clears_an_existing_config() {
+        let store = store();
+        let mut b = bucket();
+        apply_cfn_bucket_properties(
+            &mut b,
+            &json!({
+                "CorsConfiguration": {
+                    "CorsRules": [{"AllowedMethods": ["GET"], "AllowedOrigins": ["*"]}]
+                }
+            }),
+            &store,
+        )
+        .unwrap();
+        assert!(b.cors_config.is_some());
+
+        // An explicitly empty rule list means "no CORS", so the live config has
+        // to go rather than linger and keep serving allow-origin.
+        apply_cfn_bucket_properties(
+            &mut b,
+            &json!({"CorsConfiguration": {"CorsRules": []}}),
+            &store,
+        )
+        .unwrap();
+        assert!(b.cors_config.is_none());
+
+        // An absent property leaves existing state untouched, as for every
+        // other property here.
+        apply_cfn_bucket_properties(
+            &mut b,
+            &json!({
+                "CorsConfiguration": {
+                    "CorsRules": [{"AllowedMethods": ["GET"], "AllowedOrigins": ["*"]}]
+                }
+            }),
+            &store,
+        )
+        .unwrap();
+        apply_cfn_bucket_properties(&mut b, &json!({"Tags": []}), &store).unwrap();
+        assert!(b.cors_config.is_some());
+    }
+
+    #[test]
     fn lifecycle_rule_passes_validation() {
         let mut b = bucket();
         apply_cfn_bucket_properties(

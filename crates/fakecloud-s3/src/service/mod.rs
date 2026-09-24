@@ -1136,7 +1136,13 @@ impl AwsService for S3Service {
         };
 
         // Apply CORS headers to the response if Origin was present
-        if let (Some(ref origin), Some(b_name)) = (&origin_header, bucket) {
+        // Keyed on the raw header, not the usable value: an `Origin` that is
+        // blank, unreadable, or split across conflicting lines still makes the
+        // response origin-dependent, so it needs `Vary` even though it gets no
+        // allow-origin. Skipping the block entirely would ship an ACAO-less
+        // body with no `Vary`, which a shared cache then replays to a
+        // legitimate origin — the hole this whole change exists to close.
+        if let Some(b_name) = bucket.filter(|_| req.headers.contains_key("origin")) {
             let cors_config = {
                 let accounts = self.state.read();
                 let _empty_s3 = crate::state::S3State::new(&req.account_id, &req.region);
@@ -1158,6 +1164,10 @@ impl AwsService for S3Service {
                 // DELETE from that origin, which would let the browser pass the
                 // response to the page.
                 // Empty requested-headers: only a preflight declares headers.
+                // `origin_header` is `None` when the header was present but
+                // unusable; `find_cors_rule` refuses an empty origin, so such a
+                // request keeps the `Vary` above and gets no allow-origin.
+                let origin = origin_header.as_deref().unwrap_or("");
                 if let Some(rule) = find_cors_rule(&rules, origin, req.method.as_str(), &[]) {
                     let matched_origin = if rule.allowed_origins.contains(&"*".to_string()) {
                         "*"
