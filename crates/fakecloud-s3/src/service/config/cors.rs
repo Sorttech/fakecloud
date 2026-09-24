@@ -178,11 +178,16 @@ impl S3Service {
         let body_str = std::str::from_utf8(&req.body).unwrap_or("").to_string();
 
         let mut accts = self.state.write();
-        let state = accts.get_or_create(account_id);
-        let b = state
-            .buckets
-            .get_mut(bucket)
-            .ok_or_else(|| no_such_bucket(bucket))?;
+
+        // Existence is checked before `get_or_create` so a rejected request
+        // leaves nothing behind: `get_or_create` would insert an empty state
+        // for an unknown account even when the body then fails validation.
+        if !accts
+            .get(account_id)
+            .is_some_and(|s| s.buckets.contains_key(bucket))
+        {
+            return Err(no_such_bucket(bucket));
+        }
 
         // After the bucket lookup: a missing bucket is `NoSuchBucket`, not a
         // complaint about the config. Otherwise a run that races bucket
@@ -191,6 +196,11 @@ impl S3Service {
             AwsServiceError::aws_error(StatusCode::BAD_REQUEST, code, message)
         })?;
 
+        let b = accts
+            .get_or_create(account_id)
+            .buckets
+            .get_mut(bucket)
+            .ok_or_else(|| no_such_bucket(bucket))?;
         b.cors_config = Some(body_str.clone());
         self.store
             .put_bucket_subresource(bucket, BucketSubresource::Cors, &body_str)

@@ -62,15 +62,20 @@ pub fn apply_cfn_bucket_properties(
     // error. Skipping that silently deploys a green stack with no CORS applied
     // and nothing saying why, while every browser request then fails. Real
     // CloudFormation fails the resource on a type mismatch, so this does too.
-    if let Some(cors) = obj.get("CorsConfiguration") {
-        match cors.get("CorsRules") {
+    // An explicit `null` counts as absent, like every sibling property here —
+    // only a `CorsConfiguration` that is actually an object is held to the
+    // shape, and the message says which of the two problems it is.
+    match obj.get("CorsConfiguration") {
+        None | Some(Value::Null) => {}
+        Some(Value::Object(cors)) => match cors.get("CorsRules") {
             Some(rules) if rules.as_array().is_none() => {
                 return Err("CorsConfiguration: CorsRules must be a list of rules".to_string());
             }
             Some(_) => {}
-            None => {
-                return Err("CorsConfiguration: CorsRules is required".to_string());
-            }
+            None => return Err("CorsConfiguration: CorsRules is required".to_string()),
+        },
+        Some(_) => {
+            return Err("CorsConfiguration: must be an object with a CorsRules list".to_string());
         }
     }
     let cors_xml = obj.get("CorsConfiguration").and_then(build_cors_xml);
@@ -989,12 +994,24 @@ mod tests {
     fn cors_rules_with_the_wrong_shape_fails_the_resource() {
         // Skipping silently would deploy a green stack with no CORS applied and
         // nothing saying why, while every browser request against it fails.
-        for bad in [json!({"CorsRules": {"AllowedMethods": ["GET"]}}), json!({})] {
+        // An explicit null is absent, not a shape error — every sibling
+        // property tolerates it, and failing the stack over one would be a
+        // regression from "deploys with no CORS".
+        let mut b = bucket();
+        apply_cfn_bucket_properties(&mut b, &json!({"CorsConfiguration": null}), &store())
+            .expect("an explicit null is treated as absent");
+        assert!(b.cors_config.is_none());
+
+        for bad in [
+            json!({"CorsRules": {"AllowedMethods": ["GET"]}}),
+            json!({}),
+            json!("not-an-object"),
+        ] {
             let mut b = bucket();
             let err =
                 apply_cfn_bucket_properties(&mut b, &json!({ "CorsConfiguration": bad }), &store())
                     .expect_err("a CorsRules type mismatch is a property error");
-            assert!(err.contains("CorsRules"), "{err}");
+            assert!(err.contains("Cors"), "{err}");
             assert!(b.cors_config.is_none());
         }
     }
