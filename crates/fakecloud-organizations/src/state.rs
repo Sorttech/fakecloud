@@ -279,11 +279,6 @@ impl OrganizationsRegistry {
         target_account_id("EMAIL", email).is_some_and(|spelled| spelled != for_account)
     }
 
-    /// True when any account already uses `email`. AWS requires an
-    /// address to be unused (`EMAIL_ALREADY_EXISTS`), and this
-    /// resolution is authorization-relevant -- it decides who may accept
-    /// an `EMAIL`-targeted invitation -- so a duplicate would make that
-    /// answer depend on id ordering.
     /// Does this in-flight request hold `email`?
     ///
     /// A request whose address is the synthetic form of an id OTHER than
@@ -301,6 +296,11 @@ impl OrganizationsRegistry {
             .is_some_and(|mine| Self::email_reserved_for_other(email, mine))
     }
 
+    /// True when any account already uses `email`. AWS requires an
+    /// address to be unused (`EMAIL_ALREADY_EXISTS`), and this
+    /// resolution is authorization-relevant -- it decides who may accept
+    /// an `EMAIL`-targeted invitation -- so a duplicate would make that
+    /// answer depend on id ordering.
     pub fn email_in_use(&self, email: &str) -> bool {
         self.orgs
             .values()
@@ -1185,7 +1185,6 @@ impl OrganizationState {
         Ok(())
     }
 
-    /// List delegated administrators, optionally filtered by service.
     /// Is `account_id` a delegated administrator for any service?
     pub fn is_delegated_administrator(&self, account_id: &str) -> bool {
         self.delegated_administrators
@@ -1193,6 +1192,7 @@ impl OrganizationState {
             .any(|admins| admins.contains_key(account_id))
     }
 
+    /// List delegated administrators, optionally filtered by service.
     pub fn list_delegated_administrators(
         &self,
         service_principal_filter: Option<&str>,
@@ -1262,6 +1262,24 @@ impl OrganizationState {
         }
         // Detach any direct policy attachments for the now-orphan id.
         self.attachments.remove(account_id);
+        // Tags are keyed by account id, so an untagged id would come back
+        // wearing them if the account is ever re-enrolled. `ListAccounts`
+        // does not know the id meanwhile, which is the same reason
+        // `fail_create_account` drops the tags it reserved.
+        self.resource_tags.remove(account_id);
+        // And drop every delegated-administrator registration it held.
+        // The registration is an organization's grant to one of its OWN
+        // members, so it cannot outlive the membership: leaving it behind
+        // meant `ListDelegatedServicesForAccount` still answered for an
+        // account the organization no longer contains, and -- now that
+        // the registration unlocks the organization's read operations --
+        // an account that left and was later re-invited came back holding
+        // delegated-administrator authority nobody had granted it.
+        for admins in self.delegated_administrators.values_mut() {
+            admins.remove(account_id);
+        }
+        self.delegated_administrators
+            .retain(|_, admins| !admins.is_empty());
         Ok(())
     }
 

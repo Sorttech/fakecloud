@@ -1046,6 +1046,18 @@ fn handshake_payload(org: &OrganizationState, h: &crate::state::Handshake) -> Va
         .responsibility_transfer_id
         .as_deref()
         .and_then(|id| org.responsibility_transfers.get(id))
+        // A handshake written before the link existed deserializes with
+        // no transfer id, and nothing backfills it. Fall back to the
+        // transfer's own `ActiveHandshakeId`, which covers every restored
+        // handshake still OPEN. A restored handshake that had already
+        // resolved is beyond recovery -- resolution is what clears that
+        // field, and nothing else ties the two together -- so this is as
+        // far back as the stored data reaches.
+        .or_else(|| {
+            org.responsibility_transfers
+                .values()
+                .find(|t| t.active_handshake_id.as_deref() == Some(h.id.as_str()))
+        })
     {
         resources.push(json!({
             "Type": "RESPONSIBILITY_TRANSFER",

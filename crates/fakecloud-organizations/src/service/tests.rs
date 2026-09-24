@@ -3707,3 +3707,168 @@ async fn a_doomed_reservation_does_not_hold_another_accounts_address() {
         .await
         .expect("a doomed reservation must not hold the address it cannot keep");
 }
+
+/// A delegated-administrator registration is an organization's grant to
+/// one of its own members, so it cannot outlive the membership. Leaving
+/// it behind meant `ListDelegatedServicesForAccount` still answered for
+/// an account the organization no longer contains, and an account that
+/// left and was later re-invited came back holding authority nobody had
+/// granted it.
+///
+/// (`ListDelegatedAdministrators` never showed the symptom: its handler
+/// drops any registration whose account is not in `accounts`.)
+#[tokio::test]
+async fn leaving_the_organization_drops_the_delegated_administrator_grant() {
+    let (svc, state) = OrganizationsService::shared();
+    create_org_with_root(&svc).await;
+    state
+        .write()
+        .sole_mut()
+        .unwrap()
+        .enroll_account_if_missing("222222222222");
+    svc.handle(req_with(
+        "111111111111",
+        "EnableAWSServiceAccess",
+        json!({ "ServicePrincipal": "config.amazonaws.com" }),
+    ))
+    .await
+    .unwrap();
+    svc.handle(req_with(
+        "111111111111",
+        "RegisterDelegatedAdministrator",
+        json!({ "AccountId": "222222222222", "ServicePrincipal": "config.amazonaws.com" }),
+    ))
+    .await
+    .unwrap();
+
+    svc.handle(req_with("222222222222", "LeaveOrganization", json!({})))
+        .await
+        .unwrap();
+
+    // The organization no longer answers for its delegated services.
+    let listed = svc
+        .handle(req_with(
+            "111111111111",
+            "ListDelegatedServicesForAccount",
+            json!({ "AccountId": "222222222222" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_json(&listed)["DelegatedServices"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+
+    // And rejoining does not restore the grant.
+    state
+        .write()
+        .sole_mut()
+        .unwrap()
+        .enroll_account_if_missing("222222222222");
+    let err = expect_err(
+        svc.handle(req_with(
+            "222222222222",
+            "ListDelegatedAdministrators",
+            json!({}),
+        ))
+        .await,
+    );
+    assert_eq!(err.code(), "AccessDeniedException");
+}
+
+/// A `TRANSFER_RESPONSIBILITY` handshake written before the handshake
+/// carried its transfer id deserializes without one, and nothing
+/// backfills it. The transfer's own `ActiveHandshakeId` still points
+/// back for every handshake this matters for -- it is cleared only on
+/// resolution -- so the payload falls back to it rather than silently
+/// dropping the resource for a restored organization.
+#[tokio::test]
+async fn a_restored_handshake_still_reports_its_transfer() {
+    let (svc, state) = OrganizationsService::shared();
+    create_org_with_root(&svc).await;
+    let resp = svc
+        .handle(req_with(
+            "111111111111",
+            "InviteOrganizationToTransferResponsibility",
+            json!({
+                "Type": "BILLING",
+                "SourceName": "handover",
+                "StartTimestamp": 1893456000.0,
+                "Target": {"Id": "222222222222", "Type": "ACCOUNT"},
+            }),
+        ))
+        .await
+        .unwrap();
+    let id = body_json(&resp)["Handshake"]["Id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Simulate the pre-upgrade snapshot: the link the handshake now
+    // stores did not exist when it was written.
+    state
+        .write()
+        .sole_mut()
+        .unwrap()
+        .handshakes
+        .get_mut(&id)
+        .unwrap()
+        .responsibility_transfer_id = None;
+
+    let described = svc
+        .handle(req_with(
+            "222222222222",
+            "DescribeHandshake",
+            json!({ "HandshakeId": id }),
+        ))
+        .await
+        .unwrap();
+    assert!(body_json(&described)["Handshake"]["Resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["Type"] == "RESPONSIBILITY_TRANSFER"));
+}
+
+/// Tags are keyed by account id, so an account removed with tags still
+/// attached came back wearing them if it was ever re-enrolled -- and
+/// `ListTagsForResource` answered for the id meanwhile, though
+/// `ListAccounts` no longer knew it.
+#[tokio::test]
+async fn removing_an_account_drops_the_tags_it_carried() {
+    let (svc, state) = OrganizationsService::shared();
+    create_org_with_root(&svc).await;
+    state
+        .write()
+        .sole_mut()
+        .unwrap()
+        .enroll_account_if_missing("222222222222");
+    svc.handle(req_with(
+        "111111111111",
+        "TagResource",
+        json!({ "ResourceId": "222222222222", "Tags": [{"Key": "env", "Value": "prod"}] }),
+    ))
+    .await
+    .unwrap();
+
+    svc.handle(req_with(
+        "111111111111",
+        "RemoveAccountFromOrganization",
+        json!({ "AccountId": "222222222222" }),
+    ))
+    .await
+    .unwrap();
+
+    let listed = svc
+        .handle(req_with(
+            "111111111111",
+            "ListTagsForResource",
+            json!({ "ResourceId": "222222222222" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_json(&listed)["Tags"].as_array().unwrap().len(), 0);
+}
