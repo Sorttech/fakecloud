@@ -136,22 +136,20 @@ impl OrganizationsService {
         // bystander account could enumerate handshake ids to learn the
         // management account and organization id of an organization it has
         // nothing to do with.
-        let org_wide_action = matches!(
-            handshake.action.as_str(),
-            "ENABLE_ALL_FEATURES" | "APPROVE_ALL_FEATURES"
-        );
         // An EMAIL target stores the address, so resolve it back to the
         // account it names before comparing. Leaving the gate off entirely
         // would let any account anywhere read any handshake, learning
         // another organization's id and management account.
         let is_party = req.account_id == handshake.source_account_id
             || handshake_target_account(handshake).as_deref() == Some(req.account_id.as_str());
-        // An org-wide handshake has no single target, so membership of the
-        // owning organization stands in for being a party to it.
+        // AWS documents DescribeHandshake as callable "from any account in
+        // the organization", so membership of the organization that owns
+        // the handshake is enough. It is only another ORGANIZATION's
+        // handshakes that must stay invisible.
         let is_member = guard
             .org_of_handshake(&id)
             .is_some_and(|org| org.accounts.contains_key(&req.account_id));
-        if !(is_party || (org_wide_action && is_member)) {
+        if !(is_party || is_member) {
             return Err(org_error_to_aws(crate::state::OrgError::HandshakeNotFound(
                 id.clone(),
             )));

@@ -2208,7 +2208,10 @@ pub struct OrganizationsResponsibilityTransfer {
     #[serde(rename = "type")]
     pub transfer_type: String,
     pub status: String,
-    /// INBOUND / OUTBOUND.
+    /// `INBOUND` / `OUTBOUND`, relative to `organization_id`. A transfer
+    /// is recorded once, in the source organization, so every row reads
+    /// `OUTBOUND`; the target reads the same transfer as inbound through
+    /// `ListInboundResponsibilityTransfers`.
     pub direction: String,
     pub source_management_account_id: String,
     pub source_management_account_email: String,

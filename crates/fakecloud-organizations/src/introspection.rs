@@ -21,7 +21,11 @@ pub struct ResponsibilityTransferRow {
     pub name: String,
     pub transfer_type: String,
     pub status: String,
-    /// INBOUND / OUTBOUND.
+    /// `INBOUND` / `OUTBOUND`, relative to this row's `organization_id`.
+    /// A transfer is recorded once, in the source organization, so every
+    /// row reads `OUTBOUND`; the target organization reads the same
+    /// transfer as inbound through `ListInboundResponsibilityTransfers`,
+    /// which resolves by party rather than by this field.
     pub direction: String,
     pub source_management_account_id: String,
     pub source_management_account_email: String,

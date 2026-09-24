@@ -751,7 +751,10 @@ impl OrganizationState {
             {
                 transfer.status = new_state.to_string();
                 transfer.active_handshake_id = None;
-                if matches!(new_state, "ACCEPTED" | "DECLINED" | "CANCELED" | "EXPIRED") {
+                // An ACCEPTED transfer is starting, not ending -- stamping
+                // an end time here reported it as simultaneously active and
+                // already over.
+                if matches!(new_state, "DECLINED" | "CANCELED" | "EXPIRED") {
                     transfer.end_timestamp = Some(Utc::now());
                 }
             }

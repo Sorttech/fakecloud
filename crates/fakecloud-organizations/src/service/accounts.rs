@@ -302,9 +302,10 @@ impl OrganizationsService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let mut guard = self.state.write();
         // Resolve the caller's OWN organization: an account can only leave
-        // the one it is actually in. AWS answers a caller that belongs to no
-        // organization with `AWSOrganizationsNotInUseException`, the same
-        // answer every other op gives, rather than `AccountNotFoundException`.
+        // the one it is actually in. The op takes no AccountId, so AWS
+        // answers a caller that belongs to no organization with
+        // `AWSOrganizationsNotInUseException` -- also the non-leaking answer
+        // now that several organizations can coexist.
         let org = guard
             .org_of_account_mut(&req.account_id)
             .ok_or_else(organizations_not_in_use)?;
@@ -469,7 +470,7 @@ impl OrganizationsService {
 /// can resolve — an address it has never minted identifies no account,
 /// so the invitation could never be accepted and would sit OPEN
 /// forever rather than failing where the caller can see it.
-fn validate_invite_target(kind: &str, id: &str) -> Result<(), AwsServiceError> {
+pub(super) fn validate_invite_target(kind: &str, id: &str) -> Result<(), AwsServiceError> {
     match kind {
         "ACCOUNT" => {
             if id.len() == 12 && id.chars().all(|c| c.is_ascii_digit()) {
@@ -481,17 +482,17 @@ fn validate_invite_target(kind: &str, id: &str) -> Result<(), AwsServiceError> {
             }
         }
         "EMAIL" => {
+            // AWS's primary invite flow names the account owner's real
+            // address, so any address is accepted. fakecloud can only
+            // resolve one it minted itself (`<account-id>@example.com`)
+            // back to an account, so an external address yields a handshake
+            // its source can read and cancel but that no caller can prove
+            // it is the target of -- same as AWS before the owner acts on
+            // the emailed link.
             if !id.contains('@') {
                 return Err(invalid_input(
                     "Target.Id must be an email address when Target.Type is EMAIL",
                 ));
-            }
-            if crate::state::target_account_id("EMAIL", id).is_none() {
-                return Err(invalid_input(&format!(
-                    "No account is registered for {id}. fakecloud resolves an EMAIL target \
-                     only for addresses it minted (<account-id>@example.com); invite the \
-                     account by id instead."
-                )));
             }
             Ok(())
         }

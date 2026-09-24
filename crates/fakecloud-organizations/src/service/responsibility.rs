@@ -141,6 +141,11 @@ impl OrganizationsService {
             .get("Type")
             .and_then(|v| v.as_str())
             .unwrap_or("ACCOUNT");
+        // Same shape validation the account-invite path applies: without
+        // it a mismatched target (an address under Type=ACCOUNT) is stored
+        // as the target account id, and the handshake sits OPEN forever
+        // because no caller can authenticate as that string.
+        super::accounts::validate_invite_target(target_kind, &target_id)?;
         let notes = body
             .get("Notes")
             .and_then(|v| v.as_str())
@@ -267,7 +272,6 @@ impl OrganizationsService {
             .responsibility_transfers
             .get_mut(&id)
             .expect("resolved just above");
-        // Only a still-pending transfer can be terminated.
         if transfer.status == "WITHDRAWN" {
             return Err(AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -275,7 +279,10 @@ impl OrganizationsService {
                 "The responsibility transfer is already withdrawn.",
             ));
         }
-        if transfer.status != "REQUESTED" {
+        // AWS's op "ends a transfer", so it applies to one still awaiting an
+        // answer AND to one already accepted and running. Only a transfer
+        // that has already reached a terminal state cannot be ended.
+        if !matches!(transfer.status.as_str(), "REQUESTED" | "ACCEPTED") {
             return Err(AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
                 "InvalidResponsibilityTransferTransitionException",

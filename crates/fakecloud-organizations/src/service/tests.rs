@@ -353,9 +353,6 @@ async fn invite_rejects_a_target_id_that_does_not_match_its_type() {
         json!({ "Type": "ACCOUNT", "Id": "12345" }),
         json!({ "Type": "EMAIL", "Id": "222222222222" }),
         json!({ "Type": "SOMETHING", "Id": "222222222222" }),
-        // An address fakecloud never minted names no account it can
-        // resolve, so the invitation could never be accepted.
-        json!({ "Type": "EMAIL", "Id": "billing@acme.com" }),
     ] {
         let err = expect_err(
             svc.handle(req_with(
@@ -371,6 +368,147 @@ async fn invite_rejects_a_target_id_that_does_not_match_its_type() {
             "target {target} should have been rejected"
         );
     }
+}
+
+/// `TerminateResponsibilityTransfer` ends a transfer, which includes one
+/// already ACCEPTED and running -- that is the case the operation exists
+/// for. Syncing the transfer's status with its handshake must not lock
+/// the accepted transfer out of ever being ended.
+#[tokio::test]
+async fn an_accepted_responsibility_transfer_can_still_be_terminated() {
+    let (svc, _state) = OrganizationsService::shared();
+    create_org_with_root(&svc).await;
+    svc.handle(req_with("222222222222", "CreateOrganization", json!({})))
+        .await
+        .unwrap();
+    let invite = body_value(
+        svc.handle(req_with(
+            "111111111111",
+            "InviteOrganizationToTransferResponsibility",
+            json!({
+                "Type": "BILLING",
+                "SourceName": "handover",
+                "StartTimestamp": 1893456000.0,
+                "Target": {"Id": "222222222222", "Type": "ACCOUNT"},
+            }),
+        ))
+        .await
+        .unwrap(),
+    );
+    let handshake_id = invite["Handshake"]["Id"].as_str().unwrap().to_string();
+    let listed = body_value(
+        svc.handle(req_with(
+            "111111111111",
+            "ListOutboundResponsibilityTransfers",
+            json!({ "Type": "BILLING" }),
+        ))
+        .await
+        .unwrap(),
+    );
+    let transfer_id = listed["ResponsibilityTransfers"][0]["Id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    svc.handle(req_with(
+        "222222222222",
+        "AcceptHandshake",
+        json!({ "HandshakeId": handshake_id }),
+    ))
+    .await
+    .unwrap();
+
+    // An accepted transfer is starting, not over.
+    let accepted = body_value(
+        svc.handle(req_with(
+            "111111111111",
+            "DescribeResponsibilityTransfer",
+            json!({ "Id": transfer_id }),
+        ))
+        .await
+        .unwrap(),
+    );
+    assert_eq!(accepted["ResponsibilityTransfer"]["Status"], "ACCEPTED");
+    assert!(
+        accepted["ResponsibilityTransfer"]["EndTimestamp"].is_null(),
+        "an accepted transfer has not ended"
+    );
+
+    let ended = body_value(
+        svc.handle(req_with(
+            "111111111111",
+            "TerminateResponsibilityTransfer",
+            json!({ "Id": transfer_id }),
+        ))
+        .await
+        .expect("an accepted transfer can be ended"),
+    );
+    assert_eq!(ended["ResponsibilityTransfer"]["Status"], "WITHDRAWN");
+    assert!(!ended["ResponsibilityTransfer"]["EndTimestamp"].is_null());
+}
+
+/// AWS's primary invite flow names the account owner's real address, so
+/// an external address is accepted -- fakecloud just cannot resolve it
+/// to an account, exactly as AWS cannot until the owner acts on the
+/// emailed link.
+#[tokio::test]
+async fn invite_accepts_an_external_email_target() {
+    let (svc, _state) = OrganizationsService::shared();
+    create_org_with_root(&svc).await;
+    let invited = body_json(
+        &svc.handle(req_with(
+            "111111111111",
+            "InviteAccountToOrganization",
+            json!({ "Target": { "Type": "EMAIL", "Id": "owner@acme.com" } }),
+        ))
+        .await
+        .expect("a real address is a valid invite target"),
+    );
+    assert_eq!(invited["Handshake"]["State"], "OPEN");
+}
+
+/// AWS documents `DescribeHandshake` as callable from any account in the
+/// organization, not just the handshake's two parties -- while an
+/// account in a DIFFERENT organization still sees nothing.
+#[tokio::test]
+async fn describe_handshake_is_readable_by_any_member_of_the_owning_org() {
+    let (svc, state) = OrganizationsService::shared();
+    create_org_with_root(&svc).await;
+    state
+        .write()
+        .sole_mut()
+        .unwrap()
+        .enroll_account_if_missing("333333333333");
+    let invited = body_json(
+        &svc.handle(req_with(
+            "111111111111",
+            "InviteAccountToOrganization",
+            json!({ "Target": { "Type": "ACCOUNT", "Id": "222222222222" } }),
+        ))
+        .await
+        .unwrap(),
+    );
+    let handshake_id = invited["Handshake"]["Id"].as_str().unwrap().to_string();
+
+    // A plain member of the inviting organization can read it.
+    svc.handle(req_with(
+        "333333333333",
+        "DescribeHandshake",
+        json!({ "HandshakeId": handshake_id }),
+    ))
+    .await
+    .expect("any member of the owning organization may read it");
+
+    // An account outside the organization still cannot.
+    let err = expect_err(
+        svc.handle(req_with(
+            "999999999999",
+            "DescribeHandshake",
+            json!({ "HandshakeId": handshake_id }),
+        ))
+        .await,
+    );
+    assert_eq!(err.code(), "HandshakeNotFoundException");
 }
 
 /// Deleting one organization leaves every other one standing.
