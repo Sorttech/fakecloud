@@ -1,29 +1,6 @@
 //! `OrganizationsService` `handshakes` family — extracted from service.rs by audit-2026-05-19.
 
 use super::*;
-use crate::state::target_account_id;
-
-/// Is `account_id` the account a handshake names?
-///
-/// An EMAIL target records the address the source named, so the match
-/// runs the other way: look up the CALLER's own registered address and
-/// compare that. Resolving the stored address against every
-/// organization would answer "whose account is this?" for organizations
-/// the caller has nothing to do with.
-fn is_handshake_target(
-    registry: &crate::state::OrganizationsRegistry,
-    h: &crate::state::Handshake,
-    account_id: &str,
-) -> bool {
-    if target_account_id(&h.target_kind, &h.target_account_id).as_deref() == Some(account_id) {
-        return true;
-    }
-    h.target_kind == "EMAIL"
-        && registry
-            .org_of_account(account_id)
-            .and_then(|org| org.accounts.get(account_id))
-            .is_some_and(|account| account.email == h.target_account_id)
-}
 
 impl OrganizationsService {
     pub(super) fn accept_handshake(
@@ -93,7 +70,11 @@ impl OrganizationsService {
                 .is_some_and(|org| org.org_id == org_id)
         } else {
             match new_state {
-                "ACCEPTED" | "DECLINED" => is_handshake_target(&guard, &handshake, &req.account_id),
+                "ACCEPTED" | "DECLINED" => guard.account_matches_target(
+                    &handshake.target_kind,
+                    &handshake.target_account_id,
+                    &req.account_id,
+                ),
                 "CANCELED" => req.account_id == handshake.source_account_id,
                 _ => false,
             }
@@ -157,7 +138,11 @@ impl OrganizationsService {
         // would let any account anywhere read any handshake, learning
         // another organization's id and management account.
         let is_party = req.account_id == handshake.source_account_id
-            || is_handshake_target(&guard, handshake, &req.account_id);
+            || guard.account_matches_target(
+                &handshake.target_kind,
+                &handshake.target_account_id,
+                &req.account_id,
+            );
         // AWS documents DescribeHandshake as callable "from any account in
         // the organization", so membership of the organization that owns
         // the handshake is enough. It is only another ORGANIZATION's

@@ -36,23 +36,16 @@ fn require_transfer_type(body: &Value) -> Result<String, AwsServiceError> {
 
 /// Is `account_id` the target of `t`?
 ///
-/// An EMAIL target records the address the source named, so the match
-/// runs the other way: look up the CALLER's own registered address in
-/// its own organization and compare that. Resolving the stored address
-/// against every organization instead would answer "whose account is
-/// this?" for organizations the caller has nothing to do with.
+/// Delegates to the one shared predicate so this agrees with the
+/// handshake gate: an account that can accept an invitation must also
+/// be able to read and act on the transfer it accepted.
 fn is_transfer_target(
     registry: &crate::state::OrganizationsRegistry,
     t: &ResponsibilityTransfer,
     account_id: &str,
 ) -> bool {
-    if t.target_management_account_id == account_id {
-        return true;
-    }
-    registry
-        .org_of_account(account_id)
-        .and_then(|org| org.accounts.get(account_id))
-        .is_some_and(|account| account.email == t.target_management_account_id)
+    t.target_management_account_id == account_id
+        || registry.account_matches_target("EMAIL", &t.target_management_account_id, account_id)
 }
 
 fn is_transfer_party(
@@ -193,12 +186,6 @@ impl OrganizationsService {
             .clone();
         let registry = &*guard;
 
-        // Both sides of a transfer are existing management accounts, so
-        // an EMAIL target must resolve to one -- unlike an account
-        // invitation, which AWS mails to an owner fakecloud has never
-        // seen. Resolving here keeps `Target.ManagementAccountId` an
-        // account id, as the Smithy shape models it, instead of leaking
-        // an address into it.
         // Record the target EXACTLY as the caller named it, as AWS does:
         // resolving an address against other organizations' management
         // accounts would answer "does this address exist, and what is its
@@ -247,10 +234,6 @@ impl OrganizationsService {
             source_account_id: org.management_account_id.clone(),
             target_account_id: target_account_id.clone(),
             target_email: Some(target_email.clone()),
-            // The target was resolved to an account id above, so record it
-            // as such. Keeping "EMAIL" here left `target_account_id`
-            // unresolvable, and the target could then neither accept nor
-            // describe its own handshake.
             target_kind: target_kind.to_string(),
             notes,
             organization_id: org.org_id.clone(),

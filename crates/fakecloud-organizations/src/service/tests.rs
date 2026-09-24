@@ -610,6 +610,77 @@ async fn a_responsibility_transfer_cannot_target_its_own_organization() {
     .expect("an external address is a valid target");
 }
 
+/// Whoever can accept an invitation must also be able to find it and
+/// act on what it created. Two matchers that disagreed let an account
+/// accept a transfer it could then neither read nor end.
+#[tokio::test]
+async fn the_target_of_an_email_invite_can_find_accept_and_act_on_it() {
+    let (svc, _state) = OrganizationsService::shared();
+    create_org_with_root(&svc).await;
+    svc.handle(req_with("222222222222", "CreateOrganization", json!({})))
+        .await
+        .unwrap();
+
+    let invite = body_value(
+        svc.handle(req_with(
+            "111111111111",
+            "InviteOrganizationToTransferResponsibility",
+            json!({
+                "Type": "BILLING",
+                "SourceName": "handover",
+                "StartTimestamp": 1893456000.0,
+                "Target": {"Id": "222222222222@example.com", "Type": "EMAIL"},
+            }),
+        ))
+        .await
+        .unwrap(),
+    );
+    let handshake_id = invite["Handshake"]["Id"].as_str().unwrap().to_string();
+
+    // Findable...
+    let listed = body_value(
+        svc.handle(req_with(
+            "222222222222",
+            "ListHandshakesForAccount",
+            json!({}),
+        ))
+        .await
+        .unwrap(),
+    );
+    assert_eq!(listed["Handshakes"][0]["Id"], handshake_id.as_str());
+
+    // ...acceptable...
+    svc.handle(req_with(
+        "222222222222",
+        "AcceptHandshake",
+        json!({ "HandshakeId": handshake_id }),
+    ))
+    .await
+    .expect("the named account can accept");
+
+    // ...and the transfer it accepted is readable and endable by it.
+    let inbound = body_value(
+        svc.handle(req_with(
+            "222222222222",
+            "ListInboundResponsibilityTransfers",
+            json!({ "Type": "BILLING" }),
+        ))
+        .await
+        .unwrap(),
+    );
+    let transfer_id = inbound["ResponsibilityTransfers"][0]["Id"]
+        .as_str()
+        .expect("the accepted transfer is visible to its target")
+        .to_string();
+    svc.handle(req_with(
+        "222222222222",
+        "TerminateResponsibilityTransfer",
+        json!({ "Id": transfer_id }),
+    ))
+    .await
+    .expect("and can be ended by it");
+}
+
 /// Deleting one organization leaves every other one standing.
 #[tokio::test]
 async fn deleting_one_organization_leaves_the_others() {

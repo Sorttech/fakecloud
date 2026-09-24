@@ -190,10 +190,10 @@ impl OrganizationsRegistry {
             besides.contains(&id)
                 || self.orgs.values().any(|org| {
                     org.accounts.contains_key(id)
-                        || org
-                            .create_account_requests
-                            .values()
-                            .any(|req| req.account_id.as_deref() == Some(id))
+                        || org.create_account_requests.values().any(|req| {
+                            req.account_id.as_deref() == Some(id)
+                                || req.gov_cloud_account_id.as_deref() == Some(id)
+                        })
                 })
         })
     }
@@ -201,6 +201,35 @@ impl OrganizationsRegistry {
     /// Mint an account id unused by ANY organization in the process.
     pub fn next_account_id(&self) -> String {
         self.next_account_id_besides(&[])
+    }
+
+    /// Does `target` (as declared by `target_kind`) name `account_id`?
+    ///
+    /// This is the single answer used by every party gate -- handshakes,
+    /// responsibility transfers, and the account's own handshake
+    /// listing. Two matchers that disagreed let an account accept an
+    /// invitation it could then neither read nor act on.
+    ///
+    /// An `ACCOUNT` target names the id directly. An `EMAIL` target
+    /// matches either the synthetic `<account-id>@example.com` form
+    /// fakecloud mints, or the address `account_id` is actually
+    /// registered with. The lookup is of the CALLER's own account, never
+    /// a scan of other organizations, so it answers nothing about who
+    /// else exists.
+    pub fn account_matches_target(
+        &self,
+        target_kind: &str,
+        target: &str,
+        account_id: &str,
+    ) -> bool {
+        if target_account_id(target_kind, target).as_deref() == Some(account_id) {
+            return true;
+        }
+        target_kind == "EMAIL"
+            && self
+                .org_of_account(account_id)
+                .and_then(|org| org.accounts.get(account_id))
+                .is_some_and(|account| account.email == target)
     }
 
     /// The organization that stores responsibility transfer `id`. A
@@ -855,14 +884,10 @@ impl OrganizationState {
         self.handshakes
             .values()
             .filter(|h| match only_target_account {
-                // An EMAIL invite stores the address, so resolve it to the
-                // account it names -- otherwise the invited account cannot
-                // discover the handshake it is allowed to accept.
-                Some(acct) => {
-                    h.target_account_id == acct
-                        || target_account_id(&h.target_kind, &h.target_account_id).as_deref()
-                            == Some(acct)
-                }
+                // Deliberately id-only: the registered-email form of the
+                // match needs the registry, so callers that care use
+                // `OrganizationsRegistry::account_matches_target`.
+                Some(acct) => h.target_account_id == acct,
                 None => true,
             })
             .cloned()
