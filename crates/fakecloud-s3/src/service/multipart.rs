@@ -791,6 +791,29 @@ impl S3Service {
                     return Err(precondition_failed("If-None-Match"));
                 }
             }
+            // Persist the preserved null version BEFORE the completion itself.
+            // Once `mpu_complete` runs the upload dir is gone and a retry takes
+            // the idempotent path, so a sidecar failure after that point would
+            // answer the retry with the old object while disk already holds the
+            // new one. Failing here leaves the upload intact and retryable.
+            let preserved_null = if versioning_enabled {
+                let b = accts
+                    .get_or_create(account_id)
+                    .buckets
+                    .get_mut(bucket)
+                    .ok_or_else(|| no_such_bucket(bucket))?;
+                crate::service::objects::null_version_to_preserve(b, key)
+            } else {
+                None
+            };
+            if let Some(ref preserved) = preserved_null {
+                let preserved_meta = object_meta_snapshot(preserved);
+                let store = self.store.clone();
+                crate::service::objects::run_blocking_io(|| {
+                    store.put_object_meta(bucket, key, Some("null"), &preserved_meta)
+                })
+                .map_err(super::persistence_error)?;
+            }
             // Checks passed — persist, then commit to memory, all under the
             // lock. In disk mode `mpu_complete` streams the parts straight into
             // the object file and returns a disk-backed ref; use it as the
@@ -829,13 +852,7 @@ impl S3Service {
                 // Same rule as PutObject: the pre-versioning current object
                 // becomes the "null" version, sidecar included, or it is lost
                 // from the history and from disk on the next restart.
-                if let Some(preserved) = crate::service::objects::null_version_to_preserve(b, key) {
-                    let preserved_meta = object_meta_snapshot(&preserved);
-                    let store = self.store.clone();
-                    crate::service::objects::run_blocking_io(|| {
-                        store.put_object_meta(bucket, key, Some("null"), &preserved_meta)
-                    })
-                    .map_err(super::persistence_error)?;
+                if let Some(preserved) = preserved_null {
                     b.object_versions
                         .entry(key.to_string())
                         .or_default()
