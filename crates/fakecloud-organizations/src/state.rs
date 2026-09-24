@@ -875,8 +875,6 @@ impl OrganizationState {
         Ok(snapshot)
     }
 
-    /// Return a clone of every handshake currently tracked for the org,
-    /// optionally filtered by destination account id.
     /// Every handshake this organization holds.
     ///
     /// Filtering by target is deliberately NOT offered here: deciding

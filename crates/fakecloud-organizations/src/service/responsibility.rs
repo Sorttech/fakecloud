@@ -56,6 +56,22 @@ fn is_transfer_party(
     t.source_management_account_id == account_id || is_transfer_target(registry, t, account_id)
 }
 
+/// `TransferParticipant.ManagementAccountId` is modeled as an
+/// `AccountId` (exactly 12 digits), so an email-targeted transfer -- whose
+/// target is recorded as the address the source named -- carries only
+/// the email until the address resolves to an account id.
+fn target_participant(t: &ResponsibilityTransfer) -> Value {
+    let mut party = json!({
+        "ManagementAccountEmail": t.target_management_account_email,
+    });
+    if let Some(id) = crate::state::target_account_id("ACCOUNT", &t.target_management_account_id)
+        .filter(|id| id.len() == 12 && id.chars().all(|c| c.is_ascii_digit()))
+    {
+        party["ManagementAccountId"] = json!(id);
+    }
+    party
+}
+
 fn transfer_payload(t: &ResponsibilityTransfer) -> Value {
     let mut obj = json!({
         "Arn": t.arn,
@@ -67,10 +83,7 @@ fn transfer_payload(t: &ResponsibilityTransfer) -> Value {
             "ManagementAccountId": t.source_management_account_id,
             "ManagementAccountEmail": t.source_management_account_email,
         },
-        "Target": {
-            "ManagementAccountId": t.target_management_account_id,
-            "ManagementAccountEmail": t.target_management_account_email,
-        },
+        "Target": target_participant(t),
         "StartTimestamp": t.start_timestamp.timestamp() as f64,
     });
     if let Some(end) = t.end_timestamp {
@@ -203,8 +216,9 @@ impl OrganizationsService {
         // and let that member accept -- a "cross-organization" transfer
         // whose two ends were one organization.
         let target_is_own_org = registry.org_by_id(&source_org_id).is_some_and(|org| {
-            org.management_account_email == target_account_id
-                || org.accounts.contains_key(&target_account_id)
+            org.accounts
+                .keys()
+                .any(|id| registry.account_matches_target(target_kind, &target_id, id))
         });
         if target_is_own_org {
             return Err(AwsServiceError::aws_error_with_fields(
@@ -398,8 +412,11 @@ impl OrganizationsService {
         let body = req.json_body();
         // `Type` is required on both list ops.
         let transfer_type = require_transfer_type(&body)?;
-        // Both list ops model an optional `Id` to fetch a single transfer.
-        let only_id = body.get("Id").and_then(|v| v.as_str()).map(str::to_string);
+        // Only the INBOUND request models an optional `Id` to fetch a
+        // single transfer.
+        let only_id = (direction == "INBOUND")
+            .then(|| body.get("Id").and_then(|v| v.as_str()).map(str::to_string))
+            .flatten();
         let (max_results, next_token) = parse_list_pagination(&body)?;
         let guard = self.state.read();
         // The caller must be in an organization at all -- these ops declare
@@ -421,6 +438,14 @@ impl OrganizationsService {
             .collect();
         // Merged across organizations, so impose a stable order for
         // pagination rather than relying on per-organization map order.
+        // `ListInboundResponsibilityTransfers` models a not-found error, so
+        // a named id the caller is not a party to is reported rather than
+        // silently returned as an empty page.
+        if let Some(id) = &only_id {
+            if rows.is_empty() {
+                return Err(transfer_not_found(id));
+            }
+        }
         rows.sort_by(|a, b| a.id.cmp(&b.id));
         let filtered: Vec<Value> = rows.into_iter().map(transfer_payload).collect();
         let (page, token) = paginate_checked(&filtered, next_token.as_deref(), max_results)

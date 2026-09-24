@@ -574,9 +574,18 @@ async fn a_responsibility_transfer_cannot_target_its_own_organization() {
         .management_account_email
         .clone();
 
+    // A plain member of the caller's own organization, by id and by both
+    // spellings of its address, is just as much "itself".
+    state
+        .write()
+        .sole_mut()
+        .unwrap()
+        .enroll_account_if_missing("333333333333");
     for target in [
         json!({"Id": "111111111111", "Type": "ACCOUNT"}),
         json!({"Id": own_email, "Type": "EMAIL"}),
+        json!({"Id": "333333333333", "Type": "ACCOUNT"}),
+        json!({"Id": "333333333333@example.com", "Type": "EMAIL"}),
     ] {
         let err = expect_err(
             svc.handle(req_with(
