@@ -70,7 +70,8 @@ var fc = new FakeCloudClient("http://localhost:4566"); // explicit base URL
 | `CredentialsAsync()`                     | Fetch container/instance credentials (`GET /_fakecloud/credentials`) |
 | `InstanceIdentityDocumentAsync()`        | EC2 instance identity document (`/latest/dynamic/instance-identity/document`) |
 | `DnsResolveAsync(name, type)`            | Resolve a name against Route 53 records like the `--dns` resolver (`GET /_fakecloud/dns/resolve`) |
-| `CreateAdminAsync(accountId, userName)`  | Bootstrap an admin IAM user in an account  |
+| `CreateAdminAsync(accountId, userName)`  | Bootstrap a standalone admin IAM user in an account  |
+| `CreateAdminInOrgAsync(accountId, userName, organizationId)`  | Same, also enrolling the account into that organization  |
 
 ### `fc.Lambda`
 

@@ -15,15 +15,15 @@ Both the control plane and SCP enforcement are live. SCPs act as the top-of-chai
   ```json
   {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}
   ```
-- Only the `ALL` feature set is supported. `CONSOLIDATED_BILLING` disables SCPs in AWS and is not useful in a test tool; requesting it returns `UnsupportedAPIEndpointException`.
+- Both feature sets are supported. `CONSOLIDATED_BILLING` creates the org with no policy types enabled, so SCPs are unavailable — matching AWS. Any other `FeatureSet` value is `InvalidInputException`.
 - Only the management account can run write ops (`CreateOrganizationalUnit`, `MoveAccount`, `DeleteOrganization`, etc.). A member but non-management caller gets `AccessDeniedException`. A non-member caller gets `AWSOrganizationsNotInUseException` so org existence itself does not leak.
-- Accounts auto-enroll into the root OU whenever a new admin bootstraps via `/_fakecloud/iam/create-admin` and an organization exists. This means tests can create the org first, then bootstrap admins for each member account, and the membership lands automatically.
+- Bootstrapping an admin via `/_fakecloud/iam/create-admin` leaves the account **standalone** — it joins no organization, matching AWS, where a freshly vended account belongs to no organization until it is invited and accepts, or is created through `CreateAccount`. Pass `"organizationId": "o-..."` in the request body to enroll the account into that organization's root OU instead, the shortcut equivalent of an `InviteAccountToOrganization` + `AcceptHandshake` pair.
 
 ## Supported operations
 
 | Operation | Status | Notes |
 |-----------|--------|-------|
-| `CreateOrganization` | ✅ | `FeatureSet=ALL` only; caller becomes management |
+| `CreateOrganization` | ✅ | `FeatureSet` `ALL` or `CONSOLIDATED_BILLING`; caller becomes management |
 | `DescribeOrganization` | ✅ | Returns `AWSOrganizationsNotInUseException` to non-members |
 | `DeleteOrganization` | ✅ | Management only; fails if any non-management members remain |
 | `ListRoots` | ✅ | Returns the single root |

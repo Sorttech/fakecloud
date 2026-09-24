@@ -59,7 +59,7 @@ Top-level client. Defaults to `http://localhost:4566`.
 | `credentials()`                    | Fetch container/instance credentials (`GET /_fakecloud/credentials`)                              |
 | `instanceIdentityDocument()`       | EC2 instance identity document (`/latest/dynamic/instance-identity/document`)                     |
 | `dnsResolve(name, type?)`          | Resolve a name against Route 53 records like the `--dns` resolver (`GET /_fakecloud/dns/resolve`) |
-| `createAdmin(accountId, userName)` | Bootstrap an admin IAM user for an account                                                        |
+| `createAdmin(accountId, userName, organizationId?)` | Bootstrap an admin IAM user for an account (standalone unless an organization is named)           |
 
 ### `fc.acm`
 

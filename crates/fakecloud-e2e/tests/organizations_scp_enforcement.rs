@@ -39,6 +39,20 @@ async fn config_with(server: &TestServer, akid: &str, secret: &str) -> aws_confi
         .await
 }
 
+/// Create the organization and return its id, which member bootstraps
+/// pass to `create_admin_in_org` to enroll into it.
+async fn create_org(orgs: &OrgsClient) -> String {
+    orgs.create_organization()
+        .send()
+        .await
+        .unwrap()
+        .organization()
+        .unwrap()
+        .id()
+        .unwrap()
+        .to_string()
+}
+
 const SCP_ALLOW_ALL: &str =
     r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}"#;
 
@@ -54,15 +68,17 @@ async fn member_account_blocked_by_explicit_deny_scp() {
     let a_cfg = config_with(&server, &a_akid, &a_secret).await;
     let orgs = OrgsClient::new(&a_cfg);
 
-    // Management = A. Org must exist before B auto-enrolls.
-    orgs.create_organization().send().await.unwrap();
+    // Management = A.
+    let org_id = create_org(&orgs).await;
     let root_id = orgs.list_roots().send().await.unwrap().roots()[0]
         .id()
         .unwrap()
         .to_string();
 
-    // Account B auto-enrolls on admin bootstrap.
-    let (b_akid, b_secret) = server.create_admin(ACCOUNT_B, "admin-b").await;
+    // Account B is bootstrapped as a member so SCPs apply to it.
+    let (b_akid, b_secret) = server
+        .create_admin_in_org(ACCOUNT_B, "admin-b", &org_id)
+        .await;
     let b_cfg = config_with(&server, &b_akid, &b_secret).await;
 
     // Baseline: before SCP attached, B can use SQS.
@@ -181,13 +197,15 @@ async fn detach_full_aws_access_then_custom_scp_controls_ceiling() {
     let a_cfg = config_with(&server, &a_akid, &a_secret).await;
     let orgs = OrgsClient::new(&a_cfg);
 
-    orgs.create_organization().send().await.unwrap();
+    let org_id = create_org(&orgs).await;
     let root_id = orgs.list_roots().send().await.unwrap().roots()[0]
         .id()
         .unwrap()
         .to_string();
 
-    let (b_akid, b_secret) = server.create_admin(ACCOUNT_B, "admin-b").await;
+    let (b_akid, b_secret) = server
+        .create_admin_in_org(ACCOUNT_B, "admin-b", &org_id)
+        .await;
     let b_cfg = config_with(&server, &b_akid, &b_secret).await;
     let sqs_b = SqsClient::new(&b_cfg);
     let s3_b = S3Client::new(&b_cfg);

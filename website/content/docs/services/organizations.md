@@ -48,6 +48,11 @@ without needing existing credentials. Once the management account is
 bootstrapped, the rest of the org lifecycle uses normal SigV4'd
 calls.
 
+The bootstrapped account is standalone — it joins no organization,
+matching AWS. Add `"organizationId": "o-..."` to the body to enroll it
+into an organization you already created, the shortcut equivalent of an
+`InviteAccountToOrganization` + `AcceptHandshake` pair.
+
 ## Smoke test
 
 ```sh
@@ -56,7 +61,7 @@ fakecloud &
 # Bootstrap a management-account admin.
 curl -fsS -X POST http://localhost:4566/_fakecloud/iam/create-admin \
   -H 'content-type: application/json' \
-  -d '{"AccountId":"123456789012"}'
+  -d '{"accountId":"123456789012","userName":"admin"}'
 
 aws --endpoint-url http://localhost:4566 organizations create-organization \
   --feature-set ALL

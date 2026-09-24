@@ -1715,6 +1715,15 @@ pub struct Elbv2RulesResponse {
 pub struct CreateAdminRequest {
     pub account_id: String,
     pub user_name: String,
+    /// Optional organization to enroll the account into as a member,
+    /// identified by its organization id (`o-...`). Omitted (the
+    /// default) the account is standalone, matching AWS: a freshly
+    /// vended account belongs to no organization until it is invited
+    /// and accepts, or is created through `CreateAccount`. Set it only
+    /// to skip the invite/accept handshake when bootstrapping members
+    /// of an organization you already created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -76,7 +76,8 @@ FakeCloud fc = new FakeCloud("http://localhost:4566"); // explicit base URL
 | `credentials()`                     | Fetch container/instance credentials (`GET /_fakecloud/credentials`) |
 | `instanceIdentityDocument()`        | EC2 instance identity document (`/latest/dynamic/instance-identity/document`) |
 | `dnsResolve(name, type)`            | Resolve a name against Route 53 records like the `--dns` resolver (`GET /_fakecloud/dns/resolve`) |
-| `createAdmin(accountId, userName)`  | Bootstrap an admin IAM user in an account  |
+| `createAdmin(accountId, userName)`  | Bootstrap a standalone admin IAM user in an account  |
+| `createAdminInOrg(accountId, userName, organizationId)`  | Same, also enrolling the account into that organization  |
 
 ### `fc.lambda()`
 

@@ -276,10 +276,30 @@ public final class FakeCloud {
 
     // ── IAM ───────────────────────────────────────────────────────
 
+    /**
+     * Create an IAM admin user in a specific account. The account is
+     * standalone: it joins no organization, matching AWS, where a freshly
+     * vended account belongs to no organization until it is invited and
+     * accepts. Use {@link #createAdminInOrg} to enroll it into an
+     * organization you already created.
+     */
     public CreateAdminResponse createAdmin(String accountId, String userName) {
         return http.postJson(
                 "/_fakecloud/iam/create-admin",
-                new CreateAdminRequest(accountId, userName),
+                new CreateAdminRequest(accountId, userName, null),
+                CreateAdminResponse.class);
+    }
+
+    /**
+     * {@link #createAdmin} plus enrollment of the account into the
+     * organization {@code organizationId} as a member of its root OU --
+     * the shortcut equivalent of an invite/accept handshake.
+     */
+    public CreateAdminResponse createAdminInOrg(
+            String accountId, String userName, String organizationId) {
+        return http.postJson(
+                "/_fakecloud/iam/create-admin",
+                new CreateAdminRequest(accountId, userName, organizationId),
                 CreateAdminResponse.class);
     }
 

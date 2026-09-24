@@ -1311,14 +1311,28 @@ export class FakeCloud {
 
   // ── IAM ────────────────────────────────────────────────────────
 
+  /**
+   * Create an IAM admin user in a specific account.
+   *
+   * The account is standalone unless `organizationId` names an existing
+   * organization, in which case it is enrolled as a member of that
+   * organization's root OU. This matches AWS: a freshly vended account
+   * belongs to no organization until it is invited and accepts, or is
+   * created through `CreateAccount`.
+   */
   async createAdmin(
     accountId: string,
     userName: string,
+    organizationId?: string,
   ): Promise<CreateAdminResponse> {
+    const body: Record<string, string> = { accountId, userName };
+    if (organizationId !== undefined) {
+      body.organizationId = organizationId;
+    }
     const resp = await fetch(`${this.baseUrl}/_fakecloud/iam/create-admin`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ accountId, userName }),
+      body: JSON.stringify(body),
     });
     return parse(resp);
   }

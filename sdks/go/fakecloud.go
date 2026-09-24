@@ -91,12 +91,28 @@ func (fc *FakeCloud) InstanceIdentityDocument(ctx context.Context) (map[string]i
 	return out, nil
 }
 
-// CreateAdmin creates an IAM admin user in a specific account.
+// CreateAdmin creates an IAM admin user in a specific account. The
+// account is standalone: it joins no organization, matching AWS, where a
+// freshly vended account belongs to no organization until it is invited
+// and accepts. Use CreateAdminInOrg to enroll it into an organization
+// you already created.
 func (fc *FakeCloud) CreateAdmin(ctx context.Context, accountID, userName string) (*CreateAdminResponse, error) {
+	return fc.createAdmin(ctx, accountID, userName, "")
+}
+
+// CreateAdminInOrg is CreateAdmin plus enrollment of the account into the
+// organization orgID as a member of its root OU — the shortcut equivalent
+// of an invite/accept handshake.
+func (fc *FakeCloud) CreateAdminInOrg(ctx context.Context, accountID, userName, orgID string) (*CreateAdminResponse, error) {
+	return fc.createAdmin(ctx, accountID, userName, orgID)
+}
+
+func (fc *FakeCloud) createAdmin(ctx context.Context, accountID, userName, orgID string) (*CreateAdminResponse, error) {
 	var out CreateAdminResponse
 	if err := fc.doPost(ctx, "/_fakecloud/iam/create-admin", &CreateAdminRequest{
-		AccountID: accountID,
-		UserName:  userName,
+		AccountID:      accountID,
+		UserName:       userName,
+		OrganizationID: orgID,
 	}, &out); err != nil {
 		return nil, err
 	}

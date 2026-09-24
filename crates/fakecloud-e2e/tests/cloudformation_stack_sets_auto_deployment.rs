@@ -49,9 +49,11 @@ async fn start() -> TestServer {
     .await
 }
 
-/// An IAM client whose credentials belong to `account_id`.
-async fn iam_for(server: &TestServer, account_id: &str) -> aws_sdk_iam::Client {
-    let (akid, secret) = server.create_admin(account_id, "root").await;
+/// An IAM client whose credentials belong to `account_id`, bootstrapped
+/// as a member of `org_id` — joining the organization is what makes the
+/// account an auto-deployment target.
+async fn iam_for(server: &TestServer, account_id: &str, org_id: &str) -> aws_sdk_iam::Client {
+    let (akid, secret) = server.create_admin_in_org(account_id, "root", org_id).await;
     let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .endpoint_url(server.endpoint())
         .region(aws_config::Region::new("us-east-1"))
@@ -130,11 +132,17 @@ async fn auto_deployment_follows_accounts_in_and_out_of_the_target_ou() {
     let orgs = server.organizations_client().await;
     let cfn = server.cloudformation_client().await;
 
-    orgs.create_organization()
+    let org_id = orgs
+        .create_organization()
         .feature_set(aws_sdk_organizations::types::OrganizationFeatureSet::All)
         .send()
         .await
-        .unwrap();
+        .unwrap()
+        .organization()
+        .unwrap()
+        .id()
+        .unwrap()
+        .to_string();
     let root = orgs.list_roots().send().await.unwrap().roots()[0]
         .id()
         .unwrap()
@@ -146,7 +154,7 @@ async fn auto_deployment_follows_accounts_in_and_out_of_the_target_ou() {
         .unwrap();
 
     // One member account exists before the stack set is deployed.
-    let child_one = iam_for(&server, CHILD_ONE).await;
+    let child_one = iam_for(&server, CHILD_ONE, &org_id).await;
 
     cfn.create_stack_set()
         .stack_set_name("auto")
@@ -196,7 +204,7 @@ async fn auto_deployment_follows_accounts_in_and_out_of_the_target_ou() {
 
     // The reported bug: an account that joins the target OU afterwards was
     // left without the stack set's stacks.
-    let child_two = iam_for(&server, CHILD_TWO).await;
+    let child_two = iam_for(&server, CHILD_TWO, &org_id).await;
     assert!(has_role(&child_two).await, "account added after deployment");
     assert_eq!(
         instance_accounts(&cfn, "auto").await,
@@ -245,11 +253,17 @@ async fn auto_deployment_can_retain_stacks_when_an_account_is_removed() {
     let orgs = server.organizations_client().await;
     let cfn = server.cloudformation_client().await;
 
-    orgs.create_organization()
+    let org_id = orgs
+        .create_organization()
         .feature_set(aws_sdk_organizations::types::OrganizationFeatureSet::All)
         .send()
         .await
-        .unwrap();
+        .unwrap()
+        .organization()
+        .unwrap()
+        .id()
+        .unwrap()
+        .to_string();
     let root = orgs.list_roots().send().await.unwrap().roots()[0]
         .id()
         .unwrap()
@@ -259,7 +273,7 @@ async fn auto_deployment_can_retain_stacks_when_an_account_is_removed() {
         .send()
         .await
         .unwrap();
-    let child_one = iam_for(&server, CHILD_ONE).await;
+    let child_one = iam_for(&server, CHILD_ONE, &org_id).await;
 
     cfn.create_stack_set()
         .stack_set_name("retain")
@@ -304,7 +318,7 @@ async fn auto_deployment_can_retain_stacks_when_an_account_is_removed() {
 
     // The OU is still the stack set's target even with nothing deployed in
     // it, so the next account to join is deployed to.
-    let child_two = iam_for(&server, CHILD_TWO).await;
+    let child_two = iam_for(&server, CHILD_TWO, &org_id).await;
     assert_eq!(instance_accounts(&cfn, "retain").await, [CHILD_TWO]);
     assert!(has_role(&child_two).await);
 }
@@ -318,11 +332,17 @@ async fn auto_deployment_covers_an_account_created_by_a_cloudformation_stack() {
     let orgs = server.organizations_client().await;
     let cfn = server.cloudformation_client().await;
 
-    orgs.create_organization()
+    let org_id = orgs
+        .create_organization()
         .feature_set(aws_sdk_organizations::types::OrganizationFeatureSet::All)
         .send()
         .await
-        .unwrap();
+        .unwrap()
+        .organization()
+        .unwrap()
+        .id()
+        .unwrap()
+        .to_string();
     let root = orgs.list_roots().send().await.unwrap().roots()[0]
         .id()
         .unwrap()
@@ -332,7 +352,7 @@ async fn auto_deployment_covers_an_account_created_by_a_cloudformation_stack() {
         .send()
         .await
         .unwrap();
-    iam_for(&server, CHILD_ONE).await;
+    iam_for(&server, CHILD_ONE, &org_id).await;
 
     cfn.create_stack_set()
         .stack_set_name("auto")

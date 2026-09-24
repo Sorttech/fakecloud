@@ -43,10 +43,37 @@ impl FakeCloud {
     /// for the new user. Solves the multi-account bootstrap problem: the
     /// root bypass only targets the default account, so this endpoint lets
     /// callers create credentials for any account.
+    ///
+    /// The account is standalone — it joins no organization, matching AWS,
+    /// where a freshly vended account belongs to no organization until it
+    /// is invited and accepts. Use [`Self::create_admin_in_org`] to enroll
+    /// it into an organization you already created.
     pub async fn create_admin(
         &self,
         account_id: &str,
         user_name: &str,
+    ) -> Result<CreateAdminResponse, Error> {
+        self.create_admin_inner(account_id, user_name, None).await
+    }
+
+    /// Like [`Self::create_admin`], but also enrolls the account into the
+    /// organization `org_id` as a member of its root OU — the shortcut
+    /// equivalent of an invite/accept handshake.
+    pub async fn create_admin_in_org(
+        &self,
+        account_id: &str,
+        user_name: &str,
+        org_id: &str,
+    ) -> Result<CreateAdminResponse, Error> {
+        self.create_admin_inner(account_id, user_name, Some(org_id))
+            .await
+    }
+
+    async fn create_admin_inner(
+        &self,
+        account_id: &str,
+        user_name: &str,
+        org_id: Option<&str>,
     ) -> Result<CreateAdminResponse, Error> {
         let resp = self
             .client
@@ -54,6 +81,7 @@ impl FakeCloud {
             .json(&CreateAdminRequest {
                 account_id: account_id.to_string(),
                 user_name: user_name.to_string(),
+                organization_id: org_id.map(str::to_string),
             })
             .send()
             .await?;

@@ -904,8 +904,18 @@ public final class Types {
 
     // ── IAM ───────────────────────────────────────────────────────
 
+    /**
+     * Body for {@code POST /_fakecloud/iam/create-admin}. A null
+     * {@code organizationId} leaves the account standalone; naming an
+     * organization enrolls the account into its root OU.
+     */
     @JsonInclude(JsonInclude.Include.NON_NULL)
-    public record CreateAdminRequest(String accountId, String userName) {}
+    public record CreateAdminRequest(String accountId, String userName, String organizationId) {
+        /** Bootstrap a standalone account, joining no organization. */
+        public CreateAdminRequest(String accountId, String userName) {
+            this(accountId, userName, null);
+        }
+    }
 
     @JsonIgnoreProperties(ignoreUnknown = true)
     public record CreateAdminResponse(

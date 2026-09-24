@@ -2589,12 +2589,25 @@ class FakeCloud:
         return cast(Dict[str, Any], resp.json())
 
     async def create_admin(
-        self, account_id: str, user_name: str
+        self,
+        account_id: str,
+        user_name: str,
+        organization_id: Optional[str] = None,
     ) -> CreateAdminResponse:
-        """Create an IAM admin user in a specific account."""
+        """Create an IAM admin user in a specific account.
+
+        The account is standalone unless ``organization_id`` names an
+        existing organization, in which case it is enrolled as a member
+        of that organization's root OU. This matches AWS: a freshly
+        vended account belongs to no organization until it is invited
+        and accepts, or is created through ``CreateAccount``.
+        """
+        body: Dict[str, Any] = {"accountId": account_id, "userName": user_name}
+        if organization_id is not None:
+            body["organizationId"] = organization_id
         resp = await self._client.post(
             f"{self._base}/_fakecloud/iam/create-admin",
-            json={"accountId": account_id, "userName": user_name},
+            json=body,
         )
         _check(resp)
         return CreateAdminResponse.from_dict(resp.json())
@@ -2810,11 +2823,26 @@ class FakeCloudSync:
         _check(resp)
         return cast(Dict[str, Any], resp.json())
 
-    def create_admin(self, account_id: str, user_name: str) -> CreateAdminResponse:
-        """Create an IAM admin user in a specific account."""
+    def create_admin(
+        self,
+        account_id: str,
+        user_name: str,
+        organization_id: Optional[str] = None,
+    ) -> CreateAdminResponse:
+        """Create an IAM admin user in a specific account.
+
+        The account is standalone unless ``organization_id`` names an
+        existing organization, in which case it is enrolled as a member
+        of that organization's root OU. This matches AWS: a freshly
+        vended account belongs to no organization until it is invited
+        and accepts, or is created through ``CreateAccount``.
+        """
+        body: Dict[str, Any] = {"accountId": account_id, "userName": user_name}
+        if organization_id is not None:
+            body["organizationId"] = organization_id
         resp = self._client.post(
             f"{self._base}/_fakecloud/iam/create-admin",
-            json={"accountId": account_id, "userName": user_name},
+            json=body,
         )
         _check(resp)
         return CreateAdminResponse.from_dict(resp.json())

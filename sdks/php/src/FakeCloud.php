@@ -163,13 +163,30 @@ final class FakeCloud
 
     // ── IAM ───────────────────────────────────────────────────────
 
-    public function createAdmin(string $accountId, string $userName): CreateAdminResponse
-    {
+    /**
+     * Create an IAM admin user in a specific account.
+     *
+     * The account is standalone unless $organizationId names an existing
+     * organization, in which case it is enrolled as a member of that
+     * organization's root OU. This matches AWS: a freshly vended account
+     * belongs to no organization until it is invited and accepts, or is
+     * created through CreateAccount.
+     */
+    public function createAdmin(
+        string $accountId,
+        string $userName,
+        ?string $organizationId = null
+    ): CreateAdminResponse {
+        $body = [
+            'accountId' => $accountId,
+            'userName' => $userName,
+        ];
+        if ($organizationId !== null) {
+            $body['organizationId'] = $organizationId;
+        }
+
         return CreateAdminResponse::fromArray(
-            $this->http->postJson('/_fakecloud/iam/create-admin', [
-                'accountId' => $accountId,
-                'userName' => $userName,
-            ])
+            $this->http->postJson('/_fakecloud/iam/create-admin', $body)
         );
     }
 

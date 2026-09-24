@@ -2414,8 +2414,9 @@ async fn main() {
             }),
         );
     }
-    // Hook shared with the create-admin admin endpoint, which auto-enrolls an
-    // account into the org directly and must persist that through to disk.
+    // Hook shared with the create-admin admin endpoint, which enrolls an
+    // account into the org directly when the request names one, and must
+    // persist that through to disk.
     let organizations_persist_hook = organizations_inner.snapshot_hook();
     let organizations_service = Arc::new(organizations_inner);
     registry.register(organizations_service.clone());
@@ -11653,23 +11654,37 @@ async fn main() {
                             .read()
                             .as_ref()
                             .is_some_and(|org| org.accounts.contains_key(&body.account_id));
-                        let resp = reset::create_admin_in_account(
+                        let resp = match reset::create_admin_in_account(
                             &iam,
                             &orgs,
                             &body.account_id,
                             &body.user_name,
-                        );
-                        // The helper may auto-enroll the account into the org;
-                        // persist that mutation through to disk.
-                        if let Some(hook) = &persist {
-                            hook().await;
-                        }
-                        // ...and an account that just joined the root OU can
-                        // be a stack set's auto-deployment target.
-                        if !was_member {
+                            body.organization_id.as_deref(),
+                        ) {
+                            Ok(resp) => resp,
+                            Err(err) => {
+                                return (
+                                    axum::http::StatusCode::BAD_REQUEST,
+                                    axum::Json(serde_json::json!({
+                                        "error": err.message(),
+                                    })),
+                                )
+                                    .into_response();
+                            }
+                        };
+                        // Only an explicit `organizationId` mutates org state.
+                        // A standalone bootstrap leaves every organization
+                        // untouched, so there is nothing to persist or notify.
+                        if body.organization_id.is_some() && !was_member {
+                            // Persist the new membership through to disk...
+                            if let Some(hook) = &persist {
+                                hook().await;
+                            }
+                            // ...and an account that just joined the root OU
+                            // can be a stack set's auto-deployment target.
                             changed.fire_if_membership_changed(&orgs).await;
                         }
-                        axum::Json(resp)
+                        axum::Json(resp).into_response()
                     }
                 }
             }),

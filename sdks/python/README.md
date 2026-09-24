@@ -82,7 +82,7 @@ Pass `base_url` (default `http://localhost:4566`).
 | `credentials()` | Fetch container/instance credentials (`GET /_fakecloud/credentials`) |
 | `instance_identity_document()` | EC2 instance identity document (`/latest/dynamic/instance-identity/document`) |
 | `dns_resolve(name, type="A")` | Resolve a name against Route 53 records like the `--dns` resolver (`GET /_fakecloud/dns/resolve`) |
-| `create_admin(account_id, user_name)` | Create an IAM admin user in a specific account |
+| `create_admin(account_id, user_name, organization_id=None)` | Create an IAM admin user in a specific account (standalone unless an organization is named) |
 | `aclose()` *(async only)* | Close the underlying `httpx.AsyncClient` (or use `async with`) |
 
 ### `fc.lambda_`

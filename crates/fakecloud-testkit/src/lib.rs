@@ -240,23 +240,58 @@ impl TestServer {
     /// secret_access_key). Solves the multi-account bootstrap problem:
     /// the root bypass only targets the default account, so this endpoint
     /// lets tests create credentials for any account.
+    ///
+    /// The account is standalone — it joins no organization. Use
+    /// [`Self::create_admin_in_org`] to enroll it as a member of an
+    /// organization you already created.
     pub async fn create_admin(&self, account_id: &str, user_name: &str) -> (String, String) {
+        self.create_admin_inner(account_id, user_name, None).await
+    }
+
+    /// Like [`Self::create_admin`], but also enrolls the account into
+    /// the organization `org_id` as a member of its root OU — the
+    /// shortcut equivalent of an invite/accept handshake.
+    pub async fn create_admin_in_org(
+        &self,
+        account_id: &str,
+        user_name: &str,
+        org_id: &str,
+    ) -> (String, String) {
+        self.create_admin_inner(account_id, user_name, Some(org_id))
+            .await
+    }
+
+    async fn create_admin_inner(
+        &self,
+        account_id: &str,
+        user_name: &str,
+        org_id: Option<&str>,
+    ) -> (String, String) {
         let client = reqwest::Client::new();
+        let mut payload = serde_json::json!({
+            "accountId": account_id,
+            "userName": user_name,
+        });
+        if let Some(org_id) = org_id {
+            payload["organizationId"] = serde_json::Value::String(org_id.to_string());
+        }
         let resp = client
             .post(format!("{}/_fakecloud/iam/create-admin", self.endpoint))
-            .json(&serde_json::json!({
-                "accountId": account_id,
-                "userName": user_name,
-            }))
+            .json(&payload)
             .send()
             .await
             .expect("create-admin request failed");
+        let status = resp.status();
+        let body = resp.text().await.expect("create-admin body");
+        // The endpoint rejects an unknown `organizationId` with a 400 whose
+        // body names the offending id, so surface it — a bare status code
+        // sends the reader hunting for a failure the server already explained.
         assert!(
-            resp.status().is_success(),
-            "create-admin returned {}",
-            resp.status()
+            status.is_success(),
+            "create-admin returned {status}: {body}"
         );
-        let body: serde_json::Value = resp.json().await.unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(&body).expect("create-admin response is JSON");
         (
             body["accessKeyId"].as_str().unwrap().to_string(),
             body["secretAccessKey"].as_str().unwrap().to_string(),

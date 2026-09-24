@@ -995,6 +995,10 @@ type BedrockAgentRuntimeInvocationsResponse struct {
 type CreateAdminRequest struct {
 	AccountID string `json:"accountId"`
 	UserName  string `json:"userName"`
+	// OrganizationID optionally enrolls the account into that
+	// organization as a member of its root OU. Empty leaves the
+	// account standalone.
+	OrganizationID string `json:"organizationId,omitempty"`
 }
 
 // CreateAdminResponse is returned after creating an IAM admin user.
