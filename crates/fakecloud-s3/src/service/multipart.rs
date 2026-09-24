@@ -540,6 +540,7 @@ impl S3Service {
             region,
             notification_config,
             versioning_enabled,
+            versioning_suspended,
             acl_owner_id,
         ) = {
             let accts = self.state.read();
@@ -566,6 +567,7 @@ impl S3Service {
                 state.region.clone(),
                 b.notification_config.clone(),
                 b.versioning.as_deref() == Some("Enabled"),
+                b.versioning.as_deref() == Some("Suspended"),
                 b.acl_owner_id.clone(),
             )
         };
@@ -816,17 +818,25 @@ impl S3Service {
             // and `?versionId=<mpu>` 404'd. Mirror put_object: push the new
             // object as a version (bug-audit 2026-06-20, 4.1).
             if versioning_enabled {
-                let versions = b.object_versions.entry(key.to_string()).or_default();
-                // Preserve an untracked pre-versioning current object as the
-                // first version before appending the new one.
-                if versions.is_empty() {
-                    if let Some(existing) = b.objects.get(key) {
-                        if existing.version_id.is_none() {
-                            versions.push(existing.clone());
-                        }
-                    }
+                // Same rule as PutObject: the pre-versioning current object
+                // becomes the "null" version, sidecar included, or it is lost
+                // from the history and from disk on the next restart.
+                if let Some(preserved_meta) =
+                    crate::service::objects::preserve_null_version_meta(b, key)
+                {
+                    let store = self.store.clone();
+                    crate::service::objects::run_blocking_io(|| {
+                        store.put_object_meta(bucket, key, Some("null"), &preserved_meta)
+                    })
+                    .map_err(super::persistence_error)?;
                 }
-                versions.push(obj.clone());
+                b.object_versions
+                    .entry(key.to_string())
+                    .or_default()
+                    .push(obj.clone());
+            } else if versioning_suspended {
+                obj.version_id = Some("null".to_string());
+                crate::service::objects::replace_null_version(b, key, &obj);
             }
             b.objects.insert(key.to_string(), obj);
         }

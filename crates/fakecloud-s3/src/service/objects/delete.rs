@@ -739,3 +739,74 @@ impl S3Service {
         Ok(s3_xml(StatusCode::OK, body))
     }
 }
+
+#[cfg(test)]
+mod lock_target_tests {
+    use super::lock_target;
+    use crate::state::{S3Bucket, S3Object};
+
+    fn bucket(versioning: Option<&str>) -> S3Bucket {
+        let mut b = S3Bucket::new("b", "us-east-1", "123456789012");
+        b.versioning = versioning.map(|v| v.to_string());
+        b
+    }
+
+    fn object(version_id: Option<&str>, is_delete_marker: bool) -> S3Object {
+        S3Object {
+            key: "k".to_string(),
+            version_id: version_id.map(|v| v.to_string()),
+            is_delete_marker,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn never_versioned_bucket_targets_the_current_object() {
+        let mut b = bucket(None);
+        b.objects.insert("k".to_string(), object(None, false));
+        let target = lock_target(&b, "k", false, false).expect("current object is destroyed");
+        assert!(target.version_id.is_none());
+    }
+
+    #[test]
+    fn enabled_bucket_targets_nothing() {
+        // An enabled-bucket delete only stacks a marker; no data is destroyed.
+        let mut b = bucket(Some("Enabled"));
+        b.objects.insert("k".to_string(), object(Some("v1"), false));
+        assert!(lock_target(&b, "k", true, true).is_none());
+    }
+
+    #[test]
+    fn suspended_bucket_targets_the_null_version_in_history() {
+        let mut b = bucket(Some("Suspended"));
+        b.object_versions
+            .insert("k".to_string(), vec![object(Some("null"), false)]);
+        // A newer, unlocked version is current; the marker still replaces the
+        // null version, so that is what the lock must be checked against.
+        b.objects.insert("k".to_string(), object(Some("v2"), false));
+        let target = lock_target(&b, "k", true, false).expect("null version is destroyed");
+        assert_eq!(target.version_id.as_deref(), Some("null"));
+    }
+
+    #[test]
+    fn suspended_bucket_looks_past_a_null_delete_marker() {
+        // A stale null marker in the history must not hide the live null
+        // object that is current -- that object is the one being destroyed.
+        let mut b = bucket(Some("Suspended"));
+        b.object_versions
+            .insert("k".to_string(), vec![object(Some("null"), true)]);
+        b.objects.insert("k".to_string(), object(None, false));
+        let target = lock_target(&b, "k", true, false).expect("live null object is destroyed");
+        assert!(!target.is_delete_marker);
+        assert!(target.version_id.is_none());
+    }
+
+    #[test]
+    fn suspended_bucket_with_only_versioned_objects_targets_nothing() {
+        let mut b = bucket(Some("Suspended"));
+        b.object_versions
+            .insert("k".to_string(), vec![object(Some("v1"), false)]);
+        b.objects.insert("k".to_string(), object(Some("v1"), false));
+        assert!(lock_target(&b, "k", true, false).is_none());
+    }
+}

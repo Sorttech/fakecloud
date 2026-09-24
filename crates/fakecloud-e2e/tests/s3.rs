@@ -1208,33 +1208,6 @@ async fn s3_suspended_bucket_delete_creates_null_delete_marker() {
     assert_eq!(bytes.as_ref(), b"v1");
 }
 
-/// Put COMPLIANCE retention on one version of a key via the CLI.
-async fn lock_version(server: &TestServer, bucket: &str, key: &str, version_id: &str) {
-    let retain_until = chrono::Utc::now() + chrono::Duration::days(1);
-    let output = server
-        .aws_cli(&[
-            "s3api",
-            "put-object-retention",
-            "--bucket",
-            bucket,
-            "--key",
-            key,
-            "--version-id",
-            version_id,
-            "--retention",
-            &format!(
-                r#"{{"Mode":"COMPLIANCE","RetainUntilDate":"{}"}}"#,
-                retain_until.format("%Y-%m-%dT%H:%M:%SZ")
-            ),
-        ])
-        .await;
-    assert!(
-        output.success(),
-        "failed to set retention: {}",
-        output.stderr_text()
-    );
-}
-
 async fn set_versioning(s3: &aws_sdk_s3::Client, bucket: &str, enabled: bool) {
     let status = if enabled {
         aws_sdk_s3::types::BucketVersioningStatus::Enabled
@@ -1254,10 +1227,9 @@ async fn set_versioning(s3: &aws_sdk_s3::Client, bucket: &str, enabled: bool) {
 }
 
 #[tokio::test]
-async fn s3_suspended_delete_respects_lock_on_the_null_version_it_replaces() {
-    // On a suspended bucket the delete marker takes over the null version,
-    // destroying it -- so a locked null version must block the delete even
-    // when the *current* version is a newer, unlocked one.
+async fn s3_versioning_cannot_be_suspended_on_an_object_lock_bucket() {
+    // AWS refuses: lock retention is enforced per version, and a suspended
+    // bucket would let a null version overwrite a retained one.
     let server = TestServer::start().await;
     let s3 = server.s3_client().await;
 
@@ -1266,156 +1238,220 @@ async fn s3_suspended_delete_respects_lock_on_the_null_version_it_replaces() {
             "s3api",
             "create-bucket",
             "--bucket",
-            "susp-lock",
+            "lock-no-suspend",
             "--object-lock-enabled-for-bucket",
         ])
         .await;
     assert!(output.success(), "{}", output.stderr_text());
 
-    // A null version, locked, written while versioning is suspended.
-    set_versioning(&s3, "susp-lock", false).await;
-    s3.put_object()
-        .bucket("susp-lock")
-        .key("doc.txt")
-        .body(ByteStream::from_static(b"null-version"))
-        .send()
-        .await
-        .unwrap();
-    lock_version(&server, "susp-lock", "doc.txt", "null").await;
-
-    // A newer, unlocked version becomes current.
-    set_versioning(&s3, "susp-lock", true).await;
-    s3.put_object()
-        .bucket("susp-lock")
-        .key("doc.txt")
-        .body(ByteStream::from_static(b"v2"))
-        .send()
-        .await
-        .unwrap();
-    set_versioning(&s3, "susp-lock", false).await;
-
     let err = s3
-        .delete_object()
-        .bucket("susp-lock")
-        .key("doc.txt")
+        .put_bucket_versioning()
+        .bucket("lock-no-suspend")
+        .versioning_configuration(
+            aws_sdk_s3::types::VersioningConfiguration::builder()
+                .status(aws_sdk_s3::types::BucketVersioningStatus::Suspended)
+                .build(),
+        )
         .send()
         .await
-        .expect_err("the locked null version must block the suspended delete");
+        .expect_err("suspending versioning on an Object Lock bucket must be rejected");
     assert!(
-        format!("{err:?}").contains("AccessDenied"),
-        "expected AccessDenied, got: {err:?}"
+        format!("{err:?}").contains("InvalidBucketState"),
+        "expected InvalidBucketState, got: {err:?}"
     );
+
+    // Enabling again is still fine.
+    set_versioning(&s3, "lock-no-suspend", true).await;
 }
 
 #[tokio::test]
-async fn s3_suspended_delete_allowed_when_only_a_newer_version_is_locked() {
-    // The mirror image: a locked enabled-era version that the marker does NOT
-    // touch must not block the delete.
+async fn s3_suspended_put_replaces_the_null_version() {
+    // A suspended-bucket PUT takes over the null version rather than stacking
+    // a new one: earlier real versions stay, and only one null is listed.
     let server = TestServer::start().await;
     let s3 = server.s3_client().await;
 
-    let output = server
-        .aws_cli(&[
-            "s3api",
-            "create-bucket",
-            "--bucket",
-            "susp-lock-ok",
-            "--object-lock-enabled-for-bucket",
-        ])
-        .await;
-    assert!(output.success(), "{}", output.stderr_text());
-
+    s3.create_bucket().bucket("susp-put").send().await.unwrap();
+    set_versioning(&s3, "susp-put", true).await;
     let put = s3
         .put_object()
-        .bucket("susp-lock-ok")
+        .bucket("susp-put")
         .key("doc.txt")
         .body(ByteStream::from_static(b"v1"))
         .send()
         .await
         .unwrap();
     let version = put.version_id().unwrap().to_string();
-    lock_version(&server, "susp-lock-ok", "doc.txt", &version).await;
 
-    set_versioning(&s3, "susp-lock-ok", false).await;
+    set_versioning(&s3, "susp-put", false).await;
+    for body in [&b"null-1"[..], &b"null-2"[..]] {
+        s3.put_object()
+            .bucket("susp-put")
+            .key("doc.txt")
+            .body(ByteStream::from(body.to_vec()))
+            .send()
+            .await
+            .unwrap();
+    }
 
-    let del = s3
-        .delete_object()
-        .bucket("susp-lock-ok")
-        .key("doc.txt")
+    let list = s3
+        .list_object_versions()
+        .bucket("susp-put")
         .send()
         .await
-        .expect("a marker that destroys no locked data must be allowed");
-    assert_eq!(del.delete_marker(), Some(true));
-    assert_eq!(del.version_id(), Some("null"));
+        .unwrap();
+    let nulls = list
+        .versions()
+        .iter()
+        .filter(|v| v.version_id() == Some("null"))
+        .count();
+    assert_eq!(nulls, 1, "only one null version: {:?}", list.versions());
+    assert_eq!(
+        list.versions().len(),
+        2,
+        "the enabled-era version survives: {:?}",
+        list.versions()
+    );
 
-    // The locked version is untouched.
     let got = s3
         .get_object()
-        .bucket("susp-lock-ok")
+        .bucket("susp-put")
+        .key("doc.txt")
+        .version_id("null")
+        .send()
+        .await
+        .expect("the null version is the latest suspended write");
+    let bytes = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(bytes.as_ref(), b"null-2");
+
+    let got = s3
+        .get_object()
+        .bucket("susp-put")
         .key("doc.txt")
         .version_id(&version)
         .send()
         .await
-        .expect("the locked version survives");
+        .expect("the enabled-era version is untouched");
     let bytes = got.body.collect().await.unwrap().into_bytes();
     assert_eq!(bytes.as_ref(), b"v1");
 }
 
 #[tokio::test]
-async fn s3_suspended_delete_checks_live_null_behind_a_history_marker() {
-    // A null-id delete marker can sit in the version history while a live null
-    // object is current (suspended puts do not append to the history). The
-    // lock check must look past the marker at the object the delete destroys.
+async fn s3_copy_preserves_the_null_version_on_a_versioned_bucket() {
+    // CopyObject onto a pre-versioning key must keep that object as the null
+    // version, exactly as PutObject does.
     let server = TestServer::start().await;
     let s3 = server.s3_client().await;
 
-    let output = server
-        .aws_cli(&[
-            "s3api",
-            "create-bucket",
-            "--bucket",
-            "susp-marker-lock",
-            "--object-lock-enabled-for-bucket",
-        ])
-        .await;
-    assert!(output.success(), "{}", output.stderr_text());
-    set_versioning(&s3, "susp-marker-lock", false).await;
-
+    s3.create_bucket().bucket("copy-null").send().await.unwrap();
     s3.put_object()
-        .bucket("susp-marker-lock")
+        .bucket("copy-null")
         .key("doc.txt")
-        .body(ByteStream::from_static(b"A"))
+        .body(ByteStream::from_static(b"original"))
         .send()
         .await
         .unwrap();
-    // Stacks a null delete marker into the history.
-    s3.delete_object()
-        .bucket("susp-marker-lock")
-        .key("doc.txt")
-        .send()
-        .await
-        .unwrap();
-    // A fresh live null object becomes current, behind that marker.
     s3.put_object()
-        .bucket("susp-marker-lock")
-        .key("doc.txt")
-        .body(ByteStream::from_static(b"B"))
+        .bucket("copy-null")
+        .key("src.txt")
+        .body(ByteStream::from_static(b"copied"))
         .send()
         .await
         .unwrap();
-    lock_version(&server, "susp-marker-lock", "doc.txt", "null").await;
+    set_versioning(&s3, "copy-null", true).await;
 
-    let err = s3
-        .delete_object()
-        .bucket("susp-marker-lock")
+    s3.copy_object()
+        .bucket("copy-null")
+        .key("doc.txt")
+        .copy_source("copy-null/src.txt")
+        .send()
+        .await
+        .unwrap();
+
+    let got = s3
+        .get_object()
+        .bucket("copy-null")
+        .key("doc.txt")
+        .version_id("null")
+        .send()
+        .await
+        .expect("the pre-versioning object survives the copy as the null version");
+    let bytes = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(bytes.as_ref(), b"original");
+
+    let current = s3
+        .get_object()
+        .bucket("copy-null")
         .key("doc.txt")
         .send()
         .await
-        .expect_err("the locked live null object must block the delete");
-    assert!(
-        format!("{err:?}").contains("AccessDenied"),
-        "expected AccessDenied, got: {err:?}"
-    );
+        .unwrap();
+    let bytes = current.body.collect().await.unwrap().into_bytes();
+    assert_eq!(bytes.as_ref(), b"copied");
+}
+
+#[tokio::test]
+async fn s3_multipart_complete_preserves_the_null_version() {
+    // Same rule for CompleteMultipartUpload.
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+
+    s3.create_bucket().bucket("mpu-null").send().await.unwrap();
+    s3.put_object()
+        .bucket("mpu-null")
+        .key("doc.txt")
+        .body(ByteStream::from_static(b"original"))
+        .send()
+        .await
+        .unwrap();
+    set_versioning(&s3, "mpu-null", true).await;
+
+    let create = s3
+        .create_multipart_upload()
+        .bucket("mpu-null")
+        .key("doc.txt")
+        .send()
+        .await
+        .unwrap();
+    let upload_id = create.upload_id().unwrap().to_string();
+    let part = s3
+        .upload_part()
+        .bucket("mpu-null")
+        .key("doc.txt")
+        .upload_id(&upload_id)
+        .part_number(1)
+        .body(ByteStream::from(vec![b'x'; 5 * 1024 * 1024]))
+        .send()
+        .await
+        .unwrap();
+    s3.complete_multipart_upload()
+        .bucket("mpu-null")
+        .key("doc.txt")
+        .upload_id(&upload_id)
+        .multipart_upload(
+            aws_sdk_s3::types::CompletedMultipartUpload::builder()
+                .parts(
+                    aws_sdk_s3::types::CompletedPart::builder()
+                        .part_number(1)
+                        .e_tag(part.e_tag().unwrap())
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    let got = s3
+        .get_object()
+        .bucket("mpu-null")
+        .key("doc.txt")
+        .version_id("null")
+        .send()
+        .await
+        .expect("the pre-versioning object survives the MPU as the null version");
+    let bytes = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(bytes.as_ref(), b"original");
 }
 
 #[tokio::test]

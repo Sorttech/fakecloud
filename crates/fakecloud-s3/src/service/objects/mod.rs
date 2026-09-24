@@ -29,6 +29,60 @@ mod write;
 
 impl S3Service {}
 
+/// Whether `obj` occupies the bucket's "null" version slot: either it predates
+/// versioning (no id at all) or it was written while versioning was suspended.
+pub(crate) fn is_null_version(obj: &crate::state::S3Object) -> bool {
+    obj.version_id.is_none() || obj.version_id.as_deref() == Some("null")
+}
+
+/// Record the current object as the `"null"` version before a new version is
+/// stacked on top of it, so it stays reachable through `ListObjectVersions`
+/// and `?versionId=null`.
+///
+/// Returns the sidecar the caller must persist (under the `"null"` slot): the
+/// loader files a `"null"` slot whose metadata carries no version id as the
+/// CURRENT object, where the newer version then replaces it, so without the
+/// rewrite this version is lost on the next restart.
+pub(crate) fn preserve_null_version_meta(
+    b: &mut crate::state::S3Bucket,
+    key: &str,
+) -> Option<fakecloud_persistence::ObjectMeta> {
+    let history_has_null = b
+        .object_versions
+        .get(key)
+        .map(|versions| versions.iter().any(is_null_version))
+        .unwrap_or(false);
+    if history_has_null {
+        return None;
+    }
+    let existing = b.objects.get(key).filter(|o| o.version_id.is_none())?;
+    let mut preserved = existing.clone();
+    preserved.version_id = Some("null".to_string());
+    let meta = crate::persistence::object_meta_snapshot(&preserved);
+    b.object_versions
+        .entry(key.to_string())
+        .or_default()
+        .push(preserved);
+    Some(meta)
+}
+
+/// Record `obj` as the bucket's null version after a write to a
+/// versioning-suspended bucket, replacing whatever held that slot (an older
+/// null object, or a null delete marker) exactly as AWS does. Only touches
+/// the history when the key already has one -- listings read the current
+/// object directly otherwise.
+pub(crate) fn replace_null_version(
+    b: &mut crate::state::S3Bucket,
+    key: &str,
+    obj: &crate::state::S3Object,
+) {
+    let Some(versions) = b.object_versions.get_mut(key) else {
+        return;
+    };
+    versions.retain(|o| !is_null_version(o));
+    versions.push(obj.clone());
+}
+
 /// Run a blocking closure (synchronous disk IO) without starving the async
 /// runtime. On a multi-threaded tokio runtime this uses `block_in_place` so
 /// the worker hands its other tasks to a sibling thread for the duration of
