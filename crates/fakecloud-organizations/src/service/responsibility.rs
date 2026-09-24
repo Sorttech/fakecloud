@@ -112,8 +112,12 @@ impl OrganizationsService {
         if !is_transfer_party(transfer, caller) {
             return Err(transfer_not_found(id));
         }
+        // Only an offer still awaiting an answer is the source's alone to
+        // withdraw. A terminal status falls through, so the caller gets the
+        // real "already in that status" answer rather than advice to
+        // decline a handshake that no longer exists.
         if transfer.source_management_account_id != caller
-            && (source_only || transfer.status != "ACCEPTED")
+            && (source_only || transfer.status == "REQUESTED")
         {
             return Err(AwsServiceError::aws_error(
                 StatusCode::FORBIDDEN,
@@ -189,7 +193,7 @@ impl OrganizationsService {
         // otherwise nothing can prove it is the target, and the
         // invitation would sit OPEN until it expired.
         let target_account_id = registry
-            .resolve_target_account(target_kind, &target_id)
+            .resolve_target_account(target_kind, &target_id, &source_org_id)
             .ok_or_else(|| {
                 invalid_input(&format!(
                     "No account is registered for {target_id}; \

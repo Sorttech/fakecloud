@@ -386,7 +386,7 @@ impl OrganizationsService {
         // Applies to an EMAIL target too, once it resolves to an account
         // fakecloud knows -- otherwise the invite would open a handshake
         // that could never be accepted.
-        if let Some(target) = guard.resolve_target_account(kind, &id) {
+        if let Some(target) = guard.resolve_target_account(kind, &id, &org_id) {
             if let Some(other) = guard.org_of_account(&target) {
                 if other.org_id != org_id {
                     return Err(org_error_to_aws(

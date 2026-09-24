@@ -151,18 +151,32 @@ impl OrganizationsRegistry {
     }
 
     /// Resolve a handshake or transfer target to an account id, matching
-    /// an `EMAIL` target against the address each member account is
+    /// an `EMAIL` target against the address the members of `within` are
     /// actually registered with before falling back to the synthetic
-    /// form. Without this, a member created with a real email address is
-    /// invisible to the "one organization per account" guards, which
-    /// could then open an invitation for an account already enrolled.
-    pub fn resolve_target_account(&self, target_kind: &str, target: &str) -> Option<String> {
+    /// form. Without the address lookup, a member created with a real
+    /// email is invisible to the "one organization per account" guards,
+    /// which could then open an invitation for an account already
+    /// enrolled.
+    ///
+    /// The lookup is deliberately scoped to ONE organization. Scanning
+    /// every organization would turn an invitation into an
+    /// email-to-account-id oracle: a caller could name an address, be
+    /// told "already a member of an organization", and read back a
+    /// 12-digit id belonging to an organization it has no relationship
+    /// with.
+    pub fn resolve_target_account(
+        &self,
+        target_kind: &str,
+        target: &str,
+        within: &str,
+    ) -> Option<String> {
         if let Some(id) = target_account_id(target_kind, target) {
             return Some(id);
         }
         self.orgs
+            .get(within)?
+            .accounts
             .values()
-            .flat_map(|org| org.accounts.values())
             .find(|account| account.email == target)
             .map(|account| account.id.clone())
     }

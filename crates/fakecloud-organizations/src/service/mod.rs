@@ -993,7 +993,14 @@ fn handshake_payload(h: &crate::state::Handshake) -> Value {
         {"Id": h.organization_id, "Type": "ORGANIZATION"},
         {"Id": h.source_account_id, "Type": "ACCOUNT"},
         {
-            "Id": h.target_email.clone().unwrap_or_else(|| h.target_account_id.clone()),
+            // Pick the id by the party's own Type. Preferring
+            // `target_email` whenever it was recorded rendered an address
+            // under `Type: ACCOUNT` for any handshake that stored both.
+            "Id": if h.target_kind == "EMAIL" {
+                h.target_email.clone().unwrap_or_else(|| h.target_account_id.clone())
+            } else {
+                h.target_account_id.clone()
+            },
             "Type": h.target_kind,
         },
     ]);
