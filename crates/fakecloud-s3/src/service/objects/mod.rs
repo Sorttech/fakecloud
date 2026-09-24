@@ -264,6 +264,6 @@ mod null_version_tests {
         // entry -- listings read the current object directly.
         let mut b = bucket();
         replace_null_version(&mut b, "k", &object(Some("null"), "e1", false));
-        assert!(b.object_versions.get("k").is_none());
+        assert!(!b.object_versions.contains_key("k"));
     }
 }
