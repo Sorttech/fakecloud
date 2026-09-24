@@ -203,10 +203,17 @@ impl S3Service {
             });
         }
 
-        // Check object lock for non-version-specific deletes on buckets that
-        // overwrite in place: never-versioned ones, and suspended ones (whose
-        // null version the new delete marker replaces).
-        if !versioning_enabled {
+        // Object lock only bites when the delete overwrites data in place:
+        // a never-versioned bucket removes the object outright, and a
+        // suspended one replaces the null version with the marker. A
+        // suspended bucket whose current object is a real (enabled-era)
+        // version keeps that version, so the lock must not reject there.
+        let current_is_null_version = b
+            .objects
+            .get(key)
+            .map(|o| o.version_id.is_none() || o.version_id.as_deref() == Some("null"))
+            .unwrap_or(false);
+        if !versioning_configured || (!versioning_enabled && current_is_null_version) {
             if let Some(existing) = b.objects.get(key) {
                 if !existing.is_delete_marker {
                     if let Some(code) = check_object_lock_for_overwrite(existing, req) {
@@ -259,9 +266,15 @@ impl S3Service {
             b.objects.insert(key.to_string(), marker);
             resp_headers.insert("x-amz-version-id", dm_id.parse().unwrap());
             resp_headers.insert("x-amz-delete-marker", "true".parse().unwrap());
-            self.store
-                .delete_object(bucket, key, None)
-                .map_err(crate::service::persistence_error)?;
+            if !versioning_enabled {
+                // Suspended: the marker takes over the "null" slot, so the
+                // object that occupied it goes. On an Enabled bucket that
+                // slot holds the preserved pre-versioning version, which the
+                // marker must NOT destroy (the store keys `None` as "null").
+                self.store
+                    .delete_object(bucket, key, None)
+                    .map_err(crate::service::persistence_error)?;
+            }
             self.store
                 .put_object(
                     bucket,
@@ -525,6 +538,30 @@ impl S3Service {
                 // that the marker takes the literal "null" version id and
                 // replaces the existing null version (see delete_object).
                 //
+                // The lock check runs FIRST: a denied entry must leave the
+                // bucket untouched, and the preserve step below would
+                // otherwise have already written a version-history entry for
+                // a request that ends in AccessDenied.
+                let current_is_null_version = b
+                    .objects
+                    .get(key)
+                    .map(|o| o.version_id.is_none() || o.version_id.as_deref() == Some("null"))
+                    .unwrap_or(false);
+                if !versioning_enabled && current_is_null_version {
+                    let lock_denied = b
+                        .objects
+                        .get(key)
+                        .filter(|existing| !existing.is_delete_marker)
+                        .and_then(|existing| check_object_lock_for_overwrite(existing, req));
+                    if let Some(code) = lock_denied {
+                        error_xml.push_str(&format!(
+                            "<Error><Key>{}</Key><Code>{}</Code><Message>Access Denied</Message></Error>",
+                            xml_escape(key),
+                            code,
+                        ));
+                        continue;
+                    }
+                }
                 // Preserve any pre-versioning object as a "null" version
                 // before stacking the delete marker on top, otherwise
                 // the existing data is shadowed by the marker and lost
@@ -541,24 +578,6 @@ impl S3Service {
                             .push(preserved);
                     }
                 }
-                // A suspended-bucket marker overwrites the null version, so
-                // object lock must be honored exactly as on an unversioned
-                // bucket; an enabled bucket only stacks a new version.
-                if !versioning_enabled {
-                    let lock_denied = b
-                        .objects
-                        .get(key)
-                        .filter(|existing| !existing.is_delete_marker)
-                        .and_then(|existing| check_object_lock_for_overwrite(existing, req));
-                    if let Some(code) = lock_denied {
-                        error_xml.push_str(&format!(
-                            "<Error><Key>{}</Key><Code>{}</Code><Message>Access Denied</Message></Error>",
-                            xml_escape(key),
-                            code,
-                        ));
-                        continue;
-                    }
-                }
                 let dm_id = if versioning_enabled {
                     Uuid::new_v4().to_string()
                 } else {
@@ -570,12 +589,28 @@ impl S3Service {
                     "null".to_string()
                 };
                 let marker = make_delete_marker(key, &dm_id);
+                let marker_meta = object_meta_snapshot(&marker);
                 b.object_versions
                     .entry(key.to_string())
                     .or_default()
                     .push(marker.clone());
                 b.objects.insert(key.to_string(), marker);
-                if let Err(e) = self.store.delete_object(bucket, key, None) {
+                // Mirror the single-object path: drop the null slot only when
+                // the marker replaces it (suspended), and always persist the
+                // marker itself so a restart does not resurrect the object.
+                if !versioning_enabled {
+                    if let Err(e) = self.store.delete_object(bucket, key, None) {
+                        persist_error = Some(crate::service::persistence_error(e));
+                        break;
+                    }
+                }
+                if let Err(e) = self.store.put_object(
+                    bucket,
+                    key,
+                    Some(dm_id.as_str()),
+                    BodySource::Bytes(Bytes::new()),
+                    &marker_meta,
+                ) {
                     persist_error = Some(crate::service::persistence_error(e));
                     break;
                 }

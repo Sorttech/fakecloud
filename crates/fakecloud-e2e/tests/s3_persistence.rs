@@ -461,6 +461,83 @@ async fn persistence_versioning_round_trip() {
 }
 
 #[tokio::test]
+async fn persistence_batch_delete_marker_survives_restart() {
+    // DeleteObjects used to record its delete marker only in memory, so a
+    // restart resurrected the deleted key with its newest version current.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut server = TestServer::start_persistent(tmp.path()).await;
+    let client = server.s3_client().await;
+
+    client
+        .create_bucket()
+        .bucket("batch-marker")
+        .send()
+        .await
+        .unwrap();
+    client
+        .put_bucket_versioning()
+        .bucket("batch-marker")
+        .versioning_configuration(
+            VersioningConfiguration::builder()
+                .status(BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    client
+        .put_object()
+        .bucket("batch-marker")
+        .key("doc.txt")
+        .body(ByteStream::from_static(b"v1"))
+        .send()
+        .await
+        .unwrap();
+
+    client
+        .delete_objects()
+        .bucket("batch-marker")
+        .delete(
+            aws_sdk_s3::types::Delete::builder()
+                .objects(
+                    aws_sdk_s3::types::ObjectIdentifier::builder()
+                        .key("doc.txt")
+                        .build()
+                        .unwrap(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    server.restart().await;
+    let client = server.s3_client().await;
+
+    let err = client
+        .get_object()
+        .bucket("batch-marker")
+        .key("doc.txt")
+        .send()
+        .await
+        .expect_err("the delete marker must survive the restart");
+    assert!(
+        format!("{err:?}").contains("NoSuchKey"),
+        "expected NoSuchKey after restart, got: {err:?}"
+    );
+
+    let list = client
+        .list_object_versions()
+        .bucket("batch-marker")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(list.delete_markers().len(), 1, "marker must be persisted");
+    assert_eq!(list.versions().len(), 1, "the original version survives");
+}
+
+#[tokio::test]
 async fn persistence_bucket_subresources_round_trip() {
     let tmp = tempfile::tempdir().unwrap();
     let mut server = TestServer::start_persistent(tmp.path()).await;
