@@ -1718,6 +1718,12 @@ async fn s3_cors_preflight_and_response_headers() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 400);
+    // Still Vary: this 400 differs from the 200 an allowed origin gets, so a
+    // cache must not replay it to a real preflight.
+    assert_eq!(
+        resp.headers().get("vary").unwrap(),
+        "Origin, Access-Control-Request-Headers, Access-Control-Request-Method"
+    );
     assert!(resp.text().await.unwrap().contains("Origin request header"));
 
     // A preflight declaring a header the rule does not cover is denied. The
@@ -1898,8 +1904,9 @@ async fn s3_cors_preflight_and_response_headers() {
     assert_eq!(resp.status(), 400);
     assert!(resp.text().await.unwrap().contains("MalformedXML"));
 
-    // A bucket with no CORS config at all answers preflights identically for
-    // every origin, so that 403 carries no Vary.
+    // A bucket with no CORS config still answers preflights differently by
+    // Origin — 403 with one, 400 without — so its denial carries Vary too, and
+    // says CORS is not enabled rather than borrowing the not-whitelisted text.
     s3.create_bucket()
         .bucket("no-cors-bucket")
         .send()
@@ -1916,9 +1923,10 @@ async fn s3_cors_preflight_and_response_headers() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 403);
-    assert!(resp.headers().get("vary").is_none());
-    // ...and says so, rather than reporting the not-whitelisted denial that
-    // belongs to a bucket whose CORS is configured.
+    assert_eq!(
+        resp.headers().get("vary").unwrap(),
+        "Origin, Access-Control-Request-Headers, Access-Control-Request-Method"
+    );
     assert!(resp
         .text()
         .await

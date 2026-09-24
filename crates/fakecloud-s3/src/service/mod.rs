@@ -497,21 +497,29 @@ impl AwsService for S3Service {
                 // preflight with no `Origin` carries nothing to evaluate and is
                 // a malformed request, distinct from the 403 a disallowed
                 // origin gets. Empty counts as absent, as on every other path.
+                // Every preflight response varies by `Origin` — absent is a
+                // 400, present-and-allowed a 200, present-and-disallowed a 403
+                // — so all three carry `Vary`. Without it a cache keying the
+                // 400 from a bare health-check `OPTIONS` would replay it to a
+                // real browser preflight for the same URL.
+                let vary = || vec![("vary".to_string(), CORS_VARY.to_string())];
+
                 // Only the missing-`Origin` case is a documented 400. A
                 // preflight that carries `Origin` but no request-method is an
                 // ordinary non-allowed preflight and falls through to the 403
-                // below, whose message now distinguishes an unconfigured
-                // bucket from a non-matching rule.
+                // below, whose message distinguishes an unconfigured bucket
+                // from a non-matching rule.
                 if !req
                     .headers
                     .get("origin")
                     .and_then(|v| v.to_str().ok())
                     .is_some_and(|o| !o.trim().is_empty())
                 {
-                    return Err(AwsServiceError::aws_error(
+                    return Err(AwsServiceError::aws_error_with_headers(
                         StatusCode::BAD_REQUEST,
                         "InvalidRequest",
                         "Insufficient information. Origin request header needed.",
+                        vary(),
                     ));
                 }
                 let cors_config = {
@@ -611,36 +619,25 @@ impl AwsService for S3Service {
                         });
                     }
                 }
-                // A rejected preflight still carries `Vary` when the bucket has
-                // a CORS config: the same OPTIONS is a 403 for this origin and
-                // a 200 for an allowed one, so a cache that keyed this 403
-                // without `Origin` would replay it to the allowed origin's
-                // preflight and break a legitimate cross-origin request. A
-                // bucket with no CORS config answers identically for everyone
-                // and needs no `Vary`. (Reaching here means an `Origin` was
-                // present — the guard above rejects a preflight without one.)
                 // S3 distinguishes the two denials, and so must this: a caller
                 // otherwise cannot tell an unconfigured bucket from one whose
-                // rules simply do not cover their request.
-                let (headers, message) = if cors_config.is_some() {
-                    (
-                        vec![("vary".to_string(), CORS_VARY.to_string())],
-                        "CORSResponse: This CORS request is not allowed. This is usually because \
-                         the evaluation of Origin, request method / Access-Control-Request-Method \
-                         or Access-Control-Request-Headers are not whitelisted by the resource's \
-                         CORS spec.",
-                    )
+                // rules simply do not cover their request. Both carry `Vary` —
+                // even on an unconfigured bucket this 403 differs from the 400
+                // an `Origin`-less preflight gets, so the response still turns
+                // on `Origin` and must not be cached across origins.
+                let message = if cors_config.is_some() {
+                    "CORSResponse: This CORS request is not allowed. This is usually because \
+                     the evaluation of Origin, request method / Access-Control-Request-Method \
+                     or Access-Control-Request-Headers are not whitelisted by the resource's \
+                     CORS spec."
                 } else {
-                    (
-                        Vec::new(),
-                        "CORSResponse: CORS is not enabled for this bucket.",
-                    )
+                    "CORSResponse: CORS is not enabled for this bucket."
                 };
                 return Err(AwsServiceError::aws_error_with_headers(
                     StatusCode::FORBIDDEN,
                     "AccessForbidden",
                     message,
-                    headers,
+                    vary(),
                 ));
             }
         }
