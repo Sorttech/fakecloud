@@ -2566,11 +2566,11 @@ pub(crate) fn resolve_object<'a>(
         if vid == "null" {
             let is_null =
                 |o: &S3Object| o.version_id.is_none() || o.version_id.as_deref() == Some("null");
-            // A live null object wins over a stale null delete marker left in
-            // the history: a suspended-bucket put replaces the null version
-            // without touching the history, so both can be present and the
-            // object is the one the caller means (and the one the lock paths
-            // act on). A marker is only returned when it is the only null.
+            // A live null object wins over a null delete marker: the marker is
+            // only the null version until a write takes the slot back, and a
+            // key with no version history at all keeps its null object in
+            // `objects` alone. A marker is returned only when it is the only
+            // null entry, where it correctly reports the key as deleted.
             if let Some(versions) = b.object_versions.get(key) {
                 if let Some(obj) = versions.iter().find(|o| is_null(o) && !o.is_delete_marker) {
                     return Ok(obj);

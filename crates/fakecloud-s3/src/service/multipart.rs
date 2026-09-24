@@ -540,6 +540,7 @@ impl S3Service {
             region,
             notification_config,
             versioning_enabled,
+            versioning_suspended,
             acl_owner_id,
         ) = {
             let accts = self.state.read();
@@ -566,6 +567,7 @@ impl S3Service {
                 state.region.clone(),
                 b.notification_config.clone(),
                 b.versioning.as_deref() == Some("Enabled"),
+                b.versioning.as_deref() == Some("Suspended"),
                 b.acl_owner_id.clone(),
             )
         };
@@ -722,7 +724,7 @@ impl S3Service {
             None
         };
 
-        let mut obj = S3Object {
+        let obj = S3Object {
             key: key.to_string(),
             size: data.len() as u64,
             body: crate::state::memory_body(data),
@@ -758,6 +760,14 @@ impl S3Service {
         // concurrent complete). A concurrent Abort/Complete that removed the
         // upload during assembly is honored (idempotent re-completion) rather
         // than resurrected (bug-audit 2026-05-28, 4.3 class).
+        // A suspended-bucket completion owns the "null" version. Tag it before
+        // the snapshot so the persisted sidecar carries that id; a `null` slot
+        // whose metadata has no version id is loaded as a bare current object
+        // and then overwritten by the newest real version on restart.
+        let mut obj = obj;
+        if versioning_suspended {
+            obj.version_id = Some("null".to_string());
+        }
         let meta = object_meta_snapshot(&obj);
         {
             let mut accts = self.state.write();
@@ -779,6 +789,38 @@ impl S3Service {
                 // intact for retry/abort; nothing has been persisted yet.
                 if if_none_match.as_deref() == Some("*") && b.objects.contains_key(key) {
                     return Err(precondition_failed("If-None-Match"));
+                }
+            }
+            // Record the preserved null version -- sidecar, history entry and
+            // the retag of the current object -- before the completion runs.
+            // It describes the object that is ALREADY there: on a
+            // versioning-enabled bucket the pre-versioning object is the null
+            // version whether or not this upload completes. Doing all three
+            // together means a failed `mpu_complete` leaves disk and memory
+            // agreeing, instead of a sidecar that claims a version memory
+            // does not have.
+            if versioning_enabled {
+                let preserved = {
+                    let b = accts
+                        .get_or_create(account_id)
+                        .buckets
+                        .get(bucket)
+                        .ok_or_else(|| no_such_bucket(bucket))?;
+                    crate::service::objects::null_version_to_preserve(b, key)
+                };
+                if let Some(preserved) = preserved {
+                    let preserved_meta = object_meta_snapshot(&preserved);
+                    let store = self.store.clone();
+                    crate::service::objects::run_blocking_io(|| {
+                        store.put_object_meta(bucket, key, Some("null"), &preserved_meta)
+                    })
+                    .map_err(super::persistence_error)?;
+                    let b = accts
+                        .get_or_create(account_id)
+                        .buckets
+                        .get_mut(bucket)
+                        .ok_or_else(|| no_such_bucket(bucket))?;
+                    crate::service::objects::record_preserved_null(b, key, preserved);
                 }
             }
             // Checks passed — persist, then commit to memory, all under the
@@ -816,17 +858,14 @@ impl S3Service {
             // and `?versionId=<mpu>` 404'd. Mirror put_object: push the new
             // object as a version (bug-audit 2026-06-20, 4.1).
             if versioning_enabled {
-                let versions = b.object_versions.entry(key.to_string()).or_default();
-                // Preserve an untracked pre-versioning current object as the
-                // first version before appending the new one.
-                if versions.is_empty() {
-                    if let Some(existing) = b.objects.get(key) {
-                        if existing.version_id.is_none() {
-                            versions.push(existing.clone());
-                        }
-                    }
-                }
-                versions.push(obj.clone());
+                // The completed upload is a new version of its own; the null
+                // version it may have displaced was recorded above.
+                b.object_versions
+                    .entry(key.to_string())
+                    .or_default()
+                    .push(obj.clone());
+            } else if versioning_suspended {
+                crate::service::objects::replace_null_version(b, key, &obj);
             }
             b.objects.insert(key.to_string(), obj);
         }

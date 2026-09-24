@@ -97,6 +97,7 @@ impl S3Service {
         // --- Read lock phase: validate preconditions and read bucket config ---
         let (
             versioning_enabled,
+            versioning_suspended,
             acl_owner_id,
             encryption_config,
             object_lock_config,
@@ -149,6 +150,7 @@ impl S3Service {
 
             (
                 b.versioning.as_deref() == Some("Enabled"),
+                b.versioning.as_deref() == Some("Suspended"),
                 b.acl_owner_id.clone(),
                 b.encryption_config.clone(),
                 b.object_lock_config.clone(),
@@ -513,7 +515,7 @@ impl S3Service {
         } else {
             BodySource::File(spooled.path)
         };
-        let obj = S3Object {
+        let mut obj = S3Object {
             key: key.to_string(),
             size: plaintext_size,
             // The runtime body is filled in below with the BodyRef
@@ -579,54 +581,31 @@ impl S3Service {
             }
 
             if versioning_enabled {
-                // Preserve the current object as the "null" version whenever
-                // it carries no id and the history has no null entry yet --
-                // not merely when the history is empty, since a bucket can be
-                // enabled, suspended (writing a null current), and enabled
-                // again with versions already recorded.
-                let history_has_null = b
-                    .object_versions
-                    .get(key)
-                    .map(|versions| {
-                        versions.iter().any(|o| {
-                            o.version_id.is_none() || o.version_id.as_deref() == Some("null")
-                        })
-                    })
-                    .unwrap_or(false);
-                let preserved = if history_has_null {
-                    None
-                } else {
-                    b.objects
-                        .get(key)
-                        .filter(|e| e.version_id.is_none())
-                        .map(|existing| {
-                            let mut preserved = existing.clone();
-                            preserved.version_id = Some("null".to_string());
-                            preserved
-                        })
-                };
-                if let Some(preserved) = preserved {
-                    // Persist BEFORE recording it in memory: a failed sidecar
-                    // write must not leave a version in the history that disk
-                    // does not have. The loader files a "null" slot whose
-                    // sidecar has no version id as the CURRENT object, which
-                    // the new version then replaces -- so the sidecar has to
-                    // record the id or this version is lost on a restart.
+                // The current object becomes the "null" version once a real
+                // version is stacked on top of it. Persist the rewritten
+                // sidecar BEFORE recording it in memory, so a failed write
+                // cannot leave a version in the history that disk lacks.
+                if let Some(preserved) = super::null_version_to_preserve(b, key) {
                     let preserved_meta = crate::persistence::object_meta_snapshot(&preserved);
                     super::run_blocking_io(|| {
                         self.store
                             .put_object_meta(bucket, key, Some("null"), &preserved_meta)
                     })
                     .map_err(crate::service::persistence_error)?;
-                    b.object_versions
-                        .entry(key.to_string())
-                        .or_default()
-                        .push(preserved);
+                    super::record_preserved_null(b, key, preserved);
                 }
                 b.object_versions
                     .entry(key.to_string())
                     .or_default()
                     .push(obj.clone());
+            } else if versioning_suspended {
+                // A suspended write takes over the null version, replacing
+                // whatever held it (an older null object or a null delete
+                // marker), as on AWS. Tagging it "null" also keeps the disk
+                // sidecar in the versioned set, so a restart-loaded bucket
+                // agrees with the live one about which object is current.
+                obj.version_id = Some("null".to_string());
+                super::replace_null_version(b, key, &obj);
             }
             b.objects.insert(key.to_string(), obj);
 
@@ -653,7 +632,11 @@ impl S3Service {
                 if let Some(o) = b2.objects.get_mut(key) {
                     o.body = returned_body.clone();
                 }
-                if versioning_enabled {
+                // The entry this write just appended -- the new version on an
+                // enabled bucket, the replaced null version on a suspended one
+                // -- has to point at the file the store actually wrote, or a
+                // read of it serves the pre-write placeholder body.
+                if versioning_enabled || versioning_suspended {
                     if let Some(versions) = b2.object_versions.get_mut(key) {
                         if let Some(last) = versions.last_mut() {
                             last.body = returned_body;
@@ -1207,11 +1190,39 @@ impl S3Service {
         };
 
         // Store in version history if versioning enabled
-        if db.versioning.as_deref() == Some("Enabled") {
+        let dest_versioning_enabled = db.versioning.as_deref() == Some("Enabled");
+        let dest_versioning_suspended = db.versioning.as_deref() == Some("Suspended");
+        let mut dest_obj = dest_obj;
+        if dest_versioning_enabled {
+            // Same rule as PutObject: the destination's pre-versioning object
+            // becomes the "null" version instead of vanishing under the copy.
+            // Persist its sidecar before recording anything in memory.
+            if let Some(preserved) = super::null_version_to_preserve(db, dest_key) {
+                let preserved_meta = crate::persistence::object_meta_snapshot(&preserved);
+                super::run_blocking_io(|| {
+                    self.store
+                        .put_object_meta(dest_bucket, dest_key, Some("null"), &preserved_meta)
+                })
+                .map_err(crate::service::persistence_error)?;
+                let db = state
+                    .buckets
+                    .get_mut(dest_bucket)
+                    .ok_or_else(|| no_such_bucket(dest_bucket))?;
+                super::record_preserved_null(db, dest_key, preserved);
+            }
+        }
+        let db = state
+            .buckets
+            .get_mut(dest_bucket)
+            .ok_or_else(|| no_such_bucket(dest_bucket))?;
+        if dest_versioning_enabled {
             db.object_versions
                 .entry(dest_key.to_string())
                 .or_default()
                 .push(dest_obj.clone());
+        } else if dest_versioning_suspended {
+            dest_obj.version_id = Some("null".to_string());
+            super::replace_null_version(db, dest_key, &dest_obj);
         }
         db.objects.insert(dest_key.to_string(), dest_obj);
         let dest_meta = {
@@ -1239,9 +1250,15 @@ impl S3Service {
             if let Some(o) = db2.objects.get_mut(dest_key) {
                 o.body = dest_body_ref.clone();
             }
-            if let Some(versions) = db2.object_versions.get_mut(dest_key) {
-                if let Some(last) = versions.last_mut() {
-                    last.body = dest_body_ref;
+            // Only the version this copy just appended may be repointed at the
+            // new file. On a bucket that is not versioning-enabled the newest
+            // history entry belongs to some earlier version, and rewriting its
+            // body would serve the copied bytes for that version id instead.
+            if dest_versioning_enabled || dest_versioning_suspended {
+                if let Some(versions) = db2.object_versions.get_mut(dest_key) {
+                    if let Some(last) = versions.last_mut() {
+                        last.body = dest_body_ref;
+                    }
                 }
             }
         }

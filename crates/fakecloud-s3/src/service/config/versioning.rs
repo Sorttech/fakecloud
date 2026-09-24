@@ -21,6 +21,16 @@ impl S3Service {
             .buckets
             .get_mut(bucket)
             .ok_or_else(|| no_such_bucket(bucket))?;
+        // AWS refuses to suspend versioning on an Object Lock bucket: lock
+        // retention is enforced per version, and suspending would let a null
+        // version overwrite a retained one.
+        if status_val == "Suspended" && b.object_lock_config.is_some() {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::CONFLICT,
+                "InvalidBucketState",
+                "An Object Lock configuration is present on this bucket, so the versioning state cannot be changed.",
+            ));
+        }
         if status_val == "Enabled" || status_val == "Suspended" {
             b.versioning = Some(status_val);
         }
