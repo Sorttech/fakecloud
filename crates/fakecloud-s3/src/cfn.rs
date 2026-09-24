@@ -51,6 +51,14 @@ pub fn apply_cfn_bucket_properties(
     let Some(obj) = props.as_object() else {
         return Ok(());
     };
+
+    // Validate before persisting anything. Each property below writes through
+    // to the store as it goes, so a validation failure partway would leave the
+    // bucket with some subresources written and others not.
+    if let Some(xml) = obj.get("CorsConfiguration").and_then(build_cors_xml) {
+        crate::service::config::validate_cors_xml(&xml)
+            .map_err(|(code, message)| format!("{code}: {message}"))?;
+    }
     // `versioning` and `eventbridge_enabled` live in the bucket meta snapshot,
     // so a single `put_bucket_meta` at the end covers both — mirroring how the
     // versioning/notification handlers persist them.
@@ -112,12 +120,7 @@ pub fn apply_cfn_bucket_properties(
 
     if let Some(c) = obj.get("CorsConfiguration") {
         if let Some(xml) = build_cors_xml(c) {
-            // Same validation `PutBucketCors` applies. Without it a template
-            // could store a rule that matches no request — omitted
-            // AllowedMethods, a multi-wildcard value — and the stack would
-            // deploy green while every preflight against the bucket 403s.
-            crate::service::config::validate_cors_xml(&xml)
-                .map_err(|(code, message)| format!("{code}: {message}"))?;
+            // Already validated above, before any subresource was persisted.
             bucket.cors_config = Some(xml.clone());
             persist_sub(store, &bucket.name, BucketSubresource::Cors, &xml)?;
         }

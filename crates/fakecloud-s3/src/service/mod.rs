@@ -3210,9 +3210,34 @@ pub(crate) struct CorsRule {
 }
 
 /// Parse CORS configuration XML into rules.
+/// Remove `<!-- ... -->` spans so tag scanning sees only live markup.
+///
+/// Every scan of a CORS body goes through this, so validation and request-time
+/// parsing always see the same markup. An unterminated comment swallows the
+/// rest of the body, which then fails the rule-count check as the malformed
+/// XML it is.
+pub(crate) fn strip_xml_comments(xml: &str) -> String {
+    let mut out = String::with_capacity(xml.len());
+    let mut rest = xml;
+    while let Some(start) = rest.find("<!--") {
+        out.push_str(&rest[..start]);
+        match rest[start + 4..].find("-->") {
+            Some(end) => rest = &rest[start + 4 + end + 3..],
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 pub(crate) fn parse_cors_config(xml: &str) -> Vec<CorsRule> {
+    // Comments are stripped here, not only in `validate_cors_xml`: the stored
+    // body is the raw text, so if the two disagreed a `<CORSRule>` inside an
+    // `<!-- ... -->` would pass validation as absent and then go live at
+    // request time, handing out an allow-origin the caller never wrote.
+    let stripped = strip_xml_comments(xml);
     let mut rules = Vec::new();
-    let mut remaining = xml;
+    let mut remaining = stripped.as_str();
     while let Some(start) = remaining.find("<CORSRule>") {
         let after = &remaining[start + 10..];
         if let Some(end) = after.find("</CORSRule>") {

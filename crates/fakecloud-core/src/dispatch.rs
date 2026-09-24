@@ -966,12 +966,15 @@ pub async fn dispatch(
                 detected.protocol,
                 err.extra_fields(),
             );
+            // `append`, not `insert`: a service may attach two entries for one
+            // list-valued header (S3 adds `Vary` to an error that could carry
+            // its own), and inserting would keep only the last.
             for (k, v) in &error_headers {
                 if let (Ok(name), Ok(val)) = (
                     k.parse::<http::header::HeaderName>(),
                     v.parse::<http::header::HeaderValue>(),
                 ) {
-                    resp.headers_mut().insert(name, val);
+                    resp.headers_mut().append(name, val);
                 }
             }
             resp

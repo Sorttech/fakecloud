@@ -438,6 +438,25 @@ fn find_cors_rule_denies_requested_headers_when_rule_allows_none() {
 }
 
 #[test]
+fn parse_cors_config_ignores_commented_out_rules() {
+    // The stored body is the raw text, so the request-time parser has to skip
+    // comments exactly as validation does. If it did not, a commented-out rule
+    // would pass validation as absent and then go live, handing an
+    // allow-origin to an origin and method the caller never enabled.
+    let xml = "<CORSConfiguration>\
+        <!-- <CORSRule><AllowedOrigin>*</AllowedOrigin><AllowedMethod>DELETE</AllowedMethod></CORSRule> -->\
+        <CORSRule>\
+            <AllowedOrigin>https://app.example.com</AllowedOrigin>\
+            <AllowedMethod>GET</AllowedMethod>\
+        </CORSRule>\
+    </CORSConfiguration>";
+    let rules = parse_cors_config(xml);
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].allowed_methods, vec!["GET"]);
+    assert!(find_cors_rule(&rules, "https://evil.example", "DELETE", &[]).is_none());
+}
+
+#[test]
 fn test_header_matches() {
     // AWS permits one `*` per AllowedHeader; names are case-insensitive.
     assert!(header_matches("x-amz-meta-foo", "x-amz-*"));

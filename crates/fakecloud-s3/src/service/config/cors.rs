@@ -1,24 +1,7 @@
 //! `S3Service` `cors` family — extracted from service.rs by audit-2026-05-19.
 
 use super::*;
-use crate::service::parse_cors_config;
-
-/// Remove `<!-- ... -->` spans so tag scanning sees only live markup.
-/// An unterminated comment swallows the rest of the body, which then fails the
-/// rule-count check as the malformed XML it is.
-fn strip_xml_comments(xml: &str) -> String {
-    let mut out = String::with_capacity(xml.len());
-    let mut rest = xml;
-    while let Some(start) = rest.find("<!--") {
-        out.push_str(&rest[..start]);
-        match rest[start + 4..].find("-->") {
-            Some(end) => rest = &rest[start + 4 + end + 3..],
-            None => return out,
-        }
-    }
-    out.push_str(rest);
-    out
-}
+use crate::service::{parse_cors_config, strip_xml_comments};
 
 const MALFORMED_XML: &str =
     "The XML you provided was not well-formed or did not validate against our published schema";
@@ -52,7 +35,7 @@ pub(crate) fn validate_cors_xml(body_str: &str) -> Result<(), (&'static str, Str
 
     // Validate HTTP methods
     let valid_methods = ["GET", "PUT", "POST", "DELETE", "HEAD"];
-    let mut remaining = body_str;
+    let mut remaining = scannable.as_str();
     while let Some(start) = remaining.find("<AllowedMethod>") {
         let after = &remaining[start + 15..];
         if let Some(end) = after.find("</AllowedMethod>") {
