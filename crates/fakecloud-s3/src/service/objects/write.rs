@@ -585,12 +585,17 @@ impl S3Service {
                 // version is stacked on top of it. Persist the rewritten
                 // sidecar BEFORE recording it in memory, so a failed write
                 // cannot leave a version in the history that disk lacks.
-                if let Some(preserved_meta) = super::preserve_null_version_meta(b, key) {
+                if let Some(preserved) = super::null_version_to_preserve(b, key) {
+                    let preserved_meta = crate::persistence::object_meta_snapshot(&preserved);
                     super::run_blocking_io(|| {
                         self.store
                             .put_object_meta(bucket, key, Some("null"), &preserved_meta)
                     })
                     .map_err(crate::service::persistence_error)?;
+                    b.object_versions
+                        .entry(key.to_string())
+                        .or_default()
+                        .push(preserved);
                 }
                 b.object_versions
                     .entry(key.to_string())
@@ -1191,11 +1196,32 @@ impl S3Service {
         let dest_versioning_enabled = db.versioning.as_deref() == Some("Enabled");
         let dest_versioning_suspended = db.versioning.as_deref() == Some("Suspended");
         let mut dest_obj = dest_obj;
-        let mut preserved_null_meta = None;
         if dest_versioning_enabled {
             // Same rule as PutObject: the destination's pre-versioning object
             // becomes the "null" version instead of vanishing under the copy.
-            preserved_null_meta = super::preserve_null_version_meta(db, dest_key);
+            // Persist its sidecar before recording anything in memory.
+            if let Some(preserved) = super::null_version_to_preserve(db, dest_key) {
+                let preserved_meta = crate::persistence::object_meta_snapshot(&preserved);
+                super::run_blocking_io(|| {
+                    self.store
+                        .put_object_meta(dest_bucket, dest_key, Some("null"), &preserved_meta)
+                })
+                .map_err(crate::service::persistence_error)?;
+                let db = state
+                    .buckets
+                    .get_mut(dest_bucket)
+                    .ok_or_else(|| no_such_bucket(dest_bucket))?;
+                db.object_versions
+                    .entry(dest_key.to_string())
+                    .or_default()
+                    .push(preserved);
+            }
+        }
+        let db = state
+            .buckets
+            .get_mut(dest_bucket)
+            .ok_or_else(|| no_such_bucket(dest_bucket))?;
+        if dest_versioning_enabled {
             db.object_versions
                 .entry(dest_key.to_string())
                 .or_default()
@@ -1205,13 +1231,6 @@ impl S3Service {
             super::replace_null_version(db, dest_key, &dest_obj);
         }
         db.objects.insert(dest_key.to_string(), dest_obj);
-        if let Some(ref preserved_meta) = preserved_null_meta {
-            super::run_blocking_io(|| {
-                self.store
-                    .put_object_meta(dest_bucket, dest_key, Some("null"), preserved_meta)
-            })
-            .map_err(crate::service::persistence_error)?;
-        }
         let dest_meta = {
             let o = db
                 .objects

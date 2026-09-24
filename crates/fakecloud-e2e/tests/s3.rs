@@ -1337,6 +1337,63 @@ async fn s3_suspended_put_replaces_the_null_version() {
 }
 
 #[tokio::test]
+async fn s3_reenabling_versioning_preserves_a_suspended_write() {
+    // The null version can come from a suspended write, not only from a
+    // pre-versioning object. Re-enabling versioning and writing again must
+    // keep it, so "has no version id" is the wrong test for the null slot.
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+
+    s3.create_bucket()
+        .bucket("reenable-null")
+        .send()
+        .await
+        .unwrap();
+    set_versioning(&s3, "reenable-null", true).await;
+    set_versioning(&s3, "reenable-null", false).await;
+    s3.put_object()
+        .bucket("reenable-null")
+        .key("doc.txt")
+        .body(ByteStream::from_static(b"suspended-write"))
+        .send()
+        .await
+        .unwrap();
+
+    set_versioning(&s3, "reenable-null", true).await;
+    s3.put_object()
+        .bucket("reenable-null")
+        .key("doc.txt")
+        .body(ByteStream::from_static(b"v2"))
+        .send()
+        .await
+        .unwrap();
+
+    let got = s3
+        .get_object()
+        .bucket("reenable-null")
+        .key("doc.txt")
+        .version_id("null")
+        .send()
+        .await
+        .expect("the suspended write survives as the null version");
+    let bytes = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(bytes.as_ref(), b"suspended-write");
+
+    let list = s3
+        .list_object_versions()
+        .bucket("reenable-null")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        list.versions().len(),
+        2,
+        "null version + v2: {:?}",
+        list.versions()
+    );
+}
+
+#[tokio::test]
 async fn s3_copy_preserves_the_null_version_on_a_versioned_bucket() {
     // CopyObject onto a pre-versioning key must keep that object as the null
     // version, exactly as PutObject does.

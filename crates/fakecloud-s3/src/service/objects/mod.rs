@@ -35,18 +35,20 @@ pub(crate) fn is_null_version(obj: &crate::state::S3Object) -> bool {
     obj.version_id.is_none() || obj.version_id.as_deref() == Some("null")
 }
 
-/// Record the current object as the `"null"` version before a new version is
-/// stacked on top of it, so it stays reachable through `ListObjectVersions`
-/// and `?versionId=null`.
+/// The current object, tagged as the `"null"` version, when a new version is
+/// about to be stacked on top of it and the history does not already hold a
+/// null entry. Pure: the caller persists the returned object's sidecar under
+/// the `"null"` slot and only then records it in the history, so a failed
+/// write cannot leave a version in memory that disk lacks.
 ///
-/// Returns the sidecar the caller must persist (under the `"null"` slot): the
-/// loader files a `"null"` slot whose metadata carries no version id as the
-/// CURRENT object, where the newer version then replaces it, so without the
-/// rewrite this version is lost on the next restart.
-pub(crate) fn preserve_null_version_meta(
-    b: &mut crate::state::S3Bucket,
+/// The sidecar rewrite matters because the loader files a `"null"` slot whose
+/// metadata carries no version id as the CURRENT object, where the newer
+/// version then replaces it -- without the id, this version is lost on the
+/// next restart.
+pub(crate) fn null_version_to_preserve(
+    b: &crate::state::S3Bucket,
     key: &str,
-) -> Option<fakecloud_persistence::ObjectMeta> {
+) -> Option<crate::state::S3Object> {
     let history_has_null = b
         .object_versions
         .get(key)
@@ -55,15 +57,12 @@ pub(crate) fn preserve_null_version_meta(
     if history_has_null {
         return None;
     }
-    let existing = b.objects.get(key).filter(|o| o.version_id.is_none())?;
+    // A suspended-bucket write tags its object `Some("null")`, so match on
+    // "occupies the null slot" rather than "has no id at all".
+    let existing = b.objects.get(key).filter(|o| is_null_version(o))?;
     let mut preserved = existing.clone();
     preserved.version_id = Some("null".to_string());
-    let meta = crate::persistence::object_meta_snapshot(&preserved);
-    b.object_versions
-        .entry(key.to_string())
-        .or_default()
-        .push(preserved);
-    Some(meta)
+    Some(preserved)
 }
 
 /// Record `obj` as the bucket's null version after a write to a

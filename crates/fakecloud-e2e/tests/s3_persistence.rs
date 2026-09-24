@@ -859,6 +859,108 @@ async fn persistence_suspended_put_null_version_is_current_after_restart() {
 }
 
 #[tokio::test]
+async fn persistence_suspended_mpu_is_current_after_restart() {
+    // Same rule as the suspended PutObject: a CompleteMultipartUpload on a
+    // suspended bucket owns the null version, and its sidecar has to say so or
+    // the restart reconcile hands the key back to the older real version.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut server = TestServer::start_persistent(tmp.path()).await;
+    let client = server.s3_client().await;
+
+    client
+        .create_bucket()
+        .bucket("susp-mpu")
+        .send()
+        .await
+        .unwrap();
+    client
+        .put_bucket_versioning()
+        .bucket("susp-mpu")
+        .versioning_configuration(
+            VersioningConfiguration::builder()
+                .status(BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    client
+        .put_object()
+        .bucket("susp-mpu")
+        .key("doc.txt")
+        .body(ByteStream::from_static(b"v1"))
+        .send()
+        .await
+        .unwrap();
+    client
+        .put_bucket_versioning()
+        .bucket("susp-mpu")
+        .versioning_configuration(
+            VersioningConfiguration::builder()
+                .status(BucketVersioningStatus::Suspended)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    let create = client
+        .create_multipart_upload()
+        .bucket("susp-mpu")
+        .key("doc.txt")
+        .send()
+        .await
+        .unwrap();
+    let upload_id = create.upload_id().unwrap().to_string();
+    let part_body = vec![b'm'; 5 * 1024 * 1024];
+    let part = client
+        .upload_part()
+        .bucket("susp-mpu")
+        .key("doc.txt")
+        .upload_id(&upload_id)
+        .part_number(1)
+        .body(ByteStream::from(part_body.clone()))
+        .send()
+        .await
+        .unwrap();
+    client
+        .complete_multipart_upload()
+        .bucket("susp-mpu")
+        .key("doc.txt")
+        .upload_id(&upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .parts(
+                    CompletedPart::builder()
+                        .part_number(1)
+                        .e_tag(part.e_tag().unwrap())
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    server.restart().await;
+    let client = server.s3_client().await;
+
+    let current = client
+        .get_object()
+        .bucket("susp-mpu")
+        .key("doc.txt")
+        .send()
+        .await
+        .unwrap();
+    let bytes = current.body.collect().await.unwrap().into_bytes();
+    assert_eq!(
+        bytes.len(),
+        part_body.len(),
+        "the MPU result is still current after the restart"
+    );
+}
+
+#[tokio::test]
 async fn persistence_bucket_subresources_round_trip() {
     let tmp = tempfile::tempdir().unwrap();
     let mut server = TestServer::start_persistent(tmp.path()).await;
