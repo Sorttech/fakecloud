@@ -558,11 +558,12 @@ async fn an_email_targeted_responsibility_transfer_is_answerable() {
     .expect("and can accept it");
 }
 
-/// An organization cannot hand billing responsibility to itself, by id
-/// or by its own registered address. Every other target is recorded as
-/// the caller named it -- resolving it against other organizations
-/// would answer "does this address exist there?" for organizations the
-/// caller has nothing to do with.
+/// A responsibility transfer cannot name the caller's own organization,
+/// nor a plain member of another one -- neither has billing
+/// responsibility to hand over. An account in no organization IS a
+/// valid target, the way AWS's invite addresses an owner it has not
+/// seen yet. Every rejection reads the same, so the error says nothing
+/// about what exists elsewhere.
 #[tokio::test]
 async fn a_responsibility_transfer_cannot_target_its_own_organization() {
     let (svc, state) = OrganizationsService::shared();
@@ -635,9 +636,9 @@ async fn a_responsibility_transfer_cannot_target_its_own_organization() {
         assert_eq!(err.code(), "HandshakeConstraintViolationException");
     }
 
-    // A standalone account is still allowed: it may create an
-    // organization before accepting, as AWS invites an owner it has not
-    // seen yet.
+    // An account in NO organization is allowed: AWS's invite addresses an
+    // owner it has not seen yet, and the inbound reads are party-scoped
+    // so the target can still find it.
     svc.handle(req_with(
         "111111111111",
         "InviteOrganizationToTransferResponsibility",
@@ -649,7 +650,21 @@ async fn a_responsibility_transfer_cannot_target_its_own_organization() {
         }),
     ))
     .await
-    .expect("an external address is a valid target");
+    .expect("an owner fakecloud has not seen is a valid target");
+
+    // As is another organization's management account.
+    svc.handle(req_with(
+        "111111111111",
+        "InviteOrganizationToTransferResponsibility",
+        json!({
+            "Type": "BILLING",
+            "SourceName": "handover",
+            "StartTimestamp": 1893456000.0,
+            "Target": {"Id": "222222222222", "Type": "ACCOUNT"},
+        }),
+    ))
+    .await
+    .expect("another organization's management account is a valid target");
 }
 
 /// Whoever can accept an invitation must also be able to find it and

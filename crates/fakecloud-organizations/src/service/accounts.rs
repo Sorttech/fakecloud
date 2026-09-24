@@ -67,6 +67,14 @@ impl OrganizationsService {
         let name = required_str(&body, "AccountName")?.to_string();
 
         let mut guard = self.state.write();
+        // Authorize FIRST: the address check below spans the registry, so
+        // running it before the management gate would tell any caller
+        // whether an address is registered in an organization it has
+        // nothing to do with.
+        let org_id = self
+            .management_org_mut(&mut guard, &req.account_id)?
+            .org_id
+            .clone();
         // AWS requires the address to be unused. fakecloud must enforce it
         // too: resolution by address decides who may accept an
         // EMAIL-targeted invitation, so a duplicate would make that
@@ -78,7 +86,9 @@ impl OrganizationsService {
         // process-wide, so a per-organization check could hand out an id
         // another organization already owns.
         let new_account_id = guard.next_account_id();
-        let org = self.management_org_mut(&mut guard, &req.account_id)?;
+        let org = guard
+            .org_by_id_mut(&org_id)
+            .expect("management gate resolved this organization");
         let status = org.begin_create_account(&email, &name, new_account_id, None);
         let request_id = status.id.clone();
         // Apply create-time Tags to the reserved account id so
@@ -109,6 +119,11 @@ impl OrganizationsService {
         let name = required_str(&body, "AccountName")?.to_string();
 
         let mut guard = self.state.write();
+        // Authorize before the registry-wide address check, as above.
+        let org_id = self
+            .management_org_mut(&mut guard, &req.account_id)?
+            .org_id
+            .clone();
         if guard.email_in_use(&email) {
             return Err(email_already_exists(&email));
         }
@@ -121,7 +136,9 @@ impl OrganizationsService {
         // Exclude the id just minted: it is not recorded anywhere yet, so
         // a plain second call could hand back the same one.
         let gov_id = guard.next_account_id_besides(&[new_account_id.as_str()]);
-        let org = self.management_org_mut(&mut guard, &req.account_id)?;
+        let org = guard
+            .org_by_id_mut(&org_id)
+            .expect("management gate resolved this organization");
         let status = org.begin_create_account(&email, &name, new_account_id, Some(gov_id));
         let request_id = status.id.clone();
         // Apply create-time Tags to the reserved (primary) account id, mirroring

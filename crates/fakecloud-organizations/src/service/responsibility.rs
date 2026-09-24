@@ -253,11 +253,20 @@ impl OrganizationsService {
             .as_deref()
             .and_then(|id| registry.org_of_account(id));
         let target_is_own_org = target_org.is_some_and(|org| org.org_id == source_org_id);
-        // A member of ANOTHER organization that is not its management
-        // account cannot take over billing either; AWS reports both as
-        // handshake constraint violations. A standalone account is still
-        // allowed -- it may create an organization before accepting, and
-        // AWS likewise invites an owner it has not seen yet.
+        // Two rejections, and deliberately only two:
+        //
+        // - the caller's OWN organization, which cannot hand billing to
+        //   itself; and
+        // - a plain member of another organization, which has no billing
+        //   responsibility to take over.
+        //
+        // A target that belongs to NO organization is allowed. AWS's
+        // invite takes an `EMAIL` party precisely so it can address an
+        // owner it has not seen yet, and requiring the target to already
+        // run an organization would make the op unusable until it did.
+        // That is why the inbound reads below are party-scoped rather
+        // than membership-gated: the target must be able to find the
+        // transfer it was invited to before it has an organization.
         let target_is_non_management_member = match (&resolved_target, target_org) {
             (Some(id), Some(org)) => org.management_account_id != *id,
             _ => false,
@@ -337,8 +346,9 @@ impl OrganizationsService {
         let body = req.json_body();
         let id = required_str(&body, "Id")?.to_string();
         let guard = self.state.read();
-        // `AWSOrganizationsNotInUseException` is modeled here too.
-        self.require_member(&guard, &req.account_id)?;
+        // Party-scoped, not membership-gated, for the same reason as the
+        // inbound listing: the target of a transfer may not have an
+        // organization of its own yet.
         // A transfer is stored once, in the SOURCE organization, but it has
         // two parties: resolving it through the caller's own organization
         // would hide every inbound transfer from the account being invited
@@ -464,11 +474,16 @@ impl OrganizationsService {
             .flatten();
         let (max_results, next_token) = parse_list_pagination(&body)?;
         let guard = self.state.read();
-        // Both ops model `AWSOrganizationsNotInUseException`, and both
-        // parties to a transfer are management accounts -- the target
-        // must be one, so a caller in no organization has no transfers
-        // either way.
-        self.require_member(&guard, &req.account_id)?;
+        // OUTBOUND is membership-gated: its caller is a source management
+        // account by construction, so `AWSOrganizationsNotInUseException`
+        // is the right modeled answer. INBOUND is NOT: the target may be
+        // an account that has not created an organization yet -- see the
+        // invite guard above -- and it has to be able to find the
+        // transfer addressed to it. Party scoping already keeps it from
+        // seeing anything else.
+        if direction == "OUTBOUND" {
+            self.require_member(&guard, &req.account_id)?;
+        }
         let mut rows: Vec<&ResponsibilityTransfer> = guard
             .iter()
             .flat_map(|org| org.responsibility_transfers.values())

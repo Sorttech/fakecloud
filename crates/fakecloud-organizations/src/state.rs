@@ -187,11 +187,11 @@ impl OrganizationsRegistry {
         // boolean matcher may look wider, because it only ever confirms
         // an account the caller already named.
         if target_kind == "EMAIL" {
-            if let Some(account) = self
-                .orgs
-                .get(within)
-                .and_then(|org| org.accounts.values().find(|a| a.email == target))
-            {
+            if let Some(account) = self.orgs.get(within).and_then(|org| {
+                org.accounts
+                    .values()
+                    .find(|a| a.email == target && !is_gov_cloud(a))
+            }) {
                 return Some(account.id.clone());
             }
         }
@@ -854,7 +854,11 @@ impl OrganizationState {
         let resolved = self
             .accounts
             .values()
-            .find(|account| target_kind == "EMAIL" && account.email == target_account_id)
+            .find(|account| {
+                target_kind == "EMAIL"
+                    && account.email == target_account_id
+                    && !is_gov_cloud(account)
+            })
             .map(|account| account.id.clone())
             .or_else(|| self::target_account_id(target_kind, target_account_id));
         if let Some(target) = &resolved {

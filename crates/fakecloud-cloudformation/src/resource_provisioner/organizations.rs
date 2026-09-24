@@ -156,6 +156,15 @@ impl ResourceProvisioner {
             .unwrap_or_default();
 
         let mut org_lock = self.organizations_state.write();
+        // Same address-uniqueness rule the API enforces: resolution by
+        // address decides who may accept an EMAIL-targeted handshake, so
+        // two accounts sharing one would make that answer depend on id
+        // ordering.
+        if org_lock.email_in_use(&email) {
+            return Err(format!(
+                "The email address {email} is already associated with an account"
+            ));
+        }
         // Mint from the registry so the id cannot collide with an account
         // another organization already owns.
         let new_account_id = org_lock.next_account_id();
