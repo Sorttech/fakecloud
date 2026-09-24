@@ -791,14 +791,14 @@ impl S3Service {
                     return Err(precondition_failed("If-None-Match"));
                 }
             }
-            // Record the preserved null version -- on disk and in memory --
-            // before the completion runs. It describes the object that is
-            // ALREADY there: on a versioning-enabled bucket the pre-versioning
-            // object is the null version whether or not this upload completes,
-            // so doing it here leaves disk and memory agreeing on every path,
-            // including a failed `mpu_complete` (which would otherwise write
-            // the object while the sidecar rewrite never happened, or rewrite
-            // the sidecar while memory still filed the object as current).
+            // Record the preserved null version -- sidecar, history entry and
+            // the retag of the current object -- before the completion runs.
+            // It describes the object that is ALREADY there: on a
+            // versioning-enabled bucket the pre-versioning object is the null
+            // version whether or not this upload completes. Doing all three
+            // together means a failed `mpu_complete` leaves disk and memory
+            // agreeing, instead of a sidecar that claims a version memory
+            // does not have.
             if versioning_enabled {
                 let preserved = {
                     let b = accts
@@ -820,10 +820,7 @@ impl S3Service {
                         .buckets
                         .get_mut(bucket)
                         .ok_or_else(|| no_such_bucket(bucket))?;
-                    b.object_versions
-                        .entry(key.to_string())
-                        .or_default()
-                        .push(preserved);
+                    crate::service::objects::record_preserved_null(b, key, preserved);
                 }
             }
             // Checks passed — persist, then commit to memory, all under the
@@ -861,9 +858,8 @@ impl S3Service {
             // and `?versionId=<mpu>` 404'd. Mirror put_object: push the new
             // object as a version (bug-audit 2026-06-20, 4.1).
             if versioning_enabled {
-                // Same rule as PutObject: the pre-versioning current object
-                // becomes the "null" version, sidecar included, or it is lost
-                // from the history and from disk on the next restart.
+                // The completed upload is a new version of its own; the null
+                // version it may have displaced was recorded above.
                 b.object_versions
                     .entry(key.to_string())
                     .or_default()

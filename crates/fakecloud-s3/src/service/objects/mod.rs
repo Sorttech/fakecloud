@@ -65,6 +65,29 @@ pub(crate) fn null_version_to_preserve(
     Some(preserved)
 }
 
+/// Record a preserved null version in memory: push it into the history and
+/// retag the current object with the same `"null"` id. Retagging matters
+/// because the object in `objects` and the one now in `object_versions` are
+/// the same bytes, and the sidecar on disk carries the id -- leaving the
+/// current copy untagged makes `GetObject` report no version while
+/// `ListObjectVersions` shows a null one, which is also the state a later
+/// failure on the write path would freeze in place.
+pub(crate) fn record_preserved_null(
+    b: &mut crate::state::S3Bucket,
+    key: &str,
+    preserved: crate::state::S3Object,
+) {
+    if let Some(current) = b.objects.get_mut(key) {
+        if current.version_id.is_none() {
+            current.version_id = Some("null".to_string());
+        }
+    }
+    b.object_versions
+        .entry(key.to_string())
+        .or_default()
+        .push(preserved);
+}
+
 /// Record `obj` as the bucket's null version after a write to a
 /// versioning-suspended bucket, replacing whatever held that slot (an older
 /// null object, or a null delete marker) exactly as AWS does. Only touches

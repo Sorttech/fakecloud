@@ -592,10 +592,7 @@ impl S3Service {
                             .put_object_meta(bucket, key, Some("null"), &preserved_meta)
                     })
                     .map_err(crate::service::persistence_error)?;
-                    b.object_versions
-                        .entry(key.to_string())
-                        .or_default()
-                        .push(preserved);
+                    super::record_preserved_null(b, key, preserved);
                 }
                 b.object_versions
                     .entry(key.to_string())
@@ -1211,10 +1208,7 @@ impl S3Service {
                     .buckets
                     .get_mut(dest_bucket)
                     .ok_or_else(|| no_such_bucket(dest_bucket))?;
-                db.object_versions
-                    .entry(dest_key.to_string())
-                    .or_default()
-                    .push(preserved);
+                super::record_preserved_null(db, dest_key, preserved);
             }
         }
         let db = state
