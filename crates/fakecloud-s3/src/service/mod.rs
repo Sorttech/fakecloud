@@ -3248,10 +3248,17 @@ pub(crate) fn parse_cors_config(xml: &str) -> Vec<CorsRule> {
             // trims before validating and therefore accepts it, and an
             // untrimmed value matches no method, no origin, and parses to no
             // header — the bucket would go silently CORS-dead.
+            // Empty values are dropped, not kept as `""`: an empty entry
+            // matches nothing meaningful, and an empty `<AllowedMethod/>`
+            // alongside a real one would otherwise match the `""` that a
+            // preflight with no `Access-Control-Request-Method` falls back to,
+            // approving a request that must be denied. `validate_cors_xml`
+            // still rejects a rule left with no usable value at all.
             let trimmed = |tag| {
                 extract_all_xml_values(block, tag)
                     .into_iter()
                     .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
                     .collect::<Vec<_>>()
             };
             let allowed_origins = trimmed("AllowedOrigin");
@@ -3354,7 +3361,13 @@ impl AsciiMatch for str {
         if needle.is_empty() {
             return Some(0);
         }
-        (0..=self.len().saturating_sub(needle.len()))
+        // Must precede the range: `saturating_sub` would otherwise yield `0..=0`
+        // for a needle longer than the haystack, and the slice below would run
+        // off the end.
+        if needle.len() > self.len() {
+            return None;
+        }
+        (0..=self.len() - needle.len())
             .find(|&i| self.is_char_boundary(i) && eq(&self[i..i + needle.len()], needle))
     }
 }
@@ -3385,6 +3398,12 @@ pub(crate) fn find_cors_rule<'a>(
     method: &str,
     requested_headers: &[String],
 ) -> Option<&'a CorsRule> {
+    // An absent `Access-Control-Request-Method` arrives as `""`, which is not a
+    // method any rule can allow. Guarded here as well as at parse time so the
+    // deny does not depend on the stored config having no empty entry.
+    if method.is_empty() {
+        return None;
+    }
     rules.iter().find(|rule| {
         let origin_ok = rule
             .allowed_origins

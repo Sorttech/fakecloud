@@ -501,6 +501,31 @@ fn wildcard_matchers_handle_more_than_one_star() {
         "https://example.com.evil",
         "https://*.example.com"
     ));
+
+    // Regression: a middle segment longer than what is left of the value used
+    // to slice past the end and panic, taking down the request.
+    assert!(!origin_matches(
+        "https://x.com",
+        "https://*verylongmiddle*.com"
+    ));
+    assert!(!header_matches("x-a", "x-*-custom-header-*"));
+    assert!(!origin_matches("", "*a*"));
+}
+
+#[test]
+fn empty_allowed_method_cannot_approve_a_method_less_preflight() {
+    // A preflight with no Access-Control-Request-Method arrives as "". An empty
+    // <AllowedMethod/> next to a real one must not match it and hand back an
+    // allow-origin.
+    let xml = "<CORSConfiguration><CORSRule>\
+        <AllowedOrigin>https://example.com</AllowedOrigin>\
+        <AllowedMethod>GET</AllowedMethod>\
+        <AllowedMethod></AllowedMethod>\
+        </CORSRule></CORSConfiguration>";
+    let rules = parse_cors_config(xml);
+    assert_eq!(rules[0].allowed_methods, vec!["GET"]);
+    assert!(find_cors_rule(&rules, "https://example.com", "", &[]).is_none());
+    assert!(find_cors_rule(&rules, "https://example.com", "GET", &[]).is_some());
 }
 
 #[test]
