@@ -1967,6 +1967,18 @@ async fn s3_cors_preflight_and_response_headers() {
     assert_eq!(resp.status(), 400);
     assert!(resp.text().await.unwrap().contains("MalformedXML"));
 
+    // A missing bucket is NoSuchBucket even when the config is also invalid:
+    // a run racing bucket creation must not be sent to debug its config.
+    let resp = http
+        .put(format!("{}/no-such-cors-bucket?cors", server.endpoint()))
+        .header("Authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20240101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=fake")
+        .body("<CORSConfiguration><CORSRule><AllowedOrigin>https://a.example</AllowedOrigin></CORSRule></CORSConfiguration>")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    assert!(resp.text().await.unwrap().contains("NoSuchBucket"));
+
     // An unterminated <CORSRule> parses to nothing, so accepting it would store
     // a config that matches no request at all.
     let resp = http

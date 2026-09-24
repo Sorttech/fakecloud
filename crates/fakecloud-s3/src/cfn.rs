@@ -56,7 +56,17 @@ pub fn apply_cfn_bucket_properties(
     // to the store as it goes, so a validation failure partway would leave the
     // bucket with some subresources written and others not. Bound once so the
     // string that was validated is the same one that gets stored.
-    let cors_xml = obj.get("CorsConfiguration").and_then(build_cors_xml);
+    let cors_xml = match obj.get("CorsConfiguration") {
+        // `build_cors_xml` yields `None` when `CorsRules` is absent, not an
+        // array, or empty. Skipping silently would deploy a bucket with no CORS
+        // config at all from a template that asked for one — the very
+        // "preflights all fail" outcome this validation exists to prevent.
+        // Real CloudFormation rejects it, so this does too.
+        Some(c) => Some(build_cors_xml(c).ok_or_else(|| {
+            "CorsConfiguration: CorsRules must contain at least one rule".to_string()
+        })?),
+        None => None,
+    };
     if let Some(xml) = &cors_xml {
         crate::service::config::validate_cors_xml(xml)
             .map_err(|(code, message)| format!("{code}: {message}"))?;

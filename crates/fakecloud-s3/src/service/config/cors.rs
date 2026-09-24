@@ -64,17 +64,14 @@ pub(crate) fn validate_cors_xml(body_str: &str) -> Result<(), (&'static str, Str
     // `CORSRule`. A rule missing either matches nothing at request time, so
     // accepting one would leave the bucket silently CORS-dead rather than
     // telling the caller their config is wrong — AWS rejects it outright.
-    // An empty or whitespace-only value counts as missing: `<AllowedOrigin></AllowedOrigin>`
-    // parses to `""`, which matches no real request, so accepting it stores
-    // the same CORS-dead rule as omitting the tag entirely. Runs after the
-    // method validation above so an empty `<AllowedMethod>` still gets the
-    // AWS-shaped error naming the offending value.
+    // `parse_cors_config` drops empty values, so a list left empty here means
+    // the rule carried nothing usable — whether the tag was absent or present
+    // but blank. A stray blank tag beside a real value is not rejected, since
+    // the rule is still live. Runs after the method validation above so an
+    // unsupported `<AllowedMethod>` still gets the AWS-shaped error naming the
+    // offending value.
     for rule in parsed {
-        // A rule needs at least one usable value, not every value usable: a
-        // stray blank tag alongside a real origin still leaves the rule
-        // live, and rejecting that would refuse a config real S3 accepts.
-        let usable = |vs: &[String]| vs.iter().any(|v| !v.is_empty());
-        if !usable(&rule.allowed_methods) || !usable(&rule.allowed_origins) {
+        if rule.allowed_methods.is_empty() || rule.allowed_origins.is_empty() {
             return Err(("MalformedXML", MALFORMED_XML.to_string()));
         }
 
@@ -133,16 +130,20 @@ impl S3Service {
     ) -> Result<AwsResponse, AwsServiceError> {
         let body_str = std::str::from_utf8(&req.body).unwrap_or("").to_string();
 
-        validate_cors_xml(&body_str).map_err(|(code, message)| {
-            AwsServiceError::aws_error(StatusCode::BAD_REQUEST, code, message)
-        })?;
-
         let mut accts = self.state.write();
         let state = accts.get_or_create(account_id);
         let b = state
             .buckets
             .get_mut(bucket)
             .ok_or_else(|| no_such_bucket(bucket))?;
+
+        // After the bucket lookup: a missing bucket is `NoSuchBucket`, not a
+        // complaint about the config. Otherwise a run that races bucket
+        // creation sends the operator to debug a config that is fine.
+        validate_cors_xml(&body_str).map_err(|(code, message)| {
+            AwsServiceError::aws_error(StatusCode::BAD_REQUEST, code, message)
+        })?;
+
         b.cors_config = Some(body_str.clone());
         self.store
             .put_bucket_subresource(bucket, BucketSubresource::Cors, &body_str)
