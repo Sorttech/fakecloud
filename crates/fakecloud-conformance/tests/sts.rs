@@ -13,7 +13,7 @@ async fn sts_get_caller_identity() {
     assert!(resp.arn().is_some());
 }
 
-#[test_action("sts", "AssumeRole", checksum = "3a2fbf12")]
+#[test_action("sts", "AssumeRole", checksum = "fd5402b1")]
 #[tokio::test]
 async fn sts_assume_role() {
     let server = TestServer::start().await;
@@ -41,7 +41,7 @@ async fn sts_assume_role() {
     assert!(resp.credentials().is_some());
 }
 
-#[test_action("sts", "AssumeRoleWithWebIdentity", checksum = "fb45529e")]
+#[test_action("sts", "AssumeRoleWithWebIdentity", checksum = "5d2b2767")]
 #[tokio::test]
 async fn sts_assume_role_with_web_identity() {
     let server = TestServer::start().await;
@@ -71,7 +71,7 @@ async fn sts_assume_role_with_web_identity() {
     assert!(resp.credentials().is_some());
 }
 
-#[test_action("sts", "AssumeRoleWithSAML", checksum = "b2f7f5e1")]
+#[test_action("sts", "AssumeRoleWithSAML", checksum = "7bd82035")]
 #[tokio::test]
 async fn sts_assume_role_with_saml() {
     let server = TestServer::start().await;
@@ -101,7 +101,7 @@ async fn sts_assume_role_with_saml() {
     assert!(resp.credentials().is_some());
 }
 
-#[test_action("sts", "GetSessionToken", checksum = "c12501d4")]
+#[test_action("sts", "GetSessionToken", checksum = "794ce371")]
 #[tokio::test]
 async fn sts_get_session_token() {
     let server = TestServer::start().await;
@@ -110,7 +110,7 @@ async fn sts_get_session_token() {
     assert!(resp.credentials().is_some());
 }
 
-#[test_action("sts", "GetFederationToken", checksum = "ed833607")]
+#[test_action("sts", "GetFederationToken", checksum = "4937080e")]
 #[tokio::test]
 async fn sts_get_federation_token() {
     let server = TestServer::start().await;
@@ -172,7 +172,7 @@ async fn sts_decode_authorization_message() {
     assert!(result.decoded_message().is_some());
 }
 
-#[test_action("sts", "AssumeRoot", checksum = "ff632886")]
+#[test_action("sts", "AssumeRoot", checksum = "5c6126f8")]
 #[tokio::test]
 async fn sts_assume_root() {
     let server = TestServer::start().await;

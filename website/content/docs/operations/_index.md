@@ -6592,6 +6592,7 @@ This is a surface listing, not an implementation manifest. For fakecloud's per-s
 - `ListGlossaries`
 - `ListGlossaryTerms`
 - `ListIntegrationResourceProperties`
+- `ListIntegrationTableProperties`
 - `ListIterableForms`
 - `ListJobs`
 - `ListMLTransforms`
@@ -6821,6 +6822,7 @@ This is a surface listing, not an implementation manifest. For fakecloud's per-s
 - `TagResource`
 - `UntagResource`
 - `UpdateCallAnalyticsCategory`
+- `UpdateLanguageModel`
 - `UpdateMedicalVocabulary`
 - `UpdateVocabulary`
 - `UpdateVocabularyFilter`

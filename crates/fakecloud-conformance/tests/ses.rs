@@ -1591,8 +1591,8 @@ async fn ses_import_job_lifecycle() {
 
 // -- Export Jobs --
 
-#[test_action("ses", "CreateExportJob", checksum = "c875d427")]
-#[test_action("ses", "GetExportJob", checksum = "06ce323e")]
+#[test_action("ses", "CreateExportJob", checksum = "89e221b0")]
+#[test_action("ses", "GetExportJob", checksum = "dcde6eec")]
 #[test_action("ses", "ListExportJobs", checksum = "b5f292ff")]
 #[test_action("ses", "CancelExportJob", checksum = "09901f78")]
 #[tokio::test]
@@ -1873,7 +1873,7 @@ async fn ses_reputation_entity() {
 
 // -- Metrics --
 
-#[test_action("ses", "BatchGetMetricData", checksum = "944d6cf0")]
+#[test_action("ses", "BatchGetMetricData", checksum = "d15af338")]
 #[tokio::test]
 async fn ses_batch_get_metric_data() {
     let server = TestServer::start().await;

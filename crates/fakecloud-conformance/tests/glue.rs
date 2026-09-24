@@ -1621,14 +1621,14 @@ async fn ml_transform_lifecycle() {
 #[test_action("glue", "GetDataQualityRulesetEvaluationRun", checksum = "8db534f5")]
 #[test_action("glue", "CancelDataQualityRulesetEvaluationRun", checksum = "b0a62a97")]
 #[test_action("glue", "ListDataQualityRulesetEvaluationRuns", checksum = "fe701f73")]
-#[test_action("glue", "StartDataQualityRuleRecommendationRun", checksum = "bf2586f6")]
-#[test_action("glue", "GetDataQualityRuleRecommendationRun", checksum = "c3d59d2b")]
+#[test_action("glue", "StartDataQualityRuleRecommendationRun", checksum = "49f60343")]
+#[test_action("glue", "GetDataQualityRuleRecommendationRun", checksum = "2e9a9964")]
 #[test_action(
     "glue",
     "CancelDataQualityRuleRecommendationRun",
     checksum = "3e8c4340"
 )]
-#[test_action("glue", "ListDataQualityRuleRecommendationRuns", checksum = "a09d3308")]
+#[test_action("glue", "ListDataQualityRuleRecommendationRuns", checksum = "1701dcca")]
 #[test_action("glue", "GetDataQualityResult", checksum = "d9dc8ab3")]
 #[test_action("glue", "BatchGetDataQualityResult", checksum = "0865cc3e")]
 #[test_action("glue", "ListDataQualityResults", checksum = "bf58b5d5")]
@@ -2060,10 +2060,10 @@ async fn table_optimizer_lifecycle() {
 #[test_action("glue", "GetIntegrationResourceProperty", checksum = "97ca2162")]
 #[test_action("glue", "UpdateIntegrationResourceProperty", checksum = "b65da7b7")]
 #[test_action("glue", "DeleteIntegrationResourceProperty", checksum = "ebda98e8")]
-#[test_action("glue", "ListIntegrationResourceProperties", checksum = "0c4a5cd1")]
-#[test_action("glue", "CreateIntegrationTableProperties", checksum = "3e25a7a8")]
-#[test_action("glue", "GetIntegrationTableProperties", checksum = "16490001")]
-#[test_action("glue", "UpdateIntegrationTableProperties", checksum = "e154bff5")]
+#[test_action("glue", "ListIntegrationResourceProperties", checksum = "74cf57fa")]
+#[test_action("glue", "CreateIntegrationTableProperties", checksum = "e2ac255a")]
+#[test_action("glue", "GetIntegrationTableProperties", checksum = "7decc0f6")]
+#[test_action("glue", "UpdateIntegrationTableProperties", checksum = "da6fc4ad")]
 #[test_action("glue", "DeleteIntegrationTableProperties", checksum = "8f7fb282")]
 #[tokio::test]
 async fn integration_lifecycle() {
@@ -2142,6 +2142,133 @@ async fn integration_lifecycle() {
         .send()
         .await
         .unwrap();
+}
+
+// ListIntegrationTableProperties is newer than the typed aws-sdk-glue client, so
+// drive it over raw awsJson1.1 (x-amz-target: AWSGlue.<Op>).
+#[test_action("glue", "ListIntegrationTableProperties", checksum = "1637577c")]
+#[tokio::test]
+async fn list_integration_table_properties_filters_and_pages() {
+    let server = TestServer::start().await;
+    let glue = server.glue_client().await;
+
+    let arn = "arn:aws:glue:us-east-1:123456789012:integration/list-itp";
+    for table in ["orders", "shipments"] {
+        glue.create_integration_table_properties()
+            .resource_arn(arn)
+            .table_name(table)
+            .target_table_config(
+                aws_sdk_glue::types::TargetTableConfig::builder()
+                    .target_table_name(format!("{table}_target"))
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+    }
+
+    let auth = "AWS4-HMAC-SHA256 Credential=test/20240101/us-east-1/glue/aws4_request, SignedHeaders=host, Signature=0";
+    let call = |body: String| {
+        let url = server.endpoint();
+        async move {
+            reqwest::Client::new()
+                .post(url)
+                .header("Authorization", auth)
+                .header("Content-Type", "application/x-amz-json-1.1")
+                .header("X-Amz-Target", "AWSGlue.ListIntegrationTableProperties")
+                .body(body)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    // Unfiltered: both entries, and no marker because the page is complete.
+    let resp = call("{}".to_string()).await;
+    assert!(resp.status().is_success(), "list: {}", resp.status());
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let list = body["IntegrationTablePropertiesList"].as_array().unwrap();
+    assert_eq!(list.len(), 2, "both table properties listed: {body}");
+    assert!(
+        body["Marker"].is_null(),
+        "complete page has no marker: {body}"
+    );
+
+    // Filtering by target table name narrows the listing to the one entry.
+    let resp =
+        call(r#"{"Filters":[{"Name":"TargetTableName","Values":["orders_target"]}]}"#.to_string())
+            .await;
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let list = body["IntegrationTablePropertiesList"].as_array().unwrap();
+    assert_eq!(list.len(), 1, "target-table filter: {body}");
+    assert_eq!(list[0]["TableName"], "orders");
+
+    // Filtering by the source ARN keeps both; an ARN that matches nothing drops
+    // the listing to empty.
+    let resp = call(format!(
+        r#"{{"Filters":[{{"Name":"SourceArn","Values":["{arn}"]}}]}}"#
+    ))
+    .await;
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["IntegrationTablePropertiesList"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2,
+        "source-arn filter: {body}"
+    );
+    let resp = call(
+        r#"{"Filters":[{"Name":"SourceArn","Values":["arn:aws:glue:us-east-1:123456789012:integration/other"]}]}"#
+            .to_string(),
+    )
+    .await;
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["IntegrationTablePropertiesList"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "non-matching arn: {body}"
+    );
+
+    // MaxRecords hands back a marker that resumes after the first page.
+    let resp = call(r#"{"MaxRecords":1}"#.to_string()).await;
+    let first: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        first["IntegrationTablePropertiesList"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "first page: {first}"
+    );
+    let marker = first["Marker"].as_str().expect("marker on a partial page");
+    let resp = call(format!(
+        "{{\"Marker\":{},\"MaxRecords\":1}}",
+        serde_json::Value::String(marker.to_string())
+    ))
+    .await;
+    let second: serde_json::Value = resp.json().await.unwrap();
+    let second_list = second["IntegrationTablePropertiesList"].as_array().unwrap();
+    assert_eq!(second_list.len(), 1, "second page: {second}");
+    assert_ne!(
+        second_list[0]["TableName"], first["IntegrationTablePropertiesList"][0]["TableName"],
+        "the marker advanced past the first page"
+    );
+
+    // An unsupported filter key is rejected rather than silently ignored.
+    let resp = call(r#"{"Filters":[{"Name":"Nope","Values":["x"]}]}"#.to_string()).await;
+    assert_eq!(resp.status(), 400, "unknown filter key is a client error");
+
+    for table in ["orders", "shipments"] {
+        glue.delete_integration_table_properties()
+            .resource_arn(arn)
+            .table_name(table)
+            .send()
+            .await
+            .unwrap();
+    }
 }
 
 #[test_action("glue", "CreateGlueIdentityCenterConfiguration", checksum = "0d16a92e")]

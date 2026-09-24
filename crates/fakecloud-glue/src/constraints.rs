@@ -3871,6 +3871,14 @@ pub(crate) fn constraints_for(action: &str) -> &'static [FieldConstraint] {
             range_max: None,
             enum_values: &[],
         }],
+        "ListIntegrationTableProperties" => &[FieldConstraint {
+            field: "Marker",
+            len_min: Some(1),
+            len_max: Some(4096),
+            range_min: None,
+            range_max: None,
+            enum_values: &[],
+        }],
         "ListIterableForms" => &[
             FieldConstraint {
                 field: "AssetIdentifier",
@@ -6074,6 +6082,7 @@ pub(crate) fn declares_invalid_input(action: &str) -> bool {
             | "ListGlossaries"
             | "ListGlossaryTerms"
             | "ListIntegrationResourceProperties"
+            | "ListIntegrationTableProperties"
             | "ListIterableForms"
             | "ListJobs"
             | "ListMLTransforms"

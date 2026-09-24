@@ -23,7 +23,7 @@ use crate::shared::{
 };
 use crate::state::{SharedTranscribeState, TranscribeData};
 
-/// Every operation name in the Amazon Transcribe Smithy model (43 operations).
+/// Every operation name in the Amazon Transcribe Smithy model (44 operations).
 pub const TRANSCRIBE_ACTIONS: &[&str] = &[
     "CreateCallAnalyticsCategory",
     "CreateLanguageModel",
@@ -65,6 +65,7 @@ pub const TRANSCRIBE_ACTIONS: &[&str] = &[
     "TagResource",
     "UntagResource",
     "UpdateCallAnalyticsCategory",
+    "UpdateLanguageModel",
     "UpdateMedicalVocabulary",
     "UpdateVocabulary",
     "UpdateVocabularyFilter",
@@ -206,6 +207,7 @@ impl TranscribeService {
             // Custom language models
             "CreateLanguageModel" => self.create_language_model(req, &body),
             "DescribeLanguageModel" => self.describe_language_model(req, &body),
+            "UpdateLanguageModel" => self.update_language_model(req, &body),
             "ListLanguageModels" => self.list_language_models(req, &body),
             "DeleteLanguageModel" => self.delete_language_model(req, &body),
             // Tagging
@@ -1607,6 +1609,53 @@ impl TranscribeService {
             );
             let out: Vec<Value> = models.into_iter().cloned().collect();
             ok(json!({ "Models": out }))
+        })
+    }
+
+    fn update_language_model(
+        &self,
+        req: &AwsRequest,
+        body: &Value,
+    ) -> Result<AwsResponse, AwsServiceError> {
+        let name = str_member(body, "ModelName")
+            .unwrap_or_default()
+            .to_string();
+        let encryption = body.get("EncryptionConfiguration").cloned();
+        let role = str_member(body, "DataAccessRoleArn").map(str::to_string);
+        // No `reconcile()` here: settling is what a *read* does in this crate, so
+        // a model that has not been described yet is still training, and AWS
+        // rejects an update while the model is IN_PROGRESS.
+        self.with_account_mut(req, |d| {
+            let Some(model) = d.language_models.get_mut(&name) else {
+                return Err(not_found("The requested model couldn't be found. Check the model name and try your request again."));
+            };
+            let obj = model
+                .as_object_mut()
+                .expect("a stored language model is a JSON object");
+            if obj.get("ModelStatus").and_then(Value::as_str) == Some("IN_PROGRESS") {
+                return Err(conflict("Your custom language model must not be in the IN_PROGRESS state when you call this operation. Use DescribeLanguageModel to check the current state of your model."));
+            }
+            // Re-encryption happens in place: the artifacts keep their identity,
+            // only the key and the access role used to reach it change.
+            if let Some(enc) = encryption {
+                obj.insert("EncryptionConfiguration".into(), enc);
+            }
+            if let Some(role) = role {
+                let input = obj
+                    .entry("InputDataConfig")
+                    .or_insert_with(|| Value::Object(Map::new()));
+                if let Some(input) = input.as_object_mut() {
+                    input.insert("DataAccessRoleArn".into(), json!(role));
+                }
+            }
+            let now = now_epoch();
+            obj.insert("LastModifiedTime".into(), json!(now));
+            let status = obj.get("ModelStatus").cloned().unwrap_or(Value::Null);
+            ok(json!({
+                "ModelName": name,
+                "ModelStatus": status,
+                "LastModifiedTime": now,
+            }))
         })
     }
 

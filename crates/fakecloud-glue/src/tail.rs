@@ -8,8 +8,8 @@ use serde_json::{json, Value};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use crate::common::{
-    entity_not_found, error_detail, new_id, now_ts, req_present, req_str, resource_arn,
-    settle_run_status,
+    entity_not_found, error_detail, invalid_input, new_id, now_ts, req_present, req_str,
+    resource_arn, settle_run_status,
 };
 use crate::service::GlueService;
 
@@ -269,6 +269,91 @@ impl GlueService {
         st.integration_table_props
             .insert(Self::itp_key(&arn, &table), v);
         Ok(AwsResponse::ok_json(json!({})))
+    }
+
+    /// Filter keys AWS supports on `ListIntegrationTableProperties`. `SourceArn`
+    /// and `TargetArn` both match `ResourceArn` — a single stored entry holds the
+    /// connection ARN of the source or the database ARN of the target, never both.
+    fn itp_matches(entry: &Value, name: &str, values: &[Value]) -> bool {
+        let field = match name {
+            "SourceArn" | "TargetArn" => entry.get("ResourceArn"),
+            "SourceTableName" => entry.get("TableName"),
+            "TargetTableName" => entry.pointer("/TargetTableConfig/TargetTableName"),
+            // Unreachable: the caller rejects unknown filter keys before
+            // reaching this point.
+            _ => return false,
+        };
+        let Some(field) = field.and_then(Value::as_str) else {
+            return false;
+        };
+        values.iter().any(|v| v.as_str() == Some(field))
+    }
+
+    pub(crate) fn list_integration_table_properties(
+        &self,
+        req: &AwsRequest,
+    ) -> Result<AwsResponse, AwsServiceError> {
+        let body = req.json_body();
+        let filters = body
+            .get("Filters")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for f in &filters {
+            let name = f.get("Name").and_then(Value::as_str).unwrap_or_default();
+            if !matches!(
+                name,
+                "SourceArn" | "TargetArn" | "SourceTableName" | "TargetTableName"
+            ) {
+                return Err(invalid_input(format!(
+                    "Unsupported filter key: {name}. Supported filter keys are SourceArn, TargetArn, SourceTableName and TargetTableName."
+                )));
+            }
+        }
+        let marker = body.get("Marker").and_then(Value::as_str);
+        let max = body
+            .get("MaxRecords")
+            .and_then(Value::as_u64)
+            .unwrap_or(u64::MAX) as usize;
+
+        let accounts = self.state.read();
+        let mut matching: Vec<(String, Value)> = accounts
+            .get(&req.account_id)
+            .map(|s| {
+                s.integration_table_props
+                    .iter()
+                    .filter(|(_, v)| {
+                        filters.iter().all(|f| {
+                            let name = f.get("Name").and_then(Value::as_str).unwrap_or_default();
+                            let values = f
+                                .get("Values")
+                                .and_then(Value::as_array)
+                                .cloned()
+                                .unwrap_or_default();
+                            Self::itp_matches(v, name, &values)
+                        })
+                    })
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // The marker is the key the previous page stopped at, so the listing has
+        // to be ordered for paging to be stable across calls.
+        matching.sort_by(|a, b| a.0.cmp(&b.0));
+        if let Some(marker) = marker {
+            matching.retain(|(k, _)| k.as_str() > marker);
+        }
+        let next = if matching.len() > max {
+            matching.truncate(max);
+            matching.last().map(|(k, _)| k.clone())
+        } else {
+            None
+        };
+        let list: Vec<Value> = matching.into_iter().map(|(_, v)| v).collect();
+        Ok(AwsResponse::ok_json(json!({
+            "IntegrationTablePropertiesList": list,
+            "Marker": next,
+        })))
     }
 
     pub(crate) fn delete_integration_table_properties(

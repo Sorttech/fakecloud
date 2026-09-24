@@ -181,6 +181,10 @@ jobs:
         if: always() && steps.check.outcome != 'skipped'
         run: cargo run -p fakecloud-conformance -- audit
 
+      - name: Check vendored Smithy models match aws-models
+        if: always() && steps.check.outcome != 'skipped'
+        run: cargo run -p fakecloud-conformance -- vendored-models
+
       - name: Post summary
         if: always()
         run: |

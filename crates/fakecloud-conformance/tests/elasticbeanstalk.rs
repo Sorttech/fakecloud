@@ -125,7 +125,7 @@ async fn delete_application() {
         .unwrap();
 }
 
-#[test_action("elasticbeanstalk", "CreateApplicationVersion", checksum = "f40ed5e6")]
+#[test_action("elasticbeanstalk", "CreateApplicationVersion", checksum = "5d884c1b")]
 #[tokio::test]
 async fn create_application_version() {
     let s = server_with_app("ver-app").await;
@@ -149,7 +149,7 @@ async fn create_application_version() {
     );
 }
 
-#[test_action("elasticbeanstalk", "UpdateApplicationVersion", checksum = "564e6df6")]
+#[test_action("elasticbeanstalk", "UpdateApplicationVersion", checksum = "2a062f3c")]
 #[tokio::test]
 async fn update_application_version() {
     let s = server_with_app("uver-app").await;
@@ -177,7 +177,7 @@ async fn update_application_version() {
 #[test_action(
     "elasticbeanstalk",
     "DescribeApplicationVersions",
-    checksum = "cd11440a"
+    checksum = "77b4666f"
 )]
 #[tokio::test]
 async fn describe_application_versions() {
@@ -286,7 +286,7 @@ async fn describe_environments() {
 #[test_action(
     "elasticbeanstalk",
     "DescribeEnvironmentResources",
-    checksum = "0103ac40"
+    checksum = "06f12bda"
 )]
 #[tokio::test]
 async fn describe_environment_resources() {

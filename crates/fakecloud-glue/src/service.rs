@@ -218,6 +218,7 @@ const SUPPORTED_ACTIONS: &[&str] = &[
     "ListDevEndpoints",
     "ListEntities",
     "ListIntegrationResourceProperties",
+    "ListIntegrationTableProperties",
     "ListJobs",
     "ListMaterializedViewRefreshTaskRuns",
     "ListMLTransforms",
@@ -669,6 +670,7 @@ impl AwsService for GlueService {
             "ListDevEndpoints" => self.list_dev_endpoints(&req),
             "ListEntities" => self.list_entities(&req),
             "ListIntegrationResourceProperties" => self.list_integration_resource_properties(&req),
+            "ListIntegrationTableProperties" => self.list_integration_table_properties(&req),
             "ListJobs" => self.list_jobs(&req),
             "ListMaterializedViewRefreshTaskRuns" => {
                 self.list_materialized_view_refresh_task_runs(&req)
