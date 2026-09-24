@@ -939,6 +939,35 @@ async fn s3_notification_unversioned_bucket_has_no_version_id() {
 }
 
 #[tokio::test]
+async fn s3_delete_of_missing_key_emits_no_notification() {
+    // A DELETE of a key that was never uploaded is a no-op 204 on AWS and
+    // fires no event -- single delete must agree with the batch endpoint.
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+    let sqs = server.sqs_client().await;
+
+    s3.create_bucket()
+        .bucket("noop-notif")
+        .send()
+        .await
+        .unwrap();
+    let queue_url = wire_bucket_to_queue(&server, &sqs, "noop-notif", "noop-events").await;
+
+    s3.delete_object()
+        .bucket("noop-notif")
+        .key("never-existed.txt")
+        .send()
+        .await
+        .unwrap();
+
+    let records = drain_records(&sqs, &queue_url, 1).await;
+    assert!(
+        records.is_empty(),
+        "deleting a missing key must not emit an event: {records:?}"
+    );
+}
+
+#[tokio::test]
 async fn s3_delete_objects_batch_emits_notifications() {
     // DeleteObjects used to be a silent hole in the event stream: it removed
     // objects without firing any notification.

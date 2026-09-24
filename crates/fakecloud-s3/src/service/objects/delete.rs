@@ -164,6 +164,7 @@ impl S3Service {
                         &crate::service::notifications::ObjectEvent {
                             event_name: "ObjectRemoved:Delete",
                             bucket_name: &bucket_name,
+                            requester_account: account_id,
                             key: &obj_key,
                             size: 0,
                             etag: "",
@@ -248,6 +249,7 @@ impl S3Service {
                     &crate::service::notifications::ObjectEvent {
                         event_name: "ObjectRemoved:DeleteMarkerCreated",
                         bucket_name: &bucket_name,
+                        requester_account: account_id,
                         key: &obj_key,
                         size: 0,
                         etag: "",
@@ -271,28 +273,33 @@ impl S3Service {
         let bucket_name = bucket.to_string();
         let obj_key = key.to_string();
 
-        b.objects.remove(key);
+        // Deleting a key that was never there is a no-op 204 on AWS and fires
+        // no event, so only notify when something was actually removed.
+        let existed = b.objects.remove(key).is_some();
         self.store
             .delete_object(bucket, key, None)
             .map_err(crate::service::persistence_error)?;
         drop(accts);
 
         // Deliver S3 event notifications
-        if let Some(ref config) = notification_config {
-            deliver_notifications(
-                &self.delivery,
-                config,
-                &crate::service::notifications::ObjectEvent {
-                    event_name: "ObjectRemoved:Delete",
-                    bucket_name: &bucket_name,
-                    key: &obj_key,
-                    size: 0,
-                    etag: "",
-                    region: &region,
-                    version_id: None,
-                },
-                Some(&self.state),
-            );
+        if existed {
+            if let Some(ref config) = notification_config {
+                deliver_notifications(
+                    &self.delivery,
+                    config,
+                    &crate::service::notifications::ObjectEvent {
+                        event_name: "ObjectRemoved:Delete",
+                        bucket_name: &bucket_name,
+                        requester_account: account_id,
+                        key: &obj_key,
+                        size: 0,
+                        etag: "",
+                        region: &region,
+                        version_id: None,
+                    },
+                    Some(&self.state),
+                );
+            }
         }
 
         Ok(AwsResponse {
@@ -352,6 +359,10 @@ impl S3Service {
         // removed. Real S3 fires one notification per deleted object, so the
         // batch endpoint must not be a silent hole in the event stream.
         let mut pending_events: Vec<(&'static str, String, Option<String>)> = Vec::new();
+        // A persistence failure mid-batch must not swallow the events for the
+        // objects already removed: record it, stop, and still deliver what
+        // happened before returning the error.
+        let mut persist_error: Option<AwsServiceError> = None;
         for entry in &entries {
             let key = &entry.key;
             if let Some(ref vid) = entry.version_id {
@@ -439,9 +450,10 @@ impl S3Service {
                         b.objects.remove(key);
                     }
                 }
-                self.store
-                    .delete_object(bucket, key, Some(vid.as_str()))
-                    .map_err(crate::service::persistence_error)?;
+                if let Err(e) = self.store.delete_object(bucket, key, Some(vid.as_str())) {
+                    persist_error = Some(crate::service::persistence_error(e));
+                    break;
+                }
                 // Only a version that actually existed produces an event.
                 if removed_version {
                     pending_events.push((
@@ -481,9 +493,10 @@ impl S3Service {
                     .or_default()
                     .push(marker.clone());
                 b.objects.insert(key.to_string(), marker);
-                self.store
-                    .delete_object(bucket, key, None)
-                    .map_err(crate::service::persistence_error)?;
+                if let Err(e) = self.store.delete_object(bucket, key, None) {
+                    persist_error = Some(crate::service::persistence_error(e));
+                    break;
+                }
                 pending_events.push((
                     "ObjectRemoved:DeleteMarkerCreated",
                     key.to_string(),
@@ -515,9 +528,10 @@ impl S3Service {
                     continue;
                 }
                 let existed = b.objects.remove(key).is_some();
-                self.store
-                    .delete_object(bucket, key, None)
-                    .map_err(crate::service::persistence_error)?;
+                if let Err(e) = self.store.delete_object(bucket, key, None) {
+                    persist_error = Some(crate::service::persistence_error(e));
+                    break;
+                }
                 if existed {
                     pending_events.push(("ObjectRemoved:Delete", key.to_string(), None));
                 }
@@ -551,6 +565,7 @@ impl S3Service {
                     &crate::service::notifications::ObjectEvent {
                         event_name,
                         bucket_name: bucket,
+                        requester_account: account_id,
                         key,
                         size: 0,
                         etag: "",
@@ -560,6 +575,10 @@ impl S3Service {
                     Some(&self.state),
                 );
             }
+        }
+
+        if let Some(err) = persist_error {
+            return Err(err);
         }
 
         Ok(s3_xml(StatusCode::OK, body))

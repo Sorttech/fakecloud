@@ -688,6 +688,7 @@ impl S3Service {
                 &crate::service::notifications::ObjectEvent {
                     event_name,
                     bucket_name: &bucket_name,
+                    requester_account: account_id,
                     key: &obj_key,
                     size: obj_size,
                     etag: &obj_etag,
@@ -1278,6 +1279,7 @@ impl S3Service {
                 &crate::service::notifications::ObjectEvent {
                     event_name: "ObjectCreated:Copy",
                     bucket_name: &copy_bucket,
+                    requester_account: account_id,
                     key: &copy_key,
                     size: copy_size,
                     etag: &copy_etag,

@@ -433,9 +433,9 @@ pub(crate) fn encode_event_key(key: &str) -> String {
 /// same event.
 ///
 /// `requestParameters`/`responseElements` are deliberately omitted rather than
-/// filled with invented values: the caller's source IP and request id are not
-/// plumbed down to this layer, and a fabricated IP is worse than an absent
-/// field for anyone asserting on the record.
+/// filled with invented values: the caller's source IP is not plumbed down to
+/// this layer, and a fabricated IP is worse than an absent field for anyone
+/// asserting on the record.
 pub(crate) fn build_s3_event_notification(
     event: &ObjectEvent<'_>,
     configuration_id: Option<&str>,
@@ -478,7 +478,7 @@ pub(crate) fn build_s3_event_notification(
             "awsRegion": event.region,
             "eventTime": event_time,
             "eventName": event.event_name,
-            "userIdentity": { "principalId": format!("AWS:{owner_account}") },
+            "userIdentity": { "principalId": format!("AWS:{}", event.requester_account) },
             "s3": s3
         }]
     })
@@ -739,6 +739,10 @@ pub(crate) struct ObjectEvent<'a> {
     pub size: u64,
     pub etag: &'a str,
     pub region: &'a str,
+    /// The account that made the request. AWS reports the *requester* on
+    /// `userIdentity` / EventBridge `requester`, which is not necessarily the
+    /// bucket owner once cross-account writes are in play.
+    pub requester_account: &'a str,
     /// Version of the object the event describes. `Some` on a
     /// versioning-enabled bucket (including the id of a delete marker),
     /// `None` on an unversioned one -- matching when AWS includes
@@ -768,8 +772,7 @@ pub(crate) fn deliver_notifications(
     // Every target of one operation shares a sequencer, as on real S3.
     let sequencer = next_sequencer();
 
-    // The bucket owner identifies both the bucket's ownerIdentity and the
-    // EventBridge `requester`.
+    // The bucket owner fills the bucket's `ownerIdentity`.
     let owner_account = s3_state
         .and_then(|st| {
             let mas = st.read();
@@ -802,7 +805,7 @@ pub(crate) fn deliver_notifications(
             "bucket": { "name": bucket_name },
             "object": object,
             "request-id": uuid::Uuid::new_v4().to_string(),
-            "requester": owner_account,
+            "requester": event.requester_account,
         });
         if let Some(reason) = eventbridge_reason(event_name) {
             detail["reason"] = serde_json::json!(reason);
@@ -1088,6 +1091,7 @@ mod tests {
         ObjectEvent {
             event_name,
             bucket_name: "my-bucket",
+            requester_account: "999999999999",
             key,
             size: 42,
             etag: "etag",
@@ -1115,7 +1119,11 @@ mod tests {
             records[0]["s3"]["bucket"]["ownerIdentity"]["principalId"],
             "1"
         );
-        assert_eq!(records[0]["userIdentity"]["principalId"], "AWS:1");
+        // ownerIdentity is the bucket owner; userIdentity is the requester.
+        assert_eq!(
+            records[0]["userIdentity"]["principalId"],
+            "AWS:999999999999"
+        );
         // No versioning -> no versionId, like AWS.
         assert!(records[0]["s3"]["object"].get("versionId").is_none());
         // No configuration Id parsed -> field omitted rather than null.
