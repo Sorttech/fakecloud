@@ -1625,6 +1625,13 @@ async fn s3_cors_preflight_and_response_headers() {
         "Origin, Access-Control-Request-Headers, Access-Control-Request-Method",
         "error responses must send Vary too"
     );
+    // Without ACAO on the error, a `mode: 'cors'` fetch cannot tell a missing
+    // object from a network failure.
+    assert_eq!(
+        resp.headers().get("access-control-allow-origin").unwrap(),
+        "https://example.com",
+        "error responses to an allowed origin must carry ACAO"
+    );
 
     // OPTIONS from non-matching origin should fail, but the 403 is itself
     // origin-dependent, so it must not be cached and replayed to the allowed

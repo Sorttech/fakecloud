@@ -49,31 +49,38 @@ use notifications::{
 
 /// `Vary` value S3 attaches to any response it evaluates CORS for.
 ///
-/// Without it a shared cache (or the browser's own HTTP cache) can hand a
-/// response stored for one `Origin` — or for a plain non-CORS load, which
-/// carries no `Access-Control-Allow-Origin` at all — to a later CORS-mode
-/// request for the same URL, which then fails the CORS check (tainted canvas
-/// after `<img crossorigin>`, `fetch` in `cors` mode) or leaks one origin's
-/// allowance to another.
+/// A response carrying `Access-Control-Allow-Origin` is specific to the
+/// `Origin` that asked for it. Without `Vary`, a shared cache (or the browser's
+/// own HTTP cache) stores it under a key that ignores `Origin` and reuses it
+/// for a request from a *different* origin — handing out one origin's
+/// allowance, or handing an allowed origin a stored response that was rejected
+/// for someone else. Like S3, this is emitted only for requests that carry
+/// `Origin`; a response cached from an `Origin`-less load carries no `Vary`
+/// (and no `Access-Control-Allow-Origin`) either way.
 const CORS_VARY: &str = "Origin, Access-Control-Request-Headers, Access-Control-Request-Method";
 
-/// Attach [`CORS_VARY`] to whatever a CORS-evaluated request produced — success
-/// or error alike.
+/// Set a CORS response header on whatever a CORS-evaluated request produced —
+/// success or error alike.
 ///
-/// Errors matter as much as successes here: a 404 `NoSuchKey` is heuristically
-/// cacheable, so an `Access-Control-Allow-Origin`-less 404 stored under a key
-/// that ignores `Origin` gets replayed to every origin, which is the exact
-/// replay this header exists to prevent.
-fn apply_cors_vary(result: &mut Result<AwsResponse, AwsServiceError>) {
+/// Errors matter as much as successes: real S3 answers a 404 `NoSuchKey` for an
+/// allowed origin *with* `Access-Control-Allow-Origin`, so `fetch(…, {mode:
+/// 'cors'})` sees a 404 it can handle rather than an opaque CORS network error.
+/// And a 404 is heuristically cacheable, so it needs `Vary` for the same reason
+/// a 200 does.
+fn set_cors_header(
+    result: &mut Result<AwsResponse, AwsServiceError>,
+    name: &'static str,
+    value: &str,
+) {
     match result {
         Ok(resp) => {
-            resp.headers
-                .insert("vary", http::HeaderValue::from_static(CORS_VARY));
+            if let Ok(v) = value.parse::<http::HeaderValue>() {
+                resp.headers.insert(name, v);
+            }
         }
         Err(AwsServiceError::AwsError { headers, .. }) => {
-            if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("vary")) {
-                headers.push(("vary".to_string(), CORS_VARY.to_string()));
-            }
+            headers.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
+            headers.push((name.to_string(), value.to_string()));
         }
         // Other variants render without per-error headers.
         Err(_) => {}
@@ -988,30 +995,24 @@ impl AwsService for S3Service {
                 // rule or not: a disallowed origin gets no ACAO, and that
                 // ACAO-less response must not be cached and replayed to an
                 // allowed origin.
-                apply_cors_vary(&mut result);
+                set_cors_header(&mut result, "vary", CORS_VARY);
                 let rules = parse_cors_config(config);
                 if let Some(rule) = find_cors_rule(&rules, origin, None) {
-                    if let Ok(ref mut resp) = result {
-                        let matched_origin = if rule.allowed_origins.contains(&"*".to_string()) {
-                            "*"
-                        } else {
-                            origin
-                        };
-                        resp.headers.insert(
-                            "access-control-allow-origin",
-                            matched_origin
-                                .parse()
-                                .unwrap_or_else(|_| http::HeaderValue::from_static("")),
+                    let matched_origin = if rule.allowed_origins.contains(&"*".to_string()) {
+                        "*"
+                    } else {
+                        origin
+                    };
+                    // Errors get the allow-origin too: S3 answers a 404 for an
+                    // allowed origin with ACAO, so a `mode: 'cors'` fetch sees
+                    // a real 404 instead of an opaque CORS network error.
+                    set_cors_header(&mut result, "access-control-allow-origin", matched_origin);
+                    if !rule.expose_headers.is_empty() {
+                        set_cors_header(
+                            &mut result,
+                            "access-control-expose-headers",
+                            &rule.expose_headers.join(", "),
                         );
-                        if !rule.expose_headers.is_empty() {
-                            resp.headers.insert(
-                                "access-control-expose-headers",
-                                rule.expose_headers
-                                    .join(", ")
-                                    .parse()
-                                    .unwrap_or_else(|_| http::HeaderValue::from_static("")),
-                            );
-                        }
                     }
                 }
             }
