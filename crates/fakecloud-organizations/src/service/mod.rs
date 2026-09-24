@@ -898,6 +898,10 @@ fn parse_handshake_filter(body: &Value) -> Result<HandshakeFilter, AwsServiceErr
             "ENABLE_ALL_FEATURES",
             "APPROVE_ALL_FEATURES",
             "ADD_ORGANIZATIONS_SERVICE_LINKED_ROLE",
+            // A real `ActionType`, and now reachable: a source management
+            // account sees its own outbound transfer handshakes, so it can
+            // filter for them.
+            "TRANSFER_RESPONSIBILITY",
         ];
         if !ALLOWED.contains(&action.as_str()) {
             return Err(AwsServiceError::aws_error(

@@ -69,7 +69,11 @@ fn is_transfer_party(
 /// `AccountId` (exactly 12 digits), so an email-targeted transfer -- whose
 /// target is recorded as the address the source named -- carries only
 /// the email until the address resolves to an account id.
-fn target_participant(t: &ResponsibilityTransfer) -> Value {
+fn target_participant(
+    registry: &crate::state::OrganizationsRegistry,
+    t: &ResponsibilityTransfer,
+    caller: &str,
+) -> Value {
     let mut party = json!({
         "ManagementAccountEmail": t.target_management_account_email,
     });
@@ -78,16 +82,19 @@ fn target_participant(t: &ResponsibilityTransfer) -> Value {
     let resolved = if is_account_id {
         Some(stored.clone())
     } else {
-        // Only the synthetic form. Looking the address up among the
-        // source organization's members can never hit -- a target inside
-        // the source organization is rejected at invite time -- and
-        // looking it up registry-wide would RETURN a 12-digit id from an
-        // organization the caller has no relationship with, the oracle
-        // `resolve_target_account` is scoped to avoid. The synthetic form
-        // leaks nothing: it decodes only an id the caller already spelled
-        // out. A real address therefore reports no
-        // `ManagementAccountId`, which the Smithy shape allows.
-        crate::state::target_account_id("EMAIL", stored)
+        // The synthetic form decodes only an id the caller already spelled
+        // out, so it leaks nothing. A registered address otherwise
+        // resolves ONLY to the caller itself: the party gate already used
+        // that resolution to let this caller in, so telling it its own id
+        // reveals nothing, while a third party still learns nothing about
+        // whose account an address belongs to. An address that names
+        // somebody else therefore reports no `ManagementAccountId`, which
+        // the Smithy shape allows.
+        crate::state::target_account_id("EMAIL", stored).or_else(|| {
+            registry
+                .account_matches_target("EMAIL", stored, caller)
+                .then(|| caller.to_string())
+        })
     };
     if let Some(id) = resolved {
         party["ManagementAccountId"] = json!(id);
@@ -95,7 +102,11 @@ fn target_participant(t: &ResponsibilityTransfer) -> Value {
     party
 }
 
-fn transfer_payload(t: &ResponsibilityTransfer) -> Value {
+fn transfer_payload(
+    registry: &crate::state::OrganizationsRegistry,
+    t: &ResponsibilityTransfer,
+    caller: &str,
+) -> Value {
     let mut obj = json!({
         "Arn": t.arn,
         "Name": t.name,
@@ -106,7 +117,7 @@ fn transfer_payload(t: &ResponsibilityTransfer) -> Value {
             "ManagementAccountId": t.source_management_account_id,
             "ManagementAccountEmail": t.source_management_account_email,
         },
-        "Target": target_participant(t),
+        "Target": target_participant(registry, t, caller),
         "StartTimestamp": t.start_timestamp.timestamp() as f64,
     });
     if let Some(end) = t.end_timestamp {
@@ -361,7 +372,7 @@ impl OrganizationsService {
             .filter(|t| is_transfer_party(&guard, t, &req.account_id))
             .ok_or_else(|| transfer_not_found(&id))?;
         Ok(AwsResponse::ok_json(
-            json!({ "ResponsibilityTransfer": transfer_payload(transfer) }),
+            json!({ "ResponsibilityTransfer": transfer_payload(&guard, transfer, &req.account_id) }),
         ))
     }
 
@@ -381,7 +392,7 @@ impl OrganizationsService {
         transfer.name = name;
         let snapshot = transfer.clone();
         Ok(AwsResponse::ok_json(
-            json!({ "ResponsibilityTransfer": transfer_payload(&snapshot) }),
+            json!({ "ResponsibilityTransfer": transfer_payload(&guard, &snapshot, &req.account_id) }),
         ))
     }
 
@@ -438,7 +449,7 @@ impl OrganizationsService {
             }
         }
         Ok(AwsResponse::ok_json(
-            json!({ "ResponsibilityTransfer": transfer_payload(&snapshot) }),
+            json!({ "ResponsibilityTransfer": transfer_payload(&guard, &snapshot, &req.account_id) }),
         ))
     }
 
@@ -509,7 +520,10 @@ impl OrganizationsService {
             }
         }
         rows.sort_by(|a, b| a.id.cmp(&b.id));
-        let filtered: Vec<Value> = rows.into_iter().map(transfer_payload).collect();
+        let filtered: Vec<Value> = rows
+            .into_iter()
+            .map(|t| transfer_payload(&guard, t, &req.account_id))
+            .collect();
         let (page, token) = paginate_checked(&filtered, next_token.as_deref(), max_results)
             .map_err(|_| invalid_input("Invalid NextToken"))?;
         let mut out = json!({ "ResponsibilityTransfers": page });
