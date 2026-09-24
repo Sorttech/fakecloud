@@ -88,7 +88,11 @@ fn set_cors_header(
             }
         }
         Err(AwsServiceError::AwsError { headers, .. }) => {
-            headers.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
+            // Same append-vs-replace split as above, so the two arms cannot
+            // disagree if an error path ever sets its own `Vary`.
+            if !name.eq_ignore_ascii_case("vary") {
+                headers.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
+            }
             headers.push((name.to_string(), value.to_string()));
         }
         // Other variants render without per-error headers.
@@ -665,13 +669,21 @@ impl AwsService for S3Service {
         // treated as absent — the request carries nothing to evaluate CORS
         // against, and letting it through would match a `*` rule and stamp
         // CORS headers onto a request no browser would have sent that way.
-        let origin_header = req
-            .headers
-            .get("origin")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.trim())
-            .filter(|o| !o.is_empty())
-            .map(|s| s.to_string());
+        // Read with `get_all`: `Origin` gates approval like
+        // `Access-Control-Request-Headers`, and a request carrying more than
+        // one is not a single origin to allow, so it is treated as absent.
+        let origin_header = {
+            let mut lines = req.headers.get_all("origin").iter();
+            match (lines.next(), lines.next()) {
+                (Some(v), None) => v
+                    .to_str()
+                    .ok()
+                    .map(|s| s.trim())
+                    .filter(|o| !o.is_empty())
+                    .map(|s| s.to_string()),
+                _ => None,
+            }
+        };
 
         // Bucket-scoped sub-resource query params. If a request targets one
         // of these without a bucket in the path, S3 returns an error rather
