@@ -32,8 +32,7 @@ impl OrganizationsService {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let mut guard = self.state.write();
-        self.require_member_management(&guard, &req.account_id)?;
-        let org = guard.as_mut().unwrap();
+        let org = self.management_org_mut(&mut guard, &req.account_id)?;
         let policy = org
             .create_policy(name, description, content, policy_type)
             .map_err(org_error_to_aws)?;
@@ -55,8 +54,7 @@ impl OrganizationsService {
         let description = body.get("Description").and_then(|v| v.as_str());
         let content = body.get("Content").and_then(|v| v.as_str());
         let mut guard = self.state.write();
-        self.require_member_management(&guard, &req.account_id)?;
-        let org = guard.as_mut().unwrap();
+        let org = self.management_org_mut(&mut guard, &req.account_id)?;
         let policy = org
             .update_policy(policy_id, name, description, content)
             .map_err(org_error_to_aws)?;
@@ -69,8 +67,7 @@ impl OrganizationsService {
         let body = req.json_body();
         let policy_id = required_str(&body, "PolicyId")?;
         let mut guard = self.state.write();
-        self.require_member_management(&guard, &req.account_id)?;
-        let org = guard.as_mut().unwrap();
+        let org = self.management_org_mut(&mut guard, &req.account_id)?;
         org.delete_policy(policy_id).map_err(org_error_to_aws)?;
         Ok(AwsResponse::ok_json(Value::Null))
     }
@@ -115,8 +112,7 @@ impl OrganizationsService {
         let policy_id = required_str(&body, "PolicyId")?;
         let target_id = required_str(&body, "TargetId")?;
         let mut guard = self.state.write();
-        self.require_member_management(&guard, &req.account_id)?;
-        let org = guard.as_mut().unwrap();
+        let org = self.management_org_mut(&mut guard, &req.account_id)?;
         org.attach_policy(policy_id, target_id)
             .map_err(org_error_to_aws)?;
         Ok(AwsResponse::ok_json(Value::Null))
@@ -127,8 +123,7 @@ impl OrganizationsService {
         let policy_id = required_str(&body, "PolicyId")?;
         let target_id = required_str(&body, "TargetId")?;
         let mut guard = self.state.write();
-        self.require_member_management(&guard, &req.account_id)?;
-        let org = guard.as_mut().unwrap();
+        let org = self.management_org_mut(&mut guard, &req.account_id)?;
         org.detach_policy(policy_id, target_id)
             .map_err(org_error_to_aws)?;
         Ok(AwsResponse::ok_json(Value::Null))
@@ -186,8 +181,7 @@ impl OrganizationsService {
         let body = req.json_body();
         let policy_type = required_str(&body, "PolicyType")?.to_string();
         let mut guard = self.state.write();
-        self.require_member_management(&guard, &req.account_id)?;
-        let org = guard.as_mut().expect("management gate proved Some");
+        let org = self.management_org_mut(&mut guard, &req.account_id)?;
         org.enable_policy_type(&policy_type);
         let policy_types: Vec<Value> = org
             .list_policy_type_statuses()
@@ -212,8 +206,7 @@ impl OrganizationsService {
         let body = req.json_body();
         let policy_type = required_str(&body, "PolicyType")?.to_string();
         let mut guard = self.state.write();
-        self.require_member_management(&guard, &req.account_id)?;
-        let org = guard.as_mut().expect("management gate proved Some");
+        let org = self.management_org_mut(&mut guard, &req.account_id)?;
         org.disable_policy_type(&policy_type)
             .map_err(org_error_to_aws)?;
         let policy_types: Vec<Value> = org
@@ -244,7 +237,19 @@ impl OrganizationsService {
             .map(|s| s.to_string())
             .unwrap_or_else(|| req.account_id.clone());
         let guard = self.state.read();
-        let org = guard.as_ref().ok_or_else(organizations_not_in_use)?;
+        let org = self.require_member(&guard, &req.account_id)?;
+        // The target must live in the caller's own organization. Without
+        // this a foreign (or mistyped) id walked no hierarchy at all and
+        // came back as an empty, successful "no effective policy" instead
+        // of the modeled not-found.
+        if target_id != org.root_id
+            && !org.ous.contains_key(&target_id)
+            && !org.accounts.contains_key(&target_id)
+        {
+            return Err(org_error_to_aws(crate::state::OrgError::TargetNotFound(
+                target_id,
+            )));
+        }
         // The effective policy is the union of every policy of `policy_type`
         // attached up the org hierarchy from `target_id` to root. We
         // present it as a single Statement[] union so callers can audit.
@@ -293,8 +298,7 @@ impl OrganizationsService {
             )
         })?;
         let mut guard = self.state.write();
-        self.require_member_management(&guard, &req.account_id)?;
-        let org = guard.as_mut().expect("management gate proved Some");
+        let org = self.management_org_mut(&mut guard, &req.account_id)?;
         org.resource_policy = Some(content);
         let payload = json!({
             "ResourcePolicy": {
@@ -316,18 +320,20 @@ impl OrganizationsService {
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let mut guard = self.state.write();
-        self.require_member_management(&guard, &req.account_id)?;
-        let org = guard.as_mut().expect("management gate proved Some");
+        let org = self.management_org_mut(&mut guard, &req.account_id)?;
         org.resource_policy = None;
         Ok(AwsResponse::ok_json(json!({})))
     }
 
     pub(super) fn describe_resource_policy(
         &self,
-        _req: &AwsRequest,
+        req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let guard = self.state.read();
-        let org = guard.as_ref().ok_or_else(organizations_not_in_use)?;
+        // AWS allows the management account OR a member registered as a
+        // delegated administrator -- unlike `PutResourcePolicy` and
+        // `DeleteResourcePolicy`, which really are management-only.
+        let org = self.management_or_delegated_org(&guard, &req.account_id)?;
         let content = org.resource_policy.clone().ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,

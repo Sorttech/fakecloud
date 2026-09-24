@@ -10,7 +10,9 @@ Both the control plane and SCP enforcement are live. SCPs act as the top-of-chai
 
 ## Model
 
-- One organization per fakecloud process. `CreateOrganization` sets the caller's account as the management account and seeds a root OU.
+- Many independent organizations per fakecloud process. `CreateOrganization` sets the caller's account as the management account and seeds a root OU, and rejects only when **that account** is already in an organization (`AlreadyInOrganizationException`) -- another account having created one does not block it.
+- An account belongs to at most one organization. Inviting an account another organization already holds is `HandshakeConstraintViolationException` with `Reason: ALREADY_IN_AN_ORGANIZATION`, both at invite time and again when the handshake is accepted.
+- Organizations never see each other: every read resolves the caller's own organization, and a caller in none gets `AWSOrganizationsNotInUseException` -- the same answer as a process with no organizations at all. The exceptions are the operations that are cross-organization by nature, and they stay scoped to the caller's own involvement: `ListHandshakesForAccount` and `DescribeHandshake` (the account answering an invitation is not yet a member of the inviting organization, so a handshake resolves by id, readable by its two parties and by members of the organization that owns it), and the responsibility-transfer ops (a transfer is recorded once, in the source organization, and both management accounts are parties to it).
 - `FullAWSAccess` is auto-created and auto-attached to the root OU on `CreateOrganization`, matching AWS. Its content:
   ```json
   {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}

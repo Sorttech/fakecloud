@@ -25,7 +25,7 @@ impl OrganizationsService {
         let body = req.json_body();
         let child_id = required_str(&body, "ChildId")?.to_string();
         let guard = self.state.read();
-        let org = guard.as_ref().ok_or_else(organizations_not_in_use)?;
+        let org = self.require_member(&guard, &req.account_id)?;
         let parents = match org.parent_of(&child_id) {
             Some((id, kind)) => vec![json!({"Id": id, "Type": kind})],
             None => Vec::new(),
@@ -38,7 +38,7 @@ impl OrganizationsService {
         let parent_id = required_str(&body, "ParentId")?.to_string();
         let child_type = required_str(&body, "ChildType")?.to_string();
         let guard = self.state.read();
-        let org = guard.as_ref().ok_or_else(organizations_not_in_use)?;
+        let org = self.require_member(&guard, &req.account_id)?;
         let children: Vec<Value> = org
             .list_children(&parent_id, &child_type)
             .into_iter()

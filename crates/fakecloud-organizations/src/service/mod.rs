@@ -15,9 +15,9 @@ use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceErr
 use fakecloud_persistence::SnapshotStore;
 
 use crate::state::{
-    MemberAccount, OrgError, OrganizationState, OrganizationalUnit, OrganizationsSnapshot, Policy,
-    SharedOrganizationsState, FEATURE_SET_ALL, FEATURE_SET_CONSOLIDATED_BILLING,
-    ORGANIZATIONS_SNAPSHOT_SCHEMA_VERSION, POLICY_TYPE_SCP,
+    MemberAccount, OrgError, OrganizationState, OrganizationalUnit, OrganizationsRegistry,
+    OrganizationsSnapshot, Policy, SharedOrganizationsState, FEATURE_SET_ALL,
+    FEATURE_SET_CONSOLIDATED_BILLING, ORGANIZATIONS_SNAPSHOT_SCHEMA_VERSION, POLICY_TYPE_SCP,
 };
 
 /// Organizations read actions all start with `Describe` or `List`; every other
@@ -142,6 +142,22 @@ fn membership_fingerprint(org: &OrganizationState) -> u64 {
     hasher.finish()
 }
 
+/// Fingerprint of membership across EVERY organization. An organization
+/// appearing or disappearing has to register as a change too, so this
+/// hashes the whole registry rather than tracking one value per org.
+fn registry_membership_fingerprint(registry: &OrganizationsRegistry) -> Option<u64> {
+    if registry.is_empty() {
+        return None;
+    }
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // `iter()` is ordered by organization id, so the digest is stable.
+    for org in registry.iter() {
+        hasher.write_u64(membership_fingerprint(org));
+    }
+    Some(hasher.finish())
+}
+
 impl OrgChangeHooks {
     pub fn new() -> Self {
         Self::default()
@@ -163,7 +179,7 @@ impl OrgChangeHooks {
         // announced.
         let (previous, claimed) = {
             let mut seen = self.seen.lock();
-            let fingerprint = state.read().as_ref().map(membership_fingerprint);
+            let fingerprint = registry_membership_fingerprint(&state.read());
             if *seen == fingerprint {
                 return;
             }
@@ -279,7 +295,8 @@ impl OrganizationsService {
     }
 
     pub fn shared() -> (Arc<Self>, SharedOrganizationsState) {
-        let state: SharedOrganizationsState = Arc::new(parking_lot::RwLock::new(None));
+        let state: SharedOrganizationsState =
+            Arc::new(parking_lot::RwLock::new(OrganizationsRegistry::default()));
         (Arc::new(Self::new(state.clone())), state)
     }
 
@@ -319,57 +336,101 @@ impl OrganizationsService {
     pub fn rearm_in_progress_account_creations(&self) {
         let pending: Vec<String> = {
             let guard = self.state.read();
-            match guard.as_ref() {
-                Some(org) => org
-                    .create_account_requests
-                    .iter()
-                    .filter(|(_, s)| s.state == "IN_PROGRESS")
-                    .map(|(id, _)| id.clone())
-                    .collect(),
-                None => Vec::new(),
-            }
+            // Request ids are globally unique (`car-` + 20 random chars), so
+            // the completion tick can find its own request by scanning every
+            // organization — no need to thread the owning org id through.
+            guard
+                .iter()
+                .flat_map(|org| org.create_account_requests.iter())
+                .filter(|(_, s)| s.state == "IN_PROGRESS")
+                .map(|(id, _)| id.clone())
+                .collect()
         };
         for request_id in pending {
             self.spawn_create_account_completion(request_id);
         }
     }
 
-    /// Read-side helper: enforce that an org exists and the caller is a
-    /// member. Returns the borrowed org on success.
+    /// Read-side helper: resolve the organization the caller belongs to.
+    /// A caller in no organization gets the same
+    /// `AWSOrganizationsNotInUseException` as a caller in a process with
+    /// no organizations at all, so another organization's existence is
+    /// never observable from outside it.
     fn require_member<'a>(
         &self,
-        guard: &'a parking_lot::RwLockReadGuard<'_, Option<OrganizationState>>,
+        guard: &'a parking_lot::RwLockReadGuard<'_, OrganizationsRegistry>,
         account_id: &str,
     ) -> Result<&'a OrganizationState, AwsServiceError> {
-        let org = guard.as_ref().ok_or_else(organizations_not_in_use)?;
-        if !org.accounts.contains_key(account_id) {
-            return Err(organizations_not_in_use());
+        guard
+            .org_of_account(account_id)
+            .ok_or_else(organizations_not_in_use)
+    }
+
+    /// Write-side helper for mutating ops: resolve the caller's own
+    /// organization and enforce that the caller is its management
+    /// account. Returns the organization itself, so a handler never has
+    /// to re-resolve it out of the registry.
+    fn management_org_mut<'a>(
+        &self,
+        guard: &'a mut parking_lot::RwLockWriteGuard<'_, OrganizationsRegistry>,
+        account_id: &str,
+    ) -> Result<&'a mut OrganizationState, AwsServiceError> {
+        let org = guard
+            .org_of_account_mut(account_id)
+            .ok_or_else(organizations_not_in_use)?;
+        if !org.is_management(account_id) {
+            return Err(not_management());
         }
         Ok(org)
     }
 
-    /// Write-side helper for mutating ops: caller must be the
-    /// management account of an existing organization. Returns the
-    /// management-only error rather than an Option, so the caller can
-    /// unwrap the guard safely right after.
-    fn require_member_management(
+    /// The caller's organization, for the read operations AWS opens to
+    /// the management account OR to any member registered as a
+    /// delegated administrator (for any service principal).
+    ///
+    /// Delegated administration exists so a member account can run a
+    /// service's org-wide integration on the management account's
+    /// behalf, which means reading the organization it administers:
+    /// `ListHandshakesForOrganization`, `ListAWSServiceAccessForOrganization`,
+    /// `ListDelegatedAdministrators` and `ListDelegatedServicesForAccount`
+    /// are all documented as callable by a delegated administrator.
+    /// Mutating operations stay management-only via
+    /// [`Self::management_org_mut`], which is why there is no read-side
+    /// management-only gate left: every management-only op mutates.
+    fn management_or_delegated_org<'a>(
         &self,
-        guard: &parking_lot::RwLockWriteGuard<'_, Option<OrganizationState>>,
+        guard: &'a parking_lot::RwLockReadGuard<'_, OrganizationsRegistry>,
         account_id: &str,
-    ) -> Result<(), AwsServiceError> {
-        let org = guard.as_ref().ok_or_else(organizations_not_in_use)?;
-        if !org.accounts.contains_key(account_id) {
-            return Err(organizations_not_in_use());
+    ) -> Result<&'a OrganizationState, AwsServiceError> {
+        let org = self.require_member(guard, account_id)?;
+        if !org.is_management(account_id) && !org.is_delegated_administrator(account_id) {
+            return Err(not_management());
         }
-        if !org.is_management(account_id) {
-            return Err(AwsServiceError::aws_error(
-                StatusCode::FORBIDDEN,
-                "AccessDeniedException",
-                "This operation can be called only from the organization's management account.",
-            ));
-        }
-        Ok(())
+        Ok(org)
     }
+}
+
+/// AWS's handshake-time answer for "that account already belongs to an
+/// organization", carrying the modeled `Reason` discriminator.
+fn already_in_an_organization(message: String) -> AwsServiceError {
+    AwsServiceError::aws_error_with_fields(
+        StatusCode::BAD_REQUEST,
+        "HandshakeConstraintViolationException",
+        message,
+        vec![(
+            "Reason".to_string(),
+            "ALREADY_IN_AN_ORGANIZATION".to_string(),
+        )],
+    )
+}
+
+/// AWS's error for a management-only operation attempted by a member.
+fn not_management() -> AwsServiceError {
+    AwsServiceError::aws_error(
+        StatusCode::FORBIDDEN,
+        "AccessDeniedException",
+        "This operation can be called only from the organization's management account.",
+    )
 }
 
 fn parse_tags(value: Option<&Value>) -> Vec<(String, String)> {
@@ -531,7 +592,10 @@ pub async fn save_organizations_snapshot(
     let _guard = lock.lock().await;
     let snapshot = OrganizationsSnapshot {
         schema_version: ORGANIZATIONS_SNAPSHOT_SCHEMA_VERSION,
-        organization: state.read().clone(),
+        // v1's single-organization field is read-only now; v2 always
+        // writes the whole registry.
+        organization: None,
+        organizations: state.read().clone(),
     };
     let join = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
         let bytes = serde_json::to_vec(&snapshot)
@@ -777,11 +841,17 @@ fn org_error_to_aws(err: OrgError) -> AwsServiceError {
             "DuplicateHandshakeException",
             format!("An OPEN handshake already exists for account {account}."),
         ),
-        OrgError::AccountAlreadyMember(account) => AwsServiceError::aws_error(
-            StatusCode::BAD_REQUEST,
-            "AccountAlreadyRegisteredException",
-            format!("Account {account} is already a member of this organization."),
-        ),
+        // AWS reports both of these on InviteAccountToOrganization and
+        // AcceptHandshake as HandshakeConstraintViolationException with
+        // Reason=ALREADY_IN_AN_ORGANIZATION; those operations do not model
+        // AccountAlreadyRegisteredException at all, so a typed SDK catching
+        // the modeled exception would miss it.
+        OrgError::AccountAlreadyMember(account) => already_in_an_organization(format!(
+            "Account {account} is already a member of this organization."
+        )),
+        OrgError::AccountInAnotherOrganization(account) => already_in_an_organization(format!(
+            "Account {account} is already a member of an organization."
+        )),
         OrgError::AWSServiceAccessNotEnabled(svc) => AwsServiceError::aws_error(
             StatusCode::BAD_REQUEST,
             "AWSOrganizationsNotInUseException",
@@ -839,6 +909,10 @@ fn parse_handshake_filter(body: &Value) -> Result<HandshakeFilter, AwsServiceErr
             "ENABLE_ALL_FEATURES",
             "APPROVE_ALL_FEATURES",
             "ADD_ORGANIZATIONS_SERVICE_LINKED_ROLE",
+            // A real `ActionType`, and now reachable: a source management
+            // account sees its own outbound transfer handshakes, so it can
+            // filter for them.
+            "TRANSFER_RESPONSIBILITY",
         ];
         if !ALLOWED.contains(&action.as_str()) {
             return Err(AwsServiceError::aws_error(
@@ -924,7 +998,7 @@ fn parse_list_pagination(body: &Value) -> Result<(usize, Option<String>), AwsSer
     Ok((max_results, next_token))
 }
 
-fn handshake_payload(h: &crate::state::Handshake) -> Value {
+fn handshake_payload(org: &OrganizationState, h: &crate::state::Handshake) -> Value {
     // Real AWS Organizations encodes the inviter as the org itself
     // (`Type: ORGANIZATION`, `Id` = the org id) and the invitee as the
     // member account (`Type: ACCOUNT`, `Id` = account id) or its email
@@ -934,14 +1008,82 @@ fn handshake_payload(h: &crate::state::Handshake) -> Value {
         {"Id": h.organization_id, "Type": "ORGANIZATION"},
         {"Id": h.source_account_id, "Type": "ACCOUNT"},
         {
-            "Id": h.target_email.clone().unwrap_or_else(|| h.target_account_id.clone()),
+            // Pick the id by the party's own Type. Preferring
+            // `target_email` whenever it was recorded rendered an address
+            // under `Type: ACCOUNT` for any handshake that stored both.
+            "Id": if h.target_kind == "EMAIL" {
+                h.target_email.clone().unwrap_or_else(|| h.target_account_id.clone())
+            } else {
+                h.target_account_id.clone()
+            },
             "Type": h.target_kind,
         },
     ]);
-    let resources = json!([
-        {"Type": "ORGANIZATION", "Value": h.organization_id},
-        {"Type": "ACCOUNT", "Value": h.target_account_id},
-    ]);
+    // Same rule as the parties above: the value has to match the type it
+    // is labelled with. `HandshakeResourceType` models EMAIL separately,
+    // so an email-target invite reports the address as EMAIL rather than
+    // as an ACCOUNT id.
+    let target_resource = if h.target_kind == "EMAIL" {
+        json!({
+            "Type": "EMAIL",
+            "Value": h.target_email.clone().unwrap_or_else(|| h.target_account_id.clone()),
+        })
+    } else {
+        json!({"Type": "ACCOUNT", "Value": h.target_account_id})
+    };
+    let mut resources = vec![
+        json!({"Type": "ORGANIZATION", "Value": h.organization_id}),
+        target_resource,
+    ];
+    // A TRANSFER_RESPONSIBILITY handshake carries the transfer it is
+    // offering, and AWS models exactly that as a nested
+    // `RESPONSIBILITY_TRANSFER` resource -- which is how an SDK reading
+    // only the handshake learns what is being handed over and by whom.
+    // `HandshakeResourceType` defines TRANSFER_TYPE,
+    // TRANSFER_START_TIMESTAMP and MANAGEMENT_ACCOUNT for no other
+    // purpose.
+    if let Some(transfer) = h
+        .responsibility_transfer_id
+        .as_deref()
+        .and_then(|id| org.responsibility_transfers.get(id))
+        // A handshake written before the link existed deserializes with
+        // no transfer id, and nothing backfills it. Fall back to the
+        // transfer's own `ActiveHandshakeId`, which covers every restored
+        // handshake still OPEN. A restored handshake that had already
+        // resolved is beyond recovery -- resolution is what clears that
+        // field, and nothing else ties the two together -- so this is as
+        // far back as the stored data reaches.
+        .or_else(|| {
+            org.responsibility_transfers
+                .values()
+                .find(|t| t.active_handshake_id.as_deref() == Some(h.id.as_str()))
+        })
+    {
+        resources.push(json!({
+            "Type": "RESPONSIBILITY_TRANSFER",
+            "Value": transfer.id,
+            "Resources": [
+                {"Type": "TRANSFER_TYPE", "Value": transfer.transfer_type},
+                {
+                    "Type": "TRANSFER_START_TIMESTAMP",
+                    // A nested resource's Value is a string in the Smithy
+                    // model, so the timestamp goes out ISO-8601 rather
+                    // than as the epoch number the top-level timestamp
+                    // members use.
+                    "Value": transfer.start_timestamp.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                },
+                {
+                    "Type": "MANAGEMENT_ACCOUNT",
+                    "Value": transfer.source_management_account_id,
+                },
+                {
+                    "Type": "MANAGEMENT_EMAIL",
+                    "Value": transfer.source_management_account_email,
+                },
+            ],
+        }));
+    }
+    let resources = Value::Array(resources);
     let mut obj = json!({
         "Id": h.id,
         "Arn": h.arn,

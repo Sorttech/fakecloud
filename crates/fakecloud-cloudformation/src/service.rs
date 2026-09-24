@@ -4233,7 +4233,9 @@ mod tests {
             )),
             cloudwatch: Arc::new(RwLock::new(fakecloud_cloudwatch::CloudWatchAccounts::new())),
             elbv2: Arc::new(RwLock::new(fakecloud_elbv2::Elbv2Accounts::new())),
-            organizations: Arc::new(RwLock::new(None)),
+            organizations: Arc::new(RwLock::new(
+                fakecloud_organizations::OrganizationsRegistry::default(),
+            )),
             cognito: Arc::new(RwLock::new(
                 fakecloud_core::multi_account::MultiAccountState::new(
                     "123456789012",

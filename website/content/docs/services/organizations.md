@@ -20,9 +20,9 @@ fakecloud implements **63 of 63** AWS Organizations operations at 100% Smithy co
 - **StackSets auto-deployment** — a membership change (an account created, invited, moved between OUs, removed or closed) reconciles every service-managed CloudFormation stack set that has `AutoDeployment.Enabled`, so an account that joins a targeted OU is provisioned with that stack set's stacks before the Organizations call returns. See [CloudFormation](/docs/services/cloudformation/#stack-sets).
 - **Policies** — `CreatePolicy`, `UpdatePolicy`, `DeletePolicy`, `DescribePolicy`, `ListPolicies`, `ListPoliciesForTarget`, `ListTargetsForPolicy`, `AttachPolicy`, `DetachPolicy`, `EnablePolicyType`, `DisablePolicyType`, `DescribeEffectivePolicy`. The full `PolicyType` enum is accepted on the list filters; the four types fakecloud manages (`SERVICE_CONTROL_POLICY`, `TAG_POLICY`, `BACKUP_POLICY`, `AISERVICES_OPT_OUT_POLICY`) can be created — others return `PolicyTypeNotAvailableForOrganizationException`, an out-of-enum value returns `InvalidInputException`. Policy documents are JSON-validated on create/update — malformed content is rejected with `MalformedPolicyDocumentException`.
 - **Effective-policy validation** — `ListAccountsWithInvalidEffectivePolicy` and `ListEffectivePolicyValidationErrors` return the honest empty result: fakecloud stores only well-formed policies, so no account ever has an invalid effective policy.
-- **Billing responsibility transfers** — `InviteOrganizationToTransferResponsibility` opens a handshake-backed `BILLING` transfer; `DescribeResponsibilityTransfer`, `UpdateResponsibilityTransfer` (rename), `TerminateResponsibilityTransfer` (-> `WITHDRAWN`), and `ListInboundResponsibilityTransfers` / `ListOutboundResponsibilityTransfers` operate over the transfer records, filtered by direction.
+- **Billing responsibility transfers** — `InviteOrganizationToTransferResponsibility` opens a handshake-backed `BILLING` transfer; `DescribeResponsibilityTransfer`, `UpdateResponsibilityTransfer` (rename), `TerminateResponsibilityTransfer` (-> `WITHDRAWN`), and `ListInboundResponsibilityTransfers` / `ListOutboundResponsibilityTransfers` operate over the transfer records, filtered by direction. One live offer per target: a second invitation to the same account, by id or by address, returns `DuplicateHandshakeException`. The handshake reports the transfer it carries as a nested `RESPONSIBILITY_TRANSFER` resource (with `TRANSFER_TYPE`, `TRANSFER_START_TIMESTAMP`, `MANAGEMENT_ACCOUNT` and `MANAGEMENT_EMAIL`), so the invited account can read what it is being offered without a second call.
 - **Resource policies** — `PutResourcePolicy`, `DescribeResourcePolicy`, `DeleteResourcePolicy` for the org-wide delegation policy.
-- **Service access** — `EnableAWSServiceAccess`, `DisableAWSServiceAccess`, `ListAWSServiceAccessForOrganization`, `RegisterDelegatedAdministrator`, `DeregisterDelegatedAdministrator`, `ListDelegatedAdministrators`, `ListDelegatedServicesForAccount`. Delegated-admin registration is gated on the service having `EnableAWSServiceAccess` first, matching AWS error ordering.
+- **Service access** — `EnableAWSServiceAccess`, `DisableAWSServiceAccess`, `ListAWSServiceAccessForOrganization`, `RegisterDelegatedAdministrator`, `DeregisterDelegatedAdministrator`, `ListDelegatedAdministrators`, `ListDelegatedServicesForAccount`. Delegated-admin registration is gated on the service having `EnableAWSServiceAccess` first, matching AWS error ordering. A registered delegated administrator can run the organization's read operations on the management account's behalf -- `ListHandshakesForOrganization`, `ListAWSServiceAccessForOrganization`, `ListDelegatedAdministrators`, `ListDelegatedServicesForAccount` and `DescribeResourcePolicy` -- while every mutating operation stays management-only.
 - **Tagging** — `TagResource`, `UntagResource`, `ListTagsForResource` on accounts, OUs, roots, and policies.
 
 ## SCP enforcement
@@ -101,16 +101,30 @@ Response shape:
       "joinedMethod": "INVITED",
       "joinedTimestamp": "2026-05-11T00:00:00Z",
       "parentOuId": "r-1234",
+      "organizationId": "o-abc",
       "tags": [],
       "scpAttached": []
     }
   ],
   "managementAccountId": "111111111111",
-  "masterAccountId": "111111111111"
+  "masterAccountId": "111111111111",
+  "organizations": [
+    {
+      "organizationId": "o-abc",
+      "arn": "arn:aws:organizations::111111111111:organization/o-abc",
+      "managementAccountId": "111111111111",
+      "rootId": "r-1234",
+      "featureSet": "ALL"
+    }
+  ]
 }
 ```
 
 `scpAttached` lists SCPs attached directly to the account only — to resolve the full inherited set walk up the OU tree or call `DescribeEffectivePolicy`. `accounts` is empty (and the account-id fields `null`) when no organization has been created yet. `masterAccountId` mirrors `managementAccountId` for back-compat with the AWS field renamed in 2020.
+
+`accounts` spans **every** organization in the process, each entry carrying its own `organizationId`, and `organizations` lists one entry per organization. The flat `managementAccountId`/`masterAccountId` are set only when exactly one organization exists, so a caller written against the single-organization shape keeps working; with several, read `organizations` (or each account's `organizationId`) rather than getting one arbitrary organization's answer.
+
+Note that this overloads `null` on those two fields: before multi-organization support it meant "no organization has been created yet", and it now also means "more than one exists, so there is no single answer". Test `organizations` instead -- it is empty only when no organization exists.
 
 The first-party SDKs wrap this:
 

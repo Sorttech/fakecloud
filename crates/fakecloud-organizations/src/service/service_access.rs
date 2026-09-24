@@ -10,8 +10,7 @@ impl OrganizationsService {
         let body = req.json_body();
         let principal = required_str(&body, "ServicePrincipal")?.to_string();
         let mut guard = self.state.write();
-        self.require_member_management(&guard, &req.account_id)?;
-        let org = guard.as_mut().expect("management gate proved Some");
+        let org = self.management_org_mut(&mut guard, &req.account_id)?;
         org.enable_aws_service_access(&principal);
         Ok(AwsResponse::ok_json(json!({})))
     }
@@ -23,8 +22,7 @@ impl OrganizationsService {
         let body = req.json_body();
         let principal = required_str(&body, "ServicePrincipal")?.to_string();
         let mut guard = self.state.write();
-        self.require_member_management(&guard, &req.account_id)?;
-        let org = guard.as_mut().expect("management gate proved Some");
+        let org = self.management_org_mut(&mut guard, &req.account_id)?;
         org.disable_aws_service_access(&principal)
             .map_err(org_error_to_aws)?;
         Ok(AwsResponse::ok_json(json!({})))
@@ -36,9 +34,8 @@ impl OrganizationsService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let body = req.json_body();
         let (max_results, next_token) = parse_list_pagination(&body)?;
-        let guard = self.state.write();
-        self.require_member_management(&guard, &req.account_id)?;
-        let org = guard.as_ref().expect("management gate proved Some");
+        let guard = self.state.read();
+        let org = self.management_or_delegated_org(&guard, &req.account_id)?;
         let entries: Vec<Value> = org
             .list_trusted_services()
             .into_iter()

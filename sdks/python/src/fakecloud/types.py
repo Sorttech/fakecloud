@@ -3019,6 +3019,7 @@ class OrganizationsAccount:
     parent_ou_id: Optional[str] = None
     tags: List[OrganizationsTag] = field(default_factory=list)
     scp_attached: List[str] = field(default_factory=list)
+    organization_id: Optional[str] = None
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> OrganizationsAccount:
@@ -3035,6 +3036,7 @@ class OrganizationsAccount:
             parent_ou_id=d.get("parent_ou_id"),
             tags=tags,
             scp_attached=list(d.get("scp_attached", [])),
+            organization_id=d.get("organization_id"),
         )
 
 
@@ -3101,19 +3103,55 @@ class LogsFieldIndexesResponse:
 
 
 @dataclass
+class OrganizationsSummary:
+    """One organization in the process. Organizations are fully
+    independent: each has its own management account, root and SCPs."""
+
+    organization_id: str
+    arn: str
+    management_account_id: str
+    root_id: str
+    feature_set: str
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> OrganizationsSummary:
+        d = _convert_keys(data)
+        return cls(
+            organization_id=d.get("organization_id", ""),
+            arn=d.get("arn", ""),
+            management_account_id=d.get("management_account_id", ""),
+            root_id=d.get("root_id", ""),
+            feature_set=d.get("feature_set", ""),
+        )
+
+
+@dataclass
 class OrganizationsAccountsResponse:
+    """Every member account across every organization.
+
+    ``management_account_id``/``master_account_id`` are set only when
+    exactly one organization exists, so callers written against the
+    one-organization shape keep working; read ``organizations`` (or each
+    account's ``organization_id``) otherwise.
+    """
+
     accounts: List[OrganizationsAccount] = field(default_factory=list)
     management_account_id: Optional[str] = None
     master_account_id: Optional[str] = None
+    organizations: List[OrganizationsSummary] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> OrganizationsAccountsResponse:
         d = _convert_keys(data)
         accounts = [OrganizationsAccount.from_dict(a) for a in d.get("accounts", [])]
+        organizations = [
+            OrganizationsSummary.from_dict(o) for o in d.get("organizations", [])
+        ]
         return cls(
             accounts=accounts,
             management_account_id=d.get("management_account_id"),
             master_account_id=d.get("master_account_id"),
+            organizations=organizations,
         )
 
 
@@ -3136,6 +3174,7 @@ class OrganizationsResponsibilityTransfer:
     start_timestamp: str
     end_timestamp: Optional[str] = None
     active_handshake_id: Optional[str] = None
+    organization_id: Optional[str] = None
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> OrganizationsResponsibilityTransfer:
@@ -3158,6 +3197,7 @@ class OrganizationsResponsibilityTransfer:
             start_timestamp=d.get("start_timestamp", ""),
             end_timestamp=d.get("end_timestamp"),
             active_handshake_id=d.get("active_handshake_id"),
+            organization_id=d.get("organization_id"),
         )
 
 

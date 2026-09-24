@@ -486,18 +486,11 @@ pub(crate) fn organizations_accounts_snapshot(
     state: &fakecloud_organizations::SharedOrganizationsState,
 ) -> types::OrganizationsAccountsResponse {
     let guard = state.read();
-    let Some(org) = guard.as_ref() else {
-        return types::OrganizationsAccountsResponse {
-            accounts: Vec::new(),
-            management_account_id: None,
-            master_account_id: None,
-        };
-    };
 
-    let mut accounts: Vec<types::OrganizationsAccount> = org
-        .accounts
-        .values()
-        .map(|a| {
+    let mut accounts: Vec<types::OrganizationsAccount> = guard
+        .iter()
+        .flat_map(|org| org.accounts.values().map(move |a| (org, a)))
+        .map(|(org, a)| {
             let mut tags: Vec<types::OrganizationsTag> = org
                 .resource_tags
                 .get(&a.id)
@@ -538,6 +531,7 @@ pub(crate) fn organizations_accounts_snapshot(
                 joined_method: a.joined_method.clone(),
                 joined_timestamp: a.joined_timestamp.to_rfc3339(),
                 parent_ou_id: Some(a.parent_id.clone()),
+                organization_id: Some(org.org_id.clone()),
                 tags,
                 scp_attached,
             }
@@ -545,10 +539,35 @@ pub(crate) fn organizations_accounts_snapshot(
         .collect();
     accounts.sort_by(|x, y| x.id.cmp(&y.id));
 
+    let organizations: Vec<types::OrganizationsSummary> = guard
+        .iter()
+        .map(|org| types::OrganizationsSummary {
+            organization_id: org.org_id.clone(),
+            arn: org.org_arn.clone(),
+            management_account_id: org.management_account_id.clone(),
+            root_id: org.root_id.clone(),
+            feature_set: org.feature_set.clone(),
+        })
+        .collect();
+
+    // The flat management-account fields only make sense when there is a
+    // single organization to point at; with several, a caller has to read
+    // `organizations` (or each account's `organizationId`) instead of
+    // silently getting one arbitrary organization's answer.
+    //
+    // That overloads `null`, which used to mean "no organization exists".
+    // `organizations` is the unambiguous signal -- empty means none --
+    // and the docs say so.
+    let single = match organizations.as_slice() {
+        [only] => Some(only.management_account_id.clone()),
+        _ => None,
+    };
+
     types::OrganizationsAccountsResponse {
         accounts,
-        management_account_id: Some(org.management_account_id.clone()),
-        master_account_id: Some(org.management_account_id.clone()),
+        management_account_id: single.clone(),
+        master_account_id: single,
+        organizations,
     }
 }
 
@@ -830,8 +849,9 @@ mod tests {
     #[test]
     fn organizations_accounts_snapshot_empty_when_no_org() {
         use std::sync::Arc;
-        let state: fakecloud_organizations::SharedOrganizationsState =
-            Arc::new(parking_lot::RwLock::new(None));
+        let state: fakecloud_organizations::SharedOrganizationsState = Arc::new(
+            parking_lot::RwLock::new(fakecloud_organizations::OrganizationsRegistry::default()),
+        );
         let snap = super::organizations_accounts_snapshot(&state);
         assert!(snap.accounts.is_empty());
         assert!(snap.management_account_id.is_none());
@@ -876,7 +896,7 @@ mod tests {
             .expect("attach to member");
 
         let state: fakecloud_organizations::SharedOrganizationsState =
-            Arc::new(parking_lot::RwLock::new(Some(org)));
+            Arc::new(parking_lot::RwLock::new(org.into()));
         let snap = super::organizations_accounts_snapshot(&state);
 
         assert_eq!(snap.management_account_id.as_deref(), Some("111111111111"));

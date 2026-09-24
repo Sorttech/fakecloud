@@ -230,11 +230,9 @@ async fn ou_tree_crud_and_move_account() {
 /// enrolling it handed the account another organization's SCP ceiling,
 /// exposed that organization's metadata to it, and made it a stack-set
 /// auto-deployment target.
-///
-/// This is one half of #2543. The other half -- letting a second
-/// management account create an organization of its own -- needs the
-/// process-wide single-organization state to become a registry, and
-/// lands separately.
+/// See `two_accounts_each_run_their_own_organization` for the other
+/// half of #2543: a second management account running an organization
+/// of its own.
 #[tokio::test]
 async fn create_admin_leaves_the_account_outside_an_existing_organization() {
     let server = start().await;
@@ -259,6 +257,133 @@ async fn create_admin_leaves_the_account_outside_an_existing_organization() {
     let accounts = orgs_a.list_accounts().send().await.unwrap();
     let ids: Vec<&str> = accounts.accounts().iter().filter_map(|a| a.id()).collect();
     assert_eq!(ids, [ACCOUNT_A]);
+}
+
+/// The whole of #2543's repro: two management accounts, each with its
+/// own organization and its own child accounts, fully independent.
+/// Before multi-organization support the second `CreateOrganization`
+/// failed with `AlreadyInOrganizationException` purely because the
+/// first organization existed.
+#[tokio::test]
+async fn two_accounts_each_run_their_own_organization() {
+    let server = start().await;
+
+    // Distinct from the management ids: reusing an owner's own id as a
+    // child would re-bootstrap that account's admin user and invalidate
+    // the credentials this test is already holding.
+    const CHILDREN_A: [&str; 2] = ["111111110001", "111111110002"];
+    const CHILDREN_B: [&str; 2] = ["222222220001", "222222220002"];
+
+    let mut orgs_by_owner = Vec::new();
+    for (owner, children) in [(ACCOUNT_A, CHILDREN_A), (ACCOUNT_B, CHILDREN_B)] {
+        let (akid, secret) = server.create_admin(owner, "root").await;
+        let cfg = config_with(&server, &akid, &secret).await;
+        let orgs = OrgsClient::new(&cfg);
+
+        let org_id = orgs
+            .create_organization()
+            .feature_set(aws_sdk_organizations::types::OrganizationFeatureSet::All)
+            .send()
+            .await
+            .unwrap()
+            .organization()
+            .unwrap()
+            .id()
+            .unwrap()
+            .to_string();
+
+        // Two children per organization, enrolled at bootstrap.
+        for child in children {
+            server.create_admin_in_org(child, "root", &org_id).await;
+        }
+        orgs_by_owner.push((owner, orgs, org_id, children));
+    }
+
+    let (_, orgs_a, org_a, children_a) = &orgs_by_owner[0];
+    let (_, orgs_b, org_b, children_b) = &orgs_by_owner[1];
+    assert_ne!(org_a, org_b, "each account gets its own organization");
+
+    // Each management account sees only its own organization...
+    assert_eq!(
+        orgs_a
+            .describe_organization()
+            .send()
+            .await
+            .unwrap()
+            .organization()
+            .unwrap()
+            .id()
+            .unwrap(),
+        org_a
+    );
+    assert_eq!(
+        orgs_b
+            .describe_organization()
+            .send()
+            .await
+            .unwrap()
+            .organization()
+            .unwrap()
+            .id()
+            .unwrap(),
+        org_b
+    );
+
+    // ...and only its own accounts: management plus its two children,
+    // with nothing from the other organization leaking in.
+    for (owner, orgs, _, children) in [
+        (ACCOUNT_A, orgs_a, org_a, children_a),
+        (ACCOUNT_B, orgs_b, org_b, children_b),
+    ] {
+        let listed = orgs.list_accounts().send().await.unwrap();
+        let mut ids: Vec<String> = listed
+            .accounts()
+            .iter()
+            .filter_map(|a| a.id())
+            .map(str::to_string)
+            .collect();
+        ids.sort();
+        let mut expected: Vec<String> = children.iter().map(|c| c.to_string()).collect();
+        expected.push(owner.to_string());
+        expected.sort();
+        assert_eq!(
+            ids, expected,
+            "organization of {owner} has the wrong members"
+        );
+    }
+}
+
+/// An account can only ever be in one organization: an invitation to an
+/// account another organization already holds is rejected.
+#[tokio::test]
+async fn an_account_cannot_be_invited_into_a_second_organization() {
+    let server = start().await;
+    let (a_akid, a_secret) = server.create_admin(ACCOUNT_A, "admin-a").await;
+    let a_cfg = config_with(&server, &a_akid, &a_secret).await;
+    let orgs_a = OrgsClient::new(&a_cfg);
+    orgs_a.create_organization().send().await.unwrap();
+
+    let (b_akid, b_secret) = server.create_admin(ACCOUNT_B, "admin-b").await;
+    let b_cfg = config_with(&server, &b_akid, &b_secret).await;
+    let orgs_b = OrgsClient::new(&b_cfg);
+    orgs_b.create_organization().send().await.unwrap();
+
+    let err = orgs_a
+        .invite_account_to_organization()
+        .target(
+            aws_sdk_organizations::types::HandshakeParty::builder()
+                .id(ACCOUNT_B)
+                .r#type(aws_sdk_organizations::types::HandshakePartyType::Account)
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("HandshakeConstraintViolationException"),
+        "expected HandshakeConstraintViolationException, got: {err:?}"
+    );
 }
 
 /// The opt-in half of #2543: naming an organization on the bootstrap

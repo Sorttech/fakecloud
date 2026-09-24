@@ -34,7 +34,79 @@ fn require_transfer_type(body: &Value) -> Result<String, AwsServiceError> {
     Ok(t.to_string())
 }
 
-fn transfer_payload(t: &ResponsibilityTransfer) -> Value {
+/// Is `account_id` the target of `t`?
+///
+/// Delegates to the one shared predicate so this agrees with the
+/// handshake gate: an account that can accept an invitation must also
+/// be able to read and act on the transfer it accepted.
+fn is_transfer_target(
+    registry: &crate::state::OrganizationsRegistry,
+    t: &ResponsibilityTransfer,
+    account_id: &str,
+) -> bool {
+    let stored = &t.target_management_account_id;
+    if *stored == account_id {
+        return true;
+    }
+    // Only an EMAIL-form target resolves further. Reading a 12-digit id
+    // as an address let an account registered with the literal string
+    // "222222222222" pass as the target of a transfer addressed to
+    // ACCOUNT 222222222222 -- `CreateAccount` does not validate that
+    // `Email` is address-shaped.
+    let is_account_id = stored.len() == 12 && stored.chars().all(|c| c.is_ascii_digit());
+    !is_account_id && registry.account_matches_target("EMAIL", stored, account_id)
+}
+
+fn is_transfer_party(
+    registry: &crate::state::OrganizationsRegistry,
+    t: &ResponsibilityTransfer,
+    account_id: &str,
+) -> bool {
+    t.source_management_account_id == account_id || is_transfer_target(registry, t, account_id)
+}
+
+/// `TransferParticipant.ManagementAccountId` is modeled as an
+/// `AccountId` (exactly 12 digits), so an email-targeted transfer -- whose
+/// target is recorded as the address the source named -- carries only
+/// the email until the address resolves to an account id.
+fn target_participant(
+    registry: &crate::state::OrganizationsRegistry,
+    t: &ResponsibilityTransfer,
+    caller: &str,
+) -> Value {
+    let mut party = json!({
+        "ManagementAccountEmail": t.target_management_account_email,
+    });
+    let stored = &t.target_management_account_id;
+    let is_account_id = stored.len() == 12 && stored.chars().all(|c| c.is_ascii_digit());
+    let resolved = if is_account_id {
+        Some(stored.clone())
+    } else {
+        // The synthetic form decodes only an id the caller already spelled
+        // out, so it leaks nothing. A registered address otherwise
+        // resolves ONLY to the caller itself: the party gate already used
+        // that resolution to let this caller in, so telling it its own id
+        // reveals nothing, while a third party still learns nothing about
+        // whose account an address belongs to. An address that names
+        // somebody else therefore reports no `ManagementAccountId`, which
+        // the Smithy shape allows.
+        crate::state::target_account_id("EMAIL", stored).or_else(|| {
+            registry
+                .account_matches_target("EMAIL", stored, caller)
+                .then(|| caller.to_string())
+        })
+    };
+    if let Some(id) = resolved {
+        party["ManagementAccountId"] = json!(id);
+    }
+    party
+}
+
+fn transfer_payload(
+    registry: &crate::state::OrganizationsRegistry,
+    t: &ResponsibilityTransfer,
+    caller: &str,
+) -> Value {
     let mut obj = json!({
         "Arn": t.arn,
         "Name": t.name,
@@ -45,10 +117,7 @@ fn transfer_payload(t: &ResponsibilityTransfer) -> Value {
             "ManagementAccountId": t.source_management_account_id,
             "ManagementAccountEmail": t.source_management_account_email,
         },
-        "Target": {
-            "ManagementAccountId": t.target_management_account_id,
-            "ManagementAccountEmail": t.target_management_account_email,
-        },
+        "Target": target_participant(registry, t, caller),
         "StartTimestamp": t.start_timestamp.timestamp() as f64,
     });
     if let Some(end) = t.end_timestamp {
@@ -58,6 +127,63 @@ fn transfer_payload(t: &ResponsibilityTransfer) -> Value {
         obj["ActiveHandshakeId"] = json!(h);
     }
     obj
+}
+
+impl OrganizationsService {
+    /// Resolve a transfer for a MUTATING call and return the id of the
+    /// organization that stores it.
+    ///
+    /// A transfer is an arrangement between two management accounts, and
+    /// both can read it. `source_only` says whether this particular
+    /// mutation is the source's alone: renaming is, because the source
+    /// chose the name. Ending is the source's too while the offer is
+    /// still open -- `WITHDRAWN` means the inviter pulled it, and the
+    /// target's answer to an open offer is `DeclineHandshake`. Once the
+    /// transfer is ACCEPTED the riding handshake is gone, so the target
+    /// may end it as well, or it would have no way out of an
+    /// arrangement it is actively carrying.
+    ///
+    /// Resolving through the caller's own organization instead reported
+    /// "not found" to the target, which is indistinguishable from a bad
+    /// id.
+    fn party_org_of_transfer(
+        &self,
+        guard: &parking_lot::RwLockWriteGuard<'_, crate::state::OrganizationsRegistry>,
+        id: &str,
+        caller: &str,
+        source_only: bool,
+    ) -> Result<String, AwsServiceError> {
+        let org = guard
+            .org_of_responsibility_transfer(id)
+            .ok_or_else(|| transfer_not_found(id))?;
+        let transfer = org
+            .responsibility_transfers
+            .get(id)
+            .ok_or_else(|| transfer_not_found(id))?;
+        // A stranger learns nothing beyond "no such transfer".
+        if !is_transfer_party(guard, transfer, caller) {
+            return Err(transfer_not_found(id));
+        }
+        // Only an offer still awaiting an answer is the source's alone to
+        // withdraw. A terminal status falls through, so the caller gets the
+        // real "already in that status" answer rather than advice to
+        // decline a handshake that no longer exists.
+        if transfer.source_management_account_id != caller
+            && (source_only || transfer.status == "REQUESTED")
+        {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::FORBIDDEN,
+                "AccessDeniedException",
+                if source_only {
+                    "Only the source management account can rename a responsibility transfer."
+                } else {
+                    "Only the source management account can withdraw a transfer that has not \
+                     been accepted; decline the handshake instead."
+                },
+            ));
+        }
+        Ok(org.org_id.clone())
+    }
 }
 
 impl OrganizationsService {
@@ -82,30 +208,143 @@ impl OrganizationsService {
             .and_then(|v| v.as_str())
             .ok_or_else(|| invalid_input("Target.Id is required"))?
             .to_string();
+        // `HandshakeParty.Type` is modeled required here too.
         let target_kind = target_obj
             .get("Type")
             .and_then(|v| v.as_str())
-            .unwrap_or("ACCOUNT");
+            .ok_or_else(|| invalid_input("Target.Type is required"))?;
+        // Same shape validation the account-invite path applies: without
+        // it a mismatched target (an address under Type=ACCOUNT) is stored
+        // as the target account id, and the handshake sits OPEN forever
+        // because no caller can authenticate as that string.
+        super::accounts::validate_invite_target(target_kind, &target_id)?;
         let notes = body
             .get("Notes")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
         let mut guard = self.state.write();
-        self.require_member_management(&guard, &req.account_id)?;
-        let org = guard.as_mut().expect("management gate proved Some");
+        // Authorize FIRST. Resolving the target before the management gate
+        // turned "is this address registered?" into an oracle any caller
+        // could read off the difference between InvalidInputException and
+        // AWSOrganizationsNotInUseException.
+        let source_org_id = self
+            .management_org_mut(&mut guard, &req.account_id)?
+            .org_id
+            .clone();
+        let registry = &*guard;
 
-        // The invited party is identified by account id or email; record
-        // whichever the caller supplied as the target management account.
+        // Record the target EXACTLY as the caller named it, as AWS does:
+        // resolving an address against other organizations' management
+        // accounts would answer "does this address exist, and what is its
+        // account id?" for organizations the caller has nothing to do
+        // with. The party gate resolves the other way instead -- it asks
+        // the CALLER what its own address is (see `is_transfer_target`).
         let (target_account_id, target_email) = if target_kind == "EMAIL" {
             (target_id.clone(), target_id.clone())
         } else {
             (target_id.clone(), format!("{target_id}@example.com"))
         };
+        // Naming your own organization is the one case there is nothing to
+        // leak about. Comparing only against the management account let a
+        // plain member of the SAME organization be named, which opened --
+        // and let that member accept -- a "cross-organization" transfer
+        // whose two ends were one organization.
+        // Resolve once, the same way every party gate does. Asking
+        // `org_of_account` about the raw string answered `None` for every
+        // EMAIL target, so the non-management check below never fired and
+        // an address spelling a plain member of another organization got
+        // through. This scan drives a rejection only -- it never hands an
+        // id back -- so it is not the oracle the id-returning resolvers
+        // are scoped to avoid.
+        let resolved_target = registry
+            .iter()
+            .flat_map(|org| org.accounts.keys())
+            .find(|id| registry.account_matches_target(target_kind, &target_id, id))
+            .cloned();
+        let target_org = resolved_target
+            .as_deref()
+            .and_then(|id| registry.org_of_account(id));
+        let target_is_own_org = target_org.is_some_and(|org| org.org_id == source_org_id);
+        // Two rejections, and deliberately only two:
+        //
+        // - the caller's OWN organization, which cannot hand billing to
+        //   itself; and
+        // - a plain member of another organization, which has no billing
+        //   responsibility to take over.
+        //
+        // A target that belongs to NO organization is allowed. AWS's
+        // invite takes an `EMAIL` party precisely so it can address an
+        // owner it has not seen yet, and requiring the target to already
+        // run an organization would make the op unusable until it did.
+        // That is why the inbound reads below are party-scoped rather
+        // than membership-gated: the target must be able to find the
+        // transfer it was invited to before it has an organization.
+        let target_is_non_management_member = match (&resolved_target, target_org) {
+            (Some(id), Some(org)) => org.management_account_id != *id,
+            _ => false,
+        };
+        if target_is_own_org || target_is_non_management_member {
+            return Err(AwsServiceError::aws_error_with_fields(
+                StatusCode::BAD_REQUEST,
+                "HandshakeConstraintViolationException",
+                "A responsibility transfer targets another organization's \
+                 management account.",
+                vec![(
+                    "Reason".to_string(),
+                    "SOURCE_AND_TARGET_CANNOT_MATCH".to_string(),
+                )],
+            ));
+        }
+        // One live invitation per target, the same rule
+        // `InviteAccountToOrganization` enforces and with the same modeled
+        // error. Without it a caller could stack OPEN transfers on one
+        // target, and accepting any of them would move billing while the
+        // rest stayed OPEN against an organization that no longer owns it.
+        // The two handshake actions stay independent: an INVITE to the
+        // same account is a different offer and does not collide.
+        //
+        // Compare the RESOLVED target, so the same account named two ways
+        // still collides. An enrolled account resolves through the
+        // registry; an account that exists nowhere yet -- the common case
+        // here, since the invite exists to address an owner AWS has not
+        // seen -- resolves only through the synthetic address form.
+        let canonical_target = |kind: &str, id: &str| -> String {
+            registry
+                .iter()
+                .flat_map(|org| org.accounts.keys())
+                .find(|account| registry.account_matches_target(kind, id, account))
+                .cloned()
+                .or_else(|| crate::state::target_account_id(kind, id))
+                .unwrap_or_else(|| id.to_string())
+        };
+        let want = canonical_target(target_kind, &target_id);
+        let duplicate = registry
+            .org_by_id(&source_org_id)
+            .expect("management gate resolved this organization")
+            .handshakes
+            .values()
+            .filter(|h| {
+                h.action == "TRANSFER_RESPONSIBILITY"
+                    && matches!(h.state.as_str(), "REQUESTED" | "OPEN")
+            })
+            .any(|h| canonical_target(&h.target_kind, &h.target_account_id) == want);
+        if duplicate {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "DuplicateHandshakeException",
+                format!("An OPEN responsibility transfer already targets {target_id}."),
+            ));
+        }
+
+        let org = guard
+            .org_by_id_mut(&source_org_id)
+            .expect("management gate resolved this organization");
 
         let now = Utc::now();
         // The transfer rides on a handshake the invited org accepts.
         let handshake_id = format!("h-{}", random_id(32));
+        let transfer_id = format!("rt-{}", random_id(32));
         let handshake_arn = format!(
             "arn:aws:organizations::{}:handshake/{}/transfer/{}",
             org.management_account_id, org.org_id, handshake_id
@@ -123,11 +362,11 @@ impl OrganizationsService {
             target_kind: target_kind.to_string(),
             notes,
             organization_id: org.org_id.clone(),
+            responsibility_transfer_id: Some(transfer_id.clone()),
         };
         org.handshakes
             .insert(handshake_id.clone(), handshake.clone());
 
-        let transfer_id = format!("rt-{}", random_id(32));
         let transfer_arn = format!(
             "arn:aws:organizations::{}:responsibilitytransfer/{}/{}",
             org.management_account_id, org.org_id, transfer_id
@@ -151,7 +390,7 @@ impl OrganizationsService {
             .insert(transfer_id, transfer.clone());
 
         Ok(AwsResponse::ok_json(
-            json!({ "Handshake": handshake_payload(&handshake) }),
+            json!({ "Handshake": handshake_payload(org, &handshake) }),
         ))
     }
 
@@ -162,13 +401,20 @@ impl OrganizationsService {
         let body = req.json_body();
         let id = required_str(&body, "Id")?.to_string();
         let guard = self.state.read();
-        let org = guard.as_ref().ok_or_else(organizations_not_in_use)?;
-        let transfer = org
-            .responsibility_transfers
-            .get(&id)
+        // Party-scoped, not membership-gated, for the same reason as the
+        // inbound listing: the target of a transfer may not have an
+        // organization of its own yet.
+        // A transfer is stored once, in the SOURCE organization, but it has
+        // two parties: resolving it through the caller's own organization
+        // would hide every inbound transfer from the account being invited
+        // to take over billing.
+        let transfer = guard
+            .org_of_responsibility_transfer(&id)
+            .and_then(|org| org.responsibility_transfers.get(&id))
+            .filter(|t| is_transfer_party(&guard, t, &req.account_id))
             .ok_or_else(|| transfer_not_found(&id))?;
         Ok(AwsResponse::ok_json(
-            json!({ "ResponsibilityTransfer": transfer_payload(transfer) }),
+            json!({ "ResponsibilityTransfer": transfer_payload(&guard, transfer, &req.account_id) }),
         ))
     }
 
@@ -180,15 +426,15 @@ impl OrganizationsService {
         let id = required_str(&body, "Id")?.to_string();
         let name = required_str(&body, "Name")?.to_string();
         let mut guard = self.state.write();
-        let org = guard.as_mut().ok_or_else(organizations_not_in_use)?;
-        let transfer = org
-            .responsibility_transfers
-            .get_mut(&id)
-            .ok_or_else(|| transfer_not_found(&id))?;
+        let org_id = self.party_org_of_transfer(&guard, &id, &req.account_id, true)?;
+        let transfer = guard
+            .org_by_id_mut(&org_id)
+            .and_then(|org| org.responsibility_transfers.get_mut(&id))
+            .expect("resolved just above");
         transfer.name = name;
         let snapshot = transfer.clone();
         Ok(AwsResponse::ok_json(
-            json!({ "ResponsibilityTransfer": transfer_payload(&snapshot) }),
+            json!({ "ResponsibilityTransfer": transfer_payload(&guard, &snapshot, &req.account_id) }),
         ))
     }
 
@@ -203,12 +449,13 @@ impl OrganizationsService {
             .and_then(json_to_datetime)
             .unwrap_or_else(Utc::now);
         let mut guard = self.state.write();
-        let org = guard.as_mut().ok_or_else(organizations_not_in_use)?;
+        // Either party can end the arrangement.
+        let org_id = self.party_org_of_transfer(&guard, &id, &req.account_id, false)?;
+        let org = guard.org_by_id_mut(&org_id).expect("resolved just above");
         let transfer = org
             .responsibility_transfers
             .get_mut(&id)
-            .ok_or_else(|| transfer_not_found(&id))?;
-        // Only a still-pending transfer can be terminated.
+            .expect("resolved just above");
         if transfer.status == "WITHDRAWN" {
             return Err(AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -216,7 +463,10 @@ impl OrganizationsService {
                 "The responsibility transfer is already withdrawn.",
             ));
         }
-        if transfer.status != "REQUESTED" {
+        // AWS's op "ends a transfer", so it applies to one still awaiting an
+        // answer AND to one already accepted and running. Only a transfer
+        // that has already reached a terminal state cannot be ended.
+        if !matches!(transfer.status.as_str(), "REQUESTED" | "ACCEPTED") {
             return Err(AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
                 "InvalidResponsibilityTransferTransitionException",
@@ -228,16 +478,20 @@ impl OrganizationsService {
         }
         transfer.status = "WITHDRAWN".to_string();
         transfer.end_timestamp = Some(end);
-        transfer.active_handshake_id = None;
+        // Take the riding handshake id BEFORE clearing the field: reading it
+        // back off the post-clear snapshot always saw `None`, so the
+        // handshake stayed OPEN and the target could still accept a
+        // withdrawn transfer.
+        let riding_handshake = transfer.active_handshake_id.take();
         let snapshot = transfer.clone();
         // Cancel the riding handshake too.
-        if let Some(hid) = &snapshot.active_handshake_id {
+        if let Some(hid) = &riding_handshake {
             if let Some(h) = org.handshakes.get_mut(hid) {
                 h.state = "CANCELED".to_string();
             }
         }
         Ok(AwsResponse::ok_json(
-            json!({ "ResponsibilityTransfer": transfer_payload(&snapshot) }),
+            json!({ "ResponsibilityTransfer": transfer_payload(&guard, &snapshot, &req.account_id) }),
         ))
     }
 
@@ -255,6 +509,11 @@ impl OrganizationsService {
         self.list_responsibility_transfers(req, "OUTBOUND")
     }
 
+    /// AWS's `ResponsibilityTransfer` shape has no `Direction` member --
+    /// direction is expressed by which operation you call, so the stored
+    /// `direction` field is fakecloud-internal provenance surfaced only
+    /// through introspection. Which list a transfer belongs to is decided
+    /// by whether the caller is its source or its target.
     fn list_responsibility_transfers(
         &self,
         req: &AwsRequest,
@@ -263,14 +522,49 @@ impl OrganizationsService {
         let body = req.json_body();
         // `Type` is required on both list ops.
         let transfer_type = require_transfer_type(&body)?;
+        // Only the INBOUND request models an optional `Id` to fetch a
+        // single transfer.
+        let only_id = (direction == "INBOUND")
+            .then(|| body.get("Id").and_then(|v| v.as_str()).map(str::to_string))
+            .flatten();
         let (max_results, next_token) = parse_list_pagination(&body)?;
         let guard = self.state.read();
-        let org = guard.as_ref().ok_or_else(organizations_not_in_use)?;
-        let filtered: Vec<Value> = org
-            .responsibility_transfers
-            .values()
-            .filter(|t| t.direction == direction && t.transfer_type == transfer_type)
-            .map(transfer_payload)
+        // OUTBOUND is membership-gated: its caller is a source management
+        // account by construction, so `AWSOrganizationsNotInUseException`
+        // is the right modeled answer. INBOUND is NOT: the target may be
+        // an account that has not created an organization yet -- see the
+        // invite guard above -- and it has to be able to find the
+        // transfer addressed to it. Party scoping already keeps it from
+        // seeing anything else.
+        if direction == "OUTBOUND" {
+            self.require_member(&guard, &req.account_id)?;
+        }
+        let mut rows: Vec<&ResponsibilityTransfer> = guard
+            .iter()
+            .flat_map(|org| org.responsibility_transfers.values())
+            .filter(|t| {
+                only_id.as_deref().is_none_or(|id| t.id == id)
+                    && t.transfer_type == transfer_type
+                    && match direction {
+                        "OUTBOUND" => t.source_management_account_id == req.account_id,
+                        _ => is_transfer_target(&guard, t, &req.account_id),
+                    }
+            })
+            .collect();
+        // Merged across organizations, so impose a stable order for
+        // pagination rather than relying on per-organization map order.
+        // `ListInboundResponsibilityTransfers` models a not-found error, so
+        // a named id the caller is not a party to is reported rather than
+        // silently returned as an empty page.
+        if let Some(id) = &only_id {
+            if rows.is_empty() {
+                return Err(transfer_not_found(id));
+            }
+        }
+        rows.sort_by(|a, b| a.id.cmp(&b.id));
+        let filtered: Vec<Value> = rows
+            .into_iter()
+            .map(|t| transfer_payload(&guard, t, &req.account_id))
             .collect();
         let (page, token) = paginate_checked(&filtered, next_token.as_deref(), max_results)
             .map_err(|_| invalid_input("Invalid NextToken"))?;

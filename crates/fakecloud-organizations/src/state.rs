@@ -6,11 +6,423 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Shared, cross-account singleton. `None` until `CreateOrganization`
-/// runs; at most one organization exists per fakecloud process. An AWS
-/// org is not per-account state (it spans accounts), so this is NOT
-/// wrapped in `MultiAccountState`.
-pub type SharedOrganizationsState = Arc<RwLock<Option<OrganizationState>>>;
+/// Shared, cross-account registry of every organization in the process.
+/// An AWS org is not per-account state (it spans accounts), so this is
+/// NOT wrapped in `MultiAccountState` — but it is not a singleton
+/// either: any account that belongs to no organization can create its
+/// own, and the organizations are fully independent of each other.
+pub type SharedOrganizationsState = Arc<RwLock<OrganizationsRegistry>>;
+
+/// Every organization in the process, keyed by organization id
+/// (`o-...`). An account belongs to at most one organization, which is
+/// what makes [`OrganizationsRegistry::org_of_account`] well defined and
+/// lets most handlers resolve "the caller's organization" in one step.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct OrganizationsRegistry {
+    orgs: BTreeMap<String, OrganizationState>,
+}
+
+/// A GovCloud mirror lives in the `aws-us-gov` partition.
+fn is_gov_cloud(account: &MemberAccount) -> bool {
+    account.arn.starts_with("arn:aws-us-gov:")
+}
+
+/// Resolve a handshake or transfer target to an account id.
+///
+/// An `ACCOUNT` target already is one. An `EMAIL` target stores the
+/// address itself, which is only resolvable when it follows the
+/// `<account-id>@example.com` form fakecloud mints for accounts it
+/// creates (see `enroll_account_if_missing` and `complete_create_account`).
+/// A genuinely external address names an account fakecloud has never
+/// seen, so it stays unresolvable — the invitation can be read and
+/// cancelled by its source, but no caller can prove it is the target.
+///
+/// This is the id-only form. Prefer
+/// [`OrganizationsRegistry::resolve_target_account`], which also matches
+/// the address a member account was actually registered with — an
+/// account created with `CreateAccount(Email = "team@corp.com")` keeps
+/// that address, not a synthetic one.
+pub fn target_account_id(target_kind: &str, target: &str) -> Option<String> {
+    if target_kind != "EMAIL" {
+        return Some(target.to_string());
+    }
+    let local = target.strip_suffix("@example.com")?;
+    if local.len() == 12 && local.chars().all(|c| c.is_ascii_digit()) {
+        Some(local.to_string())
+    } else {
+        None
+    }
+}
+
+impl From<OrganizationState> for OrganizationsRegistry {
+    fn from(org: OrganizationState) -> Self {
+        let mut registry = Self::default();
+        registry.insert(org);
+        registry
+    }
+}
+
+impl OrganizationsRegistry {
+    pub fn is_empty(&self) -> bool {
+        self.orgs.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.orgs.len()
+    }
+
+    /// Every organization, ordered by id so callers that render or hash
+    /// the whole registry are deterministic.
+    pub fn iter(&self) -> impl Iterator<Item = &OrganizationState> {
+        self.orgs.values()
+    }
+
+    pub fn contains_org(&self, org_id: &str) -> bool {
+        self.orgs.contains_key(org_id)
+    }
+
+    pub fn org_by_id(&self, org_id: &str) -> Option<&OrganizationState> {
+        self.orgs.get(org_id)
+    }
+
+    pub fn org_by_id_mut(&mut self, org_id: &str) -> Option<&mut OrganizationState> {
+        self.orgs.get_mut(org_id)
+    }
+
+    /// The organization `account_id` belongs to, management account
+    /// included. `None` for a standalone account — which is every
+    /// account until it creates an organization, is invited into one and
+    /// accepts, or is created through `CreateAccount`.
+    pub fn org_of_account(&self, account_id: &str) -> Option<&OrganizationState> {
+        self.orgs
+            .values()
+            .find(|org| org.accounts.contains_key(account_id))
+    }
+
+    pub fn org_of_account_mut(&mut self, account_id: &str) -> Option<&mut OrganizationState> {
+        self.orgs
+            .values_mut()
+            .find(|org| org.accounts.contains_key(account_id))
+    }
+
+    /// The organization that owns handshake `handshake_id`. Handshakes
+    /// are looked up by id rather than through the caller's own
+    /// organization because the account answering an invitation is by
+    /// definition not yet a member of the inviting organization.
+    pub fn org_of_handshake(&self, handshake_id: &str) -> Option<&OrganizationState> {
+        self.orgs
+            .values()
+            .find(|org| org.handshakes.contains_key(handshake_id))
+    }
+
+    pub fn org_of_handshake_mut(&mut self, handshake_id: &str) -> Option<&mut OrganizationState> {
+        self.orgs
+            .values_mut()
+            .find(|org| org.handshakes.contains_key(handshake_id))
+    }
+
+    /// The organization holding `CreateAccount` request `request_id`.
+    /// Request ids are globally unique, so the background completion
+    /// tick finds its own request without carrying the org id.
+    pub fn org_of_create_account_request(&self, request_id: &str) -> Option<&OrganizationState> {
+        self.orgs
+            .values()
+            .find(|org| org.create_account_requests.contains_key(request_id))
+    }
+
+    pub fn org_of_create_account_request_mut(
+        &mut self,
+        request_id: &str,
+    ) -> Option<&mut OrganizationState> {
+        self.orgs
+            .values_mut()
+            .find(|org| org.create_account_requests.contains_key(request_id))
+    }
+
+    /// The only organization, when there is exactly one. `None` both
+    /// when there are none and when there are several — a caller that
+    /// means "the" organization has to say which once more than one
+    /// exists, rather than silently getting an arbitrary pick.
+    pub fn sole(&self) -> Option<&OrganizationState> {
+        match self.orgs.len() {
+            1 => self.orgs.values().next(),
+            _ => None,
+        }
+    }
+
+    pub fn sole_mut(&mut self) -> Option<&mut OrganizationState> {
+        match self.orgs.len() {
+            1 => self.orgs.values_mut().next(),
+            _ => None,
+        }
+    }
+
+    /// Resolve a handshake or transfer target to an account id, matching
+    /// an `EMAIL` target against the address the members of `within` are
+    /// actually registered with before falling back to the synthetic
+    /// form. Without the address lookup, a member created with a real
+    /// email is invisible to the "one organization per account" guards,
+    /// which could then open an invitation for an account already
+    /// enrolled.
+    ///
+    /// The lookup is deliberately scoped to ONE organization. Scanning
+    /// every organization would turn an invitation into an
+    /// email-to-account-id oracle: a caller could name an address, be
+    /// told "already a member of an organization", and read back a
+    /// 12-digit id belonging to an organization it has no relationship
+    /// with.
+    pub fn resolve_target_account(
+        &self,
+        target_kind: &str,
+        target: &str,
+        within: &str,
+    ) -> Option<String> {
+        // The registered address wins over the synthetic form, as the doc
+        // above says: an account created with
+        // `CreateAccount(Email = "222222222222@example.com")` gets a random
+        // id, so decoding the address as if it spelled one would resolve
+        // to an account that does not exist and let an invitation open for
+        // a member already enrolled.
+        // Scoped to ONE organization on purpose: resolving an address
+        // against every organization would let the caller read a foreign
+        // account id back out of the "already a member" error. The
+        // boolean matcher may look wider, because it only ever confirms
+        // an account the caller already named.
+        if target_kind == "EMAIL" {
+            if let Some(account) = self.orgs.get(within).and_then(|org| {
+                org.accounts
+                    .values()
+                    .find(|a| a.email == target && !is_gov_cloud(a) && a.status != "SUSPENDED")
+            }) {
+                return Some(account.id.clone());
+            }
+        }
+        target_account_id(target_kind, target)
+    }
+
+    /// Mint an account id unused by ANY organization in the process, and
+    /// not already reserved by an in-flight `CreateAccount`. `besides`
+    /// excludes ids minted moments ago that are not recorded yet --
+    /// `CreateGovCloudAccount` mints two in a row.
+    pub fn next_account_id_besides(&self, besides: &[&str]) -> String {
+        OrganizationState::mint_account_id(|id| {
+            besides.contains(&id)
+                || self.orgs.values().any(|org| {
+                    org.accounts.contains_key(id)
+                        || org.create_account_requests.values().any(|req| {
+                            req.account_id.as_deref() == Some(id)
+                                || req.gov_cloud_account_id.as_deref() == Some(id)
+                        })
+                })
+        })
+    }
+
+    /// Mint an account id unused by ANY organization in the process.
+    pub fn next_account_id(&self) -> String {
+        self.next_account_id_besides(&[])
+    }
+
+    /// The account registered with `email`, if any organization has one.
+    /// Used to decide whether an address names a real account or should
+    /// fall back to the synthetic `<account-id>@example.com` decode.
+    pub fn account_registered_with(&self, email: &str) -> Option<String> {
+        self.orgs
+            .values()
+            .flat_map(|org| org.accounts.values())
+            // A GovCloud mirror shares its commercial twin's address by
+            // design; the commercial account is the one an address names.
+            .find(|account| {
+                account.email == email && !is_gov_cloud(account) && account.status != "SUSPENDED"
+            })
+            .map(|account| account.id.clone())
+    }
+
+    /// Like [`Self::email_in_use`], for the in-flight request
+    /// `request_id`: its own reservation must not count against it, and
+    /// only requests made BEFORE it do. Counting every other in-flight
+    /// request made whichever tick fired first fail itself, so the
+    /// caller that asked first was the one refused.
+    pub fn email_in_use_besides(&self, email: &str, request_id: &str) -> bool {
+        let mine = self
+            .orgs
+            .values()
+            .find_map(|org| org.create_account_requests.get(request_id));
+        self.orgs
+            .values()
+            .flat_map(|org| org.accounts.values())
+            .any(|account| account.email == email && account.status != "SUSPENDED")
+            || self.orgs.values().any(|org| {
+                org.create_account_requests.iter().any(|(id, req)| {
+                    id != request_id
+                        && Self::reservation_holds(req, email)
+                        && mine.is_some_and(|m| {
+                            (req.requested_timestamp, id.as_str())
+                                < (m.requested_timestamp, request_id)
+                        })
+                })
+            })
+    }
+
+    /// True when `email` is the synthetic `<account-id>@example.com`
+    /// form of an account OTHER than `for_account`.
+    ///
+    /// fakecloud mints those addresses for the accounts it creates, so
+    /// they are reserved for the id they spell whether or not that
+    /// account exists yet. Letting an unrelated account register one
+    /// meant two live accounts shared an address -- through
+    /// `CreateAccount`, or through `CreateOrganization`, whose
+    /// management account takes its own synthetic address -- and
+    /// `account_registered_with` then answered with whichever
+    /// organization sorted first, which decides who may accept an
+    /// EMAIL-targeted handshake.
+    pub fn email_reserved_for_other(email: &str, for_account: &str) -> bool {
+        target_account_id("EMAIL", email).is_some_and(|spelled| spelled != for_account)
+    }
+
+    /// Does this in-flight request hold `email`?
+    ///
+    /// A request whose address is the synthetic form of an id OTHER than
+    /// the one it reserved is already doomed -- the completion tick
+    /// fails it with `EMAIL_ALREADY_EXISTS` -- so it must not hold the
+    /// address meanwhile. Otherwise anyone could park another account's
+    /// address for the length of the creation delay, blocking that
+    /// account's own `CreateOrganization`.
+    fn reservation_holds(req: &CreateAccountStatus, email: &str) -> bool {
+        if req.state != "IN_PROGRESS" || req.pending_email.as_deref() != Some(email) {
+            return false;
+        }
+        !req.account_id
+            .as_deref()
+            .is_some_and(|mine| Self::email_reserved_for_other(email, mine))
+    }
+
+    /// True when any account already uses `email`. AWS requires an
+    /// address to be unused (`EMAIL_ALREADY_EXISTS`), and this
+    /// resolution is authorization-relevant -- it decides who may accept
+    /// an `EMAIL`-targeted invitation -- so a duplicate would make that
+    /// answer depend on id ordering.
+    pub fn email_in_use(&self, email: &str) -> bool {
+        self.orgs
+            .values()
+            .flat_map(|org| org.accounts.values())
+            // A closed account keeps its record but releases its address:
+            // `CloseAccount` (and the CloudFormation delete that calls it)
+            // only suspends, so counting those would make a deleted stack
+            // impossible to re-deploy.
+            .any(|account| account.email == email && account.status != "SUSPENDED")
+            || self.orgs.values().any(|org| {
+                org.create_account_requests
+                    .values()
+                    .any(|req| Self::reservation_holds(req, email))
+            })
+    }
+
+    /// Does `target` (as declared by `target_kind`) name `account_id`?
+    ///
+    /// This is the single answer used by every party gate -- handshakes,
+    /// responsibility transfers, and the account's own handshake
+    /// listing. Two matchers that disagreed let an account accept an
+    /// invitation it could then neither read nor act on.
+    ///
+    /// An `ACCOUNT` target names the id directly. An `EMAIL` target
+    /// resolves to the account REGISTERED with that address if any
+    /// organization has one, and otherwise decodes the synthetic
+    /// `<account-id>@example.com` form fakecloud mints. That precedence
+    /// is what keeps one address naming one account: accepting both
+    /// readings let an invitation be accepted by an account it was never
+    /// addressed to. The consequence is that registering an address
+    /// elsewhere takes over its synthetic reading, so an invitation open
+    /// to the spelled-out id stops matching -- rare, and the safe
+    /// direction to fail.
+    ///
+    /// The registered lookup spans organizations, which is safe here
+    /// because this only ever CONFIRMS an account the caller already
+    /// named; it never hands one back. Resolvers that return an id --
+    /// `resolve_target_account` -- stay scoped to one organization so
+    /// they cannot be read as an oracle.
+    pub fn account_matches_target(
+        &self,
+        target_kind: &str,
+        target: &str,
+        account_id: &str,
+    ) -> bool {
+        if target_kind == "EMAIL" {
+            // A registered address names its own account and nothing else.
+            // Allowing the synthetic decode as well let one address name
+            // two accounts, so an account other than the intended target
+            // could read and accept the invitation.
+            if let Some(registered) = self.account_registered_with(target) {
+                return registered == account_id;
+            }
+        }
+        target_account_id(target_kind, target).as_deref() == Some(account_id)
+    }
+
+    /// The organization that stores responsibility transfer `id`. A
+    /// transfer is recorded once, in the source organization, but both
+    /// management accounts are parties to it.
+    pub fn org_of_responsibility_transfer(&self, id: &str) -> Option<&OrganizationState> {
+        self.orgs
+            .values()
+            .find(|org| org.responsibility_transfers.contains_key(id))
+    }
+
+    /// Insert an organization, keyed by its own id.
+    pub fn insert(&mut self, org: OrganizationState) {
+        self.orgs.insert(org.org_id.clone(), org);
+    }
+
+    pub fn remove(&mut self, org_id: &str) -> Option<OrganizationState> {
+        self.orgs.remove(org_id)
+    }
+
+    pub fn clear(&mut self) {
+        self.orgs.clear();
+    }
+
+    /// True when `account_id` is already claimed by some organization --
+    /// enrolled in one, or RESERVED by an in-flight `CreateAccount` that
+    /// has not finished enrolling it yet.
+    ///
+    /// Guards both `CreateOrganization` and the invite/accept path: an
+    /// account can never be in two organizations at once. Ignoring the
+    /// reservation let an account created by one organization create its
+    /// own during the completion delay, after which the background tick
+    /// enrolled it and it was in two.
+    pub fn account_is_enrolled(&self, account_id: &str) -> bool {
+        self.org_of_account(account_id).is_some() || self.account_is_reserved(account_id)
+    }
+
+    /// The organization that already claims `account_id`, if it is one
+    /// other than `org_id`. Reservation-aware, so an id an in-flight
+    /// `CreateAccount` is about to enroll counts as claimed.
+    pub fn claimed_by_other_org(&self, account_id: &str, org_id: &str) -> Option<String> {
+        if let Some(org) = self.org_of_account(account_id) {
+            return (org.org_id != org_id).then(|| org.org_id.clone());
+        }
+        self.orgs
+            .values()
+            .find(|org| {
+                org.org_id != org_id
+                    && org.create_account_requests.values().any(|req| {
+                        req.state == "IN_PROGRESS"
+                            && (req.account_id.as_deref() == Some(account_id)
+                                || req.gov_cloud_account_id.as_deref() == Some(account_id))
+                    })
+            })
+            .map(|org| org.org_id.clone())
+    }
+
+    fn account_is_reserved(&self, account_id: &str) -> bool {
+        self.orgs.values().any(|org| {
+            org.create_account_requests.values().any(|req| {
+                req.state == "IN_PROGRESS"
+                    && (req.account_id.as_deref() == Some(account_id)
+                        || req.gov_cloud_account_id.as_deref() == Some(account_id))
+            })
+        })
+    }
+}
 
 pub const FEATURE_SET_ALL: &str = "ALL";
 pub const FEATURE_SET_CONSOLIDATED_BILLING: &str = "CONSOLIDATED_BILLING";
@@ -26,16 +438,35 @@ pub const FULL_AWS_ACCESS_POLICY_CONTENT: &str =
     r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}"#;
 
 /// On-disk snapshot envelope for Organizations state. Versioned so format
-/// changes fail loudly on upgrade rather than silently mis-parsing. The whole
-/// org is a single optional value (`None` until `CreateOrganization`).
+/// changes fail loudly on upgrade rather than silently mis-parsing.
+///
+/// v1 held a single optional organization; v2 holds the whole registry.
+/// The v1 field is still read so an existing snapshot keeps loading — it
+/// folds into the registry as one organization — but is never written
+/// again.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct OrganizationsSnapshot {
     pub schema_version: u32,
-    #[serde(default)]
+    /// v1 only. Retained for reading old snapshots; `None` in v2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub organization: Option<OrganizationState>,
+    #[serde(default)]
+    pub organizations: OrganizationsRegistry,
 }
 
-pub const ORGANIZATIONS_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+impl OrganizationsSnapshot {
+    /// The registry this snapshot describes, folding a v1 single
+    /// organization into the v2 shape.
+    pub fn into_registry(self) -> OrganizationsRegistry {
+        let mut registry = self.organizations;
+        if let Some(org) = self.organization {
+            registry.insert(org);
+        }
+        registry
+    }
+}
+
+pub const ORGANIZATIONS_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OrganizationState {
@@ -111,7 +542,11 @@ impl OrganizationState {
     pub fn bootstrap(management_account_id: &str) -> Self {
         let now = Utc::now();
         let org_id = format!("o-{}", random_id(10));
-        let root_id = format!("r-{}", random_id(4));
+        // AWS root ids are 4-32 chars. Four was fine while only one
+        // organization could exist; across a registry it collides at
+        // 1/65536, which would let one organization's root id validate as
+        // a target in another.
+        let root_id = format!("r-{}", random_id(12));
         let org_arn = format!(
             "arn:aws:organizations::{}:organization/{}",
             management_account_id, org_id
@@ -302,10 +737,17 @@ impl OrganizationState {
         out
     }
 
-    /// Allocate the next pseudo-random 12-digit account id that's not
-    /// already a member. Mirrors AWS's account-id format (numeric,
-    /// 12 digits, no leading zero stripping).
+    /// Mint an account id unused by this organization.
+    ///
+    /// Prefer [`OrganizationsRegistry::next_account_id`], which checks
+    /// every organization: an account id names one account process-wide,
+    /// and a collision across organizations would break the "at most one
+    /// organization per account" invariant.
     pub fn next_account_id(&self) -> String {
+        Self::mint_account_id(|id| self.accounts.contains_key(id))
+    }
+
+    fn mint_account_id(taken: impl Fn(&str) -> bool) -> String {
         loop {
             let mut id = String::with_capacity(12);
             for _ in 0..12 {
@@ -313,7 +755,7 @@ impl OrganizationState {
                 let byte = u.as_bytes()[0];
                 id.push(((byte % 10) + b'0') as char);
             }
-            if !id.starts_with('0') && !self.accounts.contains_key(&id) {
+            if !id.starts_with('0') && !taken(&id) {
                 return id;
             }
         }
@@ -330,15 +772,19 @@ impl OrganizationState {
     /// The caller is expected to spawn a background task that calls
     /// `complete_create_account(request_id)` after a synthetic delay so
     /// pollers can observe the IN_PROGRESS -> SUCCEEDED transition.
+    /// `account_id` is minted by the caller, which holds the registry and
+    /// can therefore guarantee the id is unused process-wide rather than
+    /// only within this organization.
     pub fn begin_create_account(
         &mut self,
         email: &str,
         name: &str,
+        account_id: String,
         gov_cloud_paired_id: Option<String>,
     ) -> CreateAccountStatus {
         let now = Utc::now();
         let request_id = format!("car-{}", random_id(20));
-        let new_account_id = self.next_account_id();
+        let new_account_id = account_id;
         let status = CreateAccountStatus {
             id: request_id.clone(),
             account_id: Some(new_account_id),
@@ -402,6 +848,11 @@ impl OrganizationState {
                 "arn:aws-us-gov:organizations::{}:account/{}/{}",
                 self.management_account_id, self.org_id, gov_id
             );
+            // AWS creates the GovCloud account from the same owner
+            // address, so the response carries it. The pair is the one
+            // legitimate case of two accounts sharing an address;
+            // `account_registered_with` skips the mirror so resolution
+            // still lands on exactly one account.
             self.accounts.insert(
                 gov_id.clone(),
                 MemberAccount {
@@ -440,7 +891,19 @@ impl OrganizationState {
         status.completed_timestamp = Some(Utc::now());
         status.failure_reason = Some(reason.to_string());
         status.pending_email = None;
-        Some(status.clone())
+        let snapshot = status.clone();
+        // `CreateAccount` applies create-time tags to the reserved id
+        // straight away, on the old assumption that every request ends in
+        // SUCCEEDED. A failed request's id never becomes an account, so
+        // those tags would otherwise linger on an id `ListAccounts` does
+        // not know and AWS answers for with `TargetNotFoundException`.
+        if let Some(account_id) = &snapshot.account_id {
+            self.resource_tags.remove(account_id);
+        }
+        if let Some(gov_id) = &snapshot.gov_cloud_account_id {
+            self.resource_tags.remove(gov_id);
+        }
+        Some(snapshot)
     }
 
     /// Issue a new pending invitation handshake to `target_account_id`.
@@ -449,19 +912,52 @@ impl OrganizationState {
     pub fn invite_account(
         &mut self,
         source_account_id: &str,
+        target_kind: &str,
         target_account_id: &str,
         target_email: Option<String>,
         notes: Option<String>,
     ) -> Result<Handshake, OrgError> {
-        if self.accounts.contains_key(target_account_id) {
-            return Err(OrgError::AccountAlreadyMember(
-                target_account_id.to_string(),
-            ));
+        // Compare against the resolved account id: an EMAIL target records
+        // the address, which is never a key in `accounts` and never equal
+        // to another handshake's ACCOUNT-form target. Without this, an
+        // account already enrolled could be re-invited by email, and one
+        // account could hold two live invitations under its two spellings.
+        // The kind is the caller's declared `Target.Type`, so this agrees
+        // with the cross-organization guard in the service layer rather
+        // than re-deriving a different answer from the string's shape.
+        // Same order as `OrganizationsRegistry::resolve_target_account`:
+        // a registered address names its own account, and the synthetic
+        // decode is only a fallback. The reverse order resolved to an
+        // account nobody owns, so the already-a-member and
+        // duplicate-handshake guards below both missed.
+        let resolved = self
+            .accounts
+            .values()
+            .find(|account| {
+                target_kind == "EMAIL"
+                    && account.email == target_account_id
+                    && !is_gov_cloud(account)
+                    && account.status != "SUSPENDED"
+            })
+            .map(|account| account.id.clone())
+            .or_else(|| self::target_account_id(target_kind, target_account_id));
+        if let Some(target) = &resolved {
+            if self.accounts.contains_key(target) {
+                return Err(OrgError::AccountAlreadyMember(target.clone()));
+            }
         }
         for h in self.handshakes.values() {
-            if h.target_account_id == target_account_id
-                && matches!(h.state.as_str(), "REQUESTED" | "OPEN")
-            {
+            // Only another membership INVITE collides. A
+            // TRANSFER_RESPONSIBILITY handshake to the same account is a
+            // different arrangement entirely, and AWS keeps the two
+            // handshake actions independent.
+            if h.action != "INVITE" {
+                continue;
+            }
+            let same_target = h.target_account_id == target_account_id
+                || (resolved.is_some()
+                    && self::target_account_id(&h.target_kind, &h.target_account_id) == resolved);
+            if same_target && matches!(h.state.as_str(), "REQUESTED" | "OPEN") {
                 return Err(OrgError::DuplicateHandshakeForAccount(
                     target_account_id.to_string(),
                 ));
@@ -473,11 +969,7 @@ impl OrganizationState {
             "arn:aws:organizations::{}:handshake/{}/invite/{}",
             self.management_account_id, self.org_id, id
         );
-        let kind = if target_account_id.chars().all(|c| c.is_ascii_digit()) {
-            "ACCOUNT".to_string()
-        } else {
-            "EMAIL".to_string()
-        };
+        let kind = target_kind.to_string();
         let handshake = Handshake {
             id: id.clone(),
             arn,
@@ -491,6 +983,8 @@ impl OrganizationState {
             target_kind: kind,
             notes,
             organization_id: self.org_id.clone(),
+            // An INVITE carries no responsibility transfer.
+            responsibility_transfer_id: None,
         };
         self.handshakes.insert(id, handshake.clone());
         Ok(handshake)
@@ -501,7 +995,19 @@ impl OrganizationState {
     /// this just enforces lifecycle (open -> terminal). The original
     /// `ExpirationTimestamp` is preserved (it's the 15-day deadline,
     /// not a resolved-at marker).
-    pub fn resolve_handshake(&mut self, id: &str, new_state: &str) -> Result<Handshake, OrgError> {
+    /// `enrolling_account` is the account the caller's party gate already
+    /// proved to be the target. Re-deriving it here from the stored
+    /// target -- which the gate resolves registry-aware and this could
+    /// only resolve id-only -- let the two disagree: an accept could
+    /// enroll a phantom account nobody created, or report ACCEPTED while
+    /// enrolling nobody.
+    pub fn resolve_handshake(
+        &mut self,
+        id: &str,
+        new_state: &str,
+        enrolling_account: Option<&str>,
+        enrolling_email: Option<String>,
+    ) -> Result<Handshake, OrgError> {
         let handshake = self
             .handshakes
             .get_mut(id)
@@ -514,23 +1020,40 @@ impl OrganizationState {
         }
         handshake.state = new_state.to_string();
         let snapshot = handshake.clone();
-        if new_state == "ACCEPTED" && !self.accounts.contains_key(&snapshot.target_account_id) {
+        // Only an INVITE enrolls the target. A TRANSFER_RESPONSIBILITY
+        // handshake targets the management account of ANOTHER organization,
+        // so enrolling on accept would put that account in two
+        // organizations at once.
+        // An EMAIL target records the address, so resolve it to the account
+        // it names — enrolling the raw field would key a member account by
+        // an email string.
+        let enrolling = if new_state == "ACCEPTED" && snapshot.action == "INVITE" {
+            enrolling_account
+                .map(str::to_string)
+                .filter(|target| !self.accounts.contains_key(target))
+        } else {
+            None
+        };
+        if let Some(target) = enrolling {
             let now = Utc::now();
             let arn = format!(
                 "arn:aws:organizations::{}:account/{}/{}",
-                self.management_account_id, self.org_id, snapshot.target_account_id
+                self.management_account_id, self.org_id, target
             );
-            let email = snapshot
-                .target_email
+            // The caller supplies the address: an account's address must
+            // be unique across the whole registry, which this organization
+            // cannot see on its own.
+            let email = enrolling_email
                 .clone()
-                .unwrap_or_else(|| format!("{}@example.com", snapshot.target_account_id));
+                .or_else(|| snapshot.target_email.clone())
+                .unwrap_or_else(|| format!("{target}@example.com"));
             self.accounts.insert(
-                snapshot.target_account_id.clone(),
+                target.clone(),
                 MemberAccount {
-                    id: snapshot.target_account_id.clone(),
+                    id: target.clone(),
                     arn,
                     email,
-                    name: format!("Account {}", snapshot.target_account_id),
+                    name: format!("Account {target}"),
                     status: "ACTIVE".to_string(),
                     joined_method: "INVITED".to_string(),
                     joined_timestamp: now,
@@ -538,20 +1061,37 @@ impl OrganizationState {
                 },
             );
         }
+        // A TRANSFER_RESPONSIBILITY handshake carries a responsibility
+        // transfer. Resolving the handshake without moving the transfer
+        // left two sources of truth disagreeing: the handshake ACCEPTED,
+        // the transfer still REQUESTED with a live handshake id.
+        if snapshot.action == "TRANSFER_RESPONSIBILITY" {
+            if let Some(transfer) = self
+                .responsibility_transfers
+                .values_mut()
+                .find(|t| t.active_handshake_id.as_deref() == Some(id))
+            {
+                transfer.status = new_state.to_string();
+                transfer.active_handshake_id = None;
+                // An ACCEPTED transfer is starting, not ending -- stamping
+                // an end time here reported it as simultaneously active and
+                // already over.
+                if matches!(new_state, "DECLINED" | "CANCELED" | "EXPIRED") {
+                    transfer.end_timestamp = Some(Utc::now());
+                }
+            }
+        }
         Ok(snapshot)
     }
 
-    /// Return a clone of every handshake currently tracked for the org,
-    /// optionally filtered by destination account id.
-    pub fn list_handshakes(&self, only_target_account: Option<&str>) -> Vec<Handshake> {
-        self.handshakes
-            .values()
-            .filter(|h| match only_target_account {
-                Some(acct) => h.target_account_id == acct,
-                None => true,
-            })
-            .cloned()
-            .collect()
+    /// Every handshake this organization holds.
+    ///
+    /// Filtering by target is deliberately NOT offered here: deciding
+    /// whether a target names an account needs the registry, so callers
+    /// filter with [`OrganizationsRegistry::account_matches_target`]. An
+    /// id-only filter here would silently encode a different rule.
+    pub fn list_handshakes(&self) -> Vec<Handshake> {
+        self.handshakes.values().cloned().collect()
     }
 
     /// Mark `service_principal` as a trusted service. Idempotent: the
@@ -631,18 +1171,28 @@ impl OrganizationState {
         account_id: &str,
         service_principal: &str,
     ) -> Result<(), OrgError> {
-        let entry = self
+        // Both arms name the ACCOUNT, which is what the error says and
+        // what AWS reports. Naming the service principal when no
+        // account is registered for it at all rendered "Account
+        // config.amazonaws.com is not registered as a delegated
+        // administrator."
+        let registered = self
             .delegated_administrators
             .get_mut(service_principal)
-            .ok_or_else(|| {
-                OrgError::DelegatedAdministratorNotRegistered(service_principal.to_string())
-            })?;
-        if entry.remove(account_id).is_none() {
+            .is_some_and(|entry| entry.remove(account_id).is_some());
+        if !registered {
             return Err(OrgError::DelegatedAdministratorNotRegistered(
                 account_id.to_string(),
             ));
         }
         Ok(())
+    }
+
+    /// Is `account_id` a delegated administrator for any service?
+    pub fn is_delegated_administrator(&self, account_id: &str) -> bool {
+        self.delegated_administrators
+            .values()
+            .any(|admins| admins.contains_key(account_id))
     }
 
     /// List delegated administrators, optionally filtered by service.
@@ -715,6 +1265,24 @@ impl OrganizationState {
         }
         // Detach any direct policy attachments for the now-orphan id.
         self.attachments.remove(account_id);
+        // Tags are keyed by account id, so an untagged id would come back
+        // wearing them if the account is ever re-enrolled. `ListAccounts`
+        // does not know the id meanwhile, which is the same reason
+        // `fail_create_account` drops the tags it reserved.
+        self.resource_tags.remove(account_id);
+        // And drop every delegated-administrator registration it held.
+        // The registration is an organization's grant to one of its OWN
+        // members, so it cannot outlive the membership: leaving it behind
+        // meant `ListDelegatedServicesForAccount` still answered for an
+        // account the organization no longer contains, and -- now that
+        // the registration unlocks the organization's read operations --
+        // an account that left and was later re-invited came back holding
+        // delegated-administrator authority nobody had granted it.
+        for admins in self.delegated_administrators.values_mut() {
+            admins.remove(account_id);
+        }
+        self.delegated_administrators
+            .retain(|_, admins| !admins.is_empty());
         Ok(())
     }
 
@@ -1118,6 +1686,10 @@ pub enum OrgError {
     InvalidHandshakeParty(String),
     DuplicateHandshakeForAccount(String),
     AccountAlreadyMember(String),
+    /// The account belongs to a DIFFERENT organization. An account can
+    /// be in at most one organization, so it must leave (or be removed
+    /// from) that one before another can invite it.
+    AccountInAnotherOrganization(String),
     AWSServiceAccessNotEnabled(String),
     DelegatedAdministratorAlreadyRegistered(String),
     DelegatedAdministratorNotRegistered(String),
@@ -1189,6 +1761,15 @@ pub struct Handshake {
     pub target_kind: String,
     pub notes: Option<String>,
     pub organization_id: String,
+    /// The responsibility transfer this handshake carries, for
+    /// `TRANSFER_RESPONSIBILITY` handshakes only.
+    ///
+    /// The link has to live on the handshake because the transfer's own
+    /// `active_handshake_id` is cleared the moment the handshake
+    /// resolves -- reading the link from that side made an ACCEPTED
+    /// handshake report no transfer at all.
+    #[serde(default)]
+    pub responsibility_transfer_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1329,6 +1910,64 @@ mod tests {
             let id = random_id(len);
             assert_eq!(id.len(), len);
         }
+    }
+
+    /// A v1 snapshot holds a single organization under `organization`.
+    /// It must fold into the registry on load — silently producing an
+    /// empty registry would drop the user's entire organization on the
+    /// first restart after upgrading.
+    #[test]
+    fn a_v1_snapshot_folds_into_the_registry() {
+        let raw = serde_json::json!({
+            "schema_version": 1,
+            "organization": OrganizationState::bootstrap("111111111111"),
+        });
+        let snapshot: OrganizationsSnapshot = serde_json::from_value(raw).unwrap();
+        assert_eq!(snapshot.schema_version, 1);
+        let registry = snapshot.into_registry();
+        assert_eq!(registry.len(), 1);
+        assert!(registry.org_of_account("111111111111").is_some());
+    }
+
+    /// A v2 snapshot round-trips every organization, and the legacy
+    /// single-organization field is no longer written.
+    #[test]
+    fn a_v2_snapshot_round_trips_every_organization() {
+        let mut registry = OrganizationsRegistry::default();
+        registry.insert(OrganizationState::bootstrap("111111111111"));
+        registry.insert(OrganizationState::bootstrap("222222222222"));
+
+        let snapshot = OrganizationsSnapshot {
+            schema_version: ORGANIZATIONS_SNAPSHOT_SCHEMA_VERSION,
+            organization: None,
+            organizations: registry,
+        };
+        let bytes = serde_json::to_vec(&snapshot).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("\"organization\":"),
+            "v2 must not write the legacy single-organization field"
+        );
+
+        let loaded: OrganizationsSnapshot = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(loaded.schema_version, 2);
+        let restored = loaded.into_registry();
+        assert_eq!(restored.len(), 2);
+        assert!(restored.org_of_account("111111111111").is_some());
+        assert!(restored.org_of_account("222222222222").is_some());
+    }
+
+    /// An empty registry survives a round trip as an empty registry, not
+    /// as a missing field that fails to parse.
+    #[test]
+    fn an_empty_registry_round_trips() {
+        let snapshot = OrganizationsSnapshot {
+            schema_version: ORGANIZATIONS_SNAPSHOT_SCHEMA_VERSION,
+            organization: None,
+            organizations: OrganizationsRegistry::default(),
+        };
+        let bytes = serde_json::to_vec(&snapshot).unwrap();
+        let loaded: OrganizationsSnapshot = serde_json::from_slice(&bytes).unwrap();
+        assert!(loaded.into_registry().is_empty());
     }
 
     #[test]
@@ -1875,7 +2514,7 @@ mod tests {
     fn invite_account_creates_open_handshake() {
         let mut org = OrganizationState::bootstrap("111111111111");
         let h = org
-            .invite_account("111111111111", "222222222222", None, None)
+            .invite_account("111111111111", "ACCOUNT", "222222222222", None, None)
             .unwrap();
         assert_eq!(h.state, "OPEN");
         assert!(h.id.starts_with("h-"));
@@ -1886,7 +2525,7 @@ mod tests {
     fn invite_rejects_existing_member() {
         let mut org = OrganizationState::bootstrap("111111111111");
         let err = org
-            .invite_account("111111111111", "111111111111", None, None)
+            .invite_account("111111111111", "ACCOUNT", "111111111111", None, None)
             .unwrap_err();
         assert!(matches!(err, OrgError::AccountAlreadyMember(_)));
     }
@@ -1894,10 +2533,10 @@ mod tests {
     #[test]
     fn duplicate_open_invite_rejected() {
         let mut org = OrganizationState::bootstrap("111111111111");
-        org.invite_account("111111111111", "333333333333", None, None)
+        org.invite_account("111111111111", "ACCOUNT", "333333333333", None, None)
             .unwrap();
         let err = org
-            .invite_account("111111111111", "333333333333", None, None)
+            .invite_account("111111111111", "ACCOUNT", "333333333333", None, None)
             .unwrap_err();
         assert!(matches!(err, OrgError::DuplicateHandshakeForAccount(_)));
     }
@@ -1906,10 +2545,12 @@ mod tests {
     fn accept_handshake_enrolls_account() {
         let mut org = OrganizationState::bootstrap("111111111111");
         let h = org
-            .invite_account("111111111111", "444444444444", None, None)
+            .invite_account("111111111111", "ACCOUNT", "444444444444", None, None)
             .unwrap();
         assert!(!org.accounts.contains_key("444444444444"));
-        let resolved = org.resolve_handshake(&h.id, "ACCEPTED").unwrap();
+        let resolved = org
+            .resolve_handshake(&h.id, "ACCEPTED", Some("444444444444"), None)
+            .unwrap();
         assert_eq!(resolved.state, "ACCEPTED");
         let acct = org.accounts.get("444444444444").unwrap();
         assert_eq!(acct.joined_method, "INVITED");
@@ -1919,9 +2560,11 @@ mod tests {
     fn decline_handshake_does_not_enroll() {
         let mut org = OrganizationState::bootstrap("111111111111");
         let h = org
-            .invite_account("111111111111", "555555555555", None, None)
+            .invite_account("111111111111", "ACCOUNT", "555555555555", None, None)
             .unwrap();
-        let resolved = org.resolve_handshake(&h.id, "DECLINED").unwrap();
+        let resolved = org
+            .resolve_handshake(&h.id, "DECLINED", None, None)
+            .unwrap();
         assert_eq!(resolved.state, "DECLINED");
         assert!(!org.accounts.contains_key("555555555555"));
     }
@@ -1930,10 +2573,13 @@ mod tests {
     fn resolve_handshake_terminal_locked() {
         let mut org = OrganizationState::bootstrap("111111111111");
         let h = org
-            .invite_account("111111111111", "666666666666", None, None)
+            .invite_account("111111111111", "ACCOUNT", "666666666666", None, None)
             .unwrap();
-        org.resolve_handshake(&h.id, "ACCEPTED").unwrap();
-        let err = org.resolve_handshake(&h.id, "DECLINED").unwrap_err();
+        org.resolve_handshake(&h.id, "ACCEPTED", Some("666666666666"), None)
+            .unwrap();
+        let err = org
+            .resolve_handshake(&h.id, "DECLINED", None, None)
+            .unwrap_err();
         assert!(matches!(err, OrgError::HandshakeAlreadyResolved(_)));
     }
 }

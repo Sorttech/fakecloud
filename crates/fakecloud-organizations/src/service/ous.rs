@@ -11,8 +11,7 @@ impl OrganizationsService {
         let parent_id = required_str(&body, "ParentId")?;
         let name = required_str(&body, "Name")?;
         let mut guard = self.state.write();
-        self.require_member_management(&guard, &req.account_id)?;
-        let org = guard.as_mut().unwrap();
+        let org = self.management_org_mut(&mut guard, &req.account_id)?;
         let ou = org.create_ou(parent_id, name).map_err(org_error_to_aws)?;
         // Apply create-time Tags so ListTagsForResource reflects them without a
         // follow-up TagResource (bug-audit 2026-06-20, 1.24).
@@ -33,8 +32,7 @@ impl OrganizationsService {
         let ou_id = required_str(&body, "OrganizationalUnitId")?;
         let new_name = required_str(&body, "Name")?;
         let mut guard = self.state.write();
-        self.require_member_management(&guard, &req.account_id)?;
-        let org = guard.as_mut().unwrap();
+        let org = self.management_org_mut(&mut guard, &req.account_id)?;
         let ou = org.rename_ou(ou_id, new_name).map_err(org_error_to_aws)?;
         Ok(AwsResponse::ok_json(
             json!({ "OrganizationalUnit": ou_payload(&ou) }),
@@ -48,8 +46,7 @@ impl OrganizationsService {
         let body = req.json_body();
         let ou_id = required_str(&body, "OrganizationalUnitId")?;
         let mut guard = self.state.write();
-        self.require_member_management(&guard, &req.account_id)?;
-        let org = guard.as_mut().unwrap();
+        let org = self.management_org_mut(&mut guard, &req.account_id)?;
         org.delete_ou(ou_id).map_err(org_error_to_aws)?;
         Ok(AwsResponse::ok_json(Value::Null))
     }
