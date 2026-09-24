@@ -558,33 +558,25 @@ async fn an_email_targeted_responsibility_transfer_is_answerable() {
     .expect("and can accept it");
 }
 
-/// A responsibility transfer hands billing to ANOTHER organization, so
-/// the target must be some other organization's management account.
-/// Every other target is refused identically, so the error says nothing
-/// about what exists elsewhere.
+/// An organization cannot hand billing responsibility to itself, by id
+/// or by its own registered address. Every other target is recorded as
+/// the caller named it -- resolving it against other organizations
+/// would answer "does this address exist there?" for organizations the
+/// caller has nothing to do with.
 #[tokio::test]
-async fn a_responsibility_transfer_to_an_unknown_account_errors() {
+async fn a_responsibility_transfer_cannot_target_its_own_organization() {
     let (svc, state) = OrganizationsService::shared();
     create_org_with_root(&svc).await;
-    svc.handle(req_with("222222222222", "CreateOrganization", json!({})))
-        .await
-        .unwrap();
-    // A plain member of the other organization -- a real account, but not
-    // its management account.
-    state
-        .write()
-        .org_of_account_mut("222222222222")
+    let own_email = state
+        .read()
+        .sole()
         .unwrap()
-        .enroll_account_if_missing("222222220001");
+        .management_account_email
+        .clone();
 
     for target in [
-        // Nobody.
-        json!({"Id": "nobody@acme.com", "Type": "EMAIL"}),
-        json!({"Id": "999999999999", "Type": "ACCOUNT"}),
-        // A member account, but not a management account.
-        json!({"Id": "222222220001", "Type": "ACCOUNT"}),
-        // The caller's own organization.
         json!({"Id": "111111111111", "Type": "ACCOUNT"}),
+        json!({"Id": own_email, "Type": "EMAIL"}),
     ] {
         let err = expect_err(
             svc.handle(req_with(
@@ -599,34 +591,23 @@ async fn a_responsibility_transfer_to_an_unknown_account_errors() {
             ))
             .await,
         );
-        // Every rejection reads the same, so the error cannot be used to
-        // probe which accounts or addresses exist elsewhere.
-        assert_eq!(err.code(), "InvalidInputException");
-        assert!(
-            err.message()
-                .contains("is not the management account of another organization"),
-            "unexpected message: {}",
-            err.message()
-        );
+        assert_eq!(err.code(), "HandshakeConstraintViolationException");
     }
 
-    // ...and a caller in no organization is refused before the target is
-    // resolved at all, so the error cannot be used to probe which
-    // addresses exist elsewhere.
-    let err = expect_err(
-        svc.handle(req_with(
-            "999999999999",
-            "InviteOrganizationToTransferResponsibility",
-            json!({
-                "Type": "BILLING",
-                "SourceName": "handover",
-                "StartTimestamp": 1893456000.0,
-                "Target": {"Id": "111111111111", "Type": "ACCOUNT"},
-            }),
-        ))
-        .await,
-    );
-    assert_eq!(err.code(), "AWSOrganizationsNotInUseException");
+    // An account elsewhere -- or nowhere -- is recorded verbatim, with no
+    // lookup that could report what exists in another organization.
+    svc.handle(req_with(
+        "111111111111",
+        "InviteOrganizationToTransferResponsibility",
+        json!({
+            "Type": "BILLING",
+            "SourceName": "handover",
+            "StartTimestamp": 1893456000.0,
+            "Target": {"Id": "ops@acme.com", "Type": "EMAIL"},
+        }),
+    ))
+    .await
+    .expect("an external address is a valid target");
 }
 
 /// Deleting one organization leaves every other one standing.

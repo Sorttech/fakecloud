@@ -34,17 +34,33 @@ fn require_transfer_type(body: &Value) -> Result<String, AwsServiceError> {
     Ok(t.to_string())
 }
 
-/// The target is resolved to an account id before it is stored, so this
-/// is a plain comparison. Decoding the recorded EMAIL as if it encoded
-/// an account id handed transfer-party rights -- reading both parties'
-/// ids and emails, and ending an accepted transfer -- to whatever
-/// account id the address happened to spell.
-fn is_transfer_target(t: &ResponsibilityTransfer, account_id: &str) -> bool {
-    t.target_management_account_id == account_id
+/// Is `account_id` the target of `t`?
+///
+/// An EMAIL target records the address the source named, so the match
+/// runs the other way: look up the CALLER's own registered address in
+/// its own organization and compare that. Resolving the stored address
+/// against every organization instead would answer "whose account is
+/// this?" for organizations the caller has nothing to do with.
+fn is_transfer_target(
+    registry: &crate::state::OrganizationsRegistry,
+    t: &ResponsibilityTransfer,
+    account_id: &str,
+) -> bool {
+    if t.target_management_account_id == account_id {
+        return true;
+    }
+    registry
+        .org_of_account(account_id)
+        .and_then(|org| org.accounts.get(account_id))
+        .is_some_and(|account| account.email == t.target_management_account_id)
 }
 
-fn is_transfer_party(t: &ResponsibilityTransfer, account_id: &str) -> bool {
-    t.source_management_account_id == account_id || is_transfer_target(t, account_id)
+fn is_transfer_party(
+    registry: &crate::state::OrganizationsRegistry,
+    t: &ResponsibilityTransfer,
+    account_id: &str,
+) -> bool {
+    t.source_management_account_id == account_id || is_transfer_target(registry, t, account_id)
 }
 
 fn transfer_payload(t: &ResponsibilityTransfer) -> Value {
@@ -105,7 +121,7 @@ impl OrganizationsService {
             .get(id)
             .ok_or_else(|| transfer_not_found(id))?;
         // A stranger learns nothing beyond "no such transfer".
-        if !is_transfer_party(transfer, caller) {
+        if !is_transfer_party(guard, transfer, caller) {
             return Err(transfer_not_found(id));
         }
         // Only an offer still awaiting an answer is the source's alone to
@@ -183,25 +199,33 @@ impl OrganizationsService {
         // seen. Resolving here keeps `Target.ManagementAccountId` an
         // account id, as the Smithy shape models it, instead of leaking
         // an address into it.
-        // A responsibility transfer hands billing to ANOTHER organization,
-        // so the target must be some other organization's management
-        // account. Resolution therefore looks at management accounts
-        // only, and every failure -- unknown address, not a management
-        // account, or the caller's own organization -- reports the same
-        // message, so the error cannot be read as an oracle for which
-        // addresses exist elsewhere.
-        let bad_target = || {
-            invalid_input(&format!(
-                "{target_id} is not the management account of another organization"
-            ))
+        // Record the target EXACTLY as the caller named it, as AWS does:
+        // resolving an address against other organizations' management
+        // accounts would answer "does this address exist, and what is its
+        // account id?" for organizations the caller has nothing to do
+        // with. The party gate resolves the other way instead -- it asks
+        // the CALLER what its own address is (see `is_transfer_target`).
+        let (target_account_id, target_email) = if target_kind == "EMAIL" {
+            (target_id.clone(), target_id.clone())
+        } else {
+            (target_id.clone(), format!("{target_id}@example.com"))
         };
-        let target = registry
-            .management_account_matching(target_kind, &target_id)
-            .ok_or_else(bad_target)?;
-        if target.org_id == source_org_id {
-            return Err(bad_target());
+        // Naming yourself is the one case there is nothing to leak about.
+        let source_is_target = registry.org_by_id(&source_org_id).is_some_and(|org| {
+            org.management_account_id == target_account_id
+                || org.management_account_email == target_account_id
+        });
+        if source_is_target {
+            return Err(AwsServiceError::aws_error_with_fields(
+                StatusCode::BAD_REQUEST,
+                "HandshakeConstraintViolationException",
+                "An organization cannot transfer responsibility to itself.",
+                vec![(
+                    "Reason".to_string(),
+                    "SOURCE_AND_TARGET_CANNOT_MATCH".to_string(),
+                )],
+            ));
         }
-        let (target_account_id, target_email) = target.into_parts();
         let org = guard
             .org_by_id_mut(&source_org_id)
             .expect("management gate resolved this organization");
@@ -227,7 +251,7 @@ impl OrganizationsService {
             // as such. Keeping "EMAIL" here left `target_account_id`
             // unresolvable, and the target could then neither accept nor
             // describe its own handshake.
-            target_kind: "ACCOUNT".to_string(),
+            target_kind: target_kind.to_string(),
             notes,
             organization_id: org.org_id.clone(),
         };
@@ -276,7 +300,7 @@ impl OrganizationsService {
         let transfer = guard
             .org_of_responsibility_transfer(&id)
             .and_then(|org| org.responsibility_transfers.get(&id))
-            .filter(|t| is_transfer_party(t, &req.account_id))
+            .filter(|t| is_transfer_party(&guard, t, &req.account_id))
             .ok_or_else(|| transfer_not_found(&id))?;
         Ok(AwsResponse::ok_json(
             json!({ "ResponsibilityTransfer": transfer_payload(transfer) }),
@@ -387,6 +411,8 @@ impl OrganizationsService {
         let body = req.json_body();
         // `Type` is required on both list ops.
         let transfer_type = require_transfer_type(&body)?;
+        // Both list ops model an optional `Id` to fetch a single transfer.
+        let only_id = body.get("Id").and_then(|v| v.as_str()).map(str::to_string);
         let (max_results, next_token) = parse_list_pagination(&body)?;
         let guard = self.state.read();
         // The caller must be in an organization at all -- these ops declare
@@ -398,10 +424,11 @@ impl OrganizationsService {
             .iter()
             .flat_map(|org| org.responsibility_transfers.values())
             .filter(|t| {
-                t.transfer_type == transfer_type
+                only_id.as_deref().is_none_or(|id| t.id == id)
+                    && t.transfer_type == transfer_type
                     && match direction {
                         "OUTBOUND" => t.source_management_account_id == req.account_id,
-                        _ => is_transfer_target(t, &req.account_id),
+                        _ => is_transfer_target(&guard, t, &req.account_id),
                     }
             })
             .collect();

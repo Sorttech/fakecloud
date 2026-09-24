@@ -22,20 +22,6 @@ pub struct OrganizationsRegistry {
     orgs: BTreeMap<String, OrganizationState>,
 }
 
-/// A management account located by [`OrganizationsRegistry::management_account_matching`].
-pub struct ManagementAccountRef {
-    pub org_id: String,
-    pub account_id: String,
-    pub email: String,
-}
-
-impl ManagementAccountRef {
-    /// `(account_id, email)`.
-    pub fn into_parts(self) -> (String, String) {
-        (self.account_id, self.email)
-    }
-}
-
 /// Resolve a handshake or transfer target to an account id.
 ///
 /// An `ACCOUNT` target already is one. An `EMAIL` target stores the
@@ -195,36 +181,26 @@ impl OrganizationsRegistry {
             .map(|account| account.id.clone())
     }
 
-    /// Mint an account id unused by ANY organization in the process.
-    pub fn next_account_id(&self) -> String {
+    /// Mint an account id unused by ANY organization in the process, and
+    /// not already reserved by an in-flight `CreateAccount`. `besides`
+    /// excludes ids minted moments ago that are not recorded yet --
+    /// `CreateGovCloudAccount` mints two in a row.
+    pub fn next_account_id_besides(&self, besides: &[&str]) -> String {
         OrganizationState::mint_account_id(|id| {
-            self.orgs.values().any(|org| org.accounts.contains_key(id))
+            besides.contains(&id)
+                || self.orgs.values().any(|org| {
+                    org.accounts.contains_key(id)
+                        || org
+                            .create_account_requests
+                            .values()
+                            .any(|req| req.account_id.as_deref() == Some(id))
+                })
         })
     }
 
-    /// The management account a transfer target names, if any.
-    ///
-    /// Only management accounts are considered, because a responsibility
-    /// transfer is an arrangement between two organizations. An
-    /// `ACCOUNT` target names the id directly; an `EMAIL` target matches
-    /// the address a management account is registered with, or the
-    /// synthetic form fakecloud mints.
-    pub fn management_account_matching(
-        &self,
-        target_kind: &str,
-        target: &str,
-    ) -> Option<ManagementAccountRef> {
-        let wanted = target_account_id(target_kind, target);
-        self.orgs.values().find_map(|org| {
-            let management = org.accounts.get(&org.management_account_id)?;
-            let matches = wanted.as_deref() == Some(management.id.as_str())
-                || (target_kind == "EMAIL" && management.email == target);
-            matches.then(|| ManagementAccountRef {
-                org_id: org.org_id.clone(),
-                account_id: management.id.clone(),
-                email: management.email.clone(),
-            })
-        })
+    /// Mint an account id unused by ANY organization in the process.
+    pub fn next_account_id(&self) -> String {
+        self.next_account_id_besides(&[])
     }
 
     /// The organization that stores responsibility transfer `id`. A

@@ -3,11 +3,26 @@
 use super::*;
 use crate::state::target_account_id;
 
-/// The account a handshake names, resolving an EMAIL target back to the
-/// account id it encodes. `None` for an address fakecloud cannot map to
-/// an account.
-fn handshake_target_account(h: &crate::state::Handshake) -> Option<String> {
-    target_account_id(&h.target_kind, &h.target_account_id)
+/// Is `account_id` the account a handshake names?
+///
+/// An EMAIL target records the address the source named, so the match
+/// runs the other way: look up the CALLER's own registered address and
+/// compare that. Resolving the stored address against every
+/// organization would answer "whose account is this?" for organizations
+/// the caller has nothing to do with.
+fn is_handshake_target(
+    registry: &crate::state::OrganizationsRegistry,
+    h: &crate::state::Handshake,
+    account_id: &str,
+) -> bool {
+    if target_account_id(&h.target_kind, &h.target_account_id).as_deref() == Some(account_id) {
+        return true;
+    }
+    h.target_kind == "EMAIL"
+        && registry
+            .org_of_account(account_id)
+            .and_then(|org| org.accounts.get(account_id))
+            .is_some_and(|account| account.email == h.target_account_id)
 }
 
 impl OrganizationsService {
@@ -78,9 +93,7 @@ impl OrganizationsService {
                 .is_some_and(|org| org.org_id == org_id)
         } else {
             match new_state {
-                "ACCEPTED" | "DECLINED" => {
-                    handshake_target_account(&handshake).as_deref() == Some(req.account_id.as_str())
-                }
+                "ACCEPTED" | "DECLINED" => is_handshake_target(&guard, &handshake, &req.account_id),
                 "CANCELED" => req.account_id == handshake.source_account_id,
                 _ => false,
             }
@@ -97,17 +110,14 @@ impl OrganizationsService {
         // TRANSFER_RESPONSIBILITY handshake targets another organization's
         // management account by design.
         if new_state == "ACCEPTED" && handshake.action == "INVITE" {
-            let target = guard
-                .resolve_target_account(
-                    &handshake.target_kind,
-                    &handshake.target_account_id,
-                    &org_id,
-                )
-                .unwrap_or_default();
-            if let Some(other) = guard.org_of_account(&target) {
+            // The caller has just been proved to be the target, so its own
+            // id is the one that must not already belong elsewhere.
+            if let Some(other) = guard.org_of_account(&req.account_id) {
                 if other.org_id != org_id {
                     return Err(org_error_to_aws(
-                        crate::state::OrgError::AccountInAnotherOrganization(target.clone()),
+                        crate::state::OrgError::AccountInAnotherOrganization(
+                            req.account_id.clone(),
+                        ),
                     ));
                 }
             }
@@ -147,7 +157,7 @@ impl OrganizationsService {
         // would let any account anywhere read any handshake, learning
         // another organization's id and management account.
         let is_party = req.account_id == handshake.source_account_id
-            || handshake_target_account(handshake).as_deref() == Some(req.account_id.as_str());
+            || is_handshake_target(&guard, handshake, &req.account_id);
         // AWS documents DescribeHandshake as callable "from any account in
         // the organization", so membership of the organization that owns
         // the handshake is enough. It is only another ORGANIZATION's

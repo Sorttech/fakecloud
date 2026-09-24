@@ -108,7 +108,9 @@ impl OrganizationsService {
         // from the registry so neither can collide with another
         // organization's account.
         let new_account_id = guard.next_account_id();
-        let gov_id = guard.next_account_id();
+        // Exclude the id just minted: it is not recorded anywhere yet, so
+        // a plain second call could hand back the same one.
+        let gov_id = guard.next_account_id_besides(&[new_account_id.as_str()]);
         let org = self.management_org_mut(&mut guard, &req.account_id)?;
         let status = org.begin_create_account(&email, &name, new_account_id, Some(gov_id));
         let request_id = status.id.clone();

@@ -3117,11 +3117,11 @@ class OrganizationsSummary:
     def from_dict(cls, data: Dict[str, Any]) -> OrganizationsSummary:
         d = _convert_keys(data)
         return cls(
-            organization_id=d["organization_id"],
-            arn=d["arn"],
-            management_account_id=d["management_account_id"],
-            root_id=d["root_id"],
-            feature_set=d["feature_set"],
+            organization_id=d.get("organization_id", ""),
+            arn=d.get("arn", ""),
+            management_account_id=d.get("management_account_id", ""),
+            root_id=d.get("root_id", ""),
+            feature_set=d.get("feature_set", ""),
         )
 
 
