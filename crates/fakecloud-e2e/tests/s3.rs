@@ -1132,6 +1132,83 @@ async fn s3_null_version_delete_on_versioned_bucket_reports_null() {
 }
 
 #[tokio::test]
+async fn s3_suspended_bucket_delete_creates_null_delete_marker() {
+    // On a suspended bucket AWS stacks a delete marker with version id
+    // "null" and leaves the prior versions listable, rather than hard-removing
+    // the current object the way a never-versioned bucket does.
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+    let sqs = server.sqs_client().await;
+
+    s3.create_bucket()
+        .bucket("susp-marker")
+        .send()
+        .await
+        .unwrap();
+    s3.put_bucket_versioning()
+        .bucket("susp-marker")
+        .versioning_configuration(
+            aws_sdk_s3::types::VersioningConfiguration::builder()
+                .status(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let queue_url = wire_bucket_to_queue(&server, &sqs, "susp-marker", "susp-marker-events").await;
+
+    let put = s3
+        .put_object()
+        .bucket("susp-marker")
+        .key("doc.txt")
+        .body(ByteStream::from_static(b"v1"))
+        .send()
+        .await
+        .unwrap();
+    let version = put.version_id().unwrap().to_string();
+    let created = drain_records(&sqs, &queue_url, 1).await;
+    assert_eq!(created.len(), 1);
+
+    s3.put_bucket_versioning()
+        .bucket("susp-marker")
+        .versioning_configuration(
+            aws_sdk_s3::types::VersioningConfiguration::builder()
+                .status(aws_sdk_s3::types::BucketVersioningStatus::Suspended)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    let del = s3
+        .delete_object()
+        .bucket("susp-marker")
+        .key("doc.txt")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.delete_marker(), Some(true));
+    assert_eq!(del.version_id(), Some("null"));
+
+    let removed = drain_records(&sqs, &queue_url, 1).await;
+    assert_eq!(removed.len(), 1);
+    assert_eq!(removed[0]["eventName"], "ObjectRemoved:DeleteMarkerCreated");
+    assert_eq!(removed[0]["s3"]["object"]["versionId"], "null");
+
+    // The pre-suspension version survives and is still readable by id.
+    let got = s3
+        .get_object()
+        .bucket("susp-marker")
+        .key("doc.txt")
+        .version_id(&version)
+        .send()
+        .await
+        .expect("the enabled-era version must survive the suspended delete");
+    let bytes = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(bytes.as_ref(), b"v1");
+}
+
+#[tokio::test]
 async fn s3_delete_objects_batch_emits_notifications() {
     // DeleteObjects used to be a silent hole in the event stream: it removed
     // objects without firing any notification.

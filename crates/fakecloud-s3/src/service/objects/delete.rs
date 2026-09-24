@@ -203,7 +203,9 @@ impl S3Service {
             });
         }
 
-        // Check object lock for non-version-specific deletes on non-versioned buckets
+        // Check object lock for non-version-specific deletes on buckets that
+        // overwrite in place: never-versioned ones, and suspended ones (whose
+        // null version the new delete marker replaces).
         if !versioning_enabled {
             if let Some(existing) = b.objects.get(key) {
                 if !existing.is_delete_marker {
@@ -218,8 +220,11 @@ impl S3Service {
             }
         }
 
-        // Versioned bucket: create a delete marker
-        if versioning_enabled {
+        // Versioned bucket (Enabled or Suspended): create a delete marker.
+        // Suspended buckets keep their existing versions and stack a marker
+        // whose id is the literal "null", overwriting whatever null version
+        // was there, exactly as AWS does.
+        if versioning_configured {
             // If the existing object was created before versioning, preserve it
             if !b.object_versions.contains_key(key) {
                 if let Some(existing) = b.objects.get(key) {
@@ -233,7 +238,18 @@ impl S3Service {
                         .push(preserved);
                 }
             }
-            let dm_id = Uuid::new_v4().to_string();
+            let dm_id = if versioning_enabled {
+                Uuid::new_v4().to_string()
+            } else {
+                // Suspended: the marker IS the null version, replacing any
+                // existing one rather than stacking beside it.
+                if let Some(versions) = b.object_versions.get_mut(key) {
+                    versions.retain(|o| {
+                        !(o.version_id.is_none() || o.version_id.as_deref() == Some("null"))
+                    });
+                }
+                "null".to_string()
+            };
             let marker = make_delete_marker(key, &dm_id);
             let marker_meta = object_meta_snapshot(&marker);
             b.object_versions
@@ -504,7 +520,11 @@ impl S3Service {
                         xml_escape(vid),
                     ));
                 }
-            } else if versioning_enabled {
+            } else if versioning_configured {
+                // A suspended bucket behaves like an enabled one here except
+                // that the marker takes the literal "null" version id and
+                // replaces the existing null version (see delete_object).
+                //
                 // Preserve any pre-versioning object as a "null" version
                 // before stacking the delete marker on top, otherwise
                 // the existing data is shadowed by the marker and lost
@@ -521,7 +541,34 @@ impl S3Service {
                             .push(preserved);
                     }
                 }
-                let dm_id = Uuid::new_v4().to_string();
+                // A suspended-bucket marker overwrites the null version, so
+                // object lock must be honored exactly as on an unversioned
+                // bucket; an enabled bucket only stacks a new version.
+                if !versioning_enabled {
+                    let lock_denied = b
+                        .objects
+                        .get(key)
+                        .filter(|existing| !existing.is_delete_marker)
+                        .and_then(|existing| check_object_lock_for_overwrite(existing, req));
+                    if let Some(code) = lock_denied {
+                        error_xml.push_str(&format!(
+                            "<Error><Key>{}</Key><Code>{}</Code><Message>Access Denied</Message></Error>",
+                            xml_escape(key),
+                            code,
+                        ));
+                        continue;
+                    }
+                }
+                let dm_id = if versioning_enabled {
+                    Uuid::new_v4().to_string()
+                } else {
+                    if let Some(versions) = b.object_versions.get_mut(key.as_str()) {
+                        versions.retain(|o| {
+                            !(o.version_id.is_none() || o.version_id.as_deref() == Some("null"))
+                        });
+                    }
+                    "null".to_string()
+                };
                 let marker = make_delete_marker(key, &dm_id);
                 b.object_versions
                     .entry(key.to_string())
