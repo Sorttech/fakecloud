@@ -33,7 +33,8 @@ Sub-clients are accessed via methods: `fc.SES()`, `fc.SNS()`, `fc.Lambda()`, etc
 | `Credentials(ctx)` | Fetch container/instance credentials (`GET /_fakecloud/credentials`) |
 | `InstanceIdentityDocument(ctx)` | EC2 instance identity document (`/latest/dynamic/instance-identity/document`) |
 | `DNSResolve(ctx, name, recordType)` | Resolve a name against Route 53 records like the `--dns` resolver (`GET /_fakecloud/dns/resolve`) |
-| `CreateAdmin(ctx, accountID, userName)` | Bootstrap an admin user in a secondary account |
+| `CreateAdmin(ctx, accountID, userName)` | Bootstrap a standalone admin user in a secondary account |
+| `CreateAdminInOrg(ctx, accountID, userName, orgID)` | Same, also enrolling the account into that organization |
 
 ## `fc.SES()`
 

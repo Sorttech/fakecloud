@@ -725,9 +725,13 @@ impl OrganizationState {
 
     /// Enroll `account_id` into the root OU as a member of the
     /// organization if not already known. No-op when the account is
-    /// already enrolled anywhere in the tree. Used as the
-    /// auto-enrollment hook when a new IAM admin bootstraps via
-    /// `/_fakecloud/iam/create-admin` while an organization exists.
+    /// already enrolled anywhere in the tree. Backs the opt-in
+    /// `organizationId` of `/_fakecloud/iam/create-admin`, which is the
+    /// shortcut equivalent of an invite/accept handshake. Bootstrapping
+    /// an admin without naming an organization never calls this — a
+    /// freshly vended account must stay standalone, not silently inherit
+    /// another organization's SCPs, metadata and stack-set targeting
+    /// (#2543).
     pub fn enroll_account_if_missing(&mut self, account_id: &str) {
         if self.accounts.contains_key(account_id) {
             return;

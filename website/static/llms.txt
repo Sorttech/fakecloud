@@ -93,7 +93,7 @@ fakecloud exposes `/_fakecloud/*` endpoints your tests can use to assert on side
 - `GET /_fakecloud/sns/messages`: list SNS messages that were published
 - `GET /_fakecloud/lambda/invocations`: list Lambda invocations and their results
 - `GET /_fakecloud/cognito/confirmation-codes`: list Cognito confirmation codes (for testing signup flows)
-- `POST /_fakecloud/iam/create-admin`: bootstrap an admin user in a specific account (for multi-account tests)
+- `POST /_fakecloud/iam/create-admin`: bootstrap an admin user in a specific account (for multi-account tests). Body `{"accountId","userName"}`; the account is standalone unless the optional `organizationId` names an existing organization to enroll it into.
 - `GET /_fakecloud/credentials`: vends AWS container-credentials-format JSON; point `AWS_CONTAINER_CREDENTIALS_FULL_URI` here to run an app that expects an instance/task role unmodified (no static keys)
 - EC2 IMDS on `/latest/*` (IMDSv1 + IMDSv2): point `AWS_EC2_METADATA_SERVICE_ENDPOINT=http://localhost:4566/` to resolve credentials + instance identity via the metadata service unmodified. `--imds-link-local` (root) also binds the real `169.254.169.254`/`169.254.170.2` IPs for apps that hardcode them
 - `--dns` runs a real DNS resolver (UDP+TCP) answering A/AAAA/CNAME/MX/TXT from the Route 53 records you create, so `dig`/`getaddrinfo` and containers pointed at fakecloud resolve created records to local targets (one source of truth, no dnsmasq/hosts layer). CNAME chase; names in no local zone forward upstream so fakecloud can be a container's sole resolver. `GET /_fakecloud/dns/resolve?name=&type=` (wrapped as `dns_resolve`/`dnsResolve` in every SDK) returns the same resolution as JSON so a test can assert it without a socket

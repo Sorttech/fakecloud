@@ -61,7 +61,7 @@ $fc = new FakeCloud('http://localhost:4566'); // explicit base URL
 | `credentials()`                       | Fetch container/instance credentials (`GET /_fakecloud/credentials`) |
 | `instanceIdentityDocument()`          | EC2 instance identity document (`/latest/dynamic/instance-identity/document`) |
 | `dnsResolve($name, $type)`            | Resolve a name against Route 53 records like the `--dns` resolver (`GET /_fakecloud/dns/resolve`) |
-| `createAdmin($accountId, $userName)`  | Bootstrap an admin IAM user in an additional account |
+| `createAdmin($accountId, $userName, $organizationId = null)`  | Bootstrap an admin IAM user in an additional account (standalone unless an organization is named) |
 
 ### `$fc->lambda()`
 

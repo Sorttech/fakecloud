@@ -871,6 +871,11 @@ export interface BedrockAgentRuntimeInvocationsResponse {
 export interface CreateAdminRequest {
   accountId: string;
   userName: string;
+  /**
+   * Optionally enroll the account into that organization as a member of
+   * its root OU. Omitted, the account is standalone.
+   */
+  organizationId?: string;
 }
 
 export interface CreateAdminResponse {

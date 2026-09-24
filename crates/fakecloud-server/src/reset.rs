@@ -550,17 +550,28 @@ impl ResetState {
 /// This solves the multi-account bootstrap problem: the `test*` root
 /// bypass only targets the default account, so there's no way to create
 /// credentials for a non-default account via the normal AWS API.
+///
+/// The account is standalone unless `organization_id` names an existing
+/// organization, in which case it is enrolled into that organization's
+/// root OU. That mirrors AWS: a freshly vended account belongs to no
+/// organization until it is invited and accepts, or is created through
+/// `CreateAccount`. Bootstrapping an admin must never silently pull the
+/// account into an unrelated organization — that account then inherits
+/// SCPs it never agreed to, can read the organization's metadata, and
+/// becomes a stack-set auto-deployment target.
 pub(crate) fn create_admin_in_account(
     iam: &fakecloud_iam::SharedIamState,
     organizations: &fakecloud_organizations::SharedOrganizationsState,
     account_id: &str,
     user_name: &str,
-) -> types::CreateAdminResponse {
-    // Auto-enroll the account into the organization's root OU if an
-    // org exists. Matches AWS's InviteAccount path in spirit: tests
-    // bootstrapping admin credentials for a second account expect
-    // that account to immediately participate in SCP evaluation.
-    if let Some(org) = organizations.write().as_mut() {
+    organization_id: Option<&str>,
+) -> Result<types::CreateAdminResponse, CreateAdminError> {
+    if let Some(org_id) = organization_id {
+        let mut guard = organizations.write();
+        let org = guard
+            .as_mut()
+            .filter(|org| org.org_id == org_id)
+            .ok_or_else(|| CreateAdminError::UnknownOrganization(org_id.to_string()))?;
         org.enroll_account_if_missing(account_id);
     }
 
@@ -614,11 +625,31 @@ pub(crate) fn create_admin_in_account(
         )]),
     );
 
-    types::CreateAdminResponse {
+    Ok(types::CreateAdminResponse {
         access_key_id: akid,
         secret_access_key: secret,
         account_id: account_id.to_string(),
         arn,
+    })
+}
+
+/// Why a `/_fakecloud/iam/create-admin` call could not be satisfied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CreateAdminError {
+    /// `organizationId` was supplied but no organization with that id
+    /// exists. Enrolling into "whatever org happens to exist" is what
+    /// the caller is explicitly avoiding by naming one, so this is an
+    /// error rather than a silent fallback.
+    UnknownOrganization(String),
+}
+
+impl CreateAdminError {
+    pub(crate) fn message(&self) -> String {
+        match self {
+            Self::UnknownOrganization(id) => {
+                format!("no organization with id {id} exists")
+            }
+        }
     }
 }
 
@@ -938,7 +969,8 @@ mod tests {
         ));
         let orgs: fakecloud_organizations::SharedOrganizationsState =
             Arc::new(parking_lot::RwLock::new(None));
-        let resp = super::create_admin_in_account(&iam, &orgs, "123456789012", "admin");
+        let resp = super::create_admin_in_account(&iam, &orgs, "123456789012", "admin", None)
+            .expect("create admin");
         assert_eq!(resp.account_id, "123456789012");
         assert!(resp.access_key_id.starts_with("FKIA"));
         assert!(resp.arn.contains("123456789012"));
@@ -959,7 +991,8 @@ mod tests {
         ));
         let orgs: fakecloud_organizations::SharedOrganizationsState =
             Arc::new(parking_lot::RwLock::new(None));
-        let resp = super::create_admin_in_account(&iam, &orgs, "999999999999", "bob");
+        let resp = super::create_admin_in_account(&iam, &orgs, "999999999999", "bob", None)
+            .expect("create admin");
         assert_eq!(resp.account_id, "999999999999");
         assert!(resp.arn.contains("999999999999"));
 
@@ -984,7 +1017,8 @@ mod tests {
         ));
         let orgs: fakecloud_organizations::SharedOrganizationsState =
             Arc::new(parking_lot::RwLock::new(None));
-        let resp = super::create_admin_in_account(&iam, &orgs, "222222222222", "admin");
+        let resp = super::create_admin_in_account(&iam, &orgs, "222222222222", "admin", None)
+            .expect("create admin");
 
         let evaluator = fakecloud_iam::policy_evaluator::IamPolicyEvaluatorImpl::new(iam.clone());
         let principal = Principal {
@@ -1009,6 +1043,83 @@ mod tests {
         );
     }
 
+    /// Regression for #2543: bootstrapping an admin must not silently
+    /// pull the account into an organization someone else created. An
+    /// auto-joined account cannot become a management account of its
+    /// own, which broke multi-organization setups.
+    #[test]
+    fn create_admin_does_not_join_existing_organization() {
+        let iam: fakecloud_iam::SharedIamState = Arc::new(parking_lot::RwLock::new(
+            fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+        ));
+        let orgs: fakecloud_organizations::SharedOrganizationsState =
+            Arc::new(parking_lot::RwLock::new(Some(
+                fakecloud_organizations::OrganizationState::bootstrap("111111111111"),
+            )));
+
+        super::create_admin_in_account(&iam, &orgs, "222222222222", "admin", None)
+            .expect("create admin");
+
+        let guard = orgs.read();
+        let org = guard.as_ref().unwrap();
+        assert!(
+            !org.accounts.contains_key("222222222222"),
+            "a standalone bootstrap must leave the account outside the org"
+        );
+        assert!(org.accounts.contains_key("111111111111"));
+    }
+
+    #[test]
+    fn create_admin_with_organization_id_enrolls_account() {
+        let iam: fakecloud_iam::SharedIamState = Arc::new(parking_lot::RwLock::new(
+            fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+        ));
+        let org = fakecloud_organizations::OrganizationState::bootstrap("111111111111");
+        let org_id = org.org_id.clone();
+        let root_id = org.root_id.clone();
+        let orgs: fakecloud_organizations::SharedOrganizationsState =
+            Arc::new(parking_lot::RwLock::new(Some(org)));
+
+        super::create_admin_in_account(&iam, &orgs, "222222222222", "admin", Some(&org_id))
+            .expect("create admin");
+
+        let guard = orgs.read();
+        let member = guard
+            .as_ref()
+            .unwrap()
+            .accounts
+            .get("222222222222")
+            .expect("account enrolled");
+        assert_eq!(member.parent_id, root_id);
+        assert_eq!(member.status, "ACTIVE");
+    }
+
+    #[test]
+    fn create_admin_with_unknown_organization_id_errors() {
+        let iam: fakecloud_iam::SharedIamState = Arc::new(parking_lot::RwLock::new(
+            fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+        ));
+        let orgs: fakecloud_organizations::SharedOrganizationsState =
+            Arc::new(parking_lot::RwLock::new(Some(
+                fakecloud_organizations::OrganizationState::bootstrap("111111111111"),
+            )));
+
+        let err = super::create_admin_in_account(
+            &iam,
+            &orgs,
+            "222222222222",
+            "admin",
+            Some("o-doesnotexist"),
+        )
+        .expect_err("unknown org id must be rejected");
+        assert_eq!(
+            err,
+            super::CreateAdminError::UnknownOrganization("o-doesnotexist".to_string())
+        );
+        // The IAM user is not created when the enrollment target is bogus.
+        assert!(iam.read().get("222222222222").is_none());
+    }
+
     #[test]
     fn create_admin_credentials_resolve() {
         let iam: fakecloud_iam::SharedIamState = Arc::new(parking_lot::RwLock::new(
@@ -1016,7 +1127,8 @@ mod tests {
         ));
         let orgs: fakecloud_organizations::SharedOrganizationsState =
             Arc::new(parking_lot::RwLock::new(None));
-        let resp = super::create_admin_in_account(&iam, &orgs, "222222222222", "alice");
+        let resp = super::create_admin_in_account(&iam, &orgs, "222222222222", "alice", None)
+            .expect("create admin");
 
         // Verify the credential resolver can find this key
         let mut accounts = iam.write();

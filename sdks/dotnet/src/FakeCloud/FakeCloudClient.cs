@@ -120,10 +120,30 @@ public sealed class FakeCloudClient : IDisposable
 
     // ── IAM ───────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Create an IAM admin user in a specific account. The account is
+    /// standalone: it joins no organization, matching AWS, where a freshly
+    /// vended account belongs to no organization until it is invited and
+    /// accepts. Use <see cref="CreateAdminInOrgAsync"/> to enroll it into an
+    /// organization you already created.
+    /// </summary>
     public Task<CreateAdminResponse> CreateAdminAsync(
         string accountId, string userName, CancellationToken ct = default) =>
         _http.PostJsonAsync<CreateAdminResponse>(
-            "/_fakecloud/iam/create-admin", new CreateAdminRequest(accountId, userName), ct);
+            "/_fakecloud/iam/create-admin",
+            new CreateAdminRequest(accountId, userName), ct);
+
+    /// <summary>
+    /// <see cref="CreateAdminAsync"/> plus enrollment of the account into the
+    /// organization <paramref name="organizationId"/> as a member of its root
+    /// OU -- the shortcut equivalent of an invite/accept handshake.
+    /// </summary>
+    public Task<CreateAdminResponse> CreateAdminInOrgAsync(
+        string accountId, string userName, string organizationId,
+        CancellationToken ct = default) =>
+        _http.PostJsonAsync<CreateAdminResponse>(
+            "/_fakecloud/iam/create-admin",
+            new CreateAdminRequest(accountId, userName, organizationId), ct);
 
     // ── Sub-client accessors ───────────────────────────────────────
 

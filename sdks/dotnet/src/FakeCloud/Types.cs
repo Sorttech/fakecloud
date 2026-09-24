@@ -751,7 +751,13 @@ public sealed record ApiGatewayV2Request(
 public sealed record ApiGatewayV2RequestsResponse(IReadOnlyList<ApiGatewayV2Request>? Requests);
 
 // ── IAM ───────────────────────────────────────────────────────
-public sealed record CreateAdminRequest(string? AccountId, string? UserName);
+/// <summary>
+/// Body for <c>POST /_fakecloud/iam/create-admin</c>. A null
+/// <c>OrganizationId</c> leaves the account standalone; naming an
+/// organization enrolls the account into its root OU.
+/// </summary>
+public sealed record CreateAdminRequest(
+    string? AccountId, string? UserName, string? OrganizationId = null);
 
 public sealed record CreateAdminResponse(
     string? AccessKeyId,

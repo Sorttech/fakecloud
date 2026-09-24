@@ -143,14 +143,26 @@ async fn ou_tree_crud_and_move_account() {
     let a_cfg = config_with(&server, &a_akid, &a_secret).await;
     let orgs = OrgsClient::new(&a_cfg);
 
-    orgs.create_organization().send().await.unwrap();
+    let org_id = orgs
+        .create_organization()
+        .send()
+        .await
+        .unwrap()
+        .organization()
+        .unwrap()
+        .id()
+        .unwrap()
+        .to_string();
     let root_id = orgs.list_roots().send().await.unwrap().roots()[0]
         .id()
         .unwrap()
         .to_string();
 
-    // Create OU, account B auto-enrolls into root when admin created.
-    let (_b_akid, _b_secret) = server.create_admin(ACCOUNT_B, "admin-b").await;
+    // Bootstrap account B as a member of the org so it can be moved
+    // between OUs. `create_admin` alone leaves an account standalone.
+    let (_b_akid, _b_secret) = server
+        .create_admin_in_org(ACCOUNT_B, "admin-b", &org_id)
+        .await;
 
     let ou = orgs
         .create_organizational_unit()
@@ -213,6 +225,78 @@ async fn ou_tree_crud_and_move_account() {
         .unwrap();
 }
 
+/// Regression for #2543: bootstrapping an admin while somebody else's
+/// organization exists must leave the new account standalone. Silently
+/// enrolling it handed the account another organization's SCP ceiling,
+/// exposed that organization's metadata to it, and made it a stack-set
+/// auto-deployment target.
+///
+/// This is one half of #2543. The other half -- letting a second
+/// management account create an organization of its own -- needs the
+/// process-wide single-organization state to become a registry, and
+/// lands separately.
+#[tokio::test]
+async fn create_admin_leaves_the_account_outside_an_existing_organization() {
+    let server = start().await;
+    let (a_akid, a_secret) = server.create_admin(ACCOUNT_A, "admin-a").await;
+    let a_cfg = config_with(&server, &a_akid, &a_secret).await;
+    let orgs_a = OrgsClient::new(&a_cfg);
+    orgs_a.create_organization().send().await.unwrap();
+
+    // B is bootstrapped after A's org exists.
+    let (b_akid, b_secret) = server.create_admin(ACCOUNT_B, "admin-b").await;
+    let b_cfg = config_with(&server, &b_akid, &b_secret).await;
+    let orgs_b = OrgsClient::new(&b_cfg);
+
+    // B is a non-member: A's org is invisible to it.
+    let err = orgs_b.describe_organization().send().await.unwrap_err();
+    assert!(
+        format!("{err:?}").contains("AWSOrganizationsNotInUseException"),
+        "B must not be enrolled into A's organization, got: {err:?}"
+    );
+
+    // ...and A's organization has exactly one account, the management one.
+    let accounts = orgs_a.list_accounts().send().await.unwrap();
+    let ids: Vec<&str> = accounts.accounts().iter().filter_map(|a| a.id()).collect();
+    assert_eq!(ids, [ACCOUNT_A]);
+}
+
+/// The opt-in half of #2543: naming an organization on the bootstrap
+/// request enrolls the account into it, the shortcut equivalent of an
+/// invite/accept handshake.
+#[tokio::test]
+async fn create_admin_with_organization_id_enrolls_the_account() {
+    let server = start().await;
+    let (a_akid, a_secret) = server.create_admin(ACCOUNT_A, "admin-a").await;
+    let a_cfg = config_with(&server, &a_akid, &a_secret).await;
+    let orgs_a = OrgsClient::new(&a_cfg);
+    let org_id = orgs_a
+        .create_organization()
+        .send()
+        .await
+        .unwrap()
+        .organization()
+        .unwrap()
+        .id()
+        .unwrap()
+        .to_string();
+
+    let (b_akid, b_secret) = server
+        .create_admin_in_org(ACCOUNT_B, "admin-b", &org_id)
+        .await;
+    let b_cfg = config_with(&server, &b_akid, &b_secret).await;
+    let orgs_b = OrgsClient::new(&b_cfg);
+
+    // B now sees the org it belongs to.
+    let described = orgs_b.describe_organization().send().await.unwrap();
+    assert_eq!(described.organization().unwrap().id().unwrap(), org_id);
+
+    let accounts = orgs_a.list_accounts().send().await.unwrap();
+    let mut ids: Vec<&str> = accounts.accounts().iter().filter_map(|a| a.id()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, [ACCOUNT_A, ACCOUNT_B]);
+}
+
 #[tokio::test]
 async fn non_management_member_cannot_create_ou() {
     let server = start().await;
@@ -220,17 +304,27 @@ async fn non_management_member_cannot_create_ou() {
     let a_cfg = config_with(&server, &a_akid, &a_secret).await;
     let orgs_a = OrgsClient::new(&a_cfg);
 
-    // Create the org before bootstrapping account B so B auto-enrolls
-    // into root as a member — otherwise B is a non-member and the
-    // attempt would return `AWSOrganizationsNotInUseException` instead
-    // of `AccessDeniedException`.
-    orgs_a.create_organization().send().await.unwrap();
+    // B must be enrolled as a member — a non-member caller gets
+    // `AWSOrganizationsNotInUseException` instead of the
+    // `AccessDeniedException` this test is about.
+    let org_id = orgs_a
+        .create_organization()
+        .send()
+        .await
+        .unwrap()
+        .organization()
+        .unwrap()
+        .id()
+        .unwrap()
+        .to_string();
     let root_id = orgs_a.list_roots().send().await.unwrap().roots()[0]
         .id()
         .unwrap()
         .to_string();
 
-    let (b_akid, b_secret) = server.create_admin(ACCOUNT_B, "admin-b").await;
+    let (b_akid, b_secret) = server
+        .create_admin_in_org(ACCOUNT_B, "admin-b", &org_id)
+        .await;
     let b_cfg = config_with(&server, &b_akid, &b_secret).await;
     let orgs_b = OrgsClient::new(&b_cfg);
 

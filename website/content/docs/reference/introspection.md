@@ -289,6 +289,20 @@ When a stream has no encryption configured, `encryption` is `{ "status": "DISABL
 | -------- | ------ | ----------- |
 | `/_fakecloud/iam/create-admin` | POST | Bootstrap an admin user in a non-default account (multi-account setups). |
 
+The body takes `accountId`, `userName`, and an optional `organizationId`:
+
+```json
+{ "accountId": "222222222222", "userName": "admin", "organizationId": "o-a1b2c3d4e5" }
+```
+
+The account is **standalone** unless `organizationId` names an existing
+organization, in which case the account is enrolled as a member of that
+organization's root OU -- the shortcut equivalent of an
+`InviteAccountToOrganization` + `AcceptHandshake` pair. This mirrors AWS:
+a freshly vended account belongs to no organization until it is invited
+and accepts, or is created through `CreateAccount`. Naming an
+`organizationId` that does not exist returns `400`.
+
 ## KMS
 
 | Endpoint | Method | Description |
