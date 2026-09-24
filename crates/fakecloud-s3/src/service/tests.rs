@@ -366,7 +366,7 @@ fn parse_cors_config_trims_pretty_printed_values() {
 }
 
 #[test]
-fn find_cors_rule_matches_method_case_insensitively() {
+fn parse_cors_config_uppercases_methods_so_the_allow_header_is_valid() {
     let xml = r#"<CORSConfiguration>
         <CORSRule>
             <AllowedOrigin>https://example.com</AllowedOrigin>
@@ -374,9 +374,10 @@ fn find_cors_rule_matches_method_case_insensitively() {
         </CORSRule>
     </CORSConfiguration>"#;
     let rules = parse_cors_config(xml);
-    // `PutBucketCors` rejects a lowercase AllowedMethod, so this shape only
-    // reaches the matcher from a persisted snapshot that skipped validation.
-    // It should still allow the request rather than silently denying the rule.
+    // `Access-Control-Allow-Methods` is echoed from this list and browsers
+    // compare it case-sensitively, so matching a lowercase stored method is
+    // only half the job — it has to reach the wire uppercased too.
+    assert_eq!(rules[0].allowed_methods, vec!["GET"]);
     assert!(find_cors_rule(&rules, "https://example.com", "GET").is_some());
     // A method outside AllowedMethods is still denied, and a disallowed origin
     // is denied regardless of method.

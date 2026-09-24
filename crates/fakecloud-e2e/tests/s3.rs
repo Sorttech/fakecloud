@@ -1655,7 +1655,8 @@ async fn s3_cors_preflight_and_response_headers() {
 
     // The actual request is matched on method too: the rule allows GET and PUT,
     // so a DELETE from the allowed origin gets no ACAO and the browser blocks
-    // the response.
+    // the response. NOTE: this really deletes `file.txt` — anything added below
+    // that reads it must use its own key.
     let resp = http
         .delete(format!("{}/cors-bucket/file.txt", server.endpoint()))
         .header("Origin", "https://example.com")
@@ -1788,6 +1789,23 @@ async fn s3_cors_preflight_and_response_headers() {
         resp.text().await.unwrap().contains("MalformedXML"),
         "a CORS rule with no AllowedMethod must be rejected as MalformedXML"
     );
+
+    // An empty AllowedOrigin parses to "" and matches no real request, so it is
+    // as CORS-dead as omitting the tag and is rejected the same way.
+    let resp = http
+        .put(format!("{}/wild-cors-bucket?cors", server.endpoint()))
+        .header("Authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20240101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=fake")
+        .body(
+            "<CORSConfiguration><CORSRule>\
+             <AllowedOrigin></AllowedOrigin>\
+             <AllowedMethod>GET</AllowedMethod>\
+             </CORSRule></CORSConfiguration>",
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    assert!(resp.text().await.unwrap().contains("MalformedXML"));
 
     // An unterminated <CORSRule> parses to nothing, so accepting it would store
     // a config that matches no request at all.

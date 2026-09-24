@@ -614,13 +614,15 @@ impl AwsService for S3Service {
                 };
                 return Err(AwsServiceError::aws_error_with_headers(
                     StatusCode::FORBIDDEN,
-                    "CORSResponse",
+                    "AccessForbidden",
                     // Reached both when the bucket has no CORS config and when
                     // it has one that does not allow this origin/method, so the
-                    // message cannot claim CORS is disabled.
-                    "This CORS request is not allowed. This is usually because the evaluation \
-                     of Origin, request method / Access-Control-Request-Method or \
-                     Access-Control-Request-Headers are not whitelisted by the resource's \
+                    // message cannot claim CORS is disabled. Text and code both
+                    // match S3, which puts `CORSResponse: ` in the message and
+                    // `AccessForbidden` in the code.
+                    "CORSResponse: This CORS request is not allowed. This is usually because \
+                     the evaluation of Origin, request method / Access-Control-Request-Method \
+                     or Access-Control-Request-Headers are not whitelisted by the resource's \
                      CORS spec.",
                     headers,
                 ));
@@ -3175,7 +3177,15 @@ pub(crate) fn parse_cors_config(xml: &str) -> Vec<CorsRule> {
                     .collect::<Vec<_>>()
             };
             let allowed_origins = trimmed("AllowedOrigin");
-            let allowed_methods = trimmed("AllowedMethod");
+            // Methods are normalized to the canonical uppercase verbs.
+            // `Access-Control-Allow-Methods` is echoed from this list and
+            // browsers compare it to the request method case-sensitively, so a
+            // stored lowercase `get` must not reach the wire as `get` — the
+            // preflight would return 200 and the browser would still block it.
+            let allowed_methods = trimmed("AllowedMethod")
+                .into_iter()
+                .map(|m| m.to_ascii_uppercase())
+                .collect::<Vec<_>>();
             let allowed_headers = trimmed("AllowedHeader");
             let expose_headers = trimmed("ExposeHeader");
             // Trimmed for the same reason as the lists above: an untrimmed
@@ -3212,12 +3222,10 @@ pub(crate) fn origin_matches(origin: &str, pattern: &str) -> bool {
 
 /// Find the matching CORS rule for a given origin and HTTP method.
 ///
-/// Methods compare case-insensitively. `PutBucketCors` validates each
-/// `<AllowedMethod>` against the canonical uppercase verbs *after trimming*,
-/// so a config whose stored text differs from what was validated — the
-/// pretty-printed `<AllowedMethod>\n  GET\n</AllowedMethod>` that
-/// [`parse_cors_config`] now trims — must still match rather than silently
-/// denying every request for that rule.
+/// Methods compare case-insensitively as a backstop; [`parse_cors_config`]
+/// already trims and uppercases them, which is what makes a pretty-printed or
+/// lowercase stored config match here *and* echo correctly in
+/// `Access-Control-Allow-Methods`.
 pub(crate) fn find_cors_rule<'a>(
     rules: &'a [CorsRule],
     origin: &str,

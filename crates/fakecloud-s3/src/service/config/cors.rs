@@ -41,8 +41,12 @@ impl S3Service {
         // `CORSRule`. A rule missing either matches nothing at request time, so
         // accepting one would leave the bucket silently CORS-dead rather than
         // telling the caller their config is wrong — AWS rejects it outright.
+        // An empty or whitespace-only value counts as missing: `<AllowedOrigin></AllowedOrigin>`
+        // parses to `""`, which matches no real request, so accepting it stores
+        // the same CORS-dead rule as omitting the tag entirely.
         for rule in parsed {
-            if rule.allowed_methods.is_empty() || rule.allowed_origins.is_empty() {
+            let usable = |vs: &[String]| !vs.is_empty() && vs.iter().all(|v| !v.is_empty());
+            if !usable(&rule.allowed_methods) || !usable(&rule.allowed_origins) {
                 return Err(AwsServiceError::aws_error(
                     StatusCode::BAD_REQUEST,
                     "MalformedXML",
