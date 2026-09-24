@@ -791,28 +791,40 @@ impl S3Service {
                     return Err(precondition_failed("If-None-Match"));
                 }
             }
-            // Persist the preserved null version BEFORE the completion itself.
-            // Once `mpu_complete` runs the upload dir is gone and a retry takes
-            // the idempotent path, so a sidecar failure after that point would
-            // answer the retry with the old object while disk already holds the
-            // new one. Failing here leaves the upload intact and retryable.
-            let preserved_null = if versioning_enabled {
-                let b = accts
-                    .get_or_create(account_id)
-                    .buckets
-                    .get_mut(bucket)
-                    .ok_or_else(|| no_such_bucket(bucket))?;
-                crate::service::objects::null_version_to_preserve(b, key)
-            } else {
-                None
-            };
-            if let Some(ref preserved) = preserved_null {
-                let preserved_meta = object_meta_snapshot(preserved);
-                let store = self.store.clone();
-                crate::service::objects::run_blocking_io(|| {
-                    store.put_object_meta(bucket, key, Some("null"), &preserved_meta)
-                })
-                .map_err(super::persistence_error)?;
+            // Record the preserved null version -- on disk and in memory --
+            // before the completion runs. It describes the object that is
+            // ALREADY there: on a versioning-enabled bucket the pre-versioning
+            // object is the null version whether or not this upload completes,
+            // so doing it here leaves disk and memory agreeing on every path,
+            // including a failed `mpu_complete` (which would otherwise write
+            // the object while the sidecar rewrite never happened, or rewrite
+            // the sidecar while memory still filed the object as current).
+            if versioning_enabled {
+                let preserved = {
+                    let b = accts
+                        .get_or_create(account_id)
+                        .buckets
+                        .get(bucket)
+                        .ok_or_else(|| no_such_bucket(bucket))?;
+                    crate::service::objects::null_version_to_preserve(b, key)
+                };
+                if let Some(preserved) = preserved {
+                    let preserved_meta = object_meta_snapshot(&preserved);
+                    let store = self.store.clone();
+                    crate::service::objects::run_blocking_io(|| {
+                        store.put_object_meta(bucket, key, Some("null"), &preserved_meta)
+                    })
+                    .map_err(super::persistence_error)?;
+                    let b = accts
+                        .get_or_create(account_id)
+                        .buckets
+                        .get_mut(bucket)
+                        .ok_or_else(|| no_such_bucket(bucket))?;
+                    b.object_versions
+                        .entry(key.to_string())
+                        .or_default()
+                        .push(preserved);
+                }
             }
             // Checks passed — persist, then commit to memory, all under the
             // lock. In disk mode `mpu_complete` streams the parts straight into
@@ -852,12 +864,6 @@ impl S3Service {
                 // Same rule as PutObject: the pre-versioning current object
                 // becomes the "null" version, sidecar included, or it is lost
                 // from the history and from disk on the next restart.
-                if let Some(preserved) = preserved_null {
-                    b.object_versions
-                        .entry(key.to_string())
-                        .or_default()
-                        .push(preserved);
-                }
                 b.object_versions
                     .entry(key.to_string())
                     .or_default()
