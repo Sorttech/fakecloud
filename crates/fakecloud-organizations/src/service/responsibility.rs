@@ -64,9 +64,15 @@ fn target_participant(t: &ResponsibilityTransfer) -> Value {
     let mut party = json!({
         "ManagementAccountEmail": t.target_management_account_email,
     });
-    if let Some(id) = crate::state::target_account_id("ACCOUNT", &t.target_management_account_id)
-        .filter(|id| id.len() == 12 && id.chars().all(|c| c.is_ascii_digit()))
-    {
+    let stored = &t.target_management_account_id;
+    let is_account_id = stored.len() == 12 && stored.chars().all(|c| c.is_ascii_digit());
+    let resolved = if is_account_id {
+        Some(stored.clone())
+    } else {
+        // An address fakecloud minted still names an account.
+        crate::state::target_account_id("EMAIL", stored)
+    };
+    if let Some(id) = resolved {
         party["ManagementAccountId"] = json!(id);
     }
     party
@@ -419,11 +425,10 @@ impl OrganizationsService {
             .flatten();
         let (max_results, next_token) = parse_list_pagination(&body)?;
         let guard = self.state.read();
-        // The caller must be in an organization at all -- these ops declare
-        // AWSOrganizationsNotInUseException -- but the transfers it can see
-        // are the ones it is a party to, which for INBOUND live in the other
-        // organization.
-        self.require_member(&guard, &req.account_id)?;
+        // No membership gate: `DescribeResponsibilityTransfer` answers any
+        // party, so listing must too. A target that accepted a transfer
+        // without running an organization of its own would otherwise be
+        // carrying one it could never enumerate.
         let mut rows: Vec<&ResponsibilityTransfer> = guard
             .iter()
             .flat_map(|org| org.responsibility_transfers.values())

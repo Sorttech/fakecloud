@@ -4042,21 +4042,30 @@ impl CloudFormationService {
                 })
                 .collect()
         };
+        // Each stack set reconciles against ITS OWN administrator's
+        // organization. Reconciling every stack set in the process against
+        // one organization would deploy an administrator's stack set to
+        // accounts belonging to a different organization.
+        //
+        // `candidates` is grouped by administrator, and one administrator
+        // usually owns several stack sets, so the organization is cloned
+        // once per administrator rather than once per stack set -- the
+        // clone carries every account, OU and policy.
+        let mut current: Option<(String, fakecloud_organizations::OrganizationState)> = None;
         for (admin, set_id) in candidates {
-            // Each stack set reconciles against ITS OWN administrator's
-            // organization. Reconciling every stack set in the process
-            // against one organization would deploy an administrator's
-            // stack set to accounts belonging to a different organization.
-            let Some(org) = self
-                .deps
-                .organizations
-                .read()
-                .org_of_account(&admin)
-                .cloned()
-            else {
+            if current.as_ref().is_none_or(|(owner, _)| owner != &admin) {
+                current = self
+                    .deps
+                    .organizations
+                    .read()
+                    .org_of_account(&admin)
+                    .cloned()
+                    .map(|org| (admin.clone(), org));
+            }
+            let Some((_, org)) = &current else {
                 continue;
             };
-            self.reconcile_stack_set_auto_deployment(&org, &admin, &set_id, deadline)
+            self.reconcile_stack_set_auto_deployment(org, &admin, &set_id, deadline)
                 .await;
         }
     }
