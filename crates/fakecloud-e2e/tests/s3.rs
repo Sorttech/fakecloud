@@ -1752,19 +1752,23 @@ async fn s3_cors_preflight_and_response_headers() {
 
     // A rule with no AllowedMethod matches nothing at request time, so it is
     // rejected at write time rather than leaving the bucket silently CORS-dead.
-    let output = server
-        .aws_cli(&[
-            "s3api",
-            "put-bucket-cors",
-            "--bucket",
-            "wild-cors-bucket",
-            "--cors-configuration",
-            r#"{"CORSRules":[{"AllowedOrigins":["https://a.example"],"AllowedMethods":[]}]}"#,
-        ])
-        .await;
+    // Sent as raw XML: the CLI rejects an empty required list client-side, so
+    // going through it would never reach the server's guard.
+    let resp = http
+        .put(format!("{}/wild-cors-bucket?cors", server.endpoint()))
+        .header("Authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20240101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=fake")
+        .body(
+            "<CORSConfiguration><CORSRule>\
+             <AllowedOrigin>https://a.example</AllowedOrigin>\
+             </CORSRule></CORSConfiguration>",
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
     assert!(
-        !output.success(),
-        "a CORS rule with no AllowedMethod must be rejected"
+        resp.text().await.unwrap().contains("MalformedXML"),
+        "a CORS rule with no AllowedMethod must be rejected as MalformedXML"
     );
 
     // A bucket with no CORS config at all answers preflights identically for

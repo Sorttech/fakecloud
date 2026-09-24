@@ -3160,8 +3160,11 @@ pub(crate) fn parse_cors_config(xml: &str) -> Vec<CorsRule> {
             let allowed_methods = trimmed("AllowedMethod");
             let allowed_headers = trimmed("AllowedHeader");
             let expose_headers = trimmed("ExposeHeader");
+            // Trimmed for the same reason as the lists above: an untrimmed
+            // "\n  3600\n" fails to parse, and the preflight would silently
+            // ship without `Access-Control-Max-Age`, re-preflighting forever.
             let max_age_seconds =
-                extract_xml_value(block, "MaxAgeSeconds").and_then(|s| s.parse().ok());
+                extract_xml_value(block, "MaxAgeSeconds").and_then(|s| s.trim().parse().ok());
             rules.push(CorsRule {
                 allowed_origins,
                 allowed_methods,

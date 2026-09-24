@@ -351,12 +351,17 @@ fn parse_cors_config_trims_pretty_printed_values() {
             <ExposeHeader>
                 x-amz-request-id
             </ExposeHeader>
+            <MaxAgeSeconds>
+                3600
+            </MaxAgeSeconds>
         </CORSRule>
     </CORSConfiguration>";
     let rules = parse_cors_config(xml);
     assert_eq!(rules[0].allowed_origins, vec!["https://example.com"]);
     assert_eq!(rules[0].allowed_methods, vec!["GET"]);
     assert_eq!(rules[0].expose_headers, vec!["x-amz-request-id"]);
+    // Untrimmed this fails to parse, and the preflight loses its max-age.
+    assert_eq!(rules[0].max_age_seconds, Some(3600));
     assert!(find_cors_rule(&rules, "https://example.com", "GET").is_some());
 }
 
