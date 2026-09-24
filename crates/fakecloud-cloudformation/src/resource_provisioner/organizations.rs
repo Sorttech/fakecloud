@@ -26,6 +26,15 @@ impl ResourceProvisioner {
                 self.account_id
             ));
         }
+        // The management account registers its own synthetic address, so
+        // that address must be free -- the same rule the API's
+        // `CreateOrganization` applies.
+        let management_email = format!("{}@example.com", self.account_id);
+        if org.email_in_use(&management_email) {
+            return Err(format!(
+                "The email address {management_email} is already associated with another account"
+            ));
+        }
         let mut state = OrganizationState::bootstrap(&self.account_id);
         state.feature_set = feature_set;
         let org_id = state.org_id.clone();
@@ -168,6 +177,16 @@ impl ResourceProvisioner {
         // Mint from the registry so the id cannot collide with an account
         // another organization already owns.
         let new_account_id = org_lock.next_account_id();
+        // ...and a `<account-id>@example.com` address belongs to the id it
+        // spells, so this account cannot squat another one's.
+        if fakecloud_organizations::OrganizationsRegistry::email_reserved_for_other(
+            &email,
+            &new_account_id,
+        ) {
+            return Err(format!(
+                "The email address {email} is reserved for another account"
+            ));
+        }
         let org = org_lock
             .org_of_account_mut(&self.account_id)
             .ok_or_else(|| "Organization not yet created".to_string())?;

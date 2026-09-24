@@ -1074,6 +1074,61 @@ async fn a_synthetic_address_is_reserved_for_the_account_it_spells() {
     ));
 }
 
+/// AWS lets the management account OR a delegated administrator read
+/// the resource policy, unlike `Put`/`Delete`, which are
+/// management-only. A plain member still cannot.
+#[tokio::test]
+async fn describe_resource_policy_allows_a_delegated_administrator() {
+    let (svc, state) = OrganizationsService::shared();
+    create_org_with_root(&svc).await;
+    state
+        .write()
+        .sole_mut()
+        .unwrap()
+        .enroll_account_if_missing("222222222222");
+    svc.handle(req_with(
+        "111111111111",
+        "PutResourcePolicy",
+        json!({ "Content": "{\"Version\":\"2012-10-17\",\"Statement\":[]}" }),
+    ))
+    .await
+    .unwrap();
+
+    // A plain member cannot read it.
+    let err = expect_err(
+        svc.handle(req_with(
+            "222222222222",
+            "DescribeResourcePolicy",
+            json!({}),
+        ))
+        .await,
+    );
+    assert_eq!(err.code(), "AccessDeniedException");
+
+    // Registered as a delegated administrator, it can.
+    svc.handle(req_with(
+        "111111111111",
+        "EnableAWSServiceAccess",
+        json!({ "ServicePrincipal": "config.amazonaws.com" }),
+    ))
+    .await
+    .unwrap();
+    svc.handle(req_with(
+        "111111111111",
+        "RegisterDelegatedAdministrator",
+        json!({ "AccountId": "222222222222", "ServicePrincipal": "config.amazonaws.com" }),
+    ))
+    .await
+    .unwrap();
+    svc.handle(req_with(
+        "222222222222",
+        "DescribeResourcePolicy",
+        json!({}),
+    ))
+    .await
+    .expect("a delegated administrator may read the resource policy");
+}
+
 /// Deleting one organization leaves every other one standing.
 #[tokio::test]
 async fn deleting_one_organization_leaves_the_others() {

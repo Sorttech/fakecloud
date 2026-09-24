@@ -77,10 +77,6 @@ impl OrganizationsRegistry {
         self.orgs.values()
     }
 
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut OrganizationState> {
-        self.orgs.values_mut()
-    }
-
     pub fn contains_org(&self, org_id: &str) -> bool {
         self.orgs.contains_key(org_id)
     }

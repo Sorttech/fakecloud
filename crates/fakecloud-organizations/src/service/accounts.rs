@@ -67,10 +67,11 @@ impl OrganizationsService {
         let name = required_str(&body, "AccountName")?.to_string();
 
         let mut guard = self.state.write();
-        // Authorize FIRST: the address check below spans the registry, so
-        // running it before the management gate would tell any caller
-        // whether an address is registered in an organization it has
-        // nothing to do with.
+        // The address check runs in the completion tick, not here: AWS
+        // reports a duplicate as a FAILED request rather than a
+        // synchronous error, and running a registry-wide check here would
+        // also tell any caller whether an address is registered in an
+        // organization it has nothing to do with.
         let org_id = self
             .management_org_mut(&mut guard, &req.account_id)?
             .org_id

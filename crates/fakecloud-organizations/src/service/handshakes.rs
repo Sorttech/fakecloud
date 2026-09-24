@@ -131,9 +131,20 @@ impl OrganizationsService {
             match (guard.email_in_use(&named), guard.email_in_use(&synthetic)) {
                 (false, _) => Some(named),
                 (true, false) => Some(synthetic),
+                // Both taken. The caller is a member of NO organization --
+                // the gates above just proved it -- so reporting "already
+                // a member" would send it looking for a membership that
+                // does not exist. The real cause is that no free address
+                // is left for it.
                 (true, true) => {
-                    return Err(org_error_to_aws(
-                        crate::state::OrgError::AccountAlreadyMember(req.account_id.clone()),
+                    return Err(AwsServiceError::aws_error(
+                        StatusCode::BAD_REQUEST,
+                        "ConstraintViolationException",
+                        format!(
+                            "No free email address for account {}: both {named} and \
+                             {synthetic} are already associated with an account.",
+                            req.account_id
+                        ),
                     ))
                 }
             }
