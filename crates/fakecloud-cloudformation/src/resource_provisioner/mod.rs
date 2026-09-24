@@ -921,6 +921,12 @@ fn policy_document_string(props: &serde_json::Value) -> Result<String, String> {
 
 /// Holds references to all service states so CloudFormation can provision resources.
 pub struct ResourceProvisioner {
+    /// Signals custom-resource handlers PUT to their `ResponseURL`.
+    pub custom_resource_responses: crate::custom_resource_response::SharedCustomResourceResponses,
+    /// Base URL a Lambda *container* can reach fakecloud at, used to build the
+    /// `ResponseURL`. `None` when no container backend is available, in which
+    /// case no `ResponseURL` is sent and nothing waits for a signal.
+    pub custom_resource_response_base: Option<String>,
     pub sqs_state: SharedSqsState,
     pub sns_state: SharedSnsState,
     pub ssm_state: SharedSsmState,
@@ -3256,6 +3262,41 @@ impl ResourceProvisioner {
 
     // --- Organizations ---
 
+    /// Add the `ResponseURL` a handler signals its outcome to.
+    ///
+    /// Omitted entirely, rather than set to null, when there is no reachable
+    /// base: `cfn-response` throws on either, but a null reads like a value
+    /// that was meant to work.
+    fn attach_response_url(&self, event: &mut serde_json::Value, request_id: &str) {
+        if let Some(base) = &self.custom_resource_response_base {
+            event["ResponseURL"] = serde_json::Value::String(
+                crate::custom_resource_response::response_url(base, request_id),
+            );
+        }
+    }
+
+    /// Wait for the handler's `ResponseURL` signal and turn a FAILED into a
+    /// resource failure.
+    ///
+    /// No signal is not a failure: handlers predating `cfn-response`, and any
+    /// handler invoked without a reachable `ResponseURL`, never send one, and
+    /// failing those would break stacks that work today.
+    fn await_custom_resource_signal(&self, request_id: &str) -> Result<(), String> {
+        if self.custom_resource_response_base.is_none() {
+            return Ok(());
+        }
+        match self
+            .custom_resource_responses
+            .wait_for(request_id, std::time::Duration::from_secs(5))
+        {
+            Some(signal) if signal.failed() => Err(format!(
+                "Custom resource failed: {}",
+                signal.failure_reason()
+            )),
+            _ => Ok(()),
+        }
+    }
+
     fn invoke_lambda_sync(&self, function_arn: &str, payload: &str) -> Result<(), String> {
         let delivery = self.delivery.clone();
         let function_arn = function_arn.to_string();
@@ -3317,6 +3358,8 @@ impl ResourceProvisioner {
             "ResourceProperties": props,
         });
 
+        let mut event = event;
+        self.attach_response_url(&mut event, &request_id);
         let payload = serde_json::to_string(&event).map_err(|e| e.to_string())?;
         if self.defer_custom_invokes {
             // Changeset/update path: queue the invoke so the caller runs it off
@@ -3329,6 +3372,7 @@ impl ResourceProvisioner {
             });
         } else {
             self.invoke_lambda_sync(service_token, &payload)?;
+            self.await_custom_resource_signal(&request_id)?;
         }
 
         // Physical resource ID: use a generated ID (the Lambda could return one,
@@ -3358,6 +3402,8 @@ impl ResourceProvisioner {
             "PhysicalResourceId": resource.physical_id,
         });
 
+        let mut event = event;
+        self.attach_response_url(&mut event, &request_id);
         let payload = serde_json::to_string(&event).map_err(|e| e.to_string())?;
 
         if self.defer_custom_invokes {
@@ -3373,6 +3419,10 @@ impl ResourceProvisioner {
                 "Custom resource delete Lambda invocation failed for {}: {e}",
                 resource.logical_id
             );
+        } else if let Err(e) = self.await_custom_resource_signal(&request_id) {
+            // Same best-effort rule: a Delete that reports FAILED must not wedge
+            // the stack in DELETE_FAILED, but it should not pass unnoticed.
+            tracing::warn!("Custom resource delete for {}: {e}", resource.logical_id);
         }
         Ok(())
     }
@@ -4060,7 +4110,7 @@ mod tests {
     use super::*;
     use parking_lot::RwLock;
 
-    fn make_provisioner() -> ResourceProvisioner {
+    pub(super) fn make_provisioner() -> ResourceProvisioner {
         ResourceProvisioner {
             sqs_state: Arc::new(RwLock::new(
                 fakecloud_core::multi_account::MultiAccountState::new(
@@ -4275,6 +4325,8 @@ mod tests {
             pending_container_spawns: Arc::new(parking_lot::Mutex::new(Vec::new())),
             pending_container_teardowns: Arc::new(parking_lot::Mutex::new(Vec::new())),
             pending_custom_invokes: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            custom_resource_responses: Default::default(),
+            custom_resource_response_base: None,
             defer_custom_invokes: false,
             s3_store: Arc::new(fakecloud_persistence::s3::MemoryS3Store::new()),
             account_id: "123456789012".to_string(),
@@ -9426,5 +9478,32 @@ mod tests {
             )),
             queue.physical_id.rsplit('/').next().unwrap()
         );
+    }
+}
+
+#[cfg(test)]
+mod response_url_tests {
+    use super::tests::make_provisioner;
+
+    #[test]
+    fn the_event_carries_a_response_url_the_container_can_reach() {
+        let mut p = make_provisioner();
+        p.custom_resource_response_base = Some("http://host.docker.internal:4566".into());
+        let mut event = serde_json::json!({"RequestType": "Create"});
+        p.attach_response_url(&mut event, "req-7");
+        assert_eq!(
+            event["ResponseURL"],
+            "http://host.docker.internal:4566/_fakecloud/cfn/custom-resource-response/req-7"
+        );
+    }
+
+    #[test]
+    fn no_reachable_base_omits_the_key_rather_than_nulling_it() {
+        // cfn-response throws on `new URL(null)` exactly as it does on
+        // undefined; the difference matters to a handler that checks presence.
+        let p = make_provisioner();
+        let mut event = serde_json::json!({"RequestType": "Create"});
+        p.attach_response_url(&mut event, "req-8");
+        assert!(event.get("ResponseURL").is_none(), "{event}");
     }
 }
