@@ -107,7 +107,7 @@ impl OrganizationsService {
             .org_by_id_mut(&org_id)
             .expect("handshake lookup resolved this organization");
         let updated = org
-            .resolve_handshake(&id, new_state)
+            .resolve_handshake(&id, new_state, Some(req.account_id.as_str()))
             .map_err(org_error_to_aws)?;
         Ok(AwsResponse::ok_json(
             json!({ "Handshake": handshake_payload(&updated) }),

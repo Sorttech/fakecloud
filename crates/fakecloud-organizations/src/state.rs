@@ -254,11 +254,27 @@ impl OrganizationsRegistry {
         self.orgs.clear();
     }
 
-    /// True when `account_id` is already claimed by some organization.
+    /// True when `account_id` is already claimed by some organization --
+    /// enrolled in one, or RESERVED by an in-flight `CreateAccount` that
+    /// has not finished enrolling it yet.
+    ///
     /// Guards both `CreateOrganization` and the invite/accept path: an
-    /// account can never be in two organizations at once.
+    /// account can never be in two organizations at once. Ignoring the
+    /// reservation let an account created by one organization create its
+    /// own during the completion delay, after which the background tick
+    /// enrolled it and it was in two.
     pub fn account_is_enrolled(&self, account_id: &str) -> bool {
-        self.org_of_account(account_id).is_some()
+        self.org_of_account(account_id).is_some() || self.account_is_reserved(account_id)
+    }
+
+    fn account_is_reserved(&self, account_id: &str) -> bool {
+        self.orgs.values().any(|org| {
+            org.create_account_requests.values().any(|req| {
+                req.state == "IN_PROGRESS"
+                    && (req.account_id.as_deref() == Some(account_id)
+                        || req.gov_cloud_account_id.as_deref() == Some(account_id))
+            })
+        })
     }
 }
 
@@ -802,7 +818,18 @@ impl OrganizationState {
     /// this just enforces lifecycle (open -> terminal). The original
     /// `ExpirationTimestamp` is preserved (it's the 15-day deadline,
     /// not a resolved-at marker).
-    pub fn resolve_handshake(&mut self, id: &str, new_state: &str) -> Result<Handshake, OrgError> {
+    /// `enrolling_account` is the account the caller's party gate already
+    /// proved to be the target. Re-deriving it here from the stored
+    /// target -- which the gate resolves registry-aware and this could
+    /// only resolve id-only -- let the two disagree: an accept could
+    /// enroll a phantom account nobody created, or report ACCEPTED while
+    /// enrolling nobody.
+    pub fn resolve_handshake(
+        &mut self,
+        id: &str,
+        new_state: &str,
+        enrolling_account: Option<&str>,
+    ) -> Result<Handshake, OrgError> {
         let handshake = self
             .handshakes
             .get_mut(id)
@@ -823,7 +850,8 @@ impl OrganizationState {
         // it names — enrolling the raw field would key a member account by
         // an email string.
         let enrolling = if new_state == "ACCEPTED" && snapshot.action == "INVITE" {
-            target_account_id(&snapshot.target_kind, &snapshot.target_account_id)
+            enrolling_account
+                .map(str::to_string)
                 .filter(|target| !self.accounts.contains_key(target))
         } else {
             None
@@ -2302,7 +2330,9 @@ mod tests {
             .invite_account("111111111111", "ACCOUNT", "444444444444", None, None)
             .unwrap();
         assert!(!org.accounts.contains_key("444444444444"));
-        let resolved = org.resolve_handshake(&h.id, "ACCEPTED").unwrap();
+        let resolved = org
+            .resolve_handshake(&h.id, "ACCEPTED", Some("444444444444"))
+            .unwrap();
         assert_eq!(resolved.state, "ACCEPTED");
         let acct = org.accounts.get("444444444444").unwrap();
         assert_eq!(acct.joined_method, "INVITED");
@@ -2314,7 +2344,7 @@ mod tests {
         let h = org
             .invite_account("111111111111", "ACCOUNT", "555555555555", None, None)
             .unwrap();
-        let resolved = org.resolve_handshake(&h.id, "DECLINED").unwrap();
+        let resolved = org.resolve_handshake(&h.id, "DECLINED", None).unwrap();
         assert_eq!(resolved.state, "DECLINED");
         assert!(!org.accounts.contains_key("555555555555"));
     }
@@ -2325,8 +2355,9 @@ mod tests {
         let h = org
             .invite_account("111111111111", "ACCOUNT", "666666666666", None, None)
             .unwrap();
-        org.resolve_handshake(&h.id, "ACCEPTED").unwrap();
-        let err = org.resolve_handshake(&h.id, "DECLINED").unwrap_err();
+        org.resolve_handshake(&h.id, "ACCEPTED", Some("666666666666"))
+            .unwrap();
+        let err = org.resolve_handshake(&h.id, "DECLINED", None).unwrap_err();
         assert!(matches!(err, OrgError::HandshakeAlreadyResolved(_)));
     }
 }

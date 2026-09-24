@@ -425,10 +425,15 @@ impl OrganizationsService {
             .flatten();
         let (max_results, next_token) = parse_list_pagination(&body)?;
         let guard = self.state.read();
-        // No membership gate: `DescribeResponsibilityTransfer` answers any
-        // party, so listing must too. A target that accepted a transfer
-        // without running an organization of its own would otherwise be
-        // carrying one it could never enumerate.
+        // The OUTBOUND caller is a source management account, so it is
+        // always in an organization and AWS's modeled
+        // AWSOrganizationsNotInUseException still applies. INBOUND is not
+        // gated: a target that accepted a transfer without running an
+        // organization of its own must still be able to enumerate the one
+        // it is carrying.
+        if direction == "OUTBOUND" {
+            self.require_member(&guard, &req.account_id)?;
+        }
         let mut rows: Vec<&ResponsibilityTransfer> = guard
             .iter()
             .flat_map(|org| org.responsibility_transfers.values())
