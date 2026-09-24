@@ -335,6 +335,24 @@ fn test_parse_cors_config() {
 }
 
 #[test]
+fn find_cors_rule_matches_method_case_insensitively() {
+    let xml = r#"<CORSConfiguration>
+        <CORSRule>
+            <AllowedOrigin>https://example.com</AllowedOrigin>
+            <AllowedMethod>get</AllowedMethod>
+        </CORSRule>
+    </CORSConfiguration>"#;
+    let rules = parse_cors_config(xml);
+    // A lowercase AllowedMethod still allows the request; fakecloud does not
+    // normalize the stored config, so the comparison has to.
+    assert!(find_cors_rule(&rules, "https://example.com", "GET").is_some());
+    // A method outside AllowedMethods is still denied, and a disallowed origin
+    // is denied regardless of method.
+    assert!(find_cors_rule(&rules, "https://example.com", "DELETE").is_none());
+    assert!(find_cors_rule(&rules, "https://evil.com", "GET").is_none());
+}
+
+#[test]
 fn test_origin_matches() {
     assert!(origin_matches("https://example.com", "https://example.com"));
     assert!(origin_matches("https://example.com", "*"));

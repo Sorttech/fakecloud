@@ -367,7 +367,13 @@ impl AwsService for S3Service {
         // the shared tail below (CORS headers, access logging) — browser
         // multipart upload is the single most common reason a bucket has a CORS
         // config at all, so skipping it here is exactly the wrong place.
-        let multipart_result: Option<Result<AwsResponse, AwsServiceError>> = 'multipart: {
+        //
+        // Each arm carries its own access-log operation name: method + key
+        // alone cannot tell `AbortMultipartUpload` from a real object DELETE,
+        // and logging the former as `DELETE.OBJECT` would show a log consumer a
+        // live object being deleted.
+        #[allow(clippy::type_complexity)]
+        let multipart: Option<(&'static str, Result<AwsResponse, AwsServiceError>)> = 'multipart: {
             let Some(b) = bucket else {
                 break 'multipart None;
             };
@@ -376,11 +382,9 @@ impl AwsService for S3Service {
                 && key.is_some()
                 && req.query_params.contains_key("uploads")
             {
-                break 'multipart Some(self.create_multipart_upload(
-                    account_id,
-                    &req,
-                    b,
-                    key.as_deref().unwrap(),
+                break 'multipart Some((
+                    "POST.UPLOADS",
+                    self.create_multipart_upload(account_id, &req, b, key.as_deref().unwrap()),
                 ));
             }
 
@@ -389,23 +393,24 @@ impl AwsService for S3Service {
                 && key.is_some()
                 && req.query_params.contains_key("restore")
             {
-                break 'multipart Some(self.restore_object(
-                    account_id,
-                    &req,
-                    b,
-                    key.as_deref().unwrap(),
+                break 'multipart Some((
+                    "POST.RESTORE",
+                    self.restore_object(account_id, &req, b, key.as_deref().unwrap()),
                 ));
             }
 
             // POST /{bucket}/{key}?uploadId=X — CompleteMultipartUpload
             if req.method == Method::POST && key.is_some() {
                 if let Some(upload_id) = req.query_params.get("uploadId").cloned() {
-                    break 'multipart Some(self.complete_multipart_upload(
-                        account_id,
-                        &req,
-                        b,
-                        key.as_deref().unwrap(),
-                        &upload_id,
+                    break 'multipart Some((
+                        "POST.UPLOAD",
+                        self.complete_multipart_upload(
+                            account_id,
+                            &req,
+                            b,
+                            key.as_deref().unwrap(),
+                            &upload_id,
+                        ),
                     ));
                 }
             }
@@ -418,16 +423,20 @@ impl AwsService for S3Service {
                 ) {
                     if let Ok(part_number) = part_num_str.parse::<i64>() {
                         if req.headers.contains_key("x-amz-copy-source") {
-                            break 'multipart Some(self.upload_part_copy(
-                                account_id,
-                                &req,
-                                b,
-                                key.as_deref().unwrap(),
-                                &upload_id,
-                                part_number,
+                            break 'multipart Some((
+                                "COPY.PART",
+                                self.upload_part_copy(
+                                    account_id,
+                                    &req,
+                                    b,
+                                    key.as_deref().unwrap(),
+                                    &upload_id,
+                                    part_number,
+                                ),
                             ));
                         }
-                        break 'multipart Some(
+                        break 'multipart Some((
+                            "PUT.PART",
                             self.upload_part(
                                 account_id,
                                 &req,
@@ -437,7 +446,7 @@ impl AwsService for S3Service {
                                 part_number,
                             )
                             .await,
-                        );
+                        ));
                     }
                 }
             }
@@ -445,11 +454,14 @@ impl AwsService for S3Service {
             // DELETE /{bucket}/{key}?uploadId=X — AbortMultipartUpload
             if req.method == Method::DELETE && key.is_some() {
                 if let Some(upload_id) = req.query_params.get("uploadId").cloned() {
-                    break 'multipart Some(self.abort_multipart_upload(
-                        account_id,
-                        b,
-                        key.as_deref().unwrap(),
-                        &upload_id,
+                    break 'multipart Some((
+                        "DELETE.UPLOAD",
+                        self.abort_multipart_upload(
+                            account_id,
+                            b,
+                            key.as_deref().unwrap(),
+                            &upload_id,
+                        ),
                     ));
                 }
             }
@@ -459,22 +471,18 @@ impl AwsService for S3Service {
                 && key.is_none()
                 && req.query_params.contains_key("uploads")
             {
-                break 'multipart Some(self.list_multipart_uploads(
-                    account_id,
-                    b,
-                    &req.query_params,
+                break 'multipart Some((
+                    "GET.UPLOADS",
+                    self.list_multipart_uploads(account_id, b, &req.query_params),
                 ));
             }
 
             // GET /{bucket}/{key}?uploadId=X — ListParts
             if req.method == Method::GET && key.is_some() {
                 if let Some(upload_id) = req.query_params.get("uploadId").cloned() {
-                    break 'multipart Some(self.list_parts(
-                        account_id,
-                        &req,
-                        b,
-                        key.as_deref().unwrap(),
-                        &upload_id,
+                    break 'multipart Some((
+                        "GET.UPLOAD",
+                        self.list_parts(account_id, &req, b, key.as_deref().unwrap(), &upload_id),
                     ));
                 }
             }
@@ -494,6 +502,11 @@ impl AwsService for S3Service {
                         .get(b_name)
                         .and_then(|b| b.cors_config.clone())
                 };
+                let origin_present = req
+                    .headers
+                    .get("origin")
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|o| !o.is_empty());
                 if let Some(ref config) = cors_config {
                     let origin = req
                         .headers
@@ -506,7 +519,7 @@ impl AwsService for S3Service {
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or("");
                     let rules = parse_cors_config(config);
-                    if let Some(rule) = find_cors_rule(&rules, origin, Some(request_method)) {
+                    if let Some(rule) = find_cors_rule(&rules, origin, request_method) {
                         let mut headers = HeaderMap::new();
                         let matched_origin = if rule.allowed_origins.contains(&"*".to_string()) {
                             "*"
@@ -519,7 +532,13 @@ impl AwsService for S3Service {
                                 .parse()
                                 .unwrap_or_else(|_| http::HeaderValue::from_static("")),
                         );
-                        headers.insert("vary", http::HeaderValue::from_static(CORS_VARY));
+                        // Only a request that actually carried an `Origin` was
+                        // CORS-evaluated; an `Origin`-less OPTIONS can still
+                        // match a `*` rule, and that answer is the same for
+                        // everyone, so it needs no `Vary`.
+                        if origin_present {
+                            headers.insert("vary", http::HeaderValue::from_static(CORS_VARY));
+                        }
                         headers.insert(
                             "access-control-allow-methods",
                             rule.allowed_methods
@@ -568,12 +587,7 @@ impl AwsService for S3Service {
                 // or no `Origin` to evaluate, the answer is origin-independent
                 // and gets no `Vary` — matching S3, which emits CORS headers
                 // only for a request it actually evaluated CORS on.
-                let has_origin = req
-                    .headers
-                    .get("origin")
-                    .and_then(|v| v.to_str().ok())
-                    .is_some_and(|o| !o.is_empty());
-                let headers = if cors_config.is_some() && has_origin {
+                let headers = if cors_config.is_some() && origin_present {
                     vec![("vary".to_string(), CORS_VARY.to_string())]
                 } else {
                     Vec::new()
@@ -660,8 +674,9 @@ impl AwsService for S3Service {
             ));
         }
 
-        let mut result = match multipart_result {
-            Some(r) => r,
+        let multipart_op = multipart.as_ref().map(|(op, _)| *op);
+        let mut result = match multipart {
+            Some((_, r)) => r,
             None => match (&req.method, bucket, key.as_deref()) {
                 // ListBuckets: GET /
                 (&Method::GET, None, None) => {
@@ -1043,7 +1058,7 @@ impl AwsService for S3Service {
                 // on S3: a rule allowing only GET must not hand an ACAO to a
                 // DELETE from that origin, which would let the browser pass the
                 // response to the page.
-                if let Some(rule) = find_cors_rule(&rules, origin, Some(req.method.as_str())) {
+                if let Some(rule) = find_cors_rule(&rules, origin, req.method.as_str()) {
                     let matched_origin = if rule.allowed_origins.contains(&"*".to_string()) {
                         "*"
                     } else {
@@ -1070,7 +1085,8 @@ impl AwsService for S3Service {
                 Ok(resp) => resp.status.as_u16(),
                 Err(e) => e.status().as_u16(),
             };
-            let op = logging::operation_name(&req.method, key.as_deref());
+            let op = multipart_op
+                .unwrap_or_else(|| logging::operation_name(&req.method, key.as_deref()));
             logging::maybe_write_access_log(
                 &self.state,
                 &self.store,
@@ -3150,21 +3166,25 @@ pub(crate) fn origin_matches(origin: &str, pattern: &str) -> bool {
     origin == pattern
 }
 
-/// Find the matching CORS rule for a given origin and method.
+/// Find the matching CORS rule for a given origin and HTTP method.
+///
+/// Methods compare case-insensitively: the stored config is whatever the client
+/// wrote, and a lowercase `<AllowedMethod>get</AllowedMethod>` should still
+/// allow a `GET` rather than silently denying every request for that rule.
 pub(crate) fn find_cors_rule<'a>(
     rules: &'a [CorsRule],
     origin: &str,
-    method: Option<&str>,
+    method: &str,
 ) -> Option<&'a CorsRule> {
     rules.iter().find(|rule| {
         let origin_ok = rule
             .allowed_origins
             .iter()
             .any(|o| origin_matches(origin, o));
-        let method_ok = match method {
-            Some(m) => rule.allowed_methods.iter().any(|am| am == m),
-            None => true,
-        };
+        let method_ok = rule
+            .allowed_methods
+            .iter()
+            .any(|am| am.eq_ignore_ascii_case(method));
         origin_ok && method_ok
     })
 }
