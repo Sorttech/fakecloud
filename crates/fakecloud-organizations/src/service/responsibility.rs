@@ -34,17 +34,13 @@ fn require_transfer_type(body: &Value) -> Result<String, AwsServiceError> {
     Ok(t.to_string())
 }
 
-/// A transfer invited by email records the ADDRESS as the target
-/// management account, so resolve it back to the account it names --
-/// comparing an account id against an address never matches, and the
-/// email-invited organization would never see the transfer it was
-/// invited to take over.
+/// The target is resolved to an account id before it is stored, so this
+/// is a plain comparison. Decoding the recorded EMAIL as if it encoded
+/// an account id handed transfer-party rights -- reading both parties'
+/// ids and emails, and ending an accepted transfer -- to whatever
+/// account id the address happened to spell.
 fn is_transfer_target(t: &ResponsibilityTransfer, account_id: &str) -> bool {
     t.target_management_account_id == account_id
-        || crate::state::target_account_id("EMAIL", &t.target_management_account_id).as_deref()
-            == Some(account_id)
-        || crate::state::target_account_id("EMAIL", &t.target_management_account_email).as_deref()
-            == Some(account_id)
 }
 
 fn is_transfer_party(t: &ResponsibilityTransfer, account_id: &str) -> bool {
@@ -187,24 +183,25 @@ impl OrganizationsService {
         // seen. Resolving here keeps `Target.ManagementAccountId` an
         // account id, as the Smithy shape models it, instead of leaking
         // an address into it.
-        // An ACCOUNT target names the account directly, and any account
-        // can authenticate as itself, so it need not already exist. An
-        // EMAIL target must resolve to an account fakecloud knows --
-        // otherwise nothing can prove it is the target, and the
-        // invitation would sit OPEN until it expired.
-        let target_account_id = registry
-            .resolve_target_account(target_kind, &target_id, &source_org_id)
-            .ok_or_else(|| {
-                invalid_input(&format!(
-                    "No account is registered for {target_id}; \
-                     invite the target management account by id instead"
-                ))
-            })?;
-        let target_email = registry
-            .org_of_account(&target_account_id)
-            .and_then(|org| org.accounts.get(&target_account_id))
-            .map(|account| account.email.clone())
-            .unwrap_or_else(|| format!("{target_account_id}@example.com"));
+        // A responsibility transfer hands billing to ANOTHER organization,
+        // so the target must be some other organization's management
+        // account. Resolution therefore looks at management accounts
+        // only, and every failure -- unknown address, not a management
+        // account, or the caller's own organization -- reports the same
+        // message, so the error cannot be read as an oracle for which
+        // addresses exist elsewhere.
+        let bad_target = || {
+            invalid_input(&format!(
+                "{target_id} is not the management account of another organization"
+            ))
+        };
+        let target = registry
+            .management_account_matching(target_kind, &target_id)
+            .ok_or_else(bad_target)?;
+        if target.org_id == source_org_id {
+            return Err(bad_target());
+        }
+        let (target_account_id, target_email) = target.into_parts();
         let org = guard
             .org_by_id_mut(&source_org_id)
             .expect("management gate resolved this organization");

@@ -187,6 +187,16 @@ async fn responsibility_transfers_and_firehose_streams_introspection() {
 
     orgs.create_organization().send().await.unwrap();
 
+    // The transfer targets another ORGANIZATION's management account, so
+    // stand one up to invite.
+    let (t_akid, t_secret) = server.create_admin("222222222222", "admin").await;
+    let target_cfg = config_with(&server, &t_akid, &t_secret).await;
+    OrgsClient::new(&target_cfg)
+        .create_organization()
+        .send()
+        .await
+        .unwrap();
+
     // Invite an outbound BILLING responsibility transfer.
     orgs.invite_organization_to_transfer_responsibility()
         .r#type(ResponsibilityTransferType::Billing)

@@ -558,29 +558,57 @@ async fn an_email_targeted_responsibility_transfer_is_answerable() {
     .expect("and can accept it");
 }
 
-/// An address fakecloud cannot resolve names no account, so nothing
-/// could prove it is the target: reject it rather than open a handshake
-/// that sits OPEN until it expires. (An ACCOUNT target is fine either
-/// way -- any account can authenticate as itself.)
+/// A responsibility transfer hands billing to ANOTHER organization, so
+/// the target must be some other organization's management account.
+/// Every other target is refused identically, so the error says nothing
+/// about what exists elsewhere.
 #[tokio::test]
 async fn a_responsibility_transfer_to_an_unknown_account_errors() {
-    let (svc, _state) = OrganizationsService::shared();
+    let (svc, state) = OrganizationsService::shared();
     create_org_with_root(&svc).await;
+    svc.handle(req_with("222222222222", "CreateOrganization", json!({})))
+        .await
+        .unwrap();
+    // A plain member of the other organization -- a real account, but not
+    // its management account.
+    state
+        .write()
+        .org_of_account_mut("222222222222")
+        .unwrap()
+        .enroll_account_if_missing("222222220001");
 
-    let err = expect_err(
-        svc.handle(req_with(
-            "111111111111",
-            "InviteOrganizationToTransferResponsibility",
-            json!({
-                "Type": "BILLING",
-                "SourceName": "handover",
-                "StartTimestamp": 1893456000.0,
-                "Target": {"Id": "nobody@acme.com", "Type": "EMAIL"},
-            }),
-        ))
-        .await,
-    );
-    assert_eq!(err.code(), "InvalidInputException");
+    for target in [
+        // Nobody.
+        json!({"Id": "nobody@acme.com", "Type": "EMAIL"}),
+        json!({"Id": "999999999999", "Type": "ACCOUNT"}),
+        // A member account, but not a management account.
+        json!({"Id": "222222220001", "Type": "ACCOUNT"}),
+        // The caller's own organization.
+        json!({"Id": "111111111111", "Type": "ACCOUNT"}),
+    ] {
+        let err = expect_err(
+            svc.handle(req_with(
+                "111111111111",
+                "InviteOrganizationToTransferResponsibility",
+                json!({
+                    "Type": "BILLING",
+                    "SourceName": "handover",
+                    "StartTimestamp": 1893456000.0,
+                    "Target": target,
+                }),
+            ))
+            .await,
+        );
+        // Every rejection reads the same, so the error cannot be used to
+        // probe which accounts or addresses exist elsewhere.
+        assert_eq!(err.code(), "InvalidInputException");
+        assert!(
+            err.message()
+                .contains("is not the management account of another organization"),
+            "unexpected message: {}",
+            err.message()
+        );
+    }
 
     // ...and a caller in no organization is refused before the target is
     // resolved at all, so the error cannot be used to probe which
@@ -2346,6 +2374,11 @@ async fn list_effective_policy_validation_errors_is_empty() {
 async fn responsibility_transfer_lifecycle() {
     let (svc, _state) = OrganizationsService::shared();
     create_org_with_root(&svc).await;
+    // The op invites an ORGANIZATION, so the target must be another
+    // organization's management account.
+    svc.handle(req_with("222222222222", "CreateOrganization", json!({})))
+        .await
+        .unwrap();
     // Invite an outbound BILLING transfer.
     let invite = svc
         .handle(req_with(

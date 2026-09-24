@@ -1004,9 +1004,21 @@ fn handshake_payload(h: &crate::state::Handshake) -> Value {
             "Type": h.target_kind,
         },
     ]);
+    // Same rule as the parties above: the value has to match the type it
+    // is labelled with. `HandshakeResourceType` models EMAIL separately,
+    // so an email-target invite reports the address as EMAIL rather than
+    // as an ACCOUNT id.
+    let target_resource = if h.target_kind == "EMAIL" {
+        json!({
+            "Type": "EMAIL",
+            "Value": h.target_email.clone().unwrap_or_else(|| h.target_account_id.clone()),
+        })
+    } else {
+        json!({"Type": "ACCOUNT", "Value": h.target_account_id})
+    };
     let resources = json!([
         {"Type": "ORGANIZATION", "Value": h.organization_id},
-        {"Type": "ACCOUNT", "Value": h.target_account_id},
+        target_resource,
     ]);
     let mut obj = json!({
         "Id": h.id,
