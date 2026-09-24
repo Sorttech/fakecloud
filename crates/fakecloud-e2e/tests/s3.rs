@@ -1720,6 +1720,52 @@ async fn s3_cors_preflight_and_response_headers() {
     assert_eq!(resp.status(), 400);
     assert!(resp.text().await.unwrap().contains("Origin request header"));
 
+    // A preflight declaring a header the rule does not cover is denied. The
+    // cors-bucket rule allows `*`, so use a bucket with a narrow rule.
+    s3.create_bucket()
+        .bucket("hdr-cors-bucket")
+        .send()
+        .await
+        .unwrap();
+    let output = server
+        .aws_cli(&[
+            "s3api",
+            "put-bucket-cors",
+            "--bucket",
+            "hdr-cors-bucket",
+            "--cors-configuration",
+            r#"{"CORSRules":[{"AllowedOrigins":["https://example.com"],"AllowedMethods":["PUT"],"AllowedHeaders":["x-amz-meta-foo"]}]}"#,
+        ])
+        .await;
+    assert!(output.success(), "{}", output.stderr_text());
+    let resp = http
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{}/hdr-cors-bucket/file.txt", server.endpoint()),
+        )
+        .header("Origin", "https://example.com")
+        .header("Access-Control-Request-Method", "PUT")
+        .header("Access-Control-Request-Headers", "x-amz-meta-foo")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "covered header must be allowed");
+    let resp = http
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{}/hdr-cors-bucket/file.txt", server.endpoint()),
+        )
+        .header("Origin", "https://example.com")
+        .header("Access-Control-Request-Method", "PUT")
+        .header("Access-Control-Request-Headers", "authorization")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "uncovered header must be denied");
+    // The apostrophe in "resource's" is XML-escaped in the error body, so match
+    // on a stretch of the message that has none.
+    assert!(resp.text().await.unwrap().contains("are not whitelisted"));
+
     // The other half of a preflight is required too, and must not be reported
     // as "CORS is not enabled" on a bucket whose CORS is enabled.
     let resp = http
@@ -1843,6 +1889,13 @@ async fn s3_cors_preflight_and_response_headers() {
         .unwrap();
     assert_eq!(resp.status(), 403);
     assert!(resp.headers().get("vary").is_none());
+    // ...and says so, rather than reporting the not-whitelisted denial that
+    // belongs to a bucket whose CORS is configured.
+    assert!(resp
+        .text()
+        .await
+        .unwrap()
+        .contains("CORS is not enabled for this bucket"));
 }
 // ---- S3 Object Lock Tests ----
 

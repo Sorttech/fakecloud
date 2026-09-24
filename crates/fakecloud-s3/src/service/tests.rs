@@ -362,7 +362,7 @@ fn parse_cors_config_trims_pretty_printed_values() {
     assert_eq!(rules[0].expose_headers, vec!["x-amz-request-id"]);
     // Untrimmed this fails to parse, and the preflight loses its max-age.
     assert_eq!(rules[0].max_age_seconds, Some(3600));
-    assert!(find_cors_rule(&rules, "https://example.com", "GET").is_some());
+    assert!(find_cors_rule(&rules, "https://example.com", "GET", &[]).is_some());
 }
 
 #[test]
@@ -378,11 +378,40 @@ fn parse_cors_config_uppercases_methods_so_the_allow_header_is_valid() {
     // compare it case-sensitively, so matching a lowercase stored method is
     // only half the job — it has to reach the wire uppercased too.
     assert_eq!(rules[0].allowed_methods, vec!["GET"]);
-    assert!(find_cors_rule(&rules, "https://example.com", "GET").is_some());
+    assert!(find_cors_rule(&rules, "https://example.com", "GET", &[]).is_some());
     // A method outside AllowedMethods is still denied, and a disallowed origin
     // is denied regardless of method.
-    assert!(find_cors_rule(&rules, "https://example.com", "DELETE").is_none());
-    assert!(find_cors_rule(&rules, "https://evil.com", "GET").is_none());
+    assert!(find_cors_rule(&rules, "https://example.com", "DELETE", &[]).is_none());
+    assert!(find_cors_rule(&rules, "https://evil.com", "GET", &[]).is_none());
+}
+
+#[test]
+fn find_cors_rule_checks_requested_headers() {
+    let xml = r#"<CORSConfiguration>
+        <CORSRule>
+            <AllowedOrigin>https://example.com</AllowedOrigin>
+            <AllowedMethod>PUT</AllowedMethod>
+            <AllowedHeader>x-amz-meta-foo</AllowedHeader>
+        </CORSRule>
+    </CORSConfiguration>"#;
+    let rules = parse_cors_config(xml);
+    let allowed = ["X-Amz-Meta-Foo".to_string()];
+    let denied = ["authorization".to_string()];
+    // A preflight declaring only covered headers passes; one declaring a header
+    // the rule never allows is denied, rather than approved with an
+    // allow-headers list that does not contain what was asked for.
+    assert!(find_cors_rule(&rules, "https://example.com", "PUT", &allowed).is_some());
+    assert!(find_cors_rule(&rules, "https://example.com", "PUT", &denied).is_none());
+
+    // A `*` AllowedHeader covers anything.
+    let wild = parse_cors_config(
+        r#"<CORSConfiguration><CORSRule>
+            <AllowedOrigin>https://example.com</AllowedOrigin>
+            <AllowedMethod>PUT</AllowedMethod>
+            <AllowedHeader>*</AllowedHeader>
+        </CORSRule></CORSConfiguration>"#,
+    );
+    assert!(find_cors_rule(&wild, "https://example.com", "PUT", &denied).is_some());
 }
 
 #[test]
