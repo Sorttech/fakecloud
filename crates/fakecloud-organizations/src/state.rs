@@ -1171,13 +1171,16 @@ impl OrganizationState {
         account_id: &str,
         service_principal: &str,
     ) -> Result<(), OrgError> {
-        let entry = self
+        // Both arms name the ACCOUNT, which is what the error says and
+        // what AWS reports. Naming the service principal when no
+        // account is registered for it at all rendered "Account
+        // config.amazonaws.com is not registered as a delegated
+        // administrator."
+        let registered = self
             .delegated_administrators
             .get_mut(service_principal)
-            .ok_or_else(|| {
-                OrgError::DelegatedAdministratorNotRegistered(service_principal.to_string())
-            })?;
-        if entry.remove(account_id).is_none() {
+            .is_some_and(|entry| entry.remove(account_id).is_some());
+        if !registered {
             return Err(OrgError::DelegatedAdministratorNotRegistered(
                 account_id.to_string(),
             ));

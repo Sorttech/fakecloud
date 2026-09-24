@@ -3872,3 +3872,44 @@ async fn removing_an_account_drops_the_tags_it_carried() {
         .unwrap();
     assert_eq!(body_json(&listed)["Tags"].as_array().unwrap().len(), 0);
 }
+
+/// `AccountNotRegisteredException` names the ACCOUNT, in both the arm
+/// where the service has other delegates and the arm where it has none.
+/// Passing the service principal into the second rendered "Account
+/// config.amazonaws.com is not registered as a delegated administrator."
+#[tokio::test]
+async fn deregistering_an_unregistered_administrator_names_the_account() {
+    let (svc, state) = OrganizationsService::shared();
+    create_org_with_root(&svc).await;
+    state
+        .write()
+        .sole_mut()
+        .unwrap()
+        .enroll_account_if_missing("222222222222");
+    svc.handle(req_with(
+        "111111111111",
+        "EnableAWSServiceAccess",
+        json!({ "ServicePrincipal": "config.amazonaws.com" }),
+    ))
+    .await
+    .unwrap();
+
+    // No account is registered for the principal at all.
+    let err = expect_err(
+        svc.handle(req_with(
+            "111111111111",
+            "DeregisterDelegatedAdministrator",
+            json!({ "AccountId": "222222222222", "ServicePrincipal": "config.amazonaws.com" }),
+        ))
+        .await,
+    );
+    assert_eq!(err.code(), "AccountNotRegisteredException");
+    assert!(
+        err.to_string().contains("222222222222"),
+        "the error must name the account, got: {err}"
+    );
+    assert!(
+        !err.to_string().contains("config.amazonaws.com"),
+        "the error must not name the service principal, got: {err}"
+    );
+}
