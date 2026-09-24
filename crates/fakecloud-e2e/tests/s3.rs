@@ -1553,6 +1553,11 @@ async fn s3_cors_preflight_and_response_headers() {
         resp.headers().get("access-control-max-age").unwrap(),
         "3600"
     );
+    assert_eq!(
+        resp.headers().get("vary").unwrap(),
+        "Origin, Access-Control-Request-Headers, Access-Control-Request-Method",
+        "preflight must send Vary so caches key on Origin"
+    );
 
     // Regular GET with Origin should include CORS headers
     let resp = http
@@ -1570,6 +1575,39 @@ async fn s3_cors_preflight_and_response_headers() {
         resp.headers().get("access-control-expose-headers").unwrap(),
         "x-amz-request-id"
     );
+    assert_eq!(
+        resp.headers().get("vary").unwrap(),
+        "Origin, Access-Control-Request-Headers, Access-Control-Request-Method",
+        "actual response must send Vary so caches key on Origin"
+    );
+
+    // A disallowed origin gets no ACAO, but still gets Vary: otherwise a cache
+    // could store this ACAO-less body and replay it to the allowed origin.
+    let resp = http
+        .get(format!("{}/cors-bucket/file.txt", server.endpoint()))
+        .header("Origin", "https://evil.com")
+        .header("Authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20240101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=fake")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.headers().get("access-control-allow-origin").is_none(),
+        "disallowed origin must not get ACAO"
+    );
+    assert_eq!(
+        resp.headers().get("vary").unwrap(),
+        "Origin, Access-Control-Request-Headers, Access-Control-Request-Method"
+    );
+
+    // A request with no Origin gets no CORS headers at all, matching S3.
+    let resp = http
+        .get(format!("{}/cors-bucket/file.txt", server.endpoint()))
+        .header("Authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20240101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=fake")
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.headers().get("vary").is_none());
+    assert!(resp.headers().get("access-control-allow-origin").is_none());
 
     // OPTIONS from non-matching origin should fail
     let resp = http

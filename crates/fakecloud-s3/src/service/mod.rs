@@ -47,6 +47,16 @@ use notifications::{
     NotificationTargetType,
 };
 
+/// `Vary` value S3 attaches to any response it evaluates CORS for.
+///
+/// Without it a shared cache (or the browser's own HTTP cache) can hand a
+/// response stored for one `Origin` — or for a plain non-CORS load, which
+/// carries no `Access-Control-Allow-Origin` at all — to a later CORS-mode
+/// request for the same URL, which then fails the CORS check (tainted canvas
+/// after `<img crossorigin>`, `fetch` in `cors` mode) or leaks one origin's
+/// allowance to another.
+const CORS_VARY: &str = "Origin, Access-Control-Request-Headers, Access-Control-Request-Method";
+
 pub struct S3Service {
     state: SharedS3State,
     delivery: Arc<DeliveryBus>,
@@ -455,6 +465,7 @@ impl AwsService for S3Service {
                                 .parse()
                                 .unwrap_or_else(|_| http::HeaderValue::from_static("")),
                         );
+                        headers.insert("vary", http::HeaderValue::from_static(CORS_VARY));
                         headers.insert(
                             "access-control-allow-methods",
                             rule.allowed_methods
@@ -931,6 +942,14 @@ impl AwsService for S3Service {
                     .and_then(|b| b.cors_config.clone())
             };
             if let Some(ref config) = cors_config {
+                // `Vary` goes on every response we evaluated CORS for, matching
+                // rule or not: a disallowed origin gets no ACAO, and that
+                // ACAO-less response must not be cached and replayed to an
+                // allowed origin.
+                if let Ok(ref mut resp) = result {
+                    resp.headers
+                        .insert("vary", http::HeaderValue::from_static(CORS_VARY));
+                }
                 let rules = parse_cors_config(config);
                 if let Some(rule) = find_cors_rule(&rules, origin, None) {
                     if let Ok(ref mut resp) = result {
