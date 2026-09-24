@@ -513,6 +513,94 @@ async fn describe_handshake_is_readable_by_any_member_of_the_owning_org() {
     assert_eq!(err.code(), "HandshakeNotFoundException");
 }
 
+/// An EMAIL-targeted responsibility transfer must be answerable by the
+/// account the address names. Recording the resolved id while still
+/// labelling the target "EMAIL" made it unresolvable again, so the
+/// target could neither accept nor describe its own handshake.
+#[tokio::test]
+async fn an_email_targeted_responsibility_transfer_is_answerable() {
+    let (svc, _state) = OrganizationsService::shared();
+    create_org_with_root(&svc).await;
+    svc.handle(req_with("222222222222", "CreateOrganization", json!({})))
+        .await
+        .unwrap();
+
+    let invite = body_value(
+        svc.handle(req_with(
+            "111111111111",
+            "InviteOrganizationToTransferResponsibility",
+            json!({
+                "Type": "BILLING",
+                "SourceName": "handover",
+                "StartTimestamp": 1893456000.0,
+                "Target": {"Id": "222222222222@example.com", "Type": "EMAIL"},
+            }),
+        ))
+        .await
+        .unwrap(),
+    );
+    let handshake_id = invite["Handshake"]["Id"].as_str().unwrap().to_string();
+
+    svc.handle(req_with(
+        "222222222222",
+        "DescribeHandshake",
+        json!({ "HandshakeId": handshake_id }),
+    ))
+    .await
+    .expect("the account the address names is a party to it");
+
+    svc.handle(req_with(
+        "222222222222",
+        "AcceptHandshake",
+        json!({ "HandshakeId": handshake_id }),
+    ))
+    .await
+    .expect("and can accept it");
+}
+
+/// An address fakecloud cannot resolve names no account, so nothing
+/// could prove it is the target: reject it rather than open a handshake
+/// that sits OPEN until it expires. (An ACCOUNT target is fine either
+/// way -- any account can authenticate as itself.)
+#[tokio::test]
+async fn a_responsibility_transfer_to_an_unknown_account_errors() {
+    let (svc, _state) = OrganizationsService::shared();
+    create_org_with_root(&svc).await;
+
+    let err = expect_err(
+        svc.handle(req_with(
+            "111111111111",
+            "InviteOrganizationToTransferResponsibility",
+            json!({
+                "Type": "BILLING",
+                "SourceName": "handover",
+                "StartTimestamp": 1893456000.0,
+                "Target": {"Id": "nobody@acme.com", "Type": "EMAIL"},
+            }),
+        ))
+        .await,
+    );
+    assert_eq!(err.code(), "InvalidInputException");
+
+    // ...and a caller in no organization is refused before the target is
+    // resolved at all, so the error cannot be used to probe which
+    // addresses exist elsewhere.
+    let err = expect_err(
+        svc.handle(req_with(
+            "999999999999",
+            "InviteOrganizationToTransferResponsibility",
+            json!({
+                "Type": "BILLING",
+                "SourceName": "handover",
+                "StartTimestamp": 1893456000.0,
+                "Target": {"Id": "111111111111", "Type": "ACCOUNT"},
+            }),
+        ))
+        .await,
+    );
+    assert_eq!(err.code(), "AWSOrganizationsNotInUseException");
+}
+
 /// Deleting one organization leaves every other one standing.
 #[tokio::test]
 async fn deleting_one_organization_leaves_the_others() {

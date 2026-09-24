@@ -67,8 +67,12 @@ impl OrganizationsService {
         let name = required_str(&body, "AccountName")?.to_string();
 
         let mut guard = self.state.write();
+        // Mint from the registry: an account id names one account
+        // process-wide, so a per-organization check could hand out an id
+        // another organization already owns.
+        let new_account_id = guard.next_account_id();
         let org = self.management_org_mut(&mut guard, &req.account_id)?;
-        let status = org.begin_create_account(&email, &name, None);
+        let status = org.begin_create_account(&email, &name, new_account_id, None);
         let request_id = status.id.clone();
         // Apply create-time Tags to the reserved account id so
         // ListTagsForResource reflects them without a follow-up TagResource.
@@ -98,12 +102,15 @@ impl OrganizationsService {
         let name = required_str(&body, "AccountName")?.to_string();
 
         let mut guard = self.state.write();
-        let org = self.management_org_mut(&mut guard, &req.account_id)?;
         // The GovCloud "paired" id is a 12-digit account id in the
         // GovCloud partition; we mint one alongside the commercial id
-        // so callers see both, matching the real AWS response.
-        let gov_id = org.next_account_id();
-        let status = org.begin_create_account(&email, &name, Some(gov_id));
+        // so callers see both, matching the real AWS response. Both come
+        // from the registry so neither can collide with another
+        // organization's account.
+        let new_account_id = guard.next_account_id();
+        let gov_id = guard.next_account_id();
+        let org = self.management_org_mut(&mut guard, &req.account_id)?;
+        let status = org.begin_create_account(&email, &name, new_account_id, Some(gov_id));
         let request_id = status.id.clone();
         // Apply create-time Tags to the reserved (primary) account id, mirroring
         // CreateAccount; the id is reserved synchronously (bug-hunt).

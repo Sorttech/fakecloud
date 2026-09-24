@@ -167,8 +167,14 @@ impl OrganizationsService {
             .map(|s| s.to_string());
 
         let mut guard = self.state.write();
-        // Resolve against the whole registry first; `management_org_mut`
-        // takes a mutable borrow of it.
+        // Authorize FIRST. Resolving the target before the management gate
+        // turned "is this address registered?" into an oracle any caller
+        // could read off the difference between InvalidInputException and
+        // AWSOrganizationsNotInUseException.
+        let source_org_id = self
+            .management_org_mut(&mut guard, &req.account_id)?
+            .org_id
+            .clone();
         let registry = &*guard;
 
         // Both sides of a transfer are existing management accounts, so
@@ -177,12 +183,17 @@ impl OrganizationsService {
         // seen. Resolving here keeps `Target.ManagementAccountId` an
         // account id, as the Smithy shape models it, instead of leaking
         // an address into it.
+        // An ACCOUNT target names the account directly, and any account
+        // can authenticate as itself, so it need not already exist. An
+        // EMAIL target must resolve to an account fakecloud knows --
+        // otherwise nothing can prove it is the target, and the
+        // invitation would sit OPEN until it expired.
         let target_account_id = registry
             .resolve_target_account(target_kind, &target_id)
             .ok_or_else(|| {
                 invalid_input(&format!(
                     "No account is registered for {target_id}; \
-                     a responsibility transfer targets an existing management account"
+                     invite the target management account by id instead"
                 ))
             })?;
         let target_email = registry
@@ -190,7 +201,9 @@ impl OrganizationsService {
             .and_then(|org| org.accounts.get(&target_account_id))
             .map(|account| account.email.clone())
             .unwrap_or_else(|| format!("{target_account_id}@example.com"));
-        let org = self.management_org_mut(&mut guard, &req.account_id)?;
+        let org = guard
+            .org_by_id_mut(&source_org_id)
+            .expect("management gate resolved this organization");
 
         let now = Utc::now();
         // The transfer rides on a handshake the invited org accepts.
@@ -209,7 +222,11 @@ impl OrganizationsService {
             source_account_id: org.management_account_id.clone(),
             target_account_id: target_account_id.clone(),
             target_email: Some(target_email.clone()),
-            target_kind: target_kind.to_string(),
+            // The target was resolved to an account id above, so record it
+            // as such. Keeping "EMAIL" here left `target_account_id`
+            // unresolvable, and the target could then neither accept nor
+            // describe its own handshake.
+            target_kind: "ACCOUNT".to_string(),
             notes,
             organization_id: org.org_id.clone(),
         };

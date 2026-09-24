@@ -156,6 +156,9 @@ impl ResourceProvisioner {
             .unwrap_or_default();
 
         let mut org_lock = self.organizations_state.write();
+        // Mint from the registry so the id cannot collide with an account
+        // another organization already owns.
+        let new_account_id = org_lock.next_account_id();
         let org = org_lock
             .org_of_account_mut(&self.account_id)
             .ok_or_else(|| "Organization not yet created".to_string())?;
@@ -163,7 +166,7 @@ impl ResourceProvisioner {
         // a second layer of poll-for-completion on top. Begin the
         // request and immediately drive it to SUCCEEDED so the rest of
         // this provisioner sees a fully enrolled account.
-        let pending = org.begin_create_account(&email, &name, None);
+        let pending = org.begin_create_account(&email, &name, new_account_id, None);
         let status = org.complete_create_account(&pending.id).unwrap_or(pending);
         let account_id = status
             .account_id

@@ -167,6 +167,13 @@ impl OrganizationsRegistry {
             .map(|account| account.id.clone())
     }
 
+    /// Mint an account id unused by ANY organization in the process.
+    pub fn next_account_id(&self) -> String {
+        OrganizationState::mint_account_id(|id| {
+            self.orgs.values().any(|org| org.accounts.contains_key(id))
+        })
+    }
+
     /// The organization that stores responsibility transfer `id`. A
     /// transfer is recorded once, in the source organization, but both
     /// management accounts are parties to it.
@@ -509,7 +516,17 @@ impl OrganizationState {
     /// Allocate the next pseudo-random 12-digit account id that's not
     /// already a member. Mirrors AWS's account-id format (numeric,
     /// 12 digits, no leading zero stripping).
+    /// Mint an account id unused by this organization.
+    ///
+    /// Prefer [`OrganizationsRegistry::next_account_id`], which checks
+    /// every organization: an account id names one account process-wide,
+    /// and a collision across organizations would break the "at most one
+    /// organization per account" invariant.
     pub fn next_account_id(&self) -> String {
+        Self::mint_account_id(|id| self.accounts.contains_key(id))
+    }
+
+    fn mint_account_id(taken: impl Fn(&str) -> bool) -> String {
         loop {
             let mut id = String::with_capacity(12);
             for _ in 0..12 {
@@ -517,7 +534,7 @@ impl OrganizationState {
                 let byte = u.as_bytes()[0];
                 id.push(((byte % 10) + b'0') as char);
             }
-            if !id.starts_with('0') && !self.accounts.contains_key(&id) {
+            if !id.starts_with('0') && !taken(&id) {
                 return id;
             }
         }
@@ -534,15 +551,19 @@ impl OrganizationState {
     /// The caller is expected to spawn a background task that calls
     /// `complete_create_account(request_id)` after a synthetic delay so
     /// pollers can observe the IN_PROGRESS -> SUCCEEDED transition.
+    /// `account_id` is minted by the caller, which holds the registry and
+    /// can therefore guarantee the id is unused process-wide rather than
+    /// only within this organization.
     pub fn begin_create_account(
         &mut self,
         email: &str,
         name: &str,
+        account_id: String,
         gov_cloud_paired_id: Option<String>,
     ) -> CreateAccountStatus {
         let now = Utc::now();
         let request_id = format!("car-{}", random_id(20));
-        let new_account_id = self.next_account_id();
+        let new_account_id = account_id;
         let status = CreateAccountStatus {
             id: request_id.clone(),
             account_id: Some(new_account_id),
