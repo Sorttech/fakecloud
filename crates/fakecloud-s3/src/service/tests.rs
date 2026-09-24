@@ -335,11 +335,305 @@ fn test_parse_cors_config() {
 }
 
 #[test]
+fn parse_cors_config_trims_pretty_printed_values() {
+    // `put_bucket_cors` trims before validating, so a pretty-printed config is
+    // accepted and stored with its surrounding whitespace. If the parser kept
+    // it, no method and no origin would ever match and the bucket would go
+    // silently CORS-dead.
+    let xml = "<CORSConfiguration>
+        <CORSRule>
+            <AllowedOrigin>
+                https://example.com
+            </AllowedOrigin>
+            <AllowedMethod>
+                GET
+            </AllowedMethod>
+            <ExposeHeader>
+                x-amz-request-id
+            </ExposeHeader>
+            <MaxAgeSeconds>
+                3600
+            </MaxAgeSeconds>
+        </CORSRule>
+    </CORSConfiguration>";
+    let rules = parse_cors_config(xml);
+    assert_eq!(rules[0].allowed_origins, vec!["https://example.com"]);
+    assert_eq!(rules[0].allowed_methods, vec!["GET"]);
+    assert_eq!(rules[0].expose_headers, vec!["x-amz-request-id"]);
+    // Untrimmed this fails to parse, and the preflight loses its max-age.
+    assert_eq!(rules[0].max_age_seconds, Some(3600));
+    assert!(find_cors_rule(&rules, "https://example.com", "GET", &[]).is_some());
+}
+
+#[test]
+fn find_cors_rule_matches_methods_exactly() {
+    let xml = r#"<CORSConfiguration>
+        <CORSRule>
+            <AllowedOrigin>https://example.com</AllowedOrigin>
+            <AllowedMethod>GET</AllowedMethod>
+        </CORSRule>
+    </CORSConfiguration>"#;
+    let rules = parse_cors_config(xml);
+    // `put_bucket_cors` only ever stores the canonical uppercase verbs, and
+    // `Access-Control-Allow-Methods` is echoed from this list, which browsers
+    // compare case-sensitively — so no normalization happens here.
+    assert_eq!(rules[0].allowed_methods, vec!["GET"]);
+    assert!(find_cors_rule(&rules, "https://example.com", "GET", &[]).is_some());
+    // A method outside AllowedMethods is still denied, and a disallowed origin
+    // is denied regardless of method.
+    assert!(find_cors_rule(&rules, "https://example.com", "DELETE", &[]).is_none());
+    assert!(find_cors_rule(&rules, "https://evil.com", "GET", &[]).is_none());
+}
+
+#[test]
+fn find_cors_rule_checks_requested_headers() {
+    let xml = r#"<CORSConfiguration>
+        <CORSRule>
+            <AllowedOrigin>https://example.com</AllowedOrigin>
+            <AllowedMethod>PUT</AllowedMethod>
+            <AllowedHeader>x-amz-meta-foo</AllowedHeader>
+        </CORSRule>
+    </CORSConfiguration>"#;
+    let rules = parse_cors_config(xml);
+    let allowed = ["X-Amz-Meta-Foo".to_string()];
+    let denied = ["authorization".to_string()];
+    // A preflight declaring only covered headers passes; one declaring a header
+    // the rule never allows is denied, rather than approved with an
+    // allow-headers list that does not contain what was asked for.
+    assert!(find_cors_rule(&rules, "https://example.com", "PUT", &allowed).is_some());
+    assert!(find_cors_rule(&rules, "https://example.com", "PUT", &denied).is_none());
+
+    // A `*` AllowedHeader covers anything.
+    let wild = parse_cors_config(
+        r#"<CORSConfiguration><CORSRule>
+            <AllowedOrigin>https://example.com</AllowedOrigin>
+            <AllowedMethod>PUT</AllowedMethod>
+            <AllowedHeader>*</AllowedHeader>
+        </CORSRule></CORSConfiguration>"#,
+    );
+    assert!(find_cors_rule(&wild, "https://example.com", "PUT", &denied).is_some());
+}
+
+#[test]
+fn find_cors_rule_denies_requested_headers_when_rule_allows_none() {
+    let xml = r#"<CORSConfiguration>
+        <CORSRule>
+            <AllowedOrigin>https://example.com</AllowedOrigin>
+            <AllowedMethod>PUT</AllowedMethod>
+        </CORSRule>
+    </CORSConfiguration>"#;
+    let rules = parse_cors_config(xml);
+    // A rule with no AllowedHeader covers no header. Browsers send
+    // `Access-Control-Request-Headers: content-type` for any non-simple
+    // content type, so such a config denies those preflights — matching S3,
+    // which is why AllowedHeaders belongs in any config that posts JSON.
+    assert!(find_cors_rule(&rules, "https://example.com", "PUT", &[]).is_some());
+    assert!(find_cors_rule(
+        &rules,
+        "https://example.com",
+        "PUT",
+        &["content-type".to_string()]
+    )
+    .is_none());
+}
+
+#[test]
+fn parse_cors_config_ignores_commented_out_rules() {
+    // The stored body is the raw text, so the request-time parser has to skip
+    // comments exactly as validation does. If it did not, a commented-out rule
+    // would pass validation as absent and then go live, handing an
+    // allow-origin to an origin and method the caller never enabled.
+    let xml = "<CORSConfiguration>\
+        <!-- <CORSRule><AllowedOrigin>*</AllowedOrigin><AllowedMethod>DELETE</AllowedMethod></CORSRule> -->\
+        <CORSRule>\
+            <AllowedOrigin>https://app.example.com</AllowedOrigin>\
+            <AllowedMethod>GET</AllowedMethod>\
+        </CORSRule>\
+    </CORSConfiguration>";
+    let rules = parse_cors_config(xml);
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].allowed_methods, vec!["GET"]);
+    assert!(find_cors_rule(&rules, "https://evil.example", "DELETE", &[]).is_none());
+}
+
+#[test]
+fn test_header_matches() {
+    // AWS permits one `*` per AllowedHeader; names are case-insensitive.
+    assert!(header_matches("x-amz-meta-foo", "x-amz-*"));
+    assert!(header_matches("X-Amz-Meta-Foo", "x-amz-*"));
+    assert!(header_matches("authorization", "*"));
+    assert!(header_matches("content-type", "Content-Type"));
+    assert!(!header_matches("authorization", "x-amz-*"));
+    // A prefix shorter than the pattern must not match by wrapping.
+    assert!(!header_matches("x-amz", "x-amz-*"));
+}
+
+#[test]
+fn wildcard_matchers_handle_more_than_one_star() {
+    // `PutBucketCors` rejects multi-wildcard values, but a config stored by an
+    // earlier build or restored from a snapshot never passed that check, so the
+    // matchers must still evaluate it correctly instead of silently matching
+    // nothing and leaving the bucket CORS-dead.
+    assert!(origin_matches(
+        "https://a.b.example.com",
+        "https://*.*.example.com"
+    ));
+    assert!(!origin_matches(
+        "https://a.example.com",
+        "https://*.*.example.com"
+    ));
+    assert!(header_matches("x-amz-meta-foo", "x-*-meta-*"));
+    assert!(!header_matches("x-amz-meta-foo", "x-*-other-*"));
+
+    // Segments must not overlap: the tail cannot reuse bytes the head consumed.
+    assert!(!origin_matches("ab", "a*b*c"));
+    assert!(origin_matches("abc", "a*b*c"));
+
+    // A bare wildcard still matches anything, including empty.
+    assert!(origin_matches("", "*"));
+    assert!(origin_matches("https://example.com", "*"));
+    // An exact pattern still requires the whole value.
+    assert!(!origin_matches(
+        "https://example.com.evil",
+        "https://example.com"
+    ));
+    assert!(!origin_matches(
+        "https://example.com.evil",
+        "https://*.example.com"
+    ));
+
+    // Regression: a middle segment longer than what is left of the value used
+    // to slice past the end and panic, taking down the request.
+    assert!(!origin_matches(
+        "https://x.com",
+        "https://*verylongmiddle*.com"
+    ));
+    assert!(!header_matches("x-a", "x-*-custom-header-*"));
+    assert!(!origin_matches("", "*a*"));
+}
+
+#[test]
+fn find_cors_rule_matches_the_request_as_a_whole() {
+    // A rule matches on origin, method AND requested headers together, first
+    // match winning. A broad rule that allows no headers must not shadow a
+    // later one written specifically to permit `content-type` — denying there
+    // would refuse exactly what the bucket owner configured.
+    let xml = "<CORSConfiguration>\
+        <CORSRule>\
+            <AllowedOrigin>*</AllowedOrigin>\
+            <AllowedMethod>PUT</AllowedMethod>\
+        </CORSRule>\
+        <CORSRule>\
+            <AllowedOrigin>https://app.example.com</AllowedOrigin>\
+            <AllowedMethod>PUT</AllowedMethod>\
+            <AllowedHeader>content-type</AllowedHeader>\
+        </CORSRule>\
+    </CORSConfiguration>";
+    let rules = parse_cors_config(xml);
+    let requested = ["content-type".to_string()];
+    let matched = find_cors_rule(&rules, "https://app.example.com", "PUT", &requested)
+        .expect("the second rule allows this header");
+    assert_eq!(matched.allowed_headers, vec!["content-type"]);
+    // With no headers declared, the broad first rule wins.
+    let matched = find_cors_rule(&rules, "https://app.example.com", "PUT", &[]).unwrap();
+    assert_eq!(matched.allowed_origins, vec!["*"]);
+    // A header no rule covers is still denied.
+    assert!(find_cors_rule(
+        &rules,
+        "https://app.example.com",
+        "PUT",
+        &["authorization".to_string()]
+    )
+    .is_none());
+}
+
+#[test]
+fn a_rule_listing_both_concrete_and_wildcard_origins_matches_the_concrete_one() {
+    // The echoed allow-origin comes from the entry that matched, not from "does
+    // this rule mention `*` anywhere". Echoing `*` here would drop
+    // allow-credentials for an origin the rule names explicitly.
+    let rules = parse_cors_config(
+        "<CORSConfiguration><CORSRule>\
+         <AllowedOrigin>https://app.example.com</AllowedOrigin>\
+         <AllowedOrigin>*</AllowedOrigin>\
+         <AllowedMethod>GET</AllowedMethod>\
+         </CORSRule></CORSConfiguration>",
+    );
+    let rule = find_cors_rule(&rules, "https://app.example.com", "GET", &[]).unwrap();
+    let matched = rule
+        .allowed_origins
+        .iter()
+        .find(|o| origin_matches("https://app.example.com", o))
+        .unwrap();
+    assert_eq!(matched, "https://app.example.com");
+}
+
+#[test]
+fn empty_origin_never_matches_even_a_wildcard_rule() {
+    // An Origin that is absent, blank, or sent on several lines arrives as "".
+    // A bare `*` would otherwise match it and hand back an allow-origin for a
+    // request that declared no usable origin at all.
+    let rules = parse_cors_config(
+        "<CORSConfiguration><CORSRule>\
+         <AllowedOrigin>*</AllowedOrigin>\
+         <AllowedMethod>GET</AllowedMethod>\
+         </CORSRule></CORSConfiguration>",
+    );
+    assert!(find_cors_rule(&rules, "", "GET", &[]).is_none());
+    assert!(find_cors_rule(&rules, "https://anything.example", "GET", &[]).is_some());
+}
+
+#[test]
+fn wildcard_matchers_do_not_panic_on_non_ascii() {
+    // Callers only pass ASCII today, but the matcher must not become a
+    // request-killing panic if that ever changes.
+    assert!(!origin_matches("aé", "ab*"));
+    assert!(!origin_matches("héllo", "h*l*o!"));
+    assert!(!header_matches("x-é", "x-a*"));
+    assert!(origin_matches("héllo", "h*o"));
+}
+
+#[test]
+fn empty_allowed_method_cannot_approve_a_method_less_preflight() {
+    // A preflight with no Access-Control-Request-Method arrives as "". An empty
+    // <AllowedMethod/> next to a real one must not match it and hand back an
+    // allow-origin.
+    let xml = "<CORSConfiguration><CORSRule>\
+        <AllowedOrigin>https://example.com</AllowedOrigin>\
+        <AllowedMethod>GET</AllowedMethod>\
+        <AllowedMethod></AllowedMethod>\
+        </CORSRule></CORSConfiguration>";
+    let rules = parse_cors_config(xml);
+    assert_eq!(rules[0].allowed_methods, vec!["GET"]);
+    assert!(find_cors_rule(&rules, "https://example.com", "", &[]).is_none());
+    assert!(find_cors_rule(&rules, "https://example.com", "GET", &[]).is_some());
+}
+
+#[test]
 fn test_origin_matches() {
     assert!(origin_matches("https://example.com", "https://example.com"));
     assert!(origin_matches("https://example.com", "*"));
     assert!(origin_matches("https://foo.example.com", "*.example.com"));
     assert!(!origin_matches("https://evil.com", "https://example.com"));
+    // AWS's own documented form puts the wildcard mid-pattern; a
+    // leading-`*`-only matcher would leave such a bucket CORS-dead.
+    assert!(origin_matches(
+        "https://app.example.com",
+        "https://*.example.com"
+    ));
+    assert!(!origin_matches(
+        "http://app.example.com",
+        "https://*.example.com"
+    ));
+    assert!(!origin_matches(
+        "https://app.evil.com",
+        "https://*.example.com"
+    ));
+    // Origins are case-sensitive, unlike header names.
+    assert!(!origin_matches(
+        "https://EXAMPLE.com",
+        "https://example.com"
+    ));
 }
 
 /// Regression: resolve_object with versionId="null" must match objects

@@ -47,6 +47,84 @@ use notifications::{
     NotificationTargetType,
 };
 
+/// `Vary` value S3 attaches to any response it evaluates CORS for.
+///
+/// A response carrying `Access-Control-Allow-Origin` is specific to the
+/// `Origin` that asked for it. Without `Vary`, a shared cache (or the browser's
+/// own HTTP cache) stores it under a key that ignores `Origin` and reuses it
+/// for a request from a *different* origin — handing out one origin's
+/// allowance, or handing an allowed origin a stored response that was rejected
+/// for someone else. Like S3, this is emitted only for requests that carry
+/// `Origin`; a response cached from an `Origin`-less load carries no `Vary`
+/// (and no `Access-Control-Allow-Origin`) either way.
+const CORS_VARY: &str = "Origin, Access-Control-Request-Headers, Access-Control-Request-Method";
+
+/// Read a header that gates CORS approval, as a single trimmed value.
+///
+/// Returns `None` when the header is absent, blank, unreadable, or sent on more
+/// than one line: none of those is a single value to evaluate, and every one of
+/// them must fail closed rather than silently using the first line.
+fn single_cors_header<'a>(headers: &'a http::HeaderMap, name: &str) -> Option<&'a str> {
+    let mut seen: Option<&str> = None;
+    for line in headers.get_all(name) {
+        let value = line.to_str().ok()?.trim();
+        match seen {
+            // Repeating the same value is how a proxy or CDN duplicates a
+            // header; that is still one value, so it is not a conflict.
+            Some(first) if first == value => {}
+            Some(_) => return None,
+            None => seen = Some(value),
+        }
+    }
+    seen.filter(|s| !s.is_empty())
+}
+
+/// Set a CORS response header on whatever a CORS-evaluated request produced —
+/// success or error alike.
+///
+/// Errors matter as much as successes: real S3 answers a 404 `NoSuchKey` for an
+/// allowed origin *with* `Access-Control-Allow-Origin`, so `fetch(…, {mode:
+/// 'cors'})` sees a 404 it can handle rather than an opaque CORS network error.
+/// And a 404 is heuristically cacheable, so it needs `Vary` for the same reason
+/// a 200 does.
+fn set_cors_header(
+    result: &mut Result<AwsResponse, AwsServiceError>,
+    name: &'static str,
+    value: &str,
+) {
+    match result {
+        Ok(resp) => {
+            if let Ok(v) = value.parse::<http::HeaderValue>() {
+                // `Vary` is list-valued and combines, so append rather than
+                // replace: a handler that set its own (say `Accept-Encoding`
+                // on a range response) must not lose it just because the
+                // request carried an `Origin`. Every other CORS header here is
+                // single-valued and replaces.
+                if name.eq_ignore_ascii_case("vary") {
+                    // Deduped like the error path in `dispatch`: appending an
+                    // identical value would emit the header twice, and the
+                    // tests read only the first line so it would go unnoticed.
+                    if !resp.headers.get_all(name).iter().any(|e| e == v) {
+                        resp.headers.append(name, v);
+                    }
+                } else {
+                    resp.headers.insert(name, v);
+                }
+            }
+        }
+        Err(AwsServiceError::AwsError { headers, .. }) => {
+            // Same append-vs-replace split as above, so the two arms cannot
+            // disagree if an error path ever sets its own `Vary`.
+            if !name.eq_ignore_ascii_case("vary") {
+                headers.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
+            }
+            headers.push((name.to_string(), value.to_string()));
+        }
+        // Other variants render without per-error headers.
+        Err(_) => {}
+    }
+}
+
 pub struct S3Service {
     state: SharedS3State,
     delivery: Arc<DeliveryBus>,
@@ -322,14 +400,30 @@ impl AwsService for S3Service {
             None
         };
 
-        // Multipart upload operations (checked before main match)
-        if let Some(b) = bucket {
+        // Multipart upload operations (checked before main match). Held in an
+        // Option rather than returned directly so these responses still reach
+        // the shared tail below (CORS headers, access logging) — browser
+        // multipart upload is the single most common reason a bucket has a CORS
+        // config at all, so skipping it here is exactly the wrong place.
+        //
+        // Each arm carries its own access-log operation name: method + key
+        // alone cannot tell `AbortMultipartUpload` from a real object DELETE,
+        // and logging the former as `DELETE.OBJECT` would show a log consumer a
+        // live object being deleted.
+        #[allow(clippy::type_complexity)]
+        let multipart: Option<(&'static str, Result<AwsResponse, AwsServiceError>)> = 'multipart: {
+            let Some(b) = bucket else {
+                break 'multipart None;
+            };
             // POST /{bucket}/{key}?uploads — CreateMultipartUpload
             if req.method == Method::POST
                 && key.is_some()
                 && req.query_params.contains_key("uploads")
             {
-                return self.create_multipart_upload(account_id, &req, b, key.as_deref().unwrap());
+                break 'multipart Some((
+                    "POST.UPLOADS",
+                    self.create_multipart_upload(account_id, &req, b, key.as_deref().unwrap()),
+                ));
             }
 
             // POST /{bucket}/{key}?restore
@@ -337,19 +431,25 @@ impl AwsService for S3Service {
                 && key.is_some()
                 && req.query_params.contains_key("restore")
             {
-                return self.restore_object(account_id, &req, b, key.as_deref().unwrap());
+                break 'multipart Some((
+                    "POST.RESTORE",
+                    self.restore_object(account_id, &req, b, key.as_deref().unwrap()),
+                ));
             }
 
             // POST /{bucket}/{key}?uploadId=X — CompleteMultipartUpload
             if req.method == Method::POST && key.is_some() {
                 if let Some(upload_id) = req.query_params.get("uploadId").cloned() {
-                    return self.complete_multipart_upload(
-                        account_id,
-                        &req,
-                        b,
-                        key.as_deref().unwrap(),
-                        &upload_id,
-                    );
+                    break 'multipart Some((
+                        "POST.UPLOAD",
+                        self.complete_multipart_upload(
+                            account_id,
+                            &req,
+                            b,
+                            key.as_deref().unwrap(),
+                            &upload_id,
+                        ),
+                    ));
                 }
             }
 
@@ -361,17 +461,21 @@ impl AwsService for S3Service {
                 ) {
                     if let Ok(part_number) = part_num_str.parse::<i64>() {
                         if req.headers.contains_key("x-amz-copy-source") {
-                            return self.upload_part_copy(
-                                account_id,
-                                &req,
-                                b,
-                                key.as_deref().unwrap(),
-                                &upload_id,
-                                part_number,
-                            );
+                            break 'multipart Some((
+                                "COPY.PART",
+                                self.upload_part_copy(
+                                    account_id,
+                                    &req,
+                                    b,
+                                    key.as_deref().unwrap(),
+                                    &upload_id,
+                                    part_number,
+                                ),
+                            ));
                         }
-                        return self
-                            .upload_part(
+                        break 'multipart Some((
+                            "PUT.PART",
+                            self.upload_part(
                                 account_id,
                                 &req,
                                 b,
@@ -379,7 +483,8 @@ impl AwsService for S3Service {
                                 &upload_id,
                                 part_number,
                             )
-                            .await;
+                            .await,
+                        ));
                     }
                 }
             }
@@ -387,12 +492,15 @@ impl AwsService for S3Service {
             // DELETE /{bucket}/{key}?uploadId=X — AbortMultipartUpload
             if req.method == Method::DELETE && key.is_some() {
                 if let Some(upload_id) = req.query_params.get("uploadId").cloned() {
-                    return self.abort_multipart_upload(
-                        account_id,
-                        b,
-                        key.as_deref().unwrap(),
-                        &upload_id,
-                    );
+                    break 'multipart Some((
+                        "DELETE.UPLOAD",
+                        self.abort_multipart_upload(
+                            account_id,
+                            b,
+                            key.as_deref().unwrap(),
+                            &upload_id,
+                        ),
+                    ));
                 }
             }
 
@@ -401,26 +509,59 @@ impl AwsService for S3Service {
                 && key.is_none()
                 && req.query_params.contains_key("uploads")
             {
-                return self.list_multipart_uploads(account_id, b, &req.query_params);
+                break 'multipart Some((
+                    "GET.UPLOADS",
+                    self.list_multipart_uploads(account_id, b, &req.query_params),
+                ));
             }
 
             // GET /{bucket}/{key}?uploadId=X — ListParts
             if req.method == Method::GET && key.is_some() {
                 if let Some(upload_id) = req.query_params.get("uploadId").cloned() {
-                    return self.list_parts(
-                        account_id,
-                        &req,
-                        b,
-                        key.as_deref().unwrap(),
-                        &upload_id,
-                    );
+                    break 'multipart Some((
+                        "GET.UPLOAD",
+                        self.list_parts(account_id, &req, b, key.as_deref().unwrap(), &upload_id),
+                    ));
                 }
             }
-        }
+
+            None
+        };
 
         // Handle OPTIONS preflight requests (CORS)
         if req.method == Method::OPTIONS {
             if let Some(b_name) = bucket {
+                // S3 validates the request before evaluating CORS at all: a
+                // preflight with no `Origin` carries nothing to evaluate and is
+                // a malformed request, distinct from the 403 a disallowed
+                // origin gets. Empty counts as absent, as on every other path.
+                // Every preflight response varies by `Origin` — absent is a
+                // 400, present-and-allowed a 200, present-and-disallowed a 403
+                // — so all three carry `Vary`. Without it a cache keying the
+                // 400 from a bare health-check `OPTIONS` would replay it to a
+                // real browser preflight for the same URL.
+                let vary = || vec![("vary".to_string(), CORS_VARY.to_string())];
+
+                // Only the missing-`Origin` case is a documented 400. A
+                // preflight that carries `Origin` but no request-method is an
+                // ordinary non-allowed preflight and falls through to the 403
+                // below, whose message distinguishes an unconfigured bucket
+                // from a non-matching rule.
+                // Only a genuinely absent `Origin` gets the "needed" message. A
+                // header that is present but unusable — blank, unreadable, or
+                // sent on several lines — is not missing information, so it
+                // falls through to the denial below rather than telling the
+                // caller to add a header they already sent.
+                let origin = single_cors_header(&req.headers, "origin");
+                if origin.is_none() && req.headers.get("origin").is_none() {
+                    return Err(AwsServiceError::aws_error_with_headers(
+                        StatusCode::BAD_REQUEST,
+                        "BadRequest",
+                        "Insufficient information. Origin request header needed.",
+                        vary(),
+                    ));
+                }
+                let origin = origin.unwrap_or("");
                 let cors_config = {
                     let accounts = self.state.read();
                     let _empty_s3 = crate::state::S3State::new(&req.account_id, &req.region);
@@ -431,20 +572,65 @@ impl AwsService for S3Service {
                         .and_then(|b| b.cors_config.clone())
                 };
                 if let Some(ref config) = cors_config {
-                    let origin = req
+                    // `origin` came from the guard above, so it is a single
+                    // non-blank value. The request-method is read the same way:
+                    // two lines are not one method to allow, and approving on
+                    // the first would grant a method never evaluated.
+                    let request_method =
+                        single_cors_header(&req.headers, "access-control-request-method")
+                            .unwrap_or("");
+                    // Every header the preflight declares must be covered by
+                    // the rule, or S3 denies it — the denial message, the
+                    // `Vary` value and the docs all say this is evaluated.
+                    // `get_all`: the field may be sent as several lines, and
+                    // now that it gates approval, an unread second line would
+                    // approve headers the rule never allowed. For the same
+                    // reason a line that is not readable ASCII denies the
+                    // preflight instead of being skipped — this is a deny gate,
+                    // so an unreadable value must not fail open.
+                    let requested_headers: Option<Vec<String>> = req
                         .headers
-                        .get("origin")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("");
-                    let request_method = req
-                        .headers
-                        .get("access-control-request-method")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("");
+                        .get_all("access-control-request-headers")
+                        .iter()
+                        .map(|v| v.to_str().ok())
+                        .collect::<Option<Vec<_>>>()
+                        .map(|lines| {
+                            lines
+                                .iter()
+                                .flat_map(|v| v.split(','))
+                                .map(|h| h.trim().to_string())
+                                .filter(|h| !h.is_empty())
+                                // Deduped: this list is echoed back verbatim in
+                                // `Access-Control-Allow-Headers`, and a client
+                                // repeating a name should not produce
+                                // `x-a, x-a` where S3 sends it once.
+                                .fold(Vec::new(), |mut acc, h| {
+                                    if !acc
+                                        .iter()
+                                        .any(|seen: &String| seen.eq_ignore_ascii_case(&h))
+                                    {
+                                        acc.push(h);
+                                    }
+                                    acc
+                                })
+                        });
                     let rules = parse_cors_config(config);
-                    if let Some(rule) = find_cors_rule(&rules, origin, Some(request_method)) {
+                    if let Some((rule, requested_headers)) =
+                        requested_headers.as_ref().and_then(|rh| {
+                            find_cors_rule(&rules, origin, request_method, rh).map(|r| (r, rh))
+                        })
+                    {
                         let mut headers = HeaderMap::new();
-                        let matched_origin = if rule.allowed_origins.contains(&"*".to_string()) {
+                        // `*` only when the entry that actually matched is `*`. A rule
+                        // listing both a concrete origin and `*` matches the
+                        // concrete one first, and echoing `*` there would drop
+                        // allow-credentials for an origin the rule names.
+                        let matched_origin = if rule
+                            .allowed_origins
+                            .iter()
+                            .find(|o| origin_matches(origin, o))
+                            .is_some_and(|o| o == "*")
+                        {
                             "*"
                         } else {
                             origin
@@ -455,6 +641,22 @@ impl AwsService for S3Service {
                                 .parse()
                                 .unwrap_or_else(|_| http::HeaderValue::from_static("")),
                         );
+                        headers.insert("vary", http::HeaderValue::from_static(CORS_VARY));
+                        // A concrete allow-origin gets allow-credentials, as on
+                        // S3. Without it the Fetch spec fails any
+                        // `credentials: 'include'` request, so a preflight that
+                        // otherwise passes still blocks the real request. It is
+                        // never sent alongside `*`, which the spec forbids.
+                        if matched_origin != "*" {
+                            headers.insert(
+                                "access-control-allow-credentials",
+                                http::HeaderValue::from_static("true"),
+                            );
+                        }
+                        // The matched rule's whole method list, as S3 returns:
+                        // the browser caches one preflight per URL, so echoing
+                        // only the requested method would force a fresh
+                        // round-trip for every other method the rule allows.
                         headers.insert(
                             "access-control-allow-methods",
                             rule.allowed_methods
@@ -462,19 +664,19 @@ impl AwsService for S3Service {
                                 .parse()
                                 .unwrap_or_else(|_| http::HeaderValue::from_static("")),
                         );
-                        if !rule.allowed_headers.is_empty() {
-                            let ah = if rule.allowed_headers.contains(&"*".to_string()) {
-                                req.headers
-                                    .get("access-control-request-headers")
-                                    .and_then(|v| v.to_str().ok())
-                                    .unwrap_or("*")
-                                    .to_string()
-                            } else {
-                                rule.allowed_headers.join(", ")
-                            };
+                        // Echo the headers the preflight actually asked for —
+                        // reaching here means every one of them is covered by
+                        // the rule. Echoing `rule.allowed_headers` instead
+                        // would emit patterns like `x-amz-*`, which browsers
+                        // compare literally and would reject. With no
+                        // `Access-Control-Request-Headers` there is nothing to
+                        // allow, so the header is omitted, as on S3.
+                        if !requested_headers.is_empty() {
                             headers.insert(
                                 "access-control-allow-headers",
-                                ah.parse()
+                                requested_headers
+                                    .join(", ")
+                                    .parse()
                                     .unwrap_or_else(|_| http::HeaderValue::from_static("")),
                             );
                         }
@@ -495,20 +697,36 @@ impl AwsService for S3Service {
                         });
                     }
                 }
-                return Err(AwsServiceError::aws_error(
+                // S3 distinguishes the two denials, and so must this: a caller
+                // otherwise cannot tell an unconfigured bucket from one whose
+                // rules simply do not cover their request. Both carry `Vary` —
+                // even on an unconfigured bucket this 403 differs from the 400
+                // an `Origin`-less preflight gets, so the response still turns
+                // on `Origin` and must not be cached across origins.
+                let message = if cors_config.is_some() {
+                    "CORSResponse: This CORS request is not allowed. This is usually because \
+                     the evaluation of Origin, request method / Access-Control-Request-Method \
+                     or Access-Control-Request-Headers are not whitelisted by the resource's \
+                     CORS spec."
+                } else {
+                    "CORSResponse: CORS is not enabled for this bucket."
+                };
+                return Err(AwsServiceError::aws_error_with_headers(
                     StatusCode::FORBIDDEN,
-                    "CORSResponse",
-                    "CORS is not enabled for this bucket",
+                    "AccessForbidden",
+                    message,
+                    vary(),
                 ));
             }
         }
 
-        // Capture origin for CORS response headers
-        let origin_header = req
-            .headers
-            .get("origin")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+        // Capture origin for CORS response headers. A blank `Origin:` is
+        // treated as absent — the request carries nothing to evaluate CORS
+        // against, and letting it through would match a `*` rule and stamp
+        // CORS headers onto a request no browser would have sent that way.
+        // Same single-value read as the preflight path: a request carrying more
+        // than one `Origin` is not a single origin to allow.
+        let origin_header = single_cors_header(&req.headers, "origin").map(str::to_string);
 
         // Bucket-scoped sub-resource query params. If a request targets one
         // of these without a bucket in the path, S3 returns an error rather
@@ -576,264 +794,188 @@ impl AwsService for S3Service {
             ));
         }
 
-        let mut result = match (&req.method, bucket, key.as_deref()) {
-            // ListBuckets: GET /
-            (&Method::GET, None, None) => {
-                if req.query_params.get("x-id").map(|s| s.as_str()) == Some("ListDirectoryBuckets")
-                {
-                    self.list_directory_buckets(account_id, &req)
-                } else {
-                    self.list_buckets(account_id, &req)
+        let multipart_op = multipart.as_ref().map(|(op, _)| *op);
+        let mut result = match multipart {
+            Some((_, r)) => r,
+            None => match (&req.method, bucket, key.as_deref()) {
+                // ListBuckets: GET /
+                (&Method::GET, None, None) => {
+                    if req.query_params.get("x-id").map(|s| s.as_str())
+                        == Some("ListDirectoryBuckets")
+                    {
+                        self.list_directory_buckets(account_id, &req)
+                    } else {
+                        self.list_buckets(account_id, &req)
+                    }
                 }
-            }
 
-            // Bucket-level operations (no key)
-            (&Method::PUT, Some(b), None) => {
-                if req.query_params.contains_key("metadataAnnotationTable") {
-                    self.update_bucket_metadata_annotation_table_configuration(account_id, &req, b)
-                } else if req.query_params.contains_key("tagging") {
-                    self.put_bucket_tagging(account_id, &req, b)
-                } else if req.query_params.contains_key("acl") {
-                    self.put_bucket_acl(account_id, &req, b)
-                } else if req.query_params.contains_key("versioning") {
-                    self.put_bucket_versioning(account_id, &req, b)
-                } else if req.query_params.contains_key("cors") {
-                    self.put_bucket_cors(account_id, &req, b)
-                } else if req.query_params.contains_key("notification") {
-                    self.put_bucket_notification(account_id, &req, b)
-                } else if req.query_params.contains_key("website") {
-                    self.put_bucket_website(account_id, &req, b)
-                } else if req.query_params.contains_key("accelerate") {
-                    self.put_bucket_accelerate(account_id, &req, b)
-                } else if req.query_params.contains_key("publicAccessBlock") {
-                    self.put_public_access_block(account_id, &req, b)
-                } else if req.query_params.contains_key("encryption") {
-                    self.put_bucket_encryption(account_id, &req, b)
-                } else if req.query_params.contains_key("lifecycle") {
-                    self.put_bucket_lifecycle(account_id, &req, b)
-                } else if req.query_params.contains_key("logging") {
-                    self.put_bucket_logging(account_id, &req, b)
-                } else if req.query_params.contains_key("policy") {
-                    self.put_bucket_policy(account_id, &req, b)
-                } else if req.query_params.contains_key("object-lock") {
-                    self.put_object_lock_config(account_id, &req, b)
-                } else if req.query_params.contains_key("replication") {
-                    self.put_bucket_replication(account_id, &req, b)
-                } else if req.query_params.contains_key("ownershipControls") {
-                    self.put_bucket_ownership_controls(account_id, &req, b)
-                } else if req.query_params.contains_key("inventory") {
-                    self.put_bucket_inventory(account_id, &req, b)
-                } else if req.query_params.contains_key("analytics") {
-                    self.put_bucket_analytics_config(account_id, &req, b)
-                } else if req.query_params.contains_key("intelligent-tiering") {
-                    self.put_bucket_intelligent_tiering_config(account_id, &req, b)
-                } else if req.query_params.contains_key("metrics") {
-                    self.put_bucket_metrics_config(account_id, &req, b)
-                } else if req.query_params.contains_key("requestPayment") {
-                    self.put_bucket_request_payment(account_id, &req, b)
-                } else if req.query_params.contains_key("abac") {
-                    self.put_bucket_abac(account_id, &req, b)
-                } else if req.query_params.contains_key("metadataInventoryTable") {
-                    self.update_bucket_metadata_inventory_table(account_id, &req, b)
-                } else if req.query_params.contains_key("metadataJournalTable") {
-                    self.update_bucket_metadata_journal_table(account_id, &req, b)
-                } else {
-                    self.create_bucket(account_id, &req, b)
+                // Bucket-level operations (no key)
+                (&Method::PUT, Some(b), None) => {
+                    if req.query_params.contains_key("metadataAnnotationTable") {
+                        self.update_bucket_metadata_annotation_table_configuration(
+                            account_id, &req, b,
+                        )
+                    } else if req.query_params.contains_key("tagging") {
+                        self.put_bucket_tagging(account_id, &req, b)
+                    } else if req.query_params.contains_key("acl") {
+                        self.put_bucket_acl(account_id, &req, b)
+                    } else if req.query_params.contains_key("versioning") {
+                        self.put_bucket_versioning(account_id, &req, b)
+                    } else if req.query_params.contains_key("cors") {
+                        self.put_bucket_cors(account_id, &req, b)
+                    } else if req.query_params.contains_key("notification") {
+                        self.put_bucket_notification(account_id, &req, b)
+                    } else if req.query_params.contains_key("website") {
+                        self.put_bucket_website(account_id, &req, b)
+                    } else if req.query_params.contains_key("accelerate") {
+                        self.put_bucket_accelerate(account_id, &req, b)
+                    } else if req.query_params.contains_key("publicAccessBlock") {
+                        self.put_public_access_block(account_id, &req, b)
+                    } else if req.query_params.contains_key("encryption") {
+                        self.put_bucket_encryption(account_id, &req, b)
+                    } else if req.query_params.contains_key("lifecycle") {
+                        self.put_bucket_lifecycle(account_id, &req, b)
+                    } else if req.query_params.contains_key("logging") {
+                        self.put_bucket_logging(account_id, &req, b)
+                    } else if req.query_params.contains_key("policy") {
+                        self.put_bucket_policy(account_id, &req, b)
+                    } else if req.query_params.contains_key("object-lock") {
+                        self.put_object_lock_config(account_id, &req, b)
+                    } else if req.query_params.contains_key("replication") {
+                        self.put_bucket_replication(account_id, &req, b)
+                    } else if req.query_params.contains_key("ownershipControls") {
+                        self.put_bucket_ownership_controls(account_id, &req, b)
+                    } else if req.query_params.contains_key("inventory") {
+                        self.put_bucket_inventory(account_id, &req, b)
+                    } else if req.query_params.contains_key("analytics") {
+                        self.put_bucket_analytics_config(account_id, &req, b)
+                    } else if req.query_params.contains_key("intelligent-tiering") {
+                        self.put_bucket_intelligent_tiering_config(account_id, &req, b)
+                    } else if req.query_params.contains_key("metrics") {
+                        self.put_bucket_metrics_config(account_id, &req, b)
+                    } else if req.query_params.contains_key("requestPayment") {
+                        self.put_bucket_request_payment(account_id, &req, b)
+                    } else if req.query_params.contains_key("abac") {
+                        self.put_bucket_abac(account_id, &req, b)
+                    } else if req.query_params.contains_key("metadataInventoryTable") {
+                        self.update_bucket_metadata_inventory_table(account_id, &req, b)
+                    } else if req.query_params.contains_key("metadataJournalTable") {
+                        self.update_bucket_metadata_journal_table(account_id, &req, b)
+                    } else {
+                        self.create_bucket(account_id, &req, b)
+                    }
                 }
-            }
-            (&Method::DELETE, Some(b), None) => {
-                if req.query_params.contains_key("tagging") {
-                    self.delete_bucket_tagging(account_id, &req, b)
-                } else if req.query_params.contains_key("cors") {
-                    self.delete_bucket_cors(account_id, b)
-                } else if req.query_params.contains_key("website") {
-                    self.delete_bucket_website(account_id, b)
-                } else if req.query_params.contains_key("publicAccessBlock") {
-                    self.delete_public_access_block(account_id, b)
-                } else if req.query_params.contains_key("encryption") {
-                    self.delete_bucket_encryption(account_id, b)
-                } else if req.query_params.contains_key("lifecycle") {
-                    self.delete_bucket_lifecycle(account_id, b)
-                } else if req.query_params.contains_key("policy") {
-                    self.delete_bucket_policy(account_id, b)
-                } else if req.query_params.contains_key("replication") {
-                    self.delete_bucket_replication(account_id, b)
-                } else if req.query_params.contains_key("ownershipControls") {
-                    self.delete_bucket_ownership_controls(account_id, b)
-                } else if req.query_params.contains_key("inventory") {
-                    self.delete_bucket_inventory(account_id, &req, b)
-                } else if req.query_params.contains_key("analytics") {
-                    self.delete_bucket_analytics_config(account_id, &req, b)
-                } else if req.query_params.contains_key("intelligent-tiering") {
-                    self.delete_bucket_intelligent_tiering_config(account_id, &req, b)
-                } else if req.query_params.contains_key("metrics") {
-                    self.delete_bucket_metrics_config(account_id, &req, b)
-                } else if req.query_params.contains_key("metadataConfiguration") {
-                    self.delete_bucket_metadata_config(account_id, b)
-                } else if req.query_params.contains_key("metadataTable") {
-                    self.delete_bucket_metadata_table_config(account_id, b)
-                } else {
-                    self.delete_bucket(account_id, &req, b)
+                (&Method::DELETE, Some(b), None) => {
+                    if req.query_params.contains_key("tagging") {
+                        self.delete_bucket_tagging(account_id, &req, b)
+                    } else if req.query_params.contains_key("cors") {
+                        self.delete_bucket_cors(account_id, b)
+                    } else if req.query_params.contains_key("website") {
+                        self.delete_bucket_website(account_id, b)
+                    } else if req.query_params.contains_key("publicAccessBlock") {
+                        self.delete_public_access_block(account_id, b)
+                    } else if req.query_params.contains_key("encryption") {
+                        self.delete_bucket_encryption(account_id, b)
+                    } else if req.query_params.contains_key("lifecycle") {
+                        self.delete_bucket_lifecycle(account_id, b)
+                    } else if req.query_params.contains_key("policy") {
+                        self.delete_bucket_policy(account_id, b)
+                    } else if req.query_params.contains_key("replication") {
+                        self.delete_bucket_replication(account_id, b)
+                    } else if req.query_params.contains_key("ownershipControls") {
+                        self.delete_bucket_ownership_controls(account_id, b)
+                    } else if req.query_params.contains_key("inventory") {
+                        self.delete_bucket_inventory(account_id, &req, b)
+                    } else if req.query_params.contains_key("analytics") {
+                        self.delete_bucket_analytics_config(account_id, &req, b)
+                    } else if req.query_params.contains_key("intelligent-tiering") {
+                        self.delete_bucket_intelligent_tiering_config(account_id, &req, b)
+                    } else if req.query_params.contains_key("metrics") {
+                        self.delete_bucket_metrics_config(account_id, &req, b)
+                    } else if req.query_params.contains_key("metadataConfiguration") {
+                        self.delete_bucket_metadata_config(account_id, b)
+                    } else if req.query_params.contains_key("metadataTable") {
+                        self.delete_bucket_metadata_table_config(account_id, b)
+                    } else {
+                        self.delete_bucket(account_id, &req, b)
+                    }
                 }
-            }
-            (&Method::HEAD, Some(b), None) => self.head_bucket(account_id, b),
-            (&Method::GET, Some(b), None) => {
-                if req.query_params.contains_key("tagging") {
-                    self.get_bucket_tagging(account_id, &req, b)
-                } else if req.query_params.contains_key("location") {
-                    self.get_bucket_location(account_id, b)
-                } else if req.query_params.contains_key("acl") {
-                    self.get_bucket_acl(account_id, &req, b)
-                } else if req.query_params.contains_key("versioning") {
-                    self.get_bucket_versioning(account_id, b)
-                } else if req.query_params.contains_key("versions") {
-                    self.list_object_versions(account_id, &req, b)
-                } else if req.query_params.contains_key("object-lock") {
-                    self.get_object_lock_configuration(account_id, b)
-                } else if req.query_params.contains_key("cors") {
-                    self.get_bucket_cors(account_id, b)
-                } else if req.query_params.contains_key("notification") {
-                    self.get_bucket_notification(account_id, b)
-                } else if req.query_params.contains_key("website") {
-                    self.get_bucket_website(account_id, b)
-                } else if req.query_params.contains_key("accelerate") {
-                    self.get_bucket_accelerate(account_id, b)
-                } else if req.query_params.contains_key("publicAccessBlock") {
-                    self.get_public_access_block(account_id, b)
-                } else if req.query_params.contains_key("encryption") {
-                    self.get_bucket_encryption(account_id, b)
-                } else if req.query_params.contains_key("lifecycle") {
-                    self.get_bucket_lifecycle(account_id, b)
-                } else if req.query_params.contains_key("logging") {
-                    self.get_bucket_logging(account_id, b)
-                } else if req.query_params.contains_key("policy") {
-                    self.get_bucket_policy(account_id, b)
-                } else if req.query_params.contains_key("replication") {
-                    self.get_bucket_replication(account_id, b)
-                } else if req.query_params.contains_key("ownershipControls") {
-                    self.get_bucket_ownership_controls(account_id, b)
-                } else if req.query_params.contains_key("inventory") {
-                    if req.query_params.contains_key("id") {
-                        self.get_bucket_inventory(account_id, &req, b)
-                    } else {
-                        self.list_bucket_inventory_configurations(account_id, b)
-                    }
-                } else if req.query_params.contains_key("analytics") {
-                    if req.query_params.contains_key("id") {
-                        self.get_bucket_analytics_config(account_id, &req, b)
-                    } else {
-                        self.list_bucket_analytics_configurations(account_id, b)
-                    }
-                } else if req.query_params.contains_key("intelligent-tiering") {
-                    if req.query_params.contains_key("id") {
-                        self.get_bucket_intelligent_tiering_config(account_id, &req, b)
-                    } else {
-                        self.list_bucket_intelligent_tiering_configurations(account_id, b)
-                    }
-                } else if req.query_params.contains_key("metrics") {
-                    if req.query_params.contains_key("id") {
-                        self.get_bucket_metrics_config(account_id, &req, b)
-                    } else {
-                        self.list_bucket_metrics_configurations(account_id, b)
-                    }
-                } else if req.query_params.contains_key("requestPayment") {
-                    self.get_bucket_request_payment(account_id, b)
-                } else if req.query_params.contains_key("abac") {
-                    self.get_bucket_abac(account_id, b)
-                } else if req.query_params.contains_key("policyStatus") {
-                    self.get_bucket_policy_status(account_id, b)
-                } else if req.query_params.contains_key("metadataConfiguration") {
-                    self.get_bucket_metadata_config(account_id, b)
-                } else if req.query_params.contains_key("metadataTable") {
-                    self.get_bucket_metadata_table_config(account_id, b)
-                } else if req.query_params.contains_key("session") {
-                    self.create_session(account_id, &req, b)
-                } else if req.query_params.get("list-type").map(|s| s.as_str()) == Some("2") {
-                    self.list_objects_v2(account_id, &req, b)
-                } else if req.query_params.is_empty() {
-                    // If bucket has website config and no query params, serve index document
-                    let website_config = {
-                        let accounts = self.state.read();
-                        let _empty_s3 = crate::state::S3State::new(&req.account_id, &req.region);
-                        let state = accounts.get(&req.account_id).unwrap_or(&_empty_s3);
-                        state
-                            .buckets
-                            .get(b)
-                            .and_then(|bkt| bkt.website_config.clone())
-                    };
-                    if let Some(ref config) = website_config {
-                        if let Some(index_doc) = extract_xml_value(config, "Suffix").or_else(|| {
-                            extract_xml_value(config, "IndexDocument").and_then(|inner| {
-                                let open = "<Suffix>";
-                                let close = "</Suffix>";
-                                let s = inner.find(open)? + open.len();
-                                let e = inner.find(close)?;
-                                Some(inner[s..e].trim().to_string())
-                            })
-                        }) {
-                            self.serve_website_object(account_id, &req, b, &index_doc, config)
+                (&Method::HEAD, Some(b), None) => self.head_bucket(account_id, b),
+                (&Method::GET, Some(b), None) => {
+                    if req.query_params.contains_key("tagging") {
+                        self.get_bucket_tagging(account_id, &req, b)
+                    } else if req.query_params.contains_key("location") {
+                        self.get_bucket_location(account_id, b)
+                    } else if req.query_params.contains_key("acl") {
+                        self.get_bucket_acl(account_id, &req, b)
+                    } else if req.query_params.contains_key("versioning") {
+                        self.get_bucket_versioning(account_id, b)
+                    } else if req.query_params.contains_key("versions") {
+                        self.list_object_versions(account_id, &req, b)
+                    } else if req.query_params.contains_key("object-lock") {
+                        self.get_object_lock_configuration(account_id, b)
+                    } else if req.query_params.contains_key("cors") {
+                        self.get_bucket_cors(account_id, b)
+                    } else if req.query_params.contains_key("notification") {
+                        self.get_bucket_notification(account_id, b)
+                    } else if req.query_params.contains_key("website") {
+                        self.get_bucket_website(account_id, b)
+                    } else if req.query_params.contains_key("accelerate") {
+                        self.get_bucket_accelerate(account_id, b)
+                    } else if req.query_params.contains_key("publicAccessBlock") {
+                        self.get_public_access_block(account_id, b)
+                    } else if req.query_params.contains_key("encryption") {
+                        self.get_bucket_encryption(account_id, b)
+                    } else if req.query_params.contains_key("lifecycle") {
+                        self.get_bucket_lifecycle(account_id, b)
+                    } else if req.query_params.contains_key("logging") {
+                        self.get_bucket_logging(account_id, b)
+                    } else if req.query_params.contains_key("policy") {
+                        self.get_bucket_policy(account_id, b)
+                    } else if req.query_params.contains_key("replication") {
+                        self.get_bucket_replication(account_id, b)
+                    } else if req.query_params.contains_key("ownershipControls") {
+                        self.get_bucket_ownership_controls(account_id, b)
+                    } else if req.query_params.contains_key("inventory") {
+                        if req.query_params.contains_key("id") {
+                            self.get_bucket_inventory(account_id, &req, b)
                         } else {
-                            self.list_objects_v1(account_id, &req, b)
+                            self.list_bucket_inventory_configurations(account_id, b)
                         }
-                    } else {
-                        self.list_objects_v1(account_id, &req, b)
-                    }
-                } else {
-                    self.list_objects_v1(account_id, &req, b)
-                }
-            }
-
-            // Object-level operations
-            (&Method::PUT, Some(b), Some(k)) => {
-                if req.query_params.contains_key("annotation") {
-                    self.put_object_annotation(account_id, &req, b, k)
-                } else if req.query_params.contains_key("tagging") {
-                    self.put_object_tagging(account_id, &req, b, k)
-                } else if req.query_params.contains_key("acl") {
-                    self.put_object_acl(account_id, &req, b, k)
-                } else if req.query_params.contains_key("retention") {
-                    self.put_object_retention(account_id, &req, b, k)
-                } else if req.query_params.contains_key("legal-hold") {
-                    self.put_object_legal_hold(account_id, &req, b, k)
-                } else if req.query_params.contains_key("renameObject") {
-                    self.rename_object(account_id, &req, b, k)
-                } else if req.query_params.contains_key("encryption") {
-                    self.update_object_encryption(account_id, &req, b, k)
-                } else if req.headers.contains_key("x-amz-copy-source") {
-                    self.copy_object(account_id, &req, b, k)
-                } else {
-                    self.put_object(account_id, &req, b, k).await
-                }
-            }
-            (&Method::GET, Some(b), Some(k)) => {
-                if req.query_params.contains_key("annotation") {
-                    // Both `?annotation` reads share a URI; `AnnotationName`
-                    // selects one annotation, its absence lists them.
-                    if req.query_params.contains_key("AnnotationName") {
-                        self.get_object_annotation(account_id, &req, b, k)
-                    } else {
-                        self.list_object_annotations(account_id, &req, b, k)
-                    }
-                } else if req.query_params.contains_key("tagging") {
-                    self.get_object_tagging(account_id, &req, b, k)
-                } else if req.query_params.contains_key("acl") {
-                    self.get_object_acl(account_id, &req, b, k)
-                } else if req.query_params.contains_key("retention") {
-                    self.get_object_retention(account_id, &req, b, k)
-                } else if req.query_params.contains_key("legal-hold") {
-                    self.get_object_legal_hold(account_id, &req, b, k)
-                } else if req.query_params.contains_key("attributes") {
-                    self.get_object_attributes(account_id, &req, b, k)
-                } else if req.query_params.contains_key("torrent") {
-                    self.get_object_torrent(account_id, &req, b, k)
-                } else {
-                    let result = self.get_object(account_id, &req, b, k);
-                    // If object not found and bucket has website config, serve error document
-                    let is_not_found = matches!(
-                        &result,
-                        Err(e) if e.code() == "NoSuchKey"
-                    );
-                    if is_not_found {
+                    } else if req.query_params.contains_key("analytics") {
+                        if req.query_params.contains_key("id") {
+                            self.get_bucket_analytics_config(account_id, &req, b)
+                        } else {
+                            self.list_bucket_analytics_configurations(account_id, b)
+                        }
+                    } else if req.query_params.contains_key("intelligent-tiering") {
+                        if req.query_params.contains_key("id") {
+                            self.get_bucket_intelligent_tiering_config(account_id, &req, b)
+                        } else {
+                            self.list_bucket_intelligent_tiering_configurations(account_id, b)
+                        }
+                    } else if req.query_params.contains_key("metrics") {
+                        if req.query_params.contains_key("id") {
+                            self.get_bucket_metrics_config(account_id, &req, b)
+                        } else {
+                            self.list_bucket_metrics_configurations(account_id, b)
+                        }
+                    } else if req.query_params.contains_key("requestPayment") {
+                        self.get_bucket_request_payment(account_id, b)
+                    } else if req.query_params.contains_key("abac") {
+                        self.get_bucket_abac(account_id, b)
+                    } else if req.query_params.contains_key("policyStatus") {
+                        self.get_bucket_policy_status(account_id, b)
+                    } else if req.query_params.contains_key("metadataConfiguration") {
+                        self.get_bucket_metadata_config(account_id, b)
+                    } else if req.query_params.contains_key("metadataTable") {
+                        self.get_bucket_metadata_table_config(account_id, b)
+                    } else if req.query_params.contains_key("session") {
+                        self.create_session(account_id, &req, b)
+                    } else if req.query_params.get("list-type").map(|s| s.as_str()) == Some("2") {
+                        self.list_objects_v2(account_id, &req, b)
+                    } else if req.query_params.is_empty() {
+                        // If bucket has website config and no query params, serve index document
                         let website_config = {
                             let accounts = self.state.read();
                             let _empty_s3 =
@@ -845,82 +987,183 @@ impl AwsService for S3Service {
                                 .and_then(|bkt| bkt.website_config.clone())
                         };
                         if let Some(ref config) = website_config {
-                            if let Some(error_key) = extract_xml_value(config, "ErrorDocument")
-                                .and_then(|inner| {
-                                    let open = "<Key>";
-                                    let close = "</Key>";
-                                    let s = inner.find(open)? + open.len();
-                                    let e = inner.find(close)?;
-                                    Some(inner[s..e].trim().to_string())
+                            if let Some(index_doc) =
+                                extract_xml_value(config, "Suffix").or_else(|| {
+                                    extract_xml_value(config, "IndexDocument").and_then(|inner| {
+                                        let open = "<Suffix>";
+                                        let close = "</Suffix>";
+                                        let s = inner.find(open)? + open.len();
+                                        let e = inner.find(close)?;
+                                        Some(inner[s..e].trim().to_string())
+                                    })
                                 })
-                                .or_else(|| extract_xml_value(config, "Key"))
                             {
-                                return self.serve_website_error(account_id, &req, b, &error_key);
+                                self.serve_website_object(account_id, &req, b, &index_doc, config)
+                            } else {
+                                self.list_objects_v1(account_id, &req, b)
+                            }
+                        } else {
+                            self.list_objects_v1(account_id, &req, b)
+                        }
+                    } else {
+                        self.list_objects_v1(account_id, &req, b)
+                    }
+                }
+
+                // Object-level operations
+                (&Method::PUT, Some(b), Some(k)) => {
+                    if req.query_params.contains_key("annotation") {
+                        self.put_object_annotation(account_id, &req, b, k)
+                    } else if req.query_params.contains_key("tagging") {
+                        self.put_object_tagging(account_id, &req, b, k)
+                    } else if req.query_params.contains_key("acl") {
+                        self.put_object_acl(account_id, &req, b, k)
+                    } else if req.query_params.contains_key("retention") {
+                        self.put_object_retention(account_id, &req, b, k)
+                    } else if req.query_params.contains_key("legal-hold") {
+                        self.put_object_legal_hold(account_id, &req, b, k)
+                    } else if req.query_params.contains_key("renameObject") {
+                        self.rename_object(account_id, &req, b, k)
+                    } else if req.query_params.contains_key("encryption") {
+                        self.update_object_encryption(account_id, &req, b, k)
+                    } else if req.headers.contains_key("x-amz-copy-source") {
+                        self.copy_object(account_id, &req, b, k)
+                    } else {
+                        self.put_object(account_id, &req, b, k).await
+                    }
+                }
+                (&Method::GET, Some(b), Some(k)) => {
+                    if req.query_params.contains_key("annotation") {
+                        // Both `?annotation` reads share a URI; `AnnotationName`
+                        // selects one annotation, its absence lists them.
+                        if req.query_params.contains_key("AnnotationName") {
+                            self.get_object_annotation(account_id, &req, b, k)
+                        } else {
+                            self.list_object_annotations(account_id, &req, b, k)
+                        }
+                    } else if req.query_params.contains_key("tagging") {
+                        self.get_object_tagging(account_id, &req, b, k)
+                    } else if req.query_params.contains_key("acl") {
+                        self.get_object_acl(account_id, &req, b, k)
+                    } else if req.query_params.contains_key("retention") {
+                        self.get_object_retention(account_id, &req, b, k)
+                    } else if req.query_params.contains_key("legal-hold") {
+                        self.get_object_legal_hold(account_id, &req, b, k)
+                    } else if req.query_params.contains_key("attributes") {
+                        self.get_object_attributes(account_id, &req, b, k)
+                    } else if req.query_params.contains_key("torrent") {
+                        self.get_object_torrent(account_id, &req, b, k)
+                    } else {
+                        let result = self.get_object(account_id, &req, b, k);
+                        // If object not found and bucket has website config, serve error document
+                        let is_not_found = matches!(
+                            &result,
+                            Err(e) if e.code() == "NoSuchKey"
+                        );
+                        let mut return_website_error = None;
+                        if is_not_found {
+                            let website_config = {
+                                let accounts = self.state.read();
+                                let _empty_s3 =
+                                    crate::state::S3State::new(&req.account_id, &req.region);
+                                let state = accounts.get(&req.account_id).unwrap_or(&_empty_s3);
+                                state
+                                    .buckets
+                                    .get(b)
+                                    .and_then(|bkt| bkt.website_config.clone())
+                            };
+                            if let Some(ref config) = website_config {
+                                if let Some(error_key) = extract_xml_value(config, "ErrorDocument")
+                                    .and_then(|inner| {
+                                        let open = "<Key>";
+                                        let close = "</Key>";
+                                        let s = inner.find(open)? + open.len();
+                                        let e = inner.find(close)?;
+                                        Some(inner[s..e].trim().to_string())
+                                    })
+                                    .or_else(|| extract_xml_value(config, "Key"))
+                                {
+                                    // Fall through to the shared tail (CORS headers,
+                                    // access logging) rather than returning early,
+                                    // so a website error document is treated like
+                                    // any other response.
+                                    return_website_error = Some(
+                                        self.serve_website_error(account_id, &req, b, &error_key),
+                                    );
+                                }
                             }
                         }
+                        return_website_error.unwrap_or(result)
                     }
-                    result
                 }
-            }
-            (&Method::DELETE, Some(b), Some(k)) => {
-                if req.query_params.contains_key("annotation") {
-                    self.delete_object_annotation(account_id, &req, b, k)
-                } else if req.query_params.contains_key("tagging") {
-                    self.delete_object_tagging(account_id, b, k)
-                } else {
-                    self.delete_object(account_id, &req, b, k)
+                (&Method::DELETE, Some(b), Some(k)) => {
+                    if req.query_params.contains_key("annotation") {
+                        self.delete_object_annotation(account_id, &req, b, k)
+                    } else if req.query_params.contains_key("tagging") {
+                        self.delete_object_tagging(account_id, b, k)
+                    } else {
+                        self.delete_object(account_id, &req, b, k)
+                    }
                 }
-            }
-            (&Method::HEAD, Some(b), Some(k)) => self.head_object(account_id, &req, b, k),
+                (&Method::HEAD, Some(b), Some(k)) => self.head_object(account_id, &req, b, k),
 
-            // POST /{bucket}?delete — batch delete
-            (&Method::POST, Some(b), None) if req.query_params.contains_key("delete") => {
-                self.delete_objects(account_id, &req, b)
-            }
-            (&Method::POST, Some(b), None)
-                if req.query_params.contains_key("metadataConfiguration") =>
-            {
-                self.create_bucket_metadata_config(account_id, &req, b)
-            }
-            (&Method::POST, Some(b), None) if req.query_params.contains_key("metadataTable") => {
-                self.create_bucket_metadata_table_config(account_id, &req, b)
-            }
-            (&Method::POST, Some(b), Some(k))
-                if req.query_params.get("select-type").map(|s| s.as_str()) == Some("2") =>
-            {
-                self.select_object_content(account_id, &req, b, k)
-            }
-            (&Method::POST, Some("WriteGetObjectResponse"), None) => {
-                self.write_get_object_response(account_id, &req)
-            }
+                // POST /{bucket}?delete — batch delete
+                (&Method::POST, Some(b), None) if req.query_params.contains_key("delete") => {
+                    self.delete_objects(account_id, &req, b)
+                }
+                (&Method::POST, Some(b), None)
+                    if req.query_params.contains_key("metadataConfiguration") =>
+                {
+                    self.create_bucket_metadata_config(account_id, &req, b)
+                }
+                (&Method::POST, Some(b), None)
+                    if req.query_params.contains_key("metadataTable") =>
+                {
+                    self.create_bucket_metadata_table_config(account_id, &req, b)
+                }
+                (&Method::POST, Some(b), Some(k))
+                    if req.query_params.get("select-type").map(|s| s.as_str()) == Some("2") =>
+                {
+                    self.select_object_content(account_id, &req, b, k)
+                }
+                (&Method::POST, Some("WriteGetObjectResponse"), None) => {
+                    self.write_get_object_response(account_id, &req)
+                }
 
-            // POST /{bucket} with a multipart/form-data body — POST Object
-            // (browser-form "POST Policy" upload, the target of boto3's
-            // `generate_presigned_post`). Guarded on Content-Type so it
-            // doesn't shadow the `?delete` / metadata-config arms above,
-            // which also match `(POST, Some(b), None)` but carry their own
-            // query-param guards.
-            (&Method::POST, Some(b), None)
-                if req
-                    .headers
-                    .get(http::header::CONTENT_TYPE)
-                    .and_then(|v| v.to_str().ok())
-                    .is_some_and(|ct| {
-                        ct.to_ascii_lowercase().starts_with("multipart/form-data")
-                    }) =>
-            {
-                self.post_object(account_id, &req, b).await
-            }
+                // POST /{bucket} with a multipart/form-data body — POST Object
+                // (browser-form "POST Policy" upload, the target of boto3's
+                // `generate_presigned_post`). Guarded on Content-Type so it
+                // doesn't shadow the `?delete` / metadata-config arms above,
+                // which also match `(POST, Some(b), None)` but carry their own
+                // query-param guards.
+                (&Method::POST, Some(b), None)
+                    if req
+                        .headers
+                        .get(http::header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .is_some_and(|ct| {
+                            ct.to_ascii_lowercase().starts_with("multipart/form-data")
+                        }) =>
+                {
+                    self.post_object(account_id, &req, b).await
+                }
 
-            _ => Err(AwsServiceError::aws_error(
-                StatusCode::METHOD_NOT_ALLOWED,
-                "MethodNotAllowed",
-                "The specified method is not allowed against this resource",
-            )),
+                _ => Err(AwsServiceError::aws_error(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "MethodNotAllowed",
+                    "The specified method is not allowed against this resource",
+                )),
+            },
         };
 
         // Apply CORS headers to the response if Origin was present
-        if let (Some(ref origin), Some(b_name)) = (&origin_header, bucket) {
+        // Keyed on the raw header, not the usable value: an `Origin` that is
+        // blank, unreadable, or split across conflicting lines still makes the
+        // response origin-dependent, so it needs `Vary` even though it gets no
+        // allow-origin. Skipping the block entirely would ship an ACAO-less
+        // body with no `Vary`, which a shared cache then replays to a
+        // legitimate origin — the hole this whole change exists to close.
+        if let Some(b_name) = bucket.filter(|_| req.headers.contains_key("origin")) {
             let cors_config = {
                 let accounts = self.state.read();
                 let _empty_s3 = crate::state::S3State::new(&req.account_id, &req.region);
@@ -931,29 +1174,49 @@ impl AwsService for S3Service {
                     .and_then(|b| b.cors_config.clone())
             };
             if let Some(ref config) = cors_config {
+                // `Vary` goes on every response we evaluated CORS for, matching
+                // rule or not: a disallowed origin gets no ACAO, and that
+                // ACAO-less response must not be cached and replayed to an
+                // allowed origin.
+                set_cors_header(&mut result, "vary", CORS_VARY);
                 let rules = parse_cors_config(config);
-                if let Some(rule) = find_cors_rule(&rules, origin, None) {
-                    if let Ok(ref mut resp) = result {
-                        let matched_origin = if rule.allowed_origins.contains(&"*".to_string()) {
-                            "*"
-                        } else {
-                            origin
-                        };
-                        resp.headers.insert(
-                            "access-control-allow-origin",
-                            matched_origin
-                                .parse()
-                                .unwrap_or_else(|_| http::HeaderValue::from_static("")),
+                // The actual request is matched on method as well as origin, as
+                // on S3: a rule allowing only GET must not hand an ACAO to a
+                // DELETE from that origin, which would let the browser pass the
+                // response to the page.
+                // Empty requested-headers: only a preflight declares headers.
+                // `origin_header` is `None` when the header was present but
+                // unusable; `find_cors_rule` refuses an empty origin, so such a
+                // request keeps the `Vary` above and gets no allow-origin.
+                let origin = origin_header.as_deref().unwrap_or("");
+                if let Some(rule) = find_cors_rule(&rules, origin, req.method.as_str(), &[]) {
+                    // `*` only when the entry that actually matched is `*`. A rule
+                    // listing both a concrete origin and `*` matches the
+                    // concrete one first, and echoing `*` there would drop
+                    // allow-credentials for an origin the rule names.
+                    let matched_origin = if rule
+                        .allowed_origins
+                        .iter()
+                        .find(|o| origin_matches(origin, o))
+                        .is_some_and(|o| o == "*")
+                    {
+                        "*"
+                    } else {
+                        origin
+                    };
+                    // Errors get the allow-origin too: S3 answers a 404 for an
+                    // allowed origin with ACAO, so a `mode: 'cors'` fetch sees
+                    // a real 404 instead of an opaque CORS network error.
+                    set_cors_header(&mut result, "access-control-allow-origin", matched_origin);
+                    if matched_origin != "*" {
+                        set_cors_header(&mut result, "access-control-allow-credentials", "true");
+                    }
+                    if !rule.expose_headers.is_empty() {
+                        set_cors_header(
+                            &mut result,
+                            "access-control-expose-headers",
+                            &rule.expose_headers.join(", "),
                         );
-                        if !rule.expose_headers.is_empty() {
-                            resp.headers.insert(
-                                "access-control-expose-headers",
-                                rule.expose_headers
-                                    .join(", ")
-                                    .parse()
-                                    .unwrap_or_else(|_| http::HeaderValue::from_static("")),
-                            );
-                        }
                     }
                 }
             }
@@ -965,7 +1228,8 @@ impl AwsService for S3Service {
                 Ok(resp) => resp.status.as_u16(),
                 Err(e) => e.status().as_u16(),
             };
-            let op = logging::operation_name(&req.method, key.as_deref());
+            let op = multipart_op
+                .unwrap_or_else(|| logging::operation_name(&req.method, key.as_deref()));
             logging::maybe_write_access_log(
                 &self.state,
                 &self.store,
@@ -3004,20 +3268,72 @@ pub(crate) struct CorsRule {
     max_age_seconds: Option<u32>,
 }
 
+/// Remove `<!-- ... -->` spans so tag scanning sees only live markup.
+///
+/// Every scan of a CORS body goes through this, so validation and request-time
+/// parsing always see the same markup — otherwise a commented-out rule could
+/// validate as absent and then be honored at request time. An unterminated
+/// comment discards the rest of the body, so whatever it opened is treated as
+/// absent by both sides alike.
+pub(crate) fn strip_xml_comments(xml: &str) -> String {
+    let mut out = String::with_capacity(xml.len());
+    let mut rest = xml;
+    while let Some(start) = rest.find("<!--") {
+        out.push_str(&rest[..start]);
+        match rest[start + 4..].find("-->") {
+            Some(end) => rest = &rest[start + 4 + end + 3..],
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Parse CORS configuration XML into rules.
 pub(crate) fn parse_cors_config(xml: &str) -> Vec<CorsRule> {
+    // Comments are stripped here, not only in `validate_cors_xml`: the stored
+    // body is the raw text, so if the two disagreed a `<CORSRule>` inside an
+    // `<!-- ... -->` would pass validation as absent and then go live at
+    // request time, handing out an allow-origin the caller never wrote.
+    let stripped = strip_xml_comments(xml);
     let mut rules = Vec::new();
-    let mut remaining = xml;
+    let mut remaining = stripped.as_str();
     while let Some(start) = remaining.find("<CORSRule>") {
         let after = &remaining[start + 10..];
         if let Some(end) = after.find("</CORSRule>") {
             let block = &after[..end];
-            let allowed_origins = extract_all_xml_values(block, "AllowedOrigin");
-            let allowed_methods = extract_all_xml_values(block, "AllowedMethod");
-            let allowed_headers = extract_all_xml_values(block, "AllowedHeader");
-            let expose_headers = extract_all_xml_values(block, "ExposeHeader");
+            // Values are trimmed: `extract_all_xml_values` keeps the raw text,
+            // so a pretty-printed config stores "\n  GET\n". `put_bucket_cors`
+            // trims before validating and therefore accepts it, and an
+            // untrimmed value matches no method, no origin, and parses to no
+            // header — the bucket would go silently CORS-dead.
+            // Empty values are dropped, not kept as `""`: an empty entry
+            // matches nothing meaningful, and an empty `<AllowedMethod/>`
+            // alongside a real one would otherwise match the `""` that a
+            // preflight with no `Access-Control-Request-Method` falls back to,
+            // approving a request that must be denied. `validate_cors_xml`
+            // still rejects a rule left with no usable value at all.
+            let trimmed = |tag| {
+                extract_all_xml_values(block, tag)
+                    .into_iter()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+                    .collect::<Vec<_>>()
+            };
+            let allowed_origins = trimmed("AllowedOrigin");
+            // Not uppercased: `put_bucket_cors` validates `<AllowedMethod>`
+            // case-sensitively against the canonical verbs and rejects anything
+            // else, so a stored config only ever holds `GET`/`PUT`/... — and
+            // `Access-Control-Allow-Methods` is echoed from this list, which
+            // browsers compare case-sensitively.
+            let allowed_methods = trimmed("AllowedMethod");
+            let allowed_headers = trimmed("AllowedHeader");
+            let expose_headers = trimmed("ExposeHeader");
+            // Trimmed for the same reason as the lists above: an untrimmed
+            // "\n  3600\n" fails to parse, and the preflight would silently
+            // ship without `Access-Control-Max-Age`, re-preflighting forever.
             let max_age_seconds =
-                extract_xml_value(block, "MaxAgeSeconds").and_then(|s| s.parse().ok());
+                extract_xml_value(block, "MaxAgeSeconds").and_then(|s| s.trim().parse().ok());
             rules.push(CorsRule {
                 allowed_origins,
                 allowed_methods,
@@ -3033,34 +3349,150 @@ pub(crate) fn parse_cors_config(xml: &str) -> Vec<CorsRule> {
     rules
 }
 
-/// Match an origin against a CORS allowed origin pattern (supports "*" wildcard).
-pub(crate) fn origin_matches(origin: &str, pattern: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-    // Simple wildcard: *.example.com
-    if let Some(suffix) = pattern.strip_prefix('*') {
-        return origin.ends_with(suffix);
-    }
-    origin == pattern
+/// Match a requested header name against an `AllowedHeader` pattern.
+///
+/// AWS permits one `*` per `AllowedHeader`, and `x-amz-*` is a common config.
+/// Header names are case-insensitive.
+pub(crate) fn header_matches(header: &str, pattern: &str) -> bool {
+    wildcard_matches(header, pattern, false)
 }
 
-/// Find the matching CORS rule for a given origin and method.
+/// Match `value` against a `*`-wildcard pattern.
+///
+/// `PutBucketCors` rejects a value with more than one `*`, but a config stored
+/// by an earlier build or restored from a snapshot never passes that check, so
+/// the matcher handles any number rather than depending on an invariant it
+/// cannot enforce. A leading/trailing `*` matches an empty run, and segments
+/// must appear in order without overlapping.
+fn wildcard_matches(value: &str, pattern: &str, case_sensitive: bool) -> bool {
+    let eq = |a: &str, b: &str| {
+        if case_sensitive {
+            a == b
+        } else {
+            a.eq_ignore_ascii_case(b)
+        }
+    };
+    let mut segments = pattern.split('*');
+    let Some(prefix) = segments.next() else {
+        return false;
+    };
+    // No wildcard at all: the whole value has to match.
+    let Some(mut rest) = value.strip_prefix_matching(prefix, &eq) else {
+        return false;
+    };
+    if !pattern.contains('*') {
+        return rest.is_empty();
+    }
+    let segments: Vec<&str> = segments.collect();
+    let (last, middles) = segments.split_last().expect("pattern contains a wildcard");
+    for seg in middles {
+        match rest.find_matching(seg, &eq) {
+            Some(at) => rest = &rest[at + seg.len()..],
+            None => return false,
+        }
+    }
+    // The final segment anchors to the end, and must not overlap what the
+    // earlier segments already consumed. Boundary-checked like the helpers
+    // above, so no arm of this function depends on the ASCII contract.
+    let at = rest.len().checked_sub(last.len());
+    at.is_some_and(|at| rest.is_char_boundary(at) && eq(&rest[at..], last))
+}
+
+/// Helpers keeping [`wildcard_matches`] readable. Both operate on ASCII, which
+/// every caller guarantees: header values come from `HeaderValue::to_str`.
+trait AsciiMatch {
+    fn strip_prefix_matching<'a>(
+        &'a self,
+        p: &str,
+        eq: &dyn Fn(&str, &str) -> bool,
+    ) -> Option<&'a str>;
+    fn find_matching(&self, needle: &str, eq: &dyn Fn(&str, &str) -> bool) -> Option<usize>;
+}
+
+impl AsciiMatch for str {
+    fn strip_prefix_matching<'a>(
+        &'a self,
+        p: &str,
+        eq: &dyn Fn(&str, &str) -> bool,
+    ) -> Option<&'a str> {
+        // Boundary-checked rather than relying on the ASCII contract: callers
+        // satisfy it today, but a future one passing XML or query text would
+        // otherwise get a request-killing panic on a split multi-byte char.
+        (self.len() >= p.len() && self.is_char_boundary(p.len()) && eq(&self[..p.len()], p))
+            .then(|| &self[p.len()..])
+    }
+
+    fn find_matching(&self, needle: &str, eq: &dyn Fn(&str, &str) -> bool) -> Option<usize> {
+        if needle.is_empty() {
+            return Some(0);
+        }
+        // Must precede the range: `saturating_sub` would otherwise yield `0..=0`
+        // for a needle longer than the haystack, and the slice below would run
+        // off the end.
+        if needle.len() > self.len() {
+            return None;
+        }
+        (0..=self.len() - needle.len()).find(|&i| {
+            self.is_char_boundary(i)
+                && self.is_char_boundary(i + needle.len())
+                && eq(&self[i..i + needle.len()], needle)
+        })
+    }
+}
+
+/// Match an origin against a CORS allowed origin pattern.
+///
+/// AWS permits one `*` anywhere in `AllowedOrigin`, and its own documentation
+/// uses `https://*.example.com` — a pattern that a leading-`*`-only matcher
+/// silently fails, leaving the bucket CORS-dead. Origins compare
+/// case-sensitively, unlike header names.
+pub(crate) fn origin_matches(origin: &str, pattern: &str) -> bool {
+    wildcard_matches(origin, pattern, true)
+}
+
+/// Find the matching CORS rule for a given origin and HTTP method.
+///
+/// Methods compare exactly: `put_bucket_cors` accepts only the canonical
+/// uppercase verbs, so a stored rule cannot hold anything else, and
+/// [`parse_cors_config`] trims the pretty-printed whitespace that would
+/// otherwise make an otherwise-valid value miss.
+///
+/// `requested_headers` are the `Access-Control-Request-Headers` of a preflight,
+/// each of which must be covered by the rule's `AllowedHeader`. An actual
+/// request passes an empty slice: only a preflight declares headers.
 pub(crate) fn find_cors_rule<'a>(
     rules: &'a [CorsRule],
     origin: &str,
-    method: Option<&str>,
+    method: &str,
+    requested_headers: &[String],
 ) -> Option<&'a CorsRule> {
+    // An absent or unusable `Origin` / `Access-Control-Request-Method` arrives
+    // as `""`, which is neither an origin nor a method any rule can allow — and
+    // `""` would otherwise satisfy a bare `*`. Guarded here as well as at parse
+    // time so the deny does not depend on the stored config having no empty
+    // entry.
+    if origin.is_empty() || method.is_empty() {
+        return None;
+    }
+    // A rule matches the request as a whole — origin, method, and every
+    // requested header — and the first such rule wins, as on S3.
+    //
+    // Selecting on origin+method alone and then testing headers against that
+    // one rule looks more conservative but is simply wrong: given a broad rule
+    // followed by a narrower one that explicitly allows `content-type`, it
+    // denies the request the bucket owner wrote that second rule to permit.
+    // Refusing what the config plainly allows is not a safer failure, just a
+    // broken one.
     rules.iter().find(|rule| {
         let origin_ok = rule
             .allowed_origins
             .iter()
             .any(|o| origin_matches(origin, o));
-        let method_ok = match method {
-            Some(m) => rule.allowed_methods.iter().any(|am| am == m),
-            None => true,
-        };
-        origin_ok && method_ok
+        let method_ok = rule.allowed_methods.iter().any(|am| am == method);
+        let headers_ok = requested_headers
+            .iter()
+            .all(|h| rule.allowed_headers.iter().any(|ah| header_matches(h, ah)));
+        origin_ok && method_ok && headers_ok
     })
 }
 

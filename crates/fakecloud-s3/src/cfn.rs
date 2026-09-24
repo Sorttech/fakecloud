@@ -51,6 +51,58 @@ pub fn apply_cfn_bucket_properties(
     let Some(obj) = props.as_object() else {
         return Ok(());
     };
+
+    // Validate before persisting anything. Each property below writes through
+    // to the store as it goes, so a validation failure partway would leave the
+    // bucket with some subresources written and others not. Bound once so the
+    // string that was validated is the same one that gets stored.
+    // An absent `CorsConfiguration` is a no-op, and an empty `CorsRules: []`
+    // expresses "no CORS" — but `CorsRules` present with the wrong shape (a
+    // typo, or an intrinsic that resolved to an object or string) is a property
+    // error. Skipping that silently deploys a green stack with no CORS applied
+    // and nothing saying why, while every browser request then fails. Real
+    // CloudFormation fails the resource on a type mismatch, so this does too.
+    // An explicit `null` counts as absent, like every sibling property here —
+    // only a `CorsConfiguration` that is actually an object is held to the
+    // shape, and the message says which of the two problems it is.
+    match obj.get("CorsConfiguration") {
+        None | Some(Value::Null) => {}
+        Some(Value::Object(cors)) => match cors.get("CorsRules") {
+            Some(rules) if rules.as_array().is_none() => {
+                return Err("CorsConfiguration: CorsRules must be a list of rules".to_string());
+            }
+            Some(rules) => {
+                // Named here rather than left to the XML validator, which can
+                // only answer `MalformedXML` and never says which property was
+                // wrong. `as f64` also saturates, so a huge value would
+                // otherwise render as `18446744073709551615`.
+                for rule in rules.as_array().into_iter().flatten() {
+                    let bad_max_age = rule.get("MaxAge").is_some_and(|v| match v {
+                        Value::Number(_) => !v.as_f64().is_some_and(|n| {
+                            n.fract() == 0.0 && (0.0..=f64::from(u32::MAX)).contains(&n)
+                        }),
+                        Value::String(s) => s.trim().parse::<u32>().is_err(),
+                        _ => true,
+                    });
+                    if bad_max_age {
+                        return Err(
+                            "CorsConfiguration: MaxAge must be a whole number of seconds"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+            None => return Err("CorsConfiguration: CorsRules is required".to_string()),
+        },
+        Some(_) => {
+            return Err("CorsConfiguration: must be an object with a CorsRules list".to_string());
+        }
+    }
+    let cors_xml = obj.get("CorsConfiguration").and_then(build_cors_xml);
+    if let Some(xml) = &cors_xml {
+        crate::service::config::validate_cors_xml(xml)
+            .map_err(|(code, message)| format!("{code}: {message}"))?;
+    }
     // `versioning` and `eventbridge_enabled` live in the bucket meta snapshot,
     // so a single `put_bucket_meta` at the end covers both — mirroring how the
     // versioning/notification handlers persist them.
@@ -110,10 +162,35 @@ pub fn apply_cfn_bucket_properties(
         }
     }
 
-    if let Some(c) = obj.get("CorsConfiguration") {
-        if let Some(xml) = build_cors_xml(c) {
-            bucket.cors_config = Some(xml.clone());
-            persist_sub(store, &bucket.name, BucketSubresource::Cors, &xml)?;
+    // A `CorsConfiguration` that is present but expresses no rules clears the
+    // bucket's CORS config. Leaving the previous one in place would keep the
+    // bucket serving `Access-Control-Allow-Origin` after the template said it
+    // should not. An absent property still leaves existing state untouched,
+    // matching CFN update semantics for everything else here.
+    // Only an explicitly empty `CorsRules: []` clears. `build_cors_xml` also
+    // returns `None` when `CorsRules` is absent or not an array, and treating
+    // those as "clear" would delete a live CORS config because an intrinsic
+    // resolved to the wrong shape — every preflight then failing with nothing
+    // in the stack output to say why.
+    let clears_cors = obj
+        .get("CorsConfiguration")
+        .and_then(|c| c.get("CorsRules"))
+        .and_then(Value::as_array)
+        .is_some_and(|rules| rules.is_empty());
+    if cors_xml.is_some() || clears_cors {
+        match cors_xml {
+            Some(xml) => {
+                // The exact string validated above, before any subresource was
+                // persisted.
+                bucket.cors_config = Some(xml.clone());
+                persist_sub(store, &bucket.name, BucketSubresource::Cors, &xml)?;
+            }
+            None => {
+                bucket.cors_config = None;
+                store
+                    .delete_bucket_subresource(&bucket.name, BucketSubresource::Cors)
+                    .map_err(|e| persist_err("Cors", &bucket.name, e))?;
+            }
         }
     }
 
@@ -482,11 +559,22 @@ fn build_cors_xml(c: &Value) -> Option<String> {
         push_string_list(&mut body, rule.get("AllowedMethods"), "AllowedMethod");
         push_string_list(&mut body, rule.get("AllowedOrigins"), "AllowedOrigin");
         push_string_list(&mut body, rule.get("ExposedHeaders"), "ExposeHeader");
-        if let Some(max_age) = rule.get("MaxAge").and_then(as_scalar) {
-            body.push_str(&format!(
-                "<MaxAgeSeconds>{}</MaxAgeSeconds>",
-                xml_escape(&max_age)
-            ));
+        // Rendered as an integer. `as_scalar` stringifies a JSON number
+        // verbatim, so `MaxAge: 3600.0` would emit `3600.0` — which
+        // `validate_cors_xml` rejects, failing the whole bucket resource and
+        // taking unrelated versioning/encryption changes down with it.
+        if let Some(max_age) = rule.get("MaxAge") {
+            let seconds = max_age
+                .as_f64()
+                .filter(|n| n.fract() == 0.0 && *n >= 0.0)
+                .map(|n| (n as u64).to_string())
+                .or_else(|| as_scalar(max_age));
+            if let Some(seconds) = seconds {
+                body.push_str(&format!(
+                    "<MaxAgeSeconds>{}</MaxAgeSeconds>",
+                    xml_escape(&seconds)
+                ));
+            }
         }
         body.push_str("</CORSRule>");
     }
@@ -920,6 +1008,142 @@ mod tests {
         assert!(xml.contains("<ExposeHeader>ETag</ExposeHeader>"));
         assert!(xml.contains("<MaxAgeSeconds>3000</MaxAgeSeconds>"));
         assert!(xml.contains("<ID>rule1</ID>"));
+    }
+
+    #[test]
+    fn cors_rules_with_the_wrong_shape_fails_the_resource() {
+        // Skipping silently would deploy a green stack with no CORS applied and
+        // nothing saying why, while every browser request against it fails.
+        // An explicit null is absent, not a shape error — every sibling
+        // property tolerates it, and failing the stack over one would be a
+        // regression from "deploys with no CORS".
+        let mut b = bucket();
+        apply_cfn_bucket_properties(&mut b, &json!({"CorsConfiguration": null}), &store())
+            .expect("an explicit null is treated as absent");
+        assert!(b.cors_config.is_none());
+
+        for bad in [
+            json!({"CorsRules": {"AllowedMethods": ["GET"]}}),
+            json!({}),
+            json!("not-an-object"),
+        ] {
+            let mut b = bucket();
+            let err =
+                apply_cfn_bucket_properties(&mut b, &json!({ "CorsConfiguration": bad }), &store())
+                    .expect_err("a CorsRules type mismatch is a property error");
+            assert!(err.contains("Cors"), "{err}");
+            assert!(b.cors_config.is_none());
+        }
+    }
+
+    #[test]
+    fn cors_max_age_out_of_range_names_the_property() {
+        // `as u64` saturates, so this would otherwise render as
+        // 18446744073709551615 and fail with a generic MalformedXML that names
+        // nothing the operator can act on.
+        let mut b = bucket();
+        let err = apply_cfn_bucket_properties(
+            &mut b,
+            &json!({
+                "CorsConfiguration": {
+                    "CorsRules": [{
+                        "AllowedMethods": ["GET"],
+                        "AllowedOrigins": ["*"],
+                        "MaxAge": 1e19
+                    }]
+                }
+            }),
+            &store(),
+        )
+        .expect_err("an out-of-range max-age is a property error");
+        assert!(err.contains("MaxAge"), "{err}");
+    }
+
+    #[test]
+    fn cors_max_age_renders_an_integral_float_as_an_integer() {
+        let mut b = bucket();
+        apply_cfn_bucket_properties(
+            &mut b,
+            &json!({
+                "CorsConfiguration": {
+                    "CorsRules": [{
+                        "AllowedMethods": ["GET"],
+                        "AllowedOrigins": ["*"],
+                        "MaxAge": 3600.0
+                    }]
+                }
+            }),
+            &store(),
+        )
+        .expect("an integral float is a valid max-age");
+        // `3600.0` would fail validation and take the whole bucket resource
+        // down with it, including unrelated properties.
+        assert!(b
+            .cors_config
+            .unwrap()
+            .contains("<MaxAgeSeconds>3600</MaxAgeSeconds>"));
+    }
+
+    #[test]
+    fn cors_invalid_rule_is_rejected_before_anything_is_persisted() {
+        let mut b = bucket();
+        let err = apply_cfn_bucket_properties(
+            &mut b,
+            &json!({
+                "VersioningConfiguration": {"Status": "Enabled"},
+                // No AllowedMethods: matches nothing at request time.
+                "CorsConfiguration": {"CorsRules": [{"AllowedOrigins": ["*"]}]}
+            }),
+            &store(),
+        )
+        .expect_err("a rule that can never match must not deploy");
+        assert!(err.contains("MalformedXML"), "{err}");
+        // Validation runs before any property is applied, so nothing is left
+        // half-written.
+        assert!(b.cors_config.is_none());
+        assert!(b.versioning.is_none());
+    }
+
+    #[test]
+    fn empty_cors_rules_clears_an_existing_config() {
+        let store = store();
+        let mut b = bucket();
+        apply_cfn_bucket_properties(
+            &mut b,
+            &json!({
+                "CorsConfiguration": {
+                    "CorsRules": [{"AllowedMethods": ["GET"], "AllowedOrigins": ["*"]}]
+                }
+            }),
+            &store,
+        )
+        .unwrap();
+        assert!(b.cors_config.is_some());
+
+        // An explicitly empty rule list means "no CORS", so the live config has
+        // to go rather than linger and keep serving allow-origin.
+        apply_cfn_bucket_properties(
+            &mut b,
+            &json!({"CorsConfiguration": {"CorsRules": []}}),
+            &store,
+        )
+        .unwrap();
+        assert!(b.cors_config.is_none());
+
+        // An absent property leaves existing state untouched, as for every
+        // other property here.
+        apply_cfn_bucket_properties(
+            &mut b,
+            &json!({
+                "CorsConfiguration": {
+                    "CorsRules": [{"AllowedMethods": ["GET"], "AllowedOrigins": ["*"]}]
+                }
+            }),
+            &store,
+        )
+        .unwrap();
+        apply_cfn_bucket_properties(&mut b, &json!({"Tags": []}), &store).unwrap();
+        assert!(b.cors_config.is_some());
     }
 
     #[test]

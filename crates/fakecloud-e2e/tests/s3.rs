@@ -1641,10 +1641,21 @@ async fn s3_cors_preflight_and_response_headers() {
         resp.headers().get("access-control-allow-origin").unwrap(),
         "https://example.com"
     );
-    assert!(resp.headers().get("access-control-allow-methods").is_some());
+    // The rule's whole list, as S3 returns, and with the exact ", " separator
+    // browsers compare against. Asserting only `is_some()` let both the value
+    // and the separator drift.
+    assert_eq!(
+        resp.headers().get("access-control-allow-methods").unwrap(),
+        "GET, PUT"
+    );
     assert_eq!(
         resp.headers().get("access-control-max-age").unwrap(),
         "3600"
+    );
+    assert_eq!(
+        resp.headers().get("vary").unwrap(),
+        "Origin, Access-Control-Request-Headers, Access-Control-Request-Method",
+        "preflight must send Vary so caches key on Origin"
     );
 
     // Regular GET with Origin should include CORS headers
@@ -1663,8 +1674,67 @@ async fn s3_cors_preflight_and_response_headers() {
         resp.headers().get("access-control-expose-headers").unwrap(),
         "x-amz-request-id"
     );
+    assert_eq!(
+        resp.headers().get("vary").unwrap(),
+        "Origin, Access-Control-Request-Headers, Access-Control-Request-Method",
+        "actual response must send Vary so caches key on Origin"
+    );
 
-    // OPTIONS from non-matching origin should fail
+    // A disallowed origin gets no ACAO, but still gets Vary: otherwise a cache
+    // could store this ACAO-less body and replay it to the allowed origin.
+    let resp = http
+        .get(format!("{}/cors-bucket/file.txt", server.endpoint()))
+        .header("Origin", "https://evil.com")
+        .header("Authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20240101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=fake")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.headers().get("access-control-allow-origin").is_none(),
+        "disallowed origin must not get ACAO"
+    );
+    assert_eq!(
+        resp.headers().get("vary").unwrap(),
+        "Origin, Access-Control-Request-Headers, Access-Control-Request-Method"
+    );
+
+    // A request with no Origin gets no CORS headers at all, matching S3.
+    let resp = http
+        .get(format!("{}/cors-bucket/file.txt", server.endpoint()))
+        .header("Authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20240101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=fake")
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.headers().get("vary").is_none());
+    assert!(resp.headers().get("access-control-allow-origin").is_none());
+
+    // Error responses are CORS-evaluated too. A 404 is heuristically cacheable,
+    // so an ACAO-less 404 stored without an Origin key would be replayed to
+    // every origin.
+    let resp = http
+        .get(format!("{}/cors-bucket/missing.txt", server.endpoint()))
+        .header("Origin", "https://example.com")
+        .header("Authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20240101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=fake")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    assert_eq!(
+        resp.headers().get("vary").unwrap(),
+        "Origin, Access-Control-Request-Headers, Access-Control-Request-Method",
+        "error responses must send Vary too"
+    );
+    // Without ACAO on the error, a `mode: 'cors'` fetch cannot tell a missing
+    // object from a network failure.
+    assert_eq!(
+        resp.headers().get("access-control-allow-origin").unwrap(),
+        "https://example.com",
+        "error responses to an allowed origin must carry ACAO"
+    );
+
+    // OPTIONS from non-matching origin should fail, but the 403 is itself
+    // origin-dependent, so it must not be cached and replayed to the allowed
+    // origin.
     let resp = http
         .request(
             reqwest::Method::OPTIONS,
@@ -1676,6 +1746,421 @@ async fn s3_cors_preflight_and_response_headers() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 403);
+    assert_eq!(
+        resp.headers().get("vary").unwrap(),
+        "Origin, Access-Control-Request-Headers, Access-Control-Request-Method",
+        "rejected preflight must send Vary"
+    );
+
+    // The actual request is matched on method too: the rule allows GET and PUT,
+    // so a DELETE from the allowed origin gets no ACAO and the browser blocks
+    // the response. NOTE: this really deletes `file.txt` — anything added below
+    // that reads it must use its own key.
+    let resp = http
+        .delete(format!("{}/cors-bucket/file.txt", server.endpoint()))
+        .header("Origin", "https://example.com")
+        .header("Authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20240101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=fake")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.headers().get("access-control-allow-origin").is_none(),
+        "a method outside AllowedMethods must not get ACAO"
+    );
+    assert_eq!(
+        resp.headers().get("vary").unwrap(),
+        "Origin, Access-Control-Request-Headers, Access-Control-Request-Method"
+    );
+
+    // Multipart operations are CORS-evaluated too — browser multipart upload is
+    // the most common reason a bucket has a CORS config at all.
+    let mpu = s3
+        .create_multipart_upload()
+        .bucket("cors-bucket")
+        .key("mpu.txt")
+        .send()
+        .await
+        .unwrap();
+    let upload_id = mpu.upload_id().unwrap();
+    let resp = http
+        .get(format!(
+            "{}/cors-bucket/mpu.txt?uploadId={}",
+            server.endpoint(),
+            upload_id
+        ))
+        .header("Origin", "https://example.com")
+        .header("Authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20240101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=fake")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get("access-control-allow-origin").unwrap(),
+        "https://example.com",
+        "ListParts must carry CORS headers"
+    );
+    assert_eq!(
+        resp.headers().get("vary").unwrap(),
+        "Origin, Access-Control-Request-Headers, Access-Control-Request-Method"
+    );
+
+    // Its own key: `file.txt` was deleted above, and asserting CORS headers on
+    // a 404 would keep passing even if the 200 path broke.
+    s3.put_object()
+        .bucket("cors-bucket")
+        .key("dup-origin.txt")
+        .body(ByteStream::from_static(b"dup"))
+        .send()
+        .await
+        .unwrap();
+
+    // A proxy duplicating the same Origin is still one origin, so the request
+    // is served normally rather than failing closed.
+    let resp = http
+        .get(format!("{}/cors-bucket/dup-origin.txt", server.endpoint()))
+        .header("Origin", "https://example.com")
+        .header("Origin", "https://example.com")
+        .header("Authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20240101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=fake")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get("access-control-allow-origin").unwrap(),
+        "https://example.com"
+    );
+
+    // Two *different* origins are not one origin to allow, so no ACAO — but the
+    // response still varies by Origin, or a cache would replay this ACAO-less
+    // body to a legitimate origin.
+    let resp = http
+        .get(format!("{}/cors-bucket/dup-origin.txt", server.endpoint()))
+        .header("Origin", "https://example.com")
+        .header("Origin", "https://evil.example")
+        .header("Authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20240101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=fake")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(resp.headers().get("access-control-allow-origin").is_none());
+    assert_eq!(
+        resp.headers().get("vary").unwrap(),
+        "Origin, Access-Control-Request-Headers, Access-Control-Request-Method"
+    );
+
+    // A preflight with no Origin carries nothing to evaluate. S3 rejects it as
+    // a malformed request (400), distinct from the 403 a disallowed origin
+    // gets. It still carries Vary: every preflight outcome turns on Origin.
+    let resp = http
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{}/cors-bucket/file.txt", server.endpoint()),
+        )
+        .header("Access-Control-Request-Method", "GET")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    // Still Vary: this 400 differs from the 200 an allowed origin gets, so a
+    // cache must not replay it to a real preflight.
+    assert_eq!(
+        resp.headers().get("vary").unwrap(),
+        "Origin, Access-Control-Request-Headers, Access-Control-Request-Method"
+    );
+    assert!(resp.text().await.unwrap().contains("Origin request header"));
+
+    // A preflight declaring a header the rule does not cover is denied. The
+    // cors-bucket rule allows `*`, so use a bucket with a narrow rule.
+    s3.create_bucket()
+        .bucket("hdr-cors-bucket")
+        .send()
+        .await
+        .unwrap();
+    let output = server
+        .aws_cli(&[
+            "s3api",
+            "put-bucket-cors",
+            "--bucket",
+            "hdr-cors-bucket",
+            "--cors-configuration",
+            r#"{"CORSRules":[{"AllowedOrigins":["https://example.com"],"AllowedMethods":["PUT"],"AllowedHeaders":["x-amz-meta-foo"]}]}"#,
+        ])
+        .await;
+    assert!(output.success(), "{}", output.stderr_text());
+    let resp = http
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{}/hdr-cors-bucket/file.txt", server.endpoint()),
+        )
+        .header("Origin", "https://example.com")
+        .header("Access-Control-Request-Method", "PUT")
+        .header("Access-Control-Request-Headers", "x-amz-meta-foo")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "covered header must be allowed");
+    let resp = http
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{}/hdr-cors-bucket/file.txt", server.endpoint()),
+        )
+        .header("Origin", "https://example.com")
+        .header("Access-Control-Request-Method", "PUT")
+        .header("Access-Control-Request-Headers", "authorization")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "uncovered header must be denied");
+    // A second ACRH line is evaluated too: reading only the first would approve
+    // headers the rule never allowed.
+    let resp = http
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{}/hdr-cors-bucket/file.txt", server.endpoint()),
+        )
+        .header("Origin", "https://example.com")
+        .header("Access-Control-Request-Method", "PUT")
+        .header("Access-Control-Request-Headers", "x-amz-meta-foo")
+        .header("Access-Control-Request-Headers", "authorization")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "every ACRH line must be evaluated, not just the first"
+    );
+    // The apostrophe in "resource's" is XML-escaped in the error body, so match
+    // on a stretch of the message that has none.
+    assert!(resp.text().await.unwrap().contains("are not whitelisted"));
+
+    // An AllowedHeader wildcard covers the headers it spans: AWS permits one
+    // `*` per entry, and `x-amz-*` is a common config.
+    let output = server
+        .aws_cli(&[
+            "s3api",
+            "put-bucket-cors",
+            "--bucket",
+            "hdr-cors-bucket",
+            "--cors-configuration",
+            r#"{"CORSRules":[{"AllowedOrigins":["https://example.com"],"AllowedMethods":["PUT"],"AllowedHeaders":["x-amz-*"]}]}"#,
+        ])
+        .await;
+    assert!(output.success(), "{}", output.stderr_text());
+    let resp = http
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{}/hdr-cors-bucket/file.txt", server.endpoint()),
+        )
+        .header("Origin", "https://example.com")
+        .header("Access-Control-Request-Method", "PUT")
+        .header("Access-Control-Request-Headers", "x-amz-meta-foo")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "x-amz-* must cover x-amz-meta-foo");
+    // The echo carries what was asked for, never the literal pattern, which a
+    // browser would compare literally and reject.
+    assert_eq!(
+        resp.headers().get("access-control-allow-headers").unwrap(),
+        "x-amz-meta-foo"
+    );
+
+    // A preflight carrying Origin but no request-method is an ordinary
+    // non-allowed preflight, not a malformed request.
+    let resp = http
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{}/cors-bucket/file.txt", server.endpoint()),
+        )
+        .header("Origin", "https://example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    assert!(resp.text().await.unwrap().contains("are not whitelisted"));
+
+    // Same with a wildcard rule: an absent Origin must not satisfy
+    // AllowedOrigin `*`, or an Origin-less OPTIONS would come back as an
+    // approved preflight.
+    s3.create_bucket()
+        .bucket("wild-cors-bucket")
+        .send()
+        .await
+        .unwrap();
+    let output = server
+        .aws_cli(&[
+            "s3api",
+            "put-bucket-cors",
+            "--bucket",
+            "wild-cors-bucket",
+            "--cors-configuration",
+            r#"{"CORSRules":[{"AllowedOrigins":["*"],"AllowedMethods":["GET"]}]}"#,
+        ])
+        .await;
+    assert!(output.success(), "{}", output.stderr_text());
+    let resp = http
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{}/wild-cors-bucket/file.txt", server.endpoint()),
+        )
+        .header("Access-Control-Request-Method", "GET")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    assert!(resp.headers().get("access-control-allow-origin").is_none());
+
+    // A rule with no AllowedMethod matches nothing at request time, so it is
+    // rejected at write time rather than leaving the bucket silently CORS-dead.
+    // Sent as raw XML: the CLI rejects an empty required list client-side, so
+    // going through it would never reach the server's guard.
+    let resp = http
+        .put(format!("{}/wild-cors-bucket?cors", server.endpoint()))
+        .header("Authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20240101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=fake")
+        .body(
+            "<CORSConfiguration><CORSRule>\
+             <AllowedOrigin>https://a.example</AllowedOrigin>\
+             </CORSRule></CORSConfiguration>",
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    assert!(
+        resp.text().await.unwrap().contains("MalformedXML"),
+        "a CORS rule with no AllowedMethod must be rejected as MalformedXML"
+    );
+
+    // AWS's own documented wildcard form puts the `*` mid-pattern.
+    s3.create_bucket()
+        .bucket("sub-cors-bucket")
+        .send()
+        .await
+        .unwrap();
+    let output = server
+        .aws_cli(&[
+            "s3api",
+            "put-bucket-cors",
+            "--bucket",
+            "sub-cors-bucket",
+            "--cors-configuration",
+            r#"{"CORSRules":[{"AllowedOrigins":["https://*.example.com"],"AllowedMethods":["GET"]}]}"#,
+        ])
+        .await;
+    assert!(output.success(), "{}", output.stderr_text());
+    let resp = http
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{}/sub-cors-bucket/file.txt", server.endpoint()),
+        )
+        .header("Origin", "https://app.example.com")
+        .header("Access-Control-Request-Method", "GET")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "https://*.example.com must match");
+    assert_eq!(
+        resp.headers().get("access-control-allow-origin").unwrap(),
+        "https://app.example.com"
+    );
+
+    // AWS allows at most one wildcard per value, and the matchers only read the
+    // first, so a second one is rejected at write time.
+    let resp = http
+        .put(format!("{}/sub-cors-bucket?cors", server.endpoint()))
+        .header("Authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20240101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=fake")
+        .body(
+            "<CORSConfiguration><CORSRule>\
+             <AllowedOrigin>https://a.example</AllowedOrigin>\
+             <AllowedMethod>GET</AllowedMethod>\
+             <AllowedHeader>x-*-*</AllowedHeader>\
+             </CORSRule></CORSConfiguration>",
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    assert!(resp
+        .text()
+        .await
+        .unwrap()
+        .contains("more than one wildcard"));
+
+    // An empty AllowedOrigin parses to "" and matches no real request, so it is
+    // as CORS-dead as omitting the tag and is rejected the same way.
+    let resp = http
+        .put(format!("{}/wild-cors-bucket?cors", server.endpoint()))
+        .header("Authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20240101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=fake")
+        .body(
+            "<CORSConfiguration><CORSRule>\
+             <AllowedOrigin></AllowedOrigin>\
+             <AllowedMethod>GET</AllowedMethod>\
+             </CORSRule></CORSConfiguration>",
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    assert!(resp.text().await.unwrap().contains("MalformedXML"));
+
+    // A missing bucket is NoSuchBucket even when the config is also invalid:
+    // a run racing bucket creation must not be sent to debug its config.
+    let resp = http
+        .put(format!("{}/no-such-cors-bucket?cors", server.endpoint()))
+        .header("Authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20240101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=fake")
+        .body("<CORSConfiguration><CORSRule><AllowedOrigin>https://a.example</AllowedOrigin></CORSRule></CORSConfiguration>")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    assert!(resp.text().await.unwrap().contains("NoSuchBucket"));
+
+    // An unterminated <CORSRule> parses to nothing, so accepting it would store
+    // a config that matches no request at all.
+    let resp = http
+        .put(format!("{}/wild-cors-bucket?cors", server.endpoint()))
+        .header("Authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20240101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=fake")
+        .body(
+            "<CORSConfiguration><CORSRule>\
+             <AllowedOrigin>https://a.example</AllowedOrigin>\
+             <AllowedMethod>GET</AllowedMethod>\
+             </CORSConfiguration>",
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    assert!(resp.text().await.unwrap().contains("MalformedXML"));
+
+    // A bucket with no CORS config still answers preflights differently by
+    // Origin — 403 with one, 400 without — so its denial carries Vary too, and
+    // says CORS is not enabled rather than borrowing the not-whitelisted text.
+    s3.create_bucket()
+        .bucket("no-cors-bucket")
+        .send()
+        .await
+        .unwrap();
+    let resp = http
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{}/no-cors-bucket/file.txt", server.endpoint()),
+        )
+        .header("Origin", "https://example.com")
+        .header("Access-Control-Request-Method", "GET")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    assert_eq!(
+        resp.headers().get("vary").unwrap(),
+        "Origin, Access-Control-Request-Headers, Access-Control-Request-Method"
+    );
+    assert!(resp
+        .text()
+        .await
+        .unwrap()
+        .contains("CORS is not enabled for this bucket"));
 }
 // ---- S3 Object Lock Tests ----
 
