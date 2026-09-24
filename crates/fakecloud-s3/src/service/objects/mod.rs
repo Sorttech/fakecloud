@@ -206,6 +206,16 @@ mod null_version_tests {
     }
 
     #[test]
+    fn preserves_nothing_when_the_key_has_no_current_object() {
+        // A key whose current object was removed (a delete marker path, say)
+        // has nothing to preserve, even with real versions in the history.
+        let mut b = bucket();
+        b.object_versions
+            .insert("k".to_string(), vec![object(Some("v1"), "e1", false)]);
+        assert!(null_version_to_preserve(&b, "k").is_none());
+    }
+
+    #[test]
     fn recording_pushes_the_version_and_retags_the_current_object() {
         // The retag keeps memory agreeing with the sidecar, which the caller
         // rewrote to carry the "null" id: without it GetObject reports no
