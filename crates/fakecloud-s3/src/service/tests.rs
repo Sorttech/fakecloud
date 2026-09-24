@@ -513,6 +513,42 @@ fn wildcard_matchers_handle_more_than_one_star() {
 }
 
 #[test]
+fn find_cors_rule_settles_on_the_first_origin_method_match() {
+    // S3 takes the first rule matching origin + method, then checks the
+    // requested headers against *that* rule. Folding headers into the selection
+    // would let the narrower second rule rescue a request the first one denies,
+    // making the effective policy depend on which headers a client declares.
+    let xml = "<CORSConfiguration>\
+        <CORSRule>\
+            <AllowedOrigin>*</AllowedOrigin>\
+            <AllowedMethod>PUT</AllowedMethod>\
+        </CORSRule>\
+        <CORSRule>\
+            <AllowedOrigin>https://app.example.com</AllowedOrigin>\
+            <AllowedMethod>PUT</AllowedMethod>\
+            <AllowedHeader>content-type</AllowedHeader>\
+        </CORSRule>\
+    </CORSConfiguration>";
+    let rules = parse_cors_config(xml);
+    let requested = ["content-type".to_string()];
+    // The first rule matches origin+method and allows no headers, so the
+    // preflight is denied rather than falling through to the second rule.
+    assert!(find_cors_rule(&rules, "https://app.example.com", "PUT", &requested).is_none());
+    // With no headers declared, that same first rule approves it.
+    assert!(find_cors_rule(&rules, "https://app.example.com", "PUT", &[]).is_some());
+}
+
+#[test]
+fn wildcard_matchers_do_not_panic_on_non_ascii() {
+    // Callers only pass ASCII today, but the matcher must not become a
+    // request-killing panic if that ever changes.
+    assert!(!origin_matches("aé", "ab*"));
+    assert!(!origin_matches("héllo", "h*l*o!"));
+    assert!(!header_matches("x-é", "x-a*"));
+    assert!(origin_matches("héllo", "h*o"));
+}
+
+#[test]
 fn empty_allowed_method_cannot_approve_a_method_less_preflight() {
     // A preflight with no Access-Control-Request-Method arrives as "". An empty
     // <AllowedMethod/> next to a real one must not match it and hand back an

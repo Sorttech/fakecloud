@@ -3354,7 +3354,11 @@ impl AsciiMatch for str {
         p: &str,
         eq: &dyn Fn(&str, &str) -> bool,
     ) -> Option<&'a str> {
-        (self.len() >= p.len() && eq(&self[..p.len()], p)).then(|| &self[p.len()..])
+        // Boundary-checked rather than relying on the ASCII contract: callers
+        // satisfy it today, but a future one passing XML or query text would
+        // otherwise get a request-killing panic on a split multi-byte char.
+        (self.len() >= p.len() && self.is_char_boundary(p.len()) && eq(&self[..p.len()], p))
+            .then(|| &self[p.len()..])
     }
 
     fn find_matching(&self, needle: &str, eq: &dyn Fn(&str, &str) -> bool) -> Option<usize> {
@@ -3367,8 +3371,11 @@ impl AsciiMatch for str {
         if needle.len() > self.len() {
             return None;
         }
-        (0..=self.len() - needle.len())
-            .find(|&i| self.is_char_boundary(i) && eq(&self[i..i + needle.len()], needle))
+        (0..=self.len() - needle.len()).find(|&i| {
+            self.is_char_boundary(i)
+                && self.is_char_boundary(i + needle.len())
+                && eq(&self[i..i + needle.len()], needle)
+        })
     }
 }
 
@@ -3404,17 +3411,23 @@ pub(crate) fn find_cors_rule<'a>(
     if method.is_empty() {
         return None;
     }
-    rules.iter().find(|rule| {
+    // First rule matching origin + method wins, as on S3 — then that rule has
+    // to cover the requested headers. Folding headers into the selection
+    // instead would let a later, narrower rule rescue a request the first
+    // match denies, so a bucket's effective policy would depend on which
+    // headers the client happened to declare. That fails open; this does not.
+    let rule = rules.iter().find(|rule| {
         let origin_ok = rule
             .allowed_origins
             .iter()
             .any(|o| origin_matches(origin, o));
         let method_ok = rule.allowed_methods.iter().any(|am| am == method);
-        let headers_ok = requested_headers
-            .iter()
-            .all(|h| rule.allowed_headers.iter().any(|ah| header_matches(h, ah)));
-        origin_ok && method_ok && headers_ok
-    })
+        origin_ok && method_ok
+    })?;
+    requested_headers
+        .iter()
+        .all(|h| rule.allowed_headers.iter().any(|ah| header_matches(h, ah)))
+        .then_some(rule)
 }
 
 /// Check if an object is locked (retention or legal hold) and should block mutation.
