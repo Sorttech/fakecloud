@@ -47,20 +47,354 @@ async fn create_organization_succeeds_once() {
     assert_eq!(resp.status, StatusCode::OK);
     let v = body_json(&resp);
     assert_eq!(v["Organization"]["MasterAccountId"], "111111111111");
-    assert!(state.read().is_some());
+    assert!(!state.read().is_empty());
 }
 
 #[tokio::test]
-async fn create_organization_twice_errors() {
+async fn create_organization_twice_from_the_same_account_errors() {
     let (svc, _state) = OrganizationsService::shared();
     svc.handle(req_with("111111111111", "CreateOrganization", json!({})))
         .await
         .unwrap();
     let err = expect_err(
+        svc.handle(req_with("111111111111", "CreateOrganization", json!({})))
+            .await,
+    );
+    assert_eq!(err.code(), "AlreadyInOrganizationException");
+}
+
+/// #2543: organizations are independent. One account creating an
+/// organization must not stop an unrelated account from creating its
+/// own, and the two must not see each other.
+#[tokio::test]
+async fn a_second_account_can_create_its_own_organization() {
+    let (svc, state) = OrganizationsService::shared();
+    let first = body_json(
+        &svc.handle(req_with("111111111111", "CreateOrganization", json!({})))
+            .await
+            .unwrap(),
+    );
+    let second = body_json(
+        &svc.handle(req_with("222222222222", "CreateOrganization", json!({})))
+            .await
+            .unwrap(),
+    );
+
+    let first_id = first["Organization"]["Id"].as_str().unwrap();
+    let second_id = second["Organization"]["Id"].as_str().unwrap();
+    assert_ne!(first_id, second_id);
+    assert_eq!(state.read().len(), 2);
+
+    // Each management account describes only its own organization.
+    let described = body_json(
+        &svc.handle(req_with("222222222222", "DescribeOrganization", json!({})))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(described["Organization"]["Id"], second_id);
+    assert_eq!(described["Organization"]["MasterAccountId"], "222222222222");
+
+    // ...and lists only its own accounts.
+    let listed = body_json(
+        &svc.handle(req_with("222222222222", "ListAccounts", json!({})))
+            .await
+            .unwrap(),
+    );
+    let ids: Vec<&str> = listed["Accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["Id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["222222222222"]);
+}
+
+/// An account already in an organization cannot create another one, and
+/// the error is the same whichever organization it belongs to.
+#[tokio::test]
+async fn a_member_of_another_organization_cannot_create_one() {
+    let (svc, state) = OrganizationsService::shared();
+    svc.handle(req_with("111111111111", "CreateOrganization", json!({})))
+        .await
+        .unwrap();
+    state
+        .write()
+        .sole_mut()
+        .unwrap()
+        .enroll_account_if_missing("222222222222");
+
+    let err = expect_err(
         svc.handle(req_with("222222222222", "CreateOrganization", json!({})))
             .await,
     );
     assert_eq!(err.code(), "AlreadyInOrganizationException");
+}
+
+/// An account can only ever be in one organization, so an invitation to
+/// an account another organization already holds is rejected up front
+/// rather than opening a handshake that could never be accepted.
+#[tokio::test]
+async fn inviting_an_account_from_another_organization_errors() {
+    let (svc, _state) = OrganizationsService::shared();
+    svc.handle(req_with("111111111111", "CreateOrganization", json!({})))
+        .await
+        .unwrap();
+    svc.handle(req_with("222222222222", "CreateOrganization", json!({})))
+        .await
+        .unwrap();
+
+    let err = expect_err(
+        svc.handle(req_with(
+            "111111111111",
+            "InviteAccountToOrganization",
+            json!({ "Target": { "Type": "ACCOUNT", "Id": "222222222222" } }),
+        ))
+        .await,
+    );
+    assert_eq!(err.code(), "HandshakeConstraintViolationException");
+}
+
+/// Reads that used to be satisfied by "an organization exists" now
+/// resolve the caller's own organization. A bystander account must not
+/// be able to read another organization's tree, tags or resource policy
+/// by guessing ids.
+#[tokio::test]
+async fn a_bystander_cannot_read_another_organizations_state() {
+    let (svc, state) = OrganizationsService::shared();
+    svc.handle(req_with("111111111111", "CreateOrganization", json!({})))
+        .await
+        .unwrap();
+    let root_id = state.read().sole().unwrap().root_id.clone();
+
+    svc.handle(req_with(
+        "111111111111",
+        "PutResourcePolicy",
+        json!({ "Content": "{\"Version\":\"2012-10-17\",\"Statement\":[]}" }),
+    ))
+    .await
+    .unwrap();
+
+    for (action, body) in [
+        ("ListParents", json!({ "ChildId": "111111111111" })),
+        (
+            "ListChildren",
+            json!({ "ParentId": root_id, "ChildType": "ACCOUNT" }),
+        ),
+        ("ListTagsForResource", json!({ "ResourceId": root_id })),
+        ("DescribeResourcePolicy", json!({})),
+        (
+            "DescribeEffectivePolicy",
+            json!({ "PolicyType": "SERVICE_CONTROL_POLICY" }),
+        ),
+    ] {
+        let err = expect_err(svc.handle(req_with("999999999999", action, body)).await);
+        assert_eq!(
+            err.code(),
+            "AWSOrganizationsNotInUseException",
+            "{action} leaked another organization's state to a non-member"
+        );
+    }
+}
+
+/// A handshake is readable only by its two parties. Otherwise a
+/// bystander could enumerate handshake ids to learn another
+/// organization's id and management account.
+#[tokio::test]
+async fn describe_handshake_is_limited_to_the_parties() {
+    let (svc, _state) = OrganizationsService::shared();
+    svc.handle(req_with("111111111111", "CreateOrganization", json!({})))
+        .await
+        .unwrap();
+    let invited = body_json(
+        &svc.handle(req_with(
+            "111111111111",
+            "InviteAccountToOrganization",
+            json!({ "Target": { "Type": "ACCOUNT", "Id": "222222222222" } }),
+        ))
+        .await
+        .unwrap(),
+    );
+    let handshake_id = invited["Handshake"]["Id"].as_str().unwrap().to_string();
+
+    // The target can read it...
+    svc.handle(req_with(
+        "222222222222",
+        "DescribeHandshake",
+        json!({ "HandshakeId": handshake_id }),
+    ))
+    .await
+    .unwrap();
+
+    // ...a bystander cannot.
+    let err = expect_err(
+        svc.handle(req_with(
+            "999999999999",
+            "DescribeHandshake",
+            json!({ "HandshakeId": handshake_id }),
+        ))
+        .await,
+    );
+    assert_eq!(err.code(), "HandshakeNotFoundException");
+}
+
+/// Membership is re-checked when the handshake is accepted, not only
+/// when it is opened: the target may have joined another organization
+/// while the invitation sat open.
+#[tokio::test]
+async fn accepting_an_invite_fails_once_the_target_joined_another_organization() {
+    let (svc, _state) = OrganizationsService::shared();
+    svc.handle(req_with("111111111111", "CreateOrganization", json!({})))
+        .await
+        .unwrap();
+    let invited = body_json(
+        &svc.handle(req_with(
+            "111111111111",
+            "InviteAccountToOrganization",
+            json!({ "Target": { "Type": "ACCOUNT", "Id": "222222222222" } }),
+        ))
+        .await
+        .unwrap(),
+    );
+    let handshake_id = invited["Handshake"]["Id"].as_str().unwrap().to_string();
+
+    // The target creates its own organization before answering.
+    svc.handle(req_with("222222222222", "CreateOrganization", json!({})))
+        .await
+        .unwrap();
+
+    let err = expect_err(
+        svc.handle(req_with(
+            "222222222222",
+            "AcceptHandshake",
+            json!({ "HandshakeId": handshake_id }),
+        ))
+        .await,
+    );
+    assert_eq!(err.code(), "HandshakeConstraintViolationException");
+}
+
+/// An EMAIL-target invite records the address, not the account id. The
+/// account it names must still be able to read and accept it — matching
+/// the raw field would compare an address against a 12-digit id and
+/// never hit.
+#[tokio::test]
+async fn an_email_target_invite_is_readable_and_acceptable_by_the_account_it_names() {
+    let (svc, state) = OrganizationsService::shared();
+    svc.handle(req_with("111111111111", "CreateOrganization", json!({})))
+        .await
+        .unwrap();
+    let invited = body_json(
+        &svc.handle(req_with(
+            "111111111111",
+            "InviteAccountToOrganization",
+            json!({ "Target": { "Type": "EMAIL", "Id": "222222222222@example.com" } }),
+        ))
+        .await
+        .unwrap(),
+    );
+    let handshake_id = invited["Handshake"]["Id"].as_str().unwrap().to_string();
+
+    svc.handle(req_with(
+        "222222222222",
+        "DescribeHandshake",
+        json!({ "HandshakeId": handshake_id }),
+    ))
+    .await
+    .expect("the named account is a party to the invitation");
+
+    svc.handle(req_with(
+        "222222222222",
+        "AcceptHandshake",
+        json!({ "HandshakeId": handshake_id }),
+    ))
+    .await
+    .expect("the named account can accept");
+
+    assert!(state
+        .read()
+        .org_of_account("222222222222")
+        .is_some_and(|org| org.is_management("111111111111")));
+}
+
+/// The cross-organization guard applies to an EMAIL target too, once it
+/// resolves — otherwise the invite opens a handshake nobody can accept.
+#[tokio::test]
+async fn an_email_invite_to_an_account_in_another_organization_errors() {
+    let (svc, _state) = OrganizationsService::shared();
+    svc.handle(req_with("111111111111", "CreateOrganization", json!({})))
+        .await
+        .unwrap();
+    svc.handle(req_with("222222222222", "CreateOrganization", json!({})))
+        .await
+        .unwrap();
+
+    let err = expect_err(
+        svc.handle(req_with(
+            "111111111111",
+            "InviteAccountToOrganization",
+            json!({ "Target": { "Type": "EMAIL", "Id": "222222222222@example.com" } }),
+        ))
+        .await,
+    );
+    assert_eq!(err.code(), "HandshakeConstraintViolationException");
+}
+
+/// `Target.Id` must match the declared `Target.Type`. Accepting a
+/// mismatch opened a handshake keyed by a string no caller can ever
+/// authenticate as, which then sat OPEN forever with no error anywhere
+/// the caller could see it.
+#[tokio::test]
+async fn invite_rejects_a_target_id_that_does_not_match_its_type() {
+    let (svc, _state) = OrganizationsService::shared();
+    create_org_with_root(&svc).await;
+
+    for target in [
+        json!({ "Type": "ACCOUNT", "Id": "bob@corp.com" }),
+        json!({ "Type": "ACCOUNT", "Id": "12345" }),
+        json!({ "Type": "EMAIL", "Id": "222222222222" }),
+        json!({ "Type": "SOMETHING", "Id": "222222222222" }),
+        // An address fakecloud never minted names no account it can
+        // resolve, so the invitation could never be accepted.
+        json!({ "Type": "EMAIL", "Id": "billing@acme.com" }),
+    ] {
+        let err = expect_err(
+            svc.handle(req_with(
+                "111111111111",
+                "InviteAccountToOrganization",
+                json!({ "Target": target }),
+            ))
+            .await,
+        );
+        assert_eq!(
+            err.code(),
+            "InvalidInputException",
+            "target {target} should have been rejected"
+        );
+    }
+}
+
+/// Deleting one organization leaves every other one standing.
+#[tokio::test]
+async fn deleting_one_organization_leaves_the_others() {
+    let (svc, state) = OrganizationsService::shared();
+    svc.handle(req_with("111111111111", "CreateOrganization", json!({})))
+        .await
+        .unwrap();
+    let second = body_json(
+        &svc.handle(req_with("222222222222", "CreateOrganization", json!({})))
+            .await
+            .unwrap(),
+    );
+    let second_id = second["Organization"]["Id"].as_str().unwrap().to_string();
+
+    svc.handle(req_with("111111111111", "DeleteOrganization", json!({})))
+        .await
+        .unwrap();
+
+    let guard = state.read();
+    assert_eq!(guard.len(), 1);
+    assert!(guard.org_by_id(&second_id).is_some());
+    assert!(guard.org_of_account("111111111111").is_none());
 }
 
 #[tokio::test]
@@ -124,7 +458,7 @@ async fn member_non_management_delete_returns_access_denied() {
     // directly in state (auto-enrollment lands in Batch 2).
     {
         let mut guard = state.write();
-        let org = guard.as_mut().unwrap();
+        let org = guard.sole_mut().unwrap();
         let account_id = "222222222222".to_string();
         let parent_id = org.root_id.clone();
         let org_id = org.org_id.clone();
@@ -162,7 +496,7 @@ async fn delete_clears_state() {
     svc.handle(req_with("111111111111", "DeleteOrganization", json!({})))
         .await
         .unwrap();
-    assert!(state.read().is_none());
+    assert!(state.read().is_empty());
 }
 
 #[tokio::test]
@@ -400,7 +734,7 @@ async fn create_ou_non_management_rejected() {
     {
         let mut guard = state.write();
         guard
-            .as_mut()
+            .sole_mut()
             .unwrap()
             .enroll_account_if_missing("222222222222");
     }
@@ -510,7 +844,7 @@ async fn delete_ou_rejects_when_not_empty() {
         .to_string();
     {
         let mut guard = state.write();
-        let org = guard.as_mut().unwrap();
+        let org = guard.sole_mut().unwrap();
         org.enroll_account_if_missing("222222222222");
         let root = org.root_id.clone();
         org.move_account("222222222222", &root, &ou_id).unwrap();
@@ -627,7 +961,7 @@ async fn list_accounts_returns_all_members() {
     {
         let mut guard = state.write();
         guard
-            .as_mut()
+            .sole_mut()
             .unwrap()
             .enroll_account_if_missing("222222222222");
     }
@@ -657,7 +991,7 @@ async fn list_accounts_for_parent_scopes_to_parent() {
         .to_string();
     {
         let mut guard = state.write();
-        let org = guard.as_mut().unwrap();
+        let org = guard.sole_mut().unwrap();
         org.enroll_account_if_missing("222222222222");
         org.move_account("222222222222", &org.root_id.clone(), &ou_id)
             .unwrap();
@@ -734,7 +1068,7 @@ async fn move_account_happy_path() {
     {
         let mut guard = state.write();
         guard
-            .as_mut()
+            .sole_mut()
             .unwrap()
             .enroll_account_if_missing("222222222222");
     }
@@ -750,7 +1084,7 @@ async fn move_account_happy_path() {
     .await
     .unwrap();
     let guard = state.read();
-    let org = guard.as_ref().unwrap();
+    let org = guard.sole().unwrap();
     assert_eq!(org.accounts.get("222222222222").unwrap().parent_id, ou_id);
 }
 
@@ -792,7 +1126,7 @@ async fn move_account_wrong_source_parent() {
     {
         let mut guard = state.write();
         guard
-            .as_mut()
+            .sole_mut()
             .unwrap()
             .enroll_account_if_missing("222222222222");
     }
@@ -959,7 +1293,7 @@ async fn create_policy_non_management_rejected() {
     {
         let mut guard = state.write();
         guard
-            .as_mut()
+            .sole_mut()
             .unwrap()
             .enroll_account_if_missing("222222222222");
     }
@@ -1716,7 +2050,12 @@ async fn leave_organization_non_member_errors() {
         svc.handle(req_with("999999999999", "LeaveOrganization", json!({})))
             .await,
     );
-    assert_eq!(err.code(), "AccountNotFoundException");
+    // `LeaveOrganization` takes no AccountId, so AWS's answer for a caller
+    // that belongs to no organization is `AWSOrganizationsNotInUseException`,
+    // not `AccountNotFoundException`. It is also the non-leaking answer: with
+    // several organizations in the process, a non-member must not be able to
+    // tell whether any exist.
+    assert_eq!(err.code(), "AWSOrganizationsNotInUseException");
 }
 
 #[tokio::test]
@@ -1884,6 +2223,188 @@ async fn responsibility_transfer_lifecycle() {
     assert_eq!(err.code(), "ResponsibilityTransferAlreadyInStatusException");
 }
 
+/// The inbound side of a transfer: the target management account runs
+/// its own organization, and must be able to see, accept, and correctly
+/// read the direction of the transfer offered to it.
+#[tokio::test]
+async fn the_target_organization_sees_its_inbound_responsibility_transfer() {
+    let (svc, _state) = OrganizationsService::shared();
+    create_org_with_root(&svc).await;
+    svc.handle(req_with("222222222222", "CreateOrganization", json!({})))
+        .await
+        .unwrap();
+
+    let invite = body_value(
+        svc.handle(req_with(
+            "111111111111",
+            "InviteOrganizationToTransferResponsibility",
+            json!({
+                "Type": "BILLING",
+                "SourceName": "handover",
+                "StartTimestamp": 1893456000.0,
+                "Target": {"Id": "222222222222", "Type": "ACCOUNT"},
+            }),
+        ))
+        .await
+        .unwrap(),
+    );
+    let handshake_id = invite["Handshake"]["Id"].as_str().unwrap().to_string();
+
+    // The target lists it INBOUND -- the stored row is the source's, and
+    // reads OUTBOUND there.
+    let inbound = body_value(
+        svc.handle(req_with(
+            "222222222222",
+            "ListInboundResponsibilityTransfers",
+            json!({ "Type": "BILLING" }),
+        ))
+        .await
+        .unwrap(),
+    );
+    let rows = inbound["ResponsibilityTransfers"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "target must see the transfer offered to it");
+    let transfer_id = rows[0]["Id"].as_str().unwrap().to_string();
+
+    // The same transfer is the source's OUTBOUND one. AWS's shape carries
+    // no Direction member -- which list you call IS the direction.
+    let outbound = body_value(
+        svc.handle(req_with(
+            "111111111111",
+            "ListOutboundResponsibilityTransfers",
+            json!({ "Type": "BILLING" }),
+        ))
+        .await
+        .unwrap(),
+    );
+    assert_eq!(
+        outbound["ResponsibilityTransfers"][0]["Id"],
+        transfer_id.as_str()
+    );
+    // ...and the target can describe it directly.
+    let described = body_value(
+        svc.handle(req_with(
+            "222222222222",
+            "DescribeResponsibilityTransfer",
+            json!({ "Id": transfer_id }),
+        ))
+        .await
+        .unwrap(),
+    );
+    assert_eq!(
+        described["ResponsibilityTransfer"]["Id"],
+        transfer_id.as_str()
+    );
+
+    // Accepting the riding handshake moves the transfer with it, rather
+    // than leaving an ACCEPTED handshake beside a REQUESTED transfer.
+    svc.handle(req_with(
+        "222222222222",
+        "AcceptHandshake",
+        json!({ "HandshakeId": handshake_id }),
+    ))
+    .await
+    .unwrap();
+    let after = body_value(
+        svc.handle(req_with(
+            "111111111111",
+            "DescribeResponsibilityTransfer",
+            json!({ "Id": transfer_id }),
+        ))
+        .await
+        .unwrap(),
+    );
+    assert_eq!(after["ResponsibilityTransfer"]["Status"], "ACCEPTED");
+    assert!(after["ResponsibilityTransfer"]["ActiveHandshakeId"].is_null());
+
+    // Accepting a transfer must NOT enroll the other organization's
+    // management account as a member.
+    let listed = body_value(
+        svc.handle(req_with("111111111111", "ListAccounts", json!({})))
+            .await
+            .unwrap(),
+    );
+    let ids: Vec<&str> = listed["Accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["Id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["111111111111"]);
+}
+
+/// Both parties can read a transfer, but only the source management
+/// account -- the one that created it -- can rename or withdraw it. The
+/// target answers by accepting or declining the riding handshake, and
+/// gets a clear AccessDenied rather than a "not found" it cannot
+/// distinguish from a bad id.
+#[tokio::test]
+async fn only_the_source_can_terminate_a_responsibility_transfer() {
+    let (svc, _state) = OrganizationsService::shared();
+    create_org_with_root(&svc).await;
+    svc.handle(req_with("222222222222", "CreateOrganization", json!({})))
+        .await
+        .unwrap();
+    let invite = body_value(
+        svc.handle(req_with(
+            "111111111111",
+            "InviteOrganizationToTransferResponsibility",
+            json!({
+                "Type": "BILLING",
+                "SourceName": "handover",
+                "StartTimestamp": 1893456000.0,
+                "Target": {"Id": "222222222222", "Type": "ACCOUNT"},
+            }),
+        ))
+        .await
+        .unwrap(),
+    );
+    let _ = invite;
+    let listed = body_value(
+        svc.handle(req_with(
+            "111111111111",
+            "ListOutboundResponsibilityTransfers",
+            json!({ "Type": "BILLING" }),
+        ))
+        .await
+        .unwrap(),
+    );
+    let transfer_id = listed["ResponsibilityTransfers"][0]["Id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The target is a party, so not "not found" -- but it may not mutate.
+    let err = expect_err(
+        svc.handle(req_with(
+            "222222222222",
+            "TerminateResponsibilityTransfer",
+            json!({ "Id": transfer_id }),
+        ))
+        .await,
+    );
+    assert_eq!(err.code(), "AccessDeniedException");
+
+    // A stranger learns nothing beyond "no such transfer".
+    let err = expect_err(
+        svc.handle(req_with(
+            "999999999999",
+            "TerminateResponsibilityTransfer",
+            json!({ "Id": transfer_id }),
+        ))
+        .await,
+    );
+    assert_eq!(err.code(), "ResponsibilityTransferNotFoundException");
+
+    // The source can.
+    svc.handle(req_with(
+        "111111111111",
+        "TerminateResponsibilityTransfer",
+        json!({ "Id": transfer_id }),
+    ))
+    .await
+    .expect("the source management account withdraws its own transfer");
+}
+
 #[tokio::test]
 async fn describe_responsibility_transfer_unknown_id_errors() {
     let (svc, _state) = OrganizationsService::shared();
@@ -1922,7 +2443,8 @@ async fn invite_responsibility_transfer_rejects_bad_type() {
 #[tokio::test]
 async fn a_mutation_that_changes_no_membership_notifies_nobody() {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    let state: SharedOrganizationsState = Arc::new(parking_lot::RwLock::new(None));
+    let state: SharedOrganizationsState =
+        Arc::new(parking_lot::RwLock::new(OrganizationsRegistry::default()));
     let hooks = OrgChangeHooks::new();
     let fired = Arc::new(AtomicUsize::new(0));
     {
@@ -1938,14 +2460,16 @@ async fn a_mutation_that_changes_no_membership_notifies_nobody() {
     hooks.fire_if_membership_changed(&state).await;
     assert_eq!(fired.load(Ordering::SeqCst), 0);
 
-    *state.write() = Some(OrganizationState::bootstrap("000000000000"));
+    state
+        .write()
+        .insert(OrganizationState::bootstrap("000000000000"));
     hooks.fire_if_membership_changed(&state).await;
     assert_eq!(fired.load(Ordering::SeqCst), 1);
 
     // A tag is not a membership change.
     state
         .write()
-        .as_mut()
+        .sole_mut()
         .unwrap()
         .set_resource_tags("000000000000", &[("Env".to_string(), "dev".to_string())]);
     hooks.fire_if_membership_changed(&state).await;
@@ -1954,7 +2478,7 @@ async fn a_mutation_that_changes_no_membership_notifies_nobody() {
     // An account joining is.
     state
         .write()
-        .as_mut()
+        .sole_mut()
         .unwrap()
         .enroll_account_if_missing("111111111111");
     hooks.fire_if_membership_changed(&state).await;
@@ -1963,7 +2487,7 @@ async fn a_mutation_that_changes_no_membership_notifies_nobody() {
     // So is moving it, and so is an OU appearing for it to move into.
     let (root, ou) = {
         let mut guard = state.write();
-        let org = guard.as_mut().unwrap();
+        let org = guard.sole_mut().unwrap();
         let root = org.root_id.clone();
         let ou = org.create_ou(&root, "workloads").unwrap().id;
         (root, ou)
@@ -1972,7 +2496,7 @@ async fn a_mutation_that_changes_no_membership_notifies_nobody() {
     assert_eq!(fired.load(Ordering::SeqCst), 3);
     state
         .write()
-        .as_mut()
+        .sole_mut()
         .unwrap()
         .move_account("111111111111", &root, &ou)
         .unwrap();
@@ -1983,9 +2507,9 @@ async fn a_mutation_that_changes_no_membership_notifies_nobody() {
 #[tokio::test]
 async fn a_membership_change_is_announced_even_after_a_reversal_races_it() {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    let state: SharedOrganizationsState = Arc::new(parking_lot::RwLock::new(Some(
-        OrganizationState::bootstrap("000000000000"),
-    )));
+    let state: SharedOrganizationsState = Arc::new(parking_lot::RwLock::new(
+        OrganizationState::bootstrap("000000000000").into(),
+    ));
     let hooks = OrgChangeHooks::new();
     let fired = Arc::new(AtomicUsize::new(0));
     {
@@ -1999,7 +2523,7 @@ async fn a_membership_change_is_announced_even_after_a_reversal_races_it() {
     }
     let (root, ou) = {
         let mut guard = state.write();
-        let org = guard.as_mut().unwrap();
+        let org = guard.sole_mut().unwrap();
         org.enroll_account_if_missing("111111111111");
         let root = org.root_id.clone();
         let ou = org.create_ou(&root, "workloads").unwrap().id;
@@ -2013,13 +2537,13 @@ async fn a_membership_change_is_announced_even_after_a_reversal_races_it() {
     // between — otherwise the next real move looks like no change.
     {
         let mut guard = state.write();
-        let org = guard.as_mut().unwrap();
+        let org = guard.sole_mut().unwrap();
         org.move_account("111111111111", &root, &ou).unwrap();
     }
     hooks.fire_if_membership_changed(&state).await;
     {
         let mut guard = state.write();
-        let org = guard.as_mut().unwrap();
+        let org = guard.sole_mut().unwrap();
         org.move_account("111111111111", &ou, &root).unwrap();
     }
     hooks.fire_if_membership_changed(&state).await;
@@ -2029,7 +2553,7 @@ async fn a_membership_change_is_announced_even_after_a_reversal_races_it() {
     // The same move again is a real change and has to be announced.
     {
         let mut guard = state.write();
-        let org = guard.as_mut().unwrap();
+        let org = guard.sole_mut().unwrap();
         org.move_account("111111111111", &root, &ou).unwrap();
     }
     hooks.fire_if_membership_changed(&state).await;

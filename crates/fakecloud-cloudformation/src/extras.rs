@@ -2941,7 +2941,9 @@ pub(crate) mod tests {
             ecr: shared::<EcrState>(),
             cloudwatch: Arc::new(RwLock::new(fakecloud_cloudwatch::CloudWatchAccounts::new())),
             elbv2: Arc::new(RwLock::new(fakecloud_elbv2::Elbv2Accounts::new())),
-            organizations: Arc::new(RwLock::new(None)),
+            organizations: Arc::new(RwLock::new(
+                fakecloud_organizations::OrganizationsRegistry::default(),
+            )),
             cognito: shared::<fakecloud_cognito::CognitoState>(),
             rds: shared::<fakecloud_rds::RdsState>(),
             ec2: shared::<fakecloud_ec2::Ec2State>(),

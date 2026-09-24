@@ -15,9 +15,9 @@ use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceErr
 use fakecloud_persistence::SnapshotStore;
 
 use crate::state::{
-    MemberAccount, OrgError, OrganizationState, OrganizationalUnit, OrganizationsSnapshot, Policy,
-    SharedOrganizationsState, FEATURE_SET_ALL, FEATURE_SET_CONSOLIDATED_BILLING,
-    ORGANIZATIONS_SNAPSHOT_SCHEMA_VERSION, POLICY_TYPE_SCP,
+    MemberAccount, OrgError, OrganizationState, OrganizationalUnit, OrganizationsRegistry,
+    OrganizationsSnapshot, Policy, SharedOrganizationsState, FEATURE_SET_ALL,
+    FEATURE_SET_CONSOLIDATED_BILLING, ORGANIZATIONS_SNAPSHOT_SCHEMA_VERSION, POLICY_TYPE_SCP,
 };
 
 /// Organizations read actions all start with `Describe` or `List`; every other
@@ -142,6 +142,22 @@ fn membership_fingerprint(org: &OrganizationState) -> u64 {
     hasher.finish()
 }
 
+/// Fingerprint of membership across EVERY organization. An organization
+/// appearing or disappearing has to register as a change too, so this
+/// hashes the whole registry rather than tracking one value per org.
+fn registry_membership_fingerprint(registry: &OrganizationsRegistry) -> Option<u64> {
+    if registry.is_empty() {
+        return None;
+    }
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // `iter()` is ordered by organization id, so the digest is stable.
+    for org in registry.iter() {
+        hasher.write_u64(membership_fingerprint(org));
+    }
+    Some(hasher.finish())
+}
+
 impl OrgChangeHooks {
     pub fn new() -> Self {
         Self::default()
@@ -163,7 +179,7 @@ impl OrgChangeHooks {
         // announced.
         let (previous, claimed) = {
             let mut seen = self.seen.lock();
-            let fingerprint = state.read().as_ref().map(membership_fingerprint);
+            let fingerprint = registry_membership_fingerprint(&state.read());
             if *seen == fingerprint {
                 return;
             }
@@ -279,7 +295,8 @@ impl OrganizationsService {
     }
 
     pub fn shared() -> (Arc<Self>, SharedOrganizationsState) {
-        let state: SharedOrganizationsState = Arc::new(parking_lot::RwLock::new(None));
+        let state: SharedOrganizationsState =
+            Arc::new(parking_lot::RwLock::new(OrganizationsRegistry::default()));
         (Arc::new(Self::new(state.clone())), state)
     }
 
@@ -319,57 +336,90 @@ impl OrganizationsService {
     pub fn rearm_in_progress_account_creations(&self) {
         let pending: Vec<String> = {
             let guard = self.state.read();
-            match guard.as_ref() {
-                Some(org) => org
-                    .create_account_requests
-                    .iter()
-                    .filter(|(_, s)| s.state == "IN_PROGRESS")
-                    .map(|(id, _)| id.clone())
-                    .collect(),
-                None => Vec::new(),
-            }
+            // Request ids are globally unique (`car-` + 20 random chars), so
+            // the completion tick can find its own request by scanning every
+            // organization — no need to thread the owning org id through.
+            guard
+                .iter()
+                .flat_map(|org| org.create_account_requests.iter())
+                .filter(|(_, s)| s.state == "IN_PROGRESS")
+                .map(|(id, _)| id.clone())
+                .collect()
         };
         for request_id in pending {
             self.spawn_create_account_completion(request_id);
         }
     }
 
-    /// Read-side helper: enforce that an org exists and the caller is a
-    /// member. Returns the borrowed org on success.
+    /// Read-side helper: resolve the organization the caller belongs to.
+    /// A caller in no organization gets the same
+    /// `AWSOrganizationsNotInUseException` as a caller in a process with
+    /// no organizations at all, so another organization's existence is
+    /// never observable from outside it.
     fn require_member<'a>(
         &self,
-        guard: &'a parking_lot::RwLockReadGuard<'_, Option<OrganizationState>>,
+        guard: &'a parking_lot::RwLockReadGuard<'_, OrganizationsRegistry>,
         account_id: &str,
     ) -> Result<&'a OrganizationState, AwsServiceError> {
-        let org = guard.as_ref().ok_or_else(organizations_not_in_use)?;
-        if !org.accounts.contains_key(account_id) {
-            return Err(organizations_not_in_use());
+        guard
+            .org_of_account(account_id)
+            .ok_or_else(organizations_not_in_use)
+    }
+
+    /// Write-side helper for mutating ops: resolve the caller's own
+    /// organization and enforce that the caller is its management
+    /// account. Returns the organization itself, so a handler never has
+    /// to re-resolve it out of the registry.
+    fn management_org_mut<'a>(
+        &self,
+        guard: &'a mut parking_lot::RwLockWriteGuard<'_, OrganizationsRegistry>,
+        account_id: &str,
+    ) -> Result<&'a mut OrganizationState, AwsServiceError> {
+        let org = guard
+            .org_of_account_mut(account_id)
+            .ok_or_else(organizations_not_in_use)?;
+        if !org.is_management(account_id) {
+            return Err(not_management());
         }
         Ok(org)
     }
 
-    /// Write-side helper for mutating ops: caller must be the
-    /// management account of an existing organization. Returns the
-    /// management-only error rather than an Option, so the caller can
-    /// unwrap the guard safely right after.
-    fn require_member_management(
+    /// Read-side counterpart of [`Self::management_org_mut`], for ops
+    /// that are management-only but do not mutate.
+    fn management_org<'a>(
         &self,
-        guard: &parking_lot::RwLockWriteGuard<'_, Option<OrganizationState>>,
+        guard: &'a parking_lot::RwLockReadGuard<'_, OrganizationsRegistry>,
         account_id: &str,
-    ) -> Result<(), AwsServiceError> {
-        let org = guard.as_ref().ok_or_else(organizations_not_in_use)?;
-        if !org.accounts.contains_key(account_id) {
-            return Err(organizations_not_in_use());
-        }
+    ) -> Result<&'a OrganizationState, AwsServiceError> {
+        let org = self.require_member(guard, account_id)?;
         if !org.is_management(account_id) {
-            return Err(AwsServiceError::aws_error(
-                StatusCode::FORBIDDEN,
-                "AccessDeniedException",
-                "This operation can be called only from the organization's management account.",
-            ));
+            return Err(not_management());
         }
-        Ok(())
+        Ok(org)
     }
+}
+
+/// AWS's handshake-time answer for "that account already belongs to an
+/// organization", carrying the modeled `Reason` discriminator.
+fn already_in_an_organization(message: String) -> AwsServiceError {
+    AwsServiceError::aws_error_with_fields(
+        StatusCode::BAD_REQUEST,
+        "HandshakeConstraintViolationException",
+        message,
+        vec![(
+            "Reason".to_string(),
+            "ALREADY_IN_AN_ORGANIZATION".to_string(),
+        )],
+    )
+}
+
+/// AWS's error for a management-only operation attempted by a member.
+fn not_management() -> AwsServiceError {
+    AwsServiceError::aws_error(
+        StatusCode::FORBIDDEN,
+        "AccessDeniedException",
+        "This operation can be called only from the organization's management account.",
+    )
 }
 
 fn parse_tags(value: Option<&Value>) -> Vec<(String, String)> {
@@ -531,7 +581,10 @@ pub async fn save_organizations_snapshot(
     let _guard = lock.lock().await;
     let snapshot = OrganizationsSnapshot {
         schema_version: ORGANIZATIONS_SNAPSHOT_SCHEMA_VERSION,
-        organization: state.read().clone(),
+        // v1's single-organization field is read-only now; v2 always
+        // writes the whole registry.
+        organization: None,
+        organizations: state.read().clone(),
     };
     let join = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
         let bytes = serde_json::to_vec(&snapshot)
@@ -777,11 +830,17 @@ fn org_error_to_aws(err: OrgError) -> AwsServiceError {
             "DuplicateHandshakeException",
             format!("An OPEN handshake already exists for account {account}."),
         ),
-        OrgError::AccountAlreadyMember(account) => AwsServiceError::aws_error(
-            StatusCode::BAD_REQUEST,
-            "AccountAlreadyRegisteredException",
-            format!("Account {account} is already a member of this organization."),
-        ),
+        // AWS reports both of these on InviteAccountToOrganization and
+        // AcceptHandshake as HandshakeConstraintViolationException with
+        // Reason=ALREADY_IN_AN_ORGANIZATION; those operations do not model
+        // AccountAlreadyRegisteredException at all, so a typed SDK catching
+        // the modeled exception would miss it.
+        OrgError::AccountAlreadyMember(account) => already_in_an_organization(format!(
+            "Account {account} is already a member of this organization."
+        )),
+        OrgError::AccountInAnotherOrganization(account) => already_in_an_organization(format!(
+            "Account {account} is already a member of an organization."
+        )),
         OrgError::AWSServiceAccessNotEnabled(svc) => AwsServiceError::aws_error(
             StatusCode::BAD_REQUEST,
             "AWSOrganizationsNotInUseException",

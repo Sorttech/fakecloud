@@ -4117,7 +4117,7 @@ mod tests {
             )),
             cloudwatch_state: Arc::new(RwLock::new(fakecloud_cloudwatch::CloudWatchAccounts::new())),
             elbv2_state: Arc::new(RwLock::new(fakecloud_elbv2::Elbv2Accounts::new())),
-            organizations_state: Arc::new(RwLock::new(None)),
+            organizations_state: Arc::new(RwLock::new(fakecloud_organizations::OrganizationsRegistry::default())),
             cognito_state: Arc::new(RwLock::new(
                 fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
             )),
@@ -4676,7 +4676,7 @@ mod tests {
         .expect("org provisions");
         let root_id = {
             let g = prov.organizations_state.read();
-            g.as_ref().unwrap().root_id.clone()
+            g.sole().unwrap().root_id.clone()
         };
 
         let ou = prov
@@ -4756,7 +4756,7 @@ mod tests {
         );
 
         let g = prov.organizations_state.read();
-        let org = g.as_ref().unwrap();
+        let org = g.sole().unwrap();
         assert_eq!(org.ous.get(&ou_id).unwrap().name, "team-renamed");
         assert_eq!(org.policies.get(&pol_id).unwrap().content, "{\"v\":2}");
         assert!(

@@ -589,10 +589,14 @@ async fn main() {
     let bedrock_agent_runtime_state: fakecloud_bedrock_agent_runtime::SharedBedrockAgentRuntimeState = Arc::new(
         parking_lot::RwLock::new(fakecloud_bedrock_agent_runtime::BedrockAgentRuntimeAccounts::new()),
     );
-    // Organizations state is a global singleton (one org per fakecloud
-    // process) — not wrapped in MultiAccountState because an AWS org is
-    // a cross-account construct. `None` until CreateOrganization runs.
-    let organizations_state: SharedOrganizationsState = Arc::new(parking_lot::RwLock::new(None));
+    // Organizations state is a process-wide registry of independent
+    // organizations — not wrapped in MultiAccountState because an AWS org
+    // is a cross-account construct, but not a singleton either: every
+    // account outside an organization can create one of its own. Empty
+    // until the first CreateOrganization runs.
+    let organizations_state: SharedOrganizationsState = Arc::new(parking_lot::RwLock::new(
+        fakecloud_organizations::OrganizationsRegistry::default(),
+    ));
     let scheduler_state: fakecloud_scheduler::SharedSchedulerState = Arc::new(
         parking_lot::RwLock::new(fakecloud_core::multi_account::MultiAccountState::new(
             &cli.account_id,
@@ -2356,10 +2360,15 @@ async fn main() {
                                     fakecloud_organizations::ORGANIZATIONS_SNAPSHOT_SCHEMA_VERSION,
                                 ));
                             }
-                            let present = snapshot.organization.is_some();
-                            *organizations_state.write() = snapshot.organization;
+                            // v1 snapshots hold a single organization; v2
+                            // holds the registry. `into_registry` folds the
+                            // former into the latter, so an existing
+                            // snapshot keeps loading across the upgrade.
+                            let registry = snapshot.into_registry();
+                            let organizations = registry.len();
+                            *organizations_state.write() = registry;
                             tracing::info!(
-                                organization = present,
+                                organizations,
                                 "loaded organizations persistence snapshot"
                             );
                         }
@@ -11650,10 +11659,16 @@ async fn main() {
                     let persist = persist.clone();
                     let changed = changed.clone();
                     async move {
-                        let was_member = orgs
-                            .read()
-                            .as_ref()
-                            .is_some_and(|org| org.accounts.contains_key(&body.account_id));
+                        // Membership of the NAMED organization, not of any
+                        // organization: an account already in a different one
+                        // is rejected below, and gating on registry-wide
+                        // membership would skip the persist/notify for an
+                        // enrollment that did happen.
+                        let was_member = body.organization_id.as_deref().is_some_and(|org_id| {
+                            orgs.read()
+                                .org_by_id(org_id)
+                                .is_some_and(|org| org.accounts.contains_key(&body.account_id))
+                        });
                         let resp = match reset::create_admin_in_account(
                             &iam,
                             &orgs,
@@ -11720,6 +11735,7 @@ async fn main() {
                         let responsibility_transfers = rows
                             .into_iter()
                             .map(|r| types::OrganizationsResponsibilityTransfer {
+                                organization_id: Some(r.organization_id),
                                 id: r.id,
                                 arn: r.arn,
                                 name: r.name,

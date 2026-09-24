@@ -330,8 +330,8 @@ and accepts, or is created through `CreateAccount`. Naming an
 
 | Endpoint | Method | Description |
 | -------- | ------ | ----------- |
-| `/_fakecloud/organizations/accounts` | GET | **NEW** -- List every member account with lifecycle state, parent OU, tags, and directly-attached SCPs. |
-| `/_fakecloud/organizations/responsibility-transfers` | GET | **NEW** -- Every billing responsibility transfer in the org, with direction (INBOUND/OUTBOUND), lifecycle status, source/target management accounts, and the active handshake. Sorted by id. |
+| `/_fakecloud/organizations/accounts` | GET | **NEW** -- List every member account across every organization with lifecycle state, parent OU, owning `organizationId`, tags, and directly-attached SCPs, plus an `organizations` summary. |
+| `/_fakecloud/organizations/responsibility-transfers` | GET | **NEW** -- Every billing responsibility transfer across every organization, with the owning `organizationId`, direction (INBOUND/OUTBOUND), lifecycle status, source/target management accounts, and the active handshake. Sorted by id. |
 
 `GET /_fakecloud/organizations/responsibility-transfers` response:
 

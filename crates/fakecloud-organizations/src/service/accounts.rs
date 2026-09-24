@@ -55,8 +55,7 @@ impl OrganizationsService {
         let source = required_str(&body, "SourceParentId")?;
         let dest = required_str(&body, "DestinationParentId")?;
         let mut guard = self.state.write();
-        self.require_member_management(&guard, &req.account_id)?;
-        let org = guard.as_mut().unwrap();
+        let org = self.management_org_mut(&mut guard, &req.account_id)?;
         org.move_account(account_id, source, dest)
             .map_err(org_error_to_aws)?;
         Ok(AwsResponse::ok_json(Value::Null))
@@ -68,8 +67,7 @@ impl OrganizationsService {
         let name = required_str(&body, "AccountName")?.to_string();
 
         let mut guard = self.state.write();
-        self.require_member_management(&guard, &req.account_id)?;
-        let org = guard.as_mut().expect("management gate proved Some");
+        let org = self.management_org_mut(&mut guard, &req.account_id)?;
         let status = org.begin_create_account(&email, &name, None);
         let request_id = status.id.clone();
         // Apply create-time Tags to the reserved account id so
@@ -100,8 +98,7 @@ impl OrganizationsService {
         let name = required_str(&body, "AccountName")?.to_string();
 
         let mut guard = self.state.write();
-        self.require_member_management(&guard, &req.account_id)?;
-        let org = guard.as_mut().expect("management gate proved Some");
+        let org = self.management_org_mut(&mut guard, &req.account_id)?;
         // The GovCloud "paired" id is a 12-digit account id in the
         // GovCloud partition; we mint one alongside the commercial id
         // so callers see both, matching the real AWS response.
@@ -149,7 +146,9 @@ impl OrganizationsService {
             tokio::time::sleep(delay).await;
             let completed = {
                 let mut guard = state.write();
-                match guard.as_mut() {
+                // Request ids are globally unique, so the owning
+                // organization is whichever one holds this request.
+                match guard.org_of_create_account_request_mut(&request_id) {
                     Some(org) => {
                         org.complete_create_account(&request_id);
                         true
@@ -275,8 +274,7 @@ impl OrganizationsService {
         let target = required_str(&body, "AccountId")?.to_string();
 
         let mut guard = self.state.write();
-        self.require_member_management(&guard, &req.account_id)?;
-        let org = guard.as_mut().expect("management gate proved Some");
+        let org = self.management_org_mut(&mut guard, &req.account_id)?;
         org.close_account(&target).map_err(org_error_to_aws)?;
         Ok(AwsResponse::ok_json(json!({})))
     }
@@ -289,8 +287,7 @@ impl OrganizationsService {
         let target = required_str(&body, "AccountId")?.to_string();
 
         let mut guard = self.state.write();
-        self.require_member_management(&guard, &req.account_id)?;
-        let org = guard.as_mut().expect("management gate proved Some");
+        let org = self.management_org_mut(&mut guard, &req.account_id)?;
         org.remove_account(&target).map_err(org_error_to_aws)?;
         Ok(AwsResponse::ok_json(json!({})))
     }
@@ -304,23 +301,19 @@ impl OrganizationsService {
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let mut guard = self.state.write();
-        let org = guard.as_mut().ok_or_else(organizations_not_in_use)?;
+        // Resolve the caller's OWN organization: an account can only leave
+        // the one it is actually in. AWS answers a caller that belongs to no
+        // organization with `AWSOrganizationsNotInUseException`, the same
+        // answer every other op gives, rather than `AccountNotFoundException`.
+        let org = guard
+            .org_of_account_mut(&req.account_id)
+            .ok_or_else(organizations_not_in_use)?;
         if org.is_management(&req.account_id) {
             return Err(AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
                 "MasterCannotLeaveOrganizationException",
                 "The management account in an organization cannot be removed; \
                  delete the organization instead.",
-            ));
-        }
-        if !org.accounts.contains_key(&req.account_id) {
-            return Err(AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "AccountNotFoundException",
-                format!(
-                    "The account {} is not a member of an organization.",
-                    req.account_id
-                ),
             ));
         }
         org.remove_account(&req.account_id)
@@ -355,6 +348,11 @@ impl OrganizationsService {
                 )
             })?
             .to_string();
+        // Validate the id against the declared kind. AWS rejects a
+        // mismatch with InvalidInputException; accepting one here would
+        // open a handshake keyed by a string no caller can ever
+        // authenticate as, which sits OPEN forever.
+        validate_invite_target(kind, &id)?;
         let notes = body
             .get("Notes")
             .and_then(|v| v.as_str())
@@ -366,10 +364,32 @@ impl OrganizationsService {
         };
 
         let mut guard = self.state.write();
-        self.require_member_management(&guard, &req.account_id)?;
-        let org = guard.as_mut().expect("management gate proved Some");
+        let org_id = self
+            .management_org_mut(&mut guard, &req.account_id)?
+            .org_id
+            .clone();
+        // An account belongs to at most one organization, so an invitation
+        // to an account another organization already holds must be rejected
+        // here rather than quietly opening a handshake that could never be
+        // accepted. A target that is already OUR member falls through to
+        // `invite_account`, which reports it as such.
+        // Applies to an EMAIL target too, once it resolves to an account
+        // fakecloud knows -- otherwise the invite would open a handshake
+        // that could never be accepted.
+        if let Some(target) = crate::state::target_account_id(kind, &id) {
+            if let Some(other) = guard.org_of_account(&target) {
+                if other.org_id != org_id {
+                    return Err(org_error_to_aws(
+                        crate::state::OrgError::AccountInAnotherOrganization(target),
+                    ));
+                }
+            }
+        }
+        let org = guard
+            .org_by_id_mut(&org_id)
+            .expect("management gate resolved this organization");
         let handshake = org
-            .invite_account(&req.account_id, &id, target_email, notes)
+            .invite_account(&req.account_id, kind, &id, target_email, notes)
             .map_err(org_error_to_aws)?;
         Ok(AwsResponse::ok_json(
             json!({ "Handshake": handshake_payload(&handshake) }),
@@ -388,15 +408,22 @@ impl OrganizationsService {
         // ListHandshakesForAccount is scoped to the calling account, not to
         // an organization — a caller in no org simply has no handshakes.
         // (The op doesn't even declare AWSOrganizationsNotInUseException.)
-        let filtered: Vec<Value> = match guard.as_ref() {
-            Some(org) => org
-                .list_handshakes(Some(&req.account_id))
-                .into_iter()
-                .filter(|h| handshake_matches_filter(h, &filter))
-                .map(|h| handshake_payload(&h))
-                .collect(),
-            None => Vec::new(),
-        };
+        // It spans every organization on purpose: the invitations a
+        // standalone account most wants to list are the ones held by the
+        // organizations inviting it, none of which it belongs to yet.
+        let mut filtered: Vec<Value> = guard
+            .iter()
+            .flat_map(|org| org.list_handshakes(Some(&req.account_id)))
+            .filter(|h| handshake_matches_filter(h, &filter))
+            .map(|h| handshake_payload(&h))
+            .collect();
+        // `list_handshakes` sorts within an organization; re-sort so the
+        // merged result is stable and paginates consistently.
+        filtered.sort_by(|a, b| {
+            a.get("Id")
+                .and_then(Value::as_str)
+                .cmp(&b.get("Id").and_then(Value::as_str))
+        });
         let (page, token) = paginate_checked(&filtered, next_token.as_deref(), max_results)
             .map_err(|_| invalid_input("Invalid NextToken"))?;
         let mut body = json!({ "Handshakes": page });
@@ -413,9 +440,8 @@ impl OrganizationsService {
         let body = req.json_body();
         let account_id = required_str(&body, "AccountId")?.to_string();
         let (max_results, next_token) = parse_list_pagination(&body)?;
-        let guard = self.state.write();
-        self.require_member_management(&guard, &req.account_id)?;
-        let org = guard.as_ref().expect("management gate proved Some");
+        let guard = self.state.read();
+        let org = self.management_org(&guard, &req.account_id)?;
         let entries: Vec<Value> = org
             .list_delegated_services_for_account(&account_id)
             .into_iter()
@@ -433,5 +459,44 @@ impl OrganizationsService {
             body["NextToken"] = json!(t);
         }
         Ok(AwsResponse::ok_json(body))
+    }
+}
+
+/// Check `Target.Id` against the declared `Target.Type`.
+///
+/// An `ACCOUNT` target must be a 12-digit account id. An `EMAIL` target
+/// must be an address, and must additionally name an account fakecloud
+/// can resolve — an address it has never minted identifies no account,
+/// so the invitation could never be accepted and would sit OPEN
+/// forever rather than failing where the caller can see it.
+fn validate_invite_target(kind: &str, id: &str) -> Result<(), AwsServiceError> {
+    match kind {
+        "ACCOUNT" => {
+            if id.len() == 12 && id.chars().all(|c| c.is_ascii_digit()) {
+                Ok(())
+            } else {
+                Err(invalid_input(
+                    "Target.Id must be a 12-digit account id when Target.Type is ACCOUNT",
+                ))
+            }
+        }
+        "EMAIL" => {
+            if !id.contains('@') {
+                return Err(invalid_input(
+                    "Target.Id must be an email address when Target.Type is EMAIL",
+                ));
+            }
+            if crate::state::target_account_id("EMAIL", id).is_none() {
+                return Err(invalid_input(&format!(
+                    "No account is registered for {id}. fakecloud resolves an EMAIL target \
+                     only for addresses it minted (<account-id>@example.com); invite the \
+                     account by id instead."
+                )));
+            }
+            Ok(())
+        }
+        other => Err(invalid_input(&format!(
+            "Target.Type must be one of [ACCOUNT, EMAIL], got {other}"
+        ))),
     }
 }

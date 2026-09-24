@@ -1493,26 +1493,44 @@ type OrganizationsTag struct {
 // or root id) and ScpAttached (SCP ids directly attached — does not
 // walk up the hierarchy).
 type OrganizationsAccount struct {
-	ID              string             `json:"id"`
-	ARN             string             `json:"arn"`
-	Email           string             `json:"email"`
-	Name            string             `json:"name"`
-	Status          string             `json:"status"`
-	JoinedMethod    string             `json:"joinedMethod"`
-	JoinedTimestamp string             `json:"joinedTimestamp"`
-	ParentOuID      *string            `json:"parentOuId,omitempty"`
-	Tags            []OrganizationsTag `json:"tags"`
-	ScpAttached     []string           `json:"scpAttached"`
+	ID              string  `json:"id"`
+	ARN             string  `json:"arn"`
+	Email           string  `json:"email"`
+	Name            string  `json:"name"`
+	Status          string  `json:"status"`
+	JoinedMethod    string  `json:"joinedMethod"`
+	JoinedTimestamp string  `json:"joinedTimestamp"`
+	ParentOuID      *string `json:"parentOuId,omitempty"`
+	// OrganizationID names the organization this account belongs to,
+	// so the flattened list stays readable with several organizations.
+	OrganizationID *string            `json:"organizationId,omitempty"`
+	Tags           []OrganizationsTag `json:"tags"`
+	ScpAttached    []string           `json:"scpAttached"`
+}
+
+// OrganizationsSummary is one organization in the process. Organizations
+// are fully independent: each has its own management account, root and
+// SCPs.
+type OrganizationsSummary struct {
+	OrganizationID      string `json:"organizationId"`
+	ARN                 string `json:"arn"`
+	ManagementAccountID string `json:"managementAccountId"`
+	RootID              string `json:"rootId"`
+	FeatureSet          string `json:"featureSet"`
 }
 
 // OrganizationsAccountsResponse is the payload for
-// GET /_fakecloud/organizations/accounts. Both management and master
-// id fields are populated (AWS renamed Master to Management in 2020
-// but kept both around for back-compat). Empty when no org exists.
+// GET /_fakecloud/organizations/accounts. Accounts spans every
+// organization, each carrying its own OrganizationID. The flat
+// management/master id fields are set only when exactly one
+// organization exists (AWS renamed Master to Management in 2020 but
+// kept both around for back-compat); read Organizations otherwise.
+// Empty when no organization exists.
 type OrganizationsAccountsResponse struct {
 	Accounts            []OrganizationsAccount `json:"accounts"`
 	ManagementAccountID *string                `json:"managementAccountId,omitempty"`
 	MasterAccountID     *string                `json:"masterAccountId,omitempty"`
+	Organizations       []OrganizationsSummary `json:"organizations"`
 }
 
 // OrganizationsResponsibilityTransfer mirrors the AWS Organizations
@@ -1533,6 +1551,9 @@ type OrganizationsResponsibilityTransfer struct {
 	StartTimestamp               string  `json:"startTimestamp"`
 	EndTimestamp                 *string `json:"endTimestamp,omitempty"`
 	ActiveHandshakeID            *string `json:"activeHandshakeId,omitempty"`
+	// OrganizationID names the organization holding the transfer; the
+	// listing spans every organization in the process.
+	OrganizationID *string `json:"organizationId,omitempty"`
 }
 
 // OrganizationsResponsibilityTransfersResponse is the payload for

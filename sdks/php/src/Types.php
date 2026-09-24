@@ -3642,6 +3642,7 @@ final class OrganizationsAccount
         public readonly array $tags = [],
         /** @var string[] */
         public readonly array $scpAttached = [],
+        public readonly ?string $organizationId = null,
     ) {}
 
     public static function fromArray(array $data): self
@@ -3659,10 +3660,43 @@ final class OrganizationsAccount
             isset($data['parentOuId']) ? (string) $data['parentOuId'] : null,
             $tags,
             $scp,
+            isset($data['organizationId']) ? (string) $data['organizationId'] : null,
         );
     }
 }
 
+/**
+ * One organization in the process. Organizations are fully independent:
+ * each has its own management account, root and SCPs.
+ */
+final class OrganizationsSummary
+{
+    public function __construct(
+        public readonly string $organizationId,
+        public readonly string $arn,
+        public readonly string $managementAccountId,
+        public readonly string $rootId,
+        public readonly string $featureSet,
+    ) {}
+
+    public static function fromArray(array $data): self
+    {
+        return new self(
+            (string) ($data['organizationId'] ?? ''),
+            (string) ($data['arn'] ?? ''),
+            (string) ($data['managementAccountId'] ?? ''),
+            (string) ($data['rootId'] ?? ''),
+            (string) ($data['featureSet'] ?? ''),
+        );
+    }
+}
+
+/**
+ * Every member account across every organization. The flat
+ * managementAccountId/masterAccountId are set only when exactly one
+ * organization exists; read $organizations (or each account's
+ * $organizationId) otherwise.
+ */
 final class OrganizationsAccountsResponse
 {
     public function __construct(
@@ -3670,6 +3704,8 @@ final class OrganizationsAccountsResponse
         public readonly array $accounts,
         public readonly ?string $managementAccountId = null,
         public readonly ?string $masterAccountId = null,
+        /** @var OrganizationsSummary[] */
+        public readonly array $organizations = [],
     ) {}
 
     public static function fromArray(array $data): self
@@ -3678,6 +3714,7 @@ final class OrganizationsAccountsResponse
             array_map(OrganizationsAccount::fromArray(...), $data['accounts'] ?? []),
             isset($data['managementAccountId']) ? (string) $data['managementAccountId'] : null,
             isset($data['masterAccountId']) ? (string) $data['masterAccountId'] : null,
+            array_map(OrganizationsSummary::fromArray(...), $data['organizations'] ?? []),
         );
     }
 }
@@ -3698,6 +3735,7 @@ final class OrganizationsResponsibilityTransfer
         public readonly string $startTimestamp,
         public readonly ?string $endTimestamp = null,
         public readonly ?string $activeHandshakeId = null,
+        public readonly ?string $organizationId = null,
     ) {}
 
     public static function fromArray(array $data): self
@@ -3716,6 +3754,7 @@ final class OrganizationsResponsibilityTransfer
             (string) ($data['startTimestamp'] ?? ''),
             isset($data['endTimestamp']) ? (string) $data['endTimestamp'] : null,
             isset($data['activeHandshakeId']) ? (string) $data['activeHandshakeId'] : null,
+            isset($data['organizationId']) ? (string) $data['organizationId'] : null,
         );
     }
 }

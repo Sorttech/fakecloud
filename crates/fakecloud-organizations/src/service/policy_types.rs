@@ -8,8 +8,7 @@ impl OrganizationsService {
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let mut guard = self.state.write();
-        self.require_member_management(&guard, &req.account_id)?;
-        let org = guard.as_mut().expect("management gate proved Some");
+        let org = self.management_org_mut(&mut guard, &req.account_id)?;
         org.enable_all_features();
         // AWS returns a Handshake here; we synthesize a minimal accepted
         // shape so SDKs can deserialize the response.

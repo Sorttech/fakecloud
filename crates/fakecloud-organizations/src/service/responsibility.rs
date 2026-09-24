@@ -34,6 +34,23 @@ fn require_transfer_type(body: &Value) -> Result<String, AwsServiceError> {
     Ok(t.to_string())
 }
 
+/// A transfer invited by email records the ADDRESS as the target
+/// management account, so resolve it back to the account it names --
+/// comparing an account id against an address never matches, and the
+/// email-invited organization would never see the transfer it was
+/// invited to take over.
+fn is_transfer_target(t: &ResponsibilityTransfer, account_id: &str) -> bool {
+    t.target_management_account_id == account_id
+        || crate::state::target_account_id("EMAIL", &t.target_management_account_id).as_deref()
+            == Some(account_id)
+        || crate::state::target_account_id("EMAIL", &t.target_management_account_email).as_deref()
+            == Some(account_id)
+}
+
+fn is_transfer_party(t: &ResponsibilityTransfer, account_id: &str) -> bool {
+    t.source_management_account_id == account_id || is_transfer_target(t, account_id)
+}
+
 fn transfer_payload(t: &ResponsibilityTransfer) -> Value {
     let mut obj = json!({
         "Arn": t.arn,
@@ -58,6 +75,44 @@ fn transfer_payload(t: &ResponsibilityTransfer) -> Value {
         obj["ActiveHandshakeId"] = json!(h);
     }
     obj
+}
+
+impl OrganizationsService {
+    /// Resolve a transfer for a MUTATING call and return the id of the
+    /// organization that stores it.
+    ///
+    /// A transfer is an arrangement between two management accounts, and
+    /// both can read it -- but only the source, which created it, can
+    /// rename or withdraw it; the target answers by accepting or
+    /// declining the riding handshake. Resolving through the caller's own
+    /// organization instead reported "not found" to the target, which is
+    /// indistinguishable from a bad id.
+    fn source_org_of_transfer(
+        &self,
+        guard: &parking_lot::RwLockWriteGuard<'_, crate::state::OrganizationsRegistry>,
+        id: &str,
+        caller: &str,
+    ) -> Result<String, AwsServiceError> {
+        let org = guard
+            .org_of_responsibility_transfer(id)
+            .ok_or_else(|| transfer_not_found(id))?;
+        let transfer = org
+            .responsibility_transfers
+            .get(id)
+            .ok_or_else(|| transfer_not_found(id))?;
+        // A stranger learns nothing beyond "no such transfer".
+        if !is_transfer_party(transfer, caller) {
+            return Err(transfer_not_found(id));
+        }
+        if transfer.source_management_account_id != caller {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::FORBIDDEN,
+                "AccessDeniedException",
+                "Only the source management account can modify a responsibility transfer.",
+            ));
+        }
+        Ok(org.org_id.clone())
+    }
 }
 
 impl OrganizationsService {
@@ -92,8 +147,7 @@ impl OrganizationsService {
             .map(|s| s.to_string());
 
         let mut guard = self.state.write();
-        self.require_member_management(&guard, &req.account_id)?;
-        let org = guard.as_mut().expect("management gate proved Some");
+        let org = self.management_org_mut(&mut guard, &req.account_id)?;
 
         // The invited party is identified by account id or email; record
         // whichever the caller supplied as the target management account.
@@ -162,10 +216,14 @@ impl OrganizationsService {
         let body = req.json_body();
         let id = required_str(&body, "Id")?.to_string();
         let guard = self.state.read();
-        let org = guard.as_ref().ok_or_else(organizations_not_in_use)?;
-        let transfer = org
-            .responsibility_transfers
-            .get(&id)
+        // A transfer is stored once, in the SOURCE organization, but it has
+        // two parties: resolving it through the caller's own organization
+        // would hide every inbound transfer from the account being invited
+        // to take over billing.
+        let transfer = guard
+            .org_of_responsibility_transfer(&id)
+            .and_then(|org| org.responsibility_transfers.get(&id))
+            .filter(|t| is_transfer_party(t, &req.account_id))
             .ok_or_else(|| transfer_not_found(&id))?;
         Ok(AwsResponse::ok_json(
             json!({ "ResponsibilityTransfer": transfer_payload(transfer) }),
@@ -180,11 +238,11 @@ impl OrganizationsService {
         let id = required_str(&body, "Id")?.to_string();
         let name = required_str(&body, "Name")?.to_string();
         let mut guard = self.state.write();
-        let org = guard.as_mut().ok_or_else(organizations_not_in_use)?;
-        let transfer = org
-            .responsibility_transfers
-            .get_mut(&id)
-            .ok_or_else(|| transfer_not_found(&id))?;
+        let org_id = self.source_org_of_transfer(&guard, &id, &req.account_id)?;
+        let transfer = guard
+            .org_by_id_mut(&org_id)
+            .and_then(|org| org.responsibility_transfers.get_mut(&id))
+            .expect("resolved just above");
         transfer.name = name;
         let snapshot = transfer.clone();
         Ok(AwsResponse::ok_json(
@@ -203,11 +261,12 @@ impl OrganizationsService {
             .and_then(json_to_datetime)
             .unwrap_or_else(Utc::now);
         let mut guard = self.state.write();
-        let org = guard.as_mut().ok_or_else(organizations_not_in_use)?;
+        let org_id = self.source_org_of_transfer(&guard, &id, &req.account_id)?;
+        let org = guard.org_by_id_mut(&org_id).expect("resolved just above");
         let transfer = org
             .responsibility_transfers
             .get_mut(&id)
-            .ok_or_else(|| transfer_not_found(&id))?;
+            .expect("resolved just above");
         // Only a still-pending transfer can be terminated.
         if transfer.status == "WITHDRAWN" {
             return Err(AwsServiceError::aws_error(
@@ -228,10 +287,14 @@ impl OrganizationsService {
         }
         transfer.status = "WITHDRAWN".to_string();
         transfer.end_timestamp = Some(end);
-        transfer.active_handshake_id = None;
+        // Take the riding handshake id BEFORE clearing the field: reading it
+        // back off the post-clear snapshot always saw `None`, so the
+        // handshake stayed OPEN and the target could still accept a
+        // withdrawn transfer.
+        let riding_handshake = transfer.active_handshake_id.take();
         let snapshot = transfer.clone();
         // Cancel the riding handshake too.
-        if let Some(hid) = &snapshot.active_handshake_id {
+        if let Some(hid) = &riding_handshake {
             if let Some(h) = org.handshakes.get_mut(hid) {
                 h.state = "CANCELED".to_string();
             }
@@ -255,6 +318,11 @@ impl OrganizationsService {
         self.list_responsibility_transfers(req, "OUTBOUND")
     }
 
+    /// AWS's `ResponsibilityTransfer` shape has no `Direction` member --
+    /// direction is expressed by which operation you call, so the stored
+    /// `direction` field is fakecloud-internal provenance surfaced only
+    /// through introspection. Which list a transfer belongs to is decided
+    /// by whether the caller is its source or its target.
     fn list_responsibility_transfers(
         &self,
         req: &AwsRequest,
@@ -265,13 +333,26 @@ impl OrganizationsService {
         let transfer_type = require_transfer_type(&body)?;
         let (max_results, next_token) = parse_list_pagination(&body)?;
         let guard = self.state.read();
-        let org = guard.as_ref().ok_or_else(organizations_not_in_use)?;
-        let filtered: Vec<Value> = org
-            .responsibility_transfers
-            .values()
-            .filter(|t| t.direction == direction && t.transfer_type == transfer_type)
-            .map(transfer_payload)
+        // The caller must be in an organization at all -- these ops declare
+        // AWSOrganizationsNotInUseException -- but the transfers it can see
+        // are the ones it is a party to, which for INBOUND live in the other
+        // organization.
+        self.require_member(&guard, &req.account_id)?;
+        let mut rows: Vec<&ResponsibilityTransfer> = guard
+            .iter()
+            .flat_map(|org| org.responsibility_transfers.values())
+            .filter(|t| {
+                t.transfer_type == transfer_type
+                    && match direction {
+                        "OUTBOUND" => t.source_management_account_id == req.account_id,
+                        _ => is_transfer_target(t, &req.account_id),
+                    }
+            })
             .collect();
+        // Merged across organizations, so impose a stable order for
+        // pagination rather than relying on per-organization map order.
+        rows.sort_by(|a, b| a.id.cmp(&b.id));
+        let filtered: Vec<Value> = rows.into_iter().map(transfer_payload).collect();
         let (page, token) = paginate_checked(&filtered, next_token.as_deref(), max_results)
             .map_err(|_| invalid_input("Invalid NextToken"))?;
         let mut out = json!({ "ResponsibilityTransfers": page });

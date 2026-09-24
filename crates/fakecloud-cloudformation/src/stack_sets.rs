@@ -1501,7 +1501,7 @@ impl CloudFormationService {
             None | Some("SELF") => Ok(caller.to_string()),
             Some("DELEGATED_ADMIN") => {
                 let orgs = self.deps.organizations.read();
-                let org = orgs.as_ref().ok_or_else(|| {
+                let org = orgs.org_of_account(caller).ok_or_else(|| {
                     validation("AWS Organizations is not enabled for this account")
                 })?;
                 let registered = org
@@ -1526,7 +1526,7 @@ impl CloudFormationService {
         let trusted_in_org = {
             let orgs = self.deps.organizations.read();
             let org = orgs
-                .as_ref()
+                .org_of_account(admin)
                 .ok_or_else(|| validation("AWS Organizations is not enabled for this account"))?;
             if org.management_account_id != admin {
                 return Err(validation(
@@ -2051,7 +2051,7 @@ impl CloudFormationService {
             )?;
             (targets, explicit_regions.clone())
         } else {
-            let suspended = self.suspended_accounts_for(&updated);
+            let suspended = self.suspended_accounts_for(&updated, &admin);
             let targets = updated
                 .instances
                 .iter()
@@ -2254,7 +2254,7 @@ impl CloudFormationService {
             let filter = self.account_filter_type(dt, &filter_accounts)?;
             let orgs = self.deps.organizations.read();
             let org = orgs
-                .as_ref()
+                .org_of_account(caller)
                 .ok_or_else(|| validation("AWS Organizations is not enabled for this account"))?;
             let mut seen = BTreeSet::new();
             for ou in &dt.organizational_unit_ids {
@@ -2331,8 +2331,10 @@ impl CloudFormationService {
     }
 
     /// Organization member accounts that are not ACTIVE. Existing instances in
-    /// them are skipped again rather than failed.
-    fn suspended_accounts_for(&self, set: &StackSet) -> BTreeSet<String> {
+    /// them are skipped again rather than failed. Scoped to `admin`'s own
+    /// organization — another organization's suspended accounts are none of
+    /// this stack set's business.
+    fn suspended_accounts_for(&self, set: &StackSet, admin: &str) -> BTreeSet<String> {
         // Only service-managed stack sets deploy through the organization;
         // a self-managed one targets accounts directly.
         if set.permission_model != "SERVICE_MANAGED" {
@@ -2341,7 +2343,7 @@ impl CloudFormationService {
         self.deps
             .organizations
             .read()
-            .as_ref()
+            .org_of_account(admin)
             .map(|org| {
                 org.accounts
                     .values()
@@ -2428,7 +2430,7 @@ impl CloudFormationService {
                 "Only one of Accounts or DeploymentTargets can be specified",
             ));
         }
-        let suspended = self.suspended_accounts_for(set);
+        let suspended = self.suspended_accounts_for(set, caller);
         let mut targets = Vec::new();
         let mut push = |instance: &StackInstance| {
             if !targets
@@ -2465,7 +2467,7 @@ impl CloudFormationService {
                 .deps
                 .organizations
                 .read()
-                .as_ref()
+                .org_of_account(caller)
                 .map(|org| {
                     dt.organizational_unit_ids
                         .iter()
@@ -3679,7 +3681,7 @@ impl CloudFormationService {
         if !ous.is_empty() {
             let orgs = self.deps.organizations.read();
             let org = orgs
-                .as_ref()
+                .org_of_account(&admin)
                 .ok_or_else(|| validation("AWS Organizations is not enabled for this account"))?;
             for ou in &ous {
                 for (account, _) in accounts_under(org, ou) {
@@ -4022,10 +4024,9 @@ impl CloudFormationService {
     }
 
     async fn reconcile_auto_deployments_once(&self, deadline: tokio::time::Instant) {
-        let org = match self.deps.organizations.read().as_ref() {
-            Some(org) => org.clone(),
-            None => return,
-        };
+        if self.deps.organizations.read().is_empty() {
+            return;
+        }
         let candidates: Vec<(String, String)> = {
             let accounts = self.state.read();
             accounts
@@ -4042,6 +4043,19 @@ impl CloudFormationService {
                 .collect()
         };
         for (admin, set_id) in candidates {
+            // Each stack set reconciles against ITS OWN administrator's
+            // organization. Reconciling every stack set in the process
+            // against one organization would deploy an administrator's
+            // stack set to accounts belonging to a different organization.
+            let Some(org) = self
+                .deps
+                .organizations
+                .read()
+                .org_of_account(&admin)
+                .cloned()
+            else {
+                continue;
+            };
             self.reconcile_stack_set_auto_deployment(&org, &admin, &set_id, deadline)
                 .await;
         }
@@ -4130,7 +4144,7 @@ impl CloudFormationService {
             // Without the organization there is nothing to work out who was
             // left out, but what this call deployed is still known, and the
             // exclusions on those are cleared below either way.
-            if let Some(org) = orgs.as_ref() {
+            if let Some(org) = orgs.org_of_account(admin) {
                 for ou in &dt.organizational_unit_ids {
                     for (account, _) in accounts_under(org, ou) {
                         for region in regions {
@@ -5655,7 +5669,7 @@ mod tests {
             org.enroll_account_if_missing(account);
             org.move_account(account, &root, dest).unwrap();
         }
-        *svc.deps.organizations.write() = Some(org);
+        svc.deps.organizations.write().insert(org);
         (parent.id, child.id)
     }
 
@@ -5704,7 +5718,7 @@ mod tests {
     /// Put `account` in the organization under `parent`.
     fn join_ou(svc: &CloudFormationService, account: &str, parent: &str) {
         let mut guard = svc.deps.organizations.write();
-        let org = guard.as_mut().expect("organization");
+        let org = guard.sole_mut().expect("organization");
         let root = org.root_id.clone();
         org.enroll_account_if_missing(account);
         org.move_account(account, &root, parent).unwrap();
@@ -5764,7 +5778,7 @@ mod tests {
         // ACCT_C moves out of the target OU tree, back to the root.
         {
             let mut guard = svc.deps.organizations.write();
-            let org = guard.as_mut().expect("organization");
+            let org = guard.sole_mut().expect("organization");
             let root = org.root_id.clone();
             let parent = org.parent_of(ACCT_C).expect("parent").0;
             org.move_account(ACCT_C, &parent, &root).unwrap();
@@ -5793,7 +5807,7 @@ mod tests {
 
         {
             let mut guard = svc.deps.organizations.write();
-            let org = guard.as_mut().expect("organization");
+            let org = guard.sole_mut().expect("organization");
             let root = org.root_id.clone();
             let parent = org.parent_of(ACCT_C).expect("parent").0;
             org.move_account(ACCT_C, &parent, &root).unwrap();
@@ -5843,7 +5857,7 @@ mod tests {
         // covers the account while it is still there.
         let (root, parent) = {
             let mut guard = svc.deps.organizations.write();
-            let org = guard.as_mut().unwrap();
+            let org = guard.sole_mut().unwrap();
             let root = org.root_id.clone();
             let parent = org.parent_of(ACCT_C).unwrap().0;
             org.move_account(ACCT_C, &parent, &root).unwrap();
@@ -5852,7 +5866,7 @@ mod tests {
         svc.reconcile_auto_deployments().await;
         {
             let mut guard = svc.deps.organizations.write();
-            let org = guard.as_mut().unwrap();
+            let org = guard.sole_mut().unwrap();
             org.move_account(ACCT_C, &root, &parent).unwrap();
         }
         svc.reconcile_auto_deployments().await;
@@ -5923,7 +5937,7 @@ mod tests {
         // Two sibling OUs, each a target in the same region.
         let other = {
             let mut guard = svc.deps.organizations.write();
-            let org = guard.as_mut().unwrap();
+            let org = guard.sole_mut().unwrap();
             let root = org.root_id.clone();
             org.create_ou(&root, "sandbox").unwrap().id
         };
@@ -5951,7 +5965,7 @@ mod tests {
         // Moving between two target OUs keeps the stack but re-attributes it.
         {
             let mut guard = svc.deps.organizations.write();
-            let org = guard.as_mut().unwrap();
+            let org = guard.sole_mut().unwrap();
             org.move_account(ACCT_D, &other, &prod).unwrap();
         }
         svc.reconcile_auto_deployments().await;
@@ -5996,7 +6010,7 @@ mod tests {
         // It leaves, so the stack set has no instances at all left.
         {
             let mut guard = svc.deps.organizations.write();
-            let org = guard.as_mut().unwrap();
+            let org = guard.sole_mut().unwrap();
             let root = org.root_id.clone();
             org.move_account(ACCT_C, &prod, &root).unwrap();
         }
@@ -6041,7 +6055,7 @@ mod tests {
         .await;
         let sandbox = {
             let mut guard = svc.deps.organizations.write();
-            let org = guard.as_mut().unwrap();
+            let org = guard.sole_mut().unwrap();
             let root = org.root_id.clone();
             org.create_ou(&root, "sandbox").unwrap().id
         };
@@ -6075,7 +6089,7 @@ mod tests {
         // instance in the OU it left must not be orphaned.
         {
             let mut guard = svc.deps.organizations.write();
-            let org = guard.as_mut().unwrap();
+            let org = guard.sole_mut().unwrap();
             org.move_account(ACCT_D, &sandbox, &prod).unwrap();
         }
         svc.reconcile_auto_deployments().await;
@@ -6431,7 +6445,7 @@ mod tests {
         // A stack in an account under a *different* OU, adopted into the set.
         let sandbox = {
             let mut guard = svc.deps.organizations.write();
-            let org = guard.as_mut().unwrap();
+            let org = guard.sole_mut().unwrap();
             let root = org.root_id.clone();
             org.create_ou(&root, "sandbox").unwrap().id
         };
@@ -6684,7 +6698,7 @@ mod tests {
         let (_workloads, _prod) = auto_deployed_set(&svc, "org", false).await;
         let sandbox = {
             let mut guard = svc.deps.organizations.write();
-            let org = guard.as_mut().unwrap();
+            let org = guard.sole_mut().unwrap();
             let root = org.root_id.clone();
             org.create_ou(&root, "sandbox").unwrap().id
         };
@@ -6727,7 +6741,7 @@ mod tests {
         auto_deployed_set(&svc, "org", false).await;
         let sandbox = {
             let mut guard = svc.deps.organizations.write();
-            let org = guard.as_mut().unwrap();
+            let org = guard.sole_mut().unwrap();
             let root = org.root_id.clone();
             org.create_ou(&root, "sandbox").unwrap().id
         };
@@ -6798,7 +6812,7 @@ mod tests {
         let (_workloads, prod) = auto_deployed_set(&svc, "org", false).await;
         let sandbox = {
             let mut guard = svc.deps.organizations.write();
-            let org = guard.as_mut().unwrap();
+            let org = guard.sole_mut().unwrap();
             let root = org.root_id.clone();
             org.create_ou(&root, "sandbox").unwrap().id
         };
@@ -6932,7 +6946,7 @@ mod tests {
         .await;
         let sandbox = {
             let mut guard = svc.deps.organizations.write();
-            let org = guard.as_mut().unwrap();
+            let org = guard.sole_mut().unwrap();
             let root = org.root_id.clone();
             org.create_ou(&root, "sandbox").unwrap().id
         };
@@ -6954,7 +6968,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
         {
             let mut guard = svc.deps.organizations.write();
-            let org = guard.as_mut().unwrap();
+            let org = guard.sole_mut().unwrap();
             org.move_account(ACCT_D, &sandbox, &prod).unwrap();
         }
 
@@ -6997,7 +7011,7 @@ mod tests {
         let (workloads, _prod) = auto_deployed_set(&svc, "org", false).await;
         let sandbox = {
             let mut guard = svc.deps.organizations.write();
-            let org = guard.as_mut().unwrap();
+            let org = guard.sole_mut().unwrap();
             let root = org.root_id.clone();
             org.create_ou(&root, "sandbox").unwrap().id
         };
@@ -7036,7 +7050,7 @@ mod tests {
         // any other: the decision was about the OU it left.
         {
             let mut guard = svc.deps.organizations.write();
-            let org = guard.as_mut().unwrap();
+            let org = guard.sole_mut().unwrap();
             let parent = org.parent_of(ACCT_C).unwrap().0;
             org.move_account(ACCT_C, &parent, &sandbox).unwrap();
         }
@@ -7095,7 +7109,7 @@ mod tests {
         auto_deployed_set(&svc, "org", false).await;
         let sandbox = {
             let mut guard = svc.deps.organizations.write();
-            let org = guard.as_mut().unwrap();
+            let org = guard.sole_mut().unwrap();
             let root = org.root_id.clone();
             org.create_ou(&root, "sandbox").unwrap().id
         };
@@ -7353,7 +7367,7 @@ mod tests {
         seed_org(&svc);
         {
             let mut orgs = svc.deps.organizations.write();
-            let org = orgs.as_mut().unwrap();
+            let org = orgs.sole_mut().unwrap();
             org.enable_aws_service_access(STACKSETS_PRINCIPAL);
             org.register_delegated_administrator(ACCT_B, STACKSETS_PRINCIPAL)
                 .unwrap();
@@ -7666,7 +7680,7 @@ mod tests {
         seed_org(&svc);
         {
             let mut orgs = svc.deps.organizations.write();
-            let org = orgs.as_mut().unwrap();
+            let org = orgs.sole_mut().unwrap();
             org.enable_aws_service_access(STACKSETS_PRINCIPAL);
             org.register_delegated_administrator(ACCT_B, STACKSETS_PRINCIPAL)
                 .unwrap();
@@ -7778,7 +7792,7 @@ mod tests {
         svc.deps
             .organizations
             .write()
-            .as_mut()
+            .sole_mut()
             .unwrap()
             .close_account(ACCT_C)
             .unwrap();
@@ -7891,7 +7905,7 @@ mod tests {
         seed_org(&svc);
         {
             let mut orgs = svc.deps.organizations.write();
-            let org = orgs.as_mut().unwrap();
+            let org = orgs.sole_mut().unwrap();
             org.enable_aws_service_access(STACKSETS_PRINCIPAL);
             org.register_delegated_administrator(ACCT_B, STACKSETS_PRINCIPAL)
                 .unwrap();
@@ -8227,7 +8241,7 @@ mod tests {
         svc.deps
             .organizations
             .write()
-            .as_mut()
+            .sole_mut()
             .unwrap()
             .close_account(ACCT_C)
             .unwrap();

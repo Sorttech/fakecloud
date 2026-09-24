@@ -13,6 +13,9 @@ use crate::state::{ResponsibilityTransfer, SharedOrganizationsState};
 /// One billing-responsibility transfer flattened for introspection.
 #[derive(Debug, Clone)]
 pub struct ResponsibilityTransferRow {
+    /// The organization that holds the transfer. The listing spans every
+    /// organization, so without this a reader cannot tell them apart.
+    pub organization_id: String,
     pub id: String,
     pub arn: String,
     pub name: String,
@@ -29,8 +32,9 @@ pub struct ResponsibilityTransferRow {
     pub active_handshake_id: Option<String>,
 }
 
-fn transfer_to_row(t: &ResponsibilityTransfer) -> ResponsibilityTransferRow {
+fn transfer_to_row(org_id: &str, t: &ResponsibilityTransfer) -> ResponsibilityTransferRow {
     ResponsibilityTransferRow {
+        organization_id: org_id.to_string(),
         id: t.id.clone(),
         arn: t.arn.clone(),
         name: t.name.clone(),
@@ -47,19 +51,19 @@ fn transfer_to_row(t: &ResponsibilityTransfer) -> ResponsibilityTransferRow {
     }
 }
 
-/// List every billing-responsibility transfer in the org, sorted by id.
-/// Empty when no organization has been created.
+/// List every billing-responsibility transfer across every organization,
+/// sorted by id. Empty when no organization has been created.
 pub fn list_all_responsibility_transfers(
     state: &SharedOrganizationsState,
 ) -> Vec<ResponsibilityTransferRow> {
     let guard = state.read();
-    let Some(org) = guard.as_ref() else {
-        return Vec::new();
-    };
-    let mut rows: Vec<ResponsibilityTransferRow> = org
-        .responsibility_transfers
-        .values()
-        .map(transfer_to_row)
+    let mut rows: Vec<ResponsibilityTransferRow> = guard
+        .iter()
+        .flat_map(|org| {
+            org.responsibility_transfers
+                .values()
+                .map(|t| transfer_to_row(&org.org_id, t))
+        })
         .collect();
     rows.sort_by(|a, b| a.id.cmp(&b.id));
     rows
@@ -72,7 +76,9 @@ mod tests {
 
     #[test]
     fn empty_when_no_org() {
-        let state: SharedOrganizationsState = Arc::new(parking_lot::RwLock::new(None));
+        let state: SharedOrganizationsState = Arc::new(parking_lot::RwLock::new(
+            crate::state::OrganizationsRegistry::default(),
+        ));
         assert!(list_all_responsibility_transfers(&state).is_empty());
     }
 
@@ -101,7 +107,7 @@ mod tests {
                 },
             );
         }
-        let state: SharedOrganizationsState = Arc::new(parking_lot::RwLock::new(Some(org)));
+        let state: SharedOrganizationsState = Arc::new(parking_lot::RwLock::new(org.into()));
         let rows = list_all_responsibility_transfers(&state);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].id, "rt-a");

@@ -217,7 +217,7 @@ impl ResetState {
                 *self.athena.write() = fakecloud_athena::AthenaAccounts::new();
             }
             "organizations" => {
-                *self.organizations.write() = None;
+                self.organizations.write().clear();
             }
             _ => {
                 return Err(format!("Unknown service: {service}"));
@@ -531,10 +531,10 @@ impl ResetState {
             fakecloud_application_autoscaling::ApplicationAutoScalingAccounts::new();
         *self.wafv2.write() = fakecloud_wafv2::Wafv2Accounts::new();
         *self.athena.write() = fakecloud_athena::AthenaAccounts::new();
-        // Organizations is a cross-account singleton (not MultiAccountState);
-        // a full reset drops the org entirely so subsequent runs start
-        // with no org, matching the no-in-use default state.
-        *self.organizations.write() = None;
+        // Organizations is a cross-account registry (not MultiAccountState);
+        // a full reset drops every organization so subsequent runs start
+        // with none, matching the no-in-use default state.
+        self.organizations.write().clear();
         tracing::info!("state reset via reset API");
         axum::Json(types::ResetResponse {
             status: "ok".to_string(),
@@ -568,10 +568,26 @@ pub(crate) fn create_admin_in_account(
 ) -> Result<types::CreateAdminResponse, CreateAdminError> {
     if let Some(org_id) = organization_id {
         let mut guard = organizations.write();
+        if !guard.contains_org(org_id) {
+            return Err(CreateAdminError::UnknownOrganization(org_id.to_string()));
+        }
+        // An account belongs to at most one organization. Without this the
+        // shortcut would enroll it into a second registry entry, and which
+        // organization's SCP ceiling, DescribeOrganization view and
+        // stack-set targeting applied would come down to org-id sort order.
+        // `CreateOrganization` and `InviteAccountToOrganization` both reject
+        // this; so does the shortcut.
+        if let Some(current) = guard.org_of_account(account_id) {
+            if current.org_id != org_id {
+                return Err(CreateAdminError::AccountInAnotherOrganization {
+                    account_id: account_id.to_string(),
+                    organization_id: current.org_id.clone(),
+                });
+            }
+        }
         let org = guard
-            .as_mut()
-            .filter(|org| org.org_id == org_id)
-            .ok_or_else(|| CreateAdminError::UnknownOrganization(org_id.to_string()))?;
+            .org_by_id_mut(org_id)
+            .expect("checked just above that the organization exists");
         org.enroll_account_if_missing(account_id);
     }
 
@@ -641,6 +657,12 @@ pub(crate) enum CreateAdminError {
     /// the caller is explicitly avoiding by naming one, so this is an
     /// error rather than a silent fallback.
     UnknownOrganization(String),
+    /// The account is already a member of a different organization, and
+    /// an account can only ever be in one.
+    AccountInAnotherOrganization {
+        account_id: String,
+        organization_id: String,
+    },
 }
 
 impl CreateAdminError {
@@ -649,6 +671,12 @@ impl CreateAdminError {
             Self::UnknownOrganization(id) => {
                 format!("no organization with id {id} exists")
             }
+            Self::AccountInAnotherOrganization {
+                account_id,
+                organization_id,
+            } => format!(
+                "account {account_id} is already a member of organization {organization_id}"
+            ),
         }
     }
 }
@@ -941,7 +969,9 @@ mod tests {
             athena: Arc::new(parking_lot::RwLock::new(
                 fakecloud_athena::AthenaAccounts::new(),
             )),
-            organizations: Arc::new(parking_lot::RwLock::new(None)),
+            organizations: Arc::new(parking_lot::RwLock::new(
+                fakecloud_organizations::OrganizationsRegistry::default(),
+            )),
             container_runtime: None,
             rds_runtime: None,
             elasticache_runtime: None,
@@ -967,8 +997,9 @@ mod tests {
         let iam: fakecloud_iam::SharedIamState = Arc::new(parking_lot::RwLock::new(
             fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
         ));
-        let orgs: fakecloud_organizations::SharedOrganizationsState =
-            Arc::new(parking_lot::RwLock::new(None));
+        let orgs: fakecloud_organizations::SharedOrganizationsState = Arc::new(
+            parking_lot::RwLock::new(fakecloud_organizations::OrganizationsRegistry::default()),
+        );
         let resp = super::create_admin_in_account(&iam, &orgs, "123456789012", "admin", None)
             .expect("create admin");
         assert_eq!(resp.account_id, "123456789012");
@@ -989,8 +1020,9 @@ mod tests {
         let iam: fakecloud_iam::SharedIamState = Arc::new(parking_lot::RwLock::new(
             fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
         ));
-        let orgs: fakecloud_organizations::SharedOrganizationsState =
-            Arc::new(parking_lot::RwLock::new(None));
+        let orgs: fakecloud_organizations::SharedOrganizationsState = Arc::new(
+            parking_lot::RwLock::new(fakecloud_organizations::OrganizationsRegistry::default()),
+        );
         let resp = super::create_admin_in_account(&iam, &orgs, "999999999999", "bob", None)
             .expect("create admin");
         assert_eq!(resp.account_id, "999999999999");
@@ -1015,8 +1047,9 @@ mod tests {
         let iam: fakecloud_iam::SharedIamState = Arc::new(parking_lot::RwLock::new(
             fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
         ));
-        let orgs: fakecloud_organizations::SharedOrganizationsState =
-            Arc::new(parking_lot::RwLock::new(None));
+        let orgs: fakecloud_organizations::SharedOrganizationsState = Arc::new(
+            parking_lot::RwLock::new(fakecloud_organizations::OrganizationsRegistry::default()),
+        );
         let resp = super::create_admin_in_account(&iam, &orgs, "222222222222", "admin", None)
             .expect("create admin");
 
@@ -1053,15 +1086,15 @@ mod tests {
             fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
         ));
         let orgs: fakecloud_organizations::SharedOrganizationsState =
-            Arc::new(parking_lot::RwLock::new(Some(
-                fakecloud_organizations::OrganizationState::bootstrap("111111111111"),
-            )));
+            Arc::new(parking_lot::RwLock::new(
+                fakecloud_organizations::OrganizationState::bootstrap("111111111111").into(),
+            ));
 
         super::create_admin_in_account(&iam, &orgs, "222222222222", "admin", None)
             .expect("create admin");
 
         let guard = orgs.read();
-        let org = guard.as_ref().unwrap();
+        let org = guard.sole().unwrap();
         assert!(
             !org.accounts.contains_key("222222222222"),
             "a standalone bootstrap must leave the account outside the org"
@@ -1078,14 +1111,14 @@ mod tests {
         let org_id = org.org_id.clone();
         let root_id = org.root_id.clone();
         let orgs: fakecloud_organizations::SharedOrganizationsState =
-            Arc::new(parking_lot::RwLock::new(Some(org)));
+            Arc::new(parking_lot::RwLock::new(org.into()));
 
         super::create_admin_in_account(&iam, &orgs, "222222222222", "admin", Some(&org_id))
             .expect("create admin");
 
         let guard = orgs.read();
         let member = guard
-            .as_ref()
+            .sole()
             .unwrap()
             .accounts
             .get("222222222222")
@@ -1094,15 +1127,81 @@ mod tests {
         assert_eq!(member.status, "ACTIVE");
     }
 
+    /// An account belongs to at most one organization. The bootstrap
+    /// shortcut must reject a second enrollment rather than putting the
+    /// account in two registries at once, where which organization's SCP
+    /// ceiling and stack-set targeting applied would be arbitrary.
+    #[test]
+    fn create_admin_cannot_enroll_an_account_into_a_second_organization() {
+        let iam: fakecloud_iam::SharedIamState = Arc::new(parking_lot::RwLock::new(
+            fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+        ));
+        let first = fakecloud_organizations::OrganizationState::bootstrap("111111111111");
+        let second = fakecloud_organizations::OrganizationState::bootstrap("999999999999");
+        let first_id = first.org_id.clone();
+        let second_id = second.org_id.clone();
+        let mut registry = fakecloud_organizations::OrganizationsRegistry::default();
+        registry.insert(first);
+        registry.insert(second);
+        let orgs: fakecloud_organizations::SharedOrganizationsState =
+            Arc::new(parking_lot::RwLock::new(registry));
+
+        super::create_admin_in_account(&iam, &orgs, "222222222222", "admin", Some(&first_id))
+            .expect("first enrollment");
+
+        let err =
+            super::create_admin_in_account(&iam, &orgs, "222222222222", "admin", Some(&second_id))
+                .expect_err("a second organization must be rejected");
+        assert_eq!(
+            err,
+            super::CreateAdminError::AccountInAnotherOrganization {
+                account_id: "222222222222".to_string(),
+                organization_id: first_id.clone(),
+            }
+        );
+
+        let guard = orgs.read();
+        assert!(guard
+            .org_by_id(&first_id)
+            .unwrap()
+            .accounts
+            .contains_key("222222222222"));
+        assert!(!guard
+            .org_by_id(&second_id)
+            .unwrap()
+            .accounts
+            .contains_key("222222222222"));
+    }
+
+    /// Re-naming the organization the account is already in is a no-op
+    /// rather than an error — bootstrapping admin credentials twice for
+    /// the same member must keep working.
+    #[test]
+    fn create_admin_into_the_account_s_own_organization_is_idempotent() {
+        let iam: fakecloud_iam::SharedIamState = Arc::new(parking_lot::RwLock::new(
+            fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+        ));
+        let org = fakecloud_organizations::OrganizationState::bootstrap("111111111111");
+        let org_id = org.org_id.clone();
+        let orgs: fakecloud_organizations::SharedOrganizationsState =
+            Arc::new(parking_lot::RwLock::new(org.into()));
+
+        for _ in 0..2 {
+            super::create_admin_in_account(&iam, &orgs, "222222222222", "admin", Some(&org_id))
+                .expect("repeat enrollment is a no-op");
+        }
+        assert_eq!(orgs.read().org_by_id(&org_id).unwrap().accounts.len(), 2);
+    }
+
     #[test]
     fn create_admin_with_unknown_organization_id_errors() {
         let iam: fakecloud_iam::SharedIamState = Arc::new(parking_lot::RwLock::new(
             fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
         ));
         let orgs: fakecloud_organizations::SharedOrganizationsState =
-            Arc::new(parking_lot::RwLock::new(Some(
-                fakecloud_organizations::OrganizationState::bootstrap("111111111111"),
-            )));
+            Arc::new(parking_lot::RwLock::new(
+                fakecloud_organizations::OrganizationState::bootstrap("111111111111").into(),
+            ));
 
         let err = super::create_admin_in_account(
             &iam,
@@ -1125,8 +1224,9 @@ mod tests {
         let iam: fakecloud_iam::SharedIamState = Arc::new(parking_lot::RwLock::new(
             fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
         ));
-        let orgs: fakecloud_organizations::SharedOrganizationsState =
-            Arc::new(parking_lot::RwLock::new(None));
+        let orgs: fakecloud_organizations::SharedOrganizationsState = Arc::new(
+            parking_lot::RwLock::new(fakecloud_organizations::OrganizationsRegistry::default()),
+        );
         let resp = super::create_admin_in_account(&iam, &orgs, "222222222222", "alice", None)
             .expect("create admin");
 

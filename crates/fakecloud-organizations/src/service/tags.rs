@@ -8,8 +8,7 @@ impl OrganizationsService {
         let resource_id = required_str(&body, "ResourceId")?.to_string();
         let tags = parse_tags(body.get("Tags"));
         let mut guard = self.state.write();
-        self.require_member_management(&guard, &req.account_id)?;
-        let org = guard.as_mut().expect("management gate proved Some");
+        let org = self.management_org_mut(&mut guard, &req.account_id)?;
         org.set_resource_tags(&resource_id, &tags);
         Ok(AwsResponse::ok_json(json!({})))
     }
@@ -27,8 +26,7 @@ impl OrganizationsService {
             })
             .unwrap_or_default();
         let mut guard = self.state.write();
-        self.require_member_management(&guard, &req.account_id)?;
-        let org = guard.as_mut().expect("management gate proved Some");
+        let org = self.management_org_mut(&mut guard, &req.account_id)?;
         org.untag_resource(&resource_id, &tag_keys);
         Ok(AwsResponse::ok_json(json!({})))
     }
@@ -40,7 +38,7 @@ impl OrganizationsService {
         let body = req.json_body();
         let resource_id = required_str(&body, "ResourceId")?.to_string();
         let guard = self.state.read();
-        let org = guard.as_ref().ok_or_else(organizations_not_in_use)?;
+        let org = self.require_member(&guard, &req.account_id)?;
         let tags: Vec<Value> = org
             .list_resource_tags(&resource_id)
             .into_iter()

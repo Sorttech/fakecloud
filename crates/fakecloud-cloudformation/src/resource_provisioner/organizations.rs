@@ -17,8 +17,14 @@ impl ResourceProvisioner {
             .to_string();
 
         let mut org = self.organizations_state.write();
-        if org.is_some() {
-            return Err("Organization already exists; only one per fakecloud process".to_string());
+        // Only the stack's own account blocks this. Organizations are
+        // independent, so another account having one must not stop this
+        // stack from creating its own (#2543).
+        if org.account_is_enrolled(&self.account_id) {
+            return Err(format!(
+                "Account {} is already a member of an organization",
+                self.account_id
+            ));
         }
         let mut state = OrganizationState::bootstrap(&self.account_id);
         state.feature_set = feature_set;
@@ -26,7 +32,7 @@ impl ResourceProvisioner {
         let org_arn = state.org_arn.clone();
         let mgmt_arn = state.management_account_arn.clone();
         let root_id = state.root_id.clone();
-        *org = Some(state);
+        org.insert(state);
 
         Ok(ProvisionResult::new(org_id.clone())
             .with("Id", org_id)
@@ -35,9 +41,11 @@ impl ResourceProvisioner {
             .with("RootId", root_id))
     }
 
-    pub(crate) fn delete_organization(&self, _physical_id: &str) -> Result<(), String> {
+    pub(crate) fn delete_organization(&self, physical_id: &str) -> Result<(), String> {
+        // The physical id IS the organization id, so delete exactly the
+        // one this stack created rather than every organization.
         let mut org = self.organizations_state.write();
-        *org = None;
+        org.remove(physical_id);
         Ok(())
     }
 
@@ -60,7 +68,7 @@ impl ResourceProvisioner {
 
         let mut org_lock = self.organizations_state.write();
         let org = org_lock
-            .as_mut()
+            .org_of_account_mut(&self.account_id)
             .ok_or_else(|| "Organization not yet created".to_string())?;
         // Accept root id, OU id, or `Ref`-resolved logical id (we map to root).
         let resolved_parent_id = if parent_id == org.root_id || org.ous.contains_key(&parent_id) {
@@ -96,7 +104,7 @@ impl ResourceProvisioner {
 
     pub(crate) fn delete_organization_unit(&self, physical_id: &str) -> Result<(), String> {
         let mut org_lock = self.organizations_state.write();
-        if let Some(org) = org_lock.as_mut() {
+        if let Some(org) = org_lock.org_of_account_mut(&self.account_id) {
             org.ous.remove(physical_id);
             org.attachments.remove(physical_id);
         }
@@ -149,7 +157,7 @@ impl ResourceProvisioner {
 
         let mut org_lock = self.organizations_state.write();
         let org = org_lock
-            .as_mut()
+            .org_of_account_mut(&self.account_id)
             .ok_or_else(|| "Organization not yet created".to_string())?;
         // CFN provisioning is its own asynchronous flow; we don't need
         // a second layer of poll-for-completion on top. Begin the
@@ -216,7 +224,7 @@ impl ResourceProvisioner {
     /// `close_account` so subsequent reads see it as suspended.
     pub(crate) fn delete_organization_account(&self, physical_id: &str) -> Result<(), String> {
         let mut org_lock = self.organizations_state.write();
-        if let Some(org) = org_lock.as_mut() {
+        if let Some(org) = org_lock.org_of_account_mut(&self.account_id) {
             let _ = org.close_account(physical_id);
         }
         Ok(())
@@ -265,7 +273,7 @@ impl ResourceProvisioner {
 
         let mut org_lock = self.organizations_state.write();
         let org = org_lock
-            .as_mut()
+            .org_of_account_mut(&self.account_id)
             .ok_or_else(|| "Organization not yet created".to_string())?;
         let id_suffix: String = Uuid::new_v4()
             .simple()
@@ -307,7 +315,7 @@ impl ResourceProvisioner {
 
     pub(crate) fn delete_organization_policy(&self, physical_id: &str) -> Result<(), String> {
         let mut org_lock = self.organizations_state.write();
-        if let Some(org) = org_lock.as_mut() {
+        if let Some(org) = org_lock.org_of_account_mut(&self.account_id) {
             org.policies.remove(physical_id);
             for attachments in org.attachments.values_mut() {
                 attachments.remove(physical_id);
@@ -334,7 +342,7 @@ impl ResourceProvisioner {
 
         let mut org_lock = self.organizations_state.write();
         let org = org_lock
-            .as_mut()
+            .org_of_account_mut(&self.account_id)
             .ok_or_else(|| "Organization not yet created".to_string())?;
         org.resource_policy = Some(content);
         let arn = format!(
@@ -349,7 +357,7 @@ impl ResourceProvisioner {
         _physical_id: &str,
     ) -> Result<(), String> {
         let mut org_lock = self.organizations_state.write();
-        if let Some(org) = org_lock.as_mut() {
+        if let Some(org) = org_lock.org_of_account_mut(&self.account_id) {
             org.resource_policy = None;
         }
         Ok(())
@@ -378,7 +386,7 @@ impl ResourceProvisioner {
 
         let mut org_lock = self.organizations_state.write();
         let org = org_lock
-            .as_mut()
+            .org_of_account_mut(&self.account_id)
             .ok_or_else(|| "Organization not yet created".to_string())?;
         let ou = org
             .ous
@@ -430,7 +438,7 @@ impl ResourceProvisioner {
 
         let mut org_lock = self.organizations_state.write();
         let org = org_lock
-            .as_mut()
+            .org_of_account_mut(&self.account_id)
             .ok_or_else(|| "Organization not yet created".to_string())?;
         // AccountName/Email are immutable; do NOT mint a new account. Move to a
         // new parent if ParentIds changed and refresh tags in place.
@@ -504,7 +512,7 @@ impl ResourceProvisioner {
 
         let mut org_lock = self.organizations_state.write();
         let org = org_lock
-            .as_mut()
+            .org_of_account_mut(&self.account_id)
             .ok_or_else(|| "Organization not yet created".to_string())?;
         let (arn, name) = {
             let policy = org

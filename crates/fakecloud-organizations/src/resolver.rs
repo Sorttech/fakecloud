@@ -39,7 +39,10 @@ impl OrganizationsScpResolver {
 impl ScpResolver for OrganizationsScpResolver {
     fn scps_for(&self, principal: &Principal) -> Option<Vec<String>> {
         let guard = self.state.read();
-        let org = guard.as_ref()?;
+        // The ceiling that applies is the one from the principal's OWN
+        // organization. A principal in no organization has no ceiling —
+        // another organization's SCPs must never reach it.
+        let org = guard.org_of_account(&principal.account_id)?;
 
         // Management account: always exempt.
         if org.is_management(&principal.account_id) {
@@ -205,12 +208,14 @@ impl OrganizationsMembershipResolver {
 impl OrgMembershipResolver for OrganizationsMembershipResolver {
     fn can_assume_root_into(&self, caller_account: &str, target_account: &str) -> bool {
         let guard = self.state.read();
-        let Some(org) = guard.as_ref() else {
-            // No organization exists — there is no centralized root access to
-            // grant, so cross-account AssumeRoot is never permitted.
+        // Resolve the CALLER's organization: centralized root access is
+        // granted within one organization, so a caller outside any
+        // organization has none to grant.
+        let Some(org) = guard.org_of_account(caller_account) else {
             return false;
         };
-        // The target must be enrolled in this organization.
+        // The target must be enrolled in that same organization — a
+        // management account has no reach into another organization.
         if !org.accounts.contains_key(target_account) {
             return false;
         }
@@ -233,7 +238,7 @@ mod tests {
     use parking_lot::RwLock;
 
     fn shared(org: OrganizationState) -> SharedOrganizationsState {
-        Arc::new(RwLock::new(Some(org)))
+        Arc::new(RwLock::new(org.into()))
     }
 
     fn user_principal(account: &str) -> Principal {
@@ -249,7 +254,8 @@ mod tests {
 
     #[test]
     fn no_org_returns_none() {
-        let state: SharedOrganizationsState = Arc::new(RwLock::new(None));
+        let state: SharedOrganizationsState =
+            Arc::new(RwLock::new(crate::state::OrganizationsRegistry::default()));
         let resolver = OrganizationsScpResolver::new(state);
         assert!(resolver.scps_for(&user_principal("111111111111")).is_none());
     }
@@ -411,7 +417,8 @@ mod tests {
 
     #[test]
     fn membership_resolver_denies_when_no_org() {
-        let state: SharedOrganizationsState = Arc::new(RwLock::new(None));
+        let state: SharedOrganizationsState =
+            Arc::new(RwLock::new(crate::state::OrganizationsRegistry::default()));
         let resolver = OrganizationsMembershipResolver::new(state);
         assert!(!resolver.can_assume_root_into("111111111111", "222222222222"));
     }

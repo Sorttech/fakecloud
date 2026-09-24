@@ -101,16 +101,28 @@ Response shape:
       "joinedMethod": "INVITED",
       "joinedTimestamp": "2026-05-11T00:00:00Z",
       "parentOuId": "r-1234",
+      "organizationId": "o-abc",
       "tags": [],
       "scpAttached": []
     }
   ],
   "managementAccountId": "111111111111",
-  "masterAccountId": "111111111111"
+  "masterAccountId": "111111111111",
+  "organizations": [
+    {
+      "organizationId": "o-abc",
+      "arn": "arn:aws:organizations::111111111111:organization/o-abc",
+      "managementAccountId": "111111111111",
+      "rootId": "r-1234",
+      "featureSet": "ALL"
+    }
+  ]
 }
 ```
 
 `scpAttached` lists SCPs attached directly to the account only — to resolve the full inherited set walk up the OU tree or call `DescribeEffectivePolicy`. `accounts` is empty (and the account-id fields `null`) when no organization has been created yet. `masterAccountId` mirrors `managementAccountId` for back-compat with the AWS field renamed in 2020.
+
+`accounts` spans **every** organization in the process, each entry carrying its own `organizationId`, and `organizations` lists one entry per organization. The flat `managementAccountId`/`masterAccountId` are set only when exactly one organization exists, so a caller written against the single-organization shape keeps working; with several, read `organizations` (or each account's `organizationId`) rather than getting one arbitrary organization's answer.
 
 The first-party SDKs wrap this:
 

@@ -1398,19 +1398,39 @@ export interface OrganizationsAccount {
   /** RFC3339. */
   joinedTimestamp: string;
   parentOuId?: string;
+  /** The organization this account belongs to, so the flattened list
+   *  stays readable with several organizations. */
+  organizationId?: string;
   tags: OrganizationsTag[];
   /** SCP ids directly attached to the account. Does not include
    *  policies inherited from the parent OU or root. */
   scpAttached: string[];
 }
 
+/** One organization in the process. Organizations are fully
+ *  independent: each has its own management account, root and SCPs. */
+export interface OrganizationsSummary {
+  organizationId: string;
+  arn: string;
+  managementAccountId: string;
+  rootId: string;
+  /** ALL | CONSOLIDATED_BILLING. */
+  featureSet: string;
+}
+
 export interface OrganizationsAccountsResponse {
+  /** Every member account across every organization, each carrying its
+   *  own `organizationId`. */
   accounts: OrganizationsAccount[];
-  /** `null`/undefined when no organization has been created yet. */
+  /** Set only when exactly one organization exists, so callers written
+   *  against the one-org shape keep working; read `organizations`
+   *  otherwise. Undefined when no organization has been created yet. */
   managementAccountId?: string;
   /** Duplicate of `managementAccountId`. AWS renamed Master to
    *  Management in 2020 but kept the old field for back-compat. */
   masterAccountId?: string;
+  /** One entry per organization in the process, ordered by id. */
+  organizations: OrganizationsSummary[];
 }
 
 export interface OrganizationsResponsibilityTransfer {
@@ -1430,6 +1450,9 @@ export interface OrganizationsResponsibilityTransfer {
   /** RFC3339, or `null`/undefined while the transfer is still open. */
   endTimestamp?: string | null;
   activeHandshakeId?: string | null;
+  /** The organization holding the transfer; the listing spans every
+   *  organization in the process. */
+  organizationId?: string;
 }
 
 export interface OrganizationsResponsibilityTransfersResponse {

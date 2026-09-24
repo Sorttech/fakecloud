@@ -1305,13 +1305,67 @@ public final class Types {
             String joinedTimestamp,
             String parentOuId,
             List<OrganizationsTag> tags,
-            List<String> scpAttached) {}
+            List<String> scpAttached,
+            String organizationId) {
+        /** The pre-multi-organization shape, with no owning org id. */
+        public OrganizationsAccount(
+                String id,
+                String arn,
+                String email,
+                String name,
+                String status,
+                String joinedMethod,
+                String joinedTimestamp,
+                String parentOuId,
+                List<OrganizationsTag> tags,
+                List<String> scpAttached) {
+            this(
+                    id,
+                    arn,
+                    email,
+                    name,
+                    status,
+                    joinedMethod,
+                    joinedTimestamp,
+                    parentOuId,
+                    tags,
+                    scpAttached,
+                    null);
+        }
+    }
 
+    /**
+     * One organization in the process. Organizations are fully
+     * independent: each has its own management account, root and SCPs.
+     */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public record OrganizationsSummary(
+            String organizationId,
+            String arn,
+            String managementAccountId,
+            String rootId,
+            String featureSet) {}
+
+    /**
+     * Every member account across every organization. The flat
+     * {@code managementAccountId}/{@code masterAccountId} are set only
+     * when exactly one organization exists; read {@code organizations}
+     * (or each account's {@code organizationId}) otherwise.
+     */
     @JsonIgnoreProperties(ignoreUnknown = true)
     public record OrganizationsAccountsResponse(
             List<OrganizationsAccount> accounts,
             String managementAccountId,
-            String masterAccountId) {}
+            String masterAccountId,
+            List<OrganizationsSummary> organizations) {
+        /** The pre-multi-organization shape, with no summary list. */
+        public OrganizationsAccountsResponse(
+                List<OrganizationsAccount> accounts,
+                String managementAccountId,
+                String masterAccountId) {
+            this(accounts, managementAccountId, masterAccountId, List.of());
+        }
+    }
 
     @JsonIgnoreProperties(ignoreUnknown = true)
     public record OrganizationsResponsibilityTransfer(
@@ -1327,7 +1381,40 @@ public final class Types {
             String targetManagementAccountEmail,
             String startTimestamp,
             String endTimestamp,
-            String activeHandshakeId) {}
+            String activeHandshakeId,
+            String organizationId) {
+        /** The pre-multi-organization shape, with no owning org id. */
+        public OrganizationsResponsibilityTransfer(
+                String id,
+                String arn,
+                String name,
+                String type,
+                String status,
+                String direction,
+                String sourceManagementAccountId,
+                String sourceManagementAccountEmail,
+                String targetManagementAccountId,
+                String targetManagementAccountEmail,
+                String startTimestamp,
+                String endTimestamp,
+                String activeHandshakeId) {
+            this(
+                    id,
+                    arn,
+                    name,
+                    type,
+                    status,
+                    direction,
+                    sourceManagementAccountId,
+                    sourceManagementAccountEmail,
+                    targetManagementAccountId,
+                    targetManagementAccountEmail,
+                    startTimestamp,
+                    endTimestamp,
+                    activeHandshakeId,
+                    null);
+        }
+    }
 
     @JsonIgnoreProperties(ignoreUnknown = true)
     public record OrganizationsResponsibilityTransfersResponse(

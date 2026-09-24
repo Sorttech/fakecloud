@@ -2117,6 +2117,11 @@ pub struct OrganizationsAccount {
     /// Tags directly attached to the account (alphabetical by key).
     #[serde(default)]
     pub tags: Vec<OrganizationsTag>,
+    /// The organization this account belongs to. Present so the
+    /// flattened list stays readable once more than one organization
+    /// exists in the process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_id: Option<String>,
     /// SCP ids directly attached to the account (alphabetical).
     /// Does not include policies inherited from parent OUs or root.
     #[serde(default)]
@@ -2154,11 +2159,35 @@ pub struct OrganizationsTag {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OrganizationsAccountsResponse {
+    /// Every member account across every organization, each carrying its
+    /// own `organizationId`.
     pub accounts: Vec<OrganizationsAccount>,
+    /// The single organization's management account. Set only when
+    /// exactly one organization exists, so a caller written against the
+    /// one-org shape keeps working; read `organizations` otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub management_account_id: Option<String>,
+    /// Legacy alias of `management_account_id`, matching AWS's own
+    /// deprecated `MasterAccountId`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub master_account_id: Option<String>,
+    /// One entry per organization in the process, ordered by id.
+    #[serde(default)]
+    pub organizations: Vec<OrganizationsSummary>,
+}
+
+/// One organization in the process, as exposed by
+/// `GET /_fakecloud/organizations/accounts`. Organizations are fully
+/// independent: each has its own management account, root and SCPs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrganizationsSummary {
+    pub organization_id: String,
+    pub arn: String,
+    pub management_account_id: String,
+    pub root_id: String,
+    /// `ALL` or `CONSOLIDATED_BILLING`.
+    pub feature_set: String,
 }
 
 /// One billing-responsibility transfer as exposed by
@@ -2169,6 +2198,10 @@ pub struct OrganizationsAccountsResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OrganizationsResponsibilityTransfer {
+    /// The organization holding the transfer. The listing spans every
+    /// organization in the process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_id: Option<String>,
     pub id: String,
     pub arn: String,
     pub name: String,

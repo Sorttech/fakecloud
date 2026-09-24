@@ -1094,12 +1094,31 @@ public sealed record OrganizationsAccount(
     string? JoinedTimestamp,
     string? ParentOuId,
     IReadOnlyList<OrganizationsTag>? Tags,
-    IReadOnlyList<string>? ScpAttached);
+    IReadOnlyList<string>? ScpAttached,
+    string? OrganizationId = null);
 
+/// <summary>
+/// One organization in the process. Organizations are fully independent:
+/// each has its own management account, root and SCPs.
+/// </summary>
+public sealed record OrganizationsSummary(
+    string? OrganizationId,
+    string? Arn,
+    string? ManagementAccountId,
+    string? RootId,
+    string? FeatureSet);
+
+/// <summary>
+/// Every member account across every organization. The flat
+/// <c>ManagementAccountId</c>/<c>MasterAccountId</c> are set only when
+/// exactly one organization exists; read <c>Organizations</c> (or each
+/// account's <c>OrganizationId</c>) otherwise.
+/// </summary>
 public sealed record OrganizationsAccountsResponse(
     IReadOnlyList<OrganizationsAccount>? Accounts,
     string? ManagementAccountId,
-    string? MasterAccountId);
+    string? MasterAccountId,
+    IReadOnlyList<OrganizationsSummary>? Organizations = null);
 
 public sealed record OrganizationsResponsibilityTransfer(
     string? Id,
@@ -1114,7 +1133,10 @@ public sealed record OrganizationsResponsibilityTransfer(
     string? TargetManagementAccountEmail,
     string? StartTimestamp,
     string? EndTimestamp,
-    string? ActiveHandshakeId);
+    string? ActiveHandshakeId,
+    /// <summary>The organization holding the transfer; the listing spans
+    /// every organization in the process.</summary>
+    string? OrganizationId = null);
 
 public sealed record OrganizationsResponsibilityTransfersResponse(
     IReadOnlyList<OrganizationsResponsibilityTransfer>? ResponsibilityTransfers);

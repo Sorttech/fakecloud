@@ -24,7 +24,10 @@ impl OrganizationsService {
         }
 
         let mut guard = self.state.write();
-        if guard.is_some() {
+        // Only the CALLER's own membership blocks this. Organizations are
+        // independent of each other, so somebody else having created one
+        // must not stop this account from creating its own (#2543).
+        if guard.account_is_enrolled(&req.account_id) {
             return Err(AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
                 "AlreadyInOrganizationException",
@@ -39,7 +42,7 @@ impl OrganizationsService {
             org.enabled_policy_types.clear();
         }
         let resp_value = organization_payload(&org);
-        *guard = Some(org);
+        guard.insert(org);
         Ok(AwsResponse::ok_json(json!({ "Organization": resp_value })))
     }
 
@@ -48,14 +51,12 @@ impl OrganizationsService {
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let guard = self.state.read();
-        let org = guard.as_ref().ok_or_else(organizations_not_in_use)?;
         // AWS scopes DescribeOrganization to members of the organization.
-        // Non-members must not learn that an org exists at all — return
-        // the same `AWSOrganizationsNotInUseException` the no-org path
-        // returns so org metadata doesn't leak across account boundaries.
-        if !org.accounts.contains_key(&req.account_id) {
-            return Err(organizations_not_in_use());
-        }
+        // Non-members must not learn that an org exists at all — the
+        // resolver returns the same `AWSOrganizationsNotInUseException`
+        // the no-org path returns, so org metadata doesn't leak across
+        // account boundaries.
+        let org = self.require_member(&guard, &req.account_id)?;
         Ok(AwsResponse::ok_json(
             json!({ "Organization": organization_payload(org) }),
         ))
@@ -66,13 +67,12 @@ impl OrganizationsService {
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let mut guard = self.state.write();
-        let org = guard.as_ref().ok_or_else(organizations_not_in_use)?;
         // Non-members get the same "not in use" error as callers in a
         // process with no org at all — they should not be able to tell
         // the difference.
-        if !org.accounts.contains_key(&req.account_id) {
-            return Err(organizations_not_in_use());
-        }
+        let org = guard
+            .org_of_account(&req.account_id)
+            .ok_or_else(organizations_not_in_use)?;
         if !org.is_management(&req.account_id) {
             return Err(AwsServiceError::aws_error(
                 StatusCode::FORBIDDEN,
@@ -96,7 +96,8 @@ impl OrganizationsService {
                 "The organization still has member accounts. Remove them first.",
             ));
         }
-        *guard = None;
+        let org_id = org.org_id.clone();
+        guard.remove(&org_id);
         Ok(AwsResponse::ok_json(Value::Null))
     }
 }
