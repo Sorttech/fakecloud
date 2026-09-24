@@ -556,7 +556,7 @@ impl AwsService for S3Service {
                 if origin.is_none() && req.headers.get("origin").is_none() {
                     return Err(AwsServiceError::aws_error_with_headers(
                         StatusCode::BAD_REQUEST,
-                        "InvalidRequest",
+                        "BadRequest",
                         "Insufficient information. Origin request header needed.",
                         vary(),
                     ));

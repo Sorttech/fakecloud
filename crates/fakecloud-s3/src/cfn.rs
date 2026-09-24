@@ -56,12 +56,23 @@ pub fn apply_cfn_bucket_properties(
     // to the store as it goes, so a validation failure partway would leave the
     // bucket with some subresources written and others not. Bound once so the
     // string that was validated is the same one that gets stored.
-    // `build_cors_xml` yields `None` only when there are no rules to express
-    // (`CorsRules` absent, not an array, or empty), which is the same as
-    // configuring no CORS — so it is skipped rather than failed. Failing here
-    // would take down an unrelated versioning or encryption change in the same
-    // update. A template that does express rules is validated below, which is
-    // the case that used to deploy a bucket whose preflights all fail.
+    // An absent `CorsConfiguration` is a no-op, and an empty `CorsRules: []`
+    // expresses "no CORS" — but `CorsRules` present with the wrong shape (a
+    // typo, or an intrinsic that resolved to an object or string) is a property
+    // error. Skipping that silently deploys a green stack with no CORS applied
+    // and nothing saying why, while every browser request then fails. Real
+    // CloudFormation fails the resource on a type mismatch, so this does too.
+    if let Some(cors) = obj.get("CorsConfiguration") {
+        match cors.get("CorsRules") {
+            Some(rules) if rules.as_array().is_none() => {
+                return Err("CorsConfiguration: CorsRules must be a list of rules".to_string());
+            }
+            Some(_) => {}
+            None => {
+                return Err("CorsConfiguration: CorsRules is required".to_string());
+            }
+        }
+    }
     let cors_xml = obj.get("CorsConfiguration").and_then(build_cors_xml);
     if let Some(xml) = &cors_xml {
         crate::service::config::validate_cors_xml(xml)
@@ -972,6 +983,20 @@ mod tests {
         assert!(xml.contains("<ExposeHeader>ETag</ExposeHeader>"));
         assert!(xml.contains("<MaxAgeSeconds>3000</MaxAgeSeconds>"));
         assert!(xml.contains("<ID>rule1</ID>"));
+    }
+
+    #[test]
+    fn cors_rules_with_the_wrong_shape_fails_the_resource() {
+        // Skipping silently would deploy a green stack with no CORS applied and
+        // nothing saying why, while every browser request against it fails.
+        for bad in [json!({"CorsRules": {"AllowedMethods": ["GET"]}}), json!({})] {
+            let mut b = bucket();
+            let err =
+                apply_cfn_bucket_properties(&mut b, &json!({ "CorsConfiguration": bad }), &store())
+                    .expect_err("a CorsRules type mismatch is a property error");
+            assert!(err.contains("CorsRules"), "{err}");
+            assert!(b.cors_config.is_none());
+        }
     }
 
     #[test]
