@@ -600,7 +600,19 @@ impl AwsService for S3Service {
                                 .flat_map(|v| v.split(','))
                                 .map(|h| h.trim().to_string())
                                 .filter(|h| !h.is_empty())
-                                .collect()
+                                // Deduped: this list is echoed back verbatim in
+                                // `Access-Control-Allow-Headers`, and a client
+                                // repeating a name should not produce
+                                // `x-a, x-a` where S3 sends it once.
+                                .fold(Vec::new(), |mut acc, h| {
+                                    if !acc
+                                        .iter()
+                                        .any(|seen: &String| seen.eq_ignore_ascii_case(&h))
+                                    {
+                                        acc.push(h);
+                                    }
+                                    acc
+                                })
                         });
                     let rules = parse_cors_config(config);
                     if let Some((rule, requested_headers)) =
@@ -609,7 +621,16 @@ impl AwsService for S3Service {
                         })
                     {
                         let mut headers = HeaderMap::new();
-                        let matched_origin = if rule.allowed_origins.contains(&"*".to_string()) {
+                        // `*` only when the entry that actually matched is `*`. A rule
+                        // listing both a concrete origin and `*` matches the
+                        // concrete one first, and echoing `*` there would drop
+                        // allow-credentials for an origin the rule names.
+                        let matched_origin = if rule
+                            .allowed_origins
+                            .iter()
+                            .find(|o| origin_matches(origin, o))
+                            .is_some_and(|o| o == "*")
+                        {
                             "*"
                         } else {
                             origin
@@ -1169,7 +1190,16 @@ impl AwsService for S3Service {
                 // request keeps the `Vary` above and gets no allow-origin.
                 let origin = origin_header.as_deref().unwrap_or("");
                 if let Some(rule) = find_cors_rule(&rules, origin, req.method.as_str(), &[]) {
-                    let matched_origin = if rule.allowed_origins.contains(&"*".to_string()) {
+                    // `*` only when the entry that actually matched is `*`. A rule
+                    // listing both a concrete origin and `*` matches the
+                    // concrete one first, and echoing `*` there would drop
+                    // allow-credentials for an origin the rule names.
+                    let matched_origin = if rule
+                        .allowed_origins
+                        .iter()
+                        .find(|o| origin_matches(origin, o))
+                        .is_some_and(|o| o == "*")
+                    {
                         "*"
                     } else {
                         origin

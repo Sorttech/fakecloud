@@ -548,6 +548,27 @@ fn find_cors_rule_matches_the_request_as_a_whole() {
 }
 
 #[test]
+fn a_rule_listing_both_concrete_and_wildcard_origins_matches_the_concrete_one() {
+    // The echoed allow-origin comes from the entry that matched, not from "does
+    // this rule mention `*` anywhere". Echoing `*` here would drop
+    // allow-credentials for an origin the rule names explicitly.
+    let rules = parse_cors_config(
+        "<CORSConfiguration><CORSRule>\
+         <AllowedOrigin>https://app.example.com</AllowedOrigin>\
+         <AllowedOrigin>*</AllowedOrigin>\
+         <AllowedMethod>GET</AllowedMethod>\
+         </CORSRule></CORSConfiguration>",
+    );
+    let rule = find_cors_rule(&rules, "https://app.example.com", "GET", &[]).unwrap();
+    let matched = rule
+        .allowed_origins
+        .iter()
+        .find(|o| origin_matches("https://app.example.com", o))
+        .unwrap();
+    assert_eq!(matched, "https://app.example.com");
+}
+
+#[test]
 fn empty_origin_never_matches_even_a_wildcard_rule() {
     // An Origin that is absent, blank, or sent on several lines arrives as "".
     // A bare `*` would otherwise match it and hand back an allow-origin for a

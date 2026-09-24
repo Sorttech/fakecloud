@@ -71,7 +71,27 @@ pub fn apply_cfn_bucket_properties(
             Some(rules) if rules.as_array().is_none() => {
                 return Err("CorsConfiguration: CorsRules must be a list of rules".to_string());
             }
-            Some(_) => {}
+            Some(rules) => {
+                // Named here rather than left to the XML validator, which can
+                // only answer `MalformedXML` and never says which property was
+                // wrong. `as f64` also saturates, so a huge value would
+                // otherwise render as `18446744073709551615`.
+                for rule in rules.as_array().into_iter().flatten() {
+                    let bad_max_age = rule.get("MaxAge").is_some_and(|v| match v {
+                        Value::Number(_) => !v.as_f64().is_some_and(|n| {
+                            n.fract() == 0.0 && (0.0..=f64::from(u32::MAX)).contains(&n)
+                        }),
+                        Value::String(s) => s.trim().parse::<u32>().is_err(),
+                        _ => true,
+                    });
+                    if bad_max_age {
+                        return Err(
+                            "CorsConfiguration: MaxAge must be a whole number of seconds"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
             None => return Err("CorsConfiguration: CorsRules is required".to_string()),
         },
         Some(_) => {
@@ -1014,6 +1034,29 @@ mod tests {
             assert!(err.contains("Cors"), "{err}");
             assert!(b.cors_config.is_none());
         }
+    }
+
+    #[test]
+    fn cors_max_age_out_of_range_names_the_property() {
+        // `as u64` saturates, so this would otherwise render as
+        // 18446744073709551615 and fail with a generic MalformedXML that names
+        // nothing the operator can act on.
+        let mut b = bucket();
+        let err = apply_cfn_bucket_properties(
+            &mut b,
+            &json!({
+                "CorsConfiguration": {
+                    "CorsRules": [{
+                        "AllowedMethods": ["GET"],
+                        "AllowedOrigins": ["*"],
+                        "MaxAge": 1e19
+                    }]
+                }
+            }),
+            &store(),
+        )
+        .expect_err("an out-of-range max-age is a property error");
+        assert!(err.contains("MaxAge"), "{err}");
     }
 
     #[test]
