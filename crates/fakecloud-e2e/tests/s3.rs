@@ -1653,6 +1653,71 @@ async fn s3_cors_preflight_and_response_headers() {
         "rejected preflight must send Vary"
     );
 
+    // The actual request is matched on method too: the rule allows GET and PUT,
+    // so a DELETE from the allowed origin gets no ACAO and the browser blocks
+    // the response.
+    let resp = http
+        .delete(format!("{}/cors-bucket/file.txt", server.endpoint()))
+        .header("Origin", "https://example.com")
+        .header("Authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20240101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=fake")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.headers().get("access-control-allow-origin").is_none(),
+        "a method outside AllowedMethods must not get ACAO"
+    );
+    assert_eq!(
+        resp.headers().get("vary").unwrap(),
+        "Origin, Access-Control-Request-Headers, Access-Control-Request-Method"
+    );
+
+    // Multipart operations are CORS-evaluated too — browser multipart upload is
+    // the most common reason a bucket has a CORS config at all.
+    let mpu = s3
+        .create_multipart_upload()
+        .bucket("cors-bucket")
+        .key("mpu.txt")
+        .send()
+        .await
+        .unwrap();
+    let upload_id = mpu.upload_id().unwrap();
+    let resp = http
+        .get(format!(
+            "{}/cors-bucket/mpu.txt?uploadId={}",
+            server.endpoint(),
+            upload_id
+        ))
+        .header("Origin", "https://example.com")
+        .header("Authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20240101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=fake")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get("access-control-allow-origin").unwrap(),
+        "https://example.com",
+        "ListParts must carry CORS headers"
+    );
+    assert_eq!(
+        resp.headers().get("vary").unwrap(),
+        "Origin, Access-Control-Request-Headers, Access-Control-Request-Method"
+    );
+
+    // A preflight with no Origin is not CORS-evaluated, so it gets no Vary
+    // either, matching the actual-request path.
+    let resp = http
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{}/cors-bucket/file.txt", server.endpoint()),
+        )
+        .header("Access-Control-Request-Method", "GET")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    assert!(resp.headers().get("vary").is_none());
+
     // A bucket with no CORS config at all answers preflights identically for
     // every origin, so that 403 carries no Vary.
     s3.create_bucket()
