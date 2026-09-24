@@ -552,19 +552,29 @@ impl AwsService for S3Service {
                     // `Vary` value and the docs all say this is evaluated.
                     // `get_all`: the field may be sent as several lines, and
                     // now that it gates approval, an unread second line would
-                    // approve headers the rule never allowed.
-                    let requested_headers: Vec<String> = req
+                    // approve headers the rule never allowed. For the same
+                    // reason a line that is not readable ASCII denies the
+                    // preflight instead of being skipped — this is a deny gate,
+                    // so an unreadable value must not fail open.
+                    let requested_headers: Option<Vec<String>> = req
                         .headers
                         .get_all("access-control-request-headers")
                         .iter()
-                        .filter_map(|v| v.to_str().ok())
-                        .flat_map(|v| v.split(','))
-                        .map(|h| h.trim().to_string())
-                        .filter(|h| !h.is_empty())
-                        .collect();
+                        .map(|v| v.to_str().ok())
+                        .collect::<Option<Vec<_>>>()
+                        .map(|lines| {
+                            lines
+                                .iter()
+                                .flat_map(|v| v.split(','))
+                                .map(|h| h.trim().to_string())
+                                .filter(|h| !h.is_empty())
+                                .collect()
+                        });
                     let rules = parse_cors_config(config);
-                    if let Some(rule) =
-                        find_cors_rule(&rules, origin, request_method, &requested_headers)
+                    if let Some((rule, requested_headers)) =
+                        requested_headers.as_ref().and_then(|rh| {
+                            find_cors_rule(&rules, origin, request_method, rh).map(|r| (r, rh))
+                        })
                     {
                         let mut headers = HeaderMap::new();
                         let matched_origin = if rule.allowed_origins.contains(&"*".to_string()) {
@@ -3192,15 +3202,12 @@ pub(crate) fn parse_cors_config(xml: &str) -> Vec<CorsRule> {
                     .collect::<Vec<_>>()
             };
             let allowed_origins = trimmed("AllowedOrigin");
-            // Methods are normalized to the canonical uppercase verbs.
-            // `Access-Control-Allow-Methods` is echoed from this list and
-            // browsers compare it to the request method case-sensitively, so a
-            // stored lowercase `get` must not reach the wire as `get` — the
-            // preflight would return 200 and the browser would still block it.
-            let allowed_methods = trimmed("AllowedMethod")
-                .into_iter()
-                .map(|m| m.to_ascii_uppercase())
-                .collect::<Vec<_>>();
+            // Not uppercased: `put_bucket_cors` validates `<AllowedMethod>`
+            // case-sensitively against the canonical verbs and rejects anything
+            // else, so a stored config only ever holds `GET`/`PUT`/... — and
+            // `Access-Control-Allow-Methods` is echoed from this list, which
+            // browsers compare case-sensitively.
+            let allowed_methods = trimmed("AllowedMethod");
             let allowed_headers = trimmed("AllowedHeader");
             let expose_headers = trimmed("ExposeHeader");
             // Trimmed for the same reason as the lists above: an untrimmed
@@ -3252,10 +3259,10 @@ pub(crate) fn origin_matches(origin: &str, pattern: &str) -> bool {
 
 /// Find the matching CORS rule for a given origin and HTTP method.
 ///
-/// Methods compare case-insensitively as a backstop; [`parse_cors_config`]
-/// already trims and uppercases them, which is what makes a pretty-printed or
-/// lowercase stored config match here *and* echo correctly in
-/// `Access-Control-Allow-Methods`.
+/// Methods compare exactly: `put_bucket_cors` accepts only the canonical
+/// uppercase verbs, so a stored rule cannot hold anything else, and
+/// [`parse_cors_config`] trims the pretty-printed whitespace that would
+/// otherwise make an otherwise-valid value miss.
 ///
 /// `requested_headers` are the `Access-Control-Request-Headers` of a preflight,
 /// each of which must be covered by the rule's `AllowedHeader`. An actual
@@ -3271,10 +3278,7 @@ pub(crate) fn find_cors_rule<'a>(
             .allowed_origins
             .iter()
             .any(|o| origin_matches(origin, o));
-        let method_ok = rule
-            .allowed_methods
-            .iter()
-            .any(|am| am.eq_ignore_ascii_case(method));
+        let method_ok = rule.allowed_methods.iter().any(|am| am == method);
         let headers_ok = requested_headers
             .iter()
             .all(|h| rule.allowed_headers.iter().any(|ah| header_matches(h, ah)));

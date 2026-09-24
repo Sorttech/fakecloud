@@ -1707,7 +1707,7 @@ async fn s3_cors_preflight_and_response_headers() {
 
     // A preflight with no Origin carries nothing to evaluate. S3 rejects it as
     // a malformed request (400), distinct from the 403 a disallowed origin
-    // gets, and it is not CORS-evaluated so it gets no Vary.
+    // gets. It still carries Vary: every preflight outcome turns on Origin.
     let resp = http
         .request(
             reqwest::Method::OPTIONS,
@@ -1768,6 +1768,25 @@ async fn s3_cors_preflight_and_response_headers() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 403, "uncovered header must be denied");
+    // A second ACRH line is evaluated too: reading only the first would approve
+    // headers the rule never allowed.
+    let resp = http
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{}/hdr-cors-bucket/file.txt", server.endpoint()),
+        )
+        .header("Origin", "https://example.com")
+        .header("Access-Control-Request-Method", "PUT")
+        .header("Access-Control-Request-Headers", "x-amz-meta-foo")
+        .header("Access-Control-Request-Headers", "authorization")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "every ACRH line must be evaluated, not just the first"
+    );
     // The apostrophe in "resource's" is XML-escaped in the error body, so match
     // on a stretch of the message that has none.
     assert!(resp.text().await.unwrap().contains("are not whitelisted"));

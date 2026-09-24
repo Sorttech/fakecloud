@@ -366,17 +366,17 @@ fn parse_cors_config_trims_pretty_printed_values() {
 }
 
 #[test]
-fn parse_cors_config_uppercases_methods_so_the_allow_header_is_valid() {
+fn find_cors_rule_matches_methods_exactly() {
     let xml = r#"<CORSConfiguration>
         <CORSRule>
             <AllowedOrigin>https://example.com</AllowedOrigin>
-            <AllowedMethod>get</AllowedMethod>
+            <AllowedMethod>GET</AllowedMethod>
         </CORSRule>
     </CORSConfiguration>"#;
     let rules = parse_cors_config(xml);
-    // `Access-Control-Allow-Methods` is echoed from this list and browsers
-    // compare it case-sensitively, so matching a lowercase stored method is
-    // only half the job — it has to reach the wire uppercased too.
+    // `put_bucket_cors` only ever stores the canonical uppercase verbs, and
+    // `Access-Control-Allow-Methods` is echoed from this list, which browsers
+    // compare case-sensitively — so no normalization happens here.
     assert_eq!(rules[0].allowed_methods, vec!["GET"]);
     assert!(find_cors_rule(&rules, "https://example.com", "GET", &[]).is_some());
     // A method outside AllowedMethods is still denied, and a disallowed origin
