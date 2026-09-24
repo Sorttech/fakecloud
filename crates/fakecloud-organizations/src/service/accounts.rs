@@ -345,10 +345,13 @@ impl OrganizationsService {
                 "Target is required",
             )
         })?;
+        // `HandshakeParty.Type` is modeled required. Defaulting it meant a
+        // caller that omitted it had its id validated against a type it
+        // never declared.
         let kind = target_obj
             .get("Type")
             .and_then(|v| v.as_str())
-            .unwrap_or("ACCOUNT");
+            .ok_or_else(|| invalid_input("Target.Type is required"))?;
         let id = target_obj
             .get("Id")
             .and_then(|v| v.as_str())
@@ -389,12 +392,10 @@ impl OrganizationsService {
         // fakecloud knows -- otherwise the invite would open a handshake
         // that could never be accepted.
         if let Some(target) = guard.resolve_target_account(kind, &id, &org_id) {
-            if let Some(other) = guard.org_of_account(&target) {
-                if other.org_id != org_id {
-                    return Err(org_error_to_aws(
-                        crate::state::OrgError::AccountInAnotherOrganization(target),
-                    ));
-                }
+            if guard.claimed_by_other_org(&target, &org_id).is_some() {
+                return Err(org_error_to_aws(
+                    crate::state::OrgError::AccountInAnotherOrganization(target),
+                ));
             }
         }
         let org = guard

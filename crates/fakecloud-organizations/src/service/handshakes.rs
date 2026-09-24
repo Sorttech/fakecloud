@@ -92,15 +92,16 @@ impl OrganizationsService {
         // management account by design.
         if new_state == "ACCEPTED" && handshake.action == "INVITE" {
             // The caller has just been proved to be the target, so its own
-            // id is the one that must not already belong elsewhere.
-            if let Some(other) = guard.org_of_account(&req.account_id) {
-                if other.org_id != org_id {
-                    return Err(org_error_to_aws(
-                        crate::state::OrgError::AccountInAnotherOrganization(
-                            req.account_id.clone(),
-                        ),
-                    ));
-                }
+            // id is the one that must not already belong elsewhere --
+            // including to an in-flight `CreateAccount` that has not
+            // finished enrolling it yet.
+            if guard
+                .claimed_by_other_org(&req.account_id, &org_id)
+                .is_some()
+            {
+                return Err(org_error_to_aws(
+                    crate::state::OrgError::AccountInAnotherOrganization(req.account_id.clone()),
+                ));
             }
         }
         let org = guard

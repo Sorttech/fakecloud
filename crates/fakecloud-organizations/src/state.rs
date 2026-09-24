@@ -267,6 +267,26 @@ impl OrganizationsRegistry {
         self.org_of_account(account_id).is_some() || self.account_is_reserved(account_id)
     }
 
+    /// The organization that already claims `account_id`, if it is one
+    /// other than `org_id`. Reservation-aware, so an id an in-flight
+    /// `CreateAccount` is about to enroll counts as claimed.
+    pub fn claimed_by_other_org(&self, account_id: &str, org_id: &str) -> Option<String> {
+        if let Some(org) = self.org_of_account(account_id) {
+            return (org.org_id != org_id).then(|| org.org_id.clone());
+        }
+        self.orgs
+            .values()
+            .find(|org| {
+                org.org_id != org_id
+                    && org.create_account_requests.values().any(|req| {
+                        req.state == "IN_PROGRESS"
+                            && (req.account_id.as_deref() == Some(account_id)
+                                || req.gov_cloud_account_id.as_deref() == Some(account_id))
+                    })
+            })
+            .map(|org| org.org_id.clone())
+    }
+
     fn account_is_reserved(&self, account_id: &str) -> bool {
         self.orgs.values().any(|org| {
             org.create_account_requests.values().any(|req| {

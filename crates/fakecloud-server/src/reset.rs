@@ -577,13 +577,11 @@ pub(crate) fn create_admin_in_account(
         // stack-set targeting applied would come down to org-id sort order.
         // `CreateOrganization` and `InviteAccountToOrganization` both reject
         // this; so does the shortcut.
-        if let Some(current) = guard.org_of_account(account_id) {
-            if current.org_id != org_id {
-                return Err(CreateAdminError::AccountInAnotherOrganization {
-                    account_id: account_id.to_string(),
-                    organization_id: current.org_id.clone(),
-                });
-            }
+        if let Some(other) = guard.claimed_by_other_org(account_id, org_id) {
+            return Err(CreateAdminError::AccountInAnotherOrganization {
+                account_id: account_id.to_string(),
+                organization_id: other,
+            });
         }
         let org = guard
             .org_by_id_mut(org_id)

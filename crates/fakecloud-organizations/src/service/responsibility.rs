@@ -180,10 +180,11 @@ impl OrganizationsService {
             .and_then(|v| v.as_str())
             .ok_or_else(|| invalid_input("Target.Id is required"))?
             .to_string();
+        // `HandshakeParty.Type` is modeled required here too.
         let target_kind = target_obj
             .get("Type")
             .and_then(|v| v.as_str())
-            .unwrap_or("ACCOUNT");
+            .ok_or_else(|| invalid_input("Target.Type is required"))?;
         // Same shape validation the account-invite path applies: without
         // it a mismatched target (an address under Type=ACCOUNT) is stored
         // as the target account id, and the handshake sits OPEN forever

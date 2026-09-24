@@ -690,6 +690,53 @@ async fn the_target_of_an_email_invite_can_find_accept_and_act_on_it() {
     .expect("and can be ended by it");
 }
 
+/// `CreateAccount` hands back the new id immediately and enrolls it a
+/// moment later. During that window the id is already spoken for: it
+/// must not be able to create an organization of its own, be invited
+/// elsewhere, or accept an invitation, or the completion tick would
+/// leave it in two organizations at once.
+#[tokio::test]
+async fn an_account_id_reserved_by_create_account_is_already_claimed() {
+    let (svc, state) = OrganizationsService::shared();
+    create_org_with_root(&svc).await;
+    let created = body_value(
+        svc.handle(req_with(
+            "111111111111",
+            "CreateAccount",
+            json!({ "Email": "dev@example.com", "AccountName": "dev" }),
+        ))
+        .await
+        .unwrap(),
+    );
+    let reserved = created["CreateAccountStatus"]["AccountId"]
+        .as_str()
+        .expect("the id is handed back before enrollment")
+        .to_string();
+    // Still only the management account is enrolled.
+    assert!(state.read().org_of_account(&reserved).is_none());
+
+    // ...but it cannot start an organization of its own.
+    let err = expect_err(
+        svc.handle(req_with(&reserved, "CreateOrganization", json!({})))
+            .await,
+    );
+    assert_eq!(err.code(), "AlreadyInOrganizationException");
+
+    // ...nor be invited into another one.
+    svc.handle(req_with("222222222222", "CreateOrganization", json!({})))
+        .await
+        .unwrap();
+    let err = expect_err(
+        svc.handle(req_with(
+            "222222222222",
+            "InviteAccountToOrganization",
+            json!({ "Target": { "Type": "ACCOUNT", "Id": reserved } }),
+        ))
+        .await,
+    );
+    assert_eq!(err.code(), "HandshakeConstraintViolationException");
+}
+
 /// Deleting one organization leaves every other one standing.
 #[tokio::test]
 async fn deleting_one_organization_leaves_the_others() {
