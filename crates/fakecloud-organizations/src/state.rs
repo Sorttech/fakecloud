@@ -571,9 +571,6 @@ impl OrganizationState {
         out
     }
 
-    /// Allocate the next pseudo-random 12-digit account id that's not
-    /// already a member. Mirrors AWS's account-id format (numeric,
-    /// 12 digits, no leading zero stripping).
     /// Mint an account id unused by this organization.
     ///
     /// Prefer [`OrganizationsRegistry::next_account_id`], which checks
@@ -880,18 +877,14 @@ impl OrganizationState {
 
     /// Return a clone of every handshake currently tracked for the org,
     /// optionally filtered by destination account id.
-    pub fn list_handshakes(&self, only_target_account: Option<&str>) -> Vec<Handshake> {
-        self.handshakes
-            .values()
-            .filter(|h| match only_target_account {
-                // Deliberately id-only: the registered-email form of the
-                // match needs the registry, so callers that care use
-                // `OrganizationsRegistry::account_matches_target`.
-                Some(acct) => h.target_account_id == acct,
-                None => true,
-            })
-            .cloned()
-            .collect()
+    /// Every handshake this organization holds.
+    ///
+    /// Filtering by target is deliberately NOT offered here: deciding
+    /// whether a target names an account needs the registry, so callers
+    /// filter with [`OrganizationsRegistry::account_matches_target`]. An
+    /// id-only filter here would silently encode a different rule.
+    pub fn list_handshakes(&self) -> Vec<Handshake> {
+        self.handshakes.values().cloned().collect()
     }
 
     /// Mark `service_principal` as a trusted service. Idempotent: the

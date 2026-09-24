@@ -197,12 +197,16 @@ impl OrganizationsService {
         } else {
             (target_id.clone(), format!("{target_id}@example.com"))
         };
-        // Naming yourself is the one case there is nothing to leak about.
-        let source_is_target = registry.org_by_id(&source_org_id).is_some_and(|org| {
-            org.management_account_id == target_account_id
-                || org.management_account_email == target_account_id
+        // Naming your own organization is the one case there is nothing to
+        // leak about. Comparing only against the management account let a
+        // plain member of the SAME organization be named, which opened --
+        // and let that member accept -- a "cross-organization" transfer
+        // whose two ends were one organization.
+        let target_is_own_org = registry.org_by_id(&source_org_id).is_some_and(|org| {
+            org.management_account_email == target_account_id
+                || org.accounts.contains_key(&target_account_id)
         });
-        if source_is_target {
+        if target_is_own_org {
             return Err(AwsServiceError::aws_error_with_fields(
                 StatusCode::BAD_REQUEST,
                 "HandshakeConstraintViolationException",

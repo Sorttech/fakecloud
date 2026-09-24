@@ -425,7 +425,7 @@ impl OrganizationsService {
         // organizations inviting it, none of which it belongs to yet.
         let mut filtered: Vec<Value> = guard
             .iter()
-            .flat_map(|org| org.list_handshakes(None))
+            .flat_map(|org| org.list_handshakes())
             .filter(|h| {
                 guard.account_matches_target(&h.target_kind, &h.target_account_id, &req.account_id)
             })

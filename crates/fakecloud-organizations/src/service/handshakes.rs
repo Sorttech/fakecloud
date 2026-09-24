@@ -171,7 +171,7 @@ impl OrganizationsService {
         let guard = self.state.read();
         let org = self.management_org(&guard, &req.account_id)?;
         let filtered: Vec<Value> = org
-            .list_handshakes(None)
+            .list_handshakes()
             .into_iter()
             .filter(|h| handshake_matches_filter(h, &filter))
             .map(|h| handshake_payload(&h))
