@@ -126,11 +126,26 @@ pub fn apply_cfn_bucket_properties(
         }
     }
 
-    if let Some(xml) = cors_xml {
-        // The exact string validated above, before any subresource was
-        // persisted.
-        bucket.cors_config = Some(xml.clone());
-        persist_sub(store, &bucket.name, BucketSubresource::Cors, &xml)?;
+    // A `CorsConfiguration` that is present but expresses no rules clears the
+    // bucket's CORS config. Leaving the previous one in place would keep the
+    // bucket serving `Access-Control-Allow-Origin` after the template said it
+    // should not. An absent property still leaves existing state untouched,
+    // matching CFN update semantics for everything else here.
+    if obj.contains_key("CorsConfiguration") {
+        match cors_xml {
+            Some(xml) => {
+                // The exact string validated above, before any subresource was
+                // persisted.
+                bucket.cors_config = Some(xml.clone());
+                persist_sub(store, &bucket.name, BucketSubresource::Cors, &xml)?;
+            }
+            None => {
+                bucket.cors_config = None;
+                store
+                    .delete_bucket_subresource(&bucket.name, BucketSubresource::Cors)
+                    .map_err(|e| persist_err("Cors", &bucket.name, e))?;
+            }
+        }
     }
 
     if let Some(l) = obj.get("LifecycleConfiguration") {

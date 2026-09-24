@@ -539,6 +539,21 @@ fn find_cors_rule_settles_on_the_first_origin_method_match() {
 }
 
 #[test]
+fn empty_origin_never_matches_even_a_wildcard_rule() {
+    // An Origin that is absent, blank, or sent on several lines arrives as "".
+    // A bare `*` would otherwise match it and hand back an allow-origin for a
+    // request that declared no usable origin at all.
+    let rules = parse_cors_config(
+        "<CORSConfiguration><CORSRule>\
+         <AllowedOrigin>*</AllowedOrigin>\
+         <AllowedMethod>GET</AllowedMethod>\
+         </CORSRule></CORSConfiguration>",
+    );
+    assert!(find_cors_rule(&rules, "", "GET", &[]).is_none());
+    assert!(find_cors_rule(&rules, "https://anything.example", "GET", &[]).is_some());
+}
+
+#[test]
 fn wildcard_matchers_do_not_panic_on_non_ascii() {
     // Callers only pass ASCII today, but the matcher must not become a
     // request-killing panic if that ever changes.

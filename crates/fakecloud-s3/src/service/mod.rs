@@ -94,7 +94,12 @@ fn set_cors_header(
                 // request carried an `Origin`. Every other CORS header here is
                 // single-valued and replaces.
                 if name.eq_ignore_ascii_case("vary") {
-                    resp.headers.append(name, v);
+                    // Deduped like the error path in `dispatch`: appending an
+                    // identical value would emit the header twice, and the
+                    // tests read only the first line so it would go unnoticed.
+                    if !resp.headers.get_all(name).iter().any(|e| e == v) {
+                        resp.headers.append(name, v);
+                    }
                 } else {
                     resp.headers.insert(name, v);
                 }
@@ -535,14 +540,21 @@ impl AwsService for S3Service {
                 // ordinary non-allowed preflight and falls through to the 403
                 // below, whose message distinguishes an unconfigured bucket
                 // from a non-matching rule.
-                let Some(origin) = single_cors_header(&req.headers, "origin") else {
+                // Only a genuinely absent `Origin` gets the "needed" message. A
+                // header that is present but unusable — blank, unreadable, or
+                // sent on several lines — is not missing information, so it
+                // falls through to the denial below rather than telling the
+                // caller to add a header they already sent.
+                let origin = single_cors_header(&req.headers, "origin");
+                if origin.is_none() && req.headers.get("origin").is_none() {
                     return Err(AwsServiceError::aws_error_with_headers(
                         StatusCode::BAD_REQUEST,
                         "InvalidRequest",
                         "Insufficient information. Origin request header needed.",
                         vary(),
                     ));
-                };
+                }
+                let origin = origin.unwrap_or("");
                 let cors_config = {
                     let accounts = self.state.read();
                     let _empty_s3 = crate::state::S3State::new(&req.account_id, &req.region);
@@ -3333,8 +3345,10 @@ fn wildcard_matches(value: &str, pattern: &str, case_sensitive: bool) -> bool {
         }
     }
     // The final segment anchors to the end, and must not overlap what the
-    // earlier segments already consumed.
-    rest.len() >= last.len() && eq(&rest[rest.len() - last.len()..], last)
+    // earlier segments already consumed. Boundary-checked like the helpers
+    // above, so no arm of this function depends on the ASCII contract.
+    let at = rest.len().checked_sub(last.len());
+    at.is_some_and(|at| rest.is_char_boundary(at) && eq(&rest[at..], last))
 }
 
 /// Helpers keeping [`wildcard_matches`] readable. Both operate on ASCII, which
@@ -3405,10 +3419,12 @@ pub(crate) fn find_cors_rule<'a>(
     method: &str,
     requested_headers: &[String],
 ) -> Option<&'a CorsRule> {
-    // An absent `Access-Control-Request-Method` arrives as `""`, which is not a
-    // method any rule can allow. Guarded here as well as at parse time so the
-    // deny does not depend on the stored config having no empty entry.
-    if method.is_empty() {
+    // An absent or unusable `Origin` / `Access-Control-Request-Method` arrives
+    // as `""`, which is neither an origin nor a method any rule can allow — and
+    // `""` would otherwise satisfy a bare `*`. Guarded here as well as at parse
+    // time so the deny does not depend on the stored config having no empty
+    // entry.
+    if origin.is_empty() || method.is_empty() {
         return None;
     }
     // First rule matching origin + method wins, as on S3 — then that rule has
