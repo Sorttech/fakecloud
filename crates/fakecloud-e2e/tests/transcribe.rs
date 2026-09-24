@@ -279,7 +279,7 @@ async fn update_language_model_re_encrypts_a_settled_model() {
         r#"{"ModelName":"missing-clm"}"#.to_string(),
     )
     .await;
-    assert_eq!(resp.status(), 400);
+    assert_eq!(resp.status(), 404);
     let err: serde_json::Value = resp.json().await.unwrap();
     assert!(
         err["__type"]
