@@ -1723,6 +1723,53 @@ async fn s3_cors_preflight_and_response_headers() {
         "Origin, Access-Control-Request-Headers, Access-Control-Request-Method"
     );
 
+    // Same with a wildcard rule: "" must not satisfy AllowedOrigin `*`, or an
+    // Origin-less OPTIONS would come back as an approved preflight.
+    s3.create_bucket()
+        .bucket("wild-cors-bucket")
+        .send()
+        .await
+        .unwrap();
+    let output = server
+        .aws_cli(&[
+            "s3api",
+            "put-bucket-cors",
+            "--bucket",
+            "wild-cors-bucket",
+            "--cors-configuration",
+            r#"{"CORSRules":[{"AllowedOrigins":["*"],"AllowedMethods":["GET"]}]}"#,
+        ])
+        .await;
+    assert!(output.success(), "{}", output.stderr_text());
+    let resp = http
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{}/wild-cors-bucket/file.txt", server.endpoint()),
+        )
+        .header("Access-Control-Request-Method", "GET")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    assert!(resp.headers().get("access-control-allow-origin").is_none());
+
+    // A rule with no AllowedMethod matches nothing at request time, so it is
+    // rejected at write time rather than leaving the bucket silently CORS-dead.
+    let output = server
+        .aws_cli(&[
+            "s3api",
+            "put-bucket-cors",
+            "--bucket",
+            "wild-cors-bucket",
+            "--cors-configuration",
+            r#"{"CORSRules":[{"AllowedOrigins":["https://a.example"],"AllowedMethods":[]}]}"#,
+        ])
+        .await;
+    assert!(
+        !output.success(),
+        "a CORS rule with no AllowedMethod must be rejected"
+    );
+
     // A bucket with no CORS config at all answers preflights identically for
     // every origin, so that 403 carries no Vary.
     s3.create_bucket()

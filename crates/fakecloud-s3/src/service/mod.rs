@@ -503,10 +503,16 @@ impl AwsService for S3Service {
                         .and_then(|b| b.cors_config.clone())
                 };
                 if let Some(ref config) = cors_config {
+                    // Empty is treated as absent, same as the actual-request
+                    // path. A preflight with no `Origin` has nothing to
+                    // evaluate and is rejected below rather than matched: `""`
+                    // satisfies a `*` rule, which would otherwise approve a
+                    // preflight no browser would have sent that way.
                     let origin = req
                         .headers
                         .get("origin")
                         .and_then(|v| v.to_str().ok())
+                        .filter(|o| !o.is_empty())
                         .unwrap_or("");
                     let request_method = req
                         .headers
@@ -514,7 +520,10 @@ impl AwsService for S3Service {
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or("");
                     let rules = parse_cors_config(config);
-                    if let Some(rule) = find_cors_rule(&rules, origin, request_method) {
+                    if let Some(rule) = (!origin.is_empty())
+                        .then(|| find_cors_rule(&rules, origin, request_method))
+                        .flatten()
+                    {
                         let mut headers = HeaderMap::new();
                         let matched_origin = if rule.allowed_origins.contains(&"*".to_string()) {
                             "*"

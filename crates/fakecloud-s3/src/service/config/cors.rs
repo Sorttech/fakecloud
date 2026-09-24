@@ -1,6 +1,7 @@
 //! `S3Service` `cors` family — extracted from service.rs by audit-2026-05-19.
 
 use super::*;
+use crate::service::parse_cors_config;
 
 impl S3Service {
     // ---- CORS ----
@@ -21,6 +22,20 @@ impl S3Service {
                 "MalformedXML",
                 "The XML you provided was not well-formed or did not validate against our published schema",
             ));
+        }
+
+        // `AllowedMethods` and `AllowedOrigins` are both required members of
+        // `CORSRule`. A rule missing either matches nothing at request time, so
+        // accepting one would leave the bucket silently CORS-dead rather than
+        // telling the caller their config is wrong — AWS rejects it outright.
+        for rule in parse_cors_config(&body_str) {
+            if rule.allowed_methods.is_empty() || rule.allowed_origins.is_empty() {
+                return Err(AwsServiceError::aws_error(
+                    StatusCode::BAD_REQUEST,
+                    "MalformedXML",
+                    "The XML you provided was not well-formed or did not validate against our published schema",
+                ));
+            }
         }
 
         // Validate HTTP methods
