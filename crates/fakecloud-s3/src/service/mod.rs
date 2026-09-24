@@ -67,6 +67,19 @@ const CORS_VARY: &str = "Origin, Access-Control-Request-Headers, Access-Control-
 /// 'cors'})` sees a 404 it can handle rather than an opaque CORS network error.
 /// And a 404 is heuristically cacheable, so it needs `Vary` for the same reason
 /// a 200 does.
+/// Read a header that gates CORS approval, as a single trimmed value.
+///
+/// Returns `None` when the header is absent, blank, unreadable, or sent on more
+/// than one line: none of those is a single value to evaluate, and every one of
+/// them must fail closed rather than silently using the first line.
+fn single_cors_header<'a>(headers: &'a http::HeaderMap, name: &str) -> Option<&'a str> {
+    let mut lines = headers.get_all(name).iter();
+    match (lines.next(), lines.next()) {
+        (Some(v), None) => v.to_str().ok().map(str::trim).filter(|s| !s.is_empty()),
+        _ => None,
+    }
+}
+
 fn set_cors_header(
     result: &mut Result<AwsResponse, AwsServiceError>,
     name: &'static str,
@@ -522,19 +535,14 @@ impl AwsService for S3Service {
                 // ordinary non-allowed preflight and falls through to the 403
                 // below, whose message distinguishes an unconfigured bucket
                 // from a non-matching rule.
-                if !req
-                    .headers
-                    .get("origin")
-                    .and_then(|v| v.to_str().ok())
-                    .is_some_and(|o| !o.trim().is_empty())
-                {
+                let Some(origin) = single_cors_header(&req.headers, "origin") else {
                     return Err(AwsServiceError::aws_error_with_headers(
                         StatusCode::BAD_REQUEST,
                         "InvalidRequest",
                         "Insufficient information. Origin request header needed.",
                         vary(),
                     ));
-                }
+                };
                 let cors_config = {
                     let accounts = self.state.read();
                     let _empty_s3 = crate::state::S3State::new(&req.account_id, &req.region);
@@ -545,21 +553,13 @@ impl AwsService for S3Service {
                         .and_then(|b| b.cors_config.clone())
                 };
                 if let Some(ref config) = cors_config {
-                    // Trimmed and non-blank: the guard above already rejected a
-                    // preflight without either header, so this can never be the
-                    // blank value that would satisfy a `*` rule.
-                    let origin = req
-                        .headers
-                        .get("origin")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("")
-                        .trim();
-                    let request_method = req
-                        .headers
-                        .get("access-control-request-method")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("")
-                        .trim();
+                    // `origin` came from the guard above, so it is a single
+                    // non-blank value. The request-method is read the same way:
+                    // two lines are not one method to allow, and approving on
+                    // the first would grant a method never evaluated.
+                    let request_method =
+                        single_cors_header(&req.headers, "access-control-request-method")
+                            .unwrap_or("");
                     // Every header the preflight declares must be covered by
                     // the rule, or S3 denies it — the denial message, the
                     // `Vary` value and the docs all say this is evaluated.
@@ -602,10 +602,25 @@ impl AwsService for S3Service {
                                 .unwrap_or_else(|_| http::HeaderValue::from_static("")),
                         );
                         headers.insert("vary", http::HeaderValue::from_static(CORS_VARY));
+                        // A concrete allow-origin gets allow-credentials, as on
+                        // S3. Without it the Fetch spec fails any
+                        // `credentials: 'include'` request, so a preflight that
+                        // otherwise passes still blocks the real request. It is
+                        // never sent alongside `*`, which the spec forbids.
+                        if matched_origin != "*" {
+                            headers.insert(
+                                "access-control-allow-credentials",
+                                http::HeaderValue::from_static("true"),
+                            );
+                        }
+                        // Echo the method that was asked for, not the rule's
+                        // whole list: S3 answers `Access-Control-Request-Method:
+                        // DELETE` with `Access-Control-Allow-Methods: DELETE`,
+                        // and listing the rest would cache a preflight result
+                        // granting methods the page never probed.
                         headers.insert(
                             "access-control-allow-methods",
-                            rule.allowed_methods
-                                .join(", ")
+                            request_method
                                 .parse()
                                 .unwrap_or_else(|_| http::HeaderValue::from_static("")),
                         );
@@ -669,21 +684,9 @@ impl AwsService for S3Service {
         // treated as absent — the request carries nothing to evaluate CORS
         // against, and letting it through would match a `*` rule and stamp
         // CORS headers onto a request no browser would have sent that way.
-        // Read with `get_all`: `Origin` gates approval like
-        // `Access-Control-Request-Headers`, and a request carrying more than
-        // one is not a single origin to allow, so it is treated as absent.
-        let origin_header = {
-            let mut lines = req.headers.get_all("origin").iter();
-            match (lines.next(), lines.next()) {
-                (Some(v), None) => v
-                    .to_str()
-                    .ok()
-                    .map(|s| s.trim())
-                    .filter(|o| !o.is_empty())
-                    .map(|s| s.to_string()),
-                _ => None,
-            }
-        };
+        // Same single-value read as the preflight path: a request carrying more
+        // than one `Origin` is not a single origin to allow.
+        let origin_header = single_cors_header(&req.headers, "origin").map(str::to_string);
 
         // Bucket-scoped sub-resource query params. If a request targets one
         // of these without a bucket in the path, S3 returns an error rather
@@ -1146,6 +1149,9 @@ impl AwsService for S3Service {
                     // allowed origin with ACAO, so a `mode: 'cors'` fetch sees
                     // a real 404 instead of an opaque CORS network error.
                     set_cors_header(&mut result, "access-control-allow-origin", matched_origin);
+                    if matched_origin != "*" {
+                        set_cors_header(&mut result, "access-control-allow-credentials", "true");
+                    }
                     if !rule.expose_headers.is_empty() {
                         set_cors_header(
                             &mut result,

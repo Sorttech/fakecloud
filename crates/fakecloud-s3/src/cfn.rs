@@ -112,6 +112,12 @@ pub fn apply_cfn_bucket_properties(
 
     if let Some(c) = obj.get("CorsConfiguration") {
         if let Some(xml) = build_cors_xml(c) {
+            // Same validation `PutBucketCors` applies. Without it a template
+            // could store a rule that matches no request — omitted
+            // AllowedMethods, a multi-wildcard value — and the stack would
+            // deploy green while every preflight against the bucket 403s.
+            crate::service::config::validate_cors_xml(&xml)
+                .map_err(|(code, message)| format!("{code}: {message}"))?;
             bucket.cors_config = Some(xml.clone());
             persist_sub(store, &bucket.name, BucketSubresource::Cors, &xml)?;
         }

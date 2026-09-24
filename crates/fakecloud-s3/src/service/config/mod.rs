@@ -146,6 +146,7 @@ mod accelerate;
 mod analytics;
 mod bucket_inventory;
 mod cors;
+pub(crate) use cors::validate_cors_xml;
 mod encryption;
 mod intelligent_tiering;
 mod lifecycle;

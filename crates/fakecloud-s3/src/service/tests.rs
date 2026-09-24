@@ -415,6 +415,29 @@ fn find_cors_rule_checks_requested_headers() {
 }
 
 #[test]
+fn find_cors_rule_denies_requested_headers_when_rule_allows_none() {
+    let xml = r#"<CORSConfiguration>
+        <CORSRule>
+            <AllowedOrigin>https://example.com</AllowedOrigin>
+            <AllowedMethod>PUT</AllowedMethod>
+        </CORSRule>
+    </CORSConfiguration>"#;
+    let rules = parse_cors_config(xml);
+    // A rule with no AllowedHeader covers no header. Browsers send
+    // `Access-Control-Request-Headers: content-type` for any non-simple
+    // content type, so such a config denies those preflights — matching S3,
+    // which is why AllowedHeaders belongs in any config that posts JSON.
+    assert!(find_cors_rule(&rules, "https://example.com", "PUT", &[]).is_some());
+    assert!(find_cors_rule(
+        &rules,
+        "https://example.com",
+        "PUT",
+        &["content-type".to_string()]
+    )
+    .is_none());
+}
+
+#[test]
 fn test_header_matches() {
     // AWS permits one `*` per AllowedHeader; names are case-insensitive.
     assert!(header_matches("x-amz-meta-foo", "x-amz-*"));
