@@ -1938,7 +1938,11 @@ async fn s3_cors_preflight_and_response_headers() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 400);
-    assert!(resp.text().await.unwrap().contains("more than one wildcard"));
+    assert!(resp
+        .text()
+        .await
+        .unwrap()
+        .contains("more than one wildcard"));
 
     // An empty AllowedOrigin parses to "" and matches no real request, so it is
     // as CORS-dead as omitting the tag and is rejected the same way.

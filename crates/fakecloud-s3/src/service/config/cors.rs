@@ -75,7 +75,10 @@ impl S3Service {
         // method validation above so an empty `<AllowedMethod>` still gets the
         // AWS-shaped error naming the offending value.
         for rule in parsed {
-            let usable = |vs: &[String]| !vs.is_empty() && vs.iter().all(|v| !v.is_empty());
+            // A rule needs at least one usable value, not every value usable: a
+            // stray blank tag alongside a real origin still leaves the rule
+            // live, and rejecting that would refuse a config real S3 accepts.
+            let usable = |vs: &[String]| vs.iter().any(|v| !v.is_empty());
             if !usable(&rule.allowed_methods) || !usable(&rule.allowed_origins) {
                 return Err(AwsServiceError::aws_error(
                     StatusCode::BAD_REQUEST,

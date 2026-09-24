@@ -75,7 +75,16 @@ fn set_cors_header(
     match result {
         Ok(resp) => {
             if let Ok(v) = value.parse::<http::HeaderValue>() {
-                resp.headers.insert(name, v);
+                // `Vary` is list-valued and combines, so append rather than
+                // replace: a handler that set its own (say `Accept-Encoding`
+                // on a range response) must not lose it just because the
+                // request carried an `Origin`. Every other CORS header here is
+                // single-valued and replaces.
+                if name.eq_ignore_ascii_case("vary") {
+                    resp.headers.append(name, v);
+                } else {
+                    resp.headers.insert(name, v);
+                }
             }
         }
         Err(AwsServiceError::AwsError { headers, .. }) => {
