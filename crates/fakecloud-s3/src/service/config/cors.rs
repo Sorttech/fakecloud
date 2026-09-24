@@ -45,7 +45,11 @@ pub(crate) fn validate_cors_xml(body_str: &str) -> Result<(), (&'static str, Str
         let after = &remaining[start + 15..];
         if let Some(end) = after.find("</AllowedMethod>") {
             let method = after[..end].trim();
-            if !valid_methods.contains(&method) {
+            // An empty element has no name to report, so it falls through to
+            // the required-member check below and gets `MalformedXML` like
+            // every other empty required element, rather than an
+            // "Unsupported method is " with nothing after it.
+            if !method.is_empty() && !valid_methods.contains(&method) {
                 return Err(("InvalidRequest", format!("Found unsupported HTTP method in CORS config. Unsupported method is {method}")));
             }
             remaining = &after[end + 16..];

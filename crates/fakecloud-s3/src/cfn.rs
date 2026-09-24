@@ -54,9 +54,11 @@ pub fn apply_cfn_bucket_properties(
 
     // Validate before persisting anything. Each property below writes through
     // to the store as it goes, so a validation failure partway would leave the
-    // bucket with some subresources written and others not.
-    if let Some(xml) = obj.get("CorsConfiguration").and_then(build_cors_xml) {
-        crate::service::config::validate_cors_xml(&xml)
+    // bucket with some subresources written and others not. Bound once so the
+    // string that was validated is the same one that gets stored.
+    let cors_xml = obj.get("CorsConfiguration").and_then(build_cors_xml);
+    if let Some(xml) = &cors_xml {
+        crate::service::config::validate_cors_xml(xml)
             .map_err(|(code, message)| format!("{code}: {message}"))?;
     }
     // `versioning` and `eventbridge_enabled` live in the bucket meta snapshot,
@@ -118,12 +120,11 @@ pub fn apply_cfn_bucket_properties(
         }
     }
 
-    if let Some(c) = obj.get("CorsConfiguration") {
-        if let Some(xml) = build_cors_xml(c) {
-            // Already validated above, before any subresource was persisted.
-            bucket.cors_config = Some(xml.clone());
-            persist_sub(store, &bucket.name, BucketSubresource::Cors, &xml)?;
-        }
+    if let Some(xml) = cors_xml {
+        // The exact string validated above, before any subresource was
+        // persisted.
+        bucket.cors_config = Some(xml.clone());
+        persist_sub(store, &bucket.name, BucketSubresource::Cors, &xml)?;
     }
 
     if let Some(l) = obj.get("LifecycleConfiguration") {
