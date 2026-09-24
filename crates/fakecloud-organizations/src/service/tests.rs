@@ -1223,6 +1223,100 @@ async fn a_failed_create_account_drops_the_tags_it_reserved() {
     );
 }
 
+/// A non-party learns nothing from a handshake id it guessed -- not
+/// even whether it exists or what state it is in. The terminal-state
+/// answer is for the handshake's own parties.
+#[tokio::test]
+async fn a_bystander_cannot_read_handshake_state_off_an_error() {
+    let (svc, _state) = OrganizationsService::shared();
+    create_org_with_root(&svc).await;
+    let invited = body_json(
+        &svc.handle(req_with(
+            "111111111111",
+            "InviteAccountToOrganization",
+            json!({ "Target": { "Type": "ACCOUNT", "Id": "222222222222" } }),
+        ))
+        .await
+        .unwrap(),
+    );
+    let handshake_id = invited["Handshake"]["Id"].as_str().unwrap().to_string();
+    svc.handle(req_with(
+        "222222222222",
+        "AcceptHandshake",
+        json!({ "HandshakeId": handshake_id }),
+    ))
+    .await
+    .unwrap();
+
+    // Resolved, but a bystander is told only "not a party".
+    let err = expect_err(
+        svc.handle(req_with(
+            "999999999999",
+            "AcceptHandshake",
+            json!({ "HandshakeId": handshake_id }),
+        ))
+        .await,
+    );
+    // `InvalidHandshakeParty` renders as AccessDenied -- the point is
+    // that it says nothing about the handshake's state.
+    assert_eq!(err.code(), "AccessDeniedException");
+
+    // ...while a party still gets the transition error it needs.
+    let err = expect_err(
+        svc.handle(req_with(
+            "222222222222",
+            "AcceptHandshake",
+            json!({ "HandshakeId": handshake_id }),
+        ))
+        .await,
+    );
+    assert_eq!(err.code(), "InvalidHandshakeTransitionException");
+}
+
+/// `ListHandshakesForAccount` lists the handshakes associated with the
+/// calling account, which includes the invitations it SENT -- not only
+/// those addressed to it.
+#[tokio::test]
+async fn list_handshakes_for_account_includes_the_ones_it_sent() {
+    let (svc, _state) = OrganizationsService::shared();
+    create_org_with_root(&svc).await;
+    let invited = body_json(
+        &svc.handle(req_with(
+            "111111111111",
+            "InviteAccountToOrganization",
+            json!({ "Target": { "Type": "ACCOUNT", "Id": "222222222222" } }),
+        ))
+        .await
+        .unwrap(),
+    );
+    let handshake_id = invited["Handshake"]["Id"].as_str().unwrap().to_string();
+
+    for caller in ["111111111111", "222222222222"] {
+        let listed = body_value(
+            svc.handle(req_with(caller, "ListHandshakesForAccount", json!({})))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            listed["Handshakes"][0]["Id"],
+            handshake_id.as_str(),
+            "{caller} should see the handshake it is a party to"
+        );
+    }
+
+    // A bystander sees none of it.
+    let listed = body_value(
+        svc.handle(req_with(
+            "999999999999",
+            "ListHandshakesForAccount",
+            json!({}),
+        ))
+        .await
+        .unwrap(),
+    );
+    assert!(listed["Handshakes"].as_array().unwrap().is_empty());
+}
+
 /// Deleting one organization leaves every other one standing.
 #[tokio::test]
 async fn deleting_one_organization_leaves_the_others() {

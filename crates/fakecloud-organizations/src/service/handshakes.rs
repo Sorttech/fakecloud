@@ -47,20 +47,6 @@ impl OrganizationsService {
             (org.org_id.clone(), handshake)
         };
 
-        // Terminal state FIRST. The membership gates below are
-        // necessarily satisfied by a handshake that was already accepted
-        // -- the caller is a member by then -- so checking them first
-        // reported a re-accept as a constraint violation instead of the
-        // modeled transition error, and a client retrying after a
-        // timeout read a join that had succeeded as a hard failure.
-        // Decline and Cancel already answered correctly, so the paths
-        // also disagreed with each other.
-        if !matches!(handshake.state.as_str(), "OPEN" | "REQUESTED") {
-            return Err(org_error_to_aws(
-                crate::state::OrgError::HandshakeAlreadyResolved(handshake.state.clone()),
-            ));
-        }
-
         // AcceptHandshake / DeclineHandshake belong to the *target*
         // account; CancelHandshake belongs to the *source* (management)
         // account. Enforce party-correctness so test harnesses catch
@@ -98,6 +84,19 @@ impl OrganizationsService {
                 crate::state::OrgError::InvalidHandshakeParty(req.account_id.clone()),
             ));
         }
+        // Terminal state next: after the party gate, so a non-party cannot
+        // read a handshake's state off the error, but BEFORE the
+        // membership gates below -- those are necessarily satisfied by a
+        // handshake that was already accepted, so checking them first
+        // reported a re-accept as a constraint violation instead of the
+        // modeled transition error, and a client retrying after a timeout
+        // read a join that had succeeded as a hard failure.
+        if !matches!(handshake.state.as_str(), "OPEN" | "REQUESTED") {
+            return Err(org_error_to_aws(
+                crate::state::OrgError::HandshakeAlreadyResolved(handshake.state.clone()),
+            ));
+        }
+
         // Re-check membership at accept time, not just at invite time: the
         // target may have joined another organization while the invitation
         // sat open, and an account can only ever be in one. Only an INVITE

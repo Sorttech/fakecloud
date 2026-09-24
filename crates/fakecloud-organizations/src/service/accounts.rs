@@ -485,7 +485,17 @@ impl OrganizationsService {
             .iter()
             .flat_map(|org| org.list_handshakes())
             .filter(|h| {
-                guard.account_matches_target(&h.target_kind, &h.target_account_id, &req.account_id)
+                // "Associated with the account of the requesting user"
+                // includes the invitations it SENT, not only those
+                // addressed to it. Cross-organization isolation is
+                // unaffected: the source is always a member of the
+                // organization that owns the handshake.
+                h.source_account_id == req.account_id
+                    || guard.account_matches_target(
+                        &h.target_kind,
+                        &h.target_account_id,
+                        &req.account_id,
+                    )
             })
             .filter(|h| handshake_matches_filter(h, &filter))
             .map(|h| handshake_payload(&h))

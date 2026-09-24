@@ -44,8 +44,17 @@ fn is_transfer_target(
     t: &ResponsibilityTransfer,
     account_id: &str,
 ) -> bool {
-    t.target_management_account_id == account_id
-        || registry.account_matches_target("EMAIL", &t.target_management_account_id, account_id)
+    let stored = &t.target_management_account_id;
+    if *stored == account_id {
+        return true;
+    }
+    // Only an EMAIL-form target resolves further. Reading a 12-digit id
+    // as an address let an account registered with the literal string
+    // "222222222222" pass as the target of a transfer addressed to
+    // ACCOUNT 222222222222 -- `CreateAccount` does not validate that
+    // `Email` is address-shaped.
+    let is_account_id = stored.len() == 12 && stored.chars().all(|c| c.is_ascii_digit());
+    !is_account_id && registry.account_matches_target("EMAIL", stored, account_id)
 }
 
 fn is_transfer_party(
