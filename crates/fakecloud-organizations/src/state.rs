@@ -31,6 +31,12 @@ pub struct OrganizationsRegistry {
 /// A genuinely external address names an account fakecloud has never
 /// seen, so it stays unresolvable — the invitation can be read and
 /// cancelled by its source, but no caller can prove it is the target.
+///
+/// This is the id-only form. Prefer
+/// [`OrganizationsRegistry::resolve_target_account`], which also matches
+/// the address a member account was actually registered with — an
+/// account created with `CreateAccount(Email = "team@corp.com")` keeps
+/// that address, not a synthetic one.
 pub fn target_account_id(target_kind: &str, target: &str) -> Option<String> {
     if target_kind != "EMAIL" {
         return Some(target.to_string());
@@ -142,6 +148,23 @@ impl OrganizationsRegistry {
             1 => self.orgs.values_mut().next(),
             _ => None,
         }
+    }
+
+    /// Resolve a handshake or transfer target to an account id, matching
+    /// an `EMAIL` target against the address each member account is
+    /// actually registered with before falling back to the synthetic
+    /// form. Without this, a member created with a real email address is
+    /// invisible to the "one organization per account" guards, which
+    /// could then open an invitation for an account already enrolled.
+    pub fn resolve_target_account(&self, target_kind: &str, target: &str) -> Option<String> {
+        if let Some(id) = target_account_id(target_kind, target) {
+            return Some(id);
+        }
+        self.orgs
+            .values()
+            .flat_map(|org| org.accounts.values())
+            .find(|account| account.email == target)
+            .map(|account| account.id.clone())
     }
 
     /// The organization that stores responsibility transfer `id`. A
@@ -643,7 +666,14 @@ impl OrganizationState {
         // The kind is the caller's declared `Target.Type`, so this agrees
         // with the cross-organization guard in the service layer rather
         // than re-deriving a different answer from the string's shape.
-        let resolved = self::target_account_id(target_kind, target_account_id);
+        let resolved = self::target_account_id(target_kind, target_account_id).or_else(|| {
+            // ...and against the address this organization's members are
+            // actually registered with.
+            self.accounts
+                .values()
+                .find(|account| account.email == target_account_id)
+                .map(|account| account.id.clone())
+        });
         if let Some(target) = &resolved {
             if self.accounts.contains_key(target) {
                 return Err(OrgError::AccountAlreadyMember(target.clone()));

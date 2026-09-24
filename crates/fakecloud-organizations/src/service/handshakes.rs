@@ -97,7 +97,9 @@ impl OrganizationsService {
         // TRANSFER_RESPONSIBILITY handshake targets another organization's
         // management account by design.
         if new_state == "ACCEPTED" && handshake.action == "INVITE" {
-            let target = handshake_target_account(&handshake).unwrap_or_default();
+            let target = guard
+                .resolve_target_account(&handshake.target_kind, &handshake.target_account_id)
+                .unwrap_or_default();
             if let Some(other) = guard.org_of_account(&target) {
                 if other.org_id != org_id {
                     return Err(org_error_to_aws(

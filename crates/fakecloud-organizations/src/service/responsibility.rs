@@ -84,10 +84,12 @@ impl OrganizationsService {
     /// A transfer is an arrangement between two management accounts, and
     /// both can read it. `source_only` says whether this particular
     /// mutation is the source's alone: renaming is, because the source
-    /// chose the name; ending the arrangement is not, because once it is
-    /// accepted the riding handshake is gone and the target would
-    /// otherwise have no way out of an arrangement it is actively
-    /// carrying.
+    /// chose the name. Ending is the source's too while the offer is
+    /// still open -- `WITHDRAWN` means the inviter pulled it, and the
+    /// target's answer to an open offer is `DeclineHandshake`. Once the
+    /// transfer is ACCEPTED the riding handshake is gone, so the target
+    /// may end it as well, or it would have no way out of an
+    /// arrangement it is actively carrying.
     ///
     /// Resolving through the caller's own organization instead reported
     /// "not found" to the target, which is indistinguishable from a bad
@@ -110,11 +112,18 @@ impl OrganizationsService {
         if !is_transfer_party(transfer, caller) {
             return Err(transfer_not_found(id));
         }
-        if source_only && transfer.source_management_account_id != caller {
+        if transfer.source_management_account_id != caller
+            && (source_only || transfer.status != "ACCEPTED")
+        {
             return Err(AwsServiceError::aws_error(
                 StatusCode::FORBIDDEN,
                 "AccessDeniedException",
-                "Only the source management account can rename a responsibility transfer.",
+                if source_only {
+                    "Only the source management account can rename a responsibility transfer."
+                } else {
+                    "Only the source management account can withdraw a transfer that has not \
+                     been accepted; decline the handshake instead."
+                },
             ));
         }
         Ok(org.org_id.clone())
@@ -158,15 +167,30 @@ impl OrganizationsService {
             .map(|s| s.to_string());
 
         let mut guard = self.state.write();
-        let org = self.management_org_mut(&mut guard, &req.account_id)?;
+        // Resolve against the whole registry first; `management_org_mut`
+        // takes a mutable borrow of it.
+        let registry = &*guard;
 
-        // The invited party is identified by account id or email; record
-        // whichever the caller supplied as the target management account.
-        let (target_account_id, target_email) = if target_kind == "EMAIL" {
-            (target_id.clone(), target_id.clone())
-        } else {
-            (target_id.clone(), format!("{target_id}@example.com"))
-        };
+        // Both sides of a transfer are existing management accounts, so
+        // an EMAIL target must resolve to one -- unlike an account
+        // invitation, which AWS mails to an owner fakecloud has never
+        // seen. Resolving here keeps `Target.ManagementAccountId` an
+        // account id, as the Smithy shape models it, instead of leaking
+        // an address into it.
+        let target_account_id = registry
+            .resolve_target_account(target_kind, &target_id)
+            .ok_or_else(|| {
+                invalid_input(&format!(
+                    "No account is registered for {target_id}; \
+                     a responsibility transfer targets an existing management account"
+                ))
+            })?;
+        let target_email = registry
+            .org_of_account(&target_account_id)
+            .and_then(|org| org.accounts.get(&target_account_id))
+            .map(|account| account.email.clone())
+            .unwrap_or_else(|| format!("{target_account_id}@example.com"));
+        let org = self.management_org_mut(&mut guard, &req.account_id)?;
 
         let now = Utc::now();
         // The transfer rides on a handshake the invited org accepts.

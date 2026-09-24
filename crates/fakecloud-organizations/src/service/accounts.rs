@@ -295,7 +295,9 @@ impl OrganizationsService {
     /// `LeaveOrganization` removes the *calling* member account from its
     /// organization. The management account cannot leave its own org
     /// (it must `DeleteOrganization` instead), and a caller that isn't a
-    /// member of any org gets `AccountNotFoundException`.
+    /// member of any org gets `AWSOrganizationsNotInUseException` — the
+    /// op takes no AccountId, and with several organizations in the
+    /// process that is also the non-leaking answer.
     pub(super) fn leave_organization(
         &self,
         req: &AwsRequest,
@@ -377,7 +379,7 @@ impl OrganizationsService {
         // Applies to an EMAIL target too, once it resolves to an account
         // fakecloud knows -- otherwise the invite would open a handshake
         // that could never be accepted.
-        if let Some(target) = crate::state::target_account_id(kind, &id) {
+        if let Some(target) = guard.resolve_target_account(kind, &id) {
             if let Some(other) = guard.org_of_account(&target) {
                 if other.org_id != org_id {
                     return Err(org_error_to_aws(

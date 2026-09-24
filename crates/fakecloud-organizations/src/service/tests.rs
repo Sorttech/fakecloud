@@ -434,14 +434,16 @@ async fn an_accepted_responsibility_transfer_can_still_be_terminated() {
         "an accepted transfer has not ended"
     );
 
+    // Once accepted the riding handshake is gone, so the TARGET -- which
+    // is actively carrying the responsibility -- can end it too.
     let ended = body_value(
         svc.handle(req_with(
-            "111111111111",
+            "222222222222",
             "TerminateResponsibilityTransfer",
             json!({ "Id": transfer_id }),
         ))
         .await
-        .expect("an accepted transfer can be ended"),
+        .expect("an accepted transfer can be ended by either party"),
     );
     assert_eq!(ended["ResponsibilityTransfer"]["Status"], "WITHDRAWN");
     assert!(!ended["ResponsibilityTransfer"]["EndTimestamp"].is_null());
@@ -2534,14 +2536,25 @@ async fn only_the_source_can_rename_a_responsibility_transfer() {
     );
     assert_eq!(err.code(), "ResponsibilityTransferNotFoundException");
 
-    // Either party can end the arrangement.
+    // While the offer is still open, withdrawing it is the source's --
+    // the target's answer to an open offer is DeclineHandshake.
+    let err = expect_err(
+        svc.handle(req_with(
+            "222222222222",
+            "TerminateResponsibilityTransfer",
+            json!({ "Id": transfer_id }),
+        ))
+        .await,
+    );
+    assert_eq!(err.code(), "AccessDeniedException");
+
     svc.handle(req_with(
-        "222222222222",
+        "111111111111",
         "TerminateResponsibilityTransfer",
         json!({ "Id": transfer_id }),
     ))
     .await
-    .expect("the target management account can end the arrangement too");
+    .expect("the source withdraws its own open offer");
 }
 
 #[tokio::test]
