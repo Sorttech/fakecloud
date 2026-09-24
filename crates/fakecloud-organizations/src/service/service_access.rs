@@ -35,7 +35,7 @@ impl OrganizationsService {
         let body = req.json_body();
         let (max_results, next_token) = parse_list_pagination(&body)?;
         let guard = self.state.read();
-        let org = self.management_org(&guard, &req.account_id)?;
+        let org = self.management_or_delegated_org(&guard, &req.account_id)?;
         let entries: Vec<Value> = org
             .list_trusted_services()
             .into_iter()

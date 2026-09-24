@@ -197,7 +197,7 @@ impl OrganizationsService {
             )
             .map_err(org_error_to_aws)?;
         Ok(AwsResponse::ok_json(
-            json!({ "Handshake": handshake_payload(&updated) }),
+            json!({ "Handshake": handshake_payload(org, &updated) }),
         ))
     }
 
@@ -210,12 +210,12 @@ impl OrganizationsService {
         let guard = self.state.read();
         // DescribeHandshake is handshake-scoped; with no org the id can't be
         // found. It doesn't declare AWSOrganizationsNotInUseException.
-        let handshake = guard
-            .org_of_handshake(&id)
-            .and_then(|org| org.handshakes.get(&id))
-            .ok_or_else(|| {
-                org_error_to_aws(crate::state::OrgError::HandshakeNotFound(id.clone()))
-            })?;
+        let owner = guard.org_of_handshake(&id).ok_or_else(|| {
+            org_error_to_aws(crate::state::OrgError::HandshakeNotFound(id.clone()))
+        })?;
+        let handshake = owner.handshakes.get(&id).ok_or_else(|| {
+            org_error_to_aws(crate::state::OrgError::HandshakeNotFound(id.clone()))
+        })?;
         // Only the two parties to a handshake may read it. Without this a
         // bystander account could enumerate handshake ids to learn the
         // management account and organization id of an organization it has
@@ -234,16 +234,14 @@ impl OrganizationsService {
         // the organization", so membership of the organization that owns
         // the handshake is enough. It is only another ORGANIZATION's
         // handshakes that must stay invisible.
-        let is_member = guard
-            .org_of_handshake(&id)
-            .is_some_and(|org| org.accounts.contains_key(&req.account_id));
+        let is_member = owner.accounts.contains_key(&req.account_id);
         if !(is_party || is_member) {
             return Err(org_error_to_aws(crate::state::OrgError::HandshakeNotFound(
                 id.clone(),
             )));
         }
         Ok(AwsResponse::ok_json(
-            json!({ "Handshake": handshake_payload(handshake) }),
+            json!({ "Handshake": handshake_payload(owner, handshake) }),
         ))
     }
 
@@ -256,12 +254,12 @@ impl OrganizationsService {
         let (max_results, next_token) = parse_list_pagination(&body)?;
 
         let guard = self.state.read();
-        let org = self.management_org(&guard, &req.account_id)?;
+        let org = self.management_or_delegated_org(&guard, &req.account_id)?;
         let filtered: Vec<Value> = org
             .list_handshakes()
             .into_iter()
             .filter(|h| handshake_matches_filter(h, &filter))
-            .map(|h| handshake_payload(&h))
+            .map(|h| handshake_payload(org, &h))
             .collect();
         let (page, token) = paginate_checked(&filtered, next_token.as_deref(), max_results)
             .map_err(|_| invalid_input("Invalid NextToken"))?;

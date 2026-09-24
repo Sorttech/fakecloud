@@ -3520,3 +3520,190 @@ async fn a_membership_change_is_announced_even_after_a_reversal_races_it() {
     hooks.fire_if_membership_changed(&state).await;
     assert_eq!(fired.load(Ordering::SeqCst), after_round_trip + 1);
 }
+
+/// A delegated administrator runs a service's organization-wide
+/// integration on the management account's behalf, which AWS documents
+/// as including the organization's read operations. Gating them on the
+/// management account alone left every delegated administrator unable
+/// to read the organization it administers.
+#[tokio::test]
+async fn a_delegated_administrator_can_read_the_organization() {
+    let (svc, state) = OrganizationsService::shared();
+    create_org_with_root(&svc).await;
+    state
+        .write()
+        .sole_mut()
+        .unwrap()
+        .enroll_account_if_missing("222222222222");
+
+    let reads = [
+        ("ListHandshakesForOrganization", json!({})),
+        ("ListAWSServiceAccessForOrganization", json!({})),
+        ("ListDelegatedAdministrators", json!({})),
+        (
+            "ListDelegatedServicesForAccount",
+            json!({ "AccountId": "222222222222" }),
+        ),
+    ];
+
+    // A plain member is refused.
+    for (action, body) in &reads {
+        let err = expect_err(
+            svc.handle(req_with("222222222222", action, body.clone()))
+                .await,
+        );
+        assert_eq!(err.code(), "AccessDeniedException", "{action}");
+    }
+
+    svc.handle(req_with(
+        "111111111111",
+        "EnableAWSServiceAccess",
+        json!({ "ServicePrincipal": "config.amazonaws.com" }),
+    ))
+    .await
+    .unwrap();
+    svc.handle(req_with(
+        "111111111111",
+        "RegisterDelegatedAdministrator",
+        json!({ "AccountId": "222222222222", "ServicePrincipal": "config.amazonaws.com" }),
+    ))
+    .await
+    .unwrap();
+
+    // Registered, it can run all four.
+    for (action, body) in &reads {
+        svc.handle(req_with("222222222222", action, body.clone()))
+            .await
+            .unwrap_or_else(|e| panic!("{action} refused a delegated administrator: {e:?}"));
+    }
+}
+
+/// One live responsibility-transfer offer per target, the same rule
+/// `InviteAccountToOrganization` enforces. Stacking OPEN transfers on
+/// one target meant accepting any of them moved billing while the rest
+/// stayed OPEN against an organization that no longer owned it.
+#[tokio::test]
+async fn a_second_open_transfer_to_the_same_target_errors() {
+    let (svc, _state) = OrganizationsService::shared();
+    create_org_with_root(&svc).await;
+    let invite = |target: Value| {
+        svc.handle(req_with(
+            "111111111111",
+            "InviteOrganizationToTransferResponsibility",
+            json!({
+                "Type": "BILLING",
+                "SourceName": "handover",
+                "StartTimestamp": 1893456000.0,
+                "Target": target,
+            }),
+        ))
+    };
+
+    invite(json!({"Id": "222222222222", "Type": "ACCOUNT"}))
+        .await
+        .unwrap();
+    let err = expect_err(invite(json!({"Id": "222222222222", "Type": "ACCOUNT"})).await);
+    assert_eq!(err.code(), "DuplicateHandshakeException");
+    // The synthetic address names the same account, so it collides too.
+    let err = expect_err(invite(json!({"Id": "222222222222@example.com", "Type": "EMAIL"})).await);
+    assert_eq!(err.code(), "DuplicateHandshakeException");
+    // A different target is unaffected.
+    invite(json!({"Id": "333333333333", "Type": "ACCOUNT"}))
+        .await
+        .unwrap();
+}
+
+/// `HandshakeResourceType` models RESPONSIBILITY_TRANSFER, TRANSFER_TYPE,
+/// TRANSFER_START_TIMESTAMP and MANAGEMENT_ACCOUNT for one purpose: an
+/// SDK reading only the handshake has to learn what is being handed over
+/// and by whom. Rendering just ORGANIZATION and the target left the
+/// invited account unable to tell a billing transfer from a plain invite
+/// without a second call.
+#[tokio::test]
+async fn a_transfer_handshake_carries_the_transfer_as_a_resource() {
+    let (svc, _state) = OrganizationsService::shared();
+    create_org_with_root(&svc).await;
+    let resp = svc
+        .handle(req_with(
+            "111111111111",
+            "InviteOrganizationToTransferResponsibility",
+            json!({
+                "Type": "BILLING",
+                "SourceName": "handover",
+                "StartTimestamp": 1893456000.0,
+                "Target": {"Id": "222222222222", "Type": "ACCOUNT"},
+            }),
+        ))
+        .await
+        .unwrap();
+    let handshake = body_json(&resp)["Handshake"].clone();
+    let transfer = handshake["Resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["Type"] == "RESPONSIBILITY_TRANSFER")
+        .expect("the handshake reports the transfer it carries")
+        .clone();
+    assert!(transfer["Value"].as_str().unwrap().starts_with("rt-"));
+    let nested: HashMap<&str, &str> = transfer["Resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["Type"].as_str().unwrap(), r["Value"].as_str().unwrap()))
+        .collect();
+    assert_eq!(nested.get("TRANSFER_TYPE"), Some(&"BILLING"));
+    assert_eq!(nested.get("MANAGEMENT_ACCOUNT"), Some(&"111111111111"));
+    assert_eq!(
+        nested.get("TRANSFER_START_TIMESTAMP"),
+        Some(&"2030-01-01T00:00:00.000Z")
+    );
+
+    // The link survives resolution: the transfer clears its
+    // `ActiveHandshakeId` on accept, so reading it from that side would
+    // have made an ACCEPTED handshake report no transfer at all.
+    let id = handshake["Id"].as_str().unwrap().to_string();
+    svc.handle(req_with(
+        "222222222222",
+        "AcceptHandshake",
+        json!({ "HandshakeId": id }),
+    ))
+    .await
+    .unwrap();
+    let described = svc
+        .handle(req_with(
+            "222222222222",
+            "DescribeHandshake",
+            json!({ "HandshakeId": id }),
+        ))
+        .await
+        .unwrap();
+    assert!(body_json(&described)["Handshake"]["Resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["Type"] == "RESPONSIBILITY_TRANSFER"));
+}
+
+/// An in-flight `CreateAccount` whose address is the synthetic form of
+/// an id OTHER than the one it reserved is already doomed -- the
+/// completion tick fails it with `EMAIL_ALREADY_EXISTS`. Letting it hold
+/// the address meanwhile let any caller park another account's address
+/// for the length of the creation delay, blocking that account's own
+/// `CreateOrganization`.
+#[tokio::test]
+async fn a_doomed_reservation_does_not_hold_another_accounts_address() {
+    let (svc, _state) = OrganizationsService::shared();
+    create_org_with_root(&svc).await;
+    svc.handle(req_with(
+        "111111111111",
+        "CreateAccount",
+        json!({ "Email": "222222222222@example.com", "AccountName": "squatter" }),
+    ))
+    .await
+    .unwrap();
+    // The account that address actually names can still bootstrap while
+    // the doomed request is in flight.
+    svc.handle(req_with("222222222222", "CreateOrganization", json!({})))
+        .await
+        .expect("a doomed reservation must not hold the address it cannot keep");
+}

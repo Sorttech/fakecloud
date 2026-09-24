@@ -384,15 +384,26 @@ impl OrganizationsService {
         Ok(org)
     }
 
-    /// Read-side counterpart of [`Self::management_org_mut`], for ops
-    /// that are management-only but do not mutate.
-    fn management_org<'a>(
+    /// The caller's organization, for the read operations AWS opens to
+    /// the management account OR to any member registered as a
+    /// delegated administrator (for any service principal).
+    ///
+    /// Delegated administration exists so a member account can run a
+    /// service's org-wide integration on the management account's
+    /// behalf, which means reading the organization it administers:
+    /// `ListHandshakesForOrganization`, `ListAWSServiceAccessForOrganization`,
+    /// `ListDelegatedAdministrators` and `ListDelegatedServicesForAccount`
+    /// are all documented as callable by a delegated administrator.
+    /// Mutating operations stay management-only via
+    /// [`Self::management_org_mut`], which is why there is no read-side
+    /// management-only gate left: every management-only op mutates.
+    fn management_or_delegated_org<'a>(
         &self,
         guard: &'a parking_lot::RwLockReadGuard<'_, OrganizationsRegistry>,
         account_id: &str,
     ) -> Result<&'a OrganizationState, AwsServiceError> {
         let org = self.require_member(guard, account_id)?;
-        if !org.is_management(account_id) {
+        if !org.is_management(account_id) && !org.is_delegated_administrator(account_id) {
             return Err(not_management());
         }
         Ok(org)
@@ -987,7 +998,7 @@ fn parse_list_pagination(body: &Value) -> Result<(usize, Option<String>), AwsSer
     Ok((max_results, next_token))
 }
 
-fn handshake_payload(h: &crate::state::Handshake) -> Value {
+fn handshake_payload(org: &OrganizationState, h: &crate::state::Handshake) -> Value {
     // Real AWS Organizations encodes the inviter as the org itself
     // (`Type: ORGANIZATION`, `Id` = the org id) and the invitee as the
     // member account (`Type: ACCOUNT`, `Id` = account id) or its email
@@ -1020,10 +1031,47 @@ fn handshake_payload(h: &crate::state::Handshake) -> Value {
     } else {
         json!({"Type": "ACCOUNT", "Value": h.target_account_id})
     };
-    let resources = json!([
-        {"Type": "ORGANIZATION", "Value": h.organization_id},
+    let mut resources = vec![
+        json!({"Type": "ORGANIZATION", "Value": h.organization_id}),
         target_resource,
-    ]);
+    ];
+    // A TRANSFER_RESPONSIBILITY handshake carries the transfer it is
+    // offering, and AWS models exactly that as a nested
+    // `RESPONSIBILITY_TRANSFER` resource -- which is how an SDK reading
+    // only the handshake learns what is being handed over and by whom.
+    // `HandshakeResourceType` defines TRANSFER_TYPE,
+    // TRANSFER_START_TIMESTAMP and MANAGEMENT_ACCOUNT for no other
+    // purpose.
+    if let Some(transfer) = h
+        .responsibility_transfer_id
+        .as_deref()
+        .and_then(|id| org.responsibility_transfers.get(id))
+    {
+        resources.push(json!({
+            "Type": "RESPONSIBILITY_TRANSFER",
+            "Value": transfer.id,
+            "Resources": [
+                {"Type": "TRANSFER_TYPE", "Value": transfer.transfer_type},
+                {
+                    "Type": "TRANSFER_START_TIMESTAMP",
+                    // A nested resource's Value is a string in the Smithy
+                    // model, so the timestamp goes out ISO-8601 rather
+                    // than as the epoch number the top-level timestamp
+                    // members use.
+                    "Value": transfer.start_timestamp.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                },
+                {
+                    "Type": "MANAGEMENT_ACCOUNT",
+                    "Value": transfer.source_management_account_id,
+                },
+                {
+                    "Type": "MANAGEMENT_EMAIL",
+                    "Value": transfer.source_management_account_email,
+                },
+            ],
+        }));
+    }
+    let resources = Value::Array(resources);
     let mut obj = json!({
         "Id": h.id,
         "Arn": h.arn,

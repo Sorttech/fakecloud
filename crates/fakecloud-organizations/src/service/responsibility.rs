@@ -296,6 +296,47 @@ impl OrganizationsService {
                 )],
             ));
         }
+        // One live invitation per target, the same rule
+        // `InviteAccountToOrganization` enforces and with the same modeled
+        // error. Without it a caller could stack OPEN transfers on one
+        // target, and accepting any of them would move billing while the
+        // rest stayed OPEN against an organization that no longer owns it.
+        // The two handshake actions stay independent: an INVITE to the
+        // same account is a different offer and does not collide.
+        //
+        // Compare the RESOLVED target, so the same account named two ways
+        // still collides. An enrolled account resolves through the
+        // registry; an account that exists nowhere yet -- the common case
+        // here, since the invite exists to address an owner AWS has not
+        // seen -- resolves only through the synthetic address form.
+        let canonical_target = |kind: &str, id: &str| -> String {
+            registry
+                .iter()
+                .flat_map(|org| org.accounts.keys())
+                .find(|account| registry.account_matches_target(kind, id, account))
+                .cloned()
+                .or_else(|| crate::state::target_account_id(kind, id))
+                .unwrap_or_else(|| id.to_string())
+        };
+        let want = canonical_target(target_kind, &target_id);
+        let duplicate = registry
+            .org_by_id(&source_org_id)
+            .expect("management gate resolved this organization")
+            .handshakes
+            .values()
+            .filter(|h| {
+                h.action == "TRANSFER_RESPONSIBILITY"
+                    && matches!(h.state.as_str(), "REQUESTED" | "OPEN")
+            })
+            .any(|h| canonical_target(&h.target_kind, &h.target_account_id) == want);
+        if duplicate {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "DuplicateHandshakeException",
+                format!("An OPEN responsibility transfer already targets {target_id}."),
+            ));
+        }
+
         let org = guard
             .org_by_id_mut(&source_org_id)
             .expect("management gate resolved this organization");
@@ -303,6 +344,7 @@ impl OrganizationsService {
         let now = Utc::now();
         // The transfer rides on a handshake the invited org accepts.
         let handshake_id = format!("h-{}", random_id(32));
+        let transfer_id = format!("rt-{}", random_id(32));
         let handshake_arn = format!(
             "arn:aws:organizations::{}:handshake/{}/transfer/{}",
             org.management_account_id, org.org_id, handshake_id
@@ -320,11 +362,11 @@ impl OrganizationsService {
             target_kind: target_kind.to_string(),
             notes,
             organization_id: org.org_id.clone(),
+            responsibility_transfer_id: Some(transfer_id.clone()),
         };
         org.handshakes
             .insert(handshake_id.clone(), handshake.clone());
 
-        let transfer_id = format!("rt-{}", random_id(32));
         let transfer_arn = format!(
             "arn:aws:organizations::{}:responsibilitytransfer/{}/{}",
             org.management_account_id, org.org_id, transfer_id
@@ -348,7 +390,7 @@ impl OrganizationsService {
             .insert(transfer_id, transfer.clone());
 
         Ok(AwsResponse::ok_json(
-            json!({ "Handshake": handshake_payload(&handshake) }),
+            json!({ "Handshake": handshake_payload(org, &handshake) }),
         ))
     }
 

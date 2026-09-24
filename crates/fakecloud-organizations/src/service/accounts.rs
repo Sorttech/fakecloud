@@ -462,7 +462,7 @@ impl OrganizationsService {
             .invite_account(&req.account_id, kind, &id, target_email, notes)
             .map_err(org_error_to_aws)?;
         Ok(AwsResponse::ok_json(
-            json!({ "Handshake": handshake_payload(&handshake) }),
+            json!({ "Handshake": handshake_payload(org, &handshake) }),
         ))
     }
 
@@ -483,8 +483,8 @@ impl OrganizationsService {
         // organizations inviting it, none of which it belongs to yet.
         let mut filtered: Vec<Value> = guard
             .iter()
-            .flat_map(|org| org.list_handshakes())
-            .filter(|h| {
+            .flat_map(|org| org.list_handshakes().into_iter().map(move |h| (org, h)))
+            .filter(|(_, h)| {
                 // "Associated with the account of the requesting user"
                 // includes the invitations it SENT, not only those
                 // addressed to it. Cross-organization isolation is
@@ -497,8 +497,8 @@ impl OrganizationsService {
                         &req.account_id,
                     )
             })
-            .filter(|h| handshake_matches_filter(h, &filter))
-            .map(|h| handshake_payload(&h))
+            .filter(|(_, h)| handshake_matches_filter(h, &filter))
+            .map(|(org, h)| handshake_payload(org, &h))
             .collect();
         // `list_handshakes` sorts within an organization; re-sort so the
         // merged result is stable and paginates consistently.
@@ -524,7 +524,7 @@ impl OrganizationsService {
         let account_id = required_str(&body, "AccountId")?.to_string();
         let (max_results, next_token) = parse_list_pagination(&body)?;
         let guard = self.state.read();
-        let org = self.management_org(&guard, &req.account_id)?;
+        let org = self.management_or_delegated_org(&guard, &req.account_id)?;
         let entries: Vec<Value> = org
             .list_delegated_services_for_account(&account_id)
             .into_iter()

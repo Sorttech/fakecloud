@@ -333,14 +333,7 @@ impl OrganizationsService {
         // AWS allows the management account OR a member registered as a
         // delegated administrator -- unlike `PutResourcePolicy` and
         // `DeleteResourcePolicy`, which really are management-only.
-        let org = self.require_member(&guard, &req.account_id)?;
-        let delegated = org
-            .delegated_administrators
-            .values()
-            .any(|admins| admins.contains_key(&req.account_id));
-        if !org.is_management(&req.account_id) && !delegated {
-            return Err(not_management());
-        }
+        let org = self.management_or_delegated_org(&guard, &req.account_id)?;
         let content = org.resource_policy.clone().ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,

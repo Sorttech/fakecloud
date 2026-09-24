@@ -254,8 +254,7 @@ impl OrganizationsRegistry {
             || self.orgs.values().any(|org| {
                 org.create_account_requests.iter().any(|(id, req)| {
                     id != request_id
-                        && req.state == "IN_PROGRESS"
-                        && req.pending_email.as_deref() == Some(email)
+                        && Self::reservation_holds(req, email)
                         && mine.is_some_and(|m| {
                             (req.requested_timestamp, id.as_str())
                                 < (m.requested_timestamp, request_id)
@@ -285,6 +284,23 @@ impl OrganizationsRegistry {
     /// resolution is authorization-relevant -- it decides who may accept
     /// an `EMAIL`-targeted invitation -- so a duplicate would make that
     /// answer depend on id ordering.
+    /// Does this in-flight request hold `email`?
+    ///
+    /// A request whose address is the synthetic form of an id OTHER than
+    /// the one it reserved is already doomed -- the completion tick
+    /// fails it with `EMAIL_ALREADY_EXISTS` -- so it must not hold the
+    /// address meanwhile. Otherwise anyone could park another account's
+    /// address for the length of the creation delay, blocking that
+    /// account's own `CreateOrganization`.
+    fn reservation_holds(req: &CreateAccountStatus, email: &str) -> bool {
+        if req.state != "IN_PROGRESS" || req.pending_email.as_deref() != Some(email) {
+            return false;
+        }
+        !req.account_id
+            .as_deref()
+            .is_some_and(|mine| Self::email_reserved_for_other(email, mine))
+    }
+
     pub fn email_in_use(&self, email: &str) -> bool {
         self.orgs
             .values()
@@ -295,9 +311,9 @@ impl OrganizationsRegistry {
             // impossible to re-deploy.
             .any(|account| account.email == email && account.status != "SUSPENDED")
             || self.orgs.values().any(|org| {
-                org.create_account_requests.values().any(|req| {
-                    req.state == "IN_PROGRESS" && req.pending_email.as_deref() == Some(email)
-                })
+                org.create_account_requests
+                    .values()
+                    .any(|req| Self::reservation_holds(req, email))
             })
     }
 
@@ -967,6 +983,8 @@ impl OrganizationState {
             target_kind: kind,
             notes,
             organization_id: self.org_id.clone(),
+            // An INVITE carries no responsibility transfer.
+            responsibility_transfer_id: None,
         };
         self.handshakes.insert(id, handshake.clone());
         Ok(handshake)
@@ -1168,6 +1186,13 @@ impl OrganizationState {
     }
 
     /// List delegated administrators, optionally filtered by service.
+    /// Is `account_id` a delegated administrator for any service?
+    pub fn is_delegated_administrator(&self, account_id: &str) -> bool {
+        self.delegated_administrators
+            .values()
+            .any(|admins| admins.contains_key(account_id))
+    }
+
     pub fn list_delegated_administrators(
         &self,
         service_principal_filter: Option<&str>,
@@ -1715,6 +1740,15 @@ pub struct Handshake {
     pub target_kind: String,
     pub notes: Option<String>,
     pub organization_id: String,
+    /// The responsibility transfer this handshake carries, for
+    /// `TRANSFER_RESPONSIBILITY` handshakes only.
+    ///
+    /// The link has to live on the handshake because the transfer's own
+    /// `active_handshake_id` is cleared the moment the handshake
+    /// resolves -- reading the link from that side made an ACCEPTED
+    /// handshake report no transfer at all.
+    #[serde(default)]
+    pub responsibility_transfer_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
