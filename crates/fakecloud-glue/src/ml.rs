@@ -552,14 +552,30 @@ impl GlueService {
         let now = now_ts();
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id, &req.region);
-        st.dq_recommendation_runs.insert(
-            run_id.clone(),
-            json!({
-                "RunId": run_id, "Status": "RUNNING", "StartedOn": now,
-                "DataSource": body.get("DataSource").cloned().unwrap_or(Value::Null),
-                "Role": body.get("Role").cloned().unwrap_or(Value::Null),
-            }),
-        );
+        let mut run = json!({
+            "RunId": run_id, "Status": "RUNNING", "StartedOn": now,
+            "DataSource": body.get("DataSource").cloned().unwrap_or(Value::Null),
+            "Role": body.get("Role").cloned().unwrap_or(Value::Null),
+        });
+        // Every other request member that the run's read shape carries, so a
+        // started run describes back with what it was started with.
+        if let Some(obj) = run.as_object_mut() {
+            for member in [
+                "NumberOfWorkers",
+                "Timeout",
+                "CreatedRulesetName",
+                "DataQualitySecurityConfiguration",
+                "AdditionalRunOptions",
+                "RecommendationMode",
+            ] {
+                if let Some(v) = body.get(member) {
+                    if !v.is_null() {
+                        obj.insert(member.to_string(), v.clone());
+                    }
+                }
+            }
+        }
+        st.dq_recommendation_runs.insert(run_id.clone(), run);
         Ok(AwsResponse::ok_json(json!({ "RunId": run_id })))
     }
 

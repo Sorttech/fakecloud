@@ -115,10 +115,27 @@ fn cmd_vendored_models(project_root: &std::path::Path, models_dir: &std::path::P
                 .join(models_dir)
                 .join(format!("{service}.json"))
         };
-        let (Ok(a), Ok(b)) = (std::fs::read(copy), std::fs::read(&source)) else {
-            println!("  [x] {service}: cannot read {}", source.display());
-            stale.push(service.clone());
-            continue;
+        let a = match std::fs::read(copy) {
+            Ok(a) => a,
+            Err(e) => {
+                println!("  [x] {service}: cannot read {} ({e})", copy.display());
+                stale.push(service.clone());
+                continue;
+            }
+        };
+        // A crate whose directory suffix is not its model's file name (the
+        // `elbv2` / `elasticloadbalancingv2` shape) lands here: name the
+        // mismatch rather than reporting a stale copy.
+        let b = match std::fs::read(&source) {
+            Ok(b) => b,
+            Err(e) => {
+                println!(
+                    "  [x] {service}: no model at {} ({e}) -- does the crate suffix match the aws-models file name?",
+                    source.display()
+                );
+                stale.push(service.clone());
+                continue;
+            }
         };
         if a == b {
             println!("  [ok] {service}");

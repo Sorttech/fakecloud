@@ -48,6 +48,27 @@ fn sts_validate_range_i64(
     validate_range_i64(field, value, min, max).map_err(to_validation_error)
 }
 
+/// `MinimumSessionTokenSize` from the request, validated against the model's
+/// 0..=4096 range. STS pads the session token it issues up to this size; 0 (or
+/// an absent parameter) leaves the token at its natural size.
+fn minimum_session_token_size(req: &AwsRequest) -> Result<usize, AwsServiceError> {
+    let Some(raw) = req.query_params.get("MinimumSessionTokenSize") else {
+        return Ok(0);
+    };
+    let value: i64 = raw.parse().map_err(|_| {
+        AwsServiceError::aws_error(
+            StatusCode::BAD_REQUEST,
+            "ValidationError",
+            format!(
+                "Value '{raw}' at 'minimumSessionTokenSize' failed to satisfy constraint: \
+                 Member must be a valid integer"
+            ),
+        )
+    })?;
+    sts_validate_range_i64("minimumSessionTokenSize", value, 0, 4096)?;
+    Ok(value as usize)
+}
+
 /// Default duration for AssumeRole and similar operations (1 hour).
 const DEFAULT_ASSUME_ROLE_DURATION: i64 = 3600;
 

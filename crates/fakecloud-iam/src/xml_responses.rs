@@ -596,12 +596,51 @@ pub struct StsCredentials {
 
 impl StsCredentials {
     pub fn generate() -> Self {
+        Self::generate_with_minimum(0)
+    }
+
+    /// Credentials whose session token is at least `minimum` bytes long.
+    ///
+    /// STS pads the session token up to the caller's `MinimumSessionTokenSize`
+    /// regardless of its content, so a caller can size its own credential
+    /// storage against the largest token it will ever be handed.
+    pub fn generate_with_minimum(minimum: usize) -> Self {
         Self {
             access_key_id: generate_access_key_id(),
             secret_access_key: generate_secret_access_key(),
-            session_token: generate_session_token(),
+            session_token: pad_session_token(generate_session_token(), minimum),
         }
     }
+}
+
+/// The largest session token STS will issue, in bytes. `MinimumSessionTokenSize`
+/// is capped at this, and `SessionTokenUtilization` is a percentage of it.
+pub const MAX_SESSION_TOKEN_SIZE: usize = 4096;
+
+/// Extend `token` with filler until it is at least `minimum` bytes, keeping it
+/// in the base64 alphabet the rest of the token uses.
+fn pad_session_token(token: String, minimum: usize) -> String {
+    let minimum = minimum.min(MAX_SESSION_TOKEN_SIZE);
+    if token.len() >= minimum {
+        return token;
+    }
+    let mut token = token;
+    while token.len() < minimum {
+        let raw = uuid::Uuid::new_v4().as_bytes().to_vec();
+        token.push_str(&base64::engine::general_purpose::STANDARD.encode(&raw));
+    }
+    token.truncate(minimum);
+    token
+}
+
+/// `<SessionTokenSize>` + `<SessionTokenUtilization>`, which every STS response
+/// that hands out credentials reports alongside them.
+fn session_token_size_elements(session_token: &str) -> String {
+    let size = session_token.len();
+    let utilization = size * 100 / MAX_SESSION_TOKEN_SIZE;
+    format!(
+        "\n    <SessionTokenSize>{size}</SessionTokenSize>\n    <SessionTokenUtilization>{utilization}</SessionTokenUtilization>"
+    )
 }
 
 /// Inputs shared by all assume-role variants used to build an STS XML response.
@@ -665,6 +704,7 @@ pub fn assume_role_response(info: &AssumedRoleInfo<'_>) -> String {
     let assumed_role_arn = info.assumed_role_arn();
     let creds = info.creds();
     let source_identity = AssumedRoleInfo::opt_element("SourceIdentity", info.source_identity);
+    let token_size = session_token_size_elements(&creds.session_token);
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <AssumeRoleResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
@@ -678,7 +718,7 @@ pub fn assume_role_response(info: &AssumedRoleInfo<'_>) -> String {
     <AssumedRoleUser>
       <AssumedRoleId>{role_id}:{session}</AssumedRoleId>
       <Arn>{assumed_role_arn}</Arn>
-    </AssumedRoleUser>{source_identity}
+    </AssumedRoleUser>{source_identity}{token_size}
   </AssumeRoleResult>
   <ResponseMetadata>
     <RequestId>{request_id}</RequestId>
@@ -706,6 +746,7 @@ pub fn assume_role_with_web_identity_response(info: &AssumedRoleInfo<'_>) -> Str
     let audience = AssumedRoleInfo::opt_element("Audience", info.audience);
     let provider = AssumedRoleInfo::opt_element("Provider", info.provider);
     let source_identity = AssumedRoleInfo::opt_element("SourceIdentity", info.source_identity);
+    let token_size = session_token_size_elements(&creds.session_token);
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <AssumeRoleWithWebIdentityResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
@@ -719,7 +760,7 @@ pub fn assume_role_with_web_identity_response(info: &AssumedRoleInfo<'_>) -> Str
     <AssumedRoleUser>
       <AssumedRoleId>{assumed_role_id}:{session}</AssumedRoleId>
       <Arn>{assumed_role_arn}</Arn>
-    </AssumedRoleUser>{subject}{audience}{provider}{source_identity}
+    </AssumedRoleUser>{subject}{audience}{provider}{source_identity}{token_size}
   </AssumeRoleWithWebIdentityResult>
   <ResponseMetadata>
     <RequestId>{request_id}</RequestId>
@@ -746,6 +787,7 @@ pub fn assume_role_with_saml_response(info: &AssumedRoleInfo<'_>) -> String {
     let audience = AssumedRoleInfo::opt_element("Audience", info.audience);
     let name_qualifier = AssumedRoleInfo::opt_element("NameQualifier", info.name_qualifier);
     let source_identity = AssumedRoleInfo::opt_element("SourceIdentity", info.source_identity);
+    let token_size = session_token_size_elements(&creds.session_token);
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <AssumeRoleWithSAMLResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
@@ -759,7 +801,7 @@ pub fn assume_role_with_saml_response(info: &AssumedRoleInfo<'_>) -> String {
     <AssumedRoleUser>
       <AssumedRoleId>{assumed_role_id}:{session}</AssumedRoleId>
       <Arn>{assumed_role_arn}</Arn>
-    </AssumedRoleUser>{subject}{subject_type}{issuer}{audience}{name_qualifier}{source_identity}
+    </AssumedRoleUser>{subject}{subject_type}{issuer}{audience}{name_qualifier}{source_identity}{token_size}
   </AssumeRoleWithSAMLResult>
   <ResponseMetadata>
     <RequestId>{request_id}</RequestId>
@@ -784,6 +826,7 @@ pub fn get_session_token_response(
     let access_key_id = creds.access_key_id.as_str();
     let secret_access_key = creds.secret_access_key.as_str();
     let session_token = creds.session_token.as_str();
+    let token_size = session_token_size_elements(session_token);
 
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -794,7 +837,7 @@ pub fn get_session_token_response(
       <SecretAccessKey>{secret_access_key}</SecretAccessKey>
       <SessionToken>{session_token}</SessionToken>
       <Expiration>{expiration}</Expiration>
-    </Credentials>
+    </Credentials>{token_size}
   </GetSessionTokenResult>
   <ResponseMetadata>
     <RequestId>{request_id}</RequestId>
@@ -836,6 +879,8 @@ pub fn get_federation_token_response(
         String::new()
     };
 
+    let token_size = session_token_size_elements(session_token);
+
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <GetFederationTokenResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
@@ -849,7 +894,7 @@ pub fn get_federation_token_response(
     <FederatedUser>
       <FederatedUserId>{federated_user_id}</FederatedUserId>
       <Arn>{federated_user_arn}</Arn>
-    </FederatedUser>{policy_section}
+    </FederatedUser>{policy_section}{token_size}
   </GetFederationTokenResult>
   <ResponseMetadata>
     <RequestId>{request_id}</RequestId>
@@ -877,6 +922,7 @@ pub fn assume_root_response(
         Some(s) => format!("\n    <SourceIdentity>{}</SourceIdentity>", xml_escape(s)),
         None => String::new(),
     };
+    let token_size = session_token_size_elements(session_token);
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <AssumeRootResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
@@ -886,7 +932,7 @@ pub fn assume_root_response(
       <SecretAccessKey>{secret_access_key}</SecretAccessKey>
       <SessionToken>{session_token}</SessionToken>
       <Expiration>{expiration}</Expiration>
-    </Credentials>{source_identity_section}
+    </Credentials>{source_identity_section}{token_size}
   </AssumeRootResult>
   <ResponseMetadata>
     <RequestId>{request_id}</RequestId>

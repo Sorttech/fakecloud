@@ -8,6 +8,10 @@ pub const COMPUTE_PLATFORM: &[&str] = &["Server", "Lambda", "ECS"];
 
 pub const FILE_EXISTS_BEHAVIOR: &[&str] = &["DISALLOW", "OVERWRITE", "RETAIN"];
 
+/// `DeploymentInfo.deploymentMode`: install the revision, or restart what is
+/// already deployed.
+pub const DEPLOYMENT_MODE: &[&str] = &["STANDARD", "RESTART"];
+
 pub const OUTDATED_INSTANCES_STRATEGY: &[&str] = &["UPDATE", "IGNORE"];
 
 pub const SORT_ORDER: &[&str] = &["ascending", "descending"];

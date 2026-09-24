@@ -224,3 +224,106 @@ async fn sts_get_delegated_access_token() {
         .unwrap();
     assert!(resp.credentials().is_some());
 }
+
+// ---------------------------------------------------------------------------
+// MinimumSessionTokenSize / SessionTokenSize / SessionTokenUtilization are
+// newer than the vendored aws-sdk-sts, so exercise them via a raw awsQuery POST.
+// ---------------------------------------------------------------------------
+
+const STS_RAW_AUTH: &str =
+    "AWS4-HMAC-SHA256 Credential=test/20240101/us-east-1/sts/aws4_request, SignedHeaders=host, Signature=0";
+
+async fn sts_raw(server: &TestServer, body: &str) -> (reqwest::StatusCode, String) {
+    let resp = reqwest::Client::new()
+        .post(server.endpoint())
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header("Authorization", STS_RAW_AUTH)
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    (status, resp.text().await.unwrap())
+}
+
+/// Read the text of the first `<tag>` element in an XML response.
+fn xml_text<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&close)? + start;
+    Some(&xml[start..end])
+}
+
+#[tokio::test]
+async fn sts_minimum_session_token_size_pads_and_reports() {
+    let server = TestServer::start().await;
+
+    // Without the parameter the token keeps its natural size, and the response
+    // still reports that size and its share of the 4,096-byte maximum.
+    let (status, xml) = sts_raw(&server, "Action=GetSessionToken&Version=2011-06-15").await;
+    assert!(status.is_success(), "GetSessionToken: {status} {xml}");
+    let token = xml_text(&xml, "SessionToken").expect("session token");
+    let size: usize = xml_text(&xml, "SessionTokenSize")
+        .expect("session token size")
+        .parse()
+        .unwrap();
+    assert_eq!(size, token.len(), "reported size matches the token: {xml}");
+    let utilization: usize = xml_text(&xml, "SessionTokenUtilization")
+        .expect("session token utilization")
+        .parse()
+        .unwrap();
+    assert_eq!(utilization, size * 100 / 4096, "utilization: {xml}");
+
+    // Asking for a minimum pads the token up to it.
+    let (status, xml) = sts_raw(
+        &server,
+        "Action=GetSessionToken&Version=2011-06-15&MinimumSessionTokenSize=2048",
+    )
+    .await;
+    assert!(status.is_success(), "padded GetSessionToken: {status}");
+    let token = xml_text(&xml, "SessionToken").expect("session token");
+    assert_eq!(token.len(), 2048, "token padded to the requested minimum");
+    assert_eq!(xml_text(&xml, "SessionTokenSize"), Some("2048"));
+    assert_eq!(xml_text(&xml, "SessionTokenUtilization"), Some("50"));
+
+    // AssumeRole reports the same members. The role must exist with a trust
+    // policy admitting the caller, as assuming a missing role is denied.
+    server
+        .iam_client()
+        .await
+        .create_role()
+        .role_name("pad-role")
+        .assume_role_policy_document(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"sts:AssumeRole"}]}"#,
+        )
+        .send()
+        .await
+        .unwrap();
+    let (status, xml) = sts_raw(
+        &server,
+        "Action=AssumeRole&Version=2011-06-15\
+         &RoleArn=arn%3Aaws%3Aiam%3A%3A123456789012%3Arole%2Fpad-role\
+         &RoleSessionName=sess&MinimumSessionTokenSize=1024",
+    )
+    .await;
+    assert!(status.is_success(), "AssumeRole: {status} {xml}");
+    assert_eq!(
+        xml_text(&xml, "SessionToken").map(str::len),
+        Some(1024),
+        "AssumeRole pads its token too"
+    );
+    assert_eq!(xml_text(&xml, "SessionTokenSize"), Some("1024"));
+
+    // The model caps the minimum at 4,096 bytes.
+    let (status, xml) = sts_raw(
+        &server,
+        "Action=GetSessionToken&Version=2011-06-15&MinimumSessionTokenSize=5000",
+    )
+    .await;
+    assert_eq!(status, 400, "above the range maximum: {xml}");
+    assert!(
+        xml.contains("minimumSessionTokenSize"),
+        "error names the offending member: {xml}"
+    );
+}

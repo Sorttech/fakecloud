@@ -2606,3 +2606,57 @@ async fn update_asset_unknown_identifier() {
         "expected EntityNotFoundException, got {err}"
     );
 }
+
+/// `RecommendationMode` joined `StartDataQualityRuleRecommendationRun` and the
+/// run's read shape in a model refresh, ahead of the typed aws-sdk-glue client,
+/// so drive it over raw awsJson1.1.
+#[tokio::test]
+async fn data_quality_recommendation_run_round_trips_its_request() {
+    let server = TestServer::start().await;
+
+    let auth = "AWS4-HMAC-SHA256 Credential=test/20240101/us-east-1/glue/aws4_request, SignedHeaders=host, Signature=0";
+    let call = |op: &str, body: String| {
+        let url = server.endpoint();
+        let target = format!("AWSGlue.{op}");
+        async move {
+            reqwest::Client::new()
+                .post(url)
+                .header("Authorization", auth)
+                .header("Content-Type", "application/x-amz-json-1.1")
+                .header("X-Amz-Target", target)
+                .body(body)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    let resp = call(
+        "StartDataQualityRuleRecommendationRun",
+        r#"{"DataSource":{"GlueTable":{"DatabaseName":"db","TableName":"t"}},"Role":"arn:aws:iam::123456789012:role/glue","RecommendationMode":"ADVANCED","NumberOfWorkers":5,"CreatedRulesetName":"rs"}"#
+            .to_string(),
+    )
+    .await;
+    assert!(resp.status().is_success(), "start: {}", resp.status());
+    let started: serde_json::Value = resp.json().await.unwrap();
+    let run_id = started["RunId"].as_str().expect("run id").to_string();
+
+    let resp = call(
+        "GetDataQualityRuleRecommendationRun",
+        format!(r#"{{"RunId":"{run_id}"}}"#),
+    )
+    .await;
+    let run: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(run["RecommendationMode"], "ADVANCED", "run: {run}");
+    assert_eq!(run["NumberOfWorkers"], 5, "run: {run}");
+    assert_eq!(run["CreatedRulesetName"], "rs", "run: {run}");
+
+    // An unmodelled mode is rejected by the generated constraint table.
+    let resp = call(
+        "StartDataQualityRuleRecommendationRun",
+        r#"{"DataSource":{"GlueTable":{"DatabaseName":"db","TableName":"t"}},"Role":"arn:aws:iam::123456789012:role/glue","RecommendationMode":"TURBO"}"#
+            .to_string(),
+    )
+    .await;
+    assert_eq!(resp.status(), 400, "an unmodelled RecommendationMode");
+}

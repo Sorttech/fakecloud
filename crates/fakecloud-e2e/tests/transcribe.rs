@@ -289,3 +289,97 @@ async fn update_language_model_re_encrypts_a_settled_model() {
         "expected NotFoundException: {err}"
     );
 }
+
+/// `EncryptionConfiguration` joined the vocabulary create/update requests and
+/// the `GetVocabulary` read shape in a model refresh, ahead of the typed
+/// aws-sdk-transcribe client, so drive those over raw awsJson1.1.
+#[tokio::test]
+async fn vocabulary_round_trips_its_encryption_configuration() {
+    let server = TestServer::start().await;
+
+    let auth = "AWS4-HMAC-SHA256 Credential=test/20240101/us-east-1/transcribe/aws4_request, SignedHeaders=host, Signature=0";
+    let call = |op: &str, body: String| {
+        let url = server.endpoint().to_string();
+        let target = format!("Transcribe.{op}");
+        async move {
+            reqwest::Client::new()
+                .post(url)
+                .header("Authorization", auth)
+                .header("Content-Type", "application/x-amz-json-1.1")
+                .header("X-Amz-Target", target)
+                .body(body)
+                .send()
+                .await
+                .expect("request")
+        }
+    };
+
+    let resp = call(
+        "CreateVocabulary",
+        r#"{"VocabularyName":"enc-vocab","LanguageCode":"en-US","Phrases":["Amazon"],"DataAccessRoleArn":"arn:aws:iam::000000000000:role/vocab","EncryptionConfiguration":{"KmsKeyId":"alias/vocab"}}"#
+            .to_string(),
+    )
+    .await;
+    assert!(resp.status().is_success(), "create: {}", resp.status());
+
+    let resp = call(
+        "GetVocabulary",
+        r#"{"VocabularyName":"enc-vocab"}"#.to_string(),
+    )
+    .await;
+    let got: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        got["DataAccessRoleArn"], "arn:aws:iam::000000000000:role/vocab",
+        "vocabulary: {got}"
+    );
+    assert_eq!(
+        got["EncryptionConfiguration"]["KmsKeyId"], "alias/vocab",
+        "vocabulary: {got}"
+    );
+
+    // An update repoints the key.
+    let resp = call(
+        "UpdateVocabulary",
+        r#"{"VocabularyName":"enc-vocab","LanguageCode":"en-US","Phrases":["Amazon"],"EncryptionConfiguration":{"KmsKeyId":"alias/rotated"}}"#
+            .to_string(),
+    )
+    .await;
+    assert!(resp.status().is_success(), "update: {}", resp.status());
+    let resp = call(
+        "GetVocabulary",
+        r#"{"VocabularyName":"enc-vocab"}"#.to_string(),
+    )
+    .await;
+    let got: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        got["EncryptionConfiguration"]["KmsKeyId"], "alias/rotated",
+        "vocabulary: {got}"
+    );
+
+    // Vocabulary filters carry the same pair.
+    let resp = call(
+        "CreateVocabularyFilter",
+        r#"{"VocabularyFilterName":"enc-filter","LanguageCode":"en-US","Words":["nope"],"DataAccessRoleArn":"arn:aws:iam::000000000000:role/filter","EncryptionConfiguration":{"KmsKeyId":"alias/filter"}}"#
+            .to_string(),
+    )
+    .await;
+    assert!(
+        resp.status().is_success(),
+        "create filter: {}",
+        resp.status()
+    );
+    let resp = call(
+        "GetVocabularyFilter",
+        r#"{"VocabularyFilterName":"enc-filter"}"#.to_string(),
+    )
+    .await;
+    let got: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        got["DataAccessRoleArn"], "arn:aws:iam::000000000000:role/filter",
+        "filter: {got}"
+    );
+    assert_eq!(
+        got["EncryptionConfiguration"]["KmsKeyId"], "alias/filter",
+        "filter: {got}"
+    );
+}

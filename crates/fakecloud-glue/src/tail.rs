@@ -314,7 +314,8 @@ impl GlueService {
         let max = body
             .get("MaxRecords")
             .and_then(Value::as_u64)
-            .unwrap_or(u64::MAX) as usize;
+            .map(|n| n as usize)
+            .unwrap_or(usize::MAX);
 
         let accounts = self.state.read();
         let mut matching: Vec<(String, Value)> = accounts
@@ -337,19 +338,12 @@ impl GlueService {
                     .collect()
             })
             .unwrap_or_default();
-        // The marker is the key the previous page stopped at, so the listing has
-        // to be ordered for paging to be stable across calls.
+        // The marker is an offset into the listing, so the order has to be
+        // stable across calls for paging to land on the right page.
         matching.sort_by(|a, b| a.0.cmp(&b.0));
-        if let Some(marker) = marker {
-            matching.retain(|(k, _)| k.as_str() > marker);
-        }
-        let next = if matching.len() > max {
-            matching.truncate(max);
-            matching.last().map(|(k, _)| k.clone())
-        } else {
-            None
-        };
-        let list: Vec<Value> = matching.into_iter().map(|(_, v)| v).collect();
+        let items: Vec<Value> = matching.into_iter().map(|(_, v)| v).collect();
+        let (list, next) = fakecloud_core::pagination::paginate_checked(&items, marker, max)
+            .map_err(|_| invalid_input("Invalid value for Marker."))?;
         Ok(AwsResponse::ok_json(json!({
             "IntegrationTablePropertiesList": list,
             "Marker": next,

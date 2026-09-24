@@ -47,7 +47,7 @@ impl StsService {
         let expiration = format_expiration(expiration_at);
 
         let partition = partition_for_region(&req.region);
-        let creds = StsCredentials::generate();
+        let creds = StsCredentials::generate_with_minimum(minimum_session_token_size(req)?);
 
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
