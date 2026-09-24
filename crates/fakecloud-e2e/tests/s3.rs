@@ -968,6 +968,49 @@ async fn s3_delete_of_missing_key_emits_no_notification() {
 }
 
 #[tokio::test]
+async fn s3_version_targeted_delete_on_unversioned_bucket_has_no_version_id() {
+    // `--version-id null` against a bucket that never had versioning still
+    // removes the object, but AWS reports no versionId on the record.
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+    let sqs = server.sqs_client().await;
+
+    s3.create_bucket()
+        .bucket("nullver-notif")
+        .send()
+        .await
+        .unwrap();
+    let queue_url = wire_bucket_to_queue(&server, &sqs, "nullver-notif", "nullver-events").await;
+
+    s3.put_object()
+        .bucket("nullver-notif")
+        .key("obj.txt")
+        .body(ByteStream::from_static(b"x"))
+        .send()
+        .await
+        .unwrap();
+    let created = drain_records(&sqs, &queue_url, 1).await;
+    assert_eq!(created.len(), 1);
+
+    s3.delete_object()
+        .bucket("nullver-notif")
+        .key("obj.txt")
+        .version_id("null")
+        .send()
+        .await
+        .unwrap();
+
+    let removed = drain_records(&sqs, &queue_url, 1).await;
+    assert_eq!(removed.len(), 1, "expected the delete event");
+    assert_eq!(removed[0]["eventName"], "ObjectRemoved:Delete");
+    assert!(
+        removed[0]["s3"]["object"].get("versionId").is_none(),
+        "unversioned bucket must not report a versionId: {}",
+        removed[0]
+    );
+}
+
+#[tokio::test]
 async fn s3_delete_objects_batch_emits_notifications() {
     // DeleteObjects used to be a silent hole in the event stream: it removed
     // objects without firing any notification.

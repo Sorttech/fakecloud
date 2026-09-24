@@ -154,7 +154,6 @@ impl S3Service {
             let notification_config = b.notification_config.clone();
             let bucket_name = bucket.to_string();
             let obj_key = key.to_string();
-            let region = region.clone();
             drop(accts);
             if removed_version {
                 if let Some(ref config) = notification_config {
@@ -169,7 +168,10 @@ impl S3Service {
                             size: 0,
                             etag: "",
                             region: &region,
-                            version_id: Some(vid.as_str()),
+                            // AWS reports versionId only on a
+                            // versioning-enabled bucket, even when the
+                            // request targeted the "null" version.
+                            version_id: versioning_enabled.then_some(vid.as_str()),
                         },
                         Some(&self.state),
                     );
@@ -240,7 +242,6 @@ impl S3Service {
             let notification_config = b.notification_config.clone();
             let bucket_name = bucket.to_string();
             let obj_key = key.to_string();
-            let region = region.clone();
             drop(accts);
             if let Some(ref config) = notification_config {
                 deliver_notifications(
@@ -459,7 +460,7 @@ impl S3Service {
                     pending_events.push((
                         "ObjectRemoved:Delete",
                         key.to_string(),
-                        Some(vid.to_string()),
+                        versioning_enabled.then(|| vid.to_string()),
                     ));
                 }
                 if !quiet {
@@ -558,11 +559,10 @@ impl S3Service {
         let region = state.region.clone();
         drop(accts);
         if let Some(ref config) = notification_config {
-            for (event_name, key, version_id) in &pending_events {
-                deliver_notifications(
-                    &self.delivery,
-                    config,
-                    &crate::service::notifications::ObjectEvent {
+            let events: Vec<crate::service::notifications::ObjectEvent<'_>> = pending_events
+                .iter()
+                .map(
+                    |(event_name, key, version_id)| crate::service::notifications::ObjectEvent {
                         event_name,
                         bucket_name: bucket,
                         requester_account: account_id,
@@ -572,9 +572,16 @@ impl S3Service {
                         region: &region,
                         version_id: version_id.as_deref(),
                     },
-                    Some(&self.state),
-                );
-            }
+                )
+                .collect();
+            // One parse of the config and one state lookup for the whole
+            // batch; a 1000-key delete otherwise repeats both per object.
+            crate::service::notifications::deliver_notification_batch(
+                &self.delivery,
+                config,
+                &events,
+                Some(&self.state),
+            );
         }
 
         if let Some(err) = persist_error {

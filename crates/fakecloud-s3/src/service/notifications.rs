@@ -750,142 +750,175 @@ pub(crate) struct ObjectEvent<'a> {
     pub version_id: Option<&'a str>,
 }
 
-/// Deliver S3 event notifications for a bucket operation.
+/// Deliver S3 event notifications for a single bucket operation.
 pub(crate) fn deliver_notifications(
     delivery: &Arc<DeliveryBus>,
     notification_config: &str,
     event: &ObjectEvent<'_>,
     s3_state: Option<&SharedS3State>,
 ) {
-    let ObjectEvent {
-        event_name,
-        bucket_name,
-        key,
-        size,
-        etag,
-        version_id,
-        ..
-    } = *event;
+    deliver_notification_batch(
+        delivery,
+        notification_config,
+        std::slice::from_ref(event),
+        s3_state,
+    );
+}
+
+/// Deliver several events produced by one operation on one bucket (the
+/// `DeleteObjects` batch). The config is parsed and the bucket owner /
+/// EventBridge flag resolved once for the whole batch rather than per object,
+/// which matters for a 1000-key delete; each event still gets its own
+/// sequencer and its own message, as on AWS. All events must be for the same
+/// bucket -- the first event's bucket names the one whose state is read.
+pub(crate) fn deliver_notification_batch(
+    delivery: &Arc<DeliveryBus>,
+    notification_config: &str,
+    events: &[ObjectEvent<'_>],
+    s3_state: Option<&SharedS3State>,
+) {
+    let Some(first) = events.first() else {
+        return;
+    };
+    let bucket_name = first.bucket_name;
+    debug_assert!(
+        events.iter().all(|e| e.bucket_name == bucket_name),
+        "a notification batch must describe a single bucket"
+    );
 
     let targets = parse_notification_config(notification_config);
-    let s3_event_name = format!("s3:{event_name}");
-    // Every target of one operation shares a sequencer, as on real S3.
-    let sequencer = next_sequencer();
 
-    // The bucket owner fills the bucket's `ownerIdentity`.
-    let owner_account = s3_state
-        .and_then(|st| {
-            let mas = st.read();
-            mas.find_account(|s| s.buckets.contains_key(bucket_name))
-                .map(|a| a.to_string())
-        })
-        .unwrap_or_else(|| "000000000000".to_string());
-
-    // Deliver to EventBridge if enabled for this bucket
-    let eventbridge_enabled = s3_state
+    // One pass over S3 state for the whole batch: the bucket owner fills the
+    // bucket's `ownerIdentity`, and the EventBridge opt-in is per bucket.
+    let (owner_account, eventbridge_enabled) = s3_state
         .and_then(|st| {
             let mas = st.read();
             let acct = mas.find_account(|s| s.buckets.contains_key(bucket_name))?;
-            mas.get(acct)
+            let enabled = mas
+                .get(acct)
                 .and_then(|s| s.buckets.get(bucket_name))
                 .map(|b| b.eventbridge_enabled)
+                .unwrap_or(false);
+            Some((acct.to_string(), enabled))
         })
-        .unwrap_or(false);
-    if eventbridge_enabled {
-        let mut object = serde_json::json!({ "key": key, "sequencer": sequencer });
-        if !event_name.starts_with("ObjectRemoved") {
-            object["size"] = serde_json::json!(size);
-            object["etag"] = serde_json::json!(etag);
+        .unwrap_or_else(|| ("000000000000".to_string(), false));
+
+    // Indices of the events that matched at least one target; only those are
+    // recorded for introspection.
+    let mut delivered: Vec<usize> = Vec::new();
+
+    for (idx, event) in events.iter().enumerate() {
+        let event_name = event.event_name;
+        let key = event.key;
+        let s3_event_name = format!("s3:{event_name}");
+        // Every target of one operation shares a sequencer, as on real S3.
+        let sequencer = next_sequencer();
+
+        if eventbridge_enabled {
+            let mut object = serde_json::json!({ "key": key, "sequencer": sequencer });
+            if !event_name.starts_with("ObjectRemoved") {
+                object["size"] = serde_json::json!(event.size);
+                object["etag"] = serde_json::json!(event.etag);
+            }
+            if let Some(vid) = event.version_id {
+                object["version-id"] = serde_json::json!(vid);
+            }
+            let mut detail = serde_json::json!({
+                "version": "0",
+                "bucket": { "name": bucket_name },
+                "object": object,
+                "request-id": uuid::Uuid::new_v4().to_string(),
+                "requester": event.requester_account,
+            });
+            if let Some(reason) = eventbridge_reason(event_name) {
+                detail["reason"] = serde_json::json!(reason);
+            }
+            if event_name == "ObjectRemoved:Delete" {
+                detail["deletion-type"] = serde_json::json!("Permanently deleted");
+            } else if event_name == "ObjectRemoved:DeleteMarkerCreated" {
+                detail["deletion-type"] = serde_json::json!("Delete marker created");
+            }
+            delivery.put_event_to_eventbridge(
+                "aws.s3",
+                &eventbridge_detail_type(event_name),
+                &detail.to_string(),
+                "default",
+            );
         }
-        if let Some(vid) = version_id {
-            object["version-id"] = serde_json::json!(vid);
+
+        let mut matched = false;
+
+        for target in &targets {
+            let matches = target.events.is_empty()
+                || target
+                    .events
+                    .iter()
+                    .any(|f| event_matches(&s3_event_name, f));
+            if !matches {
+                continue;
+            }
+            if !key_matches_filters(key, &target.prefix_filter, &target.suffix_filter) {
+                continue;
+            }
+            matched = true;
+            // configurationId names the rule that fired, so the message is
+            // built per target rather than once per event.
+            let message = build_s3_event_notification(
+                event,
+                target.id.as_deref(),
+                &owner_account,
+                &sequencer,
+            );
+            match target.target_type {
+                NotificationTargetType::Sqs => {
+                    delivery.send_to_sqs(&target.arn, &message, &std::collections::HashMap::new());
+                }
+                NotificationTargetType::Sns => {
+                    delivery.publish_to_sns(&target.arn, &message, Some("Amazon S3 Notification"));
+                }
+                NotificationTargetType::Lambda => {
+                    let delivery = delivery.clone();
+                    let function_arn = target.arn.clone();
+                    let payload = message;
+                    tokio::spawn(async move {
+                        tracing::info!(
+                            function_arn = %function_arn,
+                            "S3 invoking Lambda function for notification"
+                        );
+                        match delivery.invoke_lambda(&function_arn, &payload).await {
+                            Some(Ok(_)) => {
+                                tracing::info!(
+                                    function_arn = %function_arn,
+                                    "S3->Lambda invocation succeeded"
+                                );
+                            }
+                            Some(Err(e)) => {
+                                tracing::error!(
+                                    function_arn = %function_arn,
+                                    error = %e,
+                                    "S3->Lambda invocation failed"
+                                );
+                            }
+                            None => {
+                                tracing::warn!(
+                                    function_arn = %function_arn,
+                                    "No Lambda delivery configured"
+                                );
+                            }
+                        }
+                    });
+                }
+            }
         }
-        let mut detail = serde_json::json!({
-            "version": "0",
-            "bucket": { "name": bucket_name },
-            "object": object,
-            "request-id": uuid::Uuid::new_v4().to_string(),
-            "requester": event.requester_account,
-        });
-        if let Some(reason) = eventbridge_reason(event_name) {
-            detail["reason"] = serde_json::json!(reason);
+
+        if matched {
+            delivered.push(idx);
         }
-        if event_name == "ObjectRemoved:Delete" {
-            detail["deletion-type"] = serde_json::json!("Permanently deleted");
-        } else if event_name == "ObjectRemoved:DeleteMarkerCreated" {
-            detail["deletion-type"] = serde_json::json!("Delete marker created");
-        }
-        delivery.put_event_to_eventbridge(
-            "aws.s3",
-            &eventbridge_detail_type(event_name),
-            &detail.to_string(),
-            "default",
-        );
     }
 
-    let mut delivered = false;
-
-    for target in &targets {
-        let matches = target.events.is_empty()
-            || target
-                .events
-                .iter()
-                .any(|f| event_matches(&s3_event_name, f));
-        if !matches {
-            continue;
-        }
-        if !key_matches_filters(key, &target.prefix_filter, &target.suffix_filter) {
-            continue;
-        }
-        delivered = true;
-        // configurationId names the rule that fired, so the message is built
-        // per target rather than once per operation.
-        let message =
-            build_s3_event_notification(event, target.id.as_deref(), &owner_account, &sequencer);
-        match target.target_type {
-            NotificationTargetType::Sqs => {
-                delivery.send_to_sqs(&target.arn, &message, &std::collections::HashMap::new());
-            }
-            NotificationTargetType::Sns => {
-                delivery.publish_to_sns(&target.arn, &message, Some("Amazon S3 Notification"));
-            }
-            NotificationTargetType::Lambda => {
-                let delivery = delivery.clone();
-                let function_arn = target.arn.clone();
-                let payload = message;
-                tokio::spawn(async move {
-                    tracing::info!(
-                        function_arn = %function_arn,
-                        "S3 invoking Lambda function for notification"
-                    );
-                    match delivery.invoke_lambda(&function_arn, &payload).await {
-                        Some(Ok(_)) => {
-                            tracing::info!(
-                                function_arn = %function_arn,
-                                "S3->Lambda invocation succeeded"
-                            );
-                        }
-                        Some(Err(e)) => {
-                            tracing::error!(
-                                function_arn = %function_arn,
-                                error = %e,
-                                "S3->Lambda invocation failed"
-                            );
-                        }
-                        None => {
-                            tracing::warn!(
-                                function_arn = %function_arn,
-                                "No Lambda delivery configured"
-                            );
-                        }
-                    }
-                });
-            }
-        }
-    }
-
-    // Record notification event for introspection only if at least one target matched
-    if delivered {
+    // Record notification events for introspection, only for the events that
+    // actually matched a target. One write lock for the batch.
+    if !delivered.is_empty() {
         if let Some(state) = s3_state {
             let mut mas = state.write();
             let owner_acct = mas
@@ -893,12 +926,14 @@ pub(crate) fn deliver_notifications(
                 .map(|a| a.to_string());
             if let Some(acct) = owner_acct {
                 if let Some(acct_state) = mas.get_mut(&acct) {
-                    acct_state.notification_events.push(S3NotificationEvent {
-                        bucket: bucket_name.to_string(),
-                        key: key.to_string(),
-                        event_type: s3_event_name,
-                        timestamp: Utc::now(),
-                    });
+                    for event in delivered.iter().map(|&i| &events[i]) {
+                        acct_state.notification_events.push(S3NotificationEvent {
+                            bucket: bucket_name.to_string(),
+                            key: event.key.to_string(),
+                            event_type: format!("s3:{}", event.event_name),
+                            timestamp: Utc::now(),
+                        });
+                    }
                 }
             }
         }
