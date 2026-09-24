@@ -103,6 +103,19 @@ impl OrganizationsService {
                     crate::state::OrgError::AccountInAnotherOrganization(req.account_id.clone()),
                 ));
             }
+            // ...and already being a member of the INVITING organization is
+            // equally a no-op accept. `invite_account` rejects that case at
+            // invite time; the account may have joined since, through
+            // `CreateAccount` or the bootstrap shortcut, and the two gates
+            // must agree.
+            if guard
+                .org_by_id(&org_id)
+                .is_some_and(|org| org.accounts.contains_key(&req.account_id))
+            {
+                return Err(org_error_to_aws(
+                    crate::state::OrgError::AccountAlreadyMember(req.account_id.clone()),
+                ));
+            }
         }
         let org = guard
             .org_by_id_mut(&org_id)

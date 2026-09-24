@@ -22,6 +22,11 @@ pub struct OrganizationsRegistry {
     orgs: BTreeMap<String, OrganizationState>,
 }
 
+/// A GovCloud mirror lives in the `aws-us-gov` partition.
+fn is_gov_cloud(account: &MemberAccount) -> bool {
+    account.arn.starts_with("arn:aws-us-gov:")
+}
+
 /// Resolve a handshake or transfer target to an account id.
 ///
 /// An `ACCOUNT` target already is one. An `EMAIL` target stores the
@@ -222,8 +227,27 @@ impl OrganizationsRegistry {
         self.orgs
             .values()
             .flat_map(|org| org.accounts.values())
-            .find(|account| account.email == email)
+            // A GovCloud mirror shares its commercial twin's address by
+            // design; the commercial account is the one an address names.
+            .find(|account| account.email == email && !is_gov_cloud(account))
             .map(|account| account.id.clone())
+    }
+
+    /// True when any account already uses `email`. AWS requires an
+    /// address to be unused (`EMAIL_ALREADY_EXISTS`), and this
+    /// resolution is authorization-relevant -- it decides who may accept
+    /// an `EMAIL`-targeted invitation -- so a duplicate would make that
+    /// answer depend on id ordering.
+    pub fn email_in_use(&self, email: &str) -> bool {
+        self.orgs
+            .values()
+            .flat_map(|org| org.accounts.values())
+            .any(|account| account.email == email)
+            || self.orgs.values().any(|org| {
+                org.create_account_requests.values().any(|req| {
+                    req.state == "IN_PROGRESS" && req.pending_email.as_deref() == Some(email)
+                })
+            })
     }
 
     /// Does `target` (as declared by `target_kind`) name `account_id`?
@@ -757,15 +781,17 @@ impl OrganizationState {
                 "arn:aws-us-gov:organizations::{}:account/{}/{}",
                 self.management_account_id, self.org_id, gov_id
             );
-            // Its OWN address: sharing the commercial account's would make
-            // one address name two accounts, and every target resolution
-            // would then pick whichever id sorted first.
+            // AWS creates the GovCloud account from the same owner
+            // address, so the response carries it. The pair is the one
+            // legitimate case of two accounts sharing an address;
+            // `account_registered_with` skips the mirror so resolution
+            // still lands on exactly one account.
             self.accounts.insert(
                 gov_id.clone(),
                 MemberAccount {
                     id: gov_id.clone(),
                     arn: gov_arn,
-                    email: format!("{gov_id}@example.com"),
+                    email,
                     name: account_name,
                     status: "ACTIVE".to_string(),
                     joined_method: "CREATED".to_string(),

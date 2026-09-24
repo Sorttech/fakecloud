@@ -862,6 +862,77 @@ async fn a_registered_address_names_its_own_account_and_no_other() {
     ));
 }
 
+/// AWS requires an account's address to be unused. fakecloud must
+/// enforce it too: resolution by address decides who may accept an
+/// EMAIL-targeted invitation, so a duplicate would make that answer
+/// depend on which id happened to sort first.
+#[tokio::test]
+async fn create_account_rejects_an_address_already_in_use() {
+    let (svc, _state) = OrganizationsService::shared();
+    create_org_with_root(&svc).await;
+    svc.handle(req_with(
+        "111111111111",
+        "CreateAccount",
+        json!({ "Email": "ops@corp.com", "AccountName": "ops" }),
+    ))
+    .await
+    .unwrap();
+
+    // Same organization, and a different one, both refused.
+    svc.handle(req_with("222222222222", "CreateOrganization", json!({})))
+        .await
+        .unwrap();
+    for caller in ["111111111111", "222222222222"] {
+        let err = expect_err(
+            svc.handle(req_with(
+                caller,
+                "CreateAccount",
+                json!({ "Email": "ops@corp.com", "AccountName": "dupe" }),
+            ))
+            .await,
+        );
+        assert_eq!(err.code(), "InvalidInputException");
+    }
+}
+
+/// Accepting an invitation you have since satisfied another way is not a
+/// silent no-op. `invite_account` rejects an existing member at invite
+/// time; the account may have joined between invite and accept, and the
+/// two gates must give the same answer.
+#[tokio::test]
+async fn accepting_after_joining_the_inviting_organization_errors() {
+    let (svc, state) = OrganizationsService::shared();
+    create_org_with_root(&svc).await;
+    let invited = body_json(
+        &svc.handle(req_with(
+            "111111111111",
+            "InviteAccountToOrganization",
+            json!({ "Target": { "Type": "ACCOUNT", "Id": "222222222222" } }),
+        ))
+        .await
+        .unwrap(),
+    );
+    let handshake_id = invited["Handshake"]["Id"].as_str().unwrap().to_string();
+
+    // It joins the same organization by another route while the
+    // invitation sits open.
+    state
+        .write()
+        .sole_mut()
+        .unwrap()
+        .enroll_account_if_missing("222222222222");
+
+    let err = expect_err(
+        svc.handle(req_with(
+            "222222222222",
+            "AcceptHandshake",
+            json!({ "HandshakeId": handshake_id }),
+        ))
+        .await,
+    );
+    assert_eq!(err.code(), "HandshakeConstraintViolationException");
+}
+
 /// Deleting one organization leaves every other one standing.
 #[tokio::test]
 async fn deleting_one_organization_leaves_the_others() {

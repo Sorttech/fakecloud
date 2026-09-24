@@ -72,17 +72,17 @@ fn target_participant(
     let resolved = if is_account_id {
         Some(stored.clone())
     } else {
-        // Scoped to the organization that holds the transfer: this value
-        // is RETURNED, so a registry-wide lookup would hand the source a
-        // 12-digit id from an organization it has no relationship with --
-        // the oracle `resolve_target_account` is scoped to avoid. The
-        // synthetic form leaks nothing, since it only decodes an id the
-        // caller already spelled out.
-        registry
-            .org_of_account(&t.source_management_account_id)
-            .and_then(|org| org.accounts.values().find(|a| a.email == *stored))
-            .map(|account| account.id.clone())
-            .or_else(|| crate::state::target_account_id("EMAIL", stored))
+        // Only the synthetic form. Looking the address up among the
+        // source organization's members can never hit -- a target inside
+        // the source organization is rejected at invite time -- and
+        // looking it up registry-wide would RETURN a 12-digit id from an
+        // organization the caller has no relationship with, the oracle
+        // `resolve_target_account` is scoped to avoid. The synthetic form
+        // leaks nothing: it decodes only an id the caller already spelled
+        // out. A real address therefore reports no
+        // `ManagementAccountId`, which the Smithy shape allows.
+        let _ = registry;
+        crate::state::target_account_id("EMAIL", stored)
     };
     if let Some(id) = resolved {
         party["ManagementAccountId"] = json!(id);
@@ -337,6 +337,8 @@ impl OrganizationsService {
         let body = req.json_body();
         let id = required_str(&body, "Id")?.to_string();
         let guard = self.state.read();
+        // `AWSOrganizationsNotInUseException` is modeled here too.
+        self.require_member(&guard, &req.account_id)?;
         // A transfer is stored once, in the SOURCE organization, but it has
         // two parties: resolving it through the caller's own organization
         // would hide every inbound transfer from the account being invited
@@ -462,15 +464,11 @@ impl OrganizationsService {
             .flatten();
         let (max_results, next_token) = parse_list_pagination(&body)?;
         let guard = self.state.read();
-        // The OUTBOUND caller is a source management account, so it is
-        // always in an organization and AWS's modeled
-        // AWSOrganizationsNotInUseException still applies. INBOUND is not
-        // gated: a target that accepted a transfer without running an
-        // organization of its own must still be able to enumerate the one
-        // it is carrying.
-        if direction == "OUTBOUND" {
-            self.require_member(&guard, &req.account_id)?;
-        }
+        // Both ops model `AWSOrganizationsNotInUseException`, and both
+        // parties to a transfer are management accounts -- the target
+        // must be one, so a caller in no organization has no transfers
+        // either way.
+        self.require_member(&guard, &req.account_id)?;
         let mut rows: Vec<&ResponsibilityTransfer> = guard
             .iter()
             .flat_map(|org| org.responsibility_transfers.values())

@@ -67,6 +67,13 @@ impl OrganizationsService {
         let name = required_str(&body, "AccountName")?.to_string();
 
         let mut guard = self.state.write();
+        // AWS requires the address to be unused. fakecloud must enforce it
+        // too: resolution by address decides who may accept an
+        // EMAIL-targeted invitation, so a duplicate would make that
+        // answer depend on id ordering.
+        if guard.email_in_use(&email) {
+            return Err(email_already_exists(&email));
+        }
         // Mint from the registry: an account id names one account
         // process-wide, so a per-organization check could hand out an id
         // another organization already owns.
@@ -102,6 +109,9 @@ impl OrganizationsService {
         let name = required_str(&body, "AccountName")?.to_string();
 
         let mut guard = self.state.write();
+        if guard.email_in_use(&email) {
+            return Err(email_already_exists(&email));
+        }
         // The GovCloud "paired" id is a 12-digit account id in the
         // GovCloud partition; we mint one alongside the commercial id
         // so callers see both, matching the real AWS response. Both come
@@ -524,4 +534,13 @@ pub(super) fn validate_invite_target(kind: &str, id: &str) -> Result<(), AwsServ
             "Target.Type must be one of [ACCOUNT, EMAIL], got {other}"
         ))),
     }
+}
+
+/// AWS's answer for a `CreateAccount` address that is already in use.
+fn email_already_exists(email: &str) -> AwsServiceError {
+    AwsServiceError::aws_error(
+        StatusCode::BAD_REQUEST,
+        "InvalidInputException",
+        format!("The email address {email} is already associated with an account."),
+    )
 }
