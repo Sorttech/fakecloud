@@ -1711,6 +1711,32 @@ async fn s3_cors_preflight_and_response_headers() {
         "Origin, Access-Control-Request-Headers, Access-Control-Request-Method"
     );
 
+    // A proxy duplicating the same Origin is still one origin, so the request
+    // is served normally rather than failing closed.
+    let resp = http
+        .get(format!("{}/cors-bucket/file.txt", server.endpoint()))
+        .header("Origin", "https://example.com")
+        .header("Origin", "https://example.com")
+        .header("Authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20240101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=fake")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.headers().get("access-control-allow-origin").unwrap(),
+        "https://example.com"
+    );
+
+    // Two *different* origins are not one origin to allow, so no ACAO.
+    let resp = http
+        .get(format!("{}/cors-bucket/file.txt", server.endpoint()))
+        .header("Origin", "https://example.com")
+        .header("Origin", "https://evil.example")
+        .header("Authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20240101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=fake")
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.headers().get("access-control-allow-origin").is_none());
+
     // A preflight with no Origin carries nothing to evaluate. S3 rejects it as
     // a malformed request (400), distinct from the 403 a disallowed origin
     // gets. It still carries Vary: every preflight outcome turns on Origin.

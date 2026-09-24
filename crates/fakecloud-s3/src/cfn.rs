@@ -523,11 +523,22 @@ fn build_cors_xml(c: &Value) -> Option<String> {
         push_string_list(&mut body, rule.get("AllowedMethods"), "AllowedMethod");
         push_string_list(&mut body, rule.get("AllowedOrigins"), "AllowedOrigin");
         push_string_list(&mut body, rule.get("ExposedHeaders"), "ExposeHeader");
-        if let Some(max_age) = rule.get("MaxAge").and_then(as_scalar) {
-            body.push_str(&format!(
-                "<MaxAgeSeconds>{}</MaxAgeSeconds>",
-                xml_escape(&max_age)
-            ));
+        // Rendered as an integer. `as_scalar` stringifies a JSON number
+        // verbatim, so `MaxAge: 3600.0` would emit `3600.0` — which
+        // `validate_cors_xml` rejects, failing the whole bucket resource and
+        // taking unrelated versioning/encryption changes down with it.
+        if let Some(max_age) = rule.get("MaxAge") {
+            let seconds = max_age
+                .as_f64()
+                .filter(|n| n.fract() == 0.0 && *n >= 0.0)
+                .map(|n| (n as u64).to_string())
+                .or_else(|| as_scalar(max_age));
+            if let Some(seconds) = seconds {
+                body.push_str(&format!(
+                    "<MaxAgeSeconds>{}</MaxAgeSeconds>",
+                    xml_escape(&seconds)
+                ));
+            }
         }
         body.push_str("</CORSRule>");
     }

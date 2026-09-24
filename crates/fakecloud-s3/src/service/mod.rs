@@ -65,11 +65,18 @@ const CORS_VARY: &str = "Origin, Access-Control-Request-Headers, Access-Control-
 /// than one line: none of those is a single value to evaluate, and every one of
 /// them must fail closed rather than silently using the first line.
 fn single_cors_header<'a>(headers: &'a http::HeaderMap, name: &str) -> Option<&'a str> {
-    let mut lines = headers.get_all(name).iter();
-    match (lines.next(), lines.next()) {
-        (Some(v), None) => v.to_str().ok().map(str::trim).filter(|s| !s.is_empty()),
-        _ => None,
+    let mut seen: Option<&str> = None;
+    for line in headers.get_all(name) {
+        let value = line.to_str().ok()?.trim();
+        match seen {
+            // Repeating the same value is how a proxy or CDN duplicates a
+            // header; that is still one value, so it is not a conflict.
+            Some(first) if first == value => {}
+            Some(_) => return None,
+            None => seen = Some(value),
+        }
     }
+    seen.filter(|s| !s.is_empty())
 }
 
 /// Set a CORS response header on whatever a CORS-evaluated request produced —
