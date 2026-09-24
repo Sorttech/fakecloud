@@ -966,15 +966,20 @@ pub async fn dispatch(
                 detected.protocol,
                 err.extra_fields(),
             );
-            // `append`, not `insert`: a service may attach two entries for one
-            // list-valued header (S3 adds `Vary` to an error that could carry
-            // its own), and inserting would keep only the last.
             for (k, v) in &error_headers {
                 if let (Ok(name), Ok(val)) = (
                     k.parse::<http::header::HeaderName>(),
                     v.parse::<http::header::HeaderValue>(),
                 ) {
-                    resp.headers_mut().append(name, val);
+                    // `Vary` combines, so two entries for it must both survive
+                    // (S3 adds its CORS value to an error that may carry its
+                    // own). Everything else replaces, so a service can still
+                    // override a header this builder already set.
+                    if name == http::header::VARY {
+                        resp.headers_mut().append(name, val);
+                    } else {
+                        resp.headers_mut().insert(name, val);
+                    }
                 }
             }
             resp

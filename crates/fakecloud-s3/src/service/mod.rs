@@ -613,14 +613,14 @@ impl AwsService for S3Service {
                                 http::HeaderValue::from_static("true"),
                             );
                         }
-                        // Echo the method that was asked for, not the rule's
-                        // whole list: S3 answers `Access-Control-Request-Method:
-                        // DELETE` with `Access-Control-Allow-Methods: DELETE`,
-                        // and listing the rest would cache a preflight result
-                        // granting methods the page never probed.
+                        // The matched rule's whole method list, as S3 returns:
+                        // the browser caches one preflight per URL, so echoing
+                        // only the requested method would force a fresh
+                        // round-trip for every other method the rule allows.
                         headers.insert(
                             "access-control-allow-methods",
-                            request_method
+                            rule.allowed_methods
+                                .join(", ")
                                 .parse()
                                 .unwrap_or_else(|_| http::HeaderValue::from_static("")),
                         );
@@ -3209,13 +3209,13 @@ pub(crate) struct CorsRule {
     max_age_seconds: Option<u32>,
 }
 
-/// Parse CORS configuration XML into rules.
 /// Remove `<!-- ... -->` spans so tag scanning sees only live markup.
 ///
 /// Every scan of a CORS body goes through this, so validation and request-time
-/// parsing always see the same markup. An unterminated comment swallows the
-/// rest of the body, which then fails the rule-count check as the malformed
-/// XML it is.
+/// parsing always see the same markup — otherwise a commented-out rule could
+/// validate as absent and then be honored at request time. An unterminated
+/// comment discards the rest of the body, so whatever it opened is treated as
+/// absent by both sides alike.
 pub(crate) fn strip_xml_comments(xml: &str) -> String {
     let mut out = String::with_capacity(xml.len());
     let mut rest = xml;
@@ -3230,6 +3230,7 @@ pub(crate) fn strip_xml_comments(xml: &str) -> String {
     out
 }
 
+/// Parse CORS configuration XML into rules.
 pub(crate) fn parse_cors_config(xml: &str) -> Vec<CorsRule> {
     // Comments are stripped here, not only in `validate_cors_xml`: the stored
     // body is the raw text, so if the two disagreed a `<CORSRule>` inside an

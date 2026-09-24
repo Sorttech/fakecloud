@@ -1548,7 +1548,13 @@ async fn s3_cors_preflight_and_response_headers() {
         resp.headers().get("access-control-allow-origin").unwrap(),
         "https://example.com"
     );
-    assert!(resp.headers().get("access-control-allow-methods").is_some());
+    // The rule's whole list, as S3 returns, and with the exact ", " separator
+    // browsers compare against. Asserting only `is_some()` let both the value
+    // and the separator drift.
+    assert_eq!(
+        resp.headers().get("access-control-allow-methods").unwrap(),
+        "GET, PUT"
+    );
     assert_eq!(
         resp.headers().get("access-control-max-age").unwrap(),
         "3600"
