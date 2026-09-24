@@ -238,6 +238,18 @@ impl OrganizationsService {
             .unwrap_or_else(|| req.account_id.clone());
         let guard = self.state.read();
         let org = self.require_member(&guard, &req.account_id)?;
+        // The target must live in the caller's own organization. Without
+        // this a foreign (or mistyped) id walked no hierarchy at all and
+        // came back as an empty, successful "no effective policy" instead
+        // of the modeled not-found.
+        if target_id != org.root_id
+            && !org.ous.contains_key(&target_id)
+            && !org.accounts.contains_key(&target_id)
+        {
+            return Err(org_error_to_aws(crate::state::OrgError::TargetNotFound(
+                target_id,
+            )));
+        }
         // The effective policy is the union of every policy of `policy_type`
         // attached up the org hierarchy from `target_id` to root. We
         // present it as a single Statement[] union so callers can audit.

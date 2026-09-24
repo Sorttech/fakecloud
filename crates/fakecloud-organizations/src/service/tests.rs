@@ -737,6 +737,46 @@ async fn an_account_id_reserved_by_create_account_is_already_claimed() {
     assert_eq!(err.code(), "HandshakeConstraintViolationException");
 }
 
+/// `DescribeEffectivePolicy` must not answer for a target in another
+/// organization. Walking a hierarchy that does not contain the target
+/// found no ancestors and returned an empty, successful "no effective
+/// policy" -- the worst answer for a caller auditing one.
+#[tokio::test]
+async fn describe_effective_policy_rejects_a_target_in_another_organization() {
+    let (svc, state) = OrganizationsService::shared();
+    create_org_with_root(&svc).await;
+    svc.handle(req_with("222222222222", "CreateOrganization", json!({})))
+        .await
+        .unwrap();
+    let other_root = state
+        .read()
+        .org_of_account("222222222222")
+        .unwrap()
+        .root_id
+        .clone();
+
+    for target in [other_root.as_str(), "222222222222"] {
+        let err = expect_err(
+            svc.handle(req_with(
+                "111111111111",
+                "DescribeEffectivePolicy",
+                json!({ "PolicyType": "SERVICE_CONTROL_POLICY", "TargetId": target }),
+            ))
+            .await,
+        );
+        assert_eq!(err.code(), "TargetNotFoundException");
+    }
+
+    // The caller's own account still resolves.
+    svc.handle(req_with(
+        "111111111111",
+        "DescribeEffectivePolicy",
+        json!({ "PolicyType": "SERVICE_CONTROL_POLICY" }),
+    ))
+    .await
+    .expect("the caller's own account is a valid target");
+}
+
 /// Deleting one organization leaves every other one standing.
 #[tokio::test]
 async fn deleting_one_organization_leaves_the_others() {

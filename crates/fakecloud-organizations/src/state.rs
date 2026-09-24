@@ -170,15 +170,20 @@ impl OrganizationsRegistry {
         target: &str,
         within: &str,
     ) -> Option<String> {
-        if let Some(id) = target_account_id(target_kind, target) {
-            return Some(id);
+        // The registered address wins over the synthetic form, as the doc
+        // above says: an account created with
+        // `CreateAccount(Email = "222222222222@example.com")` gets a random
+        // id, so decoding the address as if it spelled one would resolve
+        // to an account that does not exist and let an invitation open for
+        // a member already enrolled.
+        if let Some(account) = self
+            .orgs
+            .get(within)
+            .and_then(|org| org.accounts.values().find(|a| a.email == target))
+        {
+            return Some(account.id.clone());
         }
-        self.orgs
-            .get(within)?
-            .accounts
-            .values()
-            .find(|account| account.email == target)
-            .map(|account| account.id.clone())
+        target_account_id(target_kind, target)
     }
 
     /// Mint an account id unused by ANY organization in the process, and
@@ -222,14 +227,15 @@ impl OrganizationsRegistry {
         target: &str,
         account_id: &str,
     ) -> bool {
-        if target_account_id(target_kind, target).as_deref() == Some(account_id) {
-            return true;
-        }
-        target_kind == "EMAIL"
+        if target_kind == "EMAIL"
             && self
                 .org_of_account(account_id)
                 .and_then(|org| org.accounts.get(account_id))
                 .is_some_and(|account| account.email == target)
+        {
+            return true;
+        }
+        target_account_id(target_kind, target).as_deref() == Some(account_id)
     }
 
     /// The organization that stores responsibility transfer `id`. A
