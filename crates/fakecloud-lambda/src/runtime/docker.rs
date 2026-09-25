@@ -32,6 +32,13 @@ pub struct DockerBackend {
     /// `--add-host <alias>:<value>` argument injected into every container
     /// `create`, or `None` when the runtime provides the alias natively.
     add_host_arg: Option<String>,
+    /// User-defined network to attach every function container to, from
+    /// `FAKECLOUD_LAMBDA_NETWORK`. `None` leaves them on the runtime's default
+    /// bridge, reaching fakecloud only through the host. Attaching them to
+    /// fakecloud's own network additionally lets them reach it directly, which
+    /// is what the custom-resource `ResponseURL` needs to avoid publishing 443
+    /// on the host. Published ports still work either way.
+    network: Option<String>,
     /// Port the main fakecloud server bound to. Used to translate AWS
     /// private-ECR URIs in `PackageType=Image` functions to fakecloud's
     /// local OCI v2 registry.
@@ -79,6 +86,7 @@ impl DockerBackend {
             instance_id,
             host_alias: net.host_alias,
             add_host_arg: net.add_host_arg,
+            network: fakecloud_core::container_net::lambda_network(),
             server_port,
             sibling_host: net.sibling_host,
             registry_host: std::env::var("FAKECLOUD_ECR_REGISTRY_HOST")
@@ -93,6 +101,14 @@ impl DockerBackend {
     fn apply_host_alias(&self, cmd: &mut tokio::process::Command) {
         if let Some(arg) = &self.add_host_arg {
             cmd.arg("--add-host").arg(arg);
+        }
+    }
+
+    /// Attach the container to fakecloud's own network when one is
+    /// configured, so it can reach fakecloud without going through the host.
+    fn apply_network(&self, cmd: &mut tokio::process::Command) {
+        if let Some(network) = &self.network {
+            cmd.arg("--network").arg(network);
         }
     }
 
@@ -158,6 +174,7 @@ impl DockerBackend {
             .arg("--label")
             .arg(format!("fakecloud-instance={}", self.instance_id));
         self.apply_host_alias(&mut cmd);
+        self.apply_network(&mut cmd);
 
         // Defaults first: docker's last `-e` wins, so the function's own
         // environment overrides anything it sets for itself.
@@ -190,6 +207,7 @@ impl DockerBackend {
         }
         let container_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
+        self.copy_ca_bundle_into(&container_id).await;
         if let Err(e) = self.copy_layers_into(&container_id, layers).await {
             self.remove_container(&container_id).await;
             return Err(e);
@@ -254,6 +272,7 @@ impl DockerBackend {
             .arg("--label")
             .arg(format!("fakecloud-instance={}", self.instance_id));
         self.apply_host_alias(&mut cmd);
+        self.apply_network(&mut cmd);
 
         // Defaults first: docker's last `-e` wins, so the function's own
         // environment overrides anything it sets for itself.
@@ -324,6 +343,7 @@ impl DockerBackend {
             }
         }
 
+        self.copy_ca_bundle_into(&container_id).await;
         if let Err(e) = self.copy_layers_into(&container_id, layers).await {
             self.remove_container(&container_id).await;
             return Err(e);
@@ -396,6 +416,39 @@ impl DockerBackend {
         Err(RuntimeError::ContainerStartFailed(
             "container did not become ready within 10 seconds".to_string(),
         ))
+    }
+
+    /// Copy fakecloud's TLS certificate into the container so a handler can
+    /// verify the custom-resource `ResponseURL` endpoint.
+    ///
+    /// Copied rather than bind-mounted: fakecloud commonly runs in a container
+    /// while Lambda containers are its siblings on the host daemon, so a path
+    /// inside fakecloud's filesystem is not mountable into theirs. `docker cp`
+    /// streams through the CLI, which works either way.
+    ///
+    /// Best-effort: without it a handler simply cannot verify the endpoint, and
+    /// failing container startup over that would be worse.
+    async fn copy_ca_bundle_into(&self, container_id: &str) {
+        let Some(path) = ca_bundle_source_path() else {
+            return;
+        };
+        let out = tokio::process::Command::new(&self.cli)
+            .arg("cp")
+            .arg(&path)
+            .arg(format!(
+                "{container_id}:{}",
+                super::env_rewrite::CA_BUNDLE_PATH
+            ))
+            .output()
+            .await;
+        match out {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => tracing::warn!(
+                "could not copy the fakecloud CA into {container_id}: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            ),
+            Err(e) => tracing::warn!("could not copy the fakecloud CA into {container_id}: {e}"),
+        }
     }
 
     /// Extract each layer ZIP into a shared temp directory and `docker cp`
@@ -675,6 +728,13 @@ fn build_local_registry_docker_config(server_port: u16) -> Option<TempDir> {
     let config = serde_json::json!({ "auths": auths });
     std::fs::write(dir.path().join("config.json"), config.to_string()).ok()?;
     Some(dir)
+}
+
+/// Path on fakecloud's own filesystem to the certificate handed to containers,
+/// set at startup once the ResponseURL listener has generated one.
+fn ca_bundle_source_path() -> Option<String> {
+    let path = std::env::var("FAKECLOUD_LAMBDA_CA_BUNDLE").ok()?;
+    std::path::Path::new(&path).exists().then_some(path)
 }
 
 #[cfg(test)]

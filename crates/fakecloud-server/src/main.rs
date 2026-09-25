@@ -15,6 +15,7 @@ use fakecloud_sdk::types;
 mod admin_elasticache_artifacts;
 mod admin_lambda_artifacts;
 mod appas_hooks;
+mod cfn_response_tls;
 mod cli;
 mod dns;
 mod dynamodb_streams_lambda_poller;
@@ -1491,12 +1492,66 @@ async fn main() {
         } else {
             None
         };
+    // Custom-resource handlers PUT their outcome to `ResponseURL`; the URL has to
+    // be reachable from inside a Lambda container, so it uses the same host
+    // alias the Lambda runtime uses. No container backend means no handler to
+    // signal, so no URL is sent.
+    let custom_resource_responses: fakecloud_cloudformation::custom_resource_response::SharedCustomResourceResponses =
+        std::sync::Arc::new(
+            fakecloud_cloudformation::custom_resource_response::CustomResourceResponses::new(),
+        );
+    // CDK's custom-resource framework calls `https.request` with no port, so the
+    // signal can only arrive over TLS on 443. Claim the port before deciding
+    // what URL to hand out: if nothing listens, sending a URL would just make
+    // every handler fail on a connection it cannot make.
+    //
+    // Which 443 that is depends on where the handler dials us. On a shared
+    // network (`FAKECLOUD_LAMBDA_NETWORK`) it dials our container directly, so
+    // 443 is ours alone and nothing need be published on the host. Otherwise it
+    // reaches us through the host alias, and the host's 443 has to be ours -
+    // which fails whenever anything else already holds it.
+    let cfn_response_host = fakecloud_core::container_net::detect_container_cli().map(|cli| {
+        fakecloud_core::container_net::internal_self_host().unwrap_or_else(|| {
+            fakecloud_core::container_net::HostNetworking::detect(&cli).host_alias
+        })
+    });
+    let cfn_response_tls_port = cfn_response_tls::tls_port();
+    let cfn_response_tls_listener = match &cfn_response_host {
+        Some(_) => match cfn_response_tls::bind(cfn_response_tls_port).await {
+            Ok((listener, addr)) => Some((listener, addr)),
+            Err(e) => {
+                tracing::warn!(
+                    "custom-resource ResponseURL disabled: {e}. Publish port {cfn_response_tls_port} \
+                     on the host, or set FAKECLOUD_LAMBDA_NETWORK to fakecloud's own container \
+                     network so the port stays internal, to enable custom resources that signal \
+                     (CDK's do)."
+                );
+                None
+            }
+        },
+        None => None,
+    };
+    let custom_resource_response_base = match (&cfn_response_host, &cfn_response_tls_listener) {
+        (Some(host), Some((_, addr))) => {
+            Some(if addr.port() == cfn_response_tls::DEFAULT_TLS_PORT {
+                // No port: the handler ignores one anyway and assumes 443.
+                format!("https://{host}")
+            } else {
+                format!("https://{host}:{}", addr.port())
+            })
+        }
+        _ => None,
+    };
+    let custom_resource_responses_for_route = custom_resource_responses.clone();
+
     let mut cloudformation_service = CloudFormationService::new(
         cloudformation_state.clone(),
         fakecloud_cloudformation::CloudFormationDeps {
             // Lets the provisioner unwrap SSE-KMS object bodies when a resource
             // points at an S3 object (Lambda Code.S3Bucket/S3Key and friends).
             kms_hook: Some(kms_hook_for_services.clone()),
+            custom_resource_responses: custom_resource_responses.clone(),
+            custom_resource_response_base: custom_resource_response_base.clone(),
             sqs: sqs_state.clone(),
             sns: sns_state.clone(),
             ssm: ssm_state.clone(),
@@ -10595,6 +10650,32 @@ async fn main() {
             }),
         )
         .route(
+            "/_fakecloud/cfn/custom-resource-response/{request_id}",
+            // cfn-response PUTs the signal here. It sends no auth and expects a
+            // plain 200, so anything else makes the handler retry or throw.
+            axum::routing::put({
+                let responses = custom_resource_responses_for_route.clone();
+                move |axum::extract::Path(request_id): axum::extract::Path<String>,
+                      body: String| {
+                    let responses = responses.clone();
+                    async move {
+                        match serde_json::from_str::<serde_json::Value>(&body) {
+                            Ok(parsed) if responses.record(&request_id, &parsed) => {
+                                (axum::http::StatusCode::OK, "")
+                            }
+                            _ => {
+                                tracing::warn!(
+                                    %request_id,
+                                    "custom-resource response body was not a signal"
+                                );
+                                (axum::http::StatusCode::BAD_REQUEST, "")
+                            }
+                        }
+                    }
+                }
+            }),
+        )
+        .route(
             "/_fakecloud/cloudfront/distributions",
             axum::routing::get({
                 let st = cloudfront_introspection_state.clone();
@@ -12132,6 +12213,38 @@ async fn main() {
             upstream: cli.dns_upstream(),
         };
         tokio::spawn(dns::run(dns_cfg, cli.dns_addr()));
+    }
+    if let (Some(host), Some((tls_listener, tls_addr))) =
+        (cfn_response_host, cfn_response_tls_listener)
+    {
+        // Every name a Lambda container might dial us by; which one applies
+        // depends on the container runtime and topology.
+        let names = vec![
+            host.clone(),
+            "host.docker.internal".to_string(),
+            "host.containers.internal".to_string(),
+            "localhost".to_string(),
+        ];
+        match cfn_response_tls::self_signed(&names) {
+            Ok((config, pem)) => {
+                // Handlers verify this certificate rather than skipping
+                // verification, so it has to reach their containers.
+                match cfn_response_tls::publish_ca_bundle(&pem) {
+                    Ok(path) => tracing::info!(
+                        "custom-resource ResponseURL listening on https://{host}:{} (certificate at {})",
+                        tls_addr.port(),
+                        path.display()
+                    ),
+                    Err(e) => tracing::warn!(
+                        "custom-resource ResponseURL listening on https://{host}:{}, but handlers \
+                         cannot verify it: {e}",
+                        tls_addr.port()
+                    ),
+                }
+                cfn_response_tls::serve(tls_listener, app.clone(), config);
+            }
+            Err(e) => tracing::warn!("custom-resource ResponseURL listener failed to start: {e}"),
+        }
     }
     axum::serve(
         listener,
