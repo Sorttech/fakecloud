@@ -13,6 +13,7 @@ use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::multi_account::{AccountState, MultiAccountState};
 
 pub const MEMORYDB_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
@@ -198,17 +199,23 @@ impl MemoryDbState {
     /// rather than freezing whichever region created the account.
     pub fn retarget_default_arns(&mut self, region: &str, account_id: &str) {
         if let Some(user) = self.users.get_mut("default") {
-            user.arn = format!("arn:aws:memorydb:{region}:{account_id}:user/default");
+            user.arn = memorydb_arn("user", region, account_id, "default");
         }
         if let Some(acl) = self.acls.get_mut("open-access") {
-            acl.arn = format!("arn:aws:memorydb:{region}:{account_id}:acl/open-access");
+            acl.arn = memorydb_arn("acl", region, account_id, "open-access");
         }
         for (name, pg) in self.parameter_groups.iter_mut() {
             if name.starts_with("default.") {
-                pg.arn = format!("arn:aws:memorydb:{region}:{account_id}:parametergroup/{name}");
+                pg.arn = memorydb_arn("parametergroup", region, account_id, name);
             }
         }
     }
+}
+
+/// `arn:<partition>:memorydb:<region>:<account>:<kind>/<name>`, in the
+/// region's partition.
+pub fn memorydb_arn(kind: &str, region: &str, account: &str, name: &str) -> String {
+    Arn::regional("memorydb", region, account, &format!("{kind}/{name}")).to_string()
 }
 
 impl AccountState for MemoryDbState {
@@ -227,7 +234,7 @@ impl AccountState for MemoryDbState {
                     type_: "no-password".to_string(),
                     password_count: 0,
                 },
-                arn: format!("arn:aws:memorydb:{region}:{account_id}:user/default"),
+                arn: memorydb_arn("user", region, account_id, "default"),
             },
         );
         s.acls.insert(
@@ -238,7 +245,7 @@ impl AccountState for MemoryDbState {
                 user_names: vec!["default".to_string()],
                 minimum_engine_version: "6.2".to_string(),
                 clusters: vec![],
-                arn: format!("arn:aws:memorydb:{region}:{account_id}:acl/open-access"),
+                arn: memorydb_arn("acl", region, account_id, "open-access"),
             },
         );
         // AWS provides a default parameter group per supported engine family.
@@ -255,7 +262,7 @@ impl AccountState for MemoryDbState {
                     name: pg_name.to_string(),
                     family: family.to_string(),
                     description: format!("Default parameter group for {family}"),
-                    arn: format!("arn:aws:memorydb:{region}:{account_id}:parametergroup/{pg_name}"),
+                    arn: memorydb_arn("parametergroup", region, account_id, pg_name),
                     parameters: BTreeMap::new(),
                 },
             );

@@ -14,6 +14,6 @@ pub(crate) mod validation;
 
 pub use service::RedshiftService;
 pub use state::{
-    RedshiftAccounts, RedshiftSnapshot, RedshiftState, SharedRedshiftState,
+    redshift_arn, RedshiftAccounts, RedshiftSnapshot, RedshiftState, SharedRedshiftState,
     REDSHIFT_SNAPSHOT_SCHEMA_VERSION,
 };

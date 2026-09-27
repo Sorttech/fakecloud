@@ -1038,7 +1038,8 @@ pub(crate) fn describe_principal_id_format(
     let keep = |r: &str| resource_filter.is_empty() || resource_filter.iter().any(|f| f == r);
     let mut items: Vec<String> = Vec::new();
     // The account root principal carries the account-default id-format settings.
-    let root_arn = format!("arn:aws:iam::{}:root", req.account_id);
+    let root_arn =
+        fakecloud_aws::arn::Arn::global_in(&req.region, "iam", &req.account_id, "root").to_string();
     let root_statuses: Vec<String> = state
         .id_format
         .iter()

@@ -8,7 +8,7 @@ use super::*;
 /// SDKs send ARNs in cross-account scenarios. Strip everything past
 /// `:table/` and any sub-resource segment so callers can use one path.
 pub(crate) fn resolve_table_name(input: &str) -> &str {
-    if let Some(rest) = input.strip_prefix("arn:aws:dynamodb:") {
+    if let Some(rest) = fakecloud_aws::arn::arn_resource(input, "dynamodb") {
         if let Some(after_table) = rest.split(":table/").nth(1) {
             // Drop any /index/<n>, /stream/<n>, /backup/<n> suffix.
             return after_table.split('/').next().unwrap_or(after_table);

@@ -8054,3 +8054,86 @@ fn capacity_is_omitted_when_not_requested() {
         .get("ConsumedCapacity")
         .is_none());
 }
+
+#[tokio::test]
+async fn china_region_arns_use_the_china_partition_and_resolve_by_arn() {
+    let svc = make_service();
+    let call_cn = |action: &str, body: Value| {
+        let mut r = make_request(action, body);
+        r.region = "cn-north-1".to_string();
+        r
+    };
+    let resp = svc
+        .handle(call_cn(
+            "CreateTable",
+            json!({
+                "TableName": "cn-table",
+                "KeySchema": [{ "AttributeName": "pk", "KeyType": "HASH" }],
+                "AttributeDefinitions": [{ "AttributeName": "pk", "AttributeType": "S" }],
+                "BillingMode": "PAY_PER_REQUEST",
+                "StreamSpecification": { "StreamEnabled": true, "StreamViewType": "NEW_IMAGE" }
+            }),
+        ))
+        .await
+        .unwrap();
+    let created: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    let arn = created["TableDescription"]["TableArn"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        arn,
+        "arn:aws-cn:dynamodb:cn-north-1:123456789012:table/cn-table"
+    );
+    let stream = created["TableDescription"]["LatestStreamArn"]
+        .as_str()
+        .unwrap();
+    assert!(stream.starts_with(&format!("{arn}/stream/")), "{stream}");
+
+    // The ARN resolves wherever a TableName is accepted, and for tagging.
+    let resp = svc
+        .handle(call_cn("DescribeTable", json!({ "TableName": arn })))
+        .await
+        .unwrap();
+    let described: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(described["Table"]["TableName"], "cn-table");
+    svc.handle(call_cn(
+        "TagResource",
+        json!({ "ResourceArn": arn, "Tags": [{ "Key": "k", "Value": "v" }] }),
+    ))
+    .await
+    .unwrap();
+    let resp = svc
+        .handle(call_cn("ListTagsOfResource", json!({ "ResourceArn": arn })))
+        .await
+        .unwrap();
+    let tags: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(tags["Tags"][0]["Key"], "k");
+
+    let resp = svc
+        .handle(call_cn(
+            "CreateGlobalTable",
+            json!({ "GlobalTableName": "cn-table", "ReplicationGroup": [{ "RegionName": "cn-north-1" }] }),
+        ))
+        .await
+        .unwrap();
+    let global: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(
+        global["GlobalTableDescription"]["GlobalTableArn"],
+        "arn:aws-cn:dynamodb::123456789012:global-table/cn-table"
+    );
+}
+
+#[test]
+fn table_arn_parsers_accept_any_partition() {
+    let arn = "arn:aws-cn:dynamodb:cn-north-1:123456789012:table/T/stream/2026";
+    assert_eq!(super::helpers::resolve_table_name(arn), "T");
+    assert_eq!(
+        super::cross_account::arn_scope(arn),
+        Some(("cn-north-1", "123456789012"))
+    );
+    assert_eq!(
+        super::helpers::resolve_table_name("arn:bogus:dynamodb:r:1:table/T"),
+        "arn:bogus:dynamodb:r:1:table/T"
+    );
+}

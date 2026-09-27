@@ -440,7 +440,7 @@ fn res_id() -> String {
 }
 
 fn arn(ctx: &Ctx, kind: &str, id: &str) -> String {
-    format!("arn:aws:dms:{}:{}:{}:{}", ctx.region, ctx.account, kind, id)
+    crate::state::dms_arn(&ctx.region, &ctx.account, kind, id)
 }
 
 /// Build the `VpcSecurityGroups` describe list from a `VpcSecurityGroupIds`

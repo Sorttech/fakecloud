@@ -208,18 +208,10 @@ impl DynamoDbService {
         let now = Utc::now();
         // ARN carries the request's credential-scope region (req.region), not the
         // frozen server default.
-        let arn = format!(
-            "arn:aws:dynamodb:{}:{}:table/{}",
-            req.region.as_str(),
-            state.account_id,
-            table_name
-        );
+        let arn = crate::state::table_arn(req.region.as_str(), &state.account_id, &table_name);
         let stream_arn = if stream_enabled {
             Some(format!(
-                "arn:aws:dynamodb:{}:{}:table/{}/stream/{}",
-                req.region.as_str(),
-                state.account_id,
-                table_name,
+                "{arn}/stream/{}",
                 now.format("%Y-%m-%dT%H:%M:%S.%3f")
             ))
         } else {
@@ -590,10 +582,8 @@ impl DynamoDbService {
                 if table.stream_arn.is_none() {
                     let now = Utc::now();
                     table.stream_arn = Some(format!(
-                        "arn:aws:dynamodb:{}:{}:table/{}/stream/{}",
-                        region,
-                        account_id,
-                        table.name,
+                        "{}/stream/{}",
+                        crate::state::table_arn(&region, &account_id, &table.name),
                         now.format("%Y-%m-%dT%H:%M:%S.%3f")
                     ));
                 }
@@ -870,10 +860,8 @@ impl DynamoDbService {
         // collision silently overwrote the earlier backup. Use epoch-millis
         // plus a short unique suffix so every backup gets a distinct ARN.
         let backup_arn = format!(
-            "arn:aws:dynamodb:{}:{}:table/{}/backup/{:013}-{}",
-            req.region.as_str(),
-            state.account_id,
-            table.name,
+            "{}/backup/{:013}-{}",
+            crate::state::table_arn(req.region.as_str(), &state.account_id, &table.name),
             now.timestamp_millis(),
             &uuid::Uuid::new_v4().to_string().replace('-', "")[..8]
         );
@@ -1147,12 +1135,8 @@ impl DynamoDbService {
         }
 
         let now = Utc::now();
-        let arn = format!(
-            "arn:aws:dynamodb:{}:{}:table/{}",
-            req.region.as_str(),
-            state.account_id,
-            target_table_name
-        );
+        let arn =
+            crate::state::table_arn(req.region.as_str(), &state.account_id, target_table_name);
 
         // Re-mint the stream ARN against the target table name so it
         // doesn't collide with the source table's stream ARN; the
@@ -1258,12 +1242,8 @@ impl DynamoDbService {
         }
 
         let now = Utc::now();
-        let arn = format!(
-            "arn:aws:dynamodb:{}:{}:table/{}",
-            req.region.as_str(),
-            state.account_id,
-            target_table_name
-        );
+        let arn =
+            crate::state::table_arn(req.region.as_str(), &state.account_id, target_table_name);
 
         let stream_arn = if source.stream_enabled {
             Some(format!(
@@ -1427,10 +1407,12 @@ impl DynamoDbService {
 
         let now = Utc::now();
         let export_arn = format!(
-            "arn:aws:dynamodb:{}:{}:table/{}/export/{}",
-            req.region.as_str(),
-            state.account_id,
-            table_arn.rsplit('/').next().unwrap_or("unknown"),
+            "{}/export/{}",
+            crate::state::table_arn(
+                req.region.as_str(),
+                &state.account_id,
+                table_arn.rsplit('/').next().unwrap_or("unknown")
+            ),
             uuid::Uuid::new_v4()
         );
 
@@ -1784,19 +1766,8 @@ impl DynamoDbService {
         }
 
         let now = Utc::now();
-        let table_arn = format!(
-            "arn:aws:dynamodb:{}:{}:table/{}",
-            req.region.as_str(),
-            state.account_id,
-            table_name
-        );
-        let import_arn = format!(
-            "arn:aws:dynamodb:{}:{}:table/{}/import/{}",
-            req.region.as_str(),
-            state.account_id,
-            table_name,
-            uuid::Uuid::new_v4()
-        );
+        let table_arn = crate::state::table_arn(req.region.as_str(), &state.account_id, table_name);
+        let import_arn = format!("{table_arn}/import/{}", uuid::Uuid::new_v4());
 
         let processed_item_count = imported_items.len() as i64;
 

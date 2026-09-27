@@ -1069,3 +1069,74 @@ async fn modify_cluster_applies_vpc_sgs_and_log_exports() {
     assert!(xml.contains("profiler"));
     assert!(!xml.contains("audit"));
 }
+
+#[tokio::test]
+async fn china_region_arns_use_the_china_partition_and_resolve_for_tagging() {
+    let svc = service();
+    let in_cn = |action: &str, params: &[(&str, &str)]| {
+        let mut r = req(action, params);
+        r.region = "cn-north-1".to_string();
+        r
+    };
+    let xml = body(
+        &svc.handle(in_cn(
+            "CreateDBCluster",
+            &[("DBClusterIdentifier", "cn-clu"), ("Engine", "docdb")],
+        ))
+        .await
+        .unwrap(),
+    );
+    let arn = "arn:aws-cn:rds:cn-north-1:123456789012:cluster:cn-clu";
+    assert!(
+        xml.contains(&format!("<DBClusterArn>{arn}</DBClusterArn>")),
+        "{xml}"
+    );
+    svc.handle(in_cn(
+        "AddTagsToResource",
+        &[
+            ("ResourceName", arn),
+            ("Tags.Tag.1.Key", "team"),
+            ("Tags.Tag.1.Value", "data"),
+        ],
+    ))
+    .await
+    .unwrap();
+    let xml = body(
+        &svc.handle(in_cn("ListTagsForResource", &[("ResourceName", arn)]))
+            .await
+            .unwrap(),
+    );
+    assert!(xml.contains("<Key>team</Key>"), "{xml}");
+
+    let xml = body(
+        &svc.handle(in_cn(
+            "CreateGlobalCluster",
+            &[("GlobalClusterIdentifier", "cn-glob"), ("Engine", "docdb")],
+        ))
+        .await
+        .unwrap(),
+    );
+    assert!(
+        xml.contains("arn:aws-cn:rds::123456789012:global-cluster:cn-glob"),
+        "{xml}"
+    );
+}
+
+#[tokio::test]
+async fn certificate_arns_use_the_partitions_global_region() {
+    let svc = service();
+    let xml = body(&call(&svc, "DescribeCertificates", &[]).await);
+    assert!(
+        xml.contains("<CertificateArn>arn:aws:rds:us-east-1::cert:rds-ca-2019</CertificateArn>"),
+        "{xml}"
+    );
+    let mut r = req("DescribeCertificates", &[]);
+    r.region = "cn-north-1".to_string();
+    let xml = body(&svc.handle(r).await.unwrap());
+    assert!(
+        xml.contains(
+            "<CertificateArn>arn:aws-cn:rds:cn-northwest-1::cert:rds-ca-2019</CertificateArn>"
+        ),
+        "{xml}"
+    );
+}

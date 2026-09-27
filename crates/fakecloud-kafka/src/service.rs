@@ -3529,6 +3529,29 @@ mod tests {
     }
 
     #[test]
+    fn china_cluster_and_node_arns_use_the_china_partition() {
+        let s = svc();
+        let c = ctx("cn-north-1");
+        let arn = json_of(s.create_cluster(&c, &cluster_body("cn"), false).unwrap())["clusterArn"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            arn.starts_with("arn:aws-cn:kafka:cn-north-1:123456789012:cluster/cn/"),
+            "{arn}"
+        );
+        settle(&s, &c);
+        let d = json_of(s.describe_cluster(&c, &arn, false).unwrap());
+        assert_eq!(d["clusterInfo"]["clusterArn"], json!(arn));
+        let nodes = json_of(s.list_nodes(&c, &arn, &[]).unwrap());
+        let node_arn = nodes["nodeInfoList"][0]["nodeARN"].as_str().unwrap();
+        assert!(
+            node_arn.starts_with("arn:aws-cn:kafka:cn-north-1:123456789012:cluster/cn/broker/"),
+            "{node_arn}"
+        );
+    }
+
+    #[test]
     fn get_bootstrap_brokers_missing_cluster_is_bad_request() {
         // GetBootstrapBrokers declares no NotFoundException.
         let s = svc();

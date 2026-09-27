@@ -5,7 +5,9 @@ use fakecloud_aws::ec2query::{ec2_elem, ec2_list};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use crate::service::Ec2Service;
-use crate::service_helpers::{gen_id, require, require_struct, validate_max_results};
+use crate::service_helpers::{
+    ec2_global_arn, gen_id, require, require_struct, validate_max_results,
+};
 use crate::state::{Ec2State, IpamResourceDiscovery, Tag};
 
 fn region_of(req: &AwsRequest) -> String {
@@ -24,7 +26,7 @@ fn rd_xml(d: &IpamResourceDiscovery, tags: &[Tag], owner: &str, region: &str) ->
         ec2_elem("ipamResourceDiscoveryId", &d.id),
         ec2_elem(
             "ipamResourceDiscoveryArn",
-            &format!("arn:aws:ec2::{owner}:ipam-resource-discovery/{}", d.id)
+            &ec2_global_arn(region, owner, &format!("ipam-resource-discovery/{}", d.id))
         ),
         ec2_elem("ipamResourceDiscoveryRegion", region),
         ec2_elem("ownerId", owner),
@@ -453,7 +455,7 @@ fn token_xml(id: &str, ipam: &str, owner: &str, region: &str) -> String {
     format!(
         "{}{}{}{}<tokenValue>{}</tokenValue><tokenName>token</tokenName><status>valid</status><state>create-complete</state>",
         ec2_elem("ipamExternalResourceVerificationTokenId", id),
-        ec2_elem("ipamExternalResourceVerificationTokenArn", &format!("arn:aws:ec2::{owner}:ipam-external-resource-verification-token/{id}")),
+        ec2_elem("ipamExternalResourceVerificationTokenArn", &ec2_global_arn(region, owner, &format!("ipam-external-resource-verification-token/{id}"))),
         ec2_elem("ipamId", ipam),
         ec2_elem("ipamRegion", region),
         id,

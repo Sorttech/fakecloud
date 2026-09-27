@@ -5,6 +5,26 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use fakecloud_aws::arn::Arn;
+
+/// A table's ARN (`arn:<partition>:dynamodb:<region>:<account>:table/<name>`),
+/// in the region's partition. Stream, backup, export and import ARNs extend it
+/// with `/<kind>/<id>`.
+pub fn table_arn(region: &str, account_id: &str, name: &str) -> String {
+    Arn::regional("dynamodb", region, account_id, &format!("table/{name}")).to_string()
+}
+
+/// A global table's ARN: no region field, in the partition of `region`.
+pub fn global_table_arn(region: &str, account_id: &str, name: &str) -> String {
+    Arn::global_in(
+        region,
+        "dynamodb",
+        account_id,
+        &format!("global-table/{name}"),
+    )
+    .to_string()
+}
+
 fn empty_stream_records() -> Arc<RwLock<Vec<StreamRecord>>> {
     Arc::new(RwLock::new(Vec::new()))
 }

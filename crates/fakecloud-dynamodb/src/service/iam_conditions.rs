@@ -150,7 +150,7 @@ fn target(
     accounts: &fakecloud_core::multi_account::MultiAccountState<crate::state::DynamoDbState>,
     resource: &str,
 ) -> Option<Target> {
-    let rest = resource.strip_prefix("arn:aws:dynamodb:")?;
+    let rest = fakecloud_aws::arn::arn_resource(resource, "dynamodb")?;
     let (scope, path) = rest.split_once(":table/")?;
     let account = scope.split(':').nth(1)?;
     let mut segments = path.split('/');

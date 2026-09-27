@@ -7,6 +7,19 @@ use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
+use fakecloud_aws::arn::Arn;
+
+/// An RDS-namespace ARN (`arn:<partition>:rds:<region>:<account>:<kind>:<id>`)
+/// in the region's partition.
+pub fn rds_arn(region: &str, account: &str, kind: &str, id: &str) -> String {
+    Arn::regional("rds", region, account, &format!("{kind}:{id}")).to_string()
+}
+
+/// A global cluster's region-less ARN, in the partition of `region`.
+pub fn global_cluster_arn(region: &str, account: &str, id: &str) -> String {
+    Arn::global_in(region, "rds", account, &format!("global-cluster:{id}")).to_string()
+}
+
 /// Shared, account-partitioned Neptune state handle.
 pub type SharedNeptuneState =
     Arc<RwLock<fakecloud_core::multi_account::MultiAccountState<NeptuneState>>>;
