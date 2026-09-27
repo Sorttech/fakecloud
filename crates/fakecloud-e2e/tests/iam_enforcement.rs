@@ -411,10 +411,6 @@ async fn sns_publish_allowed_on_specific_topic() {
 // S3 tests
 // ======================================================================
 
-/// Real S3 requires `s3:TagResource` on top of `s3:CreateBucket` to create a
-/// bucket carrying `CreateBucketConfiguration.Tags` (issue #2553). A grant of
-/// `s3:CreateBucket` alone still creates untagged buckets, but a tagged create
-/// is denied.
 /// A create that configures the bucket needs the permission for what it
 /// configures. This matters because those settings now PERSIST: a `public-read`
 /// bucket created by a principal with no `s3:PutBucketAcl` used to lose the
@@ -583,6 +579,81 @@ async fn s3_create_bucket_with_object_lock_needs_its_permissions() {
         .unwrap();
 }
 
+/// A create carrying both tags and an ACL is several authorizations, and AWS
+/// evaluates them all against ONE request context. A tag-scoped guardrail that
+/// permits the create must therefore permit the `s3:PutBucketAcl` it implies:
+/// building the context per action left that one seeing no `aws:RequestTag/*`
+/// at all, so the condition matched and denied a create AWS allows.
+#[tokio::test]
+async fn s3_create_bucket_tag_condition_applies_to_the_implied_acl_action() {
+    let server = start_strict().await;
+    let (akid, secret) = bootstrap_user(&server, "s3ctxuser").await;
+    attach_inline_policy(
+        &server,
+        "s3ctxuser",
+        "tag-scoped",
+        r#"{"Version":"2012-10-17","Statement":[
+            {"Effect":"Allow","Action":"s3:*","Resource":"*"},
+            {"Effect":"Deny",
+             "Action":["s3:CreateBucket","s3:TagResource","s3:PutBucketAcl"],
+             "Resource":"*",
+             "Condition":{"StringNotEquals":{"aws:RequestTag/CostCenter":"123"}}}
+        ]}"#,
+    )
+    .await;
+
+    let cfg = sdk_config_with(&server, &akid, &secret).await;
+    let s3 = aws_sdk_s3::Client::new(&cfg);
+
+    // Tagged with the required value AND carrying an ACL: allowed, because
+    // every action in the request sees `aws:RequestTag/CostCenter=123`.
+    s3.create_bucket()
+        .bucket("ctx-tagged")
+        .acl(aws_sdk_s3::types::BucketCannedAcl::PublicRead)
+        .create_bucket_configuration(
+            aws_sdk_s3::types::CreateBucketConfiguration::builder()
+                .tags(
+                    aws_sdk_s3::types::Tag::builder()
+                        .key("CostCenter")
+                        .value("123")
+                        .build()
+                        .unwrap(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .expect("a create whose tags satisfy the guardrail must not be denied by its own ACL");
+
+    // The guardrail still bites when the tag value is wrong.
+    let err = s3
+        .create_bucket()
+        .bucket("ctx-wrong-tag")
+        .acl(aws_sdk_s3::types::BucketCannedAcl::PublicRead)
+        .create_bucket_configuration(
+            aws_sdk_s3::types::CreateBucketConfiguration::builder()
+                .tags(
+                    aws_sdk_s3::types::Tag::builder()
+                        .key("CostCenter")
+                        .value("999")
+                        .build()
+                        .unwrap(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .expect_err("the wrong tag value must still be denied");
+    assert!(
+        format!("{err:?}").contains("AccessDenied"),
+        "unexpected error: {err:?}"
+    );
+}
+
+/// Real S3 requires `s3:TagResource` on top of `s3:CreateBucket` to create a
+/// bucket carrying `CreateBucketConfiguration.Tags` (issue #2553). A grant of
+/// `s3:CreateBucket` alone still creates untagged buckets, but a tagged create
+/// is denied.
 #[tokio::test]
 async fn s3_create_bucket_with_tags_needs_tag_resource() {
     let server = start_strict().await;

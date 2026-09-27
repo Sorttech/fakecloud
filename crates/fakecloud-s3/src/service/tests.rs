@@ -4365,6 +4365,17 @@ fn create_bucket_requires_a_permission_per_setting_it_configures() {
         ]
     );
 
+    // `aws-exec-read` resolves to owner-only grants (its READ to the EC2
+    // service's canonical user is not modeled), so judging by grants alone let
+    // it slip past PutBucketAcl -- while the BucketOwnerEnforced conflict check
+    // has always treated it as an ACL reaching outside the owner. CloudFormation
+    // sends it for `AccessControl: AwsExecRead`, so the gap was reachable.
+    let mut exec_read = make_request(Method::PUT, "/perm-exec", &[], b"");
+    exec_read
+        .headers
+        .insert("x-amz-acl", "aws-exec-read".parse().unwrap());
+    assert_eq!(names(&exec_read), vec!["CreateBucket", "PutBucketAcl"]);
+
     // A false object-lock header configures nothing.
     let mut unlocked = make_request(Method::PUT, "/perm-unlocked", &[], b"");
     unlocked
@@ -4417,9 +4428,35 @@ fn acl_condition_keys_are_populated_from_the_request_headers() {
         Some(&vec!["id=abc123".to_string()])
     );
 
+    // Object ownership and object lock are gated by `iam_actions_for` too, so
+    // their keys are emitted as well -- `Deny CreateBucket unless
+    // s3:x-amz-object-ownership == BucketOwnerEnforced` is a guardrail people
+    // actually write.
+    let mut settings = HeaderMap::new();
+    settings.insert(
+        "x-amz-object-ownership",
+        "BucketOwnerEnforced".parse().unwrap(),
+    );
+    settings.insert("x-amz-bucket-object-lock-enabled", "true".parse().unwrap());
+    let keys = s3_condition_keys("CreateBucket", &HashMap::new(), &settings);
+    assert_eq!(
+        keys.get("s3:x-amz-object-ownership"),
+        Some(&vec!["BucketOwnerEnforced".to_string()])
+    );
+    assert_eq!(
+        keys.get("s3:x-amz-bucket-object-lock-enabled"),
+        Some(&vec!["true".to_string()])
+    );
+
     // Absent headers emit nothing, so a policy condition on them safe-fails to
     // "does not apply" rather than matching an empty value.
     assert!(s3_condition_keys("CreateBucket", &HashMap::new(), &HeaderMap::new()).is_empty());
+
+    // A present-but-empty value is skipped for the same reason, so a `Null`
+    // check does not read it as set.
+    let mut blank = HeaderMap::new();
+    blank.insert("x-amz-object-ownership", "".parse().unwrap());
+    assert!(s3_condition_keys("CreateBucket", &HashMap::new(), &blank).is_empty());
 }
 
 #[test]
@@ -4472,10 +4509,34 @@ fn create_bucket_request_tags_feed_condition_keys() {
         &[],
         b"<CreateBucketConfiguration><Tags><Tag><Key>team</Key><Value>a</Value></Tag></Tags></CreateBucketConfiguration>",
     );
-    for action in ["CreateBucket", "TagResource"] {
+    // Every action the create implies, not just the create and its TagResource:
+    // dispatch rebuilds the context per action, and AWS evaluates one context
+    // for the whole request. An `aws:RequestTag/*` guardrail that permits the
+    // create must not then deny the ACL or object-lock action it implies.
+    for action in [
+        "CreateBucket",
+        "TagResource",
+        "PutBucketAcl",
+        "PutBucketOwnershipControls",
+        "PutBucketObjectLockConfiguration",
+        "PutBucketVersioning",
+    ] {
         let tags = s3_request_tags(&req, action).expect("tags extracted");
         assert_eq!(tags.get("team").map(String::as_str), Some("a"), "{action}");
     }
+
+    // On their own operations those actions carry no create-time tag set: the
+    // body is not a `CreateBucketConfiguration`, so the map is empty rather
+    // than picking up a foreign body's tags.
+    let acl_body = make_request(
+        Method::PUT,
+        "/req-acl?acl",
+        &[("acl", "")],
+        b"<AccessControlPolicy><Owner><ID>o</ID></Owner></AccessControlPolicy>",
+    );
+    assert!(s3_request_tags(&acl_body, "PutBucketAcl")
+        .expect("tags extracted")
+        .is_empty());
 
     // A body with no tag set yields an empty map, not a miss.
     let plain = make_request(Method::PUT, "/req-plain", &[], b"");
