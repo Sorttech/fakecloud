@@ -127,6 +127,30 @@ pub fn arn_resource<'a>(arn: &'a str, service: &str) -> Option<&'a str> {
     rest.strip_prefix(service)?.strip_prefix(':')
 }
 
+/// The partition an ARN names (`arn:<partition>:...`), `aws` when it names
+/// none.
+pub fn partition_of(arn: &str) -> &str {
+    arn.split(':')
+        .nth(1)
+        .filter(|p| !p.is_empty())
+        .unwrap_or("aws")
+}
+
+/// The region a partition's global resources live in (CloudFront, WAF
+/// `CLOUDFRONT` scope, ...), the `implicitGlobalRegion` of the AWS SDK's
+/// partition metadata. `us-east-1` for an unknown partition.
+pub fn implicit_global_region(partition: &str) -> &'static str {
+    match partition {
+        "aws-cn" => "cn-northwest-1",
+        "aws-us-gov" => "us-gov-west-1",
+        "aws-iso" => "us-iso-east-1",
+        "aws-iso-b" => "us-isob-east-1",
+        "aws-iso-f" => "us-isof-south-1",
+        "aws-iso-e" => "eu-isoe-west-1",
+        _ => "us-east-1",
+    }
+}
+
 /// Every partition [`partition_for`] can return.
 pub const PARTITIONS: &[&str] = &[
     "aws",
@@ -213,6 +237,15 @@ mod tests {
             Arn::s3_in("cn-north-1", "bucket").to_string(),
             "arn:aws-cn:s3:::bucket"
         );
+    }
+
+    #[test]
+    fn partition_helpers() {
+        assert_eq!(partition_of("arn:aws-cn:iam::1:role/x"), "aws-cn");
+        assert_eq!(partition_of("not-an-arn"), "aws");
+        for p in PARTITIONS {
+            assert_eq!(partition_for(implicit_global_region(p)), *p, "{p}");
+        }
     }
 
     #[test]
