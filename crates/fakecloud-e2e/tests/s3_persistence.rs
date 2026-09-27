@@ -1728,6 +1728,123 @@ async fn persistence_recreating_a_load_refused_bucket_is_declined_not_destructiv
 }
 
 #[tokio::test]
+async fn persistence_removing_a_refused_directory_frees_the_name_without_a_restart() {
+    // The refusal is recorded at load and never re-probed, so it has to be
+    // paired with "is the data still there". An operator who follows the error
+    // text by deleting the directory outright would otherwise find the name
+    // refused for the rest of the process lifetime, told to repair something
+    // that no longer exists.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut server = TestServer::start_persistent(tmp.path()).await;
+    let client = server.s3_client().await;
+
+    client.create_bucket().bucket("gone").send().await.unwrap();
+    client
+        .put_object()
+        .bucket("gone")
+        .key("k.txt")
+        .body(ByteStream::from_static(b"v"))
+        .send()
+        .await
+        .unwrap();
+    let bucket_dir = tmp.path().join("s3").join("buckets").join("gone");
+    std::fs::write(
+        bucket_dir.join("objects").join("k.txt").join("null.toml"),
+        "not valid toml = = =",
+    )
+    .unwrap();
+
+    server.restart().await;
+    let client = server.s3_client().await;
+    assert!(
+        client.create_bucket().bucket("gone").send().await.is_err(),
+        "create must be refused while the data is there"
+    );
+
+    // Same running server, no restart.
+    std::fs::remove_dir_all(&bucket_dir).unwrap();
+    client
+        .create_bucket()
+        .bucket("gone")
+        .send()
+        .await
+        .expect("the name is free once the data is gone, restart or not");
+}
+
+#[tokio::test]
+async fn persistence_delete_will_not_discard_a_refused_bucket_under_object_lock() {
+    // The normal delete path enforces Object Lock only indirectly: a retained
+    // object keeps the bucket non-empty, so the delete is refused. The escape
+    // hatch cannot run that check -- the objects are what could not be read --
+    // so it must refuse outright rather than letting a reflexive `rb` destroy
+    // retained data.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut server = TestServer::start_persistent(tmp.path()).await;
+    let client = server.s3_client().await;
+
+    client
+        .create_bucket()
+        .bucket("locked")
+        .object_lock_enabled_for_bucket(true)
+        .send()
+        .await
+        .unwrap();
+    client
+        .put_object()
+        .bucket("locked")
+        .key("k.txt")
+        .body(ByteStream::from_static(b"retained"))
+        .send()
+        .await
+        .unwrap();
+    let bucket_dir = tmp.path().join("s3").join("buckets").join("locked");
+    assert!(
+        bucket_dir.join("object_lock.toml").exists(),
+        "expected the lock config to be persisted"
+    );
+    std::fs::write(
+        bucket_dir.join("objects").join("k.txt").join("null.toml"),
+        "not valid toml = = =",
+    )
+    .unwrap();
+
+    server.restart().await;
+    let client = server.s3_client().await;
+
+    let err = client
+        .delete_bucket()
+        .bucket("locked")
+        .send()
+        .await
+        .expect_err("a refused bucket under Object Lock must not be discarded by DeleteBucket");
+    assert!(
+        format!("{err:?}").contains("BucketNotEmpty"),
+        "unexpected error: {err:?}"
+    );
+    assert!(
+        bucket_dir.join("objects").join("k.txt").exists(),
+        "the refused delete destroyed the objects it was protecting"
+    );
+
+    // Repairing the bad file is the way out, and the bucket comes back locked.
+    std::fs::remove_dir_all(bucket_dir.join("objects").join("k.txt")).unwrap();
+    server.restart().await;
+    let client = server.s3_client().await;
+    let lock = client
+        .get_object_lock_configuration()
+        .bucket("locked")
+        .send()
+        .await
+        .expect("the repaired bucket should load with its lock configuration");
+    assert_eq!(
+        lock.object_lock_configuration()
+            .and_then(|c| c.object_lock_enabled())
+            .map(|e| e.as_str()),
+        Some("Enabled")
+    );
+}
+
+#[tokio::test]
 async fn persistence_delete_frees_a_load_refused_name() {
     // Without an in-band escape a refused name is both missing (HeadBucket 404,
     // absent from ListBuckets) and un-creatable, leaving no way out but editing

@@ -335,7 +335,13 @@ impl S3Service {
         // Refuse instead, and say how to get the name back. DeleteBucket is the
         // in-band escape (it is the explicitly destructive verb), so the name is
         // never permanently stuck.
+        // `bucket_state_exists` as well as the refusal: the refusal is recorded
+        // at load and never re-probed, so an operator who followed the advice
+        // below by deleting the directory outright -- without restarting -- would
+        // otherwise find the name refused for the rest of the process lifetime,
+        // with an error telling them to repair something that is gone.
         if self.store.bucket_load_refused(bucket)
+            && self.store.bucket_state_exists(bucket)
             && !accts
                 .iter()
                 .any(|(_, acct)| acct.buckets.contains_key(bucket))
@@ -498,9 +504,18 @@ impl S3Service {
         // What this can destroy is state the operator already discarded: a name
         // whose data the loader REFUSED is turned away earlier, before anything
         // is written, so merely-unreadable data is never what a create clears.
-        self.store
-            .delete_bucket(bucket)
-            .map_err(super::persistence_error)?;
+        //
+        // Gated on there being a directory at all, which is the case for every
+        // ordinary create. The clear is a recursive remove and this runs under
+        // the global S3 write lock, so an unconditional call would put a
+        // stat-and-walk of a possibly huge tree in front of every other S3
+        // request on the one create-after-reset that needs it -- and a bare
+        // `stat` in front of all the rest.
+        if self.store.bucket_state_exists(bucket) {
+            self.store
+                .delete_bucket(bucket)
+                .map_err(super::persistence_error)?;
+        }
         self.store
             .put_bucket_meta(bucket, &meta)
             .map_err(super::persistence_error)?;
@@ -554,6 +569,27 @@ impl S3Service {
             // and no owner check either, since the metadata carrying ownership is
             // what failed, so any caller may clear it.
             if self.store.bucket_load_refused(bucket) {
+                // Object Lock is the one thing the normal path enforces that
+                // this branch cannot: a compliance-retained object is
+                // undeletable because the bucket is never empty, and here the
+                // objects are exactly what could not be read. A reflexive
+                // `aws s3 rb` -- or a retry of the tool that just got the 409 --
+                // would otherwise destroy retained data, which no bucket on real
+                // S3 permits. The lock config is its own file and is usually
+                // readable even when an object's is not, so refuse while it is
+                // there and leave that case to the operator's own hands.
+                if self.store.bucket_subresource_exists(
+                    bucket,
+                    fakecloud_persistence::BucketSubresource::ObjectLock,
+                ) {
+                    return Err(AwsServiceError::aws_error(
+                        StatusCode::CONFLICT,
+                        "BucketNotEmpty",
+                        format!(
+                            "{bucket} could not be read at load and has an Object Lock                              configuration, so its contents cannot be shown to be free of                              retention. Repair its directory in the data path and restart, then                              delete it through the normal path."
+                        ),
+                    ));
+                }
                 tracing::warn!(
                     target: "fakecloud::s3",
                     bucket = %bucket,

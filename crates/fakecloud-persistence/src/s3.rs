@@ -389,6 +389,16 @@ pub trait S3Store: Send + Sync {
         false
     }
 
+    /// Whether the store holds this one subresource for `bucket`.
+    ///
+    /// Readable without the bucket itself being loadable, which is what makes it
+    /// usable on a load-refused bucket: the file the loader choked on is rarely
+    /// the one being asked about. Memory-only stores hold nothing, hence the
+    /// default.
+    fn bucket_subresource_exists(&self, _bucket: &str, _kind: BucketSubresource) -> bool {
+        false
+    }
+
     /// Whether the last [`S3Store::load`] REFUSED this bucket -- a corrupt
     /// object meta, a missing part body: data still on disk and recoverable by
     /// repairing the one bad file.
@@ -941,6 +951,12 @@ impl S3Store for DiskS3Store {
 
     fn bucket_state_exists(&self, bucket: &str) -> bool {
         self.bucket_dir(bucket).exists()
+    }
+
+    fn bucket_subresource_exists(&self, bucket: &str, kind: BucketSubresource) -> bool {
+        self.bucket_dir(bucket)
+            .join(Self::subresource_filename(kind))
+            .exists()
     }
 
     fn bucket_load_refused(&self, bucket: &str) -> bool {
