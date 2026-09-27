@@ -329,6 +329,34 @@ impl S3Service {
         let acl = acl_header.unwrap_or("private");
 
         let mut accts = self.state.write();
+        // A bucket the loader could not read is absent from memory, so its name
+        // looks free -- but its objects are on disk and recoverable by repairing
+        // the one bad file, and this create is about to clear the directory.
+        // Refuse instead, and say how to get the name back. DeleteBucket is the
+        // in-band escape (it is the explicitly destructive verb), so the name is
+        // never permanently stuck.
+        if self.store.bucket_load_refused(bucket)
+            && !accts
+                .iter()
+                .any(|(_, acct)| acct.buckets.contains_key(bucket))
+        {
+            tracing::warn!(
+                target: "fakecloud::s3",
+                bucket = %bucket,
+                "CreateBucket refused: the store holds data for this bucket that could not be \
+                 read at load",
+            );
+            return Err(AwsServiceError::aws_error(
+                StatusCode::CONFLICT,
+                "BucketAlreadyExists",
+                format!(
+                    "The requested bucket name is not available: {bucket} holds persisted data \
+                     that could not be read at load (an unreadable object, or a delete that \
+                     stopped partway). Repair its directory in the data path and restart, or \
+                     DeleteBucket to discard it."
+                ),
+            ));
+        }
         // Check global uniqueness across all accounts before creating
         for (other_account_id, acct_state) in accts.iter() {
             if acct_state.buckets.contains_key(bucket) {
@@ -456,33 +484,26 @@ impl S3Service {
             })?),
             None => None,
         };
-        // The meta goes first, and nothing is destroyed until it lands: a
-        // create that fails here has changed nothing on disk, where clearing
-        // the old sidecars first would have thrown away the configuration of
-        // whatever bucket this name belonged to for a create that never
-        // happened.
+        // Clear whatever the store still holds for this name BEFORE writing this
+        // bucket's own state -- the clear removes `meta.toml`, so doing it
+        // afterwards would delete the bucket this create just wrote.
+        //
+        // A bucket absent from memory can still have a directory on disk: after
+        // `/_fakecloud/reset` (which clears memory and deliberately leaves the
+        // store alone), or from a create or delete that stopped partway. Leaving
+        // it meant the new bucket inherited the previous one's `objects/` on the
+        // next load, so the caller saw an empty bucket now and the old objects
+        // came back after a restart.
+        //
+        // What this can destroy is state the operator already discarded: a name
+        // whose data the loader REFUSED is turned away earlier, before anything
+        // is written, so merely-unreadable data is never what a create clears.
+        self.store
+            .delete_bucket(bucket)
+            .map_err(super::persistence_error)?;
         self.store
             .put_bucket_meta(bucket, &meta)
             .map_err(super::persistence_error)?;
-        // Clear every stored subresource for this name before writing this
-        // bucket's own, now that the create is committed. A create or delete that stopped partway -- or a
-        // `/_fakecloud/reset`, which clears memory and leaves the store alone --
-        // can leave sidecars behind, and a later create would otherwise be
-        // restored carrying the old bucket's `policy.toml`, `acl.toml` and the
-        // rest. Each delete tolerates a missing file, which is the normal case.
-        //
-        // Scoped to the sidecars on purpose. `objects/` is NOT touched: the
-        // loader skips a bucket whose objects it cannot read, so that bucket is
-        // absent from memory while its data sits intact on disk, and clearing
-        // the directory here would make re-creating the name the thing that
-        // destroys it. Whether a create should adopt or discard a stale object
-        // tree is a separate question from this one, and this is not the change
-        // that answers it.
-        for kind in fakecloud_persistence::ALL_SUBRESOURCES {
-            self.store
-                .delete_bucket_subresource(bucket, *kind)
-                .map_err(super::persistence_error)?;
-        }
 
         self.put_bucket_subresource_if_set(
             bucket,
@@ -524,10 +545,34 @@ impl S3Service {
     ) -> Result<AwsResponse, AwsServiceError> {
         let mut accts = self.state.write();
         let state = accts.get_or_create(account_id);
-        let b = state
-            .buckets
-            .get(bucket)
-            .ok_or_else(|| no_such_bucket(bucket))?;
+        let Some(b) = state.buckets.get(bucket) else {
+            // A bucket the loader refused is absent from memory, so every read
+            // reports it missing while CreateBucket refuses its name. Delete is
+            // the explicitly destructive verb, so it is the way out: discard the
+            // unreadable directory and free the name. No emptiness check is
+            // possible here -- the objects are exactly what could not be read --
+            // and no owner check either, since the metadata carrying ownership is
+            // what failed, so any caller may clear it.
+            if self.store.bucket_load_refused(bucket) {
+                tracing::warn!(
+                    target: "fakecloud::s3",
+                    bucket = %bucket,
+                    account_id = %account_id,
+                    "DeleteBucket discarding data that could not be read at load; ownership could \
+                     not be verified, so this is reachable by any account",
+                );
+                self.store
+                    .delete_bucket(bucket)
+                    .map_err(super::persistence_error)?;
+                return Ok(AwsResponse {
+                    status: StatusCode::NO_CONTENT,
+                    content_type: "application/xml".to_string(),
+                    body: Bytes::new().into(),
+                    headers: HeaderMap::new(),
+                });
+            }
+            return Err(no_such_bucket(bucket));
+        };
         // Bucket must be empty to delete (no objects and no versions)
         let has_real_objects = b.objects.values().any(|o| !o.is_delete_marker);
         let has_versions = b.object_versions.values().any(|v| !v.is_empty());

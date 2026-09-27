@@ -379,6 +379,26 @@ pub trait S3Store: Send + Sync {
     fn delete_bucket_subresource(&self, bucket: &str, kind: BucketSubresource) -> StoreResult<()>;
     fn delete_bucket(&self, bucket: &str) -> StoreResult<()>;
 
+    /// Whether the store holds any persisted state for `bucket`.
+    ///
+    /// A bucket absent from memory can still have files on disk: after
+    /// `/_fakecloud/reset` (which clears memory and leaves the store alone), or
+    /// from a create or delete that stopped partway. Memory-only stores hold
+    /// nothing, hence the default.
+    fn bucket_state_exists(&self, _bucket: &str) -> bool {
+        false
+    }
+
+    /// Whether the last [`S3Store::load`] REFUSED this bucket -- a corrupt
+    /// object meta, a missing part body: data still on disk and recoverable by
+    /// repairing the one bad file.
+    ///
+    /// Recorded at load, not probed per call, so a caller cannot confuse "the
+    /// loader could not read this" with "this is simply not in memory".
+    fn bucket_load_refused(&self, _bucket: &str) -> bool {
+        false
+    }
+
     fn put_object(
         &self,
         bucket: &str,
@@ -536,11 +556,18 @@ impl S3Store for MemoryS3Store {
 pub struct DiskS3Store {
     root: PathBuf,
     cache: std::sync::Arc<crate::cache::BodyCache>,
+    /// Escaped directory names `load` could not read, so a caller can tell
+    /// recoverable data apart from state the operator already discarded.
+    load_refused: parking_lot::RwLock<std::collections::HashSet<String>>,
 }
 
 impl DiskS3Store {
     pub fn new(root: PathBuf, cache: std::sync::Arc<crate::cache::BodyCache>) -> Self {
-        Self { root, cache }
+        Self {
+            root,
+            cache,
+            load_refused: parking_lot::RwLock::new(std::collections::HashSet::new()),
+        }
     }
 
     fn buckets_dir(&self) -> PathBuf {
@@ -642,6 +669,10 @@ fn io_other(msg: impl Into<String>) -> StoreError {
 
 impl S3Store for DiskS3Store {
     fn load(&self) -> StoreResult<S3State> {
+        // This load decides which buckets are refused, so start clean: carrying
+        // entries over would keep a bucket whose bad file was repaired
+        // un-creatable.
+        self.load_refused.write().clear();
         let mut state = S3State::default();
         let buckets_dir = self.buckets_dir();
         if !buckets_dir.exists() {
@@ -858,11 +889,20 @@ impl S3Store for DiskS3Store {
                     state.buckets.insert(snap.meta.name.clone(), snap);
                 }
                 Ok(None) => {}
-                Err(e) => tracing::warn!(
-                    bucket = %bdir.display(),
-                    error = %e,
-                    "skipping unreadable S3 bucket during load"
-                ),
+                Err(e) => {
+                    // Remembered so a later CreateBucket knows this directory
+                    // holds recoverable data rather than state the operator
+                    // discarded.
+                    if let Some(dir_name) = bdir.file_name().and_then(|n| n.to_str()) {
+                        self.load_refused.write().insert(dir_name.to_string());
+                    }
+                    tracing::warn!(
+                        bucket = %bdir.display(),
+                        error = %e,
+                        "skipping unreadable S3 bucket during load; its name is refused until it \
+                         is repaired and the server restarted, or the bucket is deleted"
+                    );
+                }
             }
         }
         Ok(state)
@@ -899,13 +939,32 @@ impl S3Store for DiskS3Store {
         }
     }
 
+    fn bucket_state_exists(&self, bucket: &str) -> bool {
+        self.bucket_dir(bucket).exists()
+    }
+
+    fn bucket_load_refused(&self, bucket: &str) -> bool {
+        self.load_refused
+            .read()
+            .contains(&crate::key_escape::escape_key_segment(bucket))
+    }
+
     fn delete_bucket(&self, bucket: &str) -> StoreResult<()> {
         let dir = self.bucket_dir(bucket);
-        match std::fs::remove_dir_all(&dir) {
+        let outcome = match std::fs::remove_dir_all(&dir) {
             Ok(_) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e.into()),
+            Err(e) => Err(StoreError::from(e)),
+        };
+        // Only once the tree is really gone: a removal that stops partway
+        // returns Err and the caller reports 500, so dropping the refusal here
+        // would leave the next CreateBucket free to discard the remains.
+        if outcome.is_ok() {
+            self.load_refused
+                .write()
+                .remove(&crate::key_escape::escape_key_segment(bucket));
         }
+        outcome
     }
 
     fn put_object(
