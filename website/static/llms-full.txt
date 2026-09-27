@@ -6,14 +6,14 @@
 
 fakecloud emulates AWS locally for integration testing and development. It is a single Rust binary (~19 MB, ~300ms startup, ~10 MiB idle memory) — no Docker required to run fakecloud itself, no signup. Point any AWS SDK or the AWS CLI at `http://localhost:4566` with dummy credentials.
 
-**Coverage goal:** 100% of AWS services, each at 100% behavioral conformance, with 100% of cross-service integrations. Approach is depth-first — a service lands when it passes the full Smithy-model test variants and the cross-service wire-ups that matter for it, not when the API surface looks filled in. 105 services (7,508 operations) are shipped today, all at true 100% conformance — 248,557/248,557 generated Smithy variants pass on every commit; more land progressively as they hit the bar.
+**Coverage goal:** 100% of AWS services, each at 100% behavioral conformance, with 100% of cross-service integrations. Approach is depth-first — a service lands when it passes the full Smithy-model test variants and the cross-service wire-ups that matter for it, not when the API surface looks filled in. 105 services (7,509 operations) are shipped today, all at true 100% conformance — 248,557/248,557 generated Smithy variants pass on every commit; more land progressively as they hit the bar.
 
 Key design principles:
 - **Depth-first coverage**: every implemented service targets 100% conformance with real AWS, validated on every commit against AWS's own Smithy models — 248,557/248,557 generated test variants pass on every commit, true 100% across every implemented service. CI also runs upstream `hashicorp/terraform-provider-aws` `TestAcc*` suites against fakecloud.
 - **Real cross-service integrations**: 30+ service-to-service integrations wire up end-to-end — S3 notifications, SNS fan-out, EventBridge rules, DynamoDB Streams, CloudWatch Logs subscriptions, Cognito triggers, API Gateway -> Lambda, Step Functions task integrations, SES inbound -> S3/SNS/Lambda, and more. Not stubs — the downstream service actually executes.
 - **Real execution for stateful services**: Lambda runs function code in real Lambda runtime containers across 23 runtimes. RDS runs real PostgreSQL/MySQL/MariaDB. ElastiCache runs real Redis/Valkey.
 - **Zero friction**: no auth tokens, no accounts, no config files needed
-- **Test-assertion SDKs** for TypeScript, Python, Go, PHP, Java, Rust, wrapping `/_fakecloud/*` introspection endpoints
+- **Test-assertion SDKs** for TypeScript, Python, Go, PHP, Java, Rust, .NET, wrapping `/_fakecloud/*` introspection endpoints
 
 fakecloud is NOT a production-ready cloud replacement. It is for integration testing and local development.
 
@@ -94,7 +94,7 @@ Cognito User Pools, Cognito Identity, Kinesis, Firehose, RDS, RDS Data API, Auro
 Step Functions, API Gateway v1, API Gateway v2, Bedrock, Bedrock Agent,
 Bedrock Agent Runtime, Bedrock Runtime, ECR, ECS, Elastic Load Balancing v2,
 CloudFront, CloudTrail, Route 53, WAF v2, Application Auto Scaling, Athena, ACM, Glue,
-EC2, and Organizations. State is
+EC2, Organizations, and the rest. State is
 written to disk on every mutation and reloaded on startup. The one exception
 is CloudWatch metric datapoints, which are in-memory only (matching how
 ephemeral, high-cardinality metric data is treated); CloudWatch alarms,
@@ -226,7 +226,7 @@ Features: `at`, `rate`, and `cron` expressions; SQS targets; DLQ routing; one-sh
 
 Protocol: REST + JSON
 
-### IAM (176 actions) + STS (11 actions)
+### IAM (180 actions) + STS (11 actions)
 
 **Users:** CreateUser, GetUser, DeleteUser, ListUsers, UpdateUser, TagUser, UntagUser, ListUserTags, CreateAccessKey, DeleteAccessKey, ListAccessKeys, UpdateAccessKey, GetAccessKeyLastUsed, CreateLoginProfile, GetLoginProfile, UpdateLoginProfile, DeleteLoginProfile, AttachUserPolicy, DetachUserPolicy, ListAttachedUserPolicies, PutUserPolicy, GetUserPolicy, DeleteUserPolicy, ListUserPolicies
 **Roles:** CreateRole, GetRole, DeleteRole, ListRoles, UpdateRole, UpdateRoleDescription, UpdateAssumeRolePolicy, TagRole, UntagRole, ListRoleTags, PutRolePermissionsBoundary, DeleteRolePermissionsBoundary, AttachRolePolicy, DetachRolePolicy, ListAttachedRolePolicies, PutRolePolicy, GetRolePolicy, DeleteRolePolicy, ListRolePolicies, CreateServiceLinkedRole, DeleteServiceLinkedRole, GetServiceLinkedRoleDeletionStatus
@@ -242,7 +242,7 @@ Protocol: REST + JSON
 
 Protocol: Query (form-encoded body, `Action` parameter, XML responses)
 
-### SSM (146 actions)
+### SSM (152 actions)
 
 **Parameters:** PutParameter, GetParameter, GetParameters, GetParametersByPath, DeleteParameter, DeleteParameters, DescribeParameters, GetParameterHistory, LabelParameterVersion, UnlabelParameterVersion
 **Tags:** AddTagsToResource, RemoveTagsFromResource, ListTagsForResource
@@ -267,13 +267,13 @@ Features: path-style addressing, prefix/delimiter listing, pagination (including
 
 Protocol: REST (HTTP method + path-based routing, XML responses)
 
-### DynamoDB (57 actions)
+### DynamoDB (58 actions)
 
 Tables, items, transactions (TransactWriteItems, TransactGetItems), PartiQL (ExecuteStatement, BatchExecuteStatement), backups, global tables, streams, secondary indexes. Standard DynamoDB JSON wire format. Under `--iam strict`/`soft` every DynamoDB and DynamoDB Streams operation is authorized with the actions and resource ARNs AWS uses: table, index, stream, backup, export and import ARNs; the batch action on every table of a batch; per-item actions on each table of a transaction; `dynamodb:PartiQL*` actions for PartiQL; `aws:ResourceTag` / `aws:RequestTag` / `aws:TagKeys` conditions on table tags; fine-grained `dynamodb:LeadingKeys` / `Attributes` / `Select` / `ReturnValues` / `ReturnConsumedCapacity` / `EnclosingOperation` / `FullTableScan` condition keys; table and stream resource-based policies.
 
 Protocol: JSON (JSON body, `X-Amz-Target` header, JSON responses)
 
-### Lambda (70 actions)
+### Lambda (73 actions)
 
 CreateFunction, GetFunction, DeleteFunction, ListFunctions, Invoke, PublishVersion, CreateEventSourceMapping, ListEventSourceMappings, GetEventSourceMapping, DeleteEventSourceMapping
 
@@ -289,7 +289,7 @@ Features: secret versioning with AWSCURRENT/AWSPREVIOUS stage tracking, soft del
 
 Protocol: JSON (JSON body, `X-Amz-Target` header, JSON responses)
 
-### CloudWatch Logs (113 actions)
+### CloudWatch Logs (118 actions)
 
 Full log management with groups, streams, filtering, deliveries, transformers, query language, and anomaly detection.
 
@@ -323,7 +323,7 @@ Features: uniform CRUD-L interface over CloudFormation resource types, driving t
 
 Protocol: JSON 1.0 (JSON body, `X-Amz-Target` header, JSON responses)
 
-### SES (111 actions)
+### SES (116 actions)
 
 **SES v2** (97 actions, REST protocol): identities, templates, configuration sets, contact lists, contacts, send email, tagging, suppression list, event destinations, identity policies, DKIM/feedback/mail-from attributes, config set options, custom verification email templates, template rendering, dedicated IP pools and IPs, multi-region endpoints, account settings, import/export jobs.
 
@@ -331,7 +331,7 @@ Protocol: JSON 1.0 (JSON body, `X-Amz-Target` header, JSON responses)
 
 Features: email event fanout to SNS topics and EventBridge buses via configured event destinations, mailbox simulator (bounce@simulator.amazonses.com, complaint@, suppressionlist@), inbound email pipeline via /_fakecloud/ses/inbound endpoint that evaluates receipt rules and executes S3/SNS/Lambda actions.
 
-### Cognito User Pools (122 actions)
+### Cognito User Pools (132 actions)
 
 User pool management, app clients, user management, groups, authentication flows, password and session management, MFA/software tokens, identity providers, resource servers, domains, device management, tags, and import jobs.
 
@@ -339,7 +339,7 @@ Features: user pools with configurable policies, app client CRUD, user signup/co
 
 Protocol: JSON (JSON body, `X-Amz-Target` header, JSON responses)
 
-### Kinesis (39 actions)
+### Kinesis (44 actions)
 
 CreateStream, DescribeStream, DescribeStreamSummary, ListStreams, DeleteStream, GetRecords, GetShardIterator, PutRecord, PutRecords, AddTagsToStream, ListTagsForStream, RemoveTagsFromStream, IncreaseStreamRetentionPeriod, DecreaseStreamRetentionPeriod
 
@@ -371,7 +371,7 @@ Features: full Redis/Valkey control plane — clusters with shard/replica topolo
 
 Protocol: JSON 1.1 (awsJson1.1, `X-Amz-Target: AmazonMemoryDB.<Action>`)
 
-### EKS (65 actions, complete)
+### EKS (70 actions, complete)
 
 CreateCluster, DescribeCluster, ListClusters, DeleteCluster, UpdateClusterConfig, UpdateClusterVersion, DescribeUpdate, ListUpdates, TagResource, UntagResource, ListTagsForResource, CreateNodegroup, DescribeNodegroup, ListNodegroups, DeleteNodegroup, UpdateNodegroupConfig, UpdateNodegroupVersion, CreateFargateProfile, DescribeFargateProfile, ListFargateProfiles, DeleteFargateProfile, CreateAddon, DescribeAddon, ListAddons, DeleteAddon, UpdateAddon, DescribeAddonVersions, DescribeAddonConfiguration, CreateAccessEntry, DescribeAccessEntry, ListAccessEntries, DeleteAccessEntry, UpdateAccessEntry, AssociateAccessPolicy, DisassociateAccessPolicy, ListAssociatedAccessPolicies, ListAccessPolicies, AssociateIdentityProviderConfig, DisassociateIdentityProviderConfig, DescribeIdentityProviderConfig, ListIdentityProviderConfigs, CreatePodIdentityAssociation, DescribePodIdentityAssociation, ListPodIdentityAssociations, UpdatePodIdentityAssociation, DeletePodIdentityAssociation, DescribeInsight, ListInsights, DescribeInsightsRefresh, StartInsightsRefresh, AssociateEncryptionConfig, CancelUpdate, DeregisterCluster, RegisterCluster, DescribeClusterVersions, CreateCapability, DeleteCapability, DescribeCapability, ListCapabilities, UpdateCapability, CreateEksAnywhereSubscription, DeleteEksAnywhereSubscription, DescribeEksAnywhereSubscription, ListEksAnywhereSubscriptions, UpdateEksAnywhereSubscription
 
@@ -490,7 +490,7 @@ Features: HTTP APIs with route-based request handling, path parameters and wildc
 
 Protocol: REST (HTTP method + path-based routing, JSON responses)
 
-### Bedrock (101 actions) + Bedrock Runtime (10 actions)
+### Bedrock (103 actions) + Bedrock Runtime (10 actions)
 
 **Foundation Models:** ListFoundationModels, GetFoundationModel
 **Guardrails:** CreateGuardrail, GetGuardrail, ListGuardrails, UpdateGuardrail, DeleteGuardrail, CreateGuardrailVersion, ApplyGuardrail
@@ -645,7 +645,7 @@ Features: `primary` workgroup + `AwsDataCatalog` GLUE catalog auto-seeded on fir
 
 Protocol: JSON 1.1 (`X-Amz-Target: AmazonAthena.<Action>`)
 
-### EC2 (791 actions)
+### EC2 (802 actions)
 
 The complete EC2 control plane — the largest service surface in AWS, all at true 100% Smithy conformance.
 
@@ -667,13 +667,13 @@ Org tree (roots / OUs / accounts), `CreateAccount` real async `IN_PROGRESS -> SU
 
 Protocol: JSON 1.1
 
-### Glue (265 actions)
+### Glue (300 actions)
 
 Full Data Catalog (databases, tables, partitions with `GetPartitions` `Expression` pruning), jobs, crawlers, classifiers, connections, triggers, workflows, blueprints, dev endpoints, schema registry, interactive sessions, ML transforms, data quality, user-defined functions, usage profiles, column statistics, tagging. Real status transitions (crawler READY<->RUNNING, trigger/workflow/run lifecycles). Job/crawler/Spark execution itself is synthesized — fakecloud is not a Spark engine.
 
 Protocol: JSON 1.1
 
-### CloudWatch / Metrics & Alarms (46 actions)
+### CloudWatch / Metrics & Alarms (49 actions)
 
 Metrics (`PutMetricData` / `GetMetricData` / `GetMetricStatistics` / `ListMetrics` / `GetMetricWidgetImage`), metric + composite alarms with SNS / AppAS / EC2 actions on threshold transitions, dashboards, anomaly detectors, insight rules + managed rules + reports, metric streams, alarm mute rules, contributor insights, OTel enrichment, tagging. Metrics in-memory only; alarms evaluate against published data.
 
