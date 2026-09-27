@@ -21,8 +21,11 @@ impl ResourceProvisioner {
             .to_string();
 
         let arn = format!(
-            "arn:aws:firehose:{}:{}:deliverystream/{}",
-            self.region, self.account_id, name
+            "arn:{}:firehose:{}:{}:deliverystream/{}",
+            partition_for(&self.region),
+            self.region,
+            self.account_id,
+            name
         );
         let stream_type = props
             .get("DeliveryStreamType")

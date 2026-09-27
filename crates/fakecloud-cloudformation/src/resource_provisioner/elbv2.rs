@@ -46,7 +46,8 @@ impl ResourceProvisioner {
         let state = accounts.get_or_create(&self.account_id);
         let lb_id = Uuid::new_v4().simple().to_string();
         let arn = format!(
-            "arn:aws:elasticloadbalancing:{}:{}:loadbalancer/{}/{}/{}",
+            "arn:{}:elasticloadbalancing:{}:{}:loadbalancer/{}/{}/{}",
+            partition_for(&self.region),
             self.region,
             self.account_id,
             if lb_type == "network" { "net" } else { "app" },
@@ -183,7 +184,8 @@ impl ResourceProvisioner {
         let state = accounts.get_or_create(&self.account_id);
         let id = Uuid::new_v4().simple().to_string();
         let arn = format!(
-            "arn:aws:elasticloadbalancing:{}:{}:targetgroup/{}/{}",
+            "arn:{}:elasticloadbalancing:{}:{}:targetgroup/{}/{}",
+            partition_for(&self.region),
             self.region,
             self.account_id,
             name,
@@ -296,7 +298,8 @@ impl ResourceProvisioner {
             .to_string();
         let listener_id = Uuid::new_v4().simple().to_string();
         let arn = format!(
-            "arn:aws:elasticloadbalancing:{}:{}:listener/{}/{}",
+            "arn:{}:elasticloadbalancing:{}:{}:listener/{}/{}",
+            partition_for(&self.region),
             self.region,
             self.account_id,
             lb_full,
@@ -400,7 +403,8 @@ impl ResourceProvisioner {
             .to_string();
         let rule_id = Uuid::new_v4().simple().to_string();
         let arn = format!(
-            "arn:aws:elasticloadbalancing:{}:{}:listener-rule/{}/{}",
+            "arn:{}:elasticloadbalancing:{}:{}:listener-rule/{}/{}",
+            partition_for(&self.region),
             self.region,
             self.account_id,
             listener_full,
@@ -550,8 +554,12 @@ impl ResourceProvisioner {
             .take(16)
             .collect();
         let arn = format!(
-            "arn:aws:elasticloadbalancing:{}:{}:truststore/{}/{}",
-            self.region, self.account_id, name, suffix
+            "arn:{}:elasticloadbalancing:{}:{}:truststore/{}/{}",
+            partition_for(&self.region),
+            self.region,
+            self.account_id,
+            name,
+            suffix
         );
         let ts = fakecloud_elbv2::TrustStore {
             arn: arn.clone(),

@@ -47,8 +47,11 @@ impl ResourceProvisioner {
         let mut accounts = self.secretsmanager_state.write();
         let state = accounts.get_or_create(&self.account_id);
         let arn = format!(
-            "arn:aws:secretsmanager:{}:{}:secret:{}",
-            self.region, state.account_id, name
+            "arn:{}:secretsmanager:{}:{}:secret:{}",
+            partition_for(&self.region),
+            self.region,
+            state.account_id,
+            name
         );
 
         if state.secrets.contains_key(&arn) {
@@ -242,8 +245,11 @@ impl ResourceProvisioner {
             secret_id.clone()
         } else {
             let candidate = format!(
-                "arn:aws:secretsmanager:{}:{}:secret:{}",
-                self.region, state.account_id, secret_id
+                "arn:{}:secretsmanager:{}:{}:secret:{}",
+                partition_for(&self.region),
+                self.region,
+                state.account_id,
+                secret_id
             );
             if state.secrets.contains_key(&candidate) {
                 candidate
@@ -304,8 +310,11 @@ impl ResourceProvisioner {
             secret_id.clone()
         } else {
             let candidate = format!(
-                "arn:aws:secretsmanager:{}:{}:secret:{}",
-                self.region, state.account_id, secret_id
+                "arn:{}:secretsmanager:{}:{}:secret:{}",
+                partition_for(&self.region),
+                self.region,
+                state.account_id,
+                secret_id
             );
             if state.secrets.contains_key(&candidate) {
                 candidate
@@ -359,8 +368,11 @@ impl ResourceProvisioner {
             secret_id.clone()
         } else {
             let candidate = format!(
-                "arn:aws:secretsmanager:{}:{}:secret:{}",
-                self.region, state.account_id, secret_id
+                "arn:{}:secretsmanager:{}:{}:secret:{}",
+                partition_for(&self.region),
+                self.region,
+                state.account_id,
+                secret_id
             );
             if state.secrets.contains_key(&candidate) {
                 candidate

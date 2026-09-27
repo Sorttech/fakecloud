@@ -26,7 +26,7 @@ use fakecloud_application_autoscaling::{
     SharedApplicationAutoScalingState as AppasState, SuspendedState as AppasSuspendedState,
 };
 use fakecloud_athena::{DataCatalog, NamedQuery, PreparedStatement, SharedAthenaState, WorkGroup};
-use fakecloud_aws::arn::Arn;
+use fakecloud_aws::arn::{arn_resource, partition_for, Arn};
 use fakecloud_cloudfront::{
     functions::{
         CloudFrontOriginAccessIdentityConfig, FunctionConfig, KeyGroupConfig, KeyGroupItems,
@@ -398,11 +398,19 @@ fn parse_kms_key_input(props: &serde_json::Value) -> kms_provisioner::KeyCreatio
     }
 }
 
+/// The partition field of an ARN, `aws` when it is not an ARN.
+pub(crate) fn arn_partition(arn: &str) -> &str {
+    arn.strip_prefix("arn:")
+        .and_then(|rest| rest.split(':').next())
+        .filter(|p| !p.is_empty())
+        .unwrap_or("aws")
+}
+
 /// `LogGroupName` properties on Logs CFN resources may carry either a
 /// log-group ARN (when they come from `{Ref: SomeLogGroup}` in the same
 /// template) or a plain name. Extract the name in either case.
 fn parse_log_group_name(input: &str) -> String {
-    if let Some(rest) = input.strip_prefix("arn:aws:logs:") {
+    if let Some(rest) = arn_resource(input, "logs") {
         if let Some(after) = rest.split(":log-group:").nth(1) {
             // ARN ends with `:*`; trim it if present.
             return after.trim_end_matches(":*").to_string();
@@ -420,7 +428,7 @@ fn parse_log_group_name(input: &str) -> String {
 /// non-ARN input is always a qualifier.
 fn parse_lambda_function_name(input: &str) -> String {
     // Full ARN: arn:aws:lambda:region:account:function:name[:qualifier]
-    if let Some(rest) = input.strip_prefix("arn:aws:lambda:") {
+    if let Some(rest) = arn_resource(input, "lambda") {
         if let Some(after) = rest.split(":function:").nth(1) {
             return after.split(':').next().unwrap_or(after).to_string();
         }
@@ -439,7 +447,7 @@ fn parse_lambda_function_name(input: &str) -> String {
 /// (`arn:aws:lambda:region:account:function:name:alias`); a legacy bare
 /// `name:alias` value is returned unchanged.
 fn alias_state_key(physical_id: &str) -> String {
-    if let Some(rest) = physical_id.strip_prefix("arn:aws:lambda:") {
+    if let Some(rest) = arn_resource(physical_id, "lambda") {
         if let Some(after) = rest.split(":function:").nth(1) {
             return after.to_string();
         }
@@ -807,7 +815,7 @@ fn layer_code_size(
     arn: &str,
 ) -> i64 {
     // arn:aws:lambda:<region>:<account>:layer:<name>:<version>
-    let Some(rest) = arn.strip_prefix("arn:aws:lambda:") else {
+    let Some(rest) = arn_resource(arn, "lambda") else {
         return 0;
     };
     let mut parts = rest.split(':');
@@ -7188,6 +7196,145 @@ mod tests {
         assert_eq!(sr.physical_id, "service/my-cluster/my-service");
         assert!(sr.attributes.contains_key("ScalableTargetARN"));
         assert!(prov.delete_resource(&sr).is_ok());
+    }
+
+    fn cn_provisioner() -> ResourceProvisioner {
+        let mut prov = make_provisioner();
+        prov.region = "cn-north-1".to_string();
+        prov
+    }
+
+    #[test]
+    fn arns_take_the_stack_region_partition() {
+        let prov = cn_provisioner();
+        let queue = prov
+            .create_resource(&make_resource(
+                "AWS::SQS::Queue",
+                "Q",
+                serde_json::json!({"QueueName": "cn-queue"}),
+            ))
+            .unwrap();
+        assert_eq!(
+            queue.attributes["Arn"],
+            "arn:aws-cn:sqs:cn-north-1:123456789012:cn-queue"
+        );
+        let bucket = prov
+            .create_resource(&make_resource(
+                "AWS::S3::Bucket",
+                "B",
+                serde_json::json!({"BucketName": "cn-bucket"}),
+            ))
+            .unwrap();
+        assert_eq!(bucket.attributes["Arn"], "arn:aws-cn:s3:::cn-bucket");
+        assert_eq!(
+            prov.get_att(&bucket, "Arn").as_deref(),
+            Some("arn:aws-cn:s3:::cn-bucket")
+        );
+        let dashboard = prov
+            .create_resource(&make_resource(
+                "AWS::CloudWatch::Dashboard",
+                "D",
+                serde_json::json!({"DashboardName": "cn-dash", "DashboardBody": "{}"}),
+            ))
+            .unwrap();
+        assert_eq!(
+            dashboard.attributes["Arn"],
+            "arn:aws-cn:cloudwatch::123456789012:dashboard/cn-dash"
+        );
+    }
+
+    #[test]
+    fn lambda_alias_in_china_round_trips_through_its_arn() {
+        let prov = cn_provisioner();
+        let function = prov
+            .create_resource(&make_resource(
+                "AWS::Lambda::Function",
+                "Fn",
+                serde_json::json!({
+                    "FunctionName": "cn-fn",
+                    "Runtime": "nodejs20.x",
+                    "Role": "arn:aws-cn:iam::123456789012:role/lambda-role",
+                    "Handler": "index.handler",
+                }),
+            ))
+            .unwrap();
+        let function_arn = function.attributes["Arn"].clone();
+        assert_eq!(
+            function_arn,
+            "arn:aws-cn:lambda:cn-north-1:123456789012:function:cn-fn"
+        );
+        let alias = prov
+            .create_resource(&make_resource(
+                "AWS::Lambda::Alias",
+                "Live",
+                serde_json::json!({"FunctionName": function_arn, "Name": "live"}),
+            ))
+            .unwrap();
+        assert_eq!(
+            alias.physical_id,
+            "arn:aws-cn:lambda:cn-north-1:123456789012:function:cn-fn:live"
+        );
+        assert!(prov
+            .lambda_state
+            .read()
+            .get("123456789012")
+            .unwrap()
+            .aliases
+            .contains_key("cn-fn:live"));
+        prov.delete_resource(&alias).unwrap();
+        assert!(!prov
+            .lambda_state
+            .read()
+            .get("123456789012")
+            .unwrap()
+            .aliases
+            .contains_key("cn-fn:live"));
+    }
+
+    #[test]
+    fn arn_parsers_accept_any_partition() {
+        assert_eq!(
+            parse_log_group_name("arn:aws-cn:logs:cn-north-1:123456789012:log-group:/app/logs:*"),
+            "/app/logs"
+        );
+        assert_eq!(
+            alias_state_key("arn:aws-us-gov:lambda:us-gov-west-1:123456789012:function:f:live"),
+            "f:live"
+        );
+        assert_eq!(
+            arn_partition("arn:aws-cn:organizations::1:root/o-1/r-1"),
+            "aws-cn"
+        );
+        assert_eq!(arn_partition("not-an-arn"), "aws");
+    }
+
+    #[test]
+    fn organizational_unit_arn_follows_the_organization_partition() {
+        let prov = cn_provisioner();
+        prov.create_resource(&make_resource(
+            "AWS::Organizations::Organization",
+            "Org",
+            serde_json::json!({"FeatureSet": "ALL"}),
+        ))
+        .unwrap();
+        let root_id = {
+            let mut g = prov.organizations_state.write();
+            let org = g.sole_mut().unwrap();
+            org.root_arn = org.root_arn.replacen("arn:aws:", "arn:aws-cn:", 1);
+            org.root_id.clone()
+        };
+        let ou = prov
+            .create_resource(&make_resource(
+                "AWS::Organizations::OrganizationalUnit",
+                "OU",
+                serde_json::json!({"Name": "team", "ParentId": root_id}),
+            ))
+            .unwrap();
+        assert!(
+            ou.attributes["Arn"].starts_with("arn:aws-cn:organizations::"),
+            "{}",
+            ou.attributes["Arn"]
+        );
     }
 
     #[test]

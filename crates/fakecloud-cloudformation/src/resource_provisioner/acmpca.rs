@@ -56,8 +56,11 @@ impl ResourceProvisioner {
             .map(|s| s.to_string());
         let ca_id = Uuid::new_v4();
         let arn = format!(
-            "arn:aws:acm-pca:{}:{}:certificate-authority/{}",
-            self.region, self.account_id, ca_id
+            "arn:{}:acm-pca:{}:{}:certificate-authority/{}",
+            partition_for(&self.region),
+            self.region,
+            self.account_id,
+            ca_id
         );
 
         // Use the same shared builder + defaults as the API handler (one source

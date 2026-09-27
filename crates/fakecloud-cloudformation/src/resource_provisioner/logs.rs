@@ -34,8 +34,10 @@ impl ResourceProvisioner {
             .map(String::from);
 
         let arn = format!(
-            "arn:aws:logs:{}:{}:destination:{destination_name}",
-            self.region, self.account_id
+            "arn:{}:logs:{}:{}:destination:{destination_name}",
+            partition_for(&self.region),
+            self.region,
+            self.account_id
         );
         let dest = Destination {
             destination_name: destination_name.clone(),
@@ -194,8 +196,10 @@ impl ResourceProvisioner {
         });
 
         let arn = format!(
-            "arn:aws:logs:{}:{}:delivery-destination:{name}",
-            self.region, self.account_id
+            "arn:{}:logs:{}:{}:delivery-destination:{name}",
+            partition_for(&self.region),
+            self.region,
+            self.account_id
         );
         let delivery_destination_type = props
             .get("DeliveryDestinationType")
@@ -267,8 +271,10 @@ impl ResourceProvisioner {
             .to_string();
 
         let arn = format!(
-            "arn:aws:logs:{}:{}:delivery-source:{name}",
-            self.region, self.account_id
+            "arn:{}:logs:{}:{}:delivery-source:{name}",
+            partition_for(&self.region),
+            self.region,
+            self.account_id
         );
         let ds = DeliverySource {
             name: name.clone(),
@@ -320,8 +326,10 @@ impl ResourceProvisioner {
 
         let id = Uuid::new_v4().simple().to_string();
         let arn = format!(
-            "arn:aws:logs:{}:{}:delivery:{id}",
-            self.region, self.account_id
+            "arn:{}:logs:{}:{}:delivery:{id}",
+            partition_for(&self.region),
+            self.region,
+            self.account_id
         );
         let delivery = Delivery {
             id: id.clone(),

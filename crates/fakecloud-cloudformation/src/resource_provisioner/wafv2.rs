@@ -135,8 +135,13 @@ impl ResourceProvisioner {
             (self.region.as_str(), self.region.clone())
         };
         let arn = format!(
-            "arn:aws:wafv2:{}:{}:{}/webacl/{}/{}",
-            region_in_arn, self.account_id, scope_seg, name, id
+            "arn:{}:wafv2:{}:{}:{}/webacl/{}/{}",
+            partition_for(&self.region),
+            region_in_arn,
+            self.account_id,
+            scope_seg,
+            name,
+            id
         );
         let acl = WebAcl {
             id: id.clone(),
@@ -230,8 +235,13 @@ impl ResourceProvisioner {
             (self.region.as_str(), self.region.clone())
         };
         let arn = format!(
-            "arn:aws:wafv2:{}:{}:{}/ipset/{}/{}",
-            region_in_arn, self.account_id, scope_seg, name, id
+            "arn:{}:wafv2:{}:{}:{}/ipset/{}/{}",
+            partition_for(&self.region),
+            region_in_arn,
+            self.account_id,
+            scope_seg,
+            name,
+            id
         );
         let ip_set = IpSet {
             id: id.clone(),
@@ -310,8 +320,13 @@ impl ResourceProvisioner {
             (self.region.as_str(), self.region.clone())
         };
         let arn = format!(
-            "arn:aws:wafv2:{}:{}:{}/regexpatternset/{}/{}",
-            region_in_arn, self.account_id, scope_seg, name, id
+            "arn:{}:wafv2:{}:{}:{}/regexpatternset/{}/{}",
+            partition_for(&self.region),
+            region_in_arn,
+            self.account_id,
+            scope_seg,
+            name,
+            id
         );
         let set = RegexPatternSet {
             id: id.clone(),
@@ -387,8 +402,13 @@ impl ResourceProvisioner {
             (self.region.as_str(), self.region.clone())
         };
         let arn = format!(
-            "arn:aws:wafv2:{}:{}:{}/rulegroup/{}/{}",
-            region_in_arn, self.account_id, scope_seg, name, id
+            "arn:{}:wafv2:{}:{}:{}/rulegroup/{}/{}",
+            partition_for(&self.region),
+            region_in_arn,
+            self.account_id,
+            scope_seg,
+            name,
+            id
         );
         let rg = RuleGroup {
             id: id.clone(),

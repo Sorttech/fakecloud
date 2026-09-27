@@ -271,8 +271,10 @@ impl ResourceProvisioner {
         let etag = format!("E{etag_suffix}");
         let domain_name = format!("{}.cloudfront.net", id.to_lowercase());
         let arn = format!(
-            "arn:aws:cloudfront::{}:distribution/{}",
-            self.account_id, id
+            "arn:{}:cloudfront::{}:distribution/{}",
+            partition_for(&self.region),
+            self.account_id,
+            id
         );
 
         let stored = StoredDistribution {
@@ -623,8 +625,13 @@ impl ResourceProvisioner {
 
         let id = format!("FN{}", fakecloud_core::ids::short_id(12).to_uppercase());
         let etag = format!("E{}", fakecloud_core::ids::short_id(7).to_uppercase());
-        let function_arn =
-            Arn::global("cloudfront", &self.account_id, &format!("function/{name}")).to_string();
+        let function_arn = Arn::global_in(
+            &self.region,
+            "cloudfront",
+            &self.account_id,
+            &format!("function/{name}"),
+        )
+        .to_string();
 
         let now = Utc::now();
         let func = StoredFunction {

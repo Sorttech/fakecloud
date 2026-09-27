@@ -50,7 +50,8 @@ impl ResourceProvisioner {
 
         // Mint a deterministic-ish ARN — ACM uses a UUID per certificate.
         let arn = format!(
-            "arn:aws:acm:{}:{}:certificate/{}",
+            "arn:{}:acm:{}:{}:certificate/{}",
+            partition_for(&self.region),
             self.region,
             self.account_id,
             Uuid::new_v4()

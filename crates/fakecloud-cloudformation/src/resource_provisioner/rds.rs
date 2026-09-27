@@ -135,8 +135,11 @@ impl ResourceProvisioner {
             .unwrap_or("")
             .to_string();
         let arn = format!(
-            "arn:aws:rds:{}:{}:cluster-pg:{}",
-            self.region, self.account_id, name
+            "arn:{}:rds:{}:{}:cluster-pg:{}",
+            partition_for(&self.region),
+            self.region,
+            self.account_id,
+            name
         );
         let entry = serde_json::json!({
             "DBClusterParameterGroupName": name,
@@ -189,8 +192,11 @@ impl ResourceProvisioner {
             .unwrap_or("")
             .to_string();
         let arn = format!(
-            "arn:aws:rds:{}:{}:og:{}",
-            self.region, self.account_id, name
+            "arn:{}:rds:{}:{}:og:{}",
+            partition_for(&self.region),
+            self.region,
+            self.account_id,
+            name
         );
         let entry = serde_json::json!({
             "OptionGroupName": name,
@@ -304,8 +310,11 @@ impl ResourceProvisioner {
             .unwrap_or("POSTGRESQL")
             .to_string();
         let arn = format!(
-            "arn:aws:rds:{}:{}:db-proxy:{}",
-            self.region, self.account_id, name
+            "arn:{}:rds:{}:{}:db-proxy:{}",
+            partition_for(&self.region),
+            self.region,
+            self.account_id,
+            name
         );
         let endpoint = format!("{name}.proxy-default.{}.rds.amazonaws.com", self.region);
         let entry = serde_json::json!({
@@ -468,7 +477,7 @@ impl ResourceProvisioner {
         let state = accounts.get_or_create(&self.account_id);
         // Build the instance ARN from the stack's request region (self.region),
         // not the RDS sub-service state's frozen startup region.
-        let arn = Arn::new(
+        let arn = Arn::regional(
             "rds",
             &self.region,
             &state.account_id,
@@ -823,8 +832,11 @@ impl ResourceProvisioner {
         let mut accounts = self.rds_state.write();
         let state = accounts.get_or_create(&self.account_id);
         let arn = format!(
-            "arn:aws:rds:{}:{}:cluster:{}",
-            self.region, state.account_id, identifier
+            "arn:{}:rds:{}:{}:cluster:{}",
+            partition_for(&self.region),
+            self.region,
+            state.account_id,
+            identifier
         );
         let cluster_resource_id = format!("cluster-{}", Uuid::new_v4().simple());
         let endpoint = format!(

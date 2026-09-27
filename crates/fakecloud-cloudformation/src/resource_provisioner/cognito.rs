@@ -31,8 +31,11 @@ impl ResourceProvisioner {
                 .collect::<String>()
         );
         let arn = format!(
-            "arn:aws:cognito-idp:{}:{}:userpool/{}",
-            self.region, self.account_id, pool_id
+            "arn:{}:cognito-idp:{}:{}:userpool/{}",
+            partition_for(&self.region),
+            self.region,
+            self.account_id,
+            pool_id
         );
         let now = Utc::now();
 

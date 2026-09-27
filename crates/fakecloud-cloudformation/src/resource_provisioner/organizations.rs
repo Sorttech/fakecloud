@@ -93,8 +93,11 @@ impl ResourceProvisioner {
             .collect();
         let id = format!("ou-{}-{}", &org.root_id[2..], id_suffix);
         let arn = format!(
-            "arn:aws:organizations::{}:ou/{}/{}",
-            org.management_account_id, org.org_id, id
+            "arn:{}:organizations::{}:ou/{}/{}",
+            arn_partition(&org.root_arn),
+            org.management_account_id,
+            org.org_id,
+            id
         );
         org.ous.insert(
             id.clone(),
@@ -321,7 +324,8 @@ impl ResourceProvisioner {
             .collect();
         let id = format!("p-{}", id_suffix);
         let arn = format!(
-            "arn:aws:organizations::{}:policy/{}/{}/{}",
+            "arn:{}:organizations::{}:policy/{}/{}/{}",
+            arn_partition(&org.root_arn),
             org.management_account_id,
             org.org_id,
             policy_type.to_lowercase(),
@@ -384,8 +388,10 @@ impl ResourceProvisioner {
             .ok_or_else(|| "Organization not yet created".to_string())?;
         org.resource_policy = Some(content);
         let arn = format!(
-            "arn:aws:organizations::{}:resourcepolicy/{}/rp",
-            org.management_account_id, org.org_id
+            "arn:{}:organizations::{}:resourcepolicy/{}/rp",
+            arn_partition(&org.root_arn),
+            org.management_account_id,
+            org.org_id
         );
         Ok(ProvisionResult::new(arn.clone()).with("Arn", arn))
     }

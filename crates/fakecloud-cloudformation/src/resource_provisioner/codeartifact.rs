@@ -15,6 +15,7 @@
 //!   Repository -> Arn, DomainName, DomainOwner, Name
 
 use chrono::{DateTime, Utc};
+use fakecloud_aws::arn::partition_for;
 use serde_json::{json, Value};
 
 use super::{ProvisionResult, ResourceDefinition, ResourceProvisioner, StackResource};
@@ -30,11 +31,18 @@ impl ResourceProvisioner {
         let name = ca_str(props, "DomainName").unwrap_or_else(|| self.physical_name(resource));
         let owner = self.account_id.clone();
         let region = self.region.clone();
-        let arn = format!("arn:aws:codeartifact:{region}:{owner}:domain/{name}");
+        let arn = format!(
+            "arn:{}:codeartifact:{region}:{owner}:domain/{name}",
+            partition_for(&region)
+        );
         // Mirror the direct CreateDomain handler: an omitted EncryptionKey mints a
         // synthetic KMS key ARN so the stored description round-trips a key.
         let encryption_key = ca_str(props, "EncryptionKey").unwrap_or_else(|| {
-            format!("arn:aws:kms:{region}:{owner}:key/{}", uuid::Uuid::new_v4())
+            format!(
+                "arn:{}:kms:{region}:{owner}:key/{}",
+                partition_for(&region),
+                uuid::Uuid::new_v4()
+            )
         });
 
         let mut guard = self.codeartifact_state.write();
@@ -54,7 +62,7 @@ impl ResourceProvisioner {
             "encryptionKey": encryption_key.clone(),
             "repositoryCount": 0,
             "assetSizeBytes": 0,
-            "s3BucketArn": format!("arn:aws:s3:::assets-{owner}-{region}"),
+            "s3BucketArn": format!("arn:{}:s3:::assets-{owner}-{region}", partition_for(&region)),
         });
         acct.domains.insert(name.clone(), desc);
         acct.domain_order.push(name.clone());
@@ -188,7 +196,10 @@ impl ResourceProvisioner {
             .ok_or_else(|| "AWS::CodeArtifact::Repository requires DomainName".to_string())?;
         let owner = ca_str(props, "DomainOwner").unwrap_or_else(|| self.account_id.clone());
         let region = self.region.clone();
-        let arn = format!("arn:aws:codeartifact:{region}:{owner}:repository/{domain}/{repo}");
+        let arn = format!(
+            "arn:{}:codeartifact:{region}:{owner}:repository/{domain}/{repo}",
+            partition_for(&region)
+        );
         let key = format!("{domain}/{repo}");
         let description = ca_str(props, "Description").unwrap_or_default();
         let upstreams = cfn_upstreams(props);

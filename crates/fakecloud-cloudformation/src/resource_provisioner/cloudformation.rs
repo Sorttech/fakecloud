@@ -57,7 +57,8 @@ impl ResourceProvisioner {
         // AWS names a nested stack `{ParentStack}-{LogicalId}-{SUFFIX}`.
         let child_stack_name = self.physical_name(resource);
         let child_stack_id = format!(
-            "arn:aws:cloudformation:{}:{}:stack/{}/{}",
+            "arn:{}:cloudformation:{}:{}:stack/{}/{}",
+            partition_for(&self.region),
             self.region,
             self.account_id,
             child_stack_name,

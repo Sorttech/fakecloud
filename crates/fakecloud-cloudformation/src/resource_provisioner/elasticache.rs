@@ -27,8 +27,11 @@ impl ResourceProvisioner {
             .unwrap_or("")
             .to_string();
         let arn = format!(
-            "arn:aws:elasticache:{}:{}:parametergroup:{}",
-            self.region, self.account_id, name
+            "arn:{}:elasticache:{}:{}:parametergroup:{}",
+            partition_for(&self.region),
+            self.region,
+            self.account_id,
+            name
         );
         let group = CacheParameterGroup {
             cache_parameter_group_name: name.clone(),
@@ -82,8 +85,11 @@ impl ResourceProvisioner {
             })
             .unwrap_or_default();
         let arn = format!(
-            "arn:aws:elasticache:{}:{}:subnetgroup:{}",
-            self.region, self.account_id, name
+            "arn:{}:elasticache:{}:{}:subnetgroup:{}",
+            partition_for(&self.region),
+            self.region,
+            self.account_id,
+            name
         );
         let group = CacheSubnetGroup {
             cache_subnet_group_name: name.clone(),
@@ -122,8 +128,11 @@ impl ResourceProvisioner {
             .unwrap_or("")
             .to_string();
         let arn = format!(
-            "arn:aws:elasticache:{}:{}:securitygroup:{}",
-            self.region, self.account_id, name
+            "arn:{}:elasticache:{}:{}:securitygroup:{}",
+            partition_for(&self.region),
+            self.region,
+            self.account_id,
+            name
         );
         let group = CacheSecurityGroup {
             cache_security_group_name: name.clone(),
@@ -178,8 +187,11 @@ impl ResourceProvisioner {
             .unwrap_or("no-password-required")
             .to_string();
         let arn = format!(
-            "arn:aws:elasticache:{}:{}:user:{}",
-            self.region, self.account_id, user_id
+            "arn:{}:elasticache:{}:{}:user:{}",
+            partition_for(&self.region),
+            self.region,
+            self.account_id,
+            user_id
         );
         let user = EcUser {
             user_id: user_id.clone(),
@@ -264,8 +276,11 @@ impl ResourceProvisioner {
             })
             .unwrap_or_default();
         let arn = format!(
-            "arn:aws:elasticache:{}:{}:usergroup:{}",
-            self.region, self.account_id, user_group_id
+            "arn:{}:elasticache:{}:{}:usergroup:{}",
+            partition_for(&self.region),
+            self.region,
+            self.account_id,
+            user_group_id
         );
         let group = EcUserGroup {
             user_group_id: user_group_id.clone(),
@@ -472,8 +487,11 @@ impl ResourceProvisioner {
         let mut accounts = self.elasticache_state.write();
         let state = accounts.get_or_create(&self.account_id);
         let arn = format!(
-            "arn:aws:elasticache:{}:{}:cluster:{}",
-            self.region, state.account_id, id
+            "arn:{}:elasticache:{}:{}:cluster:{}",
+            partition_for(&self.region),
+            self.region,
+            state.account_id,
+            id
         );
         let endpoint_address = format!("{id}.fakecloud.{}.cache.amazonaws.com", self.region);
         let cluster = EcCacheCluster {
@@ -756,8 +774,11 @@ impl ResourceProvisioner {
         let mut accounts = self.elasticache_state.write();
         let state = accounts.get_or_create(&self.account_id);
         let arn = format!(
-            "arn:aws:elasticache:{}:{}:replicationgroup:{}",
-            self.region, state.account_id, id
+            "arn:{}:elasticache:{}:{}:replicationgroup:{}",
+            partition_for(&self.region),
+            self.region,
+            state.account_id,
+            id
         );
         let endpoint_address =
             format!("{id}.fakecloud.ng.0001.{}.cache.amazonaws.com", self.region);

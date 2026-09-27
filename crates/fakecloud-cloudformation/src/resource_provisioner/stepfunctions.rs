@@ -34,8 +34,11 @@ impl ResourceProvisioner {
         let tracing_configuration = props.get("TracingConfiguration").cloned();
 
         let arn = format!(
-            "arn:aws:states:{}:{}:stateMachine:{}",
-            self.region, self.account_id, name
+            "arn:{}:states:{}:{}:stateMachine:{}",
+            partition_for(&self.region),
+            self.region,
+            self.account_id,
+            name
         );
         let now = Utc::now();
         let revision_id = Uuid::new_v4().to_string();
@@ -187,8 +190,11 @@ impl ResourceProvisioner {
             .ok_or("Name is required")?
             .to_string();
         let arn = format!(
-            "arn:aws:states:{}:{}:activity:{}",
-            self.region, self.account_id, name
+            "arn:{}:states:{}:{}:activity:{}",
+            partition_for(&self.region),
+            self.region,
+            self.account_id,
+            name
         );
         let activity = SfnActivity {
             name: name.clone(),
@@ -318,8 +324,10 @@ impl ResourceProvisioner {
             .map(|(root, _)| root.to_string())
             .unwrap_or_else(|| {
                 format!(
-                    "arn:aws:states:{}:{}:stateMachine:unknown",
-                    self.region, self.account_id
+                    "arn:{}:states:{}:{}:stateMachine:unknown",
+                    partition_for(&self.region),
+                    self.region,
+                    self.account_id
                 )
             });
         let arn = format!("{sm_arn_root}:{name}");

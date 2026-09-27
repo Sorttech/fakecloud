@@ -29,7 +29,8 @@ impl ResourceProvisioner {
         let mut accounts = self.ssm_state.write();
         let state = accounts.get_or_create(&self.account_id);
         let arn = format!(
-            "arn:aws:ssm:{}:{}:parameter{}",
+            "arn:{}:ssm:{}:{}:parameter{}",
+            partition_for(&self.region),
             self.region,
             self.account_id,
             if name.starts_with('/') {

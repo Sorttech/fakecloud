@@ -33,13 +33,20 @@ impl ResourceProvisioner {
 
         let arn = if event_bus_name == "default" {
             format!(
-                "arn:aws:events:{}:{}:rule/{}",
-                self.region, state.account_id, rule_name
+                "arn:{}:events:{}:{}:rule/{}",
+                partition_for(&self.region),
+                self.region,
+                state.account_id,
+                rule_name
             )
         } else {
             format!(
-                "arn:aws:events:{}:{}:rule/{}/{}",
-                self.region, state.account_id, event_bus_name, rule_name
+                "arn:{}:events:{}:{}:rule/{}/{}",
+                partition_for(&self.region),
+                self.region,
+                state.account_id,
+                event_bus_name,
+                rule_name
             )
         };
 
@@ -205,14 +212,16 @@ impl ResourceProvisioner {
         }
         let now = Utc::now();
         let arn = format!(
-            "arn:aws:events:{}:{}:connection/{}/{}",
+            "arn:{}:events:{}:{}:connection/{}/{}",
+            partition_for(&self.region),
             self.region,
             state.account_id,
             name,
             Uuid::new_v4().as_simple()
         );
         let secret_arn = format!(
-            "arn:aws:secretsmanager:{}:{}:secret:events!connection/{}-{}",
+            "arn:{}:secretsmanager:{}:{}:secret:events!connection/{}-{}",
+            partition_for(&self.region),
             self.region,
             state.account_id,
             name,
@@ -285,7 +294,8 @@ impl ResourceProvisioner {
         }
         let now = Utc::now();
         let arn = format!(
-            "arn:aws:events:{}:{}:api-destination/{}/{}",
+            "arn:{}:events:{}:{}:api-destination/{}/{}",
+            partition_for(&self.region),
             self.region,
             state.account_id,
             name,
@@ -358,8 +368,11 @@ impl ResourceProvisioner {
             return Err(format!("Archive {name} already exists"));
         }
         let arn = format!(
-            "arn:aws:events:{}:{}:archive/{}",
-            self.region, state.account_id, name
+            "arn:{}:events:{}:{}:archive/{}",
+            partition_for(&self.region),
+            self.region,
+            state.account_id,
+            name
         );
         state.archives.insert(
             name.clone(),
@@ -409,8 +422,10 @@ impl ResourceProvisioner {
         let dead_letter_config = props.get("DeadLetterConfig").cloned();
         let policy = props.get("Policy").cloned();
         let arn = format!(
-            "arn:aws:events:{}:{}:event-bus/{name}",
-            self.region, self.account_id
+            "arn:{}:events:{}:{}:event-bus/{name}",
+            partition_for(&self.region),
+            self.region,
+            self.account_id
         );
         let now = Utc::now();
         let bus = EventBus {
@@ -473,7 +488,7 @@ impl ResourceProvisioner {
             let mut obj = serde_json::json!({
                 "Effect": "Allow",
                 "Resource": format!(
-                    "arn:aws:events:{}:{}:event-bus/{bus_name}",
+                    "arn:{}:events:{}:{}:event-bus/{bus_name}", partition_for(&self.region),
                     self.region, self.account_id
                 ),
             });
@@ -571,8 +586,10 @@ impl ResourceProvisioner {
 
         let endpoint_id = fakecloud_core::ids::short_id(16).to_string();
         let arn = format!(
-            "arn:aws:events:{}:{}:endpoint/{name}",
-            self.region, self.account_id
+            "arn:{}:events:{}:{}:endpoint/{name}",
+            partition_for(&self.region),
+            self.region,
+            self.account_id
         );
         let endpoint_url = format!("https://{endpoint_id}.endpoint.events.amazonaws.com");
         let now = Utc::now();

@@ -15,7 +15,7 @@ use http::StatusCode;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
-use fakecloud_aws::arn::Arn;
+use fakecloud_aws::arn::{partition_for, Arn};
 use fakecloud_aws::xml::xml_escape;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
@@ -134,6 +134,7 @@ fn register_hook(
 /// (unused today but handy for callers). (bug-audit 2026-06-13, 1.8).
 struct HookTarget<'a> {
     account_id: &'a str,
+    region: &'a str,
     target_type: &'a str,
     target_id: &'a str,
     logical_resource_id: &'a str,
@@ -148,6 +149,7 @@ fn record_hook_results(
 ) {
     let HookTarget {
         account_id,
+        region,
         target_type,
         target_id,
         logical_resource_id,
@@ -173,9 +175,9 @@ fn record_hook_results(
             "HOOK_COMPLETE_SUCCEEDED"
         };
         let result_id = rand_id();
-        let type_arn = Arn::new(
+        let type_arn = Arn::regional(
             "cloudformation",
-            "us-east-1",
+            region,
             account_id,
             &format!("type/hook/{}", type_name.replace("::", "-")),
         )
@@ -877,9 +879,9 @@ impl CloudFormationService {
                     }
                 }
 
-                let id = Arn::new(
+                let id = Arn::regional(
                     "cloudformation",
-                    "us-east-1",
+                    &req.region,
                     &aid,
                     &format!("changeSet/{cs_name}/{}", rand_id()),
                 )
@@ -888,9 +890,9 @@ impl CloudFormationService {
                     .as_ref()
                     .map(|(s, _)| s.clone())
                     .unwrap_or_else(|| {
-                        Arn::new(
+                        Arn::regional(
                             "cloudformation",
-                            "us-east-1",
+                            &req.region,
                             &aid,
                             &format!("stack/{stack_name}/{}", rand_id()),
                         )
@@ -1292,6 +1294,7 @@ impl CloudFormationService {
                             &cs_hooks,
                             &HookTarget {
                                 account_id: &aid,
+                                region: &req.region,
                                 target_type: "CLOUD_FORMATION",
                                 target_id: &target_id,
                                 logical_resource_id: &stack_name,
@@ -1487,6 +1490,7 @@ impl CloudFormationService {
                         &cs_hooks,
                         &HookTarget {
                             account_id: &aid,
+                            region: &req.region,
                             target_type: "CLOUD_FORMATION",
                             target_id: &sid,
                             logical_resource_id: &stack_name_owned,
@@ -1631,9 +1635,9 @@ impl CloudFormationService {
 
             // ── Types / extensions ──
             "ActivateType" => {
-                let arn = Arn::new(
+                let arn = Arn::regional(
                     "cloudformation",
-                    "us-east-1",
+                    &req.region,
                     &aid,
                     &format!("type/resource/{}", rand_id()),
                 )
@@ -1664,7 +1668,7 @@ impl CloudFormationService {
             "DeactivateType" => Ok(xml_response("DeactivateType", String::new(), &rid)),
             "DescribeType" => {
                 let arn = params.get("Arn").cloned().unwrap_or_else(|| {
-                    Arn::new("cloudformation", "us-east-1", &aid, "type/resource/Default")
+                    Arn::regional("cloudformation", &req.region, &aid, "type/resource/Default")
                         .to_string()
                 });
                 let inner = format!(
@@ -1766,9 +1770,9 @@ impl CloudFormationService {
                         );
                     }
                 }
-                let arn = Arn::new(
+                let arn = Arn::regional(
                     "cloudformation",
-                    "us-east-1",
+                    &req.region,
                     &aid,
                     &format!("type-config/{}", rand_id()),
                 )
@@ -1786,9 +1790,9 @@ impl CloudFormationService {
                 Ok(xml_response("SetTypeDefaultVersion", String::new(), &rid))
             }
             "TestType" => {
-                let arn = Arn::new(
+                let arn = Arn::regional(
                     "cloudformation",
-                    "us-east-1",
+                    &req.region,
                     &aid,
                     &format!("type/resource/{}", rand_id()),
                 )
@@ -1800,9 +1804,9 @@ impl CloudFormationService {
                 ))
             }
             "PublishType" => {
-                let arn = Arn::new(
+                let arn = Arn::regional(
                     "cloudformation",
-                    "us-east-1",
+                    &req.region,
                     &aid,
                     &format!("type/resource/{}", rand_id()),
                 )
@@ -1839,9 +1843,9 @@ impl CloudFormationService {
                     .get("GeneratedTemplateName")
                     .ok_or_else(|| missing("GeneratedTemplateName"))?
                     .clone();
-                let id = Arn::new(
+                let id = Arn::regional(
                     "cloudformation",
-                    "us-east-1",
+                    &req.region,
                     &aid,
                     &format!("generatedtemplate/{}", rand_id()),
                 )
@@ -1864,9 +1868,9 @@ impl CloudFormationService {
                     .get("GeneratedTemplateName")
                     .ok_or_else(|| missing("GeneratedTemplateName"))?
                     .clone();
-                let id = Arn::new(
+                let id = Arn::regional(
                     "cloudformation",
-                    "us-east-1",
+                    &req.region,
                     &aid,
                     &format!("generatedtemplate/{name}"),
                 )
@@ -1886,11 +1890,12 @@ impl CloudFormationService {
                     .ok_or_else(|| missing("GeneratedTemplateName"))?
                     .clone();
                 let inner = format!(
-                    "    <GeneratedTemplateId>arn:aws:cloudformation:us-east-1:{}:generatedtemplate/{}</GeneratedTemplateId>\n    <GeneratedTemplateName>{}</GeneratedTemplateName>\n    <Status>COMPLETE</Status>",
+                    "    <GeneratedTemplateId>arn:{}:cloudformation:{}:{}:generatedtemplate/{}</GeneratedTemplateId>\n    <GeneratedTemplateName>{}</GeneratedTemplateName>\n    <Status>COMPLETE</Status>",
+                    partition_for(&req.region),
+                    xml_escape(&req.region),
                     xml_escape(&aid),
                     xml_escape(&name),
-                    xml_escape(&name),
-                );
+                    xml_escape(&name),);
                 Ok(xml_response("DescribeGeneratedTemplate", inner, &rid))
             }
             "GetGeneratedTemplate" => {
@@ -1922,9 +1927,9 @@ impl CloudFormationService {
 
             // ── Resource scans ──
             "StartResourceScan" => {
-                let id = Arn::new(
+                let id = Arn::regional(
                     "cloudformation",
-                    "us-east-1",
+                    &req.region,
                     &aid,
                     &format!("resourceScan/{}", rand_id()),
                 )
@@ -2094,9 +2099,9 @@ impl CloudFormationService {
                     .as_str()
                     .map(str::to_owned)
                     .unwrap_or_else(|| {
-                        Arn::new(
+                        Arn::regional(
                             "cloudformation",
-                            "us-east-1",
+                            &req.region,
                             &aid,
                             &format!("stack/drift-{id}/{}", rand_id()),
                         )
@@ -3449,6 +3454,71 @@ pub(crate) mod tests {
 
     fn body_str(resp: &fakecloud_core::service::AwsResponse) -> String {
         String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap()
+    }
+
+    #[test]
+    fn change_set_in_china_uses_the_aws_cn_partition() {
+        let s = svc();
+        let in_cn = |action: &str, params: &[(&str, &str)]| {
+            let mut r = req(action, params);
+            r.region = "cn-north-1".to_string();
+            r
+        };
+        s.handle_extra_action(&in_cn(
+            "SetTypeConfiguration",
+            &[
+                ("Type", "HOOK"),
+                ("TypeName", "MyOrg::MyHook::Hook"),
+                (
+                    "Configuration",
+                    r#"{"CloudFormationConfiguration":{"HookConfiguration":{"FailureMode":"WARN"}}}"#,
+                ),
+            ],
+        ))
+        .expect("SetTypeConfiguration");
+        let resp = s
+            .handle_extra_action(&in_cn(
+                "CreateChangeSet",
+                &[
+                    ("StackName", "cn-stack"),
+                    ("ChangeSetName", "cs1"),
+                    ("ChangeSetType", "CREATE"),
+                ],
+            ))
+            .expect("CreateChangeSet");
+        let xml = body_str(&resp);
+        let tag = |xml: &str, name: &str| {
+            xml.split(&format!("<{name}>"))
+                .nth(1)
+                .and_then(|r| r.split(&format!("</{name}>")).next())
+                .unwrap_or_else(|| panic!("no {name} in {xml}"))
+                .to_string()
+        };
+        let cs_id = tag(&xml, "Id");
+        assert!(
+            cs_id.starts_with("arn:aws-cn:cloudformation:cn-north-1:000000000000:changeSet/cs1/"),
+            "{cs_id}"
+        );
+        assert!(tag(&xml, "StackId")
+            .starts_with("arn:aws-cn:cloudformation:cn-north-1:000000000000:stack/cn-stack/"));
+        s.handle_extra_action(&in_cn("DescribeChangeSet", &[("ChangeSetName", &cs_id)]))
+            .expect("DescribeChangeSet by ARN");
+        s.handle_extra_action(&in_cn("ExecuteChangeSet", &[("ChangeSetName", &cs_id)]))
+            .expect("ExecuteChangeSet by ARN");
+        let xml = body_str(
+            &s.handle_extra_action(&in_cn(
+                "ListHookResults",
+                &[
+                    ("TargetType", "CLOUD_FORMATION"),
+                    (
+                        "TypeArn",
+                        "arn:aws-cn:cloudformation:cn-north-1:000000000000:type/hook/MyOrg-MyHook-Hook",
+                    ),
+                ],
+            ))
+            .expect("ListHookResults"),
+        );
+        assert!(xml.contains("MyOrg::MyHook::Hook"), "{xml}");
     }
 
     #[test]

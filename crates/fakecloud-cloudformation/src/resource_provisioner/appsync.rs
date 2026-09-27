@@ -9,6 +9,7 @@
 //! ids encode the parent api id (`<apiId>|<name>` / `<apiId>|<type>|<field>`) to
 //! keep delete / `Fn::GetAtt` self-contained.
 
+use fakecloud_aws::arn::partition_for;
 use serde_json::{json, Value};
 
 use super::{
@@ -26,7 +27,10 @@ impl ResourceProvisioner {
         let region = &self.region;
         let account = &self.account_id;
         let api_id = gen_api_id();
-        let arn = format!("arn:aws:appsync:{region}:{account}:apis/{api_id}");
+        let arn = format!(
+            "arn:{}:appsync:{region}:{account}:apis/{api_id}",
+            partition_for(region)
+        );
         let graphql_url = format!("https://{api_id}.appsync-api.{region}.amazonaws.com/graphql");
         let realtime_url =
             format!("wss://{api_id}.appsync-realtime-api.{region}.amazonaws.com/graphql");
@@ -195,7 +199,10 @@ impl ResourceProvisioner {
             .unwrap_or_else(|| self.physical_name(resource));
         let region = &self.region;
         let account = &self.account_id;
-        let arn = format!("arn:aws:appsync:{region}:{account}:apis/{api_id}/datasources/{name}");
+        let arn = format!(
+            "arn:{}:appsync:{region}:{account}:apis/{api_id}/datasources/{name}",
+            partition_for(region)
+        );
 
         let mut ds = match cfn_props_to_camel(props, &[]) {
             Value::Object(m) => m,
@@ -324,7 +331,8 @@ impl ResourceProvisioner {
         let region = &self.region;
         let account = &self.account_id;
         let arn = format!(
-            "arn:aws:appsync:{region}:{account}:apis/{api_id}/types/{type_name}/resolvers/{field}"
+            "arn:{}:appsync:{region}:{account}:apis/{api_id}/types/{type_name}/resolvers/{field}",
+            partition_for(region)
         );
 
         let mut r = match cfn_props_to_camel(props, &[]) {

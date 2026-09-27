@@ -4,6 +4,7 @@
 //! CFN-time). Writes through the batch service's snapshot hook so the
 //! resources survive a restart (the #1766 lesson).
 
+use fakecloud_aws::arn::partition_for;
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
@@ -25,7 +26,8 @@ fn copy_prop(stored: &mut Map<String, Value>, props: &Value, cfn_key: &str, api_
 impl ResourceProvisioner {
     fn batch_arn(&self, kind: &str, name: &str) -> String {
         format!(
-            "arn:aws:batch:{}:{}:{kind}/{name}-{}",
+            "arn:{}:batch:{}:{}:{kind}/{name}-{}",
+            partition_for(&self.region),
             self.region,
             self.account_id,
             Uuid::new_v4().simple()
@@ -81,8 +83,10 @@ impl ResourceProvisioner {
         stored.insert(
             "ecsClusterArn".into(),
             json!(format!(
-                "arn:aws:ecs:{}:{}:cluster/AWSBatch-{name}-{uuid}",
-                self.region, self.account_id
+                "arn:{}:ecs:{}:{}:cluster/AWSBatch-{name}-{uuid}",
+                partition_for(&self.region),
+                self.region,
+                self.account_id
             )),
         );
         stored.insert("uuid".into(), json!(uuid));
@@ -161,8 +165,10 @@ impl ResourceProvisioner {
             *revision += 1;
             let revision = *revision;
             arn = format!(
-                "arn:aws:batch:{}:{}:job-definition/{name}:{revision}",
-                self.region, self.account_id
+                "arn:{}:batch:{}:{}:job-definition/{name}:{revision}",
+                partition_for(&self.region),
+                self.region,
+                self.account_id
             );
             let mut stored = Map::new();
             stored.insert("jobDefinitionName".into(), json!(name));
@@ -221,8 +227,10 @@ impl ResourceProvisioner {
             .map(String::from)
             .unwrap_or_else(|| self.physical_name(resource));
         let arn = format!(
-            "arn:aws:batch:{}:{}:scheduling-policy/{name}",
-            self.region, self.account_id
+            "arn:{}:batch:{}:{}:scheduling-policy/{name}",
+            partition_for(&self.region),
+            self.region,
+            self.account_id
         );
         let mut stored = Map::new();
         stored.insert("name".into(), json!(name));

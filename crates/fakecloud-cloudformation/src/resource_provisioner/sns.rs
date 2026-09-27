@@ -115,8 +115,11 @@ impl ResourceProvisioner {
         let mut __sns_mas = self.sns_state.write();
         let state = __sns_mas.get_or_create(&self.account_id);
         let topic_arn = format!(
-            "arn:aws:sns:{}:{}:{}",
-            self.region, state.account_id, topic_name
+            "arn:{}:sns:{}:{}:{}",
+            partition_for(&self.region),
+            self.region,
+            state.account_id,
+            topic_name
         );
 
         // Carry the topic configuration attributes a CFN topic can set, so

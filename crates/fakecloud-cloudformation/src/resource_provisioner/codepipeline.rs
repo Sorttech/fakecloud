@@ -8,6 +8,7 @@
 //! `Ref` resolves to the pipeline name; `Fn::GetAtt Version` to the pipeline
 //! version. The physical id IS the pipeline name.
 
+use fakecloud_aws::arn::partition_for;
 use serde_json::{json, Value};
 
 use super::{cfn_props_to_camel, ProvisionResult, ResourceDefinition, ResourceProvisioner};
@@ -60,7 +61,10 @@ impl ResourceProvisioner {
 
         let region = &self.region;
         let account = &self.account_id;
-        let arn = format!("arn:aws:codepipeline:{region}:{account}:{name}");
+        let arn = format!(
+            "arn:{}:codepipeline:{region}:{account}:{name}",
+            partition_for(region)
+        );
         let now = ts_now();
 
         let mut guard = self.codepipeline_state.write();

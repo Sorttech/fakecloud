@@ -26,6 +26,7 @@
 //! `IncorrectFileSystemLifeCycleState` guard the direct `CreateMountTarget`
 //! enforces.
 
+use fakecloud_aws::arn::partition_for;
 use serde_json::{json, Map, Value};
 
 use super::{ProvisionResult, ResourceDefinition, ResourceProvisioner, StackResource};
@@ -109,7 +110,8 @@ impl ResourceProvisioner {
                 .map(str::to_string)
                 .unwrap_or_else(|| {
                     format!(
-                        "arn:aws:kms:{}:{}:key/{}",
+                        "arn:{}:kms:{}:{}:key/{}",
+                        partition_for(&self.region),
                         self.region,
                         self.account_id,
                         uuid::Uuid::new_v4()
@@ -602,15 +604,21 @@ impl ResourceProvisioner {
 
     fn efs_fs_arn(&self, fsid: &str) -> String {
         format!(
-            "arn:aws:elasticfilesystem:{}:{}:file-system/{}",
-            self.region, self.account_id, fsid
+            "arn:{}:elasticfilesystem:{}:{}:file-system/{}",
+            partition_for(&self.region),
+            self.region,
+            self.account_id,
+            fsid
         )
     }
 
     fn efs_ap_arn(&self, apid: &str) -> String {
         format!(
-            "arn:aws:elasticfilesystem:{}:{}:access-point/{}",
-            self.region, self.account_id, apid
+            "arn:{}:elasticfilesystem:{}:{}:access-point/{}",
+            partition_for(&self.region),
+            self.region,
+            self.account_id,
+            apid
         )
     }
 

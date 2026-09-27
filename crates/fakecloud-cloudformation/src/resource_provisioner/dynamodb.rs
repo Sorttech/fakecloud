@@ -143,8 +143,11 @@ impl ResourceProvisioner {
         let mut __ddb_mas = self.dynamodb_state.write();
         let state = __ddb_mas.get_or_create(&self.account_id);
         let arn = format!(
-            "arn:aws:dynamodb:{}:{}:table/{}",
-            self.region, state.account_id, table_name
+            "arn:{}:dynamodb:{}:{}:table/{}",
+            partition_for(&self.region),
+            self.region,
+            state.account_id,
+            table_name
         );
 
         let stream_arn = if stream_enabled {

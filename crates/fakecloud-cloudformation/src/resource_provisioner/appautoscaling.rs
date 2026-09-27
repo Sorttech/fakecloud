@@ -55,7 +55,8 @@ impl ResourceProvisioner {
         });
 
         let arn = format!(
-            "arn:aws:application-autoscaling:{}:{}:scalable-target/{}",
+            "arn:{}:application-autoscaling:{}:{}:scalable-target/{}",
+            partition_for(&self.region),
             self.region,
             self.account_id,
             fakecloud_core::ids::short_id(10)
@@ -76,7 +77,7 @@ impl ResourceProvisioner {
                 _ => "ApplicationAutoScaling_Default",
             };
             format!(
-                "arn:aws:iam::{}:role/aws-service-role/applicationautoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_{}",
+                "arn:{}:iam::{}:role/aws-service-role/applicationautoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_{}", partition_for(&self.region),
                 self.account_id, suffix
             )
         });
@@ -165,7 +166,8 @@ impl ResourceProvisioner {
             ));
         }
         let arn = format!(
-            "arn:aws:autoscaling:{}:{}:scalingPolicy:{}:resource/{}/{}:policyName/{}",
+            "arn:{}:autoscaling:{}:{}:scalingPolicy:{}:resource/{}/{}:policyName/{}",
+            partition_for(&self.region),
             self.region,
             self.account_id,
             Uuid::new_v4(),

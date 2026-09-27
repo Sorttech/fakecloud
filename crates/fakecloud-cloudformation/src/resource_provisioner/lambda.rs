@@ -44,8 +44,11 @@ impl ResourceProvisioner {
 
         let cfg = parse_lambda_function_props(props)?;
         let function_arn = format!(
-            "arn:aws:lambda:{}:{}:function:{}",
-            self.region, self.account_id, function_name
+            "arn:{}:lambda:{}:{}:function:{}",
+            partition_for(&self.region),
+            self.region,
+            self.account_id,
+            function_name
         );
 
         // Resolve `Code.S3Bucket` + `Code.S3Key` against the in-process S3 state
@@ -363,8 +366,11 @@ impl ResourceProvisioner {
             ));
         }
         let function_arn = format!(
-            "arn:aws:lambda:{}:{}:function:{}",
-            self.region, self.account_id, function_name
+            "arn:{}:lambda:{}:{}:function:{}",
+            partition_for(&self.region),
+            self.region,
+            self.account_id,
+            function_name
         );
         let uuid = Uuid::new_v4().to_string();
         let esm = EventSourceMapping {
@@ -532,8 +538,11 @@ impl ResourceProvisioner {
         let mut accounts = self.lambda_state.write();
         let state = accounts.get_or_create(&self.account_id);
         let layer_arn = format!(
-            "arn:aws:lambda:{}:{}:layer:{}",
-            self.region, self.account_id, layer_name
+            "arn:{}:lambda:{}:{}:layer:{}",
+            partition_for(&self.region),
+            self.region,
+            self.account_id,
+            layer_name
         );
         let layer = state
             .layers
@@ -627,12 +636,19 @@ impl ResourceProvisioner {
         }
         let function_arn = match &qualifier {
             Some(q) => format!(
-                "arn:aws:lambda:{}:{}:function:{}:{}",
-                self.region, self.account_id, function_name, q
+                "arn:{}:lambda:{}:{}:function:{}:{}",
+                partition_for(&self.region),
+                self.region,
+                self.account_id,
+                function_name,
+                q
             ),
             None => format!(
-                "arn:aws:lambda:{}:{}:function:{}",
-                self.region, self.account_id, function_name
+                "arn:{}:lambda:{}:{}:function:{}",
+                partition_for(&self.region),
+                self.region,
+                self.account_id,
+                function_name
             ),
         };
         let function_url = format!("https://{function_name}.lambda-url.{}.on.aws/", self.region);
@@ -747,8 +763,12 @@ impl ResourceProvisioner {
             ));
         }
         let alias_arn = format!(
-            "arn:aws:lambda:{}:{}:function:{}:{}",
-            self.region, self.account_id, function_name, alias_name
+            "arn:{}:lambda:{}:{}:function:{}:{}",
+            partition_for(&self.region),
+            self.region,
+            self.account_id,
+            function_name,
+            alias_name
         );
         let key = format!("{function_name}:{alias_name}");
         state.aliases.insert(
@@ -925,8 +945,12 @@ impl ResourceProvisioner {
             .or_default()
             .insert(next_version.clone(), snapshot);
         let version_arn = format!(
-            "arn:aws:lambda:{}:{}:function:{}:{}",
-            self.region, self.account_id, function_name, next_version
+            "arn:{}:lambda:{}:{}:function:{}:{}",
+            partition_for(&self.region),
+            self.region,
+            self.account_id,
+            function_name,
+            next_version
         );
         let physical_id = format!("{function_name}:{next_version}");
         Ok(ProvisionResult::new(physical_id)
@@ -963,8 +987,12 @@ impl ResourceProvisioner {
             ));
         }
         let version_arn = format!(
-            "arn:aws:lambda:{}:{}:function:{}:{}",
-            self.region, self.account_id, function_name, version
+            "arn:{}:lambda:{}:{}:function:{}:{}",
+            partition_for(&self.region),
+            self.region,
+            self.account_id,
+            function_name,
+            version
         );
         Ok(ProvisionResult::new(existing.physical_id.clone())
             .with("Version", version.to_string())

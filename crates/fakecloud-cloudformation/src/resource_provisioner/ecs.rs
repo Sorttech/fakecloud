@@ -20,8 +20,11 @@ impl ResourceProvisioner {
             .unwrap_or(&generated_name)
             .to_string();
         let cluster_arn = format!(
-            "arn:aws:ecs:{}:{}:cluster/{}",
-            self.region, self.account_id, cluster_name
+            "arn:{}:ecs:{}:{}:cluster/{}",
+            partition_for(&self.region),
+            self.region,
+            self.account_id,
+            cluster_name
         );
         let mut cluster = EcsCluster::new(&cluster_name, cluster_arn.clone());
         cluster.tags = parse_ecs_tags(props.get("Tags"));
@@ -157,8 +160,12 @@ impl ResourceProvisioner {
             .or_insert(1);
         let revision = *revision;
         let arn = format!(
-            "arn:aws:ecs:{}:{}:task-definition/{}:{}",
-            self.region, self.account_id, family, revision
+            "arn:{}:ecs:{}:{}:task-definition/{}:{}",
+            partition_for(&self.region),
+            self.region,
+            self.account_id,
+            family,
+            revision
         );
         let td = EcsTaskDefinition {
             family: family.clone(),
@@ -348,8 +355,12 @@ impl ResourceProvisioner {
         }
         let cluster_arn = state.clusters[&cluster_name].cluster_arn.clone();
         let service_arn = format!(
-            "arn:aws:ecs:{}:{}:service/{}/{}",
-            self.region, self.account_id, cluster_name, service_name
+            "arn:{}:ecs:{}:{}:service/{}/{}",
+            partition_for(&self.region),
+            self.region,
+            self.account_id,
+            cluster_name,
+            service_name
         );
         let key = format!("{cluster_name}/{service_name}");
         let service = EcsService {
@@ -472,8 +483,11 @@ impl ResourceProvisioner {
             .unwrap_or(&generated_name)
             .to_string();
         let arn = format!(
-            "arn:aws:ecs:{}:{}:capacity-provider/{}",
-            self.region, self.account_id, name
+            "arn:{}:ecs:{}:{}:capacity-provider/{}",
+            partition_for(&self.region),
+            self.region,
+            self.account_id,
+            name
         );
         let cp = EcsCapacityProvider {
             name: name.clone(),

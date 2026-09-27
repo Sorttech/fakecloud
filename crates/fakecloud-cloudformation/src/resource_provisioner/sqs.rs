@@ -93,8 +93,11 @@ impl ResourceProvisioner {
         let state = __sqs_mas.get_or_create(&self.account_id);
         let queue_url = format!("{}/{}/{}", state.endpoint, state.account_id, queue_name);
         let arn = format!(
-            "arn:aws:sqs:{}:{}:{}",
-            self.region, state.account_id, queue_name
+            "arn:{}:sqs:{}:{}:{}",
+            partition_for(&self.region),
+            self.region,
+            state.account_id,
+            queue_name
         );
 
         let is_fifo = queue_name.ends_with(".fifo");

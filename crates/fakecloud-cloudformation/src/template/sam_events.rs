@@ -350,7 +350,7 @@ fn sanitize(s: &str) -> String {
 fn lambda_integration_uri(function_id: &str) -> Value {
     json!({
         "Fn::Sub": format!(
-            "arn:aws:apigateway:${{AWS::Region}}:lambda:path/2015-03-31/functions/${{{function_id}.Arn}}/invocations"
+            "arn:${{AWS::Partition}}:apigateway:${{AWS::Region}}:lambda:path/2015-03-31/functions/${{{function_id}.Arn}}/invocations"
         )
     })
 }
@@ -450,7 +450,7 @@ pub(super) fn synthesize_api_resources(routes: &[ApiRoute]) -> Vec<(String, Valu
                 lambda_permission(
                     &route.function_id,
                     "apigateway.amazonaws.com",
-                    json!({ "Fn::Sub": format!("arn:aws:execute-api:${{AWS::Region}}:${{AWS::AccountId}}:${{{api_id}}}/*") }),
+                    json!({ "Fn::Sub": format!("arn:${{AWS::Partition}}:execute-api:${{AWS::Region}}:${{AWS::AccountId}}:${{{api_id}}}/*") }),
                 ),
             ));
         }
@@ -529,7 +529,7 @@ pub(super) fn synthesize_api_resources(routes: &[ApiRoute]) -> Vec<(String, Valu
                 lambda_permission(
                     &route.function_id,
                     "apigateway.amazonaws.com",
-                    json!({ "Fn::Sub": format!("arn:aws:execute-api:${{AWS::Region}}:${{AWS::AccountId}}:${{{api_id}}}/*") }),
+                    json!({ "Fn::Sub": format!("arn:${{AWS::Partition}}:execute-api:${{AWS::Region}}:${{AWS::AccountId}}:${{{api_id}}}/*") }),
                 ),
             ));
         }
@@ -787,7 +787,7 @@ fn sfn_api_resources(
                 "Integration": {
                     "Type": "AWS",
                     "IntegrationHttpMethod": "POST",
-                    "Uri": { "Fn::Sub": "arn:aws:apigateway:${AWS::Region}:states:action/StartExecution" },
+                    "Uri": { "Fn::Sub": "arn:${AWS::Partition}:apigateway:${AWS::Region}:states:action/StartExecution" },
                     "Credentials": { "Fn::GetAtt": [role_id, "Arn"] },
                 }
             }
@@ -1094,6 +1094,18 @@ pub(super) fn expand_application(properties: &Value, resource_obj: &Map<String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn synthesized_api_arns_take_the_stack_partition() {
+        let uri = lambda_integration_uri("Fn");
+        assert!(
+            uri["Fn::Sub"]
+                .as_str()
+                .unwrap()
+                .starts_with("arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:"),
+            "{uri}"
+        );
+    }
 
     #[test]
     fn policies_become_execution_role() {

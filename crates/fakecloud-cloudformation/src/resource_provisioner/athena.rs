@@ -48,8 +48,11 @@ impl ResourceProvisioner {
             engine_version: Some("AUTO".to_string()),
         };
         let arn = format!(
-            "arn:aws:athena:{}:{}:workgroup/{}",
-            self.region, self.account_id, name
+            "arn:{}:athena:{}:{}:workgroup/{}",
+            partition_for(&self.region),
+            self.region,
+            self.account_id,
+            name
         );
         account.work_groups.insert(name.clone(), wg);
         if !tags.is_empty() {
@@ -72,8 +75,11 @@ impl ResourceProvisioner {
         let props = &resource.properties;
         let name = existing.physical_id.clone();
         let arn = format!(
-            "arn:aws:athena:{}:{}:workgroup/{}",
-            self.region, self.account_id, name
+            "arn:{}:athena:{}:{}:workgroup/{}",
+            partition_for(&self.region),
+            self.region,
+            self.account_id,
+            name
         );
         let tags = Self::parse_athena_tags(props.get("Tags"));
 
@@ -130,8 +136,11 @@ impl ResourceProvisioner {
         let wg = account.work_groups.get(physical_id)?;
         match attribute {
             "Arn" => Some(format!(
-                "arn:aws:athena:{}:{}:workgroup/{}",
-                self.region, self.account_id, wg.name
+                "arn:{}:athena:{}:{}:workgroup/{}",
+                partition_for(&self.region),
+                self.region,
+                self.account_id,
+                wg.name
             )),
             "Name" => Some(wg.name.clone()),
             _ => None,
@@ -192,8 +201,11 @@ impl ResourceProvisioner {
             error: None,
         };
         let arn = format!(
-            "arn:aws:athena:{}:{}:datacatalog/{}",
-            self.region, self.account_id, name
+            "arn:{}:athena:{}:{}:datacatalog/{}",
+            partition_for(&self.region),
+            self.region,
+            self.account_id,
+            name
         );
         account.data_catalogs.insert(name.clone(), cat);
         if !tags.is_empty() {
@@ -215,8 +227,11 @@ impl ResourceProvisioner {
         let props = &resource.properties;
         let name = existing.physical_id.clone();
         let arn = format!(
-            "arn:aws:athena:{}:{}:datacatalog/{}",
-            self.region, self.account_id, name
+            "arn:{}:athena:{}:{}:datacatalog/{}",
+            partition_for(&self.region),
+            self.region,
+            self.account_id,
+            name
         );
         let tags = Self::parse_athena_tags(props.get("Tags"));
 
@@ -276,8 +291,11 @@ impl ResourceProvisioner {
         let cat = account.data_catalogs.get(physical_id)?;
         match attribute {
             "Arn" => Some(format!(
-                "arn:aws:athena:{}:{}:datacatalog/{}",
-                self.region, self.account_id, cat.name
+                "arn:{}:athena:{}:{}:datacatalog/{}",
+                partition_for(&self.region),
+                self.region,
+                self.account_id,
+                cat.name
             )),
             "Name" => Some(cat.name.clone()),
             _ => None,

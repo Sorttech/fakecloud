@@ -7,6 +7,7 @@
 //! `Ref` resolves to the project name (the physical id); `Fn::GetAtt Arn` to the
 //! project ARN.
 
+use fakecloud_aws::arn::partition_for;
 use serde_json::{json, Value};
 
 use super::{cfn_props_to_camel, ProvisionResult, ResourceDefinition, ResourceProvisioner};
@@ -24,7 +25,10 @@ impl ResourceProvisioner {
             .unwrap_or_else(|| self.physical_name(resource));
         let region = &self.region;
         let account = &self.account_id;
-        let arn = format!("arn:aws:codebuild:{region}:{account}:project/{name}");
+        let arn = format!(
+            "arn:{}:codebuild:{region}:{account}:project/{name}",
+            partition_for(region)
+        );
         let now = ts_now();
 
         // Camel-case the CFN properties into the API `Project` shape.

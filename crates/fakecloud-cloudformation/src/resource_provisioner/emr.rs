@@ -8,6 +8,7 @@
 //! `Ref` resolves to the cluster id (the physical id); `Fn::GetAtt MasterPublicDNS`
 //! to the master public DNS name.
 
+use fakecloud_aws::arn::partition_for;
 use serde_json::{json, Value};
 
 use super::{ProvisionResult, ResourceDefinition, ResourceProvisioner, StackResource};
@@ -29,7 +30,10 @@ impl ResourceProvisioner {
             "j-{}",
             uuid::Uuid::new_v4().simple().to_string()[..13].to_uppercase()
         );
-        let arn = format!("arn:aws:elasticmapreduce:{region}:{account}:cluster/{id}");
+        let arn = format!(
+            "arn:{}:elasticmapreduce:{region}:{account}:cluster/{id}",
+            partition_for(region)
+        );
         let master_dns = format!("ip-10-0-0-1.{region}.compute.internal");
 
         let mut cluster = serde_json::Map::new();
