@@ -1182,6 +1182,28 @@ mod tests {
         req
     }
 
+    #[test]
+    fn assume_missing_role_denial_names_the_region_partition_root() {
+        let (sts, _state) = make_sts_service();
+        let mut req = sts_request(
+            "AssumeRole",
+            vec![
+                ("RoleArn", "arn:aws-cn:iam::123456789012:role/missing"),
+                ("RoleSessionName", "session"),
+            ],
+        );
+        req.region = "cn-north-1".to_string();
+        let err = match sts.assume_role(&req) {
+            Err(e) => e,
+            Ok(_) => panic!("a missing role must be denied"),
+        };
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("User: arn:aws-cn:iam::123456789012:root is not authorized"),
+            "{msg}"
+        );
+    }
+
     fn create_role_in_state(state: &SharedIamState, name: &str) -> String {
         // Permissive default trust so the basic-path tests don't trip
         // the new evaluator-driven trust gate. Tests that specifically

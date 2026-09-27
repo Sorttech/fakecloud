@@ -86,7 +86,7 @@ impl IamService {
         let group_name = required_param(&req.query_params, "GroupName")?;
         validate_string_length("groupName", &group_name, 1, 128)?;
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         let group = state.groups.get(&group_name).ok_or_else(|| {
@@ -257,7 +257,7 @@ impl IamService {
         let max_items = validate_list_pagination(req)? as usize;
         let marker = req.query_params.get("Marker").cloned();
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
         let path_prefix = req.query_params.get("PathPrefix").cloned();
         let mut groups: Vec<&IamGroup> = state.groups.values().collect();
@@ -447,7 +447,7 @@ impl IamService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let user_name = required_param(&req.query_params, "UserName")?;
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         if !state.users.contains_key(&user_name) {
@@ -538,7 +538,7 @@ impl IamService {
         let group_name = required_param(&req.query_params, "GroupName")?;
         let policy_name = required_param(&req.query_params, "PolicyName")?;
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         let group = state.groups.get(&group_name).ok_or_else(|| {
@@ -607,7 +607,7 @@ impl IamService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let group_name = required_param(&req.query_params, "GroupName")?;
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         let group = state.groups.get(&group_name).ok_or_else(|| {
@@ -735,7 +735,7 @@ impl IamService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let group_name = required_param(&req.query_params, "GroupName")?;
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         let group = state.groups.get(&group_name).ok_or_else(|| {
