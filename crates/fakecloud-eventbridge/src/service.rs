@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex as AsyncMutex;
 
-use fakecloud_aws::arn::Arn;
+use fakecloud_aws::arn::{partition_for, Arn};
 use fakecloud_core::delivery::DeliveryBus;
 use fakecloud_core::pagination::paginate;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
@@ -342,10 +342,7 @@ impl EventBridgeService {
             ));
         }
 
-        let arn = format!(
-            "arn:aws:events:{}:{}:event-bus/{}",
-            req.region, state.account_id, name
-        );
+        let arn = bus_arn(&req.region, &state.account_id, &name);
         let now = Utc::now();
         let description = body["Description"].as_str().map(|s| s.to_string());
         let kms_key_identifier = body["KmsKeyIdentifier"].as_str().map(|s| s.to_string());
@@ -533,17 +530,21 @@ impl EventBridgeService {
         // A `*` principal means "any account" and is stored verbatim, not as
         // an account-root ARN. The Terraform aws_cloudwatch_event_permission
         // resource reads the principal back and asserts it is exactly "*".
+        let bus_arn = arn_with_request_region(&bus.arn, &req.region);
         let principal_value = if principal == "*" {
             json!("*")
         } else {
-            json!({ "AWS": Arn::global("iam", principal, "root").to_string() })
+            let partition = bus_arn
+                .parse::<Arn>()
+                .map_or_else(|_| "aws".to_string(), |a| a.partition);
+            json!({ "AWS": Arn::global("iam", principal, "root").with_partition(&partition).to_string() })
         };
         let statement = json!({
             "Sid": statement_id,
             "Effect": "Allow",
             "Principal": principal_value,
             "Action": action,
-            "Resource": arn_with_request_region(&bus.arn, &req.region),
+            "Resource": bus_arn,
         });
 
         let policy = bus.policy.get_or_insert_with(|| {
@@ -717,17 +718,7 @@ impl EventBridgeService {
             ));
         }
 
-        let arn = if event_bus_name == "default" {
-            format!(
-                "arn:aws:events:{}:{}:rule/{}",
-                req.region, state.account_id, name
-            )
-        } else {
-            format!(
-                "arn:aws:events:{}:{}:rule/{}/{}",
-                req.region, state.account_id, event_bus_name, name
-            )
-        };
+        let arn = rule_arn(&req.region, &state.account_id, &event_bus_name, &name);
 
         let key = (event_bus_name.clone(), name.clone());
         // Preserve the mutable bookkeeping that PutRule must NOT clobber when it
@@ -1402,13 +1393,18 @@ impl EventBridgeService {
                     let bus_arn = state
                         .buses
                         .get(&event_bus_name)
-                        .map(|b| b.arn.clone())
+                        .map(|b| arn_with_request_region(&b.arn, &req.region))
                         .unwrap_or_default();
+                    let partition = bus_arn
+                        .parse::<Arn>()
+                        .map_or_else(|_| "aws".to_string(), |a| a.partition);
                     let principal =
                         req.principal
                             .clone()
                             .unwrap_or_else(|| fakecloud_core::auth::Principal {
-                                arn: Arn::global("iam", caller_account, "root").to_string(),
+                                arn: Arn::global("iam", caller_account, "root")
+                                    .with_partition(&partition)
+                                    .to_string(),
                                 user_id: caller_account.to_string(),
                                 account_id: caller_account.to_string(),
                                 principal_type: fakecloud_core::auth::PrincipalType::Root,

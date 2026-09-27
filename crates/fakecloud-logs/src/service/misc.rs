@@ -246,7 +246,7 @@ impl LogsService {
         let account_id = req.account_id.clone();
         let region = req.region.clone();
 
-        let arn = Arn::new(
+        let arn = Arn::regional(
             "logs",
             &region,
             &account_id,
@@ -425,7 +425,7 @@ impl LogsService {
         let account_id = req.account_id.clone();
         let region = req.region.clone();
 
-        let arn = Arn::new(
+        let arn = Arn::regional(
             "logs",
             &region,
             &account_id,

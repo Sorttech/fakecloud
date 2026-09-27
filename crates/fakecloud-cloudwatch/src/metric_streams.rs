@@ -92,8 +92,10 @@ impl CloudWatchService {
                 .unwrap_or(false);
 
         let arn = format!(
-            "arn:aws:cloudwatch:{}:{}:metric-stream/{name}",
-            req.region, req.account_id
+            "arn:{}:cloudwatch:{}:{}:metric-stream/{name}",
+            fakecloud_aws::arn::partition_for(&req.region),
+            req.region,
+            req.account_id
         );
         let now = Utc::now();
 

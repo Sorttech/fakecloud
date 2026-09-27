@@ -194,8 +194,9 @@ fn not_found_template(name: &str) -> AwsServiceError {
 }
 
 fn template_arn(region: &str, account: &str, name: &str, ttype: &str) -> String {
+    let partition = fakecloud_aws::arn::partition_for(region);
     format!(
-        "arn:aws:mobiletargeting:{region}:{account}:templates/{name}/{}",
+        "arn:{partition}:mobiletargeting:{region}:{account}:templates/{name}/{}",
         ttype
     )
 }

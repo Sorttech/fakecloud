@@ -3349,3 +3349,34 @@ fn delete_stream_guard_holds_for_a_cross_region_caller() {
         "ResourceInUseException",
     );
 }
+
+#[test]
+fn china_region_stream_arn_uses_the_aws_cn_partition() {
+    let (svc, _) = make_service();
+    svc.create_stream(&request_in_region(
+        "CreateStream",
+        "cn-north-1",
+        json!({ "StreamName": "cn-s", "ShardCount": 1 }),
+    ))
+    .unwrap();
+    let resp = svc
+        .describe_stream_summary(&request_in_region(
+            "DescribeStreamSummary",
+            "cn-north-1",
+            json!({ "StreamName": "cn-s" }),
+        ))
+        .unwrap();
+    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    let arn = "arn:aws-cn:kinesis:cn-north-1:123456789012:stream/cn-s";
+    assert_eq!(body["StreamDescriptionSummary"]["StreamARN"], arn);
+
+    let resp = svc
+        .describe_stream_summary(&request_in_region(
+            "DescribeStreamSummary",
+            "cn-north-1",
+            json!({ "StreamARN": arn }),
+        ))
+        .unwrap();
+    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(body["StreamDescriptionSummary"]["StreamName"], "cn-s");
+}

@@ -111,8 +111,11 @@ impl LogsService {
         }
 
         let arn = format!(
-            "arn:aws:logs:{}:{}:delivery-destination:{}",
-            req.region, state.account_id, name
+            "arn:{}:logs:{}:{}:delivery-destination:{}",
+            fakecloud_aws::arn::partition_for(&req.region),
+            req.region,
+            state.account_id,
+            name
         );
 
         // The destination type is either supplied explicitly or inferred from
@@ -456,8 +459,8 @@ impl LogsService {
             .unwrap_or("unknown")
             .to_string();
 
-        // Validate resource ARN format - must start with arn:aws:
-        if !resource_arn.starts_with("arn:aws:") {
+        // Validate resource ARN format - must be an ARN of `service`
+        if fakecloud_aws::arn::arn_resource(&resource_arn, &service).is_none() {
             return Err(AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
                 "ValidationException",
@@ -502,8 +505,11 @@ impl LogsService {
         }
 
         let arn = format!(
-            "arn:aws:logs:{}:{}:delivery-source:{}",
-            req.region, state.account_id, name
+            "arn:{}:logs:{}:{}:delivery-source:{}",
+            fakecloud_aws::arn::partition_for(&req.region),
+            req.region,
+            state.account_id,
+            name
         );
 
         let created_at = state
@@ -744,7 +750,7 @@ impl LogsService {
                     .get("destinationResourceArn")
             })
             .map(|dest_arn: &String| {
-                if dest_arn.contains(":s3:") || dest_arn.starts_with("arn:aws:s3:::") {
+                if dest_arn.contains(":s3:") {
                     "S3"
                 } else if dest_arn.contains(":firehose:") {
                     "FH"
@@ -756,8 +762,11 @@ impl LogsService {
 
         let delivery_id = uuid::Uuid::new_v4().to_string();
         let arn = format!(
-            "arn:aws:logs:{}:{}:delivery:{}",
-            req.region, state.account_id, delivery_id
+            "arn:{}:logs:{}:{}:delivery:{}",
+            fakecloud_aws::arn::partition_for(&req.region),
+            req.region,
+            state.account_id,
+            delivery_id
         );
 
         let delivery = Delivery {
