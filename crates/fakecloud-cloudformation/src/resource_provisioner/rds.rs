@@ -134,13 +134,7 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let arn = format!(
-            "arn:{}:rds:{}:{}:cluster-pg:{}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id,
-            name
-        );
+        let arn = self.regional_arn("rds", &format!("cluster-pg:{}", name));
         let entry = serde_json::json!({
             "DBClusterParameterGroupName": name,
             "DBClusterParameterGroupArn": arn,
@@ -191,13 +185,7 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let arn = format!(
-            "arn:{}:rds:{}:{}:og:{}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id,
-            name
-        );
+        let arn = self.regional_arn("rds", &format!("og:{}", name));
         let entry = serde_json::json!({
             "OptionGroupName": name,
             "OptionGroupArn": arn,
@@ -309,13 +297,7 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .unwrap_or("POSTGRESQL")
             .to_string();
-        let arn = format!(
-            "arn:{}:rds:{}:{}:db-proxy:{}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id,
-            name
-        );
+        let arn = self.regional_arn("rds", &format!("db-proxy:{}", name));
         let endpoint = format!("{name}.proxy-default.{}.rds.amazonaws.com", self.region);
         let entry = serde_json::json!({
             "DBProxyName": name,
@@ -831,13 +813,7 @@ impl ResourceProvisioner {
         let port = props.get("Port").and_then(|v| v.as_i64()).unwrap_or(5432);
         let mut accounts = self.rds_state.write();
         let state = accounts.get_or_create(&self.account_id);
-        let arn = format!(
-            "arn:{}:rds:{}:{}:cluster:{}",
-            partition_for(&self.region),
-            self.region,
-            state.account_id,
-            identifier
-        );
+        let arn = self.regional_arn("rds", &format!("cluster:{}", identifier));
         let cluster_resource_id = format!("cluster-{}", Uuid::new_v4().simple());
         let endpoint = format!(
             "{identifier}.cluster-fakecloud.{}.rds.amazonaws.com",

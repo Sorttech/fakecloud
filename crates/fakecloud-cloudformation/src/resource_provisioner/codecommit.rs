@@ -13,7 +13,6 @@
 //! `Fn::GetAtt` (verified against the AWS resource spec):
 //!   Repository -> Arn, CloneUrlHttp, CloneUrlSsh, Name
 
-use fakecloud_aws::arn::partition_for;
 use std::collections::BTreeMap;
 
 use chrono::Utc;
@@ -30,10 +29,7 @@ impl ResourceProvisioner {
         let name = cc_str(props, "RepositoryName").unwrap_or_else(|| self.physical_name(resource));
         let account = self.account_id.clone();
         let region = self.region.clone();
-        let arn = format!(
-            "arn:{}:codecommit:{region}:{account}:{name}",
-            partition_for(&region)
-        );
+        let arn = self.regional_arn("codecommit", &name);
         let now = Utc::now();
 
         let mut guard = self.codecommit_state.write();
@@ -47,13 +43,8 @@ impl ResourceProvisioner {
 
         // Mirror the direct CreateRepository handler: an omitted KmsKeyId mints a
         // synthetic KMS key ARN so the stored metadata round-trips a key.
-        let kms = cc_str(props, "KmsKeyId").unwrap_or_else(|| {
-            format!(
-                "arn:{}:kms:{region}:{account}:key/{}",
-                partition_for(&region),
-                uuid::Uuid::new_v4()
-            )
-        });
+        let kms = cc_str(props, "KmsKeyId")
+            .unwrap_or_else(|| self.regional_arn("kms", &format!("key/{}", uuid::Uuid::new_v4())));
         let clone_http = format!("https://git-codecommit.{region}.amazonaws.com/v1/repos/{name}");
         let clone_ssh = format!("ssh://git-codecommit.{region}.amazonaws.com/v1/repos/{name}");
 

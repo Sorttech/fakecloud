@@ -26,13 +26,7 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let arn = format!(
-            "arn:{}:elasticache:{}:{}:parametergroup:{}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id,
-            name
-        );
+        let arn = self.regional_arn("elasticache", &format!("parametergroup:{}", name));
         let group = CacheParameterGroup {
             cache_parameter_group_name: name.clone(),
             cache_parameter_group_family: family,
@@ -84,13 +78,7 @@ impl ResourceProvisioner {
                     .collect()
             })
             .unwrap_or_default();
-        let arn = format!(
-            "arn:{}:elasticache:{}:{}:subnetgroup:{}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id,
-            name
-        );
+        let arn = self.regional_arn("elasticache", &format!("subnetgroup:{}", name));
         let group = CacheSubnetGroup {
             cache_subnet_group_name: name.clone(),
             cache_subnet_group_description: description,
@@ -127,13 +115,7 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let arn = format!(
-            "arn:{}:elasticache:{}:{}:securitygroup:{}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id,
-            name
-        );
+        let arn = self.regional_arn("elasticache", &format!("securitygroup:{}", name));
         let group = CacheSecurityGroup {
             cache_security_group_name: name.clone(),
             description,
@@ -186,13 +168,7 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .unwrap_or("no-password-required")
             .to_string();
-        let arn = format!(
-            "arn:{}:elasticache:{}:{}:user:{}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id,
-            user_id
-        );
+        let arn = self.regional_arn("elasticache", &format!("user:{}", user_id));
         let user = EcUser {
             user_id: user_id.clone(),
             user_name,
@@ -275,13 +251,7 @@ impl ResourceProvisioner {
                     .collect()
             })
             .unwrap_or_default();
-        let arn = format!(
-            "arn:{}:elasticache:{}:{}:usergroup:{}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id,
-            user_group_id
-        );
+        let arn = self.regional_arn("elasticache", &format!("usergroup:{}", user_group_id));
         let group = EcUserGroup {
             user_group_id: user_group_id.clone(),
             engine,
@@ -486,13 +456,7 @@ impl ResourceProvisioner {
         let back_with_container = self.elasticache_runtime.is_some();
         let mut accounts = self.elasticache_state.write();
         let state = accounts.get_or_create(&self.account_id);
-        let arn = format!(
-            "arn:{}:elasticache:{}:{}:cluster:{}",
-            partition_for(&self.region),
-            self.region,
-            state.account_id,
-            id
-        );
+        let arn = self.regional_arn("elasticache", &format!("cluster:{}", id));
         let endpoint_address = format!("{id}.fakecloud.{}.cache.amazonaws.com", self.region);
         let cluster = EcCacheCluster {
             cache_cluster_id: id.clone(),
@@ -773,13 +737,7 @@ impl ResourceProvisioner {
         let back_with_container = self.elasticache_runtime.is_some();
         let mut accounts = self.elasticache_state.write();
         let state = accounts.get_or_create(&self.account_id);
-        let arn = format!(
-            "arn:{}:elasticache:{}:{}:replicationgroup:{}",
-            partition_for(&self.region),
-            self.region,
-            state.account_id,
-            id
-        );
+        let arn = self.regional_arn("elasticache", &format!("replicationgroup:{}", id));
         let endpoint_address =
             format!("{id}.fakecloud.ng.0001.{}.cache.amazonaws.com", self.region);
         let configuration_endpoint = if cluster_enabled {

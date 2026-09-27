@@ -57,12 +57,9 @@ fn str_list(p: &Value, k: &str) -> Vec<String> {
 
 impl ResourceProvisioner {
     fn asg_arn(&self, kind: &str, name: &str) -> String {
-        format!(
-            "arn:{}:autoscaling:{}:{}:{kind}:{}:{kind}Name/{name}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id,
-            Uuid::new_v4()
+        self.regional_arn(
+            "autoscaling",
+            &format!("{kind}:{}:{kind}Name/{name}", Uuid::new_v4()),
         )
     }
 

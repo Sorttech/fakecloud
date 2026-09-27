@@ -9,7 +9,6 @@
 //! (Table). A table is keyed by `table_key(db, table)` and its physical id
 //! encodes `<db>|<table>` so delete / `Fn::GetAtt` reach the nested record.
 
-use fakecloud_aws::arn::partition_for;
 use serde_json::{json, Value};
 
 use super::{ProvisionResult, ResourceDefinition, ResourceProvisioner, StackResource};
@@ -37,12 +36,7 @@ impl ResourceProvisioner {
             .get("KmsKeyId")
             .and_then(Value::as_str)
             .map(str::to_string)
-            .or_else(|| {
-                Some(format!(
-                    "arn:{}:kms:{region}:{account}:key/timestream-default",
-                    partition_for(region)
-                ))
-            });
+            .or_else(|| Some(self.regional_arn("kms", "key/timestream-default")));
 
         let db = Database {
             name: name.clone(),

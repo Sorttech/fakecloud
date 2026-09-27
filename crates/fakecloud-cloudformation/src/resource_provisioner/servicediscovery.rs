@@ -6,7 +6,7 @@
 //! one. The Cloud Map service's snapshot hook (registered in the server) then
 //! persists them so they survive a restart (#1766 lesson).
 
-use fakecloud_aws::arn::partition_for;
+use fakecloud_aws::arn::Arn;
 use std::collections::BTreeMap;
 
 use chrono::Utc;
@@ -45,17 +45,23 @@ fn new_hosted_zone_id() -> String {
 }
 
 fn namespace_arn(region: &str, account: &str, id: &str) -> String {
-    format!(
-        "arn:{}:servicediscovery:{region}:{account}:namespace/{id}",
-        partition_for(region)
+    Arn::regional(
+        "servicediscovery",
+        region,
+        account,
+        &format!("namespace/{id}"),
     )
+    .to_string()
 }
 
 fn service_arn(region: &str, account: &str, id: &str) -> String {
-    format!(
-        "arn:{}:servicediscovery:{region}:{account}:service/{id}",
-        partition_for(region)
+    Arn::regional(
+        "servicediscovery",
+        region,
+        account,
+        &format!("service/{id}"),
     )
+    .to_string()
 }
 
 /// Reduce a bare id or full ARN to its trailing resource id (Cloud Map accepts

@@ -1101,7 +1101,6 @@ impl ResourceProvisioner {
             &self.account_id,
             &format!("saml-provider/{name}"),
         )
-        .with_partition(fakecloud_aws::arn::partition_for(&self.region))
         .to_string();
         let now = Utc::now();
         let valid_until = now + chrono::Duration::days(365 * 10);
@@ -1205,7 +1204,6 @@ impl ResourceProvisioner {
             &self.account_id,
             &format!("role{path}{role_name}"),
         )
-        .with_partition(fakecloud_aws::arn::partition_for(&self.region))
         .to_string();
         // Service-linked roles get a trust policy specific to the service.
         let assume_role_policy_document = serde_json::json!({
@@ -1266,7 +1264,6 @@ impl ResourceProvisioner {
             &self.account_id,
             &format!("mfa{path}{name}"),
         )
-        .with_partition(fakecloud_aws::arn::partition_for(&self.region))
         .to_string();
         // Real AWS returns a base32 seed + a PNG QR code; we synthesize
         // deterministic placeholders so callers can read them back.

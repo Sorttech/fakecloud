@@ -43,13 +43,7 @@ impl ResourceProvisioner {
             .unwrap_or_else(|| self.physical_name(resource));
 
         let cfg = parse_lambda_function_props(props)?;
-        let function_arn = format!(
-            "arn:{}:lambda:{}:{}:function:{}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id,
-            function_name
-        );
+        let function_arn = self.regional_arn("lambda", &format!("function:{}", function_name));
 
         // Resolve `Code.S3Bucket` + `Code.S3Key` against the in-process S3 state
         // so a stack that uploads code via `AWS::S3::Bucket` + `AWS::S3::Object`
@@ -365,13 +359,7 @@ impl ResourceProvisioner {
                 "Function {function_name} does not exist yet — retry once it has been provisioned"
             ));
         }
-        let function_arn = format!(
-            "arn:{}:lambda:{}:{}:function:{}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id,
-            function_name
-        );
+        let function_arn = self.regional_arn("lambda", &format!("function:{}", function_name));
         let uuid = Uuid::new_v4().to_string();
         let esm = EventSourceMapping {
             uuid: uuid.clone(),
@@ -537,13 +525,7 @@ impl ResourceProvisioner {
 
         let mut accounts = self.lambda_state.write();
         let state = accounts.get_or_create(&self.account_id);
-        let layer_arn = format!(
-            "arn:{}:lambda:{}:{}:layer:{}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id,
-            layer_name
-        );
+        let layer_arn = self.regional_arn("lambda", &format!("layer:{}", layer_name));
         let layer = state
             .layers
             .entry(layer_name.clone())
@@ -635,21 +617,8 @@ impl ResourceProvisioner {
             ));
         }
         let function_arn = match &qualifier {
-            Some(q) => format!(
-                "arn:{}:lambda:{}:{}:function:{}:{}",
-                partition_for(&self.region),
-                self.region,
-                self.account_id,
-                function_name,
-                q
-            ),
-            None => format!(
-                "arn:{}:lambda:{}:{}:function:{}",
-                partition_for(&self.region),
-                self.region,
-                self.account_id,
-                function_name
-            ),
+            Some(q) => self.regional_arn("lambda", &format!("function:{}:{}", function_name, q)),
+            None => self.regional_arn("lambda", &format!("function:{}", function_name)),
         };
         let function_url = format!("https://{function_name}.lambda-url.{}.on.aws/", self.region);
         let now = Utc::now();
@@ -762,13 +731,9 @@ impl ResourceProvisioner {
                 "Function {function_name} does not exist yet — retry once it has been provisioned"
             ));
         }
-        let alias_arn = format!(
-            "arn:{}:lambda:{}:{}:function:{}:{}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id,
-            function_name,
-            alias_name
+        let alias_arn = self.regional_arn(
+            "lambda",
+            &format!("function:{}:{}", function_name, alias_name),
         );
         let key = format!("{function_name}:{alias_name}");
         state.aliases.insert(
@@ -944,13 +909,9 @@ impl ResourceProvisioner {
             .entry(function_name.clone())
             .or_default()
             .insert(next_version.clone(), snapshot);
-        let version_arn = format!(
-            "arn:{}:lambda:{}:{}:function:{}:{}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id,
-            function_name,
-            next_version
+        let version_arn = self.regional_arn(
+            "lambda",
+            &format!("function:{}:{}", function_name, next_version),
         );
         let physical_id = format!("{function_name}:{next_version}");
         Ok(ProvisionResult::new(physical_id)
@@ -986,14 +947,8 @@ impl ResourceProvisioner {
                 "Version {version} for function {function_name} no longer exists in lambda state"
             ));
         }
-        let version_arn = format!(
-            "arn:{}:lambda:{}:{}:function:{}:{}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id,
-            function_name,
-            version
-        );
+        let version_arn =
+            self.regional_arn("lambda", &format!("function:{}:{}", function_name, version));
         Ok(ProvisionResult::new(existing.physical_id.clone())
             .with("Version", version.to_string())
             .with("FunctionArn", version_arn))

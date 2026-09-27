@@ -21,13 +21,12 @@ use http::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use fakecloud_aws::arn::partition_for;
+use fakecloud_aws::arn::{partition_for, partition_of};
 use fakecloud_aws::xml::xml_escape;
 use fakecloud_core::multi_account::MultiAccountState;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use crate::extras::{looks_like_url, xml_response, xml_response_no_result};
-use crate::resource_provisioner::arn_partition;
 use crate::service::{AutoDeploymentClaim, CloudFormationService};
 use crate::state::CloudFormationState;
 
@@ -2016,7 +2015,7 @@ impl CloudFormationService {
             updated.administration_role_arn.get_or_insert_with(|| {
                 format!(
                     "arn:{}:iam::{admin}:role/{DEFAULT_ADMIN_ROLE}",
-                    arn_partition(&snapshot.arn)
+                    partition_of(&snapshot.arn)
                 )
             });
             updated

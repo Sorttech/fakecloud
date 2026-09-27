@@ -11,7 +11,6 @@
 //! mints. The physical id / storage key is the caller-supplied resource name, so
 //! both `Ref` and the ARN-based `Fn::GetAtt` resolve.
 
-use fakecloud_aws::arn::partition_for;
 use serde_json::{json, Value};
 
 use super::{ProvisionResult, ResourceDefinition, ResourceProvisioner, StackResource};
@@ -68,12 +67,8 @@ impl ResourceProvisioner {
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| self.physical_name(resource));
-        let region = &self.region;
         let account = &self.account_id;
-        let arn = format!(
-            "arn:{}:sagemaker:{region}:{account}:{arn_path}/{name}",
-            partition_for(region)
-        );
+        let arn = self.regional_arn("sagemaker", &format!("{arn_path}/{name}"));
         let arn_member = format!("{family}Arn");
         let now = json!(sagemaker_now());
 

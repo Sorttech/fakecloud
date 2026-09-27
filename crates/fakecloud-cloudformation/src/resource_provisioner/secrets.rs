@@ -46,13 +46,7 @@ impl ResourceProvisioner {
 
         let mut accounts = self.secretsmanager_state.write();
         let state = accounts.get_or_create(&self.account_id);
-        let arn = format!(
-            "arn:{}:secretsmanager:{}:{}:secret:{}",
-            partition_for(&self.region),
-            self.region,
-            state.account_id,
-            name
-        );
+        let arn = self.regional_arn("secretsmanager", &format!("secret:{}", name));
 
         if state.secrets.contains_key(&arn) {
             return Err(format!("Secret {name} already exists"));
@@ -244,13 +238,7 @@ impl ResourceProvisioner {
         let secret_arn = if state.secrets.contains_key(&secret_id) {
             secret_id.clone()
         } else {
-            let candidate = format!(
-                "arn:{}:secretsmanager:{}:{}:secret:{}",
-                partition_for(&self.region),
-                self.region,
-                state.account_id,
-                secret_id
-            );
+            let candidate = self.regional_arn("secretsmanager", &format!("secret:{}", secret_id));
             if state.secrets.contains_key(&candidate) {
                 candidate
             } else {
@@ -309,13 +297,7 @@ impl ResourceProvisioner {
         let secret_arn = if state.secrets.contains_key(&secret_id) {
             secret_id.clone()
         } else {
-            let candidate = format!(
-                "arn:{}:secretsmanager:{}:{}:secret:{}",
-                partition_for(&self.region),
-                self.region,
-                state.account_id,
-                secret_id
-            );
+            let candidate = self.regional_arn("secretsmanager", &format!("secret:{}", secret_id));
             if state.secrets.contains_key(&candidate) {
                 candidate
             } else {
@@ -367,13 +349,7 @@ impl ResourceProvisioner {
         let secret_arn = if state.secrets.contains_key(&secret_id) {
             secret_id.clone()
         } else {
-            let candidate = format!(
-                "arn:{}:secretsmanager:{}:{}:secret:{}",
-                partition_for(&self.region),
-                self.region,
-                state.account_id,
-                secret_id
-            );
+            let candidate = self.regional_arn("secretsmanager", &format!("secret:{}", secret_id));
             if state.secrets.contains_key(&candidate) {
                 candidate
             } else {

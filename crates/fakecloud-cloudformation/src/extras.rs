@@ -775,7 +775,7 @@ impl CloudFormationService {
                     .or_insert_with(|| stack_name.clone());
                 full_params
                     .entry("AWS::Partition".to_string())
-                    .or_insert_with(|| template::partition_for_region(&req.region).to_string());
+                    .or_insert_with(|| partition_for(&req.region).to_string());
                 full_params
                     .entry("AWS::URLSuffix".to_string())
                     .or_insert_with(|| template::url_suffix_for_region(&req.region).to_string());
@@ -1331,7 +1331,7 @@ impl CloudFormationService {
                     .or_insert_with(|| stack_name.clone());
                 cs_params
                     .entry("AWS::Partition".to_string())
-                    .or_insert_with(|| template::partition_for_region(&req.region).to_string());
+                    .or_insert_with(|| partition_for(&req.region).to_string());
                 cs_params
                     .entry("AWS::URLSuffix".to_string())
                     .or_insert_with(|| template::url_suffix_for_region(&req.region).to_string());
@@ -1889,13 +1889,18 @@ impl CloudFormationService {
                     .get("GeneratedTemplateName")
                     .ok_or_else(|| missing("GeneratedTemplateName"))?
                     .clone();
+                let id = Arn::regional(
+                    "cloudformation",
+                    &req.region,
+                    &aid,
+                    &format!("generatedtemplate/{name}"),
+                )
+                .to_string();
                 let inner = format!(
-                    "    <GeneratedTemplateId>arn:{}:cloudformation:{}:{}:generatedtemplate/{}</GeneratedTemplateId>\n    <GeneratedTemplateName>{}</GeneratedTemplateName>\n    <Status>COMPLETE</Status>",
-                    partition_for(&req.region),
-                    xml_escape(&req.region),
-                    xml_escape(&aid),
+                    "    <GeneratedTemplateId>{}</GeneratedTemplateId>\n    <GeneratedTemplateName>{}</GeneratedTemplateName>\n    <Status>COMPLETE</Status>",
+                    xml_escape(&id),
                     xml_escape(&name),
-                    xml_escape(&name),);
+                );
                 Ok(xml_response("DescribeGeneratedTemplate", inner, &rid))
             }
             "GetGeneratedTemplate" => {

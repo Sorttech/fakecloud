@@ -130,19 +130,20 @@ impl ResourceProvisioner {
 
         let id = Uuid::new_v4().to_string();
         let (region_in_arn, scope_seg): (&str, String) = if scope == "CLOUDFRONT" {
-            ("us-east-1", "global".to_string())
+            (
+                implicit_global_region(partition_for(&self.region)),
+                "global".to_string(),
+            )
         } else {
             (self.region.as_str(), self.region.clone())
         };
-        let arn = format!(
-            "arn:{}:wafv2:{}:{}:{}/webacl/{}/{}",
-            partition_for(&self.region),
+        let arn = Arn::regional(
+            "wafv2",
             region_in_arn,
-            self.account_id,
-            scope_seg,
-            name,
-            id
-        );
+            &self.account_id,
+            &format!("{scope_seg}/webacl/{name}/{id}"),
+        )
+        .to_string();
         let acl = WebAcl {
             id: id.clone(),
             name: name.clone(),
@@ -230,19 +231,20 @@ impl ResourceProvisioner {
 
         let id = Uuid::new_v4().to_string();
         let (region_in_arn, scope_seg): (&str, String) = if scope == "CLOUDFRONT" {
-            ("us-east-1", "global".to_string())
+            (
+                implicit_global_region(partition_for(&self.region)),
+                "global".to_string(),
+            )
         } else {
             (self.region.as_str(), self.region.clone())
         };
-        let arn = format!(
-            "arn:{}:wafv2:{}:{}:{}/ipset/{}/{}",
-            partition_for(&self.region),
+        let arn = Arn::regional(
+            "wafv2",
             region_in_arn,
-            self.account_id,
-            scope_seg,
-            name,
-            id
-        );
+            &self.account_id,
+            &format!("{scope_seg}/ipset/{name}/{id}"),
+        )
+        .to_string();
         let ip_set = IpSet {
             id: id.clone(),
             name: name.clone(),
@@ -315,19 +317,20 @@ impl ResourceProvisioner {
 
         let id = Uuid::new_v4().to_string();
         let (region_in_arn, scope_seg): (&str, String) = if scope == "CLOUDFRONT" {
-            ("us-east-1", "global".to_string())
+            (
+                implicit_global_region(partition_for(&self.region)),
+                "global".to_string(),
+            )
         } else {
             (self.region.as_str(), self.region.clone())
         };
-        let arn = format!(
-            "arn:{}:wafv2:{}:{}:{}/regexpatternset/{}/{}",
-            partition_for(&self.region),
+        let arn = Arn::regional(
+            "wafv2",
             region_in_arn,
-            self.account_id,
-            scope_seg,
-            name,
-            id
-        );
+            &self.account_id,
+            &format!("{scope_seg}/regexpatternset/{name}/{id}"),
+        )
+        .to_string();
         let set = RegexPatternSet {
             id: id.clone(),
             name: name.clone(),
@@ -397,19 +400,20 @@ impl ResourceProvisioner {
 
         let id = Uuid::new_v4().to_string();
         let (region_in_arn, scope_seg): (&str, String) = if scope == "CLOUDFRONT" {
-            ("us-east-1", "global".to_string())
+            (
+                implicit_global_region(partition_for(&self.region)),
+                "global".to_string(),
+            )
         } else {
             (self.region.as_str(), self.region.clone())
         };
-        let arn = format!(
-            "arn:{}:wafv2:{}:{}:{}/rulegroup/{}/{}",
-            partition_for(&self.region),
+        let arn = Arn::regional(
+            "wafv2",
             region_in_arn,
-            self.account_id,
-            scope_seg,
-            name,
-            id
-        );
+            &self.account_id,
+            &format!("{scope_seg}/rulegroup/{name}/{id}"),
+        )
+        .to_string();
         let rg = RuleGroup {
             id: id.clone(),
             name: name.clone(),

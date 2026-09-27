@@ -4,6 +4,7 @@ use http::StatusCode;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use fakecloud_aws::arn::partition_for;
 use fakecloud_core::delivery::DeliveryBus;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_dynamodb::SharedDynamoDbState;
@@ -1841,7 +1842,7 @@ impl CloudFormationService {
         // resolve_refs can substitute them into resource properties.
         let stack_id = format!(
             "arn:{}:cloudformation:{}:{}:stack/{}/{}",
-            template::partition_for_region(&req.region),
+            partition_for(&req.region),
             req.region,
             req.account_id,
             stack_name,
@@ -1861,7 +1862,7 @@ impl CloudFormationService {
             .or_insert_with(|| stack_name.clone());
         parameters
             .entry("AWS::Partition".to_string())
-            .or_insert_with(|| template::partition_for_region(&req.region).to_string());
+            .or_insert_with(|| partition_for(&req.region).to_string());
         parameters
             .entry("AWS::URLSuffix".to_string())
             .or_insert_with(|| template::url_suffix_for_region(&req.region).to_string());
@@ -2792,7 +2793,7 @@ impl CloudFormationService {
         input
             .parameters
             .entry("AWS::Partition".to_string())
-            .or_insert_with(|| template::partition_for_region(&req.region).to_string());
+            .or_insert_with(|| partition_for(&req.region).to_string());
         input
             .parameters
             .entry("AWS::URLSuffix".to_string())
@@ -2932,7 +2933,7 @@ impl CloudFormationService {
                 let stack_id = if found_stack_id.is_empty() {
                     format!(
                         "arn:{}:cloudformation:{}:{}:stack/{}/{}",
-                        template::partition_for_region(&req.region),
+                        partition_for(&req.region),
                         req.region,
                         req.account_id,
                         input.stack_name,

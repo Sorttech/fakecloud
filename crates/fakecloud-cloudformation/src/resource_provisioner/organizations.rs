@@ -94,7 +94,7 @@ impl ResourceProvisioner {
         let id = format!("ou-{}-{}", &org.root_id[2..], id_suffix);
         let arn = format!(
             "arn:{}:organizations::{}:ou/{}/{}",
-            arn_partition(&org.root_arn),
+            partition_of(&org.root_arn),
             org.management_account_id,
             org.org_id,
             id
@@ -325,7 +325,7 @@ impl ResourceProvisioner {
         let id = format!("p-{}", id_suffix);
         let arn = format!(
             "arn:{}:organizations::{}:policy/{}/{}/{}",
-            arn_partition(&org.root_arn),
+            partition_of(&org.root_arn),
             org.management_account_id,
             org.org_id,
             policy_type.to_lowercase(),
@@ -389,7 +389,7 @@ impl ResourceProvisioner {
         org.resource_policy = Some(content);
         let arn = format!(
             "arn:{}:organizations::{}:resourcepolicy/{}/rp",
-            arn_partition(&org.root_arn),
+            partition_of(&org.root_arn),
             org.management_account_id,
             org.org_id
         );

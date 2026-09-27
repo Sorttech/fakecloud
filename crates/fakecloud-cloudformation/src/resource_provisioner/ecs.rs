@@ -19,13 +19,11 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .unwrap_or(&generated_name)
             .to_string();
-        let cluster_arn = format!(
-            "arn:{}:ecs:{}:{}:cluster/{}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id,
-            cluster_name
-        );
+        let cluster_arn = self
+            .ecs_state
+            .write()
+            .get_or_create(&self.account_id)
+            .cluster_arn(&self.region, &cluster_name);
         let mut cluster = EcsCluster::new(&cluster_name, cluster_arn.clone());
         cluster.tags = parse_ecs_tags(props.get("Tags"));
         cluster.capacity_providers = props
@@ -159,14 +157,7 @@ impl ResourceProvisioner {
             .and_modify(|n| *n += 1)
             .or_insert(1);
         let revision = *revision;
-        let arn = format!(
-            "arn:{}:ecs:{}:{}:task-definition/{}:{}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id,
-            family,
-            revision
-        );
+        let arn = state.task_definition_arn(&self.region, &family, revision);
         let td = EcsTaskDefinition {
             family: family.clone(),
             revision,
@@ -354,14 +345,7 @@ impl ResourceProvisioner {
             ));
         }
         let cluster_arn = state.clusters[&cluster_name].cluster_arn.clone();
-        let service_arn = format!(
-            "arn:{}:ecs:{}:{}:service/{}/{}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id,
-            cluster_name,
-            service_name
-        );
+        let service_arn = state.service_arn(&self.region, &cluster_name, &service_name);
         let key = format!("{cluster_name}/{service_name}");
         let service = EcsService {
             service_name: service_name.clone(),
@@ -482,13 +466,7 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .unwrap_or(&generated_name)
             .to_string();
-        let arn = format!(
-            "arn:{}:ecs:{}:{}:capacity-provider/{}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id,
-            name
-        );
+        let arn = self.regional_arn("ecs", &format!("capacity-provider/{}", name));
         let cp = EcsCapacityProvider {
             name: name.clone(),
             arn: arn.clone(),

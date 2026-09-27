@@ -33,13 +33,11 @@ impl ResourceProvisioner {
         let logging_configuration = props.get("LoggingConfiguration").cloned();
         let tracing_configuration = props.get("TracingConfiguration").cloned();
 
-        let arn = format!(
-            "arn:{}:states:{}:{}:stateMachine:{}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id,
-            name
-        );
+        let arn = self
+            .stepfunctions_state
+            .write()
+            .get_or_create(&self.account_id)
+            .state_machine_arn(&self.region, &name);
         let now = Utc::now();
         let revision_id = Uuid::new_v4().to_string();
 
@@ -189,13 +187,7 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .ok_or("Name is required")?
             .to_string();
-        let arn = format!(
-            "arn:{}:states:{}:{}:activity:{}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id,
-            name
-        );
+        let arn = self.regional_arn("states", &format!("activity:{}", name));
         let activity = SfnActivity {
             name: name.clone(),
             arn: arn.clone(),
@@ -322,14 +314,7 @@ impl ResourceProvisioner {
         let sm_arn_root = first_version_arn
             .rsplit_once(':')
             .map(|(root, _)| root.to_string())
-            .unwrap_or_else(|| {
-                format!(
-                    "arn:{}:states:{}:{}:stateMachine:unknown",
-                    partition_for(&self.region),
-                    self.region,
-                    self.account_id
-                )
-            });
+            .unwrap_or_else(|| self.regional_arn("states", "stateMachine:unknown"));
         let arn = format!("{sm_arn_root}:{name}");
         let now = Utc::now();
         let alias = StateMachineAlias {

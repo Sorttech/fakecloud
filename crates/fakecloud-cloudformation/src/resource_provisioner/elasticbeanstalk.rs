@@ -32,7 +32,6 @@
 //! it mid-session; only a restart runs `recover_pending_environments`).
 
 use chrono::Utc;
-use fakecloud_aws::arn::partition_for;
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -47,31 +46,19 @@ use super::{ProvisionResult, ResourceDefinition, ResourceProvisioner, StackResou
 // ARN helpers mirror the private formats the `elasticbeanstalk` service uses so
 // a CFN-provisioned resource's ARN is byte-identical to the direct handler's.
 fn application_arn(region: &str, account: &str, name: &str) -> String {
-    format!(
-        "arn:{}:elasticbeanstalk:{region}:{account}:application/{name}",
-        partition_for(region)
-    )
+    format!("arn:aws:elasticbeanstalk:{region}:{account}:application/{name}")
 }
 
 fn application_version_arn(region: &str, account: &str, app: &str, label: &str) -> String {
-    format!(
-        "arn:{}:elasticbeanstalk:{region}:{account}:applicationversion/{app}/{label}",
-        partition_for(region)
-    )
+    format!("arn:aws:elasticbeanstalk:{region}:{account}:applicationversion/{app}/{label}")
 }
 
 fn environment_arn(region: &str, account: &str, app: &str, env: &str) -> String {
-    format!(
-        "arn:{}:elasticbeanstalk:{region}:{account}:environment/{app}/{env}",
-        partition_for(region)
-    )
+    format!("arn:aws:elasticbeanstalk:{region}:{account}:environment/{app}/{env}")
 }
 
 fn configuration_template_arn(region: &str, account: &str, app: &str, template: &str) -> String {
-    format!(
-        "arn:{}:elasticbeanstalk:{region}:{account}:configurationtemplate/{app}/{template}",
-        partition_for(region)
-    )
+    format!("arn:aws:elasticbeanstalk:{region}:{account}:configurationtemplate/{app}/{template}")
 }
 
 impl ResourceProvisioner {

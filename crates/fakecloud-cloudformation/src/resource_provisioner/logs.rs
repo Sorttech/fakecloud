@@ -33,12 +33,7 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .map(String::from);
 
-        let arn = format!(
-            "arn:{}:logs:{}:{}:destination:{destination_name}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id
-        );
+        let arn = self.regional_arn("logs", &format!("destination:{destination_name}"));
         let dest = Destination {
             destination_name: destination_name.clone(),
             target_arn,
@@ -195,12 +190,7 @@ impl ResourceProvisioner {
             }
         });
 
-        let arn = format!(
-            "arn:{}:logs:{}:{}:delivery-destination:{name}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id
-        );
+        let arn = self.regional_arn("logs", &format!("delivery-destination:{name}"));
         let delivery_destination_type = props
             .get("DeliveryDestinationType")
             .and_then(|v| v.as_str())
@@ -270,12 +260,7 @@ impl ResourceProvisioner {
             .unwrap_or("")
             .to_string();
 
-        let arn = format!(
-            "arn:{}:logs:{}:{}:delivery-source:{name}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id
-        );
+        let arn = self.regional_arn("logs", &format!("delivery-source:{name}"));
         let ds = DeliverySource {
             name: name.clone(),
             arn: arn.clone(),
@@ -325,12 +310,7 @@ impl ResourceProvisioner {
         };
 
         let id = Uuid::new_v4().simple().to_string();
-        let arn = format!(
-            "arn:{}:logs:{}:{}:delivery:{id}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id
-        );
+        let arn = self.regional_arn("logs", &format!("delivery:{id}"));
         let delivery = Delivery {
             id: id.clone(),
             delivery_source_name,

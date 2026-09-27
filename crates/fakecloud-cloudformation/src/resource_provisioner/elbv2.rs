@@ -45,14 +45,14 @@ impl ResourceProvisioner {
         let mut accounts = self.elbv2_state.write();
         let state = accounts.get_or_create(&self.account_id);
         let lb_id = Uuid::new_v4().simple().to_string();
-        let arn = format!(
-            "arn:{}:elasticloadbalancing:{}:{}:loadbalancer/{}/{}/{}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id,
-            if lb_type == "network" { "net" } else { "app" },
-            name,
-            &lb_id[..16]
+        let arn = self.regional_arn(
+            "elasticloadbalancing",
+            &format!(
+                "loadbalancer/{}/{}/{}",
+                if lb_type == "network" { "net" } else { "app" },
+                name,
+                &lb_id[..16]
+            ),
         );
         let dns_name = format!(
             "{}-{}.{}.elb.{}.amazonaws.com",
@@ -183,13 +183,9 @@ impl ResourceProvisioner {
         let mut accounts = self.elbv2_state.write();
         let state = accounts.get_or_create(&self.account_id);
         let id = Uuid::new_v4().simple().to_string();
-        let arn = format!(
-            "arn:{}:elasticloadbalancing:{}:{}:targetgroup/{}/{}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id,
-            name,
-            &id[..16]
+        let arn = self.regional_arn(
+            "elasticloadbalancing",
+            &format!("targetgroup/{}/{}", name, &id[..16]),
         );
 
         state.target_groups.insert(
@@ -297,13 +293,9 @@ impl ResourceProvisioner {
             .unwrap_or("")
             .to_string();
         let listener_id = Uuid::new_v4().simple().to_string();
-        let arn = format!(
-            "arn:{}:elasticloadbalancing:{}:{}:listener/{}/{}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id,
-            lb_full,
-            &listener_id[..16]
+        let arn = self.regional_arn(
+            "elasticloadbalancing",
+            &format!("listener/{}/{}", lb_full, &listener_id[..16]),
         );
 
         // Wire forward target groups -> LB association so dataplane probing
@@ -402,13 +394,9 @@ impl ResourceProvisioner {
             .unwrap_or("")
             .to_string();
         let rule_id = Uuid::new_v4().simple().to_string();
-        let arn = format!(
-            "arn:{}:elasticloadbalancing:{}:{}:listener-rule/{}/{}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id,
-            listener_full,
-            &rule_id[..16]
+        let arn = self.regional_arn(
+            "elasticloadbalancing",
+            &format!("listener-rule/{}/{}", listener_full, &rule_id[..16]),
         );
 
         state.rules.insert(
@@ -553,13 +541,9 @@ impl ResourceProvisioner {
             .chars()
             .take(16)
             .collect();
-        let arn = format!(
-            "arn:{}:elasticloadbalancing:{}:{}:truststore/{}/{}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id,
-            name,
-            suffix
+        let arn = self.regional_arn(
+            "elasticloadbalancing",
+            &format!("truststore/{}/{}", name, suffix),
         );
         let ts = fakecloud_elbv2::TrustStore {
             arn: arn.clone(),

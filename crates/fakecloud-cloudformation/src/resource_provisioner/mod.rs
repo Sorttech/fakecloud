@@ -26,7 +26,7 @@ use fakecloud_application_autoscaling::{
     SharedApplicationAutoScalingState as AppasState, SuspendedState as AppasSuspendedState,
 };
 use fakecloud_athena::{DataCatalog, NamedQuery, PreparedStatement, SharedAthenaState, WorkGroup};
-use fakecloud_aws::arn::{arn_resource, partition_for, Arn};
+use fakecloud_aws::arn::{arn_resource, implicit_global_region, partition_for, partition_of, Arn};
 use fakecloud_cloudfront::{
     functions::{
         CloudFrontOriginAccessIdentityConfig, FunctionConfig, KeyGroupConfig, KeyGroupItems,
@@ -396,14 +396,6 @@ fn parse_kms_key_input(props: &serde_json::Value) -> kms_provisioner::KeyCreatio
         policy: parse_key_policy(props),
         tags: parse_tag_list(props),
     }
-}
-
-/// The partition field of an ARN, `aws` when it is not an ARN.
-pub(crate) fn arn_partition(arn: &str) -> &str {
-    arn.strip_prefix("arn:")
-        .and_then(|rest| rest.split(':').next())
-        .filter(|p| !p.is_empty())
-        .unwrap_or("aws")
 }
 
 /// `LogGroupName` properties on Logs CFN resources may carry either a
@@ -1215,6 +1207,12 @@ mod timestream;
 mod wafv2;
 
 impl ResourceProvisioner {
+    /// An ARN for `service` in the stack's account and region, in that
+    /// region's partition.
+    pub(crate) fn regional_arn(&self, service: &str, resource: &str) -> String {
+        Arn::regional(service, &self.region, &self.account_id, resource).to_string()
+    }
+
     /// Create a resource and return the StackResource with physical ID.
     pub fn create_resource(&self, resource: &ResourceDefinition) -> Result<StackResource, String> {
         let result = match resource.resource_type.as_str() {
@@ -7301,11 +7299,29 @@ mod tests {
             alias_state_key("arn:aws-us-gov:lambda:us-gov-west-1:123456789012:function:f:live"),
             "f:live"
         );
-        assert_eq!(
-            arn_partition("arn:aws-cn:organizations::1:root/o-1/r-1"),
-            "aws-cn"
+    }
+
+    #[test]
+    fn cloudfront_scoped_web_acl_in_china_uses_the_partition_global_region() {
+        let prov = cn_provisioner();
+        let acl = prov
+            .create_resource(&make_resource(
+                "AWS::WAFv2::WebACL",
+                "Acl",
+                serde_json::json!({
+                    "Name": "cn-acl",
+                    "Scope": "CLOUDFRONT",
+                    "DefaultAction": {"Allow": {}},
+                    "VisibilityConfig": {},
+                }),
+            ))
+            .unwrap();
+        assert!(
+            acl.attributes["Arn"]
+                .starts_with("arn:aws-cn:wafv2:cn-northwest-1:123456789012:global/webacl/cn-acl/"),
+            "{}",
+            acl.attributes["Arn"]
         );
-        assert_eq!(arn_partition("not-an-arn"), "aws");
     }
 
     #[test]
@@ -7317,11 +7333,10 @@ mod tests {
             serde_json::json!({"FeatureSet": "ALL"}),
         ))
         .unwrap();
-        let root_id = {
-            let mut g = prov.organizations_state.write();
-            let org = g.sole_mut().unwrap();
-            org.root_arn = org.root_arn.replacen("arn:aws:", "arn:aws-cn:", 1);
-            org.root_id.clone()
+        let (root_id, root_arn) = {
+            let g = prov.organizations_state.read();
+            let org = g.sole().unwrap();
+            (org.root_id.clone(), org.root_arn.clone())
         };
         let ou = prov
             .create_resource(&make_resource(
@@ -7330,10 +7345,11 @@ mod tests {
                 serde_json::json!({"Name": "team", "ParentId": root_id}),
             ))
             .unwrap();
-        assert!(
-            ou.attributes["Arn"].starts_with("arn:aws-cn:organizations::"),
-            "{}",
-            ou.attributes["Arn"]
+        let ou_arn = &ou.attributes["Arn"];
+        assert_eq!(
+            partition_of(ou_arn),
+            partition_of(&root_arn),
+            "{ou_arn} vs {root_arn}"
         );
     }
 

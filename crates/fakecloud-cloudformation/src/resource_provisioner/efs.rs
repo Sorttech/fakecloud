@@ -26,7 +26,6 @@
 //! `IncorrectFileSystemLifeCycleState` guard the direct `CreateMountTarget`
 //! enforces.
 
-use fakecloud_aws::arn::partition_for;
 use serde_json::{json, Map, Value};
 
 use super::{ProvisionResult, ResourceDefinition, ResourceProvisioner, StackResource};
@@ -109,13 +108,7 @@ impl ResourceProvisioner {
             let kms = efs_str(props, "KmsKeyId")
                 .map(str::to_string)
                 .unwrap_or_else(|| {
-                    format!(
-                        "arn:{}:kms:{}:{}:key/{}",
-                        partition_for(&self.region),
-                        self.region,
-                        self.account_id,
-                        uuid::Uuid::new_v4()
-                    )
+                    self.regional_arn("kms", &format!("key/{}", uuid::Uuid::new_v4()))
                 });
             fs.insert("KmsKeyId".into(), json!(kms));
         }
@@ -603,23 +596,11 @@ impl ResourceProvisioner {
     // ------------------------------------------------------------- helpers
 
     fn efs_fs_arn(&self, fsid: &str) -> String {
-        format!(
-            "arn:{}:elasticfilesystem:{}:{}:file-system/{}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id,
-            fsid
-        )
+        self.regional_arn("elasticfilesystem", &format!("file-system/{}", fsid))
     }
 
     fn efs_ap_arn(&self, apid: &str) -> String {
-        format!(
-            "arn:{}:elasticfilesystem:{}:{}:access-point/{}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id,
-            apid
-        )
+        self.regional_arn("elasticfilesystem", &format!("access-point/{}", apid))
     }
 
     /// Resolve a subnet's `(availability_zone, availability_zone_id, vpc_id)`

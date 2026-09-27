@@ -54,12 +54,9 @@ impl ResourceProvisioner {
                 .and_then(|x| x.as_bool()),
         });
 
-        let arn = format!(
-            "arn:{}:application-autoscaling:{}:{}:scalable-target/{}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id,
-            fakecloud_core::ids::short_id(10)
+        let arn = self.regional_arn(
+            "application-autoscaling",
+            &format!("scalable-target/{}", fakecloud_core::ids::short_id(10)),
         );
         let role = role_arn.unwrap_or_else(|| {
             let suffix = match service_namespace.as_str() {
@@ -165,15 +162,15 @@ impl ResourceProvisioner {
                 service_namespace, resource_id, scalable_dimension
             ));
         }
-        let arn = format!(
-            "arn:{}:autoscaling:{}:{}:scalingPolicy:{}:resource/{}/{}:policyName/{}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id,
-            Uuid::new_v4(),
-            service_namespace,
-            resource_id,
-            policy_name
+        let arn = self.regional_arn(
+            "autoscaling",
+            &format!(
+                "scalingPolicy:{}:resource/{}/{}:policyName/{}",
+                Uuid::new_v4(),
+                service_namespace,
+                resource_id,
+                policy_name
+            ),
         );
         let policy = AppasScalingPolicy {
             arn: arn.clone(),

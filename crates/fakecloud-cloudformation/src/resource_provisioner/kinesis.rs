@@ -42,13 +42,7 @@ impl ResourceProvisioner {
         if state.streams.contains_key(&stream_name) {
             return Err(format!("Stream {stream_name} already exists"));
         }
-        let stream_arn = format!(
-            "arn:{}:kinesis:{}:{}:stream/{}",
-            partition_for(&self.region),
-            self.region,
-            state.account_id,
-            stream_name
-        );
+        let stream_arn = state.stream_arn(&self.region, &stream_name);
         let stream = KinesisStream {
             stream_name: stream_name.clone(),
             stream_arn: stream_arn.clone(),

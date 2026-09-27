@@ -32,22 +32,9 @@ impl ResourceProvisioner {
         }
 
         let arn = if event_bus_name == "default" {
-            format!(
-                "arn:{}:events:{}:{}:rule/{}",
-                partition_for(&self.region),
-                self.region,
-                state.account_id,
-                rule_name
-            )
+            self.regional_arn("events", &format!("rule/{}", rule_name))
         } else {
-            format!(
-                "arn:{}:events:{}:{}:rule/{}/{}",
-                partition_for(&self.region),
-                self.region,
-                state.account_id,
-                event_bus_name,
-                rule_name
-            )
+            self.regional_arn("events", &format!("rule/{}/{}", event_bus_name, rule_name))
         };
 
         let rule = EventRule {
@@ -211,21 +198,17 @@ impl ResourceProvisioner {
             return Err(format!("Connection {name} already exists"));
         }
         let now = Utc::now();
-        let arn = format!(
-            "arn:{}:events:{}:{}:connection/{}/{}",
-            partition_for(&self.region),
-            self.region,
-            state.account_id,
-            name,
-            Uuid::new_v4().as_simple()
+        let arn = self.regional_arn(
+            "events",
+            &format!("connection/{}/{}", name, Uuid::new_v4().as_simple()),
         );
-        let secret_arn = format!(
-            "arn:{}:secretsmanager:{}:{}:secret:events!connection/{}-{}",
-            partition_for(&self.region),
-            self.region,
-            state.account_id,
-            name,
-            Uuid::new_v4().as_simple()
+        let secret_arn = self.regional_arn(
+            "secretsmanager",
+            &format!(
+                "secret:events!connection/{}-{}",
+                name,
+                Uuid::new_v4().as_simple()
+            ),
         );
         let connection = Connection {
             name: name.clone(),
@@ -293,13 +276,9 @@ impl ResourceProvisioner {
             return Err(format!("ApiDestination {name} already exists"));
         }
         let now = Utc::now();
-        let arn = format!(
-            "arn:{}:events:{}:{}:api-destination/{}/{}",
-            partition_for(&self.region),
-            self.region,
-            state.account_id,
-            name,
-            Uuid::new_v4().as_simple()
+        let arn = self.regional_arn(
+            "events",
+            &format!("api-destination/{}/{}", name, Uuid::new_v4().as_simple()),
         );
         state.api_destinations.insert(
             name.clone(),
@@ -367,13 +346,7 @@ impl ResourceProvisioner {
         if state.archives.contains_key(&name) {
             return Err(format!("Archive {name} already exists"));
         }
-        let arn = format!(
-            "arn:{}:events:{}:{}:archive/{}",
-            partition_for(&self.region),
-            self.region,
-            state.account_id,
-            name
-        );
+        let arn = self.regional_arn("events", &format!("archive/{}", name));
         state.archives.insert(
             name.clone(),
             Archive {
@@ -421,12 +394,7 @@ impl ResourceProvisioner {
             .map(String::from);
         let dead_letter_config = props.get("DeadLetterConfig").cloned();
         let policy = props.get("Policy").cloned();
-        let arn = format!(
-            "arn:{}:events:{}:{}:event-bus/{name}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id
-        );
+        let arn = self.regional_arn("events", &format!("event-bus/{name}"));
         let now = Utc::now();
         let bus = EventBus {
             name: name.clone(),
@@ -487,10 +455,7 @@ impl ResourceProvisioner {
             let condition = props.get("Condition").cloned();
             let mut obj = serde_json::json!({
                 "Effect": "Allow",
-                "Resource": format!(
-                    "arn:{}:events:{}:{}:event-bus/{bus_name}", partition_for(&self.region),
-                    self.region, self.account_id
-                ),
+                "Resource": self.regional_arn("events", &format!("event-bus/{bus_name}")),
             });
             if let (Some(sid), Some(obj)) = (sid, obj.as_object_mut()) {
                 obj.insert("Sid".to_string(), serde_json::Value::String(sid));
@@ -585,12 +550,7 @@ impl ResourceProvisioner {
             .map(String::from);
 
         let endpoint_id = fakecloud_core::ids::short_id(16).to_string();
-        let arn = format!(
-            "arn:{}:events:{}:{}:endpoint/{name}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id
-        );
+        let arn = self.regional_arn("events", &format!("endpoint/{name}"));
         let endpoint_url = format!("https://{endpoint_id}.endpoint.events.amazonaws.com");
         let now = Utc::now();
         let endpoint = Endpoint {

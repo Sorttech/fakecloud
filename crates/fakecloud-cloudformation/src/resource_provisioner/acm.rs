@@ -49,13 +49,7 @@ impl ResourceProvisioner {
             .to_string();
 
         // Mint a deterministic-ish ARN — ACM uses a UUID per certificate.
-        let arn = format!(
-            "arn:{}:acm:{}:{}:certificate/{}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id,
-            Uuid::new_v4()
-        );
+        let arn = self.regional_arn("acm", &format!("certificate/{}", Uuid::new_v4()));
         let now = Utc::now();
 
         // Build a real self-signed PEM via rcgen for the cert+SANs so

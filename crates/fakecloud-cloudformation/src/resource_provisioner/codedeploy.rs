@@ -10,7 +10,6 @@
 //! so its physical id encodes `<application>/<group>` to keep the delete /
 //! `Fn::GetAtt` paths self-contained.
 
-use fakecloud_aws::arn::partition_for;
 use serde_json::{json, Value};
 
 use super::{
@@ -60,10 +59,7 @@ impl ResourceProvisioner {
         st.application_order.push(name.clone());
         let tags = cfn_tag_list_pascal(props);
         if !tags.is_empty() {
-            let arn = format!(
-                "arn:{}:codedeploy:{region}:{account}:application:{name}",
-                partition_for(region)
-            );
+            let arn = format!("arn:aws:codedeploy:{region}:{account}:application:{name}");
             st.tags.insert(arn, tags);
         }
 
@@ -79,8 +75,7 @@ impl ResourceProvisioner {
         st.application_order.retain(|n| n != physical_id);
         st.deployment_groups.remove(physical_id);
         st.tags.remove(&format!(
-            "arn:{}:codedeploy:{region}:{account}:application:{physical_id}",
-            partition_for(region)
+            "arn:aws:codedeploy:{region}:{account}:application:{physical_id}"
         ));
         Ok(())
     }
@@ -159,10 +154,8 @@ impl ResourceProvisioner {
         groups.insert(dg_name.clone(), Value::Object(group));
         let tags = cfn_tag_list_pascal(props);
         if !tags.is_empty() {
-            let arn = format!(
-                "arn:{}:codedeploy:{region}:{account}:deploymentgroup:{app}/{dg_name}",
-                partition_for(region)
-            );
+            let arn =
+                format!("arn:aws:codedeploy:{region}:{account}:deploymentgroup:{app}/{dg_name}");
             st.tags.insert(arn, tags);
         }
 
@@ -186,8 +179,7 @@ impl ResourceProvisioner {
             groups.remove(dg_name);
         }
         st.tags.remove(&format!(
-            "arn:{}:codedeploy:{region}:{account}:deploymentgroup:{app}/{dg_name}",
-            partition_for(region)
+            "arn:aws:codedeploy:{region}:{account}:deploymentgroup:{app}/{dg_name}"
         ));
         Ok(())
     }
@@ -233,10 +225,7 @@ impl ResourceProvisioner {
         if !st.applications.contains_key(&name) {
             return Err(format!("Application {name} not yet provisioned"));
         }
-        let arn = format!(
-            "arn:{}:codedeploy:{region}:{account}:application:{name}",
-            partition_for(region)
-        );
+        let arn = format!("arn:aws:codedeploy:{region}:{account}:application:{name}");
         let tags = cfn_tag_list_pascal(props);
         if tags.is_empty() {
             st.tags.remove(&arn);
@@ -319,10 +308,7 @@ impl ResourceProvisioner {
         let groups = st.deployment_groups.entry(app.to_string()).or_default();
         groups.insert(dg_name.to_string(), Value::Object(group));
 
-        let arn = format!(
-            "arn:{}:codedeploy:{region}:{account}:deploymentgroup:{app}/{dg_name}",
-            partition_for(region)
-        );
+        let arn = format!("arn:aws:codedeploy:{region}:{account}:deploymentgroup:{app}/{dg_name}");
         let tags = cfn_tag_list_pascal(props);
         if tags.is_empty() {
             st.tags.remove(&arn);

@@ -20,13 +20,7 @@ impl ResourceProvisioner {
             .unwrap_or(&generated_name)
             .to_string();
 
-        let arn = format!(
-            "arn:{}:firehose:{}:{}:deliverystream/{}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id,
-            name
-        );
+        let arn = self.regional_arn("firehose", &format!("deliverystream/{}", name));
         let stream_type = props
             .get("DeliveryStreamType")
             .and_then(|v| v.as_str())

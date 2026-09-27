@@ -4,7 +4,6 @@
 //! CFN-time). Writes through the batch service's snapshot hook so the
 //! resources survive a restart (the #1766 lesson).
 
-use fakecloud_aws::arn::partition_for;
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
@@ -25,12 +24,9 @@ fn copy_prop(stored: &mut Map<String, Value>, props: &Value, cfn_key: &str, api_
 
 impl ResourceProvisioner {
     fn batch_arn(&self, kind: &str, name: &str) -> String {
-        format!(
-            "arn:{}:batch:{}:{}:{kind}/{name}-{}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id,
-            Uuid::new_v4().simple()
+        self.regional_arn(
+            "batch",
+            &format!("{kind}/{name}-{}", Uuid::new_v4().simple()),
         )
     }
 
@@ -82,12 +78,7 @@ impl ResourceProvisioner {
         // and API-created environments read back identically.
         stored.insert(
             "ecsClusterArn".into(),
-            json!(format!(
-                "arn:{}:ecs:{}:{}:cluster/AWSBatch-{name}-{uuid}",
-                partition_for(&self.region),
-                self.region,
-                self.account_id
-            )),
+            json!(self.regional_arn("ecs", &format!("cluster/AWSBatch-{name}-{uuid}"))),
         );
         stored.insert("uuid".into(), json!(uuid));
         for (cfn, api) in [
@@ -164,12 +155,7 @@ impl ResourceProvisioner {
             let revision = acct.job_def_revisions.entry(name.clone()).or_insert(0);
             *revision += 1;
             let revision = *revision;
-            arn = format!(
-                "arn:{}:batch:{}:{}:job-definition/{name}:{revision}",
-                partition_for(&self.region),
-                self.region,
-                self.account_id
-            );
+            arn = self.regional_arn("batch", &format!("job-definition/{name}:{revision}"));
             let mut stored = Map::new();
             stored.insert("jobDefinitionName".into(), json!(name));
             stored.insert("jobDefinitionArn".into(), json!(arn));
@@ -226,12 +212,7 @@ impl ResourceProvisioner {
         let name = prop_str(props, "Name")
             .map(String::from)
             .unwrap_or_else(|| self.physical_name(resource));
-        let arn = format!(
-            "arn:{}:batch:{}:{}:scheduling-policy/{name}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id
-        );
+        let arn = self.regional_arn("batch", &format!("scheduling-policy/{name}"));
         let mut stored = Map::new();
         stored.insert("name".into(), json!(name));
         stored.insert("arn".into(), json!(arn));

@@ -7,7 +7,6 @@
 //! through the `pipes` snapshot hook (keyed off the `Pipes` resource segment),
 //! so the resource survives a restart (the #1766 lesson).
 
-use fakecloud_aws::arn::partition_for;
 use serde_json::{json, Map, Value};
 
 use super::{ProvisionResult, ResourceDefinition, ResourceProvisioner};
@@ -64,12 +63,7 @@ impl ResourceProvisioner {
         let target = require_arn_field(props, "Target")?;
         let role_arn = require_arn_field(props, "RoleArn")?;
 
-        let arn = format!(
-            "arn:{}:pipes:{}:{}:pipe/{name}",
-            partition_for(&self.region),
-            self.region,
-            self.account_id
-        );
+        let arn = self.regional_arn("pipes", &format!("pipe/{name}"));
         // CFN provisioning is synchronous, so the pipe is born settled: RUNNING
         // unless the template explicitly asks for STOPPED.
         let desired = match props.get("DesiredState").and_then(Value::as_str) {
