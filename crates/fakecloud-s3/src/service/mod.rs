@@ -249,9 +249,15 @@ impl S3Service {
         bucket: &str,
         headers: &HeaderMap,
     ) -> Result<WriteAclHeaders, AwsServiceError> {
+        // A present-but-blank value is treated as absent, the same rule
+        // `has_grant_headers` applies to the `x-amz-grant-*` family and for the
+        // same reason: it is what a client sends for an unset config field, and
+        // testing presence alone turned that into a hard 400 on every
+        // ACL-accepting write.
         let canned = headers
             .get("x-amz-acl")
             .and_then(|v| v.to_str().ok())
+            .filter(|s| !s.trim().is_empty())
             .map(|s| s.to_string());
         if let Some(acl) = canned.as_deref() {
             validate_object_canned_acl(acl)?;
@@ -268,28 +274,46 @@ impl S3Service {
                 "Specifying both Canned ACLs and Header Grants is not allowed",
             ));
         }
-        // What the request actually asks for, so both checks below judge grants
-        // rather than header spellings.
+        // The grants the request resolves to, which is what the public-ACL check
+        // below has to judge.
         let requested = match (&grants, canned.as_deref()) {
             (Some(g), _) => Some(g.clone()),
             (None, Some(acl)) => Some(canned_acl_grants_for_object(acl, account_id)),
             (None, None) => None,
         };
-        let reaches_past_owner = requested.as_deref().is_some_and(|g| {
-            g.iter().any(|grant| {
-                grant.permission != "FULL_CONTROL"
-                    || grant.grantee_type != "CanonicalUser"
-                    || grant.grantee_id.as_deref() != Some(account_id)
-            })
-        });
 
-        // BucketOwnerEnforced disables object ACLs, so asking for one is
-        // AccessControlListNotSupported -- except an ACL that grants nothing
-        // beyond the owner, which AWS still accepts there. That covers the
-        // canned `bucket-owner-full-control` AND, as the AWS wording says, "an
-        // equivalent form of this ACL", so `x-amz-grant-full-control=id=<owner>`
-        // is accepted too. A write with no ACL header is unaffected.
-        if reaches_past_owner && self.bucket_owner_enforced(account_id, bucket) {
+        // BucketOwnerEnforced disables object ACLs. The model is precise about
+        // the one exception: such a bucket "only accept[s] PUT requests that
+        // don't specify an ACL or PUT requests that specify bucket owner full
+        // control ACLs, such as the bucket-owner-full-control canned ACL or an
+        // equivalent form of this ACL expressed in the XML format".
+        //
+        // So the test is the ACL the request NAMES, not the grants it resolves
+        // to. Judging by resolved shape would also accept `private`,
+        // `bucket-owner-read` and `aws-exec-read`, all of which AWS refuses
+        // here: `private` is owner-only by definition, and the other two
+        // collapse onto an owner-only grant only because their real grantees
+        // are not modeled. `private` in particular is neither "no ACL" nor
+        // "bucket owner full control".
+        let asks_for_owner_full_control = match (&grants, canned.as_deref()) {
+            // "an equivalent form of this ACL": explicit grants that give the
+            // owner full control and nobody anything.
+            (Some(g), _) => {
+                !g.is_empty()
+                    && g.iter().all(|grant| {
+                        grant.permission == "FULL_CONTROL"
+                            && grant.grantee_type == "CanonicalUser"
+                            && grant.grantee_id.as_deref() == Some(account_id)
+                    })
+            }
+            (None, Some(acl)) => acl == "bucket-owner-full-control",
+            (None, None) => false,
+        };
+        let specifies_an_acl = grants.is_some() || canned.is_some();
+        if specifies_an_acl
+            && !asks_for_owner_full_control
+            && self.bucket_owner_enforced(account_id, bucket)
+        {
             return Err(AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
                 "AccessControlListNotSupported",
