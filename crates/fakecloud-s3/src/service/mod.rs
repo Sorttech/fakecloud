@@ -1693,7 +1693,17 @@ impl AwsService for S3Service {
             if reaches_past_owner || has_grant_headers(&request.headers) {
                 extra.push("PutBucketAcl");
             }
-            if request.headers.contains_key("x-amz-object-ownership") {
+            // Presence, but blank counts as absent -- the same rule the ACL
+            // headers and the condition keys follow. Otherwise a blank value
+            // demands a permission whose condition key is deliberately not
+            // emitted, so a `StringEquals`-gated Allow 403s a request the handler
+            // would have answered with a 400.
+            if request
+                .headers
+                .get("x-amz-object-ownership")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| !v.trim().is_empty())
+            {
                 extra.push("PutBucketOwnershipControls");
             }
             if request
@@ -1769,7 +1779,14 @@ fn s3_condition_keys(
     // are never populated. AWS exposes them on every ACL-accepting write, so
     // they are emitted whenever the request carries them rather than being
     // gated on an action list that would drift.
-    if let Some(acl) = headers.get("x-amz-acl").and_then(|v| v.to_str().ok()) {
+    if let Some(acl) = headers
+        .get("x-amz-acl")
+        .and_then(|v| v.to_str().ok())
+        // Blank is skipped like every other header here: the write paths treat a
+        // present-but-empty canned ACL as absent, so emitting the key would let
+        // `Null`/`StringEquals` guardrails deny a request that asks for no ACL.
+        .filter(|v| !v.trim().is_empty())
+    {
         out.insert("s3:x-amz-acl".to_string(), vec![acl.to_string()]);
     }
     for (header, _) in &GRANT_HEADER_PERMISSIONS {
@@ -2633,9 +2650,10 @@ pub(crate) const OBJECT_OWNERSHIP_VALUES: [&str; 3] = [
 /// `AWS::S3::Bucket` `AccessControl: AwsExecRead` maps to it), and AWS answers
 /// 200, so refusing it would turn a working call into a hard failure. Its grant
 /// is a READ to the EC2 service's canonical user, which this build cannot
-/// reproduce, so it resolves to owner-only -- `create_bucket` special-cases it
-/// when checking the BucketOwnerEnforced conflict, since the request does ask
-/// for an ACL reaching past the owner.
+/// reproduce, so it resolves to owner-only -- [`acl_reaches_past_owner`] special-
+/// cases it, since the request does ask for an ACL reaching past the owner. That
+/// drives both the BucketOwnerEnforced conflict check and the `s3:PutBucketAcl`
+/// authorization a create carrying it requires.
 ///
 /// `bucket-owner-read` and `bucket-owner-full-control` are object-scoped, and
 /// the canned-ACL table says S3 IGNORES them when they are given on a bucket
@@ -2667,6 +2685,14 @@ pub(crate) const BUCKET_CANNED_ACLS: [&str; 8] = [
 /// the EC2 service's canonical user is not modeled, so [`canned_acl_grants`]
 /// resolves it to owner-only -- but the request does ask for an ACL reaching
 /// outside the owner.
+///
+/// NOT the same question as the object-write check in
+/// [`S3Service::resolve_write_acl_headers`], which asks whether the request names
+/// bucket-owner-full-control specifically. The two look alike and must not be
+/// unified: a BucketOwnerEnforced BUCKET rejects an ACL that grants another
+/// account anything, so `private` is fine there, while a BucketOwnerEnforced
+/// bucket accepts an object PUT only when it specifies no ACL at all or
+/// bucket-owner-full-control -- which is not even a legal bucket ACL.
 pub(crate) fn acl_reaches_past_owner(acl: &str, owner_id: &str) -> bool {
     acl == "aws-exec-read"
         || !canned_acl_grants(acl, owner_id).iter().all(|g| {

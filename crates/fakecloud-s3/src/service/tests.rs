@@ -4758,6 +4758,17 @@ fn create_bucket_requires_a_permission_per_setting_it_configures() {
         .insert("x-amz-acl", "aws-exec-read".parse().unwrap());
     assert_eq!(names(&exec_read), vec!["CreateBucket", "PutBucketAcl"]);
 
+    // A blank value asks for nothing, so it configures nothing either -- the
+    // condition keys skip blanks, and demanding a permission whose key is absent
+    // turns a `StringEquals`-gated Allow into a 403 on a request the handler
+    // answers with a 400.
+    let mut blank = make_request(Method::PUT, "/perm-blank", &[], b"");
+    blank.headers.insert("x-amz-acl", "".parse().unwrap());
+    blank
+        .headers
+        .insert("x-amz-object-ownership", "".parse().unwrap());
+    assert_eq!(names(&blank), vec!["CreateBucket"]);
+
     // A false object-lock header configures nothing.
     let mut unlocked = make_request(Method::PUT, "/perm-unlocked", &[], b"");
     unlocked
@@ -4838,7 +4849,14 @@ fn acl_condition_keys_are_populated_from_the_request_headers() {
     // check does not read it as set.
     let mut blank = HeaderMap::new();
     blank.insert("x-amz-object-ownership", "".parse().unwrap());
-    assert!(s3_condition_keys("CreateBucket", &HashMap::new(), &blank).is_empty());
+    blank.insert("x-amz-bucket-object-lock-enabled", "".parse().unwrap());
+    blank.insert("x-amz-acl", "".parse().unwrap());
+    blank.insert("x-amz-grant-read", "".parse().unwrap());
+    assert!(
+        s3_condition_keys("CreateBucket", &HashMap::new(), &blank).is_empty(),
+        "blank values must be skipped on EVERY header, not most of them: {:?}",
+        s3_condition_keys("CreateBucket", &HashMap::new(), &blank)
+    );
 }
 
 #[test]

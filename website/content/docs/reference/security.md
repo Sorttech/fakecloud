@@ -132,7 +132,7 @@ Every operator supports the `...IfExists` suffix (missing key evaluates to `true
 | `s3:max-keys` | `s3:ListObjects`, `s3:ListObjectsV2` | `?max-keys=` query param |
 | `s3:x-amz-acl` | any request carrying the header (`CreateBucket`, `PutObject`, `CopyObject`, `CreateMultipartUpload`, `PutBucketAcl`, `PutObjectAcl`) | `x-amz-acl` header |
 | `s3:x-amz-grant-read`, `-write`, `-read-acp`, `-write-acp`, `-full-control` | any request carrying the header | matching `x-amz-grant-*` header |
-| `s3:x-amz-object-ownership` | any request carrying the header (`CreateBucket`, `PutBucketOwnershipControls`) | `x-amz-object-ownership` header |
+| `s3:x-amz-object-ownership` | `CreateBucket` | `x-amz-object-ownership` header (`PutBucketOwnershipControls` carries the value in its XML body, not a header, so the key is not populated there) |
 | `s3:x-amz-bucket-object-lock-enabled` | `CreateBucket` | `x-amz-bucket-object-lock-enabled` header |
 | `sns:Protocol` | `sns:Subscribe` | `Protocol` request parameter |
 | `sns:Endpoint` | `sns:Subscribe` | `Endpoint` request parameter |

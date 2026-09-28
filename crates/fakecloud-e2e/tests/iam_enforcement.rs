@@ -584,6 +584,12 @@ async fn s3_create_bucket_with_object_lock_needs_its_permissions() {
 /// permits the create must therefore permit the `s3:PutBucketAcl` it implies:
 /// building the context per action left that one seeing no `aws:RequestTag/*`
 /// at all, so the condition matched and denied a create AWS allows.
+///
+/// The Deny is written with `Null`, deliberately. A `StringNotEquals` Deny cannot
+/// catch this: an unpopulated key safe-fails every non-`IfExists` operator to
+/// false, so such a Deny would not apply on the broken code either and the test
+/// would pass against the bug. `Null` is the one operator that reads an
+/// unpopulated key AS null, which is exactly the state being asserted against.
 #[tokio::test]
 async fn s3_create_bucket_tag_condition_applies_to_the_implied_acl_action() {
     let server = start_strict().await;
@@ -597,7 +603,7 @@ async fn s3_create_bucket_tag_condition_applies_to_the_implied_acl_action() {
             {"Effect":"Deny",
              "Action":["s3:CreateBucket","s3:TagResource","s3:PutBucketAcl"],
              "Resource":"*",
-             "Condition":{"StringNotEquals":{"aws:RequestTag/CostCenter":"123"}}}
+             "Condition":{"Null":{"aws:RequestTag/CostCenter":"true"}}}
         ]}"#,
     )
     .await;
@@ -625,25 +631,14 @@ async fn s3_create_bucket_tag_condition_applies_to_the_implied_acl_action() {
         .await
         .expect("a create whose tags satisfy the guardrail must not be denied by its own ACL");
 
-    // The guardrail still bites when the tag value is wrong.
+    // The guardrail still bites: a create carrying no such tag is denied.
     let err = s3
         .create_bucket()
-        .bucket("ctx-wrong-tag")
+        .bucket("ctx-untagged")
         .acl(aws_sdk_s3::types::BucketCannedAcl::PublicRead)
-        .create_bucket_configuration(
-            aws_sdk_s3::types::CreateBucketConfiguration::builder()
-                .tags(
-                    aws_sdk_s3::types::Tag::builder()
-                        .key("CostCenter")
-                        .value("999")
-                        .build()
-                        .unwrap(),
-                )
-                .build(),
-        )
         .send()
         .await
-        .expect_err("the wrong tag value must still be denied");
+        .expect_err("a create with no CostCenter tag must be denied");
     assert!(
         format!("{err:?}").contains("AccessDenied"),
         "unexpected error: {err:?}"
