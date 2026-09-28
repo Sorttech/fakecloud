@@ -2614,6 +2614,26 @@ mod tests {
             format!("arn:aws-cn:cloudfront::{DEFAULT_ACCOUNT}:distribution/{id}")
         );
 
+        // The distribution is found by id, and both Get and List report the
+        // same aws-cn ARN the create returned.
+        let got = svc
+            .handle(cn(
+                http::Method::GET,
+                &format!("/2020-05-31/distribution/{id}"),
+                "",
+                "",
+            ))
+            .await
+            .unwrap();
+        let got = std::str::from_utf8(got.body.expect_bytes()).unwrap();
+        assert!(got.contains(&format!("<ARN>{arn}</ARN>")), "{got}");
+        let listed = svc
+            .handle(cn(http::Method::GET, "/2020-05-31/distribution", "", ""))
+            .await
+            .unwrap();
+        let listed = std::str::from_utf8(listed.body.expect_bytes()).unwrap();
+        assert!(listed.contains(&format!("<ARN>{arn}</ARN>")), "{listed}");
+
         let tags = r#"<Tags xmlns="http://cloudfront.amazonaws.com/doc/2020-05-31/"><Items><Tag><Key>env</Key><Value>prod</Value></Tag></Items></Tags>"#;
         let query = format!("Operation=Tag&Resource={arn}");
         svc.handle(cn(http::Method::POST, "/2020-05-31/tagging", &query, tags))
@@ -2630,6 +2650,47 @@ mod tests {
             .unwrap();
         let listed = std::str::from_utf8(listed.body.expect_bytes()).unwrap();
         assert!(listed.contains("<Value>prod</Value>"), "{listed}");
+    }
+
+    #[tokio::test]
+    async fn realtime_log_config_found_by_name_across_partitions() {
+        let svc = CloudFrontService::new(make_state());
+        let body = r#"<CreateRealtimeLogConfigRequest xmlns="http://cloudfront.amazonaws.com/doc/2020-05-31/"><EndPoints><member><StreamType>Kinesis</StreamType><KinesisStreamConfig><RoleARN>arn:aws-cn:iam::123456789012:role/r</RoleARN><StreamARN>arn:aws-cn:kinesis:cn-north-1:123456789012:stream/s</StreamARN></KinesisStreamConfig></member></EndPoints><Fields><Field>timestamp</Field></Fields><Name>rtl</Name><SamplingRate>10</SamplingRate></CreateRealtimeLogConfigRequest>"#;
+        let mut create = make_request(
+            http::Method::POST,
+            "/2020-05-31/realtime-log-config",
+            "",
+            body,
+        );
+        create.region = "cn-north-1".into();
+        let created = svc.handle(create).await.unwrap();
+        let xml = std::str::from_utf8(created.body.expect_bytes()).unwrap();
+        let want = format!("arn:aws-cn:cloudfront::{DEFAULT_ACCOUNT}:realtime-log-config/rtl");
+        assert!(xml.contains(&want), "{xml}");
+
+        let by_name = r#"<GetRealtimeLogConfigRequest xmlns="http://cloudfront.amazonaws.com/doc/2020-05-31/"><Name>rtl</Name></GetRealtimeLogConfigRequest>"#;
+        let got = svc
+            .handle(make_request(
+                http::Method::POST,
+                "/2020-05-31/get-realtime-log-config",
+                "",
+                by_name,
+            ))
+            .await
+            .unwrap();
+        let got = std::str::from_utf8(got.body.expect_bytes()).unwrap();
+        assert!(got.contains(&want), "{got}");
+
+        let deleted = svc
+            .handle(make_request(
+                http::Method::POST,
+                "/2020-05-31/delete-realtime-log-config",
+                "",
+                by_name,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(deleted.status, StatusCode::NO_CONTENT);
     }
 
     async fn create_distribution_returning_id(svc: &CloudFrontService, caller_ref: &str) -> String {

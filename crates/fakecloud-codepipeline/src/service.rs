@@ -398,14 +398,6 @@ impl CodePipelineService {
     fn account(&self, req: &AwsRequest) -> String {
         req.account_id.clone()
     }
-
-    fn pipeline_arn(&self, req: &AwsRequest, name: &str) -> String {
-        pipeline_arn(&req.region, &req.account_id, name)
-    }
-
-    fn webhook_arn(&self, req: &AwsRequest, name: &str) -> String {
-        webhook_arn(&req.region, &req.account_id, name)
-    }
 }
 
 /// `arn:<partition>:codepipeline:<region>:<account>:<name>`.
@@ -569,7 +561,7 @@ impl CodePipelineService {
         let name = validate_pipeline_declaration(&pipeline)?;
         let now = Utc::now();
         let account = self.account(req);
-        let arn = self.pipeline_arn(req, &name);
+        let arn = pipeline_arn(&req.region, &req.account_id, &name);
         let tags = tag_list(&b);
         let mut guard = self.state.write();
         let st = guard.get_or_create(&account);
@@ -639,11 +631,9 @@ impl CodePipelineService {
             }
             None => st.pipelines.get(&name).cloned().unwrap(),
         };
-        let meta = st
-            .pipeline_meta
-            .get(&name)
-            .cloned()
-            .unwrap_or_else(|| json!({ "pipelineArn": self.pipeline_arn(req, &name) }));
+        let meta = st.pipeline_meta.get(&name).cloned().unwrap_or_else(
+            || json!({ "pipelineArn": pipeline_arn(&req.region, &req.account_id, &name) }),
+        );
         ok(json!({ "pipeline": decl, "metadata": meta }))
     }
 
@@ -691,7 +681,7 @@ impl CodePipelineService {
         let b = body(req);
         let name = req_pipeline_name(&b, "name")?;
         let account = self.account(req);
-        let arn = self.pipeline_arn(req, &name);
+        let arn = pipeline_arn(&req.region, &req.account_id, &name);
         let mut guard = self.state.write();
         let st = guard.get_or_create(&account);
         // DeletePipeline is idempotent: no "does not exist" error is declared.
@@ -1637,7 +1627,7 @@ impl CodePipelineService {
             return Err(validation("The webhook authentication type is invalid."));
         }
         let account = self.account(req);
-        let arn = self.webhook_arn(req, &name);
+        let arn = webhook_arn(&req.region, &req.account_id, &name);
         let url = format!(
             "https://webhooks.{}.amazonaws.com/trigger?Component=1&webhookName={}",
             req.region, name
@@ -1680,7 +1670,7 @@ impl CodePipelineService {
         check_len(&b, "name", 1, 100)?;
         let name = req_str(&b, "name")?;
         let account = self.account(req);
-        let arn = self.webhook_arn(req, &name);
+        let arn = webhook_arn(&req.region, &req.account_id, &name);
         let mut guard = self.state.write();
         let st = guard.get_or_create(&account);
         if st.webhooks.remove(&name).is_some() {

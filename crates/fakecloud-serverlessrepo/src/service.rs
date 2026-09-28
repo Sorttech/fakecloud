@@ -480,7 +480,11 @@ impl ServerlessRepoService {
         out.insert("applicationId".into(), json!(app_id));
         out.insert(
             "changeSetId".into(),
-            json!(shared::new_change_set_id(&ctx.region)),
+            json!(shared::new_change_set_id(
+                &ctx.region,
+                &ctx.account,
+                &stack_name,
+            )),
         );
         out.insert(
             "stackId".into(),

@@ -6,7 +6,7 @@
 //! and so the parameter-definition parser has a single implementation shared by
 //! `CreateApplication`, `CreateApplicationVersion`, and `GetApplication`.
 
-use fakecloud_aws::arn::{partition_for, Arn};
+use fakecloud_aws::arn::Arn;
 use serde_json::{json, Map, Value};
 
 /// The application ARN,
@@ -22,14 +22,18 @@ pub fn application_arn(region: &str, account: &str, name: &str) -> String {
     .to_string()
 }
 
-/// A CloudFormation change-set id, `{stack}-{uuid}` shaped like the value
-/// `CreateCloudFormationChangeSet` returns.
-pub fn new_change_set_id(region: &str) -> String {
-    format!(
-        "arn:{}:cloudformation:changeSet/{}",
-        partition_for(region),
-        uuid::Uuid::new_v4()
+/// A CloudFormation change-set id ARN,
+/// `arn:<partition>:cloudformation:{region}:{account}:changeSet/{stack}-changeset/{uuid}`,
+/// the shape `CreateCloudFormationChangeSet` returns: the change set is named
+/// after the stack it targets and suffixed with a fresh id.
+pub fn new_change_set_id(region: &str, account: &str, stack_name: &str) -> String {
+    Arn::regional(
+        "cloudformation",
+        region,
+        account,
+        &format!("changeSet/{stack_name}-changeset/{}", uuid::Uuid::new_v4()),
     )
+    .to_string()
 }
 
 /// A CloudFormation stack id ARN of the form AWS mints for a SAR-launched

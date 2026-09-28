@@ -433,7 +433,11 @@ impl CloudFrontService {
             DEFAULT_ACCOUNT,
             &format!("realtime-log-config/{}", parsed.name),
         );
-        if account.realtime_log_configs.contains_key(&arn) {
+        if account
+            .realtime_log_configs
+            .values()
+            .any(|r| r.name == parsed.name)
+        {
             return Err(aws_error(
                 StatusCode::CONFLICT,
                 "RealtimeLogConfigAlreadyExists",
@@ -463,12 +467,14 @@ impl CloudFrontService {
             .map_err(|e| {
                 invalid_argument(format!("invalid GetRealtimeLogConfigRequest XML: {e}"))
             })?;
-        let key = self.resolve_rtl_key(req, &parsed)?;
         let state = self.state.read();
-        let r = state
+        let configs = state
             .accounts
             .get(DEFAULT_ACCOUNT)
-            .and_then(|a| a.realtime_log_configs.get(&key).cloned())
+            .map(|a| &a.realtime_log_configs);
+        let key = resolve_rtl_key(configs, &parsed)?;
+        let r = configs
+            .and_then(|c| c.get(&key).cloned())
             .ok_or_else(|| not_found("RealtimeLogConfig", &key))?;
         drop(state);
         let body = render_realtime_log(&r, "GetRealtimeLogConfigResult");
@@ -512,8 +518,14 @@ impl CloudFrontService {
             .map_err(|e| {
                 invalid_argument(format!("invalid DeleteRealtimeLogConfigRequest XML: {e}"))
             })?;
-        let key = self.resolve_rtl_key(req, &parsed)?;
         let mut state = self.state.write();
+        let key = resolve_rtl_key(
+            state
+                .accounts
+                .get(DEFAULT_ACCOUNT)
+                .map(|a| &a.realtime_log_configs),
+            &parsed,
+        )?;
         let account = state
             .accounts
             .get_mut(DEFAULT_ACCOUNT)
@@ -554,28 +566,25 @@ impl CloudFrontService {
         body.push_str("</RealtimeLogConfigs>");
         Ok(xml_response(StatusCode::OK, body, HeaderMap::new()))
     }
+}
 
-    fn resolve_rtl_key(
-        &self,
-        req: &AwsRequest,
-        parsed: &GetOrDeleteRealtimeLogConfigRequest,
-    ) -> Result<String, AwsServiceError> {
-        if let Some(arn) = &parsed.arn {
-            if !arn.is_empty() {
-                return Ok(arn.clone());
-            }
-        }
-        if let Some(name) = &parsed.name {
-            if !name.is_empty() {
-                return Ok(crate::service::cloudfront_arn(
-                    &req.region,
-                    DEFAULT_ACCOUNT,
-                    &format!("realtime-log-config/{name}"),
-                ));
-            }
-        }
-        Err(invalid_argument("Either Name or ARN must be specified"))
+/// The storage key (ARN) of the realtime log config a Get/Delete request
+/// names. A name is resolved against the stored configs rather than rebuilt
+/// into an ARN, since the stored ARN's partition is the creating request's.
+fn resolve_rtl_key(
+    configs: Option<&std::collections::BTreeMap<String, StoredRealtimeLogConfig>>,
+    parsed: &GetOrDeleteRealtimeLogConfigRequest,
+) -> Result<String, AwsServiceError> {
+    if let Some(arn) = parsed.arn.as_deref().filter(|a| !a.is_empty()) {
+        return Ok(arn.to_string());
     }
+    if let Some(name) = parsed.name.as_deref().filter(|n| !n.is_empty()) {
+        return configs
+            .and_then(|c| c.values().find(|r| r.name == name))
+            .map(|r| r.arn.clone())
+            .ok_or_else(|| not_found("RealtimeLogConfig", name));
+    }
+    Err(invalid_argument("Either Name or ARN must be specified"))
 }
 
 // ─── XML render helpers ───────────────────────────────────────────────

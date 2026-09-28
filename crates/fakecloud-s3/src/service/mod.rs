@@ -365,6 +365,17 @@ pub(crate) fn io_to_aws(err: std::io::Error) -> AwsServiceError {
 }
 
 impl S3Service {
+    /// The region of an existing bucket, searched across accounts (bucket
+    /// names are global).
+    fn bucket_region(&self, bucket: &str) -> Option<String> {
+        let mas = self.state.read();
+        let account = mas.find_account(|s| s.buckets.contains_key(bucket))?;
+        mas.get(account)?
+            .buckets
+            .get(bucket)
+            .map(|b| b.region.clone())
+    }
+
     pub fn new(state: SharedS3State, delivery: Arc<DeliveryBus>) -> Self {
         Self::with_store(state, delivery, Arc::new(MemoryS3Store::new()))
     }
@@ -1623,7 +1634,7 @@ impl AwsService for S3Service {
                     .path_segments
                     .get(2)
                     .map(|name| {
-                        Arn::s3_in(&request.region, &format!("accesspoint/{name}")).to_string()
+                        Arn::s3_access_point(&request.region, &request.account_id, name).to_string()
                     })
                     .unwrap_or_else(|| "*".to_string());
                 return Some(fakecloud_core::auth::IamAction {
@@ -1647,7 +1658,11 @@ impl AwsService for S3Service {
             "WriteGetObjectResponse" => "s3-object-lambda",
             _ => "s3",
         };
-        let resource = s3_resource_for(&request.region, action, bucket, key.as_deref());
+        // Every ARN S3 returns for a bucket carries the bucket's own region's
+        // partition, so policies written against those ARNs must match here.
+        let bucket_region = bucket.and_then(|b| self.bucket_region(b));
+        let region = bucket_region.as_deref().unwrap_or(&request.region);
+        let resource = s3_resource_for(region, action, bucket, key.as_deref());
         Some(fakecloud_core::auth::IamAction {
             service,
             action,
@@ -4100,6 +4115,57 @@ mod partition_tests {
             s3_resource_for("us-east-1", "ListObjectsV2", Some("b"), None),
             "arn:aws:s3:::b"
         );
+    }
+
+    #[test]
+    fn access_point_iam_resource_is_regional() {
+        let svc = S3Service::new(
+            Arc::new(RwLock::new(
+                fakecloud_core::multi_account::MultiAccountState::new(
+                    "123456789012",
+                    "us-east-1",
+                    "",
+                ),
+            )),
+            Arc::new(DeliveryBus::new()),
+        );
+        for (region, want) in [
+            (
+                "us-east-1",
+                "arn:aws:s3:us-east-1:123456789012:accesspoint/ap1",
+            ),
+            (
+                "cn-north-1",
+                "arn:aws-cn:s3:cn-north-1:123456789012:accesspoint/ap1",
+            ),
+        ] {
+            let mut r = request(Method::GET, region, "/v20180820/accesspoint/ap1");
+            r.headers
+                .insert("host", "123456789012.s3-control.localhost".parse().unwrap());
+            let action = svc.iam_action_for(&r).unwrap();
+            assert_eq!(action.action, "GetAccessPoint");
+            assert_eq!(action.resource, want);
+        }
+    }
+
+    #[test]
+    fn iam_resource_uses_bucket_region_partition() {
+        let state: SharedS3State = Arc::new(RwLock::new(
+            fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+        ));
+        state.write().default_mut().buckets.insert(
+            "cn-bucket".to_string(),
+            S3Bucket::new("cn-bucket", "cn-north-1", "123456789012"),
+        );
+        let svc = S3Service::new(state, Arc::new(DeliveryBus::new()));
+        let action = svc
+            .iam_action_for(&request(Method::GET, "us-east-1", "/cn-bucket/k"))
+            .unwrap();
+        assert_eq!(action.resource, "arn:aws-cn:s3:::cn-bucket/k");
+        let action = svc
+            .iam_action_for(&request(Method::GET, "cn-north-1", "/missing/k"))
+            .unwrap();
+        assert_eq!(action.resource, "arn:aws-cn:s3:::missing/k");
     }
 
     #[tokio::test]

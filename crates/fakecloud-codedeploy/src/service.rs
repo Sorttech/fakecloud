@@ -3151,12 +3151,36 @@ mod tests {
             json!({ "applicationName": "cnapp", "tags": [{ "Key": "env", "Value": "prod" }] }),
         ))
         .unwrap();
-        let arn = "arn:aws-cn:codedeploy:cn-north-1:000000000000:application:cnapp";
+        // CodeDeploy never returns an application's ARN on the wire; callers
+        // (tag clients, CloudFormation) build it, so use the same builder.
+        let arn = application_arn("cn-north-1", "000000000000", "cnapp");
+        assert_eq!(
+            arn,
+            "arn:aws-cn:codedeploy:cn-north-1:000000000000:application:cnapp"
+        );
         let tags = body_of(
             s.list_tags_for_resource(&cn("ListTagsForResource", json!({ "ResourceArn": arn })))
                 .unwrap(),
         );
         assert_eq!(tags["Tags"][0]["Value"], "prod");
+
+        // The on-premises instance ARN is returned, so read it back.
+        s.register_on_premises_instance(&cn(
+            "RegisterOnPremisesInstance",
+            json!({ "instanceName": "cn-i1", "iamUserArn": "arn:aws-cn:iam::000000000000:user/u" }),
+        ))
+        .unwrap();
+        let got = body_of(
+            s.get_on_premises_instance(&cn(
+                "GetOnPremisesInstance",
+                json!({ "instanceName": "cn-i1" }),
+            ))
+            .unwrap(),
+        );
+        assert_eq!(
+            got["instanceInfo"]["instanceArn"],
+            "arn:aws-cn:codedeploy:cn-north-1:000000000000:instance/cn-i1"
+        );
     }
 
     // T1.1: CreateApplication persists its create-time `tags` so

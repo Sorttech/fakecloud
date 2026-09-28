@@ -270,7 +270,7 @@ fn gen_uuid() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-pub fn connection_arn(region: &str, account: &str, id: &str) -> String {
+fn connection_arn(region: &str, account: &str, id: &str) -> String {
     Arn::regional(
         "codeconnections",
         region,
@@ -279,10 +279,10 @@ pub fn connection_arn(region: &str, account: &str, id: &str) -> String {
     )
     .to_string()
 }
-pub fn host_arn(region: &str, account: &str, id: &str) -> String {
+fn host_arn(region: &str, account: &str, id: &str) -> String {
     Arn::regional("codeconnections", region, account, &format!("host/{id}")).to_string()
 }
-pub fn repository_link_arn(region: &str, account: &str, id: &str) -> String {
+fn repository_link_arn(region: &str, account: &str, id: &str) -> String {
     Arn::regional(
         "codeconnections",
         region,

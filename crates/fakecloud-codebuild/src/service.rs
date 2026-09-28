@@ -1170,10 +1170,18 @@ fn find_secret<'a>(
         return Some(secret);
     }
     if arn_resource(secret_ref, "secretsmanager").is_some() {
-        for secret in st.secrets.values() {
-            if secret.arn == secret_ref || secret.arn.starts_with(secret_ref) {
-                return Some(secret);
-            }
+        if let Some(secret) = st.secrets.values().find(|s| s.arn == secret_ref) {
+            return Some(secret);
+        }
+        // A partial ARN omits only the `-XXXXXX` random suffix Secrets
+        // Manager appends to the name.
+        let is_partial_of = |arn: &str| {
+            arn.strip_prefix(secret_ref)
+                .and_then(|rest| rest.strip_prefix('-'))
+                .is_some_and(|suffix| suffix.chars().count() == 6)
+        };
+        if let Some(secret) = st.secrets.values().find(|s| is_partial_of(&s.arn)) {
+            return Some(secret);
         }
         // Fall back to the name embedded in the ARN tail.
         if let Some(tail) = secret_ref.rsplit(":secret:").next() {
@@ -3917,6 +3925,33 @@ mod tests {
         ]);
         assert_eq!(resolve_secret(&st, "prod-config"), "RIGHT");
         assert_eq!(resolve_secret(&st, "prod"), "WRONG");
+    }
+
+    #[test]
+    fn partial_secret_arn_matches_only_the_random_suffix() {
+        let prod = (
+            "prod",
+            "arn:aws:secretsmanager:us-east-1:000000000000:secret:prod-AbCdEf",
+            "PROD",
+        );
+        let prod_config = (
+            "prod-config",
+            "arn:aws:secretsmanager:us-east-1:000000000000:secret:prod-config-XyZ123",
+            "CONFIG",
+        );
+        let partial = "arn:aws:secretsmanager:us-east-1:000000000000:secret:prod";
+        let st = secrets_state(&[prod, prod_config]);
+        assert_eq!(resolve_secret(&st, partial), "PROD");
+        assert_eq!(
+            resolve_secret(
+                &st,
+                "arn:aws:secretsmanager:us-east-1:000000000000:secret:prod-config"
+            ),
+            "CONFIG"
+        );
+        // `prod` is not a partial ARN of `prod-config-XyZ123`.
+        let st = secrets_state(&[prod_config]);
+        assert_eq!(resolve_secret(&st, partial), "");
     }
 
     #[test]

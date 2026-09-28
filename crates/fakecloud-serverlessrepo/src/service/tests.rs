@@ -386,7 +386,7 @@ fn application_and_stack_arns_carry_china_partition() {
     assert!(cs["changeSetId"]
         .as_str()
         .unwrap()
-        .starts_with("arn:aws-cn:cloudformation:changeSet/"));
+        .starts_with("arn:aws-cn:cloudformation:cn-north-1:000000000000:changeSet/s-changeset/"));
     assert!(cs["stackId"]
         .as_str()
         .unwrap()
