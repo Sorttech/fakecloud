@@ -409,6 +409,23 @@ fn split_and(expr: &str) -> Vec<&str> {
     parts
 }
 
+/// Flatten a conjunction into its terms, through any depth of parentheses:
+/// `(a = :a AND (b = :b))` yields `a = :a` and `b = :b`.
+fn collect_conjuncts<'a>(expr: &'a str, out: &mut Vec<&'a str>) {
+    let trimmed = expr.trim();
+    let inner = strip_outer_parens(trimmed).trim();
+    let parts = split_and(inner);
+    if parts.len() > 1 {
+        for part in parts {
+            collect_conjuncts(part, out);
+        }
+    } else if inner.len() < trimmed.len() {
+        collect_conjuncts(inner, out);
+    } else {
+        out.push(inner);
+    }
+}
+
 /// Parse a `SearchConditionExpression`: a conjunction of equality conditions on
 /// search-schema attributes. Every other comparator is refused, on HASH and
 /// INLINE_FILTER elements alike.
@@ -419,8 +436,9 @@ fn parse_search_condition(
     values: &HashMap<String, Value>,
 ) -> Result<Vec<SearchTerm>, AwsServiceError> {
     let mut terms = Vec::new();
-    for raw in split_and(expr) {
-        let term = strip_outer_parens(raw.trim()).trim();
+    let mut raw_terms = Vec::new();
+    collect_conjuncts(expr, &mut raw_terms);
+    for term in raw_terms {
         if term.is_empty() {
             return Err(validation(
                 "Invalid SearchConditionExpression: Syntax error; empty condition",
@@ -776,6 +794,14 @@ mod tests {
         let ok = parse_search_condition("tenant = :t AND category = :c", &index, &names, &values)
             .unwrap();
         assert_eq!(ok.len(), 2);
+        for nested in [
+            "(tenant = :t AND category = :c)",
+            "((tenant = :t)) AND (category = :c)",
+            "(tenant = :t AND (category = :c))",
+        ] {
+            let terms = parse_search_condition(nested, &index, &names, &values).unwrap();
+            assert_eq!(terms.len(), 2, "{nested}");
+        }
         for bad in [
             "tenant < :t",
             "tenant = :t AND category >= :c",

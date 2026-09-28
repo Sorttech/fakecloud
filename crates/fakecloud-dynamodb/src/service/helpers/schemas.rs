@@ -288,17 +288,21 @@ pub fn parse_vector_index(v: &Value, table_arn: &str) -> Result<VectorIndex, Aws
         .to_string();
     let search_schema = v["SearchSchema"]
         .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|e| {
-                    Some((
-                        e["AttributeName"].as_str()?.to_string(),
-                        e["SearchSchemaElementType"].as_str()?.to_string(),
-                    ))
-                })
-                .collect()
+        .into_iter()
+        .flatten()
+        .map(|e| {
+            match (
+                e["AttributeName"].as_str(),
+                e["SearchSchemaElementType"].as_str(),
+            ) {
+                (Some(name), Some(kind)) => Ok((name.to_string(), kind.to_string())),
+                _ => Err(invalid(
+                    "VectorIndex.SearchSchema elements require AttributeName and \
+                     SearchSchemaElementType",
+                )),
+            }
         })
-        .unwrap_or_default();
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(VectorIndex {
         index_arn: format!("{table_arn}/index/{index_name}"),
         index_name,

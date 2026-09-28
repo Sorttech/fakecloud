@@ -8771,3 +8771,171 @@ fn vector_index_arns_take_the_table_partition() {
         "arn:aws-cn:dynamodb:cn-north-1:123456789012:table/cn-vec/index/vix"
     );
 }
+
+#[test]
+fn update_table_keeps_vector_tables_on_demand_and_serialises_index_builds() {
+    let svc = make_service();
+    create_vector_table(&svc, "COSINE");
+    let update = |body: Value| {
+        let mut body = body;
+        body["TableName"] = json!("vec-table");
+        svc.update_table(&make_request("UpdateTable", body))
+    };
+    let msg = err_message(err_of(update(json!({
+        "BillingMode": "PROVISIONED",
+        "ProvisionedThroughput": { "ReadCapacityUnits": 5, "WriteCapacityUnits": 5 },
+    }))));
+    assert!(msg.contains("Vector indexes are only supported for PAY_PER_REQUEST tables"));
+
+    update(json!({
+        "VectorIndexUpdates": [{ "Create": {
+            "IndexName": "online",
+            "VectorAttribute": { "AttributeName": "other" },
+            "Dimensions": 4,
+            "DistanceFunction": "COSINE",
+            "Projection": { "ProjectionType": "KEYS_ONLY" },
+        }}],
+    }))
+    .unwrap();
+    let gsi_create = json!({
+        "AttributeDefinitions": [{ "AttributeName": "g", "AttributeType": "S" }],
+        "GlobalSecondaryIndexUpdates": [{ "Create": {
+            "IndexName": "gsi",
+            "KeySchema": [{ "AttributeName": "g", "KeyType": "HASH" }],
+            "Projection": { "ProjectionType": "ALL" },
+        }}],
+    });
+    // While the vector index allocates: no second online index, and no other
+    // change to the UPDATING table.
+    assert_eq!(
+        err_of(update(gsi_create.clone())).code(),
+        "LimitExceededException"
+    );
+    let err = err_of(update(json!({ "DeletionProtectionEnabled": true })));
+    assert_eq!(err.code(), "ResourceInUseException");
+    assert!(err_message(err).contains("Table is being updated"));
+
+    // Backfilling: the table is ACTIVE and takes other changes, but the
+    // online index action is still held.
+    age_vector_index(
+        &svc,
+        "vec-table",
+        "online",
+        crate::state::VECTOR_INDEX_ALLOCATION_MS,
+    );
+    update(json!({ "DeletionProtectionEnabled": false })).unwrap();
+    assert_eq!(
+        err_of(update(gsi_create.clone())).code(),
+        "LimitExceededException"
+    );
+
+    age_vector_index(
+        &svc,
+        "vec-table",
+        "online",
+        crate::state::VECTOR_INDEX_BACKFILL_MS,
+    );
+    update(gsi_create).unwrap();
+}
+
+#[test]
+fn a_search_schema_element_missing_a_member_is_rejected() {
+    let svc = make_service();
+    let err = err_of(svc.create_table(&make_request(
+        "CreateTable",
+        json!({
+            "TableName": "vec-missing",
+            "KeySchema": [{ "AttributeName": "pk", "KeyType": "HASH" }],
+            "AttributeDefinitions": [
+                { "AttributeName": "pk", "AttributeType": "S" },
+                { "AttributeName": "tenant", "AttributeType": "S" },
+            ],
+            "BillingMode": "PAY_PER_REQUEST",
+            "VectorIndexes": [{
+                "IndexName": "vix",
+                "VectorAttribute": { "AttributeName": "embedding" },
+                "Dimensions": 3,
+                "DistanceFunction": "COSINE",
+                "SearchSchema": [{ "AttributeName": "tenant" }],
+                "Projection": { "ProjectionType": "ALL" },
+            }],
+        }),
+    )));
+    assert_eq!(
+        err_message(err),
+        "1 validation error detected: Value null at \
+         'vectorIndexes.1.member.searchSchema.1.member.searchSchemaElementType' failed to \
+         satisfy constraint: Member must not be null"
+    );
+}
+
+/// A KMS hook that counts key resolutions.
+struct CountingKmsHook(std::sync::atomic::AtomicUsize);
+
+impl fakecloud_core::delivery::KmsHook for CountingKmsHook {
+    fn encrypt(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &[u8],
+        _: &str,
+        _: HashMap<String, String>,
+    ) -> Result<String, String> {
+        Ok(String::new())
+    }
+
+    fn decrypt(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: HashMap<String, String>,
+    ) -> Result<Vec<u8>, String> {
+        Ok(Vec::new())
+    }
+
+    fn resolve_key_arn(&self, _: &str, _: &str, _: &str, _: &str) -> Result<String, String> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok("arn:aws:kms:us-east-1:123456789012:key/managed".to_string())
+    }
+}
+
+#[test]
+fn sse_key_is_resolved_only_for_a_request_that_succeeds() {
+    let hook = Arc::new(CountingKmsHook(std::sync::atomic::AtomicUsize::new(0)));
+    let svc = make_service().with_kms_hook(hook.clone());
+    let resolutions = || hook.0.load(std::sync::atomic::Ordering::SeqCst);
+    create_test_table(&svc);
+    let create = || {
+        svc.create_table(&make_request(
+            "CreateTable",
+            json!({
+                "TableName": "test-table",
+                "KeySchema": [{ "AttributeName": "pk", "KeyType": "HASH" }],
+                "AttributeDefinitions": [{ "AttributeName": "pk", "AttributeType": "S" }],
+                "BillingMode": "PAY_PER_REQUEST",
+                "SSESpecification": { "Enabled": true },
+            }),
+        ))
+    };
+    // The table already exists: rejected, and no key is touched.
+    assert_eq!(err_of(create()).code(), "ResourceInUseException");
+    let err = err_of(svc.update_table(&make_request(
+        "UpdateTable",
+        json!({ "TableName": "missing-table", "SSESpecification": { "Enabled": true } }),
+    )));
+    assert_eq!(err.code(), "ResourceNotFoundException");
+    assert_eq!(resolutions(), 0);
+
+    svc.update_table(&make_request(
+        "UpdateTable",
+        json!({ "TableName": "test-table", "SSESpecification": { "Enabled": true } }),
+    ))
+    .unwrap();
+    assert_eq!(resolutions(), 1);
+    assert_eq!(
+        describe(&svc, "test-table")["SSEDescription"]["KMSMasterKeyArn"],
+        "arn:aws:kms:us-east-1:123456789012:key/managed"
+    );
+}

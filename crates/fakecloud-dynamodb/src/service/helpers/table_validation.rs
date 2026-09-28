@@ -216,14 +216,22 @@ impl ModelErrors {
                 ));
             }
             for (i, e) in schema.iter().enumerate() {
-                self.check_enum(
-                    &format!(
-                        "{path}.searchSchema.{}.member.searchSchemaElementType",
-                        i + 1
-                    ),
-                    &e["SearchSchemaElementType"],
-                    &["HASH", "INLINE_FILTER"],
-                );
+                let member = format!("{path}.searchSchema.{}.member", i + 1);
+                match e["AttributeName"].as_str() {
+                    Some(name) => {
+                        self.check_length(&format!("{member}.attributeName"), name, 0, 65535)
+                    }
+                    None => self.not_null(&format!("{member}.attributeName")),
+                }
+                if e["SearchSchemaElementType"].is_null() {
+                    self.not_null(&format!("{member}.searchSchemaElementType"));
+                } else {
+                    self.check_enum(
+                        &format!("{member}.searchSchemaElementType"),
+                        &e["SearchSchemaElementType"],
+                        &["HASH", "INLINE_FILTER"],
+                    );
+                }
             }
         }
         self.check_projection(&format!("{path}.projection"), &v["Projection"]);
@@ -433,6 +441,24 @@ pub(crate) fn validate_update_table_request(
     let target_billing = body["BillingMode"]
         .as_str()
         .unwrap_or(table.billing_mode.as_str());
+    let now = chrono::Utc::now();
+    // A vector index still being built holds the table's one online index
+    // action; while it allocates resources, the table itself is UPDATING.
+    let building = table
+        .vector_indexes
+        .iter()
+        .any(|v| v.phase(now) != VectorIndexPhase::Active);
+    let allocating = table
+        .vector_indexes
+        .iter()
+        .any(|v| v.phase(now) == VectorIndexPhase::Allocating);
+
+    // Vector indexes require on-demand billing for as long as the table has one.
+    if target_billing != "PAY_PER_REQUEST" && !table.vector_indexes.is_empty() {
+        return Err(invalid(
+            "Vector indexes are only supported for PAY_PER_REQUEST tables",
+        ));
+    }
 
     // A throughput "change" to the values already provisioned is refused.
     if table.billing_mode == "PROVISIONED" && target_billing == "PROVISIONED" {
@@ -499,6 +525,9 @@ pub(crate) fn validate_update_table_request(
     };
 
     for update in gsi_updates {
+        if building && (update.get("Create").is_some() || update.get("Delete").is_some()) {
+            return Err(online_index_limit());
+        }
         if let Some(create) = update.get("Create") {
             let name = create["IndexName"].as_str().unwrap_or_default();
             if index_exists(name) {
@@ -535,17 +564,10 @@ pub(crate) fn validate_update_table_request(
         }
     }
 
-    let now = chrono::Utc::now();
     for update in vector_updates {
         if let Some(create) = update.get("Create") {
             let name = create["IndexName"].as_str().unwrap_or_default();
-            // An index still being built occupies the table's one online
-            // index action.
-            if table
-                .vector_indexes
-                .iter()
-                .any(|v| v.phase(now) != VectorIndexPhase::Active)
-            {
+            if building {
                 return Err(online_index_limit());
             }
             if index_exists(name) {
@@ -590,6 +612,17 @@ pub(crate) fn validate_update_table_request(
                 ));
             }
         }
+    }
+    // Any other change waits until the table is ACTIVE again.
+    if allocating {
+        return Err(AwsServiceError::aws_error(
+            StatusCode::BAD_REQUEST,
+            "ResourceInUseException",
+            format!(
+                "Attempt to change a resource which is still in use: Table is being updated: {}",
+                table.name
+            ),
+        ));
     }
     Ok(())
 }

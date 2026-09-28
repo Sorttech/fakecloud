@@ -140,11 +140,6 @@ impl DynamoDbService {
                     .get("KMSMasterKeyId")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
-                let kms_key = if sse_type == "KMS" {
-                    self.resolve_sse_key_arn(req, kms_key)
-                } else {
-                    kms_key
-                };
                 (Some(sse_type), kms_key)
             } else {
                 (None, None)
@@ -179,6 +174,13 @@ impl DynamoDbService {
                 format!("Table already exists: {table_name}"),
             ));
         }
+        // Every check has passed: only now resolve the SSE key, which can
+        // provision the account's AWS-managed key as a side effect.
+        let sse_kms_key_arn = if sse_type.as_deref() == Some("KMS") {
+            self.resolve_sse_key_arn(req, sse_kms_key_arn)
+        } else {
+            sse_kms_key_arn
+        };
 
         let now = Utc::now();
         // ARN carries the request's credential-scope region (req.region), not the
@@ -376,17 +378,6 @@ impl DynamoDbService {
         let table_name = require_str(&body, "TableName")?;
         validate_update_table_model(&body)?;
         validate_no_throughput_for_on_demand(&body)?;
-        // Resolve a KMS key for SSE before taking the table lock.
-        let sse_spec = &body["SSESpecification"];
-        let sse_key_arn = (sse_spec["Enabled"].as_bool() == Some(true)
-            && sse_spec["SSEType"].as_str().unwrap_or("KMS") == "KMS")
-            .then(|| {
-                self.resolve_sse_key_arn(
-                    req,
-                    sse_spec["KMSMasterKeyId"].as_str().map(str::to_string),
-                )
-            })
-            .flatten();
 
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
@@ -408,6 +399,18 @@ impl DynamoDbService {
             })?;
 
         validate_update_table_request(table, &body)?;
+        // Resolved only once the request is known to be valid, since it can
+        // provision the account's AWS-managed key as a side effect.
+        let sse_spec = &body["SSESpecification"];
+        let sse_key_arn = (sse_spec["Enabled"].as_bool() == Some(true)
+            && sse_spec["SSEType"].as_str().unwrap_or("KMS") == "KMS")
+            .then(|| {
+                self.resolve_sse_key_arn(
+                    req,
+                    sse_spec["KMSMasterKeyId"].as_str().map(str::to_string),
+                )
+            })
+            .flatten();
 
         if let Some(pt) = body.get("ProvisionedThroughput") {
             if let Ok(throughput) = parse_provisioned_throughput(pt) {
