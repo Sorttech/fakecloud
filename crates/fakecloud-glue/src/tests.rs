@@ -258,11 +258,24 @@ fn china_region_registry_arn_uses_aws_cn_partition() {
     let schema = body_of(
         svc.create_schema(&req(
             "CreateSchema",
-            json!({"RegistryId": {"RegistryName": "reg-cn"}, "SchemaName": "s", "DataFormat": "AVRO"}),
+            json!({
+                "RegistryId": {"RegistryName": "reg-cn"}, "SchemaName": "s", "DataFormat": "AVRO",
+                "SchemaDefinition": "{}"
+            }),
         ))
         .unwrap(),
     );
     assert_eq!(schema["RegistryArn"], arn);
+    let schema_arn = "arn:aws-cn:glue:cn-north-1:123456789012:schema/reg-cn/s";
+    assert_eq!(schema["SchemaArn"], schema_arn);
+    let version = body_of(
+        svc.get_schema_version(&req(
+            "GetSchemaVersion",
+            json!({"SchemaVersionId": schema["SchemaVersionId"].clone()}),
+        ))
+        .unwrap(),
+    );
+    assert_eq!(version["SchemaArn"], schema_arn);
     let deleted = body_of(
         svc.delete_registry(&req(
             "DeleteRegistry",
@@ -271,6 +284,43 @@ fn china_region_registry_arn_uses_aws_cn_partition() {
         .unwrap(),
     );
     assert_eq!(deleted["RegistryArn"], arn);
+}
+
+#[test]
+fn create_schema_in_a_missing_registry_is_entity_not_found() {
+    let svc = GlueService::default();
+    let err = svc
+        .create_schema(&req(
+            "CreateSchema",
+            json!({"RegistryId": {"RegistryName": "nope"}, "SchemaName": "s", "DataFormat": "AVRO"}),
+        ))
+        .err()
+        .unwrap();
+    assert_eq!(err.code(), "EntityNotFoundException");
+}
+
+#[test]
+fn create_schema_without_a_registry_uses_the_default_registry() {
+    let svc = GlueService::default();
+    let schema = body_of(
+        svc.create_schema(&req(
+            "CreateSchema",
+            json!({"SchemaName": "s", "DataFormat": "AVRO"}),
+        ))
+        .unwrap(),
+    );
+    let registry = body_of(
+        svc.get_registry(&req(
+            "GetRegistry",
+            json!({"RegistryId": {"RegistryName": "default-registry"}}),
+        ))
+        .unwrap(),
+    );
+    assert_eq!(schema["RegistryArn"], registry["RegistryArn"]);
+    assert_eq!(
+        schema["SchemaArn"],
+        "arn:aws:glue:us-east-1:123456789012:schema/default-registry/s"
+    );
 }
 
 #[test]

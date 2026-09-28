@@ -31,3 +31,14 @@ pub fn flow_execution_arn(
         &format!("flow/{flow_id}/execution/{execution_id}"),
     )
 }
+
+/// The execution role a flow execution snapshot reports for `flow_id`.
+pub fn flow_execution_role_arn(region: &str, account_id: &str, flow_id: &str) -> String {
+    Arn::global_in(
+        effective_region(region),
+        "iam",
+        account_id,
+        &format!("role/service-role/AmazonBedrockExecutionRoleForFlow_{flow_id}"),
+    )
+    .to_string()
+}

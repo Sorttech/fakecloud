@@ -8,8 +8,26 @@ use serde::{Deserialize, Serialize};
 pub type SharedBedrockAgentState = Arc<RwLock<BedrockAgentAccounts>>;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(from = "StoredAccounts")]
 pub struct BedrockAgentAccounts {
     pub accounts: BTreeMap<String, BedrockAgentState>,
+}
+
+/// The persisted form of [`BedrockAgentAccounts`]; loading it backfills the
+/// ARNs older snapshots did not store.
+#[derive(Deserialize)]
+struct StoredAccounts {
+    accounts: BTreeMap<String, BedrockAgentState>,
+}
+
+impl From<StoredAccounts> for BedrockAgentAccounts {
+    fn from(stored: StoredAccounts) -> Self {
+        let mut accounts = Self {
+            accounts: stored.accounts,
+        };
+        accounts.backfill_arns();
+        accounts
+    }
 }
 
 /// On-disk snapshot envelope for Bedrock Agent state. Versioned so format
@@ -40,6 +58,25 @@ impl BedrockAgentAccounts {
 
     pub fn reset(&mut self) {
         self.accounts.clear();
+    }
+
+    /// Give every flow and prompt persisted before ARNs were stored the ARN it
+    /// was created with: the account state's region is the region its records
+    /// were created in, falling back to the default server region.
+    pub fn backfill_arns(&mut self) {
+        for (account_id, state) in &mut self.accounts {
+            let region = if state.region.is_empty() {
+                "us-east-1"
+            } else {
+                state.region.as_str()
+            };
+            for flow in state.flows.values_mut().filter(|f| f.arn.is_empty()) {
+                flow.arn = crate::arns::flow_arn(region, account_id, &flow.flow_id);
+            }
+            for prompt in state.prompts.values_mut().filter(|p| p.arn.is_empty()) {
+                prompt.arn = crate::arns::prompt_arn(region, account_id, &prompt.prompt_id);
+            }
+        }
     }
 }
 
@@ -226,7 +263,8 @@ pub struct Flow {
     pub updated_at: DateTime<Utc>,
     pub version: String,
     pub definition: Option<serde_json::Value>,
-    /// The ARN minted at creation; empty for flows persisted before it was stored.
+    /// The ARN minted at creation. Snapshots written before it was stored get
+    /// it backfilled on load (see [`BedrockAgentAccounts::backfill_arns`]).
     #[serde(default)]
     pub arn: String,
 }
@@ -261,7 +299,7 @@ pub struct Prompt {
     pub version: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    /// The ARN minted at creation; empty for prompts persisted before it was stored.
+    /// The ARN minted at creation; backfilled on load like [`Flow::arn`].
     #[serde(default)]
     pub arn: String,
 }

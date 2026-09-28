@@ -10,6 +10,9 @@ use crate::common::{
 use crate::generic;
 use crate::service::GlueService;
 
+/// The registry a schema goes into when `CreateSchema` names none.
+const DEFAULT_REGISTRY: &str = "default-registry";
+
 /// The `RegistryArn` the registry `name` was created with, `null` when it does
 /// not exist.
 fn stored_registry_arn(st: &crate::state::GlueState, name: &str) -> Value {
@@ -60,7 +63,7 @@ fn schema_key(id: &Value) -> Option<String> {
         let reg = id
             .get("RegistryName")
             .and_then(|v| v.as_str())
-            .unwrap_or("default-registry");
+            .unwrap_or(DEFAULT_REGISTRY);
         return Some(format!("{reg}\u{1f}{name}"));
     }
     let arn = id.get("SchemaArn").and_then(|v| v.as_str())?;
@@ -229,17 +232,11 @@ impl GlueService {
         let body = req.json_body();
         let name = req_str(&body, "SchemaName")?.to_string();
         let data_format = req_str(&body, "DataFormat")?.to_string();
-        let reg = body
-            .get("RegistryId")
-            .and_then(registry_name)
-            .unwrap_or_else(|| "default-registry".to_string());
+        let named_registry = body.get("RegistryId").and_then(registry_name);
+        let reg = named_registry
+            .clone()
+            .unwrap_or_else(|| DEFAULT_REGISTRY.to_string());
         let key = format!("{reg}\u{1f}{name}");
-        let schema_arn = resource_arn(
-            &req.region,
-            &req.account_id,
-            "schema",
-            &format!("{reg}/{name}"),
-        );
         let compat = body
             .get("Compatibility")
             .and_then(|v| v.as_str())
@@ -254,10 +251,33 @@ impl GlueService {
 
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id, &req.region);
-        let reg_arn = match stored_registry_arn(st, &reg) {
-            Value::Null => json!(resource_arn(&req.region, &req.account_id, "registry", &reg)),
-            arn => arn,
+        // A named registry must exist; without one the schema goes into the
+        // account's default registry, which is created on first use.
+        let reg_arn = match (stored_registry_arn(st, &reg), named_registry) {
+            (Value::String(arn), _) => arn,
+            (_, Some(_)) => return Err(entity_not_found(format!("Registry {reg} not found"))),
+            (_, None) => {
+                let arn = resource_arn(&req.region, &req.account_id, "registry", &reg);
+                st.registries.insert(
+                    reg.clone(),
+                    json!({
+                        "RegistryName": reg, "RegistryArn": arn, "Description": Value::Null,
+                        "Status": "AVAILABLE", "CreatedTime": now.to_string(),
+                        "UpdatedTime": now.to_string(),
+                    }),
+                );
+                arn
+            }
         };
+        // The schema lives where its registry does, so both ARNs share one
+        // region and partition.
+        let registry_region = reg_arn.split(':').nth(3).unwrap_or(&req.region);
+        let schema_arn = resource_arn(
+            registry_region,
+            &req.account_id,
+            "schema",
+            &format!("{reg}/{name}"),
+        );
         let schema = json!({
             "RegistryName": reg, "RegistryArn": reg_arn, "SchemaName": name, "SchemaArn": schema_arn,
             "Description": desc, "DataFormat": data_format, "Compatibility": compat,

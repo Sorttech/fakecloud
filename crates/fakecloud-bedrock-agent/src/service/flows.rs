@@ -71,12 +71,7 @@ impl BedrockAgentService {
         let accts = self.state.read();
         let list: Vec<Value> = accts
             .get(&req.account_id)
-            .map(|s| {
-                s.flows
-                    .values()
-                    .map(|f| flow_summary_json(f, &req.region, &req.account_id))
-                    .collect()
-            })
+            .map(|s| s.flows.values().map(flow_summary_json).collect())
             .unwrap_or_default();
         Ok(AwsResponse::ok_json(json!({ "flowSummaries": list })))
     }

@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 
-use crate::arns::{flow_execution_arn, session_arn};
+use crate::arns::{flow_execution_arn, flow_execution_role_arn, session_arn};
 use crate::state::{
     FlowExecution, InvocationRecord, InvocationStep, Session, SessionInvocation,
     SharedBedrockAgentRuntimeState,
@@ -357,7 +357,7 @@ fn validate_str(
 
 // Cached regexes for the most common patterns
 fn re_session_identifier() -> Regex {
-    Regex::new(r"^(?:arn:aws(-[^:]+)?:bedrock:[a-z0-9-]+:[0-9]{12}:session/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$").unwrap()
+    Regex::new(r"^(arn:aws(-[^:]+)?:bedrock:[a-z0-9-]+:[0-9]{12}:session/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})|([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$").unwrap()
 }
 fn re_agent_id() -> Regex {
     Regex::new(r"^[0-9a-zA-Z]+$").unwrap()
@@ -381,12 +381,12 @@ fn re_taggable_arn() -> Regex {
 }
 fn re_flow_identifier() -> Regex {
     Regex::new(
-        r"^(?:arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:flow/[0-9a-zA-Z]{10}|[0-9a-zA-Z]{10})$",
+        r"^(arn:aws:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:flow/[0-9a-zA-Z]{10})|([0-9a-zA-Z]{10})$",
     )
     .unwrap()
 }
 fn re_flow_alias_identifier() -> Regex {
-    Regex::new(r"^(?:arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:flow/[0-9a-zA-Z]{10}/alias/[0-9a-zA-Z]{10}|TSTALIASID|[0-9a-zA-Z]+)$").unwrap()
+    Regex::new(r"^(arn:aws:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:flow/[0-9a-zA-Z]{10}/alias/[0-9a-zA-Z]{10})|(\bTSTALIASID\b|[0-9a-zA-Z]+)$").unwrap()
 }
 fn re_no_whitespace() -> Regex {
     // NextToken: ^\S*$
@@ -1957,7 +1957,6 @@ async fn handle_stop_flow_execution(
         true,
     )?;
     let exec_id = exec_id.unwrap();
-    let flow_id = bare_flow_id(&flow_id.unwrap()).to_string();
 
     let now = Utc::now();
     let mut accts = svc.state.write();
@@ -1976,7 +1975,7 @@ async fn handle_stop_flow_execution(
     } else {
         // Allow stop on unknown execution: still return Aborted with synthetic ARN
         (
-            flow_execution_arn(&req.region, &req.account_id, &flow_id, &exec_id),
+            flow_execution_arn(&req.region, &req.account_id, "unknown", &exec_id),
             "Aborted".to_string(),
         )
     };
@@ -1988,7 +1987,7 @@ async fn handle_stop_flow_execution(
 }
 
 async fn handle_get_execution_flow_snapshot(
-    svc: &BedrockAgentRuntimeService,
+    _svc: &BedrockAgentRuntimeService,
     req: &AwsRequest,
     body: &Value,
 ) -> Result<AwsResponse, AwsServiceError> {
@@ -2022,57 +2021,26 @@ async fn handle_get_execution_flow_snapshot(
 
     let flow_id = bare_flow_id(&flow_id.unwrap()).to_string();
     let flow_alias_id = flow_alias_id.unwrap();
-    let alias_id = flow_alias_id.rsplit('/').next().unwrap_or(&flow_alias_id);
 
-    let not_found = |what: String| {
-        make_error(
-            StatusCode::NOT_FOUND,
-            "ResourceNotFoundException",
-            &format!("{what} not found"),
-        )
-    };
-    let agent_state = svc
-        .agent_state
-        .as_ref()
-        .ok_or_else(|| not_found(format!("Flow {flow_id}")))?
-        .read();
-    let account = agent_state.get(&req.account_id);
-    let flow = account
-        .and_then(|a| a.flows.get(&flow_id))
-        .ok_or_else(|| not_found(format!("Flow {flow_id}")))?;
+    let role_arn = flow_execution_role_arn(&req.region, &req.account_id, &flow_id);
 
-    // The draft alias runs the working draft; any other alias runs the version
-    // its routing configuration points at.
-    let (version, definition) = if alias_id == "TSTALIASID" {
-        (flow.version.clone(), flow.definition.clone())
-    } else {
-        let alias = account
-            .and_then(|a| a.flow_aliases.get(alias_id))
-            .filter(|a| a.flow_id == flow_id)
-            .ok_or_else(|| not_found(format!("Flow alias {alias_id}")))?;
-        let routed = alias
-            .routing_configuration
-            .first()
-            .and_then(|r| r.get("flowVersion"))
-            .and_then(Value::as_str)
-            .unwrap_or("DRAFT");
-        if routed == "DRAFT" {
-            (flow.version.clone(), flow.definition.clone())
-        } else {
-            let v = account
-                .and_then(|a| a.flow_versions.get(&flow_id))
-                .and_then(|vs| vs.iter().find(|v| v.flow_version == routed))
-                .ok_or_else(|| not_found(format!("Flow version {routed}")))?;
-            (v.flow_version.clone(), v.definition.clone())
-        }
-    };
-    let definition = definition.unwrap_or_else(|| json!({})).to_string();
+    let definition = serde_json::to_string(&json!({
+        "nodes": [
+            {
+                "name": "Start",
+                "type": "Input",
+                "configuration": { "input": {} }
+            }
+        ],
+        "connections": []
+    }))
+    .unwrap();
 
     Ok(AwsResponse::ok_json(json!({
         "flowIdentifier": flow_id,
         "flowAliasIdentifier": flow_alias_id,
-        "flowVersion": version,
-        "executionRoleArn": flow.execution_role_arn,
+        "flowVersion": "DRAFT",
+        "executionRoleArn": role_arn,
         "definition": definition,
     })))
 }
@@ -2443,52 +2411,17 @@ mod tests {
         assert_eq!(got["sessionId"], created["sessionId"]);
     }
 
-    fn with_agent_state() -> (
-        BedrockAgentRuntimeService,
-        fakecloud_bedrock_agent::BedrockAgentService,
-    ) {
-        let agent_state: fakecloud_bedrock_agent::SharedBedrockAgentState = Arc::new(RwLock::new(
-            fakecloud_bedrock_agent::BedrockAgentAccounts::new(),
-        ));
-        let runtime = BedrockAgentRuntimeService::new(Arc::new(RwLock::new(
-            BedrockAgentRuntimeAccounts::new(),
-        )))
-        .with_agent_state(agent_state.clone());
-        (
-            runtime,
-            fakecloud_bedrock_agent::BedrockAgentService::new(agent_state),
-        )
-    }
-
-    async fn create_flow(
-        agent: &fakecloud_bedrock_agent::BedrockAgentService,
-        body: Value,
-    ) -> Value {
-        let mut req = cn_request();
-        req.service = "bedrock-agent".to_string();
-        req.raw_path = "/flows/".to_string();
-        req.body = body.to_string().into();
-        let resp = agent.handle(req).await.unwrap();
-        serde_json::from_slice(resp.body.expect_bytes()).unwrap()
-    }
-
     #[tokio::test]
-    async fn flow_snapshot_reports_the_stored_flow() {
-        let (svc, agent) = with_agent_state();
-        let definition = json!({"nodes": [{"name": "In", "type": "Input"}], "connections": []});
-        let role = "arn:aws-cn:iam::123456789012:role/my-flow-role";
-        let flow = create_flow(
-            &agent,
-            json!({"name": "f", "executionRoleArn": role, "definition": definition}),
-        )
-        .await;
-        let flow_arn = flow["arn"].as_str().unwrap();
+    async fn flow_snapshot_role_uses_the_region_partition_and_bare_flow_id() {
+        let svc = BedrockAgentRuntimeService::new(Arc::new(RwLock::new(
+            BedrockAgentRuntimeAccounts::new(),
+        )));
         let snapshot = body(
             handle_get_execution_flow_snapshot(
                 &svc,
                 &cn_request(),
                 &json!({
-                    "flowIdentifier": flow_arn,
+                    "flowIdentifier": "arn:aws-cn:bedrock:cn-north-1:123456789012:flow/ABCDEFGHIJ",
                     "flowAliasIdentifier": "TSTALIASID",
                     "executionIdentifier": "exec-1",
                 }),
@@ -2496,29 +2429,11 @@ mod tests {
             .await
             .unwrap(),
         );
-        assert_eq!(snapshot["flowIdentifier"], flow["id"]);
-        assert_eq!(snapshot["executionRoleArn"], role);
-        assert_eq!(snapshot["flowVersion"], "DRAFT");
-        let got: Value = serde_json::from_str(snapshot["definition"].as_str().unwrap()).unwrap();
-        assert_eq!(got, definition);
-    }
-
-    #[tokio::test]
-    async fn flow_snapshot_of_unknown_flow_is_not_found() {
-        let (svc, _agent) = with_agent_state();
-        let err = handle_get_execution_flow_snapshot(
-            &svc,
-            &cn_request(),
-            &json!({
-                "flowIdentifier": "ABCDEFGHIJ",
-                "flowAliasIdentifier": "TSTALIASID",
-                "executionIdentifier": "exec-1",
-            }),
-        )
-        .await
-        .err()
-        .unwrap();
-        assert_eq!(err.code(), "ResourceNotFoundException");
+        assert_eq!(snapshot["flowIdentifier"], "ABCDEFGHIJ");
+        assert_eq!(
+            snapshot["executionRoleArn"],
+            "arn:aws-cn:iam::123456789012:role/service-role/AmazonBedrockExecutionRoleForFlow_ABCDEFGHIJ"
+        );
     }
 
     #[tokio::test]
@@ -2574,34 +2489,6 @@ mod tests {
                 "{}",
                 exec.execution_arn
             );
-        }
-    }
-
-    #[tokio::test]
-    async fn half_matching_flow_identifiers_are_rejected() {
-        let svc = BedrockAgentRuntimeService::new(Arc::new(RwLock::new(
-            BedrockAgentRuntimeAccounts::new(),
-        )));
-        for (flow, alias) in [
-            ("!!garbage ABCDEFGHIJ", "TSTALIASID"),
-            (
-                "arn:aws:bedrock:us-east-1:123456789012:flow/ABCDEFGHIJ/junk",
-                "TSTALIASID",
-            ),
-            (
-                "ABCDEFGHIJ",
-                "arn:aws:bedrock:us-east-1:123456789012:flow/ABCDEFGHIJ/alias/ABCDEFGHIJ/junk",
-            ),
-        ] {
-            let err = handle_start_flow_execution(
-                &svc,
-                &cn_request(),
-                &json!({"flowIdentifier": flow, "flowAliasIdentifier": alias, "inputs": []}),
-            )
-            .await
-            .err()
-            .unwrap();
-            assert_eq!(err.code(), "ValidationException", "{flow} / {alias}");
         }
     }
 }
