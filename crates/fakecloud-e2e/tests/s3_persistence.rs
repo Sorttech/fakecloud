@@ -1756,9 +1756,15 @@ async fn persistence_removing_a_refused_directory_frees_the_name_without_a_resta
 
     server.restart().await;
     let client = server.s3_client().await;
+    let err = client
+        .create_bucket()
+        .bucket("gone")
+        .send()
+        .await
+        .expect_err("create must be refused while the data is there");
     assert!(
-        client.create_bucket().bucket("gone").send().await.is_err(),
-        "create must be refused while the data is there"
+        format!("{err:?}").contains("BucketAlreadyExists"),
+        "unexpected error: {err:?}"
     );
 
     // Same running server, no restart.
@@ -1769,141 +1775,55 @@ async fn persistence_removing_a_refused_directory_frees_the_name_without_a_resta
         .send()
         .await
         .expect("the name is free once the data is gone, restart or not");
-}
 
-#[tokio::test]
-async fn persistence_delete_will_not_discard_a_refused_bucket_under_object_lock() {
-    // The normal delete path enforces Object Lock only indirectly: a retained
-    // object keeps the bucket non-empty, so the delete is refused. The escape
-    // hatch cannot run that check -- the objects are what could not be read --
-    // so it must refuse outright rather than letting a reflexive `rb` destroy
-    // retained data.
-    let tmp = tempfile::tempdir().unwrap();
-    let mut server = TestServer::start_persistent(tmp.path()).await;
-    let client = server.s3_client().await;
-
-    client
-        .create_bucket()
-        .bucket("locked")
-        .object_lock_enabled_for_bucket(true)
-        .send()
-        .await
-        .unwrap();
+    // ...and that create has to leave no refusal behind. The refusal is recorded
+    // at load and consulted long afterwards, so a name whose unreadable data is
+    // gone must stop being refused -- otherwise the next reset refuses a create
+    // for a bucket that reads perfectly.
     client
         .put_object()
-        .bucket("locked")
-        .key("k.txt")
-        .body(ByteStream::from_static(b"retained"))
+        .bucket("gone")
+        .key("fresh.txt")
+        .body(ByteStream::from_static(b"fresh"))
         .send()
         .await
         .unwrap();
-    let bucket_dir = tmp.path().join("s3").join("buckets").join("locked");
-    assert!(
-        bucket_dir.join("object_lock.toml").exists(),
-        "expected the lock config to be persisted"
-    );
-    std::fs::write(
-        bucket_dir.join("objects").join("k.txt").join("null.toml"),
-        "not valid toml = = =",
-    )
-    .unwrap();
-
-    server.restart().await;
+    let status = reqwest::Client::new()
+        .post(format!("{}/_fakecloud/reset/s3", server.endpoint()))
+        .send()
+        .await
+        .expect("reset should respond")
+        .status();
+    assert!(status.is_success(), "reset failed: {status}");
     let client = server.s3_client().await;
+    client
+        .create_bucket()
+        .bucket("gone")
+        .send()
+        .await
+        .expect("a name that now holds a healthy bucket must not still be refused");
 
+    // A delete of a name absent from memory is a plain 404, never a recursive
+    // discard of whatever the store holds under it: with a stale refusal in the
+    // set, that path destroyed a live bucket's objects.
+    let status = reqwest::Client::new()
+        .post(format!("{}/_fakecloud/reset/s3", server.endpoint()))
+        .send()
+        .await
+        .expect("reset should respond")
+        .status();
+    assert!(status.is_success(), "reset failed: {status}");
+    let client = server.s3_client().await;
     let err = client
         .delete_bucket()
-        .bucket("locked")
+        .bucket("gone")
         .send()
         .await
-        .expect_err("a refused bucket under Object Lock must not be discarded by DeleteBucket");
+        .expect_err("a bucket absent from memory does not exist as far as delete is concerned");
     assert!(
-        format!("{err:?}").contains("BucketNotEmpty"),
+        format!("{err:?}").contains("NoSuchBucket"),
         "unexpected error: {err:?}"
     );
-    assert!(
-        bucket_dir.join("objects").join("k.txt").exists(),
-        "the refused delete destroyed the objects it was protecting"
-    );
-
-    // Repairing the bad file is the way out, and the bucket comes back locked.
-    std::fs::remove_dir_all(bucket_dir.join("objects").join("k.txt")).unwrap();
-    server.restart().await;
-    let client = server.s3_client().await;
-    let lock = client
-        .get_object_lock_configuration()
-        .bucket("locked")
-        .send()
-        .await
-        .expect("the repaired bucket should load with its lock configuration");
-    assert_eq!(
-        lock.object_lock_configuration()
-            .and_then(|c| c.object_lock_enabled())
-            .map(|e| e.as_str()),
-        Some("Enabled")
-    );
-}
-
-#[tokio::test]
-async fn persistence_delete_frees_a_load_refused_name() {
-    // Without an in-band escape a refused name is both missing (HeadBucket 404,
-    // absent from ListBuckets) and un-creatable, leaving no way out but editing
-    // the data path by hand. DeleteBucket is the explicitly destructive verb, so
-    // it is the one that may discard the unreadable directory.
-    let tmp = tempfile::tempdir().unwrap();
-    let mut server = TestServer::start_persistent(tmp.path()).await;
-    let client = server.s3_client().await;
-
-    client
-        .create_bucket()
-        .bucket("escape")
-        .send()
-        .await
-        .unwrap();
-    client
-        .put_object()
-        .bucket("escape")
-        .key("k.txt")
-        .body(ByteStream::from_static(b"v"))
-        .send()
-        .await
-        .unwrap();
-    std::fs::write(
-        tmp.path()
-            .join("s3")
-            .join("buckets")
-            .join("escape")
-            .join("objects")
-            .join("k.txt")
-            .join("null.toml"),
-        "not valid toml = = =",
-    )
-    .unwrap();
-
-    server.restart().await;
-    let client = server.s3_client().await;
-
-    assert!(
-        client
-            .create_bucket()
-            .bucket("escape")
-            .send()
-            .await
-            .is_err(),
-        "create must be refused first"
-    );
-    client
-        .delete_bucket()
-        .bucket("escape")
-        .send()
-        .await
-        .expect("delete must clear a load-refused bucket");
-    client
-        .create_bucket()
-        .bucket("escape")
-        .send()
-        .await
-        .expect("the name must be usable after the delete");
 }
 
 #[tokio::test]

@@ -332,14 +332,19 @@ impl S3Service {
         // A bucket the loader could not read is absent from memory, so its name
         // looks free -- but its objects are on disk and recoverable by repairing
         // the one bad file, and this create is about to clear the directory.
-        // Refuse instead, and say how to get the name back. DeleteBucket is the
-        // in-band escape (it is the explicitly destructive verb), so the name is
-        // never permanently stuck.
+        // Refuse instead, and say how to get the name back. Both ways out are in
+        // the data path, where an operator with an unreadable store already is:
+        // repair the one bad file and restart, or remove the directory, which
+        // frees the name immediately (the check below is on the data still being
+        // there, not on the refusal alone). There is deliberately no API verb
+        // that discards it -- DeleteBucket cannot check emptiness here, since the
+        // objects are exactly what could not be read, nor ownership, since the
+        // metadata carrying it is what failed.
         // `bucket_state_exists` as well as the refusal: the refusal is recorded
-        // at load and never re-probed, so an operator who followed the advice
-        // below by deleting the directory outright -- without restarting -- would
-        // otherwise find the name refused for the rest of the process lifetime,
-        // with an error telling them to repair something that is gone.
+        // at load, so an operator who took the second way out below -- removing
+        // the directory, without restarting -- would otherwise find the name
+        // refused for the rest of the process lifetime, with an error telling
+        // them to repair something that is gone.
         if self.store.bucket_load_refused(bucket)
             && self.store.bucket_state_exists(bucket)
             && !accts
@@ -352,15 +357,16 @@ impl S3Service {
                 "CreateBucket refused: the store holds data for this bucket that could not be \
                  read at load",
             );
-            return Err(AwsServiceError::aws_error(
+            return Err(AwsServiceError::aws_error_with_fields(
                 StatusCode::CONFLICT,
                 "BucketAlreadyExists",
                 format!(
                     "The requested bucket name is not available: {bucket} holds persisted data \
                      that could not be read at load (an unreadable object, or a delete that \
-                     stopped partway). Repair its directory in the data path and restart, or \
-                     DeleteBucket to discard it."
+                     stopped partway). Repair its directory in the data path and restart to get \
+                     the bucket back, or remove the directory to free the name."
                 ),
+                vec![("BucketName".to_string(), bucket.to_string())],
             ));
         }
         // Check global uniqueness across all accounts before creating
@@ -537,6 +543,14 @@ impl S3Service {
             b.ownership_controls.as_deref(),
         )?;
         state.buckets.insert(bucket.to_string(), b);
+        // This name now belongs to a bucket that loaded, so whatever the last
+        // load could not read under it is gone (either cleared above, or removed
+        // out of band, which is what let the create through at all). Leaving the
+        // refusal behind would refuse the name again after the next
+        // `/_fakecloud/reset`, for data that is no longer there.
+        self.store
+            .clear_bucket_load_refusal(bucket)
+            .map_err(super::persistence_error)?;
 
         let mut headers = HeaderMap::new();
         headers.insert("location", format!("/{bucket}").parse().unwrap());
@@ -560,55 +574,10 @@ impl S3Service {
     ) -> Result<AwsResponse, AwsServiceError> {
         let mut accts = self.state.write();
         let state = accts.get_or_create(account_id);
-        let Some(b) = state.buckets.get(bucket) else {
-            // A bucket the loader refused is absent from memory, so every read
-            // reports it missing while CreateBucket refuses its name. Delete is
-            // the explicitly destructive verb, so it is the way out: discard the
-            // unreadable directory and free the name. No emptiness check is
-            // possible here -- the objects are exactly what could not be read --
-            // and no owner check either, since the metadata carrying ownership is
-            // what failed, so any caller may clear it.
-            if self.store.bucket_load_refused(bucket) {
-                // Object Lock is the one thing the normal path enforces that
-                // this branch cannot: a compliance-retained object is
-                // undeletable because the bucket is never empty, and here the
-                // objects are exactly what could not be read. A reflexive
-                // `aws s3 rb` -- or a retry of the tool that just got the 409 --
-                // would otherwise destroy retained data, which no bucket on real
-                // S3 permits. The lock config is its own file and is usually
-                // readable even when an object's is not, so refuse while it is
-                // there and leave that case to the operator's own hands.
-                if self.store.bucket_subresource_exists(
-                    bucket,
-                    fakecloud_persistence::BucketSubresource::ObjectLock,
-                ) {
-                    return Err(AwsServiceError::aws_error(
-                        StatusCode::CONFLICT,
-                        "BucketNotEmpty",
-                        format!(
-                            "{bucket} could not be read at load and has an Object Lock                              configuration, so its contents cannot be shown to be free of                              retention. Repair its directory in the data path and restart, then                              delete it through the normal path."
-                        ),
-                    ));
-                }
-                tracing::warn!(
-                    target: "fakecloud::s3",
-                    bucket = %bucket,
-                    account_id = %account_id,
-                    "DeleteBucket discarding data that could not be read at load; ownership could \
-                     not be verified, so this is reachable by any account",
-                );
-                self.store
-                    .delete_bucket(bucket)
-                    .map_err(super::persistence_error)?;
-                return Ok(AwsResponse {
-                    status: StatusCode::NO_CONTENT,
-                    content_type: "application/xml".to_string(),
-                    body: Bytes::new().into(),
-                    headers: HeaderMap::new(),
-                });
-            }
-            return Err(no_such_bucket(bucket));
-        };
+        let b = state
+            .buckets
+            .get(bucket)
+            .ok_or_else(|| no_such_bucket(bucket))?;
         // Bucket must be empty to delete (no objects and no versions)
         let has_real_objects = b.objects.values().any(|o| !o.is_delete_marker);
         let has_versions = b.object_versions.values().any(|v| !v.is_empty());

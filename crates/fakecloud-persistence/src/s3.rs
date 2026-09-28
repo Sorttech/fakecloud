@@ -389,16 +389,6 @@ pub trait S3Store: Send + Sync {
         false
     }
 
-    /// Whether the store holds this one subresource for `bucket`.
-    ///
-    /// Readable without the bucket itself being loadable, which is what makes it
-    /// usable on a load-refused bucket: the file the loader choked on is rarely
-    /// the one being asked about. Memory-only stores hold nothing, hence the
-    /// default.
-    fn bucket_subresource_exists(&self, _bucket: &str, _kind: BucketSubresource) -> bool {
-        false
-    }
-
     /// Whether the last [`S3Store::load`] REFUSED this bucket -- a corrupt
     /// object meta, a missing part body: data still on disk and recoverable by
     /// repairing the one bad file.
@@ -407,6 +397,16 @@ pub trait S3Store: Send + Sync {
     /// loader could not read this" with "this is simply not in memory".
     fn bucket_load_refused(&self, _bucket: &str) -> bool {
         false
+    }
+
+    /// Forget that [`S3Store::load`] refused `bucket`, because the name now
+    /// belongs to a bucket that loaded.
+    ///
+    /// The refusal is recorded at load and consulted long afterwards, so it has
+    /// to be dropped when it stops being true, or a name whose unreadable data
+    /// is gone stays refused for the life of the process.
+    fn clear_bucket_load_refusal(&self, _bucket: &str) -> StoreResult<()> {
+        Ok(())
     }
 
     fn put_object(
@@ -953,16 +953,17 @@ impl S3Store for DiskS3Store {
         self.bucket_dir(bucket).exists()
     }
 
-    fn bucket_subresource_exists(&self, bucket: &str, kind: BucketSubresource) -> bool {
-        self.bucket_dir(bucket)
-            .join(Self::subresource_filename(kind))
-            .exists()
-    }
-
     fn bucket_load_refused(&self, bucket: &str) -> bool {
         self.load_refused
             .read()
             .contains(&crate::key_escape::escape_key_segment(bucket))
+    }
+
+    fn clear_bucket_load_refusal(&self, bucket: &str) -> StoreResult<()> {
+        self.load_refused
+            .write()
+            .remove(&crate::key_escape::escape_key_segment(bucket));
+        Ok(())
     }
 
     fn delete_bucket(&self, bucket: &str) -> StoreResult<()> {
