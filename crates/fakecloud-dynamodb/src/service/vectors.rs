@@ -63,6 +63,9 @@ impl DynamoDbService {
         let body = Self::parse_body(req)?;
         let table_name = require_str(&body, "TableName")?;
         let index_name = require_str(&body, "IndexName")?;
+        // A malformed or overlapping projection is rejected up front, as on
+        // Query and Scan, rather than projecting nothing.
+        validate_read_projection(&body)?;
 
         let query_vector = search_vector(body.get("SearchVector")).ok_or_else(|| {
             AwsServiceError::aws_error(

@@ -959,7 +959,9 @@ pub(crate) fn parse_projection_expression(
         check_size_and_empty(kind, src)?;
     }
     let paths = Parser::new(src, kind, ctx).projection()?;
-    check_overlap(&paths, kind)?;
+    if ctx.strict {
+        check_overlap(&paths, kind)?;
+    }
     Ok(paths)
 }
 

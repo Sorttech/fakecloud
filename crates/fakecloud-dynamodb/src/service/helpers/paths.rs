@@ -101,7 +101,14 @@ pub(crate) fn project_with_expression(
 ) -> HashMap<String, AttributeValue> {
     let values = HashMap::new();
     let mut ctx = ExprContext::new(expr_attr_names, &values, false);
-    let paths = parse_projection_expression(proj, &mut ctx).unwrap_or_default();
+    // Every caller validates the projection before reading, so a parse
+    // failure here is a missed validation, not a request error.
+    let parsed = parse_projection_expression(proj, &mut ctx);
+    debug_assert!(
+        parsed.is_ok(),
+        "unvalidated ProjectionExpression reached projection: {proj}"
+    );
+    let paths = parsed.unwrap_or_default();
     let mut result = HashMap::new();
     for path in &paths {
         project_doc_path_into(&mut result, item, path);

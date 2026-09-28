@@ -6318,6 +6318,31 @@ fn search_vectors_honors_projection_and_consumed_capacity() {
     );
 }
 
+/// An overlapping ProjectionExpression is rejected, as on Query and Scan,
+/// rather than returning items with nothing projected.
+#[test]
+fn search_vectors_rejects_overlapping_projection() {
+    let svc = make_service();
+    create_vector_table(&svc, "COSINE");
+    put_vector_item(&svc, "only", &[1.0, 0.0]);
+    let err = err_of(svc.search_vectors(&make_request(
+        "SearchVectors",
+        json!({
+            "TableName": "vec-table",
+            "IndexName": "embedding-index",
+            "SearchVector": search_vec(&[1.0, 0.0]),
+            "TopK": 1,
+            "ProjectionExpression": "a, a.b",
+        }),
+    )));
+    assert_eq!(err.code(), "ValidationException");
+    assert_eq!(
+        err.message(),
+        "Invalid ProjectionExpression: Two document paths overlap with each other; must remove \
+         or rewrite one of these paths; path one: [a], path two: [a, b]"
+    );
+}
+
 #[test]
 fn search_vectors_validates_index_and_vector() {
     let svc = make_service();
