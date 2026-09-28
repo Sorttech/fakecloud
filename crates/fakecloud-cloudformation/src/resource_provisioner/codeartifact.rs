@@ -15,7 +15,6 @@
 //!   Repository -> Arn, DomainName, DomainOwner, Name
 
 use chrono::{DateTime, Utc};
-use fakecloud_aws::arn::Arn;
 use serde_json::{json, Value};
 
 use super::{ProvisionResult, ResourceDefinition, ResourceProvisioner, StackResource};
@@ -55,7 +54,7 @@ impl ResourceProvisioner {
             "encryptionKey": encryption_key.clone(),
             "repositoryCount": 0,
             "assetSizeBytes": 0,
-            "s3BucketArn": Arn::s3_in(&region, &format!("assets-{owner}-{region}")).to_string(),
+            "s3BucketArn": fakecloud_codeartifact::asset_bucket_arn(&region, &owner),
         });
         acct.domains.insert(name.clone(), desc);
         acct.domain_order.push(name.clone());

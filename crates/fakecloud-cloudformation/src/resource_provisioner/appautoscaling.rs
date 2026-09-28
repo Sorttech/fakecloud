@@ -59,13 +59,15 @@ impl ResourceProvisioner {
             &self.account_id,
             &fakecloud_core::ids::short_id(10),
         );
-        let role = role_arn.unwrap_or_else(|| {
-            fakecloud_application_autoscaling::default_service_linked_role(
+        let role = match role_arn {
+            Some(role) => role,
+            None => fakecloud_application_autoscaling::default_service_linked_role(
                 &self.region,
                 &self.account_id,
                 &service_namespace,
             )
-        });
+            .ok_or_else(|| format!("Unsupported ServiceNamespace {service_namespace}"))?,
+        };
 
         let mut state = self.app_autoscaling_state.write();
         let account = state.accounts.entry(self.account_id.clone()).or_default();

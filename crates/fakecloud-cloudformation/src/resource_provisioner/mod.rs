@@ -95,10 +95,7 @@ use fakecloud_logs::{
     Delivery, DeliveryDestination, DeliverySource, Destination, LogStream, MetricFilter,
     MetricTransformation, QueryDefinition, ResourcePolicy, SharedLogsState, SubscriptionFilter,
 };
-use fakecloud_organizations::{
-    OrganizationState, OrganizationalUnit, Policy as OrgPolicy, SharedOrganizationsState,
-    POLICY_TYPE_SCP,
-};
+use fakecloud_organizations::{OrganizationState, SharedOrganizationsState, POLICY_TYPE_SCP};
 use fakecloud_persistence::{BucketSubresource, S3Store};
 use fakecloud_rds::{DbInstance, DbParameterGroup, DbSubnetGroup, RdsTag, SharedRdsState};
 use fakecloud_route53::{
@@ -7382,6 +7379,321 @@ mod tests {
             "{}",
             policy.attributes["Arn"]
         );
+    }
+
+    fn json_request(
+        service: &str,
+        path: &str,
+        body: serde_json::Value,
+    ) -> fakecloud_core::service::AwsRequest {
+        fakecloud_core::service::AwsRequest {
+            service: service.to_string(),
+            action: String::new(),
+            region: "us-east-1".to_string(),
+            account_id: "123456789012".to_string(),
+            request_id: "t".to_string(),
+            headers: http::HeaderMap::new(),
+            query_params: std::collections::HashMap::new(),
+            body: bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+            body_stream: parking_lot::Mutex::new(None),
+            path_segments: path
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect(),
+            raw_path: path.to_string(),
+            raw_query: String::new(),
+            method: http::Method::POST,
+            is_query_protocol: false,
+            access_key_id: None,
+            principal: None,
+        }
+    }
+
+    fn json_body(resp: &fakecloud_core::service::AwsResponse) -> serde_json::Value {
+        serde_json::from_slice(resp.body.expect_bytes()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn batch_job_queue_is_addressable_by_its_ref_arn() {
+        use fakecloud_core::service::AwsService;
+        let prov = make_provisioner();
+        let queue = prov
+            .create_resource(&make_resource(
+                "AWS::Batch::JobQueue",
+                "Q",
+                serde_json::json!({"JobQueueName": "jq", "Priority": 1}),
+            ))
+            .unwrap();
+        assert_eq!(
+            queue.physical_id,
+            "arn:aws:batch:us-east-1:123456789012:job-queue/jq"
+        );
+        let batch = fakecloud_batch::BatchService::new(prov.batch_state.clone());
+        let described = batch
+            .handle(json_request(
+                "batch",
+                "/v1/describejobqueues",
+                serde_json::json!({"jobQueues": [queue.physical_id]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            json_body(&described)["jobQueues"].as_array().unwrap().len(),
+            1
+        );
+        batch
+            .handle(json_request(
+                "batch",
+                "/v1/updatejobqueue",
+                serde_json::json!({"jobQueue": queue.physical_id, "priority": 7}),
+            ))
+            .await
+            .expect("UpdateJobQueue by the stack's ARN");
+        let st = prov.batch_state.read();
+        assert_eq!(
+            st.get("123456789012").unwrap().job_queues["jq"]["priority"],
+            7
+        );
+    }
+
+    fn cn_organization(prov: &ResourceProvisioner) -> String {
+        prov.create_resource(&make_resource(
+            "AWS::Organizations::Organization",
+            "Org",
+            serde_json::json!({"FeatureSet": "ALL"}),
+        ))
+        .unwrap();
+        prov.organizations_state
+            .read()
+            .sole()
+            .unwrap()
+            .root_id
+            .clone()
+    }
+
+    #[test]
+    fn ou_arn_follows_the_organization_partition_not_the_stack_region() {
+        let mut prov = cn_provisioner();
+        let root_id = cn_organization(&prov);
+        prov.region = "us-east-1".to_string();
+        let ou = prov
+            .create_resource(&make_resource(
+                "AWS::Organizations::OrganizationalUnit",
+                "OU",
+                serde_json::json!({"Name": "team", "ParentId": root_id}),
+            ))
+            .unwrap();
+        assert!(
+            ou.attributes["Arn"].starts_with("arn:aws-cn:organizations::123456789012:ou/"),
+            "{}",
+            ou.attributes["Arn"]
+        );
+    }
+
+    #[test]
+    fn organization_policy_failures_carry_the_service_errors() {
+        let prov = make_provisioner();
+        prov.create_resource(&make_resource(
+            "AWS::Organizations::Organization",
+            "Org",
+            serde_json::json!({"FeatureSet": "ALL"}),
+        ))
+        .unwrap();
+        let policy = |logical: &str, props: serde_json::Value| {
+            prov.create_resource(&make_resource("AWS::Organizations::Policy", logical, props))
+        };
+        let first = policy("P1", serde_json::json!({"Name": "dup", "Content": "{}"})).unwrap();
+        assert!(
+            first.attributes["Arn"].contains("/service_control_policy/"),
+            "{}",
+            first.attributes["Arn"]
+        );
+        let err = policy("P2", serde_json::json!({"Name": "dup", "Content": "{}"})).unwrap_err();
+        assert!(err.starts_with("DuplicatePolicyException"), "{err}");
+        let err = policy(
+            "P3",
+            serde_json::json!({"Name": "bad", "Content": "{not json"}),
+        )
+        .unwrap_err();
+        assert!(err.starts_with("MalformedPolicyDocumentException"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn organization_resource_policy_arn_matches_the_api() {
+        use fakecloud_core::service::AwsService;
+        let prov = make_provisioner();
+        prov.create_resource(&make_resource(
+            "AWS::Organizations::Organization",
+            "Org",
+            serde_json::json!({"FeatureSet": "ALL"}),
+        ))
+        .unwrap();
+        let rp = prov
+            .create_resource(&make_resource(
+                "AWS::Organizations::ResourcePolicy",
+                "Rp",
+                serde_json::json!({"Content": {"Version": "2012-10-17", "Statement": []}}),
+            ))
+            .unwrap();
+        let orgs =
+            fakecloud_organizations::OrganizationsService::new(prov.organizations_state.clone());
+        let mut req = json_request("organizations", "/", serde_json::json!({}));
+        req.action = "DescribeResourcePolicy".to_string();
+        req.headers.insert(
+            "x-amz-target",
+            "AWSOrganizationsV20161128.DescribeResourcePolicy"
+                .parse()
+                .unwrap(),
+        );
+        let described = json_body(&orgs.handle(req).await.unwrap());
+        assert_eq!(
+            described["ResourcePolicy"]["ResourcePolicySummary"]["Arn"],
+            serde_json::json!(rp.attributes["Arn"])
+        );
+    }
+
+    #[test]
+    fn listener_arns_derive_from_the_load_balancer_arn() {
+        let mut prov = cn_provisioner();
+        let lb = prov
+            .create_resource(&make_resource(
+                "AWS::ElasticLoadBalancingV2::LoadBalancer",
+                "Lb",
+                serde_json::json!({"Name": "cn-lb"}),
+            ))
+            .unwrap();
+        prov.region = "us-east-1".to_string();
+        let listener = prov
+            .create_resource(&make_resource(
+                "AWS::ElasticLoadBalancingV2::Listener",
+                "L",
+                serde_json::json!({
+                    "LoadBalancerArn": lb.physical_id,
+                    "Port": 80,
+                    "Protocol": "HTTP",
+                    "DefaultActions": [{"Type": "fixed-response", "FixedResponseConfig": {"StatusCode": "200"}}],
+                }),
+            ))
+            .unwrap();
+        let lb_tail = lb.physical_id.split_once(":loadbalancer/").unwrap().1;
+        assert!(
+            listener.physical_id.starts_with(&format!(
+                "arn:aws-cn:elasticloadbalancing:cn-north-1:123456789012:listener/{lb_tail}/"
+            )),
+            "{}",
+            listener.physical_id
+        );
+        let rule = prov
+            .create_resource(&make_resource(
+                "AWS::ElasticLoadBalancingV2::ListenerRule",
+                "R",
+                serde_json::json!({
+                    "ListenerArn": listener.physical_id,
+                    "Priority": 1,
+                    "Conditions": [{"Field": "path-pattern", "Values": ["/x"]}],
+                    "Actions": [{"Type": "fixed-response", "FixedResponseConfig": {"StatusCode": "200"}}],
+                }),
+            ))
+            .unwrap();
+        let listener_tail = listener.physical_id.split_once(":listener/").unwrap().1;
+        assert!(
+            rule.physical_id.starts_with(&format!(
+                "arn:aws-cn:elasticloadbalancing:cn-north-1:123456789012:listener-rule/{listener_tail}/"
+            )),
+            "{}",
+            rule.physical_id
+        );
+    }
+
+    #[test]
+    fn layer_version_numbers_are_never_reused() {
+        let prov = make_provisioner();
+        let publish = |logical: &str| {
+            prov.create_resource(&make_resource(
+                "AWS::Lambda::LayerVersion",
+                logical,
+                serde_json::json!({"LayerName": "shared"}),
+            ))
+            .unwrap()
+        };
+        let v1 = publish("V1");
+        publish("V2");
+        prov.delete_resource(&v1).unwrap();
+        let v3 = publish("V3");
+        assert!(
+            v3.physical_id.ends_with(":layer:shared:3"),
+            "{}",
+            v3.physical_id
+        );
+    }
+
+    #[test]
+    fn regional_web_acl_in_commercial_region_uses_the_regional_scope() {
+        let prov = make_provisioner();
+        let acl = prov
+            .create_resource(&make_resource(
+                "AWS::WAFv2::WebACL",
+                "Acl",
+                serde_json::json!({
+                    "Name": "acl",
+                    "Scope": "REGIONAL",
+                    "DefaultAction": {"Allow": {}},
+                    "VisibilityConfig": {},
+                }),
+            ))
+            .unwrap();
+        assert!(
+            acl.attributes["Arn"]
+                .starts_with("arn:aws:wafv2:us-east-1:123456789012:regional/webacl/acl/"),
+            "{}",
+            acl.attributes["Arn"]
+        );
+    }
+
+    #[test]
+    fn elastic_beanstalk_and_codedeploy_arns_take_the_stack_partition() {
+        let prov = cn_provisioner();
+        prov.create_resource(&make_resource(
+            "AWS::ElasticBeanstalk::Application",
+            "EbApp",
+            serde_json::json!({"ApplicationName": "cn-eb"}),
+        ))
+        .unwrap();
+        let eb_arn = prov.elasticbeanstalk_state.read().accounts["123456789012"].applications
+            ["cn-eb"]
+            .arn
+            .clone();
+        assert_eq!(
+            eb_arn,
+            "arn:aws-cn:elasticbeanstalk:cn-north-1:123456789012:application/cn-eb"
+        );
+        assert_eq!(
+            eb_arn,
+            fakecloud_elasticbeanstalk::application_arn("cn-north-1", "123456789012", "cn-eb")
+        );
+
+        prov.create_resource(&make_resource(
+            "AWS::CodeDeploy::Application",
+            "CdApp",
+            serde_json::json!({
+                "ApplicationName": "cn-cd",
+                "Tags": [{"Key": "team", "Value": "a"}],
+            }),
+        ))
+        .unwrap();
+        let expected = fakecloud_codedeploy::application_arn("cn-north-1", "123456789012", "cn-cd");
+        assert_eq!(
+            expected,
+            "arn:aws-cn:codedeploy:cn-north-1:123456789012:application:cn-cd"
+        );
+        assert!(prov
+            .codedeploy_state
+            .read()
+            .get("123456789012")
+            .unwrap()
+            .tags
+            .contains_key(&expected));
     }
 
     #[test]

@@ -579,6 +579,14 @@ impl OrganizationState {
             .to_string()
     }
 
+    /// The ARN of this organization's resource policy.
+    pub fn resource_policy_arn(&self) -> String {
+        self.resource_arn(&format!(
+            "resourcepolicy/{}/{RESOURCE_POLICY_ID}",
+            self.org_id
+        ))
+    }
+
     /// The partition this organization lives in.
     pub fn partition(&self) -> &str {
         partition_of(&self.org_arn)
@@ -1768,6 +1776,9 @@ impl OrganizationState {
         Ok(out)
     }
 }
+
+/// The id of an organization's (single) resource policy.
+pub const RESOURCE_POLICY_ID: &str = "rp-fakecloud";
 
 /// Typed errors used by organization state mutations so the service
 /// layer can translate each into the correct AWS exception code.

@@ -459,13 +459,7 @@ impl ResourceProvisioner {
         let state = accounts.get_or_create(&self.account_id);
         // Build the instance ARN from the stack's request region (self.region),
         // not the RDS sub-service state's frozen startup region.
-        let arn = Arn::regional(
-            "rds",
-            &self.region,
-            &state.account_id,
-            &format!("db:{identifier}"),
-        )
-        .to_string();
+        let arn = fakecloud_rds::rds_arn(&self.region, &state.account_id, "db", &identifier);
         let endpoint_address = format!(
             "{identifier}.cluster-fakecloud.{}.rds.amazonaws.com",
             self.region

@@ -303,8 +303,8 @@ impl OrganizationsService {
         let payload = json!({
             "ResourcePolicy": {
                 "ResourcePolicySummary": {
-                    "Id": "rp-fakecloud",
-                    "Arn": org.resource_arn(&format!("resourcepolicy/{}/rp-fakecloud", org.org_id)),
+                    "Id": crate::state::RESOURCE_POLICY_ID,
+                    "Arn": org.resource_policy_arn(),
                 },
                 "Content": org.resource_policy.clone(),
             }
@@ -341,8 +341,8 @@ impl OrganizationsService {
         Ok(AwsResponse::ok_json(json!({
             "ResourcePolicy": {
                 "ResourcePolicySummary": {
-                    "Id": "rp-fakecloud",
-                    "Arn": org.resource_arn(&format!("resourcepolicy/{}/rp-fakecloud", org.org_id)),
+                    "Id": crate::state::RESOURCE_POLICY_ID,
+                    "Arn": org.resource_policy_arn(),
                 },
                 "Content": content,
             }

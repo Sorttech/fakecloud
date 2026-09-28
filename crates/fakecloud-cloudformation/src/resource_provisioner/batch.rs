@@ -24,11 +24,7 @@ fn copy_prop(stored: &mut Map<String, Value>, props: &Value, cfn_key: &str, api_
 
 impl ResourceProvisioner {
     fn batch_arn(&self, kind: &str, name: &str) -> String {
-        fakecloud_batch::batch_arn(
-            &self.region,
-            &self.account_id,
-            &format!("{kind}/{name}-{}", Uuid::new_v4().simple()),
-        )
+        fakecloud_batch::batch_arn(&self.region, &self.account_id, &format!("{kind}/{name}"))
     }
 
     /// Seed the batch tag store from a resource's CFN `Tags` map (a JSON object),

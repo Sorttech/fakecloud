@@ -8,7 +8,6 @@ use chrono::Utc;
 use fakecloud_autoscaling::state::{
     AsgInstance, AutoScalingGroup, LaunchConfiguration, LaunchTemplateSpec,
 };
-use fakecloud_aws::arn::Arn;
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -184,13 +183,10 @@ impl ResourceProvisioner {
             instances,
             tags: Vec::new(),
             status: None,
-            service_linked_role_arn: Arn::global_in(
+            service_linked_role_arn: fakecloud_autoscaling::service_linked_role_arn(
                 &self.region,
-                "iam",
                 &self.account_id,
-                "role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling",
-            )
-            .to_string(),
+            ),
         };
         self.autoscaling_state
             .write()

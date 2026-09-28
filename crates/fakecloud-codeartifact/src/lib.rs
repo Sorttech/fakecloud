@@ -16,7 +16,8 @@ pub mod state;
 mod validate;
 
 pub use service::{
-    domain_arn, package_group_arn, repo_arn, CodeArtifactService, CODEARTIFACT_ACTIONS,
+    asset_bucket_arn, domain_arn, package_group_arn, repo_arn, CodeArtifactService,
+    CODEARTIFACT_ACTIONS,
 };
 pub use state::{
     CodeArtifactSnapshot, CodeArtifactState, SharedCodeArtifactState,

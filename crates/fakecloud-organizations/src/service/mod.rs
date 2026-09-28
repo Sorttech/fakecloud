@@ -748,7 +748,8 @@ pub(super) fn invalid_input(msg: &str) -> AwsServiceError {
     AwsServiceError::aws_error(StatusCode::BAD_REQUEST, "InvalidInputException", msg)
 }
 
-fn org_error_to_aws(err: OrgError) -> AwsServiceError {
+/// The AWS error a failed organization state mutation surfaces as.
+pub fn org_error_to_aws(err: OrgError) -> AwsServiceError {
     match err {
         OrgError::ParentNotFound(id) => AwsServiceError::aws_error(
             StatusCode::BAD_REQUEST,

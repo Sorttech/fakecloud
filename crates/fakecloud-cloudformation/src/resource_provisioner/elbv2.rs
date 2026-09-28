@@ -283,16 +283,8 @@ impl ResourceProvisioner {
             ));
         }
 
-        let lb_full = load_balancer_arn
-            .rsplit("loadbalancer/")
-            .next()
-            .unwrap_or("")
-            .to_string();
         let listener_id = Uuid::new_v4().simple().to_string();
-        let arn = self.regional_arn(
-            "elasticloadbalancing",
-            &format!("listener/{}/{}", lb_full, &listener_id[..16]),
-        );
+        let arn = fakecloud_elbv2::listener_arn(&load_balancer_arn, &listener_id[..16]);
 
         // Wire forward target groups -> LB association so dataplane probing
         // and DescribeTargetGroups round-trip the relationship.
@@ -384,16 +376,8 @@ impl ResourceProvisioner {
         if !state.listeners.contains_key(&listener_arn) {
             return Err(format!("Listener {listener_arn} not yet provisioned"));
         }
-        let listener_full = listener_arn
-            .rsplit("listener/")
-            .next()
-            .unwrap_or("")
-            .to_string();
         let rule_id = Uuid::new_v4().simple().to_string();
-        let arn = self.regional_arn(
-            "elasticloadbalancing",
-            &format!("listener-rule/{}/{}", listener_full, &rule_id[..16]),
-        );
+        let arn = fakecloud_elbv2::listener_rule_arn(&listener_arn, &rule_id[..16]);
 
         state.rules.insert(
             arn.clone(),

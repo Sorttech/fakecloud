@@ -11,7 +11,7 @@ pub mod cfn_provision;
 pub mod service;
 pub mod state;
 
-pub use service::{autoscaling_arn, AutoScalingService};
+pub use service::{autoscaling_arn, service_linked_role_arn, AutoScalingService};
 pub use state::{
     AutoScalingAccounts, AutoScalingSnapshot, SharedAutoScalingState,
     AUTOSCALING_SNAPSHOT_SCHEMA_VERSION,

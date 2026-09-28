@@ -531,12 +531,8 @@ impl ResourceProvisioner {
         let layer = state
             .layers
             .entry(layer_name.clone())
-            .or_insert_with(|| Layer {
-                layer_name: layer_name.clone(),
-                layer_arn: layer_arn.clone(),
-                versions: Vec::new(),
-            });
-        let next_version = (layer.versions.len() as i64) + 1;
+            .or_insert_with(|| Layer::new(&layer_name, layer_arn.clone()));
+        let next_version = layer.next_version();
         let version_arn = format!("{}:{}", layer.layer_arn, next_version);
         layer.versions.push(LayerVersion {
             version: next_version,

@@ -366,6 +366,19 @@ pub fn target_group_arn(region: &str, account_id: &str, name: &str, suffix: &str
     elb_arn(region, account_id, &format!("targetgroup/{name}/{suffix}"))
 }
 
+/// The ARN of a listener on `load_balancer_arn`: the load balancer's ARN with
+/// its `loadbalancer/` resource type swapped for `listener/` and `suffix`
+/// appended, so it keeps the load balancer's partition, region and account.
+pub fn listener_arn(load_balancer_arn: &str, suffix: &str) -> String {
+    format!("{load_balancer_arn}/{suffix}").replace(":loadbalancer/", ":listener/")
+}
+
+/// The ARN of a rule on `listener_arn`, derived the same way as
+/// [`listener_arn`].
+pub fn listener_rule_arn(listener_arn: &str, suffix: &str) -> String {
+    format!("{listener_arn}/{suffix}").replace(":listener/", ":listener-rule/")
+}
+
 /// The ARN of a trust store.
 pub fn trust_store_arn(region: &str, account_id: &str, name: &str, suffix: &str) -> String {
     elb_arn(region, account_id, &format!("truststore/{name}/{suffix}"))
