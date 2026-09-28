@@ -35,7 +35,7 @@ impl ResourceProvisioner {
                 "The email address {management_email} is already associated with another account"
             ));
         }
-        let mut state = OrganizationState::bootstrap(&self.account_id);
+        let mut state = OrganizationState::bootstrap_in(&self.region, &self.account_id);
         state.feature_set = feature_set;
         let org_id = state.org_id.clone();
         let org_arn = state.org_arn.clone();
@@ -92,13 +92,7 @@ impl ResourceProvisioner {
             .take(8)
             .collect();
         let id = format!("ou-{}-{}", &org.root_id[2..], id_suffix);
-        let arn = format!(
-            "arn:{}:organizations::{}:ou/{}/{}",
-            partition_of(&org.root_arn),
-            org.management_account_id,
-            org.org_id,
-            id
-        );
+        let arn = org.resource_arn(&format!("ou/{}/{id}", org.org_id));
         org.ous.insert(
             id.clone(),
             OrganizationalUnit {
@@ -323,14 +317,11 @@ impl ResourceProvisioner {
             .take(8)
             .collect();
         let id = format!("p-{}", id_suffix);
-        let arn = format!(
-            "arn:{}:organizations::{}:policy/{}/{}/{}",
-            partition_of(&org.root_arn),
-            org.management_account_id,
+        let arn = org.resource_arn(&format!(
+            "policy/{}/{}/{id}",
             org.org_id,
-            policy_type.to_lowercase(),
-            id
-        );
+            policy_type.to_lowercase()
+        ));
         org.policies.insert(
             id.clone(),
             OrgPolicy {
@@ -387,12 +378,7 @@ impl ResourceProvisioner {
             .org_of_account_mut(&self.account_id)
             .ok_or_else(|| "Organization not yet created".to_string())?;
         org.resource_policy = Some(content);
-        let arn = format!(
-            "arn:{}:organizations::{}:resourcepolicy/{}/rp",
-            partition_of(&org.root_arn),
-            org.management_account_id,
-            org.org_id
-        );
+        let arn = org.resource_arn(&format!("resourcepolicy/{}/rp", org.org_id));
         Ok(ProvisionResult::new(arn.clone()).with("Arn", arn))
     }
 

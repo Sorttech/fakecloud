@@ -23,7 +23,7 @@ impl ResourceProvisioner {
             .map(str::to_string)
             .unwrap_or_else(|| self.physical_name(resource));
         let account = &self.account_id;
-        let arn = self.regional_arn("codebuild", &format!("project/{name}"));
+        let arn = fakecloud_codebuild::project_arn(&self.region, &self.account_id, &name);
         let now = ts_now();
 
         // Camel-case the CFN properties into the API `Project` shape.

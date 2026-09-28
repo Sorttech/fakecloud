@@ -29,7 +29,7 @@ impl ResourceProvisioner {
         let name = cc_str(props, "RepositoryName").unwrap_or_else(|| self.physical_name(resource));
         let account = self.account_id.clone();
         let region = self.region.clone();
-        let arn = self.regional_arn("codecommit", &name);
+        let arn = fakecloud_codecommit::repo_arn(&self.region, &self.account_id, &name);
         let now = Utc::now();
 
         let mut guard = self.codecommit_state.write();
@@ -43,8 +43,13 @@ impl ResourceProvisioner {
 
         // Mirror the direct CreateRepository handler: an omitted KmsKeyId mints a
         // synthetic KMS key ARN so the stored metadata round-trips a key.
-        let kms = cc_str(props, "KmsKeyId")
-            .unwrap_or_else(|| self.regional_arn("kms", &format!("key/{}", uuid::Uuid::new_v4())));
+        let kms = cc_str(props, "KmsKeyId").unwrap_or_else(|| {
+            fakecloud_kms::kms_key_arn(
+                &self.region,
+                &self.account_id,
+                &uuid::Uuid::new_v4().to_string(),
+            )
+        });
         let clone_http = format!("https://git-codecommit.{region}.amazonaws.com/v1/repos/{name}");
         let clone_ssh = format!("ssh://git-codecommit.{region}.amazonaws.com/v1/repos/{name}");
 

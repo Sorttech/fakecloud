@@ -45,14 +45,12 @@ impl ResourceProvisioner {
         let mut accounts = self.elbv2_state.write();
         let state = accounts.get_or_create(&self.account_id);
         let lb_id = Uuid::new_v4().simple().to_string();
-        let arn = self.regional_arn(
-            "elasticloadbalancing",
-            &format!(
-                "loadbalancer/{}/{}/{}",
-                if lb_type == "network" { "net" } else { "app" },
-                name,
-                &lb_id[..16]
-            ),
+        let arn = fakecloud_elbv2::load_balancer_arn(
+            &self.region,
+            &self.account_id,
+            &lb_type,
+            &name,
+            &lb_id[..16],
         );
         let dns_name = format!(
             "{}-{}.{}.elb.{}.amazonaws.com",
@@ -183,10 +181,8 @@ impl ResourceProvisioner {
         let mut accounts = self.elbv2_state.write();
         let state = accounts.get_or_create(&self.account_id);
         let id = Uuid::new_v4().simple().to_string();
-        let arn = self.regional_arn(
-            "elasticloadbalancing",
-            &format!("targetgroup/{}/{}", name, &id[..16]),
-        );
+        let arn =
+            fakecloud_elbv2::target_group_arn(&self.region, &self.account_id, &name, &id[..16]);
 
         state.target_groups.insert(
             arn.clone(),
@@ -541,10 +537,7 @@ impl ResourceProvisioner {
             .chars()
             .take(16)
             .collect();
-        let arn = self.regional_arn(
-            "elasticloadbalancing",
-            &format!("truststore/{}/{}", name, suffix),
-        );
+        let arn = fakecloud_elbv2::trust_store_arn(&self.region, &self.account_id, &name, &suffix);
         let ts = fakecloud_elbv2::TrustStore {
             arn: arn.clone(),
             name: name.clone(),

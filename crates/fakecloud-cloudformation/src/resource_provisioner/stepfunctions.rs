@@ -187,7 +187,7 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .ok_or("Name is required")?
             .to_string();
-        let arn = self.regional_arn("states", &format!("activity:{}", name));
+        let arn = fakecloud_stepfunctions::activity_arn(&self.region, &self.account_id, &name);
         let activity = SfnActivity {
             name: name.clone(),
             arn: arn.clone(),
@@ -314,7 +314,13 @@ impl ResourceProvisioner {
         let sm_arn_root = first_version_arn
             .rsplit_once(':')
             .map(|(root, _)| root.to_string())
-            .unwrap_or_else(|| self.regional_arn("states", "stateMachine:unknown"));
+            .unwrap_or_else(|| {
+                fakecloud_stepfunctions::state_machine_arn(
+                    &self.region,
+                    &self.account_id,
+                    "unknown",
+                )
+            });
         let arn = format!("{sm_arn_root}:{name}");
         let now = Utc::now();
         let alias = StateMachineAlias {

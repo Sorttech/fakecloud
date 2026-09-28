@@ -54,28 +54,16 @@ impl ResourceProvisioner {
                 .and_then(|x| x.as_bool()),
         });
 
-        let arn = self.regional_arn(
-            "application-autoscaling",
-            &format!("scalable-target/{}", fakecloud_core::ids::short_id(10)),
+        let arn = fakecloud_application_autoscaling::scalable_target_arn(
+            &self.region,
+            &self.account_id,
+            &fakecloud_core::ids::short_id(10),
         );
         let role = role_arn.unwrap_or_else(|| {
-            let suffix = match service_namespace.as_str() {
-                "ecs" => "ECSService",
-                "elasticmapreduce" => "EMRContainerService",
-                "ec2" => "EC2SpotFleetRequest",
-                "appstream" => "ApplicationAutoScaling_AppStreamFleet",
-                "dynamodb" => "DynamoDBTable",
-                "rds" => "RDSCluster",
-                "sagemaker" => "SageMakerEndpoint",
-                "lambda" => "LambdaConcurrency",
-                "elasticache" => "ElastiCacheRG",
-                "cassandra" => "CassandraTable",
-                "kafka" => "KafkaCluster",
-                _ => "ApplicationAutoScaling_Default",
-            };
-            format!(
-                "arn:{}:iam::{}:role/aws-service-role/applicationautoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_{}", partition_for(&self.region),
-                self.account_id, suffix
+            fakecloud_application_autoscaling::default_service_linked_role(
+                &self.region,
+                &self.account_id,
+                &service_namespace,
             )
         });
 
@@ -162,15 +150,13 @@ impl ResourceProvisioner {
                 service_namespace, resource_id, scalable_dimension
             ));
         }
-        let arn = self.regional_arn(
-            "autoscaling",
-            &format!(
-                "scalingPolicy:{}:resource/{}/{}:policyName/{}",
-                Uuid::new_v4(),
-                service_namespace,
-                resource_id,
-                policy_name
-            ),
+        let arn = fakecloud_application_autoscaling::scaling_policy_arn(
+            &self.region,
+            &self.account_id,
+            &Uuid::new_v4().to_string(),
+            &service_namespace,
+            &resource_id,
+            &policy_name,
         );
         let policy = AppasScalingPolicy {
             arn: arn.clone(),

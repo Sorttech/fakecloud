@@ -36,7 +36,13 @@ impl ResourceProvisioner {
             .get("KmsKeyId")
             .and_then(Value::as_str)
             .map(str::to_string)
-            .or_else(|| Some(self.regional_arn("kms", "key/timestream-default")));
+            .or_else(|| {
+                Some(fakecloud_kms::kms_key_arn(
+                    &self.region,
+                    &self.account_id,
+                    "timestream-default",
+                ))
+            });
 
         let db = Database {
             name: name.clone(),

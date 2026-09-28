@@ -29,7 +29,7 @@ impl ResourceProvisioner {
             "j-{}",
             uuid::Uuid::new_v4().simple().to_string()[..13].to_uppercase()
         );
-        let arn = self.regional_arn("elasticmapreduce", &format!("cluster/{id}"));
+        let arn = fakecloud_emr::cluster_arn(&self.region, &self.account_id, &id);
         let master_dns = format!("ip-10-0-0-1.{region}.compute.internal");
 
         let mut cluster = serde_json::Map::new();

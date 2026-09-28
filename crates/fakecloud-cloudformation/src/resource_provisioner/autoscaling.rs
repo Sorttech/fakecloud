@@ -8,7 +8,7 @@ use chrono::Utc;
 use fakecloud_autoscaling::state::{
     AsgInstance, AutoScalingGroup, LaunchConfiguration, LaunchTemplateSpec,
 };
-use fakecloud_aws::arn::partition_for;
+use fakecloud_aws::arn::Arn;
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -57,9 +57,12 @@ fn str_list(p: &Value, k: &str) -> Vec<String> {
 
 impl ResourceProvisioner {
     fn asg_arn(&self, kind: &str, name: &str) -> String {
-        self.regional_arn(
-            "autoscaling",
-            &format!("{kind}:{}:{kind}Name/{name}", Uuid::new_v4()),
+        fakecloud_autoscaling::autoscaling_arn(
+            &self.region,
+            &self.account_id,
+            kind,
+            &Uuid::new_v4().to_string(),
+            name,
         )
     }
 
@@ -181,10 +184,13 @@ impl ResourceProvisioner {
             instances,
             tags: Vec::new(),
             status: None,
-            service_linked_role_arn: format!(
-                "arn:{}:iam::{}:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling", partition_for(&self.region),
-                self.account_id
-            ),
+            service_linked_role_arn: Arn::global_in(
+                &self.region,
+                "iam",
+                &self.account_id,
+                "role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling",
+            )
+            .to_string(),
         };
         self.autoscaling_state
             .write()

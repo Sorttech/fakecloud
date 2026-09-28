@@ -108,7 +108,11 @@ impl ResourceProvisioner {
             let kms = efs_str(props, "KmsKeyId")
                 .map(str::to_string)
                 .unwrap_or_else(|| {
-                    self.regional_arn("kms", &format!("key/{}", uuid::Uuid::new_v4()))
+                    fakecloud_kms::kms_key_arn(
+                        &self.region,
+                        &self.account_id,
+                        &uuid::Uuid::new_v4().to_string(),
+                    )
                 });
             fs.insert("KmsKeyId".into(), json!(kms));
         }
@@ -596,11 +600,11 @@ impl ResourceProvisioner {
     // ------------------------------------------------------------- helpers
 
     fn efs_fs_arn(&self, fsid: &str) -> String {
-        self.regional_arn("elasticfilesystem", &format!("file-system/{}", fsid))
+        fakecloud_efs::state::file_system_arn(&self.region, &self.account_id, fsid)
     }
 
     fn efs_ap_arn(&self, apid: &str) -> String {
-        self.regional_arn("elasticfilesystem", &format!("access-point/{}", apid))
+        fakecloud_efs::state::access_point_arn(&self.region, &self.account_id, apid)
     }
 
     /// Resolve a subnet's `(availability_zone, availability_zone_id, vpc_id)`

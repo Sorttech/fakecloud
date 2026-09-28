@@ -6,7 +6,6 @@
 //! one. The Cloud Map service's snapshot hook (registered in the server) then
 //! persists them so they survive a restart (#1766 lesson).
 
-use fakecloud_aws::arn::Arn;
 use std::collections::BTreeMap;
 
 use chrono::Utc;
@@ -44,26 +43,6 @@ fn new_hosted_zone_id() -> String {
     format!("Z{}", frag(21).to_uppercase())
 }
 
-fn namespace_arn(region: &str, account: &str, id: &str) -> String {
-    Arn::regional(
-        "servicediscovery",
-        region,
-        account,
-        &format!("namespace/{id}"),
-    )
-    .to_string()
-}
-
-fn service_arn(region: &str, account: &str, id: &str) -> String {
-    Arn::regional(
-        "servicediscovery",
-        region,
-        account,
-        &format!("service/{id}"),
-    )
-    .to_string()
-}
-
 /// Reduce a bare id or full ARN to its trailing resource id (Cloud Map accepts
 /// either wherever a `NamespaceId` is expected).
 fn resource_id_from(value: &str) -> &str {
@@ -87,7 +66,7 @@ impl ResourceProvisioner {
             .ok_or("Name is required")?
             .to_string();
         let id = new_namespace_id();
-        let arn = namespace_arn(&self.region, &self.account_id, &id);
+        let arn = fakecloud_servicediscovery::namespace_arn(&self.region, &self.account_id, &id);
         let hosted_zone_id = dns.as_ref().map(|d| d.hosted_zone_id.clone());
         let ns = Namespace {
             id: id.clone(),
@@ -209,7 +188,7 @@ impl ResourceProvisioner {
         let explicit_http = props.get("Type").and_then(|v| v.as_str()) == Some("HTTP");
 
         let id = new_service_id();
-        let arn = service_arn(&self.region, &self.account_id, &id);
+        let arn = fakecloud_servicediscovery::service_arn(&self.region, &self.account_id, &id);
 
         let mut accounts = self.servicediscovery_state.write();
         let state = accounts.get_or_create(&self.account_id);

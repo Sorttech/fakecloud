@@ -466,7 +466,11 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .unwrap_or(&generated_name)
             .to_string();
-        let arn = self.regional_arn("ecs", &format!("capacity-provider/{}", name));
+        let arn = fakecloud_ecs::ecs_arn(
+            &self.region,
+            &self.account_id,
+            &format!("capacity-provider/{name}"),
+        );
         let cp = EcsCapacityProvider {
             name: name.clone(),
             arn: arn.clone(),

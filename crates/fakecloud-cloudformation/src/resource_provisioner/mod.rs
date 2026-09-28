@@ -26,7 +26,7 @@ use fakecloud_application_autoscaling::{
     SharedApplicationAutoScalingState as AppasState, SuspendedState as AppasSuspendedState,
 };
 use fakecloud_athena::{DataCatalog, NamedQuery, PreparedStatement, SharedAthenaState, WorkGroup};
-use fakecloud_aws::arn::{arn_resource, implicit_global_region, partition_for, partition_of, Arn};
+use fakecloud_aws::arn::{arn_resource, partition_for, Arn};
 use fakecloud_cloudfront::{
     functions::{
         CloudFrontOriginAccessIdentityConfig, FunctionConfig, KeyGroupConfig, KeyGroupItems,
@@ -7302,7 +7302,7 @@ mod tests {
     }
 
     #[test]
-    fn cloudfront_scoped_web_acl_in_china_uses_the_partition_global_region() {
+    fn web_acl_arns_in_china_follow_the_wafv2_scope_rules() {
         let prov = cn_provisioner();
         let acl = prov
             .create_resource(&make_resource(
@@ -7322,10 +7322,29 @@ mod tests {
             "{}",
             acl.attributes["Arn"]
         );
+        let regional = prov
+            .create_resource(&make_resource(
+                "AWS::WAFv2::WebACL",
+                "RegionalAcl",
+                serde_json::json!({
+                    "Name": "cn-regional-acl",
+                    "Scope": "REGIONAL",
+                    "DefaultAction": {"Allow": {}},
+                    "VisibilityConfig": {},
+                }),
+            ))
+            .unwrap();
+        assert!(
+            regional.attributes["Arn"].starts_with(
+                "arn:aws-cn:wafv2:cn-north-1:123456789012:regional/webacl/cn-regional-acl/"
+            ),
+            "{}",
+            regional.attributes["Arn"]
+        );
     }
 
     #[test]
-    fn organizational_unit_arn_follows_the_organization_partition() {
+    fn organization_created_in_china_mints_aws_cn_arns() {
         let prov = cn_provisioner();
         prov.create_resource(&make_resource(
             "AWS::Organizations::Organization",
@@ -7345,11 +7364,23 @@ mod tests {
                 serde_json::json!({"Name": "team", "ParentId": root_id}),
             ))
             .unwrap();
+        assert!(root_arn.starts_with("arn:aws-cn:organizations::123456789012:root/"));
         let ou_arn = &ou.attributes["Arn"];
-        assert_eq!(
-            partition_of(ou_arn),
-            partition_of(&root_arn),
-            "{ou_arn} vs {root_arn}"
+        assert!(
+            ou_arn.starts_with("arn:aws-cn:organizations::123456789012:ou/"),
+            "{ou_arn}"
+        );
+        let policy = prov
+            .create_resource(&make_resource(
+                "AWS::Organizations::Policy",
+                "Pol",
+                serde_json::json!({"Name": "p1", "Content": "{}", "TargetIds": [ou.physical_id]}),
+            ))
+            .unwrap();
+        assert!(
+            policy.attributes["Arn"].starts_with("arn:aws-cn:organizations::123456789012:policy/"),
+            "{}",
+            policy.attributes["Arn"]
         );
     }
 

@@ -30,7 +30,7 @@ impl ResourceProvisioner {
                 .take(9)
                 .collect::<String>()
         );
-        let arn = self.regional_arn("cognito-idp", &format!("userpool/{}", pool_id));
+        let arn = fakecloud_cognito::user_pool_arn(&self.region, &self.account_id, &pool_id);
         let now = Utc::now();
 
         let password_policy = parse_cognito_password_policy(props.get("Policies"));

@@ -129,21 +129,14 @@ impl ResourceProvisioner {
         let capacity = props.get("Capacity").and_then(|v| v.as_i64()).unwrap_or(0);
 
         let id = Uuid::new_v4().to_string();
-        let (region_in_arn, scope_seg): (&str, String) = if scope == "CLOUDFRONT" {
-            (
-                implicit_global_region(partition_for(&self.region)),
-                "global".to_string(),
-            )
-        } else {
-            (self.region.as_str(), self.region.clone())
-        };
-        let arn = Arn::regional(
-            "wafv2",
-            region_in_arn,
+        let arn = fakecloud_wafv2::synth_arn(
             &self.account_id,
-            &format!("{scope_seg}/webacl/{name}/{id}"),
-        )
-        .to_string();
+            &self.region,
+            &scope,
+            "webacl",
+            &name,
+            &id,
+        );
         let acl = WebAcl {
             id: id.clone(),
             name: name.clone(),
@@ -230,21 +223,8 @@ impl ResourceProvisioner {
             .map(String::from);
 
         let id = Uuid::new_v4().to_string();
-        let (region_in_arn, scope_seg): (&str, String) = if scope == "CLOUDFRONT" {
-            (
-                implicit_global_region(partition_for(&self.region)),
-                "global".to_string(),
-            )
-        } else {
-            (self.region.as_str(), self.region.clone())
-        };
-        let arn = Arn::regional(
-            "wafv2",
-            region_in_arn,
-            &self.account_id,
-            &format!("{scope_seg}/ipset/{name}/{id}"),
-        )
-        .to_string();
+        let arn =
+            fakecloud_wafv2::synth_arn(&self.account_id, &self.region, &scope, "ipset", &name, &id);
         let ip_set = IpSet {
             id: id.clone(),
             name: name.clone(),
@@ -316,21 +296,14 @@ impl ResourceProvisioner {
             .map(String::from);
 
         let id = Uuid::new_v4().to_string();
-        let (region_in_arn, scope_seg): (&str, String) = if scope == "CLOUDFRONT" {
-            (
-                implicit_global_region(partition_for(&self.region)),
-                "global".to_string(),
-            )
-        } else {
-            (self.region.as_str(), self.region.clone())
-        };
-        let arn = Arn::regional(
-            "wafv2",
-            region_in_arn,
+        let arn = fakecloud_wafv2::synth_arn(
             &self.account_id,
-            &format!("{scope_seg}/regexpatternset/{name}/{id}"),
-        )
-        .to_string();
+            &self.region,
+            &scope,
+            "regexpatternset",
+            &name,
+            &id,
+        );
         let set = RegexPatternSet {
             id: id.clone(),
             name: name.clone(),
@@ -399,21 +372,14 @@ impl ResourceProvisioner {
             .unwrap_or_else(|| serde_json::json!({}));
 
         let id = Uuid::new_v4().to_string();
-        let (region_in_arn, scope_seg): (&str, String) = if scope == "CLOUDFRONT" {
-            (
-                implicit_global_region(partition_for(&self.region)),
-                "global".to_string(),
-            )
-        } else {
-            (self.region.as_str(), self.region.clone())
-        };
-        let arn = Arn::regional(
-            "wafv2",
-            region_in_arn,
+        let arn = fakecloud_wafv2::synth_arn(
             &self.account_id,
-            &format!("{scope_seg}/rulegroup/{name}/{id}"),
-        )
-        .to_string();
+            &self.region,
+            &scope,
+            "rulegroup",
+            &name,
+            &id,
+        );
         let rg = RuleGroup {
             id: id.clone(),
             name: name.clone(),

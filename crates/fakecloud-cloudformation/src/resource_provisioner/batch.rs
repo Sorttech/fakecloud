@@ -24,8 +24,9 @@ fn copy_prop(stored: &mut Map<String, Value>, props: &Value, cfn_key: &str, api_
 
 impl ResourceProvisioner {
     fn batch_arn(&self, kind: &str, name: &str) -> String {
-        self.regional_arn(
-            "batch",
+        fakecloud_batch::batch_arn(
+            &self.region,
+            &self.account_id,
             &format!("{kind}/{name}-{}", Uuid::new_v4().simple()),
         )
     }
@@ -78,7 +79,11 @@ impl ResourceProvisioner {
         // and API-created environments read back identically.
         stored.insert(
             "ecsClusterArn".into(),
-            json!(self.regional_arn("ecs", &format!("cluster/AWSBatch-{name}-{uuid}"))),
+            json!(fakecloud_ecs::ecs_arn(
+                &self.region,
+                &self.account_id,
+                &format!("cluster/AWSBatch-{name}-{uuid}")
+            )),
         );
         stored.insert("uuid".into(), json!(uuid));
         for (cfn, api) in [
@@ -155,7 +160,11 @@ impl ResourceProvisioner {
             let revision = acct.job_def_revisions.entry(name.clone()).or_insert(0);
             *revision += 1;
             let revision = *revision;
-            arn = self.regional_arn("batch", &format!("job-definition/{name}:{revision}"));
+            arn = fakecloud_batch::batch_arn(
+                &self.region,
+                &self.account_id,
+                &format!("job-definition/{name}:{revision}"),
+            );
             let mut stored = Map::new();
             stored.insert("jobDefinitionName".into(), json!(name));
             stored.insert("jobDefinitionArn".into(), json!(arn));
@@ -212,7 +221,11 @@ impl ResourceProvisioner {
         let name = prop_str(props, "Name")
             .map(String::from)
             .unwrap_or_else(|| self.physical_name(resource));
-        let arn = self.regional_arn("batch", &format!("scheduling-policy/{name}"));
+        let arn = fakecloud_batch::batch_arn(
+            &self.region,
+            &self.account_id,
+            &format!("scheduling-policy/{name}"),
+        );
         let mut stored = Map::new();
         stored.insert("name".into(), json!(name));
         stored.insert("arn".into(), json!(arn));

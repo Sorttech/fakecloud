@@ -55,7 +55,7 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
         let ca_id = Uuid::new_v4();
-        let arn = self.regional_arn("acm-pca", &format!("certificate-authority/{}", ca_id));
+        let arn = fakecloud_acmpca::ca_arn(&self.region, &self.account_id, &ca_id.to_string());
 
         // Use the same shared builder + defaults as the API handler (one source
         // of truth). CFN provisioning is synchronous and not probe-timed, so the
