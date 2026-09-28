@@ -31,7 +31,7 @@ async fn bootstrap_ecs_service(
         .container_definitions(
             ContainerDefinition::builder()
                 .name("app")
-                .image("public.ecr.aws/library/alpine:latest")
+                .image("public.ecr.aws/docker/library/alpine:latest")
                 .essential(true)
                 .build(),
         )

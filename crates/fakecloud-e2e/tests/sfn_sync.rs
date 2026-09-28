@@ -222,7 +222,7 @@ async fn sfn_sync_ecs_run_task_waits_for_stopped() {
         .container_definitions(
             ContainerDefinition::builder()
                 .name("app")
-                .image("public.ecr.aws/library/alpine:latest")
+                .image("public.ecr.aws/docker/library/alpine:latest")
                 .essential(true)
                 .build(),
         )
