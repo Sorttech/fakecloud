@@ -7230,6 +7230,155 @@ async fn partiql_refuses_values_it_cannot_build() {
     );
 }
 
+/// PartiQL writes are measured and stored like the item APIs: INSERT has
+/// PutItem's size rule and wording, UPDATE the flat update rule, and every
+/// written number -- literal or bound parameter -- is stored canonically.
+#[tokio::test]
+async fn partiql_writes_share_the_item_size_and_number_rules() {
+    let svc = make_service();
+    create_test_table(&svc);
+    // "pk" + "a" + "p" + padding: exactly one byte over the limit.
+    let pad = "x".repeat(409_600 - "pk".len() - "a".len() - "p".len() + 1);
+    let err = svc
+        .handle(make_request(
+            "ExecuteStatement",
+            json!({
+                "Statement": "INSERT INTO \"test-table\" VALUE {'pk': 'a', 'p': ?}",
+                "Parameters": [{"S": pad}]
+            }),
+        ))
+        .await
+        .err()
+        .expect("oversize INSERT");
+    assert_eq!(err.code(), "ValidationException");
+    assert_eq!(
+        err.message(),
+        "Item size has exceeded the maximum allowed size"
+    );
+    // One byte less fits.
+    call_dynamodb(
+        &svc,
+        "ExecuteStatement",
+        json!({
+            "Statement": "INSERT INTO \"test-table\" VALUE {'pk': 'a', 'p': ?}",
+            "Parameters": [{"S": &pad[1..]}]
+        }),
+    )
+    .await;
+    let err = svc
+        .handle(make_request(
+            "ExecuteStatement",
+            json!({
+                "Statement": "UPDATE \"test-table\" SET q = 'y' WHERE pk = 'a'"
+            }),
+        ))
+        .await
+        .err()
+        .expect("oversize UPDATE");
+    assert_eq!(
+        err.message(),
+        "Item size to update has exceeded the maximum allowed size"
+    );
+
+    call_dynamodb(
+        &svc,
+        "ExecuteStatement",
+        json!({
+            "Statement": "INSERT INTO \"test-table\" VALUE {'pk': 'n', 'lit': 01.50, 'p': ?, 'l': [?]}",
+            "Parameters": [{"N": "+1.5E+3"}, {"N": "0042.1200"}]
+        }),
+    )
+    .await;
+    call_dynamodb(
+        &svc,
+        "ExecuteStatement",
+        json!({
+            "Statement": "UPDATE \"test-table\" SET u = ? WHERE pk = 'n'",
+            "Parameters": [{"NS": ["1.0", "-0"]}]
+        }),
+    )
+    .await;
+    let got = call_dynamodb(
+        &svc,
+        "GetItem",
+        json!({"TableName": "test-table", "Key": {"pk": {"S": "n"}}}),
+    )
+    .await;
+    assert_eq!(got["Item"]["lit"], json!({"N": "1.5"}));
+    assert_eq!(got["Item"]["p"], json!({"N": "1500"}));
+    assert_eq!(got["Item"]["l"], json!({"L": [{"N": "42.12"}]}));
+    assert_eq!(got["Item"]["u"], json!({"NS": ["1", "0"]}));
+}
+
+/// A value an UPDATE writes is validated like an UpdateItem value before it
+/// is normalized, so it can never store a malformed number or set.
+#[tokio::test]
+async fn partiql_update_validates_written_values() {
+    let svc = make_service();
+    create_test_table(&svc);
+    call_dynamodb(
+        &svc,
+        "PutItem",
+        json!({"TableName": "test-table", "Item": {"pk": {"S": "a"}}}),
+    )
+    .await;
+    for (value, message) in [
+        (
+            json!({"NS": ["1", "1.0"]}),
+            "One or more parameter values were invalid: Input collection [1, 1.0] contains duplicates",
+        ),
+        (
+            json!({"N": "abc"}),
+            "The parameter cannot be converted to a numeric value: abc",
+        ),
+        (
+            json!({"SS": []}),
+            "One or more parameter values were invalid: An string set  may not be empty",
+        ),
+        (
+            json!({"N": "1234567890123456789012345678901234567890"}),
+            "",
+        ),
+    ] {
+        let expected = svc
+            .handle(make_request(
+                "UpdateItem",
+                json!({
+                    "TableName": "test-table",
+                    "Key": {"pk": {"S": "a"}},
+                    "UpdateExpression": "SET u = :v",
+                    "ExpressionAttributeValues": {":v": value}
+                }),
+            ))
+            .await
+            .err()
+            .expect("UpdateItem refuses the value");
+        let err = svc
+            .handle(make_request(
+                "ExecuteStatement",
+                json!({
+                    "Statement": "UPDATE \"test-table\" SET u = ? WHERE pk = 'a'",
+                    "Parameters": [value]
+                }),
+            ))
+            .await
+            .err()
+            .expect("PartiQL UPDATE refuses the value");
+        assert_eq!(err.code(), "ValidationException", "{value}");
+        assert_eq!(err.message(), expected.message(), "{value}");
+        if !message.is_empty() {
+            assert_eq!(err.message(), message, "{value}");
+        }
+    }
+    let got = call_dynamodb(
+        &svc,
+        "GetItem",
+        json!({"TableName": "test-table", "Key": {"pk": {"S": "a"}}}),
+    )
+    .await;
+    assert_eq!(got["Item"], json!({"pk": {"S": "a"}}));
+}
+
 /// A transaction that reads and writes one table reports each as what it
 /// was, not every unit as whichever came first.
 #[tokio::test]
