@@ -1123,20 +1123,21 @@ async fn china_region_arns_use_the_china_partition_and_resolve_for_tagging() {
 }
 
 #[tokio::test]
-async fn certificate_arns_use_the_partitions_global_region() {
+async fn certificate_arns_use_the_queried_region_and_its_partition() {
     let svc = service();
-    let xml = body(&call(&svc, "DescribeCertificates", &[]).await);
-    assert!(
-        xml.contains("<CertificateArn>arn:aws:rds:us-east-1::cert:rds-ca-2019</CertificateArn>"),
-        "{xml}"
-    );
-    let mut r = req("DescribeCertificates", &[]);
-    r.region = "cn-north-1".to_string();
-    let xml = body(&svc.handle(r).await.unwrap());
-    assert!(
-        xml.contains(
-            "<CertificateArn>arn:aws-cn:rds:cn-northwest-1::cert:rds-ca-2019</CertificateArn>"
+    for (region, expected) in [
+        (
+            "us-west-2",
+            "<CertificateArn>arn:aws:rds:us-west-2::cert:rds-ca-rsa2048-g1</CertificateArn>",
         ),
-        "{xml}"
-    );
+        (
+            "cn-north-1",
+            "<CertificateArn>arn:aws-cn:rds:cn-north-1::cert:rds-ca-rsa2048-g1</CertificateArn>",
+        ),
+    ] {
+        let mut r = req("DescribeCertificates", &[]);
+        r.region = region.to_string();
+        let xml = body(&svc.handle(r).await.unwrap());
+        assert!(xml.contains(expected), "{region}: {xml}");
+    }
 }

@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
-use fakecloud_aws::arn::Arn;
+use fakecloud_aws::arn::{partition_for, Arn};
 use fakecloud_core::multi_account::{AccountState, MultiAccountState};
 
 pub const MEMORYDB_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
@@ -198,14 +198,28 @@ impl MemoryDbState {
     /// back as drift. These resources exist in every region, so re-point them
     /// rather than freezing whichever region created the account.
     pub fn retarget_default_arns(&mut self, region: &str, account_id: &str) {
+        let partition = partition_for(region);
+        // `arn:<partition>:memorydb:<region>:` -- matched field by field so the
+        // common case (already in this region) neither allocates nor rewrites.
+        let targets_region = |arn: &str| {
+            let mut fields = arn.splitn(5, ':');
+            fields.next() == Some("arn")
+                && fields.next() == Some(partition)
+                && fields.next() == Some("memorydb")
+                && fields.next() == Some(region)
+        };
         if let Some(user) = self.users.get_mut("default") {
-            user.arn = memorydb_arn("user", region, account_id, "default");
+            if !targets_region(&user.arn) {
+                user.arn = memorydb_arn("user", region, account_id, "default");
+            }
         }
         if let Some(acl) = self.acls.get_mut("open-access") {
-            acl.arn = memorydb_arn("acl", region, account_id, "open-access");
+            if !targets_region(&acl.arn) {
+                acl.arn = memorydb_arn("acl", region, account_id, "open-access");
+            }
         }
         for (name, pg) in self.parameter_groups.iter_mut() {
-            if name.starts_with("default.") {
+            if name.starts_with("default.") && !targets_region(&pg.arn) {
                 pg.arn = memorydb_arn("parametergroup", region, account_id, name);
             }
         }

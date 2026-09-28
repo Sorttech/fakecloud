@@ -7,7 +7,7 @@ use chrono::Utc;
 use http::StatusCode;
 use tokio::sync::Mutex as AsyncMutex;
 
-use fakecloud_aws::arn::{implicit_global_region, partition_for, Arn};
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::query::{optional_query_param, query_response_xml, required_query_param};
 use fakecloud_core::query_filters::{
     parse_filters, requested_identifier, sibling_rds_arn, warn_unknown_filters, QueryFilter,
@@ -2126,19 +2126,10 @@ impl DocDbService {
     // --- read-only catalog ops ---
 
     fn describe_certificates(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
-        // Certificates are catalog entries with no account, reported in the
-        // partition's global region.
-        let partition = partition_for(&req.region);
-        let cert_arn = |id: &str| {
-            Arn::new(
-                "rds",
-                implicit_global_region(partition),
-                "",
-                &format!("cert:{id}"),
-            )
-            .with_partition(partition)
-            .to_string()
-        };
+        // Certificates carry no account; they are reported in the queried
+        // region and its partition.
+        let cert_arn =
+            |id: &str| Arn::regional("rds", &req.region, "", &format!("cert:{id}")).to_string();
         let inner = format!(
             "<Certificates>\
             <Certificate><CertificateIdentifier>rds-ca-2019</CertificateIdentifier><CertificateType>CA</CertificateType><Thumbprint>0000000000000000000000000000000000000000</Thumbprint><ValidFrom>2019-08-22T17:08:50Z</ValidFrom><ValidTill>2024-08-22T17:08:50Z</ValidTill><CertificateArn>{}</CertificateArn></Certificate>\
