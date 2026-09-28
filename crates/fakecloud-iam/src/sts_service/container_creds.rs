@@ -91,13 +91,7 @@ impl ContainerCredentials {
     }
 }
 
-/// Derive the partition (`arn:<partition>:…`) from an ARN, defaulting to `aws`.
-pub fn partition_of(arn: &str) -> &str {
-    arn.split(':')
-        .nth(1)
-        .filter(|p| !p.is_empty())
-        .unwrap_or("aws")
-}
+pub use fakecloud_aws::arn::partition_of;
 
 /// A deterministic, fixed-length suffix derived from `input` over a
 /// power-of-two-sized `alphabet`. Stable across builds and toolchain versions

@@ -5663,3 +5663,43 @@ fn saml_provider_name_is_unique() {
     let body = String::from_utf8_lossy(resp.body.expect_bytes());
     assert!(body.contains(&"a".repeat(1000)), "original metadata kept");
 }
+
+/// In a China region, GetUser with no caller returns its default user in the
+/// request's partition.
+#[test]
+fn get_user_default_takes_the_request_partition() {
+    let svc = make_service();
+    let mut get = make_request("GetUser", vec![]);
+    get.region = "cn-north-1".to_string();
+    let resp = svc.get_user(&get).unwrap();
+    let body = String::from_utf8_lossy(resp.body.expect_bytes());
+    assert_eq!(
+        extract_xml_tag(&body, "Arn"),
+        "arn:aws-cn:iam::123456789012:user/default_user"
+    );
+}
+
+/// On a server running in a China region, an account nothing has touched
+/// lists its seeded service-linked roles in aws-cn, the same ARNs the account
+/// holds once something writes to it.
+#[test]
+fn untouched_account_seeded_roles_match_created_account() {
+    let state: SharedIamState = Arc::new(RwLock::new(
+        fakecloud_core::multi_account::MultiAccountState::new("123456789012", "cn-north-1", ""),
+    ));
+    let svc = IamService::new(state);
+    let list = || {
+        let mut req = make_request("ListRoles", vec![]);
+        req.region = "cn-north-1".to_string();
+        req.account_id = "222222222222".to_string();
+        String::from_utf8_lossy(svc.list_roles(&req).unwrap().body.expect_bytes()).to_string()
+    };
+    let support = "arn:aws-cn:iam::222222222222:role/aws-service-role/support.amazonaws.com/AWSServiceRoleForSupport";
+    assert!(list().contains(support), "before any write");
+
+    let mut create = make_request("CreateUser", vec![("UserName", "u")]);
+    create.region = "cn-north-1".to_string();
+    create.account_id = "222222222222".to_string();
+    svc.create_user(&create).unwrap();
+    assert!(list().contains(support), "after a write");
+}
