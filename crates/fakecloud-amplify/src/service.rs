@@ -1729,7 +1729,7 @@ impl AmplifyService {
         data: &'a mut AmplifyData,
         arn: &str,
     ) -> Result<&'a mut Value, AwsServiceError> {
-        if !arn.starts_with("arn:aws:amplify:") {
+        if fakecloud_aws::arn::arn_resource(arn, "amplify").is_none() {
             return Err(bad_request(&format!(
                 "Resource arn '{arn}' does not match required pattern ^arn:aws:amplify:."
             )));
@@ -1798,7 +1798,7 @@ impl AmplifyService {
     }
 
     fn list_tags(&self, ctx: &Ctx, arn: &str) -> Result<AwsResponse, AwsServiceError> {
-        if !arn.starts_with("arn:aws:amplify:") {
+        if fakecloud_aws::arn::arn_resource(arn, "amplify").is_none() {
             return Err(bad_request(&format!(
                 "Resource arn '{arn}' does not match required pattern ^arn:aws:amplify:."
             )));
@@ -1860,6 +1860,26 @@ mod tests {
             .unwrap();
         let body = body_json(&created);
         body["app"]["appId"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn app_arn_carries_china_partition() {
+        let s = svc();
+        let c = Ctx {
+            account: "000000000000".into(),
+            region: "cn-north-1".into(),
+        };
+        let app_id = make_app(&s, &c);
+        let got = body_json(&s.get_app(&c, &app_id).unwrap());
+        let arn = got["app"]["appArn"].as_str().unwrap().to_string();
+        assert_eq!(
+            arn,
+            format!("arn:aws-cn:amplify:cn-north-1:000000000000:apps/{app_id}")
+        );
+        s.tag_resource(&c, &arn, &json!({ "tags": { "env": "prod" } }))
+            .unwrap();
+        let tags = body_json(&s.list_tags(&c, &arn).unwrap());
+        assert_eq!(tags["tags"]["env"], "prod");
     }
 
     #[test]

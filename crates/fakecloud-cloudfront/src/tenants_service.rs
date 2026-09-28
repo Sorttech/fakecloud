@@ -217,9 +217,10 @@ impl CloudFrontService {
             ));
         }
         let id = generate_tenant_id();
-        let arn = format!(
-            "arn:aws:cloudfront::{}:distribution-tenant/{}",
-            DEFAULT_ACCOUNT, id
+        let arn = crate::service::cloudfront_arn(
+            &req.region,
+            DEFAULT_ACCOUNT,
+            &format!("distribution-tenant/{id}"),
         );
         let etag = generate_id_with_prefix("E");
         let now = Utc::now();

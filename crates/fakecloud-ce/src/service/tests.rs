@@ -204,3 +204,22 @@ fn update_cost_allocation_tags_status_accepts_valid_nested_status() {
     // No per-key failures for a well-formed request.
     assert_eq!(out["Errors"].as_array().map(|a| a.len()), Some(0));
 }
+
+#[test]
+fn anomaly_monitor_arn_carries_china_partition() {
+    let s = svc();
+    let mut r = req(
+        "CreateAnomalyMonitor",
+        json!({ "AnomalyMonitor": { "MonitorName": "cn", "MonitorType": "CUSTOM" } }),
+    );
+    r.region = "cn-north-1".into();
+    let resp = dispatch(&s, &r).expect("op ok");
+    let out: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    let arn = out["MonitorArn"].as_str().unwrap().to_string();
+    assert!(
+        arn.starts_with("arn:aws-cn:ce::000000000000:anomalymonitor/"),
+        "{arn}"
+    );
+    let got = call(&s, "GetAnomalyMonitors", json!({ "MonitorArnList": [arn] }));
+    assert_eq!(got["AnomalyMonitors"][0]["MonitorArn"], arn);
+}
