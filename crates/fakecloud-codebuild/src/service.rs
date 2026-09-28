@@ -1142,59 +1142,28 @@ fn split_secret_ref(value: &str) -> (String, Option<String>) {
     }
 }
 
-/// Strip the trailing `-<6 alphanumeric>` suffix AWS appends to a secret ARN's
-/// name segment (`prod-config-AbCdEf` -> `prod-config`). Only a segment that is
-/// exactly six alphanumeric characters is treated as the suffix, so a hyphenated
-/// user-supplied name is never mangled.
-fn strip_arn_secret_suffix(name_with_suffix: &str) -> &str {
-    match name_with_suffix.rsplit_once('-') {
-        Some((base, suffix))
-            if suffix.len() == 6 && suffix.chars().all(|c| c.is_ascii_alphanumeric()) =>
-        {
-            base
-        }
-        _ => name_with_suffix,
-    }
-}
-
 /// Resolve a secret by name or ARN against a Secrets Manager account state,
-/// mirroring Secrets Manager's own lookup: exact name key, then full/partial ARN
-/// match, then the ARN's name segment (with the 6-char suffix stripped). A bare
-/// plaintext name is looked up verbatim and is never suffix-stripped, so a
-/// hyphenated name like `prod-config` cannot collide with a secret named `prod`.
+/// mirroring Secrets Manager's own lookup. A plain name is looked up verbatim
+/// (never suffix-stripped, so `prod-config` cannot collide with `prod`). An
+/// ARN resolves only to the secret whose ARN it is, or whose ARN it is a
+/// partial form of (missing just the `-XXXXXX` random suffix); since the whole
+/// stored ARN is compared, its partition, region and account must match too.
 fn find_secret<'a>(
     st: &'a fakecloud_secretsmanager::SecretsManagerState,
     secret_ref: &str,
 ) -> Option<&'a fakecloud_secretsmanager::Secret> {
-    if let Some(secret) = st.secrets.get(secret_ref) {
+    if arn_resource(secret_ref, "secretsmanager").is_none() {
+        return st.secrets.get(secret_ref);
+    }
+    if let Some(secret) = st.secrets.values().find(|s| s.arn == secret_ref) {
         return Some(secret);
     }
-    if arn_resource(secret_ref, "secretsmanager").is_some() {
-        if let Some(secret) = st.secrets.values().find(|s| s.arn == secret_ref) {
-            return Some(secret);
-        }
-        // A partial ARN omits only the `-XXXXXX` random suffix Secrets
-        // Manager appends to the name.
-        let is_partial_of = |arn: &str| {
-            arn.strip_prefix(secret_ref)
-                .and_then(|rest| rest.strip_prefix('-'))
-                .is_some_and(|suffix| suffix.chars().count() == 6)
-        };
-        if let Some(secret) = st.secrets.values().find(|s| is_partial_of(&s.arn)) {
-            return Some(secret);
-        }
-        // Fall back to the name embedded in the ARN tail.
-        if let Some(tail) = secret_ref.rsplit(":secret:").next() {
-            let name = strip_arn_secret_suffix(tail);
-            if let Some(secret) = st.secrets.get(name) {
-                return Some(secret);
-            }
-            if let Some(secret) = st.secrets.get(tail) {
-                return Some(secret);
-            }
-        }
-    }
-    None
+    let is_partial_of = |arn: &str| {
+        arn.strip_prefix(secret_ref)
+            .and_then(|rest| rest.strip_prefix('-'))
+            .is_some_and(|suffix| suffix.chars().count() == 6)
+    };
+    st.secrets.values().find(|s| is_partial_of(&s.arn))
 }
 
 /// Next per-project `buildBatchNumber`, with the same monotonic semantics.
@@ -3848,18 +3817,6 @@ mod tests {
     }
 
     #[test]
-    fn strip_arn_secret_suffix_only_strips_six_char_suffix() {
-        // ARN tails always carry the `-<6 alnum>` suffix AWS appends; it is
-        // stripped even when the real name itself contains hyphens.
-        assert_eq!(strip_arn_secret_suffix("prod-config-AbCdEf"), "prod-config");
-        assert_eq!(strip_arn_secret_suffix("mysecret-A1b2C3"), "mysecret");
-        // A trailing segment that is not exactly six alphanumeric chars is not a
-        // suffix and is left intact (e.g. a name with no random tail).
-        assert_eq!(strip_arn_secret_suffix("prod-settings"), "prod-settings");
-        assert_eq!(strip_arn_secret_suffix("prod"), "prod");
-    }
-
-    #[test]
     fn resolve_secret_bare_name() {
         let st = secrets_state(&[(
             "mysecret",
@@ -3952,6 +3909,30 @@ mod tests {
         // `prod` is not a partial ARN of `prod-config-XyZ123`.
         let st = secrets_state(&[prod_config]);
         assert_eq!(resolve_secret(&st, partial), "");
+    }
+
+    #[test]
+    fn secret_arn_never_falls_back_to_a_stripped_name() {
+        let st = secrets_state(&[(
+            "prod",
+            "arn:aws:secretsmanager:us-east-1:000000000000:secret:prod-AbCdEf",
+            "PROD",
+        )]);
+        assert_eq!(
+            resolve_secret(
+                &st,
+                "arn:aws:secretsmanager:us-east-1:000000000000:secret:prod-config"
+            ),
+            ""
+        );
+        // Same name, different region: not the same secret.
+        assert_eq!(
+            resolve_secret(
+                &st,
+                "arn:aws:secretsmanager:eu-west-1:000000000000:secret:prod-AbCdEf"
+            ),
+            ""
+        );
     }
 
     #[test]

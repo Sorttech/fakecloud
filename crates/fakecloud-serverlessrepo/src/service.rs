@@ -483,6 +483,7 @@ impl ServerlessRepoService {
             json!(shared::new_change_set_id(
                 &ctx.region,
                 &ctx.account,
+                body.get("changeSetName").and_then(Value::as_str),
                 &stack_name,
             )),
         );

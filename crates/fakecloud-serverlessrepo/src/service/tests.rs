@@ -387,6 +387,19 @@ fn application_and_stack_arns_carry_china_partition() {
         .as_str()
         .unwrap()
         .starts_with("arn:aws-cn:cloudformation:cn-north-1:000000000000:changeSet/s-changeset/"));
+
+    let named = body_of(
+        &svc.create_cloudformation_change_set(
+            &ctx,
+            &app_id,
+            &json!({ "stackName": "s", "changeSetName": "my-cs" }),
+        )
+        .unwrap(),
+    );
+    assert!(named["changeSetId"]
+        .as_str()
+        .unwrap()
+        .starts_with("arn:aws-cn:cloudformation:cn-north-1:000000000000:changeSet/my-cs/"));
     assert!(cs["stackId"]
         .as_str()
         .unwrap()

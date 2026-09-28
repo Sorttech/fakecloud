@@ -23,15 +23,24 @@ pub fn application_arn(region: &str, account: &str, name: &str) -> String {
 }
 
 /// A CloudFormation change-set id ARN,
-/// `arn:<partition>:cloudformation:{region}:{account}:changeSet/{stack}-changeset/{uuid}`,
-/// the shape `CreateCloudFormationChangeSet` returns: the change set is named
-/// after the stack it targets and suffixed with a fresh id.
-pub fn new_change_set_id(region: &str, account: &str, stack_name: &str) -> String {
+/// `arn:<partition>:cloudformation:{region}:{account}:changeSet/{name}/{uuid}`,
+/// the shape `CreateCloudFormationChangeSet` returns. `name` is the request's
+/// `changeSetName`, or `{stack}-changeset` when the request omits it.
+pub fn new_change_set_id(
+    region: &str,
+    account: &str,
+    change_set_name: Option<&str>,
+    stack_name: &str,
+) -> String {
+    let name = change_set_name
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{stack_name}-changeset"));
     Arn::regional(
         "cloudformation",
         region,
         account,
-        &format!("changeSet/{stack_name}-changeset/{}", uuid::Uuid::new_v4()),
+        &format!("changeSet/{name}/{}", uuid::Uuid::new_v4()),
     )
     .to_string()
 }
