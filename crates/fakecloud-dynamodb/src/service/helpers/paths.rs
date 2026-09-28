@@ -79,7 +79,7 @@ pub(crate) fn project_item(
 /// for list-index projections, so projected `L` values contain only the
 /// requested elements (in index order). Real list elements are never a bare
 /// JSON `null` (DynamoDB null is `{"NULL": true}`), so this only strips padding.
-fn compact_projected_lists(value: &mut Value) {
+pub(crate) fn compact_projected_lists(value: &mut Value) {
     if let Some(list) = value.get_mut("L").and_then(Value::as_array_mut) {
         list.retain(|e| !e.is_null());
         for e in list.iter_mut() {
@@ -326,200 +326,18 @@ pub(crate) fn merge_attribute_values(a: Value, b: Value) -> Value {
     b
 }
 
-fn invalid_projection(detail: impl std::fmt::Display) -> AwsServiceError {
-    AwsServiceError::aws_error(
-        StatusCode::BAD_REQUEST,
-        "ValidationException",
-        format!("Invalid ProjectionExpression: {detail}"),
-    )
-}
-
-#[derive(Debug, PartialEq)]
-enum ProjToken {
-    Name(String),
-    Alias(String),
-    Number(usize),
-    Dot,
-    Comma,
-    Open,
-    Close,
-}
-
-/// One lexed token and the byte span it covers in the expression.
-struct Lexed {
-    token: ProjToken,
-    start: usize,
-    end: usize,
-}
-
-fn lex_projection(expr: &str) -> Result<Vec<Lexed>, AwsServiceError> {
-    let bytes = expr.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    let word_end = |mut j: usize| {
-        while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
-            j += 1;
-        }
-        j
-    };
-    while i < bytes.len() {
-        let c = bytes[i];
-        let (token, end) = match c {
-            b' ' | b'\t' | b'\n' | b'\r' => {
-                i += 1;
-                continue;
-            }
-            b'.' => (ProjToken::Dot, i + 1),
-            b',' => (ProjToken::Comma, i + 1),
-            b'[' => (ProjToken::Open, i + 1),
-            b']' => (ProjToken::Close, i + 1),
-            b'#' if i + 1 < bytes.len() && word_end(i + 1) > i + 1 => {
-                let end = word_end(i + 1);
-                (ProjToken::Alias(expr[i..end].to_string()), end)
-            }
-            b'0'..=b'9' => {
-                let mut end = i;
-                while end < bytes.len() && bytes[end].is_ascii_digit() {
-                    end += 1;
-                }
-                let n = expr[i..end].parse().unwrap_or(usize::MAX);
-                (ProjToken::Number(n), end)
-            }
-            c if c.is_ascii_alphabetic() || c == b'_' => {
-                let end = word_end(i);
-                (ProjToken::Name(expr[i..end].to_string()), end)
-            }
-            _ => {
-                // An unrecognised character: DynamoDB names it as the token
-                // and quotes it together with the character that follows.
-                let ch = expr[i..].chars().next().unwrap_or_default();
-                let near: String = expr[i..].chars().take(2).collect();
-                return Err(invalid_projection(format!(
-                    "Syntax error; token: \"{ch}\", near: \"{near}\""
-                )));
-            }
-        };
-        out.push(Lexed {
-            token,
-            start: i,
-            end,
-        });
-        i = end;
-    }
-    Ok(out)
-}
-
 /// Validate a ProjectionExpression the way DynamoDB does before reading
-/// anything: the expression must parse as a comma-separated list of document
-/// paths, every `#alias` must be defined, and no two paths may overlap (one
-/// equal to, or a prefix of, another once aliases are resolved).
+/// anything, with the shared expression parser: it must parse as a
+/// comma-separated list of document paths, every `#alias` must be defined, no
+/// bare name may be a reserved word, and no two paths may overlap (one equal
+/// to, or a prefix of, another once aliases are resolved).
 pub(crate) fn validate_projection_expression(
     expr: &str,
     expr_attr_names: &HashMap<String, String>,
 ) -> Result<(), AwsServiceError> {
-    if expr.trim().is_empty() {
-        return Err(invalid_projection("The expression can not be empty;"));
-    }
-    let tokens = lex_projection(expr)?;
-    let syntax_error = |pos: usize| {
-        let (token, near) = match tokens.get(pos) {
-            Some(t) => {
-                let from = pos.checked_sub(1).map_or(t.start, |p| tokens[p].start);
-                (&expr[t.start..t.end], &expr[from..t.end])
-            }
-            None => {
-                let near = tokens.last().map_or("", |t| &expr[t.start..t.end]);
-                ("<EOF>", near)
-            }
-        };
-        invalid_projection(format!(
-            "Syntax error; token: \"{token}\", near: \"{near}\""
-        ))
-    };
-
-    let mut paths: Vec<Vec<PathSegment>> = Vec::new();
-    let mut pos = 0;
-    loop {
-        let mut path = Vec::new();
-        let resolve = |t: &ProjToken| -> Result<PathSegment, AwsServiceError> {
-            match t {
-                ProjToken::Alias(a) => expr_attr_names
-                    .get(a)
-                    .map(|n| PathSegment::Key(n.clone()))
-                    .ok_or_else(|| {
-                        invalid_projection(format!(
-                            "An expression attribute name used in the document path is not \
-                             defined; attribute name: {a}"
-                        ))
-                    }),
-                ProjToken::Name(n) => Ok(PathSegment::Key(n.clone())),
-                _ => unreachable!("only names and aliases are resolved"),
-            }
-        };
-        match tokens.get(pos).map(|t| &t.token) {
-            Some(t @ (ProjToken::Name(_) | ProjToken::Alias(_))) => path.push(resolve(t)?),
-            _ => return Err(syntax_error(pos)),
-        }
-        pos += 1;
-        loop {
-            match tokens.get(pos).map(|t| &t.token) {
-                Some(ProjToken::Dot) => match tokens.get(pos + 1).map(|t| &t.token) {
-                    Some(t @ (ProjToken::Name(_) | ProjToken::Alias(_))) => {
-                        path.push(resolve(t)?);
-                        pos += 2;
-                    }
-                    _ => return Err(syntax_error(pos + 1)),
-                },
-                Some(ProjToken::Open) => {
-                    let Some(ProjToken::Number(n)) = tokens.get(pos + 1).map(|t| &t.token) else {
-                        return Err(syntax_error(pos + 1));
-                    };
-                    if tokens.get(pos + 2).map(|t| &t.token) != Some(&ProjToken::Close) {
-                        return Err(syntax_error(pos + 2));
-                    }
-                    path.push(PathSegment::Index(*n));
-                    pos += 3;
-                }
-                _ => break,
-            }
-        }
-        paths.push(path);
-        match tokens.get(pos).map(|t| &t.token) {
-            None => break,
-            Some(ProjToken::Comma) => pos += 1,
-            Some(_) => return Err(syntax_error(pos)),
-        }
-    }
-
-    let render = |p: &[PathSegment]| {
-        let parts: Vec<String> = p
-            .iter()
-            .map(|s| match s {
-                PathSegment::Key(k) => k.clone(),
-                PathSegment::Index(i) => format!("[{i}]"),
-            })
-            .collect();
-        format!("[{}]", parts.join(", "))
-    };
-    let same = |a: &PathSegment, b: &PathSegment| match (a, b) {
-        (PathSegment::Key(x), PathSegment::Key(y)) => x == y,
-        (PathSegment::Index(x), PathSegment::Index(y)) => x == y,
-        _ => false,
-    };
-    for (i, one) in paths.iter().enumerate() {
-        for two in &paths[i + 1..] {
-            let shared = one.len().min(two.len());
-            if one.iter().zip(two).take(shared).all(|(a, b)| same(a, b)) {
-                return Err(invalid_projection(format!(
-                    "Two document paths overlap with each other; must remove or rewrite one of \
-                     these paths; path one: {}, path two: {}",
-                    render(one),
-                    render(two)
-                )));
-            }
-        }
-    }
-    Ok(())
+    let values = HashMap::new();
+    let mut ctx = ExprContext::new(expr_attr_names, &values, true);
+    parse_projection_expression(expr, &mut ctx).map(|_| ())
 }
 
 /// Validate the projection parameters of a read request block (a GetItem

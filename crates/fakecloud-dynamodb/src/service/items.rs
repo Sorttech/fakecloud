@@ -6,21 +6,25 @@ use serde_json::json;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use super::{
-    apply_update_expression, build_capacity, build_consumed_capacity,
-    build_item_collection_metrics, check_put_item_size, evaluate_condition_with_return,
-    extract_key, get_table, get_table_mut, item_size, item_write_consumed, normalize_item_numbers,
+    apply_update_expression_tracked, build_capacity, build_consumed_capacity,
+    build_item_collection_metrics, check_put_item_size, compact_projected_lists,
+    evaluate_condition_with_return, extract_key, get_data_table, get_data_table_mut,
+    insert_nested_value_segments, item_size, item_write_consumed, normalize_item_numbers,
     normalize_value_numbers, ns_members_equal, parse_expression_attribute_names,
-    parse_expression_attribute_values, project_item, read_units, require_object, require_str,
+    parse_expression_attribute_values, project_item, read_units, require_object, resolve_doc_path,
     resolve_write_condition, return_consumed_mode, return_icm_mode, validate_attribute_value,
-    validate_item_attribute_values, validate_key_attributes_in_key, validate_key_in_item,
-    validate_request_enums, AttributeValue, CapacitySplit, Consumed, DynamoDbService, UpdateCharge,
-    RETURN_CONSUMED_CAPACITY_VALUES, RETURN_ITEM_COLLECTION_METRICS_VALUES, RETURN_VALUES,
+    validate_data_table_name, validate_first_request_enum, validate_item_attribute_values,
+    validate_key_attributes_in_key, validate_key_in_item, validate_request_enums,
+    validate_request_expressions, AttributeValue, CapacitySplit, Consumed, DocPath,
+    DynamoDbService, ExprOp, PathElem, PathSegment, UpdateCharge, RETURN_CONSUMED_CAPACITY_VALUES,
+    RETURN_ITEM_COLLECTION_METRICS_VALUES, RETURN_VALUES, RETURN_VALUES_ON_FAILURE_VALUES,
 };
 
 impl DynamoDbService {
     pub(super) fn put_item(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         // --- Parse request body and expression attributes WITHOUT holding any lock ---
         let body = Self::parse_body(req)?;
+        let table_name = validate_data_table_name(&body)?;
         validate_request_enums(
             &body,
             &[
@@ -35,10 +39,26 @@ impl DynamoDbService {
                     RETURN_ITEM_COLLECTION_METRICS_VALUES,
                 ),
                 ("ReturnValues", "returnValues", RETURN_VALUES),
+                (
+                    "ReturnValuesOnConditionCheckFailure",
+                    "returnValuesOnConditionCheckFailure",
+                    RETURN_VALUES_ON_FAILURE_VALUES,
+                ),
+                ("ConditionalOperator", "conditionalOperator", &["AND", "OR"]),
             ],
         )?;
-        let table_name = require_str(&body, "TableName")?;
         let mut item = require_object(&body, "Item")?;
+        validate_request_expressions(&body, ExprOp::PutItem)?;
+        if !matches!(
+            body["ReturnValues"].as_str(),
+            None | Some("NONE" | "ALL_OLD")
+        ) {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "ValidationException",
+                "ReturnValues can only be ALL_OLD or NONE",
+            ));
+        }
         let mut expr_attr_names = parse_expression_attribute_names(&body);
         let mut expr_attr_values = parse_expression_attribute_values(&body);
         let condition =
@@ -56,7 +76,7 @@ impl DynamoDbService {
             let mut accounts = self.state.write();
             let state = accounts.get_or_create(&req.account_id);
             let region = state.region.clone();
-            let table = get_table_mut(&mut state.tables, table_name)?;
+            let table = get_data_table_mut(&mut state.tables, table_name)?;
 
             validate_key_in_item(table, &item)?;
             // Validate every attribute value (not just keys): a malformed number
@@ -195,8 +215,17 @@ impl DynamoDbService {
     pub(super) fn get_item(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         // --- Parse request body WITHOUT holding any lock ---
         let body = Self::parse_body(req)?;
-        let table_name = require_str(&body, "TableName")?;
+        let table_name = validate_data_table_name(&body)?;
+        validate_request_enums(
+            &body,
+            &[(
+                "ReturnConsumedCapacity",
+                "returnConsumedCapacity",
+                RETURN_CONSUMED_CAPACITY_VALUES,
+            )],
+        )?;
         let key = require_object(&body, "Key")?;
+        validate_request_expressions(&body, ExprOp::GetItem)?;
         let return_consumed = return_consumed_mode(&body).to_string();
 
         // --- Use a read lock for the lookup (allows concurrent GetItem calls) ---
@@ -204,7 +233,7 @@ impl DynamoDbService {
             let accounts = self.state.read();
             let empty_ddb = crate::state::DynamoDbState::new(&req.account_id, &req.region);
             let state = accounts.get(&req.account_id).unwrap_or(&empty_ddb);
-            let table = get_table(&state.tables, table_name)?;
+            let table = get_data_table(&state.tables, table_name)?;
             validate_key_attributes_in_key(table, &key)?;
             let needs_insights = table.contributor_insights_status == "ENABLED";
 
@@ -263,6 +292,7 @@ impl DynamoDbService {
     pub(super) fn delete_item(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let body = Self::parse_body(req)?;
 
+        let table_name = validate_data_table_name(&body)?;
         validate_request_enums(
             &body,
             &[
@@ -281,19 +311,28 @@ impl DynamoDbService {
                 (
                     "ReturnValuesOnConditionCheckFailure",
                     "returnValuesOnConditionCheckFailure",
-                    &["ALL_OLD", "NONE"],
+                    RETURN_VALUES_ON_FAILURE_VALUES,
                 ),
             ],
         )?;
-
-        let table_name = require_str(&body, "TableName")?;
         let key = require_object(&body, "Key")?;
+        validate_request_expressions(&body, ExprOp::DeleteItem)?;
+        if !matches!(
+            body["ReturnValues"].as_str(),
+            None | Some("NONE" | "ALL_OLD")
+        ) {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "ValidationException",
+                "ReturnValues can only be ALL_OLD or NONE",
+            ));
+        }
 
         let (result, kinesis_info) = {
             let mut accounts = self.state.write();
             let state = accounts.get_or_create(&req.account_id);
             let region = state.region.clone();
-            let table = get_table_mut(&mut state.tables, table_name)?;
+            let table = get_data_table_mut(&mut state.tables, table_name)?;
             // The same key validation GetItem and UpdateItem apply: a missing,
             // wrong-typed or empty key attribute is a ValidationException, not a
             // silent no-op delete.
@@ -390,15 +429,56 @@ impl DynamoDbService {
 
     pub(super) fn update_item(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let body = Self::parse_body(req)?;
-        let table_name = require_str(&body, "TableName")?;
+        let table_name = validate_data_table_name(&body)?;
+        // UpdateItem stops at the first invalid enum member rather than
+        // aggregating them.
+        validate_first_request_enum(
+            &body,
+            &[
+                ("ReturnValues", "returnValues", RETURN_VALUES),
+                (
+                    "ReturnConsumedCapacity",
+                    "returnConsumedCapacity",
+                    RETURN_CONSUMED_CAPACITY_VALUES,
+                ),
+                (
+                    "ReturnItemCollectionMetrics",
+                    "returnItemCollectionMetrics",
+                    RETURN_ITEM_COLLECTION_METRICS_VALUES,
+                ),
+                (
+                    "ReturnValuesOnConditionCheckFailure",
+                    "returnValuesOnConditionCheckFailure",
+                    RETURN_VALUES_ON_FAILURE_VALUES,
+                ),
+                ("ConditionalOperator", "conditionalOperator", &["AND", "OR"]),
+            ],
+        )?;
         let key = require_object(&body, "Key")?;
+        let parsed = validate_request_expressions(&body, ExprOp::UpdateItem)?;
+        // The paths the update writes, for the UPDATED_* return values.
+        let updated_paths: Vec<DocPath> =
+            match (&parsed.update, body["AttributeUpdates"].as_object()) {
+                (Some(ast), _) => ast.target_paths(),
+                (None, Some(updates)) => updates
+                    .keys()
+                    .map(|k| vec![PathElem::Attr(k.clone())])
+                    .collect(),
+                _ => Vec::new(),
+            };
+        // REMOVE targets (right after the SET targets in `updated_paths`)
+        // set nothing, so UPDATED_NEW leaves them out; UPDATED_OLD reports
+        // their old values.
+        let removed_range = parsed.update.as_ref().map_or(0..0, |ast| {
+            ast.sets.len()..ast.sets.len() + ast.removes.len()
+        });
         let return_consumed = return_consumed_mode(&body).to_string();
         let return_icm = return_icm_mode(&body).to_string();
 
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
         let region = state.region.clone();
-        let table = get_table_mut(&mut state.tables, table_name)?;
+        let table = get_data_table_mut(&mut state.tables, table_name)?;
 
         validate_key_attributes_in_key(table, &key)?;
         // Build the index up front: the `&self` lookup below cannot, so
@@ -516,10 +596,16 @@ impl DynamoDbService {
             (None, None) => UpdateCharge::default(),
         };
         let index_keys = super::index_key_specs(table);
+        let mut written_indexes: Vec<(usize, usize)> = Vec::new();
         let applied = table.update_item_at(idx, |item| {
             let before = (!index_keys.is_empty()).then(|| item.clone());
             if let Some(expr) = update_expression {
-                apply_update_expression(item, expr, &expr_attr_names, &expr_attr_values)?;
+                written_indexes = apply_update_expression_tracked(
+                    item,
+                    expr,
+                    &expr_attr_names,
+                    &expr_attr_values,
+                )?;
             } else if let Some(updates) = attribute_updates.as_ref() {
                 // Legacy AttributeUpdates (pre-2014 UpdateItem), still emitted by
                 // the AWS SDK for Java v1, older boto3, and the Terraform provider.
@@ -543,6 +629,26 @@ impl DynamoDbService {
             }
             return Err(err);
         }
+        // UPDATED_NEW reads the post-update item, so it takes each list-index
+        // SET target (the first entries of `updated_paths`, in expression
+        // order) at the index actually written -- past the end it appends --
+        // and leaves out REMOVE targets, which set nothing. UPDATED_OLD keeps
+        // the expression's own paths against the pre-update item, where an
+        // out-of-range index simply projects nothing.
+        let mut new_paths: Vec<DocPath> = updated_paths.clone();
+        for (ordinal, written) in written_indexes {
+            if let Some(PathElem::Index(i)) =
+                new_paths.get_mut(ordinal).and_then(|path| path.last_mut())
+            {
+                *i = written;
+            }
+        }
+        let new_paths: Vec<DocPath> = new_paths
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| !removed_range.contains(i))
+            .map(|(_, p)| p)
+            .collect();
 
         // Compute the ReturnValues payload per AWS semantics:
         // - ALL_NEW   : the whole post-update item
@@ -564,16 +670,8 @@ impl DynamoDbService {
             "ALL_OLD" => old_snapshot.cloned(),
             // UPDATED_NEW diffs against the pre-update image (the key-only stub
             // on insert) so it returns only the attributes the update set.
-            "UPDATED_NEW" => Some(diff_updated_attributes(
-                pre_update_item.as_ref(),
-                &table.items[idx],
-                UpdatedSide::New,
-            )),
-            "UPDATED_OLD" => Some(diff_updated_attributes(
-                old_snapshot,
-                &table.items[idx],
-                UpdatedSide::Old,
-            )),
+            "UPDATED_NEW" => Some(project_paths(Some(&table.items[idx]), &new_paths)),
+            "UPDATED_OLD" => Some(project_paths(old_snapshot, &updated_paths)),
             _ => None,
         };
 
@@ -646,67 +744,35 @@ impl DynamoDbService {
     }
 }
 
-/// Which side of an UpdateItem diff to return for the `UPDATED_*`
-/// `ReturnValues` modes.
-enum UpdatedSide {
-    /// `UPDATED_NEW`: the post-update value of each changed attribute.
-    New,
-    /// `UPDATED_OLD`: the pre-update value of each changed attribute.
-    Old,
-}
-
-/// Compute the `UPDATED_NEW` / `UPDATED_OLD` ReturnValues payload: the set
-/// of attributes whose value differs between the pre- and post-update item,
-/// projected to the requested side. AWS returns only the attributes the
-/// update touched — added, removed, or modified — not the whole item.
-///
-/// - An attribute present after but not before (or with a changed value) is
-///   "changed". For `New` we emit its post value; for `Old` its pre value
-///   (absent on the old side -> omitted).
-/// - An attribute removed by the update is "changed". For `Old` we emit its
-///   pre value; for `New` it's gone, so it's omitted.
-///
-/// `pre` is `None` only when the item didn't exist before (pure insert), in
-/// which case every post attribute is "new".
-fn diff_updated_attributes(
-    pre: Option<&HashMap<String, AttributeValue>>,
-    post: &HashMap<String, AttributeValue>,
-    side: UpdatedSide,
+/// Compute the `UPDATED_NEW` / `UPDATED_OLD` ReturnValues payload: the
+/// value at each document path the update wrote, taken from the post-update
+/// (`UPDATED_NEW`) or pre-update (`UPDATED_OLD`) item. A nested write returns
+/// only its fragment (`parent.child`, not the whole `parent` map), and a path
+/// absent on that side (a REMOVE for NEW, a new attribute for OLD) is omitted.
+fn project_paths(
+    item: Option<&HashMap<String, AttributeValue>>,
+    paths: &[DocPath],
 ) -> HashMap<String, AttributeValue> {
-    let empty = HashMap::new();
-    let pre = pre.unwrap_or(&empty);
     let mut out = HashMap::new();
-
-    // Attributes present (or changed) in the post item.
-    for (k, new_v) in post {
-        let changed = match pre.get(k) {
-            Some(old_v) => old_v != new_v,
-            None => true,
+    let Some(item) = item else {
+        return out;
+    };
+    for path in paths {
+        let Some(v) = resolve_doc_path(item, path) else {
+            continue;
         };
-        if changed {
-            match side {
-                UpdatedSide::New => {
-                    out.insert(k.clone(), new_v.clone());
-                }
-                UpdatedSide::Old => {
-                    if let Some(old_v) = pre.get(k) {
-                        out.insert(k.clone(), old_v.clone());
-                    }
-                }
-            }
-        }
+        let segments: Vec<PathSegment> = path
+            .iter()
+            .map(|e| match e {
+                PathElem::Attr(a) => PathSegment::Key(a.clone()),
+                PathElem::Index(i) => PathSegment::Index(*i),
+            })
+            .collect();
+        insert_nested_value_segments(&mut out, &segments, v.clone());
     }
-
-    // Attributes removed by the update (present before, gone after). Only
-    // the OLD side can surface their value; the NEW side has nothing.
-    if let UpdatedSide::Old = side {
-        for (k, old_v) in pre {
-            if !post.contains_key(k) {
-                out.insert(k.clone(), old_v.clone());
-            }
-        }
+    for v in out.values_mut() {
+        compact_projected_lists(v);
     }
-
     out
 }
 
@@ -844,32 +910,186 @@ mod tests {
         pairs.iter().map(|(k, v)| (k.to_string(), n(v))).collect()
     }
 
-    // bug-audit 2026-05-28, 1.8: UPDATED_NEW returns only changed
-    // attributes (new values), not the whole item.
-    #[test]
-    fn updated_new_returns_only_changed_new_values() {
-        let pre = map(&[("a", "1"), ("b", "2"), ("c", "3")]);
-        let post = map(&[("a", "1"), ("b", "20"), ("c", "3"), ("d", "4")]);
-        let got = diff_updated_attributes(Some(&pre), &post, UpdatedSide::New);
-        // b changed, d added; a and c unchanged so omitted.
-        assert_eq!(got, map(&[("b", "20"), ("d", "4")]));
+    fn path(elems: &[&str]) -> DocPath {
+        elems
+            .iter()
+            .map(|e| PathElem::Attr(e.to_string()))
+            .collect()
     }
 
-    // bug-audit 2026-05-28, 1.8: UPDATED_OLD returns the OLD value of each
-    // changed attribute (was previously empty).
+    // UPDATED_NEW / UPDATED_OLD return the value at each path the update
+    // wrote, not the whole item.
     #[test]
-    fn updated_old_returns_only_changed_old_values() {
-        let pre = map(&[("a", "1"), ("b", "2"), ("e", "9")]);
-        let post = map(&[("a", "1"), ("b", "20")]); // b changed, e removed
-        let got = diff_updated_attributes(Some(&pre), &post, UpdatedSide::Old);
-        assert_eq!(got, map(&[("b", "2"), ("e", "9")]));
+    fn updated_values_project_only_written_paths() {
+        let item = map(&[("a", "1"), ("b", "2"), ("c", "3")]);
+        let got = project_paths(Some(&item), &[path(&["b"]), path(&["d"])]);
+        // d is absent on this side, so it is omitted.
+        assert_eq!(got, map(&[("b", "2")]));
+        assert!(project_paths(None, &[path(&["b"])]).is_empty());
     }
 
+    // Clauses apply in order: after `REMOVE l[0]` the list has one element,
+    // so `SET l[10]` appends at index 1, and UPDATED_NEW reports it there.
     #[test]
-    fn updated_new_on_insert_returns_all_attributes() {
-        let post = map(&[("a", "1"), ("b", "2")]);
-        let got = diff_updated_attributes(None, &post, UpdatedSide::New);
-        assert_eq!(got, post);
+    fn list_append_after_remove_reports_written_index() {
+        let mut item: HashMap<String, AttributeValue> = HashMap::new();
+        item.insert("l".into(), json!({"L": [{"S": "a"}, {"S": "b"}]}));
+        let values: HashMap<String, serde_json::Value> =
+            HashMap::from([(":v".to_string(), json!({"S": "z"}))]);
+        let written = apply_update_expression_tracked(
+            &mut item,
+            "REMOVE l[0] SET l[10] = :v",
+            &HashMap::new(),
+            &values,
+        )
+        .unwrap();
+        assert_eq!(written, vec![(0, 1)]);
+        assert_eq!(item["l"], json!({"L": [{"S": "b"}, {"S": "z"}]}));
+        let got = project_paths(
+            Some(&item),
+            &[vec![PathElem::Attr("l".into()), PathElem::Index(1)]],
+        );
+        assert_eq!(got["l"], json!({"L": [{"S": "z"}]}));
+        // UPDATED_OLD takes the expression's paths (l[0], l[10]) against the
+        // pre-update list: l[0] was "a", and l[10] had no old value.
+        let pre: HashMap<String, AttributeValue> =
+            HashMap::from([("l".to_string(), json!({"L": [{"S": "a"}, {"S": "b"}]}))]);
+        let old = project_paths(
+            Some(&pre),
+            &[
+                vec![PathElem::Attr("l".into()), PathElem::Index(10)],
+                vec![PathElem::Attr("l".into()), PathElem::Index(0)],
+            ],
+        );
+        assert_eq!(old["l"], json!({"L": [{"S": "a"}]}));
+    }
+
+    fn apply(item: &mut HashMap<String, AttributeValue>, expr: &str) -> Vec<(usize, usize)> {
+        let values: HashMap<String, serde_json::Value> =
+            HashMap::from([(":v".to_string(), json!({"S": "v"}))]);
+        apply_update_expression_tracked(item, expr, &HashMap::new(), &values).unwrap()
+    }
+
+    // SET/REMOVE targets use the expression grammar's path segmentation, so
+    // every `[N]` of a part is a list step.
+    #[test]
+    fn multi_index_paths_set_and_remove() {
+        let mut item: HashMap<String, AttributeValue> = HashMap::new();
+        item.insert("l".into(), json!({"L": [{"L": [{"S": "a"}, {"S": "b"}]}]}));
+        item.insert(
+            "a".into(),
+            json!({"M": {"m": {"L": [{"L": [{"S": "x"}, {"S": "y"}, {"S": "z"}]}]}}}),
+        );
+
+        assert_eq!(apply(&mut item, "SET l[0][1] = :v"), vec![(0, 1)]);
+        assert_eq!(item["l"], json!({"L": [{"L": [{"S": "a"}, {"S": "v"}]}]}));
+
+        assert_eq!(apply(&mut item, "SET a.m[0][2] = :v"), vec![(0, 2)]);
+        assert_eq!(
+            item["a"],
+            json!({"M": {"m": {"L": [{"L": [{"S": "x"}, {"S": "y"}, {"S": "v"}]}]}}})
+        );
+
+        apply(&mut item, "REMOVE l[0][1]");
+        assert_eq!(item["l"], json!({"L": [{"L": [{"S": "a"}]}]}));
+        assert!(!item.contains_key("l[0]"));
+    }
+
+    // Appending past the end of an inner list lands at its length, and the
+    // UPDATED_* payloads follow the written (NEW) and requested (OLD) paths.
+    #[test]
+    fn inner_list_append_updated_values() {
+        let mut item: HashMap<String, AttributeValue> = HashMap::new();
+        item.insert("l".into(), json!({"L": [{"L": [{"S": "a"}]}]}));
+        let pre = item.clone();
+        let written = apply(&mut item, "SET l[0][9] = :v");
+        assert_eq!(written, vec![(0, 1)]);
+        assert_eq!(item["l"], json!({"L": [{"L": [{"S": "a"}, {"S": "v"}]}]}));
+        let requested = vec![
+            PathElem::Attr("l".into()),
+            PathElem::Index(0),
+            PathElem::Index(9),
+        ];
+        let mut landed = requested.clone();
+        landed[2] = PathElem::Index(written[0].1);
+        let new = project_paths(Some(&item), &[landed]);
+        assert_eq!(new["l"], json!({"L": [{"L": [{"S": "v"}]}]}));
+        assert!(project_paths(Some(&pre), &[requested]).is_empty());
+    }
+
+    // A nested list-index SET reports its written index the same way.
+    #[test]
+    fn nested_list_append_reports_written_index() {
+        let mut item: HashMap<String, AttributeValue> = HashMap::new();
+        item.insert("a".into(), json!({"M": {"l": {"L": [{"S": "x"}]}}}));
+        let values: HashMap<String, serde_json::Value> =
+            HashMap::from([(":v".to_string(), json!({"S": "y"}))]);
+        let written =
+            apply_update_expression_tracked(&mut item, "SET a.l[5] = :v", &HashMap::new(), &values)
+                .unwrap();
+        assert_eq!(written, vec![(0, 1)]);
+        assert_eq!(
+            item["a"],
+            json!({"M": {"l": {"L": [{"S": "x"}, {"S": "y"}]}}})
+        );
+        assert!(!item.contains_key("a.l[5]"));
+    }
+
+    // A nested SET returns only the written fragment of the parent map.
+    #[test]
+    fn updated_values_return_nested_fragment() {
+        let mut item: HashMap<String, AttributeValue> = HashMap::new();
+        item.insert(
+            "parent".into(),
+            json!({"M": {"keep": {"S": "k"}, "child": {"S": "new"}}}),
+        );
+        let got = project_paths(Some(&item), &[path(&["parent", "child"])]);
+        assert_eq!(got["parent"], json!({"M": {"child": {"S": "new"}}}));
+    }
+
+    // PutItem validates ConditionalOperator like DeleteItem and UpdateItem,
+    // rather than silently treating an unknown value as AND.
+    #[test]
+    fn put_item_rejects_invalid_conditional_operator() {
+        use crate::state::SharedDynamoDbState;
+        use std::sync::Arc;
+        let state: SharedDynamoDbState = Arc::new(parking_lot::RwLock::new(
+            fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+        ));
+        let svc = DynamoDbService::new(state);
+        let req = AwsRequest {
+            service: "dynamodb".into(),
+            action: "PutItem".into(),
+            region: "us-east-1".into(),
+            account_id: "123456789012".into(),
+            request_id: "r".into(),
+            headers: http::HeaderMap::new(),
+            query_params: HashMap::new(),
+            body: bytes::Bytes::from(
+                serde_json::to_vec(&json!({
+                    "TableName": "T",
+                    "Item": {"pk": {"S": "a"}},
+                    "Expected": {"pk": {"Exists": false}},
+                    "ConditionalOperator": "XOR",
+                }))
+                .unwrap(),
+            ),
+            body_stream: parking_lot::Mutex::new(None),
+            path_segments: vec![],
+            raw_path: "/".into(),
+            raw_query: String::new(),
+            method: http::Method::POST,
+            is_query_protocol: false,
+            access_key_id: None,
+            principal: None,
+        };
+        let err = svc.put_item(&req).err().expect("XOR rejected");
+        assert_eq!(err.code(), "ValidationException");
+        assert!(
+            err.message().contains("at 'conditionalOperator'"),
+            "{}",
+            err.message()
+        );
     }
 
     #[tokio::test]
@@ -967,14 +1187,6 @@ mod tests {
             body.get("Attributes").is_none(),
             "ALL_OLD on insert must return no Attributes, got: {body}"
         );
-    }
-
-    #[test]
-    fn no_changes_yields_empty() {
-        let pre = map(&[("a", "1")]);
-        let post = map(&[("a", "1")]);
-        assert!(diff_updated_attributes(Some(&pre), &post, UpdatedSide::New).is_empty());
-        assert!(diff_updated_attributes(Some(&pre), &post, UpdatedSide::Old).is_empty());
     }
 
     // Legacy AttributeUpdates ADD/DELETE path: a Number Set compares members by

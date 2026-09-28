@@ -7077,3 +7077,265 @@ async fn dynamodb_rejects_invalid_secondary_index_key_values() {
         .unwrap();
     assert_eq!(scan.count(), 0);
 }
+
+/// Expressions are validated before the table is looked up, with AWS's
+/// messages: a malformed request against a missing table reports the
+/// expression error, not ResourceNotFoundException.
+#[tokio::test]
+async fn dynamodb_expression_validation_precedes_table_lookup() {
+    use aws_sdk_dynamodb::error::ProvideErrorMetadata;
+    let server = TestServer::start().await;
+    let client = server.dynamodb_client().await;
+
+    let err = client
+        .put_item()
+        .table_name("no_such_table")
+        .item("pk", AttributeValue::S("a".into()))
+        .condition_expression("((attribute_not_exists(pk)))")
+        .send()
+        .await
+        .expect_err("redundant parentheses are rejected");
+    assert_eq!(err.code(), Some("ValidationException"));
+    assert_eq!(
+        err.message(),
+        Some("Invalid ConditionExpression: The expression has redundant parentheses;")
+    );
+
+    let err = client
+        .update_item()
+        .table_name("no_such_table")
+        .key("pk", AttributeValue::S("a".into()))
+        .update_expression("SET status = :v")
+        .expression_attribute_values(":v", AttributeValue::S("x".into()))
+        .send()
+        .await
+        .expect_err("reserved word is rejected");
+    assert_eq!(
+        err.message(),
+        Some(
+            "Invalid UpdateExpression: Attribute name is a reserved keyword; reserved keyword: \
+             status"
+        )
+    );
+
+    let err = client
+        .scan()
+        .table_name("no_such_table")
+        .projection_expression("#a, #b")
+        .expression_attribute_names("#a", "a")
+        .expression_attribute_names("#b", "a")
+        .send()
+        .await
+        .expect_err("overlapping projection paths are rejected");
+    assert_eq!(
+        err.message(),
+        Some(
+            "Invalid ProjectionExpression: Two document paths overlap with each other; must \
+             remove or rewrite one of these paths; path one: [a], path two: [a]"
+        )
+    );
+
+    // A well-formed request against a missing table is not found, without
+    // naming the table.
+    let err = client
+        .get_item()
+        .table_name("no_such_table")
+        .key("pk", AttributeValue::S("a".into()))
+        .send()
+        .await
+        .expect_err("missing table");
+    assert_eq!(err.code(), Some("ResourceNotFoundException"));
+    assert_eq!(err.message(), Some("Requested resource not found"));
+}
+
+/// UpdateItem evaluates every operand against the pre-update item and
+/// returns only the written fragment for UPDATED_NEW.
+#[tokio::test]
+async fn dynamodb_update_item_snapshot_semantics_and_updated_new_fragment() {
+    let server = TestServer::start().await;
+    let client = server.dynamodb_client().await;
+    create_pk_table(&client, "upd_sem").await;
+
+    let mut parent = HashMap::new();
+    parent.insert("keep".to_string(), AttributeValue::S("k".into()));
+    parent.insert("child".to_string(), AttributeValue::S("old".into()));
+    client
+        .put_item()
+        .table_name("upd_sem")
+        .item("pk", AttributeValue::S("p".into()))
+        .item("a", AttributeValue::S("OLD".into()))
+        .item("c", AttributeValue::N("10".into()))
+        .item("parent", AttributeValue::M(parent))
+        .send()
+        .await
+        .unwrap();
+
+    let resp = client
+        .update_item()
+        .table_name("upd_sem")
+        .key("pk", AttributeValue::S("p".into()))
+        .update_expression("SET a = :v, b = a, c = (c - :three), parent.child = :v")
+        .expression_attribute_values(":v", AttributeValue::S("NEW".into()))
+        .expression_attribute_values(":three", AttributeValue::N("3".into()))
+        .return_values(aws_sdk_dynamodb::types::ReturnValue::UpdatedNew)
+        .send()
+        .await
+        .unwrap();
+    let attrs = resp.attributes().unwrap();
+    assert_eq!(attrs["a"].as_s().unwrap(), "NEW");
+    assert_eq!(attrs["b"].as_s().unwrap(), "OLD");
+    assert_eq!(attrs["c"].as_n().unwrap(), "7");
+    let parent = attrs["parent"].as_m().unwrap();
+    assert_eq!(parent["child"].as_s().unwrap(), "NEW");
+    assert!(!parent.contains_key("keep"));
+}
+
+/// Query and Scan stop a page once it has read 1MB of data.
+#[tokio::test]
+async fn dynamodb_scan_paginates_at_one_megabyte() {
+    let server = TestServer::start().await;
+    let client = server.dynamodb_client().await;
+    create_pk_table(&client, "big_rows").await;
+    for i in 0..20 {
+        client
+            .put_item()
+            .table_name("big_rows")
+            .item("pk", AttributeValue::S(format!("row-{i}")))
+            .item("payload", AttributeValue::S("y".repeat(60_000)))
+            .send()
+            .await
+            .unwrap();
+    }
+    let first = client.scan().table_name("big_rows").send().await.unwrap();
+    assert!(first.count() < 20);
+    let lek = first.last_evaluated_key().expect("a second page follows");
+    let second = client
+        .scan()
+        .table_name("big_rows")
+        .set_exclusive_start_key(Some(lek.clone()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.count() + second.count(), 20);
+    assert!(second.last_evaluated_key().is_none());
+}
+
+/// SET on a list index past the end appends, and UPDATED_NEW reports the
+/// value at the index it actually landed on.
+#[tokio::test]
+async fn dynamodb_update_item_list_append_past_end_returns_written_value() {
+    let server = TestServer::start().await;
+    let client = server.dynamodb_client().await;
+    create_pk_table(&client, "upd_list").await;
+    client
+        .put_item()
+        .table_name("upd_list")
+        .item("pk", AttributeValue::S("p".into()))
+        .item(
+            "l",
+            AttributeValue::L(vec![
+                AttributeValue::S("a".into()),
+                AttributeValue::S("b".into()),
+            ]),
+        )
+        .send()
+        .await
+        .unwrap();
+    let resp = client
+        .update_item()
+        .table_name("upd_list")
+        .key("pk", AttributeValue::S("p".into()))
+        .update_expression("SET l[10] = :v")
+        .expression_attribute_values(":v", AttributeValue::S("z".into()))
+        .return_values(aws_sdk_dynamodb::types::ReturnValue::UpdatedNew)
+        .send()
+        .await
+        .unwrap();
+    let list = resp.attributes().unwrap()["l"].as_l().unwrap();
+    assert_eq!(list, &vec![AttributeValue::S("z".into())]);
+
+    // Clauses apply in order: after the REMOVE the list is [b, z], so the SET
+    // appends at index 2, which is where UPDATED_NEW must find it.
+    let resp = client
+        .update_item()
+        .table_name("upd_list")
+        .key("pk", AttributeValue::S("p".into()))
+        .update_expression("REMOVE l[0] SET l[10] = :w")
+        .expression_attribute_values(":w", AttributeValue::S("w".into()))
+        .return_values(aws_sdk_dynamodb::types::ReturnValue::UpdatedNew)
+        .send()
+        .await
+        .unwrap();
+    let list = resp.attributes().expect("appended value returned")["l"]
+        .as_l()
+        .unwrap();
+    assert_eq!(list, &vec![AttributeValue::S("w".into())]);
+    // UPDATED_OLD reports the expression's paths against the old list
+    // [b, z, w]: l[0] was "b"; l[10] had no old value.
+    let resp = client
+        .update_item()
+        .table_name("upd_list")
+        .key("pk", AttributeValue::S("p".into()))
+        .update_expression("REMOVE l[0] SET l[10] = :q")
+        .expression_attribute_values(":q", AttributeValue::S("q".into()))
+        .return_values(aws_sdk_dynamodb::types::ReturnValue::UpdatedOld)
+        .send()
+        .await
+        .unwrap();
+    let list = resp.attributes().expect("removed value returned")["l"]
+        .as_l()
+        .unwrap();
+    assert_eq!(list, &vec![AttributeValue::S("b".into())]);
+}
+
+/// A SET through several list indexes of one path (`l[0][1]`) writes into the
+/// nested list; UPDATED_NEW/UPDATED_OLD return that element.
+#[tokio::test]
+async fn dynamodb_update_item_multi_index_list_path() {
+    let server = TestServer::start().await;
+    let client = server.dynamodb_client().await;
+    create_pk_table(&client, "upd_multi").await;
+    let inner = AttributeValue::L(vec![
+        AttributeValue::S("a".into()),
+        AttributeValue::S("b".into()),
+    ]);
+    client
+        .put_item()
+        .table_name("upd_multi")
+        .item("pk", AttributeValue::S("p".into()))
+        .item("l", AttributeValue::L(vec![inner]))
+        .send()
+        .await
+        .unwrap();
+    let resp = client
+        .update_item()
+        .table_name("upd_multi")
+        .key("pk", AttributeValue::S("p".into()))
+        .update_expression("SET l[0][1] = :v")
+        .expression_attribute_values(":v", AttributeValue::S("v".into()))
+        .return_values(aws_sdk_dynamodb::types::ReturnValue::UpdatedOld)
+        .send()
+        .await
+        .unwrap();
+    let old = resp.attributes().unwrap()["l"].as_l().unwrap();
+    assert_eq!(
+        old,
+        &vec![AttributeValue::L(vec![AttributeValue::S("b".into())])]
+    );
+    let item = client
+        .get_item()
+        .table_name("upd_multi")
+        .key("pk", AttributeValue::S("p".into()))
+        .send()
+        .await
+        .unwrap();
+    let item = item.item().unwrap();
+    assert!(!item.contains_key("l[0]"));
+    assert_eq!(
+        item["l"].as_l().unwrap(),
+        &vec![AttributeValue::L(vec![
+            AttributeValue::S("a".into()),
+            AttributeValue::S("v".into()),
+        ])]
+    );
+}
