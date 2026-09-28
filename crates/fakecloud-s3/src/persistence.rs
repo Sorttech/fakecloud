@@ -480,7 +480,14 @@ pub fn hydrate_s3_state(
 /// malformed `acl.toml` or `tags.toml` used to abort startup -- every other
 /// bucket inaccessible because of one file. Such a bucket is skipped and handed
 /// to `refused` so it is reported exactly like a store-level refusal: absent
-/// from memory, its name refused by CreateBucket, and clearable by DeleteBucket.
+/// from memory, and its name refused by CreateBucket rather than treated as free
+/// -- a create clears the whole stored directory, so a name that is merely
+/// unreadable must not look available. Repair the file and restart, or remove
+/// the directory, to get the name back.
+///
+/// Wire this to the store's `mark_bucket_load_refused`, not to a no-op: with the
+/// hook dropped on the floor, a bucket skipped here is indistinguishable from a
+/// name nobody has used, and the next create deletes its objects.
 pub fn hydrate_s3_state_reporting(
     snapshot: S3StateSnapshot,
     account_id: &str,

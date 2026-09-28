@@ -399,6 +399,14 @@ pub trait S3Store: Send + Sync {
         false
     }
 
+    /// Record that `bucket` could not be loaded, for a reason found ABOVE the
+    /// store: its objects read fine, but a sidecar this layer does not parse
+    /// (`tags.toml`, `acl.toml`, `inventory.toml`) did not. The caller hydrating
+    /// a snapshot reports each such bucket here so it is refused exactly like a
+    /// store-level refusal -- otherwise its name looks free and the next
+    /// `CreateBucket` clears the directory, objects included.
+    fn mark_bucket_load_refused(&self, _bucket: &str) {}
+
     /// Forget that [`S3Store::load`] refused `bucket`, because the name now
     /// belongs to a bucket that loaded.
     ///
@@ -957,6 +965,12 @@ impl S3Store for DiskS3Store {
         self.load_refused
             .read()
             .contains(&crate::key_escape::escape_key_segment(bucket))
+    }
+
+    fn mark_bucket_load_refused(&self, bucket: &str) {
+        self.load_refused
+            .write()
+            .insert(crate::key_escape::escape_key_segment(bucket));
     }
 
     fn clear_bucket_load_refusal(&self, bucket: &str) -> StoreResult<()> {

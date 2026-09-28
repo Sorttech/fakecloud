@@ -1708,6 +1708,26 @@ async fn persistence_recreating_a_load_refused_bucket_is_declined_not_destructiv
         "the refused create destroyed the objects it was protecting"
     );
 
+    // Nor does DeleteBucket discard it. There is deliberately no API verb that
+    // does: delete could check neither emptiness (the objects are exactly what
+    // could not be read) nor ownership (the metadata carrying it is what
+    // failed), so a refused name answers NoSuchBucket like any other name the
+    // server cannot see, and the data stays for the operator to repair.
+    let err = client
+        .delete_bucket()
+        .bucket("refused")
+        .send()
+        .await
+        .expect_err("a refused bucket must not be discardable through the API");
+    assert!(
+        format!("{err:?}").contains("NoSuchBucket"),
+        "unexpected error: {err:?}"
+    );
+    assert!(
+        objects_dir.join("keep.txt").join("null.bin").exists(),
+        "DeleteBucket destroyed the objects the refusal was protecting"
+    );
+
     // Repairing the one bad file brings the whole bucket back.
     std::fs::remove_dir_all(objects_dir.join("corrupt.txt")).unwrap();
     server.restart().await;
@@ -1715,6 +1735,103 @@ async fn persistence_recreating_a_load_refused_bucket_is_declined_not_destructiv
     let body = client
         .get_object()
         .bucket("refused")
+        .key("keep.txt")
+        .send()
+        .await
+        .expect("the repaired bucket should load")
+        .body
+        .collect()
+        .await
+        .unwrap()
+        .into_bytes();
+    assert_eq!(&body[..], b"precious");
+}
+
+#[tokio::test]
+async fn persistence_a_bucket_skipped_for_a_corrupt_sidecar_is_refused_not_cleared() {
+    // Two layers can skip a bucket at load. The store skips one whose OBJECTS it
+    // cannot read. A layer above parses the bucket's own sidecars, and a bad
+    // `tags.toml` skips the bucket there -- with the store reporting no problem
+    // at all, since the objects read fine. Only that layer's report keeps the
+    // name from looking free, and a create clears the whole directory, so
+    // without it the create deletes objects that were never unreadable.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut server = TestServer::start_persistent(tmp.path()).await;
+    let client = server.s3_client().await;
+
+    client
+        .create_bucket()
+        .bucket("sidecar")
+        .send()
+        .await
+        .unwrap();
+    client
+        .put_object()
+        .bucket("sidecar")
+        .key("keep.txt")
+        .body(ByteStream::from_static(b"precious"))
+        .send()
+        .await
+        .unwrap();
+    client
+        .put_bucket_tagging()
+        .bucket("sidecar")
+        .tagging(
+            aws_sdk_s3::types::Tagging::builder()
+                .tag_set(
+                    aws_sdk_s3::types::Tag::builder()
+                        .key("team")
+                        .value("a")
+                        .build()
+                        .unwrap(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    let bucket_dir = tmp.path().join("s3").join("buckets").join("sidecar");
+    let tags = bucket_dir.join("tags.toml");
+    assert!(tags.exists(), "expected {tags:?}");
+    std::fs::write(&tags, "not valid toml = = =").unwrap();
+
+    server.restart().await;
+    let client = server.s3_client().await;
+
+    let list = client.list_buckets().send().await.unwrap();
+    assert!(
+        !list.buckets().iter().any(|b| b.name() == Some("sidecar")),
+        "expected the bucket to be skipped on load"
+    );
+
+    let err = client
+        .create_bucket()
+        .bucket("sidecar")
+        .send()
+        .await
+        .expect_err("the name must be refused while the objects are still there");
+    assert!(
+        format!("{err:?}").contains("BucketAlreadyExists"),
+        "unexpected error: {err:?}"
+    );
+    assert!(
+        bucket_dir
+            .join("objects")
+            .join("keep.txt")
+            .join("null.bin")
+            .exists(),
+        "the create destroyed objects the loader had no trouble reading"
+    );
+
+    // Repairing the one bad file brings the bucket back, objects included.
+    std::fs::remove_file(&tags).unwrap();
+    server.restart().await;
+    let client = server.s3_client().await;
+    let body = client
+        .get_object()
+        .bucket("sidecar")
         .key("keep.txt")
         .send()
         .await
@@ -1802,28 +1919,6 @@ async fn persistence_removing_a_refused_directory_frees_the_name_without_a_resta
         .send()
         .await
         .expect("a name that now holds a healthy bucket must not still be refused");
-
-    // A delete of a name absent from memory is a plain 404, never a recursive
-    // discard of whatever the store holds under it: with a stale refusal in the
-    // set, that path destroyed a live bucket's objects.
-    let status = reqwest::Client::new()
-        .post(format!("{}/_fakecloud/reset/s3", server.endpoint()))
-        .send()
-        .await
-        .expect("reset should respond")
-        .status();
-    assert!(status.is_success(), "reset failed: {status}");
-    let client = server.s3_client().await;
-    let err = client
-        .delete_bucket()
-        .bucket("gone")
-        .send()
-        .await
-        .expect_err("a bucket absent from memory does not exist as far as delete is concerned");
-    assert!(
-        format!("{err:?}").contains("NoSuchBucket"),
-        "unexpected error: {err:?}"
-    );
 }
 
 #[tokio::test]

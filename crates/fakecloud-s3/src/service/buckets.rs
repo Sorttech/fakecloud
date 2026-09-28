@@ -522,6 +522,23 @@ impl S3Service {
                 .delete_bucket(bucket)
                 .map_err(super::persistence_error)?;
         }
+        // This name now belongs to a bucket that loads, so whatever the last load
+        // could not read under it is gone (either cleared just above, or removed
+        // out of band, which is what let the create past the refusal at all).
+        // Leaving the refusal behind would refuse the name again after the next
+        // `/_fakecloud/reset`, for data that is no longer there.
+        //
+        // Before the writes below, not after: a create that fails partway would
+        // otherwise leave the refusal standing over a directory it had just
+        // created, and every later create for the name would be told to repair a
+        // directory holding nothing but that failed attempt's `meta.toml`. Only
+        // reached once the refusal is known not to apply, so dropping it here
+        // cannot discard a live one.
+        if self.store.bucket_load_refused(bucket) {
+            self.store
+                .clear_bucket_load_refusal(bucket)
+                .map_err(super::persistence_error)?;
+        }
         self.store
             .put_bucket_meta(bucket, &meta)
             .map_err(super::persistence_error)?;
@@ -543,14 +560,6 @@ impl S3Service {
             b.ownership_controls.as_deref(),
         )?;
         state.buckets.insert(bucket.to_string(), b);
-        // This name now belongs to a bucket that loaded, so whatever the last
-        // load could not read under it is gone (either cleared above, or removed
-        // out of band, which is what let the create through at all). Leaving the
-        // refusal behind would refuse the name again after the next
-        // `/_fakecloud/reset`, for data that is no longer there.
-        self.store
-            .clear_bucket_load_refusal(bucket)
-            .map_err(super::persistence_error)?;
 
         let mut headers = HeaderMap::new();
         headers.insert("location", format!("/{bucket}").parse().unwrap());
