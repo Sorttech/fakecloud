@@ -32,8 +32,6 @@ use serde_json::Value;
 
 use crate::state::{attribute_type_and_value, SharedDynamoDbState};
 
-use super::helpers::partiql::find_outside_quotes;
-
 /// Words in DynamoDB and PartiQL expressions that are never attribute names.
 /// Operator words of both DynamoDB expressions and PartiQL: never attribute
 /// names. Anything else is reported -- an extra name only narrows what an
@@ -426,8 +424,7 @@ fn add_request_attributes(keys: &mut Keys, body: &Value, names: &BTreeMap<String
         "KeyConditionExpression",
     ] {
         if let Some(text) = body[expr].as_str() {
-            keys.attributes
-                .extend(expression_attributes(text, names, false));
+            keys.attributes.extend(expression_attributes(text, names));
         }
     }
     for list in ["AttributesToGet"] {
@@ -592,14 +589,8 @@ fn tokenize(text: &str) -> Vec<Token> {
 }
 
 /// Top-level attribute names an expression references: every name that is
-/// not a keyword, a function call, a nested path segment or a list index. In
-/// a PartiQL statement (`partiql`) the table -- and a `"table"."index"` index
-/// -- after `FROM` / `INTO` / `UPDATE` is not an attribute either.
-fn expression_attributes(
-    text: &str,
-    names: &BTreeMap<String, String>,
-    partiql: bool,
-) -> Vec<String> {
+/// not a keyword, a function call, a nested path segment or a list index.
+fn expression_attributes(text: &str, names: &BTreeMap<String, String>) -> Vec<String> {
     let tokens = tokenize(text);
     let mut out = Vec::new();
     let mut i = 0;
@@ -614,17 +605,9 @@ fn expression_attributes(
             continue;
         };
         let lower = text.to_ascii_lowercase();
-        if partiql && !quoted && matches!(lower.as_str(), "from" | "into" | "update") {
-            // The keyword and the table name, then an optional `.index`.
-            i += 2;
-            if matches!(tokens.get(i), Some(Token::Symbol('.'))) {
-                i += 2;
-            }
-            continue;
-        }
         let keyword = !quoted
             && (EXPRESSION_WORDS.contains(&lower.as_str())
-                || (!partiql && UPDATE_CLAUSE_WORDS.contains(&lower.as_str())));
+                || UPDATE_CLAUSE_WORDS.contains(&lower.as_str()));
         let function = matches!(tokens.get(i + 1), Some(Token::Symbol('(')));
         if !nested && !keyword && !function {
             if let Some(name) = text.strip_prefix('#').map(|_| names.get(text)) {
@@ -707,11 +690,11 @@ fn key_condition_partition_value(
     None
 }
 
-/// The PartiQL condition keys for one statement, parsed exactly the way the
-/// executor parses it -- the same clause splitting, the same `?` parameter
-/// binding, the same WHERE parser and item parser -- so a statement the
-/// executor accepts cannot be read here as touching different partitions or
-/// attributes than it does.
+/// The PartiQL condition keys for one statement, read from the same parse
+/// the executor runs -- the same grammar and the same `?` parameter binding
+/// -- so a statement the executor accepts cannot be read here as touching
+/// different partitions or attributes than it does. A statement that does not
+/// parse is rejected by the executor, so it has no keys to report.
 fn add_partiql_keys(
     keys: &mut Keys,
     target: &Target,
@@ -719,112 +702,85 @@ fn add_partiql_keys(
     parameters: &[Value],
     verb: &str,
 ) {
-    use super::helpers::count_params_in_str;
-    use super::helpers::partiql::{
-        parse_partiql_table_name, parse_partiql_value_object, partiql_expr_attributes,
-        partiql_pinned_values, partiql_where_conditions, split_partiql_returning_clause,
+    use super::helpers::partiql_exec::insert_item;
+    use super::helpers::partiql_parse::{
+        conjuncts, expr_attributes, key_equality, key_values, parse_statement, path_root,
+        pinned_values, Projection, Statement, UpdateOp,
     };
 
-    let trimmed = statement.trim();
-    let upper = trimmed.to_ascii_uppercase();
-    let mut conditions = None;
-    match verb {
-        "PartiQLInsert" => {
-            let Some(into) = find_outside_quotes(&upper, "INTO") else {
-                return;
-            };
-            let (_, rest) = parse_partiql_table_name(trimmed[into + 4..].trim());
-            let rest_upper = rest.trim().to_ascii_uppercase();
-            let Some(value_pos) = find_outside_quotes(&rest_upper, "VALUE") else {
-                return;
-            };
-            let value_str = rest.trim()[value_pos + 5..].trim();
-            match parse_partiql_value_object(value_str, parameters) {
+    let Ok(stmt) = parse_statement(statement, parameters) else {
+        return;
+    };
+    let stmt = match stmt {
+        Statement::Exists(inner) => *inner,
+        other => other,
+    };
+    let mut attrs = Vec::new();
+    let filter = match &stmt {
+        Statement::Insert { value, .. } => {
+            // The item exactly as the executor builds it, bound parameters
+            // included; one it cannot build is rejected there.
+            match insert_item(value) {
                 Ok(item) => {
                     match item.get(&target.partition_key).and_then(scalar_string) {
                         Some(v) => keys.add_leading(v),
                         None => keys.leading = None,
                     }
-                    keys.attributes.extend(item.keys().cloned());
+                    keys.attributes.extend(item.into_keys());
                 }
                 Err(_) => keys.leading = None,
             }
             return;
         }
-        "PartiQLSelect" => {
-            let Some(from) = find_outside_quotes(&upper, "FROM") else {
-                return;
-            };
-            let projection = trimmed["SELECT".len()..from].trim();
-            match super::helpers::partiql::partiql_column_paths(projection) {
-                Ok(Some(paths)) => {
-                    for path in paths {
-                        if let Some(super::helpers::partiql::PathSegment::Name(name)) = path.first()
-                        {
-                            keys.attributes.insert(name.clone());
-                        }
-                    }
+        Statement::Select {
+            projection, filter, ..
+        } => {
+            match projection {
+                Projection::Paths(paths) => {
+                    attrs.extend(paths.iter().map(|p| path_root(p).to_string()));
                     keys.merge_select("SPECIFIC_ATTRIBUTES".to_string());
                 }
-                Ok(None) => keys.merge_select(if target.index.is_some() {
+                Projection::Star => keys.merge_select(if target.index.is_some() {
                     "ALL_PROJECTED_ATTRIBUTES".to_string()
                 } else {
                     "ALL_ATTRIBUTES".to_string()
                 }),
-                // The executor rejects the statement.
-                Err(_) => return,
             }
-            let (_, mut rest) = parse_partiql_table_name(trimmed[from + 4..].trim());
-            if let Some(index_part) = rest.strip_prefix('.') {
-                rest = parse_partiql_table_name(index_part).1;
-            }
-            if rest.trim().to_ascii_uppercase().starts_with("WHERE") {
-                conditions = partiql_where_conditions(rest.trim()[5..].trim(), parameters);
-            }
+            filter.as_ref()
         }
-        "PartiQLUpdate" => {
-            let (_, rest) = parse_partiql_table_name(trimmed[6..].trim());
-            let rest_upper = rest.trim().to_ascii_uppercase();
-            let Some(set_pos) = find_outside_quotes(&rest_upper, "SET") else {
-                return;
-            };
-            let (after_set, _) = split_partiql_returning_clause(rest.trim()[set_pos + 3..].trim());
-            let (set_clause, where_clause) =
-                match find_outside_quotes(&after_set.to_ascii_uppercase(), "WHERE") {
-                    Some(wp) => (&after_set[..wp], after_set[wp + 5..].trim()),
-                    None => (after_set, ""),
-                };
-            let (update_expression, _) =
-                super::helpers::partiql::prepare_partiql_update_expression(set_clause, parameters);
-            keys.attributes
-                .extend(update_targets(&update_expression, &BTreeMap::new()));
-            // Attributes the assignments read; an extra name only narrows what
-            // an attribute allow-list admits.
-            keys.attributes
-                .extend(expression_attributes(set_clause, &BTreeMap::new(), true));
-            let set_params = count_params_in_str(set_clause);
-            let where_params = parameters.get(set_params..).unwrap_or(&[]);
-            conditions = partiql_where_conditions(where_clause, where_params);
-        }
-        "PartiQLDelete" => {
-            let Some(from) = find_outside_quotes(&upper, "FROM") else {
-                return;
-            };
-            let (_, rest) = parse_partiql_table_name(trimmed[from + 4..].trim());
-            if rest.trim().to_ascii_uppercase().starts_with("WHERE") {
-                conditions = partiql_where_conditions(rest.trim()[5..].trim(), parameters);
+        Statement::Update { ops, filter, .. } => {
+            for op in ops {
+                match op {
+                    UpdateOp::Set(path, value) => {
+                        attrs.push(path_root(path).to_string());
+                        // Attributes the assignment reads; an extra name only
+                        // narrows what an attribute allow-list admits.
+                        expr_attributes(value, &mut attrs);
+                    }
+                    UpdateOp::Remove(path) => attrs.push(path_root(path).to_string()),
+                }
             }
+            filter.as_ref()
         }
-        _ => return,
+        Statement::Delete { filter, .. } => filter.as_ref(),
+        Statement::Exists(_) => return,
+    };
+    if let Some(expr) = filter {
+        expr_attributes(expr, &mut attrs);
     }
-    if let Some(expr) = &conditions {
-        let mut attrs = Vec::new();
-        partiql_expr_attributes(expr, &mut attrs);
-        keys.attributes.extend(attrs);
-    }
-    let pinned = conditions
-        .as_ref()
-        .and_then(|expr| partiql_pinned_values(expr, &target.partition_key));
+    keys.attributes.extend(attrs);
+    // The partition the executor targets: a write's key comes from the first
+    // key equality (the same function the executor pins its item with), a
+    // read's from its first equality or IN conjunct; only a read with neither
+    // falls back to every partition its OR branches can reach.
+    let parts = filter.map(conjuncts).unwrap_or_default();
+    let pinned = if verb == "PartiQLSelect" {
+        key_values(&parts, &target.partition_key)
+            .map(|vs| vs.into_iter().cloned().collect())
+            .or_else(|| filter.and_then(|expr| pinned_values(expr, &target.partition_key)))
+    } else {
+        key_equality(&parts, &target.partition_key).map(|v| vec![v.clone()])
+    };
     match &pinned {
         Some(values) => {
             for value in values {
@@ -864,7 +820,6 @@ mod tests {
         let mut got = expression_attributes(
             "SET #s = :v, Address.City = :c, tags[0] = :t REMOVE #d.x ADD score :one",
             &n,
-            false,
         );
         got.sort();
         assert_eq!(got, ["Address", "detail", "score", "status", "tags"]);
@@ -872,7 +827,6 @@ mod tests {
         let mut got = expression_attributes(
             "attribute_exists(pk) AND begins_with(sk, :p) OR size(items) > :n",
             &n,
-            false,
         );
         got.sort();
         assert_eq!(got, ["items", "pk", "sk"]);
@@ -880,13 +834,19 @@ mod tests {
 
     #[test]
     fn partiql_set_clause_attributes_skip_literals() {
-        let mut got = expression_attributes(
-            "x = y + 1, \"note\" = 'set when? size', modified = ?",
-            &BTreeMap::new(),
-            true,
+        let (_svc, state) = service_with_table();
+        let got = keys_for(
+            &state,
+            "ExecuteStatement",
+            serde_json::json!({
+                "Statement": "UPDATE \"Games\" SET x = y + 1, \"note\" = 'set when? size', modified = ? WHERE UserId = 'a' AND Title = 't'",
+                "Parameters": [{"S": "m"}]
+            }),
         );
-        got.sort();
-        assert_eq!(got, ["modified", "note", "x", "y"]);
+        assert_eq!(
+            get(&got[0].1, "dynamodb:attributes"),
+            Some(&["Title", "UserId", "modified", "note", "x", "y"].map(String::from)[..])
+        );
     }
 
     #[test]
@@ -1320,12 +1280,49 @@ mod tests {
             get(keys, "dynamodb:leadingkeys"),
             Some(&["victim".to_string()][..])
         );
-        // Exactly the attributes the executor's item parser finds.
-        let item = super::super::helpers::partiql::parse_partiql_value_object(value, &[]).unwrap();
-        let mut expected: Vec<String> = item.keys().cloned().collect();
-        expected.sort();
-        assert_eq!(get(keys, "dynamodb:attributes"), Some(&expected[..]));
-        assert!(expected.contains(&"secret".to_string()));
+        // Exactly the attributes of the item the executor inserts.
+        assert_eq!(
+            get(keys, "dynamodb:attributes"),
+            Some(&["Title", "UserId", "note", "secret"].map(String::from)[..])
+        );
+    }
+
+    /// An INSERT whose item is a bound map parameter reports that item's
+    /// partition and attributes, and a write equating the key twice reports
+    /// the partition the first equality pins -- the item the executor writes.
+    #[test]
+    fn partiql_writes_report_what_the_executor_writes() {
+        let (_svc, state) = service_with_table();
+        let got = keys_for(
+            &state,
+            "ExecuteStatement",
+            serde_json::json!({
+                "Statement": "INSERT INTO \"Games\" VALUE ?",
+                "Parameters": [{"M": {
+                    "UserId": {"S": "victim"}, "Title": {"S": "t"}, "secret": {"S": "x"}
+                }}]
+            }),
+        );
+        assert_eq!(
+            get(&got[0].1, "dynamodb:leadingkeys"),
+            Some(&["victim".to_string()][..])
+        );
+        assert_eq!(
+            get(&got[0].1, "dynamodb:attributes"),
+            Some(&["Title", "UserId", "secret"].map(String::from)[..])
+        );
+
+        let got = keys_for(
+            &state,
+            "ExecuteStatement",
+            serde_json::json!({
+                "Statement": "UPDATE \"Games\" SET n = 1 WHERE UserId = 'victim' AND UserId = 'mine' AND Title = 't'"
+            }),
+        );
+        assert_eq!(
+            get(&got[0].1, "dynamodb:leadingkeys"),
+            Some(&["victim".to_string()][..])
+        );
     }
 
     /// A Scan on an index defaults to `ALL_PROJECTED_ATTRIBUTES`, like an

@@ -6,6 +6,7 @@ mod global_tables;
 pub(crate) mod iam;
 mod iam_conditions;
 mod items;
+mod partiql;
 mod queries;
 mod streams;
 mod tables;

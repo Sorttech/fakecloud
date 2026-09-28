@@ -5404,7 +5404,9 @@ fn create_table_missing_table_name_emits_limit_exceeded() {
 }
 
 #[test]
-fn execute_statement_partiql_error_emits_resource_not_found() {
+fn execute_statement_partiql_error_emits_validation_exception() {
+    // A statement that does not parse is rejected before any table is looked
+    // up, so it is a ValidationException rather than a missing table.
     let svc = make_service();
     let err = svc
         .execute_statement(&make_request(
@@ -5413,7 +5415,7 @@ fn execute_statement_partiql_error_emits_resource_not_found() {
         ))
         .err()
         .unwrap();
-    assert_error_code(err, "ResourceNotFoundException");
+    assert_error_code(err, "ValidationException");
 }
 
 /// No snapshot store (memory mode) -> no persist hook for the CFN provisioner.
@@ -7023,7 +7025,8 @@ async fn partiql_select_from_an_index_reads_the_index() {
 }
 
 /// A PartiQL SELECT returns only the columns it names (document paths and
-/// quoted names included); `*` returns the whole item.
+/// quoted names included), each under the name of its last path step; `*`
+/// returns the whole item.
 #[tokio::test]
 async fn partiql_select_returns_only_the_named_columns() {
     let svc = make_service();
@@ -7052,7 +7055,7 @@ async fn partiql_select_returns_only_the_named_columns() {
             "pk": {"S": "a"},
             "public": {"S": "p"},
             "a.b": {"S": "dotted"},
-            "addr": {"M": {"city": {"S": "c"}}}
+            "city": {"S": "c"}
         }])
     );
     let all = call_dynamodb(
@@ -7134,6 +7137,122 @@ async fn partiql_select_columns_page_and_validate() {
         json!({"Statement": "SELECT \"u\" . \"x\", score [ 0 ] FROM \"Scores\""}),
     )
     .await;
+}
+
+/// A one-value IN list on the partition key is a point read like an
+/// equality, and finds the item.
+#[tokio::test]
+async fn partiql_point_read_through_a_one_value_in_list() {
+    let svc = make_service();
+    svc.create_table(&make_request(
+        "CreateTable",
+        json!({
+            "TableName": "Pairs",
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"}
+            ],
+            "AttributeDefinitions": [
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "sk", "AttributeType": "S"}
+            ],
+            "BillingMode": "PAY_PER_REQUEST"
+        }),
+    ))
+    .unwrap();
+    create_test_table(&svc);
+    call_dynamodb(
+        &svc,
+        "PutItem",
+        json!({"TableName": "Pairs", "Item": {"pk": {"S": "a"}, "sk": {"S": "x"}}}),
+    )
+    .await;
+    call_dynamodb(
+        &svc,
+        "PutItem",
+        json!({"TableName": "test-table", "Item": {"pk": {"S": "a"}}}),
+    )
+    .await;
+    for statement in [
+        "SELECT * FROM \"test-table\" WHERE pk IN ['a']",
+        "SELECT * FROM \"Pairs\" WHERE pk IN ['a'] AND sk = 'x'",
+    ] {
+        let got = call_dynamodb(&svc, "ExecuteStatement", json!({"Statement": statement})).await;
+        assert_eq!(got["Items"].as_array().unwrap().len(), 1, "{statement}");
+    }
+}
+
+/// A written value is built only from constants, paths and the update
+/// functions: anything else is refused rather than written as some default.
+#[tokio::test]
+async fn partiql_refuses_values_it_cannot_build() {
+    let svc = make_service();
+    create_test_table(&svc);
+    call_dynamodb(
+        &svc,
+        "PutItem",
+        json!({"TableName": "test-table", "Item": {"pk": {"S": "a"}, "s": {"SS": ["x"]}}}),
+    )
+    .await;
+    for statement in [
+        "UPDATE \"test-table\" SET v = lower(s) WHERE pk = 'a'",
+        "UPDATE \"test-table\" SET v = set_add(s, <<'y'>>) WHERE pk = 'a'",
+        "UPDATE \"test-table\" SET s = set_add(s) WHERE pk = 'a'",
+        "UPDATE \"test-table\" SET v = [missing] WHERE pk = 'a'",
+        "UPDATE \"test-table\" SET v = (1 = 1) WHERE pk = 'a'",
+        "SELECT * FROM \"test-table\" WHERE upper(pk) = 'A'",
+        "INSERT INTO \"test-table\" VALUE {'pk': 'b', 's': <<'x', 1>>}",
+        "INSERT INTO \"test-table\" VALUE {'pk': 'b', 'pk': 'c'}",
+    ] {
+        assert_eq!(
+            err_code(&svc, "ExecuteStatement", json!({"Statement": statement}))
+                .await
+                .as_deref(),
+            Some("ValidationException"),
+            "{statement}"
+        );
+    }
+    let got = call_dynamodb(
+        &svc,
+        "GetItem",
+        json!({"TableName": "test-table", "Key": {"pk": {"S": "a"}}}),
+    )
+    .await;
+    assert_eq!(got["Item"], json!({"pk": {"S": "a"}, "s": {"SS": ["x"]}}));
+    assert_eq!(
+        call_dynamodb(&svc, "Scan", json!({"TableName": "test-table"})).await["Count"],
+        1
+    );
+}
+
+/// A transaction that reads and writes one table reports each as what it
+/// was, not every unit as whichever came first.
+#[tokio::test]
+async fn partiql_transaction_capacity_splits_reads_from_writes() {
+    let svc = make_service();
+    create_test_table(&svc);
+    call_dynamodb(
+        &svc,
+        "PutItem",
+        json!({"TableName": "test-table", "Item": {"pk": {"S": "a"}}}),
+    )
+    .await;
+    let got = call_dynamodb(
+        &svc,
+        "ExecuteTransaction",
+        json!({
+            "TransactStatements": [
+                {"Statement": "EXISTS(SELECT * FROM \"test-table\" WHERE pk = 'a')"},
+                {"Statement": "UPDATE \"test-table\" SET v = 1 WHERE pk = 'a'"}
+            ],
+            "ReturnConsumedCapacity": "TOTAL"
+        }),
+    )
+    .await;
+    let cc = &got["ConsumedCapacity"][0];
+    assert_eq!(cc["ReadCapacityUnits"], json!(1.0), "{cc}");
+    assert_eq!(cc["WriteCapacityUnits"], json!(2.0), "{cc}");
+    assert_eq!(cc["CapacityUnits"], json!(3.0), "{cc}");
 }
 
 // ── Cross-account table ARNs ───────────────────────────────────────────

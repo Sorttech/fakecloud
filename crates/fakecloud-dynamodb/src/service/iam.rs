@@ -27,8 +27,6 @@ use fakecloud_core::auth::IamAction;
 use fakecloud_core::service::AwsRequest;
 use serde_json::Value;
 
-use super::helpers::partiql::{find_outside_quotes, parse_partiql_table_name};
-
 const SERVICE: &str = "dynamodb";
 
 /// The data-plane actions DynamoDB performs on a restore's target table.
@@ -432,29 +430,18 @@ fn push_unique(out: &mut Vec<IamAction>, a: IamAction) {
     }
 }
 
-/// The PartiQL action a statement's verb needs, and the table it names --
-/// with `.index` appended for a SELECT from `"table"."index"`. `None` for a
-/// statement too malformed to name a table.
+/// The PartiQL action a statement's verb needs, and the table it names.
+/// `None` for a statement too malformed to name a table.
 pub(crate) fn partiql_verb_and_table(statement: &str) -> Option<(&'static str, String)> {
-    let trimmed = statement.trim();
-    let upper = trimmed.to_ascii_uppercase();
-    let (verb, keyword) = if upper.starts_with("SELECT") {
-        ("PartiQLSelect", Some("FROM"))
-    } else if upper.starts_with("INSERT") {
-        ("PartiQLInsert", Some("INTO"))
-    } else if upper.starts_with("UPDATE") {
-        ("PartiQLUpdate", None)
-    } else if upper.starts_with("DELETE") {
-        ("PartiQLDelete", Some("FROM"))
-    } else {
-        return None;
+    use super::helpers::partiql_parse::{statement_shape, Statement};
+    let stmt = statement_shape(statement)?;
+    let verb = match &stmt {
+        Statement::Select { .. } | Statement::Exists(_) => "PartiQLSelect",
+        Statement::Insert { .. } => "PartiQLInsert",
+        Statement::Update { .. } => "PartiQLUpdate",
+        Statement::Delete { .. } => "PartiQLDelete",
     };
-    let after = match keyword {
-        Some(kw) => &trimmed[find_outside_quotes(&upper, kw)? + kw.len()..],
-        None => &trimmed["UPDATE".len()..],
-    };
-    let (table, _) = parse_partiql_table_name(after);
-    (!table.is_empty()).then_some((verb, table))
+    Some((verb, stmt.table().to_string()))
 }
 
 /// The PartiQL action a statement needs, on the table (or, for a SELECT
@@ -475,12 +462,8 @@ fn partiql_action(scope: &Scope<'_>, statement: &str) -> IamAction {
 
 /// The index a `SELECT ... FROM "table"."index"` reads, if any.
 pub(crate) fn partiql_select_index(statement: &str) -> Option<String> {
-    let trimmed = statement.trim();
-    let upper = trimmed.to_ascii_uppercase();
-    let from = find_outside_quotes(&upper, "FROM")?;
-    let (_, rest) = parse_partiql_table_name(&trimmed[from + "FROM".len()..]);
-    let (index, _) = parse_partiql_table_name(rest.strip_prefix('.')?);
-    (!index.is_empty()).then_some(index)
+    let stmt = super::helpers::partiql_parse::statement_shape(statement)?;
+    stmt.is_read().then(|| stmt.index().map(str::to_string))?
 }
 
 /// Tags on the table a resource ARN names (a table, or its index or
