@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use tokio::sync::Mutex as AsyncMutex;
 
-use fakecloud_aws::arn::{partition_for, Arn};
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::pagination::paginate_checked;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_persistence::{SnapshotHook, SnapshotStore};
@@ -1108,6 +1108,12 @@ pub fn scalable_target_arn(region: &str, account_id: &str, id: &str) -> String {
     .to_string()
 }
 
+/// A scaling policy or scheduled action ARN, which Application Auto Scaling
+/// mints under the `autoscaling` service namespace.
+fn autoscaling_arn(region: &str, account_id: &str, resource: &str) -> String {
+    Arn::regional("autoscaling", region, account_id, resource).to_string()
+}
+
 /// The ARN of a scaling policy on `namespace`/`resource_id`.
 pub fn scaling_policy_arn(
     region: &str,
@@ -1117,9 +1123,10 @@ pub fn scaling_policy_arn(
     resource_id: &str,
     name: &str,
 ) -> String {
-    format!(
-        "arn:{}:autoscaling:{region}:{account_id}:scalingPolicy:{id}:resource/{namespace}/{resource_id}:policyName/{name}",
-        partition_for(region)
+    autoscaling_arn(
+        region,
+        account_id,
+        &format!("scalingPolicy:{id}:resource/{namespace}/{resource_id}:policyName/{name}"),
     )
 }
 
@@ -1132,9 +1139,12 @@ pub fn scheduled_action_arn(
     resource_id: &str,
     name: &str,
 ) -> String {
-    format!(
-        "arn:{}:autoscaling:{region}:{account_id}:scheduledAction:{id}:resource/{namespace}/{resource_id}:scheduledActionName/{name}",
-        partition_for(region)
+    autoscaling_arn(
+        region,
+        account_id,
+        &format!(
+            "scheduledAction:{id}:resource/{namespace}/{resource_id}:scheduledActionName/{name}"
+        ),
     )
 }
 

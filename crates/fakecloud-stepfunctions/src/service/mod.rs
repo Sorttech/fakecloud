@@ -1032,6 +1032,7 @@ pub fn start_execution_from_delivery(
     };
 
     let sm_name = sm.name.clone();
+    let sm_role_arn = sm.role_arn.clone();
     let definition = sm.definition.clone();
     // No request in this delivery path; the execution inherits the region its
     // state machine ARN was minted in (the request region at CreateStateMachine).
@@ -1060,6 +1061,7 @@ pub fn start_execution_from_delivery(
         is_sync: false,
         billed_duration_ms: None,
         billed_memory_mb: None,
+        role_arn: sm_role_arn,
     };
 
     st.executions.insert(exec_arn.clone(), execution);
@@ -2289,6 +2291,7 @@ mod tests {
             is_sync: false,
             billed_duration_ms: None,
             billed_memory_mb: None,
+            role_arn: String::new(),
         }
     }
 

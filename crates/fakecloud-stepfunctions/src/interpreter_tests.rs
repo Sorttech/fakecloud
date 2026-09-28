@@ -32,6 +32,7 @@ fn create_execution(state: &SharedStepFunctionsState, arn: &str, input: Option<S
             is_sync: false,
             billed_duration_ms: None,
             billed_memory_mb: None,
+            role_arn: "arn:aws:iam::123456789012:role/test".to_string(),
         },
     );
 }
@@ -934,19 +935,6 @@ fn apply_state_catcher_returns_none_without_match() {
 }
 
 #[test]
-fn queue_url_to_arn_parses_account_and_name() {
-    assert_eq!(
-        queue_url_to_arn("http://sqs.local:4566/123456789012/my-queue", "us-east-1"),
-        "arn:aws:sqs:us-east-1:123456789012:my-queue"
-    );
-}
-
-#[test]
-fn queue_url_to_arn_falls_back_for_unparseable_input() {
-    assert_eq!(queue_url_to_arn("bad", "us-east-1"), "bad");
-}
-
-#[test]
 fn md5_hex_is_deterministic_and_32_chars() {
     let a = md5_hex("hello");
     let b = md5_hex("hello");
@@ -1173,14 +1161,6 @@ fn china_partition_integration_resource_is_dispatched() {
     });
 }
 
-#[test]
-fn queue_url_to_arn_uses_the_region_partition() {
-    assert_eq!(
-        queue_url_to_arn("http://sqs.local:4566/123456789012/my-queue", "cn-north-1"),
-        "arn:aws-cn:sqs:cn-north-1:123456789012:my-queue"
-    );
-}
-
 // ── Terminal guards on succeed/fail helpers ──────────────────────
 
 #[test]
@@ -1237,6 +1217,7 @@ fn make_exec(status: ExecutionStatus) -> Execution {
         is_sync: false,
         billed_duration_ms: None,
         billed_memory_mb: None,
+        role_arn: String::new(),
     }
 }
 
@@ -1904,5 +1885,120 @@ async fn malformed_output_path_multibyte_tail_does_not_panic() {
 
     read_exec(&state, &arn, |exec| {
         assert_ne!(exec.status, ExecutionStatus::Running);
+    });
+}
+
+/// Records SQS deliveries and resolves QueueUrls to the queue's stored ARN,
+/// the way the SQS service does.
+struct RecordingSqs {
+    queue_url: String,
+    queue_arn: String,
+    delivered: parking_lot::Mutex<Vec<String>>,
+}
+
+impl fakecloud_core::delivery::SqsDelivery for RecordingSqs {
+    fn deliver_to_queue(
+        &self,
+        queue_arn: &str,
+        _message_body: &str,
+        _attributes: &std::collections::HashMap<String, String>,
+    ) {
+        self.delivered.lock().push(queue_arn.to_string());
+    }
+
+    fn queue_arn_for_url(&self, queue_url: &str) -> Option<String> {
+        (queue_url == self.queue_url).then(|| self.queue_arn.clone())
+    }
+}
+
+fn sqs_send_def(queue_url: &str) -> Value {
+    json!({
+        "StartAt": "T",
+        "States": {
+            "T": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::sqs:sendMessage",
+                "Parameters": { "QueueUrl": queue_url, "MessageBody": "hi" },
+                "End": true
+            }
+        }
+    })
+}
+
+#[test]
+fn sqs_send_message_reaches_a_queue_in_another_region() {
+    let sqs = Arc::new(RecordingSqs {
+        queue_url: "http://localhost:4566/123456789012/orders".to_string(),
+        queue_arn: "arn:aws:sqs:us-east-1:123456789012:orders".to_string(),
+        delivered: parking_lot::Mutex::new(Vec::new()),
+    });
+    let delivery = Arc::new(DeliveryBus::new().with_sqs(sqs.clone()));
+    let state = make_state();
+    let arn = "arn:aws:states:eu-west-1:123456789012:execution:test:sqs-cross-region";
+    drive_with_delivery(
+        &state,
+        arn,
+        sqs_send_def("http://localhost:4566/123456789012/orders"),
+        Some("{}"),
+        delivery,
+    );
+    read_exec(&state, arn, |exec| {
+        assert_eq!(exec.status, ExecutionStatus::Succeeded, "{:?}", exec.cause);
+    });
+    assert_eq!(
+        *sqs.delivered.lock(),
+        vec!["arn:aws:sqs:us-east-1:123456789012:orders".to_string()]
+    );
+}
+
+#[test]
+fn sqs_send_message_to_a_missing_queue_fails_the_task() {
+    let sqs = Arc::new(RecordingSqs {
+        queue_url: "http://localhost:4566/123456789012/orders".to_string(),
+        queue_arn: "arn:aws:sqs:us-east-1:123456789012:orders".to_string(),
+        delivered: parking_lot::Mutex::new(Vec::new()),
+    });
+    let delivery = Arc::new(DeliveryBus::new().with_sqs(sqs.clone()));
+    let state = make_state();
+    let arn = arn_for("sqs-missing-queue");
+    drive_with_delivery(
+        &state,
+        &arn,
+        sqs_send_def("http://localhost:4566/123456789012/missing"),
+        Some("{}"),
+        delivery,
+    );
+    read_exec(&state, &arn, |exec| {
+        assert_eq!(exec.status, ExecutionStatus::Failed);
+        assert_eq!(
+            exec.error.as_deref(),
+            Some("SQS.QueueDoesNotExistException")
+        );
+    });
+    assert!(sqs.delivered.lock().is_empty());
+}
+
+#[test]
+fn execution_started_event_carries_the_role_recorded_at_start() {
+    // No state machine exists in `state`: the role must come from the
+    // execution itself, as when DeleteStateMachine races the interpreter.
+    let state = make_state();
+    let arn = arn_for("role-on-start");
+    drive(
+        &state,
+        &arn,
+        json!({"StartAt": "P", "States": {"P": {"Type": "Pass", "End": true}}}),
+        Some("{}"),
+    );
+    read_exec(&state, &arn, |exec| {
+        let started = exec
+            .history_events
+            .iter()
+            .find(|e| e.event_type == "ExecutionStarted")
+            .expect("ExecutionStarted event");
+        assert_eq!(
+            started.details["roleArn"],
+            "arn:aws:iam::123456789012:role/test"
+        );
     });
 }

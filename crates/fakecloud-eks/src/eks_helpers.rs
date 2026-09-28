@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use http::StatusCode;
 use serde_json::{json, Value};
 
-use fakecloud_aws::arn::partition_for;
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::service::{AwsRequest, AwsServiceError};
 
 use crate::service::LOG_TYPES;
@@ -816,19 +816,20 @@ pub(crate) fn addon_configuration_schema(addon_name: &str) -> String {
 /// The recommended pod-identity configuration for an add-on, returned by
 /// `DescribeAddonConfiguration` as `podIdentityConfiguration`.
 pub(crate) fn pod_identity_configuration(region: &str, addon_name: &str) -> Value {
-    let p = partition_for(region);
+    let policy =
+        |name: &str| Arn::global_in(region, "iam", "aws", &format!("policy/{name}")).to_string();
     match addon_name {
         "vpc-cni" => json!([{
             "serviceAccount": "aws-node",
-            "recommendedManagedPolicies": [format!("arn:{p}:iam::aws:policy/AmazonEKS_CNI_Policy")],
+            "recommendedManagedPolicies": [policy("AmazonEKS_CNI_Policy")],
         }]),
         "aws-ebs-csi-driver" => json!([{
             "serviceAccount": "ebs-csi-controller-sa",
-            "recommendedManagedPolicies": [format!("arn:{p}:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy")],
+            "recommendedManagedPolicies": [policy("service-role/AmazonEBSCSIDriverPolicy")],
         }]),
         "aws-efs-csi-driver" => json!([{
             "serviceAccount": "efs-csi-controller-sa",
-            "recommendedManagedPolicies": [format!("arn:{p}:iam::aws:policy/service-role/AmazonEFSCSIDriverPolicy")],
+            "recommendedManagedPolicies": [policy("service-role/AmazonEFSCSIDriverPolicy")],
         }]),
         _ => json!([]),
     }
@@ -984,7 +985,6 @@ pub(crate) fn pod_identity_association_summary_json(a: &PodIdentityAssociation) 
 /// `ListAccessPolicies`. Every entry is an `arn:aws:eks::aws:cluster-access-policy/*`
 /// managed policy.
 pub(crate) fn access_policy_catalog(region: &str) -> Vec<Value> {
-    let p = partition_for(region);
     const POLICIES: &[&str] = &[
         "AmazonEKSClusterAdminPolicy",
         "AmazonEKSAdminPolicy",
@@ -1002,7 +1002,7 @@ pub(crate) fn access_policy_catalog(region: &str) -> Vec<Value> {
         .map(|name| {
             json!({
                 "name": name,
-                "arn": format!("arn:{p}:eks::aws:cluster-access-policy/{name}"),
+                "arn": Arn::global_in(region, "eks", "aws", &format!("cluster-access-policy/{name}")).to_string(),
             })
         })
         .collect()

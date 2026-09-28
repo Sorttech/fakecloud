@@ -42,7 +42,9 @@ pub struct EcsState {
     /// setting name (e.g. `serviceLongArnFormat`).
     pub account_setting_defaults: BTreeMap<String, String>,
     /// Per-principal account settings (PutAccountSetting). Keyed by
-    /// principal ARN, then setting name.
+    /// [`principal_settings_key`] of the principal ARN, then setting name.
+    /// Keys persisted before that normalization are rewritten on load.
+    #[serde(deserialize_with = "deserialize_principal_settings")]
     pub principal_account_settings: BTreeMap<String, BTreeMap<String, String>>,
     /// Tasks keyed by task ID (the trailing segment of the task ARN).
     #[serde(default)]
@@ -950,10 +952,37 @@ pub fn ecs_arn(region: &str, account_id: &str, resource: &str) -> String {
 /// stored under the principal ARN with its partition normalized to `aws`: a
 /// setting written from one partition's region is read back from any other.
 pub fn principal_settings_key(principal_arn: &str) -> String {
-    match principal_arn.parse::<fakecloud_aws::arn::Arn>() {
-        Ok(arn) => arn.with_partition("aws").to_string(),
-        Err(_) => principal_arn.to_string(),
+    with_arn_partition(principal_arn, "aws")
+}
+
+/// `arn` rewritten into `partition`; anything that is not an ARN is returned
+/// unchanged.
+pub fn with_arn_partition(arn: &str, partition: &str) -> String {
+    match arn.parse::<fakecloud_aws::arn::Arn>() {
+        Ok(parsed) => parsed.with_partition(partition).to_string(),
+        Err(_) => arn.to_string(),
     }
+}
+
+/// Load principal settings keyed by [`principal_settings_key`]. Snapshots
+/// written by older builds keyed them by the raw principal ARN (for example
+/// `arn:aws-cn:iam::123:role/r`), which the normalized lookups would never
+/// find; entries whose keys collapse onto the same principal are merged.
+fn deserialize_principal_settings<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, BTreeMap<String, String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = BTreeMap::<String, BTreeMap<String, String>>::deserialize(deserializer)?;
+    let mut normalized: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    for (principal, settings) in raw {
+        normalized
+            .entry(principal_settings_key(&principal))
+            .or_default()
+            .extend(settings);
+    }
+    Ok(normalized)
 }
 
 #[cfg(test)]
@@ -1047,6 +1076,61 @@ mod tests {
             s.container_instance_arn("us-east-1", "prod", "i-abc"),
             "arn:aws:ecs:us-east-1:111122223333:container-instance/i-abc"
         );
+    }
+
+    #[test]
+    fn raw_principal_setting_keys_are_normalized_on_load() {
+        // A snapshot from a build that keyed settings by the raw principal ARN.
+        let mut old = EcsState::new("111122223333", "cn-north-1");
+        let mut role = BTreeMap::new();
+        role.insert("containerInsights".to_string(), "enabled".to_string());
+        old.principal_account_settings
+            .insert("arn:aws-cn:iam::111122223333:role/r".to_string(), role);
+        let mut root = BTreeMap::new();
+        root.insert("awsvpcTrunking".to_string(), "enabled".to_string());
+        old.principal_account_settings
+            .insert("arn:aws-cn:iam::111122223333:root".to_string(), root);
+        let mut root_aws = BTreeMap::new();
+        root_aws.insert("guardDutyActivate".to_string(), "on".to_string());
+        old.principal_account_settings
+            .insert("arn:aws:iam::111122223333:root".to_string(), root_aws);
+
+        let loaded: EcsState = serde_json::from_str(&serde_json::to_string(&old).unwrap()).unwrap();
+        assert_eq!(
+            loaded
+                .principal_account_settings
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![
+                "arn:aws:iam::111122223333:role/r".to_string(),
+                "arn:aws:iam::111122223333:root".to_string(),
+            ]
+        );
+        assert_eq!(
+            loaded
+                .effective_account_setting(
+                    "containerInsights",
+                    Some("arn:aws-cn:iam::111122223333:role/r")
+                )
+                .as_deref(),
+            Some("enabled")
+        );
+        let root_settings = &loaded.principal_account_settings["arn:aws:iam::111122223333:root"];
+        assert_eq!(root_settings.len(), 2);
+    }
+
+    #[test]
+    fn with_arn_partition_rewrites_only_arns() {
+        assert_eq!(
+            with_arn_partition("arn:aws:iam::1:role/r", "aws-cn"),
+            "arn:aws-cn:iam::1:role/r"
+        );
+        assert_eq!(
+            principal_settings_key("arn:aws-us-gov:iam::1:root"),
+            "arn:aws:iam::1:root"
+        );
+        assert_eq!(with_arn_partition("not-an-arn", "aws-cn"), "not-an-arn");
     }
 
     #[test]

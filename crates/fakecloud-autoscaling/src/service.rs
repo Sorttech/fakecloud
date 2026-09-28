@@ -8,7 +8,7 @@ use http::StatusCode;
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
-use fakecloud_aws::arn::partition_for;
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::query::{optional_query_param, query_response_xml, required_query_param};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_persistence::{SnapshotHook, SnapshotStore};
@@ -384,10 +384,13 @@ fn parse_instance_ids(xml: &str) -> Vec<String> {
 /// `launchConfiguration`), e.g.
 /// `arn:aws:autoscaling:us-east-1:123:autoScalingGroup:<id>:autoScalingGroupName/<name>`.
 pub fn autoscaling_arn(region: &str, account_id: &str, kind: &str, id: &str, name: &str) -> String {
-    format!(
-        "arn:{}:autoscaling:{region}:{account_id}:{kind}:{id}:{kind}Name/{name}",
-        partition_for(region)
+    Arn::regional(
+        "autoscaling",
+        region,
+        account_id,
+        &format!("{kind}:{id}:{kind}Name/{name}"),
     )
+    .to_string()
 }
 
 impl AutoScalingService {
@@ -566,11 +569,13 @@ impl AutoScalingService {
             status: None,
             service_linked_role_arn: optional_query_param(req, "ServiceLinkedRoleARN")
                 .unwrap_or_else(|| {
-                    format!(
-                        "arn:{}:iam::{}:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling",
-                        partition_for(&req.region),
-                        req.account_id
+                    Arn::global_in(
+                        &req.region,
+                        "iam",
+                        &req.account_id,
+                        "role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling",
                     )
+                    .to_string()
                 }),
         };
 

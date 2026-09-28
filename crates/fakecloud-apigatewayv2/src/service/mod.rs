@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 
-use fakecloud_aws::arn::{arn_resource, partition_for};
+use fakecloud_aws::arn::arn_resource;
 use fakecloud_core::delivery::DeliveryBus;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 
@@ -441,13 +441,15 @@ fn extract_identity_source_value(req: &AwsRequest, source: &str) -> Option<Strin
 /// to the corresponding user-pool ARN.
 fn issuer_to_pool_arn(account_id: &str, region: &str, issuer: &str) -> Option<String> {
     let pool_id = issuer.rsplit_once('/')?.1;
-    Some(format!(
-        "arn:{}:cognito-idp:{}:{}:userpool/{}",
-        partition_for(region),
-        region,
-        account_id,
-        pool_id
-    ))
+    Some(
+        fakecloud_aws::arn::Arn::regional(
+            "cognito-idp",
+            region,
+            account_id,
+            &format!("userpool/{pool_id}"),
+        )
+        .to_string(),
+    )
 }
 
 /// Pull a Lambda function ARN out of an `authorizerUri` value.

@@ -5,7 +5,7 @@ use chrono::Utc;
 use serde_json::{json, Value};
 use tracing::{debug, warn};
 
-use fakecloud_aws::arn::{arn_resource, Arn};
+use fakecloud_aws::arn::arn_resource;
 use fakecloud_core::delivery::DeliveryBus;
 use fakecloud_dynamodb::SharedDynamoDbState;
 
@@ -1240,8 +1240,7 @@ async fn invoke_resource(
     }
 
     if is_integration("sqs:sendMessage") {
-        let region = execution_arn.split(':').nth(3).unwrap_or_default();
-        return invoke_sqs_send_message(input, delivery, region);
+        return invoke_sqs_send_message(input, delivery);
     }
 
     if is_integration("sns:publish") {
@@ -1357,18 +1356,13 @@ fn map_sdk_service_id(service_id: &str) -> &str {
     }
 }
 
-/// The role of the state machine an execution belongs to, as recorded on its
-/// `ExecutionStarted` history event.
+/// The role recorded on an execution when it was started.
 fn execution_role_arn(state: &SharedStepFunctionsState, execution_arn: &str) -> String {
     let accounts = state.read();
     accounts
         .get(account_id_from_arn(execution_arn))
-        .and_then(|s| {
-            let exec = s.executions.get(execution_arn)?;
-            s.state_machines
-                .get(&exec.state_machine_arn)
-                .map(|sm| sm.role_arn.clone())
-        })
+        .and_then(|s| s.executions.get(execution_arn))
+        .map(|exec| exec.role_arn.clone())
         .unwrap_or_default()
 }
 

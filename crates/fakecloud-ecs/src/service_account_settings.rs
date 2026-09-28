@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use super::*;
-use crate::state::principal_settings_key;
+use crate::state::{principal_settings_key, with_arn_partition};
 
 /// Valid `SettingName` enum values from the ECS Smithy model. Used by all
 /// {Put,PutDefault,Delete,List}AccountSettings* operations to validate the
@@ -25,16 +25,6 @@ const SETTING_NAME_VALUES: &[&str] = &[
     "defaultLogDriverMode",
     "fargateEventWindows",
 ];
-
-/// Render a stored principal-settings key in `region`'s partition.
-fn principal_in_region_partition(key: &str, region: &str) -> String {
-    match key.parse::<Arn>() {
-        Ok(arn) => arn
-            .with_partition(fakecloud_aws::arn::partition_for(region))
-            .to_string(),
-        Err(_) => key.to_string(),
-    }
-}
 
 impl EcsService {
     pub(super) fn put_account_setting(
@@ -194,7 +184,10 @@ impl EcsService {
                 {
                     continue;
                 }
-                let principal = principal_in_region_partition(principal, &request.region);
+                let principal = with_arn_partition(
+                    principal,
+                    fakecloud_aws::arn::partition_for(&request.region),
+                );
                 for (k, v) in entries {
                     if matches_filter(name_filter, k) && matches_filter(value_filter, v) {
                         settings.push(json!({

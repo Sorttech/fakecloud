@@ -43,6 +43,7 @@ impl StepFunctionsService {
             .ok_or_else(|| state_machine_not_found(sm_arn))?;
 
         let sm_name = sm.name.clone();
+        let sm_role_arn = sm.role_arn.clone();
         let sm_type = sm.machine_type;
         let definition = sm.definition.clone();
         let exec_arn = state.execution_arn(&req.region, &sm_name, &execution_name);
@@ -85,6 +86,7 @@ impl StepFunctionsService {
             is_sync: false,
             billed_duration_ms: None,
             billed_memory_mb: None,
+            role_arn: sm_role_arn,
         };
 
         state.executions.insert(exec_arn.clone(), execution);
@@ -462,6 +464,7 @@ impl StepFunctionsService {
                 is_sync: true,
                 billed_duration_ms: None,
                 billed_memory_mb: None,
+                role_arn: sm.role_arn.clone(),
             };
             state.executions.insert(exec_arn.clone(), execution);
             (

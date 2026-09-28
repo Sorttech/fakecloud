@@ -106,6 +106,15 @@ pub trait SqsDelivery: Send + Sync {
         self.deliver_to_queue(queue_arn, message_body, &HashMap::new());
     }
 
+    /// The stored ARN of the queue a QueueUrl (`<endpoint>/<account>/<name>`)
+    /// names, looked up by account and queue name. A QueueUrl carries no
+    /// region, so callers holding only a URL must not rebuild the ARN from
+    /// their own region. `None` when no such queue exists.
+    fn queue_arn_for_url(&self, queue_url: &str) -> Option<String> {
+        let _ = queue_url;
+        None
+    }
+
     /// Fallible variant used by Scheduler's DLQ routing. Default
     /// implementation assumes the queue exists (preserving the
     /// fire-and-forget semantics of `deliver_to_queue`); the real SQS
@@ -705,6 +714,11 @@ impl DeliveryBus {
     pub fn with_stepfunctions(mut self, starter: Arc<dyn StepFunctionsDelivery>) -> Self {
         self.stepfunctions_starter = Some(starter);
         self
+    }
+
+    /// The stored ARN of the SQS queue a QueueUrl names, if it exists.
+    pub fn sqs_queue_arn_for_url(&self, queue_url: &str) -> Option<String> {
+        self.sqs_sender.as_ref()?.queue_arn_for_url(queue_url)
     }
 
     /// Send a message to an SQS queue identified by ARN.

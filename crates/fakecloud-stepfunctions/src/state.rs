@@ -227,6 +227,10 @@ pub struct Execution {
     /// `billingDetails.billedMemoryUsedInMB`.
     #[serde(default)]
     pub billed_memory_mb: Option<i64>,
+    /// The state machine's role when the execution started, recorded on its
+    /// `ExecutionStarted` history event.
+    #[serde(default)]
+    pub role_arn: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
