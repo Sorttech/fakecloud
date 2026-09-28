@@ -318,12 +318,6 @@ pub fn session_arn(region: &str, account: &str, cluster_id: &str, session_id: &s
     )
 }
 
-/// The account root principal EMR reports as the creator of account-level
-/// configuration.
-pub fn account_root_arn(region: &str, account: &str) -> String {
-    Arn::global_in(region, "iam", account, "root").to_string()
-}
-
 impl EmrService {
     /// Run `f` against this account's mutable state.
     pub(crate) fn with_account_mut<R>(

@@ -742,6 +742,15 @@ fn list_relation_objs(
     (ok_json(json!({ field: objs })), false)
 }
 
+/// The ARN stored on the `rtype` record `name` (its `field` member), or the one
+/// it would be minted with when no such record exists.
+fn stored_arn(data: Option<&IotData>, ctx: &Ctx, rtype: &str, name: &str, field: &str) -> String {
+    data.and_then(|d| d.get_resource(rtype, name))
+        .and_then(|r| r.get(field))
+        .and_then(Value::as_str)
+        .map_or_else(|| mint_arn(ctx, rtype, name), str::to_string)
+}
+
 fn list_relation_policies(
     svc: &IotService,
     ctx: &Ctx,
@@ -749,11 +758,12 @@ fn list_relation_policies(
     a: Option<&str>,
 ) -> (AwsResponse, bool) {
     let g = svc.state.read();
-    let values = relation_values(g.get(&ctx.account), rel, a);
+    let data = g.get(&ctx.account);
+    let values = relation_values(data, rel, a);
     let policies: Vec<Value> = values
         .into_iter()
         .map(|name| {
-            let arn = mint_arn(ctx, "policies", &name);
+            let arn = stored_arn(data, ctx, "policies", &name, "policyArn");
             json!({ "policyName": name, "policyArn": arn })
         })
         .collect();
@@ -773,7 +783,7 @@ fn list_attached_policies(
         for (key, targets) in &data.relations {
             if let Some(policy) = key.strip_prefix("policy-targets:") {
                 if targets.iter().any(|t| t == target) {
-                    let arn = mint_arn(ctx, "policies", policy);
+                    let arn = stored_arn(Some(data), ctx, "policies", policy, "policyArn");
                     policies.push(json!({ "policyName": policy, "policyArn": arn }));
                 }
             }
@@ -2028,11 +2038,12 @@ fn list_thing_groups_for_thing(
 ) -> (AwsResponse, bool) {
     let thing = lbl(labels, "thingName").unwrap_or("").to_string();
     let g = svc.state.read();
-    let groups = inverse_relation(g.get(&ctx.account), "group-things:", &thing);
+    let data = g.get(&ctx.account);
+    let groups = inverse_relation(data, "group-things:", &thing);
     let objs: Vec<Value> = groups
         .into_iter()
         .map(|grp| {
-            let arn = mint_arn(ctx, "thing-groups", &grp);
+            let arn = stored_arn(data, ctx, "thing-groups", &grp, "thingGroupArn");
             json!({ "groupName": grp, "groupArn": arn })
         })
         .collect();
@@ -2200,14 +2211,14 @@ fn cancel_job_execution(
     let thing = lbl(labels, "thingName").unwrap_or("");
     let job = lbl(labels, "jobId").unwrap_or("");
     let key = format!("{thing}/{job}");
+    let mut g = svc.state.write();
+    let data = g.get_or_create(&ctx.account);
     let execution = json!({
         "jobId": job,
-        "thingArn": mint_arn(ctx, "things", thing),
+        "thingArn": stored_arn(Some(data), ctx, "things", thing, "thingArn"),
         "status": "CANCELED",
         "lastUpdatedAt": super::now_epoch(),
     });
-    let mut g = svc.state.write();
-    let data = g.get_or_create(&ctx.account);
     data.put_resource("things/jobs", &key, json!({ "execution": execution }));
     (ok_json(Value::Object(Map::new())), true)
 }

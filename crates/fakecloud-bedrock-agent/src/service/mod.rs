@@ -1246,12 +1246,44 @@ fn agent_summary_json(a: &Agent) -> Value {
     o
 }
 
+/// The ARN a flow was created with, or (for a flow persisted before ARNs were
+/// stored) the one it would have been minted with in `region`.
+fn stored_flow_arn(f: &Flow, region: &str, account_id: &str) -> String {
+    if f.arn.is_empty() {
+        flow_arn(region, account_id, &f.flow_id)
+    } else {
+        f.arn.clone()
+    }
+}
+
+/// The ARN a prompt was created with; see [`stored_flow_arn`].
+fn stored_prompt_arn(p: &Prompt, region: &str, account_id: &str) -> String {
+    if p.arn.is_empty() {
+        prompt_arn(region, account_id, &p.prompt_id)
+    } else {
+        p.arn.clone()
+    }
+}
+
+/// The prompt ARN a version ARN (`<prompt arn>:<version>`) extends.
+fn prompt_version_base_arn(
+    state: &crate::state::BedrockAgentState,
+    prompt_id: &str,
+    region: &str,
+    account_id: &str,
+) -> String {
+    state.prompts.get(prompt_id).map_or_else(
+        || prompt_arn(region, account_id, prompt_id),
+        |p| stored_prompt_arn(p, region, account_id),
+    )
+}
+
 /// `FlowSummary` shape: requires `arn`, `id`, `name`, `status`, `createdAt`,
 /// `updatedAt`, and `version`. The full `flow_json` exposes `flowId`,
 /// `executionRoleArn`, and `definition`, none of which appear on the summary.
 fn flow_summary_json(f: &Flow, region: &str, account_id: &str) -> Value {
     let mut o = json!({
-        "arn": flow_arn(region, account_id, &f.flow_id),
+        "arn": stored_flow_arn(f, region, account_id),
         "id": f.flow_id,
         "name": f.name,
         "status": f.status,
@@ -1285,7 +1317,7 @@ fn knowledge_base_summary_json(k: &KnowledgeBase) -> Value {
 /// The full prompt JSON keys `promptId` (not `id`) and surfaces `variants`.
 fn prompt_summary_json(p: &Prompt, region: &str, account_id: &str) -> Value {
     let mut o = json!({
-        "arn": prompt_arn(region, account_id, &p.prompt_id),
+        "arn": stored_prompt_arn(p, region, account_id),
         "id": p.prompt_id,
         "name": p.name,
         "version": p.version,
@@ -1443,6 +1475,35 @@ mod tests {
 
     fn body(resp: AwsResponse) -> Value {
         serde_json::from_slice(resp.body.expect_bytes()).unwrap()
+    }
+
+    #[test]
+    fn listed_flow_and_prompt_arns_are_the_ones_they_were_created_with() {
+        let svc = BedrockAgentService::new(Arc::new(RwLock::new(BedrockAgentAccounts::new())));
+        let flow = body(svc.create_flow(&cn_request(json!({"name": "f"}))).unwrap());
+        let prompt = body(
+            svc.create_prompt(&cn_request(json!({"name": "p"})))
+                .unwrap(),
+        );
+        let version = body(
+            svc.create_prompt_version(&cn_request(
+                json!({"promptIdentifier": prompt["id"].clone()}),
+            ))
+            .unwrap(),
+        );
+        assert_eq!(
+            version["arn"],
+            format!("{}:1", prompt["arn"].as_str().unwrap())
+        );
+
+        let mut elsewhere = cn_request(json!({"promptIdentifier": prompt["id"].clone()}));
+        elsewhere.region = "us-east-1".to_string();
+        let flows = body(svc.list_flows(&elsewhere).unwrap());
+        assert_eq!(flows["flowSummaries"][0]["arn"], flow["arn"]);
+        let prompts = body(svc.list_prompts(&elsewhere).unwrap());
+        assert_eq!(prompts["promptSummaries"][0]["arn"], prompt["arn"]);
+        let versions = body(svc.list_prompt_versions(&elsewhere).unwrap());
+        assert_eq!(versions["promptSummaries"][0]["arn"], version["arn"]);
     }
 
     #[test]

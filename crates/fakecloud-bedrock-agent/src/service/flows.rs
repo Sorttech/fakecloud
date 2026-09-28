@@ -26,6 +26,7 @@ impl BedrockAgentService {
             updated_at: now_dt,
             version: "DRAFT".to_string(),
             definition: definition.clone(),
+            arn: arn.clone(),
         };
         let mut accts = self.state.write();
         let state = accts.get_or_create(&req.account_id, &req.region);

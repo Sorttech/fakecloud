@@ -226,6 +226,9 @@ pub struct Flow {
     pub updated_at: DateTime<Utc>,
     pub version: String,
     pub definition: Option<serde_json::Value>,
+    /// The ARN minted at creation; empty for flows persisted before it was stored.
+    #[serde(default)]
+    pub arn: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -258,6 +261,9 @@ pub struct Prompt {
     pub version: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// The ARN minted at creation; empty for prompts persisted before it was stored.
+    #[serde(default)]
+    pub arn: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -139,7 +139,7 @@ pub(crate) fn entity(src: &Value, allowed: &[&str], extra: Vec<(&str, Value)>) -
 }
 
 /// The ARN of the Glue resource `<kind>/<name>` in `region`'s partition.
-pub fn resource_arn(account: &str, region: &str, kind: &str, name: &str) -> String {
+pub fn resource_arn(region: &str, account: &str, kind: &str, name: &str) -> String {
     fakecloud_aws::arn::Arn::regional("glue", region, account, &format!("{kind}/{name}"))
         .to_string()
 }

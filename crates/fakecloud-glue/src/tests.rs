@@ -245,6 +245,32 @@ fn china_region_registry_arn_uses_aws_cn_partition() {
         .unwrap(),
     );
     assert_eq!(got["RegistryArn"], arn);
+
+    // Later calls from another region report the registry's own ARN.
+    let updated = body_of(
+        svc.update_registry(&req(
+            "UpdateRegistry",
+            json!({"RegistryId": {"RegistryName": "reg-cn"}, "Description": "d"}),
+        ))
+        .unwrap(),
+    );
+    assert_eq!(updated["RegistryArn"], arn);
+    let schema = body_of(
+        svc.create_schema(&req(
+            "CreateSchema",
+            json!({"RegistryId": {"RegistryName": "reg-cn"}, "SchemaName": "s", "DataFormat": "AVRO"}),
+        ))
+        .unwrap(),
+    );
+    assert_eq!(schema["RegistryArn"], arn);
+    let deleted = body_of(
+        svc.delete_registry(&req(
+            "DeleteRegistry",
+            json!({"RegistryId": {"RegistryName": "reg-cn"}}),
+        ))
+        .unwrap(),
+    );
+    assert_eq!(deleted["RegistryArn"], arn);
 }
 
 #[test]

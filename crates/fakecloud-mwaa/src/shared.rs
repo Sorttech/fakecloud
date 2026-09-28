@@ -88,11 +88,6 @@ pub fn log_group_arn(region: &str, account: &str, name: &str, suffix: &str) -> S
     .to_string()
 }
 
-/// The account root principal a web login token is issued to.
-pub fn account_root_arn(region: &str, account: &str) -> String {
-    Arn::global_in(region, "iam", account, "root").to_string()
-}
-
 /// The Celery executor SQS queue URL AWS provisions for an environment.
 pub fn celery_executor_queue(account: &str, region: &str, name: &str) -> String {
     let h = hash_str(&format!("celery/{account}/{region}/{name}"));

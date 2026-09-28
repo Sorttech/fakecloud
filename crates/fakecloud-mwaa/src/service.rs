@@ -18,6 +18,7 @@ use percent_encoding::percent_decode_str;
 use serde_json::{json, Map, Value};
 use tokio::sync::Mutex as AsyncMutex;
 
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_persistence::SnapshotStore;
 
@@ -508,7 +509,6 @@ impl MwaaService {
         body: &Value,
     ) -> Result<AwsResponse, AwsServiceError> {
         check_name_label(name)?;
-        let arn = shared::environment_arn(&ctx.region, &ctx.account, name);
         let mut guard = self.state.write();
         let data = guard.get_or_create(&ctx.account);
         let Some(env) = data
@@ -577,7 +577,7 @@ impl MwaaService {
         }
         env.insert("LastUpdate".into(), Value::Object(last_update));
 
-        ok(json!({ "Arn": arn }))
+        ok(json!({ "Arn": env.get("Arn").cloned().unwrap_or(Value::Null) }))
     }
 
     fn delete_environment(&self, ctx: &Ctx, name: &str) -> Result<AwsResponse, AwsServiceError> {
@@ -653,7 +653,7 @@ impl MwaaService {
         ok(json!({
             "WebToken": shared::mint_token(),
             "WebServerHostname": shared::webserver_hostname(&ctx.account, &ctx.region, name),
-            "IamIdentity": shared::account_root_arn(&ctx.region, &ctx.account),
+            "IamIdentity": Arn::global_in(&ctx.region, "iam", &ctx.account, "root").to_string(),
             "AirflowIdentity": "admin",
         }))
     }
@@ -956,6 +956,24 @@ mod tests {
 
         let token = body_json(&s.create_web_login_token(&c, "cn-env").unwrap());
         assert_eq!(token["IamIdentity"], "arn:aws-cn:iam::000000000000:root");
+    }
+
+    #[test]
+    fn update_reports_the_arn_the_environment_was_created_with() {
+        let s = svc();
+        let cn = Ctx {
+            account: "000000000000".into(),
+            region: "cn-north-1".into(),
+        };
+        s.create_environment(&cn, "cn-up", &create_body()).unwrap();
+        let out = body_json(
+            &s.update_environment(&ctx(), "cn-up", &json!({ "MaxWorkers": 3 }))
+                .unwrap(),
+        );
+        assert_eq!(
+            out["Arn"],
+            "arn:aws-cn:airflow:cn-north-1:000000000000:environment/cn-up"
+        );
     }
 
     #[test]

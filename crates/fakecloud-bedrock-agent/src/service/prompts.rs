@@ -18,6 +18,7 @@ impl BedrockAgentService {
             version: "DRAFT".to_string(),
             created_at: now_dt,
             updated_at: now_dt,
+            arn: arn.clone(),
         };
         let mut accts = self.state.write();
         let state = accts.get_or_create(&req.account_id, &req.region);
@@ -87,7 +88,7 @@ impl BedrockAgentService {
         versions.push(pv);
         let arn = format!(
             "{}:{version_num}",
-            prompt_arn(&req.region, &req.account_id, &id)
+            stored_prompt_arn(&prompt, &req.region, &req.account_id)
         );
         let mut out = json!({
             "name": prompt.name,
@@ -172,7 +173,7 @@ impl BedrockAgentService {
                         let mut o = json!({
                             "id": v.prompt_id,
                             "version": v.prompt_version,
-                            "arn": format!("{}:{}", prompt_arn(&req.region, &req.account_id, &v.prompt_id), v.prompt_version),
+                            "arn": format!("{}:{}", prompt_version_base_arn(state, &v.prompt_id, &req.region, &req.account_id), v.prompt_version),
                             "createdAt": v.created_at.to_rfc3339(),
                             "updatedAt": v.updated_at.to_rfc3339(),
                         });
@@ -206,7 +207,7 @@ impl BedrockAgentService {
         let mut out = json!({
             "id": v.prompt_id,
             "version": v.prompt_version,
-            "arn": format!("{}:{}", prompt_arn(&req.region, &req.account_id, &v.prompt_id), v.prompt_version),
+            "arn": format!("{}:{}", prompt_version_base_arn(state, &v.prompt_id, &req.region, &req.account_id), v.prompt_version),
             "createdAt": v.created_at.to_rfc3339(),
             "updatedAt": v.updated_at.to_rfc3339(),
             "variants": v.variants,
