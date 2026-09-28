@@ -392,6 +392,22 @@ impl S3Service {
     /// disables ACLs entirely — every ACL-mutating call must reject
     /// with `AccessControlListNotSupported` so callers don't
     /// silently no-op against a bucket that ignores their grants.
+    /// The canonical user the bucket's ACL is owned by, which is who "bucket
+    /// owner full control" means. Usually the caller, but not always: a bucket
+    /// persisted by one account is hydrated into the configured default account
+    /// on restart while keeping its own stored `acl_owner_id`.
+    ///
+    /// `None` when the bucket is not in memory, which is not an error here --
+    /// the ACL headers are validated before the operation looks the bucket up,
+    /// so the caller falls back to its own id and the missing bucket is reported
+    /// by the operation itself.
+    pub(super) fn bucket_acl_owner_id(&self, account_id: &str, bucket: &str) -> Option<String> {
+        let accts = self.state.read();
+        let state = accts.get(account_id)?;
+        let b = state.buckets.get(bucket)?;
+        Some(b.acl_owner_id.clone())
+    }
+
     pub(super) fn bucket_owner_enforced(&self, account_id: &str, bucket: &str) -> bool {
         let accts = self.state.read();
         let Some(state) = accts.get(account_id) else {
