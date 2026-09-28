@@ -34,6 +34,22 @@ fn require_docker_or_skip(test: &str) -> bool {
 
 const IMAGE: &str = "public.ecr.aws/docker/library/alpine:3.20";
 
+/// Why a job has no exit code, in the words of the job itself.
+///
+/// A container that never started reports `exit_code: None`, which reads as a
+/// Batch bug. The reason is usually one layer down -- an image pull refused
+/// because the registry's anonymous allowance is gone -- and Batch carries it on
+/// the job and its container.
+fn job_failure_detail(job: &aws_sdk_batch::types::JobDetail) -> String {
+    format!(
+        "job status={:?} statusReason={:?} container.reason={:?} attempts={:?}",
+        job.status(),
+        job.status_reason(),
+        job.container().and_then(|c| c.reason()),
+        job.attempts()
+    )
+}
+
 /// Create the CE / JQ / JD (`<name>-*`) with an alpine container running
 /// `command`; no job is submitted.
 async fn setup(batch: &aws_sdk_batch::Client, name: &str, command: Vec<&str>) {
@@ -180,7 +196,12 @@ async fn submit_job_failing_container_fails_the_job() {
     let job_id = run_job(&batch, "bad", vec!["sh", "-c", "exit 7"]).await;
     expect_terminal(&batch, &job_id, "FAILED").await;
     let d = batch.describe_jobs().jobs(&job_id).send().await.unwrap();
-    assert_eq!(d.jobs()[0].container().and_then(|c| c.exit_code()), Some(7));
+    assert_eq!(
+        d.jobs()[0].container().and_then(|c| c.exit_code()),
+        Some(7),
+        "{}",
+        job_failure_detail(&d.jobs()[0])
+    );
 }
 
 #[tokio::test]
@@ -287,7 +308,12 @@ async fn retry_strategy_reattempts_a_failing_job() {
     // Two attempts were made: one recorded retry + the final.
     let d = batch.describe_jobs().jobs(&job_id).send().await.unwrap();
     assert_eq!(d.jobs()[0].attempts().len(), 1);
-    assert_eq!(d.jobs()[0].container().and_then(|c| c.exit_code()), Some(4));
+    assert_eq!(
+        d.jobs()[0].container().and_then(|c| c.exit_code()),
+        Some(4),
+        "{}",
+        job_failure_detail(&d.jobs()[0])
+    );
 }
 
 #[tokio::test]
