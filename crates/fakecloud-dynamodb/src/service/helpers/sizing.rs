@@ -15,8 +15,8 @@ const UPDATE_WRITE_CLAUSE_COST: usize = 19;
 /// UpdateItem's per-clause charge for a `REMOVE`/`DELETE`.
 const UPDATE_REMOVE_CLAUSE_COST: usize = 2;
 
-/// The error a put-shaped write (PutItem, BatchWriteItem, a transacted Put,
-/// PartiQL INSERT) returns for an item over the limit.
+/// The error a put-shaped write (PutItem, BatchWriteItem, a transacted Put)
+/// returns for an item over the limit.
 pub(crate) fn put_item_too_large() -> AwsServiceError {
     AwsServiceError::aws_error(
         StatusCode::BAD_REQUEST,
@@ -25,8 +25,8 @@ pub(crate) fn put_item_too_large() -> AwsServiceError {
     )
 }
 
-/// The error an update-shaped write (UpdateItem, a transacted Update, PartiQL
-/// UPDATE) returns for an item over the limit.
+/// The error an update-shaped write (UpdateItem, a transacted Update) returns
+/// for an item over the limit.
 pub(crate) fn update_item_too_large() -> AwsServiceError {
     AwsServiceError::aws_error(
         StatusCode::BAD_REQUEST,
@@ -46,7 +46,7 @@ pub(crate) fn check_put_item_size(
 }
 
 /// Reject a finished item over 400KB on an update surface that measures the
-/// item flat (a transacted Update, PartiQL UPDATE).
+/// item flat rather than charging per clause (a transacted Update).
 pub(crate) fn check_update_item_size(
     item: &HashMap<String, AttributeValue>,
 ) -> Result<(), AwsServiceError> {

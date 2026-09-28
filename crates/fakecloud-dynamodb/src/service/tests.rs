@@ -7953,3 +7953,104 @@ fn put_item_reports_every_invalid_enum_together() {
     assert_eq!(err.code(), "ValidationException");
     assert!(err.message().starts_with("3 validation errors detected: "));
 }
+
+/// Only the values an update writes are normalized. A number stored in a
+/// non-canonical spelling (written by an older build and restored from its
+/// snapshot) is left alone when the update does not touch it, so it never
+/// shows up in UPDATED_NEW/UPDATED_OLD or a stream MODIFY image as changed.
+#[test]
+fn update_item_normalizes_only_the_values_it_writes() {
+    let svc = make_service();
+    create_test_table(&svc);
+    {
+        let mut accounts = svc.state.write();
+        let state = accounts.get_or_create("123456789012");
+        let table = state.tables.get_mut("test-table").unwrap();
+        let legacy: HashMap<String, Value> = serde_json::from_value(json!({
+            "pk": {"S": "legacy"},
+            "old": {"N": "1.50"},
+        }))
+        .unwrap();
+        table.put_item_at_key(legacy);
+    }
+    let req = make_request(
+        "UpdateItem",
+        json!({
+            "TableName": "test-table",
+            "Key": {"pk": {"S": "legacy"}},
+            "UpdateExpression": "SET n = :v",
+            "ExpressionAttributeValues": {":v": {"N": "+5.0"}},
+            "ReturnValues": "UPDATED_NEW",
+        }),
+    );
+    let b = body_json(&svc.update_item(&req).unwrap());
+    assert_eq!(b["Attributes"], json!({"n": {"N": "5"}}));
+
+    let req = make_request(
+        "GetItem",
+        json!({"TableName": "test-table", "Key": {"pk": {"S": "legacy"}}}),
+    );
+    let item = body_json(&svc.get_item(&req).unwrap())["Item"].clone();
+    assert_eq!(item["old"]["N"], "1.50");
+    assert_eq!(item["n"]["N"], "5");
+
+    // Legacy AttributeUpdates values are normalized the same way.
+    let req = make_request(
+        "UpdateItem",
+        json!({
+            "TableName": "test-table",
+            "Key": {"pk": {"S": "legacy"}},
+            "AttributeUpdates": {"m": {"Value": {"N": "1e2"}, "Action": "PUT"}},
+            "ReturnValues": "UPDATED_OLD",
+        }),
+    );
+    let b = body_json(&svc.update_item(&req).unwrap());
+    assert!(b.get("Attributes").is_none());
+    let req = make_request(
+        "GetItem",
+        json!({"TableName": "test-table", "Key": {"pk": {"S": "legacy"}}}),
+    );
+    let item = body_json(&svc.get_item(&req).unwrap())["Item"].clone();
+    assert_eq!(item["m"]["N"], "100");
+    assert_eq!(item["old"]["N"], "1.50");
+}
+
+/// Without ReturnConsumedCapacity no capacity block is reported by any of
+/// the operations that only size items to build one.
+#[test]
+fn capacity_is_omitted_when_not_requested() {
+    let svc = make_service();
+    create_test_table(&svc);
+    let req = make_request(
+        "BatchWriteItem",
+        json!({"RequestItems": {"test-table": [
+            {"PutRequest": {"Item": {"pk": {"S": "a"}}}},
+            {"PutRequest": {"Item": {"pk": {"S": "b"}}}},
+        ]}}),
+    );
+    assert!(body_json(&svc.batch_write_item(&req).unwrap())
+        .get("ConsumedCapacity")
+        .is_none());
+    let req = make_request(
+        "DeleteItem",
+        json!({"TableName": "test-table", "Key": {"pk": {"S": "a"}}}),
+    );
+    assert!(body_json(&svc.delete_item(&req).unwrap())
+        .get("ConsumedCapacity")
+        .is_none());
+    let req = make_request(
+        "Query",
+        json!({
+            "TableName": "test-table",
+            "KeyConditionExpression": "pk = :p",
+            "ExpressionAttributeValues": {":p": {"S": "b"}},
+        }),
+    );
+    let b = body_json(&svc.query(&req).unwrap());
+    assert_eq!(b["Count"], 1);
+    assert!(b.get("ConsumedCapacity").is_none());
+    let req = make_request("Scan", json!({"TableName": "test-table"}));
+    assert!(body_json(&svc.scan(&req).unwrap())
+        .get("ConsumedCapacity")
+        .is_none());
+}

@@ -1364,13 +1364,19 @@ pub struct DynamoDbSnapshot {
 pub const DYNAMODB_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 
 impl DynamoDbState {
-    /// Build every table's key index. The index is not persisted, so a table
-    /// restored from a snapshot has none, and until something writes to it
-    /// each lookup is a linear scan and each Scan page sorts the whole table.
-    /// Call once after loading a snapshot.
-    pub fn build_key_indexes(&mut self) {
+    /// Rebuild what a snapshot does not carry, or carries from an older
+    /// build. Call once after loading a snapshot.
+    ///
+    /// The key index is not persisted, so a restored table has none, and until
+    /// something writes to it each lookup is a linear scan and each Scan page
+    /// sorts the whole table. `item_count` and `size_bytes` are persisted but
+    /// maintained incrementally, so a snapshot written by a build that sized
+    /// items differently would otherwise leave `TableSizeBytes` drifting (or
+    /// going negative as rows sized under the new rules are removed). Both are
+    /// recomputed from the rows here.
+    pub fn rebuild_derived_state(&mut self) {
         for table in self.tables.values_mut() {
-            table.ensure_key_index();
+            table.recalculate_stats();
         }
     }
 
@@ -2315,7 +2321,7 @@ mod tests {
     }
 
     #[test]
-    fn build_key_indexes_after_snapshot_load() {
+    fn snapshot_load_builds_key_indexes() {
         let mut state = DynamoDbState::new("123456789012", "us-east-1");
         let mut t = table_with_hash_key("pk");
         t.put_item_at_key(mk_pk("a"));
@@ -2323,11 +2329,29 @@ mod tests {
         let json = serde_json::to_string(&state).unwrap();
         let mut restored: DynamoDbState = serde_json::from_str(&json).unwrap();
         assert!(matches!(restored.tables["t"].key_index, KeyIndex::Unbuilt));
-        restored.build_key_indexes();
+        restored.rebuild_derived_state();
         assert!(matches!(
             restored.tables["t"].key_index,
             KeyIndex::Built { rows: 1, .. }
         ));
+    }
+
+    /// A snapshot from a build that sized items differently carries a stale
+    /// `size_bytes`; loading it recomputes the figure from the rows.
+    #[test]
+    fn snapshot_load_recomputes_table_size() {
+        let mut state = DynamoDbState::new("123456789012", "us-east-1");
+        let mut t = table_with_hash_key("pk");
+        t.put_item_at_key(mk_pk("a"));
+        let expected = t.size_bytes;
+        t.size_bytes = 999_999;
+        t.item_count = 42;
+        state.tables.insert("t".to_string(), t);
+        let json = serde_json::to_string(&state).unwrap();
+        let mut restored: DynamoDbState = serde_json::from_str(&json).unwrap();
+        restored.rebuild_derived_state();
+        assert_eq!(restored.tables["t"].size_bytes, expected);
+        assert_eq!(restored.tables["t"].item_count, 1);
     }
 
     /// Within a partition, a Scan returns rows in sort-key order, as DynamoDB

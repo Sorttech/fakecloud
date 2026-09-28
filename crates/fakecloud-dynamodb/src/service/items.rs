@@ -9,9 +9,9 @@ use super::{
     apply_update_expression, build_capacity, build_consumed_capacity,
     build_item_collection_metrics, check_put_item_size, evaluate_condition_with_return,
     extract_key, get_table, get_table_mut, item_size, item_write_consumed, normalize_item_numbers,
-    ns_members_equal, parse_expression_attribute_names, parse_expression_attribute_values,
-    project_item, read_units, require_object, require_str, resolve_write_condition,
-    return_consumed_mode, return_icm_mode, validate_attribute_value,
+    normalize_value_numbers, ns_members_equal, parse_expression_attribute_names,
+    parse_expression_attribute_values, project_item, read_units, require_object, require_str,
+    resolve_write_condition, return_consumed_mode, return_icm_mode, validate_attribute_value,
     validate_item_attribute_values, validate_key_attributes_in_key, validate_key_in_item,
     validate_request_enums, AttributeValue, CapacitySplit, Consumed, DynamoDbService, UpdateCharge,
     RETURN_CONSUMED_CAPACITY_VALUES, RETURN_ITEM_COLLECTION_METRICS_VALUES, RETURN_VALUES,
@@ -320,7 +320,8 @@ impl DynamoDbService {
             let mut result = json!({});
             let mut kinesis_info = None;
             let return_consumed = body["ReturnConsumedCapacity"].as_str().unwrap_or("NONE");
-            let consumed = item_write_consumed(table, existing_idx.map(|i| &table.items[i]), None);
+            let consumed = (return_consumed != "NONE")
+                .then(|| item_write_consumed(table, existing_idx.map(|i| &table.items[i]), None));
 
             if let Some(idx) = existing_idx {
                 let old_item = table.items[idx].clone();
@@ -354,9 +355,12 @@ impl DynamoDbService {
                 .as_str()
                 .unwrap_or("NONE");
 
-            let cc = build_capacity(return_consumed, table_name, &consumed, CapacitySplit::None);
-            if !cc.is_null() {
-                result["ConsumedCapacity"] = cc;
+            if let Some(consumed) = consumed {
+                let cc =
+                    build_capacity(return_consumed, table_name, &consumed, CapacitySplit::None);
+                if !cc.is_null() {
+                    result["ConsumedCapacity"] = cc;
+                }
             }
 
             let icm = build_item_collection_metrics(return_icm, table, &key);
@@ -423,6 +427,24 @@ impl DynamoDbService {
                 }
             }
         }
+        // Numbers are stored in canonical form, so the values this update
+        // writes are normalized on the way in. Only those: the rest of the
+        // stored row is left exactly as it is, so an attribute the update
+        // does not touch never shows up as changed.
+        for v in expr_attr_values.values_mut() {
+            normalize_value_numbers(v);
+        }
+        let attribute_updates = body["AttributeUpdates"]
+            .as_object()
+            .cloned()
+            .map(|mut updates| {
+                for upd in updates.values_mut() {
+                    if let Some(v) = upd.get_mut("Value") {
+                        normalize_value_numbers(v);
+                    }
+                }
+                updates
+            });
 
         let existing_idx = table.find_item_index(&key);
 
@@ -447,6 +469,7 @@ impl DynamoDbService {
                 for (k, v) in &key {
                     new_item.insert(k.clone(), v.clone());
                 }
+                normalize_item_numbers(&mut new_item);
                 // Registers the row in the key index and the stats; the
                 // attribute updates below then mutate it in place through
                 // `update_item_at`, which settles the deltas.
@@ -484,7 +507,7 @@ impl DynamoDbService {
         // (a type error on a later operand) with earlier clauses already
         // written -- possibly a rewritten key. `update_item_at` puts the row
         // back as it was, so a rejected UpdateItem changes nothing, as on AWS.
-        let charge = match (update_expression, body["AttributeUpdates"].as_object()) {
+        let charge = match (update_expression, attribute_updates.as_ref()) {
             (Some(expr), _) => UpdateCharge::for_expression(expr, &expr_attr_names),
             (None, Some(updates)) => UpdateCharge::for_attribute_updates(updates),
             (None, None) => UpdateCharge::default(),
@@ -492,7 +515,7 @@ impl DynamoDbService {
         let applied = table.update_item_at(idx, |item| {
             if let Some(expr) = update_expression {
                 apply_update_expression(item, expr, &expr_attr_names, &expr_attr_values)?;
-            } else if let Some(updates) = body["AttributeUpdates"].as_object() {
+            } else if let Some(updates) = attribute_updates.as_ref() {
                 // Legacy AttributeUpdates (pre-2014 UpdateItem), still emitted by
                 // the AWS SDK for Java v1, older boto3, and the Terraform provider.
                 // Without this an UpdateItem using AttributeUpdates wrote nothing and
@@ -500,7 +523,6 @@ impl DynamoDbService {
                 // (bug-audit 2026-06-20, 1.2).
                 apply_attribute_updates(item, updates)?;
             }
-            normalize_item_numbers(item);
             charge.check(item)
         });
         if let Err(err) = applied {

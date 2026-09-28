@@ -285,7 +285,10 @@ impl DynamoDbService {
                 });
 
         let scanned_count = matched.len();
-        let consumed = read_consumed(table, index_name, &matched, consistent_read);
+        // Sizing the examined rows (projecting each one for an index read) is
+        // only worth doing when the caller asked for the figure.
+        let consumed = (return_consumed != "NONE")
+            .then(|| read_consumed(table, index_name, &matched, consistent_read));
 
         if let Some(filter) = filter_expression.as_deref() {
             matched.retain(|item| {
@@ -366,9 +369,11 @@ impl DynamoDbService {
             result["LastEvaluatedKey"] = json!(lek);
         }
 
-        let cc = build_capacity(&return_consumed, table_name, &consumed, CapacitySplit::None);
-        if !cc.is_null() {
-            result["ConsumedCapacity"] = cc;
+        if let Some(consumed) = consumed {
+            let cc = build_capacity(&return_consumed, table_name, &consumed, CapacitySplit::None);
+            if !cc.is_null() {
+                result["ConsumedCapacity"] = cc;
+            }
         }
 
         drop(accounts);
@@ -557,7 +562,10 @@ impl DynamoDbService {
                 });
 
         let scanned_count = matched.len();
-        let consumed = read_consumed(table, index_name, &matched, consistent_read);
+        // Sizing the examined rows (projecting each one for an index read) is
+        // only worth doing when the caller asked for the figure.
+        let consumed = (return_consumed != "NONE")
+            .then(|| read_consumed(table, index_name, &matched, consistent_read));
 
         if let Some(filter) = filter_expression.as_deref() {
             matched.retain(|item| {
@@ -638,9 +646,11 @@ impl DynamoDbService {
             result["LastEvaluatedKey"] = json!(lek);
         }
 
-        let cc = build_capacity(&return_consumed, table_name, &consumed, CapacitySplit::None);
-        if !cc.is_null() {
-            result["ConsumedCapacity"] = cc;
+        if let Some(consumed) = consumed {
+            let cc = build_capacity(&return_consumed, table_name, &consumed, CapacitySplit::None);
+            if !cc.is_null() {
+                result["ConsumedCapacity"] = cc;
+            }
         }
 
         drop(accounts);

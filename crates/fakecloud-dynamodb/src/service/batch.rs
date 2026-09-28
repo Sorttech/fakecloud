@@ -22,7 +22,7 @@ type PendingKinesis = (
 use super::{
     apply_update_expression, build_capacity, check_put_item_size, check_update_item_size,
     evaluate_condition, extract_key, get_table, get_table_mut, item_size, item_write_consumed,
-    keys_equal, normalize_item_numbers, parse_expression_attribute_names,
+    keys_equal, normalize_item_numbers, normalize_value_numbers, parse_expression_attribute_names,
     parse_expression_attribute_values, read_units, return_consumed_mode, return_icm_mode,
     validate_attribute_value, validate_item_attribute_values, validate_key_attributes_in_key,
     validate_key_in_item, write_units, CapacitySplit, Consumed, DynamoDbService,
@@ -309,6 +309,9 @@ impl DynamoDbService {
                 )
             })?;
 
+            // Sizing each write (and projecting it into every index) is only
+            // worth doing when the caller asked for the figure.
+            let wants_capacity = return_consumed != "NONE";
             let mut consumed = Consumed::default();
             let mut keys_for_icm: Vec<HashMap<String, AttributeValue>> = Vec::new();
             for request in reqs {
@@ -318,17 +321,21 @@ impl DynamoDbService {
                     normalize_item_numbers(&mut item);
                     let key = extract_key(table, &item);
                     keys_for_icm.push(key.clone());
-                    table.ensure_key_index();
-                    let old = table.find_item_index(&key).map(|i| &table.items[i]);
-                    consumed.add(&item_write_consumed(table, old, Some(&item)));
+                    if wants_capacity {
+                        table.ensure_key_index();
+                        let old = table.find_item_index(&key).map(|i| &table.items[i]);
+                        consumed.add(&item_write_consumed(table, old, Some(&item)));
+                    }
                     table.put_item_at_key(item);
                 } else if let Some(del_req) = request.get("DeleteRequest") {
                     let key: HashMap<String, AttributeValue> =
                         serde_json::from_value(del_req["Key"].clone()).unwrap_or_default();
                     keys_for_icm.push(key.clone());
-                    table.ensure_key_index();
-                    let old = table.find_item_index(&key).map(|i| &table.items[i]);
-                    consumed.add(&item_write_consumed(table, old, None));
+                    if wants_capacity {
+                        table.ensure_key_index();
+                        let old = table.find_item_index(&key).map(|i| &table.items[i]);
+                        consumed.add(&item_write_consumed(table, old, None));
+                    }
                     table.remove_item_by_key(&key);
                 }
             }
@@ -738,6 +745,7 @@ impl DynamoDbService {
         // results costs when an idempotent retry replays the transaction.
         let mut per_table_consumed: HashMap<String, Consumed> = HashMap::new();
         let mut per_table_replay: HashMap<String, f64> = HashMap::new();
+        let wants_capacity = return_consumed != "NONE";
 
         let push_cond_failure =
             |reasons: &mut Vec<Value>,
@@ -938,12 +946,14 @@ impl DynamoDbService {
                     let key = extract_key(table, &item);
                     let old_image = table.find_item_index(&key).map(|i| table.items[i].clone());
                     let is_modify = old_image.is_some();
-                    per_table_consumed
-                        .entry(table_name.to_string())
-                        .or_default()
-                        .add(&item_write_consumed(table, old_image.as_ref(), Some(&item)));
-                    *per_table_replay.entry(table_name.to_string()).or_default() +=
-                        2.0 * read_units(item_size(&item), true);
+                    if wants_capacity {
+                        per_table_consumed
+                            .entry(table_name.to_string())
+                            .or_default()
+                            .add(&item_write_consumed(table, old_image.as_ref(), Some(&item)));
+                        *per_table_replay.entry(table_name.to_string()).or_default() +=
+                            2.0 * read_units(item_size(&item), true);
+                    }
                     table.put_item_at_key(item.clone());
                     let event_name = if is_modify { "MODIFY" } else { "INSERT" };
                     if let Some(record) = crate::streams::generate_stream_record(
@@ -974,12 +984,14 @@ impl DynamoDbService {
                         get_table_mut(tables_of_mut(&mut accounts, req, table_name), table_name)
                             .map_err(|e| (op_idx, e))?;
                     let old_image = table.find_item_index(&key).map(|i| table.items[i].clone());
-                    per_table_consumed
-                        .entry(table_name.to_string())
-                        .or_default()
-                        .add(&item_write_consumed(table, old_image.as_ref(), None));
-                    *per_table_replay.entry(table_name.to_string()).or_default() +=
-                        2.0 * read_units(old_image.as_ref().map_or(0, item_size), true);
+                    if wants_capacity {
+                        per_table_consumed
+                            .entry(table_name.to_string())
+                            .or_default()
+                            .add(&item_write_consumed(table, old_image.as_ref(), None));
+                        *per_table_replay.entry(table_name.to_string()).or_default() +=
+                            2.0 * read_units(old_image.as_ref().map_or(0, item_size), true);
+                    }
                     table.remove_item_by_key(&key);
                     if old_image.is_some() {
                         if let Some(record) = crate::streams::generate_stream_record(
@@ -1009,7 +1021,12 @@ impl DynamoDbService {
                         serde_json::from_value(update["Key"].clone()).unwrap_or_default();
                     let update_expression = update["UpdateExpression"].as_str();
                     let expr_attr_names = parse_expression_attribute_names(update);
-                    let expr_attr_values = parse_expression_attribute_values(update);
+                    let mut expr_attr_values = parse_expression_attribute_values(update);
+                    // Only the values the update writes are normalized; the
+                    // rest of the stored row is left as it is.
+                    for v in expr_attr_values.values_mut() {
+                        normalize_value_numbers(v);
+                    }
 
                     let table =
                         get_table_mut(tables_of_mut(&mut accounts, req, table_name), table_name)
@@ -1028,6 +1045,7 @@ impl DynamoDbService {
                             for (k, v) in &key {
                                 new_item.insert(k.clone(), v.clone());
                             }
+                            normalize_item_numbers(&mut new_item);
                             table.put_item_at_key(new_item).0
                         }
                     };
@@ -1046,21 +1064,22 @@ impl DynamoDbService {
                                     &expr_attr_values,
                                 )?;
                             }
-                            normalize_item_numbers(item);
                             check_update_item_size(item)
                         })
                         .map_err(|e| (op_idx, e))?;
                     let new_image = table.items[idx].clone();
-                    per_table_consumed
-                        .entry(table_name.to_string())
-                        .or_default()
-                        .add(&item_write_consumed(
-                            table,
-                            old_image.as_ref(),
-                            Some(&new_image),
-                        ));
-                    *per_table_replay.entry(table_name.to_string()).or_default() +=
-                        2.0 * read_units(item_size(&new_image), true);
+                    if wants_capacity {
+                        per_table_consumed
+                            .entry(table_name.to_string())
+                            .or_default()
+                            .add(&item_write_consumed(
+                                table,
+                                old_image.as_ref(),
+                                Some(&new_image),
+                            ));
+                        *per_table_replay.entry(table_name.to_string()).or_default() +=
+                            2.0 * read_units(item_size(&new_image), true);
+                    }
                     let event_name = if is_modify { "MODIFY" } else { "INSERT" };
                     if let Some(record) = crate::streams::generate_stream_record(
                         table,
@@ -1082,7 +1101,7 @@ impl DynamoDbService {
                         ));
                     }
                     *per_table_writes.entry(table_name.to_string()).or_insert(0) += 1;
-                } else if let Some(check) = ti.get("ConditionCheck") {
+                } else if let Some(check) = ti.get("ConditionCheck").filter(|_| wants_capacity) {
                     // No write, but a ConditionCheck is billed as a
                     // transactional write of the item it checks.
                     let table_name = check["TableName"].as_str().unwrap_or_default();
