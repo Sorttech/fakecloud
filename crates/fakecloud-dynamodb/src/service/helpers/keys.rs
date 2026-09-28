@@ -113,12 +113,20 @@ pub(crate) fn validate_item_attribute_values(
 /// Reject an empty DynamoDB set (`SS`/`NS`/`BS`). AWS returns a
 /// `ValidationException` — storing an empty set corrupts later
 /// `ADD`/`DELETE`/`size()` semantics.
+///
+/// The wording is AWS's own, quirks included: string and number sets share a
+/// template with a doubled space, binary sets have a message of their own.
 fn validate_set_not_empty(kind: &str, is_empty: bool) -> Result<(), AwsServiceError> {
     if is_empty {
+        let detail = if kind == "binary" {
+            "Binary sets should not be empty".to_string()
+        } else {
+            format!("An {kind} set  may not be empty")
+        };
         return Err(AwsServiceError::aws_error(
             StatusCode::BAD_REQUEST,
             "ValidationException",
-            format!("One or more parameter values were invalid: An {kind} set may not be empty"),
+            format!("One or more parameter values were invalid: {detail}"),
         ));
     }
     Ok(())
@@ -158,15 +166,21 @@ pub(crate) fn validate_attribute_value(v: &Value) -> Result<(), AwsServiceError>
             "Attempting to store more than 38 significant digits in a Number",
         )
     };
-    match tag.as_str() {
-        "N" => {
-            let s = val.as_str().unwrap_or_default();
-            match significant_digit_count(s) {
-                None => return Err(bad_number(s)),
-                Some(digits) if digits > MAX_SIGNIFICANT_DIGITS => return Err(too_many_digits()),
-                Some(_) => {}
-            }
+    // A number is a bare decimal literal: whitespace anywhere in it is
+    // rejected rather than trimmed away. Past the digit limit, the magnitude
+    // must also sit inside the supported range.
+    let check_number = |s: &str| -> Result<(), AwsServiceError> {
+        if s.chars().any(char::is_whitespace) {
+            return Err(bad_number(s));
         }
+        match significant_digit_count(s) {
+            None => Err(bad_number(s)),
+            Some(digits) if digits > MAX_SIGNIFICANT_DIGITS => Err(too_many_digits()),
+            Some(_) => check_number_range(s),
+        }
+    };
+    match tag.as_str() {
+        "N" => check_number(val.as_str().unwrap_or_default())?,
         "SS" => {
             let members: Vec<&str> = val
                 .as_array()
@@ -192,13 +206,7 @@ pub(crate) fn validate_attribute_value(v: &Value) -> Result<(), AwsServiceError>
             validate_set_not_empty("number", members.is_empty())?;
             let mut seen = std::collections::HashSet::new();
             for s in &members {
-                match significant_digit_count(s) {
-                    None => return Err(bad_number(s)),
-                    Some(digits) if digits > MAX_SIGNIFICANT_DIGITS => {
-                        return Err(too_many_digits())
-                    }
-                    Some(_) => {}
-                }
+                check_number(s)?;
                 // Number-set members are deduped by numeric value, so `"1"` and
                 // `"1.0"` collide. `canonical_number` never returns `None` here
                 // because `is_valid_number` already passed.
@@ -479,18 +487,16 @@ mod attr_value_validation_tests {
 
     #[test]
     fn rejects_empty_sets() {
-        for (v, kind) in [
-            (json!({"SS": []}), "string"),
-            (json!({"NS": []}), "number"),
-            (json!({"BS": []}), "binary"),
+        for (v, message) in [
+            (json!({"SS": []}), "An string set  may not be empty"),
+            (json!({"NS": []}), "An number set  may not be empty"),
+            (json!({"BS": []}), "Binary sets should not be empty"),
         ] {
             let err = err_of(v);
             assert_eq!(err.code(), "ValidationException");
-            assert!(
-                err.message()
-                    .contains(&format!("An {kind} set may not be empty")),
-                "unexpected message for {kind}: {}",
-                err.message()
+            assert_eq!(
+                err.message(),
+                format!("One or more parameter values were invalid: {message}")
             );
         }
     }
