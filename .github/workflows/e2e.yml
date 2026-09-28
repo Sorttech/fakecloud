@@ -208,6 +208,40 @@ jobs:
             podman system prune -af || true
           fi
 
+      # Container-backed tests (ECS, Batch, CodeBuild, EC2) run Docker Official
+      # Images by their ECR Public name. ECR Public caps anonymous pulls per
+      # source IP ("toomanyrequests: Data limit exceeded"), and shared runner
+      # IPs exhaust it, failing whole partitions on an image the test never
+      # gets to run. Seed the local cache from Google's Docker Hub mirror (the
+      # same official images, no anonymous data cap) under the ECR Public name;
+      # fakecloud uses a cached image without pulling. ECR Public stays the
+      # fallback, and a partition that fails to warm an image still runs:
+      # fakecloud's own pull, with retries, is the last resort.
+      - name: Warm Docker Official Images
+        run: |
+          images="alpine:3.20 alpine:3.19 ubuntu:22.04 nginx:alpine"
+          clis=docker
+          if [ "$INSTALL_PODMAN" = "true" ]; then clis="docker podman"; fi
+          for cli in $clis; do
+            for img in $images; do
+              target="public.ecr.aws/docker/library/$img"
+              ok=
+              for attempt in 1 2 3; do
+                if $cli pull -q "mirror.gcr.io/library/$img" \
+                  && $cli tag "mirror.gcr.io/library/$img" "$target"; then
+                  ok=1; break
+                fi
+                if $cli pull -q "$target"; then ok=1; break; fi
+                sleep $((attempt * 10))
+              done
+              if [ -n "$ok" ]; then
+                echo "$cli: warmed $target"
+              else
+                echo "::warning::$cli could not warm $target; tests will pull it themselves"
+              fi
+            done
+          done
+
       - name: Download fakecloud binary
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
