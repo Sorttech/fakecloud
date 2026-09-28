@@ -6,28 +6,42 @@
 //! and so the parameter-definition parser has a single implementation shared by
 //! `CreateApplication`, `CreateApplicationVersion`, and `GetApplication`.
 
+use fakecloud_aws::arn::{partition_for, Arn};
 use serde_json::{json, Map, Value};
 
 /// The application ARN,
-/// `arn:aws:serverlessrepo:{region}:{account}:applications/{name}`. In SAR the
-/// ARN *is* the `applicationId`.
+/// `arn:<partition>:serverlessrepo:{region}:{account}:applications/{name}`. In
+/// SAR the ARN *is* the `applicationId`.
 pub fn application_arn(region: &str, account: &str, name: &str) -> String {
-    format!("arn:aws:serverlessrepo:{region}:{account}:applications/{name}")
+    Arn::regional(
+        "serverlessrepo",
+        region,
+        account,
+        &format!("applications/{name}"),
+    )
+    .to_string()
 }
 
 /// A CloudFormation change-set id, `{stack}-{uuid}` shaped like the value
 /// `CreateCloudFormationChangeSet` returns.
-pub fn new_change_set_id() -> String {
-    format!("arn:aws:cloudformation:changeSet/{}", uuid::Uuid::new_v4())
+pub fn new_change_set_id(region: &str) -> String {
+    format!(
+        "arn:{}:cloudformation:changeSet/{}",
+        partition_for(region),
+        uuid::Uuid::new_v4()
+    )
 }
 
 /// A CloudFormation stack id ARN of the form AWS mints for a SAR-launched
 /// stack.
 pub fn stack_id(region: &str, account: &str, stack_name: &str) -> String {
-    format!(
-        "arn:aws:cloudformation:{region}:{account}:stack/{stack_name}/{}",
-        uuid::Uuid::new_v4()
+    Arn::regional(
+        "cloudformation",
+        region,
+        account,
+        &format!("stack/{stack_name}/{}", uuid::Uuid::new_v4()),
     )
+    .to_string()
 }
 
 /// A CloudFormation template id (an opaque UUID).

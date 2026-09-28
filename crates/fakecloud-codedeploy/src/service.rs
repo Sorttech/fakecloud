@@ -18,6 +18,7 @@ use serde_json::{json, Map, Value};
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::pagination::paginate_checked;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_persistence::SnapshotStore;
@@ -417,16 +418,41 @@ fn is_codedeploy_arn(s: &str) -> bool {
     )
 }
 
-fn application_arn(region: &str, account: &str, name: &str) -> String {
-    format!("arn:aws:codedeploy:{region}:{account}:application:{name}")
+/// `arn:<partition>:codedeploy:<region>:<account>:application:<name>`.
+pub fn application_arn(region: &str, account: &str, name: &str) -> String {
+    Arn::regional(
+        "codedeploy",
+        region,
+        account,
+        &format!("application:{name}"),
+    )
+    .to_string()
 }
 
-fn deployment_group_arn(region: &str, account: &str, app: &str, group: &str) -> String {
-    format!("arn:aws:codedeploy:{region}:{account}:deploymentgroup:{app}/{group}")
+/// `arn:<partition>:codedeploy:<region>:<account>:deploymentgroup:<app>/<group>`.
+pub fn deployment_group_arn(region: &str, account: &str, app: &str, group: &str) -> String {
+    Arn::regional(
+        "codedeploy",
+        region,
+        account,
+        &format!("deploymentgroup:{app}/{group}"),
+    )
+    .to_string()
 }
 
-fn deployment_config_arn(region: &str, account: &str, name: &str) -> String {
-    format!("arn:aws:codedeploy:{region}:{account}:deploymentconfig:{name}")
+/// `arn:<partition>:codedeploy:<region>:<account>:deploymentconfig:<name>`.
+pub fn deployment_config_arn(region: &str, account: &str, name: &str) -> String {
+    Arn::regional(
+        "codedeploy",
+        region,
+        account,
+        &format!("deploymentconfig:{name}"),
+    )
+    .to_string()
+}
+
+fn instance_arn(region: &str, account: &str, name: &str) -> String {
+    Arn::regional("codedeploy", region, account, &format!("instance/{name}")).to_string()
 }
 
 fn opt_enum(
@@ -2007,7 +2033,7 @@ impl CodeDeployService {
                 format!("The specified on-premises instance name is already registered: {name}"),
             ));
         }
-        let instance_arn = format!("arn:aws:codedeploy:{region}:{account}:instance/{name}");
+        let instance_arn = instance_arn(&region, &account, &name);
         let mut info = Map::new();
         info.insert("instanceName".into(), json!(name));
         info.insert("instanceArn".into(), json!(instance_arn));
@@ -3110,6 +3136,27 @@ mod tests {
             .as_array()
             .cloned()
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn application_arn_carries_china_partition() {
+        let s = svc();
+        let cn = |action: &str, body: Value| {
+            let mut r = req(action, body);
+            r.region = "cn-north-1".to_string();
+            r
+        };
+        s.create_application(&cn(
+            "CreateApplication",
+            json!({ "applicationName": "cnapp", "tags": [{ "Key": "env", "Value": "prod" }] }),
+        ))
+        .unwrap();
+        let arn = "arn:aws-cn:codedeploy:cn-north-1:000000000000:application:cnapp";
+        let tags = body_of(
+            s.list_tags_for_resource(&cn("ListTagsForResource", json!({ "ResourceArn": arn })))
+                .unwrap(),
+        );
+        assert_eq!(tags["Tags"][0]["Value"], "prod");
     }
 
     // T1.1: CreateApplication persists its create-time `tags` so

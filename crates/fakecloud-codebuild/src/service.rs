@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 
+use fakecloud_aws::arn::{arn_resource, Arn};
 use fakecloud_core::delivery::S3Delivery;
 use fakecloud_core::pagination::paginate_checked;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
@@ -392,7 +393,12 @@ fn str_list(b: &Value, key: &str) -> Vec<String> {
 }
 
 fn arn(region: &str, account: &str, resource: &str) -> String {
-    format!("arn:aws:codebuild:{region}:{account}:{resource}")
+    Arn::regional("codebuild", region, account, resource).to_string()
+}
+
+/// `arn:<partition>:codebuild:<region>:<account>:project/<name>`.
+pub fn project_arn(region: &str, account: &str, name: &str) -> String {
+    arn(region, account, &format!("project/{name}"))
 }
 
 /// Validate a required string field is present and within `[min, max]`
@@ -733,7 +739,7 @@ impl CodeBuildService {
         let name = req_len(&b, "name", 2, 150)?;
         check_name_pattern("name", &name)?;
         let (region, account) = self.region_account(req);
-        let arn_str = arn(&region, &account, &format!("project/{name}"));
+        let arn_str = project_arn(&region, &account, &name);
         let now = Utc::now();
         let mut guard = self.state.write();
         let st = guard.get_or_create(&account);
@@ -1110,14 +1116,14 @@ fn resolve_env_value(
 
 /// Split a CodeBuild `SECRETS_MANAGER` env `value` into a secret reference (bare
 /// name or full ARN) and an optional json key. Because a full secret ARN
-/// (`arn:aws:secretsmanager:region:account:secret:name-suffix`) contains colons,
+/// (`arn:<partition>:secretsmanager:region:account:secret:name-suffix`) contains colons,
 /// a naive `split_once(':')` would truncate the ARN at `arn`. Secret names never
 /// contain `:`, so for a non-ARN input the first colon (if any) separates the
 /// json key; for an ARN input the json key is only the 8th colon-delimited
 /// segment (everything up to and including `secret:name-suffix` is the ARN).
 fn split_secret_ref(value: &str) -> (String, Option<String>) {
-    if value.starts_with("arn:aws:secretsmanager:") {
-        // arn(0) aws(1) secretsmanager(2) region(3) account(4) secret(5)
+    if arn_resource(value, "secretsmanager").is_some() {
+        // arn(0) partition(1) secretsmanager(2) region(3) account(4) secret(5)
         // name-suffix(6) [json-key(7)]
         let parts: Vec<&str> = value.splitn(8, ':').collect();
         if parts.len() >= 7 {
@@ -1163,7 +1169,7 @@ fn find_secret<'a>(
     if let Some(secret) = st.secrets.get(secret_ref) {
         return Some(secret);
     }
-    if secret_ref.starts_with("arn:aws:secretsmanager:") {
+    if arn_resource(secret_ref, "secretsmanager").is_some() {
         for secret in st.secrets.values() {
             if secret.arn == secret_ref || secret.arn.starts_with(secret_ref) {
                 return Some(secret);
@@ -2496,7 +2502,7 @@ impl CodeBuildService {
         opt_len(&b, "username", 1, usize::MAX)?;
         let (region, account) = self.region_account(req);
         // AWS renders the server type lowercase in the token ARN
-        // (`arn:aws:codebuild:...:token/github`) even though the `serverType`
+        // (`arn:<partition>:codebuild:...:token/github`) even though the `serverType`
         // field echoes the uppercase enum value.
         let arn_str = arn(
             &region,
@@ -3794,6 +3800,27 @@ mod tests {
         assert_eq!(
             split_secret_ref("mysecret:username"),
             ("mysecret".to_string(), Some("username".to_string()))
+        );
+    }
+
+    #[test]
+    fn project_arn_carries_china_partition() {
+        let s = svc();
+        let mut r = req("CreateProject", minimal_project("cnp"));
+        r.region = "cn-north-1".to_string();
+        let out = body_of(s.create_project(&r).unwrap());
+        assert_eq!(
+            out["project"]["arn"],
+            "arn:aws-cn:codebuild:cn-north-1:000000000000:project/cnp"
+        );
+    }
+
+    #[test]
+    fn split_secret_ref_china_arn_and_key() {
+        let arn = "arn:aws-cn:secretsmanager:cn-north-1:000000000000:secret:prod-config-AbCdEf";
+        assert_eq!(
+            split_secret_ref(&format!("{arn}:password")),
+            (arn.to_string(), Some("password".to_string()))
         );
     }
 

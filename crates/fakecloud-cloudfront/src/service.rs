@@ -11,6 +11,7 @@ use parking_lot::RwLock;
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError, ResponseBody};
 use fakecloud_persistence::SnapshotStore;
 
@@ -614,7 +615,7 @@ impl AwsService for CloudFrontService {
             "ListDomainConflicts" => self.list_domain_conflicts(&req),
             "UpdateDomainAssociation" => self.update_domain_association(&req),
             "VerifyDnsConfiguration" => self.verify_dns_configuration(&req),
-            "GetManagedCertificateDetails" => self.get_managed_certificate_details(&resolved),
+            "GetManagedCertificateDetails" => self.get_managed_certificate_details(&req, &resolved),
             "UpdateDistributionWithStagingConfig" => {
                 self.update_distribution_with_staging_config(&req, &resolved)
             }
@@ -719,11 +720,7 @@ impl CloudFrontService {
         let now = Utc::now();
         let etag = generate_etag();
         let domain = format!("{}.cloudfront.net", id.to_lowercase());
-        let arn = format!(
-            "arn:aws:cloudfront::{}:distribution/{}",
-            account_id(req),
-            id
-        );
+        let arn = distribution_arn(&req.region, account_id(req), &id);
 
         let stored = StoredDistribution {
             id: id.clone(),
@@ -1277,11 +1274,7 @@ impl CloudFrontService {
         config.staging = parsed.staging;
         let now = Utc::now();
         let etag = generate_etag();
-        let arn = format!(
-            "arn:aws:cloudfront::{}:distribution/{}",
-            account_id(req),
-            new_id
-        );
+        let arn = distribution_arn(&req.region, account_id(req), &new_id);
         let stored = StoredDistribution {
             id: new_id.clone(),
             arn: arn.clone(),
@@ -2151,6 +2144,17 @@ fn configs_equal(lhs: &DistributionConfig, rhs: &DistributionConfig) -> bool {
     a == b
 }
 
+/// A CloudFront ARN. CloudFront is global, so the ARN has no region; its
+/// partition comes from the request region.
+pub fn cloudfront_arn(region: &str, account: &str, resource: &str) -> String {
+    Arn::global_in(region, "cloudfront", account, resource).to_string()
+}
+
+/// `arn:<partition>:cloudfront::<account>:distribution/<id>`.
+pub fn distribution_arn(region: &str, account: &str, id: &str) -> String {
+    cloudfront_arn(region, account, &format!("distribution/{id}"))
+}
+
 fn account_id(_req: &AwsRequest) -> &'static str {
     // Multi-account is wired through AwsRequest.account_id elsewhere; the
     // CloudFront control plane only uses the resolved id for the ARN
@@ -2568,6 +2572,64 @@ mod tests {
         del_req.headers.insert(IF_MATCH, new_etag.parse().unwrap());
         let del = svc.handle(del_req).await.unwrap();
         assert_eq!(del.status, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn distribution_arn_carries_china_partition() {
+        let svc = CloudFrontService::new(make_state());
+        let cn = |method: http::Method, path: &str, query: &str, body: &str| {
+            let mut r = make_request(method, path, query, body);
+            r.region = "cn-north-1".into();
+            r
+        };
+        let create = svc
+            .handle(cn(
+                http::Method::POST,
+                "/2020-05-31/distribution",
+                "",
+                &minimal_dist_config_xml("cn-ref"),
+            ))
+            .await
+            .unwrap();
+        let xml = std::str::from_utf8(create.body.expect_bytes())
+            .unwrap()
+            .to_string();
+        let arn = xml
+            .split("<ARN>")
+            .nth(1)
+            .unwrap()
+            .split("</ARN>")
+            .next()
+            .unwrap()
+            .to_string();
+        let id = xml
+            .split("<Id>")
+            .nth(1)
+            .unwrap()
+            .split("</Id>")
+            .next()
+            .unwrap();
+        assert_eq!(
+            arn,
+            format!("arn:aws-cn:cloudfront::{DEFAULT_ACCOUNT}:distribution/{id}")
+        );
+
+        let tags = r#"<Tags xmlns="http://cloudfront.amazonaws.com/doc/2020-05-31/"><Items><Tag><Key>env</Key><Value>prod</Value></Tag></Items></Tags>"#;
+        let query = format!("Operation=Tag&Resource={arn}");
+        svc.handle(cn(http::Method::POST, "/2020-05-31/tagging", &query, tags))
+            .await
+            .unwrap();
+        let listed = svc
+            .handle(cn(
+                http::Method::GET,
+                "/2020-05-31/tagging",
+                &format!("Resource={arn}"),
+                "",
+            ))
+            .await
+            .unwrap();
+        let listed = std::str::from_utf8(listed.body.expect_bytes()).unwrap();
+        assert!(listed.contains("<Value>prod</Value>"), "{listed}");
     }
 
     async fn create_distribution_returning_id(svc: &CloudFrontService, caller_ref: &str) -> String {

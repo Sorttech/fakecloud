@@ -428,9 +428,10 @@ impl CloudFrontService {
             .accounts
             .entry(DEFAULT_ACCOUNT.to_string())
             .or_default();
-        let arn = format!(
-            "arn:aws:cloudfront::{}:realtime-log-config/{}",
-            DEFAULT_ACCOUNT, parsed.name
+        let arn = crate::service::cloudfront_arn(
+            &req.region,
+            DEFAULT_ACCOUNT,
+            &format!("realtime-log-config/{}", parsed.name),
         );
         if account.realtime_log_configs.contains_key(&arn) {
             return Err(aws_error(
@@ -462,7 +463,7 @@ impl CloudFrontService {
             .map_err(|e| {
                 invalid_argument(format!("invalid GetRealtimeLogConfigRequest XML: {e}"))
             })?;
-        let key = self.resolve_rtl_key(&parsed)?;
+        let key = self.resolve_rtl_key(req, &parsed)?;
         let state = self.state.read();
         let r = state
             .accounts
@@ -511,7 +512,7 @@ impl CloudFrontService {
             .map_err(|e| {
                 invalid_argument(format!("invalid DeleteRealtimeLogConfigRequest XML: {e}"))
             })?;
-        let key = self.resolve_rtl_key(&parsed)?;
+        let key = self.resolve_rtl_key(req, &parsed)?;
         let mut state = self.state.write();
         let account = state
             .accounts
@@ -556,6 +557,7 @@ impl CloudFrontService {
 
     fn resolve_rtl_key(
         &self,
+        req: &AwsRequest,
         parsed: &GetOrDeleteRealtimeLogConfigRequest,
     ) -> Result<String, AwsServiceError> {
         if let Some(arn) = &parsed.arn {
@@ -565,9 +567,10 @@ impl CloudFrontService {
         }
         if let Some(name) = &parsed.name {
             if !name.is_empty() {
-                return Ok(format!(
-                    "arn:aws:cloudfront::{}:realtime-log-config/{}",
-                    DEFAULT_ACCOUNT, name
+                return Ok(crate::service::cloudfront_arn(
+                    &req.region,
+                    DEFAULT_ACCOUNT,
+                    &format!("realtime-log-config/{name}"),
                 ));
             }
         }

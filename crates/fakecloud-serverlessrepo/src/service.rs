@@ -478,7 +478,10 @@ impl ServerlessRepoService {
             });
         let mut out = Map::new();
         out.insert("applicationId".into(), json!(app_id));
-        out.insert("changeSetId".into(), json!(shared::new_change_set_id()));
+        out.insert(
+            "changeSetId".into(),
+            json!(shared::new_change_set_id(&ctx.region)),
+        );
         out.insert(
             "stackId".into(),
             json!(shared::stack_id(&ctx.region, &ctx.account, &stack_name)),

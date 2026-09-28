@@ -357,3 +357,38 @@ fn mk_req(method: &str, path: &str) -> AwsRequest {
         principal: None,
     }
 }
+
+#[test]
+fn application_and_stack_arns_carry_china_partition() {
+    let svc = service();
+    let ctx = Ctx {
+        region: "cn-north-1".to_string(),
+        ..ctx()
+    };
+    let created = body_of(
+        &svc.create_application(
+            &ctx,
+            &json!({ "author": "a", "description": "d", "name": "cnapp" }),
+        )
+        .unwrap(),
+    );
+    let app_id = created["applicationId"].as_str().unwrap().to_string();
+    assert_eq!(
+        app_id,
+        "arn:aws-cn:serverlessrepo:cn-north-1:000000000000:applications/cnapp"
+    );
+    let got = body_of(&svc.get_application(&ctx, &app_id, &[]).unwrap());
+    assert_eq!(got["applicationId"], app_id);
+    let cs = body_of(
+        &svc.create_cloudformation_change_set(&ctx, &app_id, &json!({ "stackName": "s" }))
+            .unwrap(),
+    );
+    assert!(cs["changeSetId"]
+        .as_str()
+        .unwrap()
+        .starts_with("arn:aws-cn:cloudformation:changeSet/"));
+    assert!(cs["stackId"]
+        .as_str()
+        .unwrap()
+        .starts_with("arn:aws-cn:cloudformation:cn-north-1:000000000000:stack/s/"));
+}

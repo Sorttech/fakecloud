@@ -17,6 +17,7 @@ use serde_json::{json, Map, Value};
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::pagination::paginate_checked;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_persistence::SnapshotStore;
@@ -399,18 +400,38 @@ impl CodePipelineService {
     }
 
     fn pipeline_arn(&self, req: &AwsRequest, name: &str) -> String {
-        format!(
-            "arn:aws:codepipeline:{}:{}:{}",
-            req.region, req.account_id, name
-        )
+        pipeline_arn(&req.region, &req.account_id, name)
     }
 
     fn webhook_arn(&self, req: &AwsRequest, name: &str) -> String {
-        format!(
-            "arn:aws:codepipeline:{}:{}:webhook:{}",
-            req.region, req.account_id, name
-        )
+        webhook_arn(&req.region, &req.account_id, name)
     }
+}
+
+/// `arn:<partition>:codepipeline:<region>:<account>:<name>`.
+pub fn pipeline_arn(region: &str, account: &str, name: &str) -> String {
+    Arn::regional("codepipeline", region, account, name).to_string()
+}
+
+/// `arn:<partition>:codepipeline:<region>:<account>:webhook:<name>`.
+pub fn webhook_arn(region: &str, account: &str, name: &str) -> String {
+    Arn::regional("codepipeline", region, account, &format!("webhook:{name}")).to_string()
+}
+
+/// `arn:<partition>:codepipeline:<region>:<account>:actiontype:Custom/<category>/<provider>/<version>`.
+fn custom_action_type_arn(
+    req: &AwsRequest,
+    category: &str,
+    provider: &str,
+    version: &str,
+) -> String {
+    Arn::regional(
+        "codepipeline",
+        &req.region,
+        &req.account_id,
+        &format!("actiontype:Custom/{category}/{provider}/{version}"),
+    )
+    .to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -1473,10 +1494,7 @@ impl CodePipelineService {
         let account = self.account(req);
         let tags = tag_list(&b);
         let key = action_key(&category, &provider, &version);
-        let arn = format!(
-            "arn:aws:codepipeline:{}:{}:actiontype:Custom/{}/{}/{}",
-            req.region, req.account_id, category, provider, version
-        );
+        let arn = custom_action_type_arn(req, &category, &provider, &version);
         let mut action_type = Map::new();
         action_type.insert(
             "id".into(),
@@ -1520,10 +1538,7 @@ impl CodePipelineService {
         let version = req_str(&b, "version")?;
         let account = self.account(req);
         let key = action_key(&category, &provider, &version);
-        let arn = format!(
-            "arn:aws:codepipeline:{}:{}:actiontype:Custom/{}/{}/{}",
-            req.region, req.account_id, category, provider, version
-        );
+        let arn = custom_action_type_arn(req, &category, &provider, &version);
         let mut guard = self.state.write();
         let st = guard.get_or_create(&account);
         // Idempotent: no "does not exist" error is declared.
@@ -2094,6 +2109,41 @@ mod tests {
         ))
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn pipeline_arn_carries_china_partition() {
+        let svc = svc();
+        let cn = |action: &str, body: Value| {
+            let mut r = req(action, body);
+            r.region = "cn-north-1".to_string();
+            r
+        };
+        svc.handle(cn(
+            "CreatePipeline",
+            json!({ "pipeline": pipeline_decl("cnp", None) }),
+        ))
+        .await
+        .unwrap();
+        let resp = svc
+            .handle(cn("GetPipeline", json!({ "name": "cnp" })))
+            .await
+            .unwrap();
+        let got: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        let arn = got["metadata"]["pipelineArn"].as_str().unwrap().to_string();
+        assert_eq!(arn, "arn:aws-cn:codepipeline:cn-north-1:123456789012:cnp");
+        svc.handle(cn(
+            "TagResource",
+            json!({ "resourceArn": arn, "tags": [{ "key": "env", "value": "prod" }] }),
+        ))
+        .await
+        .unwrap();
+        let resp = svc
+            .handle(cn("ListTagsForResource", json!({ "resourceArn": arn })))
+            .await
+            .unwrap();
+        let tags: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        assert_eq!(tags["tags"], json!([{ "key": "env", "value": "prod" }]));
     }
 
     // Fix 1 + 9: settle state machine + returned changed-bool.
