@@ -702,9 +702,10 @@ fn add_partiql_keys(
     parameters: &[Value],
     verb: &str,
 ) {
+    use super::helpers::partiql_exec::insert_item;
     use super::helpers::partiql_parse::{
-        expr_attributes, parse_statement, path_root, pinned_values, Expr, Projection, Statement,
-        UpdateOp,
+        conjuncts, expr_attributes, key_equality, key_values, parse_statement, path_root,
+        pinned_values, Projection, Statement, UpdateOp,
     };
 
     let Ok(stmt) = parse_statement(statement, parameters) else {
@@ -717,20 +718,18 @@ fn add_partiql_keys(
     let mut attrs = Vec::new();
     let filter = match &stmt {
         Statement::Insert { value, .. } => {
-            let Expr::Tuple(fields) = value else {
-                keys.leading = None;
-                return;
-            };
-            let partition = fields.iter().find(|(k, _)| *k == target.partition_key);
-            match partition.and_then(|(_, v)| match v {
-                Expr::Lit(v) => scalar_string(v),
-                _ => None,
-            }) {
-                Some(v) => keys.add_leading(v),
-                None => keys.leading = None,
+            // The item exactly as the executor builds it, bound parameters
+            // included; one it cannot build is rejected there.
+            match insert_item(value) {
+                Ok(item) => {
+                    match item.get(&target.partition_key).and_then(scalar_string) {
+                        Some(v) => keys.add_leading(v),
+                        None => keys.leading = None,
+                    }
+                    keys.attributes.extend(item.into_keys());
+                }
+                Err(_) => keys.leading = None,
             }
-            keys.attributes
-                .extend(fields.iter().map(|(k, _)| k.clone()));
             return;
         }
         Statement::Select {
@@ -770,7 +769,18 @@ fn add_partiql_keys(
         expr_attributes(expr, &mut attrs);
     }
     keys.attributes.extend(attrs);
-    let pinned = filter.and_then(|expr| pinned_values(expr, &target.partition_key));
+    // The partition the executor targets: a write's key comes from the first
+    // key equality (the same function the executor pins its item with), a
+    // read's from its first equality or IN conjunct; only a read with neither
+    // falls back to every partition its OR branches can reach.
+    let parts = filter.map(conjuncts).unwrap_or_default();
+    let pinned = if verb == "PartiQLSelect" {
+        key_values(&parts, &target.partition_key)
+            .map(|vs| vs.into_iter().cloned().collect())
+            .or_else(|| filter.and_then(|expr| pinned_values(expr, &target.partition_key)))
+    } else {
+        key_equality(&parts, &target.partition_key).map(|v| vec![v.clone()])
+    };
     match &pinned {
         Some(values) => {
             for value in values {
@@ -1274,6 +1284,44 @@ mod tests {
         assert_eq!(
             get(keys, "dynamodb:attributes"),
             Some(&["Title", "UserId", "note", "secret"].map(String::from)[..])
+        );
+    }
+
+    /// An INSERT whose item is a bound map parameter reports that item's
+    /// partition and attributes, and a write equating the key twice reports
+    /// the partition the first equality pins -- the item the executor writes.
+    #[test]
+    fn partiql_writes_report_what_the_executor_writes() {
+        let (_svc, state) = service_with_table();
+        let got = keys_for(
+            &state,
+            "ExecuteStatement",
+            serde_json::json!({
+                "Statement": "INSERT INTO \"Games\" VALUE ?",
+                "Parameters": [{"M": {
+                    "UserId": {"S": "victim"}, "Title": {"S": "t"}, "secret": {"S": "x"}
+                }}]
+            }),
+        );
+        assert_eq!(
+            get(&got[0].1, "dynamodb:leadingkeys"),
+            Some(&["victim".to_string()][..])
+        );
+        assert_eq!(
+            get(&got[0].1, "dynamodb:attributes"),
+            Some(&["Title", "UserId", "secret"].map(String::from)[..])
+        );
+
+        let got = keys_for(
+            &state,
+            "ExecuteStatement",
+            serde_json::json!({
+                "Statement": "UPDATE \"Games\" SET n = 1 WHERE UserId = 'victim' AND UserId = 'mine' AND Title = 't'"
+            }),
+        );
+        assert_eq!(
+            get(&got[0].1, "dynamodb:leadingkeys"),
+            Some(&["victim".to_string()][..])
         );
     }
 

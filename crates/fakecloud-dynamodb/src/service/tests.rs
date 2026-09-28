@@ -7139,6 +7139,122 @@ async fn partiql_select_columns_page_and_validate() {
     .await;
 }
 
+/// A one-value IN list on the partition key is a point read like an
+/// equality, and finds the item.
+#[tokio::test]
+async fn partiql_point_read_through_a_one_value_in_list() {
+    let svc = make_service();
+    svc.create_table(&make_request(
+        "CreateTable",
+        json!({
+            "TableName": "Pairs",
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"}
+            ],
+            "AttributeDefinitions": [
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "sk", "AttributeType": "S"}
+            ],
+            "BillingMode": "PAY_PER_REQUEST"
+        }),
+    ))
+    .unwrap();
+    create_test_table(&svc);
+    call_dynamodb(
+        &svc,
+        "PutItem",
+        json!({"TableName": "Pairs", "Item": {"pk": {"S": "a"}, "sk": {"S": "x"}}}),
+    )
+    .await;
+    call_dynamodb(
+        &svc,
+        "PutItem",
+        json!({"TableName": "test-table", "Item": {"pk": {"S": "a"}}}),
+    )
+    .await;
+    for statement in [
+        "SELECT * FROM \"test-table\" WHERE pk IN ['a']",
+        "SELECT * FROM \"Pairs\" WHERE pk IN ['a'] AND sk = 'x'",
+    ] {
+        let got = call_dynamodb(&svc, "ExecuteStatement", json!({"Statement": statement})).await;
+        assert_eq!(got["Items"].as_array().unwrap().len(), 1, "{statement}");
+    }
+}
+
+/// A written value is built only from constants, paths and the update
+/// functions: anything else is refused rather than written as some default.
+#[tokio::test]
+async fn partiql_refuses_values_it_cannot_build() {
+    let svc = make_service();
+    create_test_table(&svc);
+    call_dynamodb(
+        &svc,
+        "PutItem",
+        json!({"TableName": "test-table", "Item": {"pk": {"S": "a"}, "s": {"SS": ["x"]}}}),
+    )
+    .await;
+    for statement in [
+        "UPDATE \"test-table\" SET v = lower(s) WHERE pk = 'a'",
+        "UPDATE \"test-table\" SET v = set_add(s, <<'y'>>) WHERE pk = 'a'",
+        "UPDATE \"test-table\" SET s = set_add(s) WHERE pk = 'a'",
+        "UPDATE \"test-table\" SET v = [missing] WHERE pk = 'a'",
+        "UPDATE \"test-table\" SET v = (1 = 1) WHERE pk = 'a'",
+        "SELECT * FROM \"test-table\" WHERE upper(pk) = 'A'",
+        "INSERT INTO \"test-table\" VALUE {'pk': 'b', 's': <<'x', 1>>}",
+        "INSERT INTO \"test-table\" VALUE {'pk': 'b', 'pk': 'c'}",
+    ] {
+        assert_eq!(
+            err_code(&svc, "ExecuteStatement", json!({"Statement": statement}))
+                .await
+                .as_deref(),
+            Some("ValidationException"),
+            "{statement}"
+        );
+    }
+    let got = call_dynamodb(
+        &svc,
+        "GetItem",
+        json!({"TableName": "test-table", "Key": {"pk": {"S": "a"}}}),
+    )
+    .await;
+    assert_eq!(got["Item"], json!({"pk": {"S": "a"}, "s": {"SS": ["x"]}}));
+    assert_eq!(
+        call_dynamodb(&svc, "Scan", json!({"TableName": "test-table"})).await["Count"],
+        1
+    );
+}
+
+/// A transaction that reads and writes one table reports each as what it
+/// was, not every unit as whichever came first.
+#[tokio::test]
+async fn partiql_transaction_capacity_splits_reads_from_writes() {
+    let svc = make_service();
+    create_test_table(&svc);
+    call_dynamodb(
+        &svc,
+        "PutItem",
+        json!({"TableName": "test-table", "Item": {"pk": {"S": "a"}}}),
+    )
+    .await;
+    let got = call_dynamodb(
+        &svc,
+        "ExecuteTransaction",
+        json!({
+            "TransactStatements": [
+                {"Statement": "EXISTS(SELECT * FROM \"test-table\" WHERE pk = 'a')"},
+                {"Statement": "UPDATE \"test-table\" SET v = 1 WHERE pk = 'a'"}
+            ],
+            "ReturnConsumedCapacity": "TOTAL"
+        }),
+    )
+    .await;
+    let cc = &got["ConsumedCapacity"][0];
+    assert_eq!(cc["ReadCapacityUnits"], json!(1.0), "{cc}");
+    assert_eq!(cc["WriteCapacityUnits"], json!(2.0), "{cc}");
+    assert_eq!(cc["CapacityUnits"], json!(3.0), "{cc}");
+}
+
 // ── Cross-account table ARNs ───────────────────────────────────────────
 
 const OWNER: &str = "444455556666";

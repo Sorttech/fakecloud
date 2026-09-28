@@ -28,8 +28,9 @@ use serde_json::{json, Value};
 use fakecloud_core::service::AwsServiceError;
 
 use super::partiql_parse::{
-    conjuncts, equality_on, expr_attributes, membership_on, path_root, validation, ArithOp, CmpOp,
-    Expr, OrderBy, Path, PathSegment, Projection, Returning, Source, Statement, UpdateOp,
+    conjuncts, equality_on, expr_attributes, key_equality, key_values, path_root, validation,
+    ArithOp, CmpOp, Expr, OrderBy, Path, PathSegment, Projection, Returning, Source, Statement,
+    UpdateOp,
 };
 use crate::state::{
     attribute_type_and_value, AttributeValue, DynamoTable, Projection as IndexProjection, RowKey,
@@ -109,43 +110,64 @@ impl Capacity {
     /// The `ConsumedCapacity` block for this capacity. `split` adds the
     /// read/write breakdown the transactional APIs report.
     pub(crate) fn to_json(&self, mode: &str, table_name: &str, split: bool) -> Value {
-        if mode != "TOTAL" && mode != "INDEXES" {
-            return Value::Null;
+        let empty = Capacity::default();
+        if self.read {
+            capacity_json(mode, table_name, self, &empty, split)
+        } else {
+            capacity_json(mode, table_name, &empty, self, split)
         }
-        let arm = |units: f64| {
-            let mut v = json!({ "CapacityUnits": units });
-            if split {
-                v[if self.read {
-                    "ReadCapacityUnits"
-                } else {
-                    "WriteCapacityUnits"
-                }] = json!(units);
-            }
-            v
-        };
-        let mut cc = arm(self.total());
-        cc["TableName"] = json!(table_name);
-        if mode == "INDEXES" {
-            cc["Table"] = arm(self.table);
-            if !self.gsi.is_empty() {
-                cc["GlobalSecondaryIndexes"] = self
-                    .gsi
-                    .iter()
-                    .map(|(k, v)| (k.clone(), arm(*v)))
-                    .collect::<serde_json::Map<_, _>>()
-                    .into();
-            }
-            if !self.lsi.is_empty() {
-                cc["LocalSecondaryIndexes"] = self
-                    .lsi
-                    .iter()
-                    .map(|(k, v)| (k.clone(), arm(*v)))
-                    .collect::<serde_json::Map<_, _>>()
-                    .into();
-            }
-        }
-        cc
     }
+}
+
+/// The `ConsumedCapacity` block for a table's read and write units, each arm
+/// summing both; `split` adds the read/write breakdown.
+pub(crate) fn capacity_json(
+    mode: &str,
+    table_name: &str,
+    reads: &Capacity,
+    writes: &Capacity,
+    split: bool,
+) -> Value {
+    if mode != "TOTAL" && mode != "INDEXES" {
+        return Value::Null;
+    }
+    let arm = |r: f64, w: f64| {
+        let mut v = json!({ "CapacityUnits": r + w });
+        if split {
+            if r > 0.0 {
+                v["ReadCapacityUnits"] = json!(r);
+            }
+            if w > 0.0 {
+                v["WriteCapacityUnits"] = json!(w);
+            }
+        }
+        v
+    };
+    let arms = |a: &BTreeMap<String, f64>, b: &BTreeMap<String, f64>| -> Option<Value> {
+        let names: std::collections::BTreeSet<&String> = a.keys().chain(b.keys()).collect();
+        (!names.is_empty()).then(|| {
+            names
+                .into_iter()
+                .map(|n| {
+                    let get = |m: &BTreeMap<String, f64>| m.get(n).copied().unwrap_or(0.0);
+                    (n.clone(), arm(get(a), get(b)))
+                })
+                .collect::<serde_json::Map<_, _>>()
+                .into()
+        })
+    };
+    let mut cc = arm(reads.total(), writes.total());
+    cc["TableName"] = json!(table_name);
+    if mode == "INDEXES" {
+        cc["Table"] = arm(reads.table, writes.table);
+        if let Some(g) = arms(&reads.gsi, &writes.gsi) {
+            cc["GlobalSecondaryIndexes"] = g;
+        }
+        if let Some(l) = arms(&reads.lsi, &writes.lsi) {
+            cc["LocalSecondaryIndexes"] = l;
+        }
+    }
+    cc
 }
 
 /// A write a statement made, for the stream and Kinesis hooks.
@@ -483,23 +505,34 @@ fn eval(e: &Expr, item: &Item) -> Option<Value> {
         Expr::Path(p) => resolve(item, p).cloned(),
         Expr::Lit(v) => Some(v.clone()),
         Expr::Missing => None,
+        // A constructor holding a MISSING element has no value: it is never
+        // built with the element silently dropped.
         Expr::List(items) => Some(json!({
-            "L": items.iter().filter_map(|i| eval(i, item)).collect::<Vec<_>>()
+            "L": items.iter().map(|i| eval(i, item)).collect::<Option<Vec<_>>>()?
         })),
         Expr::Tuple(fields) => Some(json!({
             "M": fields
                 .iter()
-                .filter_map(|(k, v)| eval(v, item).map(|v| (k.clone(), v)))
-                .collect::<serde_json::Map<_, _>>()
+                .map(|(k, v)| eval(v, item).map(|v| (k.clone(), v)))
+                .collect::<Option<serde_json::Map<_, _>>>()?
         })),
         Expr::Bag(items) => {
-            let values: Vec<Value> = items.iter().filter_map(|i| eval(i, item)).collect();
-            let kind = match values.first().and_then(attribute_type_and_value) {
-                Some(("N", _)) => "N",
-                Some(("B", _)) => "B",
-                _ => "S",
+            let values = items
+                .iter()
+                .map(|i| eval(i, item))
+                .collect::<Option<Vec<_>>>()?;
+            // A set holds scalars of one type: S, N or B.
+            let kind = match attribute_type_and_value(values.first()?)? {
+                (k @ ("S" | "N" | "B"), _) => k,
+                _ => return None,
             };
-            let members: Vec<Value> = values.iter().filter_map(|v| v.get(kind).cloned()).collect();
+            let members = values
+                .iter()
+                .map(|v| match attribute_type_and_value(v) {
+                    Some((k, m)) if k == kind => Some(m.clone()),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()?;
             Some(json!({ format!("{kind}S"): members }))
         }
         Expr::Arith(l, op, r) => {
@@ -517,8 +550,17 @@ fn eval(e: &Expr, item: &Item) -> Option<Value> {
             let v = eval(args.first()?, item)?;
             Some(json!({ "N": super::attribute_size(&v)?.to_string() }))
         }
+        Expr::Func(name, _) if name != "size" && !is_predicate_function(name) => None,
+        // A predicate used as an operand (`begins_with(a, 'x') = TRUE`).
         other => Some(json!({ "BOOL": test(other, item) })),
     }
+}
+
+fn is_predicate_function(name: &str) -> bool {
+    matches!(
+        name,
+        "begins_with" | "contains" | "attribute_type" | "attribute_exists" | "attribute_not_exists"
+    )
 }
 
 /// Evaluate an expression as a WHERE predicate.
@@ -641,16 +683,9 @@ fn pinned_key<'e>(
     let parts = filter.map(conjuncts).unwrap_or_default();
     let mut key = Item::new();
     for name in std::iter::once(table.hash_key_name()).chain(table.range_key_name()) {
-        let value = parts
-            .iter()
-            .filter_map(|c| equality_on(c))
-            .find(|(attr, _)| *attr == name)
-            .map(|(_, v)| v.clone())
-            .ok_or_else(|| {
-                validation(
-                    "Where clause does not contain a mandatory equality on all key attributes",
-                )
-            })?;
+        let value = key_equality(&parts, name).cloned().ok_or_else(|| {
+            validation("Where clause does not contain a mandatory equality on all key attributes")
+        })?;
         key.insert(name.to_string(), value);
     }
     super::validate_key_attributes_in_key(table, &key)?;
@@ -716,17 +751,6 @@ fn resolve_index<'t>(table: &'t DynamoTable, name: &str) -> Result<IndexInfo<'t>
         ));
     }
     Err(validation("The table does not have the specified index"))
-}
-
-/// The partition-key values a read's top-level conjuncts pin `attr` to, by
-/// an equality or an IN list.
-fn keyed_values<'e>(parts: &[&'e Expr], attr: &str) -> Option<Vec<&'e Value>> {
-    parts.iter().find_map(|c| {
-        if let Some((a, v)) = equality_on(c) {
-            return (a == attr).then(|| vec![v]);
-        }
-        membership_on(c).and_then(|(a, vs)| (a == attr).then_some(vs))
-    })
 }
 
 /// The pagination cursor: which read minted it and the row it stopped at.
@@ -816,7 +840,7 @@ fn select<'t>(
                 }
             }
         }
-        if keyed_values(&parts, ix.hash).is_some() {
+        if key_values(&parts, ix.hash).is_some() {
             let mut attrs = Vec::new();
             if let Some(f) = filter {
                 expr_attributes(f, &mut attrs);
@@ -841,14 +865,23 @@ fn select<'t>(
     // The rows the read walks: each base item, the row as the read sees it
     // (an index row holds only what the index projects), and its primary key.
     let hash_attr = index.as_ref().map_or(table.hash_key_name(), |i| i.hash);
-    let pinned = keyed_values(&parts, hash_attr);
-    let point = index.is_none()
-        && pinned.as_ref().is_some_and(|v| v.len() == 1)
-        && table.range_key_name().is_none_or(|rk| {
-            parts
-                .iter()
-                .any(|c| equality_on(c).is_some_and(|(a, _)| a == rk))
-        });
+    let pinned = key_values(&parts, hash_attr);
+    // A point read: the whole primary key pinned to one value. The key is
+    // built from the same conjuncts that make it a point read.
+    let point_key: Option<Item> = match (&index, &pinned) {
+        (None, Some(values)) if values.len() == 1 => {
+            let mut key = Item::new();
+            key.insert(hash_attr.to_string(), values[0].clone());
+            match table.range_key_name() {
+                Some(rk) => key_equality(&parts, rk).map(|v| {
+                    key.insert(rk.to_string(), v.clone());
+                    key
+                }),
+                None => Some(key),
+            }
+        }
+        _ => None,
+    };
     let row_of = |item: &'t Item| {
         let view = match &index {
             Some(ix) => Cow::Owned(crate::service::queries::apply_index_projection(
@@ -868,18 +901,8 @@ fn select<'t>(
             key: table.encode_key_with(|n| item.get(n)),
         }
     };
-    let mut rows: Vec<Row<'t>> = if point {
-        let mut key = Item::new();
-        for name in std::iter::once(table.hash_key_name()).chain(table.range_key_name()) {
-            if let Some((_, v)) = parts
-                .iter()
-                .filter_map(|c| equality_on(c))
-                .find(|(a, _)| *a == name)
-            {
-                key.insert(name.to_string(), v.clone());
-            }
-        }
-        find(table, &key)
+    let mut rows: Vec<Row<'t>> = if let Some(key) = &point_key {
+        find(table, key)
             .map(|(_, item)| vec![row_of(item)])
             .unwrap_or_default()
     } else {
@@ -1041,22 +1064,28 @@ fn project_columns(item: &Item, paths: &[Path]) -> Item {
 
 // --- INSERT ---
 
+/// The item an INSERT writes: its VALUE, a tuple or a bound map parameter.
+/// IAM reads the item from here too, so it sees exactly what is written.
+pub(crate) fn insert_item(value: &Expr) -> Result<Item, AwsServiceError> {
+    match eval(value, &Item::new()) {
+        Some(v) if v.get("M").is_some_and(Value::is_object) => {
+            serde_json::from_value(v["M"].clone())
+                .map_err(|_| validation("Unsupported value in INSERT"))
+        }
+        Some(_) => Err(validation(
+            "Statement wasn't well formed, can't be processed: Expected a tuple in VALUE",
+        )),
+        None => Err(validation("Unsupported value in INSERT")),
+    }
+}
+
 fn insert(
     tables: &mut BTreeMap<String, DynamoTable>,
     table_name: &str,
     value: &Expr,
 ) -> Result<Outcome, ExecError> {
     let table = super::get_table_mut(tables, table_name)?;
-    let item: Item = match eval(value, &Item::new()) {
-        Some(v) if v.get("M").is_some() => serde_json::from_value(v["M"].clone())
-            .map_err(|_| validation("Unsupported value in INSERT"))?,
-        _ => {
-            return Err(validation(
-                "Statement wasn't well formed, can't be processed: Expected a tuple in VALUE",
-            )
-            .into())
-        }
-    };
+    let item = insert_item(value)?;
     super::validate_partiql_item_against_key_schema(table, &item)?;
     super::validate_item_attribute_values(&item)?;
     if item_size(&item) > MAX_ITEM_BYTES {
@@ -1142,6 +1171,11 @@ fn plan_update(ops: &[UpdateOp], item: &Item) -> Result<UpdatePlan, AwsServiceEr
         }
 
         fn value(&mut self, e: &Expr) -> Result<String, AwsServiceError> {
+            if let Expr::Func(name, _) = e {
+                return Err(validation(format!(
+                    "Statement wasn't well formed, can't be processed: Unsupported function: {name}"
+                )));
+            }
             let v = eval(e, self.item).ok_or_else(|| {
                 validation("An operand in the update expression has an incorrect data type")
             })?;

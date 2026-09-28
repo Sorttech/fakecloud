@@ -13,7 +13,8 @@ use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 use fakecloud_core::validation::*;
 
 use super::helpers::partiql_exec::{
-    execute, transactional, Capacity, Change, ExecError, ExecOptions, Outcome, Surface,
+    capacity_json, execute, transactional, Capacity, Change, ExecError, ExecOptions, Outcome,
+    Surface,
 };
 use super::helpers::partiql_parse::{parse_statement, validation, Statement};
 use super::{require_str_with_code, return_consumed_mode, DynamoDbService};
@@ -66,15 +67,26 @@ fn record_change(
 }
 
 /// The capacity of a batch or transaction: one entry per table, in the order
-/// the tables were first touched.
+/// the tables were first touched, with its read and write units kept apart
+/// so a table both read and written reports each as what it was.
 #[derive(Default)]
-struct CapacityByTable(Vec<(String, Capacity)>);
+struct CapacityByTable(Vec<(String, Capacity, Capacity)>);
 
 impl CapacityByTable {
     fn add(&mut self, table: &str, capacity: &Capacity) {
-        match self.0.iter_mut().find(|(t, _)| t == table) {
-            Some((_, c)) => c.add(capacity),
-            None => self.0.push((table.to_string(), capacity.clone())),
+        let index = match self.0.iter().position(|(t, ..)| t == table) {
+            Some(i) => i,
+            None => {
+                self.0
+                    .push((table.to_string(), Capacity::default(), Capacity::default()));
+                self.0.len() - 1
+            }
+        };
+        let (_, reads, writes) = &mut self.0[index];
+        if capacity.read {
+            reads.add(capacity);
+        } else {
+            writes.add(capacity);
         }
     }
 
@@ -85,7 +97,7 @@ impl CapacityByTable {
         Some(Value::Array(
             self.0
                 .iter()
-                .map(|(t, c)| c.to_json(mode, t, split))
+                .map(|(t, r, w)| capacity_json(mode, t, r, w, split))
                 .collect(),
         ))
     }
@@ -433,7 +445,14 @@ fn replay_as_read(result: &mut Value) {
     fn swap(arm: &mut Value) {
         if let Some(obj) = arm.as_object_mut() {
             if let Some(units) = obj.remove("WriteCapacityUnits") {
-                obj.insert("ReadCapacityUnits".to_string(), units);
+                let read = obj
+                    .get("ReadCapacityUnits")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0);
+                obj.insert(
+                    "ReadCapacityUnits".to_string(),
+                    json!(read + units.as_f64().unwrap_or(0.0)),
+                );
             }
         }
     }

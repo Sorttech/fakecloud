@@ -423,6 +423,7 @@ pub(crate) fn parse_statement(
         ));
     }
     check_operand_types(&stmt)?;
+    check_expression_kinds(&stmt)?;
     Ok(stmt)
 }
 
@@ -910,6 +911,12 @@ impl<'a> Parser<'a> {
                             Some(Tok::Str(s)) | Some(Tok::Quoted(s)) | Some(Tok::Ident(s)) => s,
                             _ => return Err(malformed("Invalid tuple key")),
                         };
+                        // One attribute, one value: a repeated name has no
+                        // single meaning, so it is refused rather than one
+                        // occurrence silently winning.
+                        if fields.iter().any(|(k, _)| *k == key) {
+                            return Err(malformed(&format!("Duplicate key in tuple: {key}")));
+                        }
                         self.expect(&Tok::Colon)?;
                         let value = self.expr()?;
                         fields.push((key, value));
@@ -1076,6 +1083,130 @@ fn check_operand_types(stmt: &Statement) -> Result<(), AwsServiceError> {
     }
 }
 
+/// Functions a WHERE clause may call, with their arity.
+const PREDICATE_FUNCTIONS: &[(&str, usize)] = &[
+    ("begins_with", 2),
+    ("contains", 2),
+    ("attribute_type", 2),
+    ("size", 1),
+    ("attribute_exists", 1),
+    ("attribute_not_exists", 1),
+];
+
+fn unsupported_function(name: &str) -> AwsServiceError {
+    malformed(&format!("Unsupported function: {name}"))
+}
+
+fn wrong_arity(name: &str) -> AwsServiceError {
+    malformed(&format!(
+        "Incorrect number of arguments for function: {name}"
+    ))
+}
+
+/// Every expression must be one the statement position can use: a WHERE
+/// clause calls only predicate functions, and a written value (an INSERT
+/// tuple, a SET right-hand side) is built from constants, paths and the
+/// update functions only. Nothing falls through to a made-up value.
+fn check_expression_kinds(stmt: &Statement) -> Result<(), AwsServiceError> {
+    fn predicate(e: &Expr) -> Result<(), AwsServiceError> {
+        match e {
+            Expr::Func(name, args) => {
+                let (_, arity) = PREDICATE_FUNCTIONS
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .ok_or_else(|| unsupported_function(name))?;
+                if args.len() != *arity {
+                    return Err(wrong_arity(name));
+                }
+                args.iter().try_for_each(predicate)
+            }
+            Expr::Cmp(l, _, r)
+            | Expr::And(l, r)
+            | Expr::Or(l, r)
+            | Expr::Like(l, r)
+            | Expr::Arith(l, _, r) => {
+                predicate(l)?;
+                predicate(r)
+            }
+            Expr::Between(a, b, c) => {
+                predicate(a)?;
+                predicate(b)?;
+                predicate(c)
+            }
+            Expr::In(v, items) => {
+                predicate(v)?;
+                items.iter().try_for_each(predicate)
+            }
+            Expr::Not(e) | Expr::Neg(e) | Expr::Is { expr: e, .. } => predicate(e),
+            Expr::List(items) | Expr::Bag(items) => items.iter().try_for_each(predicate),
+            Expr::Tuple(fields) => fields.iter().try_for_each(|(_, v)| predicate(v)),
+            Expr::Path(_) | Expr::Lit(_) | Expr::Missing => Ok(()),
+        }
+    }
+    fn constant(e: &Expr) -> Result<(), AwsServiceError> {
+        match e {
+            Expr::Lit(_) => Ok(()),
+            Expr::List(items) | Expr::Bag(items) => items.iter().try_for_each(constant),
+            Expr::Tuple(fields) => fields.iter().try_for_each(|(_, v)| constant(v)),
+            Expr::Func(name, _) => Err(unsupported_function(name)),
+            _ => Err(malformed("Expected a constant value")),
+        }
+    }
+    /// An operand of a SET right-hand side.
+    fn operand(e: &Expr) -> Result<(), AwsServiceError> {
+        match e {
+            Expr::Path(_) => Ok(()),
+            Expr::Func(name, args) if matches!(name.as_str(), "list_append" | "if_not_exists") => {
+                if args.len() != 2 {
+                    return Err(wrong_arity(name));
+                }
+                args.iter().try_for_each(operand)
+            }
+            other => constant(other),
+        }
+    }
+    fn set_value(target: &Path, e: &Expr) -> Result<(), AwsServiceError> {
+        match e {
+            Expr::Func(name, args) if matches!(name.as_str(), "set_add" | "set_delete") => {
+                if args.len() != 2 {
+                    return Err(wrong_arity(name));
+                }
+                // The set a set_add/set_delete changes is the one it assigns.
+                match &args[0] {
+                    Expr::Path(p) if p == target => constant(&args[1]),
+                    _ => Err(malformed(&format!(
+                        "The first argument of {name} must be the attribute being set"
+                    ))),
+                }
+            }
+            Expr::Arith(l, _, r) => {
+                operand(l)?;
+                operand(r)
+            }
+            other => operand(other),
+        }
+    }
+    let filter = match stmt {
+        Statement::Select { filter, .. } | Statement::Delete { filter, .. } => filter.as_ref(),
+        Statement::Update { ops, filter, .. } => {
+            for op in ops {
+                if let UpdateOp::Set(path, value) = op {
+                    set_value(path, value)?;
+                }
+            }
+            filter.as_ref()
+        }
+        Statement::Insert { value, .. } => {
+            return match value {
+                Expr::Tuple(_) | Expr::Lit(_) => constant(value),
+                _ => Err(malformed("Expected a tuple in VALUE")),
+            };
+        }
+        Statement::Exists(inner) => return check_expression_kinds(inner),
+    };
+    filter.map_or(Ok(()), predicate)
+}
+
 // --- Analysis helpers ---
 
 /// The top-level AND conjuncts of an expression.
@@ -1121,6 +1252,29 @@ pub(crate) fn membership_on(e: &Expr) -> Option<(&str, Vec<&Value>)> {
         },
         _ => None,
     }
+}
+
+/// The value the first top-level `attr = <constant>` conjunct pins `attr`
+/// to. A write's key and a point read's key come from here, and IAM reads the
+/// same function, so a clause equating a key twice is read one way
+/// everywhere: the first equality pins the item, the other is a condition.
+pub(crate) fn key_equality<'e>(parts: &[&'e Expr], attr: &str) -> Option<&'e Value> {
+    parts
+        .iter()
+        .filter_map(|c| equality_on(c))
+        .find(|(a, _)| *a == attr)
+        .map(|(_, v)| v)
+}
+
+/// The partition values a read's first top-level equality or IN conjunct on
+/// `attr` confines it to.
+pub(crate) fn key_values<'e>(parts: &[&'e Expr], attr: &str) -> Option<Vec<&'e Value>> {
+    parts.iter().find_map(|c| {
+        if let Some((a, v)) = equality_on(c) {
+            return (a == attr).then(|| vec![v]);
+        }
+        membership_on(c).and_then(|(a, vs)| (a == attr).then_some(vs))
+    })
 }
 
 /// Every top-level attribute an expression reads, in order of appearance.
