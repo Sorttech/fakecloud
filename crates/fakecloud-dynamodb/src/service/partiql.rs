@@ -17,7 +17,7 @@ use super::helpers::partiql_exec::{
     Surface,
 };
 use super::helpers::partiql_parse::{parse_statement, validation, Statement};
-use super::{require_str_with_code, return_consumed_mode, DynamoDbService};
+use super::{require_str_with_code, return_consumed_mode, Consumed, DynamoDbService};
 use crate::state::{AttributeValue, DynamoDbState};
 
 type Item = HashMap<String, AttributeValue>;
@@ -70,7 +70,7 @@ fn record_change(
 /// the tables were first touched, with its read and write units kept apart
 /// so a table both read and written reports each as what it was.
 #[derive(Default)]
-struct CapacityByTable(Vec<(String, Capacity, Capacity)>);
+struct CapacityByTable(Vec<(String, Consumed, Consumed)>);
 
 impl CapacityByTable {
     fn add(&mut self, table: &str, capacity: &Capacity) {
@@ -78,15 +78,15 @@ impl CapacityByTable {
             Some(i) => i,
             None => {
                 self.0
-                    .push((table.to_string(), Capacity::default(), Capacity::default()));
+                    .push((table.to_string(), Consumed::default(), Consumed::default()));
                 self.0.len() - 1
             }
         };
         let (_, reads, writes) = &mut self.0[index];
         if capacity.read {
-            reads.add(capacity);
+            reads.add(&capacity.consumed);
         } else {
-            writes.add(capacity);
+            writes.add(&capacity.consumed);
         }
     }
 
