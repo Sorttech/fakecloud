@@ -794,96 +794,12 @@ pub(crate) struct TableDescriptionInput<'a> {
     pub on_demand_throughput: Option<&'a crate::state::OnDemandThroughput>,
 }
 
-/// In-place PartiQL executor used by every PartiQL entry point
-/// (ExecuteStatement, BatchExecuteStatement, ExecuteTransaction).
-/// The caller holds the write lock for the batch — ExecuteTransaction
-/// keeps it across the entire all-or-nothing apply phase, single-shot
-/// callers acquire it for one statement. Returns the response body
-/// Value plus the touched table name and (for write ops) the keys +
-/// before/after images so the caller can emit stream + kinesis events
-/// after the lock is released — mirroring the per-write hooks in
-/// items.rs and the TransactWriteItems path.
-pub(crate) struct PartiqlOutcome {
-    pub response: Value,
-    pub table_name: Option<String>,
-    pub event_name: Option<String>, // INSERT, MODIFY, REMOVE
-    pub keys: Option<HashMap<String, AttributeValue>>,
-    pub old_image: Option<HashMap<String, AttributeValue>>,
-    pub new_image: Option<HashMap<String, AttributeValue>>,
-    /// A SELECT's column list as a projection request, applied to the rows
-    /// the caller returns -- after any pagination, whose cursor needs each
-    /// row's full primary key. `None` for `*` and for writes.
-    pub projection: Option<Value>,
-}
-
-/// AST for a parsed PartiQL WHERE clause. Leaf conditions reuse
-/// [`PartiqlCond`]; the tree adds AND/OR/NOT/parens composition added
-/// in L4 so callers can express anything the DDB FilterExpression
-/// language can.
-#[derive(Debug, Clone)]
-pub(crate) enum PartiqlExpr {
-    Cond(PartiqlCond),
-    And(Box<PartiqlExpr>, Box<PartiqlExpr>),
-    Or(Box<PartiqlExpr>, Box<PartiqlExpr>),
-    Not(Box<PartiqlExpr>),
-}
-
-/// Tokens produced by [`tokenize_partiql_where`]. We keep the original
-/// source slice for `Atom` so the existing condition parser can be
-/// reused without a second tokenizer pass.
-#[derive(Debug, Clone)]
-enum WhereTok<'a> {
-    LParen,
-    RParen,
-    And,
-    Or,
-    Not,
-    Atom(&'a str),
-}
-
-/// A parsed PartiQL WHERE clause condition. Equality remains the
-/// hot path; comparison/range/membership/function ops were added in
-/// L4 so PartiQL filters can express anything DDB's expression
-/// language can.
-#[derive(Debug, Clone)]
-pub(crate) enum PartiqlCond {
-    Eq(String, Value),
-    Ne(String, Value),
-    Lt(String, Value),
-    Le(String, Value),
-    Gt(String, Value),
-    Ge(String, Value),
-    Between(String, Value, Value),
-    In(String, Vec<Value>),
-    Like(String, String),
-    BeginsWith(String, Value),
-    Contains(String, Value),
-    AttributeExists(String),
-    AttributeNotExists(String),
-}
-
-/// Count positional `?` parameters in a PartiQL clause, ignoring any `?` that
-/// appears inside a single-quoted string literal (e.g. `SET note = 'done?'`).
-/// The UPDATE executor uses this count to slice parameters between the SET and
-/// WHERE clauses, so a `?` counted inside a literal would shift every WHERE
-/// binding by one and silently no-op the update (bug-hunt 2026-07-01).
-pub(crate) fn count_params_in_str(s: &str) -> usize {
-    let mut in_quote = false;
-    let mut count = 0;
-    for c in s.chars() {
-        match c {
-            '\'' => in_quote = !in_quote,
-            '?' if !in_quote => count += 1,
-            _ => {}
-        }
-    }
-    count
-}
-
 mod conditions;
 mod keys;
 mod metrics;
 pub(crate) mod partiql;
+pub(crate) mod partiql_exec;
+pub(crate) mod partiql_parse;
 mod paths;
 mod request;
 pub(crate) mod schemas;
@@ -900,20 +816,6 @@ pub(crate) use schemas::*;
 pub(crate) use table_descriptions::*;
 pub(crate) use table_lookup::*;
 pub(crate) use updates::*;
-
-#[cfg(test)]
-mod count_params_tests {
-    use super::*;
-
-    // bug-hunt 2026-07-01: a `?` inside a single-quoted literal must NOT be
-    // counted, else the SET/WHERE parameter split shifts and no-ops the update.
-    #[test]
-    fn count_params_ignores_quoted_question_marks() {
-        assert_eq!(count_params_in_str("SET note = 'done?' WHERE id = ?"), 1);
-        assert_eq!(count_params_in_str("a = ? AND b = ?"), 2);
-        assert_eq!(count_params_in_str("note = 'a?b?c'"), 0);
-    }
-}
 
 #[cfg(test)]
 mod set_rhs_tests {

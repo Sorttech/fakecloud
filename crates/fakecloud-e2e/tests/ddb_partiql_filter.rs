@@ -604,3 +604,272 @@ async fn ddb_partiql_select_operator_char_inside_string_literal() {
         .collect();
     assert_eq!(pks, vec!["row1".to_string()]);
 }
+
+fn service_error(err: impl aws_sdk_dynamodb::error::ProvideErrorMetadata) -> (String, String) {
+    (
+        err.code().unwrap_or_default().to_string(),
+        err.message().unwrap_or_default().to_string(),
+    )
+}
+
+/// UPDATE and DELETE act on the one item their key pins; any other predicate
+/// is a condition on it, and RETURNING projects the old or new image.
+#[tokio::test]
+async fn ddb_partiql_writes_condition_and_return() {
+    let server = TestServer::start().await;
+    let ddb = server.dynamodb_client().await;
+    create_streamed_table(&ddb, "Writes").await;
+    ddb.put_item()
+        .table_name("Writes")
+        .item("pk", AttributeValue::S("a".into()))
+        .item("name", AttributeValue::S("alpha".into()))
+        .item(
+            "tags",
+            AttributeValue::L(vec![
+                AttributeValue::S("x".into()),
+                AttributeValue::S("y".into()),
+                AttributeValue::S("z".into()),
+            ]),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    // A false non-key predicate fails the write and leaves the item.
+    let err = ddb
+        .execute_statement()
+        .statement("UPDATE \"Writes\" SET n = 9 WHERE pk = 'a' AND \"name\" = 'beta'")
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(service_error(err).0, "ConditionalCheckFailedException");
+
+    // An UPDATE of a missing item is not an upsert.
+    let err = ddb
+        .execute_statement()
+        .statement("UPDATE \"Writes\" SET n = 9 WHERE pk = 'ghost'")
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(service_error(err).0, "ConditionalCheckFailedException");
+
+    // MODIFIED returns only what changed, list elements packed in index order.
+    let resp = ddb
+        .execute_statement()
+        .statement(
+            "UPDATE \"Writes\" SET tags[2] = 'c', tags[0] = 'a' REMOVE \"name\" \
+             WHERE pk = 'a' RETURNING MODIFIED OLD *",
+        )
+        .send()
+        .await
+        .unwrap();
+    let row = &resp.items()[0];
+    let tags: Vec<&str> = row["tags"]
+        .as_l()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_s().unwrap().as_str())
+        .collect();
+    assert_eq!(tags, ["x", "z"]);
+    assert_eq!(row["name"].as_s().unwrap(), "alpha");
+    assert!(!row.contains_key("pk"));
+
+    // DELETE takes only RETURNING ALL OLD *.
+    let err = ddb
+        .execute_statement()
+        .statement("DELETE FROM \"Writes\" WHERE pk = 'a' RETURNING ALL NEW *")
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        service_error(err).1,
+        "Invalid returning clause: RETURNING ALL NEW *. Only RETURNING ALL OLD * is allowed in DELETE statements."
+    );
+    let resp = ddb
+        .execute_statement()
+        .statement("DELETE FROM \"Writes\" WHERE pk = 'a' RETURNING ALL OLD *")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.items()[0]["pk"].as_s().unwrap(), "a");
+    let resp = ddb
+        .execute_statement()
+        .statement("DELETE FROM \"Writes\" WHERE pk = 'a' RETURNING ALL OLD *")
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.items().is_empty());
+}
+
+/// A read of `"table"."index"` follows the index: a GSI refuses a column it
+/// does not project, and a keyed read refuses a filter on one.
+#[tokio::test]
+async fn ddb_partiql_index_qualified_reads_follow_the_projection() {
+    use aws_sdk_dynamodb::types::{GlobalSecondaryIndex, Projection, ProjectionType};
+    let server = TestServer::start().await;
+    let ddb = server.dynamodb_client().await;
+    ddb.create_table()
+        .table_name("Indexed")
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("pk")
+                .key_type(KeyType::Hash)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("pk")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("g")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .global_secondary_indexes(
+            GlobalSecondaryIndex::builder()
+                .index_name("by-g")
+                .key_schema(
+                    KeySchemaElement::builder()
+                        .attribute_name("g")
+                        .key_type(KeyType::Hash)
+                        .build()
+                        .unwrap(),
+                )
+                .projection(
+                    Projection::builder()
+                        .projection_type(ProjectionType::KeysOnly)
+                        .build(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .billing_mode(BillingMode::PayPerRequest)
+        .send()
+        .await
+        .unwrap();
+    for (pk, g) in [("a", Some("x")), ("b", Some("x")), ("c", None)] {
+        let mut put = ddb
+            .put_item()
+            .table_name("Indexed")
+            .item("pk", AttributeValue::S(pk.into()))
+            .item("secret", AttributeValue::S(format!("s-{pk}")));
+        if let Some(g) = g {
+            put = put.item("g", AttributeValue::S(g.into()));
+        }
+        put.send().await.unwrap();
+    }
+
+    let pks = select_pks(&ddb, "SELECT * FROM \"Indexed\".\"by-g\" WHERE g = 'x'").await;
+    assert_eq!(pks, ["a", "b"]);
+
+    let err = ddb
+        .execute_statement()
+        .statement("SELECT secret FROM \"Indexed\".\"by-g\" WHERE g = 'x'")
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        service_error(err).1,
+        "One or more parameter values were invalid: Global secondary index by-g does not project [secret]"
+    );
+    let err = ddb
+        .execute_statement()
+        .statement("SELECT pk FROM \"Indexed\".\"by-g\" WHERE g = 'x' AND secret = 's-a'")
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        service_error(err).1,
+        "One or more parameter values were invalid: Secondary index by-g does not project one or more filter attributes: [secret]"
+    );
+    // Unkeyed, the read scans the index, which has no such attribute.
+    let pks = select_pks(
+        &ddb,
+        "SELECT pk FROM \"Indexed\".\"by-g\" WHERE secret = 's-a'",
+    )
+    .await;
+    assert!(pks.is_empty());
+
+    let err = ddb
+        .execute_statement()
+        .statement("SELECT * FROM \"Indexed\".\"nope\"")
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        service_error(err).1,
+        "The table does not have the specified index"
+    );
+}
+
+/// A batch member SELECT must pin the primary key, and a failed member echoes
+/// its table only when it ran; a transaction refuses RETURNING up front.
+#[tokio::test]
+async fn ddb_partiql_batch_and_transaction_rules() {
+    use aws_sdk_dynamodb::types::{
+        BatchStatementErrorCodeEnum, BatchStatementRequest, ParameterizedStatement,
+    };
+    let server = TestServer::start().await;
+    let ddb = server.dynamodb_client().await;
+    create_streamed_table(&ddb, "Multi").await;
+    put_row(&ddb, "Multi", "a", 1, "one").await;
+
+    let stmt = |s: &str| {
+        ParameterizedStatement::builder()
+            .statement(s)
+            .build()
+            .unwrap()
+    };
+    let member = |s: &str| {
+        BatchStatementRequest::builder()
+            .statement(s)
+            .build()
+            .unwrap()
+    };
+    let resp = ddb
+        .batch_execute_statement()
+        .statements(member("SELECT * FROM \"Multi\" WHERE s = 'one'"))
+        .statements(member("SELECT * FROM \"Multi\" WHERE pk = 'a'"))
+        .statements(member(
+            "UPDATE \"Multi\" SET n = 2 WHERE pk = 'a' AND s = 'two'",
+        ))
+        .send()
+        .await
+        .unwrap();
+    let r = resp.responses();
+    let err = r[0].error().unwrap();
+    assert_eq!(
+        err.code(),
+        Some(&BatchStatementErrorCodeEnum::ValidationError)
+    );
+    assert!(err
+        .message()
+        .unwrap()
+        .contains("must specify the primary key in the where clause"));
+    assert!(r[0].table_name().is_none());
+    assert_eq!(r[1].item().unwrap()["s"].as_s().unwrap(), "one");
+    assert_eq!(
+        r[2].error().unwrap().code(),
+        Some(&BatchStatementErrorCodeEnum::ConditionalCheckFailed)
+    );
+    assert_eq!(r[2].table_name(), Some("Multi"));
+
+    let err = ddb
+        .execute_transaction()
+        .transact_statements(stmt(
+            "UPDATE \"Multi\" SET n = 3 WHERE pk = 'a' RETURNING ALL NEW *",
+        ))
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        service_error(err).1,
+        "Validation failed in TransactStatements[0]: RETURNING clause is not supported in ExecuteTransaction."
+    );
+}

@@ -940,14 +940,6 @@ impl DynamoTable {
         )
     }
 
-    /// Sort `rows` of this table into Scan order (see [`RowKey`]).
-    pub(crate) fn sort_in_scan_order(&self, rows: &mut [&HashMap<String, AttributeValue>]) {
-        rows.sort_by_cached_key(|item| {
-            let key = self.encode_key(item);
-            (key.is_none(), key)
-        });
-    }
-
     /// Rebuild `key_index` from `items`. Called after loading a snapshot (the
     /// index is not persisted) and after any bulk rewrite of `items`.
     pub fn rebuild_key_index(&mut self) {

@@ -5404,7 +5404,9 @@ fn create_table_missing_table_name_emits_limit_exceeded() {
 }
 
 #[test]
-fn execute_statement_partiql_error_emits_resource_not_found() {
+fn execute_statement_partiql_error_emits_validation_exception() {
+    // A statement that does not parse is rejected before any table is looked
+    // up, so it is a ValidationException rather than a missing table.
     let svc = make_service();
     let err = svc
         .execute_statement(&make_request(
@@ -5413,7 +5415,7 @@ fn execute_statement_partiql_error_emits_resource_not_found() {
         ))
         .err()
         .unwrap();
-    assert_error_code(err, "ResourceNotFoundException");
+    assert_error_code(err, "ValidationException");
 }
 
 /// No snapshot store (memory mode) -> no persist hook for the CFN provisioner.
@@ -7023,7 +7025,8 @@ async fn partiql_select_from_an_index_reads_the_index() {
 }
 
 /// A PartiQL SELECT returns only the columns it names (document paths and
-/// quoted names included); `*` returns the whole item.
+/// quoted names included), each under the name of its last path step; `*`
+/// returns the whole item.
 #[tokio::test]
 async fn partiql_select_returns_only_the_named_columns() {
     let svc = make_service();
@@ -7052,7 +7055,7 @@ async fn partiql_select_returns_only_the_named_columns() {
             "pk": {"S": "a"},
             "public": {"S": "p"},
             "a.b": {"S": "dotted"},
-            "addr": {"M": {"city": {"S": "c"}}}
+            "city": {"S": "c"}
         }])
     );
     let all = call_dynamodb(
