@@ -326,6 +326,291 @@ pub(crate) fn merge_attribute_values(a: Value, b: Value) -> Value {
     b
 }
 
+fn invalid_projection(detail: impl std::fmt::Display) -> AwsServiceError {
+    AwsServiceError::aws_error(
+        StatusCode::BAD_REQUEST,
+        "ValidationException",
+        format!("Invalid ProjectionExpression: {detail}"),
+    )
+}
+
+#[derive(Debug, PartialEq)]
+enum ProjToken {
+    Name(String),
+    Alias(String),
+    Number(usize),
+    Dot,
+    Comma,
+    Open,
+    Close,
+}
+
+/// One lexed token and the byte span it covers in the expression.
+struct Lexed {
+    token: ProjToken,
+    start: usize,
+    end: usize,
+}
+
+fn lex_projection(expr: &str) -> Result<Vec<Lexed>, AwsServiceError> {
+    let bytes = expr.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    let word_end = |mut j: usize| {
+        while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+            j += 1;
+        }
+        j
+    };
+    while i < bytes.len() {
+        let c = bytes[i];
+        let (token, end) = match c {
+            b' ' | b'\t' | b'\n' | b'\r' => {
+                i += 1;
+                continue;
+            }
+            b'.' => (ProjToken::Dot, i + 1),
+            b',' => (ProjToken::Comma, i + 1),
+            b'[' => (ProjToken::Open, i + 1),
+            b']' => (ProjToken::Close, i + 1),
+            b'#' if i + 1 < bytes.len() && word_end(i + 1) > i + 1 => {
+                let end = word_end(i + 1);
+                (ProjToken::Alias(expr[i..end].to_string()), end)
+            }
+            b'0'..=b'9' => {
+                let mut end = i;
+                while end < bytes.len() && bytes[end].is_ascii_digit() {
+                    end += 1;
+                }
+                let n = expr[i..end].parse().unwrap_or(usize::MAX);
+                (ProjToken::Number(n), end)
+            }
+            c if c.is_ascii_alphabetic() || c == b'_' => {
+                let end = word_end(i);
+                (ProjToken::Name(expr[i..end].to_string()), end)
+            }
+            _ => {
+                // An unrecognised character: DynamoDB names it as the token
+                // and quotes it together with the character that follows.
+                let ch = expr[i..].chars().next().unwrap_or_default();
+                let near: String = expr[i..].chars().take(2).collect();
+                return Err(invalid_projection(format!(
+                    "Syntax error; token: \"{ch}\", near: \"{near}\""
+                )));
+            }
+        };
+        out.push(Lexed {
+            token,
+            start: i,
+            end,
+        });
+        i = end;
+    }
+    Ok(out)
+}
+
+/// Validate a ProjectionExpression the way DynamoDB does before reading
+/// anything: the expression must parse as a comma-separated list of document
+/// paths, every `#alias` must be defined, and no two paths may overlap (one
+/// equal to, or a prefix of, another once aliases are resolved).
+pub(crate) fn validate_projection_expression(
+    expr: &str,
+    expr_attr_names: &HashMap<String, String>,
+) -> Result<(), AwsServiceError> {
+    let tokens = lex_projection(expr)?;
+    let syntax_error = |pos: usize| {
+        let (token, near) = match tokens.get(pos) {
+            Some(t) => {
+                let from = pos.checked_sub(1).map_or(t.start, |p| tokens[p].start);
+                (&expr[t.start..t.end], &expr[from..t.end])
+            }
+            None => {
+                let near = tokens.last().map_or("", |t| &expr[t.start..t.end]);
+                ("<EOF>", near)
+            }
+        };
+        invalid_projection(format!(
+            "Syntax error; token: \"{token}\", near: \"{near}\""
+        ))
+    };
+
+    let mut paths: Vec<Vec<PathSegment>> = Vec::new();
+    let mut pos = 0;
+    loop {
+        let mut path = Vec::new();
+        let resolve = |t: &ProjToken| -> Result<PathSegment, AwsServiceError> {
+            match t {
+                ProjToken::Alias(a) => expr_attr_names
+                    .get(a)
+                    .map(|n| PathSegment::Key(n.clone()))
+                    .ok_or_else(|| {
+                        invalid_projection(format!(
+                            "An expression attribute name used in the document path is not \
+                             defined; attribute name: {a}"
+                        ))
+                    }),
+                ProjToken::Name(n) => Ok(PathSegment::Key(n.clone())),
+                _ => unreachable!("only names and aliases are resolved"),
+            }
+        };
+        match tokens.get(pos).map(|t| &t.token) {
+            Some(t @ (ProjToken::Name(_) | ProjToken::Alias(_))) => path.push(resolve(t)?),
+            _ => return Err(syntax_error(pos)),
+        }
+        pos += 1;
+        loop {
+            match tokens.get(pos).map(|t| &t.token) {
+                Some(ProjToken::Dot) => match tokens.get(pos + 1).map(|t| &t.token) {
+                    Some(t @ (ProjToken::Name(_) | ProjToken::Alias(_))) => {
+                        path.push(resolve(t)?);
+                        pos += 2;
+                    }
+                    _ => return Err(syntax_error(pos + 1)),
+                },
+                Some(ProjToken::Open) => {
+                    let Some(ProjToken::Number(n)) = tokens.get(pos + 1).map(|t| &t.token) else {
+                        return Err(syntax_error(pos + 1));
+                    };
+                    if tokens.get(pos + 2).map(|t| &t.token) != Some(&ProjToken::Close) {
+                        return Err(syntax_error(pos + 2));
+                    }
+                    path.push(PathSegment::Index(*n));
+                    pos += 3;
+                }
+                _ => break,
+            }
+        }
+        paths.push(path);
+        match tokens.get(pos).map(|t| &t.token) {
+            None => break,
+            Some(ProjToken::Comma) => pos += 1,
+            Some(_) => return Err(syntax_error(pos)),
+        }
+    }
+
+    let render = |p: &[PathSegment]| {
+        let parts: Vec<String> = p
+            .iter()
+            .map(|s| match s {
+                PathSegment::Key(k) => k.clone(),
+                PathSegment::Index(i) => format!("[{i}]"),
+            })
+            .collect();
+        format!("[{}]", parts.join(", "))
+    };
+    let same = |a: &PathSegment, b: &PathSegment| match (a, b) {
+        (PathSegment::Key(x), PathSegment::Key(y)) => x == y,
+        (PathSegment::Index(x), PathSegment::Index(y)) => x == y,
+        _ => false,
+    };
+    for (i, one) in paths.iter().enumerate() {
+        for two in &paths[i + 1..] {
+            let shared = one.len().min(two.len());
+            if one.iter().zip(two).take(shared).all(|(a, b)| same(a, b)) {
+                return Err(invalid_projection(format!(
+                    "Two document paths overlap with each other; must remove or rewrite one of \
+                     these paths; path one: {}, path two: {}",
+                    render(one),
+                    render(two)
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate the projection parameters of a read request block (a GetItem
+/// body, a BatchGetItem KeysAndAttributes entry, a TransactGetItems Get):
+/// the legacy `AttributesToGet` may not be combined with a
+/// `ProjectionExpression`, and the expression itself must be valid.
+pub(crate) fn validate_read_projection(block: &Value) -> Result<(), AwsServiceError> {
+    let expression = block["ProjectionExpression"].as_str();
+    if expression.is_some() && block.get("AttributesToGet").is_some_and(|v| !v.is_null()) {
+        return Err(AwsServiceError::aws_error(
+            StatusCode::BAD_REQUEST,
+            "ValidationException",
+            "Can not use both expression and non-expression parameters in the same request: \
+             Non-expression parameters: {AttributesToGet} Expression parameters: \
+             {ProjectionExpression}",
+        ));
+    }
+    match expression {
+        Some(expr) => {
+            validate_projection_expression(expr, &parse_expression_attribute_names(block))
+        }
+        None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod projection_validation_tests {
+    use super::*;
+
+    fn err(expr: &str, names: &[(&str, &str)]) -> String {
+        let names: HashMap<String, String> = names
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        validate_projection_expression(expr, &names)
+            .unwrap_err()
+            .message()
+            .to_string()
+    }
+
+    #[test]
+    fn accepts_well_formed_paths() {
+        let names = HashMap::from([("#a".to_string(), "a".to_string())]);
+        for expr in ["a", "a, b", "#a.b, c[0].d", "l[0], l[1]", "a.b, a.c"] {
+            assert!(
+                validate_projection_expression(expr, &names).is_ok(),
+                "{expr}"
+            );
+        }
+    }
+
+    #[test]
+    fn reports_syntax_errors_with_token_and_context() {
+        assert_eq!(
+            err("!!!", &[]),
+            "Invalid ProjectionExpression: Syntax error; token: \"!\", near: \"!!\""
+        );
+        assert_eq!(
+            err("a b", &[]),
+            "Invalid ProjectionExpression: Syntax error; token: \"b\", near: \"a b\""
+        );
+        assert_eq!(
+            err("a,", &[]),
+            "Invalid ProjectionExpression: Syntax error; token: \"<EOF>\", near: \",\""
+        );
+    }
+
+    #[test]
+    fn reports_undefined_alias() {
+        assert_eq!(
+            err("#undef", &[]),
+            "Invalid ProjectionExpression: An expression attribute name used in the document \
+             path is not defined; attribute name: #undef"
+        );
+    }
+
+    #[test]
+    fn reports_overlapping_paths_in_request_order() {
+        let overlap = |one: &str, two: &str| {
+            format!(
+                "Invalid ProjectionExpression: Two document paths overlap with each other; must \
+                 remove or rewrite one of these paths; path one: {one}, path two: {two}"
+            )
+        };
+        assert_eq!(err("a, a", &[]), overlap("[a]", "[a]"));
+        assert_eq!(err("a, a.b", &[]), overlap("[a]", "[a, b]"));
+        assert_eq!(err("a.b, a", &[]), overlap("[a, b]", "[a]"));
+        assert_eq!(
+            err("#a, #b", &[("#a", "a"), ("#b", "a")]),
+            overlap("[a]", "[a]")
+        );
+    }
+}
+
 #[cfg(test)]
 mod projection_tests {
     use super::*;
