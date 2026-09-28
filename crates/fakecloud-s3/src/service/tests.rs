@@ -3856,6 +3856,388 @@ fn put_object_acl_updates_the_versioned_copy_too() {
 }
 
 #[test]
+fn bucket_owner_full_control_is_accepted_when_ownership_disables_acls() {
+    // AWS refuses ACLs on a BucketOwnerEnforced bucket with one exception:
+    // `bucket-owner-full-control`, which grants nothing the owner does not
+    // already have. All three object-write paths share the check, so all three
+    // have to honor the exception.
+    let svc = make_service();
+    seed_bucket(&svc, "bofc");
+    seed_object(&svc, "bofc", "src.txt", b"body");
+    {
+        let mut mas = svc.state.write();
+        let state = mas.default_mut();
+        let b = state.buckets.get_mut("bofc").unwrap();
+        b.ownership_controls = Some(
+            "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership>\
+             </Rule></OwnershipControls>"
+                .to_string(),
+        );
+    }
+
+    let allowed = svc
+        .resolve_write_acl_headers("123456789012", "bofc", &{
+            let mut h = HeaderMap::new();
+            h.insert("x-amz-acl", "bucket-owner-full-control".parse().unwrap());
+            h
+        })
+        .expect("bucket-owner-full-control must be accepted");
+    // Assert what it resolves to, not that the function echoed back the header
+    // it was handed: the whole point is that the owner ends up with full
+    // control and nobody else appears.
+    let grants = allowed
+        .grants_for("123456789012")
+        .expect("the canned value resolves to grants");
+    assert_eq!(grants.len(), 1, "{grants:?}");
+    assert_eq!(grants[0].permission, "FULL_CONTROL");
+    assert_eq!(grants[0].grantee_type, "CanonicalUser");
+    assert_eq!(grants[0].grantee_id.as_deref(), Some("123456789012"));
+
+    // The exception is about what the ACL GRANTS, not how it is spelled: AWS
+    // accepts "an equivalent form of this ACL" too, so an explicit
+    // full-control grant to the owner is accepted just like the canned value.
+    svc.resolve_write_acl_headers("123456789012", "bofc", &{
+        let mut h = HeaderMap::new();
+        h.insert(
+            "x-amz-grant-full-control",
+            "id=123456789012".parse().unwrap(),
+        );
+        h
+    })
+    .expect("an owner-only grant is the equivalent form and must be accepted");
+
+    // Every other ACL is refused. The model's wording is narrow -- such a
+    // bucket "only accept[s] PUT requests that don't specify an ACL or PUT
+    // requests that specify bucket owner full control ACLs" -- so the three
+    // values that merely RESOLVE to owner-only grants are refused too:
+    // `private` is owner-only by definition, and `bucket-owner-read` and
+    // `aws-exec-read` collapse onto an owner-only grant only because their real
+    // grantees are not modeled. Judging the resolved shape rather than the ACL
+    // the request names accepted all three.
+    for (header, value) in [
+        ("x-amz-acl", "public-read"),
+        ("x-amz-acl", "private"),
+        ("x-amz-acl", "bucket-owner-read"),
+        ("x-amz-acl", "aws-exec-read"),
+        (
+            "x-amz-grant-read",
+            "uri=http://acs.amazonaws.com/groups/global/AllUsers",
+        ),
+    ] {
+        let refused = svc.resolve_write_acl_headers("123456789012", "bofc", &{
+            let mut h = HeaderMap::new();
+            h.insert(header, value.parse().unwrap());
+            h
+        });
+        let err = refused.expect_err(&format!("{header}: {value} must be refused"));
+        assert_eq!(err.code(), "AccessControlListNotSupported", "{err:?}");
+    }
+
+    // A write with no ACL header at all is what such a bucket is for.
+    svc.resolve_write_acl_headers("123456789012", "bofc", &HeaderMap::new())
+        .expect("a write specifying no ACL must be accepted");
+}
+
+#[tokio::test]
+async fn put_object_honors_the_bucket_owner_enforced_rules_end_to_end() {
+    // The three write paths share the resolver, but the helper-level test above
+    // proves nothing about whether a handler actually calls it before writing.
+    let svc = make_service();
+    seed_bucket(&svc, "bofc-e2e");
+    {
+        let mut mas = svc.state.write();
+        let state = mas.default_mut();
+        let b = state.buckets.get_mut("bofc-e2e").unwrap();
+        b.ownership_controls = Some(
+            "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership>\
+             </Rule></OwnershipControls>"
+                .to_string(),
+        );
+    }
+
+    let mut refused = make_request(Method::PUT, "/bofc-e2e/k", &[], b"body");
+    refused
+        .headers
+        .insert("x-amz-acl", "private".parse().unwrap());
+    let err = match svc
+        .put_object("123456789012", &refused, "bofc-e2e", "k")
+        .await
+    {
+        Ok(_) => panic!("`--acl private` is not one of the two ACLs such a bucket accepts"),
+        Err(e) => e,
+    };
+    assert_eq!(err.code(), "AccessControlListNotSupported", "{err:?}");
+    assert!(
+        svc.get_object(
+            "123456789012",
+            &make_request(Method::GET, "/bofc-e2e/k", &[], b""),
+            "bofc-e2e",
+            "k"
+        )
+        .is_err(),
+        "the refused write must not have stored the object"
+    );
+
+    let mut allowed = make_request(Method::PUT, "/bofc-e2e/ok", &[], b"body");
+    allowed
+        .headers
+        .insert("x-amz-acl", "bucket-owner-full-control".parse().unwrap());
+    svc.put_object("123456789012", &allowed, "bofc-e2e", "ok")
+        .await
+        .expect("bucket-owner-full-control must be accepted");
+}
+
+#[tokio::test]
+async fn a_blank_acl_header_is_treated_as_no_acl() {
+    // A present-but-blank header is what a client sends for an unset config
+    // field; the `x-amz-grant-*` family already treats it as absent, and
+    // 400-ing on the canned one made that inconsistent.
+    let svc = make_service();
+    seed_bucket(&svc, "blank-acl");
+
+    let resolved = svc
+        .resolve_write_acl_headers("123456789012", "blank-acl", &{
+            let mut h = HeaderMap::new();
+            h.insert("x-amz-acl", "".parse().unwrap());
+            h
+        })
+        .expect("a blank canned ACL asks for nothing, so it is not an error");
+    assert_eq!(resolved.canned, None);
+    assert!(resolved.grants_for("123456789012").is_none());
+
+    let mut req = make_request(Method::PUT, "/blank-acl/k", &[], b"body");
+    req.headers.insert("x-amz-acl", "".parse().unwrap());
+    svc.put_object("123456789012", &req, "blank-acl", "k")
+        .await
+        .expect("a blank canned ACL must not fail the write");
+}
+
+#[test]
+fn object_writes_refuse_a_public_acl_when_block_public_acls_is_set() {
+    // Only the Put*Acl paths enforced BlockPublicAcls, so `put-object
+    // --acl public-read` stored an AllUsers grant on a bucket that blocks
+    // exactly that, while `put-object-acl --acl public-read` was refused. AWS
+    // refuses both, and all three write paths share this resolver.
+    let svc = make_service();
+    seed_bucket(&svc, "pab-write");
+    {
+        let mut mas = svc.state.write();
+        let state = mas.default_mut();
+        let b = state.buckets.get_mut("pab-write").unwrap();
+        b.public_access_block = Some(
+            "<PublicAccessBlockConfiguration><BlockPublicAcls>true</BlockPublicAcls>\
+             </PublicAccessBlockConfiguration>"
+                .to_string(),
+        );
+    }
+
+    let refused = svc.resolve_write_acl_headers("123456789012", "pab-write", &{
+        let mut h = HeaderMap::new();
+        h.insert("x-amz-acl", "public-read".parse().unwrap());
+        h
+    });
+    let err = refused.expect_err("a public ACL must be refused");
+    assert_eq!(err.code(), "AccessDenied", "{err:?}");
+
+    // A non-public ACL is unaffected.
+    svc.resolve_write_acl_headers("123456789012", "pab-write", &{
+        let mut h = HeaderMap::new();
+        h.insert("x-amz-acl", "private".parse().unwrap());
+        h
+    })
+    .expect("private is not a public ACL");
+}
+
+#[test]
+fn create_multipart_upload_reports_a_bad_acl_value_before_ownership() {
+    // Sharing one resolver normalized the order across the write paths: an
+    // invalid canned value on a BucketOwnerEnforced bucket answers
+    // InvalidArgument (the value is wrong whatever the bucket allows) rather
+    // than AccessControlListNotSupported, which is what PutObject already did.
+    let svc = make_service();
+    seed_bucket(&svc, "mpu-order");
+    {
+        let mut mas = svc.state.write();
+        let state = mas.default_mut();
+        let b = state.buckets.get_mut("mpu-order").unwrap();
+        b.ownership_controls = Some(
+            "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership>\
+             </Rule></OwnershipControls>"
+                .to_string(),
+        );
+    }
+
+    let mut req = make_request(Method::POST, "/mpu-order/k.txt", &[("uploads", "")], b"");
+    req.headers
+        .insert("x-amz-acl", "pubic-read".parse().unwrap());
+    assert_aws_err(
+        svc.create_multipart_upload("123456789012", &req, "mpu-order", "k.txt"),
+        "InvalidArgument",
+    );
+
+    // A valid value that reaches past the owner still reports the ownership.
+    let mut valid = make_request(Method::POST, "/mpu-order/k.txt", &[("uploads", "")], b"");
+    valid
+        .headers
+        .insert("x-amz-acl", "public-read".parse().unwrap());
+    assert_aws_err(
+        svc.create_multipart_upload("123456789012", &valid, "mpu-order", "k.txt"),
+        "AccessControlListNotSupported",
+    );
+}
+
+#[test]
+fn copy_object_honors_the_canned_acl_header() {
+    // A copy used to ignore the header entirely: `copy-object --acl public-read`
+    // answered 200 and produced a private object, so the caller believed the
+    // copy was published.
+    let svc = make_service();
+    seed_bucket(&svc, "copy-src");
+    seed_bucket(&svc, "copy-dst");
+    seed_object(&svc, "copy-src", "k.txt", b"body");
+
+    let mut req = make_request(Method::PUT, "/copy-dst/k.txt", &[], b"");
+    req.headers
+        .insert("x-amz-copy-source", "copy-src/k.txt".parse().unwrap());
+    req.headers
+        .insert("x-amz-acl", "public-read".parse().unwrap());
+    svc.copy_object("123456789012", &req, "copy-dst", "k.txt")
+        .unwrap();
+
+    let get = make_request(Method::GET, "/copy-dst/k.txt", &[("acl", "")], b"");
+    let resp = svc
+        .get_object_acl("123456789012", &get, "copy-dst", "k.txt")
+        .unwrap();
+    let body = std::str::from_utf8(resp.body.expect_bytes()).unwrap();
+    assert!(
+        body.contains("AllUsers"),
+        "canned ACL ignored on copy: {body}"
+    );
+}
+
+#[test]
+fn copy_object_honors_grant_headers() {
+    let svc = make_service();
+    seed_bucket(&svc, "copy-src2");
+    seed_bucket(&svc, "copy-dst2");
+    seed_object(&svc, "copy-src2", "k.txt", b"body");
+
+    let mut req = make_request(Method::PUT, "/copy-dst2/k.txt", &[], b"");
+    req.headers
+        .insert("x-amz-copy-source", "copy-src2/k.txt".parse().unwrap());
+    req.headers.insert(
+        "x-amz-grant-read",
+        "uri=http://acs.amazonaws.com/groups/global/AllUsers"
+            .parse()
+            .unwrap(),
+    );
+    svc.copy_object("123456789012", &req, "copy-dst2", "k.txt")
+        .unwrap();
+
+    let get = make_request(Method::GET, "/copy-dst2/k.txt", &[("acl", "")], b"");
+    let resp = svc
+        .get_object_acl("123456789012", &get, "copy-dst2", "k.txt")
+        .unwrap();
+    let body = std::str::from_utf8(resp.body.expect_bytes()).unwrap();
+    assert!(
+        body.contains("AllUsers"),
+        "grant headers ignored on copy: {body}"
+    );
+    assert!(body.contains("<Permission>READ</Permission>"), "{body}");
+}
+
+#[test]
+fn copy_object_without_acl_headers_stays_private() {
+    // A copy is a new object, so an unspecified ACL is the default owner grant
+    // rather than whatever the source carried.
+    let svc = make_service();
+    seed_bucket(&svc, "copy-src3");
+    seed_bucket(&svc, "copy-dst3");
+    seed_object(&svc, "copy-src3", "k.txt", b"body");
+    {
+        let mut mas = svc.state.write();
+        let state = mas.default_mut();
+        let src = state.buckets.get_mut("copy-src3").unwrap();
+        let obj = src.objects.get_mut("k.txt").unwrap();
+        obj.acl_grants = canned_acl_grants_for_object("public-read", "123456789012");
+    }
+
+    let mut req = make_request(Method::PUT, "/copy-dst3/k.txt", &[], b"");
+    req.headers
+        .insert("x-amz-copy-source", "copy-src3/k.txt".parse().unwrap());
+    svc.copy_object("123456789012", &req, "copy-dst3", "k.txt")
+        .unwrap();
+
+    let get = make_request(Method::GET, "/copy-dst3/k.txt", &[("acl", "")], b"");
+    let resp = svc
+        .get_object_acl("123456789012", &get, "copy-dst3", "k.txt")
+        .unwrap();
+    let body = std::str::from_utf8(resp.body.expect_bytes()).unwrap();
+    assert!(
+        !body.contains("AllUsers"),
+        "the copy inherited the source's public grant: {body}"
+    );
+}
+
+#[test]
+fn copy_object_rejects_conflicting_and_disallowed_acls() {
+    let svc = make_service();
+    seed_bucket(&svc, "copy-src4");
+    seed_bucket(&svc, "copy-dst4");
+    seed_object(&svc, "copy-src4", "k.txt", b"body");
+
+    // A typo used to be accepted here while PutObject refused it.
+    let mut bad = make_request(Method::PUT, "/copy-dst4/k.txt", &[], b"");
+    bad.headers
+        .insert("x-amz-copy-source", "copy-src4/k.txt".parse().unwrap());
+    bad.headers
+        .insert("x-amz-acl", "pubic-read".parse().unwrap());
+    assert_aws_err(
+        svc.copy_object("123456789012", &bad, "copy-dst4", "k.txt"),
+        "InvalidArgument",
+    );
+
+    // Canned plus grants names the ACL two ways.
+    let mut both = make_request(Method::PUT, "/copy-dst4/k.txt", &[], b"");
+    both.headers
+        .insert("x-amz-copy-source", "copy-src4/k.txt".parse().unwrap());
+    both.headers.insert("x-amz-acl", "private".parse().unwrap());
+    both.headers.insert(
+        "x-amz-grant-read",
+        "uri=http://acs.amazonaws.com/groups/global/AllUsers"
+            .parse()
+            .unwrap(),
+    );
+    assert_aws_err(
+        svc.copy_object("123456789012", &both, "copy-dst4", "k.txt"),
+        "InvalidRequest",
+    );
+
+    // And a destination whose ownership disables ACLs refuses them.
+    {
+        let mut mas = svc.state.write();
+        let state = mas.default_mut();
+        let b = state.buckets.get_mut("copy-dst4").unwrap();
+        b.ownership_controls = Some(
+            "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership>\
+             </Rule></OwnershipControls>"
+                .to_string(),
+        );
+    }
+    let mut enforced = make_request(Method::PUT, "/copy-dst4/k.txt", &[], b"");
+    enforced
+        .headers
+        .insert("x-amz-copy-source", "copy-src4/k.txt".parse().unwrap());
+    enforced
+        .headers
+        .insert("x-amz-acl", "public-read".parse().unwrap());
+    assert_aws_err(
+        svc.copy_object("123456789012", &enforced, "copy-dst4", "k.txt"),
+        "AccessControlListNotSupported",
+    );
+}
+
+#[test]
 fn put_object_acl_rejects_an_unresolvable_grantee() {
     // The object paths share parse_grant_headers, which drops what it cannot
     // resolve. Without the shared guard they stored an object ACL with not even

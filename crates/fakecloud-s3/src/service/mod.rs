@@ -194,6 +194,25 @@ pub(crate) fn reject_conflicting_acl_sources(
     }
 }
 
+/// The ACL an object write asks for: a canned value, or resolved grant headers,
+/// or neither.
+#[derive(Debug)]
+pub(crate) struct WriteAclHeaders {
+    pub(crate) canned: Option<String>,
+    pub(crate) grants: Option<Vec<AclGrant>>,
+}
+
+impl WriteAclHeaders {
+    /// The grants to store, given the owner to fall back to.
+    pub(crate) fn grants_for(&self, owner_id: &str) -> Option<Vec<AclGrant>> {
+        match (&self.grants, self.canned.as_deref()) {
+            (Some(grants), _) => Some(grants.clone()),
+            (None, Some(acl)) => Some(canned_acl_grants_for_object(acl, owner_id)),
+            (None, None) => None,
+        }
+    }
+}
+
 /// Whether a request body carries nothing an ACL could be read from.
 ///
 /// The mutual-exclusion checks and the "names no ACL at all" check have to agree
@@ -206,6 +225,121 @@ pub(crate) fn body_is_blank(body: &[u8]) -> bool {
     // Calling it present would reject a canned ACL for conflicting with a body
     // the next line discards.
     std::str::from_utf8(body).map_or(true, |s| s.trim().is_empty())
+}
+
+impl S3Service {
+    /// Validate and resolve the ACL headers of an object write.
+    ///
+    /// Every object-write path goes through here: PutObject,
+    /// CreateMultipartUpload and CopyObject each used to keep their own copy of
+    /// these four checks, and the ORDER matters -- the canned value is validated
+    /// before the grant headers are resolved, and both before the
+    /// "named two ways" rejection, so a request carrying an unresolvable grant
+    /// answers InvalidArgument rather than InvalidRequest. The conformance probe
+    /// populates the canned member and the grant members together, and only the
+    /// first of those codes is in the S3 error allowlist, so a path that
+    /// reordered its own copy would silently drop probe variants.
+    ///
+    /// Call it before any work the request would have to undo -- in particular
+    /// before the body is spooled to disk, since nothing unlinks the spool file
+    /// on an error path.
+    pub(crate) fn resolve_write_acl_headers(
+        &self,
+        account_id: &str,
+        bucket: &str,
+        headers: &HeaderMap,
+    ) -> Result<WriteAclHeaders, AwsServiceError> {
+        // A present-but-blank value is treated as absent, the same rule
+        // `has_grant_headers` applies to the `x-amz-grant-*` family and for the
+        // same reason: it is what a client sends for an unset config field, and
+        // testing presence alone turned that into a hard 400 on every
+        // ACL-accepting write.
+        let canned = headers
+            .get("x-amz-acl")
+            .and_then(|v| v.to_str().ok())
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.to_string());
+        if let Some(acl) = canned.as_deref() {
+            validate_object_canned_acl(acl)?;
+        }
+        let grants = if has_grant_headers(headers) {
+            Some(resolved_grant_headers(headers)?)
+        } else {
+            None
+        };
+        if canned.is_some() && grants.is_some() {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                "Specifying both Canned ACLs and Header Grants is not allowed",
+            ));
+        }
+        // The grants the request resolves to, which is what the public-ACL check
+        // below has to judge.
+        let requested = match (&grants, canned.as_deref()) {
+            (Some(g), _) => Some(g.clone()),
+            (None, Some(acl)) => Some(canned_acl_grants_for_object(acl, account_id)),
+            (None, None) => None,
+        };
+
+        // BucketOwnerEnforced disables object ACLs. The model is precise about
+        // the one exception: such a bucket "only accept[s] PUT requests that
+        // don't specify an ACL or PUT requests that specify bucket owner full
+        // control ACLs, such as the bucket-owner-full-control canned ACL or an
+        // equivalent form of this ACL expressed in the XML format".
+        //
+        // So the test is the ACL the request NAMES, not the grants it resolves
+        // to. Judging by resolved shape would also accept `private`,
+        // `bucket-owner-read` and `aws-exec-read`, all of which AWS refuses
+        // here: `private` is owner-only by definition, and the other two
+        // collapse onto an owner-only grant only because their real grantees
+        // are not modeled. `private` in particular is neither "no ACL" nor
+        // "bucket owner full control".
+        let asks_for_owner_full_control = match (&grants, canned.as_deref()) {
+            // "an equivalent form of this ACL": explicit grants that give the
+            // owner full control and nobody anything.
+            (Some(g), _) => {
+                !g.is_empty()
+                    && g.iter().all(|grant| {
+                        grant.permission == "FULL_CONTROL"
+                            && grant.grantee_type == "CanonicalUser"
+                            && grant.grantee_id.as_deref() == Some(account_id)
+                    })
+            }
+            (None, Some(acl)) => acl == "bucket-owner-full-control",
+            (None, None) => false,
+        };
+        let specifies_an_acl = grants.is_some() || canned.is_some();
+        if specifies_an_acl
+            && !asks_for_owner_full_control
+            && self.bucket_owner_enforced(account_id, bucket)
+        {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "AccessControlListNotSupported",
+                "The bucket does not allow ACLs",
+            ));
+        }
+
+        // BlockPublicAcls refuses a public grant at write time too. Only the
+        // Put*Acl paths enforced it, so `put-object --acl public-read` stored an
+        // AllUsers grant on a bucket that blocks exactly that while
+        // `put-object-acl --acl public-read` was refused; AWS refuses both.
+        if let Some(requested) = requested.as_deref() {
+            if crate::service::config::grants_are_public(requested) {
+                if let Some(flags) = self.pab_flags(account_id, bucket) {
+                    if flags.block_public_acls {
+                        return Err(AwsServiceError::aws_error(
+                            StatusCode::FORBIDDEN,
+                            "AccessDenied",
+                            "User is not authorized to perform: s3:PutObject. Reason: Public Access Block (BlockPublicAcls)",
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(WriteAclHeaders { canned, grants })
+    }
 }
 
 /// Map a [`StoreError`] from the persistence layer to a 500 InternalError
