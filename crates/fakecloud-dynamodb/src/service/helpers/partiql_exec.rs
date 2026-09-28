@@ -1169,8 +1169,12 @@ fn update(
     let found = find(table, &key).map(|(id, item)| (id, item.clone()));
     // A malformed update is rejected whether or not the item exists.
     let mut plan = plan_update(ops, found.as_ref().map_or(&Item::new(), |(_, item)| item))?;
-    // The values this update writes are stored in canonical form, as
-    // UpdateItem stores them; the rest of the row is left as it is.
+    // The values this update writes are validated and then stored in
+    // canonical form, as UpdateItem does; the rest of the row is left as it
+    // is.
+    for v in plan.values.values() {
+        super::validate_attribute_value(v)?;
+    }
     for v in plan.values.values_mut() {
         normalize_value_numbers(v);
     }

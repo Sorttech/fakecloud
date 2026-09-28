@@ -7310,6 +7310,75 @@ async fn partiql_writes_share_the_item_size_and_number_rules() {
     assert_eq!(got["Item"]["u"], json!({"NS": ["1", "0"]}));
 }
 
+/// A value an UPDATE writes is validated like an UpdateItem value before it
+/// is normalized, so it can never store a malformed number or set.
+#[tokio::test]
+async fn partiql_update_validates_written_values() {
+    let svc = make_service();
+    create_test_table(&svc);
+    call_dynamodb(
+        &svc,
+        "PutItem",
+        json!({"TableName": "test-table", "Item": {"pk": {"S": "a"}}}),
+    )
+    .await;
+    for (value, message) in [
+        (
+            json!({"NS": ["1", "1.0"]}),
+            "One or more parameter values were invalid: Input collection [1, 1.0] contains duplicates",
+        ),
+        (
+            json!({"N": "abc"}),
+            "The parameter cannot be converted to a numeric value: abc",
+        ),
+        (
+            json!({"SS": []}),
+            "One or more parameter values were invalid: An string set  may not be empty",
+        ),
+        (
+            json!({"N": "1234567890123456789012345678901234567890"}),
+            "",
+        ),
+    ] {
+        let expected = svc
+            .handle(make_request(
+                "UpdateItem",
+                json!({
+                    "TableName": "test-table",
+                    "Key": {"pk": {"S": "a"}},
+                    "UpdateExpression": "SET u = :v",
+                    "ExpressionAttributeValues": {":v": value}
+                }),
+            ))
+            .await
+            .err()
+            .expect("UpdateItem refuses the value");
+        let err = svc
+            .handle(make_request(
+                "ExecuteStatement",
+                json!({
+                    "Statement": "UPDATE \"test-table\" SET u = ? WHERE pk = 'a'",
+                    "Parameters": [value]
+                }),
+            ))
+            .await
+            .err()
+            .expect("PartiQL UPDATE refuses the value");
+        assert_eq!(err.code(), "ValidationException", "{value}");
+        assert_eq!(err.message(), expected.message(), "{value}");
+        if !message.is_empty() {
+            assert_eq!(err.message(), message, "{value}");
+        }
+    }
+    let got = call_dynamodb(
+        &svc,
+        "GetItem",
+        json!({"TableName": "test-table", "Key": {"pk": {"S": "a"}}}),
+    )
+    .await;
+    assert_eq!(got["Item"], json!({"pk": {"S": "a"}}));
+}
+
 /// A transaction that reads and writes one table reports each as what it
 /// was, not every unit as whichever came first.
 #[tokio::test]
