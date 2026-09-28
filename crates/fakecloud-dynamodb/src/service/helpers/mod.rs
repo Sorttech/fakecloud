@@ -792,6 +792,7 @@ pub(crate) mod schemas;
 mod sizing;
 mod table_descriptions;
 mod table_lookup;
+mod table_validation;
 mod updates;
 pub(crate) use conditions::*;
 pub(crate) use expr::*;
@@ -804,6 +805,7 @@ pub(crate) use schemas::*;
 pub(crate) use sizing::*;
 pub(crate) use table_descriptions::*;
 pub(crate) use table_lookup::*;
+pub(crate) use table_validation::*;
 pub(crate) use updates::*;
 
 #[cfg(test)]

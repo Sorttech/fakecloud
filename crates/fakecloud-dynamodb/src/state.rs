@@ -130,7 +130,48 @@ pub struct VectorIndex {
     /// `SearchSchema` entries as `(AttributeName, SearchSchemaElementType)`.
     pub search_schema: Vec<(String, String)>,
     pub projection: Projection,
-    pub status: String,
+    /// When the index was added to a live table by UpdateTable. Such an index
+    /// builds online, on the GSI machinery: it allocates resources, then
+    /// backfills, and only then serves searches (see
+    /// [`VectorIndex::phase`]). `None` for an index created with its table,
+    /// which is ACTIVE as soon as the table is.
+    #[serde(default)]
+    pub online_created_at: Option<DateTime<Utc>>,
+}
+
+/// Where an online-built vector index is in its creation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorIndexPhase {
+    /// Resources are being allocated: IndexStatus CREATING, Backfilling
+    /// false, and the table itself UPDATING.
+    Allocating,
+    /// Existing items are being indexed: IndexStatus CREATING, Backfilling
+    /// true, the table back to ACTIVE.
+    Backfilling,
+    /// Serving searches.
+    Active,
+}
+
+/// How long an index added by UpdateTable spends allocating resources.
+pub const VECTOR_INDEX_ALLOCATION_MS: i64 = 3_000;
+/// How long it then spends backfilling before it serves searches.
+pub const VECTOR_INDEX_BACKFILL_MS: i64 = 7_000;
+
+impl VectorIndex {
+    /// The creation phase at `now`.
+    pub fn phase(&self, now: DateTime<Utc>) -> VectorIndexPhase {
+        let Some(started) = self.online_created_at else {
+            return VectorIndexPhase::Active;
+        };
+        let elapsed = (now - started).num_milliseconds();
+        if elapsed < VECTOR_INDEX_ALLOCATION_MS {
+            VectorIndexPhase::Allocating
+        } else if elapsed < VECTOR_INDEX_ALLOCATION_MS + VECTOR_INDEX_BACKFILL_MS {
+            VectorIndexPhase::Backfilling
+        } else {
+            VectorIndexPhase::Active
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

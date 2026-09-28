@@ -368,6 +368,19 @@ pub trait KmsHook: Send + Sync {
         service_principal: &str,
         encryption_context: std::collections::HashMap<String, String>,
     ) -> Result<Vec<u8>, String>;
+
+    /// Resolve `key_id` (key id, key ARN, alias name or alias ARN) to the
+    /// key's ARN, provisioning the AWS-managed `aws/<service>` key on first
+    /// use. Services report the resolved ARN on their resource descriptions.
+    fn resolve_key_arn(
+        &self,
+        _account_id: &str,
+        _region: &str,
+        _key_id: &str,
+        _service_principal: &str,
+    ) -> Result<String, String> {
+        Err("key resolution is not supported by this hook".to_string())
+    }
 }
 
 /// Cognito-issued JWT verification hook. Implementations are wired by

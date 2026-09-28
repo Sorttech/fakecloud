@@ -10,7 +10,7 @@ mod partiql;
 mod queries;
 mod streams;
 mod tables;
-mod vectors;
+pub(crate) mod vectors;
 
 use std::collections::HashMap;
 use std::io;
@@ -458,6 +458,7 @@ impl AwsService for DynamoDbService {
                 &body,
                 cross_account::CROSS_ACCOUNT_OPERATIONS,
             ) {
+                cross_account::check_foreign_table_exists(&self.state.read(), &req, &body, &owner)?;
                 req.account_id = owner;
             }
         }

@@ -20,40 +20,32 @@ use super::{
     build_table_description, build_table_description_json, find_table_by_arn,
     find_table_by_arn_mut, get_table, get_table_mut, get_table_mut_with_code, get_table_with_code,
     parse_attribute_definitions, parse_gsi, parse_gsi_throughput, parse_key_schema, parse_lsi,
-    parse_provisioned_throughput, parse_tags, require_str, validate_index_definitions,
-    DynamoDbService,
+    parse_provisioned_throughput, parse_tags, require_str, validate_attribute_definitions_used,
+    validate_create_table_model, validate_create_table_semantics, validate_index_definitions,
+    validate_no_throughput_for_on_demand, validate_update_table_model,
+    validate_update_table_request, DynamoDbService,
 };
 
 impl DynamoDbService {
     pub(super) fn create_table(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let body = Self::parse_body(req)?;
 
-        // CreateTable's Smithy `errors:` list does not include
-        // ValidationException; the only declared "client made a bad request"
-        // shape is LimitExceededException. Real AWS returns
-        // ValidationException for malformed input on this op, but the strict
-        // probe rejects undeclared codes, so we surface LimitExceeded for
-        // structurally-invalid table specs.
-        // A missing TableName stays LimitExceededException: CreateTable's
-        // Smithy `errors:` list omits ValidationException, and a pinned test
-        // depends on this code (the request never reaches the shared parsers).
-        let table_name = body["TableName"]
-            .as_str()
-            .ok_or_else(|| {
-                AwsServiceError::aws_error(
-                    StatusCode::BAD_REQUEST,
-                    "LimitExceededException",
-                    "TableName is required",
-                )
-            })?
-            .to_string();
+        // The request-model layer first: a missing or malformed TableName is
+        // reported on its own, every other member violation together. These
+        // are AWS-faithful ValidationExceptions; the conformance probe accepts
+        // them via `service_common_errors` ("dynamodb" => ValidationException),
+        // since CreateTable's Smithy `errors:` list omits the code even though
+        // the live API returns it for an invalid table spec.
+        validate_create_table_model(&body)?;
+        let table_name = body["TableName"].as_str().unwrap_or_default().to_string();
 
-        // Structural request errors below are AWS-faithful ValidationExceptions.
-        // The conformance probe accepts them via `service_common_errors`
-        // ("dynamodb" => ValidationException), since real DynamoDB returns this
-        // code across essentially every operation for malformed input.
         let key_schema = parse_key_schema(&body["KeySchema"])?;
         let attribute_definitions = parse_attribute_definitions(&body["AttributeDefinitions"])?;
+
+        // Service-layer checks that need nothing but the request: billing and
+        // stream spec conflicts, key-schema shape, LSI rules, duplicate index
+        // names, projections and vector index definitions.
+        validate_create_table_semantics(&body, &key_schema, &attribute_definitions)?;
 
         // Validate that the base-table key schema attributes are defined.
         for ks in &key_schema {
@@ -86,24 +78,12 @@ impl DynamoDbService {
             &body["LocalSecondaryIndexes"],
             &attribute_definitions,
         )?;
+        validate_attribute_definitions_used(&body, &key_schema, &attribute_definitions)?;
 
-        // BillingMode must be one of the two documented enum values.
-        let billing_mode = match body.get("BillingMode") {
-            None | Some(Value::Null) => "PROVISIONED".to_string(),
-            Some(Value::String(s)) if s == "PROVISIONED" || s == "PAY_PER_REQUEST" => s.clone(),
-            Some(other) => {
-                return Err(AwsServiceError::aws_error(
-                    StatusCode::BAD_REQUEST,
-                    "ValidationException",
-                    format!(
-                        "1 validation error detected: Value '{}' at 'billingMode' failed to \
-                         satisfy constraint: Member must satisfy enum value set: \
-                         [PROVISIONED, PAY_PER_REQUEST]",
-                        other.as_str().unwrap_or("")
-                    ),
-                ));
-            }
-        };
+        let billing_mode = body["BillingMode"]
+            .as_str()
+            .unwrap_or("PROVISIONED")
+            .to_string();
 
         let provisioned_throughput = if billing_mode == "PAY_PER_REQUEST" {
             ProvisionedThroughput {
@@ -111,16 +91,6 @@ impl DynamoDbService {
                 write_capacity_units: 0,
             }
         } else {
-            // PROVISIONED billing requires an explicit ProvisionedThroughput;
-            // AWS rejects its omission rather than silently defaulting to 5/5.
-            if !body["ProvisionedThroughput"].is_object() {
-                return Err(AwsServiceError::aws_error(
-                    StatusCode::BAD_REQUEST,
-                    "ValidationException",
-                    "One or more parameter values were invalid: \
-                     ProvisionedThroughput must be specified when BillingMode is PROVISIONED",
-                ));
-            }
             parse_provisioned_throughput(&body["ProvisionedThroughput"])?
         };
 
@@ -170,6 +140,11 @@ impl DynamoDbService {
                     .get("KMSMasterKeyId")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
+                let kms_key = if sse_type == "KMS" {
+                    self.resolve_sse_key_arn(req, kms_key)
+                } else {
+                    kms_key
+                };
                 (Some(sse_type), kms_key)
             } else {
                 (None, None)
@@ -272,20 +247,31 @@ impl DynamoDbService {
 
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
-        // Refuse if deletion protection is enabled (real AWS returns
-        // ResourceInUseException with this message).
-        if state
-            .tables
-            .get(super::resolve_table_name(table_name))
-            .is_some_and(|t| t.deletion_protection_enabled)
-        {
-            return Err(AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "ResourceInUseException",
-                format!(
-                    "Table '{table_name}' can't be deleted while DeletionProtection is enabled"
-                ),
-            ));
+        if let Some(table) = state.tables.get(super::resolve_table_name(table_name)) {
+            // Deletion protection is checked first, and answered as a
+            // validation failure rather than a resource conflict.
+            if table.deletion_protection_enabled {
+                return Err(AwsServiceError::aws_error(
+                    StatusCode::BAD_REQUEST,
+                    "ValidationException",
+                    "Resource cannot be deleted as it is currently protected against deletion. \
+                     Disable deletion protection first.",
+                ));
+            }
+            // A table cannot be deleted while an index on it is still being built.
+            let now = Utc::now();
+            if table
+                .vector_indexes
+                .iter()
+                .any(|v| v.phase(now) != crate::state::VectorIndexPhase::Active)
+            {
+                return Err(AwsServiceError::aws_error(
+                    StatusCode::BAD_REQUEST,
+                    "ResourceInUseException",
+                    "Attempt to change a resource which is still in use: Cannot delete table \
+                     while indexes are being created, updated, or deleted.",
+                ));
+            }
         }
         let table = state
             .tables
@@ -388,6 +374,19 @@ impl DynamoDbService {
     pub(super) fn update_table(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let body = Self::parse_body(req)?;
         let table_name = require_str(&body, "TableName")?;
+        validate_update_table_model(&body)?;
+        validate_no_throughput_for_on_demand(&body)?;
+        // Resolve a KMS key for SSE before taking the table lock.
+        let sse_spec = &body["SSESpecification"];
+        let sse_key_arn = (sse_spec["Enabled"].as_bool() == Some(true)
+            && sse_spec["SSEType"].as_str().unwrap_or("KMS") == "KMS")
+            .then(|| {
+                self.resolve_sse_key_arn(
+                    req,
+                    sse_spec["KMSMasterKeyId"].as_str().map(str::to_string),
+                )
+            })
+            .flatten();
 
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
@@ -407,6 +406,8 @@ impl DynamoDbService {
                     format!("Requested resource not found: Table: {table_name} not found"),
                 )
             })?;
+
+        validate_update_table_request(table, &body)?;
 
         if let Some(pt) = body.get("ProvisionedThroughput") {
             if let Ok(throughput) = parse_provisioned_throughput(pt) {
@@ -463,28 +464,26 @@ impl DynamoDbService {
             }
         }
 
-        // Handle GlobalSecondaryIndexUpdates: a list of {Create, Update, Delete}
-        // operations. Real AWS supports all three; fakecloud now mirrors the
-        // semantics so Terraform's `aws_dynamodb_table` GSI lifecycle works.
-        // Vector index updates: Create adds (or replaces) an index, Delete
-        // removes one. Same Create/Delete shape as the GSI updates below.
+        // Vector index updates (already validated above). A Create builds
+        // online: the index allocates resources, then backfills, and serves
+        // searches only after that (see `VectorIndex::phase`). A Delete
+        // removes the index -- for one still backfilling, that cancels it.
         if let Some(updates) = body.get("VectorIndexUpdates").and_then(|v| v.as_array()) {
             let table_arn = table.arn.clone();
             for op in updates {
                 if let Some(create) = op.get("Create") {
-                    let index = parse_vector_index(create, &table_arn)?;
-                    table
-                        .vector_indexes
-                        .retain(|i| i.index_name != index.index_name);
+                    let mut index = parse_vector_index(create, &table_arn)?;
+                    index.online_created_at = Some(Utc::now());
                     table.vector_indexes.push(index);
                 }
-                if let Some(delete) = op.get("Delete") {
-                    if let Some(name) = delete.get("IndexName").and_then(|v| v.as_str()) {
-                        table.vector_indexes.retain(|i| i.index_name != name);
-                    }
+                if let Some(name) = op["Delete"]["IndexName"].as_str() {
+                    table.vector_indexes.retain(|i| i.index_name != name);
                 }
             }
         }
+        // Handle GlobalSecondaryIndexUpdates: a list of {Create, Update, Delete}
+        // operations. Real AWS supports all three; fakecloud now mirrors the
+        // semantics so Terraform's `aws_dynamodb_table` GSI lifecycle works.
         if let Some(updates) = body
             .get("GlobalSecondaryIndexUpdates")
             .and_then(|v| v.as_array())
@@ -599,17 +598,21 @@ impl DynamoDbService {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             if enabled {
-                table.sse_type = Some(
-                    sse_spec
-                        .get("SSEType")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("KMS")
-                        .to_string(),
-                );
-                table.sse_kms_key_arn = sse_spec
+                let sse_type = sse_spec
+                    .get("SSEType")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("KMS")
+                    .to_string();
+                let kms_key = sse_spec
                     .get("KMSMasterKeyId")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
+                table.sse_kms_key_arn = if sse_type == "KMS" {
+                    sse_key_arn.clone().or(kms_key)
+                } else {
+                    kms_key
+                };
+                table.sse_type = Some(sse_type);
             } else {
                 table.sse_type = None;
                 table.sse_kms_key_arn = None;
@@ -630,6 +633,12 @@ impl DynamoDbService {
             .chain(table.gsi.iter().flat_map(|g| g.key_schema.iter()))
             .chain(table.lsi.iter().flat_map(|l| l.key_schema.iter()))
             .map(|k| k.attribute_name.clone())
+            .chain(
+                table
+                    .vector_indexes
+                    .iter()
+                    .flat_map(|v| v.search_schema.iter().map(|(a, _)| a.clone())),
+            )
             .collect();
         table
             .attribute_definitions
@@ -638,6 +647,28 @@ impl DynamoDbService {
         let table_desc = build_table_description(table);
 
         Self::ok_json(json!({ "TableDescription": table_desc }))
+    }
+
+    /// The ARN of the KMS key encrypting a table: the customer key named by
+    /// `KMSMasterKeyId`, or the account's AWS-managed `aws/dynamodb` key when
+    /// none is named. A customer key the KMS hook cannot resolve is kept as
+    /// given.
+    fn resolve_sse_key_arn(&self, req: &AwsRequest, key_id: Option<String>) -> Option<String> {
+        let Some(hook) = &self.kms_hook else {
+            return key_id;
+        };
+        let wanted = key_id
+            .clone()
+            .unwrap_or_else(|| "alias/aws/dynamodb".to_string());
+        match hook.resolve_key_arn(
+            &req.account_id,
+            req.region.as_str(),
+            &wanted,
+            "dynamodb.amazonaws.com",
+        ) {
+            Ok(arn) => Some(arn),
+            Err(_) => key_id,
+        }
     }
 
     // ── TTL ─────────────────────────────────────────────────────────────
@@ -656,6 +687,22 @@ impl DynamoDbService {
                 "TimeToLiveSpecification.AttributeName is required",
             )
         })?;
+        if attr_name.is_empty() || attr_name.len() > 255 {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "ValidationException",
+                format!(
+                    "1 validation error detected: Value '{attr_name}' at \
+                     'timeToLiveSpecification.attributeName' failed to satisfy constraint: \
+                     Member must have length {}",
+                    if attr_name.is_empty() {
+                        "greater than or equal to 1"
+                    } else {
+                        "less than or equal to 255"
+                    }
+                ),
+            ));
+        }
         let enabled = spec["Enabled"].as_bool().ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -719,6 +766,7 @@ impl DynamoDbService {
     pub(super) fn tag_resource(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let body = Self::parse_body(req)?;
         let resource_arn = require_str(&body, "ResourceArn")?;
+        validate_resource_arn(resource_arn)?;
         validate_required("Tags", &body["Tags"])?;
 
         let mut accounts = self.state.write();
@@ -741,6 +789,7 @@ impl DynamoDbService {
     pub(super) fn untag_resource(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let body = Self::parse_body(req)?;
         let resource_arn = require_str(&body, "ResourceArn")?;
+        validate_resource_arn(resource_arn)?;
         validate_required("TagKeys", &body["TagKeys"])?;
 
         let mut accounts = self.state.write();
@@ -764,6 +813,7 @@ impl DynamoDbService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let body = Self::parse_body(req)?;
         let resource_arn = require_str(&body, "ResourceArn")?;
+        validate_resource_arn(resource_arn)?;
 
         let accounts = self.state.read();
         let empty_ddb = crate::state::DynamoDbState::new(&req.account_id, &req.region);
@@ -2012,6 +2062,19 @@ impl DynamoDbService {
 /// AWS mints an opaque revision per write; deriving it deterministically means
 /// `PutResourcePolicy` and a later `GetResourcePolicy` (Terraform's
 /// import-state-verify) agree on the same id for the same policy document.
+/// A tagging call's `ResourceArn` must be a DynamoDB ARN at all before the
+/// resource it names is looked up.
+fn validate_resource_arn(resource_arn: &str) -> Result<(), AwsServiceError> {
+    if super::cross_account::arn_scope(resource_arn).is_none() {
+        return Err(AwsServiceError::aws_error(
+            StatusCode::BAD_REQUEST,
+            "ValidationException",
+            format!("Invalid TableArn: Invalid ResourceArn provided as input {resource_arn}"),
+        ));
+    }
+    Ok(())
+}
+
 fn policy_revision_id(policy: &str) -> String {
     use std::hash::{Hash, Hasher};
     // `DefaultHasher::new()` is seeded with fixed keys, so this is stable
