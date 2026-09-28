@@ -62,6 +62,31 @@ fn schema_mismatch() -> AwsServiceError {
 /// The ceiling on the aggregate size of the items one transaction writes.
 const MAX_TRANSACTION_BYTES: i64 = 4 * 1024 * 1024;
 
+/// The size of the item a transact Update leaves behind: the update applied
+/// to the stored item (or to a key-only item on an upsert). When the
+/// expression cannot be applied, the key plus every value the expression
+/// could write is counted instead; the apply pass reports that failure.
+fn update_write_size(
+    table: &DynamoTable,
+    op: &Value,
+    key: &HashMap<String, AttributeValue>,
+) -> i64 {
+    let before = table
+        .find_item_index(key)
+        .map(|i| table.items[i].clone())
+        .unwrap_or_else(|| key.clone());
+    let names = parse_expression_attribute_names(op);
+    let values = parse_expression_attribute_values(op);
+    let Some(expr) = op["UpdateExpression"].as_str() else {
+        return DynamoTable::estimate_item_size(&before);
+    };
+    let mut after = before;
+    match apply_update_expression(&mut after, expr, &names, &values) {
+        Ok(()) => DynamoTable::estimate_item_size(&after),
+        Err(_) => DynamoTable::estimate_item_size(key) + DynamoTable::estimate_item_size(&values),
+    }
+}
+
 /// The single action of a TransactWriteItem union and its member name. The
 /// union shape is validated before this is used.
 fn transact_op(ti: &Value) -> (&'static str, &Value) {
@@ -887,10 +912,16 @@ impl DynamoDbService {
                         validate_attribute_value(v)?;
                     }
                 }
-                transaction_bytes += DynamoTable::estimate_item_size(&key);
+                transaction_bytes += match op_key {
+                    "Update" => update_write_size(table, op, &key),
+                    "Delete" => DynamoTable::estimate_item_size(&key),
+                    // A ConditionCheck reads an item but writes nothing.
+                    _ => 0,
+                };
             }
         }
-        // The items a transaction writes may total at most 4 MB.
+        // The items a transaction writes may total at most 4 MB: a Put's
+        // item, an Update's resulting item, a Delete's key.
         if transaction_bytes > MAX_TRANSACTION_BYTES {
             return Err(AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -3241,6 +3272,44 @@ mod tests {
             .err()
             .expect("over 4 MB rejected");
         assert_eq!(err.code(), "ValidationException");
+    }
+
+    // The 4 MB cap counts what an Update writes (its resulting item), not
+    // just its key, so large SET values add up.
+    #[tokio::test]
+    async fn transact_write_4mb_cap_counts_update_values() {
+        let state = make_state();
+        seed_table_with_stream(&state, "Widgets");
+        let svc = DynamoDbService::new(state.clone());
+        let update = |i: usize| {
+            json!({"Update": {
+                "TableName": "Widgets",
+                "Key": {"pk": {"S": format!("u{i}")}},
+                "UpdateExpression": "SET payload = :v",
+                "ExpressionAttributeValues": {":v": {"S": "x".repeat(390_000)}}
+            }})
+        };
+        let under: Vec<Value> = (0..10).map(update).collect();
+        assert!(svc
+            .transact_write_items(&req_for(
+                "TransactWriteItems",
+                json!({"TransactItems": under})
+            ))
+            .is_ok());
+        // Fresh keys so the Updates are upserts of the same size.
+        let over: Vec<Value> = (100..111).map(update).collect();
+        let err = svc
+            .transact_write_items(&req_for(
+                "TransactWriteItems",
+                json!({"TransactItems": over}),
+            ))
+            .err()
+            .expect("over 4 MB of updated items rejected");
+        assert_eq!(err.code(), "ValidationException");
+        let count = state.read().get("123456789012").unwrap().tables["Widgets"]
+            .items
+            .len();
+        assert_eq!(count, 10, "the rejected transaction wrote nothing");
     }
 
     // Batch and transaction operations name no table in their not-found error.

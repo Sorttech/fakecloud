@@ -417,6 +417,9 @@ pub(crate) fn validate_projection_expression(
     expr: &str,
     expr_attr_names: &HashMap<String, String>,
 ) -> Result<(), AwsServiceError> {
+    if expr.trim().is_empty() {
+        return Err(invalid_projection("The expression can not be empty;"));
+    }
     let tokens = lex_projection(expr)?;
     let syntax_error = |pos: usize| {
         let (token, near) = match tokens.get(pos) {
@@ -582,6 +585,16 @@ mod projection_validation_tests {
             err("a,", &[]),
             "Invalid ProjectionExpression: Syntax error; token: \"<EOF>\", near: \",\""
         );
+    }
+
+    #[test]
+    fn rejects_empty_expression() {
+        for expr in ["", "   "] {
+            assert_eq!(
+                err(expr, &[]),
+                "Invalid ProjectionExpression: The expression can not be empty;"
+            );
+        }
     }
 
     #[test]
