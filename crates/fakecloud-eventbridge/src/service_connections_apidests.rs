@@ -93,13 +93,20 @@ impl EventBridgeService {
 
         let now = Utc::now();
         let conn_uuid = uuid::Uuid::new_v4();
-        let arn = format!(
-            "arn:aws:events:{}:{}:connection/{}/{}",
-            req.region, state.account_id, name, conn_uuid
-        );
+        let arn = Arn::regional(
+            "events",
+            &req.region,
+            &state.account_id,
+            &format!("connection/{name}/{conn_uuid}"),
+        )
+        .to_string();
         let secret_arn = format!(
-            "arn:aws:secretsmanager:{}:{}:secret:events!connection/{}/{}",
-            req.region, state.account_id, name, conn_uuid
+            "arn:{}:secretsmanager:{}:{}:secret:events!connection/{}/{}",
+            partition_for(&req.region),
+            req.region,
+            state.account_id,
+            name,
+            conn_uuid
         );
 
         let conn = Connection {
@@ -364,10 +371,13 @@ impl EventBridgeService {
 
         let now = Utc::now();
         let dest_uuid = uuid::Uuid::new_v4();
-        let arn = format!(
-            "arn:aws:events:{}:{}:api-destination/{}/{}",
-            req.region, state.account_id, name, dest_uuid
-        );
+        let arn = Arn::regional(
+            "events",
+            &req.region,
+            &state.account_id,
+            &format!("api-destination/{name}/{dest_uuid}"),
+        )
+        .to_string();
 
         let dest = ApiDestination {
             name: name.clone(),

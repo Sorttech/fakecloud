@@ -49,16 +49,16 @@ impl ResourcePolicyProvider for EventBridgeResourcePolicyProvider {
         state
             .buses
             .values()
-            .find(|b| b.arn == resource_arn)
+            .find(|b| b.answers_to(resource_arn))
             .and_then(|b| b.policy.as_ref())
             .map(|p| p.to_string())
     }
 }
 
 /// Light validity check on an EventBridge bus ARN. Accepts the
-/// `arn:aws:events:REGION:ACCOUNT:event-bus/NAME` shape and nothing else.
+/// `arn:PARTITION:events:REGION:ACCOUNT:event-bus/NAME` shape and nothing else.
 fn is_event_bus_arn(arn: &str) -> bool {
-    let Some(rest) = arn.strip_prefix("arn:aws:events:") else {
+    let Some(rest) = fakecloud_aws::arn::arn_resource(arn, "events") else {
         return false;
     };
     let parts: Vec<&str> = rest.splitn(3, ':').collect();

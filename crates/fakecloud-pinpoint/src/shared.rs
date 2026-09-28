@@ -24,13 +24,15 @@ pub fn now_iso() -> String {
 
 /// The ARN for an application.
 pub fn app_arn(region: &str, account: &str, app_id: &str) -> String {
-    format!("arn:aws:mobiletargeting:{region}:{account}:apps/{app_id}")
+    let partition = fakecloud_aws::arn::partition_for(region);
+    format!("arn:{partition}:mobiletargeting:{region}:{account}:apps/{app_id}")
 }
 
 /// The ARN for a resource nested under an application (e.g.
 /// `apps/<id>/campaigns/<cid>`).
 pub fn nested_arn(region: &str, account: &str, app_id: &str, kind: &str, id: &str) -> String {
-    format!("arn:aws:mobiletargeting:{region}:{account}:apps/{app_id}/{kind}/{id}")
+    let partition = fakecloud_aws::arn::partition_for(region);
+    format!("arn:{partition}:mobiletargeting:{region}:{account}:apps/{app_id}/{kind}/{id}")
 }
 
 /// Map a canonical channel key to its `Platform` value.
