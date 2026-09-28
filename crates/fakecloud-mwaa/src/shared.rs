@@ -3,13 +3,14 @@
 //! place so the create/get/token paths cannot diverge on wire format.
 
 use base64::Engine as _;
+use fakecloud_aws::arn::Arn;
 use uuid::Uuid;
 
 /// The MWAA environment ARN. MWAA's `arnNamespace` is `airflow`, so the ARN is
 /// `arn:aws:airflow:{region}:{account}:environment/{name}` -- note the resource
 /// separator is a `/` (not `:`).
 pub fn environment_arn(region: &str, account: &str, name: &str) -> String {
-    format!("arn:aws:airflow:{region}:{account}:environment/{name}")
+    Arn::regional("airflow", region, account, &format!("environment/{name}")).to_string()
 }
 
 /// The environment `Name` embedded in an MWAA environment ARN, i.e. the segment
@@ -64,9 +65,32 @@ pub fn webserver_url(account: &str, region: &str, name: &str) -> String {
     format!("https://{}", webserver_hostname(account, region, name))
 }
 
-/// The MWAA service-linked role ARN AWS creates for every environment.
-pub fn service_role_arn(account: &str) -> String {
-    format!("arn:aws:iam::{account}:role/aws-service-role/airflow.amazonaws.com/AWSServiceRoleForAmazonMWAA")
+/// The MWAA service-linked role ARN AWS creates for every environment, in
+/// `region`'s partition.
+pub fn service_role_arn(region: &str, account: &str) -> String {
+    Arn::global_in(
+        region,
+        "iam",
+        account,
+        "role/aws-service-role/airflow.amazonaws.com/AWSServiceRoleForAmazonMWAA",
+    )
+    .to_string()
+}
+
+/// The CloudWatch Logs group an environment publishes one Airflow log type to.
+pub fn log_group_arn(region: &str, account: &str, name: &str, suffix: &str) -> String {
+    Arn::regional(
+        "logs",
+        region,
+        account,
+        &format!("log-group:airflow-{name}-{suffix}:*"),
+    )
+    .to_string()
+}
+
+/// The account root principal a web login token is issued to.
+pub fn account_root_arn(region: &str, account: &str) -> String {
+    Arn::global_in(region, "iam", account, "root").to_string()
 }
 
 /// The Celery executor SQS queue URL AWS provisions for an environment.

@@ -20,10 +20,8 @@ pub(crate) fn create_inference_profile(
     // `application-inference-profile/<id>` ARN (system-defined profiles use the
     // bare `inference-profile/` resource); the provider asserts this shape.
     let profile_id = fakecloud_core::ids::short_id(12).to_string();
-    let profile_arn = format!(
-        "arn:aws:bedrock:{}:{}:application-inference-profile/{}",
-        req.region, req.account_id, profile_id
-    );
+    let profile_arn =
+        crate::arns::application_inference_profile_arn(&req.region, &req.account_id, &profile_id);
 
     let now = Utc::now();
     let profile = InferenceProfile {
@@ -257,15 +255,13 @@ const SYSTEM_PROFILE_REGIONS: &[&str] = &["us-east-1", "us-west-2"];
 
 /// Build the JSON summary for one system-defined inference profile.
 fn system_profile_json(req: &AwsRequest, profile_id: &str, model_id: &str) -> Value {
-    let arn = format!(
-        "arn:aws:bedrock:{}:{}:inference-profile/{}",
-        req.region, req.account_id, profile_id
-    );
+    let arn = crate::arns::inference_profile_arn(&req.region, &req.account_id, profile_id);
+    let partition = fakecloud_aws::arn::partition_of(&arn);
     let models: Vec<Value> = SYSTEM_PROFILE_REGIONS
         .iter()
         .map(|region| {
             json!({
-                "modelArn": format!("arn:aws:bedrock:{region}::foundation-model/{model_id}")
+                "modelArn": format!("arn:{partition}:bedrock:{region}::foundation-model/{model_id}")
             })
         })
         .collect();
@@ -299,7 +295,7 @@ fn profile_models(model_source: &Value, region: &str) -> Value {
         return json!([{ "modelArn": copy_from }]);
     }
     json!([{
-        "modelArn": format!("arn:aws:bedrock:{region}::foundation-model/amazon.titan-text-express-v1")
+        "modelArn": crate::arns::foundation_model_arn(region, "amazon.titan-text-express-v1")
     }])
 }
 

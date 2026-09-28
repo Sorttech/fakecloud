@@ -577,6 +577,41 @@ async fn guardrail_crud() {
 }
 
 #[tokio::test]
+async fn guardrail_in_china_region_uses_aws_cn_partition() {
+    let state = make_state();
+    let svc = BedrockService::new(state);
+
+    let body = serde_json::json!({
+        "name": "cn-guardrail",
+        "blockedInputMessaging": "Blocked input",
+        "blockedOutputsMessaging": "Blocked output",
+    });
+    let mut req = make_request(Method::POST, "/guardrails", &body.to_string());
+    req.region = "cn-north-1".to_string();
+    let b = body_json(&svc.handle(req).await.unwrap());
+    let arn = b["guardrailArn"].as_str().unwrap().to_string();
+    assert!(
+        arn.starts_with("arn:aws-cn:bedrock:cn-north-1:123456789012:guardrail/"),
+        "{arn}"
+    );
+
+    let encoded = arn.replace(':', "%3A").replace('/', "%2F");
+    let mut req = make_request(Method::POST, &format!("/guardrails/{encoded}"), "{}");
+    req.region = "cn-north-1".to_string();
+    let b = body_json(&svc.handle(req).await.unwrap());
+    assert_eq!(b["version"], "1");
+
+    let mut req = make_request(Method::GET, "/foundation-models", "");
+    req.region = "cn-north-1".to_string();
+    let b = body_json(&svc.handle(req).await.unwrap());
+    let model_arn = b["modelSummaries"][0]["modelArn"].as_str().unwrap();
+    assert!(
+        model_arn.starts_with("arn:aws-cn:bedrock:cn-north-1::foundation-model/"),
+        "{model_arn}"
+    );
+}
+
+#[tokio::test]
 async fn guardrail_not_found() {
     let state = make_state();
     let svc = BedrockService::new(state);

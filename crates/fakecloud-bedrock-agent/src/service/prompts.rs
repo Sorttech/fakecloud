@@ -9,7 +9,7 @@ impl BedrockAgentService {
         let id = short_id();
         let now_dt = now();
         let variants = opt_array(&body, "variants");
-        let arn = prompt_arn(&id, &req.region, &req.account_id);
+        let arn = prompt_arn(&req.region, &req.account_id, &id);
         let prompt = Prompt {
             prompt_id: id.clone(),
             name: name.clone(),
@@ -87,7 +87,7 @@ impl BedrockAgentService {
         versions.push(pv);
         let arn = format!(
             "{}:{version_num}",
-            prompt_arn(&id, &req.region, &req.account_id)
+            prompt_arn(&req.region, &req.account_id, &id)
         );
         let mut out = json!({
             "name": prompt.name,
@@ -172,7 +172,7 @@ impl BedrockAgentService {
                         let mut o = json!({
                             "id": v.prompt_id,
                             "version": v.prompt_version,
-                            "arn": format!("{}:{}", prompt_arn(&v.prompt_id, &req.region, &req.account_id), v.prompt_version),
+                            "arn": format!("{}:{}", prompt_arn(&req.region, &req.account_id, &v.prompt_id), v.prompt_version),
                             "createdAt": v.created_at.to_rfc3339(),
                             "updatedAt": v.updated_at.to_rfc3339(),
                         });
@@ -206,7 +206,7 @@ impl BedrockAgentService {
         let mut out = json!({
             "id": v.prompt_id,
             "version": v.prompt_version,
-            "arn": format!("{}:{}", prompt_arn(&v.prompt_id, &req.region, &req.account_id), v.prompt_version),
+            "arn": format!("{}:{}", prompt_arn(&req.region, &req.account_id, &v.prompt_id), v.prompt_version),
             "createdAt": v.created_at.to_rfc3339(),
             "updatedAt": v.updated_at.to_rfc3339(),
             "variants": v.variants,

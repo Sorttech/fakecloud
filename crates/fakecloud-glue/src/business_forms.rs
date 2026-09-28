@@ -456,10 +456,13 @@ impl GlueService {
             "Status": setting,
             "CreatedAt": created,
             "UpdatedAt": now,
-            "S3TableBucketArn": format!(
-                "arn:aws:s3tables:{}:{}:bucket/glue-data-catalog",
-                req.region, req.account_id
-            ),
+            "S3TableBucketArn": fakecloud_aws::arn::Arn::regional(
+                "s3tables",
+                &req.region,
+                &req.account_id,
+                "bucket/glue-data-catalog",
+            )
+            .to_string(),
         });
         if let Some(e) = encryption {
             cfg["EncryptionConfiguration"] = e.clone();

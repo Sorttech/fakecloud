@@ -1019,7 +1019,7 @@ impl EmrService {
 
     pub(crate) fn get_block_public_access(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let created = now_epoch();
-        let arn = format!("arn:aws:iam::{}:root", req.account_id);
+        let arn = account_root_arn(&req.region, &req.account_id);
         self.with_account(req, |acct| {
             let config = acct.block_public_access.clone().unwrap_or_else(|| {
                 json!({
@@ -1043,7 +1043,7 @@ impl EmrService {
         let config = body.get("BlockPublicAccessConfiguration").cloned().unwrap_or(json!({}));
         let metadata = json!({
             "CreationDateTime": now_epoch(),
-            "CreatedByArn": format!("arn:aws:iam::{}:root", req.account_id),
+            "CreatedByArn": account_root_arn(&req.region, &req.account_id),
         });
         self.with_account_mut(req, |acct| {
             acct.block_public_access = Some(config);
@@ -1135,10 +1135,7 @@ impl EmrService {
         let engine = body.get("ExecutionEngine").cloned().unwrap_or(json!({}));
         let cluster_id = sf(&engine, "Id").unwrap_or_default().to_string();
         let id = format!("ex-{}", rand_suffix(26));
-        let arn = format!(
-            "arn:aws:elasticmapreduce:{}:{}:notebook-execution/{id}",
-            req.region, req.account_id
-        );
+        let arn = notebook_execution_arn(&req.region, &req.account_id, &id);
         let now = now_epoch();
         let mut exec = serde_json::Map::new();
         exec.insert("NotebookExecutionId".into(), json!(id));
@@ -1279,10 +1276,7 @@ impl EmrService {
         let body = req.json_body();
         let cluster_id = sf(&body, "ClusterId").unwrap_or_default().to_string();
         let session_id = uuid::Uuid::new_v4().to_string();
-        let arn = format!(
-            "arn:aws:elasticmapreduce:{}:{}:cluster/{}/session/{}",
-            req.region, req.account_id, cluster_id, session_id
-        );
+        let arn = session_arn(&req.region, &req.account_id, &cluster_id, &session_id);
         let now = now_epoch();
         let mut session = serde_json::Map::new();
         session.insert("Id".into(), json!(session_id));
@@ -1754,5 +1748,43 @@ mod run_job_flow_tests {
             .unwrap(),
         );
         assert_eq!(atp["AutoTerminationPolicy"]["IdleTimeout"], 60);
+    }
+
+    #[test]
+    fn china_region_arns_share_the_aws_cn_partition() {
+        let s = svc();
+        let cn = |action: &str, body: Value| {
+            let mut r = req(action, body);
+            r.region = "cn-north-1".into();
+            r
+        };
+        let created = json_of(
+            s.run_job_flow(&cn(
+                "RunJobFlow",
+                json!({"Name": "c", "Instances": {"KeepJobFlowAliveWhenNoSteps": true}}),
+            ))
+            .unwrap(),
+        );
+        let id = created["JobFlowId"].as_str().unwrap();
+        assert_eq!(
+            created["ClusterArn"],
+            format!("arn:aws-cn:elasticmapreduce:cn-north-1:000000000000:cluster/{id}")
+        );
+        let described =
+            json_of(s.describe_cluster(&cn("DescribeCluster", json!({"ClusterId": id}))).unwrap());
+        assert_eq!(described["Cluster"]["ClusterArn"], created["ClusterArn"]);
+
+        let bpa = json_of(
+            s.get_block_public_access(&cn("GetBlockPublicAccessConfiguration", json!({})))
+                .unwrap(),
+        );
+        assert_eq!(
+            bpa["BlockPublicAccessConfigurationMetadata"]["CreatedByArn"],
+            "arn:aws-cn:iam::000000000000:root"
+        );
+        assert_eq!(
+            notebook_execution_arn("cn-north-1", "000000000000", "ex-1"),
+            "arn:aws-cn:elasticmapreduce:cn-north-1:000000000000:notebook-execution/ex-1"
+        );
     }
 }

@@ -801,10 +801,7 @@ fn create_topic_rule_destination(
     data.seq += 1;
     let kind = if vpc.is_some() { "vpc" } else { "http" };
     let uid = super::mint_uuid(&format!("{}:dest:{}", ctx.account, data.seq));
-    let arn = format!(
-        "arn:aws:iot:{}:{}:ruledestination/{kind}/{uid}",
-        ctx.region, ctx.account
-    );
+    let arn = super::rule_destination_arn(&ctx.region, &ctx.account, kind, &uid);
     let now = super::now_epoch();
 
     let mut dest = Map::new();
@@ -1896,7 +1893,7 @@ fn transfer_certificate(
     let Some(mut rec) = data.get_resource("certificates", &cert_id).cloned() else {
         return Err(super::engine::not_found(meta, &cert_id));
     };
-    let transferred_arn = format!("arn:aws:iot:{}:{}:cert/{}", ctx.region, target, cert_id);
+    let transferred_arn = super::cert_arn(&ctx.region, &target, &cert_id);
     if let Some(o) = rec.as_object_mut() {
         o.insert(
             "status".to_string(),
@@ -2086,10 +2083,7 @@ fn resolve_cert_transfer(
                 if let Some(target) = target {
                     obj.insert(
                         "certificateArn".to_string(),
-                        Value::String(format!(
-                            "arn:aws:iot:{}:{}:cert/{}",
-                            ctx.region, target, cert_id
-                        )),
+                        Value::String(super::cert_arn(&ctx.region, &target, &cert_id)),
                     );
                     obj.insert("ownedBy".to_string(), Value::String(target));
                 }

@@ -12,12 +12,9 @@ impl BedrockAgentService {
         // plausible value when the caller omits one so the response still
         // satisfies the required shape.
         let role_arn = opt_str(&body, "executionRoleArn").unwrap_or_else(|| {
-            format!(
-                "arn:aws:iam::{}:role/service-role/AmazonBedrockExecutionRoleForFlows_{id}",
-                req.account_id
-            )
+            crate::arns::default_flow_execution_role_arn(&req.region, &req.account_id, &id)
         });
-        let arn = flow_arn(&id, &req.region, &req.account_id);
+        let arn = flow_arn(&req.region, &req.account_id, &id);
         let definition = opt_json(&body, "definition");
         let flow = Flow {
             flow_id: id.clone(),

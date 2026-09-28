@@ -220,6 +220,34 @@ fn workflow_run_properties_round_trip() {
 }
 
 #[test]
+fn china_region_registry_arn_uses_aws_cn_partition() {
+    let svc = GlueService::default();
+    let cn = |action: &str, body: Value| {
+        let mut r = req(action, body);
+        r.region = "cn-north-1".to_string();
+        r
+    };
+    let created = body_of(
+        svc.create_registry(&cn("CreateRegistry", json!({"RegistryName": "reg-cn"})))
+            .unwrap(),
+    );
+    let arn = created["RegistryArn"].as_str().unwrap();
+    assert_eq!(
+        arn,
+        "arn:aws-cn:glue:cn-north-1:123456789012:registry/reg-cn"
+    );
+
+    let got = body_of(
+        svc.get_registry(&cn(
+            "GetRegistry",
+            json!({"RegistryId": {"RegistryArn": arn}}),
+        ))
+        .unwrap(),
+    );
+    assert_eq!(got["RegistryArn"], arn);
+}
+
+#[test]
 fn schema_registry_version_round_trip() {
     let svc = GlueService::default();
     svc.create_registry(&req("CreateRegistry", json!({"RegistryName": "reg"})))

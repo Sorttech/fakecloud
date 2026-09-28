@@ -1,5 +1,4 @@
 use chrono::Utc;
-use fakecloud_aws::arn::Arn;
 use http::StatusCode;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -30,10 +29,7 @@ pub(crate) fn create_model_customization_job(
     let role_arn = body["roleArn"].as_str().unwrap_or_default();
 
     let job_id = Uuid::new_v4().to_string();
-    let job_arn = format!(
-        "arn:aws:bedrock:{}:{}:model-customization-job/{}",
-        req.region, req.account_id, job_id
-    );
+    let job_arn = crate::arns::model_customization_job_arn(&req.region, &req.account_id, &job_id);
 
     let now = Utc::now();
     let job = crate::state::CustomizationJob {
@@ -100,10 +96,8 @@ pub(crate) fn get_model_customization_job(
             )
         })?;
 
-    let output_model_arn = format!(
-        "arn:aws:bedrock:{}:{}:custom-model/{}",
-        req.region, req.account_id, job.custom_model_name
-    );
+    let output_model_arn =
+        crate::arns::custom_model_arn(&req.region, &req.account_id, &job.custom_model_name);
 
     // GetModelCustomizationJobResponse requires `baseModelArn` and
     // `validationDataConfig`; the stored `baseModelIdentifier` is normalized
@@ -187,13 +181,7 @@ fn base_model_arn(base_model_identifier: &str, region: &str) -> String {
     if base_model_identifier.starts_with("arn:") {
         base_model_identifier.to_string()
     } else {
-        Arn::new(
-            "bedrock",
-            region,
-            "",
-            &format!("foundation-model/{base_model_identifier}"),
-        )
-        .to_string()
+        crate::arns::foundation_model_arn(region, base_model_identifier)
     }
 }
 

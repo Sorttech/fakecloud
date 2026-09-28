@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 
+use crate::arns::{flow_execution_arn, flow_execution_role_arn, session_arn};
 use crate::state::{
     FlowExecution, InvocationRecord, InvocationStep, Session, SessionInvocation,
     SharedBedrockAgentRuntimeState,
@@ -380,12 +381,12 @@ fn re_taggable_arn() -> Regex {
 }
 fn re_flow_identifier() -> Regex {
     Regex::new(
-        r"^(arn:aws:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:flow/[0-9a-zA-Z]{10})|([0-9a-zA-Z]{10})$",
+        r"^(arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:flow/[0-9a-zA-Z]{10})|([0-9a-zA-Z]{10})$",
     )
     .unwrap()
 }
 fn re_flow_alias_identifier() -> Regex {
-    Regex::new(r"^(arn:aws:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:flow/[0-9a-zA-Z]{10}/alias/[0-9a-zA-Z]{10})|(\bTSTALIASID\b|[0-9a-zA-Z]+)$").unwrap()
+    Regex::new(r"^(arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:flow/[0-9a-zA-Z]{10}/alias/[0-9a-zA-Z]{10})|(\bTSTALIASID\b|[0-9a-zA-Z]+)$").unwrap()
 }
 fn re_no_whitespace() -> Regex {
     // NextToken: ^\S*$
@@ -460,33 +461,6 @@ fn merge_path_params(body: Value, path_params: &[(String, String)]) -> Value {
         out.insert(k.clone(), Value::String(v.clone()));
     }
     Value::Object(out)
-}
-
-fn session_arn(account_id: &str, region: &str, session_id: &str) -> String {
-    format!(
-        "arn:aws:bedrock:{}:{}:session/{}",
-        if region.is_empty() {
-            "us-east-1"
-        } else {
-            region
-        },
-        account_id,
-        session_id
-    )
-}
-
-fn flow_execution_arn(account_id: &str, region: &str, flow_id: &str, execution_id: &str) -> String {
-    format!(
-        "arn:aws:bedrock:{}:{}:flow/{}/execution/{}",
-        if region.is_empty() {
-            "us-east-1"
-        } else {
-            region
-        },
-        account_id,
-        flow_id,
-        execution_id
-    )
 }
 
 #[async_trait]
@@ -723,8 +697,8 @@ async fn handle_invoke_flow(
             FlowExecution {
                 execution_id: execution_id.clone(),
                 execution_arn: flow_execution_arn(
-                    &req.account_id,
                     &req.region,
+                    &req.account_id,
                     &flow_id,
                     &execution_id,
                 ),
@@ -1124,7 +1098,7 @@ async fn handle_create_session(
     let session_id = uuid::Uuid::new_v4().to_string();
     // Force into UUID format
     let now = Utc::now();
-    let arn = session_arn(&req.account_id, &req.region, &session_id);
+    let arn = session_arn(&req.region, &req.account_id, &session_id);
 
     let metadata: std::collections::BTreeMap<String, String> = body
         .get("sessionMetadata")
@@ -1925,7 +1899,7 @@ async fn handle_start_flow_execution(
     let flow_id = flow_id.unwrap();
     let flow_alias_id = flow_alias_id.unwrap();
     let execution_id = uuid::Uuid::new_v4().to_string();
-    let arn = flow_execution_arn(&req.account_id, &req.region, &flow_id, &execution_id);
+    let arn = flow_execution_arn(&req.region, &req.account_id, &flow_id, &execution_id);
     let now = Utc::now();
 
     {
@@ -2001,7 +1975,7 @@ async fn handle_stop_flow_execution(
     } else {
         // Allow stop on unknown execution: still return Aborted with synthetic ARN
         (
-            flow_execution_arn(&req.account_id, &req.region, "unknown", &exec_id),
+            flow_execution_arn(&req.region, &req.account_id, "unknown", &exec_id),
             "Aborted".to_string(),
         )
     };
@@ -2048,10 +2022,10 @@ async fn handle_get_execution_flow_snapshot(
     let flow_id = flow_id.unwrap();
     let flow_alias_id = flow_alias_id.unwrap();
 
-    let role_arn = format!(
-        "arn:aws:iam::{}:role/service-role/AmazonBedrockExecutionRoleForFlow_{}",
-        req.account_id, flow_id
-    );
+    let bare_flow_id = fakecloud_aws::arn::arn_resource(&flow_id, "bedrock")
+        .and_then(|rest| rest.rsplit_once(":flow/"))
+        .map_or(flow_id.as_str(), |(_, id)| id);
+    let role_arn = flow_execution_role_arn(&req.region, &req.account_id, bare_flow_id);
 
     let definition = serde_json::to_string(&json!({
         "nodes": [
@@ -2376,4 +2350,83 @@ async fn handle_list_tags_for_resource(
         .unwrap_or_default();
 
     Ok(AwsResponse::ok_json(json!({ "tags": tags })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::BedrockAgentRuntimeAccounts;
+    use http::HeaderMap;
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+
+    fn cn_request() -> AwsRequest {
+        AwsRequest {
+            service: "bedrock-agent-runtime".to_string(),
+            action: String::new(),
+            region: "cn-north-1".to_string(),
+            account_id: "123456789012".to_string(),
+            request_id: "test-id".to_string(),
+            headers: HeaderMap::new(),
+            query_params: HashMap::new(),
+            body: Default::default(),
+            body_stream: parking_lot::Mutex::new(None),
+            path_segments: Vec::new(),
+            raw_path: String::new(),
+            raw_query: String::new(),
+            method: Method::POST,
+            is_query_protocol: false,
+            access_key_id: None,
+            principal: None,
+        }
+    }
+
+    fn body(resp: AwsResponse) -> Value {
+        serde_json::from_slice(resp.body.expect_bytes()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn china_region_session_arn_round_trips() {
+        let svc = BedrockAgentRuntimeService::new(Arc::new(RwLock::new(
+            BedrockAgentRuntimeAccounts::new(),
+        )));
+        let req = cn_request();
+        let created = body(handle_create_session(&svc, &req, &json!({})).await.unwrap());
+        let arn = created["sessionArn"].as_str().unwrap();
+        assert!(
+            arn.starts_with("arn:aws-cn:bedrock:cn-north-1:123456789012:session/"),
+            "{arn}"
+        );
+
+        let got = body(
+            handle_get_session(&svc, &req, &json!({"sessionIdentifier": arn}))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(got["sessionId"], created["sessionId"]);
+    }
+
+    #[tokio::test]
+    async fn china_region_flow_snapshot_role_uses_aws_cn_partition() {
+        let svc = BedrockAgentRuntimeService::new(Arc::new(RwLock::new(
+            BedrockAgentRuntimeAccounts::new(),
+        )));
+        let snapshot = body(
+            handle_get_execution_flow_snapshot(
+                &svc,
+                &cn_request(),
+                &json!({
+                    "flowIdentifier": "arn:aws-cn:bedrock:cn-north-1:123456789012:flow/ABCDEFGHIJ",
+                    "flowAliasIdentifier": "TSTALIASID",
+                    "executionIdentifier": "exec-1",
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(
+            snapshot["executionRoleArn"],
+            "arn:aws-cn:iam::123456789012:role/service-role/AmazonBedrockExecutionRoleForFlow_ABCDEFGHIJ"
+        );
+    }
 }

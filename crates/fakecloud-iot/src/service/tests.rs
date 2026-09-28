@@ -112,6 +112,31 @@ fn unknown_route_is_not_found() {
 // ---------- things lifecycle ----------
 
 #[test]
+fn china_region_thing_arn_uses_aws_cn_partition_and_tags_by_it() {
+    let s = svc();
+    let run_cn = |method: &str, path: &str, body: Value| {
+        let mut req = mk_req(method, path, &[], body);
+        req.region = "cn-north-1".into();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(s.handle(req))
+    };
+    let created = body_of(&run_cn("POST", "/things/cn-thing", json!({})).unwrap());
+    let arn = created["thingArn"].as_str().unwrap().to_string();
+    assert_eq!(arn, "arn:aws-cn:iot:cn-north-1:000000000000:thing/cn-thing");
+
+    run_cn(
+        "POST",
+        "/tags",
+        json!({"resourceArn": arn, "tags": [{"Key": "env", "Value": "cn"}]}),
+    )
+    .unwrap();
+    let listed = body_of(&run_cn("GET", &format!("/tags?resourceArn={arn}"), Value::Null).unwrap());
+    assert_eq!(listed["tags"][0]["Value"], "cn");
+}
+
+#[test]
 fn thing_create_get_list_delete() {
     let s = svc();
     let created = run(
