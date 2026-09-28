@@ -2446,6 +2446,75 @@ async fn cross_account_get_secret_value_allowed_with_matching_policy() {
     assert_eq!(body["SecretString"].as_str().unwrap(), "shhh");
 }
 
+#[tokio::test]
+async fn china_region_secret_arn_round_trips_across_accounts() {
+    let svc = SecretsManagerService::new(make_state());
+    let in_cn = |action: &str, account: &str, body: &str| {
+        let mut req = make_request_for(action, account, body);
+        req.region = "cn-north-1".to_string();
+        req
+    };
+
+    let resp = svc
+        .handle(in_cn(
+            "CreateSecret",
+            "111111111111",
+            r#"{"Name": "cn/secret", "SecretString": "shhh"}"#,
+        ))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    let arn = body["ARN"].as_str().unwrap().to_string();
+    assert!(
+        arn.starts_with("arn:aws-cn:secretsmanager:cn-north-1:111111111111:secret:cn/secret-"),
+        "{arn}"
+    );
+
+    // A partial ARN (without the random suffix) resolves the same secret.
+    let partial = arn.rsplit_once('-').unwrap().0;
+    let resp = svc
+        .handle(in_cn(
+            "DescribeSecret",
+            "111111111111",
+            &format!(r#"{{"SecretId": "{partial}"}}"#),
+        ))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(body["ARN"], arn);
+
+    let policy = serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"AWS": "arn:aws-cn:iam::222222222222:root"},
+            "Action": "secretsmanager:GetSecretValue",
+            "Resource": "*"
+        }]
+    });
+    svc.handle(in_cn(
+        "PutResourcePolicy",
+        "111111111111",
+        &format!(
+            r#"{{"SecretId": "{arn}", "ResourcePolicy": {}}}"#,
+            serde_json::to_string(&policy.to_string()).unwrap()
+        ),
+    ))
+    .await
+    .unwrap();
+
+    let resp = svc
+        .handle(in_cn(
+            "GetSecretValue",
+            "222222222222",
+            &format!(r#"{{"SecretId": "{arn}"}}"#),
+        ))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(body["SecretString"], "shhh");
+}
+
 #[test]
 fn secret_owner_account_extracts_from_arn() {
     assert_eq!(

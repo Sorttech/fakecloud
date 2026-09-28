@@ -6,6 +6,8 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use fakecloud_aws::arn::{partition_of, Arn};
+
 /// Shared, cross-account registry of every organization in the process.
 /// An AWS org is not per-account state (it spans accounts), so this is
 /// NOT wrapped in `MultiAccountState` — but it is not a singleton
@@ -22,9 +24,10 @@ pub struct OrganizationsRegistry {
     orgs: BTreeMap<String, OrganizationState>,
 }
 
-/// A GovCloud mirror lives in the `aws-us-gov` partition.
-fn is_gov_cloud(account: &MemberAccount) -> bool {
-    account.arn.starts_with("arn:aws-us-gov:")
+/// A GovCloud mirror lives in the `aws-us-gov` partition, outside its
+/// organization's own partition.
+fn is_gov_cloud(org: &OrganizationState, account: &MemberAccount) -> bool {
+    partition_of(&account.arn) != partition_of(&org.org_arn)
 }
 
 /// Resolve a handshake or transfer target to an account id.
@@ -214,7 +217,7 @@ impl OrganizationsRegistry {
             if let Some(account) = self.orgs.get(within).and_then(|org| {
                 org.accounts
                     .values()
-                    .find(|a| a.email == target && !is_gov_cloud(a) && a.status != "SUSPENDED")
+                    .find(|a| a.email == target && !is_gov_cloud(org, a) && a.status != "SUSPENDED")
             }) {
                 return Some(account.id.clone());
             }
@@ -250,13 +253,15 @@ impl OrganizationsRegistry {
     pub fn account_registered_with(&self, email: &str) -> Option<String> {
         self.orgs
             .values()
-            .flat_map(|org| org.accounts.values())
+            .flat_map(|org| org.accounts.values().map(move |account| (org, account)))
             // A GovCloud mirror shares its commercial twin's address by
             // design; the commercial account is the one an address names.
-            .find(|account| {
-                account.email == email && !is_gov_cloud(account) && account.status != "SUSPENDED"
+            .find(|(org, account)| {
+                account.email == email
+                    && !is_gov_cloud(org, account)
+                    && account.status != "SUSPENDED"
             })
-            .map(|account| account.id.clone())
+            .map(|(_, account)| account.id.clone())
     }
 
     /// Like [`Self::email_in_use`], for the in-flight request
@@ -562,6 +567,27 @@ impl OrganizationState {
     /// `FullAWSAccess` SCP, and auto-attaches it to root (matching AWS's
     /// default behavior).
     pub fn bootstrap(management_account_id: &str) -> Self {
+        Self::bootstrap_in("", management_account_id)
+    }
+
+    /// An ARN for `resource` owned by this organization's management
+    /// account (`arn:<p>:organizations::<mgmt>:<resource>`), in the
+    /// organization's partition.
+    pub fn resource_arn(&self, resource: &str) -> String {
+        Arn::global("organizations", &self.management_account_id, resource)
+            .with_partition(partition_of(&self.org_arn))
+            .to_string()
+    }
+
+    /// The ARN of `account_id` as a member of this organization.
+    pub fn account_arn(&self, account_id: &str) -> String {
+        self.resource_arn(&format!("account/{}/{account_id}", self.org_id))
+    }
+
+    /// [`OrganizationState::bootstrap`] for an organization created in
+    /// `region`: every ARN of the organization, its accounts, OUs, policies
+    /// and handshakes is in that region's partition.
+    pub fn bootstrap_in(region: &str, management_account_id: &str) -> Self {
         let now = Utc::now();
         let org_id = format!("o-{}", random_id(10));
         // AWS root ids are 4-32 chars. Four was fine while only one
@@ -569,28 +595,40 @@ impl OrganizationState {
         // 1/65536, which would let one organization's root id validate as
         // a target in another.
         let root_id = format!("r-{}", random_id(12));
-        let org_arn = format!(
-            "arn:aws:organizations::{}:organization/{}",
-            management_account_id, org_id
-        );
-        let root_arn = format!(
-            "arn:aws:organizations::{}:root/{}/{}",
-            management_account_id, org_id, root_id
-        );
-        let mgmt_arn = format!(
-            "arn:aws:organizations::{}:account/{}/{}",
-            management_account_id, org_id, management_account_id
-        );
+        let org_arn = Arn::global_in(
+            region,
+            "organizations",
+            management_account_id,
+            &format!("organization/{org_id}"),
+        )
+        .to_string();
+        let root_arn = Arn::global_in(
+            region,
+            "organizations",
+            management_account_id,
+            &format!("root/{org_id}/{root_id}"),
+        )
+        .to_string();
+        let mgmt_arn = Arn::global_in(
+            region,
+            "organizations",
+            management_account_id,
+            &format!("account/{org_id}/{management_account_id}"),
+        )
+        .to_string();
 
         let mut policies = BTreeMap::new();
         policies.insert(
             FULL_AWS_ACCESS_POLICY_ID.to_string(),
             Policy {
                 id: FULL_AWS_ACCESS_POLICY_ID.to_string(),
-                arn: format!(
-                    "arn:aws:organizations::aws:policy/service_control_policy/{}",
-                    FULL_AWS_ACCESS_POLICY_ID
-                ),
+                arn: Arn::global_in(
+                    region,
+                    "organizations",
+                    "aws",
+                    &format!("policy/service_control_policy/{FULL_AWS_ACCESS_POLICY_ID}"),
+                )
+                .to_string(),
                 name: FULL_AWS_ACCESS_POLICY_NAME.to_string(),
                 description: FULL_AWS_ACCESS_POLICY_DESCRIPTION.to_string(),
                 policy_type: POLICY_TYPE_SCP.to_string(),
@@ -844,10 +882,7 @@ impl OrganizationState {
         };
 
         // Enroll the commercial account.
-        let arn = format!(
-            "arn:aws:organizations::{}:account/{}/{}",
-            self.management_account_id, self.org_id, account_id
-        );
+        let arn = self.account_arn(&account_id);
         self.accounts.insert(
             account_id.clone(),
             MemberAccount {
@@ -958,7 +993,7 @@ impl OrganizationState {
             .find(|account| {
                 target_kind == "EMAIL"
                     && account.email == target_account_id
-                    && !is_gov_cloud(account)
+                    && !is_gov_cloud(self, account)
                     && account.status != "SUSPENDED"
             })
             .map(|account| account.id.clone())
@@ -987,10 +1022,7 @@ impl OrganizationState {
         }
         let now = Utc::now();
         let id = format!("h-{}", random_id(32));
-        let arn = format!(
-            "arn:aws:organizations::{}:handshake/{}/invite/{}",
-            self.management_account_id, self.org_id, id
-        );
+        let arn = self.resource_arn(&format!("handshake/{}/invite/{id}", self.org_id));
         let kind = target_kind.to_string();
         let handshake = Handshake {
             id: id.clone(),
@@ -1058,10 +1090,7 @@ impl OrganizationState {
         };
         if let Some(target) = enrolling {
             let now = Utc::now();
-            let arn = format!(
-                "arn:aws:organizations::{}:account/{}/{}",
-                self.management_account_id, self.org_id, target
-            );
+            let arn = self.account_arn(&target);
             // The caller supplies the address: an account's address must
             // be unique across the whole registry, which this organization
             // cannot see on its own.
@@ -1369,10 +1398,7 @@ impl OrganizationState {
         if self.accounts.contains_key(account_id) {
             return;
         }
-        let arn = format!(
-            "arn:aws:organizations::{}:account/{}/{}",
-            self.management_account_id, self.org_id, account_id
-        );
+        let arn = self.account_arn(account_id);
         self.accounts.insert(
             account_id.to_string(),
             MemberAccount {
@@ -1413,10 +1439,7 @@ impl OrganizationState {
         }
         let root_suffix = self.root_id.strip_prefix("r-").unwrap_or(&self.root_id);
         let id = format!("ou-{}-{}", root_suffix, random_id(8));
-        let arn = format!(
-            "arn:aws:organizations::{}:ou/{}/{}",
-            self.management_account_id, self.org_id, id
-        );
+        let arn = self.resource_arn(&format!("ou/{}/{id}", self.org_id));
         let ou = OrganizationalUnit {
             id: id.clone(),
             arn,
@@ -1527,13 +1550,11 @@ impl OrganizationState {
             return Err(OrgError::DuplicatePolicy(name.to_string()));
         }
         let id = format!("p-{}", random_id(8));
-        let arn = format!(
-            "arn:aws:organizations::{}:policy/{}/{}/{}",
-            self.management_account_id,
+        let arn = self.resource_arn(&format!(
+            "policy/{}/{}/{id}",
             self.org_id,
             policy_type_path_segment(policy_type),
-            id,
-        );
+        ));
         let policy = Policy {
             id: id.clone(),
             arn,
@@ -1992,6 +2013,27 @@ mod tests {
         let registry = snapshot.into_registry();
         assert_eq!(registry.len(), 1);
         assert!(registry.org_of_account("111111111111").is_some());
+    }
+
+    /// In an organization created in GovCloud every member lives in
+    /// `aws-us-gov`; none of them is a GovCloud mirror, so an address still
+    /// names its account.
+    #[test]
+    fn a_govcloud_organization_member_is_not_a_mirror() {
+        let mut org = OrganizationState::bootstrap_in("us-gov-west-1", "111111111111");
+        assert!(org
+            .org_arn
+            .starts_with("arn:aws-us-gov:organizations::111111111111:"));
+        org.enroll_account_if_missing("222222222222");
+        let member = org.accounts.get_mut("222222222222").unwrap();
+        assert!(member.arn.starts_with("arn:aws-us-gov:organizations::"));
+        member.email = "member@corp.example".to_string();
+        let mut registry = OrganizationsRegistry::default();
+        registry.insert(org);
+        assert_eq!(
+            registry.account_registered_with("member@corp.example"),
+            Some("222222222222".to_string())
+        );
     }
 
     /// A v2 snapshot round-trips every organization, and the legacy

@@ -4161,6 +4161,48 @@ fn describe_user_pool() {
 }
 
 #[test]
+fn china_region_user_pool_arn_uses_aws_cn_and_is_taggable() {
+    let (svc, state) = make_svc();
+    let in_cn = |action: &str, body: &str| {
+        let mut r = make_req(action, body);
+        r.region = "cn-north-1".to_string();
+        r
+    };
+    let resp =
+        block_on(svc.create_user_pool(&in_cn("CreateUserPool", r#"{"PoolName":"cn-pool"}"#)))
+            .unwrap();
+    let b = resp_json(&resp);
+    let pool_id = b["UserPool"]["Id"].as_str().unwrap().to_string();
+    let arn = b["UserPool"]["Arn"].as_str().unwrap().to_string();
+    assert_eq!(
+        arn,
+        format!("arn:aws-cn:cognito-idp:cn-north-1:123456789012:userpool/{pool_id}")
+    );
+
+    let body = json!({ "ResourceArn": arn, "Tags": { "team": "id" } }).to_string();
+    svc.tag_resource(&in_cn("TagResource", &body)).unwrap();
+    assert!(state
+        .read()
+        .get("123456789012")
+        .unwrap()
+        .tags
+        .contains_key(&arn));
+
+    let body = json!({ "UserPoolId": pool_id }).to_string();
+    svc.delete_user_pool(&in_cn("DeleteUserPool", &body))
+        .unwrap();
+    assert!(
+        !state
+            .read()
+            .get("123456789012")
+            .unwrap()
+            .tags
+            .contains_key(&arn),
+        "deleting the pool drops the tags stored under its ARN"
+    );
+}
+
+#[test]
 fn update_user_pool() {
     let (svc, _) = make_svc();
     let pool_id = create_pool(&svc);

@@ -13,14 +13,16 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
+use fakecloud_aws::arn::arn_resource;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_persistence::SnapshotStore;
 
 use crate::persistence::save_snapshot;
 use crate::state::{
-    SharedSsoAdminState, StoredApplication, StoredAssignment, StoredInstance, StoredManagedPolicy,
-    StoredOpStatus, StoredPermissionSet, StoredProvisioningStatus, StoredRegion,
-    StoredTrustedTokenIssuer,
+    application_arn, application_provider_arn, identity_store_arn, instance_arn,
+    permission_set_arn, trusted_token_issuer_arn, SharedSsoAdminState, StoredApplication,
+    StoredAssignment, StoredInstance, StoredManagedPolicy, StoredOpStatus, StoredPermissionSet,
+    StoredProvisioningStatus, StoredRegion, StoredTrustedTokenIssuer,
 };
 
 /// Every operation name in the SSO Admin Smithy model.
@@ -108,39 +110,15 @@ pub const SSOADMIN_ACTIONS: &[&str] = &[
 
 /// The fixed AWS application-provider catalogue. IAM Identity Center exposes a
 /// closed set of managed application providers; we surface a representative
-/// subset with their real ARNs and federation protocol.
+/// subset with their real provider ids and federation protocol.
 const APPLICATION_PROVIDERS: &[(&str, &str, &str)] = &[
-    (
-        "arn:aws:sso::aws:applicationProvider/custom",
-        "OAUTH",
-        "Custom application",
-    ),
-    (
-        "arn:aws:sso::aws:applicationProvider/sso",
-        "SAML",
-        "IAM Identity Center",
-    ),
-    (
-        "arn:aws:sso::aws:applicationProvider/salesforce",
-        "SAML",
-        "Salesforce",
-    ),
-    ("arn:aws:sso::aws:applicationProvider/box", "SAML", "Box"),
-    (
-        "arn:aws:sso::aws:applicationProvider/slack",
-        "SAML",
-        "Slack",
-    ),
-    (
-        "arn:aws:sso::aws:applicationProvider/google",
-        "SAML",
-        "Google Workspace",
-    ),
-    (
-        "arn:aws:sso::aws:applicationProvider/microsoft365",
-        "SAML",
-        "Microsoft 365",
-    ),
+    ("custom", "OAUTH", "Custom application"),
+    ("sso", "SAML", "IAM Identity Center"),
+    ("salesforce", "SAML", "Salesforce"),
+    ("box", "SAML", "Box"),
+    ("slack", "SAML", "Slack"),
+    ("google", "SAML", "Google Workspace"),
+    ("microsoft365", "SAML", "Microsoft 365"),
 ];
 
 pub struct SsoAdminService {
@@ -671,7 +649,7 @@ impl SsoAdminService {
         validate_common(&b)?;
         check_len(&b, "Name", 0, 255)?;
         let ssoins = format!("ssoins-{}", hex16());
-        let arn = format!("arn:aws:sso:::instance/{ssoins}");
+        let arn = instance_arn(&req.region, &ssoins);
         let identity_store_id = format!("d-{}", hex10());
         let inst = StoredInstance {
             arn: arn.clone(),
@@ -838,7 +816,7 @@ impl SsoAdminService {
             .get(&instance_arn)
             .ok_or_else(|| not_found("Instance not found."))?;
         let ssoins = inst.ssoins.clone();
-        let arn = format!("arn:aws:sso:::permissionSet/{ssoins}/ps-{}", hex16());
+        let arn = permission_set_arn(&instance_arn, &ssoins, &hex16());
         let ps = StoredPermissionSet {
             arn: arn.clone(),
             instance_arn,
@@ -1494,15 +1472,9 @@ impl SsoAdminService {
             .ok_or_else(|| not_found("Instance not found."))?;
         let ssoins = inst.ssoins.clone();
         let identity_store_id = inst.identity_store_id.clone();
-        let arn = format!(
-            "arn:aws:sso::{}:application/{ssoins}/apl-{}",
-            req.account_id,
-            hex16()
-        );
-        let identity_store_arn = format!(
-            "arn:aws:identitystore::{}:identitystore/{identity_store_id}",
-            req.account_id
-        );
+        let arn = application_arn(&instance_arn, &req.account_id, &ssoins, &hex16());
+        let identity_store_arn =
+            identity_store_arn(&instance_arn, &req.account_id, &identity_store_id);
         let app = StoredApplication {
             arn: arn.clone(),
             provider_arn,
@@ -2030,9 +2002,9 @@ impl SsoAdminService {
         validate_common(&b)?;
         let rows: Vec<Value> = APPLICATION_PROVIDERS
             .iter()
-            .map(|(arn, proto, display)| {
+            .map(|(provider, proto, display)| {
                 json!({
-                    "ApplicationProviderArn": arn,
+                    "ApplicationProviderArn": application_provider_arn(&req.region, provider),
                     "FederationProtocol": proto,
                     "DisplayData": { "DisplayName": display },
                 })
@@ -2048,12 +2020,14 @@ impl SsoAdminService {
         let b = parse(req)?;
         validate_common(&b)?;
         let arn = req_str(&b, "ApplicationProviderArn")?.to_string();
+        let provider =
+            arn_resource(&arn, "sso").and_then(|r| r.strip_prefix(":aws:applicationProvider/"));
         let found = APPLICATION_PROVIDERS
             .iter()
-            .find(|(a, _, _)| *a == arn)
+            .find(|(p, _, _)| Some(*p) == provider)
             .ok_or_else(|| not_found("Application provider not found."))?;
         ok(json!({
-            "ApplicationProviderArn": found.0,
+            "ApplicationProviderArn": arn,
             "FederationProtocol": found.1,
             "DisplayData": { "DisplayName": found.2 },
         }))
@@ -2080,10 +2054,11 @@ impl SsoAdminService {
             .map(|i| i.ssoins.clone())
             .unwrap_or_else(|| format!("ssoins-{}", hex16()));
         drop(guard);
-        let arn = format!(
-            "arn:aws:sso::{}:trustedTokenIssuer/{ssoins}/tti-{}",
-            req.account_id,
-            Uuid::new_v4()
+        let arn = trusted_token_issuer_arn(
+            &instance_arn,
+            &req.account_id,
+            &ssoins,
+            &Uuid::new_v4().to_string(),
         );
         let tti = StoredTrustedTokenIssuer {
             arn: arn.clone(),

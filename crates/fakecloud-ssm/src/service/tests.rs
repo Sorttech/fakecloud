@@ -2841,6 +2841,59 @@ fn param_arn_and_rewrite_region_helpers() {
 }
 
 #[test]
+fn china_region_parameter_arns_use_aws_cn_and_resolve_by_arn() {
+    let svc = make_service();
+    let in_cn = |action: &str, body: Value| {
+        let mut r = make_request(action, body);
+        r.region = "cn-north-1".to_string();
+        r
+    };
+    let json_of =
+        |resp: AwsResponse| -> Value { serde_json::from_slice(resp.body.expect_bytes()).unwrap() };
+    svc.put_parameter(&in_cn(
+        "PutParameter",
+        json!({ "Name": "/app/db", "Value": "v", "Type": "String" }),
+    ))
+    .unwrap();
+    let arn = "arn:aws-cn:ssm:cn-north-1:123456789012:parameter/app/db";
+
+    let got = json_of(
+        svc.get_parameter(&in_cn("GetParameter", json!({ "Name": arn })))
+            .unwrap(),
+    );
+    assert_eq!(got["Parameter"]["Name"], "/app/db");
+    assert_eq!(got["Parameter"]["ARN"], arn);
+
+    let got = json_of(
+        svc.get_parameters(&in_cn("GetParameters", json!({ "Names": [arn] })))
+            .unwrap(),
+    );
+    assert_eq!(got["Parameters"][0]["ARN"], arn);
+    assert!(got["InvalidParameters"].as_array().unwrap().is_empty());
+
+    // A public parameter seeded for the account reads back in the caller's
+    // partition too.
+    let name = "/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2";
+    let got = json_of(
+        svc.get_parameter(&in_cn("GetParameter", json!({ "Name": name })))
+            .unwrap(),
+    );
+    assert_eq!(
+        got["Parameter"]["ARN"],
+        format!("arn:aws-cn:ssm:cn-north-1:123456789012:parameter{name}")
+    );
+}
+
+#[test]
+fn an_account_seeded_in_china_stores_aws_cn_parameter_arns() {
+    let state = crate::state::SsmState::new("123456789012", "cn-north-1");
+    let p = &state.parameters["/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2"];
+    assert!(p
+        .arn
+        .starts_with("arn:aws-cn:ssm:cn-north-1:123456789012:parameter/aws/"));
+}
+
+#[test]
 fn parse_param_selector_extracts_version_and_label() {
     use crate::service::parameters::ParamSelector;
     let (name, sel) = crate::service::parameters::parse_param_selector("/a/b:42");

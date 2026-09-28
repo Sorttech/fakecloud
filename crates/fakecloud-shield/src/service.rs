@@ -17,6 +17,7 @@ use http::StatusCode;
 use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_persistence::SnapshotStore;
 
@@ -253,16 +254,16 @@ pub(crate) fn now_epoch() -> f64 {
 pub(crate) const ONE_YEAR_SECS: f64 = 365.0 * 24.0 * 60.0 * 60.0;
 
 /// Shield is a global service: its ARNs carry an empty region field.
-pub(crate) fn protection_arn(account: &str, id: &str) -> String {
-    format!("arn:aws:shield::{account}:protection/{id}")
+pub fn protection_arn(region: &str, account: &str, id: &str) -> String {
+    Arn::global_in(region, "shield", account, &format!("protection/{id}")).to_string()
 }
 
-pub(crate) fn protection_group_arn(account: &str, id: &str) -> String {
-    format!("arn:aws:shield::{account}:protection-group/{id}")
+pub fn protection_group_arn(region: &str, account: &str, id: &str) -> String {
+    Arn::global_in(region, "shield", account, &format!("protection-group/{id}")).to_string()
 }
 
-pub(crate) fn subscription_arn(account: &str) -> String {
-    format!("arn:aws:shield::{account}:subscription")
+pub fn subscription_arn(region: &str, account: &str) -> String {
+    Arn::global_in(region, "shield", account, "subscription").to_string()
 }
 
 impl ShieldService {

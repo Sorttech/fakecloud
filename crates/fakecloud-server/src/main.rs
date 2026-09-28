@@ -116,6 +116,14 @@ const DNS_INTROSPECTION_TYPES: &[&str] = &[
     "A", "AAAA", "CNAME", "MX", "TXT", "NS", "PTR", "SPF", "CAA", "SRV", "SOA",
 ];
 
+/// The role the ECS task-credentials endpoint reports for a task started
+/// without a `taskRoleArn`, in the partition of the task's own ARN.
+fn ecs_default_task_role_arn(task_arn: &str, account_id: &str) -> String {
+    fakecloud_aws::arn::Arn::global("iam", account_id, "role/ecs-task-role")
+        .with_partition(fakecloud_aws::arn::partition_of(task_arn))
+        .to_string()
+}
+
 /// Handler for `GET /_fakecloud/dns/resolve?name=<n>&type=<A|...>`. Returns what
 /// the DNS resolver would answer for the name+type straight from the Route 53
 /// records, so a test can assert resolution without opening a socket.
@@ -7803,7 +7811,7 @@ async fn main() {
                                         let mut ctx = std::collections::HashMap::new();
                                         ctx.insert(
                                             "aws:s3:arn".to_string(),
-                                            fakecloud_aws::arn::Arn::s3(bucket_name).to_string(),
+                                            fakecloud_aws::arn::Arn::s3_in(&region_for_inbound, bucket_name).to_string(),
                                         );
                                         match delivery_for_inbound.kms_encrypt(
                                             &account_id,
@@ -9831,10 +9839,13 @@ async fn main() {
                         let function_arn = if body.function_name.starts_with("arn:") {
                             body.function_name.clone()
                         } else {
-                            format!(
-                                "arn:aws:lambda:{}:{}:function:{}",
-                                region, account_id, body.function_name
+                            fakecloud_aws::arn::Arn::regional(
+                                "lambda",
+                                &region,
+                                &account_id,
+                                &format!("function:{}", body.function_name),
                             )
+                            .to_string()
                         };
                         let payload_str = body
                             .payload
@@ -10329,10 +10340,7 @@ async fn main() {
                         for (_, state) in accounts.iter() {
                             if let Some(t) = state.tasks.get(&task_id) {
                                 let role_arn = t.task_role_arn.clone().unwrap_or_else(|| {
-                                    format!(
-                                        "arn:aws:iam::{}:role/ecs-task-role",
-                                        state.account_id
-                                    )
+                                    ecs_default_task_role_arn(&t.task_arn, &state.account_id)
                                 });
                                 let expiry = chrono::Utc::now() + chrono::Duration::minutes(15);
                                 let body = serde_json::json!({
@@ -12151,6 +12159,27 @@ async fn main() {
     }
     if let Some(rt) = ec2_runtime {
         rt.stop_all().await;
+    }
+}
+
+#[cfg(test)]
+mod ecs_task_role_tests {
+    #[test]
+    fn default_task_role_follows_the_task_partition() {
+        assert_eq!(
+            super::ecs_default_task_role_arn(
+                "arn:aws-cn:ecs:cn-north-1:123456789012:task/c/abc",
+                "123456789012"
+            ),
+            "arn:aws-cn:iam::123456789012:role/ecs-task-role"
+        );
+        assert_eq!(
+            super::ecs_default_task_role_arn(
+                "arn:aws:ecs:us-east-1:123456789012:task/c/abc",
+                "123456789012"
+            ),
+            "arn:aws:iam::123456789012:role/ecs-task-role"
+        );
     }
 }
 

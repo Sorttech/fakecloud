@@ -9,14 +9,14 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
-use fakecloud_aws::arn::Arn;
+use fakecloud_aws::arn::{arn_resource, partition_of, Arn};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_core::validation::*;
 use fakecloud_persistence::SnapshotStore;
 
 use crate::state::{
-    CustomKeyStore, KeyRotation, KmsAlias, KmsGrant, KmsKey, KmsSnapshot, KmsState, SharedKmsState,
-    KMS_SNAPSHOT_SCHEMA_VERSION,
+    kms_alias_arn, kms_key_arn, CustomKeyStore, KeyRotation, KmsAlias, KmsGrant, KmsKey,
+    KmsSnapshot, KmsState, SharedKmsState, KMS_SNAPSHOT_SCHEMA_VERSION,
 };
 
 const FAKE_ENVELOPE_PREFIX: &str = "fakecloud-kms:";
@@ -472,7 +472,7 @@ impl KmsService {
         }
 
         // ARN for key
-        if key_id_or_arn.starts_with("arn:aws:kms:") {
+        if arn_resource(key_id_or_arn, "kms").is_some() {
             // Could be key ARN or alias ARN
             if key_id_or_arn.contains(":key/") {
                 if let Some(id) = key_id_or_arn.rsplit('/').next() {
@@ -606,10 +606,7 @@ impl KmsService {
             Uuid::new_v4().to_string()
         };
 
-        let arn = format!(
-            "arn:aws:kms:{}:{}:key/{}",
-            req.region, state.account_id, key_id
-        );
+        let arn = kms_key_arn(&req.region, &state.account_id, &key_id);
         let now = Utc::now().timestamp() as f64;
 
         let signing_algs = if input.key_usage == "SIGN_VERIFY" {
@@ -626,7 +623,7 @@ impl KmsService {
 
         let key_policy = input
             .policy
-            .unwrap_or_else(|| default_key_policy(&state.account_id));
+            .unwrap_or_else(|| default_key_policy(&state.account_id, &arn));
 
         // Refuse asymmetric specs we cannot really generate keys for
         // rather than store a no-DER key that would later fall through
@@ -1425,10 +1422,7 @@ impl KmsService {
             .unwrap_or(&state.region)
             .to_string();
 
-        let replica_arn = format!(
-            "arn:aws:kms:{}:{}:key/{}",
-            replica_region, account_id, source_key.key_id
-        );
+        let replica_arn = kms_key_arn(&replica_region, &account_id, &source_key.key_id);
 
         let metadata = json!({
             "KeyId": source_key.key_id,
@@ -1531,10 +1525,7 @@ impl KmsService {
         }
         key.primary_region = Some(primary_region.clone());
         // Update the ARN to reflect the new region
-        key.arn = format!(
-            "arn:aws:kms:{}:{}:key/{}",
-            primary_region, account_id, key.key_id
-        );
+        key.arn = kms_key_arn(&primary_region, &account_id, &key.key_id);
 
         Ok(AwsResponse::json(StatusCode::OK, "{}"))
     }

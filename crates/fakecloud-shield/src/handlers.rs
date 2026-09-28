@@ -32,7 +32,7 @@ fn default_subscription_limits() -> Value {
 
 /// Build a fresh Shield Advanced `Subscription` shape for `account`, starting
 /// now with a one-year auto-renewing commitment.
-fn build_subscription(account: &str) -> Value {
+fn build_subscription(region: &str, account: &str) -> Value {
     let start = now_epoch();
     json!({
         "StartTime": start,
@@ -42,7 +42,7 @@ fn build_subscription(account: &str) -> Value {
         "ProactiveEngagementStatus": "DISABLED",
         "Limits": [ { "Type": "MitigationCapacityUnits", "Max": 10000 } ],
         "SubscriptionLimits": default_subscription_limits(),
-        "SubscriptionArn": subscription_arn(account),
+        "SubscriptionArn": subscription_arn(region, account),
     })
 }
 
@@ -85,7 +85,7 @@ impl ShieldService {
         }
 
         let id = uuid::Uuid::new_v4().to_string();
-        let arn = protection_arn(&account, &id);
+        let arn = protection_arn(&req.region, &account, &id);
         let protection = json!({
             "Id": id,
             "Name": name,
@@ -201,9 +201,9 @@ impl ShieldService {
                 "A ProtectionGroup already exists for the specified ProtectionGroupId.",
             ));
         }
-        let group = build_protection_group(&body, &id, &account);
+        let group = build_protection_group(&body, &id, &req.region, &account);
         let tags = body.get("Tags").cloned();
-        let arn = protection_group_arn(&account, &id);
+        let arn = protection_group_arn(&req.region, &account, &id);
         self.with_account_mut(req, |acct| {
             acct.protection_groups.insert(id.clone(), group);
             acct.protection_group_order.push(id.clone());
@@ -227,7 +227,7 @@ impl ShieldService {
             if !acct.protection_groups.contains_key(&id) {
                 return false;
             }
-            let group = build_protection_group(&body, &id, &account);
+            let group = build_protection_group(&body, &id, &req.region, &account);
             acct.protection_groups.insert(id.clone(), group);
             true
         });
@@ -336,7 +336,7 @@ impl ShieldService {
                 "The account is already subscribed to Shield Advanced.",
             ));
         }
-        let sub = build_subscription(&account);
+        let sub = build_subscription(&req.region, &account);
         self.with_account_mut(req, |acct| {
             acct.subscription = Some(sub);
             acct.proactive_engagement_status
@@ -809,7 +809,7 @@ fn arn_resource_type(arn: &str) -> &'static str {
 }
 
 /// Build a `ProtectionGroup` shape from a Create/Update request body.
-fn build_protection_group(body: &Value, id: &str, account: &str) -> Value {
+fn build_protection_group(body: &Value, id: &str, region: &str, account: &str) -> Value {
     let members = body
         .get("Members")
         .and_then(Value::as_array)
@@ -831,7 +831,7 @@ fn build_protection_group(body: &Value, id: &str, account: &str) -> Value {
     g.insert("Members".into(), json!(members));
     g.insert(
         "ProtectionGroupArn".into(),
-        json!(protection_group_arn(account, id)),
+        json!(protection_group_arn(region, account, id)),
     );
     Value::Object(g)
 }
@@ -979,6 +979,58 @@ mod handler_tests {
             ))
             .unwrap();
         assert!(body_of(&l)["ResourceArns"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn china_region_arns_use_the_aws_cn_partition() {
+        let s = svc();
+        let in_cn = |action: &str, body: Value| {
+            let mut r = req(action, body);
+            r.region = "cn-north-1".to_string();
+            r
+        };
+        let resource = "arn:aws-cn:ec2:cn-north-1:000000000000:eip-allocation/eipalloc-1";
+        let created = s
+            .create_protection(&in_cn(
+                "CreateProtection",
+                json!({ "Name": "cn", "ResourceArn": resource }),
+            ))
+            .unwrap();
+        let id = body_of(&created)["ProtectionId"].as_str().unwrap().to_string();
+        let d = s
+            .describe_protection(&in_cn("DescribeProtection", json!({ "ProtectionId": id })))
+            .unwrap();
+        let arn = body_of(&d)["Protection"]["ProtectionArn"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(arn, format!("arn:aws-cn:shield::000000000000:protection/{id}"));
+
+        s.create_protection_group(&in_cn(
+            "CreateProtectionGroup",
+            json!({ "ProtectionGroupId": "grp", "Aggregation": "SUM", "Pattern": "ALL" }),
+        ))
+        .unwrap();
+        let g = s
+            .describe_protection_group(&in_cn(
+                "DescribeProtectionGroup",
+                json!({ "ProtectionGroupId": "grp" }),
+            ))
+            .unwrap();
+        assert_eq!(
+            body_of(&g)["ProtectionGroup"]["ProtectionGroupArn"],
+            json!("arn:aws-cn:shield::000000000000:protection-group/grp")
+        );
+
+        s.create_subscription(&in_cn("CreateSubscription", json!({})))
+            .unwrap();
+        let sub = s
+            .describe_subscription(&in_cn("DescribeSubscription", json!({})))
+            .unwrap();
+        assert_eq!(
+            body_of(&sub)["Subscription"]["SubscriptionArn"],
+            json!("arn:aws-cn:shield::000000000000:subscription")
+        );
     }
 
     #[test]

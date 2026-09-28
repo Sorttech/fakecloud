@@ -98,12 +98,7 @@ impl CognitoService {
         // pool's region; the ARN and every issuer/discovery derivation read the
         // region back out of the pool id. Storage is keyed by pool id, unchanged.
         let pool_id = generate_pool_id(req.region.as_str());
-        let arn = format!(
-            "arn:aws:cognito-idp:{}:{}:userpool/{}",
-            req.region.as_str(),
-            state.account_id,
-            pool_id
-        );
+        let arn = crate::user_pool_arn(req.region.as_str(), &state.account_id, &pool_id);
 
         let now = Utc::now();
 
@@ -442,10 +437,7 @@ impl CognitoService {
         // pool id prefix so it matches the ARN minted at CreateUserPool time,
         // regardless of the current server default region.
         let arn_region = pool_id.split('_').next().unwrap_or(&state.region);
-        let arn_prefix = format!(
-            "arn:aws:cognito-idp:{}:{}:userpool/{}",
-            arn_region, state.account_id, pool_id
-        );
+        let arn_prefix = crate::user_pool_arn(arn_region, &state.account_id, pool_id);
         state.tags.remove(&arn_prefix);
 
         // Remove associated import jobs

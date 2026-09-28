@@ -408,6 +408,80 @@ fn application_providers_catalogue() {
 }
 
 #[test]
+fn china_region_arns_use_the_aws_cn_partition() {
+    let s = svc();
+    let in_cn = |action: &str, body: Value| -> Value {
+        let mut r = req(action, body);
+        r.region = "cn-north-1".into();
+        let resp = dispatch(&s, &r).expect("op ok");
+        serde_json::from_slice(resp.body.expect_bytes()).unwrap()
+    };
+    let inst = in_cn("CreateInstance", json!({ "Name": "cn" }))["InstanceArn"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        inst.starts_with("arn:aws-cn:sso:::instance/ssoins-"),
+        "{inst}"
+    );
+    let desc = in_cn("DescribeInstance", json!({ "InstanceArn": inst }));
+    assert_eq!(desc["InstanceArn"], json!(inst));
+
+    let ps = in_cn(
+        "CreatePermissionSet",
+        json!({ "InstanceArn": inst, "Name": "admins" }),
+    );
+    let ps_arn = ps["PermissionSet"]["PermissionSetArn"].as_str().unwrap();
+    assert!(
+        ps_arn.starts_with("arn:aws-cn:sso:::permissionSet/ssoins-"),
+        "{ps_arn}"
+    );
+
+    let providers = in_cn("ListApplicationProviders", json!({}));
+    let provider = "arn:aws-cn:sso::aws:applicationProvider/sso";
+    assert!(providers["ApplicationProviders"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p["ApplicationProviderArn"] == provider));
+    let desc = in_cn(
+        "DescribeApplicationProvider",
+        json!({ "ApplicationProviderArn": provider }),
+    );
+    assert_eq!(desc["ApplicationProviderArn"], json!(provider));
+
+    let app = in_cn(
+        "CreateApplication",
+        json!({ "InstanceArn": inst, "ApplicationProviderArn": provider, "Name": "cn-app" }),
+    );
+    assert!(app["ApplicationArn"]
+        .as_str()
+        .unwrap()
+        .starts_with("arn:aws-cn:sso::000000000000:application/ssoins-"));
+    assert!(app["IdentityStoreArn"]
+        .as_str()
+        .unwrap()
+        .starts_with("arn:aws-cn:identitystore::000000000000:identitystore/d-"));
+
+    let tti = in_cn(
+        "CreateTrustedTokenIssuer",
+        json!({
+            "InstanceArn": inst, "Name": "issuer", "TrustedTokenIssuerType": "OIDC_JWT",
+            "TrustedTokenIssuerConfiguration": { "OidcJwtConfiguration": {
+                "IssuerUrl": "https://issuer.example.com",
+                "ClaimAttributePath": "email",
+                "IdentityStoreAttributePath": "emails.value",
+                "JwksRetrievalOption": "OPEN_ID_DISCOVERY"
+            }}
+        }),
+    );
+    assert!(tti["TrustedTokenIssuerArn"]
+        .as_str()
+        .unwrap()
+        .starts_with("arn:aws-cn:sso::000000000000:trustedTokenIssuer/ssoins-"));
+}
+
+#[test]
 fn pagination_windows_results() {
     let s = svc();
     let inst = new_instance(&s);

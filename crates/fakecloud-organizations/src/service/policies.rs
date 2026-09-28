@@ -304,10 +304,7 @@ impl OrganizationsService {
             "ResourcePolicy": {
                 "ResourcePolicySummary": {
                     "Id": "rp-fakecloud",
-                    "Arn": format!(
-                        "arn:aws:organizations::{}:resourcepolicy/{}/rp-fakecloud",
-                        org.management_account_id, org.org_id
-                    ),
+                    "Arn": org.resource_arn(&format!("resourcepolicy/{}/rp-fakecloud", org.org_id)),
                 },
                 "Content": org.resource_policy.clone(),
             }
@@ -345,10 +342,7 @@ impl OrganizationsService {
             "ResourcePolicy": {
                 "ResourcePolicySummary": {
                     "Id": "rp-fakecloud",
-                    "Arn": format!(
-                        "arn:aws:organizations::{}:resourcepolicy/{}/rp-fakecloud",
-                        org.management_account_id, org.org_id
-                    ),
+                    "Arn": org.resource_arn(&format!("resourcepolicy/{}/rp-fakecloud", org.org_id)),
                 },
                 "Content": content,
             }

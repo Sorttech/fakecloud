@@ -1447,7 +1447,7 @@ fn sha256_hex_lower(bytes: &[u8]) -> String {
 fn anonymous_s3_bucket(uri: &http::Uri, config: &DispatchConfig) -> Option<String> {
     let provider = config.resource_policy_provider.as_ref()?;
     let segment = uri.path().split('/').find(|s| !s.is_empty())?.to_string();
-    let arn = format!("arn:aws:s3:::{segment}");
+    let arn = fakecloud_aws::arn::Arn::s3_in(&config.region, &segment).to_string();
     provider.resource_owner_account("s3", &arn).map(|_| segment)
 }
 
@@ -1971,6 +1971,32 @@ mod tests {
     fn sanitize_header_value_collapses_consecutive_control_runs() {
         let out = sanitize_header_value("a\n\n\n\rb");
         assert_eq!(out, "a b");
+    }
+
+    #[test]
+    fn anonymous_s3_probe_uses_the_configured_regions_partition() {
+        struct RecordingProvider(parking_lot::Mutex<Vec<String>>);
+        impl crate::auth::ResourcePolicyProvider for RecordingProvider {
+            fn resource_policy(&self, _service: &str, _resource_arn: &str) -> Option<String> {
+                None
+            }
+            fn resource_owner_account(&self, _service: &str, resource_arn: &str) -> Option<String> {
+                self.0.lock().push(resource_arn.to_string());
+                Some("000000000000".to_string())
+            }
+        }
+        let provider = Arc::new(RecordingProvider(parking_lot::Mutex::new(Vec::new())));
+        let mut cfg = DispatchConfig::new("cn-north-1", "000000000000");
+        cfg.resource_policy_provider = Some(provider.clone());
+        let uri: http::Uri = "/my-bucket/key.txt".parse().unwrap();
+        assert_eq!(
+            anonymous_s3_bucket(&uri, &cfg),
+            Some("my-bucket".to_string())
+        );
+        assert_eq!(
+            *provider.0.lock(),
+            vec!["arn:aws-cn:s3:::my-bucket".to_string()]
+        );
     }
 
     #[test]
