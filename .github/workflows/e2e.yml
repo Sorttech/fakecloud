@@ -243,19 +243,44 @@ jobs:
       # capped run is diagnosable from the log rather than looking like a code
       # failure (the symptom is a container that never starts, so the assertion
       # that fails names an exit code or a missing log line, not a registry).
+      # Falls back to Docker Hub when ECR Public refuses us, then RETAGS to the
+      # ECR Public name the tests ask for -- so the runtime's `ensure_image` finds
+      # it cached and never contacts ECR Public at all. The two registries meter
+      # separately (ECR Public caps anonymous DATA, Docker Hub caps anonymous
+      # PULLS), so one spent allowance is survivable via the other.
+      #
+      # Retrying within a registry is pointless once its allowance is gone: that
+      # is a spent budget, not a busy server. The first version of this step
+      # retried three times per image with backoff and spent three minutes
+      # confirming that, then left the cache empty anyway -- so each source is
+      # tried twice and then abandoned for the next one.
       - name: Warm the container-image cache
         continue-on-error: true
         run: |
+          warm() {
+            target="$1"
+            # public.ecr.aws/docker/library/alpine:3.20 -> alpine:3.20
+            hub="${target##*/library/}"
+            for src in "$target" "$hub"; do
+              for i in 1 2; do
+                if docker pull "$src"; then
+                  [ "$src" = "$target" ] || docker tag "$src" "$target"
+                  echo "warmed $target from $src"
+                  return 0
+                fi
+                sleep $((i * 5))
+              done
+              echo "could not pull $src; trying the next source"
+            done
+            echo "::warning::could not warm $target from any registry; tests will pull for themselves"
+            return 1
+          }
           for img in \
             public.ecr.aws/docker/library/alpine:3.20 \
             public.ecr.aws/docker/library/alpine:3.19 \
             public.ecr.aws/docker/library/nginx:alpine \
             public.ecr.aws/library/alpine:latest; do
-            for i in 1 2 3; do
-              if docker pull "$img"; then break; fi
-              echo "docker pull $img attempt $i failed; retrying"
-              sleep $((i * 10))
-            done
+            warm "$img" || true
           done
           echo "=== cached images ==="
           docker images --format '{{.Repository}}:{{.Tag}} {{.Size}}'
