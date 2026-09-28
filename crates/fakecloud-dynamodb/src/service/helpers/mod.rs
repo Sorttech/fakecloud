@@ -685,6 +685,7 @@ pub(crate) fn evaluate_arithmetic_rhs(
     // Arbitrary-precision decimal arithmetic — f64 silently rounds past 2^53
     // and an `as i64` cast saturates past ~9.2e18, corrupting large counters.
     let num_str = decimal_add_sub(left_num, right_num, is_add).ok_or_else(bad_operand)?;
+    check_number_range(&num_str)?;
 
     Ok(Some(json!({ "N": num_str })))
 }
@@ -803,6 +804,7 @@ pub(crate) mod partiql_parse;
 mod paths;
 mod request;
 pub(crate) mod schemas;
+mod sizing;
 mod table_descriptions;
 mod table_lookup;
 mod updates;
@@ -813,6 +815,7 @@ pub(crate) use partiql::*;
 pub(crate) use paths::*;
 pub(crate) use request::*;
 pub(crate) use schemas::*;
+pub(crate) use sizing::*;
 pub(crate) use table_descriptions::*;
 pub(crate) use table_lookup::*;
 pub(crate) use updates::*;

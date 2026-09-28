@@ -6,7 +6,7 @@ use chrono::{DateTime, Timelike, Utc};
 use http::{HeaderMap, Method, StatusCode};
 use md5::{Digest, Md5};
 
-use fakecloud_aws::arn::Arn;
+use fakecloud_aws::arn::{arn_resource, Arn};
 use fakecloud_core::delivery::DeliveryBus;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_kms::SharedKmsState;
@@ -365,6 +365,17 @@ pub(crate) fn io_to_aws(err: std::io::Error) -> AwsServiceError {
 }
 
 impl S3Service {
+    /// The region of an existing bucket, searched across accounts (bucket
+    /// names are global).
+    fn bucket_region(&self, bucket: &str) -> Option<String> {
+        let mas = self.state.read();
+        let account = mas.find_account(|s| s.buckets.contains_key(bucket))?;
+        mas.get(account)?
+            .buckets
+            .get(bucket)
+            .map(|b| b.region.clone())
+    }
+
     pub fn new(state: SharedS3State, delivery: Arc<DeliveryBus>) -> Self {
         Self::with_store(state, delivery, Arc::new(MemoryS3Store::new()))
     }
@@ -1622,7 +1633,9 @@ impl AwsService for S3Service {
                 let resource = request
                     .path_segments
                     .get(2)
-                    .map(|name| format!("arn:aws:s3:::accesspoint/{name}"))
+                    .map(|name| {
+                        Arn::s3_access_point(&request.region, &request.account_id, name).to_string()
+                    })
                     .unwrap_or_else(|| "*".to_string());
                 return Some(fakecloud_core::auth::IamAction {
                     service: "s3",
@@ -1645,7 +1658,11 @@ impl AwsService for S3Service {
             "WriteGetObjectResponse" => "s3-object-lambda",
             _ => "s3",
         };
-        let resource = s3_resource_for(action, bucket, key.as_deref());
+        // Every ARN S3 returns for a bucket carries the bucket's own region's
+        // partition, so policies written against those ARNs must match here.
+        let bucket_region = bucket.and_then(|b| self.bucket_region(b));
+        let region = bucket_region.as_deref().unwrap_or(&request.region);
+        let resource = s3_resource_for(region, action, bucket, key.as_deref());
         Some(fakecloud_core::auth::IamAction {
             service,
             action,
@@ -1743,7 +1760,7 @@ fn s3_resource_tags(
         return Some(std::collections::BTreeMap::new());
     }
     // S3 ARNs: arn:aws:s3:::bucket or arn:aws:s3:::bucket/key
-    let after_prefix = resource_arn.strip_prefix("arn:aws:s3:::")?;
+    let after_prefix = arn_resource(resource_arn, "s3")?.strip_prefix("::")?;
     let mas = state.read();
     // S3 bucket names are globally unique; scan all accounts to find the bucket
     let bucket_name = after_prefix.split('/').next().unwrap_or(after_prefix);
@@ -2216,7 +2233,12 @@ fn s3_detect_action(
 /// Build the S3 resource ARN for an action. Returns `*` for
 /// `ListBuckets` (account-scoped), a bucket ARN for bucket-level
 /// configuration actions, or an object ARN for object-level actions.
-fn s3_resource_for(action: &'static str, bucket: Option<&str>, key: Option<&str>) -> String {
+fn s3_resource_for(
+    region: &str,
+    action: &'static str,
+    bucket: Option<&str>,
+    key: Option<&str>,
+) -> String {
     // Object-level actions work on `bucket/key`.
     const OBJECT_ACTIONS: &[&str] = &[
         "PutObject",
@@ -2250,12 +2272,12 @@ fn s3_resource_for(action: &'static str, bucket: Option<&str>, key: Option<&str>
     };
     if OBJECT_ACTIONS.contains(&action) {
         match key {
-            Some(k) if !k.is_empty() => Arn::s3(&format!("{bucket}/{k}")).to_string(),
-            _ => Arn::s3(&format!("{bucket}/*")).to_string(),
+            Some(k) if !k.is_empty() => Arn::s3_in(region, &format!("{bucket}/{k}")).to_string(),
+            _ => Arn::s3_in(region, &format!("{bucket}/*")).to_string(),
         }
     } else {
         // Bucket-level actions (ListObjectsV2, GetBucketTagging, ...).
-        Arn::s3(bucket).to_string()
+        Arn::s3_in(region, bucket).to_string()
     }
 }
 
@@ -4051,6 +4073,140 @@ pub(crate) fn check_object_lock_for_overwrite(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod partition_tests {
+    use super::*;
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+
+    fn request(method: Method, region: &str, path: &str) -> AwsRequest {
+        AwsRequest {
+            service: "s3".to_string(),
+            action: String::new(),
+            region: region.to_string(),
+            account_id: "123456789012".to_string(),
+            request_id: "test-req".to_string(),
+            headers: HeaderMap::new(),
+            query_params: HashMap::new(),
+            body: Bytes::new(),
+            body_stream: parking_lot::Mutex::new(None),
+            path_segments: path
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+            raw_path: path.to_string(),
+            raw_query: String::new(),
+            method,
+            is_query_protocol: false,
+            access_key_id: None,
+            principal: None,
+        }
+    }
+
+    #[test]
+    fn iam_resource_arns_follow_request_partition() {
+        assert_eq!(
+            s3_resource_for("cn-north-1", "GetObject", Some("b"), Some("k")),
+            "arn:aws-cn:s3:::b/k"
+        );
+        assert_eq!(
+            s3_resource_for("us-east-1", "ListObjectsV2", Some("b"), None),
+            "arn:aws:s3:::b"
+        );
+    }
+
+    #[test]
+    fn access_point_iam_resource_is_regional() {
+        let svc = S3Service::new(
+            Arc::new(RwLock::new(
+                fakecloud_core::multi_account::MultiAccountState::new(
+                    "123456789012",
+                    "us-east-1",
+                    "",
+                ),
+            )),
+            Arc::new(DeliveryBus::new()),
+        );
+        for (region, want) in [
+            (
+                "us-east-1",
+                "arn:aws:s3:us-east-1:123456789012:accesspoint/ap1",
+            ),
+            (
+                "cn-north-1",
+                "arn:aws-cn:s3:cn-north-1:123456789012:accesspoint/ap1",
+            ),
+        ] {
+            let mut r = request(Method::GET, region, "/v20180820/accesspoint/ap1");
+            r.headers
+                .insert("host", "123456789012.s3-control.localhost".parse().unwrap());
+            let action = svc.iam_action_for(&r).unwrap();
+            assert_eq!(action.action, "GetAccessPoint");
+            assert_eq!(action.resource, want);
+        }
+    }
+
+    #[test]
+    fn iam_resource_uses_bucket_region_partition() {
+        let state: SharedS3State = Arc::new(RwLock::new(
+            fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+        ));
+        state.write().default_mut().buckets.insert(
+            "cn-bucket".to_string(),
+            S3Bucket::new("cn-bucket", "cn-north-1", "123456789012"),
+        );
+        let svc = S3Service::new(state, Arc::new(DeliveryBus::new()));
+        let action = svc
+            .iam_action_for(&request(Method::GET, "us-east-1", "/cn-bucket/k"))
+            .unwrap();
+        assert_eq!(action.resource, "arn:aws-cn:s3:::cn-bucket/k");
+        let action = svc
+            .iam_action_for(&request(Method::GET, "cn-north-1", "/missing/k"))
+            .unwrap();
+        assert_eq!(action.resource, "arn:aws-cn:s3:::missing/k");
+    }
+
+    #[tokio::test]
+    async fn china_bucket_arn_round_trips() {
+        let state: SharedS3State = Arc::new(RwLock::new(
+            fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+        ));
+        let svc = S3Service::new(state.clone(), Arc::new(DeliveryBus::new()));
+        let mut create = request(Method::PUT, "cn-north-1", "/cn-bucket");
+        create.body = Bytes::from_static(
+            b"<CreateBucketConfiguration><LocationConstraint>cn-north-1</LocationConstraint></CreateBucketConfiguration>",
+        );
+        let created = svc.handle(create).await.unwrap();
+        let arn = created.headers["x-amz-bucket-arn"]
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(arn, "arn:aws-cn:s3:::cn-bucket");
+
+        let listed = svc
+            .handle(request(Method::GET, "cn-north-1", "/"))
+            .await
+            .unwrap();
+        let xml = std::str::from_utf8(listed.body.expect_bytes()).unwrap();
+        assert!(
+            xml.contains("<BucketArn>arn:aws-cn:s3:::cn-bucket</BucketArn>"),
+            "{xml}"
+        );
+
+        state
+            .write()
+            .default_mut()
+            .buckets
+            .get_mut("cn-bucket")
+            .unwrap()
+            .tags
+            .insert("env".to_string(), "prod".to_string());
+        let tags = s3_resource_tags(&state, &arn).unwrap();
+        assert_eq!(tags.get("env").map(String::as_str), Some("prod"));
+    }
+}
 
 #[cfg(test)]
 mod s3_detect_action_tests {

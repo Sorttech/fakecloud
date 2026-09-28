@@ -113,12 +113,20 @@ pub(crate) fn validate_item_attribute_values(
 /// Reject an empty DynamoDB set (`SS`/`NS`/`BS`). AWS returns a
 /// `ValidationException` — storing an empty set corrupts later
 /// `ADD`/`DELETE`/`size()` semantics.
+///
+/// The wording is AWS's own, quirks included: string and number sets share a
+/// template with a doubled space, binary sets have a message of their own.
 fn validate_set_not_empty(kind: &str, is_empty: bool) -> Result<(), AwsServiceError> {
     if is_empty {
+        let detail = if kind == "binary" {
+            "Binary sets should not be empty".to_string()
+        } else {
+            format!("An {kind} set  may not be empty")
+        };
         return Err(AwsServiceError::aws_error(
             StatusCode::BAD_REQUEST,
             "ValidationException",
-            format!("One or more parameter values were invalid: An {kind} set may not be empty"),
+            format!("One or more parameter values were invalid: {detail}"),
         ));
     }
     Ok(())
@@ -158,15 +166,21 @@ pub(crate) fn validate_attribute_value(v: &Value) -> Result<(), AwsServiceError>
             "Attempting to store more than 38 significant digits in a Number",
         )
     };
-    match tag.as_str() {
-        "N" => {
-            let s = val.as_str().unwrap_or_default();
-            match significant_digit_count(s) {
-                None => return Err(bad_number(s)),
-                Some(digits) if digits > MAX_SIGNIFICANT_DIGITS => return Err(too_many_digits()),
-                Some(_) => {}
-            }
+    // A number is a bare decimal literal: whitespace anywhere in it is
+    // rejected rather than trimmed away. Past the digit limit, the magnitude
+    // must also sit inside the supported range.
+    let check_number = |s: &str| -> Result<(), AwsServiceError> {
+        if s.chars().any(char::is_whitespace) {
+            return Err(bad_number(s));
         }
+        match significant_digit_count(s) {
+            None => Err(bad_number(s)),
+            Some(digits) if digits > MAX_SIGNIFICANT_DIGITS => Err(too_many_digits()),
+            Some(_) => check_number_range(s),
+        }
+    };
+    match tag.as_str() {
+        "N" => check_number(val.as_str().unwrap_or_default())?,
         "SS" => {
             let members: Vec<&str> = val
                 .as_array()
@@ -192,13 +206,7 @@ pub(crate) fn validate_attribute_value(v: &Value) -> Result<(), AwsServiceError>
             validate_set_not_empty("number", members.is_empty())?;
             let mut seen = std::collections::HashSet::new();
             for s in &members {
-                match significant_digit_count(s) {
-                    None => return Err(bad_number(s)),
-                    Some(digits) if digits > MAX_SIGNIFICANT_DIGITS => {
-                        return Err(too_many_digits())
-                    }
-                    Some(_) => {}
-                }
+                check_number(s)?;
                 // Number-set members are deduped by numeric value, so `"1"` and
                 // `"1.0"` collide. `canonical_number` never returns `None` here
                 // because `is_valid_number` already passed.
@@ -364,6 +372,296 @@ fn check_key_type(
     Ok(())
 }
 
+/// The message DynamoDB uses when a lookup key does not fit the table's key
+/// schema (a missing or extra attribute, or a value of the wrong type).
+pub(crate) const KEY_SCHEMA_MISMATCH: &str = "The provided key element does not match the schema";
+
+fn validation_error(message: impl Into<String>) -> AwsServiceError {
+    AwsServiceError::aws_error(StatusCode::BAD_REQUEST, "ValidationException", message)
+}
+
+/// The scalar type tag (`S`, `N`, `L`, ...) of an AttributeValue, `NULL`
+/// when the value carries none.
+fn attribute_type_tag(val: &Value) -> &str {
+    val.as_object()
+        .and_then(|o| o.keys().next().map(String::as_str))
+        .unwrap_or("NULL")
+}
+
+/// Whether `val` is an empty `S` or `B` of declared type `expected`.
+fn is_empty_scalar(val: &Value, expected: &str) -> bool {
+    matches!(expected, "S" | "B")
+        && val
+            .get(expected)
+            .and_then(Value::as_str)
+            .is_some_and(str::is_empty)
+}
+
+fn empty_kind(attr_type: &str) -> &'static str {
+    if attr_type == "B" {
+        "binary"
+    } else {
+        "string"
+    }
+}
+
+fn declared_type<'a>(table: &'a DynamoTable, name: &str) -> Option<&'a str> {
+    table
+        .attribute_definitions
+        .iter()
+        .find(|d| d.attribute_name == name)
+        .map(|d| d.attribute_type.as_str())
+}
+
+fn table_key_names(table: &DynamoTable) -> impl Iterator<Item = &str> {
+    std::iter::once(table.hash_key_name()).chain(table.range_key_name())
+}
+
+/// The up-front check DynamoDB runs on every key it receives: a table key
+/// attribute may not hold an empty String or Binary. This fires before any
+/// per-item processing, so inside a transaction it is a top-level
+/// ValidationException rather than a cancellation reason.
+pub(crate) fn empty_table_key_error(
+    table: &DynamoTable,
+    attrs: &HashMap<String, AttributeValue>,
+) -> Option<AwsServiceError> {
+    table_key_names(table).find_map(|name| {
+        let expected = declared_type(table, name)?;
+        let val = attrs.get(name)?;
+        is_empty_scalar(val, expected).then(|| {
+            validation_error(format!(
+                "One or more parameter values are not valid. The AttributeValue for a key \
+                 attribute cannot contain an empty {} value. Key: {name}",
+                empty_kind(expected)
+            ))
+        })
+    })
+}
+
+/// Whether a lookup `Key` fits the table's key schema: exactly the key
+/// attributes, each of its declared type. Returns false for a missing, extra
+/// or wrong-typed attribute, which DynamoDB reports as
+/// [`KEY_SCHEMA_MISMATCH`].
+pub(crate) fn key_matches_schema(
+    table: &DynamoTable,
+    key: &HashMap<String, AttributeValue>,
+) -> bool {
+    let mut expected_len = 0;
+    for name in table_key_names(table) {
+        expected_len += 1;
+        let Some(val) = key.get(name) else {
+            return false;
+        };
+        if let Some(expected) = declared_type(table, name) {
+            if attribute_type_tag(val) != expected {
+                return false;
+            }
+        }
+    }
+    key.len() == expected_len
+}
+
+/// The error for a written item that lacks one of the table's key
+/// attributes.
+pub(crate) fn missing_item_key_error(
+    table: &DynamoTable,
+    item: &HashMap<String, AttributeValue>,
+) -> Option<AwsServiceError> {
+    table_key_names(table)
+        .find(|name| !item.contains_key(*name))
+        .map(|name| validation_error(format!("Missing the key {name} in the item")))
+}
+
+/// The type-mismatch error for a table key attribute inside a written item,
+/// in the form PutItem reports it (`Type mismatch for key pk expected: S
+/// actual: N`). Missing attributes are not checked here.
+pub(crate) fn item_key_type_mismatch(
+    table: &DynamoTable,
+    item: &HashMap<String, AttributeValue>,
+) -> Option<String> {
+    table_key_names(table).find_map(|name| {
+        let expected = declared_type(table, name)?;
+        let actual = attribute_type_tag(item.get(name)?);
+        (actual != expected).then(|| {
+            format!(
+                "One or more parameter values were invalid: Type mismatch for key {name} \
+                 expected: {expected} actual: {actual}"
+            )
+        })
+    })
+}
+
+/// One key attribute of one secondary index that is not also a table key.
+pub(crate) struct IndexKeySpec {
+    index_name: String,
+    attr: String,
+    attr_type: String,
+}
+
+/// A written item carrying a value its secondary index cannot key on.
+pub(crate) enum IndexKeyFault {
+    /// An empty String/Binary. Caught by DynamoDB's up-front validation, so
+    /// a transaction reports it as a top-level ValidationException.
+    Empty {
+        index_name: String,
+        attr: String,
+        attr_type: String,
+    },
+    /// A value of another type (including a non-scalar). Caught while the
+    /// write executes, so a transaction cancels with a ValidationError.
+    TypeMismatch {
+        index_name: String,
+        attr: String,
+        expected: String,
+        actual: String,
+    },
+}
+
+impl IndexKeyFault {
+    /// The message for a fault in an item written whole (PutItem,
+    /// BatchWriteItem, a transact Put).
+    pub(crate) fn put_message(&self) -> String {
+        match self {
+            IndexKeyFault::Empty {
+                index_name,
+                attr,
+                attr_type,
+            } => format!(
+                "One or more parameter values are not valid. A value specified for a secondary \
+                 index key is not supported. The AttributeValue for a key attribute cannot \
+                 contain an empty {} value. IndexName: {index_name}, IndexKey: {attr}",
+                empty_kind(attr_type)
+            ),
+            IndexKeyFault::TypeMismatch {
+                index_name,
+                attr,
+                expected,
+                actual,
+            } => format!(
+                "One or more parameter values were invalid: Type mismatch for Index Key {attr} \
+                 Expected: {expected} Actual: {actual} IndexName: {index_name}"
+            ),
+        }
+    }
+
+    /// The message for a fault produced by an update expression (UpdateItem,
+    /// a transact Update). The empty-value form names neither index nor key.
+    pub(crate) fn update_message(&self) -> String {
+        match self {
+            IndexKeyFault::Empty { attr_type, .. } => format!(
+                "One or more parameter values are not valid. The update expression attempted to \
+                 update a secondary index key to a value that is not supported. The \
+                 AttributeValue for a key attribute cannot contain an empty {} value.",
+                empty_kind(attr_type)
+            ),
+            IndexKeyFault::TypeMismatch { .. } => self.put_message(),
+        }
+    }
+
+    pub(crate) fn is_empty_value(&self) -> bool {
+        matches!(self, IndexKeyFault::Empty { .. })
+    }
+
+    pub(crate) fn put_error(&self) -> AwsServiceError {
+        validation_error(self.put_message())
+    }
+
+    pub(crate) fn update_error(&self) -> AwsServiceError {
+        validation_error(self.update_message())
+    }
+}
+
+/// The secondary-index key attributes of `table` that are not table keys,
+/// ordered by index name so a value keyed by several indexes is reported
+/// against the alphabetically-first one, as DynamoDB does.
+pub(crate) fn index_key_specs(table: &DynamoTable) -> Vec<IndexKeySpec> {
+    let table_keys: Vec<&str> = table_key_names(table).collect();
+    let mut indexes: Vec<(&str, &[crate::state::KeySchemaElement])> = table
+        .gsi
+        .iter()
+        .map(|g| (g.index_name.as_str(), g.key_schema.as_slice()))
+        .chain(
+            table
+                .lsi
+                .iter()
+                .map(|l| (l.index_name.as_str(), l.key_schema.as_slice())),
+        )
+        .collect();
+    indexes.sort_by(|a, b| a.0.cmp(b.0));
+    let mut specs = Vec::new();
+    for (index_name, schema) in indexes {
+        let ordered = schema
+            .iter()
+            .filter(|k| k.key_type == "HASH")
+            .chain(schema.iter().filter(|k| k.key_type != "HASH"));
+        for k in ordered {
+            if table_keys.contains(&k.attribute_name.as_str()) {
+                continue;
+            }
+            let Some(attr_type) = declared_type(table, &k.attribute_name) else {
+                continue;
+            };
+            specs.push(IndexKeySpec {
+                index_name: index_name.to_string(),
+                attr: k.attribute_name.clone(),
+                attr_type: attr_type.to_string(),
+            });
+        }
+    }
+    specs
+}
+
+/// Find the first secondary-index key value in `item` that no index could
+/// key on. With `before`, only attributes whose value differs from it are
+/// considered, so an update is judged on what it writes rather than on an
+/// unrelated value stored before the index existed. Empty values are
+/// reported ahead of type mismatches, mirroring DynamoDB's up-front
+/// validation running before the per-item checks.
+pub(crate) fn index_key_fault(
+    specs: &[IndexKeySpec],
+    item: &HashMap<String, AttributeValue>,
+    before: Option<&HashMap<String, AttributeValue>>,
+) -> Option<IndexKeyFault> {
+    let written = |spec: &IndexKeySpec| -> Option<&Value> {
+        let val = item.get(&spec.attr)?;
+        match before {
+            Some(prev) if prev.get(&spec.attr) == Some(val) => None,
+            _ => Some(val),
+        }
+    };
+    let empty = specs.iter().find_map(|spec| {
+        let val = written(spec)?;
+        is_empty_scalar(val, &spec.attr_type).then(|| IndexKeyFault::Empty {
+            index_name: spec.index_name.clone(),
+            attr: spec.attr.clone(),
+            attr_type: spec.attr_type.clone(),
+        })
+    });
+    empty.or_else(|| {
+        specs.iter().find_map(|spec| {
+            let actual = attribute_type_tag(written(spec)?);
+            (actual != spec.attr_type).then(|| IndexKeyFault::TypeMismatch {
+                index_name: spec.index_name.clone(),
+                attr: spec.attr.clone(),
+                expected: spec.attr_type.clone(),
+                actual: actual.to_string(),
+            })
+        })
+    })
+}
+
+/// Reject an item written whole (PutItem / BatchWriteItem) whose
+/// secondary-index key values are empty or of the wrong type.
+pub(crate) fn validate_index_keys_in_item(
+    table: &DynamoTable,
+    item: &HashMap<String, AttributeValue>,
+) -> Result<(), AwsServiceError> {
+    match index_key_fault(&index_key_specs(table), item, None) {
+        Some(fault) => Err(fault.put_error()),
+        None => Ok(()),
+    }
+}
+
 /// The error DynamoDB returns for an update that writes a primary-key
 /// attribute. The message is also what [`DynamoTable::key_attribute_update_message`]
 /// hands integrations that report DynamoDB errors their own way.
@@ -479,18 +777,16 @@ mod attr_value_validation_tests {
 
     #[test]
     fn rejects_empty_sets() {
-        for (v, kind) in [
-            (json!({"SS": []}), "string"),
-            (json!({"NS": []}), "number"),
-            (json!({"BS": []}), "binary"),
+        for (v, message) in [
+            (json!({"SS": []}), "An string set  may not be empty"),
+            (json!({"NS": []}), "An number set  may not be empty"),
+            (json!({"BS": []}), "Binary sets should not be empty"),
         ] {
             let err = err_of(v);
             assert_eq!(err.code(), "ValidationException");
-            assert!(
-                err.message()
-                    .contains(&format!("An {kind} set may not be empty")),
-                "unexpected message for {kind}: {}",
-                err.message()
+            assert_eq!(
+                err.message(),
+                format!("One or more parameter values were invalid: {message}")
             );
         }
     }

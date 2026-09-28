@@ -3379,7 +3379,8 @@ fn put_item_emits_consumed_capacity_when_requested() {
     let b = body_json(&resp);
     assert_eq!(b["ConsumedCapacity"]["TableName"], "test-table");
     assert_eq!(b["ConsumedCapacity"]["CapacityUnits"], 1.0);
-    assert_eq!(b["ConsumedCapacity"]["WriteCapacityUnits"], 1.0);
+    // A single-item write reports the aggregate alone, with no write split.
+    assert!(b["ConsumedCapacity"].get("WriteCapacityUnits").is_none());
     // TOTAL must not include the breakdown.
     assert!(b["ConsumedCapacity"].get("Table").is_none());
 }
@@ -3400,8 +3401,11 @@ fn put_item_consumed_capacity_indexes_includes_breakdown() {
     let resp = svc.put_item(&req).unwrap();
     let b = body_json(&resp);
     assert_eq!(b["ConsumedCapacity"]["Table"]["CapacityUnits"], 1.0);
-    assert!(b["ConsumedCapacity"]["GlobalSecondaryIndexes"].is_object());
-    assert!(b["ConsumedCapacity"]["LocalSecondaryIndexes"].is_object());
+    // No index was charged, so neither index map is present.
+    assert!(b["ConsumedCapacity"]
+        .get("GlobalSecondaryIndexes")
+        .is_none());
+    assert!(b["ConsumedCapacity"].get("LocalSecondaryIndexes").is_none());
 }
 
 #[test]
@@ -3446,7 +3450,8 @@ fn get_item_emits_consumed_capacity_when_requested() {
     let resp = svc.get_item(&req).unwrap();
     let b = body_json(&resp);
     assert_eq!(b["ConsumedCapacity"]["TableName"], "test-table");
-    assert_eq!(b["ConsumedCapacity"]["ReadCapacityUnits"], 0.5);
+    assert_eq!(b["ConsumedCapacity"]["CapacityUnits"], 0.5);
+    assert!(b["ConsumedCapacity"].get("ReadCapacityUnits").is_none());
 }
 
 #[test]
@@ -7225,6 +7230,155 @@ async fn partiql_refuses_values_it_cannot_build() {
     );
 }
 
+/// PartiQL writes are measured and stored like the item APIs: INSERT has
+/// PutItem's size rule and wording, UPDATE the flat update rule, and every
+/// written number -- literal or bound parameter -- is stored canonically.
+#[tokio::test]
+async fn partiql_writes_share_the_item_size_and_number_rules() {
+    let svc = make_service();
+    create_test_table(&svc);
+    // "pk" + "a" + "p" + padding: exactly one byte over the limit.
+    let pad = "x".repeat(409_600 - "pk".len() - "a".len() - "p".len() + 1);
+    let err = svc
+        .handle(make_request(
+            "ExecuteStatement",
+            json!({
+                "Statement": "INSERT INTO \"test-table\" VALUE {'pk': 'a', 'p': ?}",
+                "Parameters": [{"S": pad}]
+            }),
+        ))
+        .await
+        .err()
+        .expect("oversize INSERT");
+    assert_eq!(err.code(), "ValidationException");
+    assert_eq!(
+        err.message(),
+        "Item size has exceeded the maximum allowed size"
+    );
+    // One byte less fits.
+    call_dynamodb(
+        &svc,
+        "ExecuteStatement",
+        json!({
+            "Statement": "INSERT INTO \"test-table\" VALUE {'pk': 'a', 'p': ?}",
+            "Parameters": [{"S": &pad[1..]}]
+        }),
+    )
+    .await;
+    let err = svc
+        .handle(make_request(
+            "ExecuteStatement",
+            json!({
+                "Statement": "UPDATE \"test-table\" SET q = 'y' WHERE pk = 'a'"
+            }),
+        ))
+        .await
+        .err()
+        .expect("oversize UPDATE");
+    assert_eq!(
+        err.message(),
+        "Item size to update has exceeded the maximum allowed size"
+    );
+
+    call_dynamodb(
+        &svc,
+        "ExecuteStatement",
+        json!({
+            "Statement": "INSERT INTO \"test-table\" VALUE {'pk': 'n', 'lit': 01.50, 'p': ?, 'l': [?]}",
+            "Parameters": [{"N": "+1.5E+3"}, {"N": "0042.1200"}]
+        }),
+    )
+    .await;
+    call_dynamodb(
+        &svc,
+        "ExecuteStatement",
+        json!({
+            "Statement": "UPDATE \"test-table\" SET u = ? WHERE pk = 'n'",
+            "Parameters": [{"NS": ["1.0", "-0"]}]
+        }),
+    )
+    .await;
+    let got = call_dynamodb(
+        &svc,
+        "GetItem",
+        json!({"TableName": "test-table", "Key": {"pk": {"S": "n"}}}),
+    )
+    .await;
+    assert_eq!(got["Item"]["lit"], json!({"N": "1.5"}));
+    assert_eq!(got["Item"]["p"], json!({"N": "1500"}));
+    assert_eq!(got["Item"]["l"], json!({"L": [{"N": "42.12"}]}));
+    assert_eq!(got["Item"]["u"], json!({"NS": ["1", "0"]}));
+}
+
+/// A value an UPDATE writes is validated like an UpdateItem value before it
+/// is normalized, so it can never store a malformed number or set.
+#[tokio::test]
+async fn partiql_update_validates_written_values() {
+    let svc = make_service();
+    create_test_table(&svc);
+    call_dynamodb(
+        &svc,
+        "PutItem",
+        json!({"TableName": "test-table", "Item": {"pk": {"S": "a"}}}),
+    )
+    .await;
+    for (value, message) in [
+        (
+            json!({"NS": ["1", "1.0"]}),
+            "One or more parameter values were invalid: Input collection [1, 1.0] contains duplicates",
+        ),
+        (
+            json!({"N": "abc"}),
+            "The parameter cannot be converted to a numeric value: abc",
+        ),
+        (
+            json!({"SS": []}),
+            "One or more parameter values were invalid: An string set  may not be empty",
+        ),
+        (
+            json!({"N": "1234567890123456789012345678901234567890"}),
+            "",
+        ),
+    ] {
+        let expected = svc
+            .handle(make_request(
+                "UpdateItem",
+                json!({
+                    "TableName": "test-table",
+                    "Key": {"pk": {"S": "a"}},
+                    "UpdateExpression": "SET u = :v",
+                    "ExpressionAttributeValues": {":v": value}
+                }),
+            ))
+            .await
+            .err()
+            .expect("UpdateItem refuses the value");
+        let err = svc
+            .handle(make_request(
+                "ExecuteStatement",
+                json!({
+                    "Statement": "UPDATE \"test-table\" SET u = ? WHERE pk = 'a'",
+                    "Parameters": [value]
+                }),
+            ))
+            .await
+            .err()
+            .expect("PartiQL UPDATE refuses the value");
+        assert_eq!(err.code(), "ValidationException", "{value}");
+        assert_eq!(err.message(), expected.message(), "{value}");
+        if !message.is_empty() {
+            assert_eq!(err.message(), message, "{value}");
+        }
+    }
+    let got = call_dynamodb(
+        &svc,
+        "GetItem",
+        json!({"TableName": "test-table", "Key": {"pk": {"S": "a"}}}),
+    )
+    .await;
+    assert_eq!(got["Item"], json!({"pk": {"S": "a"}}));
+}
+
 /// A transaction that reads and writes one table reports each as what it
 /// was, not every unit as whichever came first.
 #[tokio::test]
@@ -7617,4 +7771,435 @@ async fn other_accounts_tables_are_not_found_without_cross_account_support() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(got["__type"], "ResourceNotFoundException");
+}
+
+/// A table with a GSI (INCLUDE projection of `proj`) and an ALL-projected LSI,
+/// for the index write-capacity cases.
+fn create_indexed_capacity_table(svc: &DynamoDbService) {
+    let req = make_request(
+        "CreateTable",
+        json!({
+            "TableName": "idx-wcu",
+            "AttributeDefinitions": [
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "sk", "AttributeType": "S"},
+                {"AttributeName": "gsiPk", "AttributeType": "S"},
+                {"AttributeName": "lsiSk", "AttributeType": "S"}
+            ],
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"}
+            ],
+            "BillingMode": "PAY_PER_REQUEST",
+            "GlobalSecondaryIndexes": [{
+                "IndexName": "gsi-inc",
+                "KeySchema": [{"AttributeName": "gsiPk", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "INCLUDE", "NonKeyAttributes": ["proj"]}
+            }],
+            "LocalSecondaryIndexes": [{
+                "IndexName": "lsi1",
+                "KeySchema": [
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "lsiSk", "KeyType": "RANGE"}
+                ],
+                "Projection": {"ProjectionType": "ALL"}
+            }]
+        }),
+    );
+    svc.create_table(&req).unwrap();
+}
+
+#[test]
+fn write_capacity_charges_only_the_indexes_a_write_changes() {
+    let svc = make_service();
+    create_indexed_capacity_table(&svc);
+    let put = |item: Value| {
+        let req = make_request(
+            "PutItem",
+            json!({"TableName": "idx-wcu", "Item": item, "ReturnConsumedCapacity": "INDEXES"}),
+        );
+        body_json(&svc.put_item(&req).unwrap())["ConsumedCapacity"].clone()
+    };
+    let full = json!({
+        "pk": {"S": "a"}, "sk": {"S": "1"}, "gsiPk": {"S": "g"},
+        "lsiSk": {"S": "l"}, "proj": {"S": "p"}, "other": {"S": "o"}
+    });
+    let cc = put(full.clone());
+    assert_eq!(cc["CapacityUnits"], 3.0);
+    assert_eq!(cc["Table"]["CapacityUnits"], 1.0);
+    assert_eq!(
+        cc["GlobalSecondaryIndexes"]["gsi-inc"]["CapacityUnits"],
+        1.0
+    );
+    assert_eq!(cc["LocalSecondaryIndexes"]["lsi1"]["CapacityUnits"], 1.0);
+    assert!(cc["Table"].get("WriteCapacityUnits").is_none());
+
+    // An identical overwrite changes no index.
+    let cc = put(full);
+    assert_eq!(cc["CapacityUnits"], 1.0);
+    assert!(cc.get("GlobalSecondaryIndexes").is_none());
+    assert!(cc.get("LocalSecondaryIndexes").is_none());
+
+    // Moving the GSI key is a delete plus an insert on the GSI; the LSI's
+    // ALL projection sees the changed attribute too.
+    let req = make_request(
+        "UpdateItem",
+        json!({
+            "TableName": "idx-wcu",
+            "Key": {"pk": {"S": "a"}, "sk": {"S": "1"}},
+            "UpdateExpression": "SET gsiPk = :g",
+            "ExpressionAttributeValues": {":g": {"S": "moved"}},
+            "ReturnConsumedCapacity": "INDEXES",
+        }),
+    );
+    let cc = body_json(&svc.update_item(&req).unwrap())["ConsumedCapacity"].clone();
+    assert_eq!(cc["CapacityUnits"], 4.0);
+    assert_eq!(
+        cc["GlobalSecondaryIndexes"]["gsi-inc"]["CapacityUnits"],
+        2.0
+    );
+
+    // A non-projected attribute leaves the INCLUDE GSI alone.
+    let req = make_request(
+        "UpdateItem",
+        json!({
+            "TableName": "idx-wcu",
+            "Key": {"pk": {"S": "a"}, "sk": {"S": "1"}},
+            "UpdateExpression": "SET other = :o",
+            "ExpressionAttributeValues": {":o": {"S": "o2"}},
+            "ReturnConsumedCapacity": "INDEXES",
+        }),
+    );
+    let cc = body_json(&svc.update_item(&req).unwrap())["ConsumedCapacity"].clone();
+    assert_eq!(cc["CapacityUnits"], 2.0);
+    assert!(cc.get("GlobalSecondaryIndexes").is_none());
+
+    // A delete charges one write per index the item occupied.
+    let req = make_request(
+        "DeleteItem",
+        json!({
+            "TableName": "idx-wcu",
+            "Key": {"pk": {"S": "a"}, "sk": {"S": "1"}},
+            "ReturnConsumedCapacity": "TOTAL",
+        }),
+    );
+    let cc = body_json(&svc.delete_item(&req).unwrap())["ConsumedCapacity"].clone();
+    assert_eq!(cc["CapacityUnits"], 3.0);
+    assert!(cc.get("Table").is_none());
+}
+
+#[test]
+fn read_capacity_follows_item_size_and_consistency() {
+    let svc = make_service();
+    create_test_table(&svc);
+    let req = make_request(
+        "PutItem",
+        json!({"TableName": "test-table", "Item": {"pk": {"S": "big"}, "v": {"S": "x".repeat(5000)}}}),
+    );
+    svc.put_item(&req).unwrap();
+    let get = |consistent: bool| {
+        let req = make_request(
+            "GetItem",
+            json!({
+                "TableName": "test-table",
+                "Key": {"pk": {"S": "big"}},
+                "ConsistentRead": consistent,
+                "ReturnConsumedCapacity": "TOTAL",
+            }),
+        );
+        body_json(&svc.get_item(&req).unwrap())["ConsumedCapacity"]["CapacityUnits"].clone()
+    };
+    // Just over 4KB: two read units, halved when eventually consistent.
+    assert_eq!(get(true), 2.0);
+    assert_eq!(get(false), 1.0);
+}
+
+#[test]
+fn put_item_enforces_the_400kb_gate_to_the_byte() {
+    let svc = make_service();
+    create_test_table(&svc);
+    // pk (2) + "k" (1) + "p" (1) + padding.
+    let put = |padding: usize| {
+        let req = make_request(
+            "PutItem",
+            json!({"TableName": "test-table", "Item": {"pk": {"S": "k"}, "p": {"S": "x".repeat(padding)}}}),
+        );
+        svc.put_item(&req)
+    };
+    assert!(put(409_600 - 4).is_ok());
+    let err = expect_err(put(409_600 - 3));
+    assert_eq!(err.code(), "ValidationException");
+    assert_eq!(
+        err.message(),
+        "Item size has exceeded the maximum allowed size"
+    );
+}
+
+#[test]
+fn update_item_charges_what_it_writes_plus_its_clauses() {
+    let svc = make_service();
+    create_test_table(&svc);
+    let update = |key: &str, padding: usize| {
+        let req = make_request(
+            "UpdateItem",
+            json!({
+                "TableName": "test-table",
+                "Key": {"pk": {"S": key}},
+                "UpdateExpression": "SET b = :p",
+                "ExpressionAttributeValues": {":p": {"S": "x".repeat(padding)}},
+            }),
+        );
+        svc.update_item(&req)
+    };
+    // A one-byte key: the ceiling is 409,600 - 19 (22 for the clause, less
+    // the 3 key bytes the update never writes). `b` costs 1 + padding.
+    let ceiling = 409_600 - 19;
+    assert!(update("K", ceiling - 3 - 1).is_ok());
+    let err = expect_err(update("L", ceiling - 3));
+    assert_eq!(
+        err.message(),
+        "Item size to update has exceeded the maximum allowed size"
+    );
+    // The refused update left nothing behind.
+    let req = make_request(
+        "GetItem",
+        json!({"TableName": "test-table", "Key": {"pk": {"S": "L"}}}),
+    );
+    assert!(body_json(&svc.get_item(&req).unwrap())
+        .get("Item")
+        .is_none());
+
+    // A transacted Update measures the finished item flat and cancels.
+    let req = make_request(
+        "TransactWriteItems",
+        json!({"TransactItems": [{"Update": {
+            "TableName": "test-table",
+            "Key": {"pk": {"S": "T"}},
+            "UpdateExpression": "SET b = :p",
+            "ExpressionAttributeValues": {":p": {"S": "x".repeat(409_600 - 3 - 1)}},
+        }}]}),
+    );
+    let resp = svc.transact_write_items(&req).unwrap();
+    assert_eq!(resp.status, StatusCode::OK);
+    let req = make_request(
+        "TransactWriteItems",
+        json!({"TransactItems": [{"Update": {
+            "TableName": "test-table",
+            "Key": {"pk": {"S": "U"}},
+            "UpdateExpression": "SET b = :p",
+            "ExpressionAttributeValues": {":p": {"S": "x".repeat(409_600 - 3)}},
+        }}]}),
+    );
+    let resp = svc.transact_write_items(&req).unwrap();
+    let b = body_json(&resp);
+    assert_eq!(b["__type"], "TransactionCanceledException");
+    assert_eq!(b["CancellationReasons"][0]["Code"], "ValidationError");
+    assert_eq!(
+        b["CancellationReasons"][0]["Message"],
+        "Item size to update has exceeded the maximum allowed size"
+    );
+}
+
+#[test]
+fn numbers_are_stored_in_canonical_form_and_range_checked() {
+    let svc = make_service();
+    create_test_table(&svc);
+    let req = make_request(
+        "PutItem",
+        json!({"TableName": "test-table", "Item": {
+            "pk": {"S": "n"},
+            "a": {"N": "+1.5E+3"},
+            "b": {"N": "0042.1200"},
+            "c": {"N": "-0"},
+            "d": {"NS": [".5", "1e2"]},
+        }}),
+    );
+    svc.put_item(&req).unwrap();
+    let req = make_request(
+        "GetItem",
+        json!({"TableName": "test-table", "Key": {"pk": {"S": "n"}}}),
+    );
+    let item = body_json(&svc.get_item(&req).unwrap())["Item"].clone();
+    assert_eq!(item["a"]["N"], "1500");
+    assert_eq!(item["b"]["N"], "42.12");
+    assert_eq!(item["c"]["N"], "0");
+    assert_eq!(item["d"]["NS"], json!(["0.5", "100"]));
+
+    for bad in [" 5", "5 ", "1 5"] {
+        let req = make_request(
+            "PutItem",
+            json!({"TableName": "test-table", "Item": {"pk": {"S": "bad"}, "v": {"N": bad}}}),
+        );
+        let err = expect_err(svc.put_item(&req));
+        assert!(err.message().contains("numeric value"), "{bad}");
+    }
+    let req = make_request(
+        "PutItem",
+        json!({"TableName": "test-table", "Item": {"pk": {"S": "bad"}, "v": {"N": "1E+126"}}}),
+    );
+    assert!(expect_err(svc.put_item(&req))
+        .message()
+        .starts_with("Number overflow"));
+
+    let req = make_request(
+        "UpdateItem",
+        json!({
+            "TableName": "test-table",
+            "Key": {"pk": {"S": "overflow"}},
+            "UpdateExpression": "SET n = :a + :b",
+            "ExpressionAttributeValues": {":a": {"N": "9.9e125"}, ":b": {"N": "9.9e125"}},
+        }),
+    );
+    assert!(expect_err(svc.update_item(&req))
+        .message()
+        .starts_with("Number overflow"));
+}
+
+#[test]
+fn transact_write_capacity_is_doubled_and_replays_as_a_read() {
+    let svc = make_service();
+    create_test_table(&svc);
+    let body = json!({
+        "ClientRequestToken": "replay-token",
+        "ReturnConsumedCapacity": "TOTAL",
+        "TransactItems": [{"Put": {
+            "TableName": "test-table",
+            "Item": {"pk": {"S": "r"}, "big": {"S": "x".repeat(1536)}},
+        }}],
+    });
+    let first = body_json(
+        &svc.transact_write_items(&make_request("TransactWriteItems", body.clone()))
+            .unwrap(),
+    );
+    assert_eq!(first["ConsumedCapacity"][0]["WriteCapacityUnits"], 4.0);
+    assert!(first["ConsumedCapacity"][0]
+        .get("ReadCapacityUnits")
+        .is_none());
+    let replay = body_json(
+        &svc.transact_write_items(&make_request("TransactWriteItems", body))
+            .unwrap(),
+    );
+    assert_eq!(replay["ConsumedCapacity"][0]["ReadCapacityUnits"], 2.0);
+    assert!(replay["ConsumedCapacity"][0]
+        .get("WriteCapacityUnits")
+        .is_none());
+}
+
+#[test]
+fn put_item_reports_every_invalid_enum_together() {
+    let svc = make_service();
+    let req = make_request(
+        "PutItem",
+        json!({
+            "TableName": "missing-table",
+            "Item": {"pk": {"S": "x"}},
+            "ReturnConsumedCapacity": "INVALID",
+            "ReturnItemCollectionMetrics": "INVALID",
+            "ReturnValues": "INVALID",
+        }),
+    );
+    let err = expect_err(svc.put_item(&req));
+    assert_eq!(err.code(), "ValidationException");
+    assert!(err.message().starts_with("3 validation errors detected: "));
+}
+
+/// Only the values an update writes are normalized. A number stored in a
+/// non-canonical spelling (written by an older build and restored from its
+/// snapshot) is left alone when the update does not touch it, so it never
+/// shows up in UPDATED_NEW/UPDATED_OLD or a stream MODIFY image as changed.
+#[test]
+fn update_item_normalizes_only_the_values_it_writes() {
+    let svc = make_service();
+    create_test_table(&svc);
+    {
+        let mut accounts = svc.state.write();
+        let state = accounts.get_or_create("123456789012");
+        let table = state.tables.get_mut("test-table").unwrap();
+        let legacy: HashMap<String, Value> = serde_json::from_value(json!({
+            "pk": {"S": "legacy"},
+            "old": {"N": "1.50"},
+        }))
+        .unwrap();
+        table.put_item_at_key(legacy);
+    }
+    let req = make_request(
+        "UpdateItem",
+        json!({
+            "TableName": "test-table",
+            "Key": {"pk": {"S": "legacy"}},
+            "UpdateExpression": "SET n = :v",
+            "ExpressionAttributeValues": {":v": {"N": "+5.0"}},
+            "ReturnValues": "UPDATED_NEW",
+        }),
+    );
+    let b = body_json(&svc.update_item(&req).unwrap());
+    assert_eq!(b["Attributes"], json!({"n": {"N": "5"}}));
+
+    let req = make_request(
+        "GetItem",
+        json!({"TableName": "test-table", "Key": {"pk": {"S": "legacy"}}}),
+    );
+    let item = body_json(&svc.get_item(&req).unwrap())["Item"].clone();
+    assert_eq!(item["old"]["N"], "1.50");
+    assert_eq!(item["n"]["N"], "5");
+
+    // Legacy AttributeUpdates values are normalized the same way.
+    let req = make_request(
+        "UpdateItem",
+        json!({
+            "TableName": "test-table",
+            "Key": {"pk": {"S": "legacy"}},
+            "AttributeUpdates": {"m": {"Value": {"N": "1e2"}, "Action": "PUT"}},
+            "ReturnValues": "UPDATED_OLD",
+        }),
+    );
+    let b = body_json(&svc.update_item(&req).unwrap());
+    assert!(b.get("Attributes").is_none());
+    let req = make_request(
+        "GetItem",
+        json!({"TableName": "test-table", "Key": {"pk": {"S": "legacy"}}}),
+    );
+    let item = body_json(&svc.get_item(&req).unwrap())["Item"].clone();
+    assert_eq!(item["m"]["N"], "100");
+    assert_eq!(item["old"]["N"], "1.50");
+}
+
+/// Without ReturnConsumedCapacity no capacity block is reported by any of
+/// the operations that only size items to build one.
+#[test]
+fn capacity_is_omitted_when_not_requested() {
+    let svc = make_service();
+    create_test_table(&svc);
+    let req = make_request(
+        "BatchWriteItem",
+        json!({"RequestItems": {"test-table": [
+            {"PutRequest": {"Item": {"pk": {"S": "a"}}}},
+            {"PutRequest": {"Item": {"pk": {"S": "b"}}}},
+        ]}}),
+    );
+    assert!(body_json(&svc.batch_write_item(&req).unwrap())
+        .get("ConsumedCapacity")
+        .is_none());
+    let req = make_request(
+        "DeleteItem",
+        json!({"TableName": "test-table", "Key": {"pk": {"S": "a"}}}),
+    );
+    assert!(body_json(&svc.delete_item(&req).unwrap())
+        .get("ConsumedCapacity")
+        .is_none());
+    let req = make_request(
+        "Query",
+        json!({
+            "TableName": "test-table",
+            "KeyConditionExpression": "pk = :p",
+            "ExpressionAttributeValues": {":p": {"S": "b"}},
+        }),
+    );
+    let b = body_json(&svc.query(&req).unwrap());
+    assert_eq!(b["Count"], 1);
+    assert!(b.get("ConsumedCapacity").is_none());
+    let req = make_request("Scan", json!({"TableName": "test-table"}));
+    assert!(body_json(&svc.scan(&req).unwrap())
+        .get("ConsumedCapacity")
+        .is_none());
 }

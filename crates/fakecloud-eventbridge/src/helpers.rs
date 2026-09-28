@@ -47,27 +47,7 @@ pub(crate) fn validate_put_events_entry(
 /// accepts (RFC 3339 string, fractional seconds as a float, integer
 /// seconds). Falls back to "now" if the field is absent or
 /// unparseable, which matches the real service.
-/// Re-stamp the region segment of an ARN with the caller's request region.
-///
-/// The default event bus is created at account-state bootstrap, which only
-/// has access to the server's frozen startup region — not the caller's
-/// credential-scope region. Custom buses created through `CreateEventBus`
-/// already carry the request region, so this rewrite is idempotent for them
-/// and only corrects the bootstrap default bus when a client is configured
-/// for a non-default region. ARNs that don't have the expected
-/// `arn:partition:service:region:account:resource` shape are returned
-/// unchanged.
-pub(crate) fn arn_with_request_region(arn: &str, region: &str) -> String {
-    let parts: Vec<&str> = arn.splitn(6, ':').collect();
-    if parts.len() == 6 && parts[0] == "arn" {
-        format!(
-            "{}:{}:{}:{}:{}:{}",
-            parts[0], parts[1], parts[2], region, parts[4], parts[5]
-        )
-    } else {
-        arn.to_string()
-    }
-}
+pub(crate) use crate::state::{arn_with_request_region, bus_arn, rule_arn};
 
 pub(crate) fn parse_put_events_time(raw: &Value) -> DateTime<Utc> {
     if let Some(s) = raw.as_str() {
@@ -216,7 +196,7 @@ pub(crate) fn find_tags_mut<'a>(
 ) -> Result<&'a mut BTreeMap<String, String>, AwsServiceError> {
     // Check buses
     for bus in state.buses.values_mut() {
-        if bus.arn == arn {
+        if bus.answers_to(arn) {
             return Ok(&mut bus.tags);
         }
     }
@@ -256,7 +236,7 @@ pub(crate) fn find_tags<'a>(
     arn: &str,
 ) -> Result<&'a BTreeMap<String, String>, AwsServiceError> {
     for bus in state.buses.values() {
-        if bus.arn == arn {
+        if bus.answers_to(arn) {
             return Ok(&bus.tags);
         }
     }
@@ -1143,13 +1123,7 @@ pub(crate) fn deliver_to_logs(
         .entry(group_name.to_string())
         .or_insert_with(|| fakecloud_logs::LogGroup {
             name: group_name.to_string(),
-            arn: Arn::new(
-                "logs",
-                &region,
-                &account_id,
-                &format!("log-group:{group_name}"),
-            )
-            .to_string(),
+            arn: fakecloud_logs::log_group_arn(&region, &account_id, group_name),
             creation_time: ts_millis,
             retention_in_days: None,
             kms_key_id: None,

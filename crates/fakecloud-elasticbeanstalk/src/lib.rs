@@ -21,7 +21,10 @@
 pub(crate) mod service;
 pub(crate) mod state;
 
-pub use service::ElasticBeanstalkService;
+pub use service::{
+    application_arn, application_version_arn, configuration_template_arn, environment_arn,
+    ElasticBeanstalkService,
+};
 pub use state::{
     EbAccounts, ElasticBeanstalkSnapshot, SharedEbState, ELASTICBEANSTALK_SNAPSHOT_SCHEMA_VERSION,
 };

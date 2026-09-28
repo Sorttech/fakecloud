@@ -17,6 +17,7 @@ use serde_json::{json, Map, Value};
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
+use fakecloud_aws::arn::partition_for;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_persistence::SnapshotStore;
 
@@ -1068,14 +1069,16 @@ fn short_id() -> String {
 }
 
 fn group_arn(region: &str, account: &str, name: &str) -> String {
+    let partition = partition_for(region);
     format!(
-        "arn:aws:xray:{region}:{account}:group/{name}/{}",
+        "arn:{partition}:xray:{region}:{account}:group/{name}/{}",
         short_id()
     )
 }
 
 fn sampling_rule_arn(region: &str, account: &str, name: &str) -> String {
-    format!("arn:aws:xray:{region}:{account}:sampling-rule/{name}")
+    let partition = partition_for(region);
+    format!("arn:{partition}:xray:{region}:{account}:sampling-rule/{name}")
 }
 
 fn default_encryption_config() -> Value {
@@ -1629,5 +1632,50 @@ mod tests {
             Some("GetServiceGraph")
         );
         assert!(XrayService::resolve_action(&req("/NotARealOp")).is_none());
+    }
+
+    #[tokio::test]
+    async fn china_region_xray_arns_use_the_aws_cn_partition() {
+        let s = svc();
+        let cn = Ctx {
+            account: "000000000000".into(),
+            region: "cn-north-1".into(),
+        };
+        let group = body_json(
+            &s.create_group(
+                &cn,
+                &json!({ "GroupName": "cn-g", "FilterExpression": "fault" }),
+            )
+            .unwrap(),
+        );
+        let group_arn = group["Group"]["GroupARN"].as_str().unwrap().to_string();
+        assert!(
+            group_arn.starts_with("arn:aws-cn:xray:cn-north-1:000000000000:group/cn-g/"),
+            "{group_arn}"
+        );
+        s.tag_resource(
+            &cn,
+            &json!({ "ResourceARN": group_arn, "Tags": [{ "Key": "env", "Value": "cn" }] }),
+        )
+        .unwrap();
+        let tags = body_json(
+            &s.list_tags_for_resource(&cn, &json!({ "ResourceARN": group_arn }))
+                .unwrap(),
+        );
+        assert_eq!(tags["Tags"][0]["Value"], "cn");
+
+        let mut r = req("/GetSamplingRules");
+        r.region = "cn-north-1".to_string();
+        let body = body_json(&s.handle(r).await.unwrap());
+        let rule = body["SamplingRuleRecords"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["SamplingRule"]["RuleName"] == "Default")
+            .expect("built-in Default rule");
+        assert_eq!(
+            rule["SamplingRule"]["RuleARN"],
+            "arn:aws-cn:xray:cn-north-1:000000000000:sampling-rule/Default"
+        );
     }
 }

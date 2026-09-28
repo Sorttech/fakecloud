@@ -1128,3 +1128,20 @@ async fn validate_configuration_with_no_validators_succeeds() {
     .await;
     assert_eq!(resp.status.as_u16(), 204);
 }
+
+#[tokio::test]
+async fn extension_arn_carries_china_partition() {
+    let svc = service();
+    let mut r = req(
+        Method::POST,
+        "/extensions",
+        json!({ "Name": "cnext", "Actions": { "PRE_START_DEPLOYMENT": [] } }),
+    );
+    r.region = "cn-north-1".to_string();
+    let ext = body_of(&call(&svc, r).await);
+    let ext_id = id_of(&ext);
+    assert_eq!(
+        ext["Arn"],
+        format!("arn:aws-cn:appconfig:cn-north-1:000000000000:extension/{ext_id}/1")
+    );
+}

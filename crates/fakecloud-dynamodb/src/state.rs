@@ -1253,51 +1253,15 @@ impl DynamoTable {
         }
     }
 
-    /// Estimate item size in bytes (rough approximation).
-    fn estimate_item_size(item: &HashMap<String, AttributeValue>) -> i64 {
-        let mut size: i64 = 0;
-        for (k, v) in item {
-            size += k.len() as i64;
-            size += Self::estimate_value_size(v);
-        }
-        size
+    /// An item's size in bytes, as DynamoDB measures it for TableSizeBytes,
+    /// the 400KB limit and consumed capacity.
+    pub(crate) fn estimate_item_size(item: &HashMap<String, AttributeValue>) -> i64 {
+        crate::service::helpers::item_size(item) as i64
     }
 
+    #[cfg(test)]
     fn estimate_value_size(v: &Value) -> i64 {
-        match v {
-            Value::Object(obj) => {
-                if let Some(s) = obj.get("S").and_then(|v| v.as_str()) {
-                    s.len() as i64
-                } else if let Some(n) = obj.get("N").and_then(|v| v.as_str()) {
-                    n.len() as i64
-                } else if obj.contains_key("BOOL") || obj.contains_key("NULL") {
-                    1
-                } else if let Some(l) = obj.get("L").and_then(|v| v.as_array()) {
-                    3 + l.iter().map(Self::estimate_value_size).sum::<i64>()
-                } else if let Some(m) = obj.get("M").and_then(|v| v.as_object()) {
-                    3 + m
-                        .iter()
-                        .map(|(k, v)| k.len() as i64 + Self::estimate_value_size(v))
-                        .sum::<i64>()
-                } else if let Some(ss) = obj.get("SS").and_then(|v| v.as_array()) {
-                    ss.iter()
-                        .filter_map(|v| v.as_str())
-                        .map(|s| s.len() as i64)
-                        .sum()
-                } else if let Some(ns) = obj.get("NS").and_then(|v| v.as_array()) {
-                    ns.iter()
-                        .filter_map(|v| v.as_str())
-                        .map(|s| s.len() as i64)
-                        .sum()
-                } else if let Some(b) = obj.get("B").and_then(|v| v.as_str()) {
-                    // Base64-encoded binary
-                    (b.len() as i64 * 3) / 4
-                } else {
-                    v.to_string().len() as i64
-                }
-            }
-            _ => v.to_string().len() as i64,
-        }
+        crate::service::helpers::attribute_value_size(v) as i64
     }
 
     /// Record a partition key access for contributor insights.
@@ -1400,13 +1364,19 @@ pub struct DynamoDbSnapshot {
 pub const DYNAMODB_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 
 impl DynamoDbState {
-    /// Build every table's key index. The index is not persisted, so a table
-    /// restored from a snapshot has none, and until something writes to it
-    /// each lookup is a linear scan and each Scan page sorts the whole table.
-    /// Call once after loading a snapshot.
-    pub fn build_key_indexes(&mut self) {
+    /// Rebuild what a snapshot does not carry, or carries from an older
+    /// build. Call once after loading a snapshot.
+    ///
+    /// The key index is not persisted, so a restored table has none, and until
+    /// something writes to it each lookup is a linear scan and each Scan page
+    /// sorts the whole table. `item_count` and `size_bytes` are persisted but
+    /// maintained incrementally, so a snapshot written by a build that sized
+    /// items differently would otherwise leave `TableSizeBytes` drifting (or
+    /// going negative as rows sized under the new rules are removed). Both are
+    /// recomputed from the rows here.
+    pub fn rebuild_derived_state(&mut self) {
         for table in self.tables.values_mut() {
-            table.ensure_key_index();
+            table.recalculate_stats();
         }
     }
 
@@ -1663,10 +1633,11 @@ mod tests {
         assert_eq!(b, 1);
         let null = DynamoTable::estimate_value_size(&json!({"NULL": true}));
         assert_eq!(null, 1);
+        // A list or map costs 3 bytes plus one per element.
         let l = DynamoTable::estimate_value_size(&json!({"L": [{"S": "x"}, {"S": "yy"}]}));
-        assert_eq!(l, 6);
+        assert_eq!(l, 8);
         let m = DynamoTable::estimate_value_size(&json!({"M": {"key": {"S": "v"}}}));
-        assert_eq!(m, 7);
+        assert_eq!(m, 8);
         let ss = DynamoTable::estimate_value_size(&json!({"SS": ["ab", "cde"]}));
         assert_eq!(ss, 5);
         let ns = DynamoTable::estimate_value_size(&json!({"NS": ["12", "345"]}));
@@ -2350,7 +2321,7 @@ mod tests {
     }
 
     #[test]
-    fn build_key_indexes_after_snapshot_load() {
+    fn snapshot_load_builds_key_indexes() {
         let mut state = DynamoDbState::new("123456789012", "us-east-1");
         let mut t = table_with_hash_key("pk");
         t.put_item_at_key(mk_pk("a"));
@@ -2358,11 +2329,29 @@ mod tests {
         let json = serde_json::to_string(&state).unwrap();
         let mut restored: DynamoDbState = serde_json::from_str(&json).unwrap();
         assert!(matches!(restored.tables["t"].key_index, KeyIndex::Unbuilt));
-        restored.build_key_indexes();
+        restored.rebuild_derived_state();
         assert!(matches!(
             restored.tables["t"].key_index,
             KeyIndex::Built { rows: 1, .. }
         ));
+    }
+
+    /// A snapshot from a build that sized items differently carries a stale
+    /// `size_bytes`; loading it recomputes the figure from the rows.
+    #[test]
+    fn snapshot_load_recomputes_table_size() {
+        let mut state = DynamoDbState::new("123456789012", "us-east-1");
+        let mut t = table_with_hash_key("pk");
+        t.put_item_at_key(mk_pk("a"));
+        let expected = t.size_bytes;
+        t.size_bytes = 999_999;
+        t.item_count = 42;
+        state.tables.insert("t".to_string(), t);
+        let json = serde_json::to_string(&state).unwrap();
+        let mut restored: DynamoDbState = serde_json::from_str(&json).unwrap();
+        restored.rebuild_derived_state();
+        assert_eq!(restored.tables["t"].size_bytes, expected);
+        assert_eq!(restored.tables["t"].item_count, 1);
     }
 
     /// Within a partition, a Scan returns rows in sort-key order, as DynamoDB

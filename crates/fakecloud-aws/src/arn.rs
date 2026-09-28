@@ -13,6 +13,8 @@ pub struct Arn {
 }
 
 impl Arn {
+    /// An ARN in the `aws` partition. Prefer [`Arn::regional`], which takes the
+    /// partition from the region.
     pub fn new(service: &str, region: &str, account_id: &str, resource: &str) -> Self {
         Self {
             partition: "aws".to_string(),
@@ -23,9 +25,28 @@ impl Arn {
         }
     }
 
-    /// Create an ARN with no region (global services like IAM).
+    /// An ARN in `region`'s partition (`aws-cn` for `cn-*`, `aws-us-gov` for
+    /// `us-gov-*`, the isolated partitions for iso regions, `aws` otherwise).
+    pub fn regional(service: &str, region: &str, account_id: &str, resource: &str) -> Self {
+        Self::new(service, region, account_id, resource).with_partition(partition_for(region))
+    }
+
+    /// Create an ARN with no region (global services like IAM), in the `aws`
+    /// partition. Prefer [`Arn::global_in`] when a region is known.
     pub fn global(service: &str, account_id: &str, resource: &str) -> Self {
         Self::new(service, "", account_id, resource)
+    }
+
+    /// A global ARN (empty region field, e.g. IAM) in the partition `region`
+    /// belongs to.
+    pub fn global_in(region: &str, service: &str, account_id: &str, resource: &str) -> Self {
+        Self::new(service, "", account_id, resource).with_partition(partition_for(region))
+    }
+
+    /// An S3 ARN in `region`'s partition — no region, no account.
+    /// Format: `arn:<partition>:s3:::resource`.
+    pub fn s3_in(region: &str, resource: &str) -> Self {
+        Self::s3(resource).with_partition(partition_for(region))
     }
 
     /// Create an S3 ARN — no region, no account.
@@ -93,6 +114,54 @@ pub fn unique_id_for(prefix: &str, arn: &str) -> String {
     format!("{prefix}{suffix}")
 }
 
+/// The part of `arn` after `arn:<partition>:<service>:`, for any partition.
+/// `None` when `arn` is not an ARN of `service`.
+///
+/// Parsers use this rather than matching an `arn:aws:<service>:` prefix, which
+/// misses every ARN minted in a `cn-`, `us-gov-` or isolated region.
+pub fn arn_resource<'a>(arn: &'a str, service: &str) -> Option<&'a str> {
+    let (partition, rest) = arn.strip_prefix("arn:")?.split_once(':')?;
+    if !PARTITIONS.contains(&partition) {
+        return None;
+    }
+    rest.strip_prefix(service)?.strip_prefix(':')
+}
+
+/// The partition an ARN names (`arn:<partition>:...`), `aws` when it names
+/// none.
+pub fn partition_of(arn: &str) -> &str {
+    arn.split(':')
+        .nth(1)
+        .filter(|p| !p.is_empty())
+        .unwrap_or("aws")
+}
+
+/// The region a partition's global resources live in (CloudFront, WAF
+/// `CLOUDFRONT` scope, ...), the `implicitGlobalRegion` of the AWS SDK's
+/// partition metadata. `us-east-1` for an unknown partition.
+pub fn implicit_global_region(partition: &str) -> &'static str {
+    match partition {
+        "aws-cn" => "cn-northwest-1",
+        "aws-us-gov" => "us-gov-west-1",
+        "aws-iso" => "us-iso-east-1",
+        "aws-iso-b" => "us-isob-east-1",
+        "aws-iso-f" => "us-isof-south-1",
+        "aws-iso-e" => "eu-isoe-west-1",
+        _ => "us-east-1",
+    }
+}
+
+/// Every partition [`partition_for`] can return.
+pub const PARTITIONS: &[&str] = &[
+    "aws",
+    "aws-cn",
+    "aws-us-gov",
+    "aws-iso",
+    "aws-iso-b",
+    "aws-iso-f",
+    "aws-iso-e",
+];
+
 /// Map an AWS region name to its partition. Mirrors the AWS SDK's
 /// region-to-partition lookup so synthesized ARNs in cn/gov-cloud and the
 /// isolated regions emit the correct partition prefix.
@@ -149,6 +218,60 @@ pub struct ArnParseError(String);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regional_takes_the_region_partition() {
+        assert_eq!(
+            Arn::regional("sqs", "cn-north-1", "123456789012", "q").to_string(),
+            "arn:aws-cn:sqs:cn-north-1:123456789012:q"
+        );
+        assert_eq!(
+            Arn::regional("sqs", "us-east-1", "123456789012", "q").to_string(),
+            "arn:aws:sqs:us-east-1:123456789012:q"
+        );
+        assert_eq!(
+            Arn::global_in("us-gov-west-1", "iam", "123456789012", "root").to_string(),
+            "arn:aws-us-gov:iam::123456789012:root"
+        );
+        assert_eq!(
+            Arn::s3_in("cn-north-1", "bucket").to_string(),
+            "arn:aws-cn:s3:::bucket"
+        );
+    }
+
+    #[test]
+    fn partition_helpers() {
+        assert_eq!(partition_of("arn:aws-cn:iam::1:role/x"), "aws-cn");
+        assert_eq!(partition_of("not-an-arn"), "aws");
+        for p in PARTITIONS {
+            assert_eq!(partition_for(implicit_global_region(p)), *p, "{p}");
+        }
+    }
+
+    #[test]
+    fn arn_resource_reads_any_partition() {
+        assert_eq!(
+            arn_resource("arn:aws-cn:sqs:cn-north-1:1:q", "sqs"),
+            Some("cn-north-1:1:q")
+        );
+        assert_eq!(arn_resource("arn:aws:iam::1:root", "iam"), Some(":1:root"));
+        assert_eq!(arn_resource("arn:aws:sqsx:us-east-1:1:q", "sqs"), None);
+        assert_eq!(arn_resource("arn:aws:sns:us-east-1:1:t", "sqs"), None);
+        assert_eq!(arn_resource("not-an-arn", "sqs"), None);
+        assert_eq!(arn_resource("arn::sqs:us-east-1:1:q", "sqs"), None);
+        assert_eq!(arn_resource("arn:bogus:sqs:us-east-1:1:q", "sqs"), None);
+        for region in [
+            "us-east-1",
+            "cn-north-1",
+            "us-gov-west-1",
+            "us-iso-east-1",
+            "us-isob-east-1",
+            "us-isof-south-1",
+            "eu-isoe-west-1",
+        ] {
+            assert!(PARTITIONS.contains(&partition_for(region)), "{region}");
+        }
+    }
 
     #[test]
     fn round_trip() {

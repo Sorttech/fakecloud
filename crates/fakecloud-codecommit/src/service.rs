@@ -354,7 +354,13 @@ impl CodeCommitService {
             ));
         }
         let kms = str_field(&b, "kmsKeyId").unwrap_or_else(|| {
-            format!("arn:aws:kms:{}:{}:key/{}", req.region, account, new_uuid())
+            fakecloud_aws::arn::Arn::regional(
+                "kms",
+                &req.region,
+                &account,
+                &format!("key/{}", new_uuid()),
+            )
+            .to_string()
         });
         let mut metadata = Map::new();
         metadata.insert("accountId".into(), json!(account));
@@ -4014,6 +4020,31 @@ mod handler_tests {
 
     fn b64(s: &str) -> String {
         base64::engine::general_purpose::STANDARD.encode(s.as_bytes())
+    }
+
+    #[test]
+    fn repository_arns_carry_china_partition() {
+        let s = svc();
+        let cn = |action: &str, body: Value| {
+            let mut r = req_as(action, body, None);
+            r.region = "cn-north-1".into();
+            let resp = s.dispatch(action, &r).expect("op ok");
+            serde_json::from_slice::<Value>(resp.body.expect_bytes()).unwrap()
+        };
+        let out = cn("CreateRepository", json!({ "repositoryName": "cnrepo" }));
+        let md = &out["repositoryMetadata"];
+        let arn = md["Arn"].as_str().unwrap().to_string();
+        assert_eq!(arn, "arn:aws-cn:codecommit:cn-north-1:000000000000:cnrepo");
+        assert!(md["kmsKeyId"]
+            .as_str()
+            .unwrap()
+            .starts_with("arn:aws-cn:kms:cn-north-1:000000000000:key/"));
+        cn(
+            "TagResource",
+            json!({ "resourceArn": arn, "tags": { "env": "prod" } }),
+        );
+        let tags = cn("ListTagsForResource", json!({ "resourceArn": arn }));
+        assert_eq!(tags["tags"]["env"], "prod");
     }
 
     /// Create a repository and return nothing; the caller uses "repo".

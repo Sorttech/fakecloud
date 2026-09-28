@@ -4,23 +4,41 @@ use http::StatusCode;
 use serde_json::json;
 
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
-use fakecloud_core::validation::*;
 
 use super::{
-    apply_update_expression, build_consumed_capacity, build_item_collection_metrics,
-    evaluate_condition_with_return, extract_key, get_table, get_table_mut, ns_members_equal,
-    parse_expression_attribute_names, parse_expression_attribute_values, project_item,
-    require_object, require_str, resolve_write_condition, return_consumed_mode, return_icm_mode,
-    validate_attribute_value, validate_item_attribute_values, validate_key_attributes_in_key,
-    validate_key_in_item, AttributeValue, DynamoDbService,
+    apply_update_expression, build_capacity, build_consumed_capacity,
+    build_item_collection_metrics, check_put_item_size, evaluate_condition_with_return,
+    extract_key, get_table, get_table_mut, item_size, item_write_consumed, normalize_item_numbers,
+    normalize_value_numbers, ns_members_equal, parse_expression_attribute_names,
+    parse_expression_attribute_values, project_item, read_units, require_object, require_str,
+    resolve_write_condition, return_consumed_mode, return_icm_mode, validate_attribute_value,
+    validate_item_attribute_values, validate_key_attributes_in_key, validate_key_in_item,
+    validate_request_enums, AttributeValue, CapacitySplit, Consumed, DynamoDbService, UpdateCharge,
+    RETURN_CONSUMED_CAPACITY_VALUES, RETURN_ITEM_COLLECTION_METRICS_VALUES, RETURN_VALUES,
 };
 
 impl DynamoDbService {
     pub(super) fn put_item(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         // --- Parse request body and expression attributes WITHOUT holding any lock ---
         let body = Self::parse_body(req)?;
+        validate_request_enums(
+            &body,
+            &[
+                (
+                    "ReturnConsumedCapacity",
+                    "returnConsumedCapacity",
+                    RETURN_CONSUMED_CAPACITY_VALUES,
+                ),
+                (
+                    "ReturnItemCollectionMetrics",
+                    "returnItemCollectionMetrics",
+                    RETURN_ITEM_COLLECTION_METRICS_VALUES,
+                ),
+                ("ReturnValues", "returnValues", RETURN_VALUES),
+            ],
+        )?;
         let table_name = require_str(&body, "TableName")?;
-        let item = require_object(&body, "Item")?;
+        let mut item = require_object(&body, "Item")?;
         let mut expr_attr_names = parse_expression_attribute_names(&body);
         let mut expr_attr_values = parse_expression_attribute_values(&body);
         let condition =
@@ -34,7 +52,7 @@ impl DynamoDbService {
 
         // --- Acquire write lock ONLY for validation + mutation ---
         // Capture kinesis delivery info alongside the return value
-        let (old_item, kinesis_info, kms_audit, icm) = {
+        let (old_item, kinesis_info, kms_audit, icm, consumed) = {
             let mut accounts = self.state.write();
             let state = accounts.get_or_create(&req.account_id);
             let region = state.region.clone();
@@ -44,6 +62,11 @@ impl DynamoDbService {
             // Validate every attribute value (not just keys): a malformed number
             // like {"N":"abc"} is a ValidationException in real DynamoDB.
             validate_item_attribute_values(&item)?;
+            // Secondary-index key values must be non-empty and of the
+            // index's declared type.
+            super::validate_index_keys_in_item(table, &item)?;
+            normalize_item_numbers(&mut item);
+            check_put_item_size(&item)?;
 
             let key = extract_key(table, &item);
             table.ensure_key_index();
@@ -79,6 +102,10 @@ impl DynamoDbService {
             };
 
             let is_modify = existing_idx.is_some();
+
+            let consumed = (return_consumed != "NONE").then(|| {
+                item_write_consumed(table, existing_idx.map(|i| &table.items[i]), Some(&item))
+            });
 
             // Maintains item_count, size_bytes and the key index incrementally
             // rather than re-summing the whole table (#2502).
@@ -124,7 +151,7 @@ impl DynamoDbService {
 
             let icm = build_item_collection_metrics(&return_icm, table, &key);
 
-            (old_item_for_return, kinesis_info, kms_audit, icm)
+            (old_item_for_return, kinesis_info, kms_audit, icm, consumed)
         };
         // --- Write lock released, build response ---
 
@@ -152,9 +179,11 @@ impl DynamoDbService {
         if let Some(old) = old_item {
             result["Attributes"] = json!(old);
         }
-        let cc = build_consumed_capacity(&return_consumed, table_name, 0.0, 1.0);
-        if !cc.is_null() {
-            result["ConsumedCapacity"] = cc;
+        if let Some(consumed) = consumed {
+            let cc = build_capacity(&return_consumed, table_name, &consumed, CapacitySplit::None);
+            if !cc.is_null() {
+                result["ConsumedCapacity"] = cc;
+            }
         }
         if !icm.is_null() {
             result["ItemCollectionMetrics"] = icm;
@@ -179,15 +208,25 @@ impl DynamoDbService {
             validate_key_attributes_in_key(table, &key)?;
             let needs_insights = table.contributor_insights_status == "ENABLED";
 
+            let consistent = body["ConsistentRead"].as_bool().unwrap_or(false);
+            let mut read_bytes = 0;
             let mut result = match table.find_item_index(&key) {
                 Some(idx) => {
                     let item = &table.items[idx];
+                    // Capacity is charged on the whole item, whatever the
+                    // projection returns.
+                    read_bytes = item_size(item);
                     let projected = project_item(item, &body);
                     json!({ "Item": projected })
                 }
                 None => json!({}),
             };
-            let cc = build_consumed_capacity(&return_consumed, table_name, 0.5, 0.0);
+            let cc = build_consumed_capacity(
+                &return_consumed,
+                table_name,
+                read_units(read_bytes, consistent),
+                0.0,
+            );
             if !cc.is_null() {
                 result["ConsumedCapacity"] = cc;
             }
@@ -224,30 +263,27 @@ impl DynamoDbService {
     pub(super) fn delete_item(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let body = Self::parse_body(req)?;
 
-        validate_optional_enum_value(
-            "conditionalOperator",
-            &body["ConditionalOperator"],
-            &["AND", "OR"],
-        )?;
-        validate_optional_enum_value(
-            "returnConsumedCapacity",
-            &body["ReturnConsumedCapacity"],
-            &["INDEXES", "TOTAL", "NONE"],
-        )?;
-        validate_optional_enum_value(
-            "returnValues",
-            &body["ReturnValues"],
-            &["NONE", "ALL_OLD", "UPDATED_OLD", "ALL_NEW", "UPDATED_NEW"],
-        )?;
-        validate_optional_enum_value(
-            "returnItemCollectionMetrics",
-            &body["ReturnItemCollectionMetrics"],
-            &["SIZE", "NONE"],
-        )?;
-        validate_optional_enum_value(
-            "returnValuesOnConditionCheckFailure",
-            &body["ReturnValuesOnConditionCheckFailure"],
-            &["ALL_OLD", "NONE"],
+        validate_request_enums(
+            &body,
+            &[
+                ("ConditionalOperator", "conditionalOperator", &["AND", "OR"]),
+                (
+                    "ReturnConsumedCapacity",
+                    "returnConsumedCapacity",
+                    RETURN_CONSUMED_CAPACITY_VALUES,
+                ),
+                ("ReturnValues", "returnValues", RETURN_VALUES),
+                (
+                    "ReturnItemCollectionMetrics",
+                    "returnItemCollectionMetrics",
+                    RETURN_ITEM_COLLECTION_METRICS_VALUES,
+                ),
+                (
+                    "ReturnValuesOnConditionCheckFailure",
+                    "returnValuesOnConditionCheckFailure",
+                    &["ALL_OLD", "NONE"],
+                ),
+            ],
         )?;
 
         let table_name = require_str(&body, "TableName")?;
@@ -286,6 +322,9 @@ impl DynamoDbService {
 
             let mut result = json!({});
             let mut kinesis_info = None;
+            let return_consumed = body["ReturnConsumedCapacity"].as_str().unwrap_or("NONE");
+            let consumed = (return_consumed != "NONE")
+                .then(|| item_write_consumed(table, existing_idx.map(|i| &table.items[i]), None));
 
             if let Some(idx) = existing_idx {
                 let old_item = table.items[idx].clone();
@@ -315,14 +354,16 @@ impl DynamoDbService {
                 table.remove_item_by_key(&key);
             }
 
-            let return_consumed = body["ReturnConsumedCapacity"].as_str().unwrap_or("NONE");
             let return_icm = body["ReturnItemCollectionMetrics"]
                 .as_str()
                 .unwrap_or("NONE");
 
-            let cc = build_consumed_capacity(return_consumed, table_name, 0.0, 1.0);
-            if !cc.is_null() {
-                result["ConsumedCapacity"] = cc;
+            if let Some(consumed) = consumed {
+                let cc =
+                    build_capacity(return_consumed, table_name, &consumed, CapacitySplit::None);
+                if !cc.is_null() {
+                    result["ConsumedCapacity"] = cc;
+                }
             }
 
             let icm = build_item_collection_metrics(return_icm, table, &key);
@@ -389,6 +430,24 @@ impl DynamoDbService {
                 }
             }
         }
+        // Numbers are stored in canonical form, so the values this update
+        // writes are normalized on the way in. Only those: the rest of the
+        // stored row is left exactly as it is, so an attribute the update
+        // does not touch never shows up as changed.
+        for v in expr_attr_values.values_mut() {
+            normalize_value_numbers(v);
+        }
+        let attribute_updates = body["AttributeUpdates"]
+            .as_object()
+            .cloned()
+            .map(|mut updates| {
+                for upd in updates.values_mut() {
+                    if let Some(v) = upd.get_mut("Value") {
+                        normalize_value_numbers(v);
+                    }
+                }
+                updates
+            });
 
         let existing_idx = table.find_item_index(&key);
 
@@ -413,6 +472,7 @@ impl DynamoDbService {
                 for (k, v) in &key {
                     new_item.insert(k.clone(), v.clone());
                 }
+                normalize_item_numbers(&mut new_item);
                 // Registers the row in the key index and the stats; the
                 // attribute updates below then mutate it in place through
                 // `update_item_at`, which settles the deltas.
@@ -439,6 +499,7 @@ impl DynamoDbService {
         // to return the whole item for UPDATED_NEW and nothing for
         // UPDATED_OLD).
         let pre_update_item = if matches!(return_values, "ALL_OLD" | "UPDATED_OLD" | "UPDATED_NEW")
+            || return_consumed != "NONE"
         {
             Some(table.items[idx].clone())
         } else {
@@ -449,19 +510,30 @@ impl DynamoDbService {
         // (a type error on a later operand) with earlier clauses already
         // written -- possibly a rewritten key. `update_item_at` puts the row
         // back as it was, so a rejected UpdateItem changes nothing, as on AWS.
+        let charge = match (update_expression, attribute_updates.as_ref()) {
+            (Some(expr), _) => UpdateCharge::for_expression(expr, &expr_attr_names),
+            (None, Some(updates)) => UpdateCharge::for_attribute_updates(updates),
+            (None, None) => UpdateCharge::default(),
+        };
+        let index_keys = super::index_key_specs(table);
         let applied = table.update_item_at(idx, |item| {
+            let before = (!index_keys.is_empty()).then(|| item.clone());
             if let Some(expr) = update_expression {
-                apply_update_expression(item, expr, &expr_attr_names, &expr_attr_values)
-            } else if let Some(updates) = body["AttributeUpdates"].as_object() {
+                apply_update_expression(item, expr, &expr_attr_names, &expr_attr_values)?;
+            } else if let Some(updates) = attribute_updates.as_ref() {
                 // Legacy AttributeUpdates (pre-2014 UpdateItem), still emitted by
                 // the AWS SDK for Java v1, older boto3, and the Terraform provider.
                 // Without this an UpdateItem using AttributeUpdates wrote nothing and
                 // (on a missing key) left a key-only stub item -- silent data loss
                 // (bug-audit 2026-06-20, 1.2).
-                apply_attribute_updates(item, updates)
-            } else {
-                Ok(())
+                apply_attribute_updates(item, updates)?;
             }
+            // A secondary-index key the update writes must be non-empty and
+            // of the index's declared type; the row is put back otherwise.
+            if let Some(fault) = super::index_key_fault(&index_keys, item, before.as_ref()) {
+                return Err(fault.update_error());
+            }
+            charge.check(item)
         });
         if let Err(err) = applied {
             // An upsert that fails must not leave behind the key-only row it
@@ -534,6 +606,11 @@ impl DynamoDbService {
         });
 
         let icm = build_item_collection_metrics(&return_icm, table, &key);
+        let consumed = if return_consumed == "NONE" {
+            Consumed::default()
+        } else {
+            item_write_consumed(table, old_snapshot, Some(&table.items[idx]))
+        };
 
         // Release the write lock (drop `state`)
         drop(accounts);
@@ -557,7 +634,7 @@ impl DynamoDbService {
                 result["Attributes"] = json!(attrs);
             }
         }
-        let cc = build_consumed_capacity(&return_consumed, table_name, 0.0, 1.0);
+        let cc = build_capacity(&return_consumed, table_name, &consumed, CapacitySplit::None);
         if !cc.is_null() {
             result["ConsumedCapacity"] = cc;
         }

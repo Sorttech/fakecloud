@@ -200,6 +200,7 @@ pub(crate) fn apply_add_assignment(
             ) {
                 // Arbitrary-precision decimal add — f64 rounds past 2^53.
                 if let Some(num_str) = decimal_add_sub(existing_num, add_num, true) {
+                    check_number_range(&num_str)?;
                     item.insert(attr, json!({"N": num_str}));
                 }
             } else if let Some(set_type) = set_types

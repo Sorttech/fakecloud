@@ -174,6 +174,13 @@ impl LogsState {
     }
 }
 
+/// The ARN of log group `name` in `region`'s partition, without the `:*`
+/// suffix that `DescribeLogGroups` reports on `arn`.
+pub fn log_group_arn(region: &str, account_id: &str, name: &str) -> String {
+    fakecloud_aws::arn::Arn::regional("logs", region, account_id, &format!("log-group:{name}"))
+        .to_string()
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct LogGroup {
     pub name: String,

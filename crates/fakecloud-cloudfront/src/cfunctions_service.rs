@@ -73,9 +73,10 @@ impl CloudFrontService {
         let now = Utc::now();
         let etag = generate_id_with_prefix("E");
         let id = generate_id_with_prefix("CF");
-        let arn = format!(
-            "arn:aws:cloudfront::{}:connection-function/{}",
-            DEFAULT_ACCOUNT, parsed.name
+        let arn = crate::service::cloudfront_arn(
+            &req.region,
+            DEFAULT_ACCOUNT,
+            &format!("connection-function/{}", parsed.name),
         );
         let code = base64::engine::general_purpose::STANDARD
             .decode(parsed.connection_function_code.trim())

@@ -61,8 +61,11 @@ impl LogsService {
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
         let arn = format!(
-            "arn:aws:logs:{}:{}:destination:{}",
-            req.region, state.account_id, destination_name
+            "arn:{}:logs:{}:{}:destination:{}",
+            fakecloud_aws::arn::partition_for(&req.region),
+            req.region,
+            state.account_id,
+            destination_name
         );
         let now = Utc::now().timestamp_millis();
 

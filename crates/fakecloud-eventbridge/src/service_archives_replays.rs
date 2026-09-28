@@ -64,10 +64,13 @@ impl EventBridgeService {
         }
 
         let now = Utc::now();
-        let arn = format!(
-            "arn:aws:events:{}:{}:archive/{}",
-            req.region, state.account_id, name
-        );
+        let arn = Arn::regional(
+            "events",
+            &req.region,
+            &state.account_id,
+            &format!("archive/{name}"),
+        )
+        .to_string();
 
         let archive = Archive {
             name: name.clone(),
@@ -86,10 +89,7 @@ impl EventBridgeService {
 
         // Create the archive rule
         let rule_name = format!("Events-Archive-{name}");
-        let rule_arn = format!(
-            "arn:aws:events:{}:{}:rule/{}",
-            req.region, state.account_id, rule_name
-        );
+        let rule_arn = rule_arn(&req.region, &state.account_id, "default", &rule_name);
         // Merge archive event pattern with replay-name filter
         let rule_event_pattern = {
             let mut merged = if let Some(ref ep) = event_pattern {
@@ -106,7 +106,7 @@ impl EventBridgeService {
         // Build the archive target with InputTransformer
         let archive_target = EventTarget {
             id: name.clone(),
-            arn: Arn::new("events", &req.region, "", "").to_string(),
+            arn: Arn::regional("events", &req.region, "", "").to_string(),
             input: None,
             input_path: None,
             input_transformer: Some(json!({
@@ -400,10 +400,13 @@ impl EventBridgeService {
         }
 
         let now = Utc::now();
-        let arn = format!(
-            "arn:aws:events:{}:{}:replay/{}",
-            req.region, state.account_id, input.name
-        );
+        let arn = Arn::regional(
+            "events",
+            &req.region,
+            &state.account_id,
+            &format!("replay/{}", input.name),
+        )
+        .to_string();
 
         let events_to_deliver = collect_replay_events_with_targets(
             state,
