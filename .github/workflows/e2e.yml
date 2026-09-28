@@ -257,10 +257,25 @@ jobs:
       - name: Warm the container-image cache
         continue-on-error: true
         run: |
+          # Each entry is "<what the tests ask for>|<Docker Hub equivalent>".
+          # Spelled out rather than derived: the refs in use have three different
+          # shapes (`/docker/library/`, `/library/`, and `nginx/nginx` with no
+          # library segment at all), and a rule that strips "everything up to
+          # /library/" silently retries the SAME failing ref for the third shape.
+          #
+          # Keep in sync with the ECR Public refs under crates/fakecloud-e2e:
+          #   grep -rhoE 'public\.ecr\.aws/[a-z0-9._/-]+:[a-z0-9._-]+' crates/fakecloud-e2e
+          IMAGES="
+          public.ecr.aws/docker/library/alpine:3.20|alpine:3.20
+          public.ecr.aws/docker/library/alpine:3.19|alpine:3.19
+          public.ecr.aws/library/alpine:3.19|alpine:3.19
+          public.ecr.aws/library/alpine:latest|alpine:latest
+          public.ecr.aws/docker/library/nginx:alpine|nginx:alpine
+          public.ecr.aws/nginx/nginx:latest|nginx:latest
+          "
           warm() {
             target="$1"
-            # public.ecr.aws/docker/library/alpine:3.20 -> alpine:3.20
-            hub="${target##*/library/}"
+            hub="$2"
             for src in "$target" "$hub"; do
               for i in 1 2; do
                 if docker pull "$src"; then
@@ -275,12 +290,9 @@ jobs:
             echo "::warning::could not warm $target from any registry; tests will pull for themselves"
             return 1
           }
-          for img in \
-            public.ecr.aws/docker/library/alpine:3.20 \
-            public.ecr.aws/docker/library/alpine:3.19 \
-            public.ecr.aws/docker/library/nginx:alpine \
-            public.ecr.aws/library/alpine:latest; do
-            warm "$img" || true
+          echo "$IMAGES" | while IFS='|' read -r target hub; do
+            [ -n "$target" ] || continue
+            warm "$target" "$hub" || true
           done
           echo "=== cached images ==="
           docker images --format '{{.Repository}}:{{.Tag}} {{.Size}}'
