@@ -3,7 +3,9 @@ pub mod resolver;
 pub(crate) mod service;
 pub(crate) mod state;
 
-pub use service::{org_error_to_aws, OrgChangeHook, OrgChangeHooks, OrganizationsService};
+pub use service::{
+    check_create_policy_type, org_error_to_aws, OrgChangeHook, OrgChangeHooks, OrganizationsService,
+};
 pub use state::{
     MemberAccount, OrgError, OrganizationState, OrganizationalUnit, OrganizationsRegistry,
     OrganizationsSnapshot, Policy, ResponsibilityTransfer, SharedOrganizationsState,

@@ -568,9 +568,6 @@ impl ResourceProvisioner {
         let state = accounts.get_or_create(&self.account_id);
         if let Some(layer) = state.layers.get_mut(&layer_name) {
             layer.versions.retain(|v| v.version != version);
-            if layer.versions.is_empty() {
-                state.layers.remove(&layer_name);
-            }
         }
         Ok(())
     }

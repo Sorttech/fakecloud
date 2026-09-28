@@ -7517,6 +7517,21 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.starts_with("MalformedPolicyDocumentException"), "{err}");
+        let err = policy(
+            "P4",
+            serde_json::json!({"Name": "t1", "Content": "{}", "Type": "NOT_A_TYPE"}),
+        )
+        .unwrap_err();
+        assert!(err.starts_with("InvalidInputException"), "{err}");
+        let err = policy(
+            "P5",
+            serde_json::json!({"Name": "t2", "Content": "{}", "Type": "CHATBOT_POLICY"}),
+        )
+        .unwrap_err();
+        assert!(
+            err.starts_with("PolicyTypeNotAvailableForOrganizationException"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -7625,6 +7640,27 @@ mod tests {
             v3.physical_id.ends_with(":layer:shared:3"),
             "{}",
             v3.physical_id
+        );
+    }
+
+    #[test]
+    fn replacing_a_layers_only_version_does_not_reuse_its_number() {
+        let prov = make_provisioner();
+        let publish = |logical: &str| {
+            prov.create_resource(&make_resource(
+                "AWS::Lambda::LayerVersion",
+                logical,
+                serde_json::json!({"LayerName": "solo"}),
+            ))
+            .unwrap()
+        };
+        let v1 = publish("V1");
+        prov.delete_resource(&v1).unwrap();
+        let v2 = publish("V2");
+        assert!(
+            v2.physical_id.ends_with(":layer:solo:2"),
+            "{}",
+            v2.physical_id
         );
     }
 

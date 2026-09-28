@@ -380,9 +380,6 @@ fn parse_instance_ids(xml: &str) -> Vec<String> {
     out
 }
 
-/// The ARN of an Auto Scaling resource of `kind` (`autoScalingGroup`,
-/// `launchConfiguration`), e.g.
-/// `arn:aws:autoscaling:us-east-1:123:autoScalingGroup:<id>:autoScalingGroupName/<name>`.
 /// The Auto Scaling service-linked role a group uses when created without a
 /// `ServiceLinkedRoleARN`, in `region`'s partition.
 pub fn service_linked_role_arn(region: &str, account_id: &str) -> String {
@@ -395,6 +392,9 @@ pub fn service_linked_role_arn(region: &str, account_id: &str) -> String {
     .to_string()
 }
 
+/// The ARN of an Auto Scaling resource of `kind` (`autoScalingGroup`,
+/// `launchConfiguration`), e.g.
+/// `arn:aws:autoscaling:us-east-1:123:autoScalingGroup:<id>:autoScalingGroupName/<name>`.
 pub fn autoscaling_arn(region: &str, account_id: &str, kind: &str, id: &str, name: &str) -> String {
     Arn::regional(
         "autoscaling",

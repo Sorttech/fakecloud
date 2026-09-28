@@ -8,25 +8,7 @@ impl OrganizationsService {
         let name = required_str(&body, "Name")?;
         let policy_type = required_str(&body, "Type")?;
         let content = required_str(&body, "Content")?;
-        // An out-of-enum Type is a malformed request; a valid enum value that
-        // fakecloud doesn't manage isn't enabled for the org. Both are the
-        // AWS-documented responses (CreatePolicy declares neither
-        // PolicyTypeNotSupportedException — that isn't a real Organizations
-        // error code).
-        if !is_valid_policy_type(policy_type) {
-            return Err(AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "InvalidInputException",
-                format!("You specified an invalid value for the Type parameter: {policy_type}"),
-            ));
-        }
-        if !is_known_policy_type(policy_type) {
-            return Err(AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "PolicyTypeNotAvailableForOrganizationException",
-                format!("The {policy_type} policy type is not available for this organization."),
-            ));
-        }
+        check_create_policy_type(policy_type)?;
         let description = body
             .get("Description")
             .and_then(|v| v.as_str())

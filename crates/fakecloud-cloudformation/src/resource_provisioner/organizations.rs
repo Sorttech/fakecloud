@@ -4,11 +4,16 @@
 
 use super::*;
 
-/// A failed organization mutation as a CloudFormation resource failure,
-/// carrying the error code the Organizations API would return.
-fn org_failure(err: fakecloud_organizations::OrgError) -> String {
-    let err = fakecloud_organizations::org_error_to_aws(err);
+/// An Organizations API error as a CloudFormation resource failure
+/// (`<Code>: <message>`).
+fn aws_failure(err: fakecloud_core::service::AwsServiceError) -> String {
     format!("{}: {}", err.code(), err.message())
+}
+
+/// A failed organization state mutation as a CloudFormation resource
+/// failure, carrying the error code the Organizations API maps it to.
+fn org_failure(err: fakecloud_organizations::OrgError) -> String {
+    aws_failure(fakecloud_organizations::org_error_to_aws(err))
 }
 
 impl ResourceProvisioner {
@@ -291,6 +296,7 @@ impl ResourceProvisioner {
             })
             .unwrap_or_default();
 
+        fakecloud_organizations::check_create_policy_type(&policy_type).map_err(aws_failure)?;
         let mut org_lock = self.organizations_state.write();
         let org = org_lock
             .org_of_account_mut(&self.account_id)
