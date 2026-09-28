@@ -164,28 +164,44 @@ impl DynamoDbService {
             None => None,
         };
 
-        let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        // ARN carries the request's credential-scope region (req.region), not the
+        // frozen server default.
+        let arn = crate::state::table_arn(req.region.as_str(), &req.account_id, &table_name);
+        let vector_indexes = parse_vector_indexes(&body["VectorIndexes"], &arn)?;
 
-        if state.tables.contains_key(&table_name) {
-            return Err(AwsServiceError::aws_error(
+        let already_exists = || {
+            AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
                 "ResourceInUseException",
                 format!("Table already exists: {table_name}"),
-            ));
-        }
-        // Every check has passed: only now resolve the SSE key, which can
-        // provision the account's AWS-managed key as a side effect.
+            )
+        };
+        // Resolving the SSE key can provision the account's AWS-managed key
+        // and persist KMS state, so it happens only once the request is known
+        // to be valid, and never under the DynamoDB lock: check under a read
+        // lock, resolve with no lock held, and check again under the write
+        // lock below.
         let sse_kms_key_arn = if sse_type.as_deref() == Some("KMS") {
+            if self
+                .state
+                .read()
+                .get(&req.account_id)
+                .is_some_and(|s| s.tables.contains_key(&table_name))
+            {
+                return Err(already_exists());
+            }
             self.resolve_sse_key_arn(req, sse_kms_key_arn)
         } else {
             sse_kms_key_arn
         };
 
+        let mut accounts = self.state.write();
+        let state = accounts.get_or_create(&req.account_id);
+        if state.tables.contains_key(&table_name) {
+            return Err(already_exists());
+        }
+
         let now = Utc::now();
-        // ARN carries the request's credential-scope region (req.region), not the
-        // frozen server default.
-        let arn = crate::state::table_arn(req.region.as_str(), &state.account_id, &table_name);
         let stream_arn = if stream_enabled {
             Some(format!(
                 "{arn}/stream/{}",
@@ -229,7 +245,7 @@ impl DynamoDbService {
             deletion_protection_enabled,
             on_demand_throughput: on_demand_throughput.clone(),
             table_class,
-            vector_indexes: parse_vector_indexes(&body["VectorIndexes"], &arn)?,
+            vector_indexes,
         };
 
         // Build the response from the inserted table so CreateTable returns
@@ -375,9 +391,39 @@ impl DynamoDbService {
 
     pub(super) fn update_table(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let body = Self::parse_body(req)?;
-        let table_name = require_str(&body, "TableName")?;
         validate_update_table_model(&body)?;
+        let table_name = require_str(&body, "TableName")?;
         validate_no_throughput_for_on_demand(&body)?;
+
+        let not_found = || {
+            AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "ResourceNotFoundException",
+                format!("Requested resource not found: Table: {table_name} not found"),
+            )
+        };
+
+        // Turning SSE on resolves a KMS key, which can provision the account's
+        // AWS-managed key and persist KMS state. That happens only for a valid
+        // request, and never under the DynamoDB lock: validate under a read
+        // lock, resolve with no lock held, then re-validate under the write
+        // lock below before changing anything.
+        let sse_spec = &body["SSESpecification"];
+        let sse_requested = sse_spec["Enabled"].as_bool() == Some(true)
+            && sse_spec["SSEType"].as_str().unwrap_or("KMS") == "KMS";
+        let sse_key_arn = if sse_requested {
+            {
+                let accounts = self.state.read();
+                let table = accounts
+                    .get(&req.account_id)
+                    .and_then(|s| s.tables.get(super::resolve_table_name(table_name)))
+                    .ok_or_else(not_found)?;
+                validate_update_table_request(table, &body)?;
+            }
+            self.resolve_sse_key_arn(req, sse_spec["KMSMasterKeyId"].as_str().map(str::to_string))
+        } else {
+            None
+        };
 
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
@@ -390,27 +436,24 @@ impl DynamoDbService {
         let table = state
             .tables
             .get_mut(super::resolve_table_name(table_name))
-            .ok_or_else(|| {
-                AwsServiceError::aws_error(
-                    StatusCode::BAD_REQUEST,
-                    "ResourceNotFoundException",
-                    format!("Requested resource not found: Table: {table_name} not found"),
-                )
-            })?;
+            .ok_or_else(not_found)?;
 
         validate_update_table_request(table, &body)?;
-        // Resolved only once the request is known to be valid, since it can
-        // provision the account's AWS-managed key as a side effect.
-        let sse_spec = &body["SSESpecification"];
-        let sse_key_arn = (sse_spec["Enabled"].as_bool() == Some(true)
-            && sse_spec["SSEType"].as_str().unwrap_or("KMS") == "KMS")
-            .then(|| {
-                self.resolve_sse_key_arn(
-                    req,
-                    sse_spec["KMSMasterKeyId"].as_str().map(str::to_string),
-                )
-            })
-            .flatten();
+
+        // Everything fallible is settled before the first change, so a
+        // rejected UpdateTable leaves the table exactly as it was.
+        let mut new_vector_indexes = Vec::new();
+        for op in body["VectorIndexUpdates"].as_array().into_iter().flatten() {
+            if let Some(create) = op.get("Create") {
+                let mut index = parse_vector_index(create, &table.arn)?;
+                index.online_created_at = Some(Utc::now());
+                new_vector_indexes.push(index);
+            }
+        }
+        let new_attribute_definitions = match body["AttributeDefinitions"] {
+            Value::Null => Vec::new(),
+            ref defs => parse_attribute_definitions(defs)?,
+        };
 
         if let Some(pt) = body.get("ProvisionedThroughput") {
             if let Ok(throughput) = parse_provisioned_throughput(pt) {
@@ -455,15 +498,13 @@ impl DynamoDbService {
         // whose hash/range key wasn't previously defined. Previously
         // fakecloud dropped these, so a follow-up Read surfaced the old
         // attribute list and Terraform planned a redundant update.
-        if let Ok(new_attrs) = parse_attribute_definitions(&body["AttributeDefinitions"]) {
-            for attr in new_attrs {
-                if !table
-                    .attribute_definitions
-                    .iter()
-                    .any(|a| a.attribute_name == attr.attribute_name)
-                {
-                    table.attribute_definitions.push(attr);
-                }
+        for attr in new_attribute_definitions {
+            if !table
+                .attribute_definitions
+                .iter()
+                .any(|a| a.attribute_name == attr.attribute_name)
+            {
+                table.attribute_definitions.push(attr);
             }
         }
 
@@ -472,13 +513,8 @@ impl DynamoDbService {
         // searches only after that (see `VectorIndex::phase`). A Delete
         // removes the index -- for one still backfilling, that cancels it.
         if let Some(updates) = body.get("VectorIndexUpdates").and_then(|v| v.as_array()) {
-            let table_arn = table.arn.clone();
+            table.vector_indexes.extend(new_vector_indexes);
             for op in updates {
-                if let Some(create) = op.get("Create") {
-                    let mut index = parse_vector_index(create, &table_arn)?;
-                    index.online_created_at = Some(Utc::now());
-                    table.vector_indexes.push(index);
-                }
                 if let Some(name) = op["Delete"]["IndexName"].as_str() {
                     table.vector_indexes.retain(|i| i.index_name != name);
                 }

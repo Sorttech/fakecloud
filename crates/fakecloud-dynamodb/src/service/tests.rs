@@ -8869,8 +8869,9 @@ fn a_search_schema_element_missing_a_member_is_rejected() {
     );
 }
 
-/// A KMS hook that counts key resolutions.
-struct CountingKmsHook(std::sync::atomic::AtomicUsize);
+/// A KMS hook that counts key resolutions, and checks that none happens while
+/// the DynamoDB state lock is held.
+struct CountingKmsHook(std::sync::atomic::AtomicUsize, SharedDynamoDbState);
 
 impl fakecloud_core::delivery::KmsHook for CountingKmsHook {
     fn encrypt(
@@ -8896,6 +8897,10 @@ impl fakecloud_core::delivery::KmsHook for CountingKmsHook {
     }
 
     fn resolve_key_arn(&self, _: &str, _: &str, _: &str, _: &str) -> Result<String, String> {
+        assert!(
+            self.1.try_write().is_some(),
+            "the KMS key must be resolved with the DynamoDB lock released"
+        );
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok("arn:aws:kms:us-east-1:123456789012:key/managed".to_string())
     }
@@ -8903,8 +8908,12 @@ impl fakecloud_core::delivery::KmsHook for CountingKmsHook {
 
 #[test]
 fn sse_key_is_resolved_only_for_a_request_that_succeeds() {
-    let hook = Arc::new(CountingKmsHook(std::sync::atomic::AtomicUsize::new(0)));
-    let svc = make_service().with_kms_hook(hook.clone());
+    let svc = make_service();
+    let hook = Arc::new(CountingKmsHook(
+        std::sync::atomic::AtomicUsize::new(0),
+        svc.state.clone(),
+    ));
+    let svc = svc.with_kms_hook(hook.clone());
     let resolutions = || hook.0.load(std::sync::atomic::Ordering::SeqCst);
     create_test_table(&svc);
     let create = || {
@@ -8934,8 +8943,69 @@ fn sse_key_is_resolved_only_for_a_request_that_succeeds() {
     ))
     .unwrap();
     assert_eq!(resolutions(), 1);
+    svc.create_table(&make_request(
+        "CreateTable",
+        json!({
+            "TableName": "sse-created",
+            "KeySchema": [{ "AttributeName": "pk", "KeyType": "HASH" }],
+            "AttributeDefinitions": [{ "AttributeName": "pk", "AttributeType": "S" }],
+            "BillingMode": "PAY_PER_REQUEST",
+            "SSESpecification": { "Enabled": true },
+        }),
+    ))
+    .unwrap();
+    assert_eq!(resolutions(), 2);
     assert_eq!(
         describe(&svc, "test-table")["SSEDescription"]["KMSMasterKeyArn"],
         "arn:aws:kms:us-east-1:123456789012:key/managed"
     );
+}
+
+#[test]
+fn a_wrong_typed_member_fails_to_deserialize_and_changes_nothing() {
+    let svc = make_service();
+    create_vector_table(&svc, "COSINE");
+    let before = describe(&svc, "vec-table");
+    let err = err_of(svc.update_table(&make_request(
+        "UpdateTable",
+        json!({
+            "TableName": "vec-table",
+            "OnDemandThroughput": { "MaxReadRequestUnits": 10 },
+            "AttributeDefinitions": [{ "AttributeName": "cat", "AttributeType": "S" }],
+            "VectorIndexUpdates": [{ "Create": {
+                "IndexName": "typed",
+                "VectorAttribute": { "AttributeName": "other" },
+                "Dimensions": 2,
+                "DistanceFunction": "COSINE",
+                "SearchSchema": [{ "AttributeName": 7, "SearchSchemaElementType": "HASH" }],
+                "Projection": { "ProjectionType": "ALL" },
+            }}],
+        }),
+    )));
+    assert_eq!(err.code(), "SerializationException");
+    assert_eq!(
+        err_message(err),
+        "NUMBER_VALUE can not be converted to a String"
+    );
+    let after = describe(&svc, "vec-table");
+    assert_eq!(
+        before["AttributeDefinitions"],
+        after["AttributeDefinitions"]
+    );
+    assert_eq!(
+        before.get("OnDemandThroughput"),
+        after.get("OnDemandThroughput")
+    );
+    assert_eq!(before["VectorIndexes"], after["VectorIndexes"]);
+
+    let err = err_of(svc.create_table(&make_request(
+        "CreateTable",
+        json!({
+            "TableName": "typed-table",
+            "KeySchema": [{ "AttributeName": "pk", "KeyType": true }],
+            "AttributeDefinitions": [{ "AttributeName": "pk", "AttributeType": "S" }],
+            "BillingMode": "PAY_PER_REQUEST",
+        }),
+    )));
+    assert_eq!(err.code(), "SerializationException");
 }

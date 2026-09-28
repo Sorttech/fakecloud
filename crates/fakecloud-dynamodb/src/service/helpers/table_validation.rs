@@ -18,25 +18,82 @@ pub(crate) const MAX_VECTOR_DIMENSIONS: i64 = 4096;
 const TABLE_NAME_PATTERN: &str = "[a-zA-Z0-9_.-]+";
 
 /// Collected request-model violations, rendered the way DynamoDB renders them.
+///
+/// A member of the wrong JSON type never reaches validation: the request
+/// fails to deserialize, and that `SerializationException` is the answer.
 #[derive(Default)]
-pub(crate) struct ModelErrors(Vec<String>);
+pub(crate) struct ModelErrors {
+    errors: Vec<String>,
+    serialization: Option<String>,
+}
+
+/// How a request deserializer reports a JSON value of the wrong type for a
+/// member of type `target` (`String`, `Long`, ...).
+fn wrong_type_message(value: &Value, target: &str) -> String {
+    match value {
+        Value::Array(_) => "Start of list found where not expected".to_string(),
+        Value::Object(_) => "Start of structure or map found where not expected.".to_string(),
+        Value::Bool(true) => format!("TRUE_VALUE can not be converted to a {target}"),
+        Value::Bool(false) => format!("FALSE_VALUE can not be converted to a {target}"),
+        Value::Number(_) => format!("NUMBER_VALUE can not be converted to a {target}"),
+        _ => format!("STRING_VALUE can not be converted to a {target}"),
+    }
+}
 
 impl ModelErrors {
     pub(crate) fn push(&mut self, message: String) {
-        self.0.push(message);
+        self.errors.push(message);
     }
 
     pub(crate) fn into_result(self) -> Result<(), AwsServiceError> {
-        if self.0.is_empty() {
+        if let Some(message) = self.serialization {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "SerializationException",
+                message,
+            ));
+        }
+        if self.errors.is_empty() {
             return Ok(());
         }
-        let n = self.0.len();
+        let n = self.errors.len();
         let noun = if n == 1 { "error" } else { "errors" };
         Err(AwsServiceError::aws_error(
             StatusCode::BAD_REQUEST,
             "ValidationException",
-            format!("{n} validation {noun} detected: {}", self.0.join("; ")),
+            format!("{n} validation {noun} detected: {}", self.errors.join("; ")),
         ))
+    }
+
+    fn wrong_type(&mut self, value: &Value, target: &str) {
+        if self.serialization.is_none() {
+            self.serialization = Some(wrong_type_message(value, target));
+        }
+    }
+
+    /// A string member: `None` when absent, and when of the wrong type (which
+    /// is recorded as the deserialization failure it is).
+    fn string<'v>(&mut self, value: &'v Value) -> Option<&'v str> {
+        match value {
+            Value::Null => None,
+            Value::String(s) => Some(s),
+            other => {
+                self.wrong_type(other, "String");
+                None
+            }
+        }
+    }
+
+    /// A list member: `None` when absent or of the wrong type.
+    fn list<'v>(&mut self, value: &'v Value) -> Option<&'v Vec<Value>> {
+        match value {
+            Value::Null => None,
+            Value::Array(a) => Some(a),
+            other => {
+                self.wrong_type(other, "List");
+                None
+            }
+        }
     }
 
     fn not_null(&mut self, path: &str) {
@@ -46,7 +103,7 @@ impl ModelErrors {
     }
 
     fn check_enum(&mut self, path: &str, value: &Value, allowed: &[&str]) {
-        if let Some(s) = value.as_str() {
+        if let Some(s) = self.string(value) {
             if !allowed.contains(&s) {
                 self.push(format!(
                     "Value '{s}' at '{path}' failed to satisfy constraint: \
@@ -74,6 +131,9 @@ impl ModelErrors {
     }
 
     fn check_min(&mut self, path: &str, value: &Value, min: i64) {
+        if !value.is_null() && value.as_i64().is_none() {
+            self.wrong_type(value, "Long");
+        }
         if let Some(n) = value.as_i64() {
             if n < min {
                 self.push(format!(
@@ -96,7 +156,7 @@ impl ModelErrors {
     }
 
     fn check_key_schema(&mut self, path: &str, value: &Value) {
-        let Some(arr) = value.as_array() else {
+        let Some(arr) = self.list(value) else {
             if value.is_null() {
                 self.not_null(path);
             }
@@ -127,7 +187,7 @@ impl ModelErrors {
         }
         for (i, elem) in arr.iter().enumerate() {
             let member = format!("{path}.{}.member", i + 1);
-            match elem["AttributeName"].as_str() {
+            match self.string(&elem["AttributeName"]) {
                 Some(name) => self.check_length(&format!("{member}.attributeName"), name, 1, 255),
                 None => self.not_null(&format!("{member}.attributeName")),
             }
@@ -180,12 +240,37 @@ impl ModelErrors {
         }
     }
 
+    fn check_attribute_definitions(&mut self, value: &Value, required: bool) {
+        let Some(defs) = self.list(value) else {
+            if required && value.is_null() {
+                self.not_null("attributeDefinitions");
+            }
+            return;
+        };
+        for (i, def) in defs.iter().enumerate() {
+            let member = format!("attributeDefinitions.{}.member", i + 1);
+            match self.string(&def["AttributeName"]) {
+                Some(name) => self.check_length(&format!("{member}.attributeName"), name, 1, 255),
+                None => self.not_null(&format!("{member}.attributeName")),
+            }
+            if def["AttributeType"].is_null() {
+                self.not_null(&format!("{member}.attributeType"));
+            } else {
+                self.check_enum(
+                    &format!("{member}.attributeType"),
+                    &def["AttributeType"],
+                    &["B", "N", "S"],
+                );
+            }
+        }
+    }
+
     fn check_vector_index(&mut self, path: &str, v: &Value) {
-        match v["IndexName"].as_str() {
+        match self.string(&v["IndexName"]) {
             Some(name) => self.check_name(&format!("{path}.indexName"), name),
             None => self.not_null(&format!("{path}.indexName")),
         }
-        match v["VectorAttribute"]["AttributeName"].as_str() {
+        match self.string(&v["VectorAttribute"]["AttributeName"]) {
             Some(name) => self.check_length(
                 &format!("{path}.vectorAttribute.attributeName"),
                 name,
@@ -208,7 +293,7 @@ impl ModelErrors {
                 VECTOR_DISTANCE_FUNCTIONS,
             );
         }
-        if let Some(schema) = v["SearchSchema"].as_array() {
+        if let Some(schema) = self.list(&v["SearchSchema"]) {
             if schema.is_empty() {
                 self.push(format!(
                     "Value '[]' at '{path}.searchSchema' failed to satisfy constraint: \
@@ -217,7 +302,7 @@ impl ModelErrors {
             }
             for (i, e) in schema.iter().enumerate() {
                 let member = format!("{path}.searchSchema.{}.member", i + 1);
-                match e["AttributeName"].as_str() {
+                match self.string(&e["AttributeName"]) {
                     Some(name) => {
                         self.check_length(&format!("{member}.attributeName"), name, 0, 65535)
                     }
@@ -259,6 +344,13 @@ fn invalid(message: impl std::fmt::Display) -> AwsServiceError {
 /// table name's constraints: those are resolved before the rest of the request
 /// is looked at. Everything else is collected and reported together.
 pub(crate) fn validate_create_table_model(body: &Value) -> Result<(), AwsServiceError> {
+    if !body["TableName"].is_null() && !body["TableName"].is_string() {
+        return Err(AwsServiceError::aws_error(
+            StatusCode::BAD_REQUEST,
+            "SerializationException",
+            wrong_type_message(&body["TableName"], "String"),
+        ));
+    }
     let Some(table_name) = body["TableName"].as_str() else {
         return Err(AwsServiceError::aws_error(
             StatusCode::BAD_REQUEST,
@@ -271,37 +363,15 @@ pub(crate) fn validate_create_table_model(body: &Value) -> Result<(), AwsService
     name_errors.into_result()?;
 
     let mut errors = ModelErrors::default();
-    match body["AttributeDefinitions"].as_array() {
-        Some(defs) => {
-            for (i, def) in defs.iter().enumerate() {
-                let member = format!("attributeDefinitions.{}.member", i + 1);
-                match def["AttributeName"].as_str() {
-                    Some(name) => {
-                        errors.check_length(&format!("{member}.attributeName"), name, 1, 255)
-                    }
-                    None => errors.not_null(&format!("{member}.attributeName")),
-                }
-                if def["AttributeType"].is_null() {
-                    errors.not_null(&format!("{member}.attributeType"));
-                } else {
-                    errors.check_enum(
-                        &format!("{member}.attributeType"),
-                        &def["AttributeType"],
-                        &["B", "N", "S"],
-                    );
-                }
-            }
-        }
-        None => errors.not_null("attributeDefinitions"),
-    }
+    errors.check_attribute_definitions(&body["AttributeDefinitions"], true);
     errors.check_key_schema("keySchema", &body["KeySchema"]);
     for (field, path) in [
         ("LocalSecondaryIndexes", "localSecondaryIndexes"),
         ("GlobalSecondaryIndexes", "globalSecondaryIndexes"),
     ] {
-        for (i, idx) in body[field].as_array().into_iter().flatten().enumerate() {
+        for (i, idx) in errors.list(&body[field]).into_iter().flatten().enumerate() {
             let member = format!("{path}.{}.member", i + 1);
-            match idx["IndexName"].as_str() {
+            match errors.string(&idx["IndexName"]) {
                 Some(name) => errors.check_name(&format!("{member}.indexName"), name),
                 None => errors.not_null(&format!("{member}.indexName")),
             }
@@ -339,8 +409,8 @@ pub(crate) fn validate_create_table_model(body: &Value) -> Result<(), AwsService
         &body["TableClass"],
         &["STANDARD", "STANDARD_INFREQUENT_ACCESS"],
     );
-    for (i, v) in body["VectorIndexes"]
-        .as_array()
+    for (i, v) in errors
+        .list(&body["VectorIndexes"])
         .into_iter()
         .flatten()
         .enumerate()
@@ -353,18 +423,19 @@ pub(crate) fn validate_create_table_model(body: &Value) -> Result<(), AwsService
 /// The request-model layer of UpdateTable.
 pub(crate) fn validate_update_table_model(body: &Value) -> Result<(), AwsServiceError> {
     let mut errors = ModelErrors::default();
-    if let Some(name) = body["TableName"].as_str() {
+    if let Some(name) = errors.string(&body["TableName"]) {
         // UpdateTable also takes a table ARN, so only the length is modeled.
         errors.check_length("tableName", name, 1, 1024);
     }
+    errors.check_attribute_definitions(&body["AttributeDefinitions"], false);
     errors.check_enum(
         "billingMode",
         &body["BillingMode"],
         &["PROVISIONED", "PAY_PER_REQUEST"],
     );
     errors.check_throughput("provisionedThroughput", &body["ProvisionedThroughput"]);
-    for (i, update) in body["GlobalSecondaryIndexUpdates"]
-        .as_array()
+    for (i, update) in errors
+        .list(&body["GlobalSecondaryIndexUpdates"])
         .into_iter()
         .flatten()
         .enumerate()
@@ -372,7 +443,7 @@ pub(crate) fn validate_update_table_model(body: &Value) -> Result<(), AwsService
         let member = format!("globalSecondaryIndexUpdates.{}.member", i + 1);
         if let Some(create) = update.get("Create").filter(|v| v.is_object()) {
             let path = format!("{member}.create");
-            match create["IndexName"].as_str() {
+            match errors.string(&create["IndexName"]) {
                 Some(name) => errors.check_name(&format!("{path}.indexName"), name),
                 None => errors.not_null(&format!("{path}.indexName")),
             }
@@ -390,8 +461,8 @@ pub(crate) fn validate_update_table_model(body: &Value) -> Result<(), AwsService
             );
         }
     }
-    for (i, update) in body["VectorIndexUpdates"]
-        .as_array()
+    for (i, update) in errors
+        .list(&body["VectorIndexUpdates"])
         .into_iter()
         .flatten()
         .enumerate()
@@ -401,7 +472,7 @@ pub(crate) fn validate_update_table_model(body: &Value) -> Result<(), AwsService
             errors.check_vector_index(&format!("{member}.create"), create);
         }
         if let Some(delete) = update.get("Delete").filter(|v| v.is_object()) {
-            match delete["IndexName"].as_str() {
+            match errors.string(&delete["IndexName"]) {
                 Some(name) => errors.check_name(&format!("{member}.delete.indexName"), name),
                 None => errors.not_null(&format!("{member}.delete.indexName")),
             }
