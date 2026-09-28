@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 use fakecloud_core::validation::*;
 
-use crate::state::AttributeValue;
+use crate::state::{AttributeValue, DynamoTable};
 
 /// A queued Kinesis delivery for a single transact write — fired after
 /// the apply phase succeeds and the write lock is dropped. Tuple shape:
@@ -21,12 +21,126 @@ type PendingKinesis = (
 
 use super::{
     apply_update_expression, build_capacity, check_put_item_size, check_update_item_size,
-    evaluate_condition, extract_key, get_table, get_table_mut, item_size, item_write_consumed,
-    keys_equal, normalize_item_numbers, normalize_value_numbers, parse_expression_attribute_names,
-    parse_expression_attribute_values, read_units, return_consumed_mode, return_icm_mode,
-    validate_attribute_value, validate_item_attribute_values, validate_key_attributes_in_key,
-    validate_key_in_item, write_units, CapacitySplit, Consumed, DynamoDbService,
+    empty_table_key_error, evaluate_condition, extract_key, get_table, get_table_mut,
+    index_key_fault, index_key_specs, item_key_type_mismatch, item_size, item_write_consumed,
+    key_matches_schema, keys_equal, missing_item_key_error, normalize_item_numbers,
+    normalize_value_numbers, parse_expression_attribute_names, parse_expression_attribute_values,
+    read_units, return_consumed_mode, return_icm_mode, validate_attribute_value,
+    validate_index_keys_in_item, validate_item_attribute_values, validate_key_in_item,
+    validate_read_projection, write_units, CapacitySplit, Consumed, DynamoDbService,
+    KEY_SCHEMA_MISMATCH,
 };
+
+/// Look up a table named by a batch or transaction request. These operations
+/// report a missing table with the bare "Requested resource not found",
+/// without the table name the single-table operations append.
+fn item_op_table<'a>(
+    tables: &'a std::collections::BTreeMap<String, DynamoTable>,
+    name: &str,
+) -> Result<&'a DynamoTable, AwsServiceError> {
+    tables
+        .get(super::resolve_table_name(name))
+        .ok_or_else(table_not_found)
+}
+
+fn table_not_found() -> AwsServiceError {
+    AwsServiceError::aws_error(
+        StatusCode::BAD_REQUEST,
+        "ResourceNotFoundException",
+        "Requested resource not found",
+    )
+}
+
+fn schema_mismatch() -> AwsServiceError {
+    AwsServiceError::aws_error(
+        StatusCode::BAD_REQUEST,
+        "ValidationException",
+        KEY_SCHEMA_MISMATCH,
+    )
+}
+
+/// The ceiling on the aggregate size of the items one transaction writes.
+const MAX_TRANSACTION_BYTES: i64 = 4 * 1024 * 1024;
+
+/// The size of the item a transact Update leaves behind: the update applied
+/// to the stored item (or to a key-only item on an upsert). When the
+/// expression cannot be applied, the key plus every value the expression
+/// could write is counted instead; the apply pass reports that failure.
+fn update_write_size(
+    table: &DynamoTable,
+    op: &Value,
+    key: &HashMap<String, AttributeValue>,
+) -> i64 {
+    let before = table
+        .find_item_index(key)
+        .map(|i| table.items[i].clone())
+        .unwrap_or_else(|| key.clone());
+    let names = parse_expression_attribute_names(op);
+    let values = parse_expression_attribute_values(op);
+    let Some(expr) = op["UpdateExpression"].as_str() else {
+        return DynamoTable::estimate_item_size(&before);
+    };
+    let mut after = before;
+    match apply_update_expression(&mut after, expr, &names, &values) {
+        Ok(()) => DynamoTable::estimate_item_size(&after),
+        Err(_) => DynamoTable::estimate_item_size(key) + DynamoTable::estimate_item_size(&values),
+    }
+}
+
+/// The single action of a TransactWriteItem union and its member name. The
+/// union shape is validated before this is used.
+fn transact_op(ti: &Value) -> (&'static str, &Value) {
+    static NO_OP: Value = Value::Null;
+    ["Put", "Update", "Delete", "ConditionCheck"]
+        .into_iter()
+        .find_map(|k| ti.get(k).map(|op| (k, op)))
+        .unwrap_or(("ConditionCheck", &NO_OP))
+}
+
+/// A `ValidationError` cancellation reason.
+fn validation_reason(message: &str) -> Value {
+    json!({ "Code": "ValidationError", "Message": message })
+}
+
+/// Build the TransactionCanceledException response for per-action
+/// `reasons`. The message lists every action's code in request order,
+/// including `None` for the actions that would have succeeded.
+fn transaction_canceled(reasons: Vec<Value>) -> AwsResponse {
+    let codes: Vec<&str> = reasons
+        .iter()
+        .map(|r| r["Code"].as_str().unwrap_or("None"))
+        .collect();
+    let error_body = json!({
+        "__type": "TransactionCanceledException",
+        "message": format!(
+            "Transaction cancelled, please refer cancellation reasons for specific reasons [{}]",
+            codes.join(", ")
+        ),
+        "CancellationReasons": reasons,
+    });
+    AwsResponse::json(
+        StatusCode::BAD_REQUEST,
+        serde_json::to_vec(&error_body).unwrap_or_default(),
+    )
+}
+
+/// Render a request list the way DynamoDB's validation layer echoes it in a
+/// length-constraint message: one Java object reference per member.
+fn java_list_dump(class: &str, members: &[Value]) -> String {
+    use std::hash::{Hash, Hasher};
+    let refs: Vec<String> = members
+        .iter()
+        .map(|m| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            m.to_string().hash(&mut h);
+            format!(
+                "com.amazonaws.dynamodb.v20120810.{class}@{:08x}",
+                h.finish() as u32
+            )
+        })
+        .collect();
+    format!("[{}]", refs.join(", "))
+}
 
 use super::cross_account::{table_id, tables_of, tables_of_mut};
 
@@ -52,10 +166,30 @@ impl DynamoDbService {
                 )
             })?
             .clone();
+        if request_items.is_empty() {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "ValidationException",
+                "1 validation error detected: Value at 'RequestItems' failed to satisfy \
+                 constraint: Member must have length greater than or equal to 1",
+            ));
+        }
 
-        // AWS limits a single BatchGetItem to 100 keys across all
-        // tables; over that it returns a ValidationException rather than
-        // silently processing the whole oversized batch.
+        // Each table's Keys list is capped at 100 by the input model, then
+        // the whole request is capped at 100 keys across all tables.
+        for (table_name, params) in &request_items {
+            if params["Keys"].as_array().is_some_and(|k| k.len() > 100) {
+                return Err(AwsServiceError::aws_error(
+                    StatusCode::BAD_REQUEST,
+                    "ValidationException",
+                    format!(
+                        "1 validation error detected: Value at \
+                         'RequestItems.{table_name}.member.Keys' failed to satisfy constraint: \
+                         Member must have length less than or equal to 100"
+                    ),
+                ));
+            }
+        }
         let total_keys: usize = request_items
             .values()
             .filter_map(|p| p["Keys"].as_array().map(|k| k.len()))
@@ -71,6 +205,28 @@ impl DynamoDbService {
             ));
         }
 
+        // Projection parameters are validated for every table before any
+        // read: one bad entry rejects the whole batch. The request must also
+        // use one projection style throughout, not a ProjectionExpression on
+        // one table and AttributesToGet on another.
+        for params in request_items.values() {
+            validate_read_projection(params)?;
+        }
+        let uses = |field: &str| {
+            request_items
+                .values()
+                .any(|p| p.get(field).is_some_and(|v| !v.is_null()))
+        };
+        if uses("ProjectionExpression") && uses("AttributesToGet") {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "ValidationException",
+                "Can not use both expression and non-expression parameters in the same \
+                 request: Non-expression parameters: {AttributesToGet} Expression parameters: \
+                 {ProjectionExpression}",
+            ));
+        }
+
         // Each table is looked up in the account that owns it: a table ARN
         // may name another account's table.
         let accounts = self.state.read();
@@ -78,7 +234,7 @@ impl DynamoDbService {
         let mut consumed_capacity: Vec<Value> = Vec::new();
 
         for (table_name, params) in &request_items {
-            let table = get_table(tables_of(&accounts, req, table_name), table_name)?;
+            let table = item_op_table(tables_of(&accounts, req, table_name), table_name)?;
             let keys = params["Keys"].as_array().ok_or_else(|| {
                 AwsServiceError::aws_error(
                     StatusCode::BAD_REQUEST,
@@ -105,9 +261,15 @@ impl DynamoDbService {
             for key_val in keys {
                 let key: HashMap<String, AttributeValue> =
                     serde_json::from_value(key_val.clone()).unwrap_or_default();
-                // Reject malformed/under-specified keys the same way
-                // GetItem does instead of coercing to `{}`.
-                validate_key_attributes_in_key(table, &key)?;
+                // Reject malformed/under-specified keys instead of coercing
+                // them to `{}`: an empty String/Binary key value first, then a
+                // key that does not fit the schema.
+                if let Some(err) = empty_table_key_error(table, &key) {
+                    return Err(err);
+                }
+                if !key_matches_schema(table, &key) {
+                    return Err(schema_mismatch());
+                }
                 // AWS rejects a Keys list containing duplicate primary keys.
                 if seen_keys.iter().any(|k| keys_equal(table, k, &key)) {
                     return Err(AwsServiceError::aws_error(
@@ -182,10 +344,29 @@ impl DynamoDbService {
                 )
             })?
             .clone();
+        if request_items.is_empty() {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "ValidationException",
+                "The requestItems parameter is required for BatchWriteItem",
+            ));
+        }
 
-        // AWS caps a single BatchWriteItem at 25 write requests across
-        // all tables; over that it returns a ValidationException rather
-        // than processing the oversized batch.
+        // Each table's WriteRequest list is capped at 25 by the input model,
+        // then the whole request is capped at 25 writes across all tables.
+        for (table_name, requests) in &request_items {
+            if requests.as_array().is_some_and(|r| r.len() > 25) {
+                return Err(AwsServiceError::aws_error(
+                    StatusCode::BAD_REQUEST,
+                    "ValidationException",
+                    format!(
+                        "1 validation error detected: Value at 'RequestItems.{table_name}.member' \
+                         failed to satisfy constraint: Member must have length less than or \
+                         equal to 25"
+                    ),
+                ));
+            }
+        }
         let total_requests: usize = request_items
             .values()
             .filter_map(|r| r.as_array().map(|a| a.len()))
@@ -210,15 +391,7 @@ impl DynamoDbService {
         // the whole call (AWS rejects these up-front, not after partial
         // application).
         for (table_name, requests) in &request_items {
-            let table = tables_of(&accounts, req, table_name)
-                .get(super::resolve_table_name(table_name))
-                .ok_or_else(|| {
-                    AwsServiceError::aws_error(
-                        StatusCode::BAD_REQUEST,
-                        "ResourceNotFoundException",
-                        format!("Requested resource not found: Table: {table_name} not found"),
-                    )
-                })?;
+            let table = item_op_table(tables_of(&accounts, req, table_name), table_name)?;
             let reqs = requests.as_array().ok_or_else(|| {
                 AwsServiceError::aws_error(
                     StatusCode::BAD_REQUEST,
@@ -242,6 +415,9 @@ impl DynamoDbService {
                          of PutRequest or DeleteRequest",
                     ));
                 }
+                // BatchWriteItem validates every request up front, so each
+                // bad key or index value is a top-level ValidationException;
+                // a wrong-typed table key reads as a schema mismatch.
                 let key = if let Some(put_req) = request.get("PutRequest") {
                     let item: HashMap<String, AttributeValue> =
                         serde_json::from_value(put_req["Item"].clone()).map_err(|_| {
@@ -251,7 +427,14 @@ impl DynamoDbService {
                                 "PutRequest.Item is not a valid item",
                             )
                         })?;
+                    if let Some(err) = empty_table_key_error(table, &item) {
+                        return Err(err);
+                    }
+                    if item_key_type_mismatch(table, &item).is_some() {
+                        return Err(schema_mismatch());
+                    }
                     validate_key_in_item(table, &item)?;
+                    validate_index_keys_in_item(table, &item)?;
                     // Reject malformed values (bad numbers, empty/duplicate
                     // sets) up front, before applying any write, so
                     // BatchWriteItem enforces the same per-attribute validation
@@ -270,7 +453,12 @@ impl DynamoDbService {
                                 "DeleteRequest.Key is not a valid key",
                             )
                         })?;
-                    validate_key_attributes_in_key(table, &key)?;
+                    if let Some(err) = empty_table_key_error(table, &key) {
+                        return Err(err);
+                    }
+                    if !key_matches_schema(table, &key) {
+                        return Err(schema_mismatch());
+                    }
                     key
                 } else {
                     continue;
@@ -293,13 +481,7 @@ impl DynamoDbService {
         for (table_name, requests) in &request_items {
             let table = tables_of_mut(&mut accounts, req, table_name)
                 .get_mut(super::resolve_table_name(table_name))
-                .ok_or_else(|| {
-                    AwsServiceError::aws_error(
-                        StatusCode::BAD_REQUEST,
-                        "ResourceNotFoundException",
-                        format!("Requested resource not found: Table: {table_name} not found"),
-                    )
-                })?;
+                .ok_or_else(table_not_found)?;
 
             let reqs = requests.as_array().ok_or_else(|| {
                 AwsServiceError::aws_error(
@@ -413,18 +595,28 @@ impl DynamoDbService {
             return Err(AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
                 "ValidationException",
-                "1 validation error detected: Value at 'transactItems' failed \
-                 to satisfy constraint: Member must have length less than or \
-                 equal to 100",
+                format!(
+                    "1 validation error detected: Value '{}' at 'transactItems' failed to \
+                     satisfy constraint: Member must have length less than or equal to 100",
+                    java_list_dump("TransactGetItem", transact_items)
+                ),
             ));
+        }
+
+        // Projections are parsed before any per-action processing, so a bad
+        // one is a request-level ValidationException.
+        for ti in transact_items {
+            validate_read_projection(&ti["Get"])?;
         }
 
         // Each table is looked up in the account that owns it: a table ARN
         // may name another account's table.
         let accounts = self.state.read();
-        let mut responses: Vec<Value> = Vec::new();
         let mut per_table_units: HashMap<String, f64> = HashMap::new();
         let mut seen_keys: Vec<((String, String), HashMap<String, AttributeValue>)> = Vec::new();
+        // Per action: the key to read, or the ValidationError that cancels
+        // the transaction.
+        let mut lookups: Vec<Result<HashMap<String, AttributeValue>, &'static str>> = Vec::new();
 
         for ti in transact_items {
             let get = &ti["Get"];
@@ -436,9 +628,8 @@ impl DynamoDbService {
                 )
             })?;
 
-            let table = get_table(tables_of(&accounts, req, table_name), table_name)?;
-            // Parse the Key strictly and reject an under-specified/malformed key
-            // the same way GetItem does, instead of coercing it to `{}` (which
+            let table = item_op_table(tables_of(&accounts, req, table_name), table_name)?;
+            // Parse the Key strictly instead of coercing it to `{}` (which
             // matched nothing and returned a phantom miss).
             let key: HashMap<String, AttributeValue> = serde_json::from_value(get["Key"].clone())
                 .map_err(|_| {
@@ -448,7 +639,16 @@ impl DynamoDbService {
                     "Get.Key is not a valid key",
                 )
             })?;
-            validate_key_attributes_in_key(table, &key)?;
+            // An empty String/Binary key value fails DynamoDB's up-front
+            // validation; a key that does not fit the schema is caught per
+            // action and cancels the transaction instead.
+            if let Some(err) = empty_table_key_error(table, &key) {
+                return Err(err);
+            }
+            if !key_matches_schema(table, &key) {
+                lookups.push(Err(KEY_SCHEMA_MISMATCH));
+                continue;
+            }
 
             // AWS rejects a transaction that reads the same item more than once.
             let id = table_id(req, table_name);
@@ -463,9 +663,33 @@ impl DynamoDbService {
                 ));
             }
             seen_keys.push((id, key.clone()));
+            lookups.push(Ok(key));
+        }
 
+        if lookups.iter().any(Result::is_err) {
+            let reasons: Vec<Value> = lookups
+                .iter()
+                .map(|l| match l {
+                    Ok(_) => json!({ "Code": "None" }),
+                    Err(msg) => json!({ "Code": "ValidationError", "Message": msg }),
+                })
+                .collect();
+            return Ok(transaction_canceled(reasons));
+        }
+
+        let mut responses: Vec<Value> = Vec::new();
+        for (ti, key) in transact_items.iter().zip(lookups) {
+            let get = &ti["Get"];
+            let table_name = get["TableName"].as_str().unwrap_or_default();
+            let table = item_op_table(tables_of(&accounts, req, table_name), table_name)?;
+            let key = key.unwrap_or_default();
             let found = table.find_item_index(&key).map(|idx| &table.items[idx]);
-            match found {
+            // A present item whose projection selects nothing is reported
+            // like a missing one: the response omits Item entirely.
+            let projected = found
+                .map(|item| super::project_item(item, get))
+                .filter(|item| !item.is_empty());
+            match projected {
                 Some(item) => responses.push(json!({ "Item": item })),
                 None => responses.push(json!({})),
             }
@@ -563,9 +787,11 @@ impl DynamoDbService {
             return Err(AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
                 "ValidationException",
-                "1 validation error detected: Value at 'transactItems' failed \
-                 to satisfy constraint: Member must have length less than or \
-                 equal to 100",
+                format!(
+                    "1 validation error detected: Value '{}' at 'transactItems' failed to \
+                     satisfy constraint: Member must have length less than or equal to 100",
+                    java_list_dump("TransactWriteItem", transact_items)
+                ),
             ));
         }
 
@@ -629,71 +855,79 @@ impl DynamoDbService {
         // partway through the apply loop and leave earlier writes
         // committed — TransactWriteItems must be all-or-nothing.
         for ti in transact_items {
-            for op_key in ["Put", "Delete", "Update", "ConditionCheck"] {
-                if let Some(op) = ti.get(op_key) {
-                    let table_name = op["TableName"].as_str().unwrap_or_default();
-                    get_table(tables_of(&accounts, req, table_name), table_name)?;
-                }
-            }
+            let (_, op) = transact_op(ti);
+            let table_name = op["TableName"].as_str().unwrap_or_default();
+            item_op_table(tables_of(&accounts, req, table_name), table_name)?;
         }
 
-        // Validate the primary key of every write BEFORE mutating anything, and
-        // before any ConditionExpression is evaluated: these are malformed
-        // requests, which DynamoDB rejects outright rather than cancelling the
-        // transaction over a condition that happened to fail first.
-        // A Put whose Item is missing a key attribute (or a Delete/Update with
-        // a malformed Key) is a structural error: real DDB returns a plain
-        // ValidationException, not a TransactionCanceledException. Previously
-        // the apply pass parsed the item with `unwrap_or_default()` and never
-        // validated it, so an item with no PK stored an orphan row and returned
-        // success (bug-hunt 2026-07-01, DynamoDB TransactWriteItems).
+        // DynamoDB's up-front input validation, run on every action before
+        // the transaction executes. Everything it catches is a top-level
+        // ValidationException, never a cancellation reason: a missing key
+        // attribute, an empty String/Binary table or secondary-index key
+        // value, a malformed attribute value, an update that writes a key
+        // attribute. Wrong-typed keys are NOT caught here; they cancel the
+        // transaction below.
+        let mut transaction_bytes: i64 = 0;
         for ti in transact_items {
-            if let Some(put) = ti.get("Put") {
-                let table_name = put["TableName"].as_str().unwrap_or_default();
+            let (op_key, op) = transact_op(ti);
+            let table_name = op["TableName"].as_str().unwrap_or_default();
+            let table = item_op_table(tables_of(&accounts, req, table_name), table_name)?;
+            if op_key == "Put" {
                 let item: HashMap<String, AttributeValue> =
-                    serde_json::from_value(put["Item"].clone()).unwrap_or_default();
-                if let Some(table) =
-                    tables_of(&accounts, req, table_name).get(super::resolve_table_name(table_name))
-                {
-                    validate_key_in_item(table, &item)?;
+                    serde_json::from_value(op["Item"].clone()).unwrap_or_default();
+                if let Some(err) = missing_item_key_error(table, &item) {
+                    return Err(err);
                 }
-                // Malformed values (bad numbers, empty/duplicate sets) are a
-                // structural error surfaced as a plain ValidationException
-                // before the transaction runs — the same per-attribute
-                // validation single PutItem enforces.
+                if let Some(err) = empty_table_key_error(table, &item) {
+                    return Err(err);
+                }
+                if let Some(fault) = index_key_fault(&index_key_specs(table), &item, None) {
+                    if fault.is_empty_value() {
+                        return Err(fault.put_error());
+                    }
+                }
                 validate_item_attribute_values(&item)?;
                 // A Put's size is known from the request alone, so an item
                 // over the limit is refused before the transaction opens.
                 check_put_item_size(&item)?;
-            } else if let Some(op) = ti.get("Delete").or_else(|| ti.get("Update")) {
-                let table_name = op["TableName"].as_str().unwrap_or_default();
+                transaction_bytes += DynamoTable::estimate_item_size(&item);
+            } else {
                 let key: HashMap<String, AttributeValue> =
                     serde_json::from_value(op["Key"].clone()).unwrap_or_default();
-                if let Some(table) =
-                    tables_of(&accounts, req, table_name).get(super::resolve_table_name(table_name))
-                {
-                    validate_key_attributes_in_key(table, &key)?;
-                    if let Some(expr) = ti
-                        .get("Update")
-                        .and_then(|u| u["UpdateExpression"].as_str())
-                    {
+                if let Some(err) = empty_table_key_error(table, &key) {
+                    return Err(err);
+                }
+                if op_key == "Update" {
+                    if let Some(expr) = op["UpdateExpression"].as_str() {
                         super::reject_key_attribute_update_expression(
                             table,
                             expr,
                             &parse_expression_attribute_names(op),
                         )?;
                     }
-                }
-                // An Update's ExpressionAttributeValues get the same value
-                // validation single UpdateItem enforces, so a malformed number
-                // or empty/duplicate set never reaches an item.
-                if ti.get("Update").is_some() {
-                    let expr_attr_values = parse_expression_attribute_values(op);
-                    for v in expr_attr_values.values() {
+                    // An Update's ExpressionAttributeValues get the same value
+                    // validation single UpdateItem enforces, so a malformed
+                    // number or empty/duplicate set never reaches an item.
+                    for v in parse_expression_attribute_values(op).values() {
                         validate_attribute_value(v)?;
                     }
                 }
+                transaction_bytes += match op_key {
+                    "Update" => update_write_size(table, op, &key),
+                    "Delete" => DynamoTable::estimate_item_size(&key),
+                    // A ConditionCheck reads an item but writes nothing.
+                    _ => 0,
+                };
             }
+        }
+        // The items a transaction writes may total at most 4 MB: a Put's
+        // item, an Update's resulting item, a Delete's key.
+        if transaction_bytes > MAX_TRANSACTION_BYTES {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "ValidationException",
+                "Transaction request cannot include more than 4 MB of data",
+            ));
         }
 
         // AWS rejects a transaction that targets the same item more than once
@@ -703,43 +937,41 @@ impl DynamoDbService {
         // Key field of Update/Delete/ConditionCheck.
         let mut seen_keys: Vec<((String, String), HashMap<String, AttributeValue>)> = Vec::new();
         for ti in transact_items {
-            for op_key in ["Put", "Delete", "Update", "ConditionCheck"] {
-                let Some(op) = ti.get(op_key) else { continue };
-                let table_name = op["TableName"].as_str().unwrap_or_default();
-                let table = get_table(tables_of(&accounts, req, table_name), table_name)?;
-                let key = if op_key == "Put" {
-                    let item: HashMap<String, AttributeValue> =
-                        serde_json::from_value(op["Item"].clone()).unwrap_or_default();
-                    extract_key(table, &item)
-                } else {
-                    serde_json::from_value(op["Key"].clone()).unwrap_or_default()
-                };
-                let id = table_id(req, table_name);
-                if seen_keys
-                    .iter()
-                    .any(|(t, k)| *t == id && keys_equal(table, k, &key))
-                {
-                    return Err(AwsServiceError::aws_error(
-                        StatusCode::BAD_REQUEST,
-                        "ValidationException",
-                        "Transaction request cannot include multiple operations on one item",
-                    ));
-                }
-                seen_keys.push((id, key));
+            let (op_key, op) = transact_op(ti);
+            let table_name = op["TableName"].as_str().unwrap_or_default();
+            let table = item_op_table(tables_of(&accounts, req, table_name), table_name)?;
+            let key = if op_key == "Put" {
+                let item: HashMap<String, AttributeValue> =
+                    serde_json::from_value(op["Item"].clone()).unwrap_or_default();
+                extract_key(table, &item)
+            } else {
+                serde_json::from_value(op["Key"].clone()).unwrap_or_default()
+            };
+            let id = table_id(req, table_name);
+            if seen_keys
+                .iter()
+                .any(|(t, k)| *t == id && keys_equal(table, k, &key))
+            {
+                return Err(AwsServiceError::aws_error(
+                    StatusCode::BAD_REQUEST,
+                    "ValidationException",
+                    "Transaction request cannot include multiple operations on one item",
+                ));
             }
+            seen_keys.push((id, key));
         }
 
-        // First pass: validate all conditions. We collect every
-        // operation's outcome so the per-index `CancellationReasons`
-        // array has a 1:1 alignment with `TransactItems` even when
-        // multiple ops fail. When a Put/Update/Delete/ConditionCheck
-        // sets `ReturnValuesOnConditionCheckFailure=ALL_OLD` and its
-        // ConditionExpression fails, the existing item is surfaced
-        // under the reason's `Item` field — matching the real DDB
-        // response shape used by aws-sdk-go's
-        // `ConditionalCheckFailedException.Item` field.
-        let mut cancellation_reasons: Vec<Value> = Vec::new();
-        let mut failed_codes: Vec<String> = Vec::new();
+        // First pass: judge every action without writing. Each gets exactly
+        // one reason, so `CancellationReasons` aligns 1:1 with
+        // `TransactItems` even when several actions fail: `ValidationError`
+        // for a wrong-typed table or index key (caught while the transaction
+        // executes, unlike the up-front checks above),
+        // `ConditionalCheckFailed` for a failed ConditionExpression, `None`
+        // otherwise. With `ReturnValuesOnConditionCheckFailure=ALL_OLD` a
+        // failed condition surfaces the existing item under the reason's
+        // `Item` field, as aws-sdk-go's
+        // `ConditionalCheckFailedException.Item` expects.
+        let mut cancellation_reasons: Vec<Value> = Vec::with_capacity(transact_items.len());
         let mut per_table_writes: HashMap<String, u32> = HashMap::new();
         // What each table's actions consumed, and what re-reading their
         // results costs when an idempotent retry replays the transaction.
@@ -747,152 +979,90 @@ impl DynamoDbService {
         let mut per_table_replay: HashMap<String, f64> = HashMap::new();
         let wants_capacity = return_consumed != "NONE";
 
-        let push_cond_failure =
-            |reasons: &mut Vec<Value>,
-             codes: &mut Vec<String>,
-             return_values: Option<&str>,
-             existing: Option<&HashMap<String, AttributeValue>>| {
+        for ti in transact_items {
+            let (op_key, op) = transact_op(ti);
+            let table_name = op["TableName"].as_str().unwrap_or_default();
+            let table = item_op_table(tables_of(&accounts, req, table_name), table_name)?;
+            let key: HashMap<String, AttributeValue> = if op_key == "Put" {
+                let item: HashMap<String, AttributeValue> =
+                    serde_json::from_value(op["Item"].clone()).unwrap_or_default();
+                if let Some(msg) = item_key_type_mismatch(table, &item) {
+                    cancellation_reasons.push(validation_reason(&msg));
+                    continue;
+                }
+                if let Some(fault) = index_key_fault(&index_key_specs(table), &item, None) {
+                    cancellation_reasons.push(validation_reason(&fault.put_message()));
+                    continue;
+                }
+                extract_key(table, &item)
+            } else {
+                let key: HashMap<String, AttributeValue> =
+                    serde_json::from_value(op["Key"].clone()).unwrap_or_default();
+                if !key_matches_schema(table, &key) {
+                    cancellation_reasons.push(validation_reason(KEY_SCHEMA_MISMATCH));
+                    continue;
+                }
+                key
+            };
+            let existing = table.find_item_index(&key).map(|i| &table.items[i]);
+            let expr_attr_names = parse_expression_attribute_names(op);
+            let expr_attr_values = parse_expression_attribute_values(op);
+
+            // Dry-run an Update against the current item to judge the index
+            // key values it would write. An empty value is DynamoDB's
+            // up-front validation and fails the whole request; a wrong type
+            // cancels. A failure to apply the expression itself is left to
+            // the apply pass, which cancels with the underlying error.
+            if op_key == "Update" {
+                if let Some(expr) = op["UpdateExpression"].as_str() {
+                    let before = existing.cloned().unwrap_or_else(|| key.clone());
+                    let mut after = before.clone();
+                    if apply_update_expression(
+                        &mut after,
+                        expr,
+                        &expr_attr_names,
+                        &expr_attr_values,
+                    )
+                    .is_ok()
+                    {
+                        let specs = index_key_specs(table);
+                        if let Some(fault) = index_key_fault(&specs, &after, Some(&before)) {
+                            if fault.is_empty_value() {
+                                return Err(fault.update_error());
+                            }
+                            cancellation_reasons.push(validation_reason(&fault.update_message()));
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            let condition = if op_key == "ConditionCheck" {
+                Some(op["ConditionExpression"].as_str().unwrap_or_default())
+            } else {
+                op["ConditionExpression"].as_str()
+            };
+            let failed = condition.is_some_and(|cond| {
+                evaluate_condition(cond, existing, &expr_attr_names, &expr_attr_values).is_err()
+            });
+            if failed {
                 let mut reason = json!({
                     "Code": "ConditionalCheckFailed",
                     "Message": "The conditional request failed",
                 });
-                if return_values == Some("ALL_OLD") {
+                if op["ReturnValuesOnConditionCheckFailure"].as_str() == Some("ALL_OLD") {
                     if let Some(item) = existing {
                         reason["Item"] = json!(item);
                     }
                 }
-                reasons.push(reason);
-                codes.push("ConditionalCheckFailed".to_string());
-            };
-
-        for ti in transact_items {
-            if let Some(put) = ti.get("Put") {
-                let table_name = put["TableName"].as_str().unwrap_or_default();
-                let item: HashMap<String, AttributeValue> =
-                    serde_json::from_value(put["Item"].clone()).unwrap_or_default();
-                let condition = put["ConditionExpression"].as_str();
-                let return_values = put["ReturnValuesOnConditionCheckFailure"].as_str();
-
-                if let Some(cond) = condition {
-                    let table = get_table(tables_of(&accounts, req, table_name), table_name)?;
-                    let expr_attr_names = parse_expression_attribute_names(put);
-                    let expr_attr_values = parse_expression_attribute_values(put);
-                    let key = extract_key(table, &item);
-                    let existing_idx = table.find_item_index(&key);
-                    let existing = existing_idx.map(|i| &table.items[i]);
-                    if evaluate_condition(cond, existing, &expr_attr_names, &expr_attr_values)
-                        .is_err()
-                    {
-                        push_cond_failure(
-                            &mut cancellation_reasons,
-                            &mut failed_codes,
-                            return_values,
-                            existing,
-                        );
-                        continue;
-                    }
-                }
-                cancellation_reasons.push(json!({ "Code": "None" }));
-            } else if let Some(delete) = ti.get("Delete") {
-                let table_name = delete["TableName"].as_str().unwrap_or_default();
-                let key: HashMap<String, AttributeValue> =
-                    serde_json::from_value(delete["Key"].clone()).unwrap_or_default();
-                let condition = delete["ConditionExpression"].as_str();
-                let return_values = delete["ReturnValuesOnConditionCheckFailure"].as_str();
-
-                if let Some(cond) = condition {
-                    let table = get_table(tables_of(&accounts, req, table_name), table_name)?;
-                    let expr_attr_names = parse_expression_attribute_names(delete);
-                    let expr_attr_values = parse_expression_attribute_values(delete);
-                    let existing_idx = table.find_item_index(&key);
-                    let existing = existing_idx.map(|i| &table.items[i]);
-                    if evaluate_condition(cond, existing, &expr_attr_names, &expr_attr_values)
-                        .is_err()
-                    {
-                        push_cond_failure(
-                            &mut cancellation_reasons,
-                            &mut failed_codes,
-                            return_values,
-                            existing,
-                        );
-                        continue;
-                    }
-                }
-                cancellation_reasons.push(json!({ "Code": "None" }));
-            } else if let Some(update) = ti.get("Update") {
-                let table_name = update["TableName"].as_str().unwrap_or_default();
-                let key: HashMap<String, AttributeValue> =
-                    serde_json::from_value(update["Key"].clone()).unwrap_or_default();
-                let condition = update["ConditionExpression"].as_str();
-                let return_values = update["ReturnValuesOnConditionCheckFailure"].as_str();
-
-                if let Some(cond) = condition {
-                    let table = get_table(tables_of(&accounts, req, table_name), table_name)?;
-                    let expr_attr_names = parse_expression_attribute_names(update);
-                    let expr_attr_values = parse_expression_attribute_values(update);
-                    let existing_idx = table.find_item_index(&key);
-                    let existing = existing_idx.map(|i| &table.items[i]);
-                    if evaluate_condition(cond, existing, &expr_attr_names, &expr_attr_values)
-                        .is_err()
-                    {
-                        push_cond_failure(
-                            &mut cancellation_reasons,
-                            &mut failed_codes,
-                            return_values,
-                            existing,
-                        );
-                        continue;
-                    }
-                }
-                cancellation_reasons.push(json!({ "Code": "None" }));
-            } else if let Some(check) = ti.get("ConditionCheck") {
-                let table_name = check["TableName"].as_str().unwrap_or_default();
-                let key: HashMap<String, AttributeValue> =
-                    serde_json::from_value(check["Key"].clone()).unwrap_or_default();
-                let cond = check["ConditionExpression"].as_str().unwrap_or_default();
-                let return_values = check["ReturnValuesOnConditionCheckFailure"].as_str();
-
-                let table = get_table(tables_of(&accounts, req, table_name), table_name)?;
-                let expr_attr_names = parse_expression_attribute_names(check);
-                let expr_attr_values = parse_expression_attribute_values(check);
-                let existing_idx = table.find_item_index(&key);
-                let existing = existing_idx.map(|i| &table.items[i]);
-                if evaluate_condition(cond, existing, &expr_attr_names, &expr_attr_values).is_err()
-                {
-                    push_cond_failure(
-                        &mut cancellation_reasons,
-                        &mut failed_codes,
-                        return_values,
-                        existing,
-                    );
-                    continue;
-                }
-                cancellation_reasons.push(json!({ "Code": "None" }));
+                cancellation_reasons.push(reason);
             } else {
                 cancellation_reasons.push(json!({ "Code": "None" }));
             }
         }
 
-        if !failed_codes.is_empty() {
-            // Real DDB lists every failing code (deduped, in order) inside
-            // square brackets so the SDKs that match on this string still
-            // work when multiple operations fail.
-            let mut seen: Vec<String> = Vec::new();
-            for code in &failed_codes {
-                if !seen.contains(code) {
-                    seen.push(code.clone());
-                }
-            }
-            let codes_str = seen.join(", ");
-            let error_body = json!({
-                "__type": "TransactionCanceledException",
-                "message": format!("Transaction cancelled, please refer cancellation reasons for specific reasons [{codes_str}]"),
-                "CancellationReasons": cancellation_reasons
-            });
-            return Ok(AwsResponse::json(
-                StatusCode::BAD_REQUEST,
-                serde_json::to_vec(&error_body).unwrap(),
-            ));
+        if cancellation_reasons.iter().any(|r| r["Code"] != "None") {
+            return Ok(transaction_canceled(cancellation_reasons));
         }
 
         // Snapshot the items vector of every referenced table so we can
@@ -1137,28 +1307,16 @@ impl DynamoDbService {
                     table.replace_items(items);
                 }
             }
-            let msg = err.message();
             let reasons: Vec<Value> = (0..transact_items.len())
                 .map(|i| {
                     if i == failed_idx {
-                        json!({
-                            "Code": "ValidationError",
-                            "Message": msg.clone(),
-                        })
+                        validation_reason(&err.message())
                     } else {
                         json!({ "Code": "None" })
                     }
                 })
                 .collect();
-            let error_body = json!({
-                "__type": "TransactionCanceledException",
-                "message": "Transaction cancelled, please refer cancellation reasons for specific reasons [ValidationError]",
-                "CancellationReasons": reasons
-            });
-            return Ok(AwsResponse::json(
-                StatusCode::BAD_REQUEST,
-                serde_json::to_vec(&error_body).unwrap(),
-            ));
+            return Ok(transaction_canceled(reasons));
         }
 
         // Append all pending stream records under each table's
@@ -2734,7 +2892,9 @@ mod tests {
             .expect("empty TransactItems rejected");
         assert!(format!("{empty:?}").contains("ValidationException"));
 
-        // A Get whose Key omits the partition key is a malformed key.
+        // A Get whose Key omits the partition key does not fit the schema.
+        // That is caught per action, so it cancels the transaction with a
+        // ValidationError reason rather than failing the request outright.
         let malformed = svc
             .transact_get_items(&req_for(
                 "TransactGetItems",
@@ -2742,9 +2902,17 @@ mod tests {
                     {"Get": {"TableName": "Widgets", "Key": {"other": {"S": "x"}}}}
                 ]}),
             ))
-            .err()
-            .expect("malformed key rejected");
-        assert!(format!("{malformed:?}").contains("ValidationException"));
+            .expect("cancellation is a response");
+        assert_eq!(malformed.status, StatusCode::BAD_REQUEST);
+        let body = response_body(&malformed);
+        assert_eq!(body["__type"], "TransactionCanceledException");
+        assert_eq!(
+            body["CancellationReasons"],
+            json!([{
+                "Code": "ValidationError",
+                "Message": "The provided key element does not match the schema",
+            }])
+        );
 
         // Duplicate keys in one transaction are rejected.
         let dup = svc
@@ -2864,5 +3032,445 @@ mod tests {
         let records = table.stream_records.read();
         assert_eq!(records.len(), 3, "one stream record per write");
         assert!(records.iter().all(|r| r.event_name == "INSERT"));
+    }
+
+    /// Seed `Typed`: a `pk: S` table whose attribute definitions are known,
+    /// with a String-keyed index `gsi1` on `idx` and a Binary-keyed index
+    /// `gsib` on `bidx`.
+    fn seed_typed_indexed_table(state: &SharedDynamoDbState) {
+        use crate::state::{AttributeDefinition, GlobalSecondaryIndex, Projection};
+        seed_table_with_stream(state, "Typed");
+        let mut accts = state.write();
+        let table = accts
+            .get_or_create("123456789012")
+            .tables
+            .get_mut("Typed")
+            .unwrap();
+        let def = |name: &str, ty: &str| AttributeDefinition {
+            attribute_name: name.into(),
+            attribute_type: ty.into(),
+        };
+        table.attribute_definitions = vec![def("pk", "S"), def("idx", "S"), def("bidx", "B")];
+        let gsi = |name: &str, attr: &str| GlobalSecondaryIndex {
+            index_name: name.into(),
+            key_schema: vec![KeySchemaElement {
+                attribute_name: attr.into(),
+                key_type: "HASH".into(),
+            }],
+            projection: Projection {
+                projection_type: "ALL".into(),
+                non_key_attributes: vec![],
+            },
+            provisioned_throughput: None,
+            on_demand_throughput: None,
+        };
+        table.gsi = vec![gsi("gsib", "bidx"), gsi("gsi1", "idx")];
+    }
+
+    fn typed_item_count(state: &SharedDynamoDbState) -> usize {
+        state.read().get("123456789012").unwrap().tables["Typed"]
+            .items
+            .len()
+    }
+
+    fn cancellation(response: &AwsResponse) -> (String, Vec<Value>) {
+        let body = response_body(response);
+        assert_eq!(body["__type"], "TransactionCanceledException", "{body}");
+        (
+            body["message"].as_str().unwrap().to_string(),
+            body["CancellationReasons"].as_array().unwrap().clone(),
+        )
+    }
+
+    // A wrong-typed table key is caught while the transaction executes, so it
+    // cancels with a ValidationError reason; the Put form names the types,
+    // the Key form (Update/Delete/ConditionCheck) reports a schema mismatch.
+    #[tokio::test]
+    async fn transact_write_wrong_typed_keys_cancel_with_validation_error() {
+        let state = make_state();
+        seed_typed_indexed_table(&state);
+        let svc = DynamoDbService::new(state.clone());
+        let cases = [
+            (
+                json!({"Put": {"TableName": "Typed", "Item": {"pk": {"N": "5"}}}}),
+                "One or more parameter values were invalid: Type mismatch for key pk expected: S actual: N",
+            ),
+            (
+                json!({"Put": {"TableName": "Typed", "Item": {"pk": {"L": [{"S": "x"}]}}}}),
+                "One or more parameter values were invalid: Type mismatch for key pk expected: S actual: L",
+            ),
+            (
+                json!({"Delete": {"TableName": "Typed", "Key": {"pk": {"N": "5"}}}}),
+                KEY_SCHEMA_MISMATCH,
+            ),
+            (
+                json!({"ConditionCheck": {
+                    "TableName": "Typed",
+                    "Key": {"pk": {"L": [{"S": "x"}]}},
+                    "ConditionExpression": "attribute_not_exists(pk)"
+                }}),
+                KEY_SCHEMA_MISMATCH,
+            ),
+            (
+                json!({"Update": {
+                    "TableName": "Typed",
+                    "Key": {"pk": {"N": "5"}},
+                    "UpdateExpression": "SET a = :v",
+                    "ExpressionAttributeValues": {":v": {"S": "x"}}
+                }}),
+                KEY_SCHEMA_MISMATCH,
+            ),
+        ];
+        for (action, message) in cases {
+            let resp = svc
+                .transact_write_items(&req_for(
+                    "TransactWriteItems",
+                    json!({"TransactItems": [action]}),
+                ))
+                .unwrap();
+            let (summary, reasons) = cancellation(&resp);
+            assert_eq!(
+                summary,
+                "Transaction cancelled, please refer cancellation reasons for specific reasons [ValidationError]"
+            );
+            assert_eq!(
+                reasons,
+                vec![json!({"Code": "ValidationError", "Message": message})]
+            );
+        }
+        assert_eq!(typed_item_count(&state), 0);
+    }
+
+    // An empty key value is DynamoDB's up-front validation: a top-level
+    // ValidationException even inside a transaction, including ConditionCheck.
+    #[tokio::test]
+    async fn transact_write_empty_key_values_are_top_level_errors() {
+        let state = make_state();
+        seed_typed_indexed_table(&state);
+        let svc = DynamoDbService::new(state.clone());
+        let cases = [
+            (
+                json!({"ConditionCheck": {
+                    "TableName": "Typed",
+                    "Key": {"pk": {"S": ""}},
+                    "ConditionExpression": "attribute_not_exists(pk)"
+                }}),
+                "One or more parameter values are not valid. The AttributeValue for a key attribute cannot contain an empty string value. Key: pk",
+            ),
+            (
+                json!({"Put": {"TableName": "Typed", "Item": {"pk": {"S": "a"}, "idx": {"S": ""}}}}),
+                "One or more parameter values are not valid. A value specified for a secondary index key is not supported. The AttributeValue for a key attribute cannot contain an empty string value. IndexName: gsi1, IndexKey: idx",
+            ),
+            (
+                json!({"Update": {
+                    "TableName": "Typed",
+                    "Key": {"pk": {"S": "a"}},
+                    "UpdateExpression": "SET bidx = :v",
+                    "ExpressionAttributeValues": {":v": {"B": ""}}
+                }}),
+                "One or more parameter values are not valid. The update expression attempted to update a secondary index key to a value that is not supported. The AttributeValue for a key attribute cannot contain an empty binary value.",
+            ),
+        ];
+        for (action, message) in cases {
+            let err = svc
+                .transact_write_items(&req_for(
+                    "TransactWriteItems",
+                    json!({"TransactItems": [action]}),
+                ))
+                .err()
+                .expect("top-level ValidationException");
+            assert_eq!(err.code(), "ValidationException");
+            assert_eq!(err.message(), message);
+        }
+        assert_eq!(typed_item_count(&state), 0);
+    }
+
+    // A wrong-typed index key value cancels, naming the alphabetically-first
+    // index keyed on the attribute; an Update is judged on what it writes.
+    #[tokio::test]
+    async fn transact_write_wrong_typed_index_key_cancels() {
+        let state = make_state();
+        seed_typed_indexed_table(&state);
+        let svc = DynamoDbService::new(state.clone());
+        let resp = svc
+            .transact_write_items(&req_for(
+                "TransactWriteItems",
+                json!({"TransactItems": [
+                    {"Put": {"TableName": "Typed", "Item": {"pk": {"S": "a"}}}},
+                    {"Update": {
+                        "TableName": "Typed",
+                        "Key": {"pk": {"S": "b"}},
+                        "UpdateExpression": "SET idx = :v",
+                        "ExpressionAttributeValues": {":v": {"N": "5"}}
+                    }},
+                ]}),
+            ))
+            .unwrap();
+        let (summary, reasons) = cancellation(&resp);
+        assert_eq!(
+            summary,
+            "Transaction cancelled, please refer cancellation reasons for specific reasons [None, ValidationError]"
+        );
+        assert_eq!(reasons[0], json!({"Code": "None"}));
+        assert_eq!(
+            reasons[1]["Message"],
+            "One or more parameter values were invalid: Type mismatch for Index Key idx Expected: S Actual: N IndexName: gsi1"
+        );
+        assert_eq!(typed_item_count(&state), 0);
+    }
+
+    // The summary lists every action's code positionally, not deduplicated.
+    #[tokio::test]
+    async fn transact_write_summary_lists_every_code_in_order() {
+        let state = make_state();
+        seed_table_with_stream(&state, "Widgets");
+        let svc = DynamoDbService::new(state);
+        let cond = |pk: &str| {
+            json!({"ConditionCheck": {
+                "TableName": "Widgets",
+                "Key": {"pk": {"S": pk}},
+                "ConditionExpression": "attribute_exists(pk)"
+            }})
+        };
+        let resp = svc
+            .transact_write_items(&req_for(
+                "TransactWriteItems",
+                json!({"TransactItems": [cond("x"), cond("y")]}),
+            ))
+            .unwrap();
+        let (summary, _) = cancellation(&resp);
+        assert!(
+            summary.ends_with("[ConditionalCheckFailed, ConditionalCheckFailed]"),
+            "{summary}"
+        );
+    }
+
+    #[tokio::test]
+    async fn transact_write_rejects_transactions_over_4mb() {
+        let state = make_state();
+        seed_table_with_stream(&state, "Widgets");
+        let svc = DynamoDbService::new(state);
+        let put = |i: usize| {
+            json!({"Put": {"TableName": "Widgets", "Item": {
+                "pk": {"S": format!("k{i}")},
+                "payload": {"S": "x".repeat(350_000)}
+            }}})
+        };
+        let under: Vec<Value> = (0..10).map(put).collect();
+        assert!(svc
+            .transact_write_items(&req_for(
+                "TransactWriteItems",
+                json!({"TransactItems": under})
+            ))
+            .is_ok());
+        let over: Vec<Value> = (0..12).map(put).collect();
+        let err = svc
+            .transact_write_items(&req_for(
+                "TransactWriteItems",
+                json!({"TransactItems": over}),
+            ))
+            .err()
+            .expect("over 4 MB rejected");
+        assert_eq!(err.code(), "ValidationException");
+    }
+
+    // The 4 MB cap counts what an Update writes (its resulting item), not
+    // just its key, so large SET values add up.
+    #[tokio::test]
+    async fn transact_write_4mb_cap_counts_update_values() {
+        let state = make_state();
+        seed_table_with_stream(&state, "Widgets");
+        let svc = DynamoDbService::new(state.clone());
+        let update = |i: usize| {
+            json!({"Update": {
+                "TableName": "Widgets",
+                "Key": {"pk": {"S": format!("u{i}")}},
+                "UpdateExpression": "SET payload = :v",
+                "ExpressionAttributeValues": {":v": {"S": "x".repeat(390_000)}}
+            }})
+        };
+        let under: Vec<Value> = (0..10).map(update).collect();
+        assert!(svc
+            .transact_write_items(&req_for(
+                "TransactWriteItems",
+                json!({"TransactItems": under})
+            ))
+            .is_ok());
+        // Fresh keys so the Updates are upserts of the same size.
+        let over: Vec<Value> = (100..111).map(update).collect();
+        let err = svc
+            .transact_write_items(&req_for(
+                "TransactWriteItems",
+                json!({"TransactItems": over}),
+            ))
+            .err()
+            .expect("over 4 MB of updated items rejected");
+        assert_eq!(err.code(), "ValidationException");
+        let count = state.read().get("123456789012").unwrap().tables["Widgets"]
+            .items
+            .len();
+        assert_eq!(count, 10, "the rejected transaction wrote nothing");
+    }
+
+    // Batch and transaction operations name no table in their not-found error.
+    #[tokio::test]
+    async fn batch_and_transact_missing_table_message() {
+        let svc = DynamoDbService::new(make_state());
+        let errs = [
+            svc.batch_get_item(&req_for(
+                "BatchGetItem",
+                json!({"RequestItems": {"Nope": {"Keys": [{"pk": {"S": "a"}}]}}}),
+            )),
+            svc.batch_write_item(&req_for(
+                "BatchWriteItem",
+                json!({"RequestItems": {"Nope": [{"PutRequest": {"Item": {"pk": {"S": "a"}}}}]}}),
+            )),
+            svc.transact_get_items(&req_for(
+                "TransactGetItems",
+                json!({"TransactItems": [{"Get": {"TableName": "Nope", "Key": {"pk": {"S": "a"}}}}]}),
+            )),
+            svc.transact_write_items(&req_for(
+                "TransactWriteItems",
+                json!({"TransactItems": [{"Put": {"TableName": "Nope", "Item": {"pk": {"S": "a"}}}}]}),
+            )),
+        ];
+        for result in errs {
+            let err = result.err().expect("missing table rejected");
+            assert_eq!(err.code(), "ResourceNotFoundException");
+            assert_eq!(err.message(), "Requested resource not found");
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_write_validates_keys_and_index_keys_up_front() {
+        let state = make_state();
+        seed_typed_indexed_table(&state);
+        let svc = DynamoDbService::new(state.clone());
+        let cases = [
+            (json!({"PutRequest": {"Item": {"pk": {"N": "5"}}}}), KEY_SCHEMA_MISMATCH),
+            (json!({"DeleteRequest": {"Key": {"pk": {"L": []}}}}), KEY_SCHEMA_MISMATCH),
+            (
+                json!({"PutRequest": {"Item": {"pk": {"S": "a"}, "idx": {"L": [{"S": "x"}]}}}}),
+                "One or more parameter values were invalid: Type mismatch for Index Key idx Expected: S Actual: L IndexName: gsi1",
+            ),
+            (
+                json!({"PutRequest": {"Item": {"pk": {"S": "a"}, "bidx": {"B": ""}}}}),
+                "One or more parameter values are not valid. A value specified for a secondary index key is not supported. The AttributeValue for a key attribute cannot contain an empty binary value. IndexName: gsib, IndexKey: bidx",
+            ),
+        ];
+        for (request, message) in cases {
+            let err = svc
+                .batch_write_item(&req_for(
+                    "BatchWriteItem",
+                    json!({"RequestItems": {"Typed": [request]}}),
+                ))
+                .err()
+                .expect("rejected");
+            assert_eq!(err.message(), message);
+        }
+        assert_eq!(typed_item_count(&state), 0);
+
+        let empty = svc
+            .batch_write_item(&req_for("BatchWriteItem", json!({"RequestItems": {}})))
+            .err()
+            .expect("empty RequestItems rejected");
+        assert_eq!(
+            empty.message(),
+            "The requestItems parameter is required for BatchWriteItem"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_get_validates_request_shape_and_projection() {
+        let state = make_state();
+        seed_table_with_stream(&state, "Widgets");
+        seed_table_with_stream(&state, "Gadgets");
+        let svc = DynamoDbService::new(state);
+        let get = |items: Value| {
+            svc.batch_get_item(&req_for("BatchGetItem", json!({"RequestItems": items})))
+                .err()
+                .expect("rejected")
+                .message()
+                .to_string()
+        };
+        assert_eq!(
+            get(json!({})),
+            "1 validation error detected: Value at 'RequestItems' failed to satisfy constraint: Member must have length greater than or equal to 1"
+        );
+        let keys: Vec<Value> = (0..101)
+            .map(|i| json!({"pk": {"S": format!("k{i}")}}))
+            .collect();
+        assert_eq!(
+            get(json!({"Widgets": {"Keys": keys}})),
+            "1 validation error detected: Value at 'RequestItems.Widgets.member.Keys' failed to satisfy constraint: Member must have length less than or equal to 100"
+        );
+        assert_eq!(
+            get(json!({
+                "Widgets": {"Keys": [{"pk": {"S": "a"}}], "ProjectionExpression": "a, a.b"},
+                "Gadgets": {"Keys": [{"pk": {"S": "a"}}], "ProjectionExpression": "a"}
+            })),
+            "Invalid ProjectionExpression: Two document paths overlap with each other; must remove or rewrite one of these paths; path one: [a], path two: [a, b]"
+        );
+        assert!(get(json!({
+            "Widgets": {"Keys": [{"pk": {"S": "a"}}], "ProjectionExpression": "pk"},
+            "Gadgets": {"Keys": [{"pk": {"S": "a"}}], "AttributesToGet": ["pk"]}
+        }))
+        .starts_with("Can not use both expression and non-expression parameters"));
+    }
+
+    // TransactGetItems applies the projection and omits Item when it selects
+    // nothing; a bad projection fails the whole request up front.
+    #[tokio::test]
+    async fn transact_get_projects_and_omits_empty_projection() {
+        let state = make_state();
+        seed_table_with_stream(&state, "Widgets");
+        let svc = DynamoDbService::new(state);
+        svc.transact_write_items(&req_for(
+            "TransactWriteItems",
+            json!({"TransactItems": [{"Put": {"TableName": "Widgets", "Item": {
+                "pk": {"S": "a"}, "real": {"S": "here"}, "other": {"S": "x"}
+            }}}]}),
+        ))
+        .unwrap();
+        let resp = svc
+            .transact_get_items(&req_for(
+                "TransactGetItems",
+                json!({"TransactItems": [
+                    {"Get": {"TableName": "Widgets", "Key": {"pk": {"S": "a"}},
+                             "ProjectionExpression": "#x",
+                             "ExpressionAttributeNames": {"#x": "missing"}}},
+                ]}),
+            ))
+            .unwrap();
+        assert_eq!(response_body(&resp)["Responses"], json!([{}]));
+
+        let resp = svc
+            .transact_get_items(&req_for(
+                "TransactGetItems",
+                json!({"TransactItems": [
+                    {"Get": {"TableName": "Widgets", "Key": {"pk": {"S": "a"}},
+                             "ProjectionExpression": "real"}},
+                ]}),
+            ))
+            .unwrap();
+        assert_eq!(
+            response_body(&resp)["Responses"],
+            json!([{"Item": {"real": {"S": "here"}}}])
+        );
+
+        let err = svc
+            .transact_get_items(&req_for(
+                "TransactGetItems",
+                json!({"TransactItems": [
+                    {"Get": {"TableName": "Widgets", "Key": {"pk": {"S": "a"}},
+                             "ProjectionExpression": "!!!"}},
+                ]}),
+            ))
+            .err()
+            .expect("bad projection rejected");
+        assert_eq!(
+            err.message(),
+            "Invalid ProjectionExpression: Syntax error; token: \"!\", near: \"!!\""
+        );
     }
 }

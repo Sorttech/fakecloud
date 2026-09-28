@@ -62,6 +62,9 @@ impl DynamoDbService {
             // Validate every attribute value (not just keys): a malformed number
             // like {"N":"abc"} is a ValidationException in real DynamoDB.
             validate_item_attribute_values(&item)?;
+            // Secondary-index key values must be non-empty and of the
+            // index's declared type.
+            super::validate_index_keys_in_item(table, &item)?;
             normalize_item_numbers(&mut item);
             check_put_item_size(&item)?;
 
@@ -512,7 +515,9 @@ impl DynamoDbService {
             (None, Some(updates)) => UpdateCharge::for_attribute_updates(updates),
             (None, None) => UpdateCharge::default(),
         };
+        let index_keys = super::index_key_specs(table);
         let applied = table.update_item_at(idx, |item| {
+            let before = (!index_keys.is_empty()).then(|| item.clone());
             if let Some(expr) = update_expression {
                 apply_update_expression(item, expr, &expr_attr_names, &expr_attr_values)?;
             } else if let Some(updates) = attribute_updates.as_ref() {
@@ -522,6 +527,11 @@ impl DynamoDbService {
                 // (on a missing key) left a key-only stub item -- silent data loss
                 // (bug-audit 2026-06-20, 1.2).
                 apply_attribute_updates(item, updates)?;
+            }
+            // A secondary-index key the update writes must be non-empty and
+            // of the index's declared type; the row is put back otherwise.
+            if let Some(fault) = super::index_key_fault(&index_keys, item, before.as_ref()) {
+                return Err(fault.update_error());
             }
             charge.check(item)
         });

@@ -6950,3 +6950,130 @@ async fn dynamodb_item_size_gate_and_number_canonical_form() {
     assert_eq!(item["b"], AttributeValue::N("42.12".into()));
     assert_eq!(item["c"], AttributeValue::N("0".into()));
 }
+
+/// Secondary-index key values are validated on every write path: an empty
+/// value is rejected outright, a wrong-typed one is rejected by PutItem and
+/// UpdateItem and cancels a transaction with a ValidationError reason. None
+/// of the rejected writes persists.
+#[tokio::test]
+async fn dynamodb_rejects_invalid_secondary_index_key_values() {
+    let server = TestServer::start().await;
+    let client = server.dynamodb_client().await;
+    let def = |name: &str| {
+        AttributeDefinition::builder()
+            .attribute_name(name)
+            .attribute_type(ScalarAttributeType::S)
+            .build()
+            .unwrap()
+    };
+    let hash = |name: &str| {
+        KeySchemaElement::builder()
+            .attribute_name(name)
+            .key_type(KeyType::Hash)
+            .build()
+            .unwrap()
+    };
+    client
+        .create_table()
+        .table_name("IndexKeyValues")
+        .key_schema(hash("pk"))
+        .attribute_definitions(def("pk"))
+        .attribute_definitions(def("idx"))
+        .global_secondary_indexes(
+            GlobalSecondaryIndex::builder()
+                .index_name("gsi1")
+                .key_schema(hash("idx"))
+                .projection(
+                    Projection::builder()
+                        .projection_type(ProjectionType::All)
+                        .build(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .billing_mode(BillingMode::PayPerRequest)
+        .send()
+        .await
+        .unwrap();
+
+    let err = client
+        .put_item()
+        .table_name("IndexKeyValues")
+        .item("pk", AttributeValue::S("a".into()))
+        .item("idx", AttributeValue::S(String::new()))
+        .send()
+        .await
+        .unwrap_err()
+        .into_service_error();
+    assert_eq!(err.meta().code(), Some("ValidationException"));
+    assert_eq!(
+        err.meta().message(),
+        Some(
+            "One or more parameter values are not valid. A value specified for a secondary \
+             index key is not supported. The AttributeValue for a key attribute cannot contain \
+             an empty string value. IndexName: gsi1, IndexKey: idx"
+        )
+    );
+
+    let err = client
+        .update_item()
+        .table_name("IndexKeyValues")
+        .key("pk", AttributeValue::S("b".into()))
+        .update_expression("SET idx = :v")
+        .expression_attribute_values(":v", AttributeValue::N("5".into()))
+        .send()
+        .await
+        .unwrap_err()
+        .into_service_error();
+    assert_eq!(
+        err.meta().message(),
+        Some(
+            "One or more parameter values were invalid: Type mismatch for Index Key idx \
+             Expected: S Actual: N IndexName: gsi1"
+        )
+    );
+
+    let err = client
+        .transact_write_items()
+        .transact_items(
+            TransactWriteItem::builder()
+                .put(
+                    Put::builder()
+                        .table_name("IndexKeyValues")
+                        .item("pk", AttributeValue::S("c".into()))
+                        .item(
+                            "idx",
+                            AttributeValue::L(vec![AttributeValue::S("x".into())]),
+                        )
+                        .build()
+                        .unwrap(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap_err()
+        .into_service_error();
+    let cancelled = match err {
+        aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError::TransactionCanceledException(e) => e,
+        other => panic!("expected TransactionCanceledException, got {other:?}"),
+    };
+    let reasons = cancelled.cancellation_reasons();
+    assert_eq!(reasons.len(), 1);
+    assert_eq!(reasons[0].code(), Some("ValidationError"));
+    assert_eq!(
+        reasons[0].message(),
+        Some(
+            "One or more parameter values were invalid: Type mismatch for Index Key idx \
+             Expected: S Actual: L IndexName: gsi1"
+        )
+    );
+
+    let scan = client
+        .scan()
+        .table_name("IndexKeyValues")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(scan.count(), 0);
+}

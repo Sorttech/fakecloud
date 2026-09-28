@@ -1255,7 +1255,7 @@ impl DynamoTable {
 
     /// An item's size in bytes, as DynamoDB measures it for TableSizeBytes,
     /// the 400KB limit and consumed capacity.
-    fn estimate_item_size(item: &HashMap<String, AttributeValue>) -> i64 {
+    pub(crate) fn estimate_item_size(item: &HashMap<String, AttributeValue>) -> i64 {
         crate::service::helpers::item_size(item) as i64
     }
 
