@@ -596,11 +596,12 @@ impl DynamoDbService {
             (None, None) => UpdateCharge::default(),
         };
         let index_keys = super::index_key_specs(table);
-        let mut written_indexes: Vec<(usize, usize)> = Vec::new();
+        // Where each SET's value ended up once the whole expression ran.
+        let mut written_paths: Vec<(usize, DocPath)> = Vec::new();
         let applied = table.update_item_at(idx, |item| {
             let before = (!index_keys.is_empty()).then(|| item.clone());
             if let Some(expr) = update_expression {
-                written_indexes = apply_update_expression_tracked(
+                written_paths = apply_update_expression_tracked(
                     item,
                     expr,
                     &expr_attr_names,
@@ -629,18 +630,17 @@ impl DynamoDbService {
             }
             return Err(err);
         }
-        // UPDATED_NEW reads the post-update item, so it takes each list-index
-        // SET target (the first entries of `updated_paths`, in expression
-        // order) at the index actually written -- past the end it appends --
-        // and leaves out REMOVE targets, which set nothing. UPDATED_OLD keeps
+        // UPDATED_NEW reads the post-update item, so it takes each SET target
+        // (the first entries of `updated_paths`, in expression order) where
+        // its value ended up -- a list index past the end appends, and a
+        // later REMOVE of an earlier element shifts it down -- and leaves
+        // out REMOVE targets, which set nothing. UPDATED_OLD keeps
         // the expression's own paths against the pre-update item, where an
         // out-of-range index simply projects nothing.
         let mut new_paths: Vec<DocPath> = updated_paths.clone();
-        for (ordinal, written) in written_indexes {
-            if let Some(PathElem::Index(i)) =
-                new_paths.get_mut(ordinal).and_then(|path| path.last_mut())
-            {
-                *i = written;
+        for (ordinal, written) in written_paths {
+            if let Some(path) = new_paths.get_mut(ordinal) {
+                *path = written;
             }
         }
         let new_paths: Vec<DocPath> = new_paths
@@ -943,7 +943,7 @@ mod tests {
             &values,
         )
         .unwrap();
-        assert_eq!(written, vec![(0, 1)]);
+        assert_eq!(last_indexes(written), vec![(0, 1)]);
         assert_eq!(item["l"], json!({"L": [{"S": "b"}, {"S": "z"}]}));
         let got = project_paths(
             Some(&item),
@@ -964,10 +964,63 @@ mod tests {
         assert_eq!(old["l"], json!({"L": [{"S": "a"}]}));
     }
 
+    /// `(SET ordinal, final list index)` for each recorded path ending in one.
+    fn last_indexes(written: Vec<(usize, DocPath)>) -> Vec<(usize, usize)> {
+        written
+            .into_iter()
+            .filter_map(|(o, p)| match p.last() {
+                Some(PathElem::Index(i)) => Some((o, *i)),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn apply(item: &mut HashMap<String, AttributeValue>, expr: &str) -> Vec<(usize, usize)> {
         let values: HashMap<String, serde_json::Value> =
             HashMap::from([(":v".to_string(), json!({"S": "v"}))]);
-        apply_update_expression_tracked(item, expr, &HashMap::new(), &values).unwrap()
+        last_indexes(apply_update_expression_tracked(item, expr, &HashMap::new(), &values).unwrap())
+    }
+
+    // A REMOVE later in the expression shifts the list the SET wrote into:
+    // `SET l[1] = :v REMOVE l[0]` on [a, b] leaves [v], so the value is
+    // reported at l[0] (and a nested SET through the list shifts the same way).
+    #[test]
+    fn later_remove_shifts_recorded_set_paths() {
+        let mut item: HashMap<String, AttributeValue> = HashMap::new();
+        item.insert("l".into(), json!({"L": [{"S": "a"}, {"S": "b"}]}));
+        assert_eq!(apply(&mut item, "SET l[1] = :v REMOVE l[0]"), vec![(0, 0)]);
+        assert_eq!(item["l"], json!({"L": [{"S": "v"}]}));
+        let got = project_paths(
+            Some(&item),
+            &[vec![PathElem::Attr("l".into()), PathElem::Index(0)]],
+        );
+        assert_eq!(got["l"], json!({"L": [{"S": "v"}]}));
+
+        let mut item: HashMap<String, AttributeValue> = HashMap::new();
+        item.insert(
+            "l".into(),
+            json!({"L": [{"M": {"x": {"S": "0"}}}, {"M": {"x": {"S": "1"}}}]}),
+        );
+        let values: HashMap<String, serde_json::Value> =
+            HashMap::from([(":v".to_string(), json!({"S": "v"}))]);
+        let written = apply_update_expression_tracked(
+            &mut item,
+            "SET l[1].x = :v REMOVE l[0]",
+            &HashMap::new(),
+            &values,
+        )
+        .unwrap();
+        assert_eq!(
+            written,
+            vec![(
+                0,
+                vec![
+                    PathElem::Attr("l".into()),
+                    PathElem::Index(0),
+                    PathElem::Attr("x".into())
+                ]
+            )]
+        );
     }
 
     // SET/REMOVE targets use the expression grammar's path segmentation, so
@@ -1027,7 +1080,7 @@ mod tests {
         let written =
             apply_update_expression_tracked(&mut item, "SET a.l[5] = :v", &HashMap::new(), &values)
                 .unwrap();
-        assert_eq!(written, vec![(0, 1)]);
+        assert_eq!(last_indexes(written), vec![(0, 1)]);
         assert_eq!(
             item["a"],
             json!({"M": {"l": {"L": [{"S": "x"}, {"S": "y"}]}}})

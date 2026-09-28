@@ -7339,3 +7339,116 @@ async fn dynamodb_update_item_multi_index_list_path() {
         ])]
     );
 }
+
+/// ProjectionExpression paths are read with the expression grammar on
+/// GetItem and Query alike: whitespace inside a path and a subscript on an
+/// alias select just that element.
+#[tokio::test]
+async fn dynamodb_projection_paths_follow_expression_grammar() {
+    let server = TestServer::start().await;
+    let client = server.dynamodb_client().await;
+    create_pk_table(&client, "proj_grammar").await;
+    let mut a = HashMap::new();
+    a.insert("b".to_string(), AttributeValue::S("ab".into()));
+    a.insert("c".to_string(), AttributeValue::S("ac".into()));
+    let mut n1 = HashMap::new();
+    n1.insert("x".to_string(), AttributeValue::S("n1".into()));
+    n1.insert("y".to_string(), AttributeValue::S("no".into()));
+    client
+        .put_item()
+        .table_name("proj_grammar")
+        .item("pk", AttributeValue::S("p".into()))
+        .item(
+            "l",
+            AttributeValue::L(vec![
+                AttributeValue::S("x".into()),
+                AttributeValue::S("y".into()),
+            ]),
+        )
+        .item("a", AttributeValue::M(a))
+        .item(
+            "n",
+            AttributeValue::L(vec![
+                AttributeValue::M(HashMap::new()),
+                AttributeValue::M(n1),
+            ]),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    let check = |item: &HashMap<String, AttributeValue>| {
+        assert_eq!(
+            item["l"].as_l().unwrap(),
+            &vec![AttributeValue::S("x".into())]
+        );
+        let a = item["a"].as_m().unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(a["b"].as_s().unwrap(), "ab");
+        let n = item["n"].as_l().unwrap();
+        assert_eq!(n.len(), 1);
+        let n = n[0].as_m().unwrap();
+        assert_eq!(n.len(), 1);
+        assert_eq!(n["x"].as_s().unwrap(), "n1");
+    };
+
+    let got = client
+        .get_item()
+        .table_name("proj_grammar")
+        .key("pk", AttributeValue::S("p".into()))
+        .projection_expression("l[ 0 ], a . b, #n[1].x")
+        .expression_attribute_names("#n", "n")
+        .send()
+        .await
+        .unwrap();
+    check(got.item().unwrap());
+
+    let q = client
+        .query()
+        .table_name("proj_grammar")
+        .key_condition_expression("pk = :p")
+        .expression_attribute_values(":p", AttributeValue::S("p".into()))
+        .projection_expression("l[ 0 ], a . b, #n[1].x")
+        .expression_attribute_names("#n", "n")
+        .send()
+        .await
+        .unwrap();
+    check(&q.items()[0]);
+}
+
+/// A REMOVE later in the expression shifts the list a SET wrote into, and
+/// UPDATED_NEW reports the value where it ended up.
+#[tokio::test]
+async fn dynamodb_update_item_set_then_remove_reports_shifted_value() {
+    let server = TestServer::start().await;
+    let client = server.dynamodb_client().await;
+    create_pk_table(&client, "upd_shift").await;
+    client
+        .put_item()
+        .table_name("upd_shift")
+        .item("pk", AttributeValue::S("p".into()))
+        .item(
+            "l",
+            AttributeValue::L(vec![
+                AttributeValue::S("a".into()),
+                AttributeValue::S("b".into()),
+            ]),
+        )
+        .send()
+        .await
+        .unwrap();
+    let resp = client
+        .update_item()
+        .table_name("upd_shift")
+        .key("pk", AttributeValue::S("p".into()))
+        .update_expression("SET l[1] = :v REMOVE l[0]")
+        .expression_attribute_values(":v", AttributeValue::S("v".into()))
+        .return_values(aws_sdk_dynamodb::types::ReturnValue::UpdatedNew)
+        .send()
+        .await
+        .unwrap();
+    let list = resp.attributes().expect("set value returned")["l"]
+        .as_l()
+        .unwrap();
+    assert_eq!(list, &vec![AttributeValue::S("v".into())]);
+}

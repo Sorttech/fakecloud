@@ -353,17 +353,18 @@ pub(crate) fn apply_update_expression(
     apply_update_expression_tracked(item, expr, expr_attr_names, expr_attr_values).map(|_| ())
 }
 
-/// [`apply_update_expression`], also reporting where each `SET` on a list
-/// index actually wrote: `(ordinal of the SET action, index written)`. An
-/// index past the end appends, so the written index can differ from the one
-/// in the expression.
+/// [`apply_update_expression`], also reporting where each `SET` action's
+/// value ended up: `(ordinal of the SET action, document path)`. A list index
+/// past the end appends, so the written index can differ from the one in the
+/// expression, and a later `REMOVE` of an earlier element of the same list
+/// shifts it down again.
 pub(crate) fn apply_update_expression_tracked(
     item: &mut HashMap<String, AttributeValue>,
     expr: &str,
     expr_attr_names: &HashMap<String, String>,
     expr_attr_values: &HashMap<String, Value>,
-) -> Result<Vec<(usize, usize)>, AwsServiceError> {
-    let mut written_indexes = Vec::new();
+) -> Result<Vec<(usize, DocPath)>, AwsServiceError> {
+    let mut written: Vec<(usize, DocPath)> = Vec::new();
     let clauses = parse_update_clauses(expr);
     if clauses.is_empty() && !expr.trim().is_empty() {
         return Err(AwsServiceError::aws_error(
@@ -379,20 +380,30 @@ pub(crate) fn apply_update_expression_tracked(
         match action {
             UpdateAction::Set => {
                 for (ordinal, assignment) in assignments.iter().enumerate() {
-                    if let Some(index) = apply_set_assignment_from(
+                    let index = apply_set_assignment_from(
                         item,
                         &snapshot,
                         assignment,
                         expr_attr_names,
                         expr_attr_values,
-                    )? {
-                        written_indexes.push((ordinal, index));
+                    )?;
+                    let target = assignment.split_once('=').map_or("", |(l, _)| l.trim());
+                    if let Some(mut path) = parse_document_path(target, expr_attr_names) {
+                        if let (Some(i), Some(PathElem::Index(last))) = (index, path.last_mut()) {
+                            *last = i;
+                        }
+                        written.push((ordinal, path));
                     }
                 }
             }
             UpdateAction::Remove => {
                 for attr_ref in assignments {
+                    let removed = parse_document_path(attr_ref.trim(), expr_attr_names)
+                        .filter(|p| resolve_doc_path(item, p).is_some());
                     remove_path(item, attr_ref.trim(), expr_attr_names);
+                    if let Some(removed) = removed {
+                        shift_after_list_removal(&mut written, &removed);
+                    }
                 }
             }
             UpdateAction::Add => {
@@ -407,7 +418,25 @@ pub(crate) fn apply_update_expression_tracked(
             }
         }
     }
-    Ok(written_indexes)
+    Ok(written)
+}
+
+/// After `removed` (a path ending in a list index `j`) is removed, the
+/// elements after it move down one place: rewrite any recorded path that
+/// steps through that same list at an index greater than `j`.
+fn shift_after_list_removal(written: &mut [(usize, DocPath)], removed: &[PathElem]) {
+    let Some((PathElem::Index(j), parent)) = removed.split_last() else {
+        return;
+    };
+    for (_, path) in written.iter_mut() {
+        if path.len() > parent.len() && path.starts_with(parent) {
+            if let PathElem::Index(k) = &mut path[parent.len()] {
+                if *k > *j {
+                    *k -= 1;
+                }
+            }
+        }
+    }
 }
 
 pub(crate) fn parse_update_clauses(expr: &str) -> Vec<(UpdateAction, Vec<String>)> {

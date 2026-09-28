@@ -506,7 +506,7 @@ fn test_resolve_nested_path_map() {
         json!({"M": {"address": {"M": {"city": {"S": "NYC"}}}}}),
     );
 
-    let result = resolve_nested_path(&item, "info.address.city");
+    let result = resolve_path("info.address.city", &item, &HashMap::new());
     assert_eq!(result, Some(json!({"S": "NYC"})));
 }
 
@@ -518,7 +518,7 @@ fn test_resolve_nested_path_list_then_map() {
         json!({"L": [{"M": {"sku": {"S": "ABC"}}}]}),
     );
 
-    let result = resolve_nested_path(&item, "items[0].sku");
+    let result = resolve_path("items[0].sku", &item, &HashMap::new());
     assert_eq!(result, Some(json!({"S": "ABC"})));
 }
 
