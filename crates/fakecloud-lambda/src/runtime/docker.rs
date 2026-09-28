@@ -124,7 +124,10 @@ impl DockerBackend {
         );
         let pull_uri = local_pull_uri.as_deref().unwrap_or(image);
 
-        fakecloud_core::container_image::pull_image(
+        // `ensure_image` on the start path: a cold start onto a host that already
+        // has the image is a cache hit, not a registry round trip. The explicit
+        // warm-up below still pulls -- refreshing the cache is its whole job.
+        fakecloud_core::container_image::ensure_image(
             &self.cli,
             self.docker_config_path().as_deref(),
             pull_uri,

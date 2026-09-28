@@ -112,7 +112,13 @@ impl EcsRuntime {
                 self.server_port,
             );
             let pull_uri = local_pull_uri.as_deref().unwrap_or(&rp.plan.image);
-            fakecloud_core::container_image::pull_image(
+            // `ensure_image`, not `pull_image`: a task launching onto a host that
+            // already has the image must not contact the registry again. That is
+            // ECS's own default `imagePullBehavior` ("use the cached image if
+            // there is one"), and re-pulling per task is what exhausted the
+            // registry's anonymous data allowance in CI, where one partition
+            // launches dozens of tasks from the same handful of images.
+            fakecloud_core::container_image::ensure_image(
                 &self.cli,
                 self.docker_config_path().as_deref(),
                 pull_uri,
