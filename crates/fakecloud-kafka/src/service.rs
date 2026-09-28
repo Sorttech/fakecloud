@@ -30,7 +30,7 @@ use crate::runtime::{KafkaRuntime, RunningBroker, TopicError};
 use crate::shared;
 use crate::state::{ClusterDataPlane, KafkaData, SharedKafkaState};
 
-/// Every operation name in the Amazon MSK Smithy model (59 operations).
+/// Every operation name in the Amazon MSK Smithy model (64 operations).
 pub const KAFKA_ACTIONS: &[&str] = &[
     "BatchAssociateScramSecret",
     "BatchDisassociateScramSecret",
