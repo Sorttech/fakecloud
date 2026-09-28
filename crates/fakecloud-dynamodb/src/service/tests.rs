@@ -8998,14 +8998,18 @@ fn a_wrong_typed_member_fails_to_deserialize_and_changes_nothing() {
     );
     assert_eq!(before["VectorIndexes"], after["VectorIndexes"]);
 
-    let err = err_of(svc.create_table(&make_request(
-        "CreateTable",
-        json!({
-            "TableName": "typed-table",
+    // Deserialization fails before the table name is validated, so a bad,
+    // or absent, name does not change the answer.
+    for name in [json!("typed-table"), json!("ab"), Value::Null] {
+        let mut body = json!({
             "KeySchema": [{ "AttributeName": "pk", "KeyType": true }],
             "AttributeDefinitions": [{ "AttributeName": "pk", "AttributeType": "S" }],
             "BillingMode": "PAY_PER_REQUEST",
-        }),
-    )));
-    assert_eq!(err.code(), "SerializationException");
+        });
+        if !name.is_null() {
+            body["TableName"] = name.clone();
+        }
+        let err = err_of(svc.create_table(&make_request("CreateTable", body)));
+        assert_eq!(err.code(), "SerializationException", "{name}");
+    }
 }

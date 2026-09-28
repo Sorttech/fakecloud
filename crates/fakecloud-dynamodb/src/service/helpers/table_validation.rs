@@ -344,24 +344,6 @@ fn invalid(message: impl std::fmt::Display) -> AwsServiceError {
 /// table name's constraints: those are resolved before the rest of the request
 /// is looked at. Everything else is collected and reported together.
 pub(crate) fn validate_create_table_model(body: &Value) -> Result<(), AwsServiceError> {
-    if !body["TableName"].is_null() && !body["TableName"].is_string() {
-        return Err(AwsServiceError::aws_error(
-            StatusCode::BAD_REQUEST,
-            "SerializationException",
-            wrong_type_message(&body["TableName"], "String"),
-        ));
-    }
-    let Some(table_name) = body["TableName"].as_str() else {
-        return Err(AwsServiceError::aws_error(
-            StatusCode::BAD_REQUEST,
-            "ValidationException",
-            "The parameter 'TableName' is required but was not present in the request",
-        ));
-    };
-    let mut name_errors = ModelErrors::default();
-    name_errors.check_name("tableName", table_name);
-    name_errors.into_result()?;
-
     let mut errors = ModelErrors::default();
     errors.check_attribute_definitions(&body["AttributeDefinitions"], true);
     errors.check_key_schema("keySchema", &body["KeySchema"]);
@@ -417,6 +399,33 @@ pub(crate) fn validate_create_table_model(body: &Value) -> Result<(), AwsService
     {
         errors.check_vector_index(&format!("vectorIndexes.{}.member", i + 1), v);
     }
+    // A member of the wrong type fails deserialization, before any
+    // validation -- including the table name's.
+    if let Some(message) = errors.serialization.take() {
+        return Err(AwsServiceError::aws_error(
+            StatusCode::BAD_REQUEST,
+            "SerializationException",
+            message,
+        ));
+    }
+    if !body["TableName"].is_null() && !body["TableName"].is_string() {
+        return Err(AwsServiceError::aws_error(
+            StatusCode::BAD_REQUEST,
+            "SerializationException",
+            wrong_type_message(&body["TableName"], "String"),
+        ));
+    }
+    let Some(table_name) = body["TableName"].as_str() else {
+        return Err(AwsServiceError::aws_error(
+            StatusCode::BAD_REQUEST,
+            "ValidationException",
+            "The parameter 'TableName' is required but was not present in the request",
+        ));
+    };
+    let mut name_errors = ModelErrors::default();
+    name_errors.check_name("tableName", table_name);
+    name_errors.into_result()?;
+
     errors.into_result()
 }
 
