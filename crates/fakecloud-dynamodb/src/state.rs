@@ -1253,51 +1253,15 @@ impl DynamoTable {
         }
     }
 
-    /// Estimate item size in bytes (rough approximation).
+    /// An item's size in bytes, as DynamoDB measures it for TableSizeBytes,
+    /// the 400KB limit and consumed capacity.
     fn estimate_item_size(item: &HashMap<String, AttributeValue>) -> i64 {
-        let mut size: i64 = 0;
-        for (k, v) in item {
-            size += k.len() as i64;
-            size += Self::estimate_value_size(v);
-        }
-        size
+        crate::service::helpers::item_size(item) as i64
     }
 
+    #[cfg(test)]
     fn estimate_value_size(v: &Value) -> i64 {
-        match v {
-            Value::Object(obj) => {
-                if let Some(s) = obj.get("S").and_then(|v| v.as_str()) {
-                    s.len() as i64
-                } else if let Some(n) = obj.get("N").and_then(|v| v.as_str()) {
-                    n.len() as i64
-                } else if obj.contains_key("BOOL") || obj.contains_key("NULL") {
-                    1
-                } else if let Some(l) = obj.get("L").and_then(|v| v.as_array()) {
-                    3 + l.iter().map(Self::estimate_value_size).sum::<i64>()
-                } else if let Some(m) = obj.get("M").and_then(|v| v.as_object()) {
-                    3 + m
-                        .iter()
-                        .map(|(k, v)| k.len() as i64 + Self::estimate_value_size(v))
-                        .sum::<i64>()
-                } else if let Some(ss) = obj.get("SS").and_then(|v| v.as_array()) {
-                    ss.iter()
-                        .filter_map(|v| v.as_str())
-                        .map(|s| s.len() as i64)
-                        .sum()
-                } else if let Some(ns) = obj.get("NS").and_then(|v| v.as_array()) {
-                    ns.iter()
-                        .filter_map(|v| v.as_str())
-                        .map(|s| s.len() as i64)
-                        .sum()
-                } else if let Some(b) = obj.get("B").and_then(|v| v.as_str()) {
-                    // Base64-encoded binary
-                    (b.len() as i64 * 3) / 4
-                } else {
-                    v.to_string().len() as i64
-                }
-            }
-            _ => v.to_string().len() as i64,
-        }
+        crate::service::helpers::attribute_value_size(v) as i64
     }
 
     /// Record a partition key access for contributor insights.
@@ -1663,10 +1627,11 @@ mod tests {
         assert_eq!(b, 1);
         let null = DynamoTable::estimate_value_size(&json!({"NULL": true}));
         assert_eq!(null, 1);
+        // A list or map costs 3 bytes plus one per element.
         let l = DynamoTable::estimate_value_size(&json!({"L": [{"S": "x"}, {"S": "yy"}]}));
-        assert_eq!(l, 6);
+        assert_eq!(l, 8);
         let m = DynamoTable::estimate_value_size(&json!({"M": {"key": {"S": "v"}}}));
-        assert_eq!(m, 7);
+        assert_eq!(m, 8);
         let ss = DynamoTable::estimate_value_size(&json!({"SS": ["ab", "cde"]}));
         assert_eq!(ss, 5);
         let ns = DynamoTable::estimate_value_size(&json!({"NS": ["12", "345"]}));

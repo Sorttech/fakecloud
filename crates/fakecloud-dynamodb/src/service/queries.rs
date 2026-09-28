@@ -8,16 +8,28 @@ use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 use crate::state::{AttributeValue, Projection};
 
 use super::{
-    build_consumed_capacity, compare_attribute_values, evaluate_filter_expression,
-    evaluate_key_condition, extract_key_for_schema, get_table, item_matches_key,
+    build_capacity, compare_attribute_values, evaluate_filter_expression, evaluate_key_condition,
+    extract_key_for_schema, get_table, item_matches_key, item_size,
     parse_expression_attribute_names, parse_expression_attribute_values, parse_key_map,
-    project_item, require_str, resolve_attr_name, return_consumed_mode, split_on_and,
-    strip_outer_parens, translate_legacy_conditions, DynamoDbService, LegacyConditionRole,
+    project_item, read_units, require_str, resolve_attr_name, return_consumed_mode, split_on_and,
+    strip_outer_parens, translate_legacy_conditions, validate_request_enums, CapacitySplit,
+    Consumed, DynamoDbService, LegacyConditionRole, RETURN_CONSUMED_CAPACITY_VALUES,
 };
 
 impl DynamoDbService {
     pub(super) fn query(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let body = Self::parse_body(req)?;
+        validate_request_enums(
+            &body,
+            &[
+                ("Select", "select", SELECT_VALUES),
+                (
+                    "ReturnConsumedCapacity",
+                    "returnConsumedCapacity",
+                    RETURN_CONSUMED_CAPACITY_VALUES,
+                ),
+            ],
+        )?;
         let table_name = require_str(&body, "TableName")?;
         let return_consumed = return_consumed_mode(&body).to_string();
 
@@ -273,6 +285,7 @@ impl DynamoDbService {
                 });
 
         let scanned_count = matched.len();
+        let consumed = read_consumed(table, index_name, &matched, consistent_read);
 
         if let Some(filter) = filter_expression.as_deref() {
             matched.retain(|item| {
@@ -353,12 +366,7 @@ impl DynamoDbService {
             result["LastEvaluatedKey"] = json!(lek);
         }
 
-        let cc = build_consumed_capacity(
-            &return_consumed,
-            table_name,
-            (scanned_count.max(1) as f64) * 0.5,
-            0.0,
-        );
+        let cc = build_capacity(&return_consumed, table_name, &consumed, CapacitySplit::None);
         if !cc.is_null() {
             result["ConsumedCapacity"] = cc;
         }
@@ -549,6 +557,7 @@ impl DynamoDbService {
                 });
 
         let scanned_count = matched.len();
+        let consumed = read_consumed(table, index_name, &matched, consistent_read);
 
         if let Some(filter) = filter_expression.as_deref() {
             matched.retain(|item| {
@@ -629,12 +638,7 @@ impl DynamoDbService {
             result["LastEvaluatedKey"] = json!(lek);
         }
 
-        let cc = build_consumed_capacity(
-            &return_consumed,
-            table_name,
-            (scanned_count.max(1) as f64) * 0.5,
-            0.0,
-        );
+        let cc = build_capacity(&return_consumed, table_name, &consumed, CapacitySplit::None);
         if !cc.is_null() {
             result["ConsumedCapacity"] = cc;
         }
@@ -793,6 +797,14 @@ fn validate_partition_key_condition(
     Ok(())
 }
 
+/// The `Select` enum set, in the order AWS lists it.
+const SELECT_VALUES: &[&str] = &[
+    "SPECIFIC_ATTRIBUTES",
+    "COUNT",
+    "ALL_ATTRIBUTES",
+    "ALL_PROJECTED_ATTRIBUTES",
+];
+
 /// Validate the `Select` parameter for a Query/Scan and decide whether
 /// the operation returns only a count. `is_index_query` is true when an
 /// IndexName is present (only then is ALL_PROJECTED_ATTRIBUTES legal).
@@ -862,6 +874,55 @@ fn resolve_select(body: &Value, is_index_query: bool) -> Result<bool, AwsService
 /// caller's `ProjectionExpression`. AWS retains the table's primary key
 /// plus the index key; INCLUDE adds the listed non-key attributes;
 /// KEYS_ONLY drops everything else; ALL leaves the item alone.
+/// The read capacity a Query or Scan consumed.
+///
+/// Capacity is charged on every row the read examined -- before the filter
+/// drops any and whatever the projection returns -- summed and then rounded up
+/// to the next 4KB, not per row. A read served by a secondary index is charged
+/// to that index, on the entries it stores, and costs the base table nothing.
+fn read_consumed(
+    table: &crate::state::DynamoTable,
+    index_name: Option<&str>,
+    examined: &[&HashMap<String, AttributeValue>],
+    consistent: bool,
+) -> Consumed {
+    let gsi = index_name.and_then(|n| table.gsi.iter().find(|g| g.index_name == n));
+    let lsi = index_name.and_then(|n| table.lsi.iter().find(|l| l.index_name == n));
+    let index = gsi
+        .map(|g| (&g.index_name, &g.key_schema, &g.projection))
+        .or_else(|| lsi.map(|l| (&l.index_name, &l.key_schema, &l.projection)));
+    let Some((name, key_schema, projection)) = index else {
+        let bytes = examined.iter().map(|item| item_size(item)).sum();
+        return Consumed::table(read_units(bytes, consistent));
+    };
+    let key_attrs: Vec<String> = key_schema
+        .iter()
+        .map(|k| k.attribute_name.clone())
+        .collect();
+    let table_hash = table.hash_key_name();
+    let table_range = table.range_key_name();
+    let bytes = examined
+        .iter()
+        .map(|item| {
+            item_size(&apply_index_projection(
+                (*item).clone(),
+                projection,
+                &key_attrs,
+                table_hash,
+                table_range,
+            ))
+        })
+        .sum();
+    let mut consumed = Consumed::table(0.0);
+    let units = read_units(bytes, consistent);
+    if gsi.is_some() {
+        consumed.gsi.insert(name.clone(), units);
+    } else {
+        consumed.lsi.insert(name.clone(), units);
+    }
+    consumed
+}
+
 pub(crate) fn apply_index_projection(
     item: HashMap<String, AttributeValue>,
     projection: &Projection,

@@ -160,3 +160,93 @@ pub(crate) fn require_object(
     })?;
     Ok(obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
 }
+
+/// The enum sets the item operations' request members are checked against.
+pub(crate) const RETURN_CONSUMED_CAPACITY_VALUES: &[&str] = &["INDEXES", "TOTAL", "NONE"];
+pub(crate) const RETURN_ITEM_COLLECTION_METRICS_VALUES: &[&str] = &["SIZE", "NONE"];
+pub(crate) const RETURN_VALUES: &[&str] =
+    &["NONE", "ALL_OLD", "UPDATED_OLD", "ALL_NEW", "UPDATED_NEW"];
+
+/// Check several enum-typed request members at once, the way the request
+/// model layer does: every violation is collected and reported together as
+/// `N validation errors detected: ...; ...`, rather than stopping at the
+/// first. Each entry is `(body member, wire field name, allowed values)`.
+pub(crate) fn validate_request_enums(
+    body: &Value,
+    fields: &[(&str, &str, &[&str])],
+) -> Result<(), AwsServiceError> {
+    let mut violations: Vec<String> = Vec::new();
+    for (member, field, allowed) in fields {
+        let value = &body[*member];
+        if value.is_null() {
+            continue;
+        }
+        let Some(s) = value.as_str() else {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "SerializationException",
+                format!("Value for '{field}' must be a string"),
+            ));
+        };
+        if !allowed.contains(&s) {
+            violations.push(format!(
+                "Value '{s}' at '{field}' failed to satisfy constraint: \
+                 Member must satisfy enum value set: [{}]",
+                allowed.join(", ")
+            ));
+        }
+    }
+    if violations.is_empty() {
+        return Ok(());
+    }
+    let plural = if violations.len() == 1 {
+        "error"
+    } else {
+        "errors"
+    };
+    Err(AwsServiceError::aws_error(
+        StatusCode::BAD_REQUEST,
+        "ValidationException",
+        format!(
+            "{} validation {plural} detected: {}",
+            violations.len(),
+            violations.join("; ")
+        ),
+    ))
+}
+
+#[cfg(test)]
+mod request_enum_tests {
+    use super::*;
+
+    #[test]
+    fn collects_every_enum_violation() {
+        let body = json!({"ReturnConsumedCapacity": "BAD", "ReturnValues": "WORSE"});
+        let err = validate_request_enums(
+            &body,
+            &[
+                (
+                    "ReturnConsumedCapacity",
+                    "returnConsumedCapacity",
+                    RETURN_CONSUMED_CAPACITY_VALUES,
+                ),
+                ("ReturnValues", "returnValues", RETURN_VALUES),
+            ],
+        )
+        .unwrap_err();
+        let msg = err.message();
+        assert!(msg
+            .starts_with("2 validation errors detected: Value 'BAD' at 'returnConsumedCapacity'"));
+        assert!(msg.contains("; Value 'WORSE' at 'returnValues'"));
+
+        let one = json!({"ReturnValues": "WORSE"});
+        let err = validate_request_enums(&one, &[("ReturnValues", "returnValues", RETURN_VALUES)])
+            .unwrap_err();
+        assert!(err.message().starts_with("1 validation error detected: "));
+        assert!(validate_request_enums(
+            &json!({}),
+            &[("ReturnValues", "returnValues", RETURN_VALUES)]
+        )
+        .is_ok());
+    }
+}

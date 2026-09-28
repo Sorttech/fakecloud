@@ -20,11 +20,12 @@ type PendingKinesis = (
 );
 
 use super::{
-    apply_update_expression, build_consumed_capacity, evaluate_condition, extract_key, get_table,
-    get_table_mut, keys_equal, parse_expression_attribute_names, parse_expression_attribute_values,
-    return_consumed_mode, return_icm_mode, validate_attribute_value,
-    validate_item_attribute_values, validate_key_attributes_in_key, validate_key_in_item,
-    DynamoDbService,
+    apply_update_expression, build_capacity, check_put_item_size, check_update_item_size,
+    evaluate_condition, extract_key, get_table, get_table_mut, item_size, item_write_consumed,
+    keys_equal, normalize_item_numbers, parse_expression_attribute_names,
+    parse_expression_attribute_values, read_units, return_consumed_mode, return_icm_mode,
+    validate_attribute_value, validate_item_attribute_values, validate_key_attributes_in_key,
+    validate_key_in_item, write_units, CapacitySplit, Consumed, DynamoDbService,
 };
 
 use super::cross_account::{table_id, tables_of, tables_of_mut};
@@ -98,6 +99,9 @@ impl DynamoDbService {
 
             let mut items = Vec::new();
             let mut seen_keys: Vec<HashMap<String, AttributeValue>> = Vec::new();
+            // Each key is a read of its own, rounded up on its own.
+            let consistent = params["ConsistentRead"].as_bool().unwrap_or(false);
+            let mut units = 0.0;
             for key_val in keys {
                 let key: HashMap<String, AttributeValue> =
                     serde_json::from_value(key_val.clone()).unwrap_or_default();
@@ -113,18 +117,24 @@ impl DynamoDbService {
                     ));
                 }
                 seen_keys.push(key.clone());
-                if let Some(idx) = table.find_item_index(&key) {
+                let found = table.find_item_index(&key).map(|idx| &table.items[idx]);
+                units += read_units(found.map_or(0, item_size), consistent);
+                if let Some(item) = found {
                     // Honor the per-table ProjectionExpression /
                     // AttributesToGet so callers only get the attributes
                     // they asked for (GetItem already does this).
-                    let projected = super::project_item(&table.items[idx], params);
+                    let projected = super::project_item(item, params);
                     items.push(json!(projected));
                 }
             }
-            let key_count = keys.len().max(1) as f64;
             responses.insert(table_name.clone(), items);
 
-            let cc = build_consumed_capacity(&return_consumed, table_name, key_count * 0.5, 0.0);
+            let cc = build_capacity(
+                &return_consumed,
+                table_name,
+                &Consumed::table(units),
+                CapacitySplit::None,
+            );
             if !cc.is_null() {
                 consumed_capacity.push(cc);
             }
@@ -247,6 +257,9 @@ impl DynamoDbService {
                     // BatchWriteItem enforces the same per-attribute validation
                     // single PutItem does and a bad item persists nothing.
                     validate_item_attribute_values(&item)?;
+                    let mut item = item;
+                    normalize_item_numbers(&mut item);
+                    check_put_item_size(&item)?;
                     extract_key(table, &item)
                 } else if let Some(del_req) = request.get("DeleteRequest") {
                     let key: HashMap<String, AttributeValue> =
@@ -296,22 +309,27 @@ impl DynamoDbService {
                 )
             })?;
 
-            let mut write_count = 0u32;
+            let mut consumed = Consumed::default();
             let mut keys_for_icm: Vec<HashMap<String, AttributeValue>> = Vec::new();
             for request in reqs {
                 if let Some(put_req) = request.get("PutRequest") {
-                    let item: HashMap<String, AttributeValue> =
+                    let mut item: HashMap<String, AttributeValue> =
                         serde_json::from_value(put_req["Item"].clone()).unwrap_or_default();
+                    normalize_item_numbers(&mut item);
                     let key = extract_key(table, &item);
                     keys_for_icm.push(key.clone());
+                    table.ensure_key_index();
+                    let old = table.find_item_index(&key).map(|i| &table.items[i]);
+                    consumed.add(&item_write_consumed(table, old, Some(&item)));
                     table.put_item_at_key(item);
-                    write_count += 1;
                 } else if let Some(del_req) = request.get("DeleteRequest") {
                     let key: HashMap<String, AttributeValue> =
                         serde_json::from_value(del_req["Key"].clone()).unwrap_or_default();
                     keys_for_icm.push(key.clone());
+                    table.ensure_key_index();
+                    let old = table.find_item_index(&key).map(|i| &table.items[i]);
+                    consumed.add(&item_write_consumed(table, old, None));
                     table.remove_item_by_key(&key);
-                    write_count += 1;
                 }
             }
 
@@ -320,12 +338,7 @@ impl DynamoDbService {
             // index current. Re-summing the whole table once per batch was
             // half of the quadratic cost in #2502.
 
-            let cc = build_consumed_capacity(
-                &return_consumed,
-                table_name,
-                0.0,
-                write_count.max(1) as f64,
-            );
+            let cc = build_capacity(&return_consumed, table_name, &consumed, CapacitySplit::None);
             if !cc.is_null() {
                 consumed_capacity.push(cc);
             }
@@ -403,7 +416,7 @@ impl DynamoDbService {
         // may name another account's table.
         let accounts = self.state.read();
         let mut responses: Vec<Value> = Vec::new();
-        let mut per_table_count: HashMap<String, u32> = HashMap::new();
+        let mut per_table_units: HashMap<String, f64> = HashMap::new();
         let mut seen_keys: Vec<((String, String), HashMap<String, AttributeValue>)> = Vec::new();
 
         for ti in transact_items {
@@ -444,22 +457,26 @@ impl DynamoDbService {
             }
             seen_keys.push((id, key.clone()));
 
-            match table.find_item_index(&key) {
-                Some(idx) => {
-                    responses.push(json!({ "Item": table.items[idx] }));
-                }
-                None => {
-                    responses.push(json!({}));
-                }
+            let found = table.find_item_index(&key).map(|idx| &table.items[idx]);
+            match found {
+                Some(item) => responses.push(json!({ "Item": item })),
+                None => responses.push(json!({})),
             }
-            *per_table_count.entry(table_name.to_string()).or_insert(0) += 1;
+            // A transactional read costs twice a strongly-consistent one.
+            *per_table_units.entry(table_name.to_string()).or_insert(0.0) +=
+                2.0 * read_units(found.map_or(0, item_size), true);
         }
 
         let mut result = json!({ "Responses": responses });
-        let consumed: Vec<Value> = per_table_count
+        let consumed: Vec<Value> = per_table_units
             .iter()
-            .filter_map(|(t, n)| {
-                let cc = build_consumed_capacity(&return_consumed, t, (*n as f64) * 2.0, 0.0);
+            .filter_map(|(t, units)| {
+                let cc = build_capacity(
+                    &return_consumed,
+                    t,
+                    &Consumed::table(*units),
+                    CapacitySplit::Read,
+                );
                 if cc.is_null() {
                     None
                 } else {
@@ -638,6 +655,9 @@ impl DynamoDbService {
                 // before the transaction runs — the same per-attribute
                 // validation single PutItem enforces.
                 validate_item_attribute_values(&item)?;
+                // A Put's size is known from the request alone, so an item
+                // over the limit is refused before the transaction opens.
+                check_put_item_size(&item)?;
             } else if let Some(op) = ti.get("Delete").or_else(|| ti.get("Update")) {
                 let table_name = op["TableName"].as_str().unwrap_or_default();
                 let key: HashMap<String, AttributeValue> =
@@ -714,6 +734,10 @@ impl DynamoDbService {
         let mut cancellation_reasons: Vec<Value> = Vec::new();
         let mut failed_codes: Vec<String> = Vec::new();
         let mut per_table_writes: HashMap<String, u32> = HashMap::new();
+        // What each table's actions consumed, and what re-reading their
+        // results costs when an idempotent retry replays the transaction.
+        let mut per_table_consumed: HashMap<String, Consumed> = HashMap::new();
+        let mut per_table_replay: HashMap<String, f64> = HashMap::new();
 
         let push_cond_failure =
             |reasons: &mut Vec<Value>,
@@ -905,14 +929,21 @@ impl DynamoDbService {
             for (op_idx, ti) in transact_items.iter().enumerate() {
                 if let Some(put) = ti.get("Put") {
                     let table_name = put["TableName"].as_str().unwrap_or_default();
-                    let item: HashMap<String, AttributeValue> =
+                    let mut item: HashMap<String, AttributeValue> =
                         serde_json::from_value(put["Item"].clone()).unwrap_or_default();
+                    normalize_item_numbers(&mut item);
                     let table =
                         get_table_mut(tables_of_mut(&mut accounts, req, table_name), table_name)
                             .map_err(|e| (op_idx, e))?;
                     let key = extract_key(table, &item);
                     let old_image = table.find_item_index(&key).map(|i| table.items[i].clone());
                     let is_modify = old_image.is_some();
+                    per_table_consumed
+                        .entry(table_name.to_string())
+                        .or_default()
+                        .add(&item_write_consumed(table, old_image.as_ref(), Some(&item)));
+                    *per_table_replay.entry(table_name.to_string()).or_default() +=
+                        2.0 * read_units(item_size(&item), true);
                     table.put_item_at_key(item.clone());
                     let event_name = if is_modify { "MODIFY" } else { "INSERT" };
                     if let Some(record) = crate::streams::generate_stream_record(
@@ -943,6 +974,12 @@ impl DynamoDbService {
                         get_table_mut(tables_of_mut(&mut accounts, req, table_name), table_name)
                             .map_err(|e| (op_idx, e))?;
                     let old_image = table.find_item_index(&key).map(|i| table.items[i].clone());
+                    per_table_consumed
+                        .entry(table_name.to_string())
+                        .or_default()
+                        .add(&item_write_consumed(table, old_image.as_ref(), None));
+                    *per_table_replay.entry(table_name.to_string()).or_default() +=
+                        2.0 * read_units(old_image.as_ref().map_or(0, item_size), true);
                     table.remove_item_by_key(&key);
                     if old_image.is_some() {
                         if let Some(record) = crate::streams::generate_stream_record(
@@ -994,21 +1031,36 @@ impl DynamoDbService {
                             table.put_item_at_key(new_item).0
                         }
                     };
-                    if let Some(expr) = update_expression {
-                        // A failure here cancels the whole transaction, and
-                        // the revert below restores every touched table.
-                        table
-                            .update_item_at(idx, |item| {
+                    // A failure here cancels the whole transaction, and the
+                    // revert below restores every touched table. An Update's
+                    // size depends on the stored item, so one over the limit
+                    // is measured here, flat against the finished item, and
+                    // cancels rather than failing up front.
+                    table
+                        .update_item_at(idx, |item| {
+                            if let Some(expr) = update_expression {
                                 apply_update_expression(
                                     item,
                                     expr,
                                     &expr_attr_names,
                                     &expr_attr_values,
-                                )
-                            })
-                            .map_err(|e| (op_idx, e))?;
-                    }
+                                )?;
+                            }
+                            normalize_item_numbers(item);
+                            check_update_item_size(item)
+                        })
+                        .map_err(|e| (op_idx, e))?;
                     let new_image = table.items[idx].clone();
+                    per_table_consumed
+                        .entry(table_name.to_string())
+                        .or_default()
+                        .add(&item_write_consumed(
+                            table,
+                            old_image.as_ref(),
+                            Some(&new_image),
+                        ));
+                    *per_table_replay.entry(table_name.to_string()).or_default() +=
+                        2.0 * read_units(item_size(&new_image), true);
                     let event_name = if is_modify { "MODIFY" } else { "INSERT" };
                     if let Some(record) = crate::streams::generate_stream_record(
                         table,
@@ -1030,8 +1082,24 @@ impl DynamoDbService {
                         ));
                     }
                     *per_table_writes.entry(table_name.to_string()).or_insert(0) += 1;
+                } else if let Some(check) = ti.get("ConditionCheck") {
+                    // No write, but a ConditionCheck is billed as a
+                    // transactional write of the item it checks.
+                    let table_name = check["TableName"].as_str().unwrap_or_default();
+                    let key: HashMap<String, AttributeValue> =
+                        serde_json::from_value(check["Key"].clone()).unwrap_or_default();
+                    let table = get_table(tables_of(&accounts, req, table_name), table_name)
+                        .map_err(|e| (op_idx, e))?;
+                    let bytes = table
+                        .find_item_index(&key)
+                        .map_or(0, |i| item_size(&table.items[i]));
+                    per_table_consumed
+                        .entry(table_name.to_string())
+                        .or_default()
+                        .add(&Consumed::table(write_units(bytes)));
+                    *per_table_replay.entry(table_name.to_string()).or_default() +=
+                        2.0 * read_units(bytes, true);
                 }
-                // ConditionCheck: no write needed
             }
             Ok(())
         })();
@@ -1050,7 +1118,7 @@ impl DynamoDbService {
                     table.replace_items(items);
                 }
             }
-            let msg = err.to_string();
+            let msg = err.message();
             let reasons: Vec<Value> = (0..transact_items.len())
                 .map(|i| {
                     if i == failed_idx {
@@ -1085,16 +1153,19 @@ impl DynamoDbService {
         }
 
         let mut result = json!({});
-        let consumed: Vec<Value> = per_table_writes
+        // A transactional write costs twice a standard one, reported with the
+        // write split.
+        let consumed: Vec<Value> = per_table_consumed
             .iter()
-            .filter_map(|(t, n)| {
-                let cc = build_consumed_capacity(&return_consumed, t, 0.0, (*n as f64) * 2.0);
-                if cc.is_null() {
-                    None
-                } else {
-                    Some(cc)
-                }
+            .map(|(t, c)| {
+                build_capacity(
+                    &return_consumed,
+                    t,
+                    &c.clone().scaled(2.0),
+                    CapacitySplit::Write,
+                )
             })
+            .filter(|cc| !cc.is_null())
             .collect();
         if !consumed.is_empty() {
             result["ConsumedCapacity"] = json!(consumed);
@@ -1110,8 +1181,27 @@ impl DynamoDbService {
         // Cache the committed outcome while still holding the state write lock
         // so the store is atomic with the apply: an identical retry with the
         // same ClientRequestToken replays this result rather than re-applying.
+        // A replay does not write again: it re-reads the stored result, so it
+        // reports transactional read capacity sized on the items instead of
+        // the write capacity the first call reported.
         if let Some(token) = client_token.as_deref() {
-            self.transact_idempotency_store(&req.account_id, token, request_hash, &result);
+            let mut replay = result.clone();
+            let replay_consumed: Vec<Value> = per_table_replay
+                .iter()
+                .map(|(t, units)| {
+                    build_capacity(
+                        &return_consumed,
+                        t,
+                        &Consumed::table(*units),
+                        CapacitySplit::Read,
+                    )
+                })
+                .filter(|cc| !cc.is_null())
+                .collect();
+            if !replay_consumed.is_empty() {
+                replay["ConsumedCapacity"] = json!(replay_consumed);
+            }
+            self.transact_idempotency_store(&req.account_id, token, request_hash, &replay);
         }
 
         // Drop the write lock before firing kinesis deliveries so the

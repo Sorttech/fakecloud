@@ -6761,3 +6761,192 @@ async fn dynamodb_create_table_gsi_undefined_attribute_errors() {
         "{msg}"
     );
 }
+
+#[tokio::test]
+async fn dynamodb_consumed_capacity_breaks_down_index_writes_and_sizes_reads() {
+    use aws_sdk_dynamodb::types::ReturnConsumedCapacity;
+
+    let server = TestServer::start().await;
+    let client = server.dynamodb_client().await;
+
+    client
+        .create_table()
+        .table_name("CapacityTable")
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("pk")
+                .key_type(KeyType::Hash)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("pk")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("gsiPk")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .global_secondary_indexes(
+            GlobalSecondaryIndex::builder()
+                .index_name("ByGsiPk")
+                .key_schema(
+                    KeySchemaElement::builder()
+                        .attribute_name("gsiPk")
+                        .key_type(KeyType::Hash)
+                        .build()
+                        .unwrap(),
+                )
+                .projection(
+                    Projection::builder()
+                        .projection_type(ProjectionType::KeysOnly)
+                        .build(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .billing_mode(BillingMode::PayPerRequest)
+        .send()
+        .await
+        .unwrap();
+
+    // A write that lands in the GSI reports the index beside the table and
+    // folds it into the total, with no read/write split.
+    let put = client
+        .put_item()
+        .table_name("CapacityTable")
+        .item("pk", AttributeValue::S("a".into()))
+        .item("gsiPk", AttributeValue::S("g".into()))
+        .item("big", AttributeValue::S("x".repeat(5000)))
+        .return_consumed_capacity(ReturnConsumedCapacity::Indexes)
+        .send()
+        .await
+        .unwrap();
+    let cc = put.consumed_capacity().unwrap();
+    // 5KB item: five table write units, plus one for the keys-only entry.
+    assert_eq!(cc.capacity_units(), Some(6.0));
+    assert_eq!(cc.write_capacity_units(), None);
+    assert_eq!(cc.table().and_then(|t| t.capacity_units()), Some(5.0));
+    let gsi = cc.global_secondary_indexes().unwrap();
+    assert_eq!(gsi["ByGsiPk"].capacity_units(), Some(1.0));
+    assert!(cc.local_secondary_indexes().is_none());
+
+    // Reads are sized on the stored item: just over 4KB is two units,
+    // halved for an eventually-consistent read.
+    let get = client
+        .get_item()
+        .table_name("CapacityTable")
+        .key("pk", AttributeValue::S("a".into()))
+        .return_consumed_capacity(ReturnConsumedCapacity::Total)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get.consumed_capacity().unwrap().capacity_units(), Some(1.0));
+
+    // A query served by the GSI is charged to the index, not the table.
+    let query = client
+        .query()
+        .table_name("CapacityTable")
+        .index_name("ByGsiPk")
+        .key_condition_expression("gsiPk = :g")
+        .expression_attribute_values(":g", AttributeValue::S("g".into()))
+        .return_consumed_capacity(ReturnConsumedCapacity::Indexes)
+        .send()
+        .await
+        .unwrap();
+    let cc = query.consumed_capacity().unwrap();
+    assert_eq!(cc.table().and_then(|t| t.capacity_units()), Some(0.0));
+    assert_eq!(
+        cc.global_secondary_indexes().unwrap()["ByGsiPk"].capacity_units(),
+        Some(0.5)
+    );
+    assert_eq!(cc.capacity_units(), Some(0.5));
+}
+
+#[tokio::test]
+async fn dynamodb_item_size_gate_and_number_canonical_form() {
+    use aws_sdk_dynamodb::error::ProvideErrorMetadata;
+
+    let server = TestServer::start().await;
+    let client = server.dynamodb_client().await;
+
+    client
+        .create_table()
+        .table_name("SizeTable")
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("pk")
+                .key_type(KeyType::Hash)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("pk")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .billing_mode(BillingMode::PayPerRequest)
+        .send()
+        .await
+        .unwrap();
+
+    // pk (2 + 1) + p (1) + padding: exactly 409,600 is accepted, one more is not.
+    let put = |padding: usize| {
+        client
+            .put_item()
+            .table_name("SizeTable")
+            .item("pk", AttributeValue::S("k".into()))
+            .item("p", AttributeValue::S("x".repeat(padding)))
+            .send()
+    };
+    put(409_600 - 4).await.unwrap();
+    let err = put(409_600 - 3).await.unwrap_err();
+    assert_eq!(err.code(), Some("ValidationException"));
+    assert_eq!(
+        err.message(),
+        Some("Item size has exceeded the maximum allowed size")
+    );
+
+    // A number is sized by its significant digits, not its expanded length:
+    // 1E125 costs 2 bytes, so this item measures exactly 409,600.
+    client
+        .put_item()
+        .table_name("SizeTable")
+        .item("pk", AttributeValue::S("n".into()))
+        .item("n", AttributeValue::N("1E125".into()))
+        .item("p", AttributeValue::S("x".repeat(409_600 - 3 - 1 - 2 - 1)))
+        .send()
+        .await
+        .unwrap();
+
+    // Numbers come back in canonical form.
+    client
+        .put_item()
+        .table_name("SizeTable")
+        .item("pk", AttributeValue::S("canon".into()))
+        .item("a", AttributeValue::N("+1.5E+3".into()))
+        .item("b", AttributeValue::N("0042.1200".into()))
+        .item("c", AttributeValue::N("-0".into()))
+        .send()
+        .await
+        .unwrap();
+    let got = client
+        .get_item()
+        .table_name("SizeTable")
+        .key("pk", AttributeValue::S("canon".into()))
+        .send()
+        .await
+        .unwrap();
+    let item = got.item().unwrap();
+    assert_eq!(item["a"], AttributeValue::N("1500".into()));
+    assert_eq!(item["b"], AttributeValue::N("42.12".into()));
+    assert_eq!(item["c"], AttributeValue::N("0".into()));
+}
