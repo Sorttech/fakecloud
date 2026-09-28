@@ -4203,6 +4203,39 @@ fn china_region_user_pool_arn_uses_aws_cn_and_is_taggable() {
 }
 
 #[test]
+fn delete_user_pool_drops_tags_under_the_stored_arn() {
+    // A pool restored from a snapshot keeps the ARN it was minted with, which
+    // need not be what the current builder would produce for its id.
+    let (svc, state) = make_svc();
+    let mut create = make_req("CreateUserPool", r#"{"PoolName":"old-pool"}"#);
+    create.region = "cn-north-1".to_string();
+    let resp = block_on(svc.create_user_pool(&create)).unwrap();
+    let pool_id = resp_json(&resp)["UserPool"]["Id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let stored_arn = format!("arn:aws:cognito-idp:cn-north-1:123456789012:userpool/{pool_id}");
+    {
+        let mut accounts = state.write();
+        let acct = accounts.get_mut("123456789012").unwrap();
+        acct.user_pools.get_mut(&pool_id).unwrap().arn = stored_arn.clone();
+        acct.tags.insert(
+            stored_arn.clone(),
+            [("k".to_string(), "v".to_string())].into(),
+        );
+    }
+    let body = json!({ "UserPoolId": pool_id }).to_string();
+    svc.delete_user_pool(&make_req("DeleteUserPool", &body))
+        .unwrap();
+    assert!(!state
+        .read()
+        .get("123456789012")
+        .unwrap()
+        .tags
+        .contains_key(&stored_arn));
+}
+
+#[test]
 fn update_user_pool() {
     let (svc, _) = make_svc();
     let pool_id = create_pool(&svc);

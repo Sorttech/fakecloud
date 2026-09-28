@@ -2129,7 +2129,7 @@ impl SecretsManagerService {
             state
                 .secrets
                 .values()
-                .find(|s| s.arn.starts_with(secret_id))
+                .find(|s| is_partial_secret_arn(&s.arn, secret_id))
                 .map(|s| s.name.clone())
         } else {
             None
@@ -2166,7 +2166,7 @@ impl SecretsManagerService {
                     state
                         .secrets
                         .values()
-                        .find(|s| s.arn.starts_with(secret_id))
+                        .find(|s| is_partial_secret_arn(&s.arn, secret_id))
                 } else {
                     None
                 }
@@ -2434,6 +2434,16 @@ fn remap_validation_error(err: AwsServiceError) -> AwsServiceError {
         },
         other => other,
     }
+}
+
+/// True when `partial` is `stored` without its `-XXXXXX` random suffix, the
+/// partial-ARN form AWS accepts. A bare prefix does not count: the partial
+/// ARN of `app` must not resolve `app-db`.
+fn is_partial_secret_arn(stored: &str, partial: &str) -> bool {
+    stored
+        .strip_prefix(partial)
+        .and_then(|rest| rest.strip_prefix('-'))
+        .is_some_and(|suffix| suffix.chars().count() == 6)
 }
 
 /// A new secret's ARN: its name plus AWS's random six-character suffix, in the

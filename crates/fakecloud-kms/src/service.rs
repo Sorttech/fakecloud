@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
-use fakecloud_aws::arn::{arn_resource, partition_of, Arn};
+use fakecloud_aws::arn::{arn_resource, partition_for, partition_of, Arn};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_core::validation::*;
 use fakecloud_persistence::SnapshotStore;

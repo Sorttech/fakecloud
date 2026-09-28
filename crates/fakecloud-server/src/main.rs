@@ -7811,7 +7811,7 @@ async fn main() {
                                         let mut ctx = std::collections::HashMap::new();
                                         ctx.insert(
                                             "aws:s3:arn".to_string(),
-                                            fakecloud_aws::arn::Arn::s3_in(&region_for_inbound, bucket_name).to_string(),
+                                            fakecloud_aws::arn::Arn::s3(bucket_name).to_string(),
                                         );
                                         match delivery_for_inbound.kms_encrypt(
                                             &account_id,

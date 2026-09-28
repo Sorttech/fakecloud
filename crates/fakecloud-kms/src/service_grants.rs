@@ -98,13 +98,7 @@ impl KmsService {
                     true
                 }
             })
-            .map(|g| {
-                let key_arn = state.keys.get(&g.key_id).map_or_else(
-                    || kms_key_arn(&req.region, &req.account_id, &g.key_id),
-                    |k| k.arn.clone(),
-                );
-                grant_to_json(g, &req.account_id, &key_arn)
-            })
+            .map(|g| grant_to_json(g, state, &req.region))
             .collect();
 
         Ok(AwsResponse::json(
@@ -161,13 +155,7 @@ impl KmsService {
                     .as_deref()
                     .is_some_and(|rp| rp == retiring_principal)
             })
-            .map(|g| {
-                let key_arn = state.keys.get(&g.key_id).map_or_else(
-                    || kms_key_arn(&req.region, &req.account_id, &g.key_id),
-                    |k| k.arn.clone(),
-                );
-                grant_to_json(g, &req.account_id, &key_arn)
-            })
+            .map(|g| grant_to_json(g, state, &req.region))
             .collect();
         // Sort by GrantId so the marker (the GrantId of the last item on the
         // previous page) is a stable total-ordering key. Grants are stored in an

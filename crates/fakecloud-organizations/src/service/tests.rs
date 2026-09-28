@@ -1498,6 +1498,7 @@ async fn member_non_management_delete_returns_access_denied() {
                 joined_method: "INVITED".to_string(),
                 joined_timestamp: chrono::Utc::now(),
                 parent_id,
+                gov_cloud_mirror: false,
             },
         );
     }
@@ -3006,6 +3007,29 @@ async fn create_gov_cloud_account_returns_paired_id() {
         status["AccountId"].as_str().unwrap(),
         status["GovCloudAccountId"].as_str().unwrap()
     );
+}
+
+#[tokio::test]
+async fn create_gov_cloud_account_is_unavailable_outside_the_commercial_partition() {
+    for region in ["us-gov-west-1", "cn-north-1"] {
+        let (svc, _state) = OrganizationsService::shared();
+        let in_region = |action: &str, body: Value| {
+            let mut r = req_with("111111111111", action, body);
+            r.region = region.to_string();
+            r
+        };
+        svc.handle(in_region("CreateOrganization", json!({})))
+            .await
+            .unwrap();
+        let err = expect_err(
+            svc.handle(in_region(
+                "CreateGovCloudAccount",
+                json!({"Email": "gov@example.com", "AccountName": "Gov"}),
+            ))
+            .await,
+        );
+        assert_eq!(err.code(), "UnsupportedAPIEndpointException", "{region}");
+    }
 }
 
 /// Create the org, then add one member account and return its id.

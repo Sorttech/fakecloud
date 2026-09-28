@@ -2515,6 +2515,54 @@ async fn china_region_secret_arn_round_trips_across_accounts() {
     assert_eq!(body["SecretString"], "shhh");
 }
 
+#[tokio::test]
+async fn partial_arn_resolves_only_the_secret_it_names() {
+    let svc = SecretsManagerService::new(make_state());
+    let mut arns = HashMap::new();
+    for name in ["app-db", "app"] {
+        let resp = svc
+            .handle(make_request(
+                "CreateSecret",
+                &format!(r#"{{"Name": "{name}", "SecretString": "{name}-value"}}"#),
+            ))
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        arns.insert(name, body["ARN"].as_str().unwrap().to_string());
+        if name == "app-db" {
+            // With only `app-db` present, the partial ARN of `app` names
+            // nothing.
+            let app_partial = arns["app-db"]
+                .rsplit_once(":secret:")
+                .unwrap()
+                .0
+                .to_string()
+                + ":secret:app";
+            let err = expect_err(
+                svc.handle(make_request(
+                    "GetSecretValue",
+                    &format!(r#"{{"SecretId": "{app_partial}"}}"#),
+                ))
+                .await,
+            );
+            assert_eq!(err.code(), "ResourceNotFoundException");
+        }
+    }
+    for name in ["app", "app-db"] {
+        let partial = arns[name].rsplit_once('-').unwrap().0.to_string();
+        let resp = svc
+            .handle(make_request(
+                "GetSecretValue",
+                &format!(r#"{{"SecretId": "{partial}"}}"#),
+            ))
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        assert_eq!(body["Name"], name, "partial {partial}");
+        assert_eq!(body["SecretString"], format!("{name}-value"));
+    }
+}
+
 #[test]
 fn secret_owner_account_extracts_from_arn() {
     assert_eq!(

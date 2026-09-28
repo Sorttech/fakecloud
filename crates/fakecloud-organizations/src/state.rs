@@ -24,10 +24,9 @@ pub struct OrganizationsRegistry {
     orgs: BTreeMap<String, OrganizationState>,
 }
 
-/// A GovCloud mirror lives in the `aws-us-gov` partition, outside its
-/// organization's own partition.
-fn is_gov_cloud(org: &OrganizationState, account: &MemberAccount) -> bool {
-    partition_of(&account.arn) != partition_of(&org.org_arn)
+/// A GovCloud mirror created by `CreateGovCloudAccount`.
+fn is_gov_cloud(account: &MemberAccount) -> bool {
+    account.gov_cloud_mirror
 }
 
 /// Resolve a handshake or transfer target to an account id.
@@ -217,7 +216,7 @@ impl OrganizationsRegistry {
             if let Some(account) = self.orgs.get(within).and_then(|org| {
                 org.accounts
                     .values()
-                    .find(|a| a.email == target && !is_gov_cloud(org, a) && a.status != "SUSPENDED")
+                    .find(|a| a.email == target && !is_gov_cloud(a) && a.status != "SUSPENDED")
             }) {
                 return Some(account.id.clone());
             }
@@ -253,15 +252,13 @@ impl OrganizationsRegistry {
     pub fn account_registered_with(&self, email: &str) -> Option<String> {
         self.orgs
             .values()
-            .flat_map(|org| org.accounts.values().map(move |account| (org, account)))
+            .flat_map(|org| org.accounts.values())
             // A GovCloud mirror shares its commercial twin's address by
             // design; the commercial account is the one an address names.
-            .find(|(org, account)| {
-                account.email == email
-                    && !is_gov_cloud(org, account)
-                    && account.status != "SUSPENDED"
+            .find(|account| {
+                account.email == email && !is_gov_cloud(account) && account.status != "SUSPENDED"
             })
-            .map(|(_, account)| account.id.clone())
+            .map(|account| account.id.clone())
     }
 
     /// Like [`Self::email_in_use`], for the in-flight request
@@ -489,6 +486,9 @@ impl OrganizationsSnapshot {
         if let Some(org) = self.organization {
             registry.insert(org);
         }
+        for org in registry.orgs.values_mut() {
+            org.mark_legacy_gov_cloud_mirrors();
+        }
         registry
     }
 }
@@ -579,6 +579,25 @@ impl OrganizationState {
             .to_string()
     }
 
+    /// The partition this organization lives in.
+    pub fn partition(&self) -> &str {
+        partition_of(&self.org_arn)
+    }
+
+    /// Flag the GovCloud mirrors of a snapshot written before accounts
+    /// carried `gov_cloud_mirror`: in a commercial organization, the only
+    /// `aws-us-gov` accounts are the ones `CreateGovCloudAccount` paired.
+    fn mark_legacy_gov_cloud_mirrors(&mut self) {
+        if self.partition() != "aws" {
+            return;
+        }
+        for account in self.accounts.values_mut() {
+            if partition_of(&account.arn) == "aws-us-gov" {
+                account.gov_cloud_mirror = true;
+            }
+        }
+    }
+
     /// The ARN of `account_id` as a member of this organization.
     pub fn account_arn(&self, account_id: &str) -> String {
         self.resource_arn(&format!("account/{}/{account_id}", self.org_id))
@@ -655,6 +674,7 @@ impl OrganizationState {
                 joined_method: "INVITED".to_string(),
                 joined_timestamp: now,
                 parent_id: root_id.clone(),
+                gov_cloud_mirror: false,
             },
         );
 
@@ -894,6 +914,7 @@ impl OrganizationState {
                 joined_method: "CREATED".to_string(),
                 joined_timestamp: now,
                 parent_id: self.root_id.clone(),
+                gov_cloud_mirror: false,
             },
         );
 
@@ -921,6 +942,7 @@ impl OrganizationState {
                     joined_method: "CREATED".to_string(),
                     joined_timestamp: now,
                     parent_id: self.root_id.clone(),
+                    gov_cloud_mirror: true,
                 },
             );
         }
@@ -993,7 +1015,7 @@ impl OrganizationState {
             .find(|account| {
                 target_kind == "EMAIL"
                     && account.email == target_account_id
-                    && !is_gov_cloud(self, account)
+                    && !is_gov_cloud(account)
                     && account.status != "SUSPENDED"
             })
             .map(|account| account.id.clone())
@@ -1109,6 +1131,7 @@ impl OrganizationState {
                     joined_method: "INVITED".to_string(),
                     joined_timestamp: now,
                     parent_id: self.root_id.clone(),
+                    gov_cloud_mirror: false,
                 },
             );
         }
@@ -1410,6 +1433,7 @@ impl OrganizationState {
                 joined_method: "INVITED".to_string(),
                 joined_timestamp: Utc::now(),
                 parent_id: self.root_id.clone(),
+                gov_cloud_mirror: false,
             },
         );
     }
@@ -1828,6 +1852,10 @@ pub struct MemberAccount {
     pub joined_method: String,
     pub joined_timestamp: DateTime<Utc>,
     pub parent_id: String,
+    /// The GovCloud account `CreateGovCloudAccount` pairs with a commercial
+    /// one: it shares its twin's address, so address resolution skips it.
+    #[serde(default)]
+    pub gov_cloud_mirror: bool,
 }
 
 /// `InviteAccountToOrganization` handshake. Captures both parties so
@@ -2034,6 +2062,73 @@ mod tests {
             registry.account_registered_with("member@corp.example"),
             Some("222222222222".to_string())
         );
+    }
+
+    /// `CreateGovCloudAccount` flags its paired account as the mirror, so the
+    /// shared address names the commercial twin.
+    #[test]
+    fn a_created_gov_cloud_pair_flags_only_the_mirror() {
+        let mut org = OrganizationState::bootstrap("111111111111");
+        let status = org.begin_create_account(
+            "pair@corp.example",
+            "Pair",
+            "222222222222".to_string(),
+            Some("333333333333".to_string()),
+        );
+        org.complete_create_account(&status.id).unwrap();
+        assert!(!org.accounts["222222222222"].gov_cloud_mirror);
+        let mirror = &org.accounts["333333333333"];
+        assert!(mirror.gov_cloud_mirror);
+        assert!(mirror.arn.starts_with("arn:aws-us-gov:organizations::"));
+        let mut registry = OrganizationsRegistry::default();
+        registry.insert(org);
+        assert_eq!(
+            registry.account_registered_with("pair@corp.example"),
+            Some("222222222222".to_string())
+        );
+    }
+
+    /// A snapshot written before the flag existed: an `aws-us-gov` account
+    /// in a commercial organization is a mirror, while the members of a
+    /// GovCloud organization are not.
+    #[test]
+    fn loading_an_old_snapshot_flags_legacy_gov_cloud_mirrors() {
+        let mut commercial = OrganizationState::bootstrap("111111111111");
+        commercial.enroll_account_if_missing("333333333333");
+        commercial.accounts.get_mut("333333333333").unwrap().arn = format!(
+            "arn:aws-us-gov:organizations::111111111111:account/{}/333333333333",
+            commercial.org_id
+        );
+        let mut gov = OrganizationState::bootstrap_in("us-gov-west-1", "444444444444");
+        gov.enroll_account_if_missing("555555555555");
+        let mut registry = OrganizationsRegistry::default();
+        registry.insert(commercial);
+        registry.insert(gov);
+        let mut raw = serde_json::to_value(OrganizationsSnapshot {
+            schema_version: ORGANIZATIONS_SNAPSHOT_SCHEMA_VERSION,
+            organization: None,
+            organizations: registry,
+        })
+        .unwrap();
+        fn strip_flag(v: &mut serde_json::Value) {
+            match v {
+                serde_json::Value::Object(map) => {
+                    map.remove("gov_cloud_mirror");
+                    map.values_mut().for_each(strip_flag);
+                }
+                serde_json::Value::Array(items) => items.iter_mut().for_each(strip_flag),
+                _ => {}
+            }
+        }
+        strip_flag(&mut raw);
+        let loaded = serde_json::from_value::<OrganizationsSnapshot>(raw)
+            .unwrap()
+            .into_registry();
+        let commercial = loaded.org_of_account("111111111111").unwrap();
+        assert!(commercial.accounts["333333333333"].gov_cloud_mirror);
+        assert!(!commercial.accounts["111111111111"].gov_cloud_mirror);
+        let gov = loaded.org_of_account("444444444444").unwrap();
+        assert!(!gov.accounts["555555555555"].gov_cloud_mirror);
     }
 
     /// A v2 snapshot round-trips every organization, and the legacy

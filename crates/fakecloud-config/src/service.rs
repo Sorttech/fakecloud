@@ -466,8 +466,7 @@ impl AwsService for ConfigService {
                 self.describe_config_rule_evaluation_status(&account, &body)
             }
             "StartConfigRulesEvaluation" => {
-                self.start_config_rules_evaluation(&account, &region, &body)
-                    .await
+                self.start_config_rules_evaluation(&account, &body).await
             }
             "PutEvaluations" => self.put_evaluations(&account, &body),
             "PutExternalEvaluation" => self.put_external_evaluation(&account, &body),
@@ -1966,13 +1965,12 @@ impl ConfigService {
     async fn start_config_rules_evaluation(
         &self,
         account: &str,
-        region: &str,
         body: &Value,
     ) -> Result<AwsResponse, AwsServiceError> {
         self.ensure_evaluated(account);
         // For custom-Lambda rules, invoke the referenced function.
         let names = string_list(body, "ConfigRuleNames");
-        let custom_rules: Vec<(String, String, Option<String>)> = {
+        let custom_rules: Vec<(String, String, String, Option<String>)> = {
             let st = self.state.read();
             st.account(account)
                 .map(|a| {
@@ -1989,17 +1987,22 @@ impl ConfigService {
                                 .get("SourceIdentifier")
                                 .and_then(Value::as_str)?
                                 .to_string();
-                            Some((r.name.clone(), lambda_arn, r.input_parameters.clone()))
+                            Some((
+                                r.name.clone(),
+                                r.arn.clone(),
+                                lambda_arn,
+                                r.input_parameters.clone(),
+                            ))
                         })
                         .collect()
                 })
                 .unwrap_or_default()
         };
-        for (rule_name, lambda_arn, input_parameters) in custom_rules {
+        for (rule_name, rule_arn, lambda_arn, input_parameters) in custom_rules {
             self.invoke_custom_rule(
                 account,
-                region,
                 &rule_name,
+                &rule_arn,
                 &lambda_arn,
                 input_parameters.as_deref(),
             )
@@ -2015,8 +2018,8 @@ impl ConfigService {
     async fn invoke_custom_rule(
         &self,
         account: &str,
-        region: &str,
         rule_name: &str,
+        rule_arn: &str,
         lambda_arn: &str,
         input_parameters: Option<&str>,
     ) {
@@ -2031,7 +2034,13 @@ impl ConfigService {
             .unwrap_or(lambda_arn)
             .to_string();
         let result_token = format!("{rule_name}#{}", Uuid::new_v4());
-        let event = custom_rule_event(account, region, rule_name, input_parameters, &result_token);
+        let event = custom_rule_event(
+            account,
+            rule_name,
+            rule_arn,
+            input_parameters,
+            &result_token,
+        );
         // Resolve the Lambda in the rule's own account (not just the default
         // account) so a custom rule in a non-default account finds its function.
         let resolved = {
@@ -4771,8 +4780,8 @@ fn paged_response(field: &str, items: Vec<Value>, body: &Value, token_field: &st
 /// declared none — a custom rule that reads its parameters must see them.
 fn custom_rule_event(
     account: &str,
-    region: &str,
     rule_name: &str,
+    rule_arn: &str,
     input_parameters: Option<&str>,
     result_token: &str,
 ) -> Value {
@@ -4791,7 +4800,7 @@ fn custom_rule_event(
         "invokingEvent": invoking_event,
         "ruleParameters": rule_parameters,
         "resultToken": result_token,
-        "configRuleArn": config_arn(region, account, &format!("config-rule/{rule_name}")),
+        "configRuleArn": rule_arn,
         "configRuleName": rule_name,
         "accountId": account,
     })
@@ -4821,10 +4830,11 @@ mod unit_tests {
     #[test]
     fn custom_rule_event_passes_stored_input_parameters() {
         let params = r#"{"maxAccessKeyAge":"90"}"#;
+        let rule_arn = "arn:aws:config:eu-west-1:111122223333:config-rule/config-rule-abc123";
         let event = custom_rule_event(
             "111122223333",
-            "eu-west-1",
             "my-rule",
+            rule_arn,
             Some(params),
             "my-rule#tok",
         );
@@ -4834,19 +4844,16 @@ mod unit_tests {
         assert_eq!(event["configRuleName"], json!("my-rule"));
         assert_eq!(event["accountId"], json!("111122223333"));
         assert_eq!(event["resultToken"], json!("my-rule#tok"));
-        // The event's configRuleArn must carry the rule's region so it matches
-        // the ARN DescribeConfigRules returns, not a hardcoded us-east-1.
-        assert_eq!(
-            event["configRuleArn"],
-            json!("arn:aws:config:eu-west-1:111122223333:config-rule/my-rule")
-        );
+        // The event's configRuleArn is the rule's stored ARN, the one
+        // DescribeConfigRules returns.
+        assert_eq!(event["configRuleArn"], json!(rule_arn));
     }
 
     #[test]
     fn custom_rule_event_defaults_empty_parameters_to_empty_object() {
-        let none = custom_rule_event("111122223333", "us-west-2", "r", None, "r#t");
+        let none = custom_rule_event("111122223333", "r", "arn", None, "r#t");
         assert_eq!(none["ruleParameters"], json!("{}"));
-        let empty = custom_rule_event("111122223333", "us-west-2", "r", Some(""), "r#t");
+        let empty = custom_rule_event("111122223333", "r", "arn", Some(""), "r#t");
         assert_eq!(empty["ruleParameters"], json!("{}"));
     }
 

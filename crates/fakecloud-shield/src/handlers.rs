@@ -64,7 +64,10 @@ impl ShieldService {
         let resource_arn = sf(&body, "ResourceArn").unwrap_or("").to_string();
         // Shield only protects a fixed set of resource kinds; a value that is
         // not an ARN cannot be protected.
-        if !resource_arn.starts_with("arn:aws") {
+        let in_known_partition = resource_arn
+            .parse::<fakecloud_aws::arn::Arn>()
+            .is_ok_and(|arn| fakecloud_aws::arn::PARTITIONS.contains(&arn.partition.as_str()));
+        if !in_known_partition {
             return Err(invalid_resource(
                 "The resource is not valid or does not have a supported resource type.",
             ));
@@ -1031,6 +1034,30 @@ mod handler_tests {
             body_of(&sub)["Subscription"]["SubscriptionArn"],
             json!("arn:aws-cn:shield::000000000000:subscription")
         );
+    }
+
+    #[test]
+    fn create_protection_requires_a_known_partition() {
+        let s = svc();
+        let err = s
+            .create_protection(&req(
+                "CreateProtection",
+                json!({
+                    "Name": "bogus",
+                    "ResourceArn": "arn:awsbogus:ec2:us-east-1:000000000000:eip-allocation/eipalloc-1"
+                }),
+            ))
+            .err()
+            .expect("an unknown partition is not a protectable resource");
+        assert_eq!(err.code(), "InvalidResourceException");
+        s.create_protection(&req(
+            "CreateProtection",
+            json!({
+                "Name": "gov",
+                "ResourceArn": "arn:aws-us-gov:ec2:us-gov-west-1:000000000000:eip-allocation/eipalloc-1"
+            }),
+        ))
+        .unwrap();
     }
 
     #[test]
