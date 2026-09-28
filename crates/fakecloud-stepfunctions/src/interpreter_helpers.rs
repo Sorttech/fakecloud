@@ -394,6 +394,7 @@ pub(crate) fn execute_pass_state(state_def: &Value, input: &Value) -> Value {
 pub(crate) fn invoke_sqs_send_message(
     input: &Value,
     delivery: &Option<Arc<DeliveryBus>>,
+    region: &str,
 ) -> Result<Value, (String, String)> {
     let delivery = delivery.as_ref().ok_or_else(|| {
         (
@@ -421,7 +422,7 @@ pub(crate) fn invoke_sqs_send_message(
     // Convert QueueUrl to ARN format for the delivery bus
     // QueueUrl format: http://.../<account>/<queue-name>
     // ARN format: arn:aws:sqs:<region>:<account>:<queue-name>
-    let queue_arn = queue_url_to_arn(queue_url);
+    let queue_arn = queue_url_to_arn(queue_url, region);
 
     delivery.send_to_sqs(&queue_arn, &message_body, &HashMap::new());
 
@@ -1073,12 +1074,17 @@ pub(crate) fn split_top_op(s: &str, op: char) -> Option<(&str, &str)> {
 
 /// Convert an SQS queue URL to an ARN.
 /// QueueUrl format: http://localhost:4566/123456789012/my-queue
-pub(crate) fn queue_url_to_arn(url: &str) -> String {
+pub(crate) fn queue_url_to_arn(url: &str, region: &str) -> String {
     let parts: Vec<&str> = url.rsplitn(3, '/').collect();
     if parts.len() >= 2 {
         let queue_name = parts[0];
         let account_id = parts[1];
-        Arn::new("sqs", "us-east-1", account_id, queue_name).to_string()
+        let region = if region.is_empty() {
+            "us-east-1"
+        } else {
+            region
+        };
+        Arn::regional("sqs", region, account_id, queue_name).to_string()
     } else {
         url.to_string()
     }

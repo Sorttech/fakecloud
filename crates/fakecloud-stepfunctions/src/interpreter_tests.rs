@@ -936,14 +936,14 @@ fn apply_state_catcher_returns_none_without_match() {
 #[test]
 fn queue_url_to_arn_parses_account_and_name() {
     assert_eq!(
-        queue_url_to_arn("http://sqs.local:4566/123456789012/my-queue"),
+        queue_url_to_arn("http://sqs.local:4566/123456789012/my-queue", "us-east-1"),
         "arn:aws:sqs:us-east-1:123456789012:my-queue"
     );
 }
 
 #[test]
 fn queue_url_to_arn_falls_back_for_unparseable_input() {
-    assert_eq!(queue_url_to_arn("bad"), "bad");
+    assert_eq!(queue_url_to_arn("bad", "us-east-1"), "bad");
 }
 
 #[test]
@@ -1149,6 +1149,36 @@ fn task_dynamodb_get_item_without_state_fails() {
         assert_eq!(exec.status, ExecutionStatus::Failed);
         assert!(exec.cause.as_deref().unwrap().contains("DynamoDB"));
     });
+}
+
+#[test]
+fn china_partition_integration_resource_is_dispatched() {
+    let state = make_state();
+    let arn = arn_for("ddb-get-cn");
+    let def = json!({
+        "StartAt": "T",
+        "States": {
+            "T": {
+                "Type": "Task",
+                "Resource": "arn:aws-cn:states:::dynamodb:getItem",
+                "Parameters": { "TableName": "t", "Key": { "id": { "S": "1" } } },
+                "End": true
+            }
+        }
+    });
+    drive(&state, &arn, def, Some("{}"));
+    read_exec(&state, &arn, |exec| {
+        assert_eq!(exec.status, ExecutionStatus::Failed);
+        assert!(exec.cause.as_deref().unwrap().contains("DynamoDB"));
+    });
+}
+
+#[test]
+fn queue_url_to_arn_uses_the_region_partition() {
+    assert_eq!(
+        queue_url_to_arn("http://sqs.local:4566/123456789012/my-queue", "cn-north-1"),
+        "arn:aws-cn:sqs:cn-north-1:123456789012:my-queue"
+    );
 }
 
 // ── Terminal guards on succeed/fail helpers ──────────────────────

@@ -334,6 +334,43 @@ pub struct TrustStoreRevocation {
     pub content: Vec<u8>,
 }
 
+/// An Elastic Load Balancing ARN in `region`'s partition.
+fn elb_arn(region: &str, account_id: &str, resource: &str) -> String {
+    fakecloud_aws::arn::Arn::regional("elasticloadbalancing", region, account_id, resource)
+        .to_string()
+}
+
+/// The ARN of a load balancer of `lb_type` (`application`, `network` or
+/// `gateway`).
+pub fn load_balancer_arn(
+    region: &str,
+    account_id: &str,
+    lb_type: &str,
+    name: &str,
+    suffix: &str,
+) -> String {
+    let prefix = match lb_type {
+        "network" => "net",
+        "gateway" => "gwy",
+        _ => "app",
+    };
+    elb_arn(
+        region,
+        account_id,
+        &format!("loadbalancer/{prefix}/{name}/{suffix}"),
+    )
+}
+
+/// The ARN of a target group.
+pub fn target_group_arn(region: &str, account_id: &str, name: &str, suffix: &str) -> String {
+    elb_arn(region, account_id, &format!("targetgroup/{name}/{suffix}"))
+}
+
+/// The ARN of a trust store.
+pub fn trust_store_arn(region: &str, account_id: &str, name: &str, suffix: &str) -> String {
+    elb_arn(region, account_id, &format!("truststore/{name}/{suffix}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

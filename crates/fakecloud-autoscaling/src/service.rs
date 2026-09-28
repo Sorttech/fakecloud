@@ -8,6 +8,7 @@ use http::StatusCode;
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
+use fakecloud_aws::arn::partition_for;
 use fakecloud_core::query::{optional_query_param, query_response_xml, required_query_param};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_persistence::{SnapshotHook, SnapshotStore};
@@ -379,13 +380,19 @@ fn parse_instance_ids(xml: &str) -> Vec<String> {
     out
 }
 
+/// The ARN of an Auto Scaling resource of `kind` (`autoScalingGroup`,
+/// `launchConfiguration`), e.g.
+/// `arn:aws:autoscaling:us-east-1:123:autoScalingGroup:<id>:autoScalingGroupName/<name>`.
+pub fn autoscaling_arn(region: &str, account_id: &str, kind: &str, id: &str, name: &str) -> String {
+    format!(
+        "arn:{}:autoscaling:{region}:{account_id}:{kind}:{id}:{kind}Name/{name}",
+        partition_for(region)
+    )
+}
+
 impl AutoScalingService {
     fn arn(&self, account: &str, region: &str, kind: &str, name: &str) -> String {
-        // e.g. arn:aws:autoscaling:us-east-1:123:autoScalingGroup:<uuid>:autoScalingGroupName/<name>
-        format!(
-            "arn:aws:autoscaling:{region}:{account}:{kind}:{}:{kind}Name/{name}",
-            Uuid::new_v4()
-        )
+        autoscaling_arn(region, account, kind, &Uuid::new_v4().to_string(), name)
     }
 
     fn create_launch_configuration(
@@ -560,7 +567,8 @@ impl AutoScalingService {
             service_linked_role_arn: optional_query_param(req, "ServiceLinkedRoleARN")
                 .unwrap_or_else(|| {
                     format!(
-                        "arn:aws:iam::{}:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling",
+                        "arn:{}:iam::{}:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling",
+                        partition_for(&req.region),
                         req.account_id
                     )
                 }),
@@ -1713,6 +1721,50 @@ mod tests {
         assert!(
             !page3.contains("<NextToken>"),
             "last page has no token: {page3}"
+        );
+    }
+
+    #[test]
+    fn china_region_arns_use_the_aws_cn_partition() {
+        let s = svc();
+        let call = |action: &str, params: &[(&str, &str)]| {
+            let mut r = req(action, params);
+            r.region = "cn-north-1".into();
+            let resp = futures_block(s.handle(r)).unwrap();
+            String::from_utf8_lossy(resp.body.expect_bytes()).to_string()
+        };
+        call(
+            "CreateLaunchConfiguration",
+            &[
+                ("LaunchConfigurationName", "lc-cn"),
+                ("ImageId", "ami-1"),
+                ("InstanceType", "t3.micro"),
+            ],
+        );
+        call(
+            "CreateAutoScalingGroup",
+            &[
+                ("AutoScalingGroupName", "asg-cn"),
+                ("LaunchConfigurationName", "lc-cn"),
+                ("MinSize", "0"),
+                ("MaxSize", "1"),
+                ("DesiredCapacity", "0"),
+                ("AvailabilityZones.member.1", "cn-north-1a"),
+            ],
+        );
+        let lcs = call("DescribeLaunchConfigurations", &[]);
+        assert!(
+            lcs.contains("<LaunchConfigurationARN>arn:aws-cn:autoscaling:cn-north-1:123456789012:launchConfiguration:"),
+            "{lcs}"
+        );
+        let groups = call("DescribeAutoScalingGroups", &[]);
+        assert!(
+            groups.contains("<AutoScalingGroupARN>arn:aws-cn:autoscaling:cn-north-1:123456789012:autoScalingGroup:"),
+            "{groups}"
+        );
+        assert!(
+            groups.contains("<ServiceLinkedRoleARN>arn:aws-cn:iam::123456789012:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling</ServiceLinkedRoleARN>"),
+            "{groups}"
         );
     }
 }

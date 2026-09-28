@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 
+use fakecloud_aws::arn::{arn_resource, partition_for};
 use fakecloud_core::delivery::DeliveryBus;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 
@@ -29,7 +30,7 @@ fn validate_required(field: &str, value: &serde_json::Value) -> Result<(), AwsSe
 /// UntagResource, GetTags, and GetApi share one source of truth. Mirrors
 /// `stage_resource_arn` for the stage collection.
 fn api_resource_arn(region: &str, api_id: &str) -> String {
-    format!("arn:aws:apigateway:{region}::/apis/{api_id}")
+    crate::state::apigateway_arn(region, "", &format!("/apis/{api_id}"))
 }
 
 /// Overlay the ARN-keyed tag store (`state.tags[arn]`) onto a serialized
@@ -441,15 +442,18 @@ fn extract_identity_source_value(req: &AwsRequest, source: &str) -> Option<Strin
 fn issuer_to_pool_arn(account_id: &str, region: &str, issuer: &str) -> Option<String> {
     let pool_id = issuer.rsplit_once('/')?.1;
     Some(format!(
-        "arn:aws:cognito-idp:{}:{}:userpool/{}",
-        region, account_id, pool_id
+        "arn:{}:cognito-idp:{}:{}:userpool/{}",
+        partition_for(region),
+        region,
+        account_id,
+        pool_id
     ))
 }
 
 /// Pull a Lambda function ARN out of an `authorizerUri` value.
 fn extract_lambda_arn(uri: &str) -> Option<String> {
     // Expected: arn:aws:apigateway:<region>:lambda:path/2015-03-31/functions/<arn>/invocations
-    let suffix = uri.strip_prefix("arn:aws:apigateway:")?;
+    let suffix = arn_resource(uri, "apigateway")?;
     let rest = suffix.split_once("lambda:path/2015-03-31/functions/")?.1;
     let arn = rest.strip_suffix("/invocations")?;
     Some(arn.to_string())
@@ -480,14 +484,10 @@ fn build_method_arn(req: &AwsRequest, api_id: &str, stage: &str) -> String {
             .collect::<Vec<_>>()
     };
     let path = segments.join("/");
-    format!(
-        "arn:aws:execute-api:{}:{}:{}/{}/{}/{}",
-        req.region,
-        req.account_id,
-        api_id,
-        stage,
-        req.method.as_str(),
-        path
+    crate::state::execute_api_arn(
+        &req.region,
+        &req.account_id,
+        &format!("{api_id}/{stage}/{}/{path}", req.method.as_str()),
     )
 }
 
@@ -661,7 +661,7 @@ fn resolve_custom_domain(
 
 /// Returns true when `uri` is a Lambda function ARN.
 fn is_lambda_arn(uri: &str) -> bool {
-    uri.starts_with("arn:aws:lambda:") && uri.contains(":function:")
+    arn_resource(uri, "lambda").is_some() && uri.contains(":function:")
 }
 
 /// Dispatch a non-Lambda AWS_PROXY integration to the appropriate
@@ -674,7 +674,7 @@ fn dispatch_aws_service_integration(
     integration_uri: &str,
     req: &AwsRequest,
 ) -> Result<AwsResponse, AwsServiceError> {
-    if integration_uri.starts_with("arn:aws:sqs:") {
+    if arn_resource(integration_uri, "sqs").is_some() {
         let message = String::from_utf8_lossy(&req.body);
         delivery.send_to_sqs(integration_uri, &message, &std::collections::HashMap::new());
         return Ok(AwsResponse::ok_json(json!({
@@ -683,7 +683,7 @@ fn dispatch_aws_service_integration(
         })));
     }
 
-    if integration_uri.starts_with("arn:aws:sns:") {
+    if arn_resource(integration_uri, "sns").is_some() {
         let message = String::from_utf8_lossy(&req.body);
         let subject = req
             .headers
@@ -696,7 +696,8 @@ fn dispatch_aws_service_integration(
         })));
     }
 
-    if integration_uri.starts_with("arn:aws:states:") && integration_uri.contains(":stateMachine:")
+    if arn_resource(integration_uri, "states").is_some()
+        && integration_uri.contains(":stateMachine:")
     {
         let input = String::from_utf8_lossy(&req.body);
         let execution_name = format!("apigw-{}-{}", req.request_id, uuid::Uuid::new_v4().simple());

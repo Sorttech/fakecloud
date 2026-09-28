@@ -436,9 +436,10 @@ impl StepFunctionsService {
             // unlikely) UUID collision, mirroring the async StartExecution path.
             let (exec_name, exec_arn) = loop {
                 let candidate = format!("sync-{}", uuid::Uuid::new_v4());
-                let arn = format!(
-                    "arn:aws:states:{}:{}:express:{}:{}",
-                    req.region, state.account_id, sm.name, candidate
+                let arn = crate::state::states_arn(
+                    &req.region,
+                    &state.account_id,
+                    &format!("express:{}:{candidate}", sm.name),
                 );
                 if !state.executions.contains_key(&arn) {
                     break (candidate, arn);

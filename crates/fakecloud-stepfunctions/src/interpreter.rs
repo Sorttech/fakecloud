@@ -5,7 +5,7 @@ use chrono::Utc;
 use serde_json::{json, Value};
 use tracing::{debug, warn};
 
-use fakecloud_aws::arn::Arn;
+use fakecloud_aws::arn::{arn_resource, Arn};
 use fakecloud_core::delivery::DeliveryBus;
 use fakecloud_dynamodb::SharedDynamoDbState;
 
@@ -47,6 +47,7 @@ pub async fn execute_state_machine(
         .unwrap_or(json!({}));
 
     // Record ExecutionStarted event
+    let role_arn = execution_role_arn(&state, &execution_arn);
     add_event(
         &state,
         &execution_arn,
@@ -54,7 +55,7 @@ pub async fn execute_state_machine(
         0,
         json!({
             "input": serde_json::to_string(&raw_input).expect("serde_json::Value serialization is infallible"),
-            "roleArn": "arn:aws:iam::123456789012:role/execution-role"
+            "roleArn": role_arn
         }),
     );
 
@@ -1207,8 +1208,11 @@ async fn invoke_resource(
         return invoke_lambda_direct(resource, input, delivery, timeout_seconds).await;
     }
 
-    // SDK integration patterns: arn:aws:states:::<service>:<action>
-    if resource.starts_with("arn:aws:states:::lambda:invoke") {
+    // SDK integration patterns: arn:<partition>:states:::<service>:<action>
+    let integration = arn_resource(resource, "states").and_then(|r| r.strip_prefix("::"));
+    let is_integration = |prefix: &str| integration.is_some_and(|t| t.starts_with(prefix));
+
+    if is_integration("lambda:invoke") {
         let function_name = input["FunctionName"].as_str().unwrap_or("");
         let payload = if let Some(p) = input.get("Payload") {
             p.clone()
@@ -1235,31 +1239,32 @@ async fn invoke_resource(
             });
     }
 
-    if resource.starts_with("arn:aws:states:::sqs:sendMessage") {
-        return invoke_sqs_send_message(input, delivery);
+    if is_integration("sqs:sendMessage") {
+        let region = execution_arn.split(':').nth(3).unwrap_or_default();
+        return invoke_sqs_send_message(input, delivery, region);
     }
 
-    if resource.starts_with("arn:aws:states:::sns:publish") {
+    if is_integration("sns:publish") {
         return invoke_sns_publish(input, delivery);
     }
 
-    if resource.starts_with("arn:aws:states:::events:putEvents") {
+    if is_integration("events:putEvents") {
         return invoke_eventbridge_put_events(input, delivery);
     }
 
-    if resource.starts_with("arn:aws:states:::dynamodb:getItem") {
+    if is_integration("dynamodb:getItem") {
         return invoke_dynamodb_get_item(input, dynamodb_state);
     }
 
-    if resource.starts_with("arn:aws:states:::dynamodb:putItem") {
+    if is_integration("dynamodb:putItem") {
         return invoke_dynamodb_put_item(input, dynamodb_state);
     }
 
-    if resource.starts_with("arn:aws:states:::dynamodb:deleteItem") {
+    if is_integration("dynamodb:deleteItem") {
         return invoke_dynamodb_delete_item(input, dynamodb_state);
     }
 
-    if resource.starts_with("arn:aws:states:::dynamodb:updateItem") {
+    if is_integration("dynamodb:updateItem") {
         return invoke_dynamodb_update_item(input, dynamodb_state);
     }
 
@@ -1270,7 +1275,7 @@ async fn invoke_resource(
     // call. `.sync` polls `DescribeExecution` until the inner execution
     // reaches a terminal state, mirroring AWS' behavior of bubbling the
     // inner Output back to the parent.
-    if let Some(tail) = resource.strip_prefix("arn:aws:states:::") {
+    if let Some(tail) = integration {
         if tail.starts_with("states:startExecution") {
             let account_id = account_from_execution_arn(execution_arn);
             let result =
@@ -1304,7 +1309,7 @@ async fn invoke_resource(
     // ServiceRegistry, passing the Task's `Parameters` block as the
     // request body. Mirrors the AWS SDK service integration pattern in
     // real Step Functions.
-    if let Some(rest) = resource.strip_prefix("arn:aws:states:::aws-sdk:") {
+    if let Some(rest) = integration.and_then(|t| t.strip_prefix("aws-sdk:")) {
         let account_id = account_from_execution_arn(execution_arn);
         return invoke_aws_sdk_integration(rest, input, registry, &account_id, timeout_seconds)
             .await;
@@ -1313,7 +1318,7 @@ async fn invoke_resource(
     // Optimized service integrations expose `.sync` variants for ECS,
     // Athena, and Glue. Route them through the same waiter machinery as
     // `aws-sdk:` so callers can write the AWS-blessed ARN forms.
-    if let Some(tail) = resource.strip_prefix("arn:aws:states:::") {
+    if let Some(tail) = integration {
         if tail.contains(".sync") {
             let account_id = account_from_execution_arn(execution_arn);
             return invoke_aws_sdk_integration(tail, input, registry, &account_id, timeout_seconds)
@@ -1350,6 +1355,21 @@ fn map_sdk_service_id(service_id: &str) -> &str {
         // Default: pass through unchanged.
         other => other,
     }
+}
+
+/// The role of the state machine an execution belongs to, as recorded on its
+/// `ExecutionStarted` history event.
+fn execution_role_arn(state: &SharedStepFunctionsState, execution_arn: &str) -> String {
+    let accounts = state.read();
+    accounts
+        .get(account_id_from_arn(execution_arn))
+        .and_then(|s| {
+            let exec = s.executions.get(execution_arn)?;
+            s.state_machines
+                .get(&exec.state_machine_arn)
+                .map(|sm| sm.role_arn.clone())
+        })
+        .unwrap_or_default()
 }
 
 /// Extract the AWS account id from a Step Functions execution ARN

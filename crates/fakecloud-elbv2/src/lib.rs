@@ -9,8 +9,9 @@ pub const ELBV2_NAMESPACE: &str = "http://elasticloadbalancing.amazonaws.com/doc
 
 pub use service::Elbv2Service;
 pub use state::{
-    Action, AvailabilityZone, Certificate, Elbv2Accounts, Elbv2Snapshot, FixedResponseConfig,
-    ForwardConfig, Listener, LoadBalancer, LoadBalancerAddress, RedirectConfig, Rule,
-    RuleCondition, SharedElbv2State, Tag, TargetDescription, TargetGroup, TargetGroupTuple,
-    TargetHealth, TrustStore, ELBV2_SNAPSHOT_SCHEMA_VERSION,
+    load_balancer_arn, target_group_arn, trust_store_arn, Action, AvailabilityZone, Certificate,
+    Elbv2Accounts, Elbv2Snapshot, FixedResponseConfig, ForwardConfig, Listener, LoadBalancer,
+    LoadBalancerAddress, RedirectConfig, Rule, RuleCondition, SharedElbv2State, Tag,
+    TargetDescription, TargetGroup, TargetGroupTuple, TargetHealth, TrustStore,
+    ELBV2_SNAPSHOT_SCHEMA_VERSION,
 };

@@ -107,5 +107,9 @@ pub(super) fn extract_lambda_arn(uri: &str) -> Option<String> {
 /// with an API Gateway v1 stage:
 /// `arn:aws:apigateway:<region>::/restapis/<api>/stages/<stage>`.
 pub(super) fn stage_resource_arn(region: &str, api_id: &str, stage_name: &str) -> String {
-    format!("arn:aws:apigateway:{region}::/restapis/{api_id}/stages/{stage_name}",)
+    crate::state::apigateway_arn(
+        region,
+        "",
+        &format!("/restapis/{api_id}/stages/{stage_name}"),
+    )
 }

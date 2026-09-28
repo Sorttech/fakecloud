@@ -1147,6 +1147,60 @@ mod tests {
         b["stateMachineArn"].as_str().unwrap().to_string()
     }
 
+    #[test]
+    fn china_region_arns_use_the_aws_cn_partition() {
+        let svc = StepFunctionsService::new(make_state());
+        let in_china = |action: &str, body: Value| {
+            let mut req = make_request(action, &body.to_string());
+            req.region = "cn-north-1".to_string();
+            req
+        };
+        let resp = svc
+            .create_state_machine(&in_china(
+                "CreateStateMachine",
+                json!({
+                    "name": "cn-sm",
+                    "definition": VALID_DEF,
+                    "roleArn": "arn:aws-cn:iam::123456789012:role/test",
+                }),
+            ))
+            .unwrap();
+        let sm_arn = body_json(&resp)["stateMachineArn"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            sm_arn,
+            "arn:aws-cn:states:cn-north-1:123456789012:stateMachine:cn-sm"
+        );
+        let resp = svc
+            .describe_state_machine(&in_china(
+                "DescribeStateMachine",
+                json!({"stateMachineArn": sm_arn}),
+            ))
+            .unwrap();
+        assert_eq!(body_json(&resp)["name"], "cn-sm");
+
+        let resp = svc
+            .create_activity(&in_china("CreateActivity", json!({"name": "cn-act"})))
+            .unwrap();
+        let activity_arn = body_json(&resp)["activityArn"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            activity_arn,
+            "arn:aws-cn:states:cn-north-1:123456789012:activity:cn-act"
+        );
+        let resp = svc
+            .describe_activity(&in_china(
+                "DescribeActivity",
+                json!({"activityArn": activity_arn}),
+            ))
+            .unwrap();
+        assert_eq!(body_json(&resp)["name"], "cn-act");
+    }
+
     // ── CreateStateMachine ──
 
     #[test]

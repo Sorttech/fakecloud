@@ -85,7 +85,7 @@ CRATES=(
   fakecloud-mwaa             # only core/persistence deps
   fakecloud-fis              # only core/persistence deps
   fakecloud-xray             # only core/persistence/aws deps
-  fakecloud-appsync          # only core/persistence deps
+  fakecloud-appsync          # only core/persistence/aws deps
   fakecloud-amplify          # only core/persistence deps
   fakecloud-mediaconvert     # only core/persistence deps
   fakecloud-serverlessrepo   # only core/persistence deps

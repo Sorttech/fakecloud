@@ -9,7 +9,8 @@ pub(crate) mod workflows;
 
 pub use service::LambdaService;
 pub use state::{
-    AttachedLayer, EventSourceMapping, FunctionAlias, FunctionUrlConfig, LambdaFunction,
-    LambdaInvocation, LambdaSnapshot, LambdaState, Layer, LayerVersion,
-    ProvisionedConcurrencyConfig, SharedLambdaState, LAMBDA_SNAPSHOT_SCHEMA_VERSION,
+    function_arn, layer_arn, qualified_function_arn, AttachedLayer, EventSourceMapping,
+    FunctionAlias, FunctionUrlConfig, LambdaFunction, LambdaInvocation, LambdaSnapshot,
+    LambdaState, Layer, LayerVersion, ProvisionedConcurrencyConfig, SharedLambdaState,
+    LAMBDA_SNAPSHOT_SCHEMA_VERSION,
 };

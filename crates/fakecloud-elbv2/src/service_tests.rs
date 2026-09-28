@@ -797,3 +797,89 @@ async fn add_trust_store_revocations_counts_agree() {
         .unwrap();
     assert!(body_string(&describe).contains("<TotalRevokedEntries>1</TotalRevokedEntries>"));
 }
+
+#[tokio::test]
+async fn china_region_arns_use_the_aws_cn_partition() {
+    let svc = svc();
+    let call = |action: &'static str, params: Vec<(&'static str, String)>| {
+        let svc = &svc;
+        async move {
+            let params: Vec<(&str, &str)> = params.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            let mut r = req(action, &params);
+            r.region = "cn-north-1".to_string();
+            body_string(&svc.handle(r).await.unwrap())
+        }
+    };
+    let between = |body: &str, tag: &str| {
+        let open = format!("<{tag}>");
+        let start = body.find(&open).unwrap() + open.len();
+        let end = start + body[start..].find(&format!("</{tag}>")).unwrap();
+        body[start..end].to_string()
+    };
+
+    let body = call(
+        "CreateLoadBalancer",
+        vec![
+            ("Name", "cnlb".into()),
+            ("Subnets.member.1", "subnet-1".into()),
+        ],
+    )
+    .await;
+    let lb_arn = between(&body, "LoadBalancerArn");
+    assert!(
+        lb_arn.starts_with(
+            "arn:aws-cn:elasticloadbalancing:cn-north-1:123456789012:loadbalancer/app/cnlb/"
+        ),
+        "{lb_arn}"
+    );
+
+    let body = call(
+        "CreateTargetGroup",
+        vec![
+            ("Name", "cntg".into()),
+            ("Protocol", "HTTP".into()),
+            ("Port", "80".into()),
+            ("VpcId", "vpc-1".into()),
+        ],
+    )
+    .await;
+    let tg_arn = between(&body, "TargetGroupArn");
+    assert!(
+        tg_arn.starts_with(
+            "arn:aws-cn:elasticloadbalancing:cn-north-1:123456789012:targetgroup/cntg/"
+        ),
+        "{tg_arn}"
+    );
+
+    let body = call(
+        "CreateListener",
+        vec![
+            ("LoadBalancerArn", lb_arn.clone()),
+            ("Protocol", "HTTP".into()),
+            ("Port", "80".into()),
+            ("DefaultActions.member.1.Type", "forward".into()),
+            ("DefaultActions.member.1.TargetGroupArn", tg_arn.clone()),
+        ],
+    )
+    .await;
+    let listener_arn = between(&body, "ListenerArn");
+    assert!(
+        listener_arn.starts_with(
+            "arn:aws-cn:elasticloadbalancing:cn-north-1:123456789012:listener/app/cnlb/"
+        ),
+        "{listener_arn}"
+    );
+
+    let body = call(
+        "DescribeLoadBalancers",
+        vec![("LoadBalancerArns.member.1", lb_arn.clone())],
+    )
+    .await;
+    assert!(body.contains(&lb_arn), "{body}");
+    let body = call(
+        "DescribeTargetGroups",
+        vec![("TargetGroupArns.member.1", tg_arn.clone())],
+    )
+    .await;
+    assert!(body.contains(&tg_arn), "{body}");
+}

@@ -249,10 +249,8 @@ impl EcrService {
                 // the fakecloud flow honest by mirroring the source repo
                 // metadata when the target hasn't been pre-provisioned.
                 if !target_state.repositories.contains_key(repo_name) {
-                    let arn = format!(
-                        "arn:aws:ecr:{}:{}:repository/{}",
-                        dest.region, dest.registry_id, repo_name
-                    );
+                    let arn =
+                        crate::state::repository_arn(&dest.region, &dest.registry_id, repo_name);
                     let repo = Repository::new(repo_name, arn, &dest.registry_id, &endpoint);
                     target_state
                         .repositories

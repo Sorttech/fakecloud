@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use super::*;
+use crate::state::principal_settings_key;
 
 /// Valid `SettingName` enum values from the ECS Smithy model. Used by all
 /// {Put,PutDefault,Delete,List}AccountSettings* operations to validate the
@@ -25,6 +26,16 @@ const SETTING_NAME_VALUES: &[&str] = &[
     "fargateEventWindows",
 ];
 
+/// Render a stored principal-settings key in `region`'s partition.
+fn principal_in_region_partition(key: &str, region: &str) -> String {
+    match key.parse::<Arn>() {
+        Ok(arn) => arn
+            .with_partition(fakecloud_aws::arn::partition_for(region))
+            .to_string(),
+        Err(_) => key.to_string(),
+    }
+}
+
 impl EcsService {
     pub(super) fn put_account_setting(
         &self,
@@ -37,13 +48,15 @@ impl EcsService {
         let principal_arn = opt_str(&body, "principalArn")
             .map(String::from)
             .or_else(|| request.principal.as_ref().map(|p| p.arn.clone()))
-            .unwrap_or_else(|| Arn::global("iam", &request.account_id, "root").to_string());
+            .unwrap_or_else(|| {
+                Arn::global_in(&request.region, "iam", &request.account_id, "root").to_string()
+            });
         let account = request.account_id.clone();
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&account);
         state
             .principal_account_settings
-            .entry(principal_arn.clone())
+            .entry(principal_settings_key(&principal_arn))
             .or_default()
             .insert(name.clone(), value.clone());
         Ok(AwsResponse::ok_json(json!({
@@ -73,7 +86,8 @@ impl EcsService {
             "setting": {
                 "name": name,
                 "value": value,
-                "principalArn": Arn::global("iam", &state.account_id, "root").to_string(),
+                "principalArn": Arn::global_in(&request.region, "iam", &state.account_id, "root")
+                    .to_string(),
             }
         })))
     }
@@ -88,13 +102,15 @@ impl EcsService {
         let principal_arn = opt_str(&body, "principalArn")
             .map(String::from)
             .or_else(|| request.principal.as_ref().map(|p| p.arn.clone()))
-            .unwrap_or_else(|| Arn::global("iam", &request.account_id, "root").to_string());
+            .unwrap_or_else(|| {
+                Arn::global_in(&request.region, "iam", &request.account_id, "root").to_string()
+            });
         let account = request.account_id.clone();
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&account);
         let removed_value = state
             .principal_account_settings
-            .get_mut(&principal_arn)
+            .get_mut(&principal_settings_key(&principal_arn))
             .and_then(|m| m.remove(&name));
         Ok(AwsResponse::ok_json(json!({
             "setting": {
@@ -124,7 +140,9 @@ impl EcsService {
         let Some(state) = accounts.get(&account) else {
             return Ok(AwsResponse::ok_json(json!({"settings": []})));
         };
-        let root_arn = Arn::global("iam", &state.account_id, "root").to_string();
+        let root_arn =
+            Arn::global_in(&request.region, "iam", &state.account_id, "root").to_string();
+        let principal_filter_key = principal_filter.map(principal_settings_key);
         let mut settings: Vec<Value> = Vec::new();
 
         if effective_only {
@@ -135,7 +153,10 @@ impl EcsService {
                 .or_else(|| request.principal.as_ref().map(|p| p.arn.clone()))
                 .unwrap_or_else(|| root_arn.clone());
             let mut merged = state.account_setting_defaults.clone();
-            if let Some(overrides) = state.principal_account_settings.get(&principal) {
+            if let Some(overrides) = state
+                .principal_account_settings
+                .get(&principal_settings_key(&principal))
+            {
                 for (k, v) in overrides {
                     merged.insert(k.clone(), v.clone());
                 }
@@ -155,7 +176,9 @@ impl EcsService {
             for (k, v) in &state.account_setting_defaults {
                 if matches_filter(name_filter, k)
                     && matches_filter(value_filter, v)
-                    && (principal_filter.is_none() || principal_filter == Some(root_arn.as_str()))
+                    && principal_filter_key
+                        .as_ref()
+                        .is_none_or(|pf| *pf == principal_settings_key(&root_arn))
                 {
                     settings.push(json!({
                         "name": k,
@@ -165,9 +188,13 @@ impl EcsService {
                 }
             }
             for (principal, entries) in &state.principal_account_settings {
-                if principal_filter.is_some_and(|pf| pf != principal) {
+                if principal_filter_key
+                    .as_ref()
+                    .is_some_and(|pf| pf != principal)
+                {
                     continue;
                 }
+                let principal = principal_in_region_partition(principal, &request.region);
                 for (k, v) in entries {
                     if matches_filter(name_filter, k) && matches_filter(value_filter, v) {
                         settings.push(json!({

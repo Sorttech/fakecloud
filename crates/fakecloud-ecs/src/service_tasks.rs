@@ -232,13 +232,13 @@ impl EcsService {
             let containers: Vec<Container> = td_containers
                 .iter()
                 .map(|def| Container {
-                    container_arn: format!(
-                        "arn:aws:ecs:{}:{}:container/{}/{}/{}",
-                        request.region.as_str(),
-                        state.account_id,
-                        cluster_name,
-                        task_id,
-                        def.get("name").and_then(|v| v.as_str()).unwrap_or("app")
+                    container_arn: crate::state::ecs_arn(
+                        &request.region,
+                        &state.account_id,
+                        &format!(
+                            "container/{cluster_name}/{task_id}/{}",
+                            def.get("name").and_then(|v| v.as_str()).unwrap_or("app")
+                        ),
                     ),
                     name: def
                         .get("name")
