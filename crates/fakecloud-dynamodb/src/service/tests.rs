@@ -9013,3 +9013,78 @@ fn a_wrong_typed_member_fails_to_deserialize_and_changes_nothing() {
         assert_eq!(err.code(), "SerializationException", "{name}");
     }
 }
+
+#[test]
+fn partiql_writes_validate_vector_attributes() {
+    let svc = make_service();
+    create_vector_table(&svc, "COSINE");
+    let run = |statement: &str| {
+        svc.execute_statement(&make_request(
+            "ExecuteStatement",
+            json!({ "Statement": statement }),
+        ))
+    };
+    let msg = err_message(err_of(run(
+        "INSERT INTO \"vec-table\" VALUE {'pk': 'a', 'embedding': [1, 2, 3]}",
+    )));
+    assert!(
+        msg.contains("Invalid size for parameter embedding, Expected: 2, Actual: 3"),
+        "{msg}"
+    );
+
+    // An accepted INSERT reports the vector index's write under INDEXES.
+    let inserted = body_json(
+        &svc.execute_statement(&make_request(
+            "ExecuteStatement",
+            json!({
+                "Statement": "INSERT INTO \"vec-table\" VALUE {'pk': 'a', 'embedding': [1, 2]}",
+                "ReturnConsumedCapacity": "INDEXES",
+            }),
+        ))
+        .unwrap(),
+    );
+    assert_eq!(
+        inserted["ConsumedCapacity"]["VectorIndexes"]["embedding-index"]["VectorWriteRequestBytes"],
+        1024.0
+    );
+    let msg = err_message(err_of(run(
+        "UPDATE \"vec-table\" SET embedding = [1, 2, 3] WHERE pk = 'a'",
+    )));
+    assert!(
+        msg.contains("Invalid size for parameter embedding, Expected: 2, Actual: 3"),
+        "{msg}"
+    );
+    // The rejected UPDATE left the item as it was.
+    let item = &body_json(
+        &svc.get_item(&make_request(
+            "GetItem",
+            json!({ "TableName": "vec-table", "Key": { "pk": { "S": "a" } } }),
+        ))
+        .unwrap(),
+    )["Item"];
+    assert_eq!(item["embedding"]["L"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn transact_put_reports_a_bad_number_before_the_vector_shape() {
+    let svc = make_service();
+    create_vector_table(&svc, "COSINE");
+    let item = json!({
+        "pk": { "S": "a" },
+        "embedding": { "L": [{ "N": "abc" }, { "N": "1" }] },
+    });
+    let put = err_of(svc.put_item(&make_request(
+        "PutItem",
+        json!({ "TableName": "vec-table", "Item": item.clone() }),
+    )));
+    let transact = svc
+        .handle(make_request(
+            "TransactWriteItems",
+            json!({ "TransactItems": [{ "Put": { "TableName": "vec-table", "Item": item } }] }),
+        ))
+        .await
+        .err()
+        .expect("the malformed number is rejected");
+    assert_eq!(transact.code(), put.code());
+    assert_eq!(err_message(transact), err_message(put));
+}

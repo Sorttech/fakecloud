@@ -970,6 +970,11 @@ fn insert(
     // Stored and measured exactly as PutItem stores and measures it.
     normalize_item_numbers(&mut item);
     check_put_item_size(&item)?;
+    crate::service::vectors::validate_vector_item(
+        &table.vector_indexes,
+        &table.attribute_definitions,
+        &item,
+    )?;
     let key = super::extract_key(table, &item);
     if find(table, &key).is_some() {
         return Err(ExecError::ran(
@@ -1194,6 +1199,11 @@ fn update(
     // Measured flat, like a transacted Update: PartiQL does not carry
     // UpdateItem's per-clause charge.
     check_update_item_size(&new)?;
+    crate::service::vectors::validate_vector_item(
+        &table.vector_indexes,
+        &table.attribute_definitions,
+        &new,
+    )?;
     let consumed = item_write_consumed(table, Some(&old), Some(&new));
     let stored = new.clone();
     table.mutate_item_at(id, |row| *row = stored);
