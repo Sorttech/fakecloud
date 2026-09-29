@@ -54,10 +54,7 @@ impl CloudWatchService {
             optional_query_param(req, "ActionsSuppressorExtensionPeriod")
                 .and_then(|s| s.parse().ok());
 
-        let arn = format!(
-            "arn:aws:cloudwatch:{}:{}:alarm:{}",
-            req.region, req.account_id, alarm_name
-        );
+        let arn = crate::state::alarm_arn(&req.region, &req.account_id, &alarm_name);
         let now = Utc::now();
 
         let mut state = self.state.write();

@@ -14,10 +14,10 @@ impl OrganizationsService {
         // shape so SDKs can deserialize the response.
         let handshake = json!({
             "Id": "h-enableallfeatures",
-            "Arn": format!(
-                "arn:aws:organizations::{}:handshake/{}/enable-all-features/h-enableallfeatures",
-                org.management_account_id, org.org_id
-            ),
+            "Arn": org.resource_arn(&format!(
+                "handshake/{}/enable-all-features/h-enableallfeatures",
+                org.org_id
+            )),
             "Action": "ENABLE_ALL_FEATURES",
             "State": "ACCEPTED",
             "Parties": [],

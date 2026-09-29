@@ -45,7 +45,7 @@ Thanks for your interest in contributing. This document covers the conventions a
 7. Update the `conformance-baseline.json` baseline.
 8. Add a service page to [`website/content/docs/services/<service>.md`](website/content/docs/services/).
 9. If the service is a market differentiator (paywalled by LocalStack, unique cross-service wiring, real infrastructure), update the README comparison table.
-10. Ship SDK helpers for TypeScript, Python, Go, PHP, Java, and Rust if the service exposes introspection or simulation endpoints that tests benefit from. SDK updates go in the same PR as the service — not as a follow-up.
+10. Ship SDK helpers for TypeScript, Python, Go, PHP, Java, Rust, and .NET if the service exposes introspection or simulation endpoints that tests benefit from. SDK updates go in the same PR as the service — not as a follow-up.
 
 ## Reporting bugs
 

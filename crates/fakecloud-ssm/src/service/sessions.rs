@@ -100,7 +100,7 @@ impl SsmService {
             status: "Connected".to_string(),
             start_date: now,
             end_date: None,
-            owner: Arn::global("iam", &account_id, "root").to_string(),
+            owner: Arn::global_in(&req.region, "iam", &account_id, "root").to_string(),
             reason,
         };
         state.sessions.insert(session_id.clone(), session);

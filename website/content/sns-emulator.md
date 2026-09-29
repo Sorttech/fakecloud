@@ -109,7 +109,7 @@ expect(JSON.parse(messages[0].message).order).toBe('o1');
 await fc.reset();
 ```
 
-SDKs for TypeScript, Python, Go, PHP, Java, Rust.
+SDKs for TypeScript, Python, Go, PHP, Java, Rust, .NET.
 
 ## How it differs from alternatives
 

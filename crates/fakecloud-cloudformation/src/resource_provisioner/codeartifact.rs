@@ -30,11 +30,11 @@ impl ResourceProvisioner {
         let name = ca_str(props, "DomainName").unwrap_or_else(|| self.physical_name(resource));
         let owner = self.account_id.clone();
         let region = self.region.clone();
-        let arn = format!("arn:aws:codeartifact:{region}:{owner}:domain/{name}");
+        let arn = fakecloud_codeartifact::domain_arn(&region, &owner, &name);
         // Mirror the direct CreateDomain handler: an omitted EncryptionKey mints a
         // synthetic KMS key ARN so the stored description round-trips a key.
         let encryption_key = ca_str(props, "EncryptionKey").unwrap_or_else(|| {
-            format!("arn:aws:kms:{region}:{owner}:key/{}", uuid::Uuid::new_v4())
+            fakecloud_kms::kms_key_arn(&region, &owner, &uuid::Uuid::new_v4().to_string())
         });
 
         let mut guard = self.codeartifact_state.write();
@@ -54,7 +54,7 @@ impl ResourceProvisioner {
             "encryptionKey": encryption_key.clone(),
             "repositoryCount": 0,
             "assetSizeBytes": 0,
-            "s3BucketArn": format!("arn:aws:s3:::assets-{owner}-{region}"),
+            "s3BucketArn": fakecloud_codeartifact::asset_bucket_arn(&region, &owner),
         });
         acct.domains.insert(name.clone(), desc);
         acct.domain_order.push(name.clone());
@@ -188,7 +188,7 @@ impl ResourceProvisioner {
             .ok_or_else(|| "AWS::CodeArtifact::Repository requires DomainName".to_string())?;
         let owner = ca_str(props, "DomainOwner").unwrap_or_else(|| self.account_id.clone());
         let region = self.region.clone();
-        let arn = format!("arn:aws:codeartifact:{region}:{owner}:repository/{domain}/{repo}");
+        let arn = fakecloud_codeartifact::repo_arn(&region, &owner, &domain, &repo);
         let key = format!("{domain}/{repo}");
         let description = ca_str(props, "Description").unwrap_or_default();
         let upstreams = cfn_upstreams(props);

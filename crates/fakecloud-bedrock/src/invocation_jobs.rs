@@ -17,10 +17,7 @@ pub(crate) fn create_model_invocation_job(
     let role_arn = body["roleArn"].as_str().unwrap_or_default();
 
     let job_id = Uuid::new_v4().to_string();
-    let job_arn = format!(
-        "arn:aws:bedrock:{}:{}:model-invocation-job/{}",
-        req.region, req.account_id, job_id
-    );
+    let job_arn = crate::arns::model_invocation_job_arn(&req.region, &req.account_id, &job_id);
 
     let now = Utc::now();
     let job = ModelInvocationJob {

@@ -642,4 +642,140 @@ mod scheduler_reconcile {
             .expect("hook present when a store is set");
         hook().await;
     }
+
+    #[test]
+    fn china_region_arns_use_the_aws_cn_partition() {
+        let svc = EcsService::new(empty_state());
+        let in_region = |region: &str, action: &str, body: Value| {
+            let mut r = ecs_request(action, body);
+            r.region = region.into();
+            r
+        };
+        let body = |resp: AwsResponse| -> Value {
+            serde_json::from_slice(resp.body.expect_bytes()).unwrap()
+        };
+
+        let v = body(
+            svc.create_cluster(&in_region(
+                "cn-north-1",
+                "CreateCluster",
+                json!({"clusterName": "c1"}),
+            ))
+            .unwrap(),
+        );
+        let cluster_arn = v["cluster"]["clusterArn"].as_str().unwrap().to_string();
+        assert_eq!(
+            cluster_arn,
+            format!("arn:aws-cn:ecs:cn-north-1:{ACCOUNT}:cluster/c1")
+        );
+
+        let v = body(
+            svc.register_task_definition(&in_region(
+                "cn-north-1",
+                "RegisterTaskDefinition",
+                json!({
+                    "family": "web",
+                    "containerDefinitions": [{"name": "app", "image": "nginx", "essential": true}]
+                }),
+            ))
+            .unwrap(),
+        );
+        let td_arn = v["taskDefinition"]["taskDefinitionArn"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            td_arn,
+            format!("arn:aws-cn:ecs:cn-north-1:{ACCOUNT}:task-definition/web:1")
+        );
+
+        let v = body(
+            svc.describe_clusters(&in_region(
+                "cn-north-1",
+                "DescribeClusters",
+                json!({"clusters": [cluster_arn]}),
+            ))
+            .unwrap(),
+        );
+        assert_eq!(v["clusters"][0]["clusterArn"], json!(cluster_arn));
+        let v = body(
+            svc.describe_task_definition(&in_region(
+                "cn-north-1",
+                "DescribeTaskDefinition",
+                json!({"taskDefinition": td_arn}),
+            ))
+            .unwrap(),
+        );
+        assert_eq!(v["taskDefinition"]["taskDefinitionArn"], json!(td_arn));
+    }
+
+    #[test]
+    fn principal_account_settings_are_shared_across_partitions() {
+        let svc = EcsService::new(empty_state());
+        let in_region = |region: &str, action: &str, body: Value| {
+            let mut r = ecs_request(action, body);
+            r.region = region.into();
+            r
+        };
+        let body = |resp: AwsResponse| -> Value {
+            serde_json::from_slice(resp.body.expect_bytes()).unwrap()
+        };
+
+        let v = body(
+            svc.put_account_setting(&in_region(
+                "cn-north-1",
+                "PutAccountSetting",
+                json!({"name": "containerInsights", "value": "enabled"}),
+            ))
+            .unwrap(),
+        );
+        assert_eq!(
+            v["setting"]["principalArn"],
+            json!(format!("arn:aws-cn:iam::{ACCOUNT}:root"))
+        );
+
+        let v = body(
+            svc.list_account_settings(&in_region(
+                "us-east-1",
+                "ListAccountSettings",
+                json!({"name": "containerInsights", "effectiveSettings": true}),
+            ))
+            .unwrap(),
+        );
+        assert_eq!(v["settings"][0]["value"], "enabled");
+        assert_eq!(
+            v["settings"][0]["principalArn"],
+            json!(format!("arn:aws:iam::{ACCOUNT}:root"))
+        );
+
+        let v = body(
+            svc.list_account_settings(&in_region(
+                "cn-north-1",
+                "ListAccountSettings",
+                json!({"name": "containerInsights"}),
+            ))
+            .unwrap(),
+        );
+        assert_eq!(v["settings"][0]["value"], "enabled");
+        assert_eq!(
+            v["settings"][0]["principalArn"],
+            json!(format!("arn:aws-cn:iam::{ACCOUNT}:root"))
+        );
+
+        svc.delete_account_setting(&in_region(
+            "us-east-1",
+            "DeleteAccountSetting",
+            json!({"name": "containerInsights"}),
+        ))
+        .unwrap();
+        let v = body(
+            svc.list_account_settings(&in_region(
+                "cn-north-1",
+                "ListAccountSettings",
+                json!({"name": "containerInsights"}),
+            ))
+            .unwrap(),
+        );
+        assert_eq!(v["settings"], json!([]));
+    }
 }

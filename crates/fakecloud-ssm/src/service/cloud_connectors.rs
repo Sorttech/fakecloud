@@ -2,6 +2,7 @@ use chrono::Utc;
 use http::StatusCode;
 use serde_json::{json, Value};
 
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 use fakecloud_core::validation::*;
 
@@ -74,10 +75,13 @@ impl SsmService {
         let tags = parse_tags(body.get("Tags"));
 
         let id = uuid::Uuid::new_v4().to_string();
-        let arn = format!(
-            "arn:aws:ssm:{}:{}:cloud-connector/{id}",
-            req.region, req.account_id
-        );
+        let arn = Arn::regional(
+            "ssm",
+            &req.region,
+            &req.account_id,
+            &format!("cloud-connector/{id}"),
+        )
+        .to_string();
         let now = Utc::now();
         let connector = CloudConnector {
             id: id.clone(),

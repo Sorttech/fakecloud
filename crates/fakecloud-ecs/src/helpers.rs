@@ -383,8 +383,7 @@ pub(crate) fn resolve_container_instance_key(state: &EcsState, tail: &str) -> Op
 /// into `(account, resource_type, tail)`. For task definitions `tail` is
 /// `family:revision`; for clusters it's `cluster_name`.
 pub(crate) fn decode_ecs_arn(arn: &str) -> Result<(String, String, String), AwsServiceError> {
-    let rest = arn
-        .strip_prefix("arn:aws:ecs:")
+    let rest = fakecloud_aws::arn::arn_resource(arn, "ecs")
         .ok_or_else(|| invalid_parameter(format!("Malformed ECS ARN: {arn}")))?;
     // Resource portion may itself contain a trailing `:<revision>`, so we
     // split at most three ways then treat the remainder as the resource.
@@ -426,7 +425,7 @@ pub(crate) fn parse_family_revision(input: &str) -> (String, Option<i32>) {
 pub(crate) fn resolve_task_definition_ref(
     input: &str,
 ) -> Result<(Option<String>, String, Option<i32>), AwsServiceError> {
-    if input.starts_with("arn:aws:ecs:") {
+    if fakecloud_aws::arn::arn_resource(input, "ecs").is_some() {
         let (account, resource_type, tail) = decode_ecs_arn(input)?;
         if resource_type != "task-definition" {
             return Err(invalid_parameter(format!(
@@ -454,7 +453,7 @@ pub(crate) fn target_account_for_cluster(
     cluster_ref: Option<&str>,
 ) -> String {
     if let Some(input) = cluster_ref {
-        if input.starts_with("arn:aws:ecs:") {
+        if fakecloud_aws::arn::arn_resource(input, "ecs").is_some() {
             if let Ok((account, _, _)) = decode_ecs_arn(input) {
                 return account;
             }
@@ -850,13 +849,13 @@ pub(crate) fn spawn_service_tasks(
         let containers: Vec<Container> = container_defs
             .iter()
             .map(|def| Container {
-                container_arn: format!(
-                    "arn:aws:ecs:{}:{}:container/{}/{}/{}",
+                container_arn: crate::state::ecs_arn(
                     region,
-                    state.account_id,
-                    cluster_name,
-                    task_id,
-                    def.get("name").and_then(|v| v.as_str()).unwrap_or("app")
+                    &state.account_id,
+                    &format!(
+                        "container/{cluster_name}/{task_id}/{}",
+                        def.get("name").and_then(|v| v.as_str()).unwrap_or("app")
+                    ),
                 ),
                 name: def
                     .get("name")
@@ -1040,13 +1039,13 @@ pub(crate) fn spawn_daemon_tasks(
         let containers: Vec<Container> = container_defs
             .iter()
             .map(|def| Container {
-                container_arn: format!(
-                    "arn:aws:ecs:{}:{}:container/{}/{}/{}",
+                container_arn: crate::state::ecs_arn(
                     region,
-                    state.account_id,
-                    cluster_name,
-                    task_id,
-                    def.get("name").and_then(|v| v.as_str()).unwrap_or("app")
+                    &state.account_id,
+                    &format!(
+                        "container/{cluster_name}/{task_id}/{}",
+                        def.get("name").and_then(|v| v.as_str()).unwrap_or("app")
+                    ),
                 ),
                 name: def
                     .get("name")

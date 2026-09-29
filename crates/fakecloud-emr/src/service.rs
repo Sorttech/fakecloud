@@ -14,6 +14,7 @@ use http::StatusCode;
 use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_persistence::SnapshotStore;
 
@@ -293,12 +294,28 @@ pub(crate) fn rand_suffix(n: usize) -> String {
     s.to_ascii_uppercase()
 }
 
-pub(crate) fn cluster_arn(region: &str, account: &str, id: &str) -> String {
-    format!("arn:aws:elasticmapreduce:{region}:{account}:cluster/{id}")
+fn emr_arn(region: &str, account: &str, resource: &str) -> String {
+    Arn::regional("elasticmapreduce", region, account, resource).to_string()
 }
 
-pub(crate) fn studio_arn(region: &str, account: &str, id: &str) -> String {
-    format!("arn:aws:elasticmapreduce:{region}:{account}:studio/{id}")
+pub fn cluster_arn(region: &str, account: &str, id: &str) -> String {
+    emr_arn(region, account, &format!("cluster/{id}"))
+}
+
+pub fn studio_arn(region: &str, account: &str, id: &str) -> String {
+    emr_arn(region, account, &format!("studio/{id}"))
+}
+
+pub fn notebook_execution_arn(region: &str, account: &str, id: &str) -> String {
+    emr_arn(region, account, &format!("notebook-execution/{id}"))
+}
+
+pub fn session_arn(region: &str, account: &str, cluster_id: &str, session_id: &str) -> String {
+    emr_arn(
+        region,
+        account,
+        &format!("cluster/{cluster_id}/session/{session_id}"),
+    )
 }
 
 impl EmrService {

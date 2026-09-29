@@ -34,7 +34,8 @@ pub(crate) fn default_bngi() -> Value {
 /// (real MSK always echoes a resolved key ARN, so `encryption_info` round-trips
 /// and `MatchResourceAttrRegionalARN(..., "kms", "key/.+")` matches).
 fn default_kms_key_arn(region: &str, account: &str) -> String {
-    format!("arn:aws:kms:{region}:{account}:key/{}", Uuid::new_v4())
+    fakecloud_aws::arn::Arn::regional("kms", region, account, &format!("key/{}", Uuid::new_v4()))
+        .to_string()
 }
 
 /// Fill an `EncryptionInfo` with the sub-objects + AWS defaults `DescribeCluster`

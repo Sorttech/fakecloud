@@ -128,7 +128,7 @@ fn discover_s3(
             resource_name: Some(name.clone()),
             region: region.to_string(),
             availability_zone: "Regional".into(),
-            arn: format!("arn:aws:s3:::{name}"),
+            arn: fakecloud_aws::arn::Arn::s3_in(region, name).to_string(),
             tags,
             configuration: config,
         });
@@ -175,7 +175,13 @@ fn discover_ec2(
             resource_name: name,
             region: region.to_string(),
             availability_zone: inst.az.clone(),
-            arn: format!("arn:aws:ec2:{region}:{account_id}:instance/{id}"),
+            arn: fakecloud_aws::arn::Arn::regional(
+                "ec2",
+                region,
+                account_id,
+                &format!("instance/{id}"),
+            )
+            .to_string(),
             tags: tags_for(id),
             configuration: config,
         });
@@ -207,7 +213,13 @@ fn discover_ec2(
             resource_name: Some(sg.group_name.clone()),
             region: region.to_string(),
             availability_zone: "Regional".into(),
-            arn: format!("arn:aws:ec2:{region}:{account_id}:security-group/{id}"),
+            arn: fakecloud_aws::arn::Arn::regional(
+                "ec2",
+                region,
+                account_id,
+                &format!("security-group/{id}"),
+            )
+            .to_string(),
             tags: tags_for(id),
             configuration: config,
         });
@@ -225,7 +237,8 @@ fn discover_ec2(
             resource_name: tags_for(id).get("Name").cloned(),
             region: region.to_string(),
             availability_zone: "Regional".into(),
-            arn: format!("arn:aws:ec2:{region}:{account_id}:vpc/{id}"),
+            arn: fakecloud_aws::arn::Arn::regional("ec2", region, account_id, &format!("vpc/{id}"))
+                .to_string(),
             tags: tags_for(id),
             configuration: config,
         });

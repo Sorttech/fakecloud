@@ -3397,3 +3397,74 @@ async fn snapshot_hook_fires_with_store() {
         .expect("hook present when a store is set");
     hook().await;
 }
+
+#[test]
+fn china_region_sns_arns_use_the_aws_cn_partition() {
+    use fakecloud_core::auth::ResourcePolicyProvider;
+
+    let (svc, state) = make_sns();
+    let in_china = |action: &str, params: Vec<(&str, &str)>| {
+        let mut req = sns_request(action, params);
+        req.region = "cn-north-1".to_string();
+        req
+    };
+    let body =
+        response_body(&svc.create_topic(&in_china("CreateTopic", vec![("Name", "cn-topic")])));
+    let topic_arn = "arn:aws-cn:sns:cn-north-1:123456789012:cn-topic";
+    assert!(body.contains(topic_arn), "{body}");
+
+    assert_ok(&svc.subscribe(&in_china(
+        "Subscribe",
+        vec![
+            ("TopicArn", topic_arn),
+            ("Protocol", "sqs"),
+            ("Endpoint", "arn:aws-cn:sqs:cn-north-1:123456789012:cn-q"),
+        ],
+    )));
+
+    assert_ok(&svc.add_permission(&in_china(
+        "AddPermission",
+        vec![
+            ("TopicArn", topic_arn),
+            ("Label", "Single"),
+            ("AWSAccountId.member.1", "111111111111"),
+            ("ActionName.member.1", "Publish"),
+        ],
+    )));
+    let policy_str = state.read().default_ref().topics[topic_arn].attributes["Policy"].clone();
+    let policy: Value = serde_json::from_str(&policy_str).unwrap();
+    let single = policy["Statement"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["Sid"] == "Single")
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        single["Principal"]["AWS"],
+        "arn:aws-cn:iam::111111111111:root"
+    );
+    let provider = crate::resource_policy::SnsResourcePolicyProvider::new(state.clone());
+    assert!(provider.resource_policy("sns", topic_arn).is_some());
+
+    let app = response_body(&svc.create_platform_application(&in_china(
+        "CreatePlatformApplication",
+        vec![
+            ("Name", "cn-app"),
+            ("Platform", "GCM"),
+            ("Attributes.entry.1.key", "PlatformCredential"),
+            ("Attributes.entry.1.value", "secret"),
+        ],
+    )));
+    let app_arn = "arn:aws-cn:sns:cn-north-1:123456789012:app/GCM/cn-app";
+    assert!(app.contains(app_arn), "{app}");
+    let endpoint = response_body(&svc.create_platform_endpoint(&in_china(
+        "CreatePlatformEndpoint",
+        vec![("PlatformApplicationArn", app_arn), ("Token", "t-1")],
+    )));
+    assert!(
+        endpoint
+            .contains("<EndpointArn>arn:aws-cn:sns:cn-north-1:123456789012:endpoint/GCM/cn-app/"),
+        "{endpoint}"
+    );
+}

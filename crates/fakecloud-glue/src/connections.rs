@@ -201,7 +201,7 @@ impl GlueService {
         req_present(&body, "ConnectionProperties")?;
         req_present(&body, "ConnectorAuthenticationConfiguration")?;
         req_present(&body, "RestConfiguration")?;
-        let arn = resource_arn(&req.account_id, &req.region, "connectionType", &ct);
+        let arn = resource_arn(&req.region, &req.account_id, "connectionType", &ct);
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id, &req.region);
         state.connection_types.insert(

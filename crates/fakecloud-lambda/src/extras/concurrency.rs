@@ -172,10 +172,7 @@ impl LambdaService {
                 .map(|(k, cfg)| {
                     let qualifier = k.split(':').next_back().unwrap_or("$LATEST");
                     json!({
-                        "FunctionArn": format!(
-                            "arn:aws:lambda:{}:{}:function:{}:{}",
-                            region, state.account_id, function_name, qualifier
-                        ),
+                        "FunctionArn": qualified_function_arn(region, &state.account_id, function_name, qualifier),
                         "Status": cfg.status,
                         "RequestedProvisionedConcurrentExecutions": cfg.requested,
                         "AvailableProvisionedConcurrentExecutions": cfg.allocated,
@@ -239,10 +236,7 @@ impl LambdaService {
             if let Some(v) = cfg.max_execution_environments {
                 applied.insert("MaxExecutionEnvironments".into(), json!(v));
             }
-            let function_arn = format!(
-                "arn:aws:lambda:{}:{}:function:{}",
-                req.region, state.account_id, function_name
-            );
+            let function_arn = function_arn(&req.region, &state.account_id, function_name);
             ok(json!({
                 "FunctionArn": function_arn,
                 "AppliedFunctionScalingConfig": Value::Object(applied.clone()),

@@ -22,7 +22,7 @@ pub(crate) mod service;
 pub(crate) mod state;
 pub(crate) mod validate;
 
-pub use service::TextractService;
+pub use service::{adapter_arn, adapter_version_arn, TextractService};
 pub use state::{
     SharedTextractState, TextractSnapshot, TextractState, TEXTRACT_SNAPSHOT_SCHEMA_VERSION,
 };

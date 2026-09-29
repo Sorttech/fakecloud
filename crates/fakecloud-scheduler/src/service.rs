@@ -1871,4 +1871,60 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status, StatusCode::OK);
     }
+
+    #[tokio::test]
+    async fn china_region_schedule_arns_use_the_aws_cn_partition() {
+        let svc = SchedulerService::new(Arc::new(RwLock::new(
+            fakecloud_core::multi_account::MultiAccountState::new("111122223333", "cn-north-1", ""),
+        )));
+        let in_china = |method: Method, path: &str, body: &str| {
+            let mut req = make_request(method, path, body);
+            req.region = "cn-north-1".to_string();
+            req
+        };
+        let resp = svc
+            .handle(in_china(Method::POST, "/schedule-groups/cn", "{}"))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        let group_arn = "arn:aws-cn:scheduler:cn-north-1:111122223333:schedule-group/cn";
+        assert_eq!(v["ScheduleGroupArn"], group_arn);
+
+        let body = json!({
+            "GroupName": "cn",
+            "ScheduleExpression": "rate(1 minute)",
+            "FlexibleTimeWindow": { "Mode": "OFF" },
+            "Target": {
+                "Arn": "arn:aws-cn:sqs:cn-north-1:111122223333:q",
+                "RoleArn": "arn:aws-cn:iam::111122223333:role/scheduler"
+            }
+        })
+        .to_string();
+        let resp = svc
+            .handle(in_china(Method::POST, "/schedules/s", &body))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        assert_eq!(
+            v["ScheduleArn"],
+            "arn:aws-cn:scheduler:cn-north-1:111122223333:schedule/cn/s"
+        );
+
+        let encoded =
+            percent_encoding::utf8_percent_encode(group_arn, percent_encoding::NON_ALPHANUMERIC)
+                .to_string();
+        svc.handle(in_china(
+            Method::POST,
+            &format!("/tags/{encoded}"),
+            r#"{"Tags":[{"Key":"env","Value":"cn"}]}"#,
+        ))
+        .await
+        .unwrap();
+        let resp = svc
+            .handle(in_china(Method::GET, &format!("/tags/{encoded}"), ""))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        assert_eq!(v["Tags"][0]["Value"], "cn");
+    }
 }

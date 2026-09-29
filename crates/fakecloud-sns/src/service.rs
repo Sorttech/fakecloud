@@ -399,27 +399,15 @@ impl AwsService for SnsService {
             .find(|a| *a == request.action)?;
         let resource = match action {
             "CreateTopic" => {
-                // The to-be-created topic ARN is built from the same
-                // account id the handler uses (state.account_id via
-                // `Arn::new`), not `principal.account_id`, so policy
-                // evaluation and the actual ARN can't diverge even if
-                // the two sources ever drift (identified by cubic on
+                // The to-be-created topic ARN is built by the same
+                // `topic_arn` helper, from the same account id the handler
+                // uses (state.account_id), not `principal.account_id`, so
+                // policy evaluation and the actual ARN can't diverge even
+                // if the two sources ever drift (identified by cubic on
                 // PR #399).
                 let _accts = self.state.read(); let _empty = crate::state::SnsState::new(&request.account_id, &request.region, ""); let state = _accts.get(&request.account_id).unwrap_or(&_empty);
-                let partition = if request.region.starts_with("cn-") {
-                    "aws-cn"
-                } else if request.region.starts_with("us-gov-") {
-                    "aws-us-gov"
-                } else {
-                    "aws"
-                };
                 param(request, "Name")
-                    .map(|n| {
-                        format!(
-                            "arn:{}:sns:{}:{}:{}",
-                            partition, request.region, state.account_id, n
-                        )
-                    })
+                    .map(|n| topic_arn(&request.region, &state.account_id, &n))
                     .unwrap_or_else(|| "*".to_string())
             }
             "DeleteTopic"
@@ -579,7 +567,7 @@ impl SnsService {
 
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
-        let topic_arn = Arn::new("sns", &req.region, &state.account_id, &name).to_string();
+        let topic_arn = topic_arn(&req.region, &state.account_id, &name);
 
         if !state.topics.contains_key(&topic_arn) {
             let mut attributes = BTreeMap::new();
@@ -930,7 +918,7 @@ impl SnsService {
         }
 
         // Validate SQS endpoint (must be an ARN)
-        if protocol == "sqs" && !endpoint.starts_with("arn:aws:sqs:") {
+        if protocol == "sqs" && fakecloud_aws::arn::arn_resource(&endpoint, "sqs").is_none() {
             return Err(AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
                 "InvalidParameter",
@@ -1633,13 +1621,21 @@ impl SnsService {
         }
 
         // Build principal
+        let partition = topic_arn
+            .parse::<Arn>()
+            .map_or_else(|_| "aws".to_string(), |a| a.partition);
+        let root_arn = |id: &str| {
+            Arn::global("iam", id, "root")
+                .with_partition(&partition)
+                .to_string()
+        };
         let principal = if account_ids.len() == 1 {
-            Value::String(Arn::global("iam", &account_ids[0], "root").to_string())
+            Value::String(root_arn(&account_ids[0]))
         } else {
             Value::Array(
                 account_ids
                     .iter()
-                    .map(|id| Value::String(Arn::global("iam", id, "root").to_string()))
+                    .map(|id| Value::String(root_arn(id)))
                     .collect(),
             )
         };
@@ -1907,6 +1903,7 @@ mod service_sms;
 
 #[path = "helpers.rs"]
 mod helpers;
+pub use helpers::topic_arn;
 pub(crate) use helpers::*;
 
 #[cfg(test)]

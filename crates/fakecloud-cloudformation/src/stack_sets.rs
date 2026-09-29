@@ -21,6 +21,7 @@ use http::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use fakecloud_aws::arn::{partition_for, partition_of};
 use fakecloud_aws::xml::xml_escape;
 use fakecloud_core::multi_account::MultiAccountState;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
@@ -357,7 +358,8 @@ fn migrate_legacy_stack_sets(accounts: &mut MultiAccountState<CloudFormationStat
                 continue;
             }
             let arn = format!(
-                "arn:aws:cloudformation:{}:{account_id}:stackset/{id}",
+                "arn:{}:cloudformation:{}:{account_id}:stackset/{id}",
+                partition_for(&state.region),
                 state.region
             );
             state.stack_sets.insert(
@@ -1619,7 +1621,10 @@ impl CloudFormationService {
                         .get("AdministrationRoleARN")
                         .cloned()
                         .unwrap_or_else(|| {
-                            format!("arn:aws:iam::{admin}:role/{DEFAULT_ADMIN_ROLE}")
+                            format!(
+                                "arn:{}:iam::{admin}:role/{DEFAULT_ADMIN_ROLE}",
+                                partition_for(&req.region)
+                            )
                         }),
                 ),
                 Some(
@@ -1633,7 +1638,8 @@ impl CloudFormationService {
 
         let id = format!("{name}:{}", uuid::Uuid::new_v4());
         let arn = format!(
-            "arn:aws:cloudformation:{}:{admin}:stackset/{id}",
+            "arn:{}:cloudformation:{}:{admin}:stackset/{id}",
+            partition_for(&req.region),
             req.region
         );
         let mut accounts = self.state.write();
@@ -2006,9 +2012,12 @@ impl CloudFormationService {
             if let Some(role) = params.get("ExecutionRoleName") {
                 updated.execution_role_name = Some(role.clone());
             }
-            updated
-                .administration_role_arn
-                .get_or_insert_with(|| format!("arn:aws:iam::{admin}:role/{DEFAULT_ADMIN_ROLE}"));
+            updated.administration_role_arn.get_or_insert_with(|| {
+                format!(
+                    "arn:{}:iam::{admin}:role/{DEFAULT_ADMIN_ROLE}",
+                    partition_of(&snapshot.arn)
+                )
+            });
             updated
                 .execution_role_name
                 .get_or_insert_with(|| DEFAULT_EXECUTION_ROLE.to_string());
@@ -3033,7 +3042,10 @@ impl CloudFormationService {
     /// has one. A deployment proceeds only when the function answers
     /// `SUCCEEDED`; an account without the function is not gated.
     async fn account_gate(&self, account: &str, region: &str) -> GateResult {
-        let arn = format!("arn:aws:lambda:{region}:{account}:function:{ACCOUNT_GATE_FUNCTION}");
+        let arn = format!(
+            "arn:{}:lambda:{region}:{account}:function:{ACCOUNT_GATE_FUNCTION}",
+            partition_for(region)
+        );
         let exists = self
             .deps
             .lambda
@@ -5683,6 +5695,51 @@ mod tests {
     }
 
     const ACCT_D: &str = "333333333333";
+
+    #[tokio::test]
+    async fn stack_set_in_china_keeps_the_aws_cn_partition() {
+        let svc = service();
+        seed_org(&svc);
+        ok(&svc, "ActivateOrganizationsAccess", &[]).await;
+        let mut create = req(
+            "CreateStackSet",
+            &[
+                ("StackSetName", "cn-set"),
+                ("TemplateBody", QUEUE_TEMPLATE),
+                ("PermissionModel", "SERVICE_MANAGED"),
+                ("AutoDeployment.Enabled", "false"),
+            ],
+        );
+        create.account_id = ADMIN.to_string();
+        create.region = "cn-north-1".to_string();
+        svc.handle(create).await.expect("CreateStackSet");
+        let set = stored_set(&svc, "cn-set");
+        assert!(
+            set.arn
+                .starts_with("arn:aws-cn:cloudformation:cn-north-1:000000000000:stackset/cn-set:"),
+            "{}",
+            set.arn
+        );
+
+        // Switching to SELF_MANAGED defaults the administration role in the
+        // stack set's partition, whichever region the update arrives in.
+        ok(
+            &svc,
+            "UpdateStackSet",
+            &[
+                ("StackSetName", "cn-set"),
+                ("UsePreviousTemplate", "true"),
+                ("PermissionModel", "SELF_MANAGED"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            stored_set(&svc, "cn-set")
+                .administration_role_arn
+                .as_deref(),
+            Some("arn:aws-cn:iam::000000000000:role/AWSCloudFormationStackSetAdministrationRole")
+        );
+    }
 
     /// A service-managed stack set with AutoDeployment enabled, deployed to
     /// `workloads` in us-east-1. Returns the OU ids from `seed_org`.

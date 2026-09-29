@@ -30,7 +30,7 @@ use crate::runtime::{KafkaRuntime, RunningBroker, TopicError};
 use crate::shared;
 use crate::state::{ClusterDataPlane, KafkaData, SharedKafkaState};
 
-/// Every operation name in the Amazon MSK Smithy model (59 operations).
+/// Every operation name in the Amazon MSK Smithy model (64 operations).
 pub const KAFKA_ACTIONS: &[&str] = &[
     "BatchAssociateScramSecret",
     "BatchDisassociateScramSecret",
@@ -3526,6 +3526,41 @@ mod tests {
             .starts_with("arn:aws:kms:"));
         // No client_authentication is echoed for an auth-less cluster.
         assert!(d["clusterInfo"].get("clientAuthentication").is_none());
+    }
+
+    #[test]
+    fn china_cluster_and_node_arns_use_the_china_partition() {
+        let s = svc();
+        let c = ctx("cn-north-1");
+        let arn = json_of(s.create_cluster(&c, &cluster_body("cn"), false).unwrap())["clusterArn"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            arn.starts_with("arn:aws-cn:kafka:cn-north-1:123456789012:cluster/cn/"),
+            "{arn}"
+        );
+        settle(&s, &c);
+        let d = json_of(s.describe_cluster(&c, &arn, false).unwrap());
+        assert_eq!(d["clusterInfo"]["clusterArn"], json!(arn));
+        // The synthesized at-rest key is the ARN KMS itself mints for that key
+        // id in the cluster's region.
+        let kms = d["clusterInfo"]["encryptionInfo"]["encryptionAtRest"]["dataVolumeKMSKeyId"]
+            .as_str()
+            .unwrap();
+        let key_id = kms
+            .strip_prefix("arn:aws-cn:kms:cn-north-1:123456789012:key/")
+            .unwrap_or_else(|| panic!("{kms}"));
+        assert_eq!(
+            kms,
+            fakecloud_kms::kms_key_arn("cn-north-1", "123456789012", key_id)
+        );
+        let nodes = json_of(s.list_nodes(&c, &arn, &[]).unwrap());
+        let node_arn = nodes["nodeInfoList"][0]["nodeARN"].as_str().unwrap();
+        assert!(
+            node_arn.starts_with("arn:aws-cn:kafka:cn-north-1:123456789012:cluster/cn/broker/"),
+            "{node_arn}"
+        );
     }
 
     #[test]

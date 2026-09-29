@@ -18,14 +18,15 @@ use serde_json::{json, Map, Value};
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 
+use fakecloud_aws::arn::arn_resource;
 use fakecloud_core::pagination::paginate_checked;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_persistence::SnapshotStore;
 
 use crate::state::{
-    invitation_arn, managed_permission_arn, permission_arn, resource_share_arn, AssociationRecord,
-    InvitationRecord, PermissionRecord, PermissionVersionRecord, ResourceShareRecord,
-    SharedRamState, TagMap,
+    invitation_arn, managed_permission_arn, managed_permission_name, permission_arn,
+    resource_share_arn, AssociationRecord, InvitationRecord, PermissionRecord,
+    PermissionVersionRecord, ResourceShareRecord, SharedRamState, TagMap,
 };
 use crate::validate;
 
@@ -396,7 +397,7 @@ fn is_external_principal(principal: &str, account_id: &str) -> bool {
         return false;
     }
     let is_account = principal.len() == 12 && principal.chars().all(|c| c.is_ascii_digit());
-    is_account || principal.starts_with("arn:aws:organizations::")
+    is_account || arn_resource(principal, "organizations").is_some_and(|r| r.starts_with(':'))
 }
 
 /// Numeric-offset pagination reading `maxResults`/`nextToken` from the JSON body.
@@ -487,9 +488,9 @@ fn invitation_to_value(inv: &InvitationRecord) -> Value {
     })
 }
 
-fn managed_summary(name: &str, resource_type: &str, now: DateTime<Utc>) -> Value {
+fn managed_summary(region: &str, name: &str, resource_type: &str, now: DateTime<Utc>) -> Value {
     json!({
-        "arn": managed_permission_arn(name),
+        "arn": managed_permission_arn(region, name),
         "version": "1",
         "defaultVersion": true,
         "name": name,
@@ -539,14 +540,14 @@ fn customer_detail(p: &PermissionRecord, v: &PermissionVersionRecord) -> Value {
     })
 }
 
-fn managed_detail(name: &str, resource_type: &str, now: DateTime<Utc>) -> Value {
+fn managed_detail(region: &str, name: &str, resource_type: &str, now: DateTime<Utc>) -> Value {
     let policy = json!({
         "Effect": "Allow",
         "Action": [format!("{}:*", resource_type.split(':').next().unwrap_or("*"))],
     })
     .to_string();
     json!({
-        "arn": managed_permission_arn(name),
+        "arn": managed_permission_arn(region, name),
         "version": "1",
         "defaultVersion": true,
         "name": name,
@@ -565,7 +566,7 @@ fn managed_detail(name: &str, resource_type: &str, now: DateTime<Utc>) -> Value 
 fn find_managed(arn: &str) -> Option<(&'static str, &'static str)> {
     MANAGED_PERMISSIONS
         .iter()
-        .find(|(name, _)| managed_permission_arn(name) == arn)
+        .find(|(name, _)| managed_permission_name(arn) == Some(*name))
         .copied()
 }
 
@@ -1174,7 +1175,9 @@ impl RamService {
         let arn = req_str(body, "permissionArn")?;
         let now = Utc::now();
         if let Some((name, rt)) = find_managed(&arn) {
-            return Ok(ok(json!({ "permission": managed_detail(name, rt, now) })));
+            return Ok(ok(
+                json!({ "permission": managed_detail(&req.region, name, rt, now) }),
+            ));
         }
         let accounts = self.state.read();
         let p = accounts
@@ -1202,7 +1205,7 @@ impl RamService {
         if perm_type == "ALL" || perm_type == "AWS_MANAGED" {
             for (name, rt) in MANAGED_PERMISSIONS {
                 if type_filter.as_deref().is_none_or(|t| t == *rt) {
-                    items.push(managed_summary(name, rt, now));
+                    items.push(managed_summary(&req.region, name, rt, now));
                 }
             }
         }
@@ -1268,7 +1271,7 @@ impl RamService {
         let mut items: Vec<Value> = Vec::new();
         for perm_arn in &share.permission_arns {
             if let Some((name, rt)) = find_managed(perm_arn) {
-                items.push(managed_summary(name, rt, now));
+                items.push(managed_summary(&req.region, name, rt, now));
             } else if let Some(p) = st.permissions.get(perm_arn) {
                 items.push(customer_summary(p));
             }
@@ -1689,6 +1692,44 @@ mod tests {
 
     fn json_of(resp: AwsResponse) -> Value {
         serde_json::from_slice(resp.body.expect_bytes()).unwrap()
+    }
+
+    #[test]
+    fn china_region_arns_use_the_aws_cn_partition() {
+        let s = svc();
+        let in_cn = |body: &Value| {
+            let mut r = req(body);
+            r.region = "cn-north-1".to_string();
+            r
+        };
+        let managed = "arn:aws-cn:ram::aws:permission/AWSRAMDefaultPermissionSubnet";
+        let create_body = json!({ "name": "cn-share", "permissionArns": [managed] });
+        let created = json_of(
+            s.create_resource_share(&in_cn(&create_body), &create_body)
+                .unwrap(),
+        );
+        let share_arn = created["resourceShare"]["resourceShareArn"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            share_arn.starts_with("arn:aws-cn:ram:cn-north-1:123456789012:resource-share/"),
+            "{share_arn}"
+        );
+
+        let list_body = json!({ "resourceShareArn": share_arn });
+        let perms = json_of(
+            s.list_resource_share_permissions(&in_cn(&list_body), &list_body)
+                .unwrap(),
+        );
+        assert_eq!(perms["permissions"][0]["arn"], managed);
+
+        let get_body = json!({ "permissionArn": managed });
+        let got = json_of(s.get_permission(&in_cn(&get_body), &get_body).unwrap());
+        assert_eq!(got["permission"]["arn"], managed);
+
+        let org = "arn:aws-cn:organizations::111122223333:organization/o-abc";
+        assert!(is_external_principal(org, "123456789012"));
     }
 
     #[test]

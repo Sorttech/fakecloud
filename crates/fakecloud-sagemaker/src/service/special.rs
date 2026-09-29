@@ -408,10 +408,7 @@ fn start_pipeline_execution(
         "PipelineExecution",
         &data.next_seq().to_string(),
     );
-    let arn = format!(
-        "arn:aws:sagemaker:{}:{}:pipeline/{}/execution/{}",
-        ctx.region, ctx.account, pipeline_name, exec_id
-    );
+    let arn = super::pipeline_execution_arn(&ctx.region, &ctx.account, &pipeline_name, &exec_id);
     let mut seed = body.clone();
     seed.insert(
         "PipelineExecutionArn".to_string(),
@@ -419,9 +416,10 @@ fn start_pipeline_execution(
     );
     seed.insert(
         "PipelineArn".to_string(),
-        Value::String(format!(
-            "arn:aws:sagemaker:{}:{}:pipeline/{}",
-            ctx.region, ctx.account, pipeline_name
+        Value::String(super::pipeline_arn(
+            &ctx.region,
+            &ctx.account,
+            &pipeline_name,
         )),
     );
     seed.entry("PipelineExecutionStatus".to_string())
@@ -473,10 +471,7 @@ fn import_hub_content(
     let mut seed = body.clone();
     seed.insert(
         "HubArn".to_string(),
-        Value::String(format!(
-            "arn:aws:sagemaker:{}:{}:hub/{}",
-            ctx.region, ctx.account, hub_name
-        )),
+        Value::String(super::hub_arn(&ctx.region, &ctx.account, &hub_name)),
     );
     seed.entry("HubContentStatus".to_string())
         .or_insert_with(|| Value::String("Available".to_string()));
@@ -1050,10 +1045,7 @@ fn send_pipeline_execution_step(
     // stable execution arn from the token. It is stored on the step record so
     // `ListPipelineExecutionSteps(PipelineExecutionArn=…)` can scope to it, and
     // echoed in the response's required `PipelineExecutionArn`.
-    let exec_arn = format!(
-        "arn:aws:sagemaker:{}:{}:pipeline/callback/execution/{}",
-        ctx.region, ctx.account, token
-    );
+    let exec_arn = super::pipeline_execution_arn(&ctx.region, &ctx.account, "callback", &token);
     {
         let mut g = svc.state.write();
         let data = g.get_or_create(&ctx.account);

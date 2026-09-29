@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
+use fakecloud_aws::arn::Arn;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
@@ -267,19 +268,25 @@ impl KinesisState {
     // ARN carries the request's credential-scope region (req.region), not the
     // frozen server default. Streams are keyed by name, so keying is unchanged.
     pub fn stream_arn(&self, region: &str, stream_name: &str) -> String {
-        format!(
-            "arn:aws:kinesis:{}:{}:stream/{}",
-            region, self.account_id, stream_name
+        Arn::regional(
+            "kinesis",
+            region,
+            &self.account_id,
+            &format!("stream/{stream_name}"),
         )
+        .to_string()
     }
 
     // Like `stream_arn`, the ARN carries the request's credential-scope region.
     // AWS puts the channel's id, not its name, in the resource segment.
     pub fn channel_arn(&self, region: &str, channel_id: &str) -> String {
-        format!(
-            "arn:aws:kinesis:{}:{}:channel/{}",
-            region, self.account_id, channel_id
+        Arn::regional(
+            "kinesis",
+            region,
+            &self.account_id,
+            &format!("channel/{channel_id}"),
         )
+        .to_string()
     }
 
     /// Resolve a `ChannelARN` to the name of an existing channel. Like

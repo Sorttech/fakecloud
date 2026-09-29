@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 use tokio::sync::Mutex as AsyncMutex;
 
-use fakecloud_aws::arn::Arn;
+use fakecloud_aws::arn::{arn_resource, partition_of, Arn};
 use fakecloud_core::delivery::DeliveryBus;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_core::validation::*;
@@ -306,13 +306,7 @@ impl SecretsManagerService {
             ));
         }
 
-        let arn = format!(
-            "arn:aws:secretsmanager:{}:{}:secret:{}-{}",
-            req.region,
-            req.account_id,
-            input.name,
-            &uuid::Uuid::new_v4().to_string()[..6]
-        );
+        let arn = secret_arn(&req.region, &req.account_id, &input.name);
 
         let now = Utc::now();
 
@@ -838,13 +832,7 @@ impl SecretsManagerService {
                 }
                 Err(_) => {
                     // For force delete of non-existent secret, AWS returns success
-                    let arn = format!(
-                        "arn:aws:secretsmanager:{}:{}:secret:{}-{}",
-                        req.region,
-                        req.account_id,
-                        secret_id,
-                        &uuid::Uuid::new_v4().to_string()[..6]
-                    );
+                    let arn = secret_arn(&req.region, &req.account_id, &secret_id);
                     let deletion_date = Utc::now();
                     let response = json!({
                         "ARN": arn,
@@ -2137,11 +2125,11 @@ impl SecretsManagerService {
             Some(secret_id.to_string())
         } else if let Some(secret) = state.secrets.values().find(|s| s.arn == secret_id) {
             Some(secret.name.clone())
-        } else if secret_id.starts_with("arn:aws:secretsmanager:") {
+        } else if arn_resource(secret_id, "secretsmanager").is_some() {
             state
                 .secrets
                 .values()
-                .find(|s| s.arn.starts_with(secret_id))
+                .find(|s| is_partial_secret_arn(&s.arn, secret_id))
                 .map(|s| s.name.clone())
         } else {
             None
@@ -2174,11 +2162,11 @@ impl SecretsManagerService {
             .get(secret_id)
             .or_else(|| state.secrets.values().find(|s| s.arn == secret_id))
             .or_else(|| {
-                if secret_id.starts_with("arn:aws:secretsmanager:") {
+                if arn_resource(secret_id, "secretsmanager").is_some() {
                     state
                         .secrets
                         .values()
-                        .find(|s| s.arn.starts_with(secret_id))
+                        .find(|s| is_partial_secret_arn(&s.arn, secret_id))
                 } else {
                     None
                 }
@@ -2448,11 +2436,33 @@ fn remap_validation_error(err: AwsServiceError) -> AwsServiceError {
     }
 }
 
+/// True when `partial` is `stored` without its `-XXXXXX` random suffix, the
+/// partial-ARN form AWS accepts. A bare prefix does not count: the partial
+/// ARN of `app` must not resolve `app-db`.
+fn is_partial_secret_arn(stored: &str, partial: &str) -> bool {
+    stored
+        .strip_prefix(partial)
+        .and_then(|rest| rest.strip_prefix('-'))
+        .is_some_and(|suffix| suffix.chars().count() == 6)
+}
+
+/// A new secret's ARN: its name plus AWS's random six-character suffix, in the
+/// partition of `region`.
+pub fn secret_arn(region: &str, account_id: &str, name: &str) -> String {
+    Arn::regional(
+        "secretsmanager",
+        region,
+        account_id,
+        &format!("secret:{name}-{}", &uuid::Uuid::new_v4().to_string()[..6]),
+    )
+    .to_string()
+}
+
 /// Extract the owning account-id from an `arn:aws:secretsmanager:...:ACCOUNT:secret:...`
 /// secret id. Returns `caller_account` when the input is a bare name
 /// or a same-account ARN.
 fn secret_owner_account(secret_id: &str, caller_account: &str) -> String {
-    if !secret_id.starts_with("arn:aws:secretsmanager:") {
+    if arn_resource(secret_id, "secretsmanager").is_none() {
         return caller_account.to_string();
     }
     let parts: Vec<&str> = secret_id.splitn(7, ':').collect();
@@ -2478,7 +2488,9 @@ fn resource_policy_allows(policy_doc: &str, caller_account: &str, secret_arn: &s
     use fakecloud_core::auth::{Principal, PrincipalType};
     use fakecloud_iam::evaluator::{evaluate, EvalRequest, PolicyDocument};
     let doc = PolicyDocument::parse(policy_doc);
-    let principal_arn = Arn::global("iam", caller_account, "root").to_string();
+    let principal_arn = Arn::global("iam", caller_account, "root")
+        .with_partition(partition_of(secret_arn))
+        .to_string();
     let principal = Principal {
         arn: principal_arn.clone(),
         user_id: principal_arn.clone(),

@@ -153,6 +153,32 @@ async fn seed_image(endpoint: &str, repo: &str, tag: &str) -> String {
         .expect("write docker config");
 
     run_docker_with_config(docker_home.path(), &["push", &local_uri]).await;
+
+    // Drop the local tag now that the registry holds it. The runtime rewrites the
+    // AWS URI to this very same `127.0.0.1:<port>/<repo>:<tag>`, so leaving the
+    // tag in the daemon means a consumer can satisfy the "pull" from the local
+    // cache and never touch fakecloud's registry at all -- and this is the only
+    // e2e in the repo where a container runtime pulls from the bundled OCI
+    // registry, so that would quietly retire the coverage. It is not theoretical:
+    // a change that made ECS's launch cache-aware did exactly that, and every
+    // assertion here still passed.
+    //
+    // Best effort: the layers stay behind (shared with the public seed image), so
+    // this removes the NAME the runtime resolves, which is what decides whether
+    // the registry is asked. A daemon that refuses the untag should not fail a
+    // suite that can still run.
+    let untag = Command::new("docker")
+        .args(["rmi", &local_uri])
+        .output()
+        .await
+        .expect("spawn docker");
+    if !untag.status.success() {
+        eprintln!(
+            "note: could not untag {local_uri}: {}",
+            String::from_utf8_lossy(&untag.stderr).trim()
+        );
+    }
+
     aws_uri
 }
 

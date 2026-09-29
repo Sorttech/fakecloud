@@ -128,13 +128,13 @@ pub fn gen_id() -> String {
 
 /// Build a cluster ARN: `arn:aws:dsql:<region>:<account>:cluster/<id>`.
 pub fn cluster_arn(region: &str, account_id: &str, id: &str) -> String {
-    Arn::new("dsql", region, account_id, &format!("cluster/{id}")).to_string()
+    Arn::regional("dsql", region, account_id, &format!("cluster/{id}")).to_string()
 }
 
 /// Build a stream ARN:
 /// `arn:aws:dsql:<region>:<account>:cluster/<cluster>/stream/<stream>`.
 pub fn stream_arn(region: &str, account_id: &str, cluster: &str, stream: &str) -> String {
-    Arn::new(
+    Arn::regional(
         "dsql",
         region,
         account_id,
@@ -173,6 +173,18 @@ mod tests {
         assert_eq!(
             s,
             format!("arn:aws:dsql:us-east-1:123456789012:cluster/{id}/stream/{id}")
+        );
+    }
+
+    #[test]
+    fn arns_take_the_region_partition() {
+        assert_eq!(
+            cluster_arn("cn-north-1", "123456789012", "c"),
+            "arn:aws-cn:dsql:cn-north-1:123456789012:cluster/c"
+        );
+        assert_eq!(
+            stream_arn("us-gov-west-1", "123456789012", "c", "s"),
+            "arn:aws-us-gov:dsql:us-gov-west-1:123456789012:cluster/c/stream/s"
         );
     }
 

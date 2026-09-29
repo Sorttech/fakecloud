@@ -157,9 +157,8 @@ pub(super) fn cluster_snapshot_as_source(
     let field = |key: &str| entry.get(key).and_then(|v| v.as_str()).map(str::to_string);
     // The snapshot's own ARN names its OWNER, which is not the caller for
     // a snapshot shared with them.
-    let snapshot_arn = field("DBClusterSnapshotArn").unwrap_or_else(|| {
-        format!("arn:aws:rds:{region}:{account_id}:cluster-snapshot:{snapshot_id}")
-    });
+    let snapshot_arn = field("DBClusterSnapshotArn")
+        .unwrap_or_else(|| rds_arn(region, account_id, "cluster-snapshot", snapshot_id));
     // The captured database, base64 in the entry, exactly as
     // RestoreDBClusterFromSnapshot replays it -- without this the restore
     // reports `available` with an empty database.

@@ -6,7 +6,7 @@ use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use crate::service::Ec2Service;
 use crate::service_helpers::{
-    gen_id, indexed_list, require, validate_enum, validate_int_range, validate_length,
+    ec2_arn, gen_id, indexed_list, require, validate_enum, validate_int_range, validate_length,
     validate_max_results,
 };
 use crate::state::{CapacityReservation, Ec2State, Tag};
@@ -40,7 +40,7 @@ fn cr_xml(r: &CapacityReservation, tags: &[Tag], owner: &str) -> String {
          <ebsOptimized>{}</ebsOptimized><ephemeralStorage>{}</ephemeralStorage>{}{}{}{}{}{}",
         ec2_elem("capacityReservationId", &r.id),
         ec2_elem("ownerId", owner),
-        ec2_elem("capacityReservationArn", &format!("arn:aws:ec2:{}:{owner}:capacity-reservation/{}", region_of(r), r.id)),
+        ec2_elem("capacityReservationArn", &ec2_arn(&region_of(r), owner, &format!("capacity-reservation/{}", r.id))),
         ec2_elem("instanceType", &r.instance_type),
         ec2_elem("instancePlatform", &r.instance_platform),
         ec2_elem("availabilityZone", &r.availability_zone),

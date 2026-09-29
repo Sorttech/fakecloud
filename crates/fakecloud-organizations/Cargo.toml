@@ -8,6 +8,7 @@ homepage.workspace = true
 version.workspace = true
 
 [dependencies]
+fakecloud-aws = { workspace = true }
 fakecloud-core = { workspace = true }
 fakecloud-persistence = { workspace = true }
 async-trait = { workspace = true }
@@ -23,5 +24,4 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 bytes = { workspace = true }
-fakecloud-aws = { workspace = true }
 tokio = { workspace = true }

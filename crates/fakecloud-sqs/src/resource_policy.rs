@@ -59,10 +59,10 @@ impl ResourcePolicyProvider for SqsResourcePolicyProvider {
 }
 
 /// Light validity check on an SQS queue ARN. Accepts the
-/// `arn:aws:sqs:REGION:ACCOUNT:NAME` shape and nothing else — anything
+/// `arn:PARTITION:sqs:REGION:ACCOUNT:NAME` shape and nothing else — anything
 /// that doesn't look like an SQS queue ARN short-circuits to `None`.
 fn is_sqs_queue_arn(arn: &str) -> bool {
-    let Some(rest) = arn.strip_prefix("arn:aws:sqs:") else {
+    let Some(rest) = fakecloud_aws::arn::arn_resource(arn, "sqs") else {
         return false;
     };
     let parts: Vec<&str> = rest.splitn(3, ':').collect();

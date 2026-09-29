@@ -6,7 +6,8 @@ use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use crate::service::Ec2Service;
 use crate::service_helpers::{
-    gen_id, indexed_list, require, validate_enum, validate_int_range, validate_max_results,
+    ec2_global_arn, gen_id, indexed_list, require, validate_enum, validate_int_range,
+    validate_max_results,
 };
 
 use crate::state::{Ec2State, Ipam, IpamPool, IpamScope, Tag};
@@ -37,7 +38,10 @@ fn ipam_xml(i: &Ipam, tags: &[Tag], owner: &str, region: &str) -> String {
     format!(
         "{}{}{}{}{}{}{}<scopeCount>2</scopeCount><state>create-complete</state>{}{}{}",
         ec2_elem("ipamId", &i.id),
-        ec2_elem("ipamArn", &format!("arn:aws:ec2::{owner}:ipam/{}", i.id)),
+        ec2_elem(
+            "ipamArn",
+            &ec2_global_arn(region, owner, &format!("ipam/{}", i.id))
+        ),
         ec2_elem("ipamRegion", region),
         ec2_elem("ownerId", owner),
         ec2_elem("publicDefaultScopeId", &i.public_scope_id),
@@ -199,7 +203,7 @@ pub(crate) fn modify_ipam(
 
 // ---- scopes ----
 
-fn scope_xml(sc: &IpamScope, tags: &[Tag], owner: &str) -> String {
+fn scope_xml(sc: &IpamScope, tags: &[Tag], owner: &str, region: &str) -> String {
     let scope_type = if sc.scope_type.is_empty() {
         "private"
     } else {
@@ -208,8 +212,8 @@ fn scope_xml(sc: &IpamScope, tags: &[Tag], owner: &str) -> String {
     format!(
         "{}{}{}{}<ipamScopeType>{}</ipamScopeType><isDefault>false</isDefault><poolCount>0</poolCount><state>create-complete</state>{}",
         ec2_elem("ipamScopeId", &sc.id),
-        ec2_elem("ipamScopeArn", &format!("arn:aws:ec2::{owner}:ipam-scope/{}", sc.id)),
-        ec2_elem("ipamArn", &format!("arn:aws:ec2::{owner}:ipam/{}", sc.ipam_id)),
+        ec2_elem("ipamScopeArn", &ec2_global_arn(region, owner, &format!("ipam-scope/{}", sc.id))),
+        ec2_elem("ipamArn", &ec2_global_arn(region, owner, &format!("ipam/{}", sc.ipam_id))),
         ec2_elem("description", &sc.description),
         scope_type,
         super::tags::tag_set_xml(tags),
@@ -246,7 +250,10 @@ pub(crate) fn create_ipam_scope(
     Ok(Ec2Service::respond(
         "CreateIpamScope",
         &req.request_id,
-        &format!("<ipamScope>{}</ipamScope>", scope_xml(&sc, &tags, &owner)),
+        &format!(
+            "<ipamScope>{}</ipamScope>",
+            scope_xml(&sc, &tags, &owner, &req.region)
+        ),
     ))
 }
 
@@ -269,7 +276,10 @@ pub(crate) fn delete_ipam_scope(
     Ok(Ec2Service::respond(
         "DeleteIpamScope",
         &req.request_id,
-        &format!("<ipamScope>{}</ipamScope>", scope_xml(&sc, &tags, &owner)),
+        &format!(
+            "<ipamScope>{}</ipamScope>",
+            scope_xml(&sc, &tags, &owner, &req.region)
+        ),
     ))
 }
 
@@ -285,7 +295,7 @@ pub(crate) fn describe_ipam_scopes(
     let mut items: Vec<String> = state
         .ipam_scopes
         .values()
-        .map(|sc| scope_xml(sc, state.tags_for(&sc.id), &owner))
+        .map(|sc| scope_xml(sc, state.tags_for(&sc.id), &owner, &req.region))
         .collect();
     items.sort();
     Ok(Ec2Service::respond(
@@ -325,18 +335,21 @@ pub(crate) fn modify_ipam_scope(
     Ok(Ec2Service::respond(
         "ModifyIpamScope",
         &req.request_id,
-        &format!("<ipamScope>{}</ipamScope>", scope_xml(&sc, &tags, &owner)),
+        &format!(
+            "<ipamScope>{}</ipamScope>",
+            scope_xml(&sc, &tags, &owner, &req.region)
+        ),
     ))
 }
 
 // ---- pools ----
 
-fn pool_xml(p: &IpamPool, tags: &[Tag], owner: &str) -> String {
+fn pool_xml(p: &IpamPool, tags: &[Tag], owner: &str, region: &str) -> String {
     format!(
         "{}{}{}{}<ipamScopeType>private</ipamScopeType><poolDepth>1</poolDepth><state>create-complete</state><addressFamily>{}</addressFamily><autoImport>false</autoImport>{}",
         ec2_elem("ipamPoolId", &p.id),
-        ec2_elem("ipamPoolArn", &format!("arn:aws:ec2::{owner}:ipam-pool/{}", p.id)),
-        ec2_elem("ipamScopeArn", &format!("arn:aws:ec2::{owner}:ipam-scope/{}", p.scope_id)),
+        ec2_elem("ipamPoolArn", &ec2_global_arn(region, owner, &format!("ipam-pool/{}", p.id))),
+        ec2_elem("ipamScopeArn", &ec2_global_arn(region, owner, &format!("ipam-scope/{}", p.scope_id))),
         ec2_elem("description", &p.description),
         p.address_family,
         super::tags::tag_set_xml(tags),
@@ -376,7 +389,10 @@ pub(crate) fn create_ipam_pool(
     Ok(Ec2Service::respond(
         "CreateIpamPool",
         &req.request_id,
-        &format!("<ipamPool>{}</ipamPool>", pool_xml(&p, &tags, &owner)),
+        &format!(
+            "<ipamPool>{}</ipamPool>",
+            pool_xml(&p, &tags, &owner, &req.region)
+        ),
     ))
 }
 
@@ -401,7 +417,10 @@ pub(crate) fn delete_ipam_pool(
     Ok(Ec2Service::respond(
         "DeleteIpamPool",
         &req.request_id,
-        &format!("<ipamPool>{}</ipamPool>", pool_xml(&p, &tags, &owner)),
+        &format!(
+            "<ipamPool>{}</ipamPool>",
+            pool_xml(&p, &tags, &owner, &req.region)
+        ),
     ))
 }
 
@@ -417,7 +436,7 @@ pub(crate) fn describe_ipam_pools(
     let mut items: Vec<String> = state
         .ipam_pools
         .values()
-        .map(|p| pool_xml(p, state.tags_for(&p.id), &owner))
+        .map(|p| pool_xml(p, state.tags_for(&p.id), &owner, &req.region))
         .collect();
     items.sort();
     Ok(Ec2Service::respond(
@@ -458,7 +477,10 @@ pub(crate) fn modify_ipam_pool(
     Ok(Ec2Service::respond(
         "ModifyIpamPool",
         &req.request_id,
-        &format!("<ipamPool>{}</ipamPool>", pool_xml(&p, &tags, &owner)),
+        &format!(
+            "<ipamPool>{}</ipamPool>",
+            pool_xml(&p, &tags, &owner, &req.region)
+        ),
     ))
 }
 

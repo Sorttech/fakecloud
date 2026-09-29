@@ -23,10 +23,8 @@ pub(crate) fn create_automated_reasoning_policy(
     })?;
 
     let policy_id = Uuid::new_v4().to_string();
-    let policy_arn = format!(
-        "arn:aws:bedrock:{}:{}:automated-reasoning-policy/{}",
-        req.region, req.account_id, policy_id
-    );
+    let policy_arn =
+        crate::arns::automated_reasoning_policy_arn(&req.region, &req.account_id, &policy_id);
 
     let now = Utc::now();
     let policy = AutomatedReasoningPolicy {

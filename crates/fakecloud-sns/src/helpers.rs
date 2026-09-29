@@ -37,6 +37,11 @@ pub(crate) fn is_mutating_action(action: &str) -> bool {
     )
 }
 
+/// The ARN of topic `name` in `region`'s partition.
+pub fn topic_arn(region: &str, account_id: &str, name: &str) -> String {
+    fakecloud_aws::arn::Arn::regional("sns", region, account_id, name).to_string()
+}
+
 pub(crate) fn default_policy(topic_arn: &str, account_id: &str) -> String {
     serde_json::json!({
         "Version": "2008-10-17",

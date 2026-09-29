@@ -88,12 +88,7 @@ impl ElastiCacheService {
         }
 
         // ARN carries the request's credential-scope region (req.region).
-        let arn = format!(
-            "arn:aws:elasticache:{}:{}:user:{}",
-            request.region.as_str(),
-            state.account_id,
-            user_id
-        );
+        let arn = elasticache_arn(request.region.as_str(), &state.account_id, "user", &user_id);
 
         let user = ElastiCacheUser {
             user_id: user_id.clone(),
@@ -279,11 +274,11 @@ impl ElastiCacheService {
             }
         }
 
-        let arn = format!(
-            "arn:aws:elasticache:{}:{}:usergroup:{}",
+        let arn = elasticache_arn(
             request.region.as_str(),
-            state.account_id,
-            user_group_id
+            &state.account_id,
+            "usergroup",
+            &user_group_id,
         );
 
         let group = ElastiCacheUserGroup {

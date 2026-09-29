@@ -24,13 +24,16 @@ fn validate_lt_strings(req: &AwsRequest) -> Result<(), AwsServiceError> {
 
 // ---- launch templates ----
 
-fn lt_xml(t: &LaunchTemplate, tags: &[Tag], owner: &str) -> String {
+fn lt_xml(t: &LaunchTemplate, tags: &[Tag], owner: &str, region: &str) -> String {
     format!(
         "{}{}{}{}<defaultVersionNumber>{}</defaultVersionNumber><latestVersionNumber>{}</latestVersionNumber>{}",
         ec2_elem("launchTemplateId", &t.id),
         ec2_elem("launchTemplateName", &t.name),
         ec2_elem("createTime", FIXED_TIME),
-        ec2_elem("createdBy", &format!("arn:aws:iam::{owner}:root")),
+        ec2_elem(
+            "createdBy",
+            &fakecloud_aws::arn::Arn::global_in(region, "iam", owner, "root").to_string(),
+        ),
         t.default_version,
         t.latest_version,
         super::tags::tag_set_xml(tags),
@@ -256,6 +259,7 @@ fn lt_version_xml(
     version: i64,
     owner: &str,
     data: &BTreeMap<String, String>,
+    region: &str,
 ) -> String {
     format!(
         "{}{}<versionNumber>{}</versionNumber>{}{}<defaultVersion>{}</defaultVersion>{}",
@@ -263,7 +267,10 @@ fn lt_version_xml(
         ec2_elem("launchTemplateName", &t.name),
         version,
         ec2_elem("createTime", FIXED_TIME),
-        ec2_elem("createdBy", &format!("arn:aws:iam::{owner}:root")),
+        ec2_elem(
+            "createdBy",
+            &fakecloud_aws::arn::Arn::global_in(region, "iam", owner, "root").to_string(),
+        ),
         version == t.default_version,
         render_lt_data(data),
     )
@@ -306,7 +313,7 @@ pub(crate) fn create_launch_template(
         &req.request_id,
         &format!(
             "<launchTemplate>{}</launchTemplate>",
-            lt_xml(&t, &tags, &owner)
+            lt_xml(&t, &tags, &owner, &req.region)
         ),
     ))
 }
@@ -362,7 +369,7 @@ pub(crate) fn create_launch_template_version(
         &req.request_id,
         &format!(
             "<launchTemplateVersion>{}</launchTemplateVersion>",
-            lt_version_xml(&t, version, &owner, &data)
+            lt_version_xml(&t, version, &owner, &data, &req.region)
         ),
     ))
 }
@@ -399,7 +406,7 @@ pub(crate) fn delete_launch_template(
         state.tags.remove(&t.id);
         format!(
             "<launchTemplate>{}</launchTemplate>",
-            lt_xml(&t, &tags, &owner)
+            lt_xml(&t, &tags, &owner, &req.region)
         )
     } else {
         String::new()
@@ -458,7 +465,7 @@ pub(crate) fn describe_launch_templates(
         .launch_templates
         .values()
         .filter(|t| wanted.is_empty() || wanted.contains(&t.id))
-        .map(|t| lt_xml(t, state.tags_for(&t.id), &owner))
+        .map(|t| lt_xml(t, state.tags_for(&t.id), &owner, &req.region))
         .collect();
     items.sort();
     Ok(Ec2Service::respond(
@@ -483,7 +490,7 @@ pub(crate) fn describe_launch_template_versions(
             (1..=t.latest_version)
                 .map(|v| {
                     let data = t.versions.get(&v).unwrap_or(&empty_data);
-                    lt_version_xml(&t, v, &owner, data)
+                    lt_version_xml(&t, v, &owner, data, &req.region)
                 })
                 .collect()
         })
@@ -534,7 +541,7 @@ pub(crate) fn modify_launch_template(
         .map(|t| {
             format!(
                 "<launchTemplate>{}</launchTemplate>",
-                lt_xml(&t, &tags, &owner)
+                lt_xml(&t, &tags, &owner, &req.region)
             )
         })
         .unwrap_or_default();

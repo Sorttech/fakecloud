@@ -103,10 +103,7 @@ impl CloudWatchService {
             }
         }
 
-        let arn = format!(
-            "arn:aws:cloudwatch:{}:{}:alarm:{}",
-            req.region, req.account_id, alarm_name
-        );
+        let arn = crate::state::alarm_arn(&req.region, &req.account_id, &alarm_name);
         let now = Utc::now();
 
         let mut state = self.state.write();

@@ -25,7 +25,7 @@ use parking_lot::RwLock;
 
 use base64::Engine;
 
-use crate::state::{KmsKey, KmsState, SharedKmsState};
+use crate::state::{kms_alias_arn, kms_key_arn, parse_kms_arn, KmsKey, KmsState, SharedKmsState};
 
 /// One recorded KMS hook call. Returned by the introspection endpoint
 /// so test code can assert `kms:GenerateDataKey` / `kms:Decrypt` ran
@@ -211,6 +211,18 @@ impl KmsServiceHook {
         Ok(plaintext)
     }
 
+    /// Resolve `key_id` to its key ARN, provisioning an AWS-managed
+    /// `aws/<service>` key on first use.
+    pub fn resolve_key_arn(
+        &self,
+        account_id: &str,
+        region: &str,
+        key_id: &str,
+        service_principal: &str,
+    ) -> Result<String, KmsHookError> {
+        self.resolve_or_provision(account_id, region, key_id, service_principal)
+    }
+
     fn resolve_or_provision(
         &self,
         account_id: &str,
@@ -246,17 +258,11 @@ impl KmsServiceHook {
     }
 }
 
-/// Strip the `arn:aws:kms:<region>:<account>:` ARN prefix and return
+/// Strip the `arn:<partition>:kms:<region>:<account>:` ARN prefix and return
 /// the resource portion (e.g. `key/<id>` or `alias/<name>`). Returns
 /// `None` for ARNs that don't have the right shape.
 fn strip_kms_arn_prefix(key_id: &str) -> Option<&str> {
-    let rest = key_id.strip_prefix("arn:aws:kms:")?;
-    // Format after prefix: <region>:<account>:<resource>. Need to skip
-    // both `region` and `account` separately so the resource starts
-    // cleanly at `key/...` or `alias/...`.
-    let (_region, after_region) = rest.split_once(':')?;
-    let (_account, resource) = after_region.split_once(':')?;
-    Some(resource)
+    parse_kms_arn(key_id).map(|(_region, _account, resource)| resource)
 }
 
 /// Resolve `key_id` (raw id, alias name, alias ARN, or key ARN) to the
@@ -347,11 +353,7 @@ fn provision_aws_managed_key(
     service_principal: &str,
 ) -> String {
     let key_id = uuid::Uuid::new_v4().to_string();
-    let arn = format!(
-        "arn:aws:kms:{region}:{account}:key/{key_id}",
-        account = state.account_id,
-        region = region,
-    );
+    let arn = kms_key_arn(region, &state.account_id, &key_id);
     let policy = serde_json::json!({
         "Version": "2012-10-17",
         "Statement": [{
@@ -400,11 +402,7 @@ fn provision_aws_managed_key(
         alias_full.clone(),
         crate::state::KmsAlias {
             alias_name: alias_full,
-            alias_arn: format!(
-                "arn:aws:kms:{region}:{account}:alias/{alias}",
-                account = state.account_id,
-                region = region,
-            ),
+            alias_arn: kms_alias_arn(region, &state.account_id, &format!("alias/{alias}")),
             target_key_id: key_id,
             creation_date: Utc::now().timestamp() as f64,
         },
@@ -421,6 +419,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn aws_managed_keys_take_the_partition_of_their_region() {
+        let state: SharedKmsState = std::sync::Arc::new(parking_lot::RwLock::new(
+            fakecloud_core::multi_account::MultiAccountState::new("123456789012", "cn-north-1", ""),
+        ));
+        let hook = KmsServiceHook::new(state, Default::default());
+        let arn = hook
+            .resolve_key_arn(
+                "123456789012",
+                "cn-north-1",
+                "alias/aws/dynamodb",
+                "dynamodb.amazonaws.com",
+            )
+            .unwrap();
+        assert!(
+            arn.starts_with("arn:aws-cn:kms:cn-north-1:123456789012:key/"),
+            "{arn}"
+        );
+        // The same key resolves again by its own ARN.
+        assert_eq!(
+            hook.resolve_key_arn("123456789012", "cn-north-1", &arn, "dynamodb.amazonaws.com")
+                .unwrap(),
+            arn
+        );
+    }
+
+    #[test]
     fn strip_arn_prefix_skips_region_and_account() {
         assert_eq!(
             strip_kms_arn_prefix("arn:aws:kms:us-east-1:000000000000:key/abc-123"),
@@ -433,6 +457,37 @@ mod tests {
         assert_eq!(strip_kms_arn_prefix("not-an-arn"), None);
         // Missing one of region/account should return None, not a half-stripped resource.
         assert_eq!(strip_kms_arn_prefix("arn:aws:kms:key/abc"), None);
+        assert_eq!(
+            strip_kms_arn_prefix("arn:aws-cn:kms:cn-north-1:000000000000:key/abc-123"),
+            Some("key/abc-123")
+        );
+    }
+
+    #[test]
+    fn china_region_managed_key_is_minted_and_resolved_in_aws_cn() {
+        let mut state = KmsState::new("000000000000", "cn-north-1");
+        let arn = provision_aws_managed_key(
+            &mut state,
+            "cn-north-1",
+            "aws/secretsmanager",
+            "secretsmanager.amazonaws.com",
+        );
+        assert!(
+            arn.starts_with("arn:aws-cn:kms:cn-north-1:000000000000:key/"),
+            "{arn}"
+        );
+        assert_eq!(
+            state.aliases["alias/aws/secretsmanager"].alias_arn,
+            "arn:aws-cn:kms:cn-north-1:000000000000:alias/aws/secretsmanager"
+        );
+        assert_eq!(resolve_key(&state, &arn), Some(arn.clone()));
+        assert_eq!(
+            resolve_key(
+                &state,
+                "arn:aws-cn:kms:cn-north-1:000000000000:alias/aws/secretsmanager"
+            ),
+            Some(arn)
+        );
     }
 
     #[test]

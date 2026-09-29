@@ -75,7 +75,7 @@ expect(emails[0].content.simple.subject.data).toBe('Hello');
 await fc.reset();
 ```
 
-SDKs for TypeScript, Python, Go, PHP, Java, Rust.
+SDKs for TypeScript, Python, Go, PHP, Java, Rust, .NET.
 
 ## Templates
 

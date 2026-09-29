@@ -22,5 +22,6 @@ pub(crate) mod xml;
 
 pub use service::NeptuneService;
 pub use state::{
-    NeptuneSnapshot, NeptuneState, SharedNeptuneState, NEPTUNE_SNAPSHOT_SCHEMA_VERSION,
+    global_cluster_arn, rds_arn, NeptuneSnapshot, NeptuneState, SharedNeptuneState,
+    NEPTUNE_SNAPSHOT_SCHEMA_VERSION,
 };

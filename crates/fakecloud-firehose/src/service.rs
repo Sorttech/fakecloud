@@ -511,7 +511,7 @@ fn encryption_config_json(enc: &EncryptionConfig) -> Value {
 }
 
 fn arn_for(region: &str, account: &str, name: &str) -> String {
-    Arn::new(
+    Arn::regional(
         "firehose",
         region,
         account,
@@ -521,7 +521,7 @@ fn arn_for(region: &str, account: &str, name: &str) -> String {
 }
 
 fn bucket_name_from_arn(arn: &str) -> Option<&str> {
-    arn.strip_prefix("arn:aws:s3:::")
+    fakecloud_aws::arn::arn_resource(arn, "s3")?.strip_prefix("::")
 }
 
 impl FirehoseService {
@@ -1889,5 +1889,36 @@ mod tests {
             .get("real-bucket")
             .unwrap();
         assert!(real.objects.is_empty(), "no object should be written");
+    }
+
+    #[test]
+    fn china_region_delivery_stream_uses_the_aws_cn_partition() {
+        let svc = service();
+        let in_china = |action: &str, body: Value| AwsRequest {
+            region: "cn-north-1".to_string(),
+            ..request(action, body)
+        };
+        svc.create_delivery_stream(&in_china(
+            "CreateDeliveryStream",
+            json!({ "DeliveryStreamName": "cn-fh" }),
+        ))
+        .unwrap();
+        let resp = svc
+            .describe_delivery_stream(&in_china(
+                "DescribeDeliveryStream",
+                json!({ "DeliveryStreamName": "cn-fh" }),
+            ))
+            .unwrap();
+        let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        assert_eq!(
+            body["DeliveryStreamDescription"]["DeliveryStreamARN"],
+            "arn:aws-cn:firehose:cn-north-1:123456789012:deliverystream/cn-fh"
+        );
+        assert_eq!(
+            bucket_name_from_arn("arn:aws-cn:s3:::cn-bucket"),
+            Some("cn-bucket")
+        );
+        assert_eq!(bucket_name_from_arn("arn:aws:s3:::bucket"), Some("bucket"));
+        assert_eq!(bucket_name_from_arn("arn:aws-cn:sqs:cn-north-1:1:q"), None);
     }
 }

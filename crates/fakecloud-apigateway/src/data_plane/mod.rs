@@ -2544,6 +2544,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn china_region_arns_use_the_aws_cn_partition() {
+        assert_eq!(
+            stage_resource_arn("cn-north-1", "abc123", "prod"),
+            "arn:aws-cn:apigateway:cn-north-1::/restapis/abc123/stages/prod"
+        );
+        let mut req = make_request(HeaderMap::new());
+        req.region = "cn-north-1".to_string();
+        assert_eq!(
+            build_method_arn(&req, "abc123", "prod", "/items"),
+            "arn:aws-cn:execute-api:cn-north-1:000000000000:abc123/prod/GET/items"
+        );
+        assert_eq!(
+            extract_lambda_arn(
+                "arn:aws-cn:apigateway:cn-north-1:lambda:path/2015-03-31/functions/arn:aws-cn:lambda:cn-north-1:000000000000:function:my-fn/invocations"
+            ),
+            Some("arn:aws-cn:lambda:cn-north-1:000000000000:function:my-fn".to_string())
+        );
+
+        let stub = Arc::new(StubAwsService {
+            name: "dynamodb".to_string(),
+            last_request: parking_lot::Mutex::new(None),
+        });
+        let mut registry = fakecloud_core::registry::ServiceRegistry::new();
+        registry.register(stub.clone());
+        let registry_handle = Arc::new(std::sync::OnceLock::new());
+        let _ = registry_handle.set(Arc::new(registry));
+        let service =
+            ApiGatewayService::new(build_state("NONE", None)).with_registry(registry_handle);
+        let resp = aws_direct_integration(
+            &req,
+            "arn:aws-cn:apigateway:cn-north-1:dynamodb:action/PutItem",
+            &aws_integration(Some("POST")),
+            &service,
+        )
+        .await
+        .expect("an aws-cn integration uri must dispatch");
+        assert_eq!(resp.status, StatusCode::OK);
+        let locked = stub.last_request.lock();
+        assert_eq!(locked.as_ref().unwrap().action, "PutItem");
+    }
+
+    #[tokio::test]
     async fn aws_direct_integration_uses_integration_method_not_client_method() {
         // Regression for #1776: a `GET` resource with an `AWS` Lambda
         // integration (`integrationHttpMethod = POST`) must reach the

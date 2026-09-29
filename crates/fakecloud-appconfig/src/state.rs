@@ -18,6 +18,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::multi_account::{AccountState, MultiAccountState};
 
 pub const APPCONFIG_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
@@ -162,27 +163,61 @@ pub struct AppConfigSnapshot {
 // ---------------------------------------------------------------------------
 
 pub fn application_arn(region: &str, account_id: &str, id: &str) -> String {
-    format!("arn:aws:appconfig:{region}:{account_id}:application/{id}")
+    Arn::regional(
+        "appconfig",
+        region,
+        account_id,
+        &format!("application/{id}"),
+    )
+    .to_string()
 }
 
 pub fn environment_arn(region: &str, account_id: &str, app: &str, env: &str) -> String {
-    format!("arn:aws:appconfig:{region}:{account_id}:application/{app}/environment/{env}")
+    Arn::regional(
+        "appconfig",
+        region,
+        account_id,
+        &format!("application/{app}/environment/{env}"),
+    )
+    .to_string()
 }
 
 pub fn profile_arn(region: &str, account_id: &str, app: &str, profile: &str) -> String {
-    format!(
-        "arn:aws:appconfig:{region}:{account_id}:application/{app}/configurationprofile/{profile}"
+    Arn::regional(
+        "appconfig",
+        region,
+        account_id,
+        &format!("application/{app}/configurationprofile/{profile}"),
     )
+    .to_string()
 }
 
 pub fn deployment_strategy_arn(region: &str, account_id: &str, id: &str) -> String {
-    format!("arn:aws:appconfig:{region}:{account_id}:deploymentstrategy/{id}")
+    Arn::regional(
+        "appconfig",
+        region,
+        account_id,
+        &format!("deploymentstrategy/{id}"),
+    )
+    .to_string()
 }
 
 pub fn extension_arn(region: &str, account_id: &str, id: &str, version: i64) -> String {
-    format!("arn:aws:appconfig:{region}:{account_id}:extension/{id}/{version}")
+    Arn::regional(
+        "appconfig",
+        region,
+        account_id,
+        &format!("extension/{id}/{version}"),
+    )
+    .to_string()
 }
 
 pub fn extension_association_arn(region: &str, account_id: &str, id: &str) -> String {
-    format!("arn:aws:appconfig:{region}:{account_id}:extensionassociation/{id}")
+    Arn::regional(
+        "appconfig",
+        region,
+        account_id,
+        &format!("extensionassociation/{id}"),
+    )
+    .to_string()
 }

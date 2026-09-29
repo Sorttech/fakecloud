@@ -1774,7 +1774,7 @@ impl EksService {
                 "addonName": addon_name,
                 "addonVersion": addon_version,
                 "configurationSchema": addon_configuration_schema(&addon_name),
-                "podIdentityConfiguration": pod_identity_configuration(&addon_name),
+                "podIdentityConfiguration": pod_identity_configuration(&req.region, &addon_name),
             })
             .to_string(),
         ))
@@ -2107,7 +2107,7 @@ impl EksService {
         // contract declares no client error for it.
         let max_results = validate_max_results(req)?;
         let next_token = req.query_params.get("nextToken").cloned();
-        let catalog = access_policy_catalog();
+        let catalog = access_policy_catalog(&req.region);
         let (page, token) = paginate_checked(&catalog, next_token.as_deref(), max_results)
             .unwrap_or_else(|_| (catalog.clone(), None));
         let mut out = json!({ "accessPolicies": page });
