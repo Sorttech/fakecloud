@@ -38,10 +38,7 @@ impl KmsService {
         let state = accounts.get_or_create(&req.account_id);
 
         if state.aliases.contains_key(&alias_name) {
-            let alias_arn = format!(
-                "arn:aws:kms:{}:{}:{}",
-                req.region, state.account_id, alias_name
-            );
+            let alias_arn = kms_alias_arn(&req.region, &state.account_id, &alias_name);
             return Err(AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
                 "AlreadyExistsException",
@@ -49,10 +46,7 @@ impl KmsService {
             ));
         }
 
-        let alias_arn = format!(
-            "arn:aws:kms:{}:{}:{}",
-            req.region, state.account_id, alias_name
-        );
+        let alias_arn = kms_alias_arn(&req.region, &state.account_id, &alias_name);
 
         state.aliases.insert(
             alias_name.clone(),
@@ -91,10 +85,7 @@ impl KmsService {
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
         if state.aliases.remove(alias_name).is_none() {
-            let alias_arn = format!(
-                "arn:aws:kms:{}:{}:{}",
-                req.region, state.account_id, alias_name
-            );
+            let alias_arn = kms_alias_arn(&req.region, &state.account_id, alias_name);
             return Err(AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
                 "NotFoundException",

@@ -379,6 +379,49 @@ pub trait S3Store: Send + Sync {
     fn delete_bucket_subresource(&self, bucket: &str, kind: BucketSubresource) -> StoreResult<()>;
     fn delete_bucket(&self, bucket: &str) -> StoreResult<()>;
 
+    /// Whether the store holds any persisted state for `bucket`.
+    ///
+    /// A bucket absent from memory can still have files on disk: after
+    /// `/_fakecloud/reset` (which clears memory and leaves the store alone), or
+    /// from a create or delete that stopped partway. Memory-only stores hold
+    /// nothing, hence the default.
+    fn bucket_state_exists(&self, _bucket: &str) -> bool {
+        false
+    }
+
+    /// Whether this bucket was REFUSED at load: data still on disk and
+    /// recoverable by repairing the one bad file.
+    ///
+    /// Covers both layers that can refuse one. [`S3Store::load`] records the
+    /// buckets whose OBJECTS it could not read (a corrupt object meta, a missing
+    /// part body); the layer that parses a bucket's own files reports the rest
+    /// through [`S3Store::mark_bucket_load_refused`], since the store reads those
+    /// as opaque text and sees nothing wrong.
+    ///
+    /// Recorded at load, not probed per call, so a caller cannot confuse "the
+    /// loader could not read this" with "this is simply not in memory".
+    fn bucket_load_refused(&self, _bucket: &str) -> bool {
+        false
+    }
+
+    /// Record that `bucket` could not be loaded, for a reason found ABOVE the
+    /// store: its objects read fine, but a sidecar this layer does not parse
+    /// (`tags.toml`, `acl.toml`, `inventory.toml`) did not. The caller hydrating
+    /// a snapshot reports each such bucket here so it is refused exactly like a
+    /// store-level refusal -- otherwise its name looks free and the next
+    /// `CreateBucket` clears the directory, objects included.
+    fn mark_bucket_load_refused(&self, _bucket: &str) {}
+
+    /// Forget that `bucket` was refused at load, because the name now belongs to
+    /// a bucket that loaded.
+    ///
+    /// The refusal is recorded at load and consulted long afterwards, so it has
+    /// to be dropped when it stops being true, or a name whose unreadable data
+    /// is gone stays refused for the life of the process.
+    fn clear_bucket_load_refusal(&self, _bucket: &str) -> StoreResult<()> {
+        Ok(())
+    }
+
     fn put_object(
         &self,
         bucket: &str,
@@ -536,11 +579,18 @@ impl S3Store for MemoryS3Store {
 pub struct DiskS3Store {
     root: PathBuf,
     cache: std::sync::Arc<crate::cache::BodyCache>,
+    /// Escaped directory names `load` could not read, so a caller can tell
+    /// recoverable data apart from state the operator already discarded.
+    load_refused: parking_lot::RwLock<std::collections::HashSet<String>>,
 }
 
 impl DiskS3Store {
     pub fn new(root: PathBuf, cache: std::sync::Arc<crate::cache::BodyCache>) -> Self {
-        Self { root, cache }
+        Self {
+            root,
+            cache,
+            load_refused: parking_lot::RwLock::new(std::collections::HashSet::new()),
+        }
     }
 
     fn buckets_dir(&self) -> PathBuf {
@@ -642,6 +692,10 @@ fn io_other(msg: impl Into<String>) -> StoreError {
 
 impl S3Store for DiskS3Store {
     fn load(&self) -> StoreResult<S3State> {
+        // This load decides which buckets are refused, so start clean: carrying
+        // entries over would keep a bucket whose bad file was repaired
+        // un-creatable.
+        self.load_refused.write().clear();
         let mut state = S3State::default();
         let buckets_dir = self.buckets_dir();
         if !buckets_dir.exists() {
@@ -858,11 +912,21 @@ impl S3Store for DiskS3Store {
                     state.buckets.insert(snap.meta.name.clone(), snap);
                 }
                 Ok(None) => {}
-                Err(e) => tracing::warn!(
-                    bucket = %bdir.display(),
-                    error = %e,
-                    "skipping unreadable S3 bucket during load"
-                ),
+                Err(e) => {
+                    // Remembered so a later CreateBucket knows this directory
+                    // holds recoverable data rather than state the operator
+                    // discarded.
+                    if let Some(dir_name) = bdir.file_name().and_then(|n| n.to_str()) {
+                        self.load_refused.write().insert(dir_name.to_string());
+                    }
+                    tracing::warn!(
+                        bucket = %bdir.display(),
+                        error = %e,
+                        "skipping unreadable S3 bucket during load; its name is refused until \
+                         the bad file is repaired and the server restarted, or the bucket's \
+                         directory is removed -- no API call discards it"
+                    );
+                }
             }
         }
         Ok(state)
@@ -899,13 +963,45 @@ impl S3Store for DiskS3Store {
         }
     }
 
+    fn bucket_state_exists(&self, bucket: &str) -> bool {
+        self.bucket_dir(bucket).exists()
+    }
+
+    fn bucket_load_refused(&self, bucket: &str) -> bool {
+        self.load_refused
+            .read()
+            .contains(&crate::key_escape::escape_key_segment(bucket))
+    }
+
+    fn mark_bucket_load_refused(&self, bucket: &str) {
+        self.load_refused
+            .write()
+            .insert(crate::key_escape::escape_key_segment(bucket));
+    }
+
+    fn clear_bucket_load_refusal(&self, bucket: &str) -> StoreResult<()> {
+        self.load_refused
+            .write()
+            .remove(&crate::key_escape::escape_key_segment(bucket));
+        Ok(())
+    }
+
     fn delete_bucket(&self, bucket: &str) -> StoreResult<()> {
         let dir = self.bucket_dir(bucket);
-        match std::fs::remove_dir_all(&dir) {
+        let outcome = match std::fs::remove_dir_all(&dir) {
             Ok(_) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e.into()),
+            Err(e) => Err(StoreError::from(e)),
+        };
+        // Only once the tree is really gone: a removal that stops partway
+        // returns Err and the caller reports 500, so dropping the refusal here
+        // would leave the next CreateBucket free to discard the remains.
+        if outcome.is_ok() {
+            self.load_refused
+                .write()
+                .remove(&crate::key_escape::escape_key_segment(bucket));
         }
+        outcome
     }
 
     fn put_object(
@@ -1308,6 +1404,44 @@ mod disk_tests {
             size,
             ..Default::default()
         }
+    }
+
+    /// The refusal set is written by two layers that name a bucket differently:
+    /// `load` inserts the on-disk directory name, while the sidecar layer above
+    /// the store hands `mark_bucket_load_refused` a bucket NAME. Both readers
+    /// escape. A name that escapes to itself -- which every name in the e2e
+    /// suites happens to be -- cannot tell the two key spaces apart, so pin it
+    /// with one that does not.
+    #[test]
+    fn a_refusal_is_found_under_the_escaped_directory_name() {
+        let tmp = TempDir::new().unwrap();
+        let store = new_store(&tmp);
+
+        let name = "odd:name";
+        let escaped = crate::key_escape::escape_key_segment(name);
+        assert_ne!(escaped, name, "pick a name that actually escapes");
+
+        assert!(!store.bucket_load_refused(name));
+        store.mark_bucket_load_refused(name);
+        assert!(
+            store.bucket_load_refused(name),
+            "marked by name, read back by name"
+        );
+
+        // The directory the store creates for it is the escaped one, so `load`'s
+        // raw-directory-name insert lands on the same key this reader uses.
+        let meta = BucketMeta {
+            name: name.to_string(),
+            ..Default::default()
+        };
+        store.put_bucket_meta(name, &meta).unwrap();
+        assert!(
+            tmp.path().join("buckets").join(&escaped).is_dir(),
+            "expected the bucket directory under the escaped name"
+        );
+
+        store.clear_bucket_load_refusal(name).unwrap();
+        assert!(!store.bucket_load_refused(name));
     }
 
     #[test]

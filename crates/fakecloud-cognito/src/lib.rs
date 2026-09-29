@@ -24,6 +24,17 @@ pub use state::{
     UserPoolClient, UserPoolDomain, COGNITO_SNAPSHOT_SCHEMA_VERSION,
 };
 
+/// A user pool's ARN, in the partition of `region`.
+pub fn user_pool_arn(region: &str, account_id: &str, pool_id: &str) -> String {
+    fakecloud_aws::arn::Arn::regional(
+        "cognito-idp",
+        region,
+        account_id,
+        &format!("userpool/{pool_id}"),
+    )
+    .to_string()
+}
+
 /// `CognitoJwtVerifier` impl backed by the in-process Cognito state.
 /// Wired by fakecloud-server so cross-service consumers (API Gateway v1
 /// `COGNITO_USER_POOLS` authorizer) can verify pool-issued JWTs without

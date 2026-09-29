@@ -319,6 +319,47 @@ impl S3Service {
         let acl = acl_header.unwrap_or("private");
 
         let mut accts = self.state.write();
+        // A bucket the loader could not read is absent from memory, so its name
+        // looks free -- but its objects are on disk and recoverable by repairing
+        // the one bad file, and this create is about to clear the directory.
+        // Refuse instead, and say how to get the name back. Both ways out are in
+        // the data path, where an operator with an unreadable store already is:
+        // repair the one bad file and restart, or remove the directory, which
+        // frees the name immediately (the check below is on the data still being
+        // there, not on the refusal alone). There is deliberately no API verb
+        // that discards it -- DeleteBucket cannot check emptiness here, since the
+        // objects are exactly what could not be read, nor ownership, since the
+        // metadata carrying it is what failed.
+        // `bucket_state_exists` as well as the refusal: the refusal is recorded
+        // at load, so an operator who took the second way out below -- removing
+        // the directory, without restarting -- would otherwise find the name
+        // refused for the rest of the process lifetime, with an error telling
+        // them to repair something that is gone.
+        if self.store.bucket_load_refused(bucket)
+            && self.store.bucket_state_exists(bucket)
+            && !accts
+                .iter()
+                .any(|(_, acct)| acct.buckets.contains_key(bucket))
+        {
+            tracing::warn!(
+                target: "fakecloud::s3",
+                bucket = %bucket,
+                "CreateBucket refused: the store holds data for this bucket that could not be \
+                 read at load",
+            );
+            return Err(AwsServiceError::aws_error_with_fields(
+                StatusCode::CONFLICT,
+                "BucketAlreadyExists",
+                format!(
+                    "The requested bucket name is not available: {bucket} holds persisted data \
+                     that could not be read at load -- an unreadable object, one of the bucket's \
+                     own files (tags.toml, acl.toml, inventory.toml), or a delete that stopped \
+                     partway. The server logged which file it was. Repair it in the data path and \
+                     restart to get the bucket back, or remove the directory to free the name."
+                ),
+                vec![("BucketName".to_string(), bucket.to_string())],
+            ));
+        }
         // Check global uniqueness across all accounts before creating
         for (other_account_id, acct_state) in accts.iter() {
             if acct_state.buckets.contains_key(bucket) {
@@ -446,33 +487,52 @@ impl S3Service {
             })?),
             None => None,
         };
-        // The meta goes first, and nothing is destroyed until it lands: a
-        // create that fails here has changed nothing on disk, where clearing
-        // the old sidecars first would have thrown away the configuration of
-        // whatever bucket this name belonged to for a create that never
-        // happened.
+        // Clear whatever the store still holds for this name BEFORE writing this
+        // bucket's own state -- the clear removes `meta.toml`, so doing it
+        // afterwards would delete the bucket this create just wrote.
+        //
+        // A bucket absent from memory can still have a directory on disk: after
+        // `/_fakecloud/reset` (which clears memory and deliberately leaves the
+        // store alone), or from a create or delete that stopped partway. Leaving
+        // it meant the new bucket inherited the previous one's `objects/` on the
+        // next load, so the caller saw an empty bucket now and the old objects
+        // came back after a restart.
+        //
+        // What this can destroy is state the operator already discarded: a name
+        // whose data the loader REFUSED is turned away earlier, before anything
+        // is written, so merely-unreadable data is never what a create clears.
+        //
+        // Gated on there being a directory at all, which is the case for every
+        // ordinary create. The clear is a recursive remove and this runs under
+        // the global S3 write lock, so an unconditional call would put a
+        // stat-and-walk of a possibly huge tree in front of every other S3
+        // request on the one create-after-reset that needs it -- and a bare
+        // `stat` in front of all the rest.
+        if self.store.bucket_state_exists(bucket) {
+            self.store
+                .delete_bucket(bucket)
+                .map_err(super::persistence_error)?;
+        }
+        // This name now belongs to a bucket that loads, so whatever the last load
+        // could not read under it is gone (either cleared just above, or removed
+        // out of band, which is what let the create past the refusal at all).
+        // Leaving the refusal behind would refuse the name again after the next
+        // `/_fakecloud/reset`, for data that is no longer there.
+        //
+        // Before the writes below, not after: a create that fails partway would
+        // otherwise leave the refusal standing over a directory it had just
+        // created, and every later create for the name would be told to repair a
+        // directory holding nothing but that failed attempt's `meta.toml`. Only
+        // reached once the refusal is known not to apply, so dropping it here
+        // cannot discard a live one.
+        if self.store.bucket_load_refused(bucket) {
+            self.store
+                .clear_bucket_load_refusal(bucket)
+                .map_err(super::persistence_error)?;
+        }
         self.store
             .put_bucket_meta(bucket, &meta)
             .map_err(super::persistence_error)?;
-        // Clear every stored subresource for this name before writing this
-        // bucket's own, now that the create is committed. A create or delete that stopped partway -- or a
-        // `/_fakecloud/reset`, which clears memory and leaves the store alone --
-        // can leave sidecars behind, and a later create would otherwise be
-        // restored carrying the old bucket's `policy.toml`, `acl.toml` and the
-        // rest. Each delete tolerates a missing file, which is the normal case.
-        //
-        // Scoped to the sidecars on purpose. `objects/` is NOT touched: the
-        // loader skips a bucket whose objects it cannot read, so that bucket is
-        // absent from memory while its data sits intact on disk, and clearing
-        // the directory here would make re-creating the name the thing that
-        // destroys it. Whether a create should adopt or discard a stale object
-        // tree is a separate question from this one, and this is not the change
-        // that answers it.
-        for kind in fakecloud_persistence::ALL_SUBRESOURCES {
-            self.store
-                .delete_bucket_subresource(bucket, *kind)
-                .map_err(super::persistence_error)?;
-        }
 
         self.put_bucket_subresource_if_set(
             bucket,

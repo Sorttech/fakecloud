@@ -21,5 +21,5 @@ pub(crate) mod service;
 pub(crate) mod state;
 pub(crate) mod validate;
 
-pub use service::ShieldService;
+pub use service::{protection_arn, protection_group_arn, subscription_arn, ShieldService};
 pub use state::{SharedShieldState, ShieldSnapshot, ShieldState, SHIELD_SNAPSHOT_SCHEMA_VERSION};

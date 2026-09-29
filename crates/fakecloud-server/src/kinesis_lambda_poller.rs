@@ -220,7 +220,10 @@ impl KinesisLambdaPoller {
                         "eventSource": "aws:kinesis",
                         "eventSourceARN": mapping.stream_arn,
                         "eventVersion": "1.0",
-                        "invokeIdentityArn": "arn:aws:iam::123456789012:role/lambda-role",
+                        "invokeIdentityArn": format!(
+                            "arn:{}:iam::123456789012:role/lambda-role",
+                            fakecloud_aws::arn::partition_of(&mapping.stream_arn)
+                        ),
                         "kinesis": {
                             "approximateArrivalTimestamp": record.approximate_arrival_timestamp.timestamp_millis() as f64 / 1000.0,
                             "data": base64::engine::general_purpose::STANDARD.encode(&record.data),

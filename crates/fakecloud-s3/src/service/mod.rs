@@ -249,15 +249,9 @@ impl S3Service {
         bucket: &str,
         headers: &HeaderMap,
     ) -> Result<WriteAclHeaders, AwsServiceError> {
-        // A present-but-blank value is treated as absent, the same rule
-        // `has_grant_headers` applies to the `x-amz-grant-*` family and for the
-        // same reason: it is what a client sends for an unset config field, and
-        // testing presence alone turned that into a hard 400 on every
-        // ACL-accepting write.
         let canned = headers
             .get("x-amz-acl")
             .and_then(|v| v.to_str().ok())
-            .filter(|s| !s.trim().is_empty())
             .map(|s| s.to_string());
         if let Some(acl) = canned.as_deref() {
             validate_object_canned_acl(acl)?;
@@ -274,11 +268,28 @@ impl S3Service {
                 "Specifying both Canned ACLs and Header Grants is not allowed",
             ));
         }
+        // The bucket's ACL owner, which is who "bucket owner full control" means
+        // -- not the caller. They coincide for a bucket this account created, and
+        // diverge for one persisted by another account and hydrated into the
+        // default account on restart, where comparing against the caller accepted
+        // a grant to somebody who is not the owner and refused the grant to the
+        // owner that AWS accepts.
+        //
+        // Looked up only when the request actually names an ACL: the overwhelming
+        // majority of object writes carry none, and this takes the global read
+        // lock. Resolved once and used for both the grants below and the exception
+        // check, so the two cannot derive the owner differently.
+        let bucket_owner = (canned.is_some() || grants.is_some())
+            .then(|| self.bucket_acl_owner_id(account_id, bucket))
+            .flatten();
+        let owner_id = bucket_owner.as_deref().unwrap_or(account_id);
+
         // The grants the request resolves to, which is what the public-ACL check
-        // below has to judge.
+        // below has to judge. Resolved against the bucket's owner, which is what
+        // the write paths store them under.
         let requested = match (&grants, canned.as_deref()) {
             (Some(g), _) => Some(g.clone()),
-            (None, Some(acl)) => Some(canned_acl_grants_for_object(acl, account_id)),
+            (None, Some(acl)) => Some(canned_acl_grants_for_object(acl, owner_id)),
             (None, None) => None,
         };
 
@@ -297,15 +308,14 @@ impl S3Service {
         // "bucket owner full control".
         let asks_for_owner_full_control = match (&grants, canned.as_deref()) {
             // "an equivalent form of this ACL": explicit grants that give the
-            // owner full control and nobody anything.
-            (Some(g), _) => {
-                !g.is_empty()
-                    && g.iter().all(|grant| {
-                        grant.permission == "FULL_CONTROL"
-                            && grant.grantee_type == "CanonicalUser"
-                            && grant.grantee_id.as_deref() == Some(account_id)
-                    })
-            }
+            // owner full control and nobody anything. `resolved_grant_headers`
+            // never yields an empty vector (it errors instead), so every grant
+            // here is a real clause from the request.
+            (Some(g), _) => g.iter().all(|grant| {
+                grant.permission == "FULL_CONTROL"
+                    && grant.grantee_type == "CanonicalUser"
+                    && grant.grantee_id.as_deref() == Some(owner_id)
+            }),
             (None, Some(acl)) => acl == "bucket-owner-full-control",
             (None, None) => false,
         };

@@ -116,6 +116,14 @@ const DNS_INTROSPECTION_TYPES: &[&str] = &[
     "A", "AAAA", "CNAME", "MX", "TXT", "NS", "PTR", "SPF", "CAA", "SRV", "SOA",
 ];
 
+/// The role the ECS task-credentials endpoint reports for a task started
+/// without a `taskRoleArn`, in the partition of the task's own ARN.
+fn ecs_default_task_role_arn(task_arn: &str, account_id: &str) -> String {
+    fakecloud_aws::arn::Arn::global("iam", account_id, "role/ecs-task-role")
+        .with_partition(fakecloud_aws::arn::partition_of(task_arn))
+        .to_string()
+}
+
 /// Handler for `GET /_fakecloud/dns/resolve?name=<n>&type=<A|...>`. Returns what
 /// the DNS resolver would answer for the name+type straight from the Route 53
 /// records, so a test can assert resolution without opening a socket.
@@ -2539,10 +2547,20 @@ async fn main() {
                     let bucket_count = snapshot.buckets.len();
                     let object_count: usize =
                         snapshot.buckets.values().map(|b| b.objects.len()).sum();
-                    let hydrated = match fakecloud_s3::persistence::hydrate_s3_state(
+                    // Report each bucket the sidecar layer cannot read into the
+                    // store's refusal set. Its objects loaded fine, so nothing
+                    // below this layer knows the bucket is unusable -- and a name
+                    // absent from both memory and that set is one CreateBucket
+                    // clears the directory of, objects included.
+                    let mut refused = |bucket: &str, _err: &str| {
+                        <fakecloud_persistence::s3::DiskS3Store as fakecloud_persistence::S3Store>::
+                            mark_bucket_load_refused(&disk, bucket);
+                    };
+                    let hydrated = match fakecloud_s3::persistence::hydrate_s3_state_reporting(
                         snapshot,
                         &cli.account_id,
                         &cli.region,
+                        &mut refused,
                     ) {
                         Ok(h) => h,
                         Err(err) => fatal_exit(format_args!(
@@ -9831,10 +9849,13 @@ async fn main() {
                         let function_arn = if body.function_name.starts_with("arn:") {
                             body.function_name.clone()
                         } else {
-                            format!(
-                                "arn:aws:lambda:{}:{}:function:{}",
-                                region, account_id, body.function_name
+                            fakecloud_aws::arn::Arn::regional(
+                                "lambda",
+                                &region,
+                                &account_id,
+                                &format!("function:{}", body.function_name),
                             )
+                            .to_string()
                         };
                         let payload_str = body
                             .payload
@@ -10329,10 +10350,7 @@ async fn main() {
                         for (_, state) in accounts.iter() {
                             if let Some(t) = state.tasks.get(&task_id) {
                                 let role_arn = t.task_role_arn.clone().unwrap_or_else(|| {
-                                    format!(
-                                        "arn:aws:iam::{}:role/ecs-task-role",
-                                        state.account_id
-                                    )
+                                    ecs_default_task_role_arn(&t.task_arn, &state.account_id)
                                 });
                                 let expiry = chrono::Utc::now() + chrono::Duration::minutes(15);
                                 let body = serde_json::json!({
@@ -12151,6 +12169,27 @@ async fn main() {
     }
     if let Some(rt) = ec2_runtime {
         rt.stop_all().await;
+    }
+}
+
+#[cfg(test)]
+mod ecs_task_role_tests {
+    #[test]
+    fn default_task_role_follows_the_task_partition() {
+        assert_eq!(
+            super::ecs_default_task_role_arn(
+                "arn:aws-cn:ecs:cn-north-1:123456789012:task/c/abc",
+                "123456789012"
+            ),
+            "arn:aws-cn:iam::123456789012:role/ecs-task-role"
+        );
+        assert_eq!(
+            super::ecs_default_task_role_arn(
+                "arn:aws:ecs:us-east-1:123456789012:task/c/abc",
+                "123456789012"
+            ),
+            "arn:aws:iam::123456789012:role/ecs-task-role"
+        );
     }
 }
 

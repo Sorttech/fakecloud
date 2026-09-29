@@ -345,10 +345,8 @@ impl OrganizationsService {
         // The transfer rides on a handshake the invited org accepts.
         let handshake_id = format!("h-{}", random_id(32));
         let transfer_id = format!("rt-{}", random_id(32));
-        let handshake_arn = format!(
-            "arn:aws:organizations::{}:handshake/{}/transfer/{}",
-            org.management_account_id, org.org_id, handshake_id
-        );
+        let handshake_arn =
+            org.resource_arn(&format!("handshake/{}/transfer/{handshake_id}", org.org_id));
         let handshake = crate::state::Handshake {
             id: handshake_id.clone(),
             arn: handshake_arn,
@@ -367,10 +365,10 @@ impl OrganizationsService {
         org.handshakes
             .insert(handshake_id.clone(), handshake.clone());
 
-        let transfer_arn = format!(
-            "arn:aws:organizations::{}:responsibilitytransfer/{}/{}",
-            org.management_account_id, org.org_id, transfer_id
-        );
+        let transfer_arn = org.resource_arn(&format!(
+            "responsibilitytransfer/{}/{transfer_id}",
+            org.org_id
+        ));
         let transfer = ResponsibilityTransfer {
             id: transfer_id.clone(),
             arn: transfer_arn,

@@ -45,6 +45,7 @@ cargo fmt --check                        # format check
 - SDK tests should use official `aws-sdk-rust` crates.
 - CLI tests should use `TestServer::aws_cli()`.
 - Conformance coverage and E2E coverage serve different purposes; do not mix them.
+- DynamoDB behavior is also gated by the independent paritysuite suite (expectations recorded against live DynamoDB): `scripts/dynamodb-conformance.sh [path/to/fakecloud]` (needs node 24, npm, jq), run in CI by `dynamodb-conformance.yml`. Any failing test outside `scripts/dynamodb-conformance-known-failures.txt` fails CI; fix the behavior, never add a line to hide a regression.
 
 ### Behavior And Fidelity
 

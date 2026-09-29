@@ -200,7 +200,8 @@ impl SsmService {
             None
         };
         let resolved_owner = owner.map(|s| s.to_string()).unwrap_or_else(|| {
-            fakecloud_aws::arn::Arn::global("iam", &state.account_id, "root").to_string()
+            fakecloud_aws::arn::Arn::global_in(&state.region, "iam", &state.account_id, "root")
+                .to_string()
         });
         let session = crate::state::SsmSession {
             session_id: id.clone(),
