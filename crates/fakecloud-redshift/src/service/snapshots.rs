@@ -84,9 +84,11 @@ fn snapshot_from_cluster(
 ) -> Snapshot {
     Snapshot {
         snapshot_identifier: id.to_string(),
-        snapshot_arn: format!(
-            "arn:aws:redshift:{region}:{owner}:snapshot:{}/{id}",
-            cluster.cluster_identifier
+        snapshot_arn: crate::state::redshift_arn(
+            region,
+            owner,
+            "snapshot",
+            &format!("{}/{id}", cluster.cluster_identifier),
         ),
         cluster_identifier: cluster.cluster_identifier.clone(),
         snapshot_create_time: Utc::now(),

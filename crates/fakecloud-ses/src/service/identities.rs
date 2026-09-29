@@ -8,6 +8,7 @@ use crate::state::EmailIdentity;
 use crate::state::IdentityCertificate;
 use crate::state::SesState;
 
+use super::helpers::identity_arn;
 use super::SesV2Service;
 
 /// Expected DNS records the customer must publish for SES to accept the
@@ -148,10 +149,7 @@ impl SesV2Service {
         // Replace rather than merge so a Create after Delete (or a
         // Create that omits Tags) doesn't inherit stale entries from a
         // previous incarnation of the ARN.
-        let arn = format!(
-            "arn:aws:ses:{}:{}:identity/{}",
-            req.region, req.account_id, identity_name
-        );
+        let arn = identity_arn(&req.region, &req.account_id, &identity_name);
         if let Some(tags_arr) = body["Tags"].as_array() {
             let mut tag_map = std::collections::BTreeMap::new();
             for tag in tags_arr {
@@ -296,10 +294,7 @@ impl SesV2Service {
         // Surface stored tags from the per-ARN tag map. Echoing keeps
         // the round-trip honest: anything CreateEmailIdentity/TagResource
         // wrote is visible on the read side.
-        let arn = format!(
-            "arn:aws:ses:{}:{}:identity/{}",
-            req.region, req.account_id, identity_name
-        );
+        let arn = identity_arn(&req.region, &req.account_id, identity_name);
         if let Some(tag_map) = state.tags.get(&arn) {
             response["Tags"] =
                 Value::Array(fakecloud_core::tags::tags_to_json(tag_map, "Key", "Value"));
@@ -325,10 +320,7 @@ impl SesV2Service {
         }
 
         // Remove tags for this identity
-        let arn = format!(
-            "arn:aws:ses:{}:{}:identity/{}",
-            req.region, req.account_id, identity_name
-        );
+        let arn = identity_arn(&req.region, &req.account_id, identity_name);
         state.tags.remove(&arn);
 
         // Remove policies for this identity

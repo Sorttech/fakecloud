@@ -5271,3 +5271,47 @@ async fn test_update_configuration_set_route_is_not_a_configuration_set_name() {
     let err: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
     assert_eq!(err["__type"], "NotFoundException");
 }
+
+#[tokio::test]
+async fn china_region_resource_arns_use_the_aws_cn_partition() {
+    let state = make_state();
+    let svc = SesV2Service::new(state.clone());
+    let in_china = |method: Method, path: &str, body: &str| {
+        let mut req = make_request(method, path, body);
+        req.region = "cn-north-1".to_string();
+        req
+    };
+    svc.handle(in_china(
+        Method::POST,
+        "/v2/email/identities",
+        r#"{"EmailIdentity": "cn@example.com", "Tags": [{"Key": "env", "Value": "cn"}]}"#,
+    ))
+    .await
+    .unwrap();
+    svc.handle(in_china(
+        Method::POST,
+        "/v2/email/configuration-sets",
+        r#"{"ConfigurationSetName": "cn-set", "Tags": [{"Key": "env", "Value": "cn"}]}"#,
+    ))
+    .await
+    .unwrap();
+    {
+        let accounts = state.read();
+        let tags = &accounts.default_ref().tags;
+        assert!(tags.contains_key("arn:aws-cn:ses:cn-north-1:123456789012:identity/cn@example.com"));
+        assert!(
+            tags.contains_key("arn:aws-cn:ses:cn-north-1:123456789012:configuration-set/cn-set")
+        );
+    }
+
+    let resp = svc
+        .handle(in_china(
+            Method::GET,
+            "/v2/email/identities/cn@example.com",
+            "",
+        ))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(body["Tags"][0]["Value"], "cn");
+}

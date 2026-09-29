@@ -1068,6 +1068,14 @@ mod tests {
             parse_resource_arn("arn:aws:dsql:us-east-1:123456789012:cluster/abc/stream/xyz"),
             Some(("abc".to_string(), Some("xyz".to_string())))
         );
+        assert_eq!(
+            parse_resource_arn(&crate::state::cluster_arn(
+                "cn-north-1",
+                "123456789012",
+                "abc"
+            )),
+            Some(("abc".to_string(), None))
+        );
     }
 
     #[test]

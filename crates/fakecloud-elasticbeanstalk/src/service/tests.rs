@@ -82,6 +82,39 @@ fn create_and_describe_application() {
 }
 
 #[test]
+fn application_arn_carries_china_partition() {
+    let s = svc();
+    let mut r = req("CreateApplication", &[("ApplicationName", "cnapp")]);
+    r.region = "cn-north-1".into();
+    let out = block(s.handle(r)).unwrap();
+    let out = String::from_utf8_lossy(out.body.expect_bytes()).to_string();
+    let arn = "arn:aws-cn:elasticbeanstalk:cn-north-1:123456789012:application/cnapp";
+    assert!(out.contains(arn), "{out}");
+
+    let mut r = req(
+        "UpdateTagsForResource",
+        &[
+            ("ResourceArn", arn),
+            ("TagsToAdd.member.1.Key", "env"),
+            ("TagsToAdd.member.1.Value", "prod"),
+        ],
+    );
+    r.region = "cn-north-1".into();
+    block(s.handle(r)).unwrap();
+    let listed = body(&s, "ListTagsForResource", &[("ResourceArn", arn)]);
+    assert!(listed.contains("<Value>prod</Value>"), "{listed}");
+
+    let mut r = req("ListPlatformVersions", &[]);
+    r.region = "cn-north-1".into();
+    let out = block(s.handle(r)).unwrap();
+    let out = String::from_utf8_lossy(out.body.expect_bytes()).to_string();
+    assert!(
+        out.contains("<PlatformArn>arn:aws-cn:elasticbeanstalk:cn-north-1::platform/"),
+        "{out}"
+    );
+}
+
+#[test]
 fn create_application_requires_name() {
     let s = svc();
     assert_eq!(err_code(&s, "CreateApplication", &[]), "MissingParameter");

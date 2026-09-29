@@ -987,6 +987,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn china_region_terminology_arn_uses_aws_cn_partition() {
+        let svc = service();
+        let cn = |action: &str, body: Value| {
+            let mut r = req(action, body);
+            r.region = "cn-north-1".to_string();
+            r
+        };
+        let file =
+            base64::engine::general_purpose::STANDARD.encode("en,fr\nhello,bonjour\n".as_bytes());
+        svc.handle(cn(
+            "ImportTerminology",
+            json!({
+                "Name": "cn-term",
+                "MergeStrategy": "OVERWRITE",
+                "TerminologyData": { "File": file, "Format": "CSV" }
+            }),
+        ))
+        .await
+        .unwrap();
+        let got = body_of(
+            svc.handle(cn("GetTerminology", json!({ "Name": "cn-term" })))
+                .await
+                .unwrap(),
+        );
+        let arn = got["TerminologyProperties"]["Arn"].as_str().unwrap();
+        assert_eq!(
+            arn,
+            "arn:aws-cn:translate:cn-north-1:000000000000:terminology/cn-term"
+        );
+        svc.handle(cn(
+            "TagResource",
+            json!({ "ResourceArn": arn, "Tags": [{ "Key": "team", "Value": "loc" }] }),
+        ))
+        .await
+        .unwrap();
+        let tags = body_of(
+            svc.handle(cn("ListTagsForResource", json!({ "ResourceArn": arn })))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(tags["Tags"][0]["Key"], "team");
+    }
+
+    #[tokio::test]
     async fn terminology_round_trip_and_tagging() {
         let svc = service();
         let file = base64::engine::general_purpose::STANDARD

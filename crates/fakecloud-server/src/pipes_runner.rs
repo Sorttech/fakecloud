@@ -1185,7 +1185,10 @@ fn kinesis_source_event(
         "eventVersion": "1.0",
         "eventID": format!("{}:{}", shard_id, record.sequence_number),
         "eventName": "aws:kinesis:record",
-        "invokeIdentityArn": "arn:aws:iam::123456789012:role/pipes-role",
+        "invokeIdentityArn": format!(
+            "arn:{}:iam::123456789012:role/pipes-role",
+            fakecloud_aws::arn::partition_of(source_arn)
+        ),
         "awsRegion": region,
         "eventSourceARN": source_arn,
         "kinesis": {

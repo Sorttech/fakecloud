@@ -756,17 +756,14 @@ impl SsmState {
     }
 
     fn insert_default_param(&mut self, name: &str, value: &str, now: DateTime<Utc>) {
-        let arn = if name.starts_with('/') {
-            format!(
-                "arn:aws:ssm:{}:{}:parameter{}",
-                self.region, self.account_id, name
-            )
+        let resource = if name.starts_with('/') {
+            format!("parameter{name}")
         } else {
-            format!(
-                "arn:aws:ssm:{}:{}:parameter/{}",
-                self.region, self.account_id, name
-            )
+            format!("parameter/{name}")
         };
+        let arn =
+            fakecloud_aws::arn::Arn::regional("ssm", &self.region, &self.account_id, &resource)
+                .to_string();
         self.parameters.insert(
             name.to_string(),
             SsmParameter {

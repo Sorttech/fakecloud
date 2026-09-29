@@ -37,15 +37,21 @@ IDLE_MEM_MIB=10
 BINARY_MB=19
 
 # --- Lambda runtime count ---
-# Canonical source: `runtime_to_image()` in crates/fakecloud-lambda/src/runtime.rs.
-# That match expression is the actual list of supported runtimes — anything not
-# in it returns None and `CreateFunction` rejects it. Count it with:
+# Canonical source: `runtime_to_image()` in
+# crates/fakecloud-lambda/src/runtime/docker.rs. That match expression is the
+# actual list of supported runtimes — anything not in it returns None and
+# `CreateFunction` rejects it. Count it with:
 #
-#   grep -cE '^\s*"[^"]+"\s*=>\s*\(' crates/fakecloud-lambda/src/runtime.rs
+#   grep -cE '^\s*"[^"]+" => \("' crates/fakecloud-lambda/src/runtime/docker.rs
 #
-# (= 23 as of 2026-05-20). When fakecloud-lambda gains/drops a runtime, update
-# this constant, the runtime list in docs/services/lambda.md, and audit every
-# page in FILES in the same PR.
+# (= 23 as of 2026-09-27). When fakecloud-lambda gains/drops a runtime, update
+# this constant, the runtime list in docs/services/lambda.md AND the runtime
+# enumerations in faq.md, and audit every gated page in the same PR.
+#
+# NOTE (2026-09-27): the path above used to read `src/runtime.rs`, which no
+# longer exists — the recipe silently returned nothing, so this constant could
+# drift unnoticed. A canonical pointer that 404s is the same bug class as a
+# stale count: verify the source resolves before trusting the number it guards.
 LAMBDA_RUNTIMES=23
 
 # Canonical service count = row count in parity.md table.
@@ -94,6 +100,36 @@ bedrock_family=$(( ${bedrock_ctrl:-0} + ${bedrock_runtime:-0} + ${bedrock_agent:
 variants_pass=$(jq -r .variants_passed "$BASELINE")
 variants_total=$(jq -r .total_variants "$BASELINE")
 
+# Extract the FIRST number from a whole table cell, or nothing. Always exits 0.
+#
+# Cells need the first number, unlike last_num's grep -o fragments: a cell reads
+# "105 (7,509 ops) at true 100% conformance, incl. ECR + ECS + ELBv2" and the
+# LAST number there is the 2 in "ELBv2" (and "at true 100%" yields 100). The
+# claim is the number the cell leads with.
+first_num() {
+    printf '%s' "$1" | awk 'match($0, /[0-9][0-9,]*/) { print substr($0, RSTART, RLENGTH); exit }'
+}
+
+# Extract the LAST number from a matched fragment, or nothing. Always exits 0.
+#
+# "Last" rather than "first" because the number we want sits next to the noun the
+# grep matched on, while the service NAME can contain digits: "| API Gateway v2 |
+# 103 |" must yield 103, not the 2 in "v2". grep -o already truncates the fragment
+# at the noun, so the last number is the claim.
+#
+# NEVER replace this with `grep -oE ... | head -1` in a command substitution —
+# see the note above.
+last_num() {
+    printf '%s' "$1" | awk '{
+        n = ""
+        while (match($0, /[0-9][0-9,]*/)) {
+            n = substr($0, RSTART, RLENGTH)
+            $0 = substr($0, RSTART + RLENGTH)
+        }
+        print n
+    }'
+}
+
 # Comma-format thousands. Locale-free: `printf %'d` depends on a locale being
 # installed (e.g. en_US.UTF-8), which is not guaranteed on minimal CI images
 # and silently degrades to "1234" instead of "1,234" — that would cause the
@@ -126,39 +162,36 @@ echo "  bedrock surface    = $bedrock_ctrl + $bedrock_runtime + $bedrock_agent +
 echo "  lambda_runtimes    = $LAMBDA_RUNTIMES (script constant; canonical: docs/services/lambda.md)"
 echo
 
-# Files to check. Evergreen-only. Blog posts and dated marketing drafts excluded
-# per feedback_no_blogpost_updates.
-FILES=(
-    README.md
-    AGENTS.md
-    website/content/_index.md
-    website/content/docs/_index.md
-    website/content/docs/parity.md
-    website/content/docs/services/_index.md
-    website/content/docs/about/conformance.md
-    website/content/docs/about/what-it-is.md
-    website/content/docs/migration-from-localstack.md
-    website/content/docs/getting-started/install.md
-    website/content/faq.md
-    website/content/glossary.md
-    website/content/localstack-alternative.md
-    website/content/supported-services.md
-    website/content/fake-aws-server.md
-    website/content/fake-bedrock.md
-    website/content/dynamodb-emulator.md
-    website/content/vs/dynamodb-local.md
-    website/content/vs/elasticmq.md
-    website/content/vs/floci.md
-    website/content/vs/localstack.md
-    website/content/vs/minio.md
-    website/content/vs/ministack.md
-    website/content/vs/moto.md
-    website/content/vs/s3mock.md
-    website/content/vs/sam-local.md
-    website/content/vs/testcontainers.md
-    website/static/llms.txt
-    website/static/llms-full.txt
-    website/templates/index.html
+# Files to check. Evergreen-only, derived by EXCLUSION, not by an allowlist.
+#
+# NOTE (2026-09-27): this used to be a hand-maintained FILES=( ... ) array of 30
+# paths while website/content held 68 evergreen pages — every SEO landing page
+# (sqs-emulator.md, local-rds.md, ses-emulator.md, vs/aws-sdk-client-mock.md, ...)
+# was ungated, because a new page only gets checked if somebody remembers to add
+# it here. Inclusions rot; exclusions are stable. Gate everything evergreen by
+# default and list only what must NOT be checked. Print the count with
+# `echo "${#FILES[@]}"` rather than trusting a number written in a comment.
+#
+# Excluded, deliberately:
+#   */blog/*      point-in-time posts, never retroactively updated
+#   marketing/*   dated drafts, same rule
+#   docs/operations/  generated by scripts/generate-operations-index.sh
+#   node_modules, target, website/public  vendored or build output
+FILES=()
+while IFS= read -r _f; do
+    FILES+=("$_f")
+done < <(
+    {
+        find website/content website/static website/templates \
+             README.md AGENTS.md CONTRIBUTING.md conformance-baseline-notes.md \
+             -type f \( -name '*.md' -o -name '*.txt' -o -name '*.html' \) 2>/dev/null
+        # crates/fakecloud-conformance/README.md claimed "80,074 / 81,489 (98.3%)
+        # across 33 services" — a public contradiction of the "true 100%" headline
+        # that survived precisely because only website/ + 4 root files were gated.
+        find crates -name 'README.md' -type f 2>/dev/null
+    } \
+    | grep -vE '/blog/|/marketing/|/node_modules/|/target/|/docs/operations/|website/public/' \
+    | sort
 )
 
 # Known exceptions: file:kind:value
@@ -203,20 +236,44 @@ is_exception() {
 fail=0
 problems=()
 
+if [ "${#FILES[@]}" -eq 0 ]; then
+    echo "no evergreen files matched — check the find roots in this script" >&2
+    exit 2
+fi
+
 for f in "${FILES[@]}"; do
     if [ ! -f "$f" ]; then
         continue
     fi
 
     # --- Service count claims ---
-    # Catches "39 services", "39 AWS services", "39 services covered", etc.
-    while read -r hit; do
-        [ -z "$hit" ] && continue
-        if [ "$hit" != "$parity_services" ] && ! is_exception "$f" services "$hit"; then
-            problems+=("$f: claims '$hit services', expected $parity_services")
+    # Catches "39 services", "39 AWS services", and — since 2026-09-27 — forms
+    # with a qualifier BETWEEN the number and the noun: "46 other services",
+    # "46 other AWS services", "20 more services". The old regex required the
+    # number and the noun to be adjacent, so every "N other services" on the
+    # site (faq.md, vs/minio, vs/s3mock, vs/elasticmq, vs/dynamodb-local,
+    # vs/sam-local, localstack-alternative) sailed past a green gate while
+    # claiming 21/22/46. That is what an HN commenter quoted back at us.
+    #
+    # N-1 is legitimate and expected: "fakecloud does S3 among 104 other
+    # services" excludes the subject service, so accept services-1 whenever the
+    # phrase carries "other"/"more".
+    while read -r phrase; do
+        [ -z "$phrase" ] && continue
+        hit=$(printf '%s' "$phrase" | grep -oE "^[0-9]+")
+        expected="$parity_services"
+        case "$phrase" in
+            # Word-boundaried: "46 other AWS services" is N-1 (the page's subject
+            # service is excluded). Deliberately NOT *more* — "12 more services on
+            # the roadmap" means 12 ADDITIONAL, not services-1 — nor a bare
+            # *other* substring, which also matches "another"/"mother".
+            [0-9]*' other '*) expected=$(( parity_services - 1 )) ;;
+        esac
+        if [ "$hit" != "$expected" ] && ! is_exception "$f" services "$hit"; then
+            problems+=("$f: claims '$phrase', expected $expected")
             fail=1
         fi
-    done < <(grep -oE "\b[0-9]+ (AWS )?services\b" "$f" | grep -oE "^[0-9]+" | sort -u)
+    done < <(grep -oE "\b[0-9]+(( [a-z][a-z-]+){0,2}) (AWS )?services\b" "$f" | sort -u)
 
     # --- Operation total claims ---
     # Comma-formatted thousands only — avoids matching per-service mini-counts
@@ -227,7 +284,7 @@ for f in "${FILES[@]}"; do
             problems+=("$f: claims '$hit operations', expected $ops_fmt")
             fail=1
         fi
-    done < <(grep -oE "\b[0-9],[0-9]{3} (API )?operations\b" "$f" | grep -oE "^[0-9],[0-9]{3}" | sort -u)
+    done < <(grep -oE "\b[0-9]{1,3}(,[0-9]{3})+(( [a-z][a-z-]+){0,2}) (API )?(operations|ops|actions)\b" "$f" | grep -oE "^[0-9]{1,3}(,[0-9]{3})+" | sort -u)
 
     # --- Variant pass-rate claims (X,XXX/Y,YYY) ---
     expected_pair="$vp_fmt/$vt_fmt"
@@ -237,7 +294,7 @@ for f in "${FILES[@]}"; do
             problems+=("$f: variants '$hit', expected $expected_pair")
             fail=1
         fi
-    done < <(grep -oE "\b[0-9]+,[0-9]{3}/[0-9]+,[0-9]{3}\b" "$f" | sort -u)
+    done < <(grep -oE "\b[0-9]{1,3}(,[0-9]{3})+/[0-9]{1,3}(,[0-9]{3})+\b" "$f" | sort -u)
 
     # --- Bare variant total claims ("86,327 variants", "86,327 generated...") ---
     # Catches stale "59,000+ variants" / "54,000+ variants" framing too.
@@ -247,7 +304,7 @@ for f in "${FILES[@]}"; do
             problems+=("$f: claims '$hit variants', expected $vp_fmt")
             fail=1
         fi
-    done < <(grep -oE "\b[0-9]+,[0-9]{3}\+? (Smithy[-a-z]* )?(generated )?(test )?variants\b" "$f" | grep -oE "^[0-9]+,[0-9]{3}" | sort -u)
+    done < <(grep -oE "\b[0-9]{1,3}(,[0-9]{3})+\+?(( [a-z][a-z-]+){0,3}) variants\b" "$f" | grep -oE "^[0-9]{1,3}(,[0-9]{3})+" | sort -u)
 
     # --- Lambda runtime-count claims ---
     # Catches "23 runtimes", "27 runtimes", "X Lambda runtimes" — anywhere on
@@ -260,7 +317,7 @@ for f in "${FILES[@]}"; do
             problems+=("$f: claims '$hit runtimes', expected $LAMBDA_RUNTIMES")
             fail=1
         fi
-    done < <(grep -oE '\b[0-9]+\s+runtimes\b' "$f" | grep -oE '^[0-9]+' | sort -u)
+    done < <(grep -oE '\b[0-9]+(( [a-z][a-z-]+){0,2}) runtimes\b' "$f" | grep -oE '^[0-9]+' | sort -u)
 
     # --- Startup time claims ---
     # Pulls every "~?Nms" / "~?N ms" / "<Nms" that appears on a line mentioning
@@ -354,42 +411,121 @@ for f in "${FILES[@]}"; do
             | sort -u
     )
 
-    # --- Per-service op count claims ---
-    # Catches "**S3**: 154 operations", "Lambda (82 operations)", etc. Walks the
-    # per-service map and looks for any service-name followed by a number+ops
-    # phrase. Skips parity.md (it's the source) and the per-service service docs
-    # under docs/services/ (those are the source for their own service).
-    if [[ "$f" == "$PARITY" || "$f" == website/content/docs/services/*.md ]]; then
-        continue_per_service=1
-    else
-        continue_per_service=0
-    fi
-    if [ "$continue_per_service" -eq 0 ]; then
-        while IFS=$'\t' read -r svc canonical_ops; do
-            [ -z "$svc" ] && continue
-            # Bedrock family is handled by the dedicated Bedrock-surface check
-            # above, which accepts both the per-API count and the family sum.
-            # Skipping here avoids double-firing on the same phrase.
-            case "$svc" in
-                "Bedrock"|"Bedrock Runtime"|"Bedrock Agent"|"Bedrock Agent Runtime") continue ;;
-            esac
-            # Escape regex specials in service name for grep (parentheses, etc.)
-            svc_re=$(printf '%s\n' "$svc" | sed 's/[][\.*^$()+?{}|]/\\&/g')
-            while read -r hit; do
-                [ -z "$hit" ] && continue
-                if [ "$hit" != "$canonical_ops" ] && ! is_exception "$f" "ops_${svc}" "$hit"; then
-                    problems+=("$f: claims '$svc: $hit ops', expected $canonical_ops")
-                    fail=1
-                fi
-            done < <(
-                grep -oE "(\*\*)?${svc_re}(\*\*)?[: ]\(?[ ]*[0-9]+ (operations?|ops)\b" "$f" \
-                    | grep -oE '[0-9]+ (operations?|ops)' \
-                    | grep -oE '^[0-9]+' \
-                    | sort -u
-            )
-        done <<< "$service_ops_map"
-    fi
 done
+
+
+# --- Per-service op count claims (hoisted out of the per-file loop) ----------
+# Catches "**S3**: 154 operations", "Lambda (82 operations)", etc. Skips
+# parity.md (it's the source) and the per-service docs under docs/services/
+# (those are the source for their own service).
+#
+# PERF (2026-09-27): this used to run one grep per (file x service) pair. With
+# the allowlist replaced by an exclusion-based file set the gated file count
+# went from 30 hand-listed paths to every evergreen file under website/ plus the
+# root docs and crate READMEs. At 105 services a grep-per-(file x service) meant
+# thousands of processes and pushed a single run into the minutes. Grepping every
+# file in ONE invocation per service drops that to a few hundred spawns for the
+# same coverage (~40s total). Fix the hot path, don't raise the timeout.
+PS_FILES=()
+for _f in "${FILES[@]}"; do
+    [ -f "$_f" ] || continue
+    [[ "$_f" == "$PARITY" ]] && continue
+    # Per-service docs are the source for their OWN service, so they are skipped
+    # — but _index.md is an aggregate that restates every service's count, and
+    # excluding it is why 17 of its rows silently rotted (fixed 2026-09-27).
+    if [[ "$_f" == website/content/docs/services/*.md && "$_f" != website/content/docs/services/_index.md ]]; then
+        continue
+    fi
+    PS_FILES+=("$_f")
+done
+
+if [ "${#PS_FILES[@]}" -gt 0 ]; then
+    while IFS=$'\t' read -r svc canonical_ops; do
+        [ -z "$svc" ] && continue
+        # Bedrock family is handled by the dedicated Bedrock-surface check above,
+        # which accepts both the per-API count and the family sum. Skipping here
+        # avoids double-firing on the same phrase.
+        case "$svc" in
+            "Bedrock"|"Bedrock Runtime"|"Bedrock Agent"|"Bedrock Agent Runtime") continue ;;
+        esac
+        svc_re=$(printf '%s\n' "$svc" | sed 's/[][\.*^$()+?{}|]/\\&/g')
+        while IFS= read -r hit; do
+            [ -z "$hit" ] && continue
+            hf=${hit%%:*}
+            n=$(last_num "${hit#*:}")
+            [ -z "$n" ] && continue
+            if [ "$n" != "$canonical_ops" ] && ! is_exception "$hf" "ops_${svc}" "$n"; then
+                problems+=("$hf: claims '$svc: $n ops', expected $canonical_ops")
+                fail=1
+            fi
+        done < <(
+            {
+                grep -oHE "(\*\*)?${svc_re}(\*\*)?[: ]\(?[ ]*[0-9]+ (operations?|ops|actions)\b" "${PS_FILES[@]}" 2>/dev/null || true
+                # "### DynamoDB (58 actions)" / "**Bedrock** (103 ops)"
+                grep -oHE "(\*\*|### )${svc_re}(\*\*)? \([0-9]+ (operations?|ops|actions)\)" "${PS_FILES[@]}" 2>/dev/null || true
+                # "| ACM (Certificate Manager) |  40 |" aggregate table rows
+                grep -oHE "^\| *${svc_re} *\| *[0-9]+ (operations?|ops)?" "${PS_FILES[@]}" 2>/dev/null || true
+                # "<td>Cognito User Pools</td><td class=\"check\">132 operations"
+                grep -oHE "<td>${svc_re}</td><td[^>]*>[0-9]+ (operations?|ops)" "${PS_FILES[@]}" 2>/dev/null || true
+            } | sort -u
+        )
+    done <<< "$service_ops_map"
+fi
+
+# --- Table-cell / row-label claims -------------------------------------------
+# The class no <number><noun> regex can reach: the number sits in a value cell
+# and the NOUN lives in the row-label cell or a preceding <td>, with the number
+# followed by a qualifier instead.
+#
+#   | Service count | 47 at true 100% conformance (depth-first) |
+#   | Services covered today | 47 (3,966 ops) at true 100% conformance |
+#   <tr><td>AWS services</td><td class="check">46 at true 100% conformance</td>
+#
+# All three were live and green on 2026-09-27. Scan any row whose label cell
+# talks about service/operation coverage and check the first number in the
+# NEXT cell against the canonical totals.
+while IFS= read -r hit; do
+    [ -z "$hit" ] && continue
+    hf=${hit%%:*}
+    rest=${hit#*:}
+    lineno=${rest%%:*}
+    text=${rest#*:}
+    # Take the number from the VALUE cell, never the whole line: a digit in the
+    # label ("| Service count (2026) |") would otherwise win, and a competitor
+    # column ("LocalStack 20 / fakecloud 105") would match the wrong side.
+    case "$text" in
+        '|'*) value=$(printf '%s' "$text" | awk -F'|' '{print $3}') ;;
+        *)    value=$(printf '%s' "$text" | sed -E 's#^.*<td>[^<]*[Aa][Ww][Ss] services[^<]*</td>[[:space:]]*<td[^>]*>##; s#</td>.*##') ;;
+    esac
+    # `|| true`: grep exits 1 when the cell holds no digit (a legitimate value
+    # like "see the parity matrix"). Under `set -euo pipefail` that aborts the
+    # WHOLE script from the parent shell — no FAIL header, every problem already
+    # collected thrown away, CI showing a bare exit 1 with no diagnostic.
+    n=$(first_num "$value")
+    [ -z "$n" ] && continue
+    # "N other/more services" rows in a label cell are N-1 (the page's subject
+    # service is excluded from the count).
+    expected_cell="$parity_services"
+    case "$text" in
+        *[Oo]ther*) expected_cell=$(( parity_services - 1 )) ;;
+    esac
+    if [ "$n" != "$expected_cell" ] && [ "$n" != "$ops_fmt" ] && [ "$n" != "$parity_ops" ] \
+       && ! is_exception "$hf" table_cell "$n"; then
+        problems+=("$hf:$lineno: table row claims '$n', expected $expected_cell services / $ops_fmt operations")
+        fail=1
+    fi
+done < <(
+    # NOTE: `set -e` is inherited by this subshell, and grep exits 1 when a file
+    # has no match — without `|| true` the very first non-matching file would
+    # kill the loop and the whole pass would silently scan nothing. That is
+    # exactly how this check shipped as dead code on its first draft; it looked
+    # correct and caught nothing.
+    for _f in "${FILES[@]}"; do
+        [ -f "$_f" ] || continue
+        grep -nHE '^\| *[^|]*([Ss]ervices? (count|covered)|[Oo]ther AWS services)[^|]*\|' "$_f" 2>/dev/null || true
+        grep -nHE '<td>[^<]*AWS services[^<]*</td><td[^>]*>[0-9]' "$_f" 2>/dev/null || true
+    done | sort -u
+)
 
 if [ "$fail" -eq 0 ]; then
     echo "OK — every evergreen surface agrees with the canonical sources."

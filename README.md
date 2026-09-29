@@ -53,14 +53,14 @@ Works as a drop-in for LocalStack in CI, with Terraform (`endpoints` block), CDK
 - **Real infrastructure for stateful services.** Lambda (23 runtimes), RDS (Postgres/MySQL/MariaDB/Oracle/SQL Server/Db2), ElastiCache (Redis/Valkey/Memcached), ECS, and EC2 run as real containers. Use Docker (default) or native Kubernetes Pods via `FAKECLOUD_CONTAINER_BACKEND=k8s`. See the [Kubernetes backend guide](https://fakecloud.dev/docs/guides/kubernetes-backend/).
 - **Single binary.** ~19 MB, ~10 MiB idle, ~300ms startup. No Docker needed to run fakecloud itself.
 - **Full Bedrock surface.** 216 ops across 4 APIs with real `InvokeModel`/`Converse` streaming, guardrails, agents, and flows. Configurable responses + fault injection for deterministic tests. See [`/bedrock-emulator/`](https://fakecloud.dev/bedrock-emulator/).
-- **First-party test SDKs** for TypeScript, Python, Go, PHP, Java, and Rust. Assert on what your code called without raw HTTP.
+- **First-party test SDKs** for TypeScript, Python, Go, PHP, Java, Rust, and .NET. Assert on what your code called without raw HTTP.
 - **Opt-in SigV4 verification and IAM enforcement.** Off by default so tests just work; `--verify-sigv4` for real signature checking and `--iam soft|strict` for policy evaluation across IAM, STS, SQS, SNS, S3, KMS, Lambda, DynamoDB (and Streams), ELBv2 and Scheduler. See [security docs](https://fakecloud.dev/docs/reference/security/).
 - **Run your app unmodified.** An app that expects an instance/task role resolves the AWS SDK default credential chain against fakecloud with no static keys and no code change: point `AWS_CONTAINER_CREDENTIALS_FULL_URI` at `/_fakecloud/credentials`. See [Run an app unmodified](https://fakecloud.dev/docs/guides/instance-credentials/).
 - **LocalStack and real-AWS URL compatibility.** Both `*.localhost.localstack.cloud` and `*.amazonaws.com` Host headers route correctly, including every S3 virtual-hosted variant. Persisted URLs and dev scripts from either system replay unchanged.
 
 ## Supported services
 
-105 services, 7,508 operations, and true 100% conformance across every implemented service.
+105 services, 7,509 operations, and true 100% conformance across every implemented service.
 
 Highlights: S3, DynamoDB, SQS, SNS, EventBridge, Lambda, IAM, STS, KMS, Secrets Manager, CloudFormation, SES, Cognito, Kinesis, RDS (6 real engines), ElastiCache, ECS/ECR, EC2, Step Functions, API Gateway v1/v2, Bedrock, and 80+ more.
 
@@ -80,7 +80,7 @@ Since March 2026, LocalStack's Community image requires an account and token, an
 | Footprint | ~19 MB binary, ~10 MiB idle, ~300ms start, no Docker | ~1 GB image, ~150 MiB idle, ~3s start, Docker required |
 | Conformance | true 100% (248,557 Smithy variants) | partial |
 | Paywalled services | None (RDS, Cognito, SES, ElastiCache, ECS/ECR, EKS, Redshift, and more are all free) | Many core services paid-only |
-| Test-assertion SDKs | TypeScript, Python, Go, PHP, Java, Rust | Python, Java |
+| Test-assertion SDKs | TypeScript, Python, Go, PHP, Java, Rust, .NET | Python, Java |
 
 Full feature-by-feature comparison: [fakecloud.dev/vs/localstack](https://fakecloud.dev/vs/localstack/).
 

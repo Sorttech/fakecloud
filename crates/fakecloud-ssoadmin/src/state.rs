@@ -17,6 +17,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use fakecloud_aws::arn::{partition_of, Arn};
 use fakecloud_core::multi_account::{AccountState, MultiAccountState};
 
 pub const SSOADMIN_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
@@ -225,6 +226,63 @@ pub struct SsoAdminSnapshot {
     pub accounts: MultiAccountState<SsoAdminData>,
 }
 
+/// An IAM Identity Center instance ARN, in the partition of `region`.
+pub fn instance_arn(region: &str, ssoins: &str) -> String {
+    Arn::global_in(region, "sso", "", &format!("instance/{ssoins}")).to_string()
+}
+
+/// A permission set's ARN, in the partition of its instance's ARN.
+pub fn permission_set_arn(instance_arn: &str, ssoins: &str, id: &str) -> String {
+    Arn::global("sso", "", &format!("permissionSet/{ssoins}/ps-{id}"))
+        .with_partition(partition_of(instance_arn))
+        .to_string()
+}
+
+/// An application's ARN, in the partition of its instance's ARN.
+pub fn application_arn(instance_arn: &str, account: &str, ssoins: &str, id: &str) -> String {
+    Arn::global("sso", account, &format!("application/{ssoins}/apl-{id}"))
+        .with_partition(partition_of(instance_arn))
+        .to_string()
+}
+
+/// A trusted token issuer's ARN, in the partition of its instance's ARN.
+pub fn trusted_token_issuer_arn(
+    instance_arn: &str,
+    account: &str,
+    ssoins: &str,
+    id: &str,
+) -> String {
+    Arn::global(
+        "sso",
+        account,
+        &format!("trustedTokenIssuer/{ssoins}/tti-{id}"),
+    )
+    .with_partition(partition_of(instance_arn))
+    .to_string()
+}
+
+/// The Identity Store ARN paired with an instance, in the instance's partition.
+pub fn identity_store_arn(instance_arn: &str, account: &str, identity_store_id: &str) -> String {
+    Arn::global(
+        "identitystore",
+        account,
+        &format!("identitystore/{identity_store_id}"),
+    )
+    .with_partition(partition_of(instance_arn))
+    .to_string()
+}
+
+/// An AWS-managed application provider's ARN, in the partition of `region`.
+pub fn application_provider_arn(region: &str, provider: &str) -> String {
+    Arn::global_in(
+        region,
+        "sso",
+        "aws",
+        &format!("applicationProvider/{provider}"),
+    )
+    .to_string()
+}
+
 /// Seed a default, always-`ACTIVE` IAM Identity Center instance for `account_id`
 /// when it has none. Real AWS requires enabling IAM Identity Center before
 /// instances exist, but seeding one makes the control plane (and the paired
@@ -241,7 +299,7 @@ pub fn ensure_default_instance(state: &SharedSsoAdminState, account_id: &str, re
     }
     let pad = format!("{account_id:0<16}");
     let ssoins = format!("ssoins-{}", &pad[..16]);
-    let arn = format!("arn:aws:sso:::instance/{ssoins}");
+    let arn = instance_arn(region, &ssoins);
     let identity_store_id = format!("d-{}", &pad[..10]);
     let ts = chrono::Utc::now().timestamp();
     acct.instances.insert(

@@ -66,6 +66,9 @@ pub(crate) fn evaluate_key_condition(
     expr_attr_names: &HashMap<String, String>,
     expr_attr_values: &HashMap<String, Value>,
 ) -> bool {
+    if let Some(cond) = parse_condition_lenient(expr, expr_attr_names, expr_attr_values) {
+        return eval_cond(&cond, item, expr_attr_values);
+    }
     let trimmed = expr.trim();
 
     let parts = split_on_and(trimmed);
@@ -380,7 +383,8 @@ pub(crate) fn key_cond_simple_comparison(
 /// silently filtering type-mismatched rows in FilterExpression context).
 pub(crate) fn attribute_size(val: &Value) -> Option<usize> {
     if let Some(s) = val.get("S").and_then(|v| v.as_str()) {
-        return Some(s.len());
+        // DynamoDB measures a string's size in UTF-16 code units.
+        return Some(s.encode_utf16().count());
     }
     if let Some(b) = val.get("B").and_then(|v| v.as_str()) {
         // B is base64-encoded — return decoded byte count
@@ -744,6 +748,20 @@ fn build_legacy_fragment(
 }
 
 pub(crate) fn evaluate_filter_expression(
+    expr: &str,
+    item: &HashMap<String, AttributeValue>,
+    expr_attr_names: &HashMap<String, String>,
+    expr_attr_values: &HashMap<String, Value>,
+) -> bool {
+    if let Some(cond) = parse_condition_lenient(expr, expr_attr_names, expr_attr_values) {
+        return eval_cond(&cond, item, expr_attr_values);
+    }
+    evaluate_filter_expression_text(expr, item, expr_attr_names, expr_attr_values)
+}
+
+/// Text-level evaluator for expressions outside the parsed grammar (for
+/// example inline PartiQL-style literals).
+fn evaluate_filter_expression_text(
     expr: &str,
     item: &HashMap<String, AttributeValue>,
     expr_attr_names: &HashMap<String, String>,

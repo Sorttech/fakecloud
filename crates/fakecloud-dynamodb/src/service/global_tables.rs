@@ -50,10 +50,7 @@ impl DynamoDbService {
             ));
         }
 
-        let arn = format!(
-            "arn:aws:dynamodb::{}:global-table/{}",
-            state.account_id, global_table_name
-        );
+        let arn = crate::state::global_table_arn(&req.region, &state.account_id, global_table_name);
         let now = Utc::now();
 
         let gt = GlobalTableDescription {

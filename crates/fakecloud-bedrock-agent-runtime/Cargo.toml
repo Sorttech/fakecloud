@@ -22,6 +22,7 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 fakecloud-bedrock-agent = { workspace = true }
+fakecloud-aws = { workspace = true }
 fakecloud-core = { workspace = true }
 
 [dev-dependencies]

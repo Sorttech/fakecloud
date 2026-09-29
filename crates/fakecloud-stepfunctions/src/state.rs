@@ -6,6 +6,8 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use fakecloud_aws::arn::Arn;
+
 pub type SharedStepFunctionsState =
     Arc<RwLock<fakecloud_core::multi_account::MultiAccountState<StepFunctionsState>>>;
 
@@ -225,6 +227,10 @@ pub struct Execution {
     /// `billingDetails.billedMemoryUsedInMB`.
     #[serde(default)]
     pub billed_memory_mb: Option<i64>,
+    /// The state machine's role when the execution started, recorded on its
+    /// `ExecutionStarted` history event.
+    #[serde(default)]
+    pub role_arn: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -285,10 +291,7 @@ impl StepFunctionsState {
     }
 
     pub fn state_machine_arn(&self, region: &str, name: &str) -> String {
-        format!(
-            "arn:aws:states:{}:{}:stateMachine:{}",
-            region, self.account_id, name
-        )
+        state_machine_arn(region, &self.account_id, name)
     }
 
     pub fn execution_arn(
@@ -297,11 +300,38 @@ impl StepFunctionsState {
         state_machine_name: &str,
         execution_name: &str,
     ) -> String {
-        format!(
-            "arn:aws:states:{}:{}:execution:{}:{}",
-            region, self.account_id, state_machine_name, execution_name
-        )
+        execution_arn(region, &self.account_id, state_machine_name, execution_name)
     }
+}
+
+/// A Step Functions ARN (`arn:<partition>:states:<region>:<account>:<resource>`)
+/// in `region`'s partition.
+pub fn states_arn(region: &str, account_id: &str, resource: &str) -> String {
+    Arn::regional("states", region, account_id, resource).to_string()
+}
+
+/// The ARN of a state machine.
+pub fn state_machine_arn(region: &str, account_id: &str, name: &str) -> String {
+    states_arn(region, account_id, &format!("stateMachine:{name}"))
+}
+
+/// The ARN of a standard-workflow execution.
+pub fn execution_arn(
+    region: &str,
+    account_id: &str,
+    state_machine_name: &str,
+    execution_name: &str,
+) -> String {
+    states_arn(
+        region,
+        account_id,
+        &format!("execution:{state_machine_name}:{execution_name}"),
+    )
+}
+
+/// The ARN of an activity.
+pub fn activity_arn(region: &str, account_id: &str, name: &str) -> String {
+    states_arn(region, account_id, &format!("activity:{name}"))
 }
 
 #[cfg(test)]

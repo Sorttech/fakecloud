@@ -17,6 +17,7 @@ use rand::Rng;
 use serde_json::{json, Map, Value};
 use tokio::sync::Mutex as AsyncMutex;
 
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_persistence::SnapshotStore;
 
@@ -285,12 +286,18 @@ fn iso(dt: &DateTime<Utc>) -> Value {
     json!(dt.to_rfc3339_opts(SecondsFormat::Micros, true))
 }
 
-fn policy_store_arn(account: &str, id: &str) -> String {
-    format!("arn:aws:verifiedpermissions::{account}:policy-store/{id}")
+pub fn policy_store_arn(region: &str, account: &str, id: &str) -> String {
+    Arn::global_in(
+        region,
+        "verifiedpermissions",
+        account,
+        &format!("policy-store/{id}"),
+    )
+    .to_string()
 }
 
-fn alias_arn(region: &str, account: &str, alias_name: &str) -> String {
-    format!("arn:aws:verifiedpermissions:{region}:{account}:{alias_name}")
+pub fn alias_arn(region: &str, account: &str, alias_name: &str) -> String {
+    Arn::regional("verifiedpermissions", region, account, alias_name).to_string()
 }
 
 /// Extract the policy-store id from a policy-store ARN
@@ -395,7 +402,7 @@ impl VerifiedPermissionsService {
             }
         }
         let id = gen_id(22);
-        let arn = policy_store_arn(&req.account_id, &id);
+        let arn = policy_store_arn(&req.region, &req.account_id, &id);
         let now = Utc::now();
         let mut tags = std::collections::BTreeMap::new();
         if let Some(m) = b.get("tags").and_then(Value::as_object) {

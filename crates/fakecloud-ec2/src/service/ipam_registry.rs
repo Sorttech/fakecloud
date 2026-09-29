@@ -29,8 +29,8 @@ use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use crate::service::Ec2Service;
 use crate::service_helpers::{
-    filter_value_matches, gen_id, indexed_list, invalid_parameter_value, not_found, paginate,
-    parse_filters, require, validate_enum, validate_max_results, Filter,
+    ec2_global_arn, filter_value_matches, gen_id, indexed_list, invalid_parameter_value, not_found,
+    paginate, parse_filters, require, validate_enum, validate_max_results, Filter,
 };
 use crate::state::{
     Ec2State, IpamIdempotencyRecord, IpamInternetRegistryAssociation,
@@ -384,15 +384,21 @@ fn require_enabled(a: &IpamInternetRegistryAssociation) -> Result<(), AwsService
     ))
 }
 
-fn association_xml(a: &IpamInternetRegistryAssociation, owner: &str, tags: &[Tag]) -> String {
+fn association_xml(
+    a: &IpamInternetRegistryAssociation,
+    owner: &str,
+    tags: &[Tag],
+    region: &str,
+) -> String {
     let mut s = String::new();
     s.push_str(&ec2_elem("ownerId", owner));
     s.push_str(&ec2_elem("ipamInternetRegistryAssociationId", &a.id));
     s.push_str(&ec2_elem(
         "ipamInternetRegistryAssociationArn",
-        &format!(
-            "arn:aws:ec2::{owner}:ipam-internet-registry-association/{}",
-            a.id
+        &ec2_global_arn(
+            region,
+            owner,
+            &format!("ipam-internet-registry-association/{}", a.id),
         ),
     ));
     s.push_str(&ec2_elem("ipamId", &a.ipam_id));
@@ -557,7 +563,7 @@ pub(crate) fn create_ipam_internet_registry_association(
                 &req.request_id,
                 &format!(
                     "<ipamInternetRegistryAssociation>{}</ipamInternetRegistryAssociation>",
-                    association_xml(existing, &owner, &tags)
+                    association_xml(existing, &owner, &tags, &req.region)
                 ),
             ));
         }
@@ -596,7 +602,7 @@ pub(crate) fn create_ipam_internet_registry_association(
         &req.request_id,
         &format!(
             "<ipamInternetRegistryAssociation>{}</ipamInternetRegistryAssociation>",
-            association_xml(&association, &owner, &tags)
+            association_xml(&association, &owner, &tags, &req.region)
         ),
     ))
 }
@@ -671,7 +677,7 @@ pub(crate) fn enable_ipam_internet_registry_association(
     }
     let body = format!(
         "<ipamInternetRegistryAssociation>{}</ipamInternetRegistryAssociation>",
-        association_xml(a, &owner, &tags)
+        association_xml(a, &owner, &tags, &req.region)
     );
     Ok(Ec2Service::respond(
         "EnableIpamInternetRegistryAssociation",
@@ -732,7 +738,7 @@ pub(crate) fn delete_ipam_internet_registry_association(
         &req.request_id,
         &format!(
             "<ipamInternetRegistryAssociation>{}</ipamInternetRegistryAssociation>",
-            association_xml(&association, &owner, &tags)
+            association_xml(&association, &owner, &tags, &req.region)
         ),
     ))
 }
@@ -756,7 +762,7 @@ pub(crate) fn describe_ipam_internet_registry_associations(
             if !association_matches(a, &owner, &tags, &filters) {
                 continue;
             }
-            items.push(association_xml(a, &owner, &tags));
+            items.push(association_xml(a, &owner, &tags, &req.region));
         }
     }
     Ok(paged_response(

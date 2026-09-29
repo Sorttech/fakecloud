@@ -1,6 +1,6 @@
 +++
 title = "fakecloud vs DynamoDB Local"
-description = "How fakecloud compares to DynamoDB Local. Same DynamoDB behavior, plus cross-service triggers, Lambda execution, and the 22 other AWS services around it."
+description = "How fakecloud compares to DynamoDB Local. Same DynamoDB behavior, plus cross-service triggers, Lambda execution, and the 104 other AWS services around it."
 template = "page.html"
 +++
 
@@ -34,7 +34,7 @@ DynamoDB Local is focused and battle-tested. For pure DynamoDB tests, nothing wr
 | Global tables | Yes | Yes (limited) |
 | Lambda consumes Streams (real) | **Yes** | **No** (no Lambda service) |
 | S3 writes trigger DynamoDB updates via Lambda | **Yes** | **No** |
-| Other AWS services available | 22 more | None |
+| Other AWS services available | 104 more | None |
 | Runtime | Single Rust binary (~19 MB) | Java JAR or Docker image |
 | Startup | ~300ms | ~2s |
 | Install size | ~19 MB | ~60 MB JAR + JVM |

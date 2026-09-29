@@ -8,5 +8,6 @@ pub(crate) mod state;
 pub use service::provisioner;
 pub use service::KmsService;
 pub use state::{
-    KmsAlias, KmsKey, KmsSnapshot, KmsState, SharedKmsState, KMS_SNAPSHOT_SCHEMA_VERSION,
+    kms_alias_arn, kms_key_arn, parse_kms_arn, KmsAlias, KmsKey, KmsSnapshot, KmsState,
+    SharedKmsState, KMS_SNAPSHOT_SCHEMA_VERSION,
 };

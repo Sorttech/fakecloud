@@ -15,7 +15,7 @@ pub use provision::{
     build_pending_ca, default_revocation_configuration, fill_keygen, generate_ca_material,
     subject_of, CaCreateParams, DEFAULT_KEY_STORAGE_STANDARD,
 };
-pub use service::AcmPcaService;
+pub use service::{ca_arn, AcmPcaService};
 pub use state::{
     AccountState, AcmPcaAccounts, AcmPcaSnapshot, AuditReport, CertificateAuthority,
     IssuedCertificate, Permission, RevokedCertificate, SharedAcmPcaState, TagEntry,

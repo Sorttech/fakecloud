@@ -12,12 +12,9 @@ impl BedrockAgentService {
         // plausible value when the caller omits one so the response still
         // satisfies the required shape.
         let role_arn = opt_str(&body, "executionRoleArn").unwrap_or_else(|| {
-            format!(
-                "arn:aws:iam::{}:role/service-role/AmazonBedrockExecutionRoleForFlows_{id}",
-                req.account_id
-            )
+            crate::arns::default_flow_execution_role_arn(&req.region, &req.account_id, &id)
         });
-        let arn = flow_arn(&id, &req.region, &req.account_id);
+        let arn = flow_arn(&req.region, &req.account_id, &id);
         let definition = opt_json(&body, "definition");
         let flow = Flow {
             flow_id: id.clone(),
@@ -29,6 +26,7 @@ impl BedrockAgentService {
             updated_at: now_dt,
             version: "DRAFT".to_string(),
             definition: definition.clone(),
+            arn: arn.clone(),
         };
         let mut accts = self.state.write();
         let state = accts.get_or_create(&req.account_id, &req.region);
@@ -73,12 +71,7 @@ impl BedrockAgentService {
         let accts = self.state.read();
         let list: Vec<Value> = accts
             .get(&req.account_id)
-            .map(|s| {
-                s.flows
-                    .values()
-                    .map(|f| flow_summary_json(f, &req.region, &req.account_id))
-                    .collect()
-            })
+            .map(|s| s.flows.values().map(flow_summary_json).collect())
             .unwrap_or_default();
         Ok(AwsResponse::ok_json(json!({ "flowSummaries": list })))
     }

@@ -6,7 +6,7 @@ use chrono::{DateTime, Timelike, Utc};
 use http::{HeaderMap, Method, StatusCode};
 use md5::{Digest, Md5};
 
-use fakecloud_aws::arn::Arn;
+use fakecloud_aws::arn::{arn_resource, Arn};
 use fakecloud_core::delivery::DeliveryBus;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_kms::SharedKmsState;
@@ -142,6 +142,216 @@ pub struct S3Service {
     pub(crate) credential_resolver: Option<Arc<dyn fakecloud_core::auth::CredentialResolver>>,
 }
 
+/// Serialize a persistence snapshot, turning a failure into a 500 rather than an
+/// empty document.
+///
+/// An empty file is worse than no file: the loader either skips it (losing the
+/// configuration with no word, which the next Put then makes permanent) or, for
+/// `acl.toml`, takes its presence to mean an explicit ACL and drops the default
+/// owner grant.
+pub(crate) fn toml_or_internal_error<T: serde::Serialize>(
+    value: &T,
+) -> Result<String, AwsServiceError> {
+    toml::to_string(value).map_err(|e| {
+        AwsServiceError::aws_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalError",
+            format!("failed to serialize persisted state: {e}"),
+        )
+    })
+}
+
+/// Reject a request that names an ACL more than one way.
+///
+/// A canned header, the `x-amz-grant-*` headers and an `AccessControlPolicy`
+/// body are mutually exclusive on S3, and letting one win silently discards what
+/// the others asked for -- durably, since the result is persisted. Shared so the
+/// bucket and object paths cannot drift on which pairs they reject.
+pub(crate) fn reject_conflicting_acl_sources(
+    canned: Option<&str>,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<(), AwsServiceError> {
+    let grants = has_grant_headers(headers);
+    let has_body = !body_is_blank(body);
+    let conflict = match (canned.is_some(), grants, has_body) {
+        (true, true, _) => Some("Specifying both Canned ACLs and Header Grants is not allowed"),
+        (true, _, true) => {
+            Some("Specifying both a Canned ACL and an AccessControlPolicy body is not allowed")
+        }
+        (_, true, true) => {
+            Some("Specifying both Header Grants and an AccessControlPolicy body is not allowed")
+        }
+        _ => None,
+    };
+    match conflict {
+        Some(message) => Err(AwsServiceError::aws_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            message,
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The ACL an object write asks for: a canned value, or resolved grant headers,
+/// or neither.
+#[derive(Debug)]
+pub(crate) struct WriteAclHeaders {
+    pub(crate) canned: Option<String>,
+    pub(crate) grants: Option<Vec<AclGrant>>,
+}
+
+impl WriteAclHeaders {
+    /// The grants to store, given the owner to fall back to.
+    pub(crate) fn grants_for(&self, owner_id: &str) -> Option<Vec<AclGrant>> {
+        match (&self.grants, self.canned.as_deref()) {
+            (Some(grants), _) => Some(grants.clone()),
+            (None, Some(acl)) => Some(canned_acl_grants_for_object(acl, owner_id)),
+            (None, None) => None,
+        }
+    }
+}
+
+/// Whether a request body carries nothing an ACL could be read from.
+///
+/// The mutual-exclusion checks and the "names no ACL at all" check have to agree
+/// on this: testing raw emptiness in one and trimmed emptiness in the other made
+/// a canned ACL plus a stray newline -- one ACL, named once -- fail as though it
+/// named two.
+pub(crate) fn body_is_blank(body: &[u8]) -> bool {
+    // A body that does not decode is one no ACL can be read from, which is
+    // exactly how the parse sites treat it (`from_utf8(..).unwrap_or("")`).
+    // Calling it present would reject a canned ACL for conflicting with a body
+    // the next line discards.
+    std::str::from_utf8(body).map_or(true, |s| s.trim().is_empty())
+}
+
+impl S3Service {
+    /// Validate and resolve the ACL headers of an object write.
+    ///
+    /// Every object-write path goes through here: PutObject,
+    /// CreateMultipartUpload and CopyObject each used to keep their own copy of
+    /// these four checks, and the ORDER matters -- the canned value is validated
+    /// before the grant headers are resolved, and both before the
+    /// "named two ways" rejection, so a request carrying an unresolvable grant
+    /// answers InvalidArgument rather than InvalidRequest. The conformance probe
+    /// populates the canned member and the grant members together, and only the
+    /// first of those codes is in the S3 error allowlist, so a path that
+    /// reordered its own copy would silently drop probe variants.
+    ///
+    /// Call it before any work the request would have to undo -- in particular
+    /// before the body is spooled to disk, since nothing unlinks the spool file
+    /// on an error path.
+    pub(crate) fn resolve_write_acl_headers(
+        &self,
+        account_id: &str,
+        bucket: &str,
+        headers: &HeaderMap,
+    ) -> Result<WriteAclHeaders, AwsServiceError> {
+        let canned = headers
+            .get("x-amz-acl")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        if let Some(acl) = canned.as_deref() {
+            validate_object_canned_acl(acl)?;
+        }
+        let grants = if has_grant_headers(headers) {
+            Some(resolved_grant_headers(headers)?)
+        } else {
+            None
+        };
+        if canned.is_some() && grants.is_some() {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                "Specifying both Canned ACLs and Header Grants is not allowed",
+            ));
+        }
+        // The bucket's ACL owner, which is who "bucket owner full control" means
+        // -- not the caller. They coincide for a bucket this account created, and
+        // diverge for one persisted by another account and hydrated into the
+        // default account on restart, where comparing against the caller accepted
+        // a grant to somebody who is not the owner and refused the grant to the
+        // owner that AWS accepts.
+        //
+        // Looked up only when the request actually names an ACL: the overwhelming
+        // majority of object writes carry none, and this takes the global read
+        // lock. Resolved once and used for both the grants below and the exception
+        // check, so the two cannot derive the owner differently.
+        let bucket_owner = (canned.is_some() || grants.is_some())
+            .then(|| self.bucket_acl_owner_id(account_id, bucket))
+            .flatten();
+        let owner_id = bucket_owner.as_deref().unwrap_or(account_id);
+
+        // The grants the request resolves to, which is what the public-ACL check
+        // below has to judge. Resolved against the bucket's owner, which is what
+        // the write paths store them under.
+        let requested = match (&grants, canned.as_deref()) {
+            (Some(g), _) => Some(g.clone()),
+            (None, Some(acl)) => Some(canned_acl_grants_for_object(acl, owner_id)),
+            (None, None) => None,
+        };
+
+        // BucketOwnerEnforced disables object ACLs. The model is precise about
+        // the one exception: such a bucket "only accept[s] PUT requests that
+        // don't specify an ACL or PUT requests that specify bucket owner full
+        // control ACLs, such as the bucket-owner-full-control canned ACL or an
+        // equivalent form of this ACL expressed in the XML format".
+        //
+        // So the test is the ACL the request NAMES, not the grants it resolves
+        // to. Judging by resolved shape would also accept `private`,
+        // `bucket-owner-read` and `aws-exec-read`, all of which AWS refuses
+        // here: `private` is owner-only by definition, and the other two
+        // collapse onto an owner-only grant only because their real grantees
+        // are not modeled. `private` in particular is neither "no ACL" nor
+        // "bucket owner full control".
+        let asks_for_owner_full_control = match (&grants, canned.as_deref()) {
+            // "an equivalent form of this ACL": explicit grants that give the
+            // owner full control and nobody anything. `resolved_grant_headers`
+            // never yields an empty vector (it errors instead), so every grant
+            // here is a real clause from the request.
+            (Some(g), _) => g.iter().all(|grant| {
+                grant.permission == "FULL_CONTROL"
+                    && grant.grantee_type == "CanonicalUser"
+                    && grant.grantee_id.as_deref() == Some(owner_id)
+            }),
+            (None, Some(acl)) => acl == "bucket-owner-full-control",
+            (None, None) => false,
+        };
+        let specifies_an_acl = grants.is_some() || canned.is_some();
+        if specifies_an_acl
+            && !asks_for_owner_full_control
+            && self.bucket_owner_enforced(account_id, bucket)
+        {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "AccessControlListNotSupported",
+                "The bucket does not allow ACLs",
+            ));
+        }
+
+        // BlockPublicAcls refuses a public grant at write time too. Only the
+        // Put*Acl paths enforced it, so `put-object --acl public-read` stored an
+        // AllUsers grant on a bucket that blocks exactly that while
+        // `put-object-acl --acl public-read` was refused; AWS refuses both.
+        if let Some(requested) = requested.as_deref() {
+            if crate::service::config::grants_are_public(requested) {
+                if let Some(flags) = self.pab_flags(account_id, bucket) {
+                    if flags.block_public_acls {
+                        return Err(AwsServiceError::aws_error(
+                            StatusCode::FORBIDDEN,
+                            "AccessDenied",
+                            "User is not authorized to perform: s3:PutObject. Reason: Public Access Block (BlockPublicAcls)",
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(WriteAclHeaders { canned, grants })
+    }
+}
+
 /// Map a [`StoreError`] from the persistence layer to a 500 InternalError
 /// response. Invoked at every mutation site when the write-through persistence
 /// call fails: the in-memory mutation has already happened, but we surface the
@@ -165,6 +375,17 @@ pub(crate) fn io_to_aws(err: std::io::Error) -> AwsServiceError {
 }
 
 impl S3Service {
+    /// The region of an existing bucket, searched across accounts (bucket
+    /// names are global).
+    fn bucket_region(&self, bucket: &str) -> Option<String> {
+        let mas = self.state.read();
+        let account = mas.find_account(|s| s.buckets.contains_key(bucket))?;
+        mas.get(account)?
+            .buckets
+            .get(bucket)
+            .map(|b| b.region.clone())
+    }
+
     pub fn new(state: SharedS3State, delivery: Arc<DeliveryBus>) -> Self {
         Self::with_store(state, delivery, Arc::new(MemoryS3Store::new()))
     }
@@ -1422,7 +1643,9 @@ impl AwsService for S3Service {
                 let resource = request
                     .path_segments
                     .get(2)
-                    .map(|name| format!("arn:aws:s3:::accesspoint/{name}"))
+                    .map(|name| {
+                        Arn::s3_access_point(&request.region, &request.account_id, name).to_string()
+                    })
                     .unwrap_or_else(|| "*".to_string());
                 return Some(fakecloud_core::auth::IamAction {
                     service: "s3",
@@ -1445,7 +1668,11 @@ impl AwsService for S3Service {
             "WriteGetObjectResponse" => "s3-object-lambda",
             _ => "s3",
         };
-        let resource = s3_resource_for(action, bucket, key.as_deref());
+        // Every ARN S3 returns for a bucket carries the bucket's own region's
+        // partition, so policies written against those ARNs must match here.
+        let bucket_region = bucket.and_then(|b| self.bucket_region(b));
+        let region = bucket_region.as_deref().unwrap_or(&request.region);
+        let resource = s3_resource_for(region, action, bucket, key.as_deref());
         Some(fakecloud_core::auth::IamAction {
             service,
             action,
@@ -1453,12 +1680,98 @@ impl AwsService for S3Service {
         })
     }
 
+    /// Tagging a bucket at create time needs `s3:TagResource` as well as
+    /// `s3:CreateBucket` — the S3 model says so on
+    /// `CreateBucketConfiguration$Tags` ("You must have the
+    /// `s3:TagResource` permission to create a general purpose bucket with
+    /// tags"). Dispatch requires every returned action to be allowed, so a
+    /// principal granted only `s3:CreateBucket` can still create an untagged
+    /// bucket but not a tagged one, as on AWS.
+    fn iam_actions_for(&self, request: &AwsRequest) -> Vec<fakecloud_core::auth::IamAction> {
+        let Some(action) = self.iam_action_for(request) else {
+            return Vec::new();
+        };
+        if action.service == "s3" && action.action == "CreateBucket" {
+            // A create that also configures the bucket needs the permission for
+            // each thing it configures, as on AWS: dispatch requires every
+            // returned action to be allowed, so a principal holding only
+            // `s3:CreateBucket` can still create a plain bucket. This matters
+            // more now that these settings PERSIST -- a bucket created
+            // `public-read` by a caller with no `s3:PutBucketAcl` used to lose
+            // the grant on restart, and now keeps it.
+            let mut extra = Vec::new();
+            let body = std::str::from_utf8(&request.body).unwrap_or("");
+            if !create_bucket_configuration_tags(body).is_empty() {
+                extra.push("TagResource");
+            }
+            // Per the CreateBucket permissions in the vendored model: an ACL set
+            // to public-read, public-read-write, authenticated-read "or any
+            // other custom ACLs" needs s3:PutBucketAcl, while "if you set the
+            // ACL to private, or if you don't specify any ACLs, only the
+            // s3:CreateBucket permission is required". Judged by the grants the
+            // request resolves to, so the two spellings of an owner-only ACL
+            // agree -- and so a least-privilege caller that always sends
+            // `--acl private` is not refused.
+            let reaches_past_owner = request
+                .headers
+                .get("x-amz-acl")
+                .and_then(|v| v.to_str().ok())
+                // Blank counts as absent here too. It resolves to owner-only today
+                // only because `canned_acl_grants` falls through to the owner for
+                // any unrecognized value -- so without this, an arm that ever made
+                // an unknown value resolve past the owner would silently start
+                // demanding `s3:PutBucketAcl` for an empty header.
+                .filter(|acl| !acl.trim().is_empty())
+                .is_some_and(|acl| acl_reaches_past_owner(acl, &request.account_id));
+            if reaches_past_owner || has_grant_headers(&request.headers) {
+                extra.push("PutBucketAcl");
+            }
+            // Presence, but blank counts as absent -- the same rule the ACL
+            // headers and the condition keys follow. Otherwise a blank value
+            // demands a permission whose condition key is deliberately not
+            // emitted, so a `StringEquals`-gated Allow 403s a request the handler
+            // would have answered with a 400.
+            if request
+                .headers
+                .get("x-amz-object-ownership")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| !v.trim().is_empty())
+            {
+                extra.push("PutBucketOwnershipControls");
+            }
+            if request
+                .headers
+                .get("x-amz-bucket-object-lock-enabled")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+            {
+                // Object lock forces versioning on, so AWS wants both.
+                extra.push("PutBucketObjectLockConfiguration");
+                extra.push("PutBucketVersioning");
+            }
+            if !extra.is_empty() {
+                let mut actions = Vec::with_capacity(extra.len() + 1);
+                let resource = action.resource.clone();
+                actions.push(action);
+                for name in extra {
+                    actions.push(fakecloud_core::auth::IamAction {
+                        service: "s3",
+                        action: name,
+                        resource: resource.clone(),
+                    });
+                }
+                return actions;
+            }
+        }
+        vec![action]
+    }
+
     fn iam_condition_keys_for(
         &self,
         request: &AwsRequest,
         action: &fakecloud_core::auth::IamAction,
     ) -> std::collections::BTreeMap<String, Vec<String>> {
-        s3_condition_keys(action.action, &request.query_params)
+        s3_condition_keys(action.action, &request.query_params, &request.headers)
     }
 
     fn resource_tags_for(
@@ -1481,15 +1794,77 @@ impl AwsService for S3Service {
 
 /// Extract service-specific IAM condition keys from an S3 request.
 ///
-/// Today only `ListObjects` / `ListObjectsV2` expose keys (`s3:prefix`,
-/// `s3:delimiter`, `s3:max-keys`) via their query params. Other actions
-/// return an empty map so the evaluator's safe-fail semantics treat any
-/// policy condition referencing an unknown key as "doesn't apply".
+/// `ListObjects` / `ListObjectsV2` expose `s3:prefix`, `s3:delimiter` and
+/// `s3:max-keys` from their query params, and any request carrying the ACL,
+/// object-ownership or object-lock headers exposes the matching `s3:x-amz-*`
+/// keys. An action with nothing to expose returns an empty map, so the
+/// evaluator's safe-fail semantics treat a policy condition on an unknown key
+/// as "doesn't apply".
 fn s3_condition_keys(
     action: &str,
     query: &std::collections::HashMap<String, String>,
+    headers: &HeaderMap,
 ) -> std::collections::BTreeMap<String, Vec<String>> {
     let mut out = std::collections::BTreeMap::new();
+    // `s3:x-amz-acl` and the `s3:x-amz-grant-*` family are how a policy pins
+    // down which ACL a write may ask for -- a guardrail like
+    // `Deny s3:CreateBucket when s3:x-amz-acl != private` is useless while they
+    // are never populated. AWS exposes them on every ACL-accepting write, so
+    // they are emitted whenever the request carries them rather than being
+    // gated on an action list that would drift.
+    if let Some(acl) = headers
+        .get("x-amz-acl")
+        .and_then(|v| v.to_str().ok())
+        // Blank is skipped for consistency with every other key family here (the
+        // grant headers, object ownership): a present-but-empty header names no
+        // value, and a key emitted as `""` matches nothing a policy can sensibly
+        // write. Note this does NOT mean the request succeeds -- three of the four
+        // canned-ACL paths answer 400 for a blank value; it means the policy
+        // decision is not made on an empty string.
+        .filter(|v| !v.trim().is_empty())
+    {
+        out.insert("s3:x-amz-acl".to_string(), vec![acl.to_string()]);
+    }
+    for (header, _) in &GRANT_HEADER_PERMISSIONS {
+        // Blank values are skipped for the same reason `has_grant_headers`
+        // treats them as absent: a present-but-empty header asks for no grant,
+        // and emitting the key would make a `Null`-based guardrail read it as
+        // present and deny the request.
+        let values: Vec<String> = headers
+            .get_all(*header)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .filter(|v| !v.trim().is_empty())
+            .map(|v| v.to_string())
+            .collect();
+        if !values.is_empty() {
+            out.insert(format!("s3:{header}"), values);
+        }
+    }
+    // The ACL is not the only setting `iam_actions_for` gates: object ownership is
+    // too, and `Deny CreateBucket unless s3:x-amz-object-ownership ==
+    // BucketOwnerEnforced` is just as useless while its key is never populated.
+    //
+    // Object lock is deliberately NOT here. AWS defines no condition key for the
+    // `x-amz-bucket-object-lock-enabled` header -- its object-lock keys are
+    // `s3:object-lock-mode`, `-legal-hold`, `-remaining-retention-days` and
+    // `-retain-until-date`, all about an object's retention rather than a bucket's
+    // creation. Emitting `s3:x-amz-bucket-object-lock-enabled` would invert the
+    // point of populating keys at all: a guardrail written against it would work
+    // here and be a permanent no-op against AWS. The permission the lock header
+    // requires is unaffected -- that comes from the model's Permissions text.
+    if let Some(value) = headers
+        .get("x-amz-object-ownership")
+        .and_then(|v| v.to_str().ok())
+        // Blank is skipped like the grant family: present but empty asks for
+        // nothing, and emitting the key would make a `Null` check read it as set.
+        .filter(|v| !v.trim().is_empty())
+    {
+        out.insert(
+            "s3:x-amz-object-ownership".to_string(),
+            vec![value.to_string()],
+        );
+    }
     if matches!(action, "ListObjects" | "ListObjectsV2") {
         // Both list variants share the same query param shape.
         if let Some(prefix) = query.get("prefix") {
@@ -1518,7 +1893,7 @@ fn s3_resource_tags(
         return Some(std::collections::BTreeMap::new());
     }
     // S3 ARNs: arn:aws:s3:::bucket or arn:aws:s3:::bucket/key
-    let after_prefix = resource_arn.strip_prefix("arn:aws:s3:::")?;
+    let after_prefix = arn_resource(resource_arn, "s3")?.strip_prefix("::")?;
     let mas = state.read();
     // S3 bucket names are globally unique; scan all accounts to find the bucket
     let bucket_name = after_prefix.split('/').next().unwrap_or(after_prefix);
@@ -1570,6 +1945,24 @@ fn s3_request_tags(
             // Tags come in XML body
             let body = std::str::from_utf8(&request.body).unwrap_or("");
             let tags = parse_tagging_xml(body);
+            Some(tags.into_iter().collect())
+        }
+        // CreateBucket carries its tag set inside CreateBucketConfiguration, and
+        // every authorization it requires alongside `s3:CreateBucket` is
+        // evaluated against the same tags -- AWS builds one request context for
+        // the whole request, so an `aws:RequestTag/*` guardrail that permits the
+        // create must not then deny the ACL or object-lock action it implies.
+        // The extra names are harmless on their own operations: a real
+        // PutBucketAcl body is not a `CreateBucketConfiguration`, so it yields
+        // the same empty map the catch-all arm would.
+        "CreateBucket"
+        | "TagResource"
+        | "PutBucketAcl"
+        | "PutBucketOwnershipControls"
+        | "PutBucketObjectLockConfiguration"
+        | "PutBucketVersioning" => {
+            let body = std::str::from_utf8(&request.body).unwrap_or("");
+            let tags = create_bucket_configuration_tags(body);
             Some(tags.into_iter().collect())
         }
         _ => Some(std::collections::BTreeMap::new()),
@@ -1982,7 +2375,12 @@ fn s3_detect_action(
 /// Build the S3 resource ARN for an action. Returns `*` for
 /// `ListBuckets` (account-scoped), a bucket ARN for bucket-level
 /// configuration actions, or an object ARN for object-level actions.
-fn s3_resource_for(action: &'static str, bucket: Option<&str>, key: Option<&str>) -> String {
+fn s3_resource_for(
+    region: &str,
+    action: &'static str,
+    bucket: Option<&str>,
+    key: Option<&str>,
+) -> String {
     // Object-level actions work on `bucket/key`.
     const OBJECT_ACTIONS: &[&str] = &[
         "PutObject",
@@ -2016,12 +2414,12 @@ fn s3_resource_for(action: &'static str, bucket: Option<&str>, key: Option<&str>
     };
     if OBJECT_ACTIONS.contains(&action) {
         match key {
-            Some(k) if !k.is_empty() => Arn::s3(&format!("{bucket}/{k}")).to_string(),
-            _ => Arn::s3(&format!("{bucket}/*")).to_string(),
+            Some(k) if !k.is_empty() => Arn::s3_in(region, &format!("{bucket}/{k}")).to_string(),
+            _ => Arn::s3_in(region, &format!("{bucket}/*")).to_string(),
         }
     } else {
         // Bucket-level actions (ListObjectsV2, GetBucketTagging, ...).
-        Arn::s3(bucket).to_string()
+        Arn::s3_in(region, bucket).to_string()
     }
 }
 
@@ -2228,6 +2626,13 @@ pub(crate) fn build_acl_xml(owner_id: &str, grants: &[AclGrant], _account_id: &s
                  <URI>{}</URI></Grantee>",
                 xml_escape(uri),
             )
+        } else if g.grantee_type == "AmazonCustomerByEmail" {
+            let email = g.grantee_display_name.as_deref().unwrap_or("");
+            format!(
+                "<Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"AmazonCustomerByEmail\">\
+                 <EmailAddress>{}</EmailAddress></Grantee>",
+                xml_escape(email),
+            )
         } else {
             let id = g.grantee_id.as_deref().unwrap_or("");
             format!(
@@ -2250,6 +2655,104 @@ pub(crate) fn build_acl_xml(owner_id: &str, grants: &[AclGrant], _account_id: &s
          </AccessControlPolicy>",
         owner_id = xml_escape(owner_id),
     )
+}
+
+/// The canned ACLs an object accepts, per `com.amazonaws.s3#ObjectCannedACL`.
+/// `log-delivery-write` is bucket-only and is not among them.
+pub(crate) const OBJECT_CANNED_ACLS: [&str; 7] = [
+    "private",
+    "public-read",
+    "public-read-write",
+    "authenticated-read",
+    "aws-exec-read",
+    "bucket-owner-read",
+    "bucket-owner-full-control",
+];
+
+/// Reject a canned ACL an object does not accept. An unrecognized value used to
+/// fall through `canned_acl_grants`' catch-all to owner-only, silently wiping
+/// the object's grants with a 200.
+pub(crate) fn validate_object_canned_acl(acl: &str) -> Result<(), AwsServiceError> {
+    if OBJECT_CANNED_ACLS.contains(&acl) {
+        return Ok(());
+    }
+    Err(AwsServiceError::aws_error(
+        StatusCode::BAD_REQUEST,
+        "InvalidArgument",
+        format!("Invalid x-amz-acl value: {acl}"),
+    ))
+}
+
+/// The values `x-amz-object-ownership` accepts, per
+/// `com.amazonaws.s3#ObjectOwnership`. Matched case-sensitively, as S3 does.
+pub(crate) const OBJECT_OWNERSHIP_VALUES: [&str; 3] = [
+    "BucketOwnerPreferred",
+    "ObjectWriter",
+    "BucketOwnerEnforced",
+];
+
+/// The canned ACLs a bucket accepts. `com.amazonaws.s3#BucketCannedACL` lists
+/// only the first four; `log-delivery-write` is bucket-scoped in the S3
+/// canned-ACL table (it is how a server-access-logging target is set up), so
+/// the header takes it even though the modeled enum omits it.
+///
+/// `aws-exec-read` is bucket-scoped too (CloudFormation's
+/// `AWS::S3::Bucket` `AccessControl: AwsExecRead` maps to it), and AWS answers
+/// 200, so refusing it would turn a working call into a hard failure. Its grant
+/// is a READ to the EC2 service's canonical user, which this build cannot
+/// reproduce, so it resolves to owner-only -- [`acl_reaches_past_owner`] special-
+/// cases it, since the request does ask for an ACL reaching past the owner. That
+/// drives both the BucketOwnerEnforced conflict check and the `s3:PutBucketAcl`
+/// authorization a create carrying it requires.
+///
+/// `bucket-owner-read` and `bucket-owner-full-control` are object-scoped, and
+/// the canned-ACL table says S3 IGNORES them when they are given on a bucket
+/// rather than refusing the call -- so they are accepted here and resolve to
+/// the owner's FULL_CONTROL, which is what ignoring them produces. Rejecting
+/// them would have turned a working call into a hard failure on a claim about
+/// live S3 this build cannot check. A value S3 does not define at all is still
+/// refused, since that is a typo silently wiping the bucket's grants.
+pub(crate) const BUCKET_CANNED_ACLS: [&str; 8] = [
+    "private",
+    "public-read",
+    "public-read-write",
+    "authenticated-read",
+    "aws-exec-read",
+    "log-delivery-write",
+    "bucket-owner-read",
+    "bucket-owner-full-control",
+];
+
+/// Whether the ACL a request asks for reaches past the bucket owner.
+///
+/// Both the `BucketOwnerEnforced` conflict check and the `s3:PutBucketAcl`
+/// authorization turn on this one question, so they share the answer rather
+/// than each re-deriving it -- they disagreed once already, and the IAM side
+/// silently authorized an ACL the conflict check treats as reaching outside the
+/// owner.
+///
+/// `aws-exec-read` is the case that needs saying out loud: its READ grant to
+/// the EC2 service's canonical user is not modeled, so [`canned_acl_grants`]
+/// resolves it to owner-only -- but the request does ask for an ACL reaching
+/// outside the owner.
+///
+/// NOT the same question as the object-write check in
+/// [`S3Service::resolve_write_acl_headers`], which asks whether the request names
+/// bucket-owner-full-control specifically. The two look alike and must not be
+/// unified: a BucketOwnerEnforced BUCKET rejects an ACL that grants another
+/// account anything, so `private` is fine there, while a BucketOwnerEnforced
+/// bucket accepts an object PUT only when it specifies no ACL at all or
+/// bucket-owner-full-control -- a value that is object-scoped in the model
+/// (`com.amazonaws.s3#BucketCannedACL` omits it), so the bucket-side question
+/// never has this answer. The header is still accepted on a bucket, resolving to
+/// the owner's FULL_CONTROL, which is what S3 ignoring it produces.
+pub(crate) fn acl_reaches_past_owner(acl: &str, owner_id: &str) -> bool {
+    acl == "aws-exec-read"
+        || !canned_acl_grants(acl, owner_id).iter().all(|g| {
+            g.permission == "FULL_CONTROL"
+                && g.grantee_type == "CanonicalUser"
+                && g.grantee_id.as_deref() == Some(owner_id)
+        })
 }
 
 pub(crate) fn canned_acl_grants(acl: &str, owner_id: &str) -> Vec<AclGrant> {
@@ -2301,6 +2804,27 @@ pub(crate) fn canned_acl_grants(acl: &str, owner_id: &str) -> Vec<AclGrant> {
                 permission: "READ".to_string(),
             },
         ],
+        // Grants the log-delivery group what it needs to write access logs into
+        // the bucket, which is the entire point of this canned ACL.
+        "log-delivery-write" => vec![
+            owner_grant,
+            AclGrant {
+                grantee_type: "Group".to_string(),
+                grantee_id: None,
+                grantee_display_name: None,
+                grantee_uri: Some("http://acs.amazonaws.com/groups/s3/LogDelivery".to_string()),
+                permission: "WRITE".to_string(),
+            },
+            AclGrant {
+                grantee_type: "Group".to_string(),
+                grantee_id: None,
+                grantee_display_name: None,
+                grantee_uri: Some("http://acs.amazonaws.com/groups/s3/LogDelivery".to_string()),
+                permission: "READ_ACP".to_string(),
+            },
+        ],
+        // `bucket-owner-read` / `bucket-owner-full-control` on an object owned
+        // by the caller come out as the owner's FULL_CONTROL.
         "bucket-owner-full-control" => vec![owner_grant],
         _ => vec![owner_grant],
     }
@@ -2311,29 +2835,143 @@ pub(crate) fn canned_acl_grants_for_object(acl: &str, owner_id: &str) -> Vec<Acl
     canned_acl_grants(acl, owner_id)
 }
 
+/// The `x-amz-grant-*` headers and the ACL permission each one grants.
+pub(crate) const GRANT_HEADER_PERMISSIONS: [(&str, &str); 5] = [
+    ("x-amz-grant-read", "READ"),
+    ("x-amz-grant-write", "WRITE"),
+    ("x-amz-grant-read-acp", "READ_ACP"),
+    ("x-amz-grant-write-acp", "WRITE_ACP"),
+    ("x-amz-grant-full-control", "FULL_CONTROL"),
+];
+
+/// How many grantee clauses the `x-amz-grant-*` headers carry, counting every
+/// comma-separated entry whether or not [`parse_grant_headers`] can turn it
+/// into a grant.
+///
+/// That function skips a clause it cannot make a usable grantee of -- an `id=`
+/// or `uri=` with nothing after it, or a key it does not recognize at all -- so
+/// a caller about to STORE the parsed grants as the authoritative ACL compares
+/// the two counts: fewer grants than clauses means the request asked for
+/// something the stored ACL would not express.
+pub(crate) fn grant_header_clause_count(headers: &HeaderMap) -> usize {
+    let mut clauses = 0;
+    for (header, _) in &GRANT_HEADER_PERMISSIONS {
+        // `get_all`, not `get`: a repeated header carries more than one value,
+        // and counting only the first would let the extras be dropped silently
+        // -- the very thing the count exists to catch.
+        for value in headers.get_all(*header) {
+            match value.to_str() {
+                Ok(value) => {
+                    clauses += value
+                        .split(',')
+                        .filter(|part| !part.trim().is_empty())
+                        .count();
+                }
+                // Header values are opaque bytes. `parse_grant_headers` cannot
+                // read this one either, so counting it as zero would let the
+                // counts agree and the grant disappear -- count it as a clause
+                // that did not resolve.
+                Err(_) => clauses += 1,
+            }
+        }
+    }
+    clauses
+}
+
+/// Whether the request carries any of the recognized `x-amz-grant-*` headers.
+/// Matched by exact name, not by prefix, so an unknown `x-amz-grant-…` header
+/// is ignored rather than turning a valid create into an error.
+pub(crate) fn has_grant_headers(headers: &HeaderMap) -> bool {
+    // A present-but-blank value is what a client sends for an unset config
+    // field, and S3 treats it as absent. Testing presence alone turned that
+    // into a hard rejection on every ACL-setting operation.
+    GRANT_HEADER_PERMISSIONS.iter().any(|(header, _)| {
+        headers
+            .get_all(*header)
+            .iter()
+            .any(|v| v.to_str().map(|s| !s.trim().is_empty()).unwrap_or(true))
+    })
+}
+
+/// Resolve the `x-amz-grant-*` headers into grants, refusing the request when
+/// any grantee clause does not resolve into one.
+///
+/// [`parse_grant_headers`] skips a clause it cannot make a grantee of -- a key
+/// with an empty value, or one it does not recognize -- so a caller that STORES
+/// the result as the authoritative ACL would persist a permission set nobody
+/// asked for, and a request where nothing resolves would store an ACL with not
+/// even an owner entry. Every ACL-setting path goes through here so they all
+/// agree. (`emailAddress=` IS resolved, into an AmazonCustomerByEmail grantee.)
+pub(crate) fn resolved_grant_headers(
+    headers: &HeaderMap,
+) -> Result<Vec<AclGrant>, AwsServiceError> {
+    let grants = parse_grant_headers(headers);
+    if grants.is_empty() || grants.len() != grant_header_clause_count(headers) {
+        return Err(AwsServiceError::aws_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "Argument format not recognized: grantees must be specified as id=<canonical-id> or uri=<group-uri>",
+        ));
+    }
+    Ok(grants)
+}
+
 pub(crate) fn parse_grant_headers(headers: &HeaderMap) -> Vec<AclGrant> {
     let mut grants = Vec::new();
-    let header_permission_map = [
-        ("x-amz-grant-read", "READ"),
-        ("x-amz-grant-write", "WRITE"),
-        ("x-amz-grant-read-acp", "READ_ACP"),
-        ("x-amz-grant-write-acp", "WRITE_ACP"),
-        ("x-amz-grant-full-control", "FULL_CONTROL"),
-    ];
+    let header_permission_map = GRANT_HEADER_PERMISSIONS;
 
     for (header, permission) in &header_permission_map {
-        if let Some(value) = headers.get(*header).and_then(|v| v.to_str().ok()) {
+        for value in headers.get_all(*header) {
+            let Ok(value) = value.to_str() else { continue };
             // Parse "id=xxx" or "uri=xxx" or "emailAddress=xxx"
             for part in value.split(',') {
                 let part = part.trim();
                 if let Some((key, val)) = part.split_once('=') {
-                    let val = val.trim().trim_matches('"');
+                    // Quotes first, then trim: trimming first leaves `"  "` as
+                    // two spaces, which the emptiness checks below would accept
+                    // as a grantee naming somebody.
+                    let val = val.trim().trim_matches('"').trim();
                     let key = key.trim().to_lowercase();
+                    // `id=` / `uri=` with nothing after it names no grantee.
+                    // Emitting a grant with an empty id would store an ACL
+                    // entry that can never match anyone; leaving it out lets
+                    // the caller's clause count catch the request instead.
+                    if val.is_empty() {
+                        continue;
+                    }
                     match key.as_str() {
                         "id" => {
                             grants.push(AclGrant {
                                 grantee_type: "CanonicalUser".to_string(),
                                 grantee_id: Some(val.to_string()),
+                                grantee_display_name: Some(val.to_string()),
+                                grantee_uri: None,
+                                permission: permission.to_string(),
+                            });
+                        }
+                        // S3 resolves an email to the account's canonical id.
+                        // There is no directory to resolve against here, so the
+                        // grant keeps the address as an AmazonCustomerByEmail
+                        // grantee -- a real ACL grantee type -- rather than
+                        // being dropped (which would silently lose a grant) or
+                        // refused (which would fail a call AWS accepts).
+                        //
+                        // It is recorded, not enforced: every authorization path
+                        // matches a Group URI or a canonical id, so this grant
+                        // gives the named address no access. Say so rather than
+                        // letting it look like working authorization.
+                        "emailaddress" => {
+                            tracing::warn!(
+                                target: "fakecloud::s3",
+                                email = %val,
+                                permission = %permission,
+                                "storing an email-addressed ACL grant that is not enforced: \
+                                 email grantees are not resolved to a canonical user here, so \
+                                 this grant conveys no access",
+                            );
+                            grants.push(AclGrant {
+                                grantee_type: "AmazonCustomerByEmail".to_string(),
+                                grantee_id: None,
                                 grantee_display_name: Some(val.to_string()),
                                 grantee_uri: None,
                                 permission: permission.to_string(),
@@ -2388,7 +3026,21 @@ pub(crate) fn parse_acl_xml(xml: &str) -> Result<Vec<AclGrant>, AwsServiceError>
 
             // Determine grantee type
             if grant_body.contains("xsi:type=\"Group\"") || grant_body.contains("<URI>") {
-                let uri = extract_xml_value(grant_body, "URI").unwrap_or_default();
+                // Trimmed: `<URI>\n  http://...\n</URI>` is what a formatted
+                // policy carries, and the padding would otherwise be stored as
+                // part of the group URI and never match.
+                let uri = extract_xml_value(grant_body, "URI")
+                    .map(|u| u.trim().to_string())
+                    .unwrap_or_default();
+                // Same rule as an empty <ID>: a grant naming no group can never
+                // match anyone, and it would be stored as the bucket's ACL.
+                if uri.is_empty() {
+                    return Err(AwsServiceError::aws_error(
+                        StatusCode::BAD_REQUEST,
+                        "MalformedACLError",
+                        "The XML you provided was not well-formed or did not validate against our published schema",
+                    ));
+                }
                 grants.push(AclGrant {
                     grantee_type: "Group".to_string(),
                     grantee_id: None,
@@ -2396,10 +3048,60 @@ pub(crate) fn parse_acl_xml(xml: &str) -> Result<Vec<AclGrant>, AwsServiceError>
                     grantee_uri: Some(uri),
                     permission,
                 });
+            } else if grant_body.contains("AmazonCustomerByEmail")
+                || grant_body.contains("<EmailAddress>")
+            {
+                // S3 allows exactly one grantee identifier. A Grantee carrying
+                // both an ID and an EmailAddress used to silently drop the
+                // canonical id in favor of the (unenforced) email grant, and the
+                // wrong one was the persisted one.
+                if grant_body.contains("<ID>") {
+                    return Err(AwsServiceError::aws_error(
+                        StatusCode::BAD_REQUEST,
+                        "MalformedACLError",
+                        "The XML you provided was not well-formed or did not validate against our published schema",
+                    ));
+                }
+                // An email grantee carries <EmailAddress>, never <ID>. Reading it
+                // as a CanonicalUser would store a grant with an empty id --
+                // an entry that can never match anyone, which is exactly what
+                // the header path refuses. This is reachable by feeding
+                // GetBucketAcl output straight back into PutBucketAcl.
+                let email = extract_xml_value(grant_body, "EmailAddress")
+                    .map(|e| e.trim().to_string())
+                    .unwrap_or_default();
+                if email.is_empty() {
+                    return Err(AwsServiceError::aws_error(
+                        StatusCode::BAD_REQUEST,
+                        "MalformedACLError",
+                        "The XML you provided was not well-formed or did not validate against our published schema",
+                    ));
+                }
+                grants.push(AclGrant {
+                    grantee_type: "AmazonCustomerByEmail".to_string(),
+                    grantee_id: None,
+                    grantee_display_name: Some(email),
+                    grantee_uri: None,
+                    permission,
+                });
             } else {
-                let id = extract_xml_value(grant_body, "ID").unwrap_or_default();
-                let display =
-                    extract_xml_value(grant_body, "DisplayName").unwrap_or_else(|| id.clone());
+                // Trimmed for the same reason: a pretty-printed canonical id
+                // would otherwise be stored with its padding and never match
+                // the owner in any authorization comparison.
+                let id = extract_xml_value(grant_body, "ID")
+                    .map(|i| i.trim().to_string())
+                    .unwrap_or_default();
+                if id.is_empty() {
+                    return Err(AwsServiceError::aws_error(
+                        StatusCode::BAD_REQUEST,
+                        "MalformedACLError",
+                        "The XML you provided was not well-formed or did not validate against our published schema",
+                    ));
+                }
+                let display = extract_xml_value(grant_body, "DisplayName")
+                    .map(|d| d.trim().to_string())
+                    .filter(|d| !d.is_empty())
+                    .unwrap_or_else(|| id.clone());
                 grants.push(AclGrant {
                     grantee_type: "CanonicalUser".to_string(),
                     grantee_id: Some(id),
@@ -2938,6 +3640,22 @@ pub(crate) fn parse_delete_objects_quiet(xml: &str) -> bool {
     extract_xml_value(xml, "Quiet")
         .map(|v| v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
+}
+
+/// Extract the `<Tags>` tag set from a `CreateBucketConfiguration` body.
+///
+/// The tag set was added to `CreateBucketConfiguration` in the 2025 S3 API;
+/// it is serialized as `<Tags><Tag><Key/><Value/></Tag></Tags>`, the same
+/// `Tag` shape `PutBucketTagging` uses. Returns an empty vec for a body that
+/// is not a `CreateBucketConfiguration` or carries no tags — no `<Tags>`
+/// element means no `<Tag>` elements to find, so the scan is its own gate
+/// and an element written with a namespace or attribute
+/// (`<Tags xmlns="...">`) is not silently skipped.
+pub(crate) fn create_bucket_configuration_tags(body: &str) -> Vec<(String, String)> {
+    if body.is_empty() || !body.contains("CreateBucketConfiguration") {
+        return Vec::new();
+    }
+    parse_tagging_xml(body)
 }
 
 /// Minimal XML parser for `<Tagging><TagSet><Tag><Key>k</Key><Value>v</Value></Tag>...`.
@@ -3530,6 +4248,140 @@ pub(crate) fn check_object_lock_for_overwrite(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod partition_tests {
+    use super::*;
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+
+    fn request(method: Method, region: &str, path: &str) -> AwsRequest {
+        AwsRequest {
+            service: "s3".to_string(),
+            action: String::new(),
+            region: region.to_string(),
+            account_id: "123456789012".to_string(),
+            request_id: "test-req".to_string(),
+            headers: HeaderMap::new(),
+            query_params: HashMap::new(),
+            body: Bytes::new(),
+            body_stream: parking_lot::Mutex::new(None),
+            path_segments: path
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+            raw_path: path.to_string(),
+            raw_query: String::new(),
+            method,
+            is_query_protocol: false,
+            access_key_id: None,
+            principal: None,
+        }
+    }
+
+    #[test]
+    fn iam_resource_arns_follow_request_partition() {
+        assert_eq!(
+            s3_resource_for("cn-north-1", "GetObject", Some("b"), Some("k")),
+            "arn:aws-cn:s3:::b/k"
+        );
+        assert_eq!(
+            s3_resource_for("us-east-1", "ListObjectsV2", Some("b"), None),
+            "arn:aws:s3:::b"
+        );
+    }
+
+    #[test]
+    fn access_point_iam_resource_is_regional() {
+        let svc = S3Service::new(
+            Arc::new(RwLock::new(
+                fakecloud_core::multi_account::MultiAccountState::new(
+                    "123456789012",
+                    "us-east-1",
+                    "",
+                ),
+            )),
+            Arc::new(DeliveryBus::new()),
+        );
+        for (region, want) in [
+            (
+                "us-east-1",
+                "arn:aws:s3:us-east-1:123456789012:accesspoint/ap1",
+            ),
+            (
+                "cn-north-1",
+                "arn:aws-cn:s3:cn-north-1:123456789012:accesspoint/ap1",
+            ),
+        ] {
+            let mut r = request(Method::GET, region, "/v20180820/accesspoint/ap1");
+            r.headers
+                .insert("host", "123456789012.s3-control.localhost".parse().unwrap());
+            let action = svc.iam_action_for(&r).unwrap();
+            assert_eq!(action.action, "GetAccessPoint");
+            assert_eq!(action.resource, want);
+        }
+    }
+
+    #[test]
+    fn iam_resource_uses_bucket_region_partition() {
+        let state: SharedS3State = Arc::new(RwLock::new(
+            fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+        ));
+        state.write().default_mut().buckets.insert(
+            "cn-bucket".to_string(),
+            S3Bucket::new("cn-bucket", "cn-north-1", "123456789012"),
+        );
+        let svc = S3Service::new(state, Arc::new(DeliveryBus::new()));
+        let action = svc
+            .iam_action_for(&request(Method::GET, "us-east-1", "/cn-bucket/k"))
+            .unwrap();
+        assert_eq!(action.resource, "arn:aws-cn:s3:::cn-bucket/k");
+        let action = svc
+            .iam_action_for(&request(Method::GET, "cn-north-1", "/missing/k"))
+            .unwrap();
+        assert_eq!(action.resource, "arn:aws-cn:s3:::missing/k");
+    }
+
+    #[tokio::test]
+    async fn china_bucket_arn_round_trips() {
+        let state: SharedS3State = Arc::new(RwLock::new(
+            fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+        ));
+        let svc = S3Service::new(state.clone(), Arc::new(DeliveryBus::new()));
+        let mut create = request(Method::PUT, "cn-north-1", "/cn-bucket");
+        create.body = Bytes::from_static(
+            b"<CreateBucketConfiguration><LocationConstraint>cn-north-1</LocationConstraint></CreateBucketConfiguration>",
+        );
+        let created = svc.handle(create).await.unwrap();
+        let arn = created.headers["x-amz-bucket-arn"]
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(arn, "arn:aws-cn:s3:::cn-bucket");
+
+        let listed = svc
+            .handle(request(Method::GET, "cn-north-1", "/"))
+            .await
+            .unwrap();
+        let xml = std::str::from_utf8(listed.body.expect_bytes()).unwrap();
+        assert!(
+            xml.contains("<BucketArn>arn:aws-cn:s3:::cn-bucket</BucketArn>"),
+            "{xml}"
+        );
+
+        state
+            .write()
+            .default_mut()
+            .buckets
+            .get_mut("cn-bucket")
+            .unwrap()
+            .tags
+            .insert("env".to_string(), "prod".to_string());
+        let tags = s3_resource_tags(&state, &arn).unwrap();
+        assert_eq!(tags.get("env").map(String::as_str), Some("prod"));
+    }
+}
 
 #[cfg(test)]
 mod s3_detect_action_tests {

@@ -14,7 +14,7 @@ The point is to let you run your application code against something that behaves
 
 **Not a production cloud.** It's not designed for scale, durability, multi-tenancy, or production workloads. State is in-memory by default. Persistence is limited to a subset of services. It's single-binary and single-process. Don't put it in front of real users.
 
-**Not a drop-in for all of AWS.** It implements 105 services — the ones most teams actually test against. If you need EKS, Redshift, or SageMaker, fakecloud isn't the right tool (yet).
+**Not a drop-in for all of AWS.** It implements 105 services — the ones most teams actually test against. If you need QuickSight, Polly, or Rekognition, fakecloud isn't the right tool (yet). See the [parity matrix](@/docs/parity.md) for what ships today.
 
 **Not a mock.** Mocks return predefined values regardless of whether you call them correctly. fakecloud speaks real AWS wire protocols, validates real SigV4 headers (without signature checking), and returns AWS-shaped responses that the real SDK parses and deserializes. If your code assembles the request wrong, fakecloud fails the same way real AWS would.
 

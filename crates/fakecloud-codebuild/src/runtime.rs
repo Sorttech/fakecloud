@@ -38,6 +38,7 @@ use serde_json::{json, Map, Value};
 use tokio::process::Command;
 use tokio::sync::Mutex as AsyncMutex;
 
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::delivery::S3Delivery;
 use fakecloud_logs::ingest::{append_events, IngestEvent};
 use fakecloud_logs::SharedLogsState;
@@ -1186,10 +1187,13 @@ fn log_target(job: &BuildJob) -> Option<(String, String)> {
 /// CloudWatch group/stream a client can read via `GetLogEvents`.
 fn self_logs_location(job: &BuildJob) -> Option<Value> {
     let (group, stream) = log_target(job)?;
-    let arn = format!(
-        "arn:aws:logs:{}:{}:log-group:{}:log-stream:{}",
-        job.region, job.account, group, stream
-    );
+    let arn = Arn::regional(
+        "logs",
+        &job.region,
+        &job.account,
+        &format!("log-group:{group}:log-stream:{stream}"),
+    )
+    .to_string();
     Some(json!({
         "groupName": group,
         "streamName": stream,

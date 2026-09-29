@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 
 use chrono::Utc;
-use fakecloud_aws::arn::Arn;
+use fakecloud_aws::arn::arn_resource;
 use uuid::Uuid;
 
 use super::asym;
@@ -25,7 +25,7 @@ use super::helpers::{
     default_key_policy, encryption_algorithms_for_key, mac_algorithms_for_key_spec, rand_bytes,
     signing_algorithms_for_key_spec,
 };
-use crate::state::{KmsAlias, KmsKey, SharedKmsState};
+use crate::state::{kms_alias_arn, kms_key_arn, KmsAlias, KmsKey, SharedKmsState};
 
 /// Inputs accepted by [`build_kms_key`]. Mirrors the subset of
 /// `AWS::KMS::Key` properties + `CreateKey` request fields that
@@ -162,7 +162,7 @@ pub fn build_kms_key(
     } else {
         Uuid::new_v4().to_string()
     };
-    let arn = Arn::new("kms", region, account_id, &format!("key/{key_id}")).to_string();
+    let arn = kms_key_arn(region, account_id, &key_id);
     let now = Utc::now().timestamp() as f64;
 
     let signing_algs = if input.key_usage == "SIGN_VERIFY" {
@@ -194,7 +194,7 @@ pub fn build_kms_key(
     let policy = input
         .policy
         .clone()
-        .unwrap_or_else(|| default_key_policy(account_id));
+        .unwrap_or_else(|| default_key_policy(account_id, &arn));
 
     Ok(KmsKey {
         key_id,
@@ -288,8 +288,7 @@ pub fn provision_replica_key(
     }
 
     let replica_key_id = format!("mrk-replica-{}", Uuid::new_v4().as_simple());
-    let replica_arn =
-        Arn::new("kms", region, account_id, &format!("key/{replica_key_id}")).to_string();
+    let replica_arn = kms_key_arn(region, account_id, &replica_key_id);
     let mut replica = source;
     replica.key_id = replica_key_id.clone();
     replica.arn = replica_arn.clone();
@@ -340,9 +339,8 @@ pub fn provision_alias(
     let s = accounts.get_or_create(account_id);
     let target_key_id = if s.keys.contains_key(target_input) {
         target_input.to_string()
-    } else if let Some(id) = target_input
-        .strip_prefix("arn:aws:kms:")
-        .and_then(|rest| rest.split(":key/").nth(1))
+    } else if let Some(id) =
+        arn_resource(target_input, "kms").and_then(|rest| rest.split(":key/").nth(1))
     {
         if s.keys.contains_key(id) {
             id.to_string()
@@ -352,7 +350,7 @@ pub fn provision_alias(
     } else {
         return Err(format!("KMS key '{target_input}' does not exist"));
     };
-    let alias_arn = Arn::new("kms", region, &s.account_id, alias_name).to_string();
+    let alias_arn = kms_alias_arn(region, &s.account_id, alias_name);
     let alias = KmsAlias {
         alias_name: alias_name.to_string(),
         alias_arn,
@@ -427,9 +425,8 @@ pub fn update_alias_target(
     let s = accounts.get_or_create(account_id);
     let target_key_id = if s.keys.contains_key(target_input) {
         target_input.to_string()
-    } else if let Some(id) = target_input
-        .strip_prefix("arn:aws:kms:")
-        .and_then(|rest| rest.split(":key/").nth(1))
+    } else if let Some(id) =
+        arn_resource(target_input, "kms").and_then(|rest| rest.split(":key/").nth(1))
     {
         if s.keys.contains_key(id) {
             id.to_string()

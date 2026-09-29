@@ -1,4 +1,62 @@
 use super::*;
+use fakecloud_aws::arn::Arn;
+
+/// The ARN of SES identity `name` in `region`'s partition.
+pub(crate) fn identity_arn(region: &str, account_id: &str, name: &str) -> String {
+    Arn::regional("ses", region, account_id, &format!("identity/{name}")).to_string()
+}
+
+/// The ARN of SES configuration-set `name` in `region`'s partition.
+pub(crate) fn configuration_set_arn(region: &str, account_id: &str, name: &str) -> String {
+    Arn::regional(
+        "ses",
+        region,
+        account_id,
+        &format!("configuration-set/{name}"),
+    )
+    .to_string()
+}
+
+/// The ARN of SES contact-list `name` in `region`'s partition.
+pub(crate) fn contact_list_arn(region: &str, account_id: &str, name: &str) -> String {
+    Arn::regional("ses", region, account_id, &format!("contact-list/{name}")).to_string()
+}
+
+/// The ARN of SES template `name` in `region`'s partition.
+pub(crate) fn template_arn(region: &str, account_id: &str, name: &str) -> String {
+    Arn::regional("ses", region, account_id, &format!("template/{name}")).to_string()
+}
+
+/// The ARN of SES custom-verification-email-template `name` in `region`'s partition.
+pub(crate) fn custom_verification_email_template_arn(
+    region: &str,
+    account_id: &str,
+    name: &str,
+) -> String {
+    Arn::regional(
+        "ses",
+        region,
+        account_id,
+        &format!("custom-verification-email-template/{name}"),
+    )
+    .to_string()
+}
+
+/// The ARN of SES dedicated-ip-pool `name` in `region`'s partition.
+pub(crate) fn dedicated_ip_pool_arn(region: &str, account_id: &str, name: &str) -> String {
+    Arn::regional(
+        "ses",
+        region,
+        account_id,
+        &format!("dedicated-ip-pool/{name}"),
+    )
+    .to_string()
+}
+
+/// The ARN of SES tenant `name` in `region`'s partition.
+pub(crate) fn tenant_arn(region: &str, account_id: &str, name: &str) -> String {
+    Arn::regional("ses", region, account_id, &format!("tenant/{name}")).to_string()
+}
 
 /// URL-decode a path segment (e.g. `test%40example.com` -> `test@example.com`).
 pub(crate) fn decode_segment(s: &str) -> String {

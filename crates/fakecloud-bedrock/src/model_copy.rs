@@ -16,14 +16,9 @@ pub(crate) fn create_model_copy_job(
     let target_model_name = body["targetModelName"].as_str().unwrap_or("copied-model");
 
     let job_id = Uuid::new_v4().to_string();
-    let job_arn = format!(
-        "arn:aws:bedrock:{}:{}:model-copy-job/{}",
-        req.region, req.account_id, job_id
-    );
-    let target_model_arn = format!(
-        "arn:aws:bedrock:{}:{}:custom-model/{}",
-        req.region, req.account_id, target_model_name
-    );
+    let job_arn = crate::arns::model_copy_job_arn(&req.region, &req.account_id, &job_id);
+    let target_model_arn =
+        crate::arns::custom_model_arn(&req.region, &req.account_id, target_model_name);
 
     let job = ModelCopyJob {
         job_arn: job_arn.clone(),

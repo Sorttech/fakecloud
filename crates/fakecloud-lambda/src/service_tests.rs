@@ -4254,3 +4254,89 @@ async fn list_function_url_configs_is_scoped_to_its_function() {
         "another function's config leaked: {body}"
     );
 }
+
+#[tokio::test]
+async fn china_region_arns_use_the_aws_cn_partition() {
+    let svc = LambdaService::new(make_state());
+    let in_china = |method: Method, path: &str, body: &str| {
+        let mut req = make_request(method, path, body);
+        req.region = "cn-north-1".to_string();
+        req
+    };
+    let create_body = json!({
+        "FunctionName": "cn-func",
+        "Runtime": "python3.12",
+        "Role": "arn:aws-cn:iam::123456789012:role/test-role",
+        "Handler": "index.handler",
+        "Code": { "ZipFile": "UEsFBgAAAAAAAAAAAAAAAAAAAAA=" }
+    });
+    let resp = svc
+        .handle(in_china(
+            Method::POST,
+            "/2015-03-31/functions",
+            &create_body.to_string(),
+        ))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    let function_arn = body["FunctionArn"].as_str().unwrap().to_string();
+    assert_eq!(
+        function_arn,
+        "arn:aws-cn:lambda:cn-north-1:123456789012:function:cn-func"
+    );
+
+    let resp = svc
+        .handle(in_china(
+            Method::GET,
+            &format!("/2015-03-31/functions/{function_arn}"),
+            "",
+        ))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(body["Configuration"]["FunctionArn"], json!(function_arn));
+
+    let resp = svc
+        .handle(in_china(
+            Method::POST,
+            "/2015-03-31/functions/cn-func/aliases",
+            &json!({"Name": "live", "FunctionVersion": "$LATEST"}).to_string(),
+        ))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(
+        body["AliasArn"],
+        "arn:aws-cn:lambda:cn-north-1:123456789012:function:cn-func:live"
+    );
+
+    svc.handle(in_china(
+        Method::POST,
+        &format!("/2017-03-31/tags/{function_arn}"),
+        &json!({"Tags": {"env": "cn"}}).to_string(),
+    ))
+    .await
+    .unwrap();
+    let resp = svc
+        .handle(in_china(
+            Method::GET,
+            &format!("/2017-03-31/tags/{function_arn}"),
+            "",
+        ))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(body["Tags"]["env"], "cn");
+
+    let resp = svc
+        .handle(in_china(Method::GET, "/2015-03-31/functions/missing", ""))
+        .await
+        .err()
+        .expect("missing function");
+    assert!(
+        resp.message()
+            .contains("arn:aws-cn:lambda:cn-north-1:123456789012:function:missing"),
+        "{}",
+        resp.message()
+    );
+}

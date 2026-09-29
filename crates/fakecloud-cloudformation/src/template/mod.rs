@@ -399,6 +399,39 @@ Resources:
     }
 
     #[test]
+    fn sam_managed_policies_resolve_in_the_stack_partition() {
+        let template = r#"{
+            "Transform": "AWS::Serverless-2016-10-31",
+            "Resources": {
+                "F": {
+                    "Type": "AWS::Serverless::Function",
+                    "Properties": {
+                        "Handler": "index.handler",
+                        "Runtime": "python3.12",
+                        "InlineCode": "x",
+                        "Policies": ["AmazonS3ReadOnlyAccess"]
+                    }
+                }
+            }
+        }"#;
+        let mut params = BTreeMap::new();
+        params.insert("AWS::Region".to_string(), "cn-north-1".to_string());
+        let parsed = parse_template(template, &params).unwrap();
+        let role = parsed
+            .resources
+            .iter()
+            .find(|r| r.logical_id == "FRole")
+            .expect("execution role");
+        assert_eq!(
+            role.properties["ManagedPolicyArns"],
+            serde_json::json!([
+                "arn:aws-cn:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
+                "arn:aws-cn:iam::aws:policy/AmazonS3ReadOnlyAccess"
+            ])
+        );
+    }
+
+    #[test]
     fn bb6_partition_for_govcloud_region_is_aws_us_gov() {
         let template = r#"{
             "Resources": {

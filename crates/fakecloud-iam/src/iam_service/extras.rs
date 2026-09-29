@@ -15,8 +15,8 @@ use crate::state::{
 };
 
 use super::{
-    empty_response, parse_tags, required_param_with_code, resolve_calling_user, tags_xml,
-    validate_string_length_with_code, IamService,
+    empty_response, existing_arn_partition, parse_tags, required_param_with_code,
+    resolve_calling_user, tags_xml, validate_string_length_with_code, IamService,
 };
 use fakecloud_core::query::required_param;
 
@@ -444,7 +444,7 @@ impl IamService {
         )?;
         let service_name = req.query_params.get("ServiceName").cloned();
         let accounts = self.state.read();
-        let empty = IamState::new(&req.account_id);
+        let empty = IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
         let user_name = req
             .query_params
@@ -645,7 +645,7 @@ impl IamService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let job_id = required_param(&req.query_params, "JobId")?;
         let accounts = self.state.read();
-        let empty = IamState::new(&req.account_id);
+        let empty = IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
         let report = state
             .organizations_access_reports
@@ -674,7 +674,7 @@ impl IamService {
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let accounts = self.state.read();
-        let empty = IamState::new(&req.account_id);
+        let empty = IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
         let mut features = Vec::new();
         if state.organizations_root_credentials_management {
@@ -743,7 +743,7 @@ impl IamService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let job_id = required_param(&req.query_params, "JobId")?;
         let accounts = self.state.read();
-        let empty = IamState::new(&req.account_id);
+        let empty = IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
         let job = state
             .service_last_accessed_jobs
@@ -790,7 +790,7 @@ impl IamService {
             1000,
         )?;
         let accounts = self.state.read();
-        let empty = IamState::new(&req.account_id);
+        let empty = IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
         let (status, creation, completion) = state
             .service_last_accessed_jobs
@@ -893,7 +893,7 @@ impl IamService {
         };
         validate_extra_id_param_with_code(arn_param, &arn, code)?;
         let accounts = self.state.read();
-        let empty = IamState::new(&req.account_id);
+        let empty = IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
         let tags: Vec<crate::iam_service::Tag> = state
             .extra_tags
@@ -1059,7 +1059,7 @@ impl IamService {
                 })?;
                 caller_arn.get_or_insert_with(|| source_arn.clone());
                 let accounts = self.state.read();
-                let empty = IamState::new(&req.account_id);
+                let empty = IamState::new_in_region(&req.account_id, accounts.region());
                 let state = accounts.get(&req.account_id).unwrap_or(&empty);
                 for (source_id, body) in collect_principal_policy_sources(state, source_arn) {
                     identity_sources.push((source_id, PolicyDocument::parse(&body)));
@@ -1093,9 +1093,9 @@ impl IamService {
             .map(|(_, doc)| doc.clone())
             .collect();
 
-        let principal_arn_str = caller_arn
-            .clone()
-            .unwrap_or_else(|| Arn::global("iam", &req.account_id, "root").to_string());
+        let principal_arn_str = caller_arn.clone().unwrap_or_else(|| {
+            Arn::global_in(&req.region, "iam", &req.account_id, "root").to_string()
+        });
         let principal = Principal {
             arn: principal_arn_str.clone(),
             user_id: principal_arn_str.clone(),
@@ -1288,7 +1288,9 @@ impl IamService {
         // payload (OldPassword != NewPassword) above.
         let user_name = req.principal.as_ref().and_then(|p| {
             let arn = &p.arn;
-            arn.strip_prefix("arn:aws:iam::")
+            arn.strip_prefix("arn:")
+                .and_then(|rest| rest.split_once(':'))
+                .and_then(|(_partition, rest)| rest.strip_prefix("iam::"))
                 .and_then(|rest| rest.split_once(":user/"))
                 .map(|(_, name)| name.to_string())
         });
@@ -1351,7 +1353,7 @@ impl IamService {
     pub(super) fn get_mfa_device(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let serial = required_param(&req.query_params, "SerialNumber")?;
         let accounts = self.state.read();
-        let empty = IamState::new(&req.account_id);
+        let empty = IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
         let device = state.virtual_mfa_devices.get(&serial).ok_or_else(|| {
             AwsServiceError::aws_error(
@@ -1506,7 +1508,8 @@ impl IamService {
         updated.server_certificate_name = final_name.clone();
         // Rebuild ARN with the new path/name so metadata responses reflect the rename.
         updated.arn = format!(
-            "arn:aws:iam::{account}:server-certificate{path}{name}",
+            "arn:{partition}:iam::{account}:server-certificate{path}{name}",
+            partition = existing_arn_partition(&updated.arn, &req.region),
             account = req.account_id,
             path = if updated.path.starts_with('/') {
                 updated.path.clone()
@@ -1726,7 +1729,7 @@ impl IamService {
         let id = required_param_iam(&req.query_params, "DelegationRequestId")?;
         validate_string_length("DelegationRequestId", &id, 16, 128)?;
         let accounts = self.state.read();
-        let empty = IamState::new(&req.account_id);
+        let empty = IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
         let dr = state.delegation_requests.get(&id).ok_or_else(|| {
             AwsServiceError::aws_error(
@@ -1768,7 +1771,7 @@ impl IamService {
             "InvalidInput",
         )?;
         let accounts = self.state.read();
-        let empty = IamState::new(&req.account_id);
+        let empty = IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
         let owner_filter = req.query_params.get("OwnerId").cloned();
         let members: String = state
@@ -1855,7 +1858,7 @@ impl IamService {
         let id = required_param_iam(&req.query_params, "DelegationRequestId")?;
         validate_string_length("DelegationRequestId", &id, 16, 128)?;
         let accounts = self.state.read();
-        let empty = IamState::new(&req.account_id);
+        let empty = IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
         if !state.delegation_requests.contains_key(&id) {
             return Err(AwsServiceError::aws_error(
@@ -1945,7 +1948,7 @@ impl IamService {
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let accounts = self.state.read();
-        let empty = IamState::new(&req.account_id);
+        let empty = IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
         let body = format!(
             "  <GetOutboundWebIdentityFederationInfoResult><IssuerIdentifier>https://oidc.fakecloud.local/{}</IssuerIdentifier><JwtVendingEnabled>{}</JwtVendingEnabled></GetOutboundWebIdentityFederationInfoResult>",

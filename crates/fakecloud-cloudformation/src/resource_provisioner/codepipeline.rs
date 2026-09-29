@@ -58,9 +58,8 @@ impl ResourceProvisioner {
         }
         let decl = Value::Object(decl);
 
-        let region = &self.region;
         let account = &self.account_id;
-        let arn = format!("arn:aws:codepipeline:{region}:{account}:{name}");
+        let arn = fakecloud_codepipeline::pipeline_arn(&self.region, &self.account_id, &name);
         let now = ts_now();
 
         let mut guard = self.codepipeline_state.write();

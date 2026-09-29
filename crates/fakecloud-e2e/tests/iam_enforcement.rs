@@ -411,6 +411,380 @@ async fn sns_publish_allowed_on_specific_topic() {
 // S3 tests
 // ======================================================================
 
+/// A create that configures the bucket needs the permission for what it
+/// configures. This matters because those settings now PERSIST: a `public-read`
+/// bucket created by a principal with no `s3:PutBucketAcl` used to lose the
+/// grant on restart and now keeps it.
+#[tokio::test]
+async fn s3_create_bucket_with_acl_needs_put_bucket_acl() {
+    let server = start_strict().await;
+    let (akid, secret) = bootstrap_user(&server, "s3aclcreate").await;
+    attach_inline_policy(
+        &server,
+        "s3aclcreate",
+        "create-only",
+        r#"{"Version":"2012-10-17","Statement":[
+            {"Effect":"Allow","Action":"s3:CreateBucket","Resource":"*"}
+        ]}"#,
+    )
+    .await;
+
+    let cfg = sdk_config_with(&server, &akid, &secret).await;
+    let s3 = aws_sdk_s3::Client::new(&cfg);
+
+    // A plain create is still allowed by s3:CreateBucket alone.
+    s3.create_bucket()
+        .bucket("aclperm-plain")
+        .send()
+        .await
+        .unwrap();
+
+    // So is `--acl private`: the model'"'"'s CreateBucket permissions exempt it
+    // and a no-ACL create from s3:PutBucketAcl, and clients that always send a
+    // canned ACL (Terraform'"'"'s legacy `acl` attribute, SDK wrappers) would
+    // otherwise be refused where real S3 succeeds.
+    s3.create_bucket()
+        .bucket("aclperm-private")
+        .acl(aws_sdk_s3::types::BucketCannedAcl::Private)
+        .send()
+        .await
+        .expect("a private canned ACL needs only s3:CreateBucket");
+
+    // Asking for an ACL is not.
+    let err = s3
+        .create_bucket()
+        .bucket("aclperm-denied")
+        .acl(aws_sdk_s3::types::BucketCannedAcl::PublicRead)
+        .send()
+        .await
+        .expect_err("a canned ACL needs s3:PutBucketAcl");
+    assert!(
+        format!("{err:?}").contains("AccessDenied"),
+        "unexpected error: {err:?}"
+    );
+
+    // Granting it unblocks the create, and the bucket really is public-read.
+    attach_inline_policy(
+        &server,
+        "s3aclcreate",
+        "create-and-acl",
+        r#"{"Version":"2012-10-17","Statement":[
+            {"Effect":"Allow","Action":["s3:CreateBucket","s3:PutBucketAcl","s3:GetBucketAcl"],"Resource":"*"}
+        ]}"#,
+    )
+    .await;
+    s3.create_bucket()
+        .bucket("aclperm-allowed")
+        .acl(aws_sdk_s3::types::BucketCannedAcl::PublicRead)
+        .send()
+        .await
+        .unwrap();
+    let acl = s3
+        .get_bucket_acl()
+        .bucket("aclperm-allowed")
+        .send()
+        .await
+        .unwrap();
+    assert!(acl.grants().iter().any(|g| {
+        g.grantee()
+            .and_then(|gr| gr.uri())
+            .is_some_and(|u| u.contains("AllUsers"))
+    }));
+}
+
+/// The `s3:x-amz-acl` condition key is what a policy uses to pin down WHICH ACL
+/// a create may ask for. It was never populated, so such a guardrail silently
+/// authorized exactly what it was written to block.
+#[tokio::test]
+async fn s3_create_bucket_acl_condition_key_gates_the_canned_value() {
+    let server = start_strict().await;
+    let (akid, secret) = bootstrap_user(&server, "s3aclcond").await;
+    attach_inline_policy(
+        &server,
+        "s3aclcond",
+        "private-acls-only",
+        r#"{"Version":"2012-10-17","Statement":[
+            {"Effect":"Allow","Action":["s3:CreateBucket","s3:PutBucketAcl"],"Resource":"*",
+             "Condition":{"StringEquals":{"s3:x-amz-acl":"private"}}}
+        ]}"#,
+    )
+    .await;
+
+    let cfg = sdk_config_with(&server, &akid, &secret).await;
+    let s3 = aws_sdk_s3::Client::new(&cfg);
+
+    s3.create_bucket()
+        .bucket("aclcond-private")
+        .acl(aws_sdk_s3::types::BucketCannedAcl::Private)
+        .send()
+        .await
+        .expect("the permitted canned value must be allowed");
+
+    let err = s3
+        .create_bucket()
+        .bucket("aclcond-public")
+        .acl(aws_sdk_s3::types::BucketCannedAcl::PublicRead)
+        .send()
+        .await
+        .expect_err("public-read must be denied by the condition");
+    assert!(
+        format!("{err:?}").contains("AccessDenied"),
+        "unexpected error: {err:?}"
+    );
+}
+
+/// Object lock enables versioning, so AWS wants both permissions.
+#[tokio::test]
+async fn s3_create_bucket_with_object_lock_needs_its_permissions() {
+    let server = start_strict().await;
+    let (akid, secret) = bootstrap_user(&server, "s3lockcreate").await;
+    attach_inline_policy(
+        &server,
+        "s3lockcreate",
+        "create-only",
+        r#"{"Version":"2012-10-17","Statement":[
+            {"Effect":"Allow","Action":"s3:CreateBucket","Resource":"*"}
+        ]}"#,
+    )
+    .await;
+
+    let cfg = sdk_config_with(&server, &akid, &secret).await;
+    let s3 = aws_sdk_s3::Client::new(&cfg);
+    let err = s3
+        .create_bucket()
+        .bucket("lockperm-denied")
+        .object_lock_enabled_for_bucket(true)
+        .send()
+        .await
+        .expect_err("object lock needs its own permissions");
+    assert!(
+        format!("{err:?}").contains("AccessDenied"),
+        "unexpected error: {err:?}"
+    );
+
+    attach_inline_policy(
+        &server,
+        "s3lockcreate",
+        "create-and-lock",
+        r#"{"Version":"2012-10-17","Statement":[
+            {"Effect":"Allow","Action":["s3:CreateBucket","s3:PutBucketObjectLockConfiguration","s3:PutBucketVersioning"],"Resource":"*"}
+        ]}"#,
+    )
+    .await;
+    s3.create_bucket()
+        .bucket("lockperm-allowed")
+        .object_lock_enabled_for_bucket(true)
+        .send()
+        .await
+        .unwrap();
+}
+
+/// A create carrying both tags and an ACL is several authorizations, and AWS
+/// evaluates them all against ONE request context. A tag-scoped guardrail that
+/// permits the create must therefore permit the `s3:PutBucketAcl` it implies:
+/// building the context per action left that one seeing no `aws:RequestTag/*`
+/// at all, so the condition matched and denied a create AWS allows.
+///
+/// The Deny is written with `Null`, deliberately. A `StringNotEquals` Deny cannot
+/// catch this: an unpopulated key safe-fails every non-`IfExists` operator to
+/// false, so such a Deny would not apply on the broken code either and the test
+/// would pass against the bug. `Null` is the one operator that reads an
+/// unpopulated key AS null, which is exactly the state being asserted against.
+#[tokio::test]
+async fn s3_create_bucket_tag_condition_applies_to_the_implied_acl_action() {
+    let server = start_strict().await;
+    let (akid, secret) = bootstrap_user(&server, "s3ctxuser").await;
+    attach_inline_policy(
+        &server,
+        "s3ctxuser",
+        "tag-scoped",
+        r#"{"Version":"2012-10-17","Statement":[
+            {"Effect":"Allow","Action":"s3:*","Resource":"*"},
+            {"Effect":"Deny",
+             "Action":["s3:CreateBucket","s3:TagResource","s3:PutBucketAcl"],
+             "Resource":"*",
+             "Condition":{"Null":{"aws:RequestTag/CostCenter":"true"}}}
+        ]}"#,
+    )
+    .await;
+
+    let cfg = sdk_config_with(&server, &akid, &secret).await;
+    let s3 = aws_sdk_s3::Client::new(&cfg);
+
+    // Tagged with the required value AND carrying an ACL: allowed, because
+    // every action in the request sees `aws:RequestTag/CostCenter=123`.
+    s3.create_bucket()
+        .bucket("ctx-tagged")
+        .acl(aws_sdk_s3::types::BucketCannedAcl::PublicRead)
+        .create_bucket_configuration(
+            aws_sdk_s3::types::CreateBucketConfiguration::builder()
+                .tags(
+                    aws_sdk_s3::types::Tag::builder()
+                        .key("CostCenter")
+                        .value("123")
+                        .build()
+                        .unwrap(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .expect("a create whose tags satisfy the guardrail must not be denied by its own ACL");
+
+    // The guardrail still bites: a create carrying no such tag is denied.
+    let err = s3
+        .create_bucket()
+        .bucket("ctx-untagged")
+        .acl(aws_sdk_s3::types::BucketCannedAcl::PublicRead)
+        .send()
+        .await
+        .expect_err("a create with no CostCenter tag must be denied");
+    assert!(
+        format!("{err:?}").contains("AccessDenied"),
+        "unexpected error: {err:?}"
+    );
+}
+
+/// Real S3 requires `s3:TagResource` on top of `s3:CreateBucket` to create a
+/// bucket carrying `CreateBucketConfiguration.Tags` (issue #2553). A grant of
+/// `s3:CreateBucket` alone still creates untagged buckets, but a tagged create
+/// is denied.
+#[tokio::test]
+async fn s3_create_bucket_with_tags_needs_tag_resource() {
+    let server = start_strict().await;
+    let (akid, secret) = bootstrap_user(&server, "s3taguser").await;
+    attach_inline_policy(
+        &server,
+        "s3taguser",
+        "create-only",
+        r#"{"Version":"2012-10-17","Statement":[
+            {"Effect":"Allow","Action":"s3:CreateBucket","Resource":"*"}
+        ]}"#,
+    )
+    .await;
+
+    let cfg = sdk_config_with(&server, &akid, &secret).await;
+    let s3 = aws_sdk_s3::Client::new(&cfg);
+
+    // Untagged create is allowed by s3:CreateBucket alone.
+    s3.create_bucket()
+        .bucket("tagperm-untagged")
+        .send()
+        .await
+        .unwrap();
+
+    // The same grant must not authorize a tagged create.
+    let err = s3
+        .create_bucket()
+        .bucket("tagperm-denied")
+        .create_bucket_configuration(
+            aws_sdk_s3::types::CreateBucketConfiguration::builder()
+                .tags(
+                    aws_sdk_s3::types::Tag::builder()
+                        .key("team")
+                        .value("a")
+                        .build()
+                        .unwrap(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("AccessDenied"),
+        "expected AccessDenied for tagged create, got {msg}"
+    );
+
+    // Adding s3:TagResource unblocks it, and the bucket comes out tagged.
+    attach_inline_policy(
+        &server,
+        "s3taguser",
+        "create-and-tag",
+        r#"{"Version":"2012-10-17","Statement":[
+            {"Effect":"Allow","Action":["s3:CreateBucket","s3:TagResource","s3:GetBucketTagging"],"Resource":"*"}
+        ]}"#,
+    )
+    .await;
+    s3.create_bucket()
+        .bucket("tagperm-allowed")
+        .create_bucket_configuration(
+            aws_sdk_s3::types::CreateBucketConfiguration::builder()
+                .tags(
+                    aws_sdk_s3::types::Tag::builder()
+                        .key("team")
+                        .value("a")
+                        .build()
+                        .unwrap(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let tags = s3
+        .get_bucket_tagging()
+        .bucket("tagperm-allowed")
+        .send()
+        .await
+        .unwrap();
+    assert!(tags
+        .tag_set()
+        .iter()
+        .any(|t| t.key() == "team" && t.value() == "a"));
+}
+
+/// The create-time tag set feeds `aws:RequestTag/*`, so a policy conditioned
+/// on the tag value actually decides the create.
+#[tokio::test]
+async fn s3_create_bucket_tags_drive_request_tag_condition() {
+    let server = start_strict().await;
+    let (akid, secret) = bootstrap_user(&server, "s3reqtaguser").await;
+    attach_inline_policy(
+        &server,
+        "s3reqtaguser",
+        "team-a-only",
+        r#"{"Version":"2012-10-17","Statement":[
+            {"Effect":"Allow","Action":["s3:CreateBucket","s3:TagResource"],"Resource":"*",
+             "Condition":{"StringEquals":{"aws:RequestTag/team":"a"}}}
+        ]}"#,
+    )
+    .await;
+
+    let cfg = sdk_config_with(&server, &akid, &secret).await;
+    let s3 = aws_sdk_s3::Client::new(&cfg);
+    let create_with_team = |bucket: &'static str, team: &'static str| {
+        let s3 = s3.clone();
+        async move {
+            s3.create_bucket()
+                .bucket(bucket)
+                .create_bucket_configuration(
+                    aws_sdk_s3::types::CreateBucketConfiguration::builder()
+                        .tags(
+                            aws_sdk_s3::types::Tag::builder()
+                                .key("team")
+                                .value(team)
+                                .build()
+                                .unwrap(),
+                        )
+                        .build(),
+                )
+                .send()
+                .await
+        }
+    };
+
+    create_with_team("reqtag-allowed", "a").await.unwrap();
+
+    let err = create_with_team("reqtag-denied", "b").await.unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("AccessDenied"),
+        "expected AccessDenied for the non-matching tag value, got {msg}"
+    );
+}
+
 #[tokio::test]
 async fn s3_get_object_resource_scoped() {
     let server = start_strict().await;

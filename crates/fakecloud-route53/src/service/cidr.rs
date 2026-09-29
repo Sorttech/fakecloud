@@ -30,8 +30,9 @@ impl Route53Service {
             ));
         }
         let id = Uuid::new_v4().to_string();
-        // CIDR-collection ARNs omit the account id: arn:aws:route53:::cidrcollection/<id>.
-        let arn = Arn::global("route53", "", &format!("cidrcollection/{id}")).to_string();
+        // CIDR-collection ARNs omit the account id: arn:<partition>:route53:::cidrcollection/<id>.
+        let arn =
+            Arn::global_in(&req.region, "route53", "", &format!("cidrcollection/{id}")).to_string();
         let stored = StoredCidrCollection {
             id: id.clone(),
             name: cfg.name,

@@ -12,6 +12,7 @@ use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceErr
 use fakecloud_persistence::SnapshotStore;
 
 use crate::runtime::ContainerRuntime;
+use crate::state::{function_arn, qualified_function_arn};
 use crate::state::{
     EventSourceMapping, LambdaFunction, LambdaSnapshot, LambdaState, SharedLambdaState,
     LAMBDA_SNAPSHOT_SCHEMA_VERSION,
@@ -391,12 +392,7 @@ pub(crate) fn iam_action_name_for(op: &str) -> Option<&'static str> {
 /// input is not a Lambda ARN. Hardcoding `arn:aws:lambda:` previously
 /// dropped China / GovCloud ARNs on the floor.
 fn strip_lambda_arn_prefix(input: &str) -> Option<&str> {
-    let rest = input.strip_prefix("arn:")?;
-    let (partition, after) = rest.split_once(':')?;
-    if partition.is_empty() {
-        return None;
-    }
-    after.strip_prefix("lambda:")
+    fakecloud_aws::arn::arn_resource(input, "lambda")
 }
 
 pub(crate) fn normalize_function_name(input: &str) -> String {
@@ -1788,10 +1784,7 @@ impl AwsService for LambdaService {
                     // caller spelled FunctionName, or policy evaluation
                     // mismatches the actual function.
                     let name = normalize_function_name(&raw);
-                    format!(
-                        "arn:aws:lambda:{}:{}:function:{}",
-                        request.region, state.account_id, name
-                    )
+                    function_arn(&request.region, &state.account_id, &name)
                 }
             }
             "CreateFunction" => {
@@ -1802,12 +1795,9 @@ impl AwsService for LambdaService {
                 serde_json::from_slice::<Value>(&request.body)
                     .ok()
                     .and_then(|v| {
-                        v.get("FunctionName").and_then(|f| f.as_str()).map(|n| {
-                            format!(
-                                "arn:aws:lambda:{}:{}:function:{}",
-                                request.region, state.account_id, n
-                            )
-                        })
+                        v.get("FunctionName")
+                            .and_then(|f| f.as_str())
+                            .map(|n| function_arn(&request.region, &state.account_id, n))
                     })
                     .unwrap_or_else(|| "*".to_string())
             }

@@ -506,7 +506,7 @@ fn test_resolve_nested_path_map() {
         json!({"M": {"address": {"M": {"city": {"S": "NYC"}}}}}),
     );
 
-    let result = resolve_nested_path(&item, "info.address.city");
+    let result = resolve_path("info.address.city", &item, &HashMap::new());
     assert_eq!(result, Some(json!({"S": "NYC"})));
 }
 
@@ -518,7 +518,7 @@ fn test_resolve_nested_path_list_then_map() {
         json!({"L": [{"M": {"sku": {"S": "ABC"}}}]}),
     );
 
-    let result = resolve_nested_path(&item, "items[0].sku");
+    let result = resolve_path("items[0].sku", &item, &HashMap::new());
     assert_eq!(result, Some(json!({"S": "ABC"})));
 }
 
@@ -1334,19 +1334,50 @@ fn export_lifecycle() {
         .as_str()
         .unwrap()
         .to_string();
-    assert_eq!(body["ExportDescription"]["ExportStatus"], "COMPLETED");
+    // The start call reports the export as accepted; DescribeExport shows
+    // the finished export.
+    assert_eq!(body["ExportDescription"]["ExportStatus"], "IN_PROGRESS");
 
     // Describe
     let req = make_request("DescribeExport", json!({ "ExportArn": export_arn }));
     let resp = svc.describe_export(&req).unwrap();
     let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
     assert_eq!(body["ExportDescription"]["S3Bucket"], "my-bucket");
+    assert_eq!(body["ExportDescription"]["ExportStatus"], "COMPLETED");
 
     // List
     let req = make_request("ListExports", json!({}));
     let resp = svc.list_exports(&req).unwrap();
     let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
     assert_eq!(body["ExportSummaries"].as_array().unwrap().len(), 1);
+}
+
+/// An export to a missing bucket is accepted IN_PROGRESS and then described
+/// as FAILED with the reason.
+#[test]
+fn failed_export_reports_failure_on_describe() {
+    let s3: fakecloud_s3::SharedS3State = Arc::new(RwLock::new(
+        fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+    ));
+    let svc = make_service().with_s3(s3);
+    create_test_table(&svc);
+    let req = make_request(
+        "ExportTableToPointInTime",
+        json!({
+            "TableArn": "arn:aws:dynamodb:us-east-1:123456789012:table/test-table",
+            "S3Bucket": "missing-bucket"
+        }),
+    );
+    let resp = svc.export_table_to_point_in_time(&req).unwrap();
+    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(body["ExportDescription"]["ExportStatus"], "IN_PROGRESS");
+    let export_arn = body["ExportDescription"]["ExportArn"].as_str().unwrap();
+
+    let req = make_request("DescribeExport", json!({ "ExportArn": export_arn }));
+    let resp = svc.describe_export(&req).unwrap();
+    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(body["ExportDescription"]["ExportStatus"], "FAILED");
+    assert_eq!(body["ExportDescription"]["FailureCode"], "S3NoSuchBucket");
 }
 
 #[test]
@@ -1371,7 +1402,10 @@ fn import_lifecycle() {
         .as_str()
         .unwrap()
         .to_string();
-    assert_eq!(body["ImportTableDescription"]["ImportStatus"], "COMPLETED");
+    assert_eq!(
+        body["ImportTableDescription"]["ImportStatus"],
+        "IN_PROGRESS"
+    );
 
     // Describe import
     let req = make_request("DescribeImport", json!({ "ImportArn": import_arn }));
@@ -2277,10 +2311,9 @@ fn test_evaluate_condition_no_existing_item() {
 
     assert!(evaluate_condition("attribute_not_exists(#s)", None, &names, &values).is_ok());
     assert!(evaluate_condition("attribute_exists(#s)", None, &names, &values).is_err());
-    // A comparison against a missing attribute is false for EVERY operator in
-    // DynamoDB (presence is tested with attribute_exists/not_exists), so both
-    // `<>` and `=` fail the condition here (bug-audit 2026-06-26, 1.5).
-    assert!(evaluate_condition("#s <> :v", None, &names, &values).is_err());
+    // A missing attribute equals nothing: `=` fails the condition and `<>`
+    // passes it.
+    assert!(evaluate_condition("#s <> :v", None, &names, &values).is_ok());
     assert!(evaluate_condition("#s = :v", None, &names, &values).is_err());
 }
 
@@ -2693,9 +2726,9 @@ fn test_unrecognized_expression_returns_false() {
 }
 
 #[test]
-fn test_set_list_index_out_of_range_returns_error() {
-    // SET list[N] where N > len must return a ValidationException,
-    // not silently no-op.
+fn test_set_list_index_past_end_appends() {
+    // SET list[N] where N > len appends the value to the end of the list,
+    // as AWS does.
     let mut item = HashMap::new();
     item.insert("items".to_string(), json!({"L": [{"S": "a"}, {"S": "b"}]}));
 
@@ -2703,19 +2736,14 @@ fn test_set_list_index_out_of_range_returns_error() {
     let mut values = HashMap::new();
     values.insert(":v".to_string(), json!({"S": "z"}));
 
-    let result = apply_update_expression(&mut item, "SET items[5] = :v", &names, &values);
-    assert!(
-        result.is_err(),
-        "out-of-range list index must return an error"
-    );
-
-    // List should be unchanged
+    apply_update_expression(&mut item, "SET items[5] = :v", &names, &values).unwrap();
     let list = item
         .get("items")
         .and_then(|v| v.get("L"))
         .and_then(|v| v.as_array())
         .unwrap();
-    assert_eq!(list.len(), 2);
+    assert_eq!(list.len(), 3);
+    assert_eq!(list[2], json!({"S": "z"}));
 }
 
 #[test]
@@ -3379,7 +3407,8 @@ fn put_item_emits_consumed_capacity_when_requested() {
     let b = body_json(&resp);
     assert_eq!(b["ConsumedCapacity"]["TableName"], "test-table");
     assert_eq!(b["ConsumedCapacity"]["CapacityUnits"], 1.0);
-    assert_eq!(b["ConsumedCapacity"]["WriteCapacityUnits"], 1.0);
+    // A single-item write reports the aggregate alone, with no write split.
+    assert!(b["ConsumedCapacity"].get("WriteCapacityUnits").is_none());
     // TOTAL must not include the breakdown.
     assert!(b["ConsumedCapacity"].get("Table").is_none());
 }
@@ -3400,8 +3429,11 @@ fn put_item_consumed_capacity_indexes_includes_breakdown() {
     let resp = svc.put_item(&req).unwrap();
     let b = body_json(&resp);
     assert_eq!(b["ConsumedCapacity"]["Table"]["CapacityUnits"], 1.0);
-    assert!(b["ConsumedCapacity"]["GlobalSecondaryIndexes"].is_object());
-    assert!(b["ConsumedCapacity"]["LocalSecondaryIndexes"].is_object());
+    // No index was charged, so neither index map is present.
+    assert!(b["ConsumedCapacity"]
+        .get("GlobalSecondaryIndexes")
+        .is_none());
+    assert!(b["ConsumedCapacity"].get("LocalSecondaryIndexes").is_none());
 }
 
 #[test]
@@ -3446,7 +3478,8 @@ fn get_item_emits_consumed_capacity_when_requested() {
     let resp = svc.get_item(&req).unwrap();
     let b = body_json(&resp);
     assert_eq!(b["ConsumedCapacity"]["TableName"], "test-table");
-    assert_eq!(b["ConsumedCapacity"]["ReadCapacityUnits"], 0.5);
+    assert_eq!(b["ConsumedCapacity"]["CapacityUnits"], 0.5);
+    assert!(b["ConsumedCapacity"].get("ReadCapacityUnits").is_none());
 }
 
 #[test]
@@ -3803,7 +3836,6 @@ fn update_table_add_gsi() {
             "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
             "AttributeDefinitions": [
                 {"AttributeName": "pk", "AttributeType": "S"},
-                {"AttributeName": "gk", "AttributeType": "S"},
             ],
             "BillingMode": "PAY_PER_REQUEST",
         }),
@@ -3814,6 +3846,7 @@ fn update_table_add_gsi() {
         "UpdateTable",
         json!({
             "TableName": "upd-table",
+            "AttributeDefinitions": [{"AttributeName": "gk", "AttributeType": "S"}],
             "GlobalSecondaryIndexUpdates": [{
                 "Create": {
                     "IndexName": "new-gsi",
@@ -4211,7 +4244,7 @@ fn partiql_update_emits_stream_record() {
     let req = make_request(
         "CreateTable",
         json!({
-            "TableName": "T",
+            "TableName": "Tbl",
             "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
             "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
             "BillingMode": "PAY_PER_REQUEST",
@@ -4224,7 +4257,7 @@ fn partiql_update_emits_stream_record() {
     svc.create_table(&req).unwrap();
     svc.put_item(&make_request(
         "PutItem",
-        json!({"TableName": "T", "Item": {"pk": {"S": "u1"}, "v": {"N": "1"}}}),
+        json!({"TableName": "Tbl", "Item": {"pk": {"S": "u1"}, "v": {"N": "1"}}}),
     ))
     .unwrap();
 
@@ -4234,7 +4267,7 @@ fn partiql_update_emits_stream_record() {
             .get("123456789012")
             .unwrap()
             .tables
-            .get("T")
+            .get("Tbl")
             .unwrap()
             .stream_records
             .read()
@@ -4244,13 +4277,13 @@ fn partiql_update_emits_stream_record() {
 
     svc.execute_statement(&make_request(
         "ExecuteStatement",
-        json!({"Statement": "UPDATE \"T\" SET v = 99 WHERE pk = 'u1'"}),
+        json!({"Statement": "UPDATE \"Tbl\" SET v = 99 WHERE pk = 'u1'"}),
     ))
     .unwrap();
 
     let after = {
         let s = svc.state.read();
-        let t = s.get("123456789012").unwrap().tables.get("T").unwrap();
+        let t = s.get("123456789012").unwrap().tables.get("Tbl").unwrap();
         let recs = t.stream_records.read();
         let last = recs.last().cloned();
         (recs.len(), last)
@@ -4266,7 +4299,7 @@ fn partiql_delete_emits_stream_record() {
     let req = make_request(
         "CreateTable",
         json!({
-            "TableName": "T",
+            "TableName": "Tbl",
             "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
             "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
             "BillingMode": "PAY_PER_REQUEST",
@@ -4279,7 +4312,7 @@ fn partiql_delete_emits_stream_record() {
     svc.create_table(&req).unwrap();
     svc.put_item(&make_request(
         "PutItem",
-        json!({"TableName": "T", "Item": {"pk": {"S": "d1"}}}),
+        json!({"TableName": "Tbl", "Item": {"pk": {"S": "d1"}}}),
     ))
     .unwrap();
 
@@ -4289,7 +4322,7 @@ fn partiql_delete_emits_stream_record() {
             .get("123456789012")
             .unwrap()
             .tables
-            .get("T")
+            .get("Tbl")
             .unwrap()
             .stream_records
             .read()
@@ -4299,13 +4332,13 @@ fn partiql_delete_emits_stream_record() {
 
     svc.execute_statement(&make_request(
         "ExecuteStatement",
-        json!({"Statement": "DELETE FROM \"T\" WHERE pk = 'd1'"}),
+        json!({"Statement": "DELETE FROM \"Tbl\" WHERE pk = 'd1'"}),
     ))
     .unwrap();
 
     let after = {
         let s = svc.state.read();
-        let t = s.get("123456789012").unwrap().tables.get("T").unwrap();
+        let t = s.get("123456789012").unwrap().tables.get("Tbl").unwrap();
         let recs = t.stream_records.read();
         let last = recs.last().cloned();
         (recs.len(), last)
@@ -4322,7 +4355,7 @@ fn partiql_insert_rejects_missing_sort_key() {
     let req = make_request(
         "CreateTable",
         json!({
-            "TableName": "T",
+            "TableName": "Tbl",
             "KeySchema": [
                 {"AttributeName": "pk", "KeyType": "HASH"},
                 {"AttributeName": "sk", "KeyType": "RANGE"}
@@ -4338,7 +4371,7 @@ fn partiql_insert_rejects_missing_sort_key() {
     let err = svc
         .execute_statement(&make_request(
             "ExecuteStatement",
-            json!({"Statement": "INSERT INTO \"T\" VALUE {'pk': 'a'}"}),
+            json!({"Statement": "INSERT INTO \"Tbl\" VALUE {'pk': 'a'}"}),
         ))
         .err()
         .expect("missing sort key");
@@ -4707,7 +4740,7 @@ fn put_resource_policy_missing_policy_errors() {
     let req = make_request(
         "CreateTable",
         json!({
-            "TableName": "rp",
+            "TableName": "rp-table",
             "AttributeDefinitions": [{"AttributeName": "k", "AttributeType": "S"}],
             "KeySchema": [{"AttributeName": "k", "KeyType": "HASH"}],
             "BillingMode": "PAY_PER_REQUEST"
@@ -4716,7 +4749,7 @@ fn put_resource_policy_missing_policy_errors() {
     svc.create_table(&req).unwrap();
     let req = make_request(
         "PutResourcePolicy",
-        json!({"ResourceArn": "arn:aws:dynamodb:us-east-1:123456789012:table/rp"}),
+        json!({"ResourceArn": "arn:aws:dynamodb:us-east-1:123456789012:table/rp-table"}),
     );
     assert!(svc.put_resource_policy(&req).is_err());
 }
@@ -4893,7 +4926,7 @@ fn scan_with_consistent_read_on_gsi_rejected() {
     svc.create_table(&make_request(
         "CreateTable",
         json!({
-            "TableName": "t",
+            "TableName": "tbl",
             "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
             "AttributeDefinitions": [
                 {"AttributeName": "pk", "AttributeType": "S"},
@@ -4911,7 +4944,7 @@ fn scan_with_consistent_read_on_gsi_rejected() {
     let err = svc
         .scan(&make_request(
             "Scan",
-            json!({"TableName": "t", "IndexName": "by-gsi", "ConsistentRead": true}),
+            json!({"TableName": "tbl", "IndexName": "by-gsi", "ConsistentRead": true}),
         ))
         .err()
         .expect("scan with ConsistentRead on GSI must fail");
@@ -5391,7 +5424,7 @@ fn list_imports_rejects_out_of_range_optional_params() {
 }
 
 #[test]
-fn create_table_missing_table_name_emits_limit_exceeded() {
+fn create_table_missing_table_name_is_a_validation_error() {
     let svc = make_service();
     let err = svc
         .create_table(&make_request(
@@ -5400,11 +5433,13 @@ fn create_table_missing_table_name_emits_limit_exceeded() {
         ))
         .err()
         .unwrap();
-    assert_error_code(err, "LimitExceededException");
+    assert_error_code(err, "ValidationException");
 }
 
 #[test]
-fn execute_statement_partiql_error_emits_resource_not_found() {
+fn execute_statement_partiql_error_emits_validation_exception() {
+    // A statement that does not parse is rejected before any table is looked
+    // up, so it is a ValidationException rather than a missing table.
     let svc = make_service();
     let err = svc
         .execute_statement(&make_request(
@@ -5413,7 +5448,7 @@ fn execute_statement_partiql_error_emits_resource_not_found() {
         ))
         .err()
         .unwrap();
-    assert_error_code(err, "ResourceNotFoundException");
+    assert_error_code(err, "ValidationException");
 }
 
 /// No snapshot store (memory mode) -> no persist hook for the CFN provisioner.
@@ -5611,7 +5646,7 @@ fn update_table_prunes_attributes_orphaned_by_gsi_delete() {
     svc.create_table(&make_request(
         "CreateTable",
         json!({
-            "TableName": "t",
+            "TableName": "tbl",
             "KeySchema": [{ "AttributeName": "pk", "KeyType": "HASH" }],
             "AttributeDefinitions": [
                 { "AttributeName": "pk", "AttributeType": "S" },
@@ -5631,7 +5666,7 @@ fn update_table_prunes_attributes_orphaned_by_gsi_delete() {
     svc.update_table(&make_request(
         "UpdateTable",
         json!({
-            "TableName": "t",
+            "TableName": "tbl",
             "AttributeDefinitions": [{ "AttributeName": "pk", "AttributeType": "S" }],
             "GlobalSecondaryIndexUpdates": [{ "Delete": { "IndexName": "gsi" } }]
         }),
@@ -5639,7 +5674,10 @@ fn update_table_prunes_attributes_orphaned_by_gsi_delete() {
     .unwrap();
 
     let resp = svc
-        .describe_table(&make_request("DescribeTable", json!({ "TableName": "t" })))
+        .describe_table(&make_request(
+            "DescribeTable",
+            json!({ "TableName": "tbl" }),
+        ))
         .unwrap();
     let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
     let attrs: Vec<&str> = body["Table"]["AttributeDefinitions"]
@@ -5652,9 +5690,10 @@ fn update_table_prunes_attributes_orphaned_by_gsi_delete() {
 }
 
 #[test]
-fn filter_comparison_missing_attribute_is_false() {
-    // An item without the `status` attribute. AWS: every comparison against a
-    // missing attribute is false (1.5).
+fn filter_comparison_missing_attribute_semantics() {
+    // An item without the `status` attribute. AWS: `=` and the ordering
+    // comparisons against a missing attribute are false, while `<>` is true
+    // (a missing value is not equal to anything).
     let item: HashMap<String, AttributeValue> = [("pk".to_string(), json!({"S": "a"}))]
         .into_iter()
         .collect();
@@ -5663,12 +5702,18 @@ fn filter_comparison_missing_attribute_is_false() {
         .into_iter()
         .collect();
 
-    for op in ["status <> :s", "status < :s", "status <= :s", "status = :s"] {
+    for op in ["status < :s", "status <= :s", "status = :s"] {
         assert!(
             !evaluate_filter_expression(op, &item, &names, &values),
             "`{op}` must be false when `status` is missing"
         );
     }
+    assert!(evaluate_filter_expression(
+        "status <> :s",
+        &item,
+        &names,
+        &values
+    ));
 }
 
 #[test]
@@ -6041,16 +6086,28 @@ fn create_vector_table(svc: &DynamoDbService, distance_function: &str) {
         json!({
             "TableName": "vec-table",
             "KeySchema": [{ "AttributeName": "pk", "KeyType": "HASH" }],
-            "AttributeDefinitions": [{ "AttributeName": "pk", "AttributeType": "S" }],
+            "AttributeDefinitions": [
+                { "AttributeName": "pk", "AttributeType": "S" },
+                { "AttributeName": "tenant", "AttributeType": "S" },
+            ],
             "BillingMode": "PAY_PER_REQUEST",
-            "VectorIndexes": [{
-                "IndexName": "embedding-index",
-                "VectorAttribute": { "AttributeName": "embedding" },
-                "Dimensions": 2,
-                "DistanceFunction": distance_function,
-                "SearchSchema": [{ "AttributeName": "pk", "SearchSchemaElementType": "FILTERABLE" }],
-                "Projection": { "ProjectionType": "ALL" },
-            }],
+            "VectorIndexes": [
+                {
+                    "IndexName": "embedding-index",
+                    "VectorAttribute": { "AttributeName": "embedding" },
+                    "Dimensions": 2,
+                    "DistanceFunction": distance_function,
+                    "Projection": { "ProjectionType": "ALL" },
+                },
+                {
+                    "IndexName": "tenant-index",
+                    "VectorAttribute": { "AttributeName": "embedding" },
+                    "Dimensions": 2,
+                    "DistanceFunction": distance_function,
+                    "SearchSchema": [{ "AttributeName": "tenant", "SearchSchemaElementType": "HASH" }],
+                    "Projection": { "ProjectionType": "KEYS_ONLY" },
+                },
+            ],
         }),
     );
     svc.create_table(&req).unwrap();
@@ -6075,6 +6132,13 @@ fn err_of(r: Result<AwsResponse, AwsServiceError>) -> AwsServiceError {
     }
 }
 
+fn err_message(err: AwsServiceError) -> String {
+    match err {
+        AwsServiceError::AwsError { message, .. } => message,
+        other => panic!("expected AwsError, got {other:?}"),
+    }
+}
+
 fn search(svc: &DynamoDbService, body: Value) -> Value {
     let resp = svc
         .search_vectors(&make_request("SearchVectors", body))
@@ -6082,97 +6146,172 @@ fn search(svc: &DynamoDbService, body: Value) -> Value {
     serde_json::from_slice(resp.body.expect_bytes()).unwrap()
 }
 
+fn describe(svc: &DynamoDbService, table: &str) -> Value {
+    let resp = svc
+        .describe_table(&make_request(
+            "DescribeTable",
+            json!({ "TableName": table }),
+        ))
+        .unwrap();
+    serde_json::from_slice::<Value>(resp.body.expect_bytes()).unwrap()["Table"].clone()
+}
+
 #[test]
 fn create_table_stores_vector_indexes_and_describe_returns_them() {
     let svc = make_service();
     create_vector_table(&svc, "COSINE");
 
-    let resp = svc
-        .describe_table(&make_request(
-            "DescribeTable",
-            json!({ "TableName": "vec-table" }),
-        ))
-        .unwrap();
-    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
-    let idx = &body["Table"]["VectorIndexes"][0];
+    let table = describe(&svc, "vec-table");
+    let idx = &table["VectorIndexes"][0];
     assert_eq!(idx["IndexName"], "embedding-index");
     assert_eq!(idx["Dimensions"], 2);
     assert_eq!(idx["DistanceFunction"], "COSINE");
     assert_eq!(idx["VectorAttribute"]["AttributeName"], "embedding");
+    // An index created with its table is ACTIVE with it, and never reports
+    // Backfilling.
     assert_eq!(idx["IndexStatus"], "ACTIVE");
-    assert_eq!(idx["SearchSchema"][0]["AttributeName"], "pk");
+    assert!(idx.get("Backfilling").is_none());
+    assert_eq!(idx["ItemCount"], 0);
     assert!(idx["IndexArn"]
         .as_str()
         .unwrap()
-        .ends_with("/vector-index/embedding-index"));
+        .ends_with(":table/vec-table/index/embedding-index"));
+    assert_eq!(
+        table["VectorIndexes"][1]["SearchSchema"][0]["SearchSchemaElementType"],
+        "HASH"
+    );
+
+    put_vector_item(&svc, "a", &[1.0, 0.0]);
+    let table = describe(&svc, "vec-table");
+    assert_eq!(table["VectorIndexes"][0]["ItemCount"], 1);
+    // The item has no tenant, so it is not in the HASH-schema index.
+    assert_eq!(table["VectorIndexes"][1]["ItemCount"], 0);
 
     // A table with no vector index omits the member rather than sending [].
     create_test_table(&svc);
-    let resp = svc
-        .describe_table(&make_request(
-            "DescribeTable",
-            json!({ "TableName": "test-table" }),
-        ))
+    assert!(describe(&svc, "test-table").get("VectorIndexes").is_none());
+}
+
+/// Rewind an online-built index's creation clock by `ms`.
+fn age_vector_index(svc: &DynamoDbService, table: &str, index: &str, ms: i64) {
+    let mut accounts = svc.state.write();
+    let state = accounts.get_or_create("123456789012");
+    let idx = state
+        .tables
+        .get_mut(table)
+        .unwrap()
+        .vector_indexes
+        .iter_mut()
+        .find(|v| v.index_name == index)
         .unwrap();
-    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
-    assert!(body["Table"].get("VectorIndexes").is_none());
+    idx.online_created_at =
+        Some(idx.online_created_at.unwrap() - chrono::Duration::milliseconds(ms));
 }
 
 #[test]
-fn update_table_creates_and_deletes_vector_indexes() {
+fn update_table_builds_a_vector_index_online() {
     let svc = make_service();
     create_test_table(&svc);
-
-    svc.update_table(&make_request(
-        "UpdateTable",
-        json!({
-            "TableName": "test-table",
-            "VectorIndexUpdates": [{ "Create": {
+    let create = |name: &str| {
+        svc.update_table(&make_request(
+            "UpdateTable",
+            json!({
+                "TableName": "test-table",
+                "VectorIndexUpdates": [{ "Create": {
+                    "IndexName": name,
+                    "VectorAttribute": { "AttributeName": "vec" },
+                    "Dimensions": 3,
+                    "DistanceFunction": "EUCLIDEAN",
+                    "Projection": { "ProjectionType": "ALL" },
+                }}],
+            }),
+        ))
+    };
+    let delete = |name: &str| {
+        svc.update_table(&make_request(
+            "UpdateTable",
+            json!({
+                "TableName": "test-table",
+                "VectorIndexUpdates": [{ "Delete": { "IndexName": name } }],
+            }),
+        ))
+    };
+    let search_added = || {
+        svc.search_vectors(&make_request(
+            "SearchVectors",
+            json!({
+                "TableName": "test-table",
                 "IndexName": "added",
-                "VectorAttribute": { "AttributeName": "vec" },
-                "Dimensions": 3,
-                "DistanceFunction": "EUCLIDEAN",
-                "Projection": { "ProjectionType": "ALL" },
-            }}],
-        }),
-    ))
-    .unwrap();
-    let resp = svc
-        .describe_table(&make_request(
-            "DescribeTable",
-            json!({ "TableName": "test-table" }),
+                "SearchVector": search_vec(&[1.0, 0.0, 0.0]),
+                "TopK": 1,
+            }),
         ))
-        .unwrap();
-    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
-    assert_eq!(body["Table"]["VectorIndexes"][0]["IndexName"], "added");
-    assert_eq!(
-        body["Table"]["VectorIndexes"][0]["DistanceFunction"],
-        "EUCLIDEAN"
-    );
+    };
+    create("added").unwrap();
 
-    svc.update_table(&make_request(
+    // Allocating: the table is UPDATING, the index CREATING with Backfilling
+    // false, and neither a cancel nor a second index is taken.
+    let table = describe(&svc, "test-table");
+    assert_eq!(table["TableStatus"], "UPDATING");
+    assert_eq!(table["VectorIndexes"][0]["IndexStatus"], "CREATING");
+    assert_eq!(table["VectorIndexes"][0]["Backfilling"], false);
+    assert!(err_message(err_of(delete("added"))).contains("resource allocation phase"));
+    assert_eq!(err_of(create("second")).code(), "LimitExceededException");
+    assert!(err_message(err_of(search_added()))
+        .contains("The table does not have the specified index: added"));
+    let err = err_of(svc.delete_table(&make_request(
+        "DeleteTable",
+        json!({ "TableName": "test-table" }),
+    )));
+    assert_eq!(err.code(), "ResourceInUseException");
+
+    // Backfilling: the table is ACTIVE again while the index still builds.
+    age_vector_index(
+        &svc,
+        "test-table",
+        "added",
+        crate::state::VECTOR_INDEX_ALLOCATION_MS,
+    );
+    let table = describe(&svc, "test-table");
+    assert_eq!(table["TableStatus"], "ACTIVE");
+    assert_eq!(table["VectorIndexes"][0]["IndexStatus"], "CREATING");
+    assert_eq!(table["VectorIndexes"][0]["Backfilling"], true);
+    assert!(err_message(err_of(search_added()))
+        .contains("Cannot search backfilling vector index: added"));
+
+    // Built: ACTIVE, Backfilling gone, searches served.
+    age_vector_index(
+        &svc,
+        "test-table",
+        "added",
+        crate::state::VECTOR_INDEX_BACKFILL_MS,
+    );
+    let table = describe(&svc, "test-table");
+    assert_eq!(table["VectorIndexes"][0]["IndexStatus"], "ACTIVE");
+    assert!(table["VectorIndexes"][0].get("Backfilling").is_none());
+    search_added().unwrap();
+
+    // Two online actions in one request are refused; one is taken.
+    let both = svc.update_table(&make_request(
         "UpdateTable",
         json!({
             "TableName": "test-table",
-            "VectorIndexUpdates": [{ "Delete": { "IndexName": "added" } }],
+            "VectorIndexUpdates": [
+                { "Delete": { "IndexName": "added" } },
+                { "Delete": { "IndexName": "added" } },
+            ],
         }),
-    ))
-    .unwrap();
-    let resp = svc
-        .describe_table(&make_request(
-            "DescribeTable",
-            json!({ "TableName": "test-table" }),
-        ))
-        .unwrap();
-    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
-    assert!(body["Table"].get("VectorIndexes").is_none());
+    ));
+    assert_eq!(err_of(both).code(), "LimitExceededException");
+    delete("added").unwrap();
+    assert!(describe(&svc, "test-table").get("VectorIndexes").is_none());
+    assert_eq!(err_of(delete("added")).code(), "ResourceNotFoundException");
 }
 
 #[test]
-fn search_vectors_ranks_by_cosine_similarity() {
+fn search_vectors_scores_cosine_as_a_distance() {
     let svc = make_service();
     create_vector_table(&svc, "COSINE");
-    // `near` points the same way as the query, `far` points away.
     put_vector_item(&svc, "near", &[1.0, 0.0]);
     put_vector_item(&svc, "diag", &[1.0, 1.0]);
     put_vector_item(&svc, "far", &[-1.0, 0.0]);
@@ -6190,9 +6329,11 @@ fn search_vectors_ranks_by_cosine_similarity() {
     assert_eq!(results.len(), 2, "TopK caps the result set");
     assert_eq!(results[0]["Item"]["pk"]["S"], "near");
     assert_eq!(results[1]["Item"]["pk"]["S"], "diag");
-    // An identical direction scores 1.0 under cosine.
-    assert!((results[0]["Score"].as_f64().unwrap() - 1.0).abs() < 1e-9);
-    assert!(results[0]["Score"].as_f64().unwrap() > results[1]["Score"].as_f64().unwrap());
+    // An identical direction is at distance 0; lower is closer.
+    assert_eq!(results[0]["Score"].as_f64().unwrap(), 0.0);
+    assert!(results[1]["Score"].as_f64().unwrap() > 0.0);
+    // The vector itself is left out unless projected for.
+    assert!(results[0]["Item"].get("embedding").is_none());
 }
 
 #[test]
@@ -6212,44 +6353,70 @@ fn search_vectors_ranks_euclidean_nearest_first() {
         }),
     );
     let results = body["SearchResults"].as_array().unwrap();
-    // Euclidean is a distance: nearest first, and the score rises with it.
     assert_eq!(results[0]["Item"]["pk"]["S"], "close");
-    assert!((results[0]["Score"].as_f64().unwrap() - 1.0).abs() < 1e-9);
+    assert_eq!(results[0]["Score"].as_f64().unwrap(), 1.0);
     assert!(results[1]["Score"].as_f64().unwrap() > results[0]["Score"].as_f64().unwrap());
 }
 
 #[test]
-fn search_vectors_skips_items_without_a_usable_vector() {
+fn search_vectors_scopes_a_hash_schema_index_to_one_partition() {
     let svc = make_service();
     create_vector_table(&svc, "COSINE");
-    put_vector_item(&svc, "good", &[1.0, 0.0]);
-    // No embedding at all, and an embedding of the wrong width.
-    svc.put_item(&make_request(
-        "PutItem",
-        json!({ "TableName": "vec-table", "Item": { "pk": { "S": "no-vector" } } }),
-    ))
-    .unwrap();
-    put_vector_item(&svc, "wrong-width", &[1.0, 0.0, 0.0]);
+    for (pk, tenant) in [("a", Some("t1")), ("b", Some("t2")), ("c", None)] {
+        let mut item = json!({ "pk": { "S": pk }, "embedding": vec_attr(&[1.0, 0.0]) });
+        if let Some(t) = tenant {
+            item["tenant"] = json!({ "S": t });
+        }
+        svc.put_item(&make_request(
+            "PutItem",
+            json!({ "TableName": "vec-table", "Item": item }),
+        ))
+        .unwrap();
+    }
+    let base = json!({
+        "TableName": "vec-table",
+        "IndexName": "tenant-index",
+        "SearchVector": search_vec(&[1.0, 0.0]),
+        "TopK": 10,
+    });
+    let err = err_of(svc.search_vectors(&make_request("SearchVectors", base.clone())));
+    assert!(err_message(err).contains("must be provided when SearchSchema has a HASH key"));
 
-    let body = search(
-        &svc,
-        json!({
-            "TableName": "vec-table",
-            "IndexName": "embedding-index",
-            "SearchVector": search_vec(&[1.0, 0.0]),
-            "TopK": 10,
-        }),
-    );
-    let results = body["SearchResults"].as_array().unwrap();
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0]["Item"]["pk"]["S"], "good");
+    let mut scoped = base.clone();
+    scoped["SearchConditionExpression"] = json!("#t = :t");
+    scoped["ExpressionAttributeNames"] = json!({ "#t": "tenant" });
+    scoped["ExpressionAttributeValues"] = json!({ ":t": { "S": "t1" } });
+    let results = search(&svc, scoped)["SearchResults"].clone();
+    let pks: Vec<&str> = results
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["Item"]["pk"]["S"].as_str().unwrap())
+        .collect();
+    assert_eq!(pks, ["a"]);
+
+    let mut ranged = base;
+    ranged["SearchConditionExpression"] = json!("tenant > :t");
+    ranged["ExpressionAttributeValues"] = json!({ ":t": { "S": "t1" } });
+    let err = err_of(svc.search_vectors(&make_request("SearchVectors", ranged)));
+    assert!(err_message(err).contains("Invalid comparator"));
 }
 
 #[test]
-fn search_vectors_honors_projection_and_consumed_capacity() {
+fn search_vectors_returns_the_index_f32_copy_when_projected() {
     let svc = make_service();
     create_vector_table(&svc, "COSINE");
-    put_vector_item(&svc, "only", &[1.0, 0.0]);
+    svc.put_item(&make_request(
+        "PutItem",
+        json!({
+            "TableName": "vec-table",
+            "Item": {
+                "pk": { "S": "p" },
+                "embedding": { "L": [{ "N": "16777217" }, { "N": "0.1" }] },
+            },
+        }),
+    ))
+    .unwrap();
 
     let body = search(
         &svc,
@@ -6258,21 +6425,40 @@ fn search_vectors_honors_projection_and_consumed_capacity() {
             "IndexName": "embedding-index",
             "SearchVector": search_vec(&[1.0, 0.0]),
             "TopK": 1,
-            "ProjectionExpression": "pk",
+            "ProjectionExpression": "pk, embedding",
             "ReturnConsumedCapacity": "TOTAL",
         }),
     );
     let item = &body["SearchResults"][0]["Item"];
-    assert_eq!(item["pk"]["S"], "only");
-    assert!(
-        item.get("embedding").is_none(),
-        "projection drops embedding"
-    );
-    assert!(
-        body["ConsumedCapacity"]["VectorSearchRequestBytes"]
-            .as_f64()
-            .unwrap()
-            > 0.0
+    assert_eq!(item["embedding"]["L"][0]["N"], "16777216");
+    assert_eq!(item["embedding"]["L"][1]["N"], "0.1");
+    let cc = &body["ConsumedCapacity"];
+    assert!(cc["VectorSearchRequestBytes"].as_f64().unwrap() > 0.0);
+    assert!(cc.get("CapacityUnits").is_none());
+}
+
+/// An overlapping ProjectionExpression is rejected, as on Query and Scan,
+/// rather than returning items with nothing projected.
+#[test]
+fn search_vectors_rejects_overlapping_projection() {
+    let svc = make_service();
+    create_vector_table(&svc, "COSINE");
+    put_vector_item(&svc, "only", &[1.0, 0.0]);
+    let err = err_of(svc.search_vectors(&make_request(
+        "SearchVectors",
+        json!({
+            "TableName": "vec-table",
+            "IndexName": "embedding-index",
+            "SearchVector": search_vec(&[1.0, 0.0]),
+            "TopK": 1,
+            "ProjectionExpression": "a, a.b",
+        }),
+    )));
+    assert_eq!(err.code(), "ValidationException");
+    assert_eq!(
+        err.message(),
+        "Invalid ProjectionExpression: Two document paths overlap with each other; must remove \
+         or rewrite one of these paths; path one: [a], path two: [a, b]"
     );
 }
 
@@ -6280,43 +6466,101 @@ fn search_vectors_honors_projection_and_consumed_capacity() {
 fn search_vectors_validates_index_and_vector() {
     let svc = make_service();
     create_vector_table(&svc, "COSINE");
-
-    let err = err_of(svc.search_vectors(&make_request(
-        "SearchVectors",
-        json!({
-            "TableName": "vec-table",
-            "IndexName": "no-such-index",
-            "SearchVector": search_vec(&[1.0, 0.0]),
-            "TopK": 1,
-        }),
-    )));
-    assert_eq!(err.code(), "ResourceNotFoundException");
-
-    // A query vector of the wrong width cannot be compared at all.
-    let err = err_of(svc.search_vectors(&make_request(
-        "SearchVectors",
-        json!({
-            "TableName": "vec-table",
-            "IndexName": "embedding-index",
-            "SearchVector": search_vec(&[1.0, 0.0, 0.0]),
-            "TopK": 1,
-        }),
-    )));
-    assert_eq!(err.code(), "ValidationException");
-
-    // TopK is required and at least 1.
-    for top_k in [json!(0), Value::Null] {
+    let request = |index: &str, vector: Value, top_k: Value| {
         let mut body = json!({
             "TableName": "vec-table",
-            "IndexName": "embedding-index",
-            "SearchVector": search_vec(&[1.0, 0.0]),
+            "IndexName": index,
+            "SearchVector": vector,
         });
         if !top_k.is_null() {
             body["TopK"] = top_k;
         }
-        let err = err_of(svc.search_vectors(&make_request("SearchVectors", body)));
-        assert_eq!(err.code(), "ValidationException");
+        svc.search_vectors(&make_request("SearchVectors", body))
+    };
+
+    let msg = err_message(err_of(request(
+        "no-such-index",
+        search_vec(&[1.0, 0.0]),
+        json!(1),
+    )));
+    assert_eq!(
+        msg,
+        "The table does not have the specified index: no-such-index"
+    );
+    let msg = err_message(err_of(request(
+        "embedding-index",
+        search_vec(&[1.0, 0.0, 0.0]),
+        json!(1),
+    )));
+    assert_eq!(
+        msg,
+        "Input search vector dimension 3 does not match vector index dimension 2"
+    );
+    let msg = err_message(err_of(request(
+        "embedding-index",
+        json!([{ "L": search_vec(&[1.0, 0.0]) }]),
+        json!(1),
+    )));
+    assert!(msg.starts_with("Search vector contains invalid values"));
+    let msg = err_message(err_of(request(
+        "embedding-index",
+        search_vec(&[1.0, 0.0]),
+        json!(101),
+    )));
+    assert!(msg.starts_with("Provided TopK value '101' is out of valid range"));
+    for top_k in [json!(0), Value::Null] {
+        let err = err_of(request("embedding-index", search_vec(&[1.0, 0.0]), top_k));
+        assert!(err_message(err).starts_with("1 validation error detected"));
     }
+}
+
+#[test]
+fn vector_writes_are_validated_and_charged_per_index() {
+    let svc = make_service();
+    create_vector_table(&svc, "COSINE");
+    let put = |item: Value| {
+        svc.put_item(&make_request(
+            "PutItem",
+            json!({ "TableName": "vec-table", "Item": item, "ReturnConsumedCapacity": "INDEXES" }),
+        ))
+    };
+    let msg = err_message(err_of(put(json!({
+        "pk": { "S": "x" }, "embedding": vec_attr(&[1.0, 0.0, 0.0]),
+    }))));
+    assert_eq!(
+        msg,
+        "One or more parameter values were invalid. Invalid size for parameter embedding, \
+         Expected: 2, Actual: 3 IndexName: embedding-index"
+    );
+    let msg = err_message(err_of(put(json!({
+        "pk": { "S": "x" }, "embedding": { "L": [{ "N": "1" }, { "S": "no" }] },
+    }))));
+    assert!(
+        msg.contains("Invalid type for parameter embedding[1]"),
+        "{msg}"
+    );
+    let msg = err_message(err_of(put(json!({
+        "pk": { "S": "x" }, "tenant": { "S": "" }, "embedding": vec_attr(&[1.0, 0.0]),
+    }))));
+    assert!(
+        msg.contains("IndexName: tenant-index, IndexKey: tenant"),
+        "{msg}"
+    );
+
+    let item = json!({
+        "pk": { "S": "x" }, "tenant": { "S": "t" }, "embedding": vec_attr(&[1.0, 0.0]),
+    });
+    let first: Value =
+        serde_json::from_slice(put(item.clone()).unwrap().body.expect_bytes()).unwrap();
+    let charged = &first["ConsumedCapacity"]["VectorIndexes"];
+    assert_eq!(
+        charged["embedding-index"]["VectorWriteRequestBytes"],
+        1024.0
+    );
+    assert_eq!(charged["tenant-index"]["VectorWriteRequestBytes"], 1024.0);
+    // Replication is delta-based: rewriting the same item charges nothing.
+    let again: Value = serde_json::from_slice(put(item).unwrap().body.expect_bytes()).unwrap();
+    assert!(again["ConsumedCapacity"].get("VectorIndexes").is_none());
 }
 
 #[test]
@@ -6324,10 +6568,12 @@ fn create_table_rejects_a_malformed_vector_index() {
     let svc = make_service();
     for bad in [
         json!({ "VectorAttribute": { "AttributeName": "v" }, "Dimensions": 2 }),
-        json!({ "IndexName": "i", "Dimensions": 2 }),
-        json!({ "IndexName": "i", "VectorAttribute": { "AttributeName": "v" }, "Dimensions": 0 }),
-        json!({ "IndexName": "i", "VectorAttribute": { "AttributeName": "v" }, "Dimensions": 2,
+        json!({ "IndexName": "idx", "Dimensions": 2 }),
+        json!({ "IndexName": "idx", "VectorAttribute": { "AttributeName": "v" }, "Dimensions": 0 }),
+        json!({ "IndexName": "idx", "VectorAttribute": { "AttributeName": "v" }, "Dimensions": 2,
                 "DistanceFunction": "MANHATTAN" }),
+        json!({ "IndexName": "idx", "VectorAttribute": { "AttributeName": "v" }, "Dimensions": 4097,
+                "DistanceFunction": "COSINE", "Projection": { "ProjectionType": "ALL" } }),
     ] {
         let err = err_of(svc.create_table(&make_request(
             "CreateTable",
@@ -6677,7 +6923,7 @@ async fn table_operations_and_insights_accept_a_table_arn() {
         .await
         .err()
         .expect("deletion protection must hold when the table is named by ARN");
-    assert_eq!(err.code(), "ResourceInUseException");
+    assert_eq!(err.code(), "ValidationException");
 
     call_dynamodb(
         &svc,
@@ -7023,7 +7269,8 @@ async fn partiql_select_from_an_index_reads_the_index() {
 }
 
 /// A PartiQL SELECT returns only the columns it names (document paths and
-/// quoted names included); `*` returns the whole item.
+/// quoted names included), each under the name of its last path step; `*`
+/// returns the whole item.
 #[tokio::test]
 async fn partiql_select_returns_only_the_named_columns() {
     let svc = make_service();
@@ -7052,7 +7299,7 @@ async fn partiql_select_returns_only_the_named_columns() {
             "pk": {"S": "a"},
             "public": {"S": "p"},
             "a.b": {"S": "dotted"},
-            "addr": {"M": {"city": {"S": "c"}}}
+            "city": {"S": "c"}
         }])
     );
     let all = call_dynamodb(
@@ -7134,6 +7381,271 @@ async fn partiql_select_columns_page_and_validate() {
         json!({"Statement": "SELECT \"u\" . \"x\", score [ 0 ] FROM \"Scores\""}),
     )
     .await;
+}
+
+/// A one-value IN list on the partition key is a point read like an
+/// equality, and finds the item.
+#[tokio::test]
+async fn partiql_point_read_through_a_one_value_in_list() {
+    let svc = make_service();
+    svc.create_table(&make_request(
+        "CreateTable",
+        json!({
+            "TableName": "Pairs",
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"}
+            ],
+            "AttributeDefinitions": [
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "sk", "AttributeType": "S"}
+            ],
+            "BillingMode": "PAY_PER_REQUEST"
+        }),
+    ))
+    .unwrap();
+    create_test_table(&svc);
+    call_dynamodb(
+        &svc,
+        "PutItem",
+        json!({"TableName": "Pairs", "Item": {"pk": {"S": "a"}, "sk": {"S": "x"}}}),
+    )
+    .await;
+    call_dynamodb(
+        &svc,
+        "PutItem",
+        json!({"TableName": "test-table", "Item": {"pk": {"S": "a"}}}),
+    )
+    .await;
+    for statement in [
+        "SELECT * FROM \"test-table\" WHERE pk IN ['a']",
+        "SELECT * FROM \"Pairs\" WHERE pk IN ['a'] AND sk = 'x'",
+    ] {
+        let got = call_dynamodb(&svc, "ExecuteStatement", json!({"Statement": statement})).await;
+        assert_eq!(got["Items"].as_array().unwrap().len(), 1, "{statement}");
+    }
+}
+
+/// A written value is built only from constants, paths and the update
+/// functions: anything else is refused rather than written as some default.
+#[tokio::test]
+async fn partiql_refuses_values_it_cannot_build() {
+    let svc = make_service();
+    create_test_table(&svc);
+    call_dynamodb(
+        &svc,
+        "PutItem",
+        json!({"TableName": "test-table", "Item": {"pk": {"S": "a"}, "s": {"SS": ["x"]}}}),
+    )
+    .await;
+    for statement in [
+        "UPDATE \"test-table\" SET v = lower(s) WHERE pk = 'a'",
+        "UPDATE \"test-table\" SET v = set_add(s, <<'y'>>) WHERE pk = 'a'",
+        "UPDATE \"test-table\" SET s = set_add(s) WHERE pk = 'a'",
+        "UPDATE \"test-table\" SET v = [missing] WHERE pk = 'a'",
+        "UPDATE \"test-table\" SET v = (1 = 1) WHERE pk = 'a'",
+        "SELECT * FROM \"test-table\" WHERE upper(pk) = 'A'",
+        "INSERT INTO \"test-table\" VALUE {'pk': 'b', 's': <<'x', 1>>}",
+        "INSERT INTO \"test-table\" VALUE {'pk': 'b', 'pk': 'c'}",
+    ] {
+        assert_eq!(
+            err_code(&svc, "ExecuteStatement", json!({"Statement": statement}))
+                .await
+                .as_deref(),
+            Some("ValidationException"),
+            "{statement}"
+        );
+    }
+    let got = call_dynamodb(
+        &svc,
+        "GetItem",
+        json!({"TableName": "test-table", "Key": {"pk": {"S": "a"}}}),
+    )
+    .await;
+    assert_eq!(got["Item"], json!({"pk": {"S": "a"}, "s": {"SS": ["x"]}}));
+    assert_eq!(
+        call_dynamodb(&svc, "Scan", json!({"TableName": "test-table"})).await["Count"],
+        1
+    );
+}
+
+/// PartiQL writes are measured and stored like the item APIs: INSERT has
+/// PutItem's size rule and wording, UPDATE the flat update rule, and every
+/// written number -- literal or bound parameter -- is stored canonically.
+#[tokio::test]
+async fn partiql_writes_share_the_item_size_and_number_rules() {
+    let svc = make_service();
+    create_test_table(&svc);
+    // "pk" + "a" + "p" + padding: exactly one byte over the limit.
+    let pad = "x".repeat(409_600 - "pk".len() - "a".len() - "p".len() + 1);
+    let err = svc
+        .handle(make_request(
+            "ExecuteStatement",
+            json!({
+                "Statement": "INSERT INTO \"test-table\" VALUE {'pk': 'a', 'p': ?}",
+                "Parameters": [{"S": pad}]
+            }),
+        ))
+        .await
+        .err()
+        .expect("oversize INSERT");
+    assert_eq!(err.code(), "ValidationException");
+    assert_eq!(
+        err.message(),
+        "Item size has exceeded the maximum allowed size"
+    );
+    // One byte less fits.
+    call_dynamodb(
+        &svc,
+        "ExecuteStatement",
+        json!({
+            "Statement": "INSERT INTO \"test-table\" VALUE {'pk': 'a', 'p': ?}",
+            "Parameters": [{"S": &pad[1..]}]
+        }),
+    )
+    .await;
+    let err = svc
+        .handle(make_request(
+            "ExecuteStatement",
+            json!({
+                "Statement": "UPDATE \"test-table\" SET q = 'y' WHERE pk = 'a'"
+            }),
+        ))
+        .await
+        .err()
+        .expect("oversize UPDATE");
+    assert_eq!(
+        err.message(),
+        "Item size to update has exceeded the maximum allowed size"
+    );
+
+    call_dynamodb(
+        &svc,
+        "ExecuteStatement",
+        json!({
+            "Statement": "INSERT INTO \"test-table\" VALUE {'pk': 'n', 'lit': 01.50, 'p': ?, 'l': [?]}",
+            "Parameters": [{"N": "+1.5E+3"}, {"N": "0042.1200"}]
+        }),
+    )
+    .await;
+    call_dynamodb(
+        &svc,
+        "ExecuteStatement",
+        json!({
+            "Statement": "UPDATE \"test-table\" SET u = ? WHERE pk = 'n'",
+            "Parameters": [{"NS": ["1.0", "-0"]}]
+        }),
+    )
+    .await;
+    let got = call_dynamodb(
+        &svc,
+        "GetItem",
+        json!({"TableName": "test-table", "Key": {"pk": {"S": "n"}}}),
+    )
+    .await;
+    assert_eq!(got["Item"]["lit"], json!({"N": "1.5"}));
+    assert_eq!(got["Item"]["p"], json!({"N": "1500"}));
+    assert_eq!(got["Item"]["l"], json!({"L": [{"N": "42.12"}]}));
+    assert_eq!(got["Item"]["u"], json!({"NS": ["1", "0"]}));
+}
+
+/// A value an UPDATE writes is validated like an UpdateItem value before it
+/// is normalized, so it can never store a malformed number or set.
+#[tokio::test]
+async fn partiql_update_validates_written_values() {
+    let svc = make_service();
+    create_test_table(&svc);
+    call_dynamodb(
+        &svc,
+        "PutItem",
+        json!({"TableName": "test-table", "Item": {"pk": {"S": "a"}}}),
+    )
+    .await;
+    for (value, message) in [
+        (
+            json!({"NS": ["1", "1.0"]}),
+            "One or more parameter values were invalid: Input collection [1, 1.0] contains duplicates",
+        ),
+        (
+            json!({"N": "abc"}),
+            "The parameter cannot be converted to a numeric value: abc",
+        ),
+        (
+            json!({"SS": []}),
+            "One or more parameter values were invalid: An string set  may not be empty",
+        ),
+        (
+            json!({"N": "1234567890123456789012345678901234567890"}),
+            "",
+        ),
+    ] {
+        let expected = svc
+            .handle(make_request(
+                "UpdateItem",
+                json!({
+                    "TableName": "test-table",
+                    "Key": {"pk": {"S": "a"}},
+                    "UpdateExpression": "SET u = :v",
+                    "ExpressionAttributeValues": {":v": value}
+                }),
+            ))
+            .await
+            .err()
+            .expect("UpdateItem refuses the value");
+        let err = svc
+            .handle(make_request(
+                "ExecuteStatement",
+                json!({
+                    "Statement": "UPDATE \"test-table\" SET u = ? WHERE pk = 'a'",
+                    "Parameters": [value]
+                }),
+            ))
+            .await
+            .err()
+            .expect("PartiQL UPDATE refuses the value");
+        assert_eq!(err.code(), "ValidationException", "{value}");
+        assert_eq!(err.message(), expected.message(), "{value}");
+        if !message.is_empty() {
+            assert_eq!(err.message(), message, "{value}");
+        }
+    }
+    let got = call_dynamodb(
+        &svc,
+        "GetItem",
+        json!({"TableName": "test-table", "Key": {"pk": {"S": "a"}}}),
+    )
+    .await;
+    assert_eq!(got["Item"], json!({"pk": {"S": "a"}}));
+}
+
+/// A transaction that reads and writes one table reports each as what it
+/// was, not every unit as whichever came first.
+#[tokio::test]
+async fn partiql_transaction_capacity_splits_reads_from_writes() {
+    let svc = make_service();
+    create_test_table(&svc);
+    call_dynamodb(
+        &svc,
+        "PutItem",
+        json!({"TableName": "test-table", "Item": {"pk": {"S": "a"}}}),
+    )
+    .await;
+    let got = call_dynamodb(
+        &svc,
+        "ExecuteTransaction",
+        json!({
+            "TransactStatements": [
+                {"Statement": "EXISTS(SELECT * FROM \"test-table\" WHERE pk = 'a')"},
+                {"Statement": "UPDATE \"test-table\" SET v = 1 WHERE pk = 'a'"}
+            ],
+            "ReturnConsumedCapacity": "TOTAL"
+        }),
+    )
+    .await;
+    let cc = &got["ConsumedCapacity"][0];
+    assert_eq!(cc["ReadCapacityUnits"], json!(1.0), "{cc}");
+    assert_eq!(cc["WriteCapacityUnits"], json!(2.0), "{cc}");
+    assert_eq!(cc["CapacityUnits"], json!(3.0), "{cc}");
 }
 
 // ── Cross-account table ARNs ───────────────────────────────────────────
@@ -7498,4 +8010,1081 @@ async fn other_accounts_tables_are_not_found_without_cross_account_support() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(got["__type"], "ResourceNotFoundException");
+}
+
+/// A table with a GSI (INCLUDE projection of `proj`) and an ALL-projected LSI,
+/// for the index write-capacity cases.
+fn create_indexed_capacity_table(svc: &DynamoDbService) {
+    let req = make_request(
+        "CreateTable",
+        json!({
+            "TableName": "idx-wcu",
+            "AttributeDefinitions": [
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "sk", "AttributeType": "S"},
+                {"AttributeName": "gsiPk", "AttributeType": "S"},
+                {"AttributeName": "lsiSk", "AttributeType": "S"}
+            ],
+            "KeySchema": [
+                {"AttributeName": "pk", "KeyType": "HASH"},
+                {"AttributeName": "sk", "KeyType": "RANGE"}
+            ],
+            "BillingMode": "PAY_PER_REQUEST",
+            "GlobalSecondaryIndexes": [{
+                "IndexName": "gsi-inc",
+                "KeySchema": [{"AttributeName": "gsiPk", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "INCLUDE", "NonKeyAttributes": ["proj"]}
+            }],
+            "LocalSecondaryIndexes": [{
+                "IndexName": "lsi1",
+                "KeySchema": [
+                    {"AttributeName": "pk", "KeyType": "HASH"},
+                    {"AttributeName": "lsiSk", "KeyType": "RANGE"}
+                ],
+                "Projection": {"ProjectionType": "ALL"}
+            }]
+        }),
+    );
+    svc.create_table(&req).unwrap();
+}
+
+#[test]
+fn write_capacity_charges_only_the_indexes_a_write_changes() {
+    let svc = make_service();
+    create_indexed_capacity_table(&svc);
+    let put = |item: Value| {
+        let req = make_request(
+            "PutItem",
+            json!({"TableName": "idx-wcu", "Item": item, "ReturnConsumedCapacity": "INDEXES"}),
+        );
+        body_json(&svc.put_item(&req).unwrap())["ConsumedCapacity"].clone()
+    };
+    let full = json!({
+        "pk": {"S": "a"}, "sk": {"S": "1"}, "gsiPk": {"S": "g"},
+        "lsiSk": {"S": "l"}, "proj": {"S": "p"}, "other": {"S": "o"}
+    });
+    let cc = put(full.clone());
+    assert_eq!(cc["CapacityUnits"], 3.0);
+    assert_eq!(cc["Table"]["CapacityUnits"], 1.0);
+    assert_eq!(
+        cc["GlobalSecondaryIndexes"]["gsi-inc"]["CapacityUnits"],
+        1.0
+    );
+    assert_eq!(cc["LocalSecondaryIndexes"]["lsi1"]["CapacityUnits"], 1.0);
+    assert!(cc["Table"].get("WriteCapacityUnits").is_none());
+
+    // An identical overwrite changes no index.
+    let cc = put(full);
+    assert_eq!(cc["CapacityUnits"], 1.0);
+    assert!(cc.get("GlobalSecondaryIndexes").is_none());
+    assert!(cc.get("LocalSecondaryIndexes").is_none());
+
+    // Moving the GSI key is a delete plus an insert on the GSI; the LSI's
+    // ALL projection sees the changed attribute too.
+    let req = make_request(
+        "UpdateItem",
+        json!({
+            "TableName": "idx-wcu",
+            "Key": {"pk": {"S": "a"}, "sk": {"S": "1"}},
+            "UpdateExpression": "SET gsiPk = :g",
+            "ExpressionAttributeValues": {":g": {"S": "moved"}},
+            "ReturnConsumedCapacity": "INDEXES",
+        }),
+    );
+    let cc = body_json(&svc.update_item(&req).unwrap())["ConsumedCapacity"].clone();
+    assert_eq!(cc["CapacityUnits"], 4.0);
+    assert_eq!(
+        cc["GlobalSecondaryIndexes"]["gsi-inc"]["CapacityUnits"],
+        2.0
+    );
+
+    // A non-projected attribute leaves the INCLUDE GSI alone.
+    let req = make_request(
+        "UpdateItem",
+        json!({
+            "TableName": "idx-wcu",
+            "Key": {"pk": {"S": "a"}, "sk": {"S": "1"}},
+            "UpdateExpression": "SET #o = :o",
+            "ExpressionAttributeNames": {"#o": "other"},
+            "ExpressionAttributeValues": {":o": {"S": "o2"}},
+            "ReturnConsumedCapacity": "INDEXES",
+        }),
+    );
+    let cc = body_json(&svc.update_item(&req).unwrap())["ConsumedCapacity"].clone();
+    assert_eq!(cc["CapacityUnits"], 2.0);
+    assert!(cc.get("GlobalSecondaryIndexes").is_none());
+
+    // A delete charges one write per index the item occupied.
+    let req = make_request(
+        "DeleteItem",
+        json!({
+            "TableName": "idx-wcu",
+            "Key": {"pk": {"S": "a"}, "sk": {"S": "1"}},
+            "ReturnConsumedCapacity": "TOTAL",
+        }),
+    );
+    let cc = body_json(&svc.delete_item(&req).unwrap())["ConsumedCapacity"].clone();
+    assert_eq!(cc["CapacityUnits"], 3.0);
+    assert!(cc.get("Table").is_none());
+}
+
+#[test]
+fn read_capacity_follows_item_size_and_consistency() {
+    let svc = make_service();
+    create_test_table(&svc);
+    let req = make_request(
+        "PutItem",
+        json!({"TableName": "test-table", "Item": {"pk": {"S": "big"}, "v": {"S": "x".repeat(5000)}}}),
+    );
+    svc.put_item(&req).unwrap();
+    let get = |consistent: bool| {
+        let req = make_request(
+            "GetItem",
+            json!({
+                "TableName": "test-table",
+                "Key": {"pk": {"S": "big"}},
+                "ConsistentRead": consistent,
+                "ReturnConsumedCapacity": "TOTAL",
+            }),
+        );
+        body_json(&svc.get_item(&req).unwrap())["ConsumedCapacity"]["CapacityUnits"].clone()
+    };
+    // Just over 4KB: two read units, halved when eventually consistent.
+    assert_eq!(get(true), 2.0);
+    assert_eq!(get(false), 1.0);
+}
+
+#[test]
+fn put_item_enforces_the_400kb_gate_to_the_byte() {
+    let svc = make_service();
+    create_test_table(&svc);
+    // pk (2) + "k" (1) + "p" (1) + padding.
+    let put = |padding: usize| {
+        let req = make_request(
+            "PutItem",
+            json!({"TableName": "test-table", "Item": {"pk": {"S": "k"}, "p": {"S": "x".repeat(padding)}}}),
+        );
+        svc.put_item(&req)
+    };
+    assert!(put(409_600 - 4).is_ok());
+    let err = expect_err(put(409_600 - 3));
+    assert_eq!(err.code(), "ValidationException");
+    assert_eq!(
+        err.message(),
+        "Item size has exceeded the maximum allowed size"
+    );
+}
+
+#[test]
+fn update_item_charges_what_it_writes_plus_its_clauses() {
+    let svc = make_service();
+    create_test_table(&svc);
+    let update = |key: &str, padding: usize| {
+        let req = make_request(
+            "UpdateItem",
+            json!({
+                "TableName": "test-table",
+                "Key": {"pk": {"S": key}},
+                "UpdateExpression": "SET b = :p",
+                "ExpressionAttributeValues": {":p": {"S": "x".repeat(padding)}},
+            }),
+        );
+        svc.update_item(&req)
+    };
+    // A one-byte key: the ceiling is 409,600 - 19 (22 for the clause, less
+    // the 3 key bytes the update never writes). `b` costs 1 + padding.
+    let ceiling = 409_600 - 19;
+    assert!(update("K", ceiling - 3 - 1).is_ok());
+    let err = expect_err(update("L", ceiling - 3));
+    assert_eq!(
+        err.message(),
+        "Item size to update has exceeded the maximum allowed size"
+    );
+    // The refused update left nothing behind.
+    let req = make_request(
+        "GetItem",
+        json!({"TableName": "test-table", "Key": {"pk": {"S": "L"}}}),
+    );
+    assert!(body_json(&svc.get_item(&req).unwrap())
+        .get("Item")
+        .is_none());
+
+    // A transacted Update measures the finished item flat and cancels.
+    let req = make_request(
+        "TransactWriteItems",
+        json!({"TransactItems": [{"Update": {
+            "TableName": "test-table",
+            "Key": {"pk": {"S": "T"}},
+            "UpdateExpression": "SET b = :p",
+            "ExpressionAttributeValues": {":p": {"S": "x".repeat(409_600 - 3 - 1)}},
+        }}]}),
+    );
+    let resp = svc.transact_write_items(&req).unwrap();
+    assert_eq!(resp.status, StatusCode::OK);
+    let req = make_request(
+        "TransactWriteItems",
+        json!({"TransactItems": [{"Update": {
+            "TableName": "test-table",
+            "Key": {"pk": {"S": "U"}},
+            "UpdateExpression": "SET b = :p",
+            "ExpressionAttributeValues": {":p": {"S": "x".repeat(409_600 - 3)}},
+        }}]}),
+    );
+    let resp = svc.transact_write_items(&req).unwrap();
+    let b = body_json(&resp);
+    assert_eq!(b["__type"], "TransactionCanceledException");
+    assert_eq!(b["CancellationReasons"][0]["Code"], "ValidationError");
+    assert_eq!(
+        b["CancellationReasons"][0]["Message"],
+        "Item size to update has exceeded the maximum allowed size"
+    );
+}
+
+#[test]
+fn numbers_are_stored_in_canonical_form_and_range_checked() {
+    let svc = make_service();
+    create_test_table(&svc);
+    let req = make_request(
+        "PutItem",
+        json!({"TableName": "test-table", "Item": {
+            "pk": {"S": "n"},
+            "a": {"N": "+1.5E+3"},
+            "b": {"N": "0042.1200"},
+            "c": {"N": "-0"},
+            "d": {"NS": [".5", "1e2"]},
+        }}),
+    );
+    svc.put_item(&req).unwrap();
+    let req = make_request(
+        "GetItem",
+        json!({"TableName": "test-table", "Key": {"pk": {"S": "n"}}}),
+    );
+    let item = body_json(&svc.get_item(&req).unwrap())["Item"].clone();
+    assert_eq!(item["a"]["N"], "1500");
+    assert_eq!(item["b"]["N"], "42.12");
+    assert_eq!(item["c"]["N"], "0");
+    assert_eq!(item["d"]["NS"], json!(["0.5", "100"]));
+
+    for bad in [" 5", "5 ", "1 5"] {
+        let req = make_request(
+            "PutItem",
+            json!({"TableName": "test-table", "Item": {"pk": {"S": "bad"}, "v": {"N": bad}}}),
+        );
+        let err = expect_err(svc.put_item(&req));
+        assert!(err.message().contains("numeric value"), "{bad}");
+    }
+    let req = make_request(
+        "PutItem",
+        json!({"TableName": "test-table", "Item": {"pk": {"S": "bad"}, "v": {"N": "1E+126"}}}),
+    );
+    assert!(expect_err(svc.put_item(&req))
+        .message()
+        .starts_with("Number overflow"));
+
+    let req = make_request(
+        "UpdateItem",
+        json!({
+            "TableName": "test-table",
+            "Key": {"pk": {"S": "overflow"}},
+            "UpdateExpression": "SET n = :a + :b",
+            "ExpressionAttributeValues": {":a": {"N": "9.9e125"}, ":b": {"N": "9.9e125"}},
+        }),
+    );
+    assert!(expect_err(svc.update_item(&req))
+        .message()
+        .starts_with("Number overflow"));
+}
+
+#[test]
+fn transact_write_capacity_is_doubled_and_replays_as_a_read() {
+    let svc = make_service();
+    create_test_table(&svc);
+    let body = json!({
+        "ClientRequestToken": "replay-token",
+        "ReturnConsumedCapacity": "TOTAL",
+        "TransactItems": [{"Put": {
+            "TableName": "test-table",
+            "Item": {"pk": {"S": "r"}, "big": {"S": "x".repeat(1536)}},
+        }}],
+    });
+    let first = body_json(
+        &svc.transact_write_items(&make_request("TransactWriteItems", body.clone()))
+            .unwrap(),
+    );
+    assert_eq!(first["ConsumedCapacity"][0]["WriteCapacityUnits"], 4.0);
+    assert!(first["ConsumedCapacity"][0]
+        .get("ReadCapacityUnits")
+        .is_none());
+    let replay = body_json(
+        &svc.transact_write_items(&make_request("TransactWriteItems", body))
+            .unwrap(),
+    );
+    assert_eq!(replay["ConsumedCapacity"][0]["ReadCapacityUnits"], 2.0);
+    assert!(replay["ConsumedCapacity"][0]
+        .get("WriteCapacityUnits")
+        .is_none());
+}
+
+#[test]
+fn put_item_reports_every_invalid_enum_together() {
+    let svc = make_service();
+    let req = make_request(
+        "PutItem",
+        json!({
+            "TableName": "missing-table",
+            "Item": {"pk": {"S": "x"}},
+            "ReturnConsumedCapacity": "INVALID",
+            "ReturnItemCollectionMetrics": "INVALID",
+            "ReturnValues": "INVALID",
+        }),
+    );
+    let err = expect_err(svc.put_item(&req));
+    assert_eq!(err.code(), "ValidationException");
+    assert!(err.message().starts_with("3 validation errors detected: "));
+}
+
+/// Only the values an update writes are normalized. A number stored in a
+/// non-canonical spelling (written by an older build and restored from its
+/// snapshot) is left alone when the update does not touch it, so it never
+/// shows up in UPDATED_NEW/UPDATED_OLD or a stream MODIFY image as changed.
+#[test]
+fn update_item_normalizes_only_the_values_it_writes() {
+    let svc = make_service();
+    create_test_table(&svc);
+    {
+        let mut accounts = svc.state.write();
+        let state = accounts.get_or_create("123456789012");
+        let table = state.tables.get_mut("test-table").unwrap();
+        let legacy: HashMap<String, Value> = serde_json::from_value(json!({
+            "pk": {"S": "legacy"},
+            "old": {"N": "1.50"},
+        }))
+        .unwrap();
+        table.put_item_at_key(legacy);
+    }
+    let req = make_request(
+        "UpdateItem",
+        json!({
+            "TableName": "test-table",
+            "Key": {"pk": {"S": "legacy"}},
+            "UpdateExpression": "SET n = :v",
+            "ExpressionAttributeValues": {":v": {"N": "+5.0"}},
+            "ReturnValues": "UPDATED_NEW",
+        }),
+    );
+    let b = body_json(&svc.update_item(&req).unwrap());
+    assert_eq!(b["Attributes"], json!({"n": {"N": "5"}}));
+
+    let req = make_request(
+        "GetItem",
+        json!({"TableName": "test-table", "Key": {"pk": {"S": "legacy"}}}),
+    );
+    let item = body_json(&svc.get_item(&req).unwrap())["Item"].clone();
+    assert_eq!(item["old"]["N"], "1.50");
+    assert_eq!(item["n"]["N"], "5");
+
+    // Legacy AttributeUpdates values are normalized the same way.
+    let req = make_request(
+        "UpdateItem",
+        json!({
+            "TableName": "test-table",
+            "Key": {"pk": {"S": "legacy"}},
+            "AttributeUpdates": {"m": {"Value": {"N": "1e2"}, "Action": "PUT"}},
+            "ReturnValues": "UPDATED_OLD",
+        }),
+    );
+    let b = body_json(&svc.update_item(&req).unwrap());
+    assert!(b.get("Attributes").is_none());
+    let req = make_request(
+        "GetItem",
+        json!({"TableName": "test-table", "Key": {"pk": {"S": "legacy"}}}),
+    );
+    let item = body_json(&svc.get_item(&req).unwrap())["Item"].clone();
+    assert_eq!(item["m"]["N"], "100");
+    assert_eq!(item["old"]["N"], "1.50");
+}
+
+/// Without ReturnConsumedCapacity no capacity block is reported by any of
+/// the operations that only size items to build one.
+#[test]
+fn capacity_is_omitted_when_not_requested() {
+    let svc = make_service();
+    create_test_table(&svc);
+    let req = make_request(
+        "BatchWriteItem",
+        json!({"RequestItems": {"test-table": [
+            {"PutRequest": {"Item": {"pk": {"S": "a"}}}},
+            {"PutRequest": {"Item": {"pk": {"S": "b"}}}},
+        ]}}),
+    );
+    assert!(body_json(&svc.batch_write_item(&req).unwrap())
+        .get("ConsumedCapacity")
+        .is_none());
+    let req = make_request(
+        "DeleteItem",
+        json!({"TableName": "test-table", "Key": {"pk": {"S": "a"}}}),
+    );
+    assert!(body_json(&svc.delete_item(&req).unwrap())
+        .get("ConsumedCapacity")
+        .is_none());
+    let req = make_request(
+        "Query",
+        json!({
+            "TableName": "test-table",
+            "KeyConditionExpression": "pk = :p",
+            "ExpressionAttributeValues": {":p": {"S": "b"}},
+        }),
+    );
+    let b = body_json(&svc.query(&req).unwrap());
+    assert_eq!(b["Count"], 1);
+    assert!(b.get("ConsumedCapacity").is_none());
+    let req = make_request("Scan", json!({"TableName": "test-table"}));
+    assert!(body_json(&svc.scan(&req).unwrap())
+        .get("ConsumedCapacity")
+        .is_none());
+}
+
+#[tokio::test]
+async fn china_region_arns_use_the_china_partition_and_resolve_by_arn() {
+    let svc = make_service();
+    let call_cn = |action: &str, body: Value| {
+        let mut r = make_request(action, body);
+        r.region = "cn-north-1".to_string();
+        r
+    };
+    let resp = svc
+        .handle(call_cn(
+            "CreateTable",
+            json!({
+                "TableName": "cn-table",
+                "KeySchema": [{ "AttributeName": "pk", "KeyType": "HASH" }],
+                "AttributeDefinitions": [{ "AttributeName": "pk", "AttributeType": "S" }],
+                "BillingMode": "PAY_PER_REQUEST",
+                "StreamSpecification": { "StreamEnabled": true, "StreamViewType": "NEW_IMAGE" }
+            }),
+        ))
+        .await
+        .unwrap();
+    let created: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    let arn = created["TableDescription"]["TableArn"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        arn,
+        "arn:aws-cn:dynamodb:cn-north-1:123456789012:table/cn-table"
+    );
+    let stream = created["TableDescription"]["LatestStreamArn"]
+        .as_str()
+        .unwrap();
+    assert!(stream.starts_with(&format!("{arn}/stream/")), "{stream}");
+
+    // The ARN resolves wherever a TableName is accepted, and for tagging.
+    let resp = svc
+        .handle(call_cn("DescribeTable", json!({ "TableName": arn })))
+        .await
+        .unwrap();
+    let described: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(described["Table"]["TableName"], "cn-table");
+    svc.handle(call_cn(
+        "TagResource",
+        json!({ "ResourceArn": arn, "Tags": [{ "Key": "k", "Value": "v" }] }),
+    ))
+    .await
+    .unwrap();
+    let resp = svc
+        .handle(call_cn("ListTagsOfResource", json!({ "ResourceArn": arn })))
+        .await
+        .unwrap();
+    let tags: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(tags["Tags"][0]["Key"], "k");
+
+    let resp = svc
+        .handle(call_cn(
+            "CreateGlobalTable",
+            json!({ "GlobalTableName": "cn-table", "ReplicationGroup": [{ "RegionName": "cn-north-1" }] }),
+        ))
+        .await
+        .unwrap();
+    let global: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(
+        global["GlobalTableDescription"]["GlobalTableArn"],
+        "arn:aws-cn:dynamodb::123456789012:global-table/cn-table"
+    );
+}
+
+#[test]
+fn table_arn_parsers_accept_any_partition() {
+    let arn = "arn:aws-cn:dynamodb:cn-north-1:123456789012:table/T/stream/2026";
+    assert_eq!(super::helpers::resolve_table_name(arn), "T");
+    assert_eq!(
+        super::cross_account::arn_scope(arn),
+        Some(("cn-north-1", "123456789012"))
+    );
+    assert_eq!(
+        super::helpers::resolve_table_name("arn:bogus:dynamodb:r:1:table/T"),
+        "arn:bogus:dynamodb:r:1:table/T"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Table control-plane validation
+// ---------------------------------------------------------------------
+
+#[test]
+fn create_table_semantic_rejections_carry_aws_messages() {
+    let svc = make_service();
+    let base = json!({
+        "TableName": "sem-table",
+        "KeySchema": [{ "AttributeName": "pk", "KeyType": "HASH" }],
+        "AttributeDefinitions": [{ "AttributeName": "pk", "AttributeType": "S" }],
+        "BillingMode": "PAY_PER_REQUEST",
+    });
+    let reject = |patch: &dyn Fn(&mut Value)| {
+        let mut body = base.clone();
+        patch(&mut body);
+        err_message(err_of(svc.create_table(&make_request("CreateTable", body))))
+    };
+    assert_eq!(
+        reject(&|b| b["ProvisionedThroughput"] =
+            json!({"ReadCapacityUnits": 5, "WriteCapacityUnits": 5})),
+        "One or more parameter values were invalid: Neither ReadCapacityUnits nor \
+         WriteCapacityUnits can be specified when BillingMode is PAY_PER_REQUEST"
+    );
+    assert_eq!(
+        reject(&|b| b["StreamSpecification"] =
+            json!({"StreamEnabled": false, "StreamViewType": "NEW_IMAGE"})),
+        "One or more parameter values were invalid: Table is being created with a stream \
+         disabled, UpdateViewType should not be specified"
+    );
+    assert_eq!(
+        reject(&|b| b["KeySchema"] = json!([
+            { "AttributeName": "pk", "KeyType": "HASH" },
+            { "AttributeName": "pk", "KeyType": "RANGE" },
+        ])),
+        "Invalid KeySchema: Some index key attribute have no definition"
+    );
+    assert!(reject(&|b| b["LocalSecondaryIndexes"] = json!([{
+        "IndexName": "lsi1",
+        "KeySchema": [{ "AttributeName": "pk", "KeyType": "HASH" }],
+        "Projection": { "ProjectionType": "ALL" },
+    }]))
+    .contains("Table KeySchema does not have a range key"));
+    assert_eq!(
+        reject(&|b| {
+            b["AttributeDefinitions"] = json!([
+                { "AttributeName": "pk", "AttributeType": "S" },
+                { "AttributeName": "g", "AttributeType": "S" },
+            ]);
+            b["GlobalSecondaryIndexes"] = json!([{
+                "IndexName": "gsi",
+                "KeySchema": [{ "AttributeName": "g", "KeyType": "HASH" }],
+                "Projection": { "ProjectionType": "INCLUDE" },
+            }]);
+        }),
+        "One or more parameter values were invalid: ProjectionType is INCLUDE, but \
+         NonKeyAttributes is not specified"
+    );
+    assert!(reject(&|b| b["TableName"] = json!("a".repeat(256)))
+        .contains("Member must have length less than or equal to 255"));
+}
+
+fn create_provisioned_table(svc: &DynamoDbService) {
+    svc.create_table(&make_request(
+        "CreateTable",
+        json!({
+            "TableName": "prov-table",
+            "KeySchema": [{ "AttributeName": "pk", "KeyType": "HASH" }],
+            "AttributeDefinitions": [{ "AttributeName": "pk", "AttributeType": "S" }],
+            "ProvisionedThroughput": { "ReadCapacityUnits": 5, "WriteCapacityUnits": 5 },
+        }),
+    ))
+    .unwrap();
+}
+
+#[test]
+fn update_table_rejects_invalid_throughput_and_index_changes() {
+    let svc = make_service();
+    create_provisioned_table(&svc);
+    let update = |body: Value| {
+        let mut body = body;
+        body["TableName"] = json!("prov-table");
+        svc.update_table(&make_request("UpdateTable", body))
+    };
+
+    let msg = err_message(err_of(update(json!({
+        "ProvisionedThroughput": { "ReadCapacityUnits": 5, "WriteCapacityUnits": 5 },
+    }))));
+    assert!(msg.starts_with("The provisioned throughput for the table will not change."));
+    let msg = err_message(err_of(update(json!({
+        "ProvisionedThroughput": { "ReadCapacityUnits": 0, "WriteCapacityUnits": 5 },
+    }))));
+    assert!(
+        msg.contains("'provisionedThroughput.readCapacityUnits'"),
+        "{msg}"
+    );
+    let msg = err_message(err_of(update(json!({
+        "BillingMode": "PAY_PER_REQUEST",
+        "ProvisionedThroughput": { "ReadCapacityUnits": 6, "WriteCapacityUnits": 6 },
+    }))));
+    assert!(msg.contains("Neither ReadCapacityUnits nor WriteCapacityUnits"));
+
+    // A new GSI's keys must be defined in the request itself.
+    let msg = err_message(err_of(update(json!({
+        "GlobalSecondaryIndexUpdates": [{ "Create": {
+            "IndexName": "by-pk",
+            "KeySchema": [{ "AttributeName": "pk", "KeyType": "HASH" }],
+            "Projection": { "ProjectionType": "ALL" },
+            "ProvisionedThroughput": { "ReadCapacityUnits": 1, "WriteCapacityUnits": 1 },
+        }}],
+    }))));
+    assert!(
+        msg.contains("Some index key attributes are not defined"),
+        "{msg}"
+    );
+    let err = err_of(update(json!({
+        "GlobalSecondaryIndexUpdates": [{ "Delete": { "IndexName": "missing" } }],
+    })));
+    assert_eq!(err.code(), "ResourceNotFoundException");
+
+    update(json!({
+        "AttributeDefinitions": [{ "AttributeName": "g", "AttributeType": "S" }],
+        "GlobalSecondaryIndexUpdates": [{ "Create": {
+            "IndexName": "gsi",
+            "KeySchema": [{ "AttributeName": "g", "KeyType": "HASH" }],
+            "Projection": { "ProjectionType": "ALL" },
+            "ProvisionedThroughput": { "ReadCapacityUnits": 1, "WriteCapacityUnits": 1 },
+        }}],
+    }))
+    .unwrap();
+    let msg = err_message(err_of(update(json!({
+        "AttributeDefinitions": [{ "AttributeName": "g", "AttributeType": "S" }],
+        "GlobalSecondaryIndexUpdates": [{ "Create": {
+            "IndexName": "gsi",
+            "KeySchema": [{ "AttributeName": "g", "KeyType": "HASH" }],
+            "Projection": { "ProjectionType": "ALL" },
+            "ProvisionedThroughput": { "ReadCapacityUnits": 1, "WriteCapacityUnits": 1 },
+        }}],
+    }))));
+    assert_eq!(msg, "Attempting to create an index which already exists");
+}
+
+#[test]
+fn ttl_and_tagging_validate_their_inputs() {
+    let svc = make_service();
+    create_test_table(&svc);
+    let err = err_of(svc.update_time_to_live(&make_request(
+        "UpdateTimeToLive",
+        json!({
+            "TableName": "test-table",
+            "TimeToLiveSpecification": { "AttributeName": "", "Enabled": true },
+        }),
+    )));
+    assert!(err_message(err).contains("'timeToLiveSpecification.attributeName'"));
+
+    let err = err_of(svc.tag_resource(&make_request(
+        "TagResource",
+        json!({ "ResourceArn": "not-a-valid-arn", "Tags": [{ "Key": "k", "Value": "v" }] }),
+    )));
+    assert_eq!(err.code(), "ValidationException");
+}
+
+#[tokio::test]
+async fn a_missing_table_in_another_account_is_access_denied() {
+    let svc = make_service();
+    let err = svc
+        .handle(make_request(
+            "ListTagsOfResource",
+            json!({ "ResourceArn": "arn:aws:dynamodb:us-east-1:000000000000:table/nope" }),
+        ))
+        .await
+        .err()
+        .expect("a foreign table without a policy cannot be read");
+    assert_eq!(err.code(), "AccessDeniedException");
+}
+
+#[test]
+fn index_reads_reject_unknown_indexes_and_foreign_start_keys() {
+    let svc = make_service();
+    svc.create_table(&make_request(
+        "CreateTable",
+        json!({
+            "TableName": "idx-table",
+            "KeySchema": [{ "AttributeName": "pk", "KeyType": "HASH" }],
+            "AttributeDefinitions": [
+                { "AttributeName": "pk", "AttributeType": "S" },
+                { "AttributeName": "g", "AttributeType": "S" },
+            ],
+            "BillingMode": "PAY_PER_REQUEST",
+            "GlobalSecondaryIndexes": [{
+                "IndexName": "gsi",
+                "KeySchema": [{ "AttributeName": "g", "KeyType": "HASH" }],
+                "Projection": { "ProjectionType": "ALL" },
+            }],
+        }),
+    ))
+    .unwrap();
+    let msg = err_message(err_of(svc.scan(&make_request(
+        "Scan",
+        json!({ "TableName": "idx-table", "IndexName": "nope" }),
+    ))));
+    assert_eq!(msg, "The table does not have the specified index: nope");
+    let msg = err_message(err_of(svc.query(&make_request(
+        "Query",
+        json!({
+            "TableName": "idx-table",
+            "IndexName": "gsi",
+            "KeyConditionExpression": "g = :g",
+            "ExpressionAttributeValues": { ":g": { "S": "x" } },
+            "ExclusiveStartKey": { "pk": { "S": "x" } },
+        }),
+    ))));
+    assert!(
+        msg.starts_with("The provided starting key is invalid"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn vector_index_arns_take_the_table_partition() {
+    let svc = make_service();
+    let mut req = make_request(
+        "CreateTable",
+        json!({
+            "TableName": "cn-vec",
+            "KeySchema": [{ "AttributeName": "pk", "KeyType": "HASH" }],
+            "AttributeDefinitions": [{ "AttributeName": "pk", "AttributeType": "S" }],
+            "BillingMode": "PAY_PER_REQUEST",
+            "VectorIndexes": [{
+                "IndexName": "vix",
+                "VectorAttribute": { "AttributeName": "embedding" },
+                "Dimensions": 2,
+                "DistanceFunction": "COSINE",
+                "Projection": { "ProjectionType": "ALL" },
+            }],
+        }),
+    );
+    req.region = "cn-north-1".to_string();
+    let body = body_json(&svc.create_table(&req).unwrap());
+    assert_eq!(
+        body["TableDescription"]["VectorIndexes"][0]["IndexArn"],
+        "arn:aws-cn:dynamodb:cn-north-1:123456789012:table/cn-vec/index/vix"
+    );
+}
+
+#[test]
+fn update_table_keeps_vector_tables_on_demand_and_serialises_index_builds() {
+    let svc = make_service();
+    create_vector_table(&svc, "COSINE");
+    let update = |body: Value| {
+        let mut body = body;
+        body["TableName"] = json!("vec-table");
+        svc.update_table(&make_request("UpdateTable", body))
+    };
+    let msg = err_message(err_of(update(json!({
+        "BillingMode": "PROVISIONED",
+        "ProvisionedThroughput": { "ReadCapacityUnits": 5, "WriteCapacityUnits": 5 },
+    }))));
+    assert!(msg.contains("Vector indexes are only supported for PAY_PER_REQUEST tables"));
+
+    update(json!({
+        "VectorIndexUpdates": [{ "Create": {
+            "IndexName": "online",
+            "VectorAttribute": { "AttributeName": "other" },
+            "Dimensions": 4,
+            "DistanceFunction": "COSINE",
+            "Projection": { "ProjectionType": "KEYS_ONLY" },
+        }}],
+    }))
+    .unwrap();
+    let gsi_create = json!({
+        "AttributeDefinitions": [{ "AttributeName": "g", "AttributeType": "S" }],
+        "GlobalSecondaryIndexUpdates": [{ "Create": {
+            "IndexName": "gsi",
+            "KeySchema": [{ "AttributeName": "g", "KeyType": "HASH" }],
+            "Projection": { "ProjectionType": "ALL" },
+        }}],
+    });
+    // While the vector index allocates: no second online index, and no other
+    // change to the UPDATING table.
+    assert_eq!(
+        err_of(update(gsi_create.clone())).code(),
+        "LimitExceededException"
+    );
+    let err = err_of(update(json!({ "DeletionProtectionEnabled": true })));
+    assert_eq!(err.code(), "ResourceInUseException");
+    assert!(err_message(err).contains("Table is being updated"));
+
+    // Backfilling: the table is ACTIVE and takes other changes, but the
+    // online index action is still held.
+    age_vector_index(
+        &svc,
+        "vec-table",
+        "online",
+        crate::state::VECTOR_INDEX_ALLOCATION_MS,
+    );
+    update(json!({ "DeletionProtectionEnabled": false })).unwrap();
+    assert_eq!(
+        err_of(update(gsi_create.clone())).code(),
+        "LimitExceededException"
+    );
+
+    age_vector_index(
+        &svc,
+        "vec-table",
+        "online",
+        crate::state::VECTOR_INDEX_BACKFILL_MS,
+    );
+    update(gsi_create).unwrap();
+}
+
+#[test]
+fn a_search_schema_element_missing_a_member_is_rejected() {
+    let svc = make_service();
+    let err = err_of(svc.create_table(&make_request(
+        "CreateTable",
+        json!({
+            "TableName": "vec-missing",
+            "KeySchema": [{ "AttributeName": "pk", "KeyType": "HASH" }],
+            "AttributeDefinitions": [
+                { "AttributeName": "pk", "AttributeType": "S" },
+                { "AttributeName": "tenant", "AttributeType": "S" },
+            ],
+            "BillingMode": "PAY_PER_REQUEST",
+            "VectorIndexes": [{
+                "IndexName": "vix",
+                "VectorAttribute": { "AttributeName": "embedding" },
+                "Dimensions": 3,
+                "DistanceFunction": "COSINE",
+                "SearchSchema": [{ "AttributeName": "tenant" }],
+                "Projection": { "ProjectionType": "ALL" },
+            }],
+        }),
+    )));
+    assert_eq!(
+        err_message(err),
+        "1 validation error detected: Value null at \
+         'vectorIndexes.1.member.searchSchema.1.member.searchSchemaElementType' failed to \
+         satisfy constraint: Member must not be null"
+    );
+}
+
+/// A KMS hook that counts key resolutions, and checks that none happens while
+/// the DynamoDB state lock is held.
+struct CountingKmsHook(std::sync::atomic::AtomicUsize, SharedDynamoDbState);
+
+impl fakecloud_core::delivery::KmsHook for CountingKmsHook {
+    fn encrypt(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &[u8],
+        _: &str,
+        _: HashMap<String, String>,
+    ) -> Result<String, String> {
+        Ok(String::new())
+    }
+
+    fn decrypt(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: HashMap<String, String>,
+    ) -> Result<Vec<u8>, String> {
+        Ok(Vec::new())
+    }
+
+    fn resolve_key_arn(&self, _: &str, _: &str, _: &str, _: &str) -> Result<String, String> {
+        assert!(
+            self.1.try_write().is_some(),
+            "the KMS key must be resolved with the DynamoDB lock released"
+        );
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok("arn:aws:kms:us-east-1:123456789012:key/managed".to_string())
+    }
+}
+
+#[test]
+fn sse_key_is_resolved_only_for_a_request_that_succeeds() {
+    let svc = make_service();
+    let hook = Arc::new(CountingKmsHook(
+        std::sync::atomic::AtomicUsize::new(0),
+        svc.state.clone(),
+    ));
+    let svc = svc.with_kms_hook(hook.clone());
+    let resolutions = || hook.0.load(std::sync::atomic::Ordering::SeqCst);
+    create_test_table(&svc);
+    let create = || {
+        svc.create_table(&make_request(
+            "CreateTable",
+            json!({
+                "TableName": "test-table",
+                "KeySchema": [{ "AttributeName": "pk", "KeyType": "HASH" }],
+                "AttributeDefinitions": [{ "AttributeName": "pk", "AttributeType": "S" }],
+                "BillingMode": "PAY_PER_REQUEST",
+                "SSESpecification": { "Enabled": true },
+            }),
+        ))
+    };
+    // The table already exists: rejected, and no key is touched.
+    assert_eq!(err_of(create()).code(), "ResourceInUseException");
+    let err = err_of(svc.update_table(&make_request(
+        "UpdateTable",
+        json!({ "TableName": "missing-table", "SSESpecification": { "Enabled": true } }),
+    )));
+    assert_eq!(err.code(), "ResourceNotFoundException");
+    assert_eq!(resolutions(), 0);
+
+    svc.update_table(&make_request(
+        "UpdateTable",
+        json!({ "TableName": "test-table", "SSESpecification": { "Enabled": true } }),
+    ))
+    .unwrap();
+    assert_eq!(resolutions(), 1);
+    svc.create_table(&make_request(
+        "CreateTable",
+        json!({
+            "TableName": "sse-created",
+            "KeySchema": [{ "AttributeName": "pk", "KeyType": "HASH" }],
+            "AttributeDefinitions": [{ "AttributeName": "pk", "AttributeType": "S" }],
+            "BillingMode": "PAY_PER_REQUEST",
+            "SSESpecification": { "Enabled": true },
+        }),
+    ))
+    .unwrap();
+    assert_eq!(resolutions(), 2);
+    assert_eq!(
+        describe(&svc, "test-table")["SSEDescription"]["KMSMasterKeyArn"],
+        "arn:aws:kms:us-east-1:123456789012:key/managed"
+    );
+}
+
+#[test]
+fn a_wrong_typed_member_fails_to_deserialize_and_changes_nothing() {
+    let svc = make_service();
+    create_vector_table(&svc, "COSINE");
+    let before = describe(&svc, "vec-table");
+    let err = err_of(svc.update_table(&make_request(
+        "UpdateTable",
+        json!({
+            "TableName": "vec-table",
+            "OnDemandThroughput": { "MaxReadRequestUnits": 10 },
+            "AttributeDefinitions": [{ "AttributeName": "cat", "AttributeType": "S" }],
+            "VectorIndexUpdates": [{ "Create": {
+                "IndexName": "typed",
+                "VectorAttribute": { "AttributeName": "other" },
+                "Dimensions": 2,
+                "DistanceFunction": "COSINE",
+                "SearchSchema": [{ "AttributeName": 7, "SearchSchemaElementType": "HASH" }],
+                "Projection": { "ProjectionType": "ALL" },
+            }}],
+        }),
+    )));
+    assert_eq!(err.code(), "SerializationException");
+    assert_eq!(
+        err_message(err),
+        "NUMBER_VALUE can not be converted to a String"
+    );
+    let after = describe(&svc, "vec-table");
+    assert_eq!(
+        before["AttributeDefinitions"],
+        after["AttributeDefinitions"]
+    );
+    assert_eq!(
+        before.get("OnDemandThroughput"),
+        after.get("OnDemandThroughput")
+    );
+    assert_eq!(before["VectorIndexes"], after["VectorIndexes"]);
+
+    // Deserialization fails before the table name is validated, so a bad,
+    // or absent, name does not change the answer.
+    for name in [json!("typed-table"), json!("ab"), Value::Null] {
+        let mut body = json!({
+            "KeySchema": [{ "AttributeName": "pk", "KeyType": true }],
+            "AttributeDefinitions": [{ "AttributeName": "pk", "AttributeType": "S" }],
+            "BillingMode": "PAY_PER_REQUEST",
+        });
+        if !name.is_null() {
+            body["TableName"] = name.clone();
+        }
+        let err = err_of(svc.create_table(&make_request("CreateTable", body)));
+        assert_eq!(err.code(), "SerializationException", "{name}");
+    }
+}
+
+#[test]
+fn partiql_writes_validate_vector_attributes() {
+    let svc = make_service();
+    create_vector_table(&svc, "COSINE");
+    let run = |statement: &str| {
+        svc.execute_statement(&make_request(
+            "ExecuteStatement",
+            json!({ "Statement": statement }),
+        ))
+    };
+    let msg = err_message(err_of(run(
+        "INSERT INTO \"vec-table\" VALUE {'pk': 'a', 'embedding': [1, 2, 3]}",
+    )));
+    assert!(
+        msg.contains("Invalid size for parameter embedding, Expected: 2, Actual: 3"),
+        "{msg}"
+    );
+
+    // An accepted INSERT reports the vector index's write under INDEXES.
+    let inserted = body_json(
+        &svc.execute_statement(&make_request(
+            "ExecuteStatement",
+            json!({
+                "Statement": "INSERT INTO \"vec-table\" VALUE {'pk': 'a', 'embedding': [1, 2]}",
+                "ReturnConsumedCapacity": "INDEXES",
+            }),
+        ))
+        .unwrap(),
+    );
+    assert_eq!(
+        inserted["ConsumedCapacity"]["VectorIndexes"]["embedding-index"]["VectorWriteRequestBytes"],
+        1024.0
+    );
+    let msg = err_message(err_of(run(
+        "UPDATE \"vec-table\" SET embedding = [1, 2, 3] WHERE pk = 'a'",
+    )));
+    assert!(
+        msg.contains("Invalid size for parameter embedding, Expected: 2, Actual: 3"),
+        "{msg}"
+    );
+    // The rejected UPDATE left the item as it was.
+    let item = &body_json(
+        &svc.get_item(&make_request(
+            "GetItem",
+            json!({ "TableName": "vec-table", "Key": { "pk": { "S": "a" } } }),
+        ))
+        .unwrap(),
+    )["Item"];
+    assert_eq!(item["embedding"]["L"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn transact_put_reports_a_bad_number_before_the_vector_shape() {
+    let svc = make_service();
+    create_vector_table(&svc, "COSINE");
+    let item = json!({
+        "pk": { "S": "a" },
+        "embedding": { "L": [{ "N": "abc" }, { "N": "1" }] },
+    });
+    let put = err_of(svc.put_item(&make_request(
+        "PutItem",
+        json!({ "TableName": "vec-table", "Item": item.clone() }),
+    )));
+    let transact = svc
+        .handle(make_request(
+            "TransactWriteItems",
+            json!({ "TransactItems": [{ "Put": { "TableName": "vec-table", "Item": item } }] }),
+        ))
+        .await
+        .err()
+        .expect("the malformed number is rejected");
+    assert_eq!(transact.code(), put.code());
+    assert_eq!(err_message(transact), err_message(put));
 }

@@ -16,9 +16,11 @@ impl RdsService {
         use serde_json::json;
         let snapshot_id = required_query_param(request, "DBClusterSnapshotIdentifier")?;
         let cluster_id = required_query_param(request, "DBClusterIdentifier")?;
-        let arn = format!(
-            "arn:aws:rds:{}:{}:cluster-snapshot:{}",
-            request.region, request.account_id, snapshot_id
+        let arn = rds_arn(
+            &request.region,
+            &request.account_id,
+            "cluster-snapshot",
+            &snapshot_id,
         );
 
         // A duplicate identifier is the declared AlreadyExists fault, not
@@ -255,10 +257,7 @@ impl RdsService {
                     },
                 )
             })?;
-        let arn = format!(
-            "arn:aws:rds:{}:{}:cluster:{}",
-            request.region, request.account_id, target
-        );
+        let arn = rds_arn(&request.region, &request.account_id, "cluster", &target);
 
         let mut accounts = self.state.write();
         // Resolved before the mutable borrow the cluster insert needs.
@@ -451,10 +450,7 @@ impl RdsService {
                     "Source DB cluster identifier not provided.",
                 )
             })?;
-        let arn = format!(
-            "arn:aws:rds:{}:{}:cluster:{}",
-            request.region, request.account_id, target
-        );
+        let arn = rds_arn(&request.region, &request.account_id, "cluster", &target);
 
         let writer_info = {
             let accounts = self.state.read();

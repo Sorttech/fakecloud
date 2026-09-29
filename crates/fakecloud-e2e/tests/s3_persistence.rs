@@ -4,10 +4,12 @@ use std::time::Duration;
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
-    BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, CorsConfiguration, CorsRule,
+    BucketCannedAcl, BucketVersioningStatus, CompletedMultipartUpload, CompletedPart,
+    CorsConfiguration, CorsRule, CreateBucketConfiguration, ObjectCannedAcl,
     ObjectLockConfiguration, ObjectLockEnabled, ObjectLockLegalHold, ObjectLockLegalHoldStatus,
-    ServerSideEncryption, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration,
-    ServerSideEncryptionRule, StorageClass, Tag, Tagging, VersioningConfiguration,
+    ObjectOwnership, ServerSideEncryption, ServerSideEncryptionByDefault,
+    ServerSideEncryptionConfiguration, ServerSideEncryptionRule, StorageClass, Tag, Tagging,
+    VersioningConfiguration,
 };
 use helpers::{run_until_exit, TestServer};
 use sha2::{Digest, Sha256};
@@ -1262,4 +1264,730 @@ async fn persistence_body_cache_small_and_large_objects() {
         let got = get.body.collect().await.unwrap().into_bytes();
         assert_eq!(sha256(&got), sha256(expected), "body mismatch for {}", key);
     }
+}
+
+#[tokio::test]
+async fn persistence_create_time_acl_object_lock_and_ownership_round_trip() {
+    // The canned ACL, object-lock enablement, and object-ownership rule a
+    // bucket is CREATED with live in subresources, not in BucketMeta, so
+    // without an explicit write at create time they were all gone after a
+    // restart -- object-lock retention silently stopped being enforced, and a
+    // public-read bucket came back owner-only.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut server = TestServer::start_persistent(tmp.path()).await;
+    let client = server.s3_client().await;
+
+    client
+        .create_bucket()
+        .bucket("create-subres")
+        .acl(BucketCannedAcl::PublicRead)
+        .object_lock_enabled_for_bucket(true)
+        .object_ownership(ObjectOwnership::ObjectWriter)
+        .send()
+        .await
+        .unwrap();
+
+    server.restart().await;
+    let client = server.s3_client().await;
+
+    let acl = client
+        .get_bucket_acl()
+        .bucket("create-subres")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        acl.grants().iter().any(|g| {
+            g.grantee()
+                .and_then(|gr| gr.uri())
+                .is_some_and(|uri| uri.contains("AllUsers"))
+        }),
+        "create-time public-read grant lost across restart: {:?}",
+        acl.grants()
+    );
+
+    let lock = client
+        .get_object_lock_configuration()
+        .bucket("create-subres")
+        .send()
+        .await;
+    assert!(
+        lock.is_ok(),
+        "create-time object lock lost across restart: {:?}",
+        lock.err()
+    );
+
+    let ownership = client
+        .get_bucket_ownership_controls()
+        .bucket("create-subres")
+        .send()
+        .await
+        .expect("create-time ownership controls lost across restart");
+    assert_eq!(
+        ownership
+            .ownership_controls()
+            .and_then(|oc| oc.rules().first())
+            .map(|r| r.object_ownership()),
+        Some(&ObjectOwnership::ObjectWriter),
+    );
+}
+
+#[tokio::test]
+async fn persistence_plain_create_clears_orphan_create_time_subresources() {
+    // A create that failed partway leaves sidecars in a directory the loader
+    // skips (no meta.toml). A later plain create of that name must not adopt
+    // them.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut server = TestServer::start_persistent(tmp.path()).await;
+    let _client = server.s3_client().await;
+
+    let orphan_dir = tmp.path().join("s3").join("buckets").join("orphan-subres");
+    std::fs::create_dir_all(&orphan_dir).unwrap();
+    std::fs::write(
+        orphan_dir.join("ownership.toml"),
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+    )
+    .unwrap();
+    std::fs::write(
+        orphan_dir.join("object_lock.toml"),
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>",
+    )
+    .unwrap();
+    // Subresources the create path never writes must be cleared too -- the
+    // whole directory is stale, not just the three create-time sidecars.
+    std::fs::write(
+        orphan_dir.join("policy.toml"),
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::orphan-subres/*"}]}"#,
+    )
+    .unwrap();
+    std::fs::write(orphan_dir.join("versioning.toml"), "Enabled").unwrap();
+
+    server.restart().await;
+    let client = server.s3_client().await;
+    client
+        .create_bucket()
+        .bucket("orphan-subres")
+        .send()
+        .await
+        .unwrap();
+
+    server.restart().await;
+    let client = server.s3_client().await;
+
+    let ownership = client
+        .get_bucket_ownership_controls()
+        .bucket("orphan-subres")
+        .send()
+        .await;
+    assert!(
+        ownership.is_err(),
+        "plain create inherited an orphan ownership rule"
+    );
+    let lock = client
+        .get_object_lock_configuration()
+        .bucket("orphan-subres")
+        .send()
+        .await;
+    assert!(
+        lock.is_err(),
+        "plain create inherited an orphan object-lock configuration"
+    );
+    let policy = client
+        .get_bucket_policy()
+        .bucket("orphan-subres")
+        .send()
+        .await;
+    assert!(policy.is_err(), "plain create inherited an orphan policy");
+    let versioning = client
+        .get_bucket_versioning()
+        .bucket("orphan-subres")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        versioning.status().is_none(),
+        "plain create inherited orphan versioning state: {:?}",
+        versioning.status()
+    );
+}
+
+#[tokio::test]
+async fn persistence_create_bucket_grant_headers_round_trip() {
+    // CreateBucket honors the x-amz-grant-* headers as well as the canned
+    // x-amz-acl, and the resulting ACL is an explicit one, so it gets an
+    // acl.toml and survives a restart.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut server = TestServer::start_persistent(tmp.path()).await;
+    let client = server.s3_client().await;
+
+    client
+        .create_bucket()
+        .bucket("grant-hdr")
+        .grant_read("uri=http://acs.amazonaws.com/groups/global/AllUsers")
+        .send()
+        .await
+        .unwrap();
+
+    let before = client
+        .get_bucket_acl()
+        .bucket("grant-hdr")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        before.grants().iter().any(|g| {
+            g.permission().map(|p| p.as_str()) == Some("READ")
+                && g.grantee()
+                    .and_then(|gr| gr.uri())
+                    .is_some_and(|uri| uri.contains("AllUsers"))
+        }),
+        "grant header ignored at create: {:?}",
+        before.grants()
+    );
+
+    server.restart().await;
+    let client = server.s3_client().await;
+
+    let after = client
+        .get_bucket_acl()
+        .bucket("grant-hdr")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        after.grants().iter().any(|g| {
+            g.permission().map(|p| p.as_str()) == Some("READ")
+                && g.grantee()
+                    .and_then(|gr| gr.uri())
+                    .is_some_and(|uri| uri.contains("AllUsers"))
+        }),
+        "create-time grant headers lost across restart: {:?}",
+        after.grants()
+    );
+}
+
+#[tokio::test]
+async fn persistence_create_bucket_tags_survive_restart() {
+    // Tags supplied through CreateBucketConfiguration go to the same Tags
+    // subresource PutBucketTagging writes, so they must reload after a restart.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut server = TestServer::start_persistent(tmp.path()).await;
+    let client = server.s3_client().await;
+
+    client
+        .create_bucket()
+        .bucket("create-tag-bucket")
+        .create_bucket_configuration(
+            CreateBucketConfiguration::builder()
+                .tags(Tag::builder().key("team").value("a").build().unwrap())
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    server.restart().await;
+    let client = server.s3_client().await;
+
+    let tags = client
+        .get_bucket_tagging()
+        .bucket("create-tag-bucket")
+        .send()
+        .await
+        .unwrap();
+    let ts = tags.tag_set();
+    assert!(
+        ts.iter().any(|t| t.key() == "team" && t.value() == "a"),
+        "create-time tags lost across restart: {ts:?}"
+    );
+}
+
+#[tokio::test]
+async fn persistence_untagged_create_clears_an_orphan_tag_file() {
+    // A create that fails after writing its tag set (or dies between the tag
+    // write and meta.toml) leaves a tags.toml in a directory with no meta.toml.
+    // The loader skips such a directory, but a later untagged CreateBucket of
+    // the same name must not adopt that never-committed tag set on the next
+    // restart.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut server = TestServer::start_persistent(tmp.path()).await;
+    let client = server.s3_client().await;
+
+    // Simulate the half-written create: a bucket directory holding only tags.
+    let orphan_dir = tmp.path().join("s3").join("buckets").join("orphan-tags");
+    std::fs::create_dir_all(&orphan_dir).unwrap();
+    std::fs::write(orphan_dir.join("tags.toml"), "[tags]\nteam = \"ghost\"\n").unwrap();
+
+    server.restart().await;
+    let client2 = server.s3_client().await;
+    // No meta.toml, so the loader skipped it and no bucket exists.
+    client2
+        .head_bucket()
+        .bucket("orphan-tags")
+        .send()
+        .await
+        .expect_err("orphan directory must not resurrect the bucket");
+    drop(client);
+
+    client2
+        .create_bucket()
+        .bucket("orphan-tags")
+        .send()
+        .await
+        .unwrap();
+
+    server.restart().await;
+    let client3 = server.s3_client().await;
+
+    let err = client3
+        .get_bucket_tagging()
+        .bucket("orphan-tags")
+        .send()
+        .await
+        .expect_err("untagged create must not inherit the orphan tag set");
+    let msg = format!("{err:?}");
+    assert!(msg.contains("NoSuchTagSet"), "unexpected error: {msg}");
+}
+
+#[tokio::test]
+async fn persistence_create_after_reset_reuses_the_name() {
+    // `/_fakecloud/reset/s3` clears in-memory state and deliberately leaves the
+    // store alone, so every bucket ever created still has a readable meta.toml
+    // on disk afterwards. Re-creating those names has to keep working -- gating
+    // the "unloaded state" refusal on files existing would brick all of them.
+    let tmp = tempfile::tempdir().unwrap();
+    let server = TestServer::start_persistent(tmp.path()).await;
+    let client = server.s3_client().await;
+
+    client
+        .create_bucket()
+        .bucket("reset-reuse")
+        .send()
+        .await
+        .unwrap();
+    client
+        .put_object()
+        .bucket("reset-reuse")
+        .key("k.txt")
+        .body(ByteStream::from_static(b"v"))
+        .send()
+        .await
+        .unwrap();
+    // The bucket needs a stored configuration for the assertion below to mean
+    // anything: without a tag set there is nothing that could be adopted.
+    client
+        .put_bucket_tagging()
+        .bucket("reset-reuse")
+        .tagging(
+            Tagging::builder()
+                .tag_set(Tag::builder().key("era").value("before").build().unwrap())
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    let status = reqwest::Client::new()
+        .post(format!("{}/_fakecloud/reset/s3", server.endpoint()))
+        .send()
+        .await
+        .expect("reset should respond")
+        .status();
+    assert!(status.is_success(), "reset failed: {status}");
+
+    // The name is free again as far as the running server is concerned.
+    client
+        .create_bucket()
+        .bucket("reset-reuse")
+        .send()
+        .await
+        .expect("re-creating a bucket after a reset must succeed");
+
+    // The re-created bucket is empty, and stays empty across a restart. Leaving
+    // the old directory in place meant the caller saw an empty bucket now and
+    // the previous incarnation's objects came back on the next load.
+    let list = client
+        .list_objects_v2()
+        .bucket("reset-reuse")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        list.contents().is_empty(),
+        "re-created bucket is not empty: {:?}",
+        list.contents()
+    );
+
+    let mut server = server;
+    server.restart().await;
+    let client = server.s3_client().await;
+
+    let list = client
+        .list_objects_v2()
+        .bucket("reset-reuse")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        list.contents().is_empty(),
+        "the previous bucket's objects came back after a restart: {:?}",
+        list.contents()
+    );
+    // Nor does its stored configuration carry over.
+    let tags = client
+        .get_bucket_tagging()
+        .bucket("reset-reuse")
+        .send()
+        .await;
+    assert!(
+        tags.is_err(),
+        "the pre-reset tag set was adopted by the re-created bucket"
+    );
+}
+
+#[tokio::test]
+async fn persistence_recreating_a_load_refused_bucket_is_declined_not_destructive() {
+    // The loader skips a bucket it cannot fully read and logs a warning: the data
+    // is on disk and recoverable by fixing the one bad file. Such a bucket is
+    // absent from ListBuckets, so its name looks free -- and a create now clears
+    // the directory, so it has to be refused rather than becoming the thing that
+    // destroys the data.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut server = TestServer::start_persistent(tmp.path()).await;
+    let client = server.s3_client().await;
+
+    client
+        .create_bucket()
+        .bucket("refused")
+        .send()
+        .await
+        .unwrap();
+    for key in ["keep.txt", "corrupt.txt"] {
+        client
+            .put_object()
+            .bucket("refused")
+            .key(key)
+            .body(ByteStream::from_static(b"precious"))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    let objects_dir = tmp
+        .path()
+        .join("s3")
+        .join("buckets")
+        .join("refused")
+        .join("objects");
+    let corrupt = objects_dir.join("corrupt.txt").join("null.toml");
+    assert!(corrupt.exists(), "expected {corrupt:?}");
+    std::fs::write(&corrupt, "not valid toml = = =").unwrap();
+
+    server.restart().await;
+    let client = server.s3_client().await;
+
+    let list = client.list_buckets().send().await.unwrap();
+    assert!(
+        !list.buckets().iter().any(|b| b.name() == Some("refused")),
+        "expected the unreadable bucket to be skipped on load"
+    );
+
+    let err = client
+        .create_bucket()
+        .bucket("refused")
+        .send()
+        .await
+        .expect_err("the name must be refused while the data is still there");
+    assert!(
+        format!("{err:?}").contains("BucketAlreadyExists"),
+        "unexpected error: {err:?}"
+    );
+    assert!(
+        objects_dir.join("keep.txt").join("null.bin").exists(),
+        "the refused create destroyed the objects it was protecting"
+    );
+
+    // Nor does DeleteBucket discard it. There is deliberately no API verb that
+    // does: delete could check neither emptiness (the objects are exactly what
+    // could not be read) nor ownership (the metadata carrying it is what
+    // failed), so a refused name answers NoSuchBucket like any other name the
+    // server cannot see, and the data stays for the operator to repair.
+    let err = client
+        .delete_bucket()
+        .bucket("refused")
+        .send()
+        .await
+        .expect_err("a refused bucket must not be discardable through the API");
+    assert!(
+        format!("{err:?}").contains("NoSuchBucket"),
+        "unexpected error: {err:?}"
+    );
+    assert!(
+        objects_dir.join("keep.txt").join("null.bin").exists(),
+        "DeleteBucket destroyed the objects the refusal was protecting"
+    );
+
+    // Repairing the one bad file brings the whole bucket back.
+    std::fs::remove_dir_all(objects_dir.join("corrupt.txt")).unwrap();
+    server.restart().await;
+    let client = server.s3_client().await;
+    let body = client
+        .get_object()
+        .bucket("refused")
+        .key("keep.txt")
+        .send()
+        .await
+        .expect("the repaired bucket should load")
+        .body
+        .collect()
+        .await
+        .unwrap()
+        .into_bytes();
+    assert_eq!(&body[..], b"precious");
+}
+
+#[tokio::test]
+async fn persistence_a_bucket_skipped_for_a_corrupt_sidecar_is_refused_not_cleared() {
+    // Two layers can skip a bucket at load. The store skips one whose OBJECTS it
+    // cannot read. A layer above parses the bucket's own sidecars, and a bad
+    // `tags.toml` skips the bucket there -- with the store reporting no problem
+    // at all, since the objects read fine. Only that layer's report keeps the
+    // name from looking free, and a create clears the whole directory, so
+    // without it the create deletes objects that were never unreadable.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut server = TestServer::start_persistent(tmp.path()).await;
+    let client = server.s3_client().await;
+
+    client
+        .create_bucket()
+        .bucket("sidecar")
+        .send()
+        .await
+        .unwrap();
+    client
+        .put_object()
+        .bucket("sidecar")
+        .key("keep.txt")
+        .body(ByteStream::from_static(b"precious"))
+        .send()
+        .await
+        .unwrap();
+    client
+        .put_bucket_tagging()
+        .bucket("sidecar")
+        .tagging(
+            aws_sdk_s3::types::Tagging::builder()
+                .tag_set(
+                    aws_sdk_s3::types::Tag::builder()
+                        .key("team")
+                        .value("a")
+                        .build()
+                        .unwrap(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    let bucket_dir = tmp.path().join("s3").join("buckets").join("sidecar");
+    let tags = bucket_dir.join("tags.toml");
+    assert!(tags.exists(), "expected {tags:?}");
+    std::fs::write(&tags, "not valid toml = = =").unwrap();
+
+    server.restart().await;
+    let client = server.s3_client().await;
+
+    let list = client.list_buckets().send().await.unwrap();
+    assert!(
+        !list.buckets().iter().any(|b| b.name() == Some("sidecar")),
+        "expected the bucket to be skipped on load"
+    );
+
+    let err = client
+        .create_bucket()
+        .bucket("sidecar")
+        .send()
+        .await
+        .expect_err("the name must be refused while the objects are still there");
+    assert!(
+        format!("{err:?}").contains("BucketAlreadyExists"),
+        "unexpected error: {err:?}"
+    );
+    assert!(
+        bucket_dir
+            .join("objects")
+            .join("keep.txt")
+            .join("null.bin")
+            .exists(),
+        "the create destroyed objects the loader had no trouble reading"
+    );
+
+    // Repairing the one bad file brings the bucket back, objects included.
+    std::fs::remove_file(&tags).unwrap();
+    server.restart().await;
+    let client = server.s3_client().await;
+    let body = client
+        .get_object()
+        .bucket("sidecar")
+        .key("keep.txt")
+        .send()
+        .await
+        .expect("the repaired bucket should load")
+        .body
+        .collect()
+        .await
+        .unwrap()
+        .into_bytes();
+    assert_eq!(&body[..], b"precious");
+}
+
+#[tokio::test]
+async fn persistence_removing_a_refused_directory_frees_the_name_without_a_restart() {
+    // The refusal is recorded at load and never re-probed, so it has to be
+    // paired with "is the data still there". An operator who follows the error
+    // text by deleting the directory outright would otherwise find the name
+    // refused for the rest of the process lifetime, told to repair something
+    // that no longer exists.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut server = TestServer::start_persistent(tmp.path()).await;
+    let client = server.s3_client().await;
+
+    client.create_bucket().bucket("gone").send().await.unwrap();
+    client
+        .put_object()
+        .bucket("gone")
+        .key("k.txt")
+        .body(ByteStream::from_static(b"v"))
+        .send()
+        .await
+        .unwrap();
+    let bucket_dir = tmp.path().join("s3").join("buckets").join("gone");
+    std::fs::write(
+        bucket_dir.join("objects").join("k.txt").join("null.toml"),
+        "not valid toml = = =",
+    )
+    .unwrap();
+
+    server.restart().await;
+    let client = server.s3_client().await;
+    let err = client
+        .create_bucket()
+        .bucket("gone")
+        .send()
+        .await
+        .expect_err("create must be refused while the data is there");
+    assert!(
+        format!("{err:?}").contains("BucketAlreadyExists"),
+        "unexpected error: {err:?}"
+    );
+
+    // Same running server, no restart.
+    std::fs::remove_dir_all(&bucket_dir).unwrap();
+    client
+        .create_bucket()
+        .bucket("gone")
+        .send()
+        .await
+        .expect("the name is free once the data is gone, restart or not");
+
+    // ...and that create has to leave no refusal behind. The refusal is recorded
+    // at load and consulted long afterwards, so a name whose unreadable data is
+    // gone must stop being refused -- otherwise the next reset refuses a create
+    // for a bucket that reads perfectly.
+    client
+        .put_object()
+        .bucket("gone")
+        .key("fresh.txt")
+        .body(ByteStream::from_static(b"fresh"))
+        .send()
+        .await
+        .unwrap();
+    let status = reqwest::Client::new()
+        .post(format!("{}/_fakecloud/reset/s3", server.endpoint()))
+        .send()
+        .await
+        .expect("reset should respond")
+        .status();
+    assert!(status.is_success(), "reset failed: {status}");
+    let client = server.s3_client().await;
+    client
+        .create_bucket()
+        .bucket("gone")
+        .send()
+        .await
+        .expect("a name that now holds a healthy bucket must not still be refused");
+}
+
+#[tokio::test]
+async fn persistence_put_object_acl_survives_restart() {
+    // PutObjectAcl writes the object's meta sidecar, and that snapshot copies
+    // acl_grants -- so snapshotting before applying the new grants persists the
+    // OLD ACL and leaves the new one memory-only, which only a restart reveals.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut server = TestServer::start_persistent(tmp.path()).await;
+    let client = server.s3_client().await;
+
+    client
+        .create_bucket()
+        .bucket("obj-acl-persist")
+        .send()
+        .await
+        .unwrap();
+    client
+        .put_object()
+        .bucket("obj-acl-persist")
+        .key("k.txt")
+        .body(ByteStream::from_static(b"v"))
+        .send()
+        .await
+        .unwrap();
+
+    client
+        .put_object_acl()
+        .bucket("obj-acl-persist")
+        .key("k.txt")
+        .acl(ObjectCannedAcl::PublicRead)
+        .send()
+        .await
+        .unwrap();
+
+    let before = client
+        .get_object_acl()
+        .bucket("obj-acl-persist")
+        .key("k.txt")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        before.grants().iter().any(|g| {
+            g.grantee()
+                .and_then(|gr| gr.uri())
+                .is_some_and(|u| u.contains("AllUsers"))
+        }),
+        "public-read not applied: {:?}",
+        before.grants()
+    );
+
+    server.restart().await;
+    let client = server.s3_client().await;
+
+    let after = client
+        .get_object_acl()
+        .bucket("obj-acl-persist")
+        .key("k.txt")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        after.grants().iter().any(|g| {
+            g.grantee()
+                .and_then(|gr| gr.uri())
+                .is_some_and(|u| u.contains("AllUsers"))
+        }),
+        "object ACL reverted across restart: {:?}",
+        after.grants()
+    );
 }
