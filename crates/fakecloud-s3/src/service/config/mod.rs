@@ -386,6 +386,24 @@ impl S3Service {
         }
     }
 
+    /// The canonical user the bucket's ACL is owned by, which is who "bucket
+    /// owner full control" means. Usually the caller, but not always: a bucket
+    /// persisted by one account is hydrated into the configured default account
+    /// on restart while keeping its own stored `acl_owner_id`.
+    ///
+    /// `None` when the bucket is not in memory. That is not an error here, and
+    /// callers may fall back to the caller's own id: every consumer of this pairs
+    /// it with [`S3Service::bucket_owner_enforced`], which returns `false` for
+    /// exactly the same two misses, so the fallback value is never the one an
+    /// answer turns on -- and the missing bucket is reported by the operation
+    /// itself.
+    pub(super) fn bucket_acl_owner_id(&self, account_id: &str, bucket: &str) -> Option<String> {
+        let accts = self.state.read();
+        let state = accts.get(account_id)?;
+        let b = state.buckets.get(bucket)?;
+        Some(b.acl_owner_id.clone())
+    }
+
     /// Returns true when the bucket has
     /// `ObjectOwnership=BucketOwnerEnforced` set in its
     /// `OwnershipControls` configuration. Under that mode AWS

@@ -3885,26 +3885,45 @@ fn bucket_owner_full_control_is_accepted_when_ownership_disables_acls() {
     // Assert what it resolves to, not that the function echoed back the header
     // it was handed: the whole point is that the owner ends up with full
     // control and nobody else appears.
+    // Resolved against the bucket's own ACL owner, which is what the write paths
+    // pass and therefore what ends up stored.
     let grants = allowed
-        .grants_for("123456789012")
+        .grants_for("owner")
         .expect("the canned value resolves to grants");
     assert_eq!(grants.len(), 1, "{grants:?}");
     assert_eq!(grants[0].permission, "FULL_CONTROL");
     assert_eq!(grants[0].grantee_type, "CanonicalUser");
-    assert_eq!(grants[0].grantee_id.as_deref(), Some("123456789012"));
+    assert_eq!(grants[0].grantee_id.as_deref(), Some("owner"));
 
     // The exception is about what the ACL GRANTS, not how it is spelled: AWS
-    // accepts "an equivalent form of this ACL" too, so an explicit
-    // full-control grant to the owner is accepted just like the canned value.
+    // accepts "an equivalent form of this ACL" too, so an explicit full-control
+    // grant to the BUCKET OWNER is accepted just like the canned value.
+    //
+    // `seed_bucket` owns this bucket as "owner" while the caller is
+    // 123456789012, which is the case that distinguishes the two. They coincide
+    // for a bucket the caller created; they diverge for one persisted by another
+    // account and hydrated into the default account on restart.
     svc.resolve_write_acl_headers("123456789012", "bofc", &{
         let mut h = HeaderMap::new();
-        h.insert(
-            "x-amz-grant-full-control",
-            "id=123456789012".parse().unwrap(),
-        );
+        h.insert("x-amz-grant-full-control", "id=owner".parse().unwrap());
         h
     })
-    .expect("an owner-only grant is the equivalent form and must be accepted");
+    .expect("full control to the bucket owner is the equivalent form");
+
+    // ...and a grant to anyone else is not, even the caller. Such a request
+    // would leave an object on a BucketOwnerEnforced bucket whose ACL gives the
+    // bucket owner nothing, which is the state that setting exists to prevent.
+    let err = svc
+        .resolve_write_acl_headers("123456789012", "bofc", &{
+            let mut h = HeaderMap::new();
+            h.insert(
+                "x-amz-grant-full-control",
+                "id=123456789012".parse().unwrap(),
+            );
+            h
+        })
+        .expect_err("full control to a non-owner is not the equivalent form");
+    assert_eq!(err.code(), "AccessControlListNotSupported", "{err:?}");
 
     // Every other ACL is refused. The model's wording is narrow -- such a
     // bucket "only accept[s] PUT requests that don't specify an ACL or PUT
@@ -3988,28 +4007,31 @@ async fn put_object_honors_the_bucket_owner_enforced_rules_end_to_end() {
 }
 
 #[tokio::test]
-async fn a_blank_acl_header_is_treated_as_no_acl() {
-    // A present-but-blank header is what a client sends for an unset config
-    // field; the `x-amz-grant-*` family already treats it as absent, and
-    // 400-ing on the canned one made that inconsistent.
+async fn a_blank_acl_header_is_rejected_on_every_acl_setting_path() {
+    // `""` is not a member of `ObjectCannedACL`, and every path that accepts a
+    // canned ACL answers 400 for it. Treating it as "no ACL asked for" on the
+    // object-write paths alone made one operation disagree with four; the
+    // `x-amz-grant-*` family's blank rule is a different case, since an empty
+    // value there names no grantee rather than naming an invalid ACL.
     let svc = make_service();
     seed_bucket(&svc, "blank-acl");
 
-    let resolved = svc
+    let err = svc
         .resolve_write_acl_headers("123456789012", "blank-acl", &{
             let mut h = HeaderMap::new();
             h.insert("x-amz-acl", "".parse().unwrap());
             h
         })
-        .expect("a blank canned ACL asks for nothing, so it is not an error");
-    assert_eq!(resolved.canned, None);
-    assert!(resolved.grants_for("123456789012").is_none());
+        .expect_err("a blank canned ACL is not a canned ACL");
+    assert_eq!(err.code(), "InvalidArgument", "{err:?}");
 
     let mut req = make_request(Method::PUT, "/blank-acl/k", &[], b"body");
     req.headers.insert("x-amz-acl", "".parse().unwrap());
-    svc.put_object("123456789012", &req, "blank-acl", "k")
-        .await
-        .expect("a blank canned ACL must not fail the write");
+    let err = match svc.put_object("123456789012", &req, "blank-acl", "k").await {
+        Ok(_) => panic!("a blank canned ACL must not be accepted"),
+        Err(e) => e,
+    };
+    assert_eq!(err.code(), "InvalidArgument", "{err:?}");
 }
 
 #[test]
