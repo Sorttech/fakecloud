@@ -237,7 +237,7 @@ impl PipesService {
     }
 
     fn arn(&self, account: &str, region: &str, name: &str) -> String {
-        Arn::new("pipes", region, account, &format!("pipe/{name}")).to_string()
+        Arn::regional("pipes", region, account, &format!("pipe/{name}")).to_string()
     }
 
     /// Map an incoming restJson1 request to its operation name from the URI
@@ -1898,5 +1898,58 @@ mod tests {
             PipesService::resolve_action(&make_request(Method::GET, "/v1/pipes")),
             Some("ListPipes")
         );
+    }
+
+    #[tokio::test]
+    async fn china_region_pipe_arn_uses_the_aws_cn_partition() {
+        use parking_lot::RwLock;
+        let svc = PipesService::new(Arc::new(RwLock::new(crate::state::PipesAccounts::new())));
+        let in_china = |method: Method, path: &str, body: Value| {
+            let mut req = make_request(method, path);
+            req.region = "cn-north-1".to_string();
+            req.body = serde_json::to_vec(&body).unwrap().into();
+            req
+        };
+        let resp = svc
+            .handle(in_china(
+                Method::POST,
+                "/v1/pipes/cnp",
+                json!({
+                    "Source": "arn:aws-cn:sqs:cn-north-1:123456789012:src",
+                    "Target": "arn:aws-cn:sqs:cn-north-1:123456789012:dst",
+                    "RoleArn": "arn:aws-cn:iam::123456789012:role/p"
+                }),
+            ))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        let arn = "arn:aws-cn:pipes:cn-north-1:123456789012:pipe/cnp";
+        assert_eq!(v["Arn"], arn);
+        let described = svc
+            .handle(in_china(Method::GET, "/v1/pipes/cnp", json!({})))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(described.body.expect_bytes()).unwrap();
+        assert_eq!(v["Arn"], arn);
+        assert_eq!(v["SourceParameters"]["SqsQueueParameters"]["BatchSize"], 10);
+
+        let encoded = arn.replace(':', "%3A").replace('/', "%2F");
+        svc.handle(in_china(
+            Method::POST,
+            &format!("/tags/{encoded}"),
+            json!({ "tags": { "env": "cn" } }),
+        ))
+        .await
+        .unwrap();
+        let resp = svc
+            .handle(in_china(
+                Method::GET,
+                &format!("/tags/{encoded}"),
+                json!({}),
+            ))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        assert_eq!(v["tags"]["env"], "cn");
     }
 }

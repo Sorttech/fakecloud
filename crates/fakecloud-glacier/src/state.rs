@@ -15,6 +15,7 @@ use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::multi_account::{AccountState, MultiAccountState};
 
 pub const GLACIER_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
@@ -174,5 +175,22 @@ pub struct GlacierSnapshot {
 
 /// The ARN of a vault: `arn:aws:glacier:<region>:<account>:vaults/<name>`.
 pub fn vault_arn(region: &str, account_id: &str, name: &str) -> String {
-    format!("arn:aws:glacier:{region}:{account_id}:vaults/{name}")
+    Arn::regional("glacier", region, account_id, &format!("vaults/{name}")).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vault_arn_takes_the_region_partition() {
+        assert_eq!(
+            vault_arn("us-east-1", "123456789012", "v"),
+            "arn:aws:glacier:us-east-1:123456789012:vaults/v"
+        );
+        assert_eq!(
+            vault_arn("cn-north-1", "123456789012", "v"),
+            "arn:aws-cn:glacier:cn-north-1:123456789012:vaults/v"
+        );
+    }
 }

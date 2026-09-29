@@ -1,3 +1,4 @@
+pub mod arns;
 pub(crate) mod service;
 pub(crate) mod state;
 

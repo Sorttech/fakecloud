@@ -139,9 +139,13 @@ impl IamService {
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
 
-        let arn = Arn::global("iam", &state.account_id, &format!("saml-provider/{name}"))
-            .with_partition(fakecloud_aws::arn::partition_for(&req.region))
-            .to_string();
+        let arn = Arn::global_in(
+            &req.region,
+            "iam",
+            &state.account_id,
+            &format!("saml-provider/{name}"),
+        )
+        .to_string();
 
         // Names are unique per account; a second create must not replace the
         // existing provider's metadata, tags and creation date.
@@ -185,7 +189,7 @@ impl IamService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let arn = required_param(&req.query_params, "SAMLProviderArn")?;
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         let provider = state.saml_providers.get(&arn).ok_or_else(|| {
@@ -245,7 +249,7 @@ impl IamService {
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         let members: String = state
@@ -405,7 +409,7 @@ impl IamService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let arn = required_param(&req.query_params, "OpenIDConnectProviderArn")?;
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         let provider = state.oidc_providers.get(&arn).ok_or_else(|| {
@@ -480,7 +484,7 @@ impl IamService {
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         let members: String = state
@@ -650,7 +654,7 @@ impl IamService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let arn = required_param(&req.query_params, "OpenIDConnectProviderArn")?;
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         let provider = state.oidc_providers.get(&arn).ok_or_else(|| {
@@ -752,7 +756,7 @@ impl IamService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let name = required_param(&req.query_params, "ServerCertificateName")?;
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         let cert = state.server_certificates.get(&name).ok_or_else(|| {
@@ -833,7 +837,7 @@ impl IamService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let _ = super::validate_list_pagination(req)?;
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         let members: String = state

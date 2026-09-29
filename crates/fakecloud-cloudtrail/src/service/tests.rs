@@ -724,3 +724,35 @@ fn search_sample_queries_filters_by_phrase() {
     );
     assert!(none["SearchResults"].as_array().unwrap().is_empty());
 }
+
+#[test]
+fn china_region_trail_arns_use_the_aws_cn_partition() {
+    let s = svc();
+    let in_china = |action: &str, body: Value| {
+        let mut r = req(action, body);
+        r.region = "cn-north-1".into();
+        r
+    };
+    let call_cn = |action: &str, body: Value| -> Value {
+        let resp = dispatch(&s, &in_china(action, body)).expect("op ok");
+        serde_json::from_slice(resp.body.expect_bytes()).unwrap()
+    };
+    let created = call_cn(
+        "CreateTrail",
+        json!({ "Name": "cn-t", "S3BucketName": "b", "SnsTopicName": "topic" }),
+    );
+    let trail_arn = "arn:aws-cn:cloudtrail:cn-north-1:000000000000:trail/cn-t";
+    assert_eq!(created["TrailARN"], json!(trail_arn));
+    assert_eq!(
+        created["SnsTopicARN"],
+        json!("arn:aws-cn:sns:cn-north-1:000000000000:topic")
+    );
+    let got = call_cn("GetTrail", json!({ "Name": trail_arn }));
+    assert_eq!(got["Trail"]["Name"], json!("cn-t"));
+
+    let eds = call_cn("CreateEventDataStore", json!({ "Name": "cn-eds" }));
+    assert!(eds["EventDataStoreArn"]
+        .as_str()
+        .unwrap()
+        .starts_with("arn:aws-cn:cloudtrail:cn-north-1:000000000000:eventdatastore/"));
+}

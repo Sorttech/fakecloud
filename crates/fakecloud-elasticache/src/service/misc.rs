@@ -673,9 +673,11 @@ impl ElastiCacheService {
                     format!("ReservedCacheNodesOffering {offering_id} not found."),
                 )
             })?;
-        let arn = format!(
-            "arn:aws:elasticache:{}:{}:reserved-instance:{}",
-            request.region, request.account_id, id
+        let arn = elasticache_arn(
+            &request.region,
+            &request.account_id,
+            "reserved-instance",
+            &id,
         );
         let node = ReservedCacheNode {
             reserved_cache_node_id: id.clone(),

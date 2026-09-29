@@ -30,7 +30,7 @@ impl DynamoDbResourcePolicyProvider {
 /// The account, table name and sub-resource path of a DynamoDB table-scoped
 /// ARN: `arn:aws:dynamodb:REGION:ACCOUNT:table/NAME[/KIND/ID]`.
 fn parse(arn: &str) -> Option<(&str, &str, Option<&str>)> {
-    let rest = arn.strip_prefix("arn:aws:dynamodb:")?;
+    let rest = fakecloud_aws::arn::arn_resource(arn, "dynamodb")?;
     let (scope, path) = rest.split_once(":table/")?;
     let account = scope.split(':').nth(1).filter(|a| !a.is_empty())?;
     let (name, sub) = match path.split_once('/') {

@@ -22,10 +22,7 @@ impl ElastiCacheService {
                 format!("CacheSecurityGroup {name} already exists."),
             ));
         }
-        let arn = format!(
-            "arn:aws:elasticache:{}:{}:securitygroup:{}",
-            request.region, request.account_id, name
-        );
+        let arn = elasticache_arn(&request.region, &request.account_id, "securitygroup", &name);
         let sg = crate::state::CacheSecurityGroup {
             cache_security_group_name: name.clone(),
             description,

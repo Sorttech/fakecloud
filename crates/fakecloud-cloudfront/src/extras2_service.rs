@@ -53,9 +53,10 @@ impl CloudFrontService {
             ));
         }
         let id = generate_id_with_prefix("CG");
-        let arn = format!(
-            "arn:aws:cloudfront::{}:connection-group/{}",
-            DEFAULT_ACCOUNT, id
+        let arn = crate::service::cloudfront_arn(
+            &req.region,
+            DEFAULT_ACCOUNT,
+            &format!("connection-group/{id}"),
         );
         let routing_endpoint = format!("{}.cloudfront.net", id.to_lowercase());
         let etag = generate_id_with_prefix("E");
@@ -381,6 +382,7 @@ impl CloudFrontService {
 
     pub(crate) fn get_managed_certificate_details(
         &self,
+        req: &AwsRequest,
         route: &Route,
     ) -> Result<AwsResponse, AwsServiceError> {
         let id = route_id(route, "ManagedCertificate")?;
@@ -401,10 +403,16 @@ impl CloudFrontService {
         body.push_str(&format!("<ManagedCertificateDetails xmlns=\"{NS}\">"));
         body.push_str(&format!(
             "<CertificateArn>{}</CertificateArn>",
-            esc(&format!(
-                "arn:aws:acm:us-east-1:{}:certificate/{}",
-                DEFAULT_ACCOUNT, id
-            ))
+            esc(&{
+                let partition = fakecloud_aws::arn::partition_for(&req.region);
+                fakecloud_aws::arn::Arn::regional(
+                    "acm",
+                    fakecloud_aws::arn::implicit_global_region(partition),
+                    DEFAULT_ACCOUNT,
+                    &format!("certificate/{id}"),
+                )
+                .to_string()
+            })
         ));
         body.push_str("<CertificateStatus>issued</CertificateStatus>");
         body.push_str("<ValidationTokenHost>cloudfront</ValidationTokenHost>");

@@ -41,11 +41,7 @@ pub fn append_events(
         .entry(group_name.to_string())
         .or_insert_with(|| LogGroup {
             name: group_name.to_string(),
-            arn: format!(
-                "arn:aws:logs:{region}:{account_id}:log-group:{group_name}",
-                region = region,
-                account_id = account_id,
-            ),
+            arn: crate::state::log_group_arn(region, account_id, group_name),
             creation_time: now,
             retention_in_days: None,
             kms_key_id: None,

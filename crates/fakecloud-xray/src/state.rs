@@ -90,7 +90,10 @@ impl XrayData {
     /// The built-in rule exists in every region, so re-point it instead of
     /// freezing whichever region happened to create the account.
     pub(crate) fn ensure_default_rule(&mut self, region: &str, account: &str) {
-        let want = format!("arn:aws:xray:{region}:{account}:sampling-rule/{DEFAULT_SAMPLING_RULE}");
+        let partition = fakecloud_aws::arn::partition_for(region);
+        let want = format!(
+            "arn:{partition}:xray:{region}:{account}:sampling-rule/{DEFAULT_SAMPLING_RULE}"
+        );
         if let Some(existing) = self.sampling_rules.get_mut(DEFAULT_SAMPLING_RULE) {
             if let Some(rule) = existing.get_mut("SamplingRule") {
                 if rule.get("RuleARN").and_then(|v| v.as_str()) != Some(want.as_str()) {

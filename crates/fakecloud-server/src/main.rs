@@ -2622,7 +2622,7 @@ async fn main() {
                             if let Some(mut accounts) = snapshot.accounts {
                                 let account_count = accounts.account_count();
                                 for (_, state) in accounts.iter_mut() {
-                                    state.build_key_indexes();
+                                    state.rebuild_derived_state();
                                 }
                                 *dynamodb_state_for_register.write() = accounts;
                                 tracing::info!(
@@ -2630,7 +2630,7 @@ async fn main() {
                                     "loaded dynamodb persistence snapshot (multi-account)",
                                 );
                             } else if let Some(mut single_state) = snapshot.state {
-                                single_state.build_key_indexes();
+                                single_state.rebuild_derived_state();
                                 let table_count = single_state.tables.len();
                                 let account_id = single_state.account_id.clone();
                                 let mut mas = dynamodb_state_for_register.write();

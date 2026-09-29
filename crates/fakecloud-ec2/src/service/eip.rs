@@ -5,8 +5,8 @@ use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use crate::service::Ec2Service;
 use crate::service_helpers::{
-    filter_value_matches, gen_id, indexed_list, not_found, parse_filters, require, validate_enum,
-    validate_max_results, Filter,
+    ec2_arn, filter_value_matches, gen_id, indexed_list, not_found, parse_filters, require,
+    validate_enum, validate_max_results, Filter,
 };
 use crate::state::{Ec2State, ElasticIp, KeyPair, PlacementGroup, Tag};
 
@@ -656,10 +656,7 @@ fn pg_xml(p: &PlacementGroup, tags: &[Tag], owner: &str, region: &str) -> String
         ec2_elem("strategy", &p.strategy),
         ec2_elem(
             "groupArn",
-            &format!(
-                "arn:aws:ec2:{region}:{owner}:placement-group/{}",
-                p.group_name
-            )
+            &ec2_arn(region, owner, &format!("placement-group/{}", p.group_name))
         ),
     );
     if let Some(n) = p.partition_count {

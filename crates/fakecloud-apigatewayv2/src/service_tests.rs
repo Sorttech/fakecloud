@@ -3653,3 +3653,109 @@ async fn update_portal_product_preserves_untouched_fields() {
     assert_eq!(b["description"], "the original description");
     assert_eq!(b["tags"]["owner"], "team-a");
 }
+
+#[test]
+fn china_region_arn_helpers_use_the_aws_cn_partition() {
+    assert_eq!(
+        api_resource_arn("cn-north-1", "abc123"),
+        "arn:aws-cn:apigateway:cn-north-1::/apis/abc123"
+    );
+    assert_eq!(
+        issuer_to_pool_arn(
+            "123456789012",
+            "cn-north-1",
+            "https://cognito-idp.cn-north-1.amazonaws.com/cn-north-1_abc"
+        )
+        .as_deref(),
+        Some("arn:aws-cn:cognito-idp:cn-north-1:123456789012:userpool/cn-north-1_abc")
+    );
+    assert_eq!(
+        extract_lambda_arn(
+            "arn:aws-cn:apigateway:cn-north-1:lambda:path/2015-03-31/functions/arn:aws-cn:lambda:cn-north-1:123456789012:function:auth/invocations"
+        )
+        .as_deref(),
+        Some("arn:aws-cn:lambda:cn-north-1:123456789012:function:auth")
+    );
+    assert!(is_lambda_arn(
+        "arn:aws-cn:lambda:cn-north-1:123456789012:function:fn"
+    ));
+    let mut req = make_request(Method::GET, "/prod/pets", "");
+    req.region = "cn-north-1".to_string();
+    assert_eq!(
+        build_method_arn(&req, "abc123", "prod"),
+        "arn:aws-cn:execute-api:cn-north-1:123456789012:abc123/prod/GET/pets"
+    );
+}
+
+#[tokio::test]
+async fn china_region_aws_proxy_dispatches_to_aws_cn_queue_and_topic() {
+    for (uri, path) in [
+        (
+            "arn:aws-cn:sqs:cn-north-1:123456789012:my-queue",
+            "/prod/messages",
+        ),
+        (
+            "arn:aws-cn:sns:cn-north-1:123456789012:my-topic",
+            "/prod/messages",
+        ),
+        (
+            "arn:aws-cn:states:cn-north-1:123456789012:stateMachine:my-sm",
+            "/prod/messages",
+        ),
+    ] {
+        let delivery = Arc::new(fakecloud_core::delivery::DeliveryBus::new());
+        let svc = ApiGatewayV2Service::new(make_state()).with_delivery(delivery);
+        let in_china = |method: Method, path: &str, body: &str| {
+            let mut r = make_request(method, path, body);
+            r.region = "cn-north-1".to_string();
+            r
+        };
+        let resp = svc
+            .handle(in_china(
+                Method::POST,
+                "/v2/apis",
+                &serde_json::json!({"name": "cn-api", "protocolType": "HTTP"}).to_string(),
+            ))
+            .await
+            .unwrap();
+        let api_id = body_json(&resp)["apiId"].as_str().unwrap().to_string();
+        let resp = svc
+            .handle(in_china(
+                Method::POST,
+                &format!("/v2/apis/{api_id}/integrations"),
+                &serde_json::json!({"integrationType": "AWS_PROXY", "integrationUri": uri})
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+        let integration_id = body_json(&resp)["integrationId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        svc.handle(in_china(
+            Method::POST,
+            &format!("/v2/apis/{api_id}/routes"),
+            &serde_json::json!({
+                "routeKey": "POST /messages",
+                "target": format!("integrations/{integration_id}"),
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+        svc.handle(in_china(
+            Method::POST,
+            &format!("/v2/apis/{api_id}/stages"),
+            &serde_json::json!({"stageName": "prod"}).to_string(),
+        ))
+        .await
+        .unwrap();
+
+        let resp = svc
+            .handle(in_china(Method::POST, path, "hello"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status, StatusCode::OK, "{uri}");
+        assert_eq!(body_json(&resp)["statusCode"], 200, "{uri}");
+    }
+}

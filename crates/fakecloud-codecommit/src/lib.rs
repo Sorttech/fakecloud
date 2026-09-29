@@ -22,6 +22,7 @@ pub(crate) mod service;
 pub(crate) mod state;
 mod validate;
 
+pub use codecommit_helpers::repo_arn;
 pub use service::{CodeCommitService, CODECOMMIT_ACTIONS};
 pub use state::{
     CodeCommitSnapshot, CodeCommitState, SharedCodeCommitState, CODECOMMIT_SNAPSHOT_SCHEMA_VERSION,

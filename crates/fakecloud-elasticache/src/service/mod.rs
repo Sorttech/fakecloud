@@ -13,13 +13,14 @@ use fakecloud_s3::{memory_body, S3Object, SharedS3State};
 
 use crate::runtime::ElastiCacheRuntime;
 use crate::state::{
-    default_engine_versions, default_parameters_for_family, CacheCluster, CacheEngineVersion,
-    CacheParameterGroup, CacheSnapshot, CacheSubnetGroup, ElastiCacheSnapshot, ElastiCacheState,
-    ElastiCacheUser, ElastiCacheUserGroup, EngineDefaultParameter, GlobalReplicationGroup,
-    GlobalReplicationGroupMember, LogDeliveryConfiguration, RecurringCharge, ReplicationGroup,
-    ReservedCacheNode, ReservedCacheNodesOffering, ServerlessCache, ServerlessCacheDataStorage,
-    ServerlessCacheEcpuPerSecond, ServerlessCacheEndpoint, ServerlessCacheSnapshot,
-    ServerlessCacheUsageLimits, SharedElastiCacheState, ELASTICACHE_SNAPSHOT_SCHEMA_VERSION,
+    default_engine_versions, default_parameters_for_family, elasticache_arn, CacheCluster,
+    CacheEngineVersion, CacheParameterGroup, CacheSnapshot, CacheSubnetGroup, ElastiCacheSnapshot,
+    ElastiCacheState, ElastiCacheUser, ElastiCacheUserGroup, EngineDefaultParameter,
+    GlobalReplicationGroup, GlobalReplicationGroupMember, LogDeliveryConfiguration,
+    RecurringCharge, ReplicationGroup, ReservedCacheNode, ReservedCacheNodesOffering,
+    ServerlessCache, ServerlessCacheDataStorage, ServerlessCacheEcpuPerSecond,
+    ServerlessCacheEndpoint, ServerlessCacheSnapshot, ServerlessCacheUsageLimits,
+    SharedElastiCacheState, ELASTICACHE_SNAPSHOT_SCHEMA_VERSION,
 };
 
 const ELASTICACHE_NS: &str = "http://elasticache.amazonaws.com/doc/2015-02-02/";

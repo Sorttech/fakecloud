@@ -394,14 +394,16 @@ pub(super) async fn aws_direct_integration(
     // or `path/...` and can carry embedded `:` (e.g. Lambda ARNs). Naive
     // `split(':').collect()` truncated those at the first colon and
     // mis-routed the integration.
-    let parts: Vec<&str> = uri.splitn(6, ':').collect();
-    if parts.len() < 6 || parts[0] != "arn" || parts[1] != "aws" || parts[2] != "apigateway" {
+    let parts: Vec<&str> = fakecloud_aws::arn::arn_resource(uri, "apigateway")
+        .map(|rest| rest.splitn(3, ':').collect())
+        .unwrap_or_default();
+    if parts.len() < 3 {
         return Err(bad_gateway(format!(
             "AWS integration uri not in expected ARN format: {uri}"
         )));
     }
-    let target_service = parts[4];
-    let action_or_path = parts[5];
+    let target_service = parts[1];
+    let action_or_path = parts[2];
 
     let target = registry.get(target_service).ok_or_else(|| {
         bad_gateway(format!(

@@ -32,14 +32,15 @@ use super::partiql_parse::{
     ArithOp, CmpOp, Expr, OrderBy, Path, PathSegment, Projection, Returning, Source, Statement,
     UpdateOp,
 };
+use super::{
+    build_capacity, check_put_item_size, check_update_item_size, item_size, item_write_consumed,
+    normalize_item_numbers, normalize_value_numbers, read_units, CapacitySplit, Consumed,
+};
 use crate::state::{
     attribute_type_and_value, AttributeValue, DynamoTable, Projection as IndexProjection, RowKey,
 };
 
 type Item = HashMap<String, AttributeValue>;
-
-/// DynamoDB's item size ceiling.
-pub(crate) const MAX_ITEM_BYTES: usize = 409_600;
 
 /// The data one page of a read evaluates at most.
 const MAX_PAGE_BYTES: usize = 1024 * 1024;
@@ -75,96 +76,84 @@ impl ExecOptions<'_> {
     }
 }
 
-/// Capacity one statement consumed, by arm.
+/// Capacity one statement consumed, by arm, and whether it was a read.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Capacity {
     pub read: bool,
-    pub table: f64,
-    pub gsi: BTreeMap<String, f64>,
-    pub lsi: BTreeMap<String, f64>,
+    pub consumed: Consumed,
 }
 
 impl Capacity {
-    pub(crate) fn total(&self) -> f64 {
-        self.table + self.gsi.values().sum::<f64>() + self.lsi.values().sum::<f64>()
-    }
-
-    fn scale(&mut self, factor: f64) {
-        self.table *= factor;
-        for v in self.gsi.values_mut().chain(self.lsi.values_mut()) {
-            *v *= factor;
+    fn read(consumed: Consumed) -> Self {
+        Capacity {
+            read: true,
+            consumed,
         }
     }
 
-    /// Fold another statement's capacity on the same table into this one.
-    pub(crate) fn add(&mut self, other: &Capacity) {
-        self.table += other.table;
-        for (k, v) in &other.gsi {
-            *self.gsi.entry(k.clone()).or_default() += v;
-        }
-        for (k, v) in &other.lsi {
-            *self.lsi.entry(k.clone()).or_default() += v;
+    fn write(consumed: Consumed) -> Self {
+        Capacity {
+            read: false,
+            consumed,
         }
     }
 
     /// The `ConsumedCapacity` block for this capacity. `split` adds the
     /// read/write breakdown the transactional APIs report.
     pub(crate) fn to_json(&self, mode: &str, table_name: &str, split: bool) -> Value {
-        let empty = Capacity::default();
+        let empty = Consumed::default();
         if self.read {
-            capacity_json(mode, table_name, self, &empty, split)
+            capacity_json(mode, table_name, &self.consumed, &empty, split)
         } else {
-            capacity_json(mode, table_name, &empty, self, split)
+            capacity_json(mode, table_name, &empty, &self.consumed, split)
         }
     }
 }
 
-/// The `ConsumedCapacity` block for a table's read and write units, each arm
-/// summing both; `split` adds the read/write breakdown.
+/// The `ConsumedCapacity` block for a table's read and write units. A table
+/// only read or only written is reported by the shared builder; one both
+/// read and written (a transaction's condition check beside its write) sums
+/// the two in every arm, and `split` reports each as what it was.
 pub(crate) fn capacity_json(
     mode: &str,
     table_name: &str,
-    reads: &Capacity,
-    writes: &Capacity,
+    reads: &Consumed,
+    writes: &Consumed,
     split: bool,
 ) -> Value {
-    if mode != "TOTAL" && mode != "INDEXES" {
-        return Value::Null;
+    let split_as = |kind| if split { kind } else { CapacitySplit::None };
+    if writes.total() == 0.0 {
+        return build_capacity(mode, table_name, reads, split_as(CapacitySplit::Read));
     }
-    let arm = |r: f64, w: f64| {
-        let mut v = json!({ "CapacityUnits": r + w });
-        if split {
+    if reads.total() == 0.0 {
+        return build_capacity(mode, table_name, writes, split_as(CapacitySplit::Write));
+    }
+    let mut both = reads.clone();
+    both.add(writes);
+    let mut cc = build_capacity(mode, table_name, &both, CapacitySplit::None);
+    if split {
+        let mark = |arm: &mut Value, r: f64, w: f64| {
             if r > 0.0 {
-                v["ReadCapacityUnits"] = json!(r);
+                arm["ReadCapacityUnits"] = json!(r);
             }
             if w > 0.0 {
-                v["WriteCapacityUnits"] = json!(w);
+                arm["WriteCapacityUnits"] = json!(w);
             }
+        };
+        mark(&mut cc, reads.total(), writes.total());
+        if let Some(arm) = cc.get_mut("Table") {
+            mark(arm, reads.table, writes.table);
         }
-        v
-    };
-    let arms = |a: &BTreeMap<String, f64>, b: &BTreeMap<String, f64>| -> Option<Value> {
-        let names: std::collections::BTreeSet<&String> = a.keys().chain(b.keys()).collect();
-        (!names.is_empty()).then(|| {
-            names
-                .into_iter()
-                .map(|n| {
-                    let get = |m: &BTreeMap<String, f64>| m.get(n).copied().unwrap_or(0.0);
-                    (n.clone(), arm(get(a), get(b)))
-                })
-                .collect::<serde_json::Map<_, _>>()
-                .into()
-        })
-    };
-    let mut cc = arm(reads.total(), writes.total());
-    cc["TableName"] = json!(table_name);
-    if mode == "INDEXES" {
-        cc["Table"] = arm(reads.table, writes.table);
-        if let Some(g) = arms(&reads.gsi, &writes.gsi) {
-            cc["GlobalSecondaryIndexes"] = g;
-        }
-        if let Some(l) = arms(&reads.lsi, &writes.lsi) {
-            cc["LocalSecondaryIndexes"] = l;
+        for (group, r, w) in [
+            ("GlobalSecondaryIndexes", &reads.gsi, &writes.gsi),
+            ("LocalSecondaryIndexes", &reads.lsi, &writes.lsi),
+        ] {
+            if let Some(map) = cc.get_mut(group).and_then(Value::as_object_mut) {
+                for (name, arm) in map.iter_mut() {
+                    let get = |m: &BTreeMap<String, f64>| m.get(name).copied().unwrap_or(0.0);
+                    mark(arm, get(r), get(w));
+                }
+            }
         }
     }
     cc
@@ -278,10 +267,8 @@ pub(crate) fn execute(
             };
             let table = super::get_table(tables, &source.table)?;
             let (key, condition) = pinned_key(table, filter.as_ref())?;
-            let found = find(table, &key)
-                .map(|(_, item)| condition.iter().all(|c| test(c, item)))
-                .unwrap_or(false);
-            if !found {
+            let found = find(table, &key).map(|(_, item)| item);
+            if !found.is_some_and(|item| condition.iter().all(|c| test(c, item))) {
                 return Err(ExecError::ran(condition_failed(None, false), &table.name));
             }
             Ok(Outcome {
@@ -289,11 +276,10 @@ pub(crate) fn execute(
                 items: Vec::new(),
                 returns_items: false,
                 next_token: None,
-                capacity: Capacity {
-                    read: true,
-                    table: 0.5,
-                    ..Default::default()
-                },
+                capacity: Capacity::read(Consumed::table(read_units(
+                    found.map_or(0, item_size),
+                    false,
+                ))),
                 change: None,
             })
         }
@@ -310,110 +296,6 @@ pub(crate) fn execute(
             returning,
         } => delete(tables, source, filter.as_ref(), *returning, opts),
     }
-}
-
-// --- Sizes and capacity ---
-
-/// The size DynamoDB charges for a Number: a byte per two significant digits
-/// on each side of the point, plus one, plus one for a negative sign.
-fn number_size(n: &str) -> usize {
-    let n = n.trim();
-    let negative = n.starts_with('-');
-    let body = n.trim_start_matches(['-', '+']);
-    let (mantissa, exp) = match body.split_once(['e', 'E']) {
-        Some((m, e)) => (m, e.parse::<i64>().unwrap_or(0)),
-        None => (body, 0),
-    };
-    let (int_text, frac_text) = mantissa.split_once('.').unwrap_or((mantissa, ""));
-    let digits = format!("{int_text}{frac_text}");
-    if !digits.bytes().any(|b| (b'1'..=b'9').contains(&b)) {
-        return 1;
-    }
-    let point = int_text.len() as i64 + exp;
-    let (int_part, frac_part) = if point <= 0 {
-        (
-            String::new(),
-            format!("{}{digits}", "0".repeat((-point) as usize)),
-        )
-    } else if point as usize >= digits.len() {
-        (
-            format!("{digits}{}", "0".repeat(point as usize - digits.len())),
-            String::new(),
-        )
-    } else {
-        (
-            digits[..point as usize].to_string(),
-            digits[point as usize..].to_string(),
-        )
-    };
-    let int_part = int_part.trim_start_matches('0');
-    let frac_part = frac_part.trim_end_matches('0');
-    let int_sig = if frac_part.is_empty() {
-        int_part.trim_end_matches('0').len()
-    } else {
-        int_part.len()
-    };
-    let frac_sig = if int_part.is_empty() {
-        frac_part.trim_start_matches('0').len()
-    } else {
-        frac_part.len()
-    };
-    1 + int_sig.div_ceil(2) + frac_sig.div_ceil(2) + usize::from(negative)
-}
-
-fn value_size(v: &Value) -> usize {
-    let b64 = |s: &str| {
-        base64::engine::general_purpose::STANDARD
-            .decode(s)
-            .map(|b| b.len())
-            .unwrap_or(s.len())
-    };
-    match attribute_type_and_value(v) {
-        Some(("S", s)) => s.as_str().map_or(0, str::len),
-        Some(("N", n)) => n.as_str().map_or(1, number_size),
-        Some(("B", b)) => b.as_str().map_or(0, b64),
-        Some(("BOOL" | "NULL", _)) => 1,
-        Some(("SS", a)) => a.as_array().map_or(0, |a| {
-            a.iter().filter_map(Value::as_str).map(str::len).sum()
-        }),
-        Some(("NS", a)) => a.as_array().map_or(0, |a| {
-            a.iter().filter_map(Value::as_str).map(number_size).sum()
-        }),
-        Some(("BS", a)) => a
-            .as_array()
-            .map_or(0, |a| a.iter().filter_map(Value::as_str).map(b64).sum()),
-        Some(("L", l)) => {
-            3 + l
-                .as_array()
-                .map_or(0, |l| l.iter().map(|e| 1 + value_size(e)).sum())
-        }
-        Some(("M", m)) => {
-            3 + m.as_object().map_or(0, |m| {
-                m.iter().map(|(k, e)| 1 + k.len() + value_size(e)).sum()
-            })
-        }
-        _ => 0,
-    }
-}
-
-/// An item's size: every attribute's name plus its value.
-pub(crate) fn item_size(item: &Item) -> usize {
-    item.iter().map(|(k, v)| k.len() + value_size(v)).sum()
-}
-
-/// Read units for `bytes` read in one request: a unit per 4 KB, halved for
-/// an eventually consistent read.
-fn read_units(bytes: usize, consistent: bool) -> f64 {
-    let units = bytes.div_ceil(4096).max(1) as f64;
-    if consistent {
-        units
-    } else {
-        units / 2.0
-    }
-}
-
-fn write_units(bytes: usize) -> f64 {
-    bytes.div_ceil(1024).max(1) as f64
 }
 
 // --- Evaluation ---
@@ -1002,22 +884,19 @@ fn select<'t>(
         _ => false,
     };
 
-    let mut capacity = Capacity {
-        read: true,
-        ..Default::default()
-    };
+    let mut consumed = Consumed::default();
     let walked_bytes: usize = rows.iter().map(|r| item_size(&r.view)).sum();
     match &index {
-        None => capacity.table = read_units(walked_bytes, opts.consistent_read),
+        None => consumed.table = read_units(walked_bytes, opts.consistent_read),
         Some(ix) => {
             let units = read_units(walked_bytes, opts.consistent_read);
             if ix.global {
-                capacity.gsi.insert(ix.name.to_string(), units);
+                consumed.gsi.insert(ix.name.to_string(), units);
             } else {
-                capacity.lsi.insert(ix.name.to_string(), units);
+                consumed.lsi.insert(ix.name.to_string(), units);
             }
             if reach_back {
-                capacity.table = rows
+                consumed.table = rows
                     .iter()
                     .map(|r| read_units(item_size(r.base), opts.consistent_read))
                     .sum();
@@ -1041,7 +920,7 @@ fn select<'t>(
         items,
         returns_items: true,
         next_token,
-        capacity,
+        capacity: Capacity::read(consumed),
         change: None,
     })
 }
@@ -1085,12 +964,17 @@ fn insert(
     value: &Expr,
 ) -> Result<Outcome, ExecError> {
     let table = super::get_table_mut(tables, table_name)?;
-    let item = insert_item(value)?;
+    let mut item = insert_item(value)?;
     super::validate_partiql_item_against_key_schema(table, &item)?;
     super::validate_item_attribute_values(&item)?;
-    if item_size(&item) > MAX_ITEM_BYTES {
-        return Err(validation("Item size has exceeded the maximum allowed size").into());
-    }
+    // Stored and measured exactly as PutItem stores and measures it.
+    normalize_item_numbers(&mut item);
+    check_put_item_size(&item)?;
+    crate::service::vectors::validate_vector_item(
+        &table.vector_indexes,
+        &table.attribute_definitions,
+        &item,
+    )?;
     let key = super::extract_key(table, &item);
     if find(table, &key).is_some() {
         return Err(ExecError::ran(
@@ -1102,17 +986,14 @@ fn insert(
             &table.name,
         ));
     }
-    let units = write_units(item_size(&item));
+    let consumed = item_write_consumed(table, None, Some(&item));
     table.put_item_at_key(item.clone());
     Ok(Outcome {
         table_name: table.name.clone(),
         items: Vec::new(),
         returns_items: false,
         next_token: None,
-        capacity: Capacity {
-            table: units,
-            ..Default::default()
-        },
+        capacity: Capacity::write(consumed),
         change: Some(Change {
             event_name: "INSERT",
             keys: key,
@@ -1292,7 +1173,16 @@ fn update(
     let ran = |error: AwsServiceError| ExecError::ran(error, &table_name);
     let found = find(table, &key).map(|(id, item)| (id, item.clone()));
     // A malformed update is rejected whether or not the item exists.
-    let plan = plan_update(ops, found.as_ref().map_or(&Item::new(), |(_, item)| item))?;
+    let mut plan = plan_update(ops, found.as_ref().map_or(&Item::new(), |(_, item)| item))?;
+    // The values this update writes are validated and then stored in
+    // canonical form, as UpdateItem does; the rest of the row is left as it
+    // is.
+    for v in plan.values.values() {
+        super::validate_attribute_value(v)?;
+    }
+    for v in plan.values.values_mut() {
+        normalize_value_numbers(v);
+    }
     super::reject_key_attribute_update_expression(table, &plan.expression, &plan.names)?;
     let Some((id, old)) = found else {
         // Not an upsert: there is no item for the condition to hold on.
@@ -1306,10 +1196,15 @@ fn update(
     }
     let mut new = old.clone();
     super::apply_update_expression(&mut new, &plan.expression, &plan.names, &plan.values)?;
-    if item_size(&new) > MAX_ITEM_BYTES {
-        return Err(validation("Item size to update has exceeded the maximum allowed size").into());
-    }
-    let units = write_units(item_size(&old).max(item_size(&new)));
+    // Measured flat, like a transacted Update: PartiQL does not carry
+    // UpdateItem's per-clause charge.
+    check_update_item_size(&new)?;
+    crate::service::vectors::validate_vector_item(
+        &table.vector_indexes,
+        &table.attribute_definitions,
+        &new,
+    )?;
+    let consumed = item_write_consumed(table, Some(&old), Some(&new));
     let stored = new.clone();
     table.mutate_item_at(id, |row| *row = stored);
     let items: Vec<Item> = returning
@@ -1321,10 +1216,7 @@ fn update(
         items,
         returns_items: returning.is_some(),
         next_token: None,
-        capacity: Capacity {
-            table: units,
-            ..Default::default()
-        },
+        capacity: Capacity::write(consumed),
         change: Some(Change {
             event_name: "MODIFY",
             keys: key,
@@ -1348,10 +1240,7 @@ fn delete(
         items: Vec::new(),
         returns_items: returning.is_some(),
         next_token: None,
-        capacity: Capacity {
-            table: 1.0,
-            ..Default::default()
-        },
+        capacity: Capacity::write(Consumed::table(1.0)),
         change: None,
     };
     // A missing item is a no-op: there is nothing for the condition to fail on.
@@ -1364,7 +1253,7 @@ fn delete(
             &table.name,
         ));
     }
-    outcome.capacity.table = write_units(item_size(old));
+    outcome.capacity = Capacity::write(item_write_consumed(table, Some(old), None));
     let removed = table.remove_item_at(id);
     if returning.is_some() {
         outcome.items.push(removed.clone());
@@ -1380,35 +1269,13 @@ fn delete(
 
 /// Scale a statement's capacity for a transaction (every unit counts twice).
 pub(crate) fn transactional(mut capacity: Capacity) -> Capacity {
-    capacity.scale(2.0);
+    capacity.consumed = capacity.consumed.scaled(2.0);
     capacity
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn number_sizes_match_dynamodb() {
-        for (n, size) in [
-            ("0", 1),
-            ("1", 2),
-            ("12", 2),
-            ("123", 3),
-            ("0042", 2),
-            ("100", 2),
-            ("1010", 3),
-            ("0.0000001", 2),
-            ("1E125", 2),
-            ("1.5", 3),
-            ("3.14159", 5),
-            ("100.5", 4),
-            ("0.15", 2),
-            ("-42", 3),
-        ] {
-            assert_eq!(number_size(n), size, "{n}");
-        }
-    }
 
     #[test]
     fn equality_treats_sets_as_unordered() {

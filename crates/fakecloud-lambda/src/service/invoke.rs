@@ -33,8 +33,8 @@ impl LambdaService {
                         StatusCode::NOT_FOUND,
                         "ResourceNotFoundException",
                         format!(
-                            "Function not found: arn:aws:lambda:{}:{}:function:{function_name}:{q}",
-                            region, state.account_id
+                            "Function not found: {}",
+                            qualified_function_arn(region, &state.account_id, function_name, q)
                         ),
                     ));
                 }
@@ -94,8 +94,8 @@ impl LambdaService {
                     StatusCode::NOT_FOUND,
                     "ResourceNotFoundException",
                     format!(
-                        "Function not found: arn:aws:lambda:{}:{}:function:{}",
-                        region, state.account_id, function_name
+                        "Function not found: {}",
+                        function_arn(region, &state.account_id, function_name)
                     ),
                 )
             })?;

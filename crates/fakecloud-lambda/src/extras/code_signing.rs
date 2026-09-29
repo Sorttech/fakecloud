@@ -13,10 +13,13 @@ impl LambdaService {
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
         let id = id_from_time("csc-");
-        let arn = format!(
-            "arn:aws:lambda:{}:{}:code-signing-config:{}",
-            req.region, state.account_id, id
-        );
+        let arn = fakecloud_aws::arn::Arn::regional(
+            "lambda",
+            &req.region,
+            &state.account_id,
+            &format!("code-signing-config:{id}"),
+        )
+        .to_string();
         let publishers: Vec<String> = body
             .get("AllowedPublishers")
             .and_then(|v| v.get("SigningProfileVersionArns"))

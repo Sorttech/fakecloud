@@ -1,5 +1,4 @@
 use chrono::Utc;
-use fakecloud_aws::arn::Arn;
 use http::StatusCode;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -30,10 +29,7 @@ pub(crate) fn create_model_customization_job(
     let role_arn = body["roleArn"].as_str().unwrap_or_default();
 
     let job_id = Uuid::new_v4().to_string();
-    let job_arn = format!(
-        "arn:aws:bedrock:{}:{}:model-customization-job/{}",
-        req.region, req.account_id, job_id
-    );
+    let job_arn = crate::arns::model_customization_job_arn(&req.region, &req.account_id, &job_id);
 
     let now = Utc::now();
     let job = crate::state::CustomizationJob {
@@ -100,10 +96,10 @@ pub(crate) fn get_model_customization_job(
             )
         })?;
 
-    let output_model_arn = format!(
-        "arn:aws:bedrock:{}:{}:custom-model/{}",
-        req.region, req.account_id, job.custom_model_name
-    );
+    // The job's output model and base model live where the job was created.
+    let region = job_region(&job.job_arn, &req.region);
+    let output_model_arn =
+        crate::arns::custom_model_arn(region, &req.account_id, &job.custom_model_name);
 
     // GetModelCustomizationJobResponse requires `baseModelArn` and
     // `validationDataConfig`; the stored `baseModelIdentifier` is normalized
@@ -118,7 +114,7 @@ pub(crate) fn get_model_customization_job(
         "status": job.status,
         "creationTime": job.created_at.to_rfc3339(),
         "lastModifiedTime": job.last_modified_at.to_rfc3339(),
-        "baseModelArn": base_model_arn(&job.base_model_identifier, &req.region),
+        "baseModelArn": base_model_arn(&job.base_model_identifier, region),
         "trainingDataConfig": job.training_data_config,
         "validationDataConfig": json!({ "validators": [] }),
         "outputDataConfig": job.output_data_config,
@@ -162,7 +158,10 @@ pub(crate) fn list_model_customization_jobs(
                 "jobArn": j.job_arn,
                 "jobName": j.job_name,
                 "status": j.status,
-                "baseModelArn": base_model_arn(&j.base_model_identifier, &req.region),
+                "baseModelArn": base_model_arn(
+                    &j.base_model_identifier,
+                    job_region(&j.job_arn, &req.region),
+                ),
                 "customModelName": j.custom_model_name,
                 "creationTime": j.created_at.to_rfc3339(),
                 "lastModifiedTime": j.last_modified_at.to_rfc3339(),
@@ -181,19 +180,22 @@ pub(crate) fn list_model_customization_jobs(
     Ok(AwsResponse::ok_json(resp))
 }
 
+/// The region a job ARN was minted in, `fallback` for a malformed one.
+fn job_region<'a>(job_arn: &'a str, fallback: &'a str) -> &'a str {
+    job_arn
+        .split(':')
+        .nth(3)
+        .filter(|r| !r.is_empty())
+        .unwrap_or(fallback)
+}
+
 /// Normalize the customization job's stored base model identifier into a
 /// full foundation-model ARN, since the Smithy summary requires `baseModelArn`.
 fn base_model_arn(base_model_identifier: &str, region: &str) -> String {
     if base_model_identifier.starts_with("arn:") {
         base_model_identifier.to_string()
     } else {
-        Arn::new(
-            "bedrock",
-            region,
-            "",
-            &format!("foundation-model/{base_model_identifier}"),
-        )
-        .to_string()
+        crate::arns::foundation_model_arn(region, base_model_identifier)
     }
 }
 
@@ -307,6 +309,29 @@ mod tests {
         assert_eq!(
             job.hyper_parameters.get("epochs").map(String::as_str),
             Some("3")
+        );
+    }
+
+    #[test]
+    fn get_job_reports_model_arns_from_the_region_the_job_was_created_in() {
+        let s = shared();
+        let mut cn = req();
+        cn.region = "cn-north-1".to_string();
+        create_model_customization_job(
+            &s,
+            &cn,
+            &json!({"jobName": "cn-job", "baseModelIdentifier": "amazon.titan-text-express-v1"}),
+        )
+        .unwrap();
+        let resp = get_model_customization_job(&s, &req(), "cn-job").unwrap();
+        let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        assert_eq!(
+            v["outputModelArn"],
+            "arn:aws-cn:bedrock:cn-north-1:123456789012:custom-model/cn-job"
+        );
+        assert_eq!(
+            v["baseModelArn"],
+            "arn:aws-cn:bedrock:cn-north-1::foundation-model/amazon.titan-text-express-v1"
         );
     }
 

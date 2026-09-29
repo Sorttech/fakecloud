@@ -402,7 +402,7 @@ impl ApiGatewayV2Service {
     /// WebACL with an API Gateway v2 stage:
     /// `arn:aws:apigateway:<region>::/apis/<api>/stages/<stage>`.
     pub(super) fn stage_resource_arn(&self, region: &str, api_id: &str, stage: &str) -> String {
-        format!("arn:aws:apigateway:{region}::/apis/{api_id}/stages/{stage}")
+        crate::state::apigateway_arn(region, "", &format!("/apis/{api_id}/stages/{stage}"))
     }
 
     pub(super) fn emit_access_log(

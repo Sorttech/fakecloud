@@ -15,6 +15,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::multi_account::{AccountState, MultiAccountState};
 
 pub const OPENSEARCH_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
@@ -209,7 +210,23 @@ impl AccountState for OpenSearchState {
 
 /// Build the ARN for a domain. Both APIs use the `es` service namespace.
 pub fn domain_arn(region: &str, account_id: &str, name: &str) -> String {
-    format!("arn:aws:es:{region}:{account_id}:domain/{name}")
+    Arn::regional("es", region, account_id, &format!("domain/{name}")).to_string()
+}
+
+/// Build the ARN for an OpenSearch UI application.
+pub fn application_arn(region: &str, account_id: &str, id: &str) -> String {
+    Arn::regional("es", region, account_id, &format!("application/{id}")).to_string()
+}
+
+/// Build the ARN for a direct-query data source.
+pub fn direct_query_data_source_arn(region: &str, account_id: &str, name: &str) -> String {
+    Arn::regional(
+        "es",
+        region,
+        account_id,
+        &format!("directquerydatasource/{name}"),
+    )
+    .to_string()
 }
 
 pub type SharedOpenSearchState = Arc<RwLock<MultiAccountState<OpenSearchState>>>;
@@ -218,4 +235,29 @@ pub type SharedOpenSearchState = Arc<RwLock<MultiAccountState<OpenSearchState>>>
 pub struct OpenSearchSnapshot {
     pub schema_version: u32,
     pub accounts: MultiAccountState<OpenSearchState>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arns_take_the_region_partition() {
+        assert_eq!(
+            domain_arn("us-east-1", "123456789012", "d"),
+            "arn:aws:es:us-east-1:123456789012:domain/d"
+        );
+        assert_eq!(
+            domain_arn("cn-north-1", "123456789012", "d"),
+            "arn:aws-cn:es:cn-north-1:123456789012:domain/d"
+        );
+        assert_eq!(
+            application_arn("cn-north-1", "123456789012", "a1"),
+            "arn:aws-cn:es:cn-north-1:123456789012:application/a1"
+        );
+        assert_eq!(
+            direct_query_data_source_arn("cn-north-1", "123456789012", "ds"),
+            "arn:aws-cn:es:cn-north-1:123456789012:directquerydatasource/ds"
+        );
+    }
 }

@@ -220,6 +220,110 @@ fn workflow_run_properties_round_trip() {
 }
 
 #[test]
+fn china_region_registry_arn_uses_aws_cn_partition() {
+    let svc = GlueService::default();
+    let cn = |action: &str, body: Value| {
+        let mut r = req(action, body);
+        r.region = "cn-north-1".to_string();
+        r
+    };
+    let created = body_of(
+        svc.create_registry(&cn("CreateRegistry", json!({"RegistryName": "reg-cn"})))
+            .unwrap(),
+    );
+    let arn = created["RegistryArn"].as_str().unwrap();
+    assert_eq!(
+        arn,
+        "arn:aws-cn:glue:cn-north-1:123456789012:registry/reg-cn"
+    );
+
+    let got = body_of(
+        svc.get_registry(&cn(
+            "GetRegistry",
+            json!({"RegistryId": {"RegistryArn": arn}}),
+        ))
+        .unwrap(),
+    );
+    assert_eq!(got["RegistryArn"], arn);
+
+    // Later calls from another region report the registry's own ARN.
+    let updated = body_of(
+        svc.update_registry(&req(
+            "UpdateRegistry",
+            json!({"RegistryId": {"RegistryName": "reg-cn"}, "Description": "d"}),
+        ))
+        .unwrap(),
+    );
+    assert_eq!(updated["RegistryArn"], arn);
+    let schema = body_of(
+        svc.create_schema(&req(
+            "CreateSchema",
+            json!({
+                "RegistryId": {"RegistryName": "reg-cn"}, "SchemaName": "s", "DataFormat": "AVRO",
+                "SchemaDefinition": "{}"
+            }),
+        ))
+        .unwrap(),
+    );
+    assert_eq!(schema["RegistryArn"], arn);
+    let schema_arn = "arn:aws-cn:glue:cn-north-1:123456789012:schema/reg-cn/s";
+    assert_eq!(schema["SchemaArn"], schema_arn);
+    let version = body_of(
+        svc.get_schema_version(&req(
+            "GetSchemaVersion",
+            json!({"SchemaVersionId": schema["SchemaVersionId"].clone()}),
+        ))
+        .unwrap(),
+    );
+    assert_eq!(version["SchemaArn"], schema_arn);
+    let deleted = body_of(
+        svc.delete_registry(&req(
+            "DeleteRegistry",
+            json!({"RegistryId": {"RegistryName": "reg-cn"}}),
+        ))
+        .unwrap(),
+    );
+    assert_eq!(deleted["RegistryArn"], arn);
+}
+
+#[test]
+fn create_schema_in_a_missing_registry_is_entity_not_found() {
+    let svc = GlueService::default();
+    let err = svc
+        .create_schema(&req(
+            "CreateSchema",
+            json!({"RegistryId": {"RegistryName": "nope"}, "SchemaName": "s", "DataFormat": "AVRO"}),
+        ))
+        .err()
+        .unwrap();
+    assert_eq!(err.code(), "EntityNotFoundException");
+}
+
+#[test]
+fn create_schema_without_a_registry_uses_the_default_registry() {
+    let svc = GlueService::default();
+    let schema = body_of(
+        svc.create_schema(&req(
+            "CreateSchema",
+            json!({"SchemaName": "s", "DataFormat": "AVRO"}),
+        ))
+        .unwrap(),
+    );
+    let registry = body_of(
+        svc.get_registry(&req(
+            "GetRegistry",
+            json!({"RegistryId": {"RegistryName": "default-registry"}}),
+        ))
+        .unwrap(),
+    );
+    assert_eq!(schema["RegistryArn"], registry["RegistryArn"]);
+    assert_eq!(
+        schema["SchemaArn"],
+        "arn:aws:glue:us-east-1:123456789012:schema/default-registry/s"
+    );
+}
+
+#[test]
 fn schema_registry_version_round_trip() {
     let svc = GlueService::default();
     svc.create_registry(&req("CreateRegistry", json!({"RegistryName": "reg"})))

@@ -84,10 +84,8 @@ pub(crate) fn create_advanced_prompt_optimization_job(
     }
 
     let job_id = Uuid::new_v4().to_string();
-    let job_arn = format!(
-        "arn:aws:bedrock:{}:{}:advanced-prompt-optimization-job/{}",
-        req.region, req.account_id, job_id
-    );
+    let job_arn =
+        crate::arns::advanced_prompt_optimization_job_arn(&req.region, &req.account_id, &job_id);
 
     let now = Utc::now();
     let job = AdvancedPromptOptimizationJob {

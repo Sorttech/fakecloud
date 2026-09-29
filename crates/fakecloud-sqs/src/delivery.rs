@@ -53,6 +53,16 @@ impl SqsDeliveryImpl {
 }
 
 impl SqsDelivery for SqsDeliveryImpl {
+    fn queue_arn_for_url(&self, queue_url: &str) -> Option<String> {
+        let mut segments = queue_url.trim_end_matches('/').rsplit('/');
+        let name = segments.next().filter(|s| !s.is_empty())?;
+        let account = segments.next().filter(|s| !s.is_empty())?;
+        let accounts = self.state.read();
+        let state = accounts.get(account)?;
+        let url = state.name_to_url.get(name)?;
+        state.queues.get(url).map(|q| q.arn.clone())
+    }
+
     fn deliver_to_queue(
         &self,
         queue_arn: &str,
@@ -351,6 +361,28 @@ mod tests {
             .insert(queue.queue_name.clone(), queue.queue_url.clone());
         state.queues.insert(queue.queue_url.clone(), queue);
         Arc::new(RwLock::new(multi))
+    }
+
+    #[test]
+    fn queue_arn_for_url_resolves_the_stored_arn_by_account_and_name() {
+        let mut queue = make_queue("orders", false, false);
+        queue.arn = Arn::regional("sqs", "eu-west-1", ACCOUNT, "orders").to_string();
+        let delivery = SqsDeliveryImpl::new(make_state_with_queue(queue));
+        // Any host: a QueueUrl names the queue by account and name only.
+        assert_eq!(
+            delivery
+                .queue_arn_for_url(&format!("https://sqs.example.internal/{ACCOUNT}/orders"))
+                .as_deref(),
+            Some("arn:aws:sqs:eu-west-1:123456789012:orders")
+        );
+        assert_eq!(
+            delivery.queue_arn_for_url(&format!("{ENDPOINT}/{ACCOUNT}/missing")),
+            None
+        );
+        assert_eq!(
+            delivery.queue_arn_for_url(&format!("{ENDPOINT}/999999999999/orders")),
+            None
+        );
     }
 
     #[test]

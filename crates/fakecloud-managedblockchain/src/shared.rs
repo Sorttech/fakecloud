@@ -54,38 +54,43 @@ pub fn new_billing_token() -> String {
         .collect()
 }
 
+fn managedblockchain_arn(region: &str, account: &str, resource: &str) -> String {
+    fakecloud_aws::arn::Arn::regional("managedblockchain", region, account, resource).to_string()
+}
+
 /// The network ARN. Managed Blockchain networks are global, so the ARN carries
-/// no region and no account.
-pub fn network_arn(id: &str) -> String {
-    format!("arn:aws:managedblockchain:::networks/{id}")
+/// no region and no account; only its partition comes from `region`.
+pub fn network_arn(region: &str, id: &str) -> String {
+    fakecloud_aws::arn::Arn::global_in(region, "managedblockchain", "", &format!("networks/{id}"))
+        .to_string()
 }
 
 /// The member ARN, `arn:aws:managedblockchain:{region}:{account}:members/{id}`.
 pub fn member_arn(region: &str, account: &str, id: &str) -> String {
-    format!("arn:aws:managedblockchain:{region}:{account}:members/{id}")
+    managedblockchain_arn(region, account, &format!("members/{id}"))
 }
 
 /// The node ARN, `arn:aws:managedblockchain:{region}:{account}:nodes/{id}`.
 pub fn node_arn(region: &str, account: &str, id: &str) -> String {
-    format!("arn:aws:managedblockchain:{region}:{account}:nodes/{id}")
+    managedblockchain_arn(region, account, &format!("nodes/{id}"))
 }
 
 /// The proposal ARN,
 /// `arn:aws:managedblockchain:{region}:{account}:proposals/{id}`.
 pub fn proposal_arn(region: &str, account: &str, id: &str) -> String {
-    format!("arn:aws:managedblockchain:{region}:{account}:proposals/{id}")
+    managedblockchain_arn(region, account, &format!("proposals/{id}"))
 }
 
 /// The invitation ARN,
 /// `arn:aws:managedblockchain:{region}:{account}:invitations/{id}`.
 pub fn invitation_arn(region: &str, account: &str, id: &str) -> String {
-    format!("arn:aws:managedblockchain:{region}:{account}:invitations/{id}")
+    managedblockchain_arn(region, account, &format!("invitations/{id}"))
 }
 
 /// The accessor ARN,
 /// `arn:aws:managedblockchain:{region}:{account}:accessors/{id}`.
 pub fn accessor_arn(region: &str, account: &str, id: &str) -> String {
-    format!("arn:aws:managedblockchain:{region}:{account}:accessors/{id}")
+    managedblockchain_arn(region, account, &format!("accessors/{id}"))
 }
 
 /// Current time as an ISO-8601 `date-time` string (the format every Managed

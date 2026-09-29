@@ -217,6 +217,35 @@ fn fuota_task_created_at_is_numeric_timestamp() {
 // ---------- tags ----------
 
 #[test]
+fn china_region_arn_uses_aws_cn_partition_and_tags_by_it() {
+    let s = svc();
+    let run_cn = |method: &str, path: &str, body: Value| {
+        let mut req = mk_req(method, path, &[], body);
+        req.region = "cn-north-1".into();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(s.handle(req))
+    };
+    let created =
+        body_of(&run_cn("POST", "/device-profiles", json!({"Name": "cn-profile"})).unwrap());
+    let id = created["Id"].as_str().unwrap();
+    let arn = created["Arn"].as_str().unwrap().to_string();
+    assert_eq!(
+        arn,
+        format!("arn:aws-cn:iotwireless:cn-north-1:000000000000:DeviceProfile/{id}")
+    );
+    run_cn(
+        "POST",
+        &format!("/tags?resourceArn={arn}"),
+        json!({"Tags": [{"Key": "env", "Value": "cn"}]}),
+    )
+    .unwrap();
+    let listed = body_of(&run_cn("GET", &format!("/tags?resourceArn={arn}"), Value::Null).unwrap());
+    assert_eq!(listed["Tags"][0]["Value"], "cn");
+}
+
+#[test]
 fn tags_round_trip() {
     let s = svc();
     let arn = "arn:aws:iotwireless:us-east-1:000000000000:WirelessDevice/abc";

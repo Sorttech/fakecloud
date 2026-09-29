@@ -464,11 +464,11 @@ mod tests {
             ENDPOINT,
         )));
         let svc = DynamoDbService::new(dynamodb_state.clone());
-        create_streamed_table(&svc, DEFAULT_ACCOUNT, "t").await;
-        put_item(&svc, DEFAULT_ACCOUNT, "t", "a").await;
-        put_item(&svc, DEFAULT_ACCOUNT, "t", "b").await;
+        create_streamed_table(&svc, DEFAULT_ACCOUNT, "tbl").await;
+        put_item(&svc, DEFAULT_ACCOUNT, "tbl", "a").await;
+        put_item(&svc, DEFAULT_ACCOUNT, "tbl", "b").await;
 
-        let arn = stream_arn(&dynamodb_state, DEFAULT_ACCOUNT, "t");
+        let arn = stream_arn(&dynamodb_state, DEFAULT_ACCOUNT, "tbl");
         let lambda_state = lambda_state_with(DEFAULT_ACCOUNT, esm("esm-1", DEFAULT_ACCOUNT, &arn));
 
         let poller = DynamoDbStreamsLambdaPoller::new(dynamodb_state.clone(), lambda_state.clone());
@@ -522,10 +522,10 @@ mod tests {
             ENDPOINT,
         )));
         let svc = DynamoDbService::new(dynamodb_state.clone());
-        create_streamed_table(&svc, OTHER, "t").await;
-        put_item(&svc, OTHER, "t", "a").await;
+        create_streamed_table(&svc, OTHER, "tbl").await;
+        put_item(&svc, OTHER, "tbl", "a").await;
 
-        let arn = stream_arn(&dynamodb_state, OTHER, "t");
+        let arn = stream_arn(&dynamodb_state, OTHER, "tbl");
         assert!(arn.contains(OTHER), "stream arn carries the other account");
         let lambda_state = lambda_state_with(OTHER, esm("esm-x", OTHER, &arn));
 

@@ -53,9 +53,10 @@ impl CloudFrontService {
         }
         let now = Utc::now();
         let etag = generate_id_with_prefix("E");
-        let function_arn = format!(
-            "arn:aws:cloudfront::{}:function/{}",
-            DEFAULT_ACCOUNT, parsed.name
+        let function_arn = crate::service::cloudfront_arn(
+            &req.region,
+            DEFAULT_ACCOUNT,
+            &format!("function/{}", parsed.name),
         );
         let stored = StoredFunction {
             name: parsed.name.clone(),
@@ -692,9 +693,10 @@ impl CloudFrontService {
         let now = Utc::now();
         let id = Uuid::new_v4().to_string();
         let etag = generate_id_with_prefix("E");
-        let arn = format!(
-            "arn:aws:cloudfront::{}:key-value-store/{}",
-            DEFAULT_ACCOUNT, id
+        let arn = crate::service::cloudfront_arn(
+            &req.region,
+            DEFAULT_ACCOUNT,
+            &format!("key-value-store/{id}"),
         );
         let stored = StoredKeyValueStore {
             name: parsed.name.clone(),
