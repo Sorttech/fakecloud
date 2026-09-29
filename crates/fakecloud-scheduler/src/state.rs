@@ -202,9 +202,10 @@ pub struct SchedulerSnapshot {
 }
 
 /// Build an EventBridge Scheduler schedule ARN.
-/// Format: `arn:aws:scheduler:<region>:<account>:schedule/<group>/<name>`.
+/// Format: `arn:<partition>:scheduler:<region>:<account>:schedule/<group>/<name>`,
+/// in `region`'s partition.
 pub fn schedule_arn(region: &str, account_id: &str, group: &str, name: &str) -> String {
-    Arn::new(
+    Arn::regional(
         "scheduler",
         region,
         account_id,
@@ -214,9 +215,10 @@ pub fn schedule_arn(region: &str, account_id: &str, group: &str, name: &str) -> 
 }
 
 /// Build a schedule-group ARN.
-/// Format: `arn:aws:scheduler:<region>:<account>:schedule-group/<group>`.
+/// Format: `arn:<partition>:scheduler:<region>:<account>:schedule-group/<group>`,
+/// in `region`'s partition.
 pub fn group_arn(region: &str, account_id: &str, group: &str) -> String {
-    Arn::new(
+    Arn::regional(
         "scheduler",
         region,
         account_id,

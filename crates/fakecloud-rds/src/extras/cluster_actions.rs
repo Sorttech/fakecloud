@@ -396,9 +396,7 @@ pub(super) fn modify_db_cluster_action(
                         return Err(cluster_already_exists(new_id));
                     }
                     if let Some(mut entry) = map.remove(&id) {
-                        let new_arn =
-                            Arn::new("rds", region, account_id, &format!("cluster:{new_id}"))
-                                .to_string();
+                        let new_arn = rds_arn(region, account_id, "cluster", new_id);
                         if let Some(obj) = entry.as_object_mut() {
                             obj.insert("DBClusterIdentifier".to_string(), json!(new_id));
                             obj.insert("DBClusterArn".to_string(), json!(new_arn));
@@ -412,7 +410,7 @@ pub(super) fn modify_db_cluster_action(
     }
 
     let final_id = new_id.unwrap_or_else(|| id.clone());
-    let final_arn = Arn::new("rds", region, account_id, &format!("cluster:{final_id}")).to_string();
+    let final_arn = rds_arn(region, account_id, "cluster", &final_id);
 
     if any_change {
         svc.emit_event(
@@ -444,7 +442,7 @@ pub(super) fn start_db_cluster_action(
     rid: &str,
 ) -> Result<AwsResponse, AwsServiceError> {
     let id = get_param(req, "DBClusterIdentifier").ok_or_else(|| missing("DBClusterIdentifier"))?;
-    let arn = Arn::new("rds", region, account_id, &format!("cluster:{id}")).to_string();
+    let arn = rds_arn(region, account_id, "cluster", &id);
     let entry = cluster_entry(svc, account_id, &id)?;
     let status = cluster_status(&entry);
     if status != "stopped" {
@@ -480,7 +478,7 @@ pub(super) fn stop_db_cluster_action(
     rid: &str,
 ) -> Result<AwsResponse, AwsServiceError> {
     let id = get_param(req, "DBClusterIdentifier").ok_or_else(|| missing("DBClusterIdentifier"))?;
-    let arn = Arn::new("rds", region, account_id, &format!("cluster:{id}")).to_string();
+    let arn = rds_arn(region, account_id, "cluster", &id);
     let entry = cluster_entry(svc, account_id, &id)?;
     let status = cluster_status(&entry);
     if status != "available" {
@@ -516,7 +514,7 @@ pub(super) fn reboot_db_cluster_action(
     rid: &str,
 ) -> Result<AwsResponse, AwsServiceError> {
     let id = get_param(req, "DBClusterIdentifier").ok_or_else(|| missing("DBClusterIdentifier"))?;
-    let arn = Arn::new("rds", region, account_id, &format!("cluster:{id}")).to_string();
+    let arn = rds_arn(region, account_id, "cluster", &id);
     let entry = cluster_entry(svc, account_id, &id)?;
     let status = cluster_status(&entry);
     if status != "available" {
@@ -558,7 +556,7 @@ pub(super) fn failover_db_cluster_action(
     rid: &str,
 ) -> Result<AwsResponse, AwsServiceError> {
     let id = get_param(req, "DBClusterIdentifier").ok_or_else(|| missing("DBClusterIdentifier"))?;
-    let arn = Arn::new("rds", region, account_id, &format!("cluster:{id}")).to_string();
+    let arn = rds_arn(region, account_id, "cluster", &id);
     let target = get_param(req, "TargetDBInstanceIdentifier");
 
     let entry = cluster_entry(svc, account_id, &id)?;
@@ -693,7 +691,7 @@ pub(super) fn backtrack_db_cluster_action(
     )
     .ok_or_else(|| missing("DBClusterIdentifier"))?;
     let backtrack_to = get_param(req, "BacktrackTo").ok_or_else(|| missing("BacktrackTo"))?;
-    let arn = Arn::new("rds", region, account_id, &format!("cluster:{id}")).to_string();
+    let arn = rds_arn(region, account_id, "cluster", &id);
     let entry = cluster_entry(svc, account_id, &id)?;
     let engine = cluster_engine(&entry).to_string();
     if !engine.starts_with("aurora-mysql") && engine != "aurora" {

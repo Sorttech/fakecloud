@@ -17,14 +17,9 @@ pub(crate) fn create_model_import_job(
     let role_arn = body["roleArn"].as_str().unwrap_or_default();
 
     let job_id = Uuid::new_v4().to_string();
-    let job_arn = format!(
-        "arn:aws:bedrock:{}:{}:model-import-job/{}",
-        req.region, req.account_id, job_id
-    );
-    let imported_model_arn = format!(
-        "arn:aws:bedrock:{}:{}:imported-model/{}",
-        req.region, req.account_id, imported_model_name
-    );
+    let job_arn = crate::arns::model_import_job_arn(&req.region, &req.account_id, &job_id);
+    let imported_model_arn =
+        crate::arns::imported_model_arn(&req.region, &req.account_id, imported_model_name);
 
     let now = Utc::now();
     let model_data_source = body.get("modelDataSource").cloned().unwrap_or(json!({}));

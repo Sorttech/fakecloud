@@ -1,6 +1,6 @@
 +++
 title = "fakecloud vs MinIO"
-description = "How fakecloud compares to MinIO. MinIO is an S3-compatible object store; fakecloud is an AWS emulator with S3 plus 22 other services."
+description = "How fakecloud compares to MinIO. MinIO is an S3-compatible object store; fakecloud is an AWS emulator with S3 plus 104 other services."
 template = "page.html"
 +++
 
@@ -35,7 +35,7 @@ MinIO is excellent for these. It's not primarily a testing tool; it's real infra
 | S3 notifications | Yes | Yes |
 | Notifications fire Lambda | **Yes** (real Lambda runs) | **No** (no Lambda service) |
 | IAM + STS API | Yes | MinIO-specific IAM (not AWS IAM API) |
-| Other AWS services (Lambda, DynamoDB, SQS, etc.) | **22 more** | **None** |
+| Other AWS services (Lambda, DynamoDB, SQS, etc.) | **104 more** | **None** |
 | Encryption via KMS | Yes (real AWS KMS emulation) | MinIO-specific KMS gateway |
 | Startup | ~300ms | ~1-2s |
 | Use case | Local integration testing | Real object storage |

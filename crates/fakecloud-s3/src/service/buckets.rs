@@ -120,8 +120,9 @@ impl S3Service {
         let mut buckets_xml = String::new();
         for b in page {
             buckets_xml.push_str(&format!(
-                "<Bucket><Name>{name}</Name><CreationDate>{cd}</CreationDate><BucketRegion>{region}</BucketRegion><BucketArn>arn:aws:s3:::{name}</BucketArn></Bucket>",
+                "<Bucket><Name>{name}</Name><CreationDate>{cd}</CreationDate><BucketRegion>{region}</BucketRegion><BucketArn>{arn}</BucketArn></Bucket>",
                 name = xml_escape(&b.name),
+                arn = xml_escape(&Arn::s3_in(&b.region, &b.name).to_string()),
                 cd = b.creation_date.format("%Y-%m-%dT%H:%M:%S%.3fZ"),
                 region = xml_escape(&b.region),
             ));
@@ -495,7 +496,10 @@ impl S3Service {
         headers.insert("location", format!("/{bucket}").parse().unwrap());
         headers.insert(
             "x-amz-bucket-arn",
-            Arn::s3(bucket).to_string().parse().unwrap(),
+            Arn::s3_in(&requested_region, bucket)
+                .to_string()
+                .parse()
+                .unwrap(),
         );
         Ok(AwsResponse {
             status: StatusCode::OK,

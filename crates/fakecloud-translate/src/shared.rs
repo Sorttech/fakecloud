@@ -36,7 +36,13 @@ pub fn job_id() -> String {
 /// `resource_type` is one of the kebab-case type names the live service uses
 /// (`terminology`, `parallel-data`).
 pub fn resource_arn(region: &str, account: &str, resource_type: &str, name: &str) -> String {
-    format!("arn:aws:translate:{region}:{account}:{resource_type}/{name}")
+    fakecloud_aws::arn::Arn::regional(
+        "translate",
+        region,
+        account,
+        &format!("{resource_type}/{name}"),
+    )
+    .to_string()
 }
 
 /// Split a Translate ARN into `(resource_type, name)`.

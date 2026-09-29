@@ -149,6 +149,21 @@ pub(crate) fn build_table_description_json(input: &TableDescriptionInput<'_>) ->
     desc
 }
 
+/// The status DescribeTable reports: the table sits in UPDATING while a vector
+/// index added to it is still allocating resources.
+pub(crate) fn effective_table_status(table: &DynamoTable) -> &str {
+    let now = chrono::Utc::now();
+    if table
+        .vector_indexes
+        .iter()
+        .any(|v| v.phase(now) == VectorIndexPhase::Allocating)
+    {
+        "UPDATING"
+    } else {
+        &table.status
+    }
+}
+
 pub(crate) fn build_table_description(table: &DynamoTable) -> Value {
     let mut desc = build_table_description_json(&TableDescriptionInput {
         arn: &table.arn,
@@ -162,7 +177,7 @@ pub(crate) fn build_table_description(table: &DynamoTable) -> Value {
         created_at: table.created_at,
         item_count: table.item_count,
         size_bytes: table.size_bytes,
-        status: &table.status,
+        status: effective_table_status(table),
         deletion_protection_enabled: table.deletion_protection_enabled,
         on_demand_throughput: table.on_demand_throughput.as_ref(),
     });
@@ -217,7 +232,7 @@ pub(crate) fn build_table_description(table: &DynamoTable) -> Value {
             table
                 .vector_indexes
                 .iter()
-                .map(build_vector_index_description)
+                .map(|idx| build_vector_index_description(table, idx))
                 .collect(),
         );
     }
@@ -226,28 +241,44 @@ pub(crate) fn build_table_description(table: &DynamoTable) -> Value {
 }
 
 /// Project a stored [`VectorIndex`] into a `VectorIndexDescription`.
-pub(crate) fn build_vector_index_description(idx: &VectorIndex) -> Value {
-    json!({
+///
+/// `Backfilling` is reported only while an index added by UpdateTable is being
+/// created -- false while it allocates resources, true once it backfills -- and
+/// is absent otherwise, including for every index created with its table.
+pub(crate) fn build_vector_index_description(table: &DynamoTable, idx: &VectorIndex) -> Value {
+    let phase = idx.phase(chrono::Utc::now());
+    let (count, bytes) = crate::service::vectors::vector_index_stats(table, idx);
+    let mut desc = json!({
         "IndexName": idx.index_name,
         "IndexArn": idx.index_arn,
-        "IndexStatus": idx.status,
-        "Backfilling": false,
-        "ItemCount": 0,
-        "IndexSizeBytes": 0,
+        "IndexStatus": if phase == VectorIndexPhase::Active { "ACTIVE" } else { "CREATING" },
+        "ItemCount": count,
+        "IndexSizeBytes": bytes,
         "Dimensions": idx.dimensions,
         "DistanceFunction": idx.distance_function,
         "VectorAttribute": { "AttributeName": idx.vector_attribute },
-        "SearchSchema": idx
+    });
+    match phase {
+        VectorIndexPhase::Allocating => desc["Backfilling"] = json!(false),
+        VectorIndexPhase::Backfilling => desc["Backfilling"] = json!(true),
+        VectorIndexPhase::Active => {}
+    }
+    if !idx.search_schema.is_empty() {
+        desc["SearchSchema"] = idx
             .search_schema
             .iter()
-            .map(|(name, kind)| json!({
-                "AttributeName": name,
-                "SearchSchemaElementType": kind,
-            }))
-            .collect::<Vec<Value>>(),
-        "Projection": {
-            "ProjectionType": idx.projection.projection_type,
-            "NonKeyAttributes": idx.projection.non_key_attributes,
-        },
-    })
+            .map(|(name, kind)| {
+                json!({
+                    "AttributeName": name,
+                    "SearchSchemaElementType": kind,
+                })
+            })
+            .collect();
+    }
+    let mut projection = json!({ "ProjectionType": idx.projection.projection_type });
+    if !idx.projection.non_key_attributes.is_empty() {
+        projection["NonKeyAttributes"] = json!(idx.projection.non_key_attributes);
+    }
+    desc["Projection"] = projection;
+    desc
 }

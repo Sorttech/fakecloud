@@ -4,7 +4,6 @@
 use chrono::Utc;
 use uuid::Uuid;
 
-use fakecloud_aws::arn::Arn;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use super::helpers::*;
@@ -970,13 +969,7 @@ impl RedshiftService {
             let region = &req.region;
             let account_id = &req.account_id;
             let mut push = |resource_type: &str, name: &str, tags: &[crate::state::Tag]| {
-                let arn = Arn::new(
-                    "redshift",
-                    region,
-                    account_id,
-                    &format!("{resource_type}:{name}"),
-                )
-                .to_string();
+                let arn = crate::state::redshift_arn(region, account_id, resource_type, name);
                 if name_filter.as_ref().is_some_and(|n| n != &arn) {
                     return;
                 }

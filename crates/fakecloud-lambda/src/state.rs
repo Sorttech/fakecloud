@@ -441,6 +441,36 @@ pub struct AccountSettings {
     pub total_code_size: i64,
 }
 
+/// The ARN of an unqualified function, in `region`'s partition.
+pub fn function_arn(region: &str, account_id: &str, function_name: &str) -> String {
+    fakecloud_aws::arn::Arn::regional(
+        "lambda",
+        region,
+        account_id,
+        &format!("function:{function_name}"),
+    )
+    .to_string()
+}
+
+/// The ARN of a function version or alias (`function:<name>:<qualifier>`).
+pub fn qualified_function_arn(
+    region: &str,
+    account_id: &str,
+    function_name: &str,
+    qualifier: &str,
+) -> String {
+    format!(
+        "{}:{qualifier}",
+        function_arn(region, account_id, function_name)
+    )
+}
+
+/// The ARN of a layer (without a version).
+pub fn layer_arn(region: &str, account_id: &str, layer_name: &str) -> String {
+    fakecloud_aws::arn::Arn::regional("lambda", region, account_id, &format!("layer:{layer_name}"))
+        .to_string()
+}
+
 impl LambdaState {
     pub fn new(account_id: &str, region: &str) -> Self {
         Self {

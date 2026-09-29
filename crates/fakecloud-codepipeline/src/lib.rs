@@ -15,7 +15,7 @@ pub mod service;
 pub mod state;
 mod validate;
 
-pub use service::{CodePipelineService, CODEPIPELINE_ACTIONS};
+pub use service::{pipeline_arn, webhook_arn, CodePipelineService, CODEPIPELINE_ACTIONS};
 pub use state::{
     CodePipelineSnapshot, CodePipelineState, SharedCodePipelineState,
     CODEPIPELINE_SNAPSHOT_SCHEMA_VERSION,

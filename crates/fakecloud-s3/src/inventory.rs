@@ -33,7 +33,7 @@ fn parse_inventory_destination(xml: &str) -> Option<InventoryDestination> {
 
 /// Extract the bucket name from an ARN like `arn:aws:s3:::my-bucket`.
 fn bucket_name_from_arn(arn: &str) -> Option<&str> {
-    arn.strip_prefix("arn:aws:s3:::")
+    fakecloud_aws::arn::arn_resource(arn, "s3").and_then(|rest| rest.strip_prefix("::"))
 }
 
 /// Generate an inventory report for a bucket and store it in the destination.

@@ -118,7 +118,9 @@ impl EcsService {
             .principal
             .as_ref()
             .map(|p| p.arn.clone())
-            .unwrap_or_else(|| Arn::global("iam", &request.account_id, "root").to_string());
+            .unwrap_or_else(|| {
+                Arn::global_in(&request.region, "iam", &request.account_id, "root").to_string()
+            });
 
         let (service_json, spawn_task_ids) = {
             let mut accounts = self.state.write();
@@ -268,13 +270,10 @@ impl EcsService {
             );
             if is_code_deploy {
                 let ts_id = uuid::Uuid::new_v4().to_string().replace('-', "");
-                let ts_arn = format!(
-                    "arn:aws:ecs:{}:{}:task-set/{}/{}/{}",
+                let ts_arn = crate::state::ecs_arn(
                     request.region.as_str(),
-                    state.account_id,
-                    cluster_name,
-                    service_name,
-                    ts_id
+                    &state.account_id,
+                    &format!("task-set/{}/{}/{}", cluster_name, service_name, ts_id),
                 );
                 let task_set = TaskSet {
                     task_set_id: ts_id,
@@ -380,7 +379,9 @@ impl EcsService {
             .principal
             .as_ref()
             .map(|p| p.arn.clone())
-            .unwrap_or_else(|| Arn::global("iam", &request.account_id, "root").to_string());
+            .unwrap_or_else(|| {
+                Arn::global_in(&request.region, "iam", &request.account_id, "root").to_string()
+            });
         let runtime = self.runtime.clone();
 
         let (service_json, spawn_ids, stop_ids) = {
@@ -623,13 +624,10 @@ impl EcsService {
 
                 // Create new ACTIVE task set with the new TD
                 let ts_id = uuid::Uuid::new_v4().to_string().replace('-', "");
-                let ts_arn = format!(
-                    "arn:aws:ecs:{}:{}:task-set/{}/{}/{}",
+                let ts_arn = crate::state::ecs_arn(
                     request.region.as_str(),
-                    state.account_id,
-                    cluster_name,
-                    service_name,
-                    ts_id
+                    &state.account_id,
+                    &format!("task-set/{}/{}/{}", cluster_name, service_name, ts_id),
                 );
                 let svc_snapshot = state.services.get(&key).unwrap().clone();
                 let task_set = TaskSet {

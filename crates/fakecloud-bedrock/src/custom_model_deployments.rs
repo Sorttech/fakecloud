@@ -19,10 +19,8 @@ pub(crate) fn create_custom_model_deployment(
     let model_arn = body["modelArn"].as_str().unwrap_or_default();
 
     let deployment_id = Uuid::new_v4().to_string();
-    let deployment_arn = format!(
-        "arn:aws:bedrock:{}:{}:custom-model-deployment/{}",
-        req.region, req.account_id, deployment_id
-    );
+    let deployment_arn =
+        crate::arns::custom_model_deployment_arn(&req.region, &req.account_id, &deployment_id);
 
     let now = Utc::now();
     let deployment = CustomModelDeployment {

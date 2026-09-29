@@ -8,6 +8,7 @@ use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use crate::state::{Contact, ContactList, SesState};
 
+use super::helpers::contact_list_arn;
 use super::{parse_topic_preferences, parse_topics, SesV2Service};
 
 impl SesV2Service {
@@ -57,10 +58,7 @@ impl SesV2Service {
         // Persist tags under the contact-list ARN so GetContactList echoes
         // them (previously dropped).
         if let Some(tags_arr) = body["Tags"].as_array() {
-            let arn = format!(
-                "arn:aws:ses:{}:{}:contact-list/{}",
-                req.region, req.account_id, name
-            );
+            let arn = contact_list_arn(&req.region, &req.account_id, &name);
             let mut tag_map = BTreeMap::new();
             for tag in tags_arr {
                 if let (Some(k), Some(v)) = (tag["Key"].as_str(), tag["Value"].as_str()) {
@@ -105,10 +103,7 @@ impl SesV2Service {
             })
             .collect();
 
-        let arn = format!(
-            "arn:aws:ses:{}:{}:contact-list/{}",
-            req.region, req.account_id, name
-        );
+        let arn = contact_list_arn(&req.region, &req.account_id, name);
         let tags = state
             .tags
             .get(&arn)
@@ -203,10 +198,7 @@ impl SesV2Service {
         state.contacts.remove(name);
 
         // Remove tags for this contact list
-        let arn = format!(
-            "arn:aws:ses:{}:{}:contact-list/{}",
-            req.region, req.account_id, name
-        );
+        let arn = contact_list_arn(&req.region, &req.account_id, name);
         state.tags.remove(&arn);
 
         Ok(AwsResponse::json(StatusCode::OK, "{}"))

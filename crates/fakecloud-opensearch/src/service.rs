@@ -2104,10 +2104,7 @@ impl OpenSearchService {
             return Err(conflict(format!("Application {name} already exists.")));
         }
         let id = short_id();
-        let arn = format!(
-            "arn:aws:es:{}:{}:application/{id}",
-            req.region, req.account_id
-        );
+        let arn = crate::state::application_arn(&req.region, &req.account_id, &id);
         let now = Utc::now();
         let app = Application {
             id: id.clone(),
@@ -2530,10 +2527,7 @@ impl OpenSearchService {
         let name = req_str(&b, "DataSourceName")?;
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id);
-        let arn = format!(
-            "arn:aws:es:{}:{}:directquerydatasource/{name}",
-            req.region, req.account_id
-        );
+        let arn = crate::state::direct_query_data_source_arn(&req.region, &req.account_id, &name);
         let dq = DirectQueryDataSource {
             name: name.clone(),
             arn: arn.clone(),

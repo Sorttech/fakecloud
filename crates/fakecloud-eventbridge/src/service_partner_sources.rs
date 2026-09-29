@@ -39,10 +39,13 @@ impl EventBridgeService {
                 format!("Partner event source {name} already exists."),
             ));
         }
-        let arn = format!(
-            "arn:aws:events:{}::event-source/aws.partner/{}",
-            req.region, name
-        );
+        let arn = Arn::regional(
+            "events",
+            &req.region,
+            "",
+            &format!("event-source/aws.partner/{name}"),
+        )
+        .to_string();
         let now = Utc::now();
         let ps = PartnerEventSource {
             name: name.clone(),

@@ -150,8 +150,36 @@ async fn ecs_task_with_host_bind_volume_writes_to_host_path() {
     // to `host_dir` on the host. If the bind mount worked, the file
     // is now sitting on the host filesystem.
     let marker = host_dir.join("marker.txt");
-    let body = std::fs::read_to_string(&marker)
-        .unwrap_or_else(|e| panic!("expected marker file at {marker:?}: {e}"));
+    let body = match std::fs::read_to_string(&marker) {
+        Ok(b) => b,
+        Err(e) => {
+            // A container that never started writes nothing, and "no such file"
+            // says nothing about why -- it points at the bind mount, which is the
+            // wrong suspect. The task carries the reason, so ask it.
+            let reason = match ecs
+                .describe_tasks()
+                .cluster("volume-cluster")
+                .tasks(arn.clone())
+                .send()
+                .await
+            {
+                Ok(d) => d
+                    .tasks()
+                    .first()
+                    .map(|t| {
+                        format!(
+                            "stopCode={:?} stoppedReason={:?} containers={:?}",
+                            t.stop_code(),
+                            t.stopped_reason(),
+                            t.containers()
+                        )
+                    })
+                    .unwrap_or_else(|| "task not described".to_string()),
+                Err(e) => format!("describe_tasks failed: {e}"),
+            };
+            panic!("expected marker file at {marker:?}: {e} -- task {reason}");
+        }
+    };
     assert!(
         body.contains("hello-from-container"),
         "unexpected marker contents: {body:?}"

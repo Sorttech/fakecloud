@@ -5,7 +5,9 @@ use fakecloud_aws::ec2query::{ec2_elem, ec2_list};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use crate::service::Ec2Service;
-use crate::service_helpers::{gen_id, indexed_list, require, validate_enum, validate_max_results};
+use crate::service_helpers::{
+    ec2_arn, gen_id, indexed_list, require, validate_enum, validate_max_results,
+};
 use crate::state::{
     Ec2State, Tag, VerifiedAccessEndpoint, VerifiedAccessGroup, VerifiedAccessInstance,
     VerifiedAccessLoggingConfig, VerifiedAccessTrustProvider,
@@ -390,10 +392,7 @@ fn group_xml(g: &VerifiedAccessGroup, tags: &[Tag], owner: &str, region: &str) -
         ec2_elem("description", &g.description),
         ec2_elem(
             "verifiedAccessGroupArn",
-            &format!(
-                "arn:aws:ec2:{region}:{owner}:verified-access-group/{}",
-                g.id
-            )
+            &ec2_arn(region, owner, &format!("verified-access-group/{}", g.id))
         ),
         owner,
         FIXED_TIME,

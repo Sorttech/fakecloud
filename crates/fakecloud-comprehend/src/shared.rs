@@ -38,7 +38,13 @@ pub fn hex32(seed: &str) -> String {
 /// (`document-classifier`, `entity-recognizer`, `document-classifier-endpoint`,
 /// `entity-recognizer-endpoint`, `flywheel`, `sentiment-detection-job`, ...).
 pub fn resource_arn(region: &str, account: &str, resource_type: &str, tail: &str) -> String {
-    format!("arn:aws:comprehend:{region}:{account}:{resource_type}/{tail}")
+    fakecloud_aws::arn::Arn::regional(
+        "comprehend",
+        region,
+        account,
+        &format!("{resource_type}/{tail}"),
+    )
+    .to_string()
 }
 
 /// Split a Comprehend ARN into `(resource_type, tail)`.

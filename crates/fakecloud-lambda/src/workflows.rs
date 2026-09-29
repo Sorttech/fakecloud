@@ -39,7 +39,7 @@ fn check_len(field: &str, v: &str, min: usize, max: usize) -> Result<(), AwsServ
 }
 
 fn arn_for_capacity_provider(region: &str, account: &str, name: &str) -> String {
-    Arn::new(
+    Arn::regional(
         "lambda",
         region,
         account,
@@ -439,7 +439,7 @@ pub(crate) fn stop_durable_execution(
 /// The ARN shape of a durable execution, used to synthesize a parent for a
 /// callback token that was never minted here.
 fn execution_arn(region: &str, account: &str, id: &str) -> String {
-    Arn::new(
+    Arn::regional(
         "lambda",
         region,
         account,

@@ -136,6 +136,10 @@ impl SqsService {
             }
         }
 
+        let partition = queue
+            .arn
+            .parse::<Arn>()
+            .map_or_else(|_| "aws".to_string(), |a| a.partition);
         // Add new statement for each account/action pair
         for account_id in &account_ids {
             let action_values: Vec<String> = actions
@@ -159,7 +163,9 @@ impl SqsService {
                 "Sid": label,
                 "Effect": "Allow",
                 "Principal": {
-                    "AWS": Arn::global("iam", account_id, "root").to_string()
+                    "AWS": Arn::global("iam", account_id, "root")
+                        .with_partition(&partition)
+                        .to_string()
                 },
                 "Action": action_value,
                 "Resource": queue.arn,

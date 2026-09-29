@@ -1435,10 +1435,7 @@ impl CloudWatchService {
             }
         }
 
-        let arn = format!(
-            "arn:aws:cloudwatch:{}:{}:alarm:{}",
-            req.region, req.account_id, alarm_name
-        );
+        let arn = crate::state::alarm_arn(&req.region, &req.account_id, &alarm_name);
         let now = Utc::now();
 
         let mut state = self.state.write();
@@ -2017,7 +2014,8 @@ impl CloudWatchService {
             ));
         }
         let arn = format!(
-            "arn:aws:cloudwatch::{}:dashboard/{dashboard_name}",
+            "arn:{}:cloudwatch::{}:dashboard/{dashboard_name}",
+            fakecloud_aws::arn::partition_for(&req.region),
             req.account_id
         );
         let dashboard = Dashboard {

@@ -16,10 +16,7 @@ pub(crate) fn create_custom_model(
     let model_name = body["modelName"].as_str().unwrap_or(&default_name);
 
     let model_id = Uuid::new_v4().to_string();
-    let model_arn = format!(
-        "arn:aws:bedrock:{}:{}:custom-model/{}",
-        req.region, req.account_id, model_id
-    );
+    let model_arn = crate::arns::custom_model_arn(&req.region, &req.account_id, &model_id);
 
     let base_model_name = body["baseModelIdentifier"]
         .as_str()
@@ -29,10 +26,7 @@ pub(crate) fn create_custom_model(
     let base_model_arn = if base_model_name.starts_with("arn:") {
         base_model_name.clone()
     } else {
-        format!(
-            "arn:aws:bedrock:{}::foundation-model/{}",
-            req.region, base_model_name
-        )
+        crate::arns::foundation_model_arn(&req.region, &base_model_name)
     };
 
     let model = CustomModel {

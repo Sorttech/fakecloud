@@ -4187,3 +4187,148 @@ fn list_event_buses_includes_creation_time() {
         "ListEventBuses entry should carry CreationTime, got {first}"
     );
 }
+
+#[test]
+fn china_region_event_bridge_arns_use_the_aws_cn_partition() {
+    use fakecloud_core::auth::ResourcePolicyProvider;
+
+    let state = Arc::new(RwLock::new(
+        fakecloud_core::multi_account::MultiAccountState::new("123456789012", "cn-north-1", ""),
+    ));
+    let svc = EventBridgeService::new(state.clone(), Arc::new(DeliveryBus::new()));
+    let in_china = |action: &str, body: Value| {
+        let mut req = make_request(action, body);
+        req.region = "cn-north-1".to_string();
+        req
+    };
+    let json_of =
+        |resp: AwsResponse| -> Value { serde_json::from_slice(resp.body.expect_bytes()).unwrap() };
+
+    let bus = json_of(
+        svc.create_event_bus(&in_china("CreateEventBus", json!({ "Name": "cn-bus" })))
+            .unwrap(),
+    );
+    let bus_arn = "arn:aws-cn:events:cn-north-1:123456789012:event-bus/cn-bus";
+    assert_eq!(bus["EventBusArn"], json!(bus_arn));
+    let default_bus = json_of(
+        svc.describe_event_bus(&in_china("DescribeEventBus", json!({})))
+            .unwrap(),
+    );
+    assert_eq!(
+        default_bus["Arn"],
+        json!("arn:aws-cn:events:cn-north-1:123456789012:event-bus/default")
+    );
+
+    let rule = json_of(
+        svc.put_rule(&in_china(
+            "PutRule",
+            json!({ "Name": "r", "EventBusName": bus_arn, "EventPattern": r#"{"source":["a"]}"# }),
+        ))
+        .unwrap(),
+    );
+    let rule_arn = "arn:aws-cn:events:cn-north-1:123456789012:rule/cn-bus/r";
+    assert_eq!(rule["RuleArn"], json!(rule_arn));
+    svc.tag_resource(&in_china(
+        "TagResource",
+        json!({ "ResourceARN": rule_arn, "Tags": [{ "Key": "k", "Value": "v" }] }),
+    ))
+    .unwrap();
+
+    svc.put_permission(&in_china(
+        "PutPermission",
+        json!({
+            "EventBusName": "cn-bus",
+            "Action": "events:PutEvents",
+            "Principal": "111111111111",
+            "StatementId": "cn"
+        }),
+    ))
+    .unwrap();
+    let provider = crate::resource_policy::EventBridgeResourcePolicyProvider::new(state);
+    let policy: Value =
+        serde_json::from_str(&provider.resource_policy("events", bus_arn).unwrap()).unwrap();
+    assert_eq!(
+        policy["Statement"][0]["Principal"]["AWS"],
+        json!("arn:aws-cn:iam::111111111111:root")
+    );
+    assert_eq!(policy["Statement"][0]["Resource"], json!(bus_arn));
+
+    let conn = json_of(
+        svc.create_connection(&in_china(
+            "CreateConnection",
+            json!({
+                "Name": "c",
+                "AuthorizationType": "API_KEY",
+                "AuthParameters": {
+                    "ApiKeyAuthParameters": { "ApiKeyName": "k", "ApiKeyValue": "v" }
+                }
+            }),
+        ))
+        .unwrap(),
+    );
+    assert!(conn["ConnectionArn"]
+        .as_str()
+        .unwrap()
+        .starts_with("arn:aws-cn:events:cn-north-1:123456789012:connection/c/"));
+}
+#[test]
+fn default_bus_arn_handed_to_a_china_region_caller_resolves() {
+    use fakecloud_core::auth::ResourcePolicyProvider;
+
+    let state = Arc::new(RwLock::new(
+        fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+    ));
+    let svc = EventBridgeService::new(state.clone(), Arc::new(DeliveryBus::new()));
+    let in_china = |action: &str, body: Value| {
+        let mut req = make_request(action, body);
+        req.region = "cn-north-1".to_string();
+        req
+    };
+    let described: Value = serde_json::from_slice(
+        svc.describe_event_bus(&in_china("DescribeEventBus", json!({})))
+            .unwrap()
+            .body
+            .expect_bytes(),
+    )
+    .unwrap();
+    let bus_arn = "arn:aws-cn:events:cn-north-1:123456789012:event-bus/default";
+    assert_eq!(described["Arn"], json!(bus_arn));
+
+    svc.tag_resource(&in_china(
+        "TagResource",
+        json!({ "ResourceARN": bus_arn, "Tags": [{ "Key": "k", "Value": "v" }] }),
+    ))
+    .unwrap();
+    let tags: Value = serde_json::from_slice(
+        svc.list_tags_for_resource(&in_china(
+            "ListTagsForResource",
+            json!({ "ResourceARN": bus_arn }),
+        ))
+        .unwrap()
+        .body
+        .expect_bytes(),
+    )
+    .unwrap();
+    assert_eq!(tags["Tags"][0]["Value"], json!("v"));
+
+    svc.put_permission(&in_china(
+        "PutPermission",
+        json!({ "Action": "events:PutEvents", "Principal": "111111111111", "StatementId": "cn" }),
+    ))
+    .unwrap();
+    let provider = crate::resource_policy::EventBridgeResourcePolicyProvider::new(state);
+    let policy: Value =
+        serde_json::from_str(&provider.resource_policy("events", bus_arn).unwrap()).unwrap();
+    assert_eq!(
+        policy["Statement"][0]["Principal"]["AWS"],
+        json!("arn:aws-cn:iam::111111111111:root")
+    );
+    assert_eq!(policy["Statement"][0]["Resource"], json!(bus_arn));
+    // The stored (server-region) form still resolves.
+    assert!(provider
+        .resource_policy(
+            "events",
+            "arn:aws:events:us-east-1:123456789012:event-bus/default"
+        )
+        .is_some());
+}

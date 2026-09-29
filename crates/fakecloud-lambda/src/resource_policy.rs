@@ -67,7 +67,7 @@ impl ResourcePolicyProvider for LambdaResourcePolicyProvider {
 /// ARN so the caller short-circuits to "no policy" rather than
 /// looking up stray map keys.
 fn parse_function_name(arn: &str) -> Option<&str> {
-    let rest = arn.strip_prefix("arn:aws:lambda:")?;
+    let rest = fakecloud_aws::arn::arn_resource(arn, "lambda")?;
     // arn:aws:lambda:REGION:ACCOUNT:function:NAME[:QUALIFIER]
     // After the prefix: REGION:ACCOUNT:function:NAME[:QUALIFIER]
     let parts: Vec<&str> = rest.split(':').collect();
@@ -163,6 +163,14 @@ mod tests {
     fn parse_function_name_accepts_valid_arn() {
         assert_eq!(
             parse_function_name("arn:aws:lambda:us-east-1:123456789012:function:my-fn"),
+            Some("my-fn")
+        );
+    }
+
+    #[test]
+    fn parse_function_name_accepts_china_partition_arn() {
+        assert_eq!(
+            parse_function_name("arn:aws-cn:lambda:cn-north-1:123456789012:function:my-fn:PROD"),
             Some("my-fn")
         );
     }

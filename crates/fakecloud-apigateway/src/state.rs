@@ -387,3 +387,16 @@ pub fn make_id() -> String {
     let s = uuid::Uuid::new_v4().simple().to_string();
     s[..10].to_string()
 }
+
+/// An API Gateway management ARN
+/// (`arn:<partition>:apigateway:<region>:<account>:<path>`) in `region`'s
+/// partition. Most API Gateway resources carry an empty account field.
+pub fn apigateway_arn(region: &str, account_id: &str, path: &str) -> String {
+    fakecloud_aws::arn::Arn::regional("apigateway", region, account_id, path).to_string()
+}
+
+/// An `execute-api` ARN (`arn:<partition>:execute-api:<region>:<account>:<resource>`),
+/// the form authorizer policies and Lambda permissions reference.
+pub fn execute_api_arn(region: &str, account_id: &str, resource: &str) -> String {
+    fakecloud_aws::arn::Arn::regional("execute-api", region, account_id, resource).to_string()
+}

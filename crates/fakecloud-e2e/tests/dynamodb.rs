@@ -3608,6 +3608,55 @@ async fn dynamodb_sse_specification_kms() {
 }
 
 #[tokio::test]
+async fn dynamodb_sse_aws_managed_key_reports_its_arn() {
+    // SSE enabled without a KMSMasterKeyId uses the account's AWS-managed
+    // `aws/dynamodb` key, and DescribeTable reports that key's ARN.
+    let server = TestServer::start().await;
+    let client = server.dynamodb_client().await;
+    client
+        .create_table()
+        .table_name("ManagedSseTable")
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("pk")
+                .key_type(KeyType::Hash)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("pk")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .billing_mode(BillingMode::PayPerRequest)
+        .sse_specification(SseSpecification::builder().enabled(true).build())
+        .send()
+        .await
+        .unwrap();
+
+    let desc = client
+        .describe_table()
+        .table_name("ManagedSseTable")
+        .send()
+        .await
+        .unwrap();
+    let sse = desc.table().unwrap().sse_description().unwrap();
+    assert_eq!(sse.sse_type().unwrap().as_str(), "KMS");
+    let key_arn = sse.kms_master_key_arn().unwrap();
+
+    let kms = server.kms_client().await;
+    let managed = kms
+        .describe_key()
+        .key_id("alias/aws/dynamodb")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(managed.key_metadata().unwrap().arn().unwrap(), key_arn);
+}
+
+#[tokio::test]
 async fn dynamodb_sse_default_omitted() {
     let server = TestServer::start().await;
     let client = server.dynamodb_client().await;
@@ -5682,11 +5731,11 @@ async fn create_pk_table(client: &aws_sdk_dynamodb::Client, name: &str) {
 async fn dynamodb_query_legacy_key_conditions_eq() {
     let server = TestServer::start().await;
     let client = server.dynamodb_client().await;
-    create_pk_table(&client, "t").await;
+    create_pk_table(&client, "tbl").await;
 
     client
         .put_item()
-        .table_name("t")
+        .table_name("tbl")
         .item("pk", AttributeValue::S("a".to_string()))
         .item("v", AttributeValue::S("1".to_string()))
         .send()
@@ -5694,7 +5743,7 @@ async fn dynamodb_query_legacy_key_conditions_eq() {
         .unwrap();
     client
         .put_item()
-        .table_name("t")
+        .table_name("tbl")
         .item("pk", AttributeValue::S("b".to_string()))
         .item("v", AttributeValue::S("2".to_string()))
         .send()
@@ -5706,7 +5755,7 @@ async fn dynamodb_query_legacy_key_conditions_eq() {
             "dynamodb",
             "query",
             "--table-name",
-            "t",
+            "tbl",
             "--key-conditions",
             r#"{"pk":{"AttributeValueList":[{"S":"a"}],"ComparisonOperator":"EQ"}}"#,
         ])
@@ -5807,12 +5856,12 @@ async fn dynamodb_query_legacy_key_conditions_begins_with() {
 async fn dynamodb_query_legacy_query_filter() {
     let server = TestServer::start().await;
     let client = server.dynamodb_client().await;
-    create_pk_table(&client, "t").await;
+    create_pk_table(&client, "tbl").await;
 
     for (pk, color) in [("a", "red"), ("b", "red"), ("c", "blue")] {
         client
             .put_item()
-            .table_name("t")
+            .table_name("tbl")
             .item("pk", AttributeValue::S(pk.to_string()))
             .item("color", AttributeValue::S(color.to_string()))
             .send()
@@ -5825,7 +5874,7 @@ async fn dynamodb_query_legacy_query_filter() {
             "dynamodb",
             "query",
             "--table-name",
-            "t",
+            "tbl",
             "--key-conditions",
             r#"{"pk":{"AttributeValueList":[{"S":"a"}],"ComparisonOperator":"EQ"}}"#,
             "--query-filter",
@@ -5848,12 +5897,12 @@ async fn dynamodb_query_legacy_query_filter() {
 async fn dynamodb_scan_legacy_scan_filter() {
     let server = TestServer::start().await;
     let client = server.dynamodb_client().await;
-    create_pk_table(&client, "t").await;
+    create_pk_table(&client, "tbl").await;
 
     for (pk, color) in [("a", "red"), ("b", "blue"), ("c", "red")] {
         client
             .put_item()
-            .table_name("t")
+            .table_name("tbl")
             .item("pk", AttributeValue::S(pk.to_string()))
             .item("color", AttributeValue::S(color.to_string()))
             .send()
@@ -5866,7 +5915,7 @@ async fn dynamodb_scan_legacy_scan_filter() {
             "dynamodb",
             "scan",
             "--table-name",
-            "t",
+            "tbl",
             "--scan-filter",
             r#"{"color":{"AttributeValueList":[{"S":"red"}],"ComparisonOperator":"EQ"}}"#,
         ])
@@ -5886,14 +5935,14 @@ async fn dynamodb_scan_legacy_scan_filter() {
 async fn dynamodb_query_rejects_mixed_key_condition_forms() {
     let server = TestServer::start().await;
     let client = server.dynamodb_client().await;
-    create_pk_table(&client, "t").await;
+    create_pk_table(&client, "tbl").await;
 
     let output = server
         .aws_cli(&[
             "dynamodb",
             "query",
             "--table-name",
-            "t",
+            "tbl",
             "--key-condition-expression",
             "pk = :v",
             "--expression-attribute-values",
@@ -6760,4 +6809,695 @@ async fn dynamodb_create_table_gsi_undefined_attribute_errors() {
         msg.contains("ValidationException") || msg.contains("not defined in AttributeDefinitions"),
         "{msg}"
     );
+}
+
+#[tokio::test]
+async fn dynamodb_consumed_capacity_breaks_down_index_writes_and_sizes_reads() {
+    use aws_sdk_dynamodb::types::ReturnConsumedCapacity;
+
+    let server = TestServer::start().await;
+    let client = server.dynamodb_client().await;
+
+    client
+        .create_table()
+        .table_name("CapacityTable")
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("pk")
+                .key_type(KeyType::Hash)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("pk")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("gsiPk")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .global_secondary_indexes(
+            GlobalSecondaryIndex::builder()
+                .index_name("ByGsiPk")
+                .key_schema(
+                    KeySchemaElement::builder()
+                        .attribute_name("gsiPk")
+                        .key_type(KeyType::Hash)
+                        .build()
+                        .unwrap(),
+                )
+                .projection(
+                    Projection::builder()
+                        .projection_type(ProjectionType::KeysOnly)
+                        .build(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .billing_mode(BillingMode::PayPerRequest)
+        .send()
+        .await
+        .unwrap();
+
+    // A write that lands in the GSI reports the index beside the table and
+    // folds it into the total, with no read/write split.
+    let put = client
+        .put_item()
+        .table_name("CapacityTable")
+        .item("pk", AttributeValue::S("a".into()))
+        .item("gsiPk", AttributeValue::S("g".into()))
+        .item("big", AttributeValue::S("x".repeat(5000)))
+        .return_consumed_capacity(ReturnConsumedCapacity::Indexes)
+        .send()
+        .await
+        .unwrap();
+    let cc = put.consumed_capacity().unwrap();
+    // 5KB item: five table write units, plus one for the keys-only entry.
+    assert_eq!(cc.capacity_units(), Some(6.0));
+    assert_eq!(cc.write_capacity_units(), None);
+    assert_eq!(cc.table().and_then(|t| t.capacity_units()), Some(5.0));
+    let gsi = cc.global_secondary_indexes().unwrap();
+    assert_eq!(gsi["ByGsiPk"].capacity_units(), Some(1.0));
+    assert!(cc.local_secondary_indexes().is_none());
+
+    // Reads are sized on the stored item: just over 4KB is two units,
+    // halved for an eventually-consistent read.
+    let get = client
+        .get_item()
+        .table_name("CapacityTable")
+        .key("pk", AttributeValue::S("a".into()))
+        .return_consumed_capacity(ReturnConsumedCapacity::Total)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get.consumed_capacity().unwrap().capacity_units(), Some(1.0));
+
+    // A query served by the GSI is charged to the index, not the table.
+    let query = client
+        .query()
+        .table_name("CapacityTable")
+        .index_name("ByGsiPk")
+        .key_condition_expression("gsiPk = :g")
+        .expression_attribute_values(":g", AttributeValue::S("g".into()))
+        .return_consumed_capacity(ReturnConsumedCapacity::Indexes)
+        .send()
+        .await
+        .unwrap();
+    let cc = query.consumed_capacity().unwrap();
+    assert_eq!(cc.table().and_then(|t| t.capacity_units()), Some(0.0));
+    assert_eq!(
+        cc.global_secondary_indexes().unwrap()["ByGsiPk"].capacity_units(),
+        Some(0.5)
+    );
+    assert_eq!(cc.capacity_units(), Some(0.5));
+}
+
+#[tokio::test]
+async fn dynamodb_item_size_gate_and_number_canonical_form() {
+    use aws_sdk_dynamodb::error::ProvideErrorMetadata;
+
+    let server = TestServer::start().await;
+    let client = server.dynamodb_client().await;
+
+    client
+        .create_table()
+        .table_name("SizeTable")
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("pk")
+                .key_type(KeyType::Hash)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("pk")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .billing_mode(BillingMode::PayPerRequest)
+        .send()
+        .await
+        .unwrap();
+
+    // pk (2 + 1) + p (1) + padding: exactly 409,600 is accepted, one more is not.
+    let put = |padding: usize| {
+        client
+            .put_item()
+            .table_name("SizeTable")
+            .item("pk", AttributeValue::S("k".into()))
+            .item("p", AttributeValue::S("x".repeat(padding)))
+            .send()
+    };
+    put(409_600 - 4).await.unwrap();
+    let err = put(409_600 - 3).await.unwrap_err();
+    assert_eq!(err.code(), Some("ValidationException"));
+    assert_eq!(
+        err.message(),
+        Some("Item size has exceeded the maximum allowed size")
+    );
+
+    // A number is sized by its significant digits, not its expanded length:
+    // 1E125 costs 2 bytes, so this item measures exactly 409,600.
+    client
+        .put_item()
+        .table_name("SizeTable")
+        .item("pk", AttributeValue::S("n".into()))
+        .item("n", AttributeValue::N("1E125".into()))
+        .item("p", AttributeValue::S("x".repeat(409_600 - 3 - 1 - 2 - 1)))
+        .send()
+        .await
+        .unwrap();
+
+    // Numbers come back in canonical form.
+    client
+        .put_item()
+        .table_name("SizeTable")
+        .item("pk", AttributeValue::S("canon".into()))
+        .item("a", AttributeValue::N("+1.5E+3".into()))
+        .item("b", AttributeValue::N("0042.1200".into()))
+        .item("c", AttributeValue::N("-0".into()))
+        .send()
+        .await
+        .unwrap();
+    let got = client
+        .get_item()
+        .table_name("SizeTable")
+        .key("pk", AttributeValue::S("canon".into()))
+        .send()
+        .await
+        .unwrap();
+    let item = got.item().unwrap();
+    assert_eq!(item["a"], AttributeValue::N("1500".into()));
+    assert_eq!(item["b"], AttributeValue::N("42.12".into()));
+    assert_eq!(item["c"], AttributeValue::N("0".into()));
+}
+
+/// Secondary-index key values are validated on every write path: an empty
+/// value is rejected outright, a wrong-typed one is rejected by PutItem and
+/// UpdateItem and cancels a transaction with a ValidationError reason. None
+/// of the rejected writes persists.
+#[tokio::test]
+async fn dynamodb_rejects_invalid_secondary_index_key_values() {
+    let server = TestServer::start().await;
+    let client = server.dynamodb_client().await;
+    let def = |name: &str| {
+        AttributeDefinition::builder()
+            .attribute_name(name)
+            .attribute_type(ScalarAttributeType::S)
+            .build()
+            .unwrap()
+    };
+    let hash = |name: &str| {
+        KeySchemaElement::builder()
+            .attribute_name(name)
+            .key_type(KeyType::Hash)
+            .build()
+            .unwrap()
+    };
+    client
+        .create_table()
+        .table_name("IndexKeyValues")
+        .key_schema(hash("pk"))
+        .attribute_definitions(def("pk"))
+        .attribute_definitions(def("idx"))
+        .global_secondary_indexes(
+            GlobalSecondaryIndex::builder()
+                .index_name("gsi1")
+                .key_schema(hash("idx"))
+                .projection(
+                    Projection::builder()
+                        .projection_type(ProjectionType::All)
+                        .build(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .billing_mode(BillingMode::PayPerRequest)
+        .send()
+        .await
+        .unwrap();
+
+    let err = client
+        .put_item()
+        .table_name("IndexKeyValues")
+        .item("pk", AttributeValue::S("a".into()))
+        .item("idx", AttributeValue::S(String::new()))
+        .send()
+        .await
+        .unwrap_err()
+        .into_service_error();
+    assert_eq!(err.meta().code(), Some("ValidationException"));
+    assert_eq!(
+        err.meta().message(),
+        Some(
+            "One or more parameter values are not valid. A value specified for a secondary \
+             index key is not supported. The AttributeValue for a key attribute cannot contain \
+             an empty string value. IndexName: gsi1, IndexKey: idx"
+        )
+    );
+
+    let err = client
+        .update_item()
+        .table_name("IndexKeyValues")
+        .key("pk", AttributeValue::S("b".into()))
+        .update_expression("SET idx = :v")
+        .expression_attribute_values(":v", AttributeValue::N("5".into()))
+        .send()
+        .await
+        .unwrap_err()
+        .into_service_error();
+    assert_eq!(
+        err.meta().message(),
+        Some(
+            "One or more parameter values were invalid: Type mismatch for Index Key idx \
+             Expected: S Actual: N IndexName: gsi1"
+        )
+    );
+
+    let err = client
+        .transact_write_items()
+        .transact_items(
+            TransactWriteItem::builder()
+                .put(
+                    Put::builder()
+                        .table_name("IndexKeyValues")
+                        .item("pk", AttributeValue::S("c".into()))
+                        .item(
+                            "idx",
+                            AttributeValue::L(vec![AttributeValue::S("x".into())]),
+                        )
+                        .build()
+                        .unwrap(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap_err()
+        .into_service_error();
+    let cancelled = match err {
+        aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError::TransactionCanceledException(e) => e,
+        other => panic!("expected TransactionCanceledException, got {other:?}"),
+    };
+    let reasons = cancelled.cancellation_reasons();
+    assert_eq!(reasons.len(), 1);
+    assert_eq!(reasons[0].code(), Some("ValidationError"));
+    assert_eq!(
+        reasons[0].message(),
+        Some(
+            "One or more parameter values were invalid: Type mismatch for Index Key idx \
+             Expected: S Actual: L IndexName: gsi1"
+        )
+    );
+
+    let scan = client
+        .scan()
+        .table_name("IndexKeyValues")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(scan.count(), 0);
+}
+
+/// Expressions are validated before the table is looked up, with AWS's
+/// messages: a malformed request against a missing table reports the
+/// expression error, not ResourceNotFoundException.
+#[tokio::test]
+async fn dynamodb_expression_validation_precedes_table_lookup() {
+    use aws_sdk_dynamodb::error::ProvideErrorMetadata;
+    let server = TestServer::start().await;
+    let client = server.dynamodb_client().await;
+
+    let err = client
+        .put_item()
+        .table_name("no_such_table")
+        .item("pk", AttributeValue::S("a".into()))
+        .condition_expression("((attribute_not_exists(pk)))")
+        .send()
+        .await
+        .expect_err("redundant parentheses are rejected");
+    assert_eq!(err.code(), Some("ValidationException"));
+    assert_eq!(
+        err.message(),
+        Some("Invalid ConditionExpression: The expression has redundant parentheses;")
+    );
+
+    let err = client
+        .update_item()
+        .table_name("no_such_table")
+        .key("pk", AttributeValue::S("a".into()))
+        .update_expression("SET status = :v")
+        .expression_attribute_values(":v", AttributeValue::S("x".into()))
+        .send()
+        .await
+        .expect_err("reserved word is rejected");
+    assert_eq!(
+        err.message(),
+        Some(
+            "Invalid UpdateExpression: Attribute name is a reserved keyword; reserved keyword: \
+             status"
+        )
+    );
+
+    let err = client
+        .scan()
+        .table_name("no_such_table")
+        .projection_expression("#a, #b")
+        .expression_attribute_names("#a", "a")
+        .expression_attribute_names("#b", "a")
+        .send()
+        .await
+        .expect_err("overlapping projection paths are rejected");
+    assert_eq!(
+        err.message(),
+        Some(
+            "Invalid ProjectionExpression: Two document paths overlap with each other; must \
+             remove or rewrite one of these paths; path one: [a], path two: [a]"
+        )
+    );
+
+    // A well-formed request against a missing table is not found, without
+    // naming the table.
+    let err = client
+        .get_item()
+        .table_name("no_such_table")
+        .key("pk", AttributeValue::S("a".into()))
+        .send()
+        .await
+        .expect_err("missing table");
+    assert_eq!(err.code(), Some("ResourceNotFoundException"));
+    assert_eq!(err.message(), Some("Requested resource not found"));
+}
+
+/// UpdateItem evaluates every operand against the pre-update item and
+/// returns only the written fragment for UPDATED_NEW.
+#[tokio::test]
+async fn dynamodb_update_item_snapshot_semantics_and_updated_new_fragment() {
+    let server = TestServer::start().await;
+    let client = server.dynamodb_client().await;
+    create_pk_table(&client, "upd_sem").await;
+
+    let mut parent = HashMap::new();
+    parent.insert("keep".to_string(), AttributeValue::S("k".into()));
+    parent.insert("child".to_string(), AttributeValue::S("old".into()));
+    client
+        .put_item()
+        .table_name("upd_sem")
+        .item("pk", AttributeValue::S("p".into()))
+        .item("a", AttributeValue::S("OLD".into()))
+        .item("c", AttributeValue::N("10".into()))
+        .item("parent", AttributeValue::M(parent))
+        .send()
+        .await
+        .unwrap();
+
+    let resp = client
+        .update_item()
+        .table_name("upd_sem")
+        .key("pk", AttributeValue::S("p".into()))
+        .update_expression("SET a = :v, b = a, c = (c - :three), parent.child = :v")
+        .expression_attribute_values(":v", AttributeValue::S("NEW".into()))
+        .expression_attribute_values(":three", AttributeValue::N("3".into()))
+        .return_values(aws_sdk_dynamodb::types::ReturnValue::UpdatedNew)
+        .send()
+        .await
+        .unwrap();
+    let attrs = resp.attributes().unwrap();
+    assert_eq!(attrs["a"].as_s().unwrap(), "NEW");
+    assert_eq!(attrs["b"].as_s().unwrap(), "OLD");
+    assert_eq!(attrs["c"].as_n().unwrap(), "7");
+    let parent = attrs["parent"].as_m().unwrap();
+    assert_eq!(parent["child"].as_s().unwrap(), "NEW");
+    assert!(!parent.contains_key("keep"));
+}
+
+/// Query and Scan stop a page once it has read 1MB of data.
+#[tokio::test]
+async fn dynamodb_scan_paginates_at_one_megabyte() {
+    let server = TestServer::start().await;
+    let client = server.dynamodb_client().await;
+    create_pk_table(&client, "big_rows").await;
+    for i in 0..20 {
+        client
+            .put_item()
+            .table_name("big_rows")
+            .item("pk", AttributeValue::S(format!("row-{i}")))
+            .item("payload", AttributeValue::S("y".repeat(60_000)))
+            .send()
+            .await
+            .unwrap();
+    }
+    let first = client.scan().table_name("big_rows").send().await.unwrap();
+    assert!(first.count() < 20);
+    let lek = first.last_evaluated_key().expect("a second page follows");
+    let second = client
+        .scan()
+        .table_name("big_rows")
+        .set_exclusive_start_key(Some(lek.clone()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.count() + second.count(), 20);
+    assert!(second.last_evaluated_key().is_none());
+}
+
+/// SET on a list index past the end appends, and UPDATED_NEW reports the
+/// value at the index it actually landed on.
+#[tokio::test]
+async fn dynamodb_update_item_list_append_past_end_returns_written_value() {
+    let server = TestServer::start().await;
+    let client = server.dynamodb_client().await;
+    create_pk_table(&client, "upd_list").await;
+    client
+        .put_item()
+        .table_name("upd_list")
+        .item("pk", AttributeValue::S("p".into()))
+        .item(
+            "l",
+            AttributeValue::L(vec![
+                AttributeValue::S("a".into()),
+                AttributeValue::S("b".into()),
+            ]),
+        )
+        .send()
+        .await
+        .unwrap();
+    let resp = client
+        .update_item()
+        .table_name("upd_list")
+        .key("pk", AttributeValue::S("p".into()))
+        .update_expression("SET l[10] = :v")
+        .expression_attribute_values(":v", AttributeValue::S("z".into()))
+        .return_values(aws_sdk_dynamodb::types::ReturnValue::UpdatedNew)
+        .send()
+        .await
+        .unwrap();
+    let list = resp.attributes().unwrap()["l"].as_l().unwrap();
+    assert_eq!(list, &vec![AttributeValue::S("z".into())]);
+
+    // Clauses apply in order: after the REMOVE the list is [b, z], so the SET
+    // appends at index 2, which is where UPDATED_NEW must find it.
+    let resp = client
+        .update_item()
+        .table_name("upd_list")
+        .key("pk", AttributeValue::S("p".into()))
+        .update_expression("REMOVE l[0] SET l[10] = :w")
+        .expression_attribute_values(":w", AttributeValue::S("w".into()))
+        .return_values(aws_sdk_dynamodb::types::ReturnValue::UpdatedNew)
+        .send()
+        .await
+        .unwrap();
+    let list = resp.attributes().expect("appended value returned")["l"]
+        .as_l()
+        .unwrap();
+    assert_eq!(list, &vec![AttributeValue::S("w".into())]);
+    // UPDATED_OLD reports the expression's paths against the old list
+    // [b, z, w]: l[0] was "b"; l[10] had no old value.
+    let resp = client
+        .update_item()
+        .table_name("upd_list")
+        .key("pk", AttributeValue::S("p".into()))
+        .update_expression("REMOVE l[0] SET l[10] = :q")
+        .expression_attribute_values(":q", AttributeValue::S("q".into()))
+        .return_values(aws_sdk_dynamodb::types::ReturnValue::UpdatedOld)
+        .send()
+        .await
+        .unwrap();
+    let list = resp.attributes().expect("removed value returned")["l"]
+        .as_l()
+        .unwrap();
+    assert_eq!(list, &vec![AttributeValue::S("b".into())]);
+}
+
+/// A SET through several list indexes of one path (`l[0][1]`) writes into the
+/// nested list; UPDATED_NEW/UPDATED_OLD return that element.
+#[tokio::test]
+async fn dynamodb_update_item_multi_index_list_path() {
+    let server = TestServer::start().await;
+    let client = server.dynamodb_client().await;
+    create_pk_table(&client, "upd_multi").await;
+    let inner = AttributeValue::L(vec![
+        AttributeValue::S("a".into()),
+        AttributeValue::S("b".into()),
+    ]);
+    client
+        .put_item()
+        .table_name("upd_multi")
+        .item("pk", AttributeValue::S("p".into()))
+        .item("l", AttributeValue::L(vec![inner]))
+        .send()
+        .await
+        .unwrap();
+    let resp = client
+        .update_item()
+        .table_name("upd_multi")
+        .key("pk", AttributeValue::S("p".into()))
+        .update_expression("SET l[0][1] = :v")
+        .expression_attribute_values(":v", AttributeValue::S("v".into()))
+        .return_values(aws_sdk_dynamodb::types::ReturnValue::UpdatedOld)
+        .send()
+        .await
+        .unwrap();
+    let old = resp.attributes().unwrap()["l"].as_l().unwrap();
+    assert_eq!(
+        old,
+        &vec![AttributeValue::L(vec![AttributeValue::S("b".into())])]
+    );
+    let item = client
+        .get_item()
+        .table_name("upd_multi")
+        .key("pk", AttributeValue::S("p".into()))
+        .send()
+        .await
+        .unwrap();
+    let item = item.item().unwrap();
+    assert!(!item.contains_key("l[0]"));
+    assert_eq!(
+        item["l"].as_l().unwrap(),
+        &vec![AttributeValue::L(vec![
+            AttributeValue::S("a".into()),
+            AttributeValue::S("v".into()),
+        ])]
+    );
+}
+
+/// ProjectionExpression paths are read with the expression grammar on
+/// GetItem and Query alike: whitespace inside a path and a subscript on an
+/// alias select just that element.
+#[tokio::test]
+async fn dynamodb_projection_paths_follow_expression_grammar() {
+    let server = TestServer::start().await;
+    let client = server.dynamodb_client().await;
+    create_pk_table(&client, "proj_grammar").await;
+    let mut a = HashMap::new();
+    a.insert("b".to_string(), AttributeValue::S("ab".into()));
+    a.insert("c".to_string(), AttributeValue::S("ac".into()));
+    let mut n1 = HashMap::new();
+    n1.insert("x".to_string(), AttributeValue::S("n1".into()));
+    n1.insert("y".to_string(), AttributeValue::S("no".into()));
+    client
+        .put_item()
+        .table_name("proj_grammar")
+        .item("pk", AttributeValue::S("p".into()))
+        .item(
+            "l",
+            AttributeValue::L(vec![
+                AttributeValue::S("x".into()),
+                AttributeValue::S("y".into()),
+            ]),
+        )
+        .item("a", AttributeValue::M(a))
+        .item(
+            "n",
+            AttributeValue::L(vec![
+                AttributeValue::M(HashMap::new()),
+                AttributeValue::M(n1),
+            ]),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    let check = |item: &HashMap<String, AttributeValue>| {
+        assert_eq!(
+            item["l"].as_l().unwrap(),
+            &vec![AttributeValue::S("x".into())]
+        );
+        let a = item["a"].as_m().unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(a["b"].as_s().unwrap(), "ab");
+        let n = item["n"].as_l().unwrap();
+        assert_eq!(n.len(), 1);
+        let n = n[0].as_m().unwrap();
+        assert_eq!(n.len(), 1);
+        assert_eq!(n["x"].as_s().unwrap(), "n1");
+    };
+
+    let got = client
+        .get_item()
+        .table_name("proj_grammar")
+        .key("pk", AttributeValue::S("p".into()))
+        .projection_expression("l[ 0 ], a . b, #n[1].x")
+        .expression_attribute_names("#n", "n")
+        .send()
+        .await
+        .unwrap();
+    check(got.item().unwrap());
+
+    let q = client
+        .query()
+        .table_name("proj_grammar")
+        .key_condition_expression("pk = :p")
+        .expression_attribute_values(":p", AttributeValue::S("p".into()))
+        .projection_expression("l[ 0 ], a . b, #n[1].x")
+        .expression_attribute_names("#n", "n")
+        .send()
+        .await
+        .unwrap();
+    check(&q.items()[0]);
+}
+
+/// A REMOVE later in the expression shifts the list a SET wrote into, and
+/// UPDATED_NEW reports the value where it ended up.
+#[tokio::test]
+async fn dynamodb_update_item_set_then_remove_reports_shifted_value() {
+    let server = TestServer::start().await;
+    let client = server.dynamodb_client().await;
+    create_pk_table(&client, "upd_shift").await;
+    client
+        .put_item()
+        .table_name("upd_shift")
+        .item("pk", AttributeValue::S("p".into()))
+        .item(
+            "l",
+            AttributeValue::L(vec![
+                AttributeValue::S("a".into()),
+                AttributeValue::S("b".into()),
+            ]),
+        )
+        .send()
+        .await
+        .unwrap();
+    let resp = client
+        .update_item()
+        .table_name("upd_shift")
+        .key("pk", AttributeValue::S("p".into()))
+        .update_expression("SET l[1] = :v REMOVE l[0]")
+        .expression_attribute_values(":v", AttributeValue::S("v".into()))
+        .return_values(aws_sdk_dynamodb::types::ReturnValue::UpdatedNew)
+        .send()
+        .await
+        .unwrap();
+    let list = resp.attributes().expect("set value returned")["l"]
+        .as_l()
+        .unwrap();
+    assert_eq!(list, &vec![AttributeValue::S("v".into())]);
 }

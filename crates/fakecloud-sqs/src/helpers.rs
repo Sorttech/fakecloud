@@ -495,13 +495,7 @@ pub(crate) fn is_mutating_action(action: &str) -> bool {
 /// account-level actions or when the queue can't be identified from the
 /// request.
 pub(crate) fn sqs_resource_for(action: &str, account: &str, region: &str, body: &Value) -> String {
-    let partition = if region.starts_with("cn-") {
-        "aws-cn"
-    } else if region.starts_with("us-gov-") {
-        "aws-us-gov"
-    } else {
-        "aws"
-    };
+    let partition = fakecloud_aws::arn::partition_for(region);
     let queue_arn = |name: &str| format!("arn:{}:sqs:{}:{}:{}", partition, region, account, name);
     match action {
         "ListQueues" => "*".to_string(),

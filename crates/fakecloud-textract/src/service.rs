@@ -22,6 +22,7 @@ use http::StatusCode;
 use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_persistence::SnapshotStore;
 
@@ -255,12 +256,24 @@ fn new_adapter_id() -> String {
     rand_hex(32)
 }
 
-fn adapter_arn(region: &str, account: &str, adapter_id: &str) -> String {
-    format!("arn:aws:textract:{region}:{account}:adapter/{adapter_id}")
+pub fn adapter_arn(region: &str, account: &str, adapter_id: &str) -> String {
+    Arn::regional(
+        "textract",
+        region,
+        account,
+        &format!("adapter/{adapter_id}"),
+    )
+    .to_string()
 }
 
-fn adapter_version_arn(region: &str, account: &str, adapter_id: &str, version: &str) -> String {
-    format!("arn:aws:textract:{region}:{account}:adapter/{adapter_id}/version/{version}")
+pub fn adapter_version_arn(region: &str, account: &str, adapter_id: &str, version: &str) -> String {
+    Arn::regional(
+        "textract",
+        region,
+        account,
+        &format!("adapter/{adapter_id}/version/{version}"),
+    )
+    .to_string()
 }
 
 fn sf<'a>(b: &'a Value, k: &str) -> Option<&'a str> {
@@ -989,6 +1002,42 @@ mod tests {
             .await,
         );
         assert_eq!(code, "InvalidJobIdException");
+    }
+
+    #[tokio::test]
+    async fn china_region_adapter_arn_uses_aws_cn_partition() {
+        let svc = service();
+        let cn = |action: &str, body: Value| {
+            let mut r = req(action, body);
+            r.region = "cn-north-1".to_string();
+            r
+        };
+        let adapter_id = body_of(
+            svc.handle(cn(
+                "CreateAdapter",
+                json!({
+                    "AdapterName": "cn-adapter",
+                    "FeatureTypes": ["TABLES"],
+                    "Tags": { "env": "cn" }
+                }),
+            ))
+            .await
+            .unwrap(),
+        )
+        .get("AdapterId")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+        let arn = format!("arn:aws-cn:textract:cn-north-1:000000000000:adapter/{adapter_id}");
+        assert_eq!(adapter_arn("cn-north-1", "000000000000", &adapter_id), arn);
+        let tags = svc
+            .handle(cn("ListTagsForResource", json!({ "ResourceARN": arn })))
+            .await
+            .unwrap();
+        assert_eq!(
+            body_of(tags).pointer("/Tags/env").and_then(Value::as_str),
+            Some("cn")
+        );
     }
 
     #[tokio::test]
