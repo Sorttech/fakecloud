@@ -6,6 +6,7 @@ use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 use crate::state::ConfigurationSet;
 use crate::state::SesState;
 
+use super::helpers::configuration_set_arn;
 use super::{
     event_destination_to_json, extract_string_array, parse_event_destination_definition,
     validate_message_security_options, SesV2Service,
@@ -120,10 +121,7 @@ impl SesV2Service {
         // what the caller sent. Replace rather than merge so a Create
         // after Delete (or a Create that omits Tags) doesn't inherit
         // stale entries from a previous incarnation of the ARN.
-        let arn = format!(
-            "arn:aws:ses:{}:{}:configuration-set/{}",
-            req.region, req.account_id, name
-        );
+        let arn = configuration_set_arn(&req.region, &req.account_id, &name);
         if let Some(tags_arr) = body["Tags"].as_array() {
             let mut tag_map = std::collections::BTreeMap::new();
             for tag in tags_arr {
@@ -260,10 +258,7 @@ impl SesV2Service {
 
         // Surface the per-ARN tag map on Get so the round-trip echo for
         // Tags is honored end-to-end.
-        let arn = format!(
-            "arn:aws:ses:{}:{}:configuration-set/{}",
-            req.region, req.account_id, name
-        );
+        let arn = configuration_set_arn(&req.region, &req.account_id, name);
         if let Some(tag_map) = state.tags.get(&arn) {
             response["Tags"] =
                 Value::Array(fakecloud_core::tags::tags_to_json(tag_map, "Key", "Value"));
@@ -348,10 +343,7 @@ impl SesV2Service {
         }
 
         // Remove tags for this configuration set
-        let arn = format!(
-            "arn:aws:ses:{}:{}:configuration-set/{}",
-            req.region, req.account_id, name
-        );
+        let arn = configuration_set_arn(&req.region, &req.account_id, name);
         state.tags.remove(&arn);
 
         // Remove event destinations for this configuration set

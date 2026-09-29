@@ -21,7 +21,7 @@ pub(crate) mod service;
 pub(crate) mod state;
 mod validate;
 
-pub use service::{CodeBuildService, CODEBUILD_ACTIONS};
+pub use service::{project_arn, CodeBuildService, CODEBUILD_ACTIONS};
 pub use state::{
     CodeBuildSnapshot, CodeBuildState, SharedCodeBuildState, CODEBUILD_SNAPSHOT_SCHEMA_VERSION,
 };

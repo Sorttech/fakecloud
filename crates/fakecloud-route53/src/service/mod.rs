@@ -989,6 +989,42 @@ mod tests {
     }
 
     #[test]
+    fn cidr_collection_arn_carries_china_partition() {
+        let svc = Route53Service::new(Arc::new(RwLock::new(Route53Accounts::default())));
+        let req = AwsRequest {
+            service: "route53".to_string(),
+            action: "CreateCidrCollection".to_string(),
+            region: "cn-north-1".to_string(),
+            account_id: DEFAULT_ACCOUNT.to_string(),
+            request_id: "rid".to_string(),
+            headers: HeaderMap::new(),
+            query_params: std::collections::HashMap::new(),
+            body: Bytes::from_static(
+                b"<CreateCidrCollectionRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Name>cn</Name><CallerReference>r</CallerReference></CreateCidrCollectionRequest>",
+            ),
+            body_stream: parking_lot::Mutex::new(None),
+            path_segments: vec!["2013-04-01".into(), "cidrcollection".into()],
+            raw_path: "/2013-04-01/cidrcollection".to_string(),
+            raw_query: String::new(),
+            method: http::Method::POST,
+            is_query_protocol: false,
+            access_key_id: None,
+            principal: None,
+        };
+        svc.create_cidr_collection(&req).unwrap();
+        let st = svc.state.read();
+        let c = st.accounts[DEFAULT_ACCOUNT]
+            .cidr_collections
+            .values()
+            .next()
+            .unwrap();
+        assert_eq!(
+            c.arn,
+            format!("arn:aws-cn:route53:::cidrcollection/{}", c.id)
+        );
+    }
+
+    #[test]
     fn set_health_check_status_flips_status_and_failure_reason() {
         let svc = svc_with_health_check("hc-1");
         assert!(svc.set_health_check_status(

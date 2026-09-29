@@ -11,10 +11,7 @@ impl StepFunctionsService {
         validate_name(name)?;
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
-        let arn = format!(
-            "arn:aws:states:{}:{}:activity:{}",
-            req.region, state.account_id, name
-        );
+        let arn = crate::state::activity_arn(&req.region, &state.account_id, name);
         if state.activities.contains_key(&arn) {
             return Err(AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,

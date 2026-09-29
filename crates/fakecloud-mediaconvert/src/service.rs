@@ -1480,6 +1480,27 @@ mod tests {
     }
 
     #[test]
+    fn china_region_queue_arn_uses_aws_cn_partition_and_tags_by_it() {
+        let s = svc();
+        let c = Ctx {
+            account: "000000000000".into(),
+            region: "cn-north-1".into(),
+        };
+        let created = s
+            .create_queue(&c, &json!({ "name": "cn-q", "tags": { "k": "v" } }))
+            .unwrap();
+        let q: Value = serde_json::from_slice(created.body.expect_bytes()).unwrap();
+        let arn = q["queue"]["arn"].as_str().unwrap().to_string();
+        assert_eq!(
+            arn,
+            "arn:aws-cn:mediaconvert:cn-north-1:000000000000:queues/cn-q"
+        );
+        let resp = s.list_tags(&c, &arn).unwrap();
+        let tags: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        assert_eq!(tags["resourceTags"]["tags"]["k"], "v");
+    }
+
+    #[test]
     fn tag_and_list_tags() {
         let s = svc();
         let c = ctx();

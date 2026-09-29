@@ -5,25 +5,29 @@
 
 use rand::Rng;
 
+fn mediaconvert_arn(region: &str, account: &str, resource: &str) -> String {
+    fakecloud_aws::arn::Arn::regional("mediaconvert", region, account, resource).to_string()
+}
+
 /// The queue ARN, `arn:aws:mediaconvert:{region}:{account}:queues/{name}`.
 pub fn queue_arn(region: &str, account: &str, name: &str) -> String {
-    format!("arn:aws:mediaconvert:{region}:{account}:queues/{name}")
+    mediaconvert_arn(region, account, &format!("queues/{name}"))
 }
 
 /// The preset ARN, `arn:aws:mediaconvert:{region}:{account}:presets/{name}`.
 pub fn preset_arn(region: &str, account: &str, name: &str) -> String {
-    format!("arn:aws:mediaconvert:{region}:{account}:presets/{name}")
+    mediaconvert_arn(region, account, &format!("presets/{name}"))
 }
 
 /// The job-template ARN,
 /// `arn:aws:mediaconvert:{region}:{account}:jobTemplates/{name}`.
 pub fn job_template_arn(region: &str, account: &str, name: &str) -> String {
-    format!("arn:aws:mediaconvert:{region}:{account}:jobTemplates/{name}")
+    mediaconvert_arn(region, account, &format!("jobTemplates/{name}"))
 }
 
 /// The job ARN, `arn:aws:mediaconvert:{region}:{account}:jobs/{id}`.
 pub fn job_arn(region: &str, account: &str, id: &str) -> String {
-    format!("arn:aws:mediaconvert:{region}:{account}:jobs/{id}")
+    mediaconvert_arn(region, account, &format!("jobs/{id}"))
 }
 
 /// Generate a fresh MediaConvert job id of AWS's `{epoch-millis}-{6 base-36}`

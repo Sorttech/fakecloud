@@ -17,6 +17,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::multi_account::{AccountState, MultiAccountState};
 
 pub const S3TABLES_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
@@ -125,9 +126,9 @@ pub struct S3TablesSnapshot {
 // ARN builders
 // ---------------------------------------------------------------------------
 
-/// ARN for a table bucket: `arn:aws:s3tables:<region>:<account>:bucket/<name>`.
+/// ARN for a table bucket: `arn:<partition>:s3tables:<region>:<account>:bucket/<name>`.
 pub fn table_bucket_arn(region: &str, account_id: &str, name: &str) -> String {
-    format!("arn:aws:s3tables:{region}:{account_id}:bucket/{name}")
+    Arn::regional("s3tables", region, account_id, &format!("bucket/{name}")).to_string()
 }
 
 /// ARN for a table: `<bucketArn>/table/<table_id>`.

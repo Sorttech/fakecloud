@@ -21,4 +21,7 @@ pub(crate) mod validation;
 pub(crate) mod xml;
 
 pub use service::DocDbService;
-pub use state::{DocDbSnapshot, DocDbState, SharedDocDbState, DOCDB_SNAPSHOT_SCHEMA_VERSION};
+pub use state::{
+    global_cluster_arn, rds_arn, DocDbSnapshot, DocDbState, SharedDocDbState,
+    DOCDB_SNAPSHOT_SCHEMA_VERSION,
+};

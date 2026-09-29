@@ -78,8 +78,11 @@ impl LogsService {
         let state = accounts.get_or_create(&req.account_id);
         let detector_id = uuid::Uuid::new_v4().to_string();
         let arn = format!(
-            "arn:aws:logs:{}:{}:anomaly-detector:{}",
-            req.region, state.account_id, detector_id
+            "arn:{}:logs:{}:{}:anomaly-detector:{}",
+            fakecloud_aws::arn::partition_for(&req.region),
+            req.region,
+            state.account_id,
+            detector_id
         );
 
         let detector = AnomalyDetector {

@@ -338,12 +338,7 @@ fn cache_manifest(
         .repositories
         .entry(repo_name.to_string())
         .or_insert_with(|| {
-            let arn = format!(
-                "arn:aws:ecr:{region}:{account_id}:repository/{repo_name}",
-                region = region,
-                account_id = account_id,
-                repo_name = repo_name,
-            );
+            let arn = crate::state::repository_arn(&region, &account_id, repo_name);
             crate::state::Repository::new(
                 repo_name,
                 arn,
@@ -395,12 +390,7 @@ fn cache_blob(
         .repositories
         .entry(repo_name.to_string())
         .or_insert_with(|| {
-            let arn = format!(
-                "arn:aws:ecr:{region}:{account_id}:repository/{repo_name}",
-                region = region,
-                account_id = account_id,
-                repo_name = repo_name,
-            );
+            let arn = crate::state::repository_arn(&region, &account_id, repo_name);
             crate::state::Repository::new(
                 repo_name,
                 arn,

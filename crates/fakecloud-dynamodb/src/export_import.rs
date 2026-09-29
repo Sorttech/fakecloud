@@ -278,7 +278,7 @@ fn build_table(
 
     let mut table = DynamoTable {
         name: name.to_string(),
-        arn: format!("arn:aws:dynamodb:{region}:{account_id}:table/{name}"),
+        arn: crate::state::table_arn(region, account_id, name),
         table_id: uuid::Uuid::new_v4().to_string().replace('-', ""),
         key_schema,
         attribute_definitions,

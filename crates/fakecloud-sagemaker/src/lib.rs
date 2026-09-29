@@ -76,9 +76,7 @@ pub fn start_pipeline_execution_from_delivery(
     let mut g = state.write();
     let data = g.get_or_create(account);
     let exec_id = service::mint_id(account, "PipelineExecution", &data.next_seq().to_string());
-    let exec_arn = format!(
-        "arn:aws:sagemaker:{region}:{account}:pipeline/{pipeline_name}/execution/{exec_id}"
-    );
+    let exec_arn = service::pipeline_execution_arn(region, account, pipeline_name, &exec_id);
     let mut record = serde_json::Map::new();
     record.insert(
         "PipelineExecutionArn".to_string(),

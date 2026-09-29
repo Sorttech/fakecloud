@@ -3300,6 +3300,24 @@ mod tests {
         (status, v)
     }
 
+    #[tokio::test]
+    async fn resource_arns_carry_china_partition() {
+        let svc = Route53ResolverService::default();
+        let mut r = req(
+            "CreateFirewallDomainList",
+            json!({ "CreatorRequestId": "c", "Name": "cn-list" }),
+        );
+        r.region = "cn-north-1".into();
+        let resp = svc.handle(r).await.unwrap();
+        let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        let arn = v["FirewallDomainList"]["Arn"].as_str().unwrap();
+        let id = v["FirewallDomainList"]["Id"].as_str().unwrap();
+        assert_eq!(
+            arn,
+            format!("arn:aws-cn:route53resolver:cn-north-1:123456789012:firewall-domain-list/{id}")
+        );
+    }
+
     // Finding 7: a valid multi-subnet endpoint (AWS minimum is two) must succeed
     // in standalone mode where no EC2 state is wired.
     #[tokio::test]

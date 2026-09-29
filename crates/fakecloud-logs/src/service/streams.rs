@@ -67,7 +67,8 @@ impl LogsService {
         }
 
         let arn = format!(
-            "arn:aws:logs:{region}:{account_id}:log-group:{group_name}:log-stream:{stream_name}",
+            "arn:{partition}:logs:{region}:{account_id}:log-group:{group_name}:log-stream:{stream_name}",
+            partition = fakecloud_aws::arn::partition_for(&region),
         );
         let now = Utc::now().timestamp_millis();
 
@@ -162,7 +163,7 @@ impl LogsService {
                 ));
             }
             // If it's an ARN, extract the log group name
-            if identifier.starts_with("arn:aws:logs:") {
+            if fakecloud_aws::arn::arn_resource(identifier, "logs").is_some() {
                 extract_log_group_from_arn(identifier).unwrap_or_else(|| identifier.to_string())
             } else {
                 identifier.to_string()
@@ -563,7 +564,7 @@ impl LogsService {
                                 .delivery_destination_configuration
                                 .get("destinationResourceArn")
                             {
-                                if dest_arn.contains(":s3:") || dest_arn.starts_with("arn:aws:s3") {
+                                if dest_arn.contains(":s3:") {
                                     return Some(dest_arn.clone());
                                 }
                             }
@@ -599,7 +600,9 @@ impl LogsService {
             let now_str = now_dt.format("%Y%m%dT%H%M%SZ").to_string();
             let account_id_owned = state.account_id.clone();
             for dest_arn in &delivery_targets {
-                let bucket = dest_arn.strip_prefix("arn:aws:s3:::").unwrap_or(dest_arn);
+                let bucket = fakecloud_aws::arn::arn_resource(dest_arn, "s3")
+                    .and_then(|r| r.strip_prefix("::"))
+                    .unwrap_or(dest_arn);
                 // Mirror the CloudWatch Logs delivery key shape:
                 // `aws-logs-write/<accountId>/<group>/<date>/<stream>-<ts>.gz`.
                 let s3_key = format!(
@@ -813,7 +816,7 @@ impl LogsService {
                     ),
                 ));
             }
-            if identifier.starts_with("arn:aws:logs:") {
+            if fakecloud_aws::arn::arn_resource(identifier, "logs").is_some() {
                 extract_log_group_from_arn(identifier).unwrap_or_else(|| identifier.to_string())
             } else {
                 identifier.to_string()
@@ -2914,5 +2917,72 @@ mod tests {
         let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
         let scanned = body["statistics"]["recordsScanned"].as_f64().unwrap();
         assert_eq!(scanned, 1.0, "retention should hide the 12-day-old event");
+    }
+
+    #[test]
+    fn china_region_log_arns_use_the_aws_cn_partition() {
+        let svc = make_service();
+        let in_china = |action: &str, body: Value| fakecloud_core::service::AwsRequest {
+            region: "cn-north-1".to_string(),
+            ..make_request(action, body)
+        };
+        svc.create_log_group(&in_china(
+            "CreateLogGroup",
+            json!({ "logGroupName": "cn-g" }),
+        ))
+        .unwrap();
+        svc.create_log_stream(&in_china(
+            "CreateLogStream",
+            json!({ "logGroupName": "cn-g", "logStreamName": "s1" }),
+        ))
+        .unwrap();
+        let groups: Value = serde_json::from_slice(
+            svc.describe_log_groups(&in_china(
+                "DescribeLogGroups",
+                json!({ "logGroupNamePrefix": "cn-g" }),
+            ))
+            .unwrap()
+            .body
+            .expect_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            groups["logGroups"][0]["arn"],
+            "arn:aws-cn:logs:cn-north-1:123456789012:log-group:cn-g:*"
+        );
+
+        let streams: Value = serde_json::from_slice(
+            svc.describe_log_streams(&in_china(
+                "DescribeLogStreams",
+                json!({ "logGroupIdentifier": "arn:aws-cn:logs:cn-north-1:123456789012:log-group:cn-g" }),
+            ))
+            .unwrap()
+            .body
+            .expect_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            streams["logStreams"][0]["arn"],
+            "arn:aws-cn:logs:cn-north-1:123456789012:log-group:cn-g:log-stream:s1"
+        );
+
+        let source: Value = serde_json::from_slice(
+            svc.put_delivery_source(&in_china(
+                "PutDeliverySource",
+                json!({
+                    "name": "cn-src",
+                    "resourceArn": "arn:aws-cn:bedrock:cn-north-1:123456789012:knowledge-base/kb",
+                    "logType": "APPLICATION_LOGS"
+                }),
+            ))
+            .unwrap()
+            .body
+            .expect_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            source["deliverySource"]["arn"],
+            "arn:aws-cn:logs:cn-north-1:123456789012:delivery-source:cn-src"
+        );
     }
 }

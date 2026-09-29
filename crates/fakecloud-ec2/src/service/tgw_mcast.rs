@@ -5,7 +5,7 @@ use fakecloud_aws::ec2query::{ec2_elem, ec2_list};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use crate::service::Ec2Service;
-use crate::service_helpers::{gen_id, indexed_list, require, validate_max_results};
+use crate::service_helpers::{ec2_arn, gen_id, indexed_list, require, validate_max_results};
 use crate::state::{
     Ec2State, TgwMcastAssociation, TgwMcastGroup, TgwMeteringPolicy, TgwMulticastDomain,
 };
@@ -24,7 +24,7 @@ fn mcast_xml(d: &TgwMulticastDomain, owner: &str, region: &str) -> String {
          <staticSourcesSupport>disable</staticSourcesSupport><autoAcceptSharedAssociations>disable</autoAcceptSharedAssociations></options>{}",
         ec2_elem("transitGatewayMulticastDomainId", &d.id),
         ec2_elem("transitGatewayId", &d.tgw_id),
-        ec2_elem("transitGatewayMulticastDomainArn", &format!("arn:aws:ec2:{region}:{owner}:transit-gateway-multicast-domain/{}", d.id)),
+        ec2_elem("transitGatewayMulticastDomainArn", &ec2_arn(region, owner, &format!("transit-gateway-multicast-domain/{}", d.id))),
         ec2_elem("ownerId", owner),
         ec2_elem("creationTime", FIXED_TIME),
     )

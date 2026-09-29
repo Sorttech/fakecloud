@@ -16,6 +16,7 @@ use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::multi_account::{AccountState, MultiAccountState};
 
 pub const EKS_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
@@ -411,9 +412,15 @@ impl AccountState for EksState {
     }
 }
 
+/// An EKS ARN (`arn:<partition>:eks:<region>:<account>:<resource>`) in
+/// `region`'s partition.
+fn eks_arn(region: &str, account_id: &str, resource: &str) -> String {
+    Arn::regional("eks", region, account_id, resource).to_string()
+}
+
 /// Build the ARN for a cluster.
 pub fn cluster_arn(region: &str, account_id: &str, name: &str) -> String {
-    format!("arn:aws:eks:{region}:{account_id}:cluster/{name}")
+    eks_arn(region, account_id, &format!("cluster/{name}"))
 }
 
 /// Build the ARN for a node group. AWS appends a random UUID segment after
@@ -426,7 +433,11 @@ pub fn nodegroup_arn(
     name: &str,
     id: &str,
 ) -> String {
-    format!("arn:aws:eks:{region}:{account_id}:nodegroup/{cluster}/{name}/{id}")
+    eks_arn(
+        region,
+        account_id,
+        &format!("nodegroup/{cluster}/{name}/{id}"),
+    )
 }
 
 /// Build the ARN for a Fargate profile.
@@ -437,13 +448,17 @@ pub fn fargate_profile_arn(
     name: &str,
     id: &str,
 ) -> String {
-    format!("arn:aws:eks:{region}:{account_id}:fargateprofile/{cluster}/{name}/{id}")
+    eks_arn(
+        region,
+        account_id,
+        &format!("fargateprofile/{cluster}/{name}/{id}"),
+    )
 }
 
 /// Build the ARN for an add-on. AWS appends a random UUID segment after
 /// `addon/{cluster}/{name}` so each add-on's ARN is unique across recreate.
 pub fn addon_arn(region: &str, account_id: &str, cluster: &str, name: &str, id: &str) -> String {
-    format!("arn:aws:eks:{region}:{account_id}:addon/{cluster}/{name}/{id}")
+    eks_arn(region, account_id, &format!("addon/{cluster}/{name}/{id}"))
 }
 
 /// Build the ARN for an access entry. AWS's access-entry ARN embeds the
@@ -458,8 +473,10 @@ pub fn access_entry_arn(
     principal_name: &str,
     id: &str,
 ) -> String {
-    format!(
-        "arn:aws:eks:{region}:{account_id}:access-entry/{cluster}/{principal_type}/{account_id}/{principal_name}/{id}"
+    eks_arn(
+        region,
+        account_id,
+        &format!("access-entry/{cluster}/{principal_type}/{account_id}/{principal_name}/{id}"),
     )
 }
 
@@ -472,7 +489,11 @@ pub fn identity_provider_config_arn(
     name: &str,
     id: &str,
 ) -> String {
-    format!("arn:aws:eks:{region}:{account_id}:identityproviderconfig/{cluster}/oidc/{name}/{id}")
+    eks_arn(
+        region,
+        account_id,
+        &format!("identityproviderconfig/{cluster}/oidc/{name}/{id}"),
+    )
 }
 
 /// Build the ARN for a pod identity association attached to an add-on.
@@ -482,7 +503,11 @@ pub fn pod_identity_association_arn(
     cluster: &str,
     id: &str,
 ) -> String {
-    format!("arn:aws:eks:{region}:{account_id}:podidentityassociation/{cluster}/a-{id}")
+    eks_arn(
+        region,
+        account_id,
+        &format!("podidentityassociation/{cluster}/a-{id}"),
+    )
 }
 
 /// Build the ARN for a cluster capability. AWS appends a random UUID segment
@@ -494,12 +519,20 @@ pub fn capability_arn(
     name: &str,
     id: &str,
 ) -> String {
-    format!("arn:aws:eks:{region}:{account_id}:capability/{cluster}/{name}/{id}")
+    eks_arn(
+        region,
+        account_id,
+        &format!("capability/{cluster}/{name}/{id}"),
+    )
 }
 
 /// Build the ARN for an EKS Anywhere subscription.
 pub fn eks_anywhere_subscription_arn(region: &str, account_id: &str, id: &str) -> String {
-    format!("arn:aws:eks:{region}:{account_id}:eks-anywhere-subscription/{id}")
+    eks_arn(
+        region,
+        account_id,
+        &format!("eks-anywhere-subscription/{id}"),
+    )
 }
 
 pub type SharedEksState = Arc<RwLock<MultiAccountState<EksState>>>;

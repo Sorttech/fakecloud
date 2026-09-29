@@ -447,11 +447,10 @@ impl EcsService {
                 "Capacity provider already exists: {name}"
             )));
         }
-        let arn = format!(
-            "arn:aws:ecs:{}:{}:capacity-provider/{}",
+        let arn = crate::state::ecs_arn(
             request.region.as_str(),
-            state.account_id,
-            name
+            &state.account_id,
+            &format!("capacity-provider/{}", name),
         );
         let cp = CapacityProvider {
             name: name.clone(),
@@ -683,13 +682,10 @@ impl EcsService {
         let ts_id = format!("ecs-svc-{}", uuid::Uuid::new_v4().simple());
         let task_set = TaskSet {
             task_set_id: ts_id.clone(),
-            task_set_arn: format!(
-                "arn:aws:ecs:{}:{}:task-set/{}/{}/{}",
+            task_set_arn: crate::state::ecs_arn(
                 request.region.as_str(),
-                state.account_id,
-                cluster_name,
-                service_name,
-                ts_id
+                &state.account_id,
+                &format!("task-set/{}/{}/{}", cluster_name, service_name, ts_id),
             ),
             service_arn: svc.service_arn.clone(),
             cluster_arn: svc.cluster_arn.clone(),
