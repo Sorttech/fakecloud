@@ -478,6 +478,15 @@ impl BedrockAgentService {
                 return Some(("ListFlows", params));
             }
         }
+        // Checked before `/flows/{flowIdentifier}`, whose POST (PrepareFlow)
+        // would otherwise swallow it as a flow named `validate-definition`.
+        if segs.len() == 2
+            && segs[0] == "flows"
+            && segs[1] == "validate-definition"
+            && *m == Method::POST
+        {
+            return Some(("ValidateFlowDefinition", params));
+        }
         if segs.len() == 2 && segs[0] == "flows" {
             params.push(("flowIdentifier".to_string(), segs[1].clone()));
             if *m == Method::GET {
@@ -533,13 +542,6 @@ impl BedrockAgentService {
             if *m == Method::DELETE {
                 return Some(("DeleteFlowVersion", params));
             }
-        }
-        if segs.len() == 2
-            && segs[0] == "flows"
-            && segs[1] == "validate-definition"
-            && *m == Method::POST
-        {
-            return Some(("ValidateFlowDefinition", params));
         }
 
         // Prompts
@@ -1021,6 +1023,14 @@ fn now() -> DateTime<Utc> {
     Utc::now()
 }
 
+/// Percent-decode an `@httpLabel` path segment. An ARN identifier arrives
+/// URL-encoded (`arn%3Aaws%3A...%2F...`); a bare ID is unchanged.
+fn decode_label(segment: &str) -> String {
+    percent_encoding::percent_decode_str(segment)
+        .decode_utf8_lossy()
+        .into_owned()
+}
+
 fn short_id() -> String {
     // Smithy ResourceIdentifier shape is @pattern("^[0-9a-zA-Z]{10}$"): the
     // first 10 hex chars of a v4 UUID.
@@ -1247,8 +1257,9 @@ fn agent_summary_json(a: &Agent) -> Value {
 }
 
 /// `FlowSummary` shape: requires `arn`, `id`, `name`, `status`, `createdAt`,
-/// `updatedAt`, and `version`. The full `flow_json` exposes `flowId`,
-/// `executionRoleArn`, and `definition`, none of which appear on the summary.
+/// `updatedAt`, and `version`. The full `flow_json` adds `executionRoleArn`,
+/// `customerEncryptionKeyArn`, and `definition`, none of which appear on the
+/// summary.
 fn flow_summary_json(f: &Flow) -> Value {
     let mut o = json!({
         "arn": f.arn,
@@ -1298,10 +1309,14 @@ fn prompt_summary_json(p: &Prompt) -> Value {
     o
 }
 
+/// `GetFlowResponse` / `CreateFlowResponse` / `UpdateFlowResponse` members:
+/// `name`, `description`, `executionRoleArn`, `customerEncryptionKeyArn`,
+/// `id`, `arn`, `status`, `createdAt`, `updatedAt`, `version`, `definition`.
 fn flow_json(f: &Flow) -> Value {
     let mut o = json!({
-        "flowId": f.flow_id,
         "name": f.name,
+        "id": f.flow_id,
+        "arn": f.arn,
         "status": f.status,
         "createdAt": f.created_at.to_rfc3339(),
         "updatedAt": f.updated_at.to_rfc3339(),
@@ -1313,21 +1328,44 @@ fn flow_json(f: &Flow) -> Value {
     if let Some(ref r) = f.execution_role_arn {
         o["executionRoleArn"] = json!(r);
     }
+    if let Some(ref k) = f.customer_encryption_key_arn {
+        o["customerEncryptionKeyArn"] = json!(k);
+    }
     if let Some(ref def) = f.definition {
         o["definition"] = def.clone();
     }
     o
 }
 
-fn flow_version_json(v: &FlowVersion) -> Value {
+/// `GetFlowVersionResponse` / `CreateFlowVersionResponse` members. `id` and
+/// `arn` are the flow's (a flow version has no ARN of its own); the
+/// flow-level fields come from the version snapshot, falling back to the flow
+/// for versions persisted before they were captured.
+fn flow_version_json(f: &Flow, v: &FlowVersion) -> Value {
     let mut o = json!({
-        "flowVersion": v.flow_version,
-        "flowId": v.flow_id,
+        "name": v.name.as_deref().unwrap_or(&f.name),
+        "id": f.flow_id,
+        "arn": f.arn,
+        "status": v.status.as_deref().unwrap_or(&f.status),
         "createdAt": v.created_at.to_rfc3339(),
-        "updatedAt": v.updated_at.to_rfc3339(),
+        "version": v.flow_version,
     });
     if let Some(ref d) = v.description {
         o["description"] = json!(d);
+    }
+    if let Some(r) = v
+        .execution_role_arn
+        .as_ref()
+        .or(f.execution_role_arn.as_ref())
+    {
+        o["executionRoleArn"] = json!(r);
+    }
+    if let Some(k) = v
+        .customer_encryption_key_arn
+        .as_ref()
+        .or(f.customer_encryption_key_arn.as_ref())
+    {
+        o["customerEncryptionKeyArn"] = json!(k);
     }
     if let Some(ref def) = v.definition {
         o["definition"] = def.clone();
@@ -1335,11 +1373,15 @@ fn flow_version_json(v: &FlowVersion) -> Value {
     o
 }
 
-fn flow_alias_json(a: &FlowAlias) -> Value {
+/// `GetFlowAliasResponse` / `FlowAliasSummary` members: `name`,
+/// `description`, `routingConfiguration`, `concurrencyConfiguration`,
+/// `flowId`, `id`, `arn`, `createdAt`, `updatedAt`.
+fn flow_alias_json(flow_arn: &str, a: &FlowAlias) -> Value {
     let mut o = json!({
-        "aliasId": a.alias_id,
-        "aliasName": a.alias_name,
+        "name": a.alias_name,
         "flowId": a.flow_id,
+        "id": a.alias_id,
+        "arn": format!("{flow_arn}/alias/{}", a.alias_id),
         "routingConfiguration": a.routing_configuration,
         "createdAt": a.created_at.to_rfc3339(),
         "updatedAt": a.updated_at.to_rfc3339(),
@@ -1347,13 +1389,21 @@ fn flow_alias_json(a: &FlowAlias) -> Value {
     if let Some(ref d) = a.description {
         o["description"] = json!(d);
     }
+    if let Some(ref c) = a.concurrency_configuration {
+        o["concurrencyConfiguration"] = c.clone();
+    }
     o
 }
 
+/// `GetPromptResponse` / `CreatePromptResponse` / `UpdatePromptResponse`
+/// members for the working draft: `name`, `description`,
+/// `customerEncryptionKeyArn`, `defaultVariant`, `variants`, `id`, `arn`,
+/// `version`, `createdAt`, `updatedAt`.
 fn prompt_json(p: &Prompt) -> Value {
     let mut o = json!({
-        "promptId": p.prompt_id,
         "name": p.name,
+        "id": p.prompt_id,
+        "arn": p.arn,
         "variants": p.variants,
         "version": p.version,
         "createdAt": p.created_at.to_rfc3339(),
@@ -1361,6 +1411,36 @@ fn prompt_json(p: &Prompt) -> Value {
     });
     if let Some(ref d) = p.description {
         o["description"] = json!(d);
+    }
+    if let Some(ref k) = p.customer_encryption_key_arn {
+        o["customerEncryptionKeyArn"] = json!(k);
+    }
+    if let Some(ref dv) = p.default_variant {
+        o["defaultVariant"] = json!(dv);
+    }
+    o
+}
+
+/// The same members for a numbered prompt version: its ARN is the prompt ARN
+/// with a `:<version>` suffix.
+fn prompt_version_json(p: &Prompt, v: &PromptVersion) -> Value {
+    let mut o = json!({
+        "name": v.name.as_deref().unwrap_or(&p.name),
+        "id": p.prompt_id,
+        "arn": format!("{}:{}", p.arn, v.prompt_version),
+        "variants": v.variants,
+        "version": v.prompt_version,
+        "createdAt": v.created_at.to_rfc3339(),
+        "updatedAt": v.updated_at.to_rfc3339(),
+    });
+    if let Some(ref d) = v.description {
+        o["description"] = json!(d);
+    }
+    if let Some(ref k) = p.customer_encryption_key_arn {
+        o["customerEncryptionKeyArn"] = json!(k);
+    }
+    if let Some(dv) = v.default_variant.as_ref().or(p.default_variant.as_ref()) {
+        o["defaultVariant"] = json!(dv);
     }
     o
 }
@@ -1443,6 +1523,346 @@ mod tests {
 
     fn body(resp: AwsResponse) -> Value {
         serde_json::from_slice(resp.body.expect_bytes()).unwrap()
+    }
+
+    /// Send `method path[?query]` with a JSON body through the service's own
+    /// REST routing, the way an SDK request arrives.
+    async fn call(
+        svc: &BedrockAgentService,
+        method: Method,
+        path: &str,
+        query: &[(&str, &str)],
+        payload: Value,
+    ) -> (StatusCode, Value) {
+        let mut req = cn_request(payload);
+        req.region = "us-east-1".to_string();
+        req.method = method;
+        req.raw_path = path.to_string();
+        req.query_params = query
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let resp = svc.handle(req).await.unwrap();
+        let status = resp.status;
+        (status, body(resp))
+    }
+
+    fn keys(v: &Value) -> Vec<&str> {
+        let mut k: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        k.sort_unstable();
+        k
+    }
+
+    #[tokio::test]
+    async fn flow_responses_carry_the_model_output_members() {
+        let svc = BedrockAgentService::new(Arc::new(RwLock::new(BedrockAgentAccounts::new())));
+        let (status, created) = call(
+            &svc,
+            Method::POST,
+            "/flows/",
+            &[],
+            json!({
+                "name": "f",
+                "description": "d",
+                "executionRoleArn": "arn:aws:iam::123456789012:role/r",
+                "customerEncryptionKeyArn": "arn:aws:kms:us-east-1:123456789012:key/k",
+                "definition": {"nodes": [], "connections": []},
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let id = created["id"].as_str().unwrap().to_string();
+        let arn = format!("arn:aws:bedrock:us-east-1:123456789012:flow/{id}");
+        assert_eq!(created["arn"], arn);
+        let flow_members = vec![
+            "arn",
+            "createdAt",
+            "customerEncryptionKeyArn",
+            "definition",
+            "description",
+            "executionRoleArn",
+            "id",
+            "name",
+            "status",
+            "updatedAt",
+            "version",
+        ];
+        assert_eq!(keys(&created), flow_members);
+
+        // GetFlow by ID and by ARN returns the same top-level shape.
+        let (_, got) = call(&svc, Method::GET, &format!("/flows/{id}/"), &[], json!({})).await;
+        assert_eq!(keys(&got), flow_members);
+        assert_eq!(got["id"], id);
+        assert_eq!(got["arn"], arn);
+        assert_eq!(got["status"], "NotPrepared");
+        assert!(got.get("flowId").is_none() && got.get("flow").is_none());
+        let encoded_arn = arn.replace(':', "%3A").replace('/', "%2F");
+        let (_, by_arn) = call(
+            &svc,
+            Method::GET,
+            &format!("/flows/{encoded_arn}/"),
+            &[],
+            json!({}),
+        )
+        .await;
+        assert_eq!(by_arn["id"], id);
+
+        let (status, prepared) =
+            call(&svc, Method::POST, &format!("/flows/{id}/"), &[], json!({})).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(prepared, json!({"id": id, "status": "Prepared"}));
+
+        let (_, updated) = call(
+            &svc,
+            Method::PUT,
+            &format!("/flows/{id}/"),
+            &[],
+            json!({"name": "f2", "executionRoleArn": "arn:aws:iam::123456789012:role/r"}),
+        )
+        .await;
+        assert_eq!(keys(&updated), flow_members);
+        assert_eq!(updated["name"], "f2");
+        assert_eq!(updated["arn"], arn);
+        assert_eq!(updated["status"], "NotPrepared");
+
+        let (status, version) = call(
+            &svc,
+            Method::POST,
+            &format!("/flows/{id}/versions"),
+            &[],
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(version["id"], id);
+        assert_eq!(version["arn"], arn);
+        assert_eq!(version["version"], "1");
+        assert_eq!(version["name"], "f2");
+        let (_, got_version) = call(
+            &svc,
+            Method::GET,
+            &format!("/flows/{id}/versions/1/"),
+            &[],
+            json!({}),
+        )
+        .await;
+        assert_eq!(got_version, version);
+
+        let (status, alias) = call(
+            &svc,
+            Method::POST,
+            &format!("/flows/{id}/aliases"),
+            &[],
+            json!({"name": "live", "routingConfiguration": [{"flowVersion": "1"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let alias_id = alias["id"].as_str().unwrap().to_string();
+        assert_eq!(alias["flowId"], id);
+        assert_eq!(alias["arn"], format!("{arn}/alias/{alias_id}"));
+        assert_eq!(
+            keys(&alias),
+            vec![
+                "arn",
+                "createdAt",
+                "flowId",
+                "id",
+                "name",
+                "routingConfiguration",
+                "updatedAt"
+            ]
+        );
+        let (_, got_alias) = call(
+            &svc,
+            Method::GET,
+            &format!("/flows/{id}/aliases/{alias_id}"),
+            &[],
+            json!({}),
+        )
+        .await;
+        assert_eq!(got_alias, alias);
+
+        let (_, deleted_alias) = call(
+            &svc,
+            Method::DELETE,
+            &format!("/flows/{id}/aliases/{alias_id}"),
+            &[],
+            json!({}),
+        )
+        .await;
+        assert_eq!(deleted_alias, json!({"flowId": id, "id": alias_id}));
+        let (_, deleted_version) = call(
+            &svc,
+            Method::DELETE,
+            &format!("/flows/{id}/versions/1/"),
+            &[],
+            json!({}),
+        )
+        .await;
+        assert_eq!(deleted_version, json!({"id": id, "version": "1"}));
+        let (_, deleted) = call(
+            &svc,
+            Method::DELETE,
+            &format!("/flows/{id}/"),
+            &[],
+            json!({}),
+        )
+        .await;
+        assert_eq!(deleted, json!({"id": id}));
+    }
+
+    #[tokio::test]
+    async fn validate_flow_definition_reports_structural_problems() {
+        let svc = BedrockAgentService::new(Arc::new(RwLock::new(BedrockAgentAccounts::new())));
+        let input = json!({"name": "In", "type": "Input",
+            "outputs": [{"name": "document", "type": "String"}]});
+        let output = json!({"name": "Out", "type": "Output",
+            "inputs": [{"name": "document", "type": "String", "expression": "$.data"}]});
+        let link = |name: &str, source: &str, target: &str| {
+            json!({"name": name, "source": source, "target": target, "type": "Data",
+                "configuration": {"data": {"sourceOutput": "document", "targetInput": "document"}}})
+        };
+
+        // A well-formed Input -> Output flow validates clean. The route must
+        // not be swallowed by PrepareFlow's POST /flows/{flowIdentifier}.
+        let (status, ok) = call(
+            &svc,
+            Method::POST,
+            "/flows/validate-definition",
+            &[],
+            json!({"definition": {"nodes": [input, output],
+                "connections": [link("c1", "In", "Out")]}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ok, json!({"validations": []}));
+
+        // No Output node, a connection to a missing node, an unreachable node.
+        let stray = json!({"name": "Stray", "type": "Prompt", "inputs": [], "outputs": []});
+        let (_, bad) = call(
+            &svc,
+            Method::POST,
+            "/flows/validate-definition",
+            &[],
+            json!({"definition": {"nodes": [input, stray],
+                "connections": [link("c1", "In", "Ghost")]}}),
+        )
+        .await;
+        let types: Vec<&str> = bad["validations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            types,
+            vec![
+                "MissingEndingNodes",
+                "UnknownConnectionTarget",
+                "UnreachableNode"
+            ]
+        );
+        assert_eq!(
+            bad["validations"][1]["details"],
+            json!({"unknownConnectionTarget": {"connection": "c1"}})
+        );
+        assert_eq!(bad["validations"][2]["severity"], "Warning");
+    }
+
+    #[tokio::test]
+    async fn prompt_responses_carry_the_model_output_members() {
+        let svc = BedrockAgentService::new(Arc::new(RwLock::new(BedrockAgentAccounts::new())));
+        let variants = json!([{"name": "v1", "templateType": "TEXT",
+            "templateConfiguration": {"text": {"text": "hi"}}}]);
+        let (status, created) = call(
+            &svc,
+            Method::POST,
+            "/prompts/",
+            &[],
+            json!({"name": "p", "defaultVariant": "v1", "variants": variants}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let id = created["id"].as_str().unwrap().to_string();
+        let arn = format!("arn:aws:bedrock:us-east-1:123456789012:prompt/{id}");
+        let prompt_members = vec![
+            "arn",
+            "createdAt",
+            "defaultVariant",
+            "id",
+            "name",
+            "updatedAt",
+            "variants",
+            "version",
+        ];
+
+        let (_, got) = call(
+            &svc,
+            Method::GET,
+            &format!("/prompts/{id}/"),
+            &[],
+            json!({}),
+        )
+        .await;
+        assert_eq!(keys(&got), prompt_members);
+        assert_eq!(got["id"], id);
+        assert_eq!(got["arn"], arn);
+        assert_eq!(got["version"], "DRAFT");
+        assert_eq!(got["defaultVariant"], "v1");
+        assert!(got.get("promptId").is_none() && got.get("prompt").is_none());
+
+        let (_, updated) = call(
+            &svc,
+            Method::PUT,
+            &format!("/prompts/{id}/"),
+            &[],
+            json!({"name": "p2", "variants": variants}),
+        )
+        .await;
+        assert_eq!(keys(&updated), prompt_members);
+        assert_eq!(updated["name"], "p2");
+        assert_eq!(updated["arn"], arn);
+
+        let (_, version) = call(
+            &svc,
+            Method::POST,
+            &format!("/prompts/{id}/versions"),
+            &[],
+            json!({}),
+        )
+        .await;
+        assert_eq!(version["arn"], format!("{arn}:1"));
+        // GetPrompt with ?promptVersion= returns that version.
+        let (_, got_version) = call(
+            &svc,
+            Method::GET,
+            &format!("/prompts/{id}/"),
+            &[("promptVersion", "1")],
+            json!({}),
+        )
+        .await;
+        assert_eq!(got_version, version);
+        assert_eq!(got_version["version"], "1");
+        assert_eq!(got_version["name"], "p2");
+
+        let (_, deleted_version) = call(
+            &svc,
+            Method::DELETE,
+            &format!("/prompts/{id}/"),
+            &[("promptVersion", "1")],
+            json!({}),
+        )
+        .await;
+        assert_eq!(deleted_version, json!({"id": id, "version": "1"}));
+        let (_, deleted) = call(
+            &svc,
+            Method::DELETE,
+            &format!("/prompts/{id}/"),
+            &[],
+            json!({}),
+        )
+        .await;
+        assert_eq!(deleted, json!({"id": id}));
     }
 
     #[test]

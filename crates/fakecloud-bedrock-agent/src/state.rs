@@ -70,8 +70,15 @@ impl BedrockAgentAccounts {
             } else {
                 state.region.as_str()
             };
-            for flow in state.flows.values_mut().filter(|f| f.arn.is_empty()) {
-                flow.arn = crate::arns::flow_arn(region, account_id, &flow.flow_id);
+            for flow in state.flows.values_mut() {
+                if flow.arn.is_empty() {
+                    flow.arn = crate::arns::flow_arn(region, account_id, &flow.flow_id);
+                }
+                // PrepareFlow used to store the enum name instead of its wire
+                // value; FlowStatus serializes as `Prepared`.
+                if flow.status == "PREPARED" {
+                    flow.status = "Prepared".to_string();
+                }
             }
             for prompt in state.prompts.values_mut().filter(|p| p.arn.is_empty()) {
                 prompt.arn = crate::arns::prompt_arn(region, account_id, &prompt.prompt_id);
@@ -267,6 +274,8 @@ pub struct Flow {
     /// it backfilled on load (see [`BedrockAgentAccounts::backfill_arns`]).
     #[serde(default)]
     pub arn: String,
+    #[serde(default)]
+    pub customer_encryption_key_arn: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -278,8 +287,13 @@ pub struct FlowAlias {
     pub description: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub concurrency_configuration: Option<serde_json::Value>,
 }
 
+/// A numbered, immutable snapshot of a flow. The flow-level fields are
+/// captured at CreateFlowVersion time; snapshots written before they were
+/// captured leave them `None`, and readers fall back to the parent flow.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlowVersion {
     pub flow_version: String,
@@ -288,6 +302,14 @@ pub struct FlowVersion {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub definition: Option<serde_json::Value>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub execution_role_arn: Option<String>,
+    #[serde(default)]
+    pub customer_encryption_key_arn: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -302,8 +324,14 @@ pub struct Prompt {
     /// The ARN minted at creation; backfilled on load like [`Flow::arn`].
     #[serde(default)]
     pub arn: String,
+    #[serde(default)]
+    pub customer_encryption_key_arn: Option<String>,
+    #[serde(default)]
+    pub default_variant: Option<String>,
 }
 
+/// A numbered snapshot of a prompt. `name` and `default_variant` are captured
+/// at CreatePromptVersion time; older snapshots fall back to the prompt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PromptVersion {
     pub prompt_version: String,
@@ -312,6 +340,10 @@ pub struct PromptVersion {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub variants: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub default_variant: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
