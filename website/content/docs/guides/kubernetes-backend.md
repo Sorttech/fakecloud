@@ -48,7 +48,7 @@ Optional env vars:
 
 ## RBAC
 
-The fakecloud Pod's ServiceAccount needs permission to create / list / watch / delete Pods in the configured namespace. The ElastiCache backend additionally execs into cache Pods (`redis-cli` for CONFIG/ACL and snapshot SAVE), so it needs `pods/exec` too.
+The fakecloud Pod's ServiceAccount needs permission to create / list / watch / delete Pods in the configured namespace. The ElastiCache backend additionally execs into cache Pods (`redis-cli` for CONFIG/ACL and snapshot SAVE), so it needs `pods/exec` too. The Lambda backend hands each function Pod its execution-role credentials through a per-Pod Secret (owned by the Pod, deleted with it), so it needs `create` / `patch` / `delete` on Secrets.
 
 ```yaml
 apiVersion: v1
@@ -66,6 +66,10 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["create", "get", "list", "watch", "delete"]
+  # Required for the Lambda backend (per-Pod execution-role credentials).
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "patch", "delete"]
   # Required only for the ElastiCache backend (exec into cache Pods).
   - apiGroups: [""]
     resources: ["pods/exec"]

@@ -3019,6 +3019,7 @@ pub(crate) mod tests {
             appconfig: shared::<fakecloud_appconfig::AppConfigState>(),
             delivery: Arc::new(DeliveryBus::new()),
             lambda_runtime: None,
+            iam_mode: Default::default(),
             rds_runtime: None,
             ec2_runtime: None,
             ecs_runtime: None,

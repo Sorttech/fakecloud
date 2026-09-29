@@ -580,6 +580,9 @@ pub struct CloudFormationDeps {
     /// runtime is configured — provisioning still works, the first Invoke just
     /// falls back to a cold pull.
     pub lambda_runtime: Option<Arc<fakecloud_lambda::runtime::ContainerRuntime>>,
+    /// IAM enforcement mode. `AWS::Lambda::Function` only refuses a
+    /// cross-account execution role (as AWS does) while it is on.
+    pub iam_mode: fakecloud_core::auth::IamMode,
     /// Container runtimes for the stateful services whose CFN-provisioned
     /// resources must be backed by REAL containers (not phantom metadata).
     /// When present, the provisioner inserts the resource record synchronously
@@ -1229,6 +1232,7 @@ impl CloudFormationService {
             cloudformation_state: self.state.clone(),
             delivery: self.deps.delivery.clone(),
             lambda_runtime: self.deps.lambda_runtime.clone(),
+            iam_mode: self.deps.iam_mode,
             rds_runtime: self.deps.rds_runtime.clone(),
             ec2_runtime: self.deps.ec2_runtime.clone(),
             ecs_runtime: self.deps.ecs_runtime.clone(),
@@ -4416,6 +4420,7 @@ mod tests {
             appconfig: mas(),
             delivery: Arc::new(DeliveryBus::new()),
             lambda_runtime: None,
+            iam_mode: Default::default(),
             rds_runtime: None,
             ec2_runtime: None,
             ecs_runtime: None,

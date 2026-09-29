@@ -6,8 +6,8 @@
 use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::{
-    Container, EmptyDirVolumeSource, EnvVar, LocalObjectReference, Pod, PodSpec,
-    ResourceRequirements, Volume, VolumeMount,
+    Container, EmptyDirVolumeSource, EnvVar, EnvVarSource, LocalObjectReference, Pod, PodSpec,
+    ResourceRequirements, Secret, SecretKeySelector, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -15,8 +15,9 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use fakecloud_k8s::names::label_safe;
 
 use super::super::docker::runtime_to_image;
-use super::super::env_rewrite::rewrite_localhost_envs;
+use super::super::environment::{credential_envs, function_environment, CREDENTIAL_ENV_KEYS};
 use crate::state::LambdaFunction;
+use fakecloud_core::auth::SessionCredentials;
 
 /// Inputs that don't come from the function itself — instance identity,
 /// the in-cluster fakecloud URL, the bearer token the init container
@@ -45,6 +46,9 @@ pub struct PodSpecContext<'a> {
     /// `kubernetes.io/dockerconfigjson` used as `imagePullSecrets` for
     /// container-image functions.
     pub pull_secret: Option<&'a str>,
+    /// Name of the Secret holding this instance's execution-role
+    /// credentials (see [`build_credentials_secret`]); `None` exports none.
+    pub credentials_secret: Option<&'a str>,
 }
 
 /// Resource cap for the `/tmp` `emptyDir` (`medium: Memory`) — sized
@@ -96,9 +100,14 @@ pub fn build_pod_spec(
         label_safe(&deploy_id[..deploy_id.len().min(40)]),
     );
 
-    // Env vars — user-supplied (with localhost rewritten to in-cluster
-    // fakecloud host) + the AWS_LAMBDA_FUNCTION_TIMEOUT the RIE honors.
-    let mut env: Vec<EnvVar> = rewrite_localhost_envs(&func.environment, ctx.self_host)
+    // The function's execution environment: the reserved Lambda variables
+    // plus the user's own (localhost rewritten to the in-cluster fakecloud
+    // host), with SDK calls pointed at the same in-cluster fakecloud URL the
+    // init container fetches code from.
+    // Credentials never sit in the Pod spec: they are read from the
+    // per-Pod Secret (see [`build_credentials_secret`]).
+    let endpoint_url = ctx.self_url.trim_end_matches('/');
+    let mut env: Vec<EnvVar> = function_environment(func, endpoint_url, ctx.self_host, None)
         .into_iter()
         .map(|(k, v)| EnvVar {
             name: k,
@@ -106,11 +115,20 @@ pub fn build_pod_spec(
             value_from: None,
         })
         .collect();
-    env.push(EnvVar {
-        name: "AWS_LAMBDA_FUNCTION_TIMEOUT".into(),
-        value: Some(func.timeout.to_string()),
-        value_from: None,
-    });
+    if let Some(secret) = ctx.credentials_secret {
+        env.extend(CREDENTIAL_ENV_KEYS.iter().map(|key| EnvVar {
+            name: (*key).to_string(),
+            value: None,
+            value_from: Some(EnvVarSource {
+                secret_key_ref: Some(SecretKeySelector {
+                    name: secret.to_string(),
+                    key: (*key).to_string(),
+                    optional: Some(false),
+                }),
+                ..EnvVarSource::default()
+            }),
+        }));
+    }
 
     // Shared volumes — init container writes /var/task, /opt, layers;
     // main container reads them. `/tmp` is sized from ephemeral_storage.
@@ -263,6 +281,39 @@ pub fn build_pod_spec(
 /// function + deploy_id. Truncated/lowercased so it fits the 63-char
 /// label limit. The suffix is a stable hash of `deploy_id` so a new
 /// deploy gets a fresh, non-colliding Pod name.
+/// The Secret carrying one instance's execution-role credentials, named
+/// `name` (the instance's Pod name) and labelled like the Pod so the same
+/// ownership rules apply. The Pod references it through `secretKeyRef`, so
+/// the credentials never appear in the Pod spec.
+pub fn build_credentials_secret(
+    name: &str,
+    credentials: &SessionCredentials,
+    instance_id: &str,
+) -> Secret {
+    let mut labels = BTreeMap::new();
+    labels.insert(
+        fakecloud_k8s::labels::MANAGED_BY.into(),
+        fakecloud_k8s::labels::MANAGED_BY_VALUE.into(),
+    );
+    labels.insert(fakecloud_k8s::labels::INSTANCE.into(), instance_id.into());
+    labels.insert(fakecloud_k8s::labels::SERVICE.into(), super::SERVICE.into());
+    Secret {
+        metadata: ObjectMeta {
+            name: Some(name.to_string()),
+            labels: Some(labels),
+            ..ObjectMeta::default()
+        },
+        type_: Some("Opaque".into()),
+        string_data: Some(
+            credential_envs(credentials)
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+        ),
+        ..Secret::default()
+    }
+}
+
 pub fn pod_name_for(function_name: &str, deploy_id: &str) -> String {
     fakecloud_k8s::names::pod_name("fakecloud-lambda", function_name, deploy_id)
 }
@@ -322,6 +373,7 @@ mod tests {
             internal_token: "secret-token-xyz",
             account_id: "000000000000",
             pull_secret: None,
+            credentials_secret: None,
         }
     }
 
@@ -469,6 +521,81 @@ mod tests {
             .clone()
             .unwrap();
         assert_eq!(t, "30");
+    }
+
+    #[test]
+    fn main_container_gets_the_aws_environment_pointed_at_the_cluster() {
+        let f = zip_function("my-fn");
+        let mut c = ctx();
+        c.credentials_secret = Some("my-fn-pod");
+        let pod = build_pod_spec(&f, "d", &c).unwrap();
+        let env = pod.spec.unwrap().containers[0].env.clone().unwrap();
+        let get = |k: &str| {
+            env.iter()
+                .find(|e| e.name == k)
+                .and_then(|e| e.value.clone())
+        };
+        assert_eq!(
+            get("AWS_ENDPOINT_URL").as_deref(),
+            Some("http://fakecloud.fakecloud.svc.cluster.local:4566")
+        );
+        assert_eq!(get("AWS_REGION").as_deref(), Some("us-east-1"));
+        assert_eq!(get("AWS_LAMBDA_FUNCTION_NAME").as_deref(), Some("my-fn"));
+
+        // Credentials come from the per-Pod Secret, never inline values.
+        for key in CREDENTIAL_ENV_KEYS {
+            let var = env.iter().find(|e| e.name == key).expect(key);
+            assert_eq!(var.value, None, "{key} must not be inline");
+            let r = var
+                .value_from
+                .as_ref()
+                .and_then(|v| v.secret_key_ref.as_ref())
+                .expect("secretKeyRef");
+            assert_eq!(r.name, "my-fn-pod");
+            assert_eq!(r.key, key);
+        }
+        // Kubernetes keeps duplicate names ambiguous; each is set once.
+        let mut names: Vec<&str> = env.iter().map(|e| e.name.as_str()).collect();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), total);
+    }
+
+    #[test]
+    fn no_credential_vars_without_a_secret() {
+        let pod = build_pod_spec(&zip_function("my-fn"), "d", &ctx()).unwrap();
+        let env = pod.spec.unwrap().containers[0].env.clone().unwrap();
+        assert!(env
+            .iter()
+            .all(|e| !CREDENTIAL_ENV_KEYS.contains(&e.name.as_str())));
+    }
+
+    #[test]
+    fn credentials_secret_carries_every_referenced_key() {
+        let creds = SessionCredentials {
+            access_key_id: "FSIAEXAMPLE".into(),
+            secret_access_key: "secret".into(),
+            session_token: "token".into(),
+            expiration: Utc::now(),
+            account_id: "000000000000".into(),
+        };
+        let secret = build_credentials_secret("my-fn-pod", &creds, "fakecloud-1234");
+        assert_eq!(secret.metadata.name.as_deref(), Some("my-fn-pod"));
+        let labels = secret.metadata.labels.unwrap();
+        assert_eq!(
+            labels
+                .get(fakecloud_k8s::labels::INSTANCE)
+                .map(String::as_str),
+            Some("fakecloud-1234")
+        );
+        let data = secret.string_data.unwrap();
+        for key in CREDENTIAL_ENV_KEYS {
+            assert!(data.contains_key(key), "{key}");
+        }
+        assert_eq!(data["AWS_ACCESS_KEY_ID"], "FSIAEXAMPLE");
+        assert_eq!(data["AWS_SECRET_ACCESS_KEY"], "secret");
+        assert_eq!(data["AWS_SESSION_TOKEN"], "token");
     }
 
     #[test]

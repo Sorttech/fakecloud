@@ -3487,6 +3487,7 @@ impl crate::runtime::LambdaBackend for PrepullSpy {
         _code_zip: Option<&[u8]>,
         _layers: &[Vec<u8>],
         _deploy_id: &str,
+        _credentials: Option<&fakecloud_core::auth::SessionCredentials>,
     ) -> Result<crate::runtime::WarmInstance, crate::runtime::RuntimeError> {
         unreachable!("prepull regression test never invokes launch")
     }

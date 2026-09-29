@@ -9,6 +9,7 @@
 pub(crate) mod backend;
 pub(crate) mod docker;
 pub(crate) mod env_rewrite;
+pub mod environment;
 pub(crate) mod facade;
 pub mod k8s;
 

@@ -562,6 +562,70 @@ pub(crate) fn validate_ephemeral_storage(size: i64) -> Result<i64, AwsServiceErr
     Ok(size)
 }
 
+/// Lambda reserves some environment keys (region, credentials, function
+/// metadata) for the values it sets itself; a configuration that sets any of
+/// them is rejected, as on AWS.
+pub(crate) fn validate_environment(
+    environment: &BTreeMap<String, String>,
+) -> Result<(), AwsServiceError> {
+    match crate::runtime::environment::reserved_keys_message(environment) {
+        None => Ok(()),
+        Some(message) => Err(AwsServiceError::aws_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidParameterValueException",
+            message,
+        )),
+    }
+}
+
+/// The execution-role checks `CreateFunction` and `UpdateFunctionConfiguration`
+/// run before accepting a role, shared with CloudFormation's
+/// `AWS::Lambda::Function`:
+///
+/// - With IAM enforcement on (`--iam soft|strict`), `iam:PassRole` is
+///   same-account only, as on AWS: a role owned by another account is refused
+///   with `AccessDeniedException`, whatever its trust policy says. With it off
+///   (the default) such a role is accepted, so templates carrying another
+///   emulator's default account (`000000000000`) keep working; nothing is
+///   enforced in that mode anyway.
+/// - The role's trust policy must let `lambda.amazonaws.com` assume it,
+///   looked up in the account that owns the role. Always applied, as it
+///   always was on `CreateFunction`.
+pub fn validate_execution_role(
+    caller_account: &str,
+    role_arn: &str,
+    validator: Option<&dyn fakecloud_core::auth::RoleTrustValidator>,
+    iam_mode: fakecloud_core::auth::IamMode,
+) -> Result<(), AwsServiceError> {
+    let role_account = role_arn
+        .strip_prefix("arn:")
+        .and_then(|rest| rest.split(':').nth(3))
+        .filter(|a| !a.is_empty());
+    if iam_mode.is_enabled() && role_account.is_some_and(|a| a != caller_account) {
+        return Err(AwsServiceError::aws_error(
+            StatusCode::FORBIDDEN,
+            "AccessDeniedException",
+            "Cross-account pass role is not allowed.",
+        ));
+    }
+    if let Some(validator) = validator {
+        validator
+            .validate(
+                role_account.unwrap_or(caller_account),
+                role_arn,
+                "lambda.amazonaws.com",
+            )
+            .map_err(|err| {
+                AwsServiceError::aws_error(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidParameterValueException",
+                    err.to_string(),
+                )
+            })?;
+    }
+    Ok(())
+}
+
 /// All fields of a `CreateFunction` request, already parsed and
 /// defaulted. The code zip (if any) is eagerly base64-decoded so the
 /// caller can hash it without doing the decode again.
@@ -623,6 +687,7 @@ impl CreateFunctionInput {
                     .collect()
             })
             .unwrap_or_default();
+        validate_environment(&environment)?;
 
         let architectures = body["Architectures"]
             .as_array()
@@ -1006,6 +1071,9 @@ pub struct LambdaService {
     snapshot_lock: Arc<AsyncMutex<()>>,
     pub(crate) delivery_bus: Option<Arc<fakecloud_core::delivery::DeliveryBus>>,
     pub(crate) role_trust_validator: Option<Arc<dyn fakecloud_core::auth::RoleTrustValidator>>,
+    /// IAM enforcement mode; a cross-account execution role is refused only
+    /// while it is on (see [`validate_execution_role`]).
+    pub(crate) iam_mode: fakecloud_core::auth::IamMode,
     pub(crate) s3_delivery: Option<Arc<dyn fakecloud_core::delivery::S3Delivery>>,
     /// Per-account-per-function in-flight invocation count, used to
     /// gate `Invoke` against `PutFunctionConcurrency`'s
@@ -1030,6 +1098,7 @@ impl LambdaService {
             snapshot_lock: Arc::new(AsyncMutex::new(())),
             delivery_bus: None,
             role_trust_validator: None,
+            iam_mode: fakecloud_core::auth::IamMode::Off,
             s3_delivery: None,
             inflight_invocations: Arc::new(parking_lot::RwLock::new(BTreeMap::new())),
         }
@@ -1060,6 +1129,12 @@ impl LambdaService {
         validator: Arc<dyn fakecloud_core::auth::RoleTrustValidator>,
     ) -> Self {
         self.role_trust_validator = Some(validator);
+        self
+    }
+
+    /// Apply the server's IAM enforcement mode to the execution-role checks.
+    pub fn with_iam_mode(mut self, mode: fakecloud_core::auth::IamMode) -> Self {
+        self.iam_mode = mode;
         self
     }
 

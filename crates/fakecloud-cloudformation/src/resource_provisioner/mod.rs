@@ -530,6 +530,11 @@ fn parse_lambda_function_props(props: &serde_json::Value) -> Result<LambdaFuncti
                 .collect::<BTreeMap<String, String>>()
         })
         .unwrap_or_default();
+    if let Some(message) =
+        fakecloud_lambda::runtime::environment::reserved_keys_message(&environment)
+    {
+        return Err(message);
+    }
 
     // CFN tags ride as `[{Key, Value}, ...]`; flatten to the map shape
     // the lambda crate stores tags in.
@@ -987,6 +992,8 @@ pub struct ResourceProvisioner {
     /// images (see `CloudFormationDeps::lambda_runtime`). `None` outside a
     /// configured runtime (e.g. unit tests).
     pub lambda_runtime: Option<Arc<fakecloud_lambda::runtime::ContainerRuntime>>,
+    /// IAM enforcement mode (see `CloudFormationDeps::iam_mode`).
+    pub iam_mode: fakecloud_core::auth::IamMode,
     /// Container runtimes for stateful services whose CFN-provisioned resources
     /// must be backed by REAL containers. See `CloudFormationDeps`. `None`
     /// (no Docker/Podman, e.g. CI/unit tests) keeps metadata-only provisioning.
@@ -4274,6 +4281,7 @@ mod tests {
             )),
             delivery: Arc::new(DeliveryBus::new()),
             lambda_runtime: None,
+            iam_mode: Default::default(),
             rds_runtime: None,
             ec2_runtime: None,
             ecs_runtime: None,
@@ -8116,7 +8124,14 @@ mod tests {
             "MyRole",
             serde_json::json!({
                 "RoleName": "my-role",
-                "AssumeRolePolicyDocument": {"Version": "2012-10-17", "Statement": []}
+                "AssumeRolePolicyDocument": {
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": {"Service": "lambda.amazonaws.com"},
+                        "Action": "sts:AssumeRole"
+                    }]
+                }
             }),
         );
         let role_sr = prov.create_resource(&role).unwrap();
@@ -8135,6 +8150,51 @@ mod tests {
         let arn = prov.get_att(&fn_sr, "Arn").expect("Arn should resolve");
         assert!(arn.starts_with("arn:aws:lambda:"));
         assert!(arn.contains(":function:my-fn"));
+    }
+
+    #[test]
+    fn lambda_function_role_runs_the_create_function_checks() {
+        let prov = make_provisioner();
+        let untrusted = make_resource(
+            "AWS::IAM::Role",
+            "Untrusted",
+            serde_json::json!({
+                "RoleName": "untrusted",
+                "AssumeRolePolicyDocument": {"Version": "2012-10-17", "Statement": []}
+            }),
+        );
+        let untrusted = prov.create_resource(&untrusted).unwrap();
+        let func = |role: &str| {
+            make_resource(
+                "AWS::Lambda::Function",
+                "Fn",
+                serde_json::json!({
+                    "FunctionName": "checked-fn",
+                    "Runtime": "python3.12",
+                    "Handler": "index.handler",
+                    "Role": role,
+                    "Code": {"ZipFile": "def handler(e,c): return e"}
+                }),
+            )
+        };
+        let err = prov
+            .create_resource(&func(&untrusted.physical_id))
+            .unwrap_err();
+        assert!(err.contains("InvalidParameterValueException"), "{err}");
+
+        // Another account's role: accepted with IAM enforcement off (the
+        // default), refused like AWS with it on.
+        prov.create_resource(&func("arn:aws:iam::999999999999:role/elsewhere"))
+            .expect("default mode accepts another account's role");
+        let mut enforcing = make_provisioner();
+        enforcing.iam_mode = fakecloud_core::auth::IamMode::Strict;
+        let err = enforcing
+            .create_resource(&func("arn:aws:iam::999999999999:role/elsewhere"))
+            .unwrap_err();
+        assert!(
+            err.contains("AccessDeniedException") && err.contains("Cross-account pass role"),
+            "{err}"
+        );
     }
 
     #[test]

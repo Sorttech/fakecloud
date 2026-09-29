@@ -59,6 +59,12 @@ impl ResetState {
         match service {
             "iam" | "sts" => {
                 self.iam.write().reset();
+                // The reset dropped the execution-role sessions warm Lambda
+                // instances hold; stop handing them invocations.
+                if let Some(ref rt) = self.container_runtime {
+                    let rt = rt.clone();
+                    tokio::spawn(async move { rt.retire_credentialed_instances(None).await });
+                }
             }
             "sqs" => {
                 self.sqs.write().reset();
@@ -235,10 +241,19 @@ impl ResetState {
     ) -> Result<(), String> {
         match service {
             "iam" | "sts" => {
-                let mut mas = self.iam.write();
-                let region = mas.region().to_string();
-                if let Some(state) = mas.get_mut(account_id) {
-                    state.reset(&region);
+                {
+                    let mut mas = self.iam.write();
+                    let region = mas.region().to_string();
+                    if let Some(state) = mas.get_mut(account_id) {
+                        state.reset(&region);
+                    }
+                }
+                if let Some(ref rt) = self.container_runtime {
+                    let rt = rt.clone();
+                    let account_id = account_id.to_string();
+                    tokio::spawn(async move {
+                        rt.retire_credentialed_instances(Some(&account_id)).await
+                    });
                 }
             }
             "sqs" => {

@@ -376,6 +376,15 @@ async fn main() {
     // runtime is resolved) instead of scattering five separate log lines.
     let mut degraded_runtimes: Vec<&str> = Vec::new();
     if let Some(ref rt) = container_runtime {
+        // Function code runs with its execution role's credentials, minted
+        // and registered like an AssumeRole session so its SDK calls resolve
+        // to the role (and verify under --verify-sigv4).
+        rt.set_credential_issuer(
+            fakecloud_iam::sts_service::container_creds::IamSessionCredentialIssuer::shared(
+                iam_state.clone(),
+                cli.account_id.clone(),
+            ),
+        );
         tracing::info!(backend = rt.cli_name(), "Lambda execution enabled");
     } else {
         degraded_runtimes.push("Lambda (Invoke returns errors for functions with code)");
@@ -1567,6 +1576,7 @@ async fn main() {
             appconfig: appconfig_state.clone(),
             delivery: delivery_for_cf,
             lambda_runtime: container_runtime.clone(),
+            iam_mode: cli.iam_mode(),
             rds_runtime: rds_runtime.clone(),
             ec2_runtime: ec2_runtime.clone(),
             ecs_runtime: ecs_runtime.clone(),
@@ -2091,6 +2101,7 @@ async fn main() {
     lambda_service = lambda_service.with_role_trust_validator(
         fakecloud_iam::pass_role::IamRoleTrustValidator::shared(iam_state.clone()),
     );
+    lambda_service = lambda_service.with_iam_mode(cli.iam_mode());
     lambda_service = lambda_service.with_s3_delivery(s3_delivery_for_logs.clone());
     if let Some(ref rt) = container_runtime {
         lambda_service = lambda_service.with_runtime(rt.clone());

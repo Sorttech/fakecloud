@@ -618,6 +618,40 @@ pub trait RoleTrustValidator: Send + Sync {
     ) -> Result<(), PassRoleError>;
 }
 
+/// Temporary credentials for an assumed-role session, as a compute service
+/// hands them to the code it runs (Lambda's execution-role environment, for
+/// example).
+#[derive(Clone, Debug)]
+pub struct SessionCredentials {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub session_token: String,
+    pub expiration: DateTime<Utc>,
+    /// Account the session is registered under, so it can be revoked there.
+    pub account_id: String,
+}
+
+/// Issues assumed-role session credentials on behalf of a compute service,
+/// registered so that requests signed with them resolve to
+/// `arn:<partition>:sts::<account>:assumed-role/<role>/<session>` (and verify
+/// under `--verify-sigv4`). Implemented over IAM state; services that run
+/// user code under a role take it as an optional hook so they stay decoupled
+/// from the IAM crate.
+pub trait SessionCredentialIssuer: Send + Sync {
+    /// Mint credentials for `role_arn` with the given session name, valid for
+    /// `duration`.
+    fn issue(
+        &self,
+        role_arn: &str,
+        session_name: &str,
+        duration: chrono::Duration,
+    ) -> SessionCredentials;
+
+    /// Unregister credentials once the code they were issued to has stopped.
+    /// Idempotent.
+    fn revoke(&self, credentials: &SessionCredentials);
+}
+
 /// Composite [`ResourcePolicyProvider`] that delegates to a list of
 /// sub-providers in order, returning the first `Some` hit.
 ///

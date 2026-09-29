@@ -128,6 +128,7 @@ impl ResourceProvisioner {
             cloudformation_state: self.cloudformation_state.clone(),
             delivery: self.delivery.clone(),
             lambda_runtime: self.lambda_runtime.clone(),
+            iam_mode: self.iam_mode,
             rds_runtime: self.rds_runtime.clone(),
             ec2_runtime: self.ec2_runtime.clone(),
             ecs_runtime: self.ecs_runtime.clone(),

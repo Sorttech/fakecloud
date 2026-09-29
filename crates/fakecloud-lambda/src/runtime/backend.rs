@@ -9,6 +9,7 @@
 //! fakecloud process.
 
 use async_trait::async_trait;
+use fakecloud_core::auth::SessionCredentials;
 
 use crate::state::LambdaFunction;
 
@@ -84,12 +85,16 @@ pub trait LambdaBackend: Send + Sync + 'static {
     /// package functions). `layers` are the attached layer ZIPs in
     /// attach order. `deploy_id` is the facade-computed fingerprint
     /// used to label resources so reaper logic can correlate.
+    /// `credentials` are the execution role's session credentials for this
+    /// instance, exported into its environment (see
+    /// [`super::environment::function_environment`]).
     async fn launch(
         &self,
         func: &LambdaFunction,
         code_zip: Option<&[u8]>,
         layers: &[Vec<u8>],
         deploy_id: &str,
+        credentials: Option<&SessionCredentials>,
     ) -> Result<WarmInstance, RuntimeError>;
 
     /// Tear down one instance. Must be idempotent — the facade may call
