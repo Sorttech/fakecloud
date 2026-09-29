@@ -14,25 +14,22 @@ pub(crate) fn resolve_attr_name(name: &str, expr_attr_names: &HashMap<String, St
     }
 }
 
-/// Resolve a (possibly dotted, possibly `#name`-containing) document path to
-/// the leaf `AttributeValue` inside `item`. Single-segment paths (`foo`,
-/// `#foo`) resolve to a top-level attribute. Dotted paths (`profile.email`,
-/// `#p.#e`, `items[0].sku`) walk into `M`/`L` containers. Returns `None` if
-/// any segment is missing or the intermediate value isn't a map/list.
+/// Resolve a document path (`foo`, `#foo`, `profile.email`, `#p.#e`,
+/// `items[0].sku`, `l[0][1]`) to the leaf `AttributeValue` inside `item`,
+/// segmenting it with the expression grammar's own path parser. An alias is
+/// one whole name, so `#sw` -> `Safety.Warning` is a top-level attribute.
+/// Text the grammar does not accept (such as a quoted PartiQL name) is taken
+/// as a literal top-level attribute name. Returns `None` if any step is
+/// missing or the intermediate value isn't a map/list.
 pub(crate) fn resolve_path(
     path: &str,
     item: &HashMap<String, AttributeValue>,
     expr_attr_names: &HashMap<String, String>,
 ) -> Option<Value> {
-    // Fast path: a single-segment expression (no `.` and no `[` in the raw
-    // input) refers to a top-level attribute by its literal name, even if the
-    // resolved alias contains a `.`. Without this, `#sw` -> `Safety.Warning`
-    // would be misread as the nested path `Safety` -> `Warning`.
-    if !path.contains('.') && !path.contains('[') {
-        return item.get(&resolve_attr_name(path, expr_attr_names)).cloned();
+    match parse_document_path(path.trim(), expr_attr_names) {
+        Some(doc) => resolve_doc_path(item, &doc).cloned(),
+        None => item.get(&resolve_attr_name(path, expr_attr_names)).cloned(),
     }
-    let segs = resolve_projection_path_segments(path, expr_attr_names);
-    resolve_nested_path_segments(item, &segs)
 }
 
 pub(crate) fn project_item(
@@ -56,7 +53,9 @@ pub(crate) fn project_item(
                     let names = HashMap::new();
                     let mut result = HashMap::new();
                     for raw in attrs.iter().filter_map(|v| v.as_str()) {
-                        project_single_path_into(&mut result, item, raw, &names);
+                        let path = parse_document_path(raw, &names)
+                            .unwrap_or_else(|| vec![PathElem::Attr(raw.to_string())]);
+                        project_doc_path_into(&mut result, item, &path);
                     }
                     result
                 }
@@ -79,7 +78,7 @@ pub(crate) fn project_item(
 /// for list-index projections, so projected `L` values contain only the
 /// requested elements (in index order). Real list elements are never a bare
 /// JSON `null` (DynamoDB null is `{"NULL": true}`), so this only strips padding.
-fn compact_projected_lists(value: &mut Value) {
+pub(crate) fn compact_projected_lists(value: &mut Value) {
     if let Some(list) = value.get_mut("L").and_then(Value::as_array_mut) {
         list.retain(|e| !e.is_null());
         for e in list.iter_mut() {
@@ -92,87 +91,49 @@ fn compact_projected_lists(value: &mut Value) {
     }
 }
 
-/// Project an item using a comma-separated `ProjectionExpression`,
-/// resolving `#alias` references via `expr_attr_names`.
+/// Project an item using a `ProjectionExpression`, parsed with the same
+/// parser that validates it, resolving `#alias` references via
+/// `expr_attr_names`.
 pub(crate) fn project_with_expression(
     item: &HashMap<String, AttributeValue>,
     proj: &str,
     expr_attr_names: &HashMap<String, String>,
 ) -> HashMap<String, AttributeValue> {
+    let values = HashMap::new();
+    let mut ctx = ExprContext::new(expr_attr_names, &values, false);
+    // Every caller validates the projection before reading, so a parse
+    // failure here is a missed validation, not a request error.
+    let parsed = parse_projection_expression(proj, &mut ctx);
+    debug_assert!(
+        parsed.is_ok(),
+        "unvalidated ProjectionExpression reached projection: {proj}"
+    );
+    let paths = parsed.unwrap_or_default();
     let mut result = HashMap::new();
-    for raw in proj.split(',') {
-        project_single_path_into(&mut result, item, raw.trim(), expr_attr_names);
+    for path in &paths {
+        project_doc_path_into(&mut result, item, path);
     }
     result
 }
 
-/// Resolve a single projection path against `item` and merge the result
-/// into `result`. Shared by ProjectionExpression and AttributesToGet.
-fn project_single_path_into(
+/// Copy the value at `path` (if present) from `item` into `result`, nested
+/// under the same path. Shared by ProjectionExpression and AttributesToGet.
+fn project_doc_path_into(
     result: &mut HashMap<String, AttributeValue>,
     item: &HashMap<String, AttributeValue>,
-    raw: &str,
-    expr_attr_names: &HashMap<String, String>,
+    path: &[PathElem],
 ) {
-    // Single-segment: treat as literal top-level attribute even if the
-    // alias resolves to a name containing `.` (e.g. `#sw` ->
-    // `Safety.Warning`).
-    if !raw.contains('.') && !raw.contains('[') {
-        let key = resolve_attr_name(raw, expr_attr_names);
-        if let Some(v) = item.get(&key) {
-            result.insert(key, v.clone());
-        }
-    } else {
-        let segs = resolve_projection_path_segments(raw, expr_attr_names);
-        if let Some(v) = resolve_nested_path_segments(item, &segs) {
-            insert_nested_value_segments(result, &segs, v);
-        }
-    }
-}
-
-/// Resolve a projection path to logical `PathSegment`s, substituting
-/// `#alias` references without re-splitting the resolved name. Use
-/// this when the result will feed back into
-/// [`resolve_nested_path_segments`] / [`insert_nested_value_segments`]
-/// — otherwise an alias whose value contains `.` (e.g. `#sw` ->
-/// `Safety.Warning`) produces extra spurious segments.
-pub(crate) fn resolve_projection_path_segments(
-    path: &str,
-    expr_attr_names: &HashMap<String, String>,
-) -> Vec<PathSegment> {
-    let raw = parse_path_segments(path);
-    raw.into_iter()
-        .map(|seg| match seg {
-            PathSegment::Key(k) => PathSegment::Key(resolve_attr_name(&k, expr_attr_names)),
-            other => other,
-        })
-        .collect()
-}
-
-/// Like [`resolve_nested_path`] but operating on pre-resolved segments.
-pub(crate) fn resolve_nested_path_segments(
-    item: &HashMap<String, AttributeValue>,
-    segments: &[PathSegment],
-) -> Option<Value> {
-    if segments.is_empty() {
-        return None;
-    }
-    let top_key = match &segments[0] {
-        PathSegment::Key(k) => k.as_str(),
-        _ => return None,
+    let Some(v) = resolve_doc_path(item, path) else {
+        return;
     };
-    let mut current = item.get(top_key)?.clone();
-    for segment in &segments[1..] {
-        match segment {
-            PathSegment::Key(k) => {
-                current = current.get("M")?.get(k)?.clone();
-            }
-            PathSegment::Index(idx) => {
-                current = current.get("L")?.get(*idx)?.clone();
-            }
-        }
-    }
-    Some(current)
+    let segments: Vec<PathSegment> = path
+        .iter()
+        .map(|e| match e {
+            PathElem::Attr(a) => PathSegment::Key(a.clone()),
+            PathElem::Index(i) => PathSegment::Index(*i),
+        })
+        .collect();
+    insert_nested_value_segments(result, &segments, v.clone());
 }
 
 /// Insert a value into `result` at the given pre-resolved segment path.
@@ -199,63 +160,6 @@ pub(crate) fn insert_nested_value_segments(
         None => wrapped,
     };
     result.insert(top_key, merged);
-}
-
-/// Resolve a potentially nested path like "a.b.c" or "a[0].b" from an item.
-///
-/// Kept for tests that exercise raw path parsing; production callers
-/// should resolve aliases first via
-/// [`resolve_projection_path_segments`] and then call
-/// [`resolve_nested_path_segments`] directly.
-#[cfg(test)]
-pub(crate) fn resolve_nested_path(
-    item: &HashMap<String, AttributeValue>,
-    path: &str,
-) -> Option<Value> {
-    resolve_nested_path_segments(item, &parse_path_segments(path))
-}
-
-/// Parse a path like "a.b[0].c" into segments: [Key("a"), Key("b"), Index(0), Key("c")]
-pub(crate) fn parse_path_segments(path: &str) -> Vec<PathSegment> {
-    let mut segments = Vec::new();
-    let mut current = String::new();
-
-    let chars: Vec<char> = path.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        match chars[i] {
-            '.' => {
-                if !current.is_empty() {
-                    segments.push(PathSegment::Key(current.clone()));
-                    current.clear();
-                }
-            }
-            '[' => {
-                if !current.is_empty() {
-                    segments.push(PathSegment::Key(current.clone()));
-                    current.clear();
-                }
-                i += 1;
-                let mut num = String::new();
-                while i < chars.len() && chars[i] != ']' {
-                    num.push(chars[i]);
-                    i += 1;
-                }
-                if let Ok(idx) = num.parse::<usize>() {
-                    segments.push(PathSegment::Index(idx));
-                }
-                // skip ']'
-            }
-            c => {
-                current.push(c);
-            }
-        }
-        i += 1;
-    }
-    if !current.is_empty() {
-        segments.push(PathSegment::Key(current));
-    }
-    segments
 }
 
 /// Wrap a value in the nested path structure.
@@ -326,200 +230,18 @@ pub(crate) fn merge_attribute_values(a: Value, b: Value) -> Value {
     b
 }
 
-fn invalid_projection(detail: impl std::fmt::Display) -> AwsServiceError {
-    AwsServiceError::aws_error(
-        StatusCode::BAD_REQUEST,
-        "ValidationException",
-        format!("Invalid ProjectionExpression: {detail}"),
-    )
-}
-
-#[derive(Debug, PartialEq)]
-enum ProjToken {
-    Name(String),
-    Alias(String),
-    Number(usize),
-    Dot,
-    Comma,
-    Open,
-    Close,
-}
-
-/// One lexed token and the byte span it covers in the expression.
-struct Lexed {
-    token: ProjToken,
-    start: usize,
-    end: usize,
-}
-
-fn lex_projection(expr: &str) -> Result<Vec<Lexed>, AwsServiceError> {
-    let bytes = expr.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    let word_end = |mut j: usize| {
-        while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
-            j += 1;
-        }
-        j
-    };
-    while i < bytes.len() {
-        let c = bytes[i];
-        let (token, end) = match c {
-            b' ' | b'\t' | b'\n' | b'\r' => {
-                i += 1;
-                continue;
-            }
-            b'.' => (ProjToken::Dot, i + 1),
-            b',' => (ProjToken::Comma, i + 1),
-            b'[' => (ProjToken::Open, i + 1),
-            b']' => (ProjToken::Close, i + 1),
-            b'#' if i + 1 < bytes.len() && word_end(i + 1) > i + 1 => {
-                let end = word_end(i + 1);
-                (ProjToken::Alias(expr[i..end].to_string()), end)
-            }
-            b'0'..=b'9' => {
-                let mut end = i;
-                while end < bytes.len() && bytes[end].is_ascii_digit() {
-                    end += 1;
-                }
-                let n = expr[i..end].parse().unwrap_or(usize::MAX);
-                (ProjToken::Number(n), end)
-            }
-            c if c.is_ascii_alphabetic() || c == b'_' => {
-                let end = word_end(i);
-                (ProjToken::Name(expr[i..end].to_string()), end)
-            }
-            _ => {
-                // An unrecognised character: DynamoDB names it as the token
-                // and quotes it together with the character that follows.
-                let ch = expr[i..].chars().next().unwrap_or_default();
-                let near: String = expr[i..].chars().take(2).collect();
-                return Err(invalid_projection(format!(
-                    "Syntax error; token: \"{ch}\", near: \"{near}\""
-                )));
-            }
-        };
-        out.push(Lexed {
-            token,
-            start: i,
-            end,
-        });
-        i = end;
-    }
-    Ok(out)
-}
-
 /// Validate a ProjectionExpression the way DynamoDB does before reading
-/// anything: the expression must parse as a comma-separated list of document
-/// paths, every `#alias` must be defined, and no two paths may overlap (one
-/// equal to, or a prefix of, another once aliases are resolved).
+/// anything, with the shared expression parser: it must parse as a
+/// comma-separated list of document paths, every `#alias` must be defined, no
+/// bare name may be a reserved word, and no two paths may overlap (one equal
+/// to, or a prefix of, another once aliases are resolved).
 pub(crate) fn validate_projection_expression(
     expr: &str,
     expr_attr_names: &HashMap<String, String>,
 ) -> Result<(), AwsServiceError> {
-    if expr.trim().is_empty() {
-        return Err(invalid_projection("The expression can not be empty;"));
-    }
-    let tokens = lex_projection(expr)?;
-    let syntax_error = |pos: usize| {
-        let (token, near) = match tokens.get(pos) {
-            Some(t) => {
-                let from = pos.checked_sub(1).map_or(t.start, |p| tokens[p].start);
-                (&expr[t.start..t.end], &expr[from..t.end])
-            }
-            None => {
-                let near = tokens.last().map_or("", |t| &expr[t.start..t.end]);
-                ("<EOF>", near)
-            }
-        };
-        invalid_projection(format!(
-            "Syntax error; token: \"{token}\", near: \"{near}\""
-        ))
-    };
-
-    let mut paths: Vec<Vec<PathSegment>> = Vec::new();
-    let mut pos = 0;
-    loop {
-        let mut path = Vec::new();
-        let resolve = |t: &ProjToken| -> Result<PathSegment, AwsServiceError> {
-            match t {
-                ProjToken::Alias(a) => expr_attr_names
-                    .get(a)
-                    .map(|n| PathSegment::Key(n.clone()))
-                    .ok_or_else(|| {
-                        invalid_projection(format!(
-                            "An expression attribute name used in the document path is not \
-                             defined; attribute name: {a}"
-                        ))
-                    }),
-                ProjToken::Name(n) => Ok(PathSegment::Key(n.clone())),
-                _ => unreachable!("only names and aliases are resolved"),
-            }
-        };
-        match tokens.get(pos).map(|t| &t.token) {
-            Some(t @ (ProjToken::Name(_) | ProjToken::Alias(_))) => path.push(resolve(t)?),
-            _ => return Err(syntax_error(pos)),
-        }
-        pos += 1;
-        loop {
-            match tokens.get(pos).map(|t| &t.token) {
-                Some(ProjToken::Dot) => match tokens.get(pos + 1).map(|t| &t.token) {
-                    Some(t @ (ProjToken::Name(_) | ProjToken::Alias(_))) => {
-                        path.push(resolve(t)?);
-                        pos += 2;
-                    }
-                    _ => return Err(syntax_error(pos + 1)),
-                },
-                Some(ProjToken::Open) => {
-                    let Some(ProjToken::Number(n)) = tokens.get(pos + 1).map(|t| &t.token) else {
-                        return Err(syntax_error(pos + 1));
-                    };
-                    if tokens.get(pos + 2).map(|t| &t.token) != Some(&ProjToken::Close) {
-                        return Err(syntax_error(pos + 2));
-                    }
-                    path.push(PathSegment::Index(*n));
-                    pos += 3;
-                }
-                _ => break,
-            }
-        }
-        paths.push(path);
-        match tokens.get(pos).map(|t| &t.token) {
-            None => break,
-            Some(ProjToken::Comma) => pos += 1,
-            Some(_) => return Err(syntax_error(pos)),
-        }
-    }
-
-    let render = |p: &[PathSegment]| {
-        let parts: Vec<String> = p
-            .iter()
-            .map(|s| match s {
-                PathSegment::Key(k) => k.clone(),
-                PathSegment::Index(i) => format!("[{i}]"),
-            })
-            .collect();
-        format!("[{}]", parts.join(", "))
-    };
-    let same = |a: &PathSegment, b: &PathSegment| match (a, b) {
-        (PathSegment::Key(x), PathSegment::Key(y)) => x == y,
-        (PathSegment::Index(x), PathSegment::Index(y)) => x == y,
-        _ => false,
-    };
-    for (i, one) in paths.iter().enumerate() {
-        for two in &paths[i + 1..] {
-            let shared = one.len().min(two.len());
-            if one.iter().zip(two).take(shared).all(|(a, b)| same(a, b)) {
-                return Err(invalid_projection(format!(
-                    "Two document paths overlap with each other; must remove or rewrite one of \
-                     these paths; path one: {}, path two: {}",
-                    render(one),
-                    render(two)
-                )));
-            }
-        }
-    }
-    Ok(())
+    let values = HashMap::new();
+    let mut ctx = ExprContext::new(expr_attr_names, &values, true);
+    parse_projection_expression(expr, &mut ctx).map(|_| ())
 }
 
 /// Validate the projection parameters of a read request block (a GetItem
@@ -628,6 +350,32 @@ mod projection_validation_tests {
 mod projection_tests {
     use super::*;
     use serde_json::json;
+
+    // Projection uses the same parser as validation, so whitespace inside a
+    // path and a subscript on an alias behave as in any other expression.
+    #[test]
+    fn projection_paths_share_the_expression_parser() {
+        let mut item: HashMap<String, AttributeValue> = HashMap::new();
+        item.insert("l".into(), json!({"L": [{"S": "x"}, {"S": "y"}]}));
+        item.insert(
+            "a".into(),
+            json!({"M": {"b": {"S": "ab"}, "c": {"S": "ac"}}}),
+        );
+        item.insert(
+            "n".into(),
+            json!({"L": [{"M": {"x": {"S": "n0"}}}, {"M": {"x": {"S": "n1"}, "y": {"S": "no"}}}]}),
+        );
+        let projected = project_item(
+            &item,
+            &json!({
+                "ProjectionExpression": "l[ 0 ], a . b, #n[1].x",
+                "ExpressionAttributeNames": {"#n": "n"},
+            }),
+        );
+        assert_eq!(projected["l"], json!({"L": [{"S": "x"}]}));
+        assert_eq!(projected["a"], json!({"M": {"b": {"S": "ab"}}}));
+        assert_eq!(projected["n"], json!({"L": [{"M": {"x": {"S": "n1"}}}]}));
+    }
 
     #[test]
     fn list_index_projection_compacts_padding() {

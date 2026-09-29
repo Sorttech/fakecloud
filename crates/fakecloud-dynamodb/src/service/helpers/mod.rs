@@ -350,6 +350,21 @@ pub(crate) fn apply_update_expression(
     expr_attr_names: &HashMap<String, String>,
     expr_attr_values: &HashMap<String, Value>,
 ) -> Result<(), AwsServiceError> {
+    apply_update_expression_tracked(item, expr, expr_attr_names, expr_attr_values).map(|_| ())
+}
+
+/// [`apply_update_expression`], also reporting where each `SET` action's
+/// value ended up: `(ordinal of the SET action, document path)`. A list index
+/// past the end appends, so the written index can differ from the one in the
+/// expression, and a later `REMOVE` of an earlier element of the same list
+/// shifts it down again.
+pub(crate) fn apply_update_expression_tracked(
+    item: &mut HashMap<String, AttributeValue>,
+    expr: &str,
+    expr_attr_names: &HashMap<String, String>,
+    expr_attr_values: &HashMap<String, Value>,
+) -> Result<Vec<(usize, DocPath)>, AwsServiceError> {
+    let mut written: Vec<(usize, DocPath)> = Vec::new();
     let clauses = parse_update_clauses(expr);
     if clauses.is_empty() && !expr.trim().is_empty() {
         return Err(AwsServiceError::aws_error(
@@ -358,16 +373,37 @@ pub(crate) fn apply_update_expression(
             "Invalid UpdateExpression: Syntax error; token: \"<expression>\"",
         ));
     }
+    // Every operand reads the item as it was before the update: a later
+    // clause sees the pre-update value of an attribute an earlier clause set.
+    let snapshot = item.clone();
     for (action, assignments) in &clauses {
         match action {
             UpdateAction::Set => {
-                for assignment in assignments {
-                    apply_set_assignment(item, assignment, expr_attr_names, expr_attr_values)?;
+                for (ordinal, assignment) in assignments.iter().enumerate() {
+                    let index = apply_set_assignment_from(
+                        item,
+                        &snapshot,
+                        assignment,
+                        expr_attr_names,
+                        expr_attr_values,
+                    )?;
+                    let target = assignment.split_once('=').map_or("", |(l, _)| l.trim());
+                    if let Some(mut path) = parse_document_path(target, expr_attr_names) {
+                        if let (Some(i), Some(PathElem::Index(last))) = (index, path.last_mut()) {
+                            *last = i;
+                        }
+                        written.push((ordinal, path));
+                    }
                 }
             }
             UpdateAction::Remove => {
                 for attr_ref in assignments {
+                    let removed = parse_document_path(attr_ref.trim(), expr_attr_names)
+                        .filter(|p| resolve_doc_path(item, p).is_some());
                     remove_path(item, attr_ref.trim(), expr_attr_names);
+                    if let Some(removed) = removed {
+                        shift_after_list_removal(&mut written, &removed);
+                    }
                 }
             }
             UpdateAction::Add => {
@@ -382,7 +418,25 @@ pub(crate) fn apply_update_expression(
             }
         }
     }
-    Ok(())
+    Ok(written)
+}
+
+/// After `removed` (a path ending in a list index `j`) is removed, the
+/// elements after it move down one place: rewrite any recorded path that
+/// steps through that same list at an index greater than `j`.
+fn shift_after_list_removal(written: &mut [(usize, DocPath)], removed: &[PathElem]) {
+    let Some((PathElem::Index(j), parent)) = removed.split_last() else {
+        return;
+    };
+    for (_, path) in written.iter_mut() {
+        if path.len() > parent.len() && path.starts_with(parent) {
+            if let PathElem::Index(k) = &mut path[parent.len()] {
+                if *k > *j {
+                    *k -= 1;
+                }
+            }
+        }
+    }
 }
 
 pub(crate) fn parse_update_clauses(expr: &str) -> Vec<(UpdateAction, Vec<String>)> {
@@ -452,14 +506,17 @@ pub(crate) fn parse_update_clauses(expr: &str) -> Vec<(UpdateAction, Vec<String>
     clauses
 }
 
-pub(crate) fn apply_set_assignment(
+/// Apply one `SET` assignment, evaluating its right-hand side against
+/// `source` (the pre-update item) and writing the result into `item`.
+pub(crate) fn apply_set_assignment_from(
     item: &mut HashMap<String, AttributeValue>,
+    source: &HashMap<String, AttributeValue>,
     assignment: &str,
     expr_attr_names: &HashMap<String, String>,
     expr_attr_values: &HashMap<String, Value>,
-) -> Result<(), AwsServiceError> {
+) -> Result<Option<usize>, AwsServiceError> {
     let Some((left, right)) = assignment.split_once('=') else {
-        return Ok(());
+        return Ok(None);
     };
 
     let left_trimmed = left.trim();
@@ -470,38 +527,15 @@ pub(crate) fn apply_set_assignment(
     // all work against nested paths, not just top-level attributes. The evaluator
     // returns Ok(None) when the RHS is a no-op (if_not_exists where the target
     // already has a value, or an unresolvable plain reference).
-    let new_value = evaluate_set_rhs(right, item, expr_attr_names, expr_attr_values)?;
+    let new_value = evaluate_set_rhs(right, source, expr_attr_names, expr_attr_values)?;
 
-    if is_dotted_path(left_trimmed) {
-        // A None value is a no-op (if_not_exists skip, or unresolvable plain
-        // ref) — matches top-level SET's silent-skip behavior for the same
-        // shapes. Structural errors (missing parent map, non-map intermediate)
-        // surface from assign_nested_path itself.
-        let Some(v) = new_value else {
-            return Ok(());
-        };
-        return assign_nested_path(item, left_trimmed, expr_attr_names, v);
-    }
-
-    // Split off a trailing `[N]` list-index suffix so we can resolve the
-    // attribute name ref on its own. Without this, `resolve_attr_name` sees
-    // "#items[0]" as a whole and misses the `#items` → `items` mapping.
-    let (attr_ref, list_index) = match parse_list_index_suffix(left_trimmed) {
-        Some((name, idx)) => (name, Some(idx)),
-        None => (left_trimmed, None),
-    };
-    let attr = resolve_attr_name(attr_ref, expr_attr_names);
-
+    // A None value is a no-op (if_not_exists skip, or unresolvable plain
+    // ref). Structural errors (missing parent, wrong container type) surface
+    // from assign_nested_path itself.
     let Some(v) = new_value else {
-        return Ok(());
+        return Ok(None);
     };
-    match list_index {
-        Some(idx) => assign_list_index(item, &attr, idx, v),
-        None => {
-            item.insert(attr, v);
-            Ok(())
-        }
-    }
+    assign_nested_path(item, left_trimmed, expr_attr_names, v)
 }
 
 /// Evaluate the RHS of a `SET` assignment without writing it anywhere.
@@ -515,6 +549,8 @@ pub(crate) fn evaluate_set_rhs(
     expr_attr_names: &HashMap<String, String>,
     expr_attr_values: &HashMap<String, Value>,
 ) -> Result<Option<Value>, AwsServiceError> {
+    // A parenthesised value (`SET c = (c - :v)`) is the value inside.
+    let right = strip_outer_parens(right);
     // Arithmetic is checked first so a top-level `+`/`-` is split before the
     // `if_not_exists(`/`list_append(` prefixes are tested. The canonical
     // atomic-counter idiom `if_not_exists(#c, :zero) + :inc` (and its mirror
@@ -576,7 +612,7 @@ pub(crate) fn evaluate_arithmetic_operand(
     expr_attr_names: &HashMap<String, String>,
     expr_attr_values: &HashMap<String, Value>,
 ) -> Option<Value> {
-    let operand = operand.trim();
+    let operand = strip_outer_parens(operand.trim());
     if let Some(rest) = operand
         .strip_prefix("if_not_exists(")
         .or_else(|| operand.strip_prefix("if_not_exists ("))
@@ -690,53 +726,6 @@ pub(crate) fn evaluate_arithmetic_rhs(
     Ok(Some(json!({ "N": num_str })))
 }
 
-/// Parse a trailing `[N]` list-index suffix off the LHS of a SET assignment.
-/// Returns the bare attribute reference and the index, or None when the LHS
-/// is a plain attribute (or a path shape we don't yet support).
-pub(crate) fn parse_list_index_suffix(path: &str) -> Option<(&str, usize)> {
-    let path = path.trim();
-    if !path.ends_with(']') {
-        return None;
-    }
-    let open = path.rfind('[')?;
-    // Require no further `.` / `[` / `]` inside the bracketed portion and no
-    // further path segments after — we only handle the single-index case
-    // `name[N]`, not nested shapes like `a.b[0].c`.
-    let idx_str = &path[open + 1..path.len() - 1];
-    let idx: usize = idx_str.parse().ok()?;
-    let name = &path[..open];
-    if name.is_empty() || name.contains('[') || name.contains(']') || name.contains('.') {
-        return None;
-    }
-    Some((name, idx))
-}
-
-/// Assign a value to a specific index of a `L`-typed attribute. If `idx` is
-/// within the current list, replaces that slot; if it's at the end, appends.
-/// AWS rejects writes beyond `len`, so we return a `ValidationException` for
-/// out-of-range indices and non-list attributes.
-pub(crate) fn assign_list_index(
-    item: &mut HashMap<String, AttributeValue>,
-    attr: &str,
-    idx: usize,
-    value: Value,
-) -> Result<(), AwsServiceError> {
-    let Some(existing) = item.get_mut(attr) else {
-        return Err(invalid_document_path());
-    };
-    let Some(list) = existing.get_mut("L").and_then(|l| l.as_array_mut()) else {
-        return Err(invalid_document_path());
-    };
-    if idx < list.len() {
-        list[idx] = value;
-    } else if idx == list.len() {
-        list.push(value);
-    } else {
-        return Err(invalid_document_path());
-    }
-    Ok(())
-}
-
 pub(crate) fn invalid_document_path() -> AwsServiceError {
     AwsServiceError::aws_error(
         StatusCode::BAD_REQUEST,
@@ -772,12 +761,6 @@ pub(crate) fn resolve_ref_or_path(
     })
 }
 
-/// True if `path` targets a nested key inside an M-typed attribute. Bracketed
-/// list indices (`a[0]`, `a.b[0]`) are not supported by the nested-SET writer.
-pub(crate) fn is_dotted_path(path: &str) -> bool {
-    path.contains('.') && !path.contains('[')
-}
-
 pub(crate) struct TableDescriptionInput<'a> {
     pub arn: &'a str,
     pub table_id: &'a str,
@@ -796,6 +779,7 @@ pub(crate) struct TableDescriptionInput<'a> {
 }
 
 mod conditions;
+mod expr;
 mod keys;
 mod metrics;
 pub(crate) mod partiql;
@@ -803,12 +787,14 @@ pub(crate) mod partiql_exec;
 pub(crate) mod partiql_parse;
 mod paths;
 mod request;
+mod reserved_words;
 pub(crate) mod schemas;
 mod sizing;
 mod table_descriptions;
 mod table_lookup;
 mod updates;
 pub(crate) use conditions::*;
+pub(crate) use expr::*;
 pub(crate) use keys::*;
 pub(crate) use metrics::*;
 pub(crate) use partiql::*;

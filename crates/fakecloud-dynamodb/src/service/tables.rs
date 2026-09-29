@@ -1125,6 +1125,7 @@ impl DynamoDbService {
                 format!("Backup not found: {backup_arn}"),
             )
         })?;
+        let source_table_arn = backup.table_arn.clone();
 
         if state.tables.contains_key(target_table_name) {
             return Err(AwsServiceError::aws_error(
@@ -1189,8 +1190,17 @@ impl DynamoDbService {
         };
         table.recalculate_stats();
 
-        let desc = build_table_description(&table);
+        let mut desc = build_table_description(&table);
         state.tables.insert(target_table_name.to_string(), table);
+        // The response describes the restore as AWS accepts it: the new
+        // table is still being created from the backup.
+        desc["TableStatus"] = json!("CREATING");
+        desc["RestoreSummary"] = json!({
+            "SourceBackupArn": backup_arn,
+            "SourceTableArn": source_table_arn,
+            "RestoreDateTime": now.timestamp() as f64,
+            "RestoreInProgress": true,
+        });
 
         Self::ok_json(json!({
             "TableDescription": desc
@@ -1543,32 +1553,30 @@ impl DynamoDbService {
             export_time: now,
             item_count,
             billed_size_bytes: data_size,
+            failure_code: export_failed.then(|| failure_code.to_string()),
+            failure_message: export_failed.then_some(failure_reason),
         };
 
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
         state.exports.insert(export_arn.clone(), export);
 
-        let mut response = json!({
+        // The export runs to completion before we answer, but the call itself
+        // reports what AWS reports when it accepts an export: IN_PROGRESS,
+        // with no end time or counts yet. DescribeExport and ListExports
+        // carry the final status.
+        Self::ok_json(json!({
             "ExportDescription": {
                 "ExportArn": export_arn,
-                "ExportStatus": export_status,
+                "ExportStatus": "IN_PROGRESS",
                 "TableArn": table_arn,
                 "S3Bucket": s3_bucket,
                 "S3Prefix": s3_prefix,
                 "ExportFormat": export_format,
                 "StartTime": now.timestamp() as f64,
-                "EndTime": now.timestamp() as f64,
-                "ExportTime": now.timestamp() as f64,
-                "ItemCount": item_count,
-                "BilledSizeBytes": data_size
+                "ExportTime": now.timestamp() as f64
             }
-        });
-        if export_failed {
-            response["ExportDescription"]["FailureCode"] = json!(failure_code);
-            response["ExportDescription"]["FailureMessage"] = json!(failure_reason);
-        }
-        Self::ok_json(response)
+        }))
     }
 
     pub(super) fn describe_export(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
@@ -1586,21 +1594,26 @@ impl DynamoDbService {
             )
         })?;
 
-        Self::ok_json(json!({
-            "ExportDescription": {
-                "ExportArn": export.export_arn,
-                "ExportStatus": export.export_status,
-                "TableArn": export.table_arn,
-                "S3Bucket": export.s3_bucket,
-                "S3Prefix": export.s3_prefix,
-                "ExportFormat": export.export_format,
-                "StartTime": export.start_time.timestamp() as f64,
-                "EndTime": export.end_time.timestamp() as f64,
-                "ExportTime": export.export_time.timestamp() as f64,
-                "ItemCount": export.item_count,
-                "BilledSizeBytes": export.billed_size_bytes
-            }
-        }))
+        let mut description = json!({
+            "ExportArn": export.export_arn,
+            "ExportStatus": export.export_status,
+            "TableArn": export.table_arn,
+            "S3Bucket": export.s3_bucket,
+            "S3Prefix": export.s3_prefix,
+            "ExportFormat": export.export_format,
+            "StartTime": export.start_time.timestamp() as f64,
+            "EndTime": export.end_time.timestamp() as f64,
+            "ExportTime": export.export_time.timestamp() as f64,
+            "ItemCount": export.item_count,
+            "BilledSizeBytes": export.billed_size_bytes
+        });
+        if let Some(code) = &export.failure_code {
+            description["FailureCode"] = json!(code);
+        }
+        if let Some(message) = &export.failure_message {
+            description["FailureMessage"] = json!(message);
+        }
+        Self::ok_json(json!({ "ExportDescription": description }))
     }
 
     pub(super) fn list_exports(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
@@ -1856,10 +1869,13 @@ impl DynamoDbService {
             .map(|a| json!({"AttributeName": a.attribute_name, "AttributeType": a.attribute_type}))
             .collect();
 
+        // As with ExportTableToPointInTime, the import is finished by the
+        // time we answer, but the call reports the IN_PROGRESS state AWS
+        // returns on acceptance; DescribeImport carries the final counts.
         Self::ok_json(json!({
             "ImportTableDescription": {
                 "ImportArn": import_arn,
-                "ImportStatus": "COMPLETED",
+                "ImportStatus": "IN_PROGRESS",
                 "TableArn": table_arn,
                 "TableId": table_ref.table_id,
                 "S3BucketSource": {
@@ -1871,12 +1887,7 @@ impl DynamoDbService {
                     "KeySchema": ks,
                     "AttributeDefinitions": ad
                 },
-                "StartTime": now.timestamp() as f64,
-                "EndTime": now.timestamp() as f64,
-                "ProcessedItemCount": processed_item_count,
-                "ProcessedSizeBytes": processed_size_bytes,
-                "ImportedItemCount": imported_item_count,
-                "ErrorCount": error_count
+                "StartTime": now.timestamp() as f64
             }
         }))
     }

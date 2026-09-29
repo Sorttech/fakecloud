@@ -93,3 +93,33 @@ pub(crate) fn find_table_by_arn_mut<'a>(
         )
     })
 }
+
+/// The bare not-found error the item-level data plane reports.
+pub(crate) fn data_table_not_found() -> AwsServiceError {
+    AwsServiceError::aws_error(
+        StatusCode::BAD_REQUEST,
+        "ResourceNotFoundException",
+        "Requested resource not found",
+    )
+}
+
+/// Table lookup for the item-level data plane (GetItem, PutItem, Query, ...),
+/// which reports a missing table without naming it, unlike DescribeTable.
+pub(crate) fn get_data_table<'a>(
+    tables: &'a BTreeMap<String, DynamoTable>,
+    name: &str,
+) -> Result<&'a DynamoTable, AwsServiceError> {
+    tables
+        .get(resolve_table_name(name))
+        .ok_or_else(data_table_not_found)
+}
+
+/// Mutable variant of [`get_data_table`].
+pub(crate) fn get_data_table_mut<'a>(
+    tables: &'a mut BTreeMap<String, DynamoTable>,
+    name: &str,
+) -> Result<&'a mut DynamoTable, AwsServiceError> {
+    tables
+        .get_mut(resolve_table_name(name))
+        .ok_or_else(data_table_not_found)
+}

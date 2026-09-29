@@ -106,6 +106,14 @@ pub(crate) fn validate_item_attribute_values(
 ) -> Result<(), AwsServiceError> {
     for v in item.values() {
         validate_attribute_value(v)?;
+        if attribute_depth(v) > MAX_NESTING_DEPTH {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "ValidationException",
+                "Nesting Levels have exceeded supported limits: Attributes in the item have \
+                 nested levels beyond supported limit",
+            ));
+        }
     }
     Ok(())
 }
@@ -140,6 +148,20 @@ fn duplicate_set(members: &[&str]) -> AwsServiceError {
         "ValidationException",
         format!(
             "One or more parameter values were invalid: Input collection [{}] contains duplicates",
+            members.join(", ")
+        ),
+    )
+}
+
+/// The binary-set duplicate message names the set type, with AWS's missing
+/// space before `of`.
+fn duplicate_binary_set(members: &[&str]) -> AwsServiceError {
+    AwsServiceError::aws_error(
+        StatusCode::BAD_REQUEST,
+        "ValidationException",
+        format!(
+            "One or more parameter values were invalid: Input collection [{}]of type BS contains \
+             duplicates",
             members.join(", ")
         ),
     )
@@ -234,8 +256,18 @@ pub(crate) fn validate_attribute_value(v: &Value) -> Result<(), AwsServiceError>
                     .decode(m)
                     .unwrap_or_else(|_| m.as_bytes().to_vec());
                 if !seen.insert(key) {
-                    return Err(duplicate_set(&members));
+                    return Err(duplicate_binary_set(&members));
                 }
+            }
+        }
+        "NULL" => {
+            if val.as_bool() != Some(true) {
+                return Err(AwsServiceError::aws_error(
+                    StatusCode::BAD_REQUEST,
+                    "ValidationException",
+                    "One or more parameter values were invalid: Null attribute value types must \
+                     have the value of true",
+                ));
             }
         }
         "L" => {
@@ -259,23 +291,10 @@ pub(crate) fn validate_key_in_item(
     table: &DynamoTable,
     item: &HashMap<String, AttributeValue>,
 ) -> Result<(), AwsServiceError> {
+    if let Some(err) = missing_item_key_error(table, item) {
+        return Err(err);
+    }
     let hash_key = table.hash_key_name();
-    if !item.contains_key(hash_key) {
-        return Err(AwsServiceError::aws_error(
-            StatusCode::BAD_REQUEST,
-            "ValidationException",
-            format!("Missing the key {hash_key} in the item"),
-        ));
-    }
-    if let Some(range_key) = table.range_key_name() {
-        if !item.contains_key(range_key) {
-            return Err(AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "ValidationException",
-                format!("Missing the key {range_key} in the item"),
-            ));
-        }
-    }
     check_key_type(table, item, hash_key)?;
     if let Some(range_key) = table.range_key_name() {
         check_key_type(table, item, range_key)?;
@@ -287,26 +306,14 @@ pub(crate) fn validate_key_attributes_in_key(
     table: &DynamoTable,
     key: &HashMap<String, AttributeValue>,
 ) -> Result<(), AwsServiceError> {
+    // A Key must name exactly the table's key attributes, each of its
+    // declared type: a missing range key (which would otherwise
+    // under-specify the row), an extra attribute or a wrong type is the
+    // same schema mismatch.
+    if !key_matches_schema(table, key) {
+        return Err(validation_error(KEY_SCHEMA_MISMATCH));
+    }
     let hash_key = table.hash_key_name();
-    if !key.contains_key(hash_key) {
-        return Err(AwsServiceError::aws_error(
-            StatusCode::BAD_REQUEST,
-            "ValidationException",
-            format!("Missing the key {hash_key} in the item"),
-        ));
-    }
-    // Composite-key tables require BOTH hash and range in the Key map;
-    // omitting the range key would otherwise let GetItem / DeleteItem
-    // succeed with an under-specified key.
-    if let Some(range_key) = table.range_key_name() {
-        if !key.contains_key(range_key) {
-            return Err(AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "ValidationException",
-                format!("Missing the key {range_key} in the item"),
-            ));
-        }
-    }
     check_key_type(table, key, hash_key)?;
     if let Some(range_key) = table.range_key_name() {
         check_key_type(table, key, range_key)?;
@@ -369,7 +376,44 @@ fn check_key_type(
             ),
         ));
     }
+    // Key values are size-capped: 2048 bytes for the partition key, 1024 for
+    // the sort key. The limit applies on reads as well as writes.
+    let size = key_value_size(expected, val);
+    let is_hash = name == table.hash_key_name();
+    let message = if is_hash && size > 2048 {
+        Some(
+            "One or more parameter values were invalid: Size of hashkey has exceeded the \
+             maximum size limit of2048 bytes",
+        )
+    } else if !is_hash && size > 1024 {
+        Some(
+            "One or more parameter values were invalid: Aggregated size of all range keys has \
+             exceeded the size limit of 1024 bytes",
+        )
+    } else {
+        None
+    };
+    if let Some(message) = message {
+        return Err(AwsServiceError::aws_error(
+            StatusCode::BAD_REQUEST,
+            "ValidationException",
+            message,
+        ));
+    }
     Ok(())
+}
+
+/// Stored size of a scalar key value: UTF-8 bytes of a string, decoded bytes
+/// of a binary, digits of a number.
+fn key_value_size(ty: &str, val: &Value) -> usize {
+    let raw = val.get(ty).and_then(Value::as_str).unwrap_or_default();
+    match ty {
+        "B" => base64::engine::general_purpose::STANDARD
+            .decode(raw)
+            .map(|b| b.len())
+            .unwrap_or(raw.len()),
+        _ => raw.len(),
+    }
 }
 
 /// The message DynamoDB uses when a lookup key does not fit the table's key
@@ -469,7 +513,11 @@ pub(crate) fn missing_item_key_error(
 ) -> Option<AwsServiceError> {
     table_key_names(table)
         .find(|name| !item.contains_key(*name))
-        .map(|name| validation_error(format!("Missing the key {name} in the item")))
+        .map(|name| {
+            validation_error(format!(
+                "One or more parameter values were invalid: Missing the key {name} in the item"
+            ))
+        })
 }
 
 /// The type-mismatch error for a table key attribute inside a written item,

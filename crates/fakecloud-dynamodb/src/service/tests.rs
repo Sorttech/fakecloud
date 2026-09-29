@@ -506,7 +506,7 @@ fn test_resolve_nested_path_map() {
         json!({"M": {"address": {"M": {"city": {"S": "NYC"}}}}}),
     );
 
-    let result = resolve_nested_path(&item, "info.address.city");
+    let result = resolve_path("info.address.city", &item, &HashMap::new());
     assert_eq!(result, Some(json!({"S": "NYC"})));
 }
 
@@ -518,7 +518,7 @@ fn test_resolve_nested_path_list_then_map() {
         json!({"L": [{"M": {"sku": {"S": "ABC"}}}]}),
     );
 
-    let result = resolve_nested_path(&item, "items[0].sku");
+    let result = resolve_path("items[0].sku", &item, &HashMap::new());
     assert_eq!(result, Some(json!({"S": "ABC"})));
 }
 
@@ -1334,19 +1334,50 @@ fn export_lifecycle() {
         .as_str()
         .unwrap()
         .to_string();
-    assert_eq!(body["ExportDescription"]["ExportStatus"], "COMPLETED");
+    // The start call reports the export as accepted; DescribeExport shows
+    // the finished export.
+    assert_eq!(body["ExportDescription"]["ExportStatus"], "IN_PROGRESS");
 
     // Describe
     let req = make_request("DescribeExport", json!({ "ExportArn": export_arn }));
     let resp = svc.describe_export(&req).unwrap();
     let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
     assert_eq!(body["ExportDescription"]["S3Bucket"], "my-bucket");
+    assert_eq!(body["ExportDescription"]["ExportStatus"], "COMPLETED");
 
     // List
     let req = make_request("ListExports", json!({}));
     let resp = svc.list_exports(&req).unwrap();
     let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
     assert_eq!(body["ExportSummaries"].as_array().unwrap().len(), 1);
+}
+
+/// An export to a missing bucket is accepted IN_PROGRESS and then described
+/// as FAILED with the reason.
+#[test]
+fn failed_export_reports_failure_on_describe() {
+    let s3: fakecloud_s3::SharedS3State = Arc::new(RwLock::new(
+        fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+    ));
+    let svc = make_service().with_s3(s3);
+    create_test_table(&svc);
+    let req = make_request(
+        "ExportTableToPointInTime",
+        json!({
+            "TableArn": "arn:aws:dynamodb:us-east-1:123456789012:table/test-table",
+            "S3Bucket": "missing-bucket"
+        }),
+    );
+    let resp = svc.export_table_to_point_in_time(&req).unwrap();
+    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(body["ExportDescription"]["ExportStatus"], "IN_PROGRESS");
+    let export_arn = body["ExportDescription"]["ExportArn"].as_str().unwrap();
+
+    let req = make_request("DescribeExport", json!({ "ExportArn": export_arn }));
+    let resp = svc.describe_export(&req).unwrap();
+    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(body["ExportDescription"]["ExportStatus"], "FAILED");
+    assert_eq!(body["ExportDescription"]["FailureCode"], "S3NoSuchBucket");
 }
 
 #[test]
@@ -1371,7 +1402,10 @@ fn import_lifecycle() {
         .as_str()
         .unwrap()
         .to_string();
-    assert_eq!(body["ImportTableDescription"]["ImportStatus"], "COMPLETED");
+    assert_eq!(
+        body["ImportTableDescription"]["ImportStatus"],
+        "IN_PROGRESS"
+    );
 
     // Describe import
     let req = make_request("DescribeImport", json!({ "ImportArn": import_arn }));
@@ -2277,10 +2311,9 @@ fn test_evaluate_condition_no_existing_item() {
 
     assert!(evaluate_condition("attribute_not_exists(#s)", None, &names, &values).is_ok());
     assert!(evaluate_condition("attribute_exists(#s)", None, &names, &values).is_err());
-    // A comparison against a missing attribute is false for EVERY operator in
-    // DynamoDB (presence is tested with attribute_exists/not_exists), so both
-    // `<>` and `=` fail the condition here (bug-audit 2026-06-26, 1.5).
-    assert!(evaluate_condition("#s <> :v", None, &names, &values).is_err());
+    // A missing attribute equals nothing: `=` fails the condition and `<>`
+    // passes it.
+    assert!(evaluate_condition("#s <> :v", None, &names, &values).is_ok());
     assert!(evaluate_condition("#s = :v", None, &names, &values).is_err());
 }
 
@@ -2693,9 +2726,9 @@ fn test_unrecognized_expression_returns_false() {
 }
 
 #[test]
-fn test_set_list_index_out_of_range_returns_error() {
-    // SET list[N] where N > len must return a ValidationException,
-    // not silently no-op.
+fn test_set_list_index_past_end_appends() {
+    // SET list[N] where N > len appends the value to the end of the list,
+    // as AWS does.
     let mut item = HashMap::new();
     item.insert("items".to_string(), json!({"L": [{"S": "a"}, {"S": "b"}]}));
 
@@ -2703,19 +2736,14 @@ fn test_set_list_index_out_of_range_returns_error() {
     let mut values = HashMap::new();
     values.insert(":v".to_string(), json!({"S": "z"}));
 
-    let result = apply_update_expression(&mut item, "SET items[5] = :v", &names, &values);
-    assert!(
-        result.is_err(),
-        "out-of-range list index must return an error"
-    );
-
-    // List should be unchanged
+    apply_update_expression(&mut item, "SET items[5] = :v", &names, &values).unwrap();
     let list = item
         .get("items")
         .and_then(|v| v.get("L"))
         .and_then(|v| v.as_array())
         .unwrap();
-    assert_eq!(list.len(), 2);
+    assert_eq!(list.len(), 3);
+    assert_eq!(list[2], json!({"S": "z"}));
 }
 
 #[test]
@@ -5659,9 +5687,10 @@ fn update_table_prunes_attributes_orphaned_by_gsi_delete() {
 }
 
 #[test]
-fn filter_comparison_missing_attribute_is_false() {
-    // An item without the `status` attribute. AWS: every comparison against a
-    // missing attribute is false (1.5).
+fn filter_comparison_missing_attribute_semantics() {
+    // An item without the `status` attribute. AWS: `=` and the ordering
+    // comparisons against a missing attribute are false, while `<>` is true
+    // (a missing value is not equal to anything).
     let item: HashMap<String, AttributeValue> = [("pk".to_string(), json!({"S": "a"}))]
         .into_iter()
         .collect();
@@ -5670,12 +5699,18 @@ fn filter_comparison_missing_attribute_is_false() {
         .into_iter()
         .collect();
 
-    for op in ["status <> :s", "status < :s", "status <= :s", "status = :s"] {
+    for op in ["status < :s", "status <= :s", "status = :s"] {
         assert!(
             !evaluate_filter_expression(op, &item, &names, &values),
             "`{op}` must be false when `status` is missing"
         );
     }
+    assert!(evaluate_filter_expression(
+        "status <> :s",
+        &item,
+        &names,
+        &values
+    ));
 }
 
 #[test]
@@ -6280,6 +6315,31 @@ fn search_vectors_honors_projection_and_consumed_capacity() {
             .as_f64()
             .unwrap()
             > 0.0
+    );
+}
+
+/// An overlapping ProjectionExpression is rejected, as on Query and Scan,
+/// rather than returning items with nothing projected.
+#[test]
+fn search_vectors_rejects_overlapping_projection() {
+    let svc = make_service();
+    create_vector_table(&svc, "COSINE");
+    put_vector_item(&svc, "only", &[1.0, 0.0]);
+    let err = err_of(svc.search_vectors(&make_request(
+        "SearchVectors",
+        json!({
+            "TableName": "vec-table",
+            "IndexName": "embedding-index",
+            "SearchVector": search_vec(&[1.0, 0.0]),
+            "TopK": 1,
+            "ProjectionExpression": "a, a.b",
+        }),
+    )));
+    assert_eq!(err.code(), "ValidationException");
+    assert_eq!(
+        err.message(),
+        "Invalid ProjectionExpression: Two document paths overlap with each other; must remove \
+         or rewrite one of these paths; path one: [a], path two: [a, b]"
     );
 }
 
@@ -7865,7 +7925,8 @@ fn write_capacity_charges_only_the_indexes_a_write_changes() {
         json!({
             "TableName": "idx-wcu",
             "Key": {"pk": {"S": "a"}, "sk": {"S": "1"}},
-            "UpdateExpression": "SET other = :o",
+            "UpdateExpression": "SET #o = :o",
+            "ExpressionAttributeNames": {"#o": "other"},
             "ExpressionAttributeValues": {":o": {"S": "o2"}},
             "ReturnConsumedCapacity": "INDEXES",
         }),

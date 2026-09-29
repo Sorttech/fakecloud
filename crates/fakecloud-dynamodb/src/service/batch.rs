@@ -31,26 +31,6 @@ use super::{
     KEY_SCHEMA_MISMATCH,
 };
 
-/// Look up a table named by a batch or transaction request. These operations
-/// report a missing table with the bare "Requested resource not found",
-/// without the table name the single-table operations append.
-fn item_op_table<'a>(
-    tables: &'a std::collections::BTreeMap<String, DynamoTable>,
-    name: &str,
-) -> Result<&'a DynamoTable, AwsServiceError> {
-    tables
-        .get(super::resolve_table_name(name))
-        .ok_or_else(table_not_found)
-}
-
-fn table_not_found() -> AwsServiceError {
-    AwsServiceError::aws_error(
-        StatusCode::BAD_REQUEST,
-        "ResourceNotFoundException",
-        "Requested resource not found",
-    )
-}
-
 fn schema_mismatch() -> AwsServiceError {
     AwsServiceError::aws_error(
         StatusCode::BAD_REQUEST,
@@ -234,7 +214,7 @@ impl DynamoDbService {
         let mut consumed_capacity: Vec<Value> = Vec::new();
 
         for (table_name, params) in &request_items {
-            let table = item_op_table(tables_of(&accounts, req, table_name), table_name)?;
+            let table = super::get_data_table(tables_of(&accounts, req, table_name), table_name)?;
             let keys = params["Keys"].as_array().ok_or_else(|| {
                 AwsServiceError::aws_error(
                     StatusCode::BAD_REQUEST,
@@ -391,7 +371,7 @@ impl DynamoDbService {
         // the whole call (AWS rejects these up-front, not after partial
         // application).
         for (table_name, requests) in &request_items {
-            let table = item_op_table(tables_of(&accounts, req, table_name), table_name)?;
+            let table = super::get_data_table(tables_of(&accounts, req, table_name), table_name)?;
             let reqs = requests.as_array().ok_or_else(|| {
                 AwsServiceError::aws_error(
                     StatusCode::BAD_REQUEST,
@@ -481,7 +461,7 @@ impl DynamoDbService {
         for (table_name, requests) in &request_items {
             let table = tables_of_mut(&mut accounts, req, table_name)
                 .get_mut(super::resolve_table_name(table_name))
-                .ok_or_else(table_not_found)?;
+                .ok_or_else(super::data_table_not_found)?;
 
             let reqs = requests.as_array().ok_or_else(|| {
                 AwsServiceError::aws_error(
@@ -628,7 +608,7 @@ impl DynamoDbService {
                 )
             })?;
 
-            let table = item_op_table(tables_of(&accounts, req, table_name), table_name)?;
+            let table = super::get_data_table(tables_of(&accounts, req, table_name), table_name)?;
             // Parse the Key strictly instead of coercing it to `{}` (which
             // matched nothing and returned a phantom miss).
             let key: HashMap<String, AttributeValue> = serde_json::from_value(get["Key"].clone())
@@ -681,7 +661,7 @@ impl DynamoDbService {
         for (ti, key) in transact_items.iter().zip(lookups) {
             let get = &ti["Get"];
             let table_name = get["TableName"].as_str().unwrap_or_default();
-            let table = item_op_table(tables_of(&accounts, req, table_name), table_name)?;
+            let table = super::get_data_table(tables_of(&accounts, req, table_name), table_name)?;
             let key = key.unwrap_or_default();
             let found = table.find_item_index(&key).map(|idx| &table.items[idx]);
             // A present item whose projection selects nothing is reported
@@ -857,7 +837,7 @@ impl DynamoDbService {
         for ti in transact_items {
             let (_, op) = transact_op(ti);
             let table_name = op["TableName"].as_str().unwrap_or_default();
-            item_op_table(tables_of(&accounts, req, table_name), table_name)?;
+            super::get_data_table(tables_of(&accounts, req, table_name), table_name)?;
         }
 
         // DynamoDB's up-front input validation, run on every action before
@@ -871,7 +851,7 @@ impl DynamoDbService {
         for ti in transact_items {
             let (op_key, op) = transact_op(ti);
             let table_name = op["TableName"].as_str().unwrap_or_default();
-            let table = item_op_table(tables_of(&accounts, req, table_name), table_name)?;
+            let table = super::get_data_table(tables_of(&accounts, req, table_name), table_name)?;
             if op_key == "Put" {
                 let item: HashMap<String, AttributeValue> =
                     serde_json::from_value(op["Item"].clone()).unwrap_or_default();
@@ -939,7 +919,7 @@ impl DynamoDbService {
         for ti in transact_items {
             let (op_key, op) = transact_op(ti);
             let table_name = op["TableName"].as_str().unwrap_or_default();
-            let table = item_op_table(tables_of(&accounts, req, table_name), table_name)?;
+            let table = super::get_data_table(tables_of(&accounts, req, table_name), table_name)?;
             let key = if op_key == "Put" {
                 let item: HashMap<String, AttributeValue> =
                     serde_json::from_value(op["Item"].clone()).unwrap_or_default();
@@ -982,7 +962,7 @@ impl DynamoDbService {
         for ti in transact_items {
             let (op_key, op) = transact_op(ti);
             let table_name = op["TableName"].as_str().unwrap_or_default();
-            let table = item_op_table(tables_of(&accounts, req, table_name), table_name)?;
+            let table = super::get_data_table(tables_of(&accounts, req, table_name), table_name)?;
             let key: HashMap<String, AttributeValue> = if op_key == "Put" {
                 let item: HashMap<String, AttributeValue> =
                     serde_json::from_value(op["Item"].clone()).unwrap_or_default();
@@ -3449,7 +3429,8 @@ mod tests {
                 "TransactGetItems",
                 json!({"TransactItems": [
                     {"Get": {"TableName": "Widgets", "Key": {"pk": {"S": "a"}},
-                             "ProjectionExpression": "real"}},
+                             "ProjectionExpression": "#r",
+                             "ExpressionAttributeNames": {"#r": "real"}}},
                 ]}),
             ))
             .unwrap();

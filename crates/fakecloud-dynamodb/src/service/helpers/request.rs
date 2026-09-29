@@ -166,15 +166,31 @@ pub(crate) const RETURN_CONSUMED_CAPACITY_VALUES: &[&str] = &["INDEXES", "TOTAL"
 pub(crate) const RETURN_ITEM_COLLECTION_METRICS_VALUES: &[&str] = &["SIZE", "NONE"];
 pub(crate) const RETURN_VALUES: &[&str] =
     &["NONE", "ALL_OLD", "UPDATED_OLD", "ALL_NEW", "UPDATED_NEW"];
+pub(crate) const RETURN_VALUES_ON_FAILURE_VALUES: &[&str] = &["ALL_OLD", "NONE"];
 
-/// Check several enum-typed request members at once, the way the request
-/// model layer does: every violation is collected and reported together as
-/// `N validation errors detected: ...; ...`, rather than stopping at the
-/// first. Each entry is `(body member, wire field name, allowed values)`.
-pub(crate) fn validate_request_enums(
+/// Build the framework-level `ValidationException` AWS returns for request
+/// members that violate their modeled constraints:
+/// `N validation error(s) detected: <e1>; <e2>`.
+pub(crate) fn framework_validation_error(errors: &[String]) -> AwsServiceError {
+    let noun = if errors.len() == 1 { "error" } else { "errors" };
+    AwsServiceError::aws_error(
+        StatusCode::BAD_REQUEST,
+        "ValidationException",
+        format!(
+            "{} validation {noun} detected: {}",
+            errors.len(),
+            errors.join("; ")
+        ),
+    )
+}
+
+/// The enum violations among `fields` (`(body member, wire field name,
+/// allowed values)`), in order. A non-string member is a
+/// SerializationException.
+pub(crate) fn request_enum_violations(
     body: &Value,
     fields: &[(&str, &str, &[&str])],
-) -> Result<(), AwsServiceError> {
+) -> Result<Vec<String>, AwsServiceError> {
     let mut violations: Vec<String> = Vec::new();
     for (member, field, allowed) in fields {
         let value = &body[*member];
@@ -196,23 +212,75 @@ pub(crate) fn validate_request_enums(
             ));
         }
     }
+    Ok(violations)
+}
+
+/// Check several enum-typed request members at once, the way the request
+/// model layer does: every violation is collected and reported together as
+/// `N validation errors detected: ...; ...`, rather than stopping at the
+/// first. Each entry is `(body member, wire field name, allowed values)`.
+pub(crate) fn validate_request_enums(
+    body: &Value,
+    fields: &[(&str, &str, &[&str])],
+) -> Result<(), AwsServiceError> {
+    let violations = request_enum_violations(body, fields)?;
     if violations.is_empty() {
-        return Ok(());
-    }
-    let plural = if violations.len() == 1 {
-        "error"
+        Ok(())
     } else {
-        "errors"
+        Err(framework_validation_error(&violations))
+    }
+}
+
+/// Like [`validate_request_enums`] but reporting only the first violation,
+/// as UpdateItem does.
+pub(crate) fn validate_first_request_enum(
+    body: &Value,
+    fields: &[(&str, &str, &[&str])],
+) -> Result<(), AwsServiceError> {
+    match request_enum_violations(body, fields)?.into_iter().next() {
+        Some(first) => Err(framework_validation_error(&[first])),
+        None => Ok(()),
+    }
+}
+
+/// Validate the `TableName` member of a data-plane request (GetItem, PutItem,
+/// Query, ...) the way AWS's request validation does, before any table lookup.
+/// A table ARN is accepted in place of a name.
+pub(crate) fn validate_data_table_name(body: &Value) -> Result<&str, AwsServiceError> {
+    let Some(name) = body["TableName"].as_str() else {
+        return Err(framework_validation_error(&[
+            "Value null at 'tableName' failed to satisfy constraint: Member must not be null"
+                .to_string(),
+        ]));
     };
-    Err(AwsServiceError::aws_error(
-        StatusCode::BAD_REQUEST,
-        "ValidationException",
-        format!(
-            "{} validation {plural} detected: {}",
-            violations.len(),
-            violations.join("; ")
-        ),
-    ))
+    let is_arn = name.starts_with("arn:");
+    let max = if is_arn { 1024 } else { 255 };
+    let error = if name.is_empty() {
+        Some(format!(
+            "Value '{name}' at 'tableName' failed to satisfy constraint: Member must have length \
+             greater than or equal to 1"
+        ))
+    } else if name.len() > max {
+        Some(format!(
+            "Value '{name}' at 'tableName' failed to satisfy constraint: Member must have length \
+             less than or equal to {max}"
+        ))
+    } else if !is_arn
+        && !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+    {
+        Some(format!(
+            "Value '{name}' at 'tableName' failed to satisfy constraint: Member must satisfy \
+             regular expression pattern: [a-zA-Z0-9_.-]+"
+        ))
+    } else {
+        None
+    };
+    match error {
+        Some(e) => Err(framework_validation_error(&[e])),
+        None => Ok(name),
+    }
 }
 
 #[cfg(test)]

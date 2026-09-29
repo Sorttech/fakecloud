@@ -709,6 +709,11 @@ pub struct ExportDescription {
     pub export_time: DateTime<Utc>,
     pub item_count: i64,
     pub billed_size_bytes: i64,
+    /// Set when the export failed, reported by DescribeExport.
+    #[serde(default)]
+    pub failure_code: Option<String>,
+    #[serde(default)]
+    pub failure_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
