@@ -114,10 +114,17 @@ impl OrganizationsService {
 
         let mut guard = self.state.write();
         // Authorize before the registry-wide address check, as above.
-        let org_id = self
-            .management_org_mut(&mut guard, &req.account_id)?
-            .org_id
-            .clone();
+        let org = self.management_org_mut(&mut guard, &req.account_id)?;
+        // Only a management account in the commercial partition can pair a
+        // GovCloud account; AWS does not offer the action anywhere else.
+        if org.partition() != "aws" {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "UnsupportedAPIEndpointException",
+                "This action isn't available in the current AWS Region.",
+            ));
+        }
+        let org_id = org.org_id.clone();
         // The GovCloud "paired" id is a 12-digit account id in the
         // GovCloud partition; we mint one alongside the commercial id
         // so callers see both, matching the real AWS response. Both come

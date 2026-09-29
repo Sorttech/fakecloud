@@ -85,6 +85,93 @@ fn key_and_alias_arns_use_request_region_not_server_default() {
     );
 }
 
+#[test]
+fn china_region_key_alias_policy_and_grant_use_the_aws_cn_partition() {
+    let svc = make_service();
+    let in_cn = |action: &str, body: Value| {
+        let mut r = make_request(action, body);
+        r.region = "cn-north-1".to_string();
+        r
+    };
+    let json_of =
+        |resp: AwsResponse| -> Value { serde_json::from_slice(resp.body.expect_bytes()).unwrap() };
+
+    let created = json_of(svc.create_key(&in_cn("CreateKey", json!({}))).unwrap());
+    let key_arn = created["KeyMetadata"]["Arn"].as_str().unwrap().to_string();
+    let key_id = created["KeyMetadata"]["KeyId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        key_arn,
+        format!("arn:aws-cn:kms:cn-north-1:123456789012:key/{key_id}")
+    );
+
+    // The key is found by its own ARN.
+    let described = json_of(
+        svc.describe_key(&in_cn("DescribeKey", json!({ "KeyId": key_arn })))
+            .unwrap(),
+    );
+    assert_eq!(described["KeyMetadata"]["KeyId"], key_id);
+
+    let policy = json_of(
+        svc.get_key_policy(&in_cn(
+            "GetKeyPolicy",
+            json!({ "KeyId": key_id, "PolicyName": "default" }),
+        ))
+        .unwrap(),
+    );
+    let policy: Value = serde_json::from_str(policy["Policy"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        policy["Statement"][0]["Principal"]["AWS"],
+        "arn:aws-cn:iam::123456789012:root"
+    );
+
+    svc.create_alias(&in_cn(
+        "CreateAlias",
+        json!({ "AliasName": "alias/cn", "TargetKeyId": key_arn }),
+    ))
+    .unwrap();
+    let aliases = json_of(svc.list_aliases(&in_cn("ListAliases", json!({}))).unwrap());
+    let alias_arn = aliases["Aliases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["AliasName"] == "alias/cn")
+        .unwrap()["AliasArn"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(alias_arn, "arn:aws-cn:kms:cn-north-1:123456789012:alias/cn");
+    let by_alias = json_of(
+        svc.describe_key(&in_cn("DescribeKey", json!({ "KeyId": alias_arn })))
+            .unwrap(),
+    );
+    assert_eq!(by_alias["KeyMetadata"]["KeyId"], key_id);
+
+    svc.create_grant(&in_cn(
+        "CreateGrant",
+        json!({
+            "KeyId": key_arn,
+            "GranteePrincipal": "arn:aws-cn:iam::123456789012:role/r",
+            "Operations": ["Decrypt"]
+        }),
+    ))
+    .unwrap();
+    let grants = json_of(
+        svc.list_grants(&in_cn("ListGrants", json!({ "KeyId": key_arn })))
+            .unwrap(),
+    );
+    assert_eq!(
+        grants["Grants"][0]["IssuingAccount"],
+        "arn:aws-cn:iam::123456789012:root"
+    );
+
+    let policy_provider = crate::resource_policy::KmsResourcePolicyProvider::new(svc.state.clone());
+    use fakecloud_core::auth::ResourcePolicyProvider;
+    assert!(policy_provider.resource_policy("kms", &key_arn).is_some());
+}
+
 /// Helper: run GetParametersForImport, RSA-OAEP-wrap `material` under
 /// the returned public key, and call ImportKeyMaterial. Used by every
 /// import-flow test so they exercise the real OAEP unwrap path

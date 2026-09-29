@@ -285,7 +285,9 @@ pub(crate) fn kms_resource_for(
     "*".to_string()
 }
 
-pub(crate) fn default_key_policy(account_id: &str) -> String {
+/// The policy a key gets when created without one; `key_arn` supplies the
+/// partition of the account root it trusts.
+pub(crate) fn default_key_policy(account_id: &str, key_arn: &str) -> String {
     serde_json::to_string(&json!({
         "Version": "2012-10-17",
         "Id": "key-default-1",
@@ -293,7 +295,7 @@ pub(crate) fn default_key_policy(account_id: &str) -> String {
             {
                 "Sid": "Enable IAM User Permissions",
                 "Effect": "Allow",
-                "Principal": {"AWS": Arn::global("iam", account_id, "root").to_string()},
+                "Principal": {"AWS": Arn::global("iam", account_id, "root").with_partition(partition_of(key_arn)).to_string()},
                 "Action": "kms:*",
                 "Resource": "*",
             }
@@ -797,13 +799,19 @@ pub(crate) fn fmt_enum_set(items: &[String]) -> String {
     format!("[{}]", inner.join(", "))
 }
 
-pub(crate) fn grant_to_json(grant: &KmsGrant, account_id: &str) -> Value {
+/// A grant as the API reports it. `IssuingAccount` is the account root in the
+/// partition of the granted key (`region`'s, if the key is gone).
+pub(crate) fn grant_to_json(grant: &KmsGrant, state: &KmsState, region: &str) -> Value {
+    let partition = state
+        .keys
+        .get(&grant.key_id)
+        .map_or_else(|| partition_for(region), |k| partition_of(&k.arn));
     let mut v = json!({
         "KeyId": grant.key_id,
         "GrantId": grant.grant_id,
         "GranteePrincipal": grant.grantee_principal,
         "Operations": grant.operations,
-        "IssuingAccount": fakecloud_aws::arn::Arn::global("iam", account_id, "root").to_string(),
+        "IssuingAccount": Arn::global("iam", &state.account_id, "root").with_partition(partition).to_string(),
         "CreationDate": grant.creation_date,
     });
 

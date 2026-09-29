@@ -14,6 +14,7 @@ use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
+use fakecloud_aws::arn::{arn_resource, Arn};
 use fakecloud_core::multi_account::{AccountState, MultiAccountState};
 
 pub const RAM_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
@@ -131,19 +132,30 @@ pub struct RamSnapshot {
 // ---------------------------------------------------------------------------
 
 pub fn resource_share_arn(region: &str, account_id: &str, id: &str) -> String {
-    format!("arn:aws:ram:{region}:{account_id}:resource-share/{id}")
+    Arn::regional("ram", region, account_id, &format!("resource-share/{id}")).to_string()
 }
 
 pub fn invitation_arn(region: &str, account_id: &str, id: &str) -> String {
-    format!("arn:aws:ram:{region}:{account_id}:resource-share-invitation/{id}")
+    Arn::regional(
+        "ram",
+        region,
+        account_id,
+        &format!("resource-share-invitation/{id}"),
+    )
+    .to_string()
 }
 
 /// ARN for a customer-managed permission.
 pub fn permission_arn(region: &str, account_id: &str, name: &str) -> String {
-    format!("arn:aws:ram:{region}:{account_id}:permission/{name}")
+    Arn::regional("ram", region, account_id, &format!("permission/{name}")).to_string()
 }
 
 /// ARN for an AWS-managed default permission (partition-scoped, no region/account).
-pub fn managed_permission_arn(name: &str) -> String {
-    format!("arn:aws:ram::aws:permission/{name}")
+pub fn managed_permission_arn(region: &str, name: &str) -> String {
+    Arn::global_in(region, "ram", "aws", &format!("permission/{name}")).to_string()
+}
+
+/// The AWS-managed permission name an ARN from any partition names.
+pub fn managed_permission_name(arn: &str) -> Option<&str> {
+    arn_resource(arn, "ram")?.strip_prefix(":aws:permission/")
 }

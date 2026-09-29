@@ -591,6 +591,7 @@ pub(crate) fn create_admin_in_account(
     }
 
     let mut accounts = iam.write();
+    let region = accounts.region().to_string();
     let state = accounts.get_or_create(account_id);
 
     let user_id = format!(
@@ -600,7 +601,7 @@ pub(crate) fn create_admin_in_account(
             .replace('-', "")
             .to_uppercase()[..16]
     );
-    let arn = Arn::global("iam", account_id, &format!("user/{user_name}")).to_string();
+    let arn = Arn::global_in(&region, "iam", account_id, &format!("user/{user_name}")).to_string();
     let akid = format!(
         "FKIA{}",
         &uuid::Uuid::new_v4()
@@ -1012,6 +1013,23 @@ mod tests {
         assert!(state.users.contains_key("admin"));
         assert!(state.access_keys.contains_key("admin"));
         assert!(state.user_inline_policies.contains_key("admin"));
+    }
+
+    #[test]
+    fn create_admin_on_a_china_server_uses_the_aws_cn_partition() {
+        let iam: fakecloud_iam::SharedIamState = Arc::new(parking_lot::RwLock::new(
+            fakecloud_core::multi_account::MultiAccountState::new("123456789012", "cn-north-1", ""),
+        ));
+        let orgs: fakecloud_organizations::SharedOrganizationsState = Arc::new(
+            parking_lot::RwLock::new(fakecloud_organizations::OrganizationsRegistry::default()),
+        );
+        let resp = super::create_admin_in_account(&iam, &orgs, "222222222222", "admin", None)
+            .expect("create admin");
+        assert_eq!(resp.arn, "arn:aws-cn:iam::222222222222:user/admin");
+        assert_eq!(
+            iam.read().get("222222222222").unwrap().users["admin"].arn,
+            resp.arn
+        );
     }
 
     #[test]

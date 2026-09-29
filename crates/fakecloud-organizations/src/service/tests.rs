@@ -51,6 +51,83 @@ async fn create_organization_succeeds_once() {
 }
 
 #[tokio::test]
+async fn an_organization_created_in_china_uses_the_aws_cn_partition() {
+    let (svc, _state) = OrganizationsService::shared();
+    let call = |account: &str, action: &str, body: Value| {
+        let mut r = req_with(account, action, body);
+        r.region = "cn-north-1".to_string();
+        let svc = &svc;
+        async move { body_json(&svc.handle(r).await.unwrap()) }
+    };
+    let org = call("111111111111", "CreateOrganization", json!({})).await;
+    let org_id = org["Organization"]["Id"].as_str().unwrap().to_string();
+    assert_eq!(
+        org["Organization"]["Arn"],
+        format!("arn:aws-cn:organizations::111111111111:organization/{org_id}")
+    );
+    assert_eq!(
+        org["Organization"]["MasterAccountArn"],
+        format!("arn:aws-cn:organizations::111111111111:account/{org_id}/111111111111")
+    );
+    let roots = call("111111111111", "ListRoots", json!({})).await;
+    let root = &roots["Roots"][0];
+    assert!(root["Arn"]
+        .as_str()
+        .unwrap()
+        .starts_with("arn:aws-cn:organizations::111111111111:root/"));
+
+    let ou = call(
+        "111111111111",
+        "CreateOrganizationalUnit",
+        json!({ "ParentId": root["Id"], "Name": "eng" }),
+    )
+    .await;
+    assert!(ou["OrganizationalUnit"]["Arn"]
+        .as_str()
+        .unwrap()
+        .starts_with("arn:aws-cn:organizations::111111111111:ou/"));
+
+    let policies = call(
+        "111111111111",
+        "ListPolicies",
+        json!({ "Filter": "SERVICE_CONTROL_POLICY" }),
+    )
+    .await;
+    assert_eq!(
+        policies["Policies"][0]["Arn"],
+        "arn:aws-cn:organizations::aws:policy/service_control_policy/p-FullAWSAccess"
+    );
+
+    let invited = call(
+        "111111111111",
+        "InviteAccountToOrganization",
+        json!({ "Target": { "Type": "ACCOUNT", "Id": "222222222222" } }),
+    )
+    .await;
+    assert!(invited["Handshake"]["Arn"]
+        .as_str()
+        .unwrap()
+        .starts_with("arn:aws-cn:organizations::111111111111:handshake/"));
+    let handshake_id = invited["Handshake"]["Id"].as_str().unwrap().to_string();
+    call(
+        "222222222222",
+        "AcceptHandshake",
+        json!({ "HandshakeId": handshake_id }),
+    )
+    .await;
+    let described = call(
+        "111111111111",
+        "DescribeAccount",
+        json!({ "AccountId": "222222222222" }),
+    )
+    .await;
+    assert_eq!(
+        described["Account"]["Arn"],
+        format!("arn:aws-cn:organizations::111111111111:account/{org_id}/222222222222")
+    );
+}
+
+#[tokio::test]
 async fn create_organization_twice_from_the_same_account_errors() {
     let (svc, _state) = OrganizationsService::shared();
     svc.handle(req_with("111111111111", "CreateOrganization", json!({})))
@@ -1421,6 +1498,7 @@ async fn member_non_management_delete_returns_access_denied() {
                 joined_method: "INVITED".to_string(),
                 joined_timestamp: chrono::Utc::now(),
                 parent_id,
+                gov_cloud_mirror: false,
             },
         );
     }
@@ -2929,6 +3007,29 @@ async fn create_gov_cloud_account_returns_paired_id() {
         status["AccountId"].as_str().unwrap(),
         status["GovCloudAccountId"].as_str().unwrap()
     );
+}
+
+#[tokio::test]
+async fn create_gov_cloud_account_is_unavailable_outside_the_commercial_partition() {
+    for region in ["us-gov-west-1", "cn-north-1"] {
+        let (svc, _state) = OrganizationsService::shared();
+        let in_region = |action: &str, body: Value| {
+            let mut r = req_with("111111111111", action, body);
+            r.region = region.to_string();
+            r
+        };
+        svc.handle(in_region("CreateOrganization", json!({})))
+            .await
+            .unwrap();
+        let err = expect_err(
+            svc.handle(in_region(
+                "CreateGovCloudAccount",
+                json!({"Email": "gov@example.com", "AccountName": "Gov"}),
+            ))
+            .await,
+        );
+        assert_eq!(err.code(), "UnsupportedAPIEndpointException", "{region}");
+    }
 }
 
 /// Create the org, then add one member account and return its id.

@@ -878,6 +878,7 @@ mod tests {
                 joined_method: "CREATED".to_string(),
                 joined_timestamp: Utc::now(),
                 parent_id: parent_id.clone(),
+                gov_cloud_mirror: false,
             },
         );
 
