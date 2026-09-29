@@ -3564,6 +3564,47 @@ fn create_archive_missing_source_arn_errors() {
 }
 
 #[test]
+fn archive_rule_on_custom_bus_carries_bus_in_arn() {
+    let svc = make_service();
+    create_event_bus(&svc, "orders");
+    svc.create_archive(&make_request(
+        "CreateArchive",
+        json!({
+            "ArchiveName": "orders-arc",
+            "EventSourceArn": "arn:aws:events:us-east-1:123456789012:event-bus/orders"
+        }),
+    ))
+    .unwrap();
+    create_archive(&svc, "default-arc");
+
+    let resp = svc
+        .describe_rule(&make_request(
+            "DescribeRule",
+            json!({"Name": "Events-Archive-orders-arc", "EventBusName": "orders"}),
+        ))
+        .unwrap();
+    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(
+        body["Arn"],
+        "arn:aws:events:us-east-1:123456789012:rule/orders/Events-Archive-orders-arc"
+    );
+    assert_eq!(body["EventBusName"], "orders");
+
+    // An archive on the default bus keeps the bus-less rule ARN.
+    let resp = svc
+        .describe_rule(&make_request(
+            "DescribeRule",
+            json!({"Name": "Events-Archive-default-arc"}),
+        ))
+        .unwrap();
+    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(
+        body["Arn"],
+        "arn:aws:events:us-east-1:123456789012:rule/Events-Archive-default-arc"
+    );
+}
+
+#[test]
 fn delete_archive_missing_errors() {
     let svc = make_service();
     let req = make_request("DeleteArchive", json!({"ArchiveName": "ghost"}));
