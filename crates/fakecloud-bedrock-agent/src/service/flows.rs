@@ -2,24 +2,40 @@
 
 use super::*;
 
-/// The flow ID a `flowIdentifier` names: the identifier is either the bare
-/// flow ID or the (URL-encoded) flow ARN (`arn:...:flow/<id>`).
-fn flow_id_of(identifier: &str) -> String {
-    let identifier = decode_label(identifier);
-    identifier
-        .rsplit_once(":flow/")
-        .map_or(identifier.as_str(), |(_, id)| id)
-        .to_string()
+/// The flow ID a `flowIdentifier` names: the bare flow ID, or the ARN of a
+/// flow in the caller's account and region (`arn:...:flow/<id>`). An ARN of
+/// anything else names no flow here.
+fn flow_id_of(req: &AwsRequest, identifier: &str) -> Result<String, AwsServiceError> {
+    match parse_identifier(req, identifier) {
+        Some(Identifier::Id(id)) => Ok(id.to_string()),
+        Some(Identifier::Resource(resource)) => resource
+            .strip_prefix("flow/")
+            .filter(|id| !id.is_empty() && !id.contains('/'))
+            .map(str::to_string)
+            .ok_or_else(|| flow_not_found(identifier)),
+        None => Err(flow_not_found(identifier)),
+    }
 }
 
-/// The alias ID an `aliasIdentifier` names: the bare alias ID or the alias
-/// ARN (`arn:...:flow/<flow-id>/alias/<alias-id>`).
-fn alias_id_of(identifier: &str) -> String {
-    let identifier = decode_label(identifier);
-    identifier
-        .rsplit_once("/alias/")
-        .map_or(identifier.as_str(), |(_, id)| id)
-        .to_string()
+/// The alias ID an `aliasIdentifier` names: the bare alias ID, or the ARN of
+/// an alias of `flow_id` in the caller's account and region
+/// (`arn:...:flow/<flow-id>/alias/<alias-id>`).
+fn alias_id_of(
+    req: &AwsRequest,
+    flow_id: &str,
+    identifier: &str,
+) -> Result<String, AwsServiceError> {
+    let not_found_alias = || not_found(format!("Flow alias {identifier} not found"));
+    match parse_identifier(req, identifier) {
+        Some(Identifier::Id(id)) => Ok(id.to_string()),
+        Some(Identifier::Resource(resource)) => resource
+            .strip_prefix("flow/")
+            .and_then(|rest| rest.split_once("/alias/"))
+            .filter(|(flow, alias)| *flow == flow_id && !alias.is_empty())
+            .map(|(_, alias)| alias.to_string())
+            .ok_or_else(not_found_alias),
+        None => Err(not_found_alias()),
+    }
 }
 
 fn flow_not_found(id: &str) -> AwsServiceError {
@@ -39,7 +55,8 @@ fn flow_validation(severity: &str, kind: &str, message: String, details: Value) 
 /// reports: the flow needs a starting (`Input`) and an ending (`Output`) node;
 /// every connection must join existing nodes (and, for data connections, an
 /// existing output of the source to an existing input of the target); no two
-/// connections may join the same pair of nodes; no node input may be fed by
+/// connections may join the same ends; node names must be present and unique;
+/// no node input may be fed by
 /// more than one data connection or by none; connections may not form a cycle;
 /// and every node should be reachable from a starting node.
 fn validate_definition(definition: &Value) -> Vec<Value> {
@@ -55,22 +72,43 @@ fn validate_definition(definition: &Value) -> Vec<Value> {
             .unwrap_or_default()
     };
 
-    // node name -> (type, input names, output names)
-    let by_name: BTreeMap<String, (String, BTreeSet<String>, BTreeSet<String>)> = nodes
-        .iter()
-        .map(|n| {
-            (
-                str_of(n, "name"),
-                (
-                    str_of(n, "type"),
-                    names_of(n, "inputs"),
-                    names_of(n, "outputs"),
-                ),
-            )
-        })
-        .collect();
-
+    // node name -> (type, input names, output names). A node with no name,
+    // or a name another node already took, can't be addressed by a
+    // connection; it is reported (the model has no dedicated validation type
+    // for either, so as `Unspecified`) rather than silently merged away.
     let mut out = Vec::new();
+    let mut by_name: BTreeMap<String, (String, BTreeSet<String>, BTreeSet<String>)> =
+        BTreeMap::new();
+    for (index, n) in nodes.iter().enumerate() {
+        let name = str_of(n, "name");
+        if name.is_empty() {
+            out.push(flow_validation(
+                "Error",
+                "Unspecified",
+                format!("Node at index {index} has no name."),
+                json!({ "unspecified": {} }),
+            ));
+            continue;
+        }
+        if by_name.contains_key(&name) {
+            out.push(flow_validation(
+                "Error",
+                "Unspecified",
+                format!("Node name {name} is used by more than one node."),
+                json!({ "unspecified": {} }),
+            ));
+            continue;
+        }
+        by_name.insert(
+            name,
+            (
+                str_of(n, "type"),
+                names_of(n, "inputs"),
+                names_of(n, "outputs"),
+            ),
+        );
+    }
+
     if !by_name.values().any(|(t, _, _)| t == "Input") {
         out.push(flow_validation(
             "Error",
@@ -113,7 +151,23 @@ fn validate_definition(definition: &Value) -> Vec<Value> {
                 json!({ "unknownConnectionTarget": { "connection": name } }),
             ));
         }
-        if !seen_pairs.insert((source.clone(), target.clone())) {
+        // Two connections duplicate each other when they join the same ends:
+        // the same output to the same input for a data connection, the same
+        // condition for a conditional one. One node feeding two different
+        // inputs of another is two distinct connections.
+        let ends = match (
+            c["configuration"].get("data"),
+            c["configuration"].get("conditional"),
+        ) {
+            (Some(data), _) => format!(
+                "data:{}:{}",
+                str_of(data, "sourceOutput"),
+                str_of(data, "targetInput")
+            ),
+            (None, Some(cond)) => format!("conditional:{}", str_of(cond, "condition")),
+            (None, None) => String::new(),
+        };
+        if !seen_pairs.insert((source.clone(), target.clone(), ends)) {
             out.push(flow_validation(
                 "Error",
                 "DuplicateConnections",
@@ -256,6 +310,7 @@ impl BedrockAgentService {
             definition: opt_json(&body, "definition"),
             arn: flow_arn(&req.region, &req.account_id, &id),
             customer_encryption_key_arn: opt_str(&body, "customerEncryptionKeyArn"),
+            latest_version: 0,
         };
         let out = flow_json(&flow);
         let mut accts = self.state.write();
@@ -266,7 +321,7 @@ impl BedrockAgentService {
 
     pub(super) fn get_flow(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let body = req.json_body();
-        let id = flow_id_of(&req_str(&body, "flowIdentifier")?);
+        let id = flow_id_of(req, &req_str(&body, "flowIdentifier")?)?;
         let accts = self.state.read();
         let f = accts
             .get(&req.account_id)
@@ -286,7 +341,7 @@ impl BedrockAgentService {
 
     pub(super) fn update_flow(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let body = req.json_body();
-        let id = flow_id_of(&req_str(&body, "flowIdentifier")?);
+        let id = flow_id_of(req, &req_str(&body, "flowIdentifier")?)?;
         let mut accts = self.state.write();
         let state = accts.get_or_create(&req.account_id, &req.region);
         let f = state
@@ -316,7 +371,7 @@ impl BedrockAgentService {
 
     pub(super) fn delete_flow(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let body = req.json_body();
-        let id = flow_id_of(&req_str(&body, "flowIdentifier")?);
+        let id = flow_id_of(req, &req_str(&body, "flowIdentifier")?)?;
         let mut accts = self.state.write();
         let state = accts.get_or_create(&req.account_id, &req.region);
         state.flows.remove(&id).ok_or_else(|| flow_not_found(&id))?;
@@ -327,7 +382,7 @@ impl BedrockAgentService {
 
     pub(super) fn prepare_flow(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let body = req.json_body();
-        let id = flow_id_of(&req_str(&body, "flowIdentifier")?);
+        let id = flow_id_of(req, &req_str(&body, "flowIdentifier")?)?;
         let mut accts = self.state.write();
         let state = accts.get_or_create(&req.account_id, &req.region);
         let f = state
@@ -350,17 +405,21 @@ impl BedrockAgentService {
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let body = req.json_body();
-        let flow_id = flow_id_of(&req_str(&body, "flowIdentifier")?);
+        let flow_id = flow_id_of(req, &req_str(&body, "flowIdentifier")?)?;
         let now_dt = now();
         let mut accts = self.state.write();
         let state = accts.get_or_create(&req.account_id, &req.region);
+        // `flows` and `flow_versions` are disjoint fields, so the flow can be
+        // borrowed while its version list is extended.
         let flow = state
             .flows
-            .get(&flow_id)
-            .ok_or_else(|| flow_not_found(&flow_id))?
-            .clone();
+            .get_mut(&flow_id)
+            .ok_or_else(|| flow_not_found(&flow_id))?;
         let versions = state.flow_versions.entry(flow_id.clone()).or_default();
-        let version_num = (versions.len() as u64 + 1).to_string();
+        let version_num = next_version(
+            &mut flow.latest_version,
+            versions.iter().map(|v| v.flow_version.as_str()),
+        );
         let fv = FlowVersion {
             flow_version: version_num,
             flow_id,
@@ -373,7 +432,7 @@ impl BedrockAgentService {
             customer_encryption_key_arn: flow.customer_encryption_key_arn.clone(),
             status: Some(flow.status.clone()),
         };
-        let out = flow_version_json(&flow, &fv);
+        let out = flow_version_json(flow, &fv);
         versions.push(fv);
         Ok(AwsResponse::json_value(StatusCode::CREATED, out))
     }
@@ -383,7 +442,7 @@ impl BedrockAgentService {
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let body = req.json_body();
-        let flow_id = flow_id_of(&req_str(&body, "flowIdentifier")?);
+        let flow_id = flow_id_of(req, &req_str(&body, "flowIdentifier")?)?;
         let version = req_str(&body, "flowVersion")?;
         let accts = self.state.read();
         let version_not_found = || not_found(format!("Flow version {version} not found"));
@@ -402,7 +461,7 @@ impl BedrockAgentService {
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let body = req.json_body();
-        let flow_id = flow_id_of(&req_str(&body, "flowIdentifier")?);
+        let flow_id = flow_id_of(req, &req_str(&body, "flowIdentifier")?)?;
         let accts = self.state.read();
         let state = accts
             .get(&req.account_id)
@@ -438,7 +497,7 @@ impl BedrockAgentService {
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let body = req.json_body();
-        let flow_id = flow_id_of(&req_str(&body, "flowIdentifier")?);
+        let flow_id = flow_id_of(req, &req_str(&body, "flowIdentifier")?)?;
         let version = req_str(&body, "flowVersion")?;
         let mut accts = self.state.write();
         let state = accts.get_or_create(&req.account_id, &req.region);
@@ -476,7 +535,7 @@ impl BedrockAgentService {
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let body = req.json_body();
-        let flow_id = flow_id_of(&req_str(&body, "flowIdentifier")?);
+        let flow_id = flow_id_of(req, &req_str(&body, "flowIdentifier")?)?;
         let name = req_str(&body, "name")?;
         let alias_id = short_id();
         let now_dt = now();
@@ -505,8 +564,8 @@ impl BedrockAgentService {
 
     pub(super) fn get_flow_alias(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let body = req.json_body();
-        let flow_id = flow_id_of(&req_str(&body, "flowIdentifier")?);
-        let alias_id = alias_id_of(&req_str(&body, "aliasIdentifier")?);
+        let flow_id = flow_id_of(req, &req_str(&body, "flowIdentifier")?)?;
+        let alias_id = alias_id_of(req, &flow_id, &req_str(&body, "aliasIdentifier")?)?;
         let accts = self.state.read();
         let alias_not_found = || not_found(format!("Flow alias {alias_id} not found"));
         let state = accts.get(&req.account_id).ok_or_else(alias_not_found)?;
@@ -524,7 +583,7 @@ impl BedrockAgentService {
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let body = req.json_body();
-        let flow_id = flow_id_of(&req_str(&body, "flowIdentifier")?);
+        let flow_id = flow_id_of(req, &req_str(&body, "flowIdentifier")?)?;
         let accts = self.state.read();
         let state = accts
             .get(&req.account_id)
@@ -547,8 +606,8 @@ impl BedrockAgentService {
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let body = req.json_body();
-        let flow_id = flow_id_of(&req_str(&body, "flowIdentifier")?);
-        let alias_id = alias_id_of(&req_str(&body, "aliasIdentifier")?);
+        let flow_id = flow_id_of(req, &req_str(&body, "flowIdentifier")?)?;
+        let alias_id = alias_id_of(req, &flow_id, &req_str(&body, "aliasIdentifier")?)?;
         let mut accts = self.state.write();
         let state = accts.get_or_create(&req.account_id, &req.region);
         let alias_not_found = || not_found(format!("Flow alias {alias_id} not found"));
@@ -584,8 +643,8 @@ impl BedrockAgentService {
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let body = req.json_body();
-        let flow_id = flow_id_of(&req_str(&body, "flowIdentifier")?);
-        let alias_id = alias_id_of(&req_str(&body, "aliasIdentifier")?);
+        let flow_id = flow_id_of(req, &req_str(&body, "flowIdentifier")?)?;
+        let alias_id = alias_id_of(req, &flow_id, &req_str(&body, "aliasIdentifier")?)?;
         let mut accts = self.state.write();
         let state = accts.get_or_create(&req.account_id, &req.region);
         match state.flow_aliases.get(&alias_id) {

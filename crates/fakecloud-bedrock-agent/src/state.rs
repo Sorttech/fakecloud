@@ -276,6 +276,10 @@ pub struct Flow {
     pub arn: String,
     #[serde(default)]
     pub customer_encryption_key_arn: Option<String>,
+    /// The highest version number ever minted for this flow, so a deleted
+    /// version's number is never handed out again.
+    #[serde(default)]
+    pub latest_version: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -328,10 +332,15 @@ pub struct Prompt {
     pub customer_encryption_key_arn: Option<String>,
     #[serde(default)]
     pub default_variant: Option<String>,
+    /// The highest version number ever minted for this prompt; see
+    /// [`Flow::latest_version`].
+    #[serde(default)]
+    pub latest_version: u64,
 }
 
-/// A numbered snapshot of a prompt. `name` and `default_variant` are captured
-/// at CreatePromptVersion time; older snapshots fall back to the prompt.
+/// A numbered snapshot of a prompt. `name`, `default_variant` and
+/// `customer_encryption_key_arn` are captured at CreatePromptVersion time;
+/// older snapshots fall back to the prompt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PromptVersion {
     pub prompt_version: String,
@@ -344,6 +353,8 @@ pub struct PromptVersion {
     pub name: Option<String>,
     #[serde(default)]
     pub default_variant: Option<String>,
+    #[serde(default)]
+    pub customer_encryption_key_arn: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

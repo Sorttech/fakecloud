@@ -570,16 +570,6 @@ impl BedrockAgentService {
             if *m == Method::POST {
                 return Some(("CreatePromptVersion", params));
             }
-            if *m == Method::GET {
-                return Some(("ListPromptVersions", params));
-            }
-        }
-        if segs.len() == 4 && segs[0] == "prompts" && segs[2] == "versions" {
-            params.push(("promptIdentifier".to_string(), segs[1].clone()));
-            params.push(("promptVersion".to_string(), segs[3].clone()));
-            if *m == Method::GET {
-                return Some(("GetPromptVersion", params));
-            }
         }
 
         // Tags
@@ -630,8 +620,11 @@ impl AwsService for BedrockAgentService {
             if body.is_null() {
                 body = serde_json::Value::Object(serde_json::Map::new());
             }
+            // Path labels arrive percent-encoded (an ARN identifier is
+            // `arn%3Aaws%3A...`); decode each once here so every handler sees
+            // the identifier the caller sent.
             for (k, v) in path_params {
-                body[k] = serde_json::Value::String(v);
+                body[k] = serde_json::Value::String(decode_label(&v));
             }
             req.body = serde_json::to_vec(&body).unwrap_or_default().into();
         }
@@ -677,7 +670,6 @@ impl AwsService for BedrockAgentService {
             "GetKnowledgeBase" => self.get_knowledge_base(&req),
             "GetKnowledgeBaseDocuments" => self.get_knowledge_base_documents(&req),
             "GetPrompt" => self.get_prompt(&req),
-            "GetPromptVersion" => self.get_prompt_version(&req),
             "IngestKnowledgeBaseDocuments" => self.ingest_knowledge_base_documents(&req),
             "ListAgentActionGroups" => self.list_agent_action_groups(&req),
             "ListAgentAliases" => self.list_agent_aliases(&req),
@@ -693,7 +685,6 @@ impl AwsService for BedrockAgentService {
             "ListKnowledgeBaseDocuments" => self.list_knowledge_base_documents(&req),
             "ListKnowledgeBases" => self.list_knowledge_bases(&req),
             "ListPrompts" => self.list_prompts(&req),
-            "ListPromptVersions" => self.list_prompt_versions(&req),
             "ListTagsForResource" => self.list_tags_for_resource(&req),
             "PrepareAgent" => self.prepare_agent(&req),
             "PrepareFlow" => self.prepare_flow(&req),
@@ -1031,6 +1022,42 @@ fn decode_label(segment: &str) -> String {
         .into_owned()
 }
 
+/// A resource identifier as a request names it.
+enum Identifier<'a> {
+    /// A bare resource ID.
+    Id(&'a str),
+    /// The resource part of a Bedrock ARN in the caller's account and region
+    /// (`flow/<id>`, `prompt/<id>:<version>`, ...).
+    Resource(&'a str),
+}
+
+/// Parse an identifier that is either a bare ID or a Bedrock ARN. An ARN that
+/// is not Bedrock's, or that names another account, region or partition,
+/// yields `None`: it can never resolve to a resource in this account's state.
+fn parse_identifier<'a>(req: &AwsRequest, identifier: &'a str) -> Option<Identifier<'a>> {
+    if !identifier.starts_with("arn:") {
+        return Some(Identifier::Id(identifier));
+    }
+    let rest = fakecloud_aws::arn::arn_resource(identifier, "bedrock")?;
+    let mut parts = rest.splitn(3, ':');
+    let (region, account, resource) = (parts.next()?, parts.next()?, parts.next()?);
+    let local = region == req.region
+        && account == req.account_id
+        && fakecloud_aws::arn::partition_of(identifier)
+            == fakecloud_aws::arn::partition_for(region);
+    local.then_some(Identifier::Resource(resource))
+}
+
+/// Mint the next version number for a resource whose highest minted number is
+/// `latest` and whose live versions are `existing`. Numbers only grow, so a
+/// deleted version's number is never reused; `existing` covers state persisted
+/// before `latest` was tracked.
+fn next_version<'a>(latest: &mut u64, existing: impl Iterator<Item = &'a str>) -> String {
+    let highest_live = existing.filter_map(|v| v.parse::<u64>().ok()).max();
+    *latest = (*latest).max(highest_live.unwrap_or(0)) + 1;
+    latest.to_string()
+}
+
 fn short_id() -> String {
     // Smithy ResourceIdentifier shape is @pattern("^[0-9a-zA-Z]{10}$"): the
     // first 10 hex chars of a v4 UUID.
@@ -1292,8 +1319,10 @@ fn knowledge_base_summary_json(k: &KnowledgeBase) -> Value {
     o
 }
 
-/// `PromptSummary`: `arn`, `id`, `name`, `version`, `createdAt`, `updatedAt`.
-/// The full prompt JSON keys `promptId` (not `id`) and surfaces `variants`.
+/// `PromptSummary` for a prompt's working draft: `arn`, `id`, `name`,
+/// `version`, `createdAt`, `updatedAt`, and optional `description`. The full
+/// `prompt_json` adds `variants`, `defaultVariant` and
+/// `customerEncryptionKeyArn`, which the summary omits.
 fn prompt_summary_json(p: &Prompt) -> Value {
     let mut o = json!({
         "arn": p.arn,
@@ -1342,6 +1371,16 @@ fn flow_json(f: &Flow) -> Value {
 /// flow-level fields come from the version snapshot, falling back to the flow
 /// for versions persisted before they were captured.
 fn flow_version_json(f: &Flow, v: &FlowVersion) -> Value {
+    // A version's own snapshot is authoritative; only one persisted before the
+    // snapshot was captured (`name` unset) falls back to the live flow.
+    let legacy = v.name.is_none();
+    let captured = |own: &Option<String>, live: &Option<String>| {
+        if legacy {
+            live.clone()
+        } else {
+            own.clone()
+        }
+    };
     let mut o = json!({
         "name": v.name.as_deref().unwrap_or(&f.name),
         "id": f.flow_id,
@@ -1353,18 +1392,13 @@ fn flow_version_json(f: &Flow, v: &FlowVersion) -> Value {
     if let Some(ref d) = v.description {
         o["description"] = json!(d);
     }
-    if let Some(r) = v
-        .execution_role_arn
-        .as_ref()
-        .or(f.execution_role_arn.as_ref())
-    {
+    if let Some(r) = captured(&v.execution_role_arn, &f.execution_role_arn) {
         o["executionRoleArn"] = json!(r);
     }
-    if let Some(k) = v
-        .customer_encryption_key_arn
-        .as_ref()
-        .or(f.customer_encryption_key_arn.as_ref())
-    {
+    if let Some(k) = captured(
+        &v.customer_encryption_key_arn,
+        &f.customer_encryption_key_arn,
+    ) {
         o["customerEncryptionKeyArn"] = json!(k);
     }
     if let Some(ref def) = v.definition {
@@ -1422,8 +1456,18 @@ fn prompt_json(p: &Prompt) -> Value {
 }
 
 /// The same members for a numbered prompt version: its ARN is the prompt ARN
-/// with a `:<version>` suffix.
+/// with a `:<version>` suffix. The version's own snapshot is authoritative; a
+/// version persisted before the snapshot was captured (`name` unset) falls
+/// back to the prompt.
 fn prompt_version_json(p: &Prompt, v: &PromptVersion) -> Value {
+    let legacy = v.name.is_none();
+    let captured = |own: &Option<String>, live: &Option<String>| {
+        if legacy {
+            live.clone()
+        } else {
+            own.clone()
+        }
+    };
     let mut o = json!({
         "name": v.name.as_deref().unwrap_or(&p.name),
         "id": p.prompt_id,
@@ -1436,10 +1480,13 @@ fn prompt_version_json(p: &Prompt, v: &PromptVersion) -> Value {
     if let Some(ref d) = v.description {
         o["description"] = json!(d);
     }
-    if let Some(ref k) = p.customer_encryption_key_arn {
+    if let Some(k) = captured(
+        &v.customer_encryption_key_arn,
+        &p.customer_encryption_key_arn,
+    ) {
         o["customerEncryptionKeyArn"] = json!(k);
     }
-    if let Some(dv) = v.default_variant.as_ref().or(p.default_variant.as_ref()) {
+    if let Some(dv) = captured(&v.default_variant, &p.default_variant) {
         o["defaultVariant"] = json!(dv);
     }
     o
@@ -1534,6 +1581,18 @@ mod tests {
         query: &[(&str, &str)],
         payload: Value,
     ) -> (StatusCode, Value) {
+        let resp = try_call(svc, method, path, query, payload).await.unwrap();
+        let status = resp.status;
+        (status, body(resp))
+    }
+
+    async fn try_call(
+        svc: &BedrockAgentService,
+        method: Method,
+        path: &str,
+        query: &[(&str, &str)],
+        payload: Value,
+    ) -> Result<AwsResponse, AwsServiceError> {
         let mut req = cn_request(payload);
         req.region = "us-east-1".to_string();
         req.method = method;
@@ -1542,15 +1601,473 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        let resp = svc.handle(req).await.unwrap();
-        let status = resp.status;
-        (status, body(resp))
+        svc.handle(req).await
     }
 
     fn keys(v: &Value) -> Vec<&str> {
         let mut k: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
         k.sort_unstable();
         k
+    }
+
+    fn encode(arn: &str) -> String {
+        arn.replace(':', "%3A").replace('/', "%2F")
+    }
+
+    fn validation_types(v: &Value) -> Vec<&str> {
+        v["validations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["type"].as_str().unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn version_numbers_are_never_reused_after_a_delete() {
+        let svc = BedrockAgentService::new(Arc::new(RwLock::new(BedrockAgentAccounts::new())));
+        let (_, flow) = call(
+            &svc,
+            Method::POST,
+            "/flows/",
+            &[],
+            json!({"name": "f", "executionRoleArn": "arn:aws:iam::123456789012:role/r"}),
+        )
+        .await;
+        let fid = flow["id"].as_str().unwrap().to_string();
+        let (_, prompt) = call(&svc, Method::POST, "/prompts/", &[], json!({"name": "p"})).await;
+        let pid = prompt["id"].as_str().unwrap().to_string();
+        let flow_versions = format!("/flows/{fid}/versions");
+        let prompt_versions = format!("/prompts/{pid}/versions");
+        let mint = |path: String| {
+            let svc = &svc;
+            async move {
+                let (_, v) = call(svc, Method::POST, &path, &[], json!({})).await;
+                v["version"].as_str().unwrap().to_string()
+            }
+        };
+
+        assert_eq!(mint(flow_versions.clone()).await, "1");
+        assert_eq!(mint(flow_versions.clone()).await, "2");
+        call(
+            &svc,
+            Method::DELETE,
+            &format!("/flows/{fid}/versions/1/"),
+            &[],
+            json!({}),
+        )
+        .await;
+        assert_eq!(mint(flow_versions.clone()).await, "3");
+        // Deleting the highest version doesn't free its number either.
+        call(
+            &svc,
+            Method::DELETE,
+            &format!("/flows/{fid}/versions/3/"),
+            &[],
+            json!({}),
+        )
+        .await;
+        assert_eq!(mint(flow_versions).await, "4");
+
+        assert_eq!(mint(prompt_versions.clone()).await, "1");
+        assert_eq!(mint(prompt_versions.clone()).await, "2");
+        let prompt_path = format!("/prompts/{pid}/");
+        call(
+            &svc,
+            Method::DELETE,
+            &prompt_path,
+            &[("promptVersion", "1")],
+            json!({}),
+        )
+        .await;
+        assert_eq!(mint(prompt_versions.clone()).await, "3");
+        call(
+            &svc,
+            Method::DELETE,
+            &prompt_path,
+            &[("promptVersion", "3")],
+            json!({}),
+        )
+        .await;
+        assert_eq!(mint(prompt_versions).await, "4");
+    }
+
+    #[tokio::test]
+    async fn delete_prompt_rejects_a_non_numeric_version() {
+        let svc = BedrockAgentService::new(Arc::new(RwLock::new(BedrockAgentAccounts::new())));
+        let (_, prompt) = call(&svc, Method::POST, "/prompts/", &[], json!({"name": "p"})).await;
+        let path = format!("/prompts/{}/", prompt["id"].as_str().unwrap());
+        for bad in ["DRAFT", "x1", "123456"] {
+            let err = try_call(
+                &svc,
+                Method::DELETE,
+                &path,
+                &[("promptVersion", bad)],
+                json!({}),
+            )
+            .await
+            .err()
+            .expect("non-numeric promptVersion must be rejected");
+            assert_eq!(err.code(), "ValidationException", "{bad}");
+        }
+        // The prompt survived every rejected delete.
+        let (status, got) = call(&svc, Method::GET, &path, &[], json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(got["id"], prompt["id"]);
+        // GetPrompt's promptVersion does accept DRAFT: the working draft.
+        let (_, draft) = call(
+            &svc,
+            Method::GET,
+            &path,
+            &[("promptVersion", "DRAFT")],
+            json!({}),
+        )
+        .await;
+        assert_eq!(draft, got);
+    }
+
+    #[tokio::test]
+    async fn list_prompts_with_an_identifier_lists_that_prompts_versions() {
+        let svc = BedrockAgentService::new(Arc::new(RwLock::new(BedrockAgentAccounts::new())));
+        let (_, p) = call(&svc, Method::POST, "/prompts/", &[], json!({"name": "p"})).await;
+        call(
+            &svc,
+            Method::POST,
+            "/prompts/",
+            &[],
+            json!({"name": "other"}),
+        )
+        .await;
+        let id = p["id"].as_str().unwrap().to_string();
+        let arn = p["arn"].as_str().unwrap().to_string();
+        call(
+            &svc,
+            Method::POST,
+            &format!("/prompts/{id}/versions"),
+            &[],
+            json!({}),
+        )
+        .await;
+
+        let (_, all) = call(&svc, Method::GET, "/prompts/", &[], json!({})).await;
+        assert_eq!(all["promptSummaries"].as_array().unwrap().len(), 2);
+
+        for identifier in [id.as_str(), arn.as_str()] {
+            let (_, versions) = call(
+                &svc,
+                Method::GET,
+                "/prompts/",
+                &[("promptIdentifier", identifier)],
+                json!({}),
+            )
+            .await;
+            let summaries = versions["promptSummaries"].as_array().unwrap();
+            let listed: Vec<(&str, &str)> = summaries
+                .iter()
+                .map(|s| (s["version"].as_str().unwrap(), s["arn"].as_str().unwrap()))
+                .collect();
+            let v1_arn = format!("{arn}:1");
+            assert_eq!(
+                listed,
+                vec![("DRAFT", arn.as_str()), ("1", v1_arn.as_str())]
+            );
+            assert_eq!(
+                keys(&summaries[1]),
+                vec!["arn", "createdAt", "id", "name", "updatedAt", "version"]
+            );
+        }
+
+        let err = try_call(
+            &svc,
+            Method::GET,
+            "/prompts/",
+            &[("promptIdentifier", "NOSUCHID01")],
+            json!({}),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(err.code(), "ResourceNotFoundException");
+
+        // The version routes the model doesn't have are gone.
+        for (method, path) in [
+            (Method::GET, format!("/prompts/{id}/versions")),
+            (Method::GET, format!("/prompts/{id}/versions/1")),
+        ] {
+            let err = try_call(&svc, method, &path, &[], json!({}))
+                .await
+                .err()
+                .unwrap();
+            assert!(
+                matches!(err, AwsServiceError::ActionNotImplemented { .. }),
+                "{path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_version_keeps_the_key_it_was_created_with() {
+        let svc = BedrockAgentService::new(Arc::new(RwLock::new(BedrockAgentAccounts::new())));
+        let k1 = "arn:aws:kms:us-east-1:123456789012:key/one";
+        let k2 = "arn:aws:kms:us-east-1:123456789012:key/two";
+        let (_, p) = call(
+            &svc,
+            Method::POST,
+            "/prompts/",
+            &[],
+            json!({"name": "p", "customerEncryptionKeyArn": k1}),
+        )
+        .await;
+        let id = p["id"].as_str().unwrap().to_string();
+        call(
+            &svc,
+            Method::POST,
+            &format!("/prompts/{id}/versions"),
+            &[],
+            json!({}),
+        )
+        .await;
+        call(
+            &svc,
+            Method::PUT,
+            &format!("/prompts/{id}/"),
+            &[],
+            json!({"name": "p", "customerEncryptionKeyArn": k2}),
+        )
+        .await;
+        let path = format!("/prompts/{id}/");
+        let (_, v1) = call(
+            &svc,
+            Method::GET,
+            &path,
+            &[("promptVersion", "1")],
+            json!({}),
+        )
+        .await;
+        assert_eq!(v1["customerEncryptionKeyArn"], k1);
+        let (_, draft) = call(&svc, Method::GET, &path, &[], json!({})).await;
+        assert_eq!(draft["customerEncryptionKeyArn"], k2);
+    }
+
+    #[tokio::test]
+    async fn arn_identifiers_must_name_this_account_and_region() {
+        let svc = BedrockAgentService::new(Arc::new(RwLock::new(BedrockAgentAccounts::new())));
+        let (_, flow) = call(
+            &svc,
+            Method::POST,
+            "/flows/",
+            &[],
+            json!({"name": "f", "executionRoleArn": "arn:aws:iam::123456789012:role/r"}),
+        )
+        .await;
+        let (_, prompt) = call(&svc, Method::POST, "/prompts/", &[], json!({"name": "p"})).await;
+        let fid = flow["id"].as_str().unwrap();
+        let pid = prompt["id"].as_str().unwrap();
+        call(
+            &svc,
+            Method::POST,
+            &format!("/prompts/{pid}/versions"),
+            &[],
+            json!({}),
+        )
+        .await;
+
+        // The local ARNs (URL-encoded, as an SDK sends them) resolve.
+        let (_, by_arn) = call(
+            &svc,
+            Method::GET,
+            &format!("/flows/{}/", encode(flow["arn"].as_str().unwrap())),
+            &[],
+            json!({}),
+        )
+        .await;
+        assert_eq!(by_arn["id"], fid);
+        let pinned = format!("{}:1", prompt["arn"].as_str().unwrap());
+        let (_, v1) = call(
+            &svc,
+            Method::GET,
+            &format!("/prompts/{}/", encode(&pinned)),
+            &[],
+            json!({}),
+        )
+        .await;
+        assert_eq!(v1["version"], "1");
+        assert_eq!(v1["arn"], pinned);
+
+        // The same IDs under another account, region or partition do not.
+        for foreign in [
+            format!("arn:aws:bedrock:us-east-1:999999999999:flow/{fid}"),
+            format!("arn:aws:bedrock:eu-west-1:123456789012:flow/{fid}"),
+            format!("arn:aws-cn:bedrock:us-east-1:123456789012:flow/{fid}"),
+            format!("arn:aws:lambda:us-east-1:123456789012:flow/{fid}"),
+        ] {
+            let err = try_call(
+                &svc,
+                Method::GET,
+                &format!("/flows/{}/", encode(&foreign)),
+                &[],
+                json!({}),
+            )
+            .await
+            .err()
+            .unwrap();
+            assert_eq!(err.code(), "ResourceNotFoundException", "{foreign}");
+        }
+        let foreign_prompt = format!("arn:aws:bedrock:us-east-1:999999999999:prompt/{pid}");
+        let err = try_call(
+            &svc,
+            Method::DELETE,
+            &format!("/prompts/{}/", encode(&foreign_prompt)),
+            &[],
+            json!({}),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(err.code(), "ResourceNotFoundException");
+        let (status, _) = call(
+            &svc,
+            Method::GET,
+            &format!("/prompts/{pid}/"),
+            &[],
+            json!({}),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the foreign-ARN delete must not touch it"
+        );
+
+        // An alias ARN must belong to the flow it is addressed under.
+        let (_, alias) = call(
+            &svc,
+            Method::POST,
+            &format!("/flows/{fid}/aliases"),
+            &[],
+            json!({"name": "a", "routingConfiguration": []}),
+        )
+        .await;
+        let alias_arn = alias["arn"].as_str().unwrap();
+        let (_, got) = call(
+            &svc,
+            Method::GET,
+            &format!("/flows/{fid}/aliases/{}", encode(alias_arn)),
+            &[],
+            json!({}),
+        )
+        .await;
+        assert_eq!(got["id"], alias["id"]);
+        let other_flow = alias_arn.replace(fid, "OTHERFLOW1");
+        let err = try_call(
+            &svc,
+            Method::GET,
+            &format!("/flows/{fid}/aliases/{}", encode(&other_flow)),
+            &[],
+            json!({}),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(err.code(), "ResourceNotFoundException");
+    }
+
+    #[tokio::test]
+    async fn validate_flow_definition_accepts_one_node_feeding_two_inputs() {
+        // The AWS sample: the flow input's document feeds both the `genre`
+        // and the `number` input of one prompt node.
+        let svc = BedrockAgentService::new(Arc::new(RwLock::new(BedrockAgentAccounts::new())));
+        let data = |name: &str, source: &str, target: &str, out: &str, input: &str| {
+            json!({"name": name, "source": source, "target": target, "type": "Data",
+                "configuration": {"data": {"sourceOutput": out, "targetInput": input}}})
+        };
+        let nodes = json!([
+            {"name": "FlowInput", "type": "Input",
+                "outputs": [{"name": "document", "type": "Object"}]},
+            {"name": "MakePlaylist", "type": "Prompt",
+                "inputs": [
+                    {"name": "genre", "type": "String", "expression": "$.data.genre"},
+                    {"name": "number", "type": "Number", "expression": "$.data.number"}
+                ],
+                "outputs": [{"name": "modelCompletion", "type": "String"}]},
+            {"name": "FlowOutput", "type": "Output",
+                "inputs": [{"name": "document", "type": "String", "expression": "$.data"}]}
+        ]);
+        let mut connections = vec![
+            data("c1", "FlowInput", "MakePlaylist", "document", "genre"),
+            data("c2", "FlowInput", "MakePlaylist", "document", "number"),
+            data(
+                "c3",
+                "MakePlaylist",
+                "FlowOutput",
+                "modelCompletion",
+                "document",
+            ),
+        ];
+        let (_, ok) = call(
+            &svc,
+            Method::POST,
+            "/flows/validate-definition",
+            &[],
+            json!({"definition": {"nodes": nodes, "connections": connections}}),
+        )
+        .await;
+        assert_eq!(ok, json!({"validations": []}));
+
+        // A true duplicate (same output into the same input) is still flagged.
+        connections.push(data("c4", "FlowInput", "MakePlaylist", "document", "genre"));
+        let (_, dup) = call(
+            &svc,
+            Method::POST,
+            "/flows/validate-definition",
+            &[],
+            json!({"definition": {"nodes": nodes, "connections": connections}}),
+        )
+        .await;
+        assert_eq!(
+            validation_types(&dup),
+            vec!["DuplicateConnections", "MultipleNodeInputConnections"]
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_flow_definition_reports_duplicate_and_missing_node_names() {
+        let svc = BedrockAgentService::new(Arc::new(RwLock::new(BedrockAgentAccounts::new())));
+        let (_, got) = call(
+            &svc,
+            Method::POST,
+            "/flows/validate-definition",
+            &[],
+            json!({"definition": {
+                "nodes": [
+                    {"name": "In", "type": "Input", "outputs": [{"name": "document", "type": "String"}]},
+                    {"name": "In", "type": "Output", "inputs": []},
+                    {"type": "Output", "inputs": []}
+                ],
+                "connections": []
+            }}),
+        )
+        .await;
+        let validations = got["validations"].as_array().unwrap();
+        let unspecified: Vec<&str> = validations
+            .iter()
+            .filter(|v| v["type"] == "Unspecified")
+            .map(|v| v["message"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            unspecified,
+            vec![
+                "Node name In is used by more than one node.",
+                "Node at index 2 has no name."
+            ]
+        );
+        assert!(validations
+            .iter()
+            .filter(|v| v["type"] == "Unspecified")
+            .all(|v| v["details"] == json!({"unspecified": {}}) && v["severity"] == "Error"));
+        // The second `In` (an Output node) was not merged into the first, so
+        // the flow still has no ending node.
+        assert!(validation_types(&got).contains(&"MissingEndingNodes"));
     }
 
     #[tokio::test]
@@ -1884,14 +2401,18 @@ mod tests {
             format!("{}:1", prompt["arn"].as_str().unwrap())
         );
 
-        let mut elsewhere = cn_request(json!({"promptIdentifier": prompt["id"].clone()}));
+        let mut elsewhere = cn_request(json!({}));
         elsewhere.region = "us-east-1".to_string();
         let flows = body(svc.list_flows(&elsewhere).unwrap());
         assert_eq!(flows["flowSummaries"][0]["arn"], flow["arn"]);
         let prompts = body(svc.list_prompts(&elsewhere).unwrap());
         assert_eq!(prompts["promptSummaries"][0]["arn"], prompt["arn"]);
-        let versions = body(svc.list_prompt_versions(&elsewhere).unwrap());
-        assert_eq!(versions["promptSummaries"][0]["arn"], version["arn"]);
+        elsewhere.query_params.insert(
+            "promptIdentifier".to_string(),
+            prompt["id"].as_str().unwrap().to_string(),
+        );
+        let versions = body(svc.list_prompts(&elsewhere).unwrap());
+        assert_eq!(versions["promptSummaries"][1]["arn"], version["arn"]);
     }
 
     #[test]
