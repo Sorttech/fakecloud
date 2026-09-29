@@ -6,7 +6,7 @@ fn s3_condition_keys_emits_list_params() {
     q.insert("prefix".to_string(), "logs/".to_string());
     q.insert("delimiter".to_string(), "/".to_string());
     q.insert("max-keys".to_string(), "100".to_string());
-    let keys = s3_condition_keys("ListObjectsV2", &q);
+    let keys = s3_condition_keys("ListObjectsV2", &q, &HeaderMap::new());
     assert_eq!(keys.get("s3:prefix"), Some(&vec!["logs/".to_string()]));
     assert_eq!(keys.get("s3:delimiter"), Some(&vec!["/".to_string()]));
     assert_eq!(keys.get("s3:max-keys"), Some(&vec!["100".to_string()]));
@@ -15,7 +15,7 @@ fn s3_condition_keys_emits_list_params() {
 #[test]
 fn s3_condition_keys_omits_absent_params() {
     let q = std::collections::HashMap::new();
-    let keys = s3_condition_keys("ListObjectsV2", &q);
+    let keys = s3_condition_keys("ListObjectsV2", &q, &HeaderMap::new());
     assert!(keys.is_empty());
 }
 
@@ -23,7 +23,7 @@ fn s3_condition_keys_omits_absent_params() {
 fn s3_condition_keys_partial_params() {
     let mut q = std::collections::HashMap::new();
     q.insert("prefix".to_string(), "archive/".to_string());
-    let keys = s3_condition_keys("ListObjects", &q);
+    let keys = s3_condition_keys("ListObjects", &q, &HeaderMap::new());
     assert_eq!(keys.len(), 1);
     assert_eq!(keys.get("s3:prefix"), Some(&vec!["archive/".to_string()]));
 }
@@ -32,9 +32,9 @@ fn s3_condition_keys_partial_params() {
 fn s3_condition_keys_empty_for_non_list_actions() {
     let mut q = std::collections::HashMap::new();
     q.insert("prefix".to_string(), "logs/".to_string());
-    assert!(s3_condition_keys("GetObject", &q).is_empty());
-    assert!(s3_condition_keys("PutObject", &q).is_empty());
-    assert!(s3_condition_keys("ListBuckets", &q).is_empty());
+    assert!(s3_condition_keys("GetObject", &q, &HeaderMap::new()).is_empty());
+    assert!(s3_condition_keys("PutObject", &q, &HeaderMap::new()).is_empty());
+    assert!(s3_condition_keys("ListBuckets", &q, &HeaderMap::new()).is_empty());
 }
 
 #[test]
@@ -4705,6 +4705,183 @@ fn create_bucket_tags_decode_xml_entities() {
 }
 
 #[test]
+fn create_bucket_requires_a_permission_per_setting_it_configures() {
+    use fakecloud_core::service::AwsService as _;
+
+    let svc = make_service();
+    let names = |req: &AwsRequest| -> Vec<&'static str> {
+        svc.iam_actions_for(req).iter().map(|a| a.action).collect()
+    };
+
+    // A plain create needs only s3:CreateBucket.
+    let plain = make_request(Method::PUT, "/perm-plain", &[], b"");
+    assert_eq!(names(&plain), vec!["CreateBucket"]);
+
+    // An ACL that reaches past the owner needs PutBucketAcl -- the settings
+    // persist now, so a create that configures them is a configuration call as
+    // much as a create.
+    let mut canned = make_request(Method::PUT, "/perm-acl", &[], b"");
+    canned
+        .headers
+        .insert("x-amz-acl", "public-read".parse().unwrap());
+    assert_eq!(names(&canned), vec!["CreateBucket", "PutBucketAcl"]);
+
+    // ...but `private` does not. The model'"'"'s CreateBucket permissions are
+    // explicit: "if you set the ACL to private, or if you don'"'"'t specify any
+    // ACLs, only the s3:CreateBucket permission is required". A least-privilege
+    // caller that always sends `--acl private` must not be refused.
+    let mut private = make_request(Method::PUT, "/perm-private", &[], b"");
+    private
+        .headers
+        .insert("x-amz-acl", "private".parse().unwrap());
+    assert_eq!(names(&private), vec!["CreateBucket"]);
+
+    let mut granted = make_request(Method::PUT, "/perm-grant", &[], b"");
+    granted.headers.insert(
+        "x-amz-grant-read",
+        "uri=http://acs.amazonaws.com/groups/global/AllUsers"
+            .parse()
+            .unwrap(),
+    );
+    assert_eq!(names(&granted), vec!["CreateBucket", "PutBucketAcl"]);
+
+    let mut owned = make_request(Method::PUT, "/perm-own", &[], b"");
+    owned.headers.insert(
+        "x-amz-object-ownership",
+        "BucketOwnerEnforced".parse().unwrap(),
+    );
+    assert_eq!(
+        names(&owned),
+        vec!["CreateBucket", "PutBucketOwnershipControls"]
+    );
+
+    // Object lock turns versioning on, so both permissions are required.
+    let mut locked = make_request(Method::PUT, "/perm-lock", &[], b"");
+    locked
+        .headers
+        .insert("x-amz-bucket-object-lock-enabled", "true".parse().unwrap());
+    assert_eq!(
+        names(&locked),
+        vec![
+            "CreateBucket",
+            "PutBucketObjectLockConfiguration",
+            "PutBucketVersioning"
+        ]
+    );
+
+    // `aws-exec-read` resolves to owner-only grants (its READ to the EC2
+    // service's canonical user is not modeled), so judging by grants alone let
+    // it slip past PutBucketAcl -- while the BucketOwnerEnforced conflict check
+    // has always treated it as an ACL reaching outside the owner. CloudFormation
+    // sends it for `AccessControl: AwsExecRead`, so the gap was reachable.
+    let mut exec_read = make_request(Method::PUT, "/perm-exec", &[], b"");
+    exec_read
+        .headers
+        .insert("x-amz-acl", "aws-exec-read".parse().unwrap());
+    assert_eq!(names(&exec_read), vec!["CreateBucket", "PutBucketAcl"]);
+
+    // A blank value asks for nothing, so it configures nothing either -- the
+    // condition keys skip blanks, and demanding a permission whose key is absent
+    // turns a `StringEquals`-gated Allow into a 403 on a request the handler
+    // answers with a 400.
+    let mut blank = make_request(Method::PUT, "/perm-blank", &[], b"");
+    blank.headers.insert("x-amz-acl", "".parse().unwrap());
+    blank
+        .headers
+        .insert("x-amz-object-ownership", "".parse().unwrap());
+    assert_eq!(names(&blank), vec!["CreateBucket"]);
+
+    // A false object-lock header configures nothing.
+    let mut unlocked = make_request(Method::PUT, "/perm-unlocked", &[], b"");
+    unlocked
+        .headers
+        .insert("x-amz-bucket-object-lock-enabled", "false".parse().unwrap());
+    assert_eq!(names(&unlocked), vec!["CreateBucket"]);
+
+    // Everything at once, tags included, in one authorization set.
+    let mut everything = make_request(
+        Method::PUT,
+        "/perm-all",
+        &[],
+        b"<CreateBucketConfiguration><Tags><Tag><Key>team</Key><Value>a</Value></Tag></Tags></CreateBucketConfiguration>",
+    );
+    everything
+        .headers
+        .insert("x-amz-acl", "public-read".parse().unwrap());
+    everything
+        .headers
+        .insert("x-amz-object-ownership", "ObjectWriter".parse().unwrap());
+    assert_eq!(
+        names(&everything),
+        vec![
+            "CreateBucket",
+            "TagResource",
+            "PutBucketAcl",
+            "PutBucketOwnershipControls"
+        ]
+    );
+}
+
+#[test]
+fn acl_condition_keys_are_populated_from_the_request_headers() {
+    // A guardrail like `Deny s3:CreateBucket when s3:x-amz-acl != private` is
+    // useless while the key is never emitted, which is what made the
+    // over-permission above invisible to policy.
+    let mut headers = HeaderMap::new();
+    headers.insert("x-amz-acl", "public-read".parse().unwrap());
+    let keys = s3_condition_keys("CreateBucket", &HashMap::new(), &headers);
+    assert_eq!(
+        keys.get("s3:x-amz-acl"),
+        Some(&vec!["public-read".to_string()])
+    );
+
+    let mut grants = HeaderMap::new();
+    grants.insert("x-amz-grant-full-control", "id=abc123".parse().unwrap());
+    let keys = s3_condition_keys("PutObject", &HashMap::new(), &grants);
+    assert_eq!(
+        keys.get("s3:x-amz-grant-full-control"),
+        Some(&vec!["id=abc123".to_string()])
+    );
+
+    // Object ownership and object lock are gated by `iam_actions_for` too, so
+    // their keys are emitted as well -- `Deny CreateBucket unless
+    // s3:x-amz-object-ownership == BucketOwnerEnforced` is a guardrail people
+    // actually write.
+    let mut settings = HeaderMap::new();
+    settings.insert(
+        "x-amz-object-ownership",
+        "BucketOwnerEnforced".parse().unwrap(),
+    );
+    settings.insert("x-amz-bucket-object-lock-enabled", "true".parse().unwrap());
+    let keys = s3_condition_keys("CreateBucket", &HashMap::new(), &settings);
+    assert_eq!(
+        keys.get("s3:x-amz-object-ownership"),
+        Some(&vec!["BucketOwnerEnforced".to_string()])
+    );
+    // AWS defines no condition key for the object-lock header, so emitting one
+    // would give policy authors a guardrail that works here and silently does
+    // nothing on AWS.
+    assert_eq!(keys.get("s3:x-amz-bucket-object-lock-enabled"), None);
+
+    // Absent headers emit nothing, so a policy condition on them safe-fails to
+    // "does not apply" rather than matching an empty value.
+    assert!(s3_condition_keys("CreateBucket", &HashMap::new(), &HeaderMap::new()).is_empty());
+
+    // A present-but-empty value is skipped for the same reason, so a `Null`
+    // check does not read it as set.
+    let mut blank = HeaderMap::new();
+    blank.insert("x-amz-object-ownership", "".parse().unwrap());
+    blank.insert("x-amz-bucket-object-lock-enabled", "".parse().unwrap());
+    blank.insert("x-amz-acl", "".parse().unwrap());
+    blank.insert("x-amz-grant-read", "".parse().unwrap());
+    assert!(
+        s3_condition_keys("CreateBucket", &HashMap::new(), &blank).is_empty(),
+        "blank values must be skipped on EVERY header, not most of them: {:?}",
+        s3_condition_keys("CreateBucket", &HashMap::new(), &blank)
+    );
+}
+
+#[test]
 fn create_bucket_with_tags_also_requires_tag_resource() {
     use fakecloud_core::service::AwsService as _;
 
@@ -4754,10 +4931,34 @@ fn create_bucket_request_tags_feed_condition_keys() {
         &[],
         b"<CreateBucketConfiguration><Tags><Tag><Key>team</Key><Value>a</Value></Tag></Tags></CreateBucketConfiguration>",
     );
-    for action in ["CreateBucket", "TagResource"] {
+    // Every action the create implies, not just the create and its TagResource:
+    // dispatch rebuilds the context per action, and AWS evaluates one context
+    // for the whole request. An `aws:RequestTag/*` guardrail that permits the
+    // create must not then deny the ACL or object-lock action it implies.
+    for action in [
+        "CreateBucket",
+        "TagResource",
+        "PutBucketAcl",
+        "PutBucketOwnershipControls",
+        "PutBucketObjectLockConfiguration",
+        "PutBucketVersioning",
+    ] {
         let tags = s3_request_tags(&req, action).expect("tags extracted");
         assert_eq!(tags.get("team").map(String::as_str), Some("a"), "{action}");
     }
+
+    // On their own operations those actions carry no create-time tag set: the
+    // body is not a `CreateBucketConfiguration`, so the map is empty rather
+    // than picking up a foreign body's tags.
+    let acl_body = make_request(
+        Method::PUT,
+        "/req-acl?acl",
+        &[("acl", "")],
+        b"<AccessControlPolicy><Owner><ID>o</ID></Owner></AccessControlPolicy>",
+    );
+    assert!(s3_request_tags(&acl_body, "PutBucketAcl")
+        .expect("tags extracted")
+        .is_empty());
 
     // A body with no tag set yields an empty map, not a miss.
     let plain = make_request(Method::PUT, "/req-plain", &[], b"");

@@ -1692,14 +1692,75 @@ impl AwsService for S3Service {
             return Vec::new();
         };
         if action.service == "s3" && action.action == "CreateBucket" {
+            // A create that also configures the bucket needs the permission for
+            // each thing it configures, as on AWS: dispatch requires every
+            // returned action to be allowed, so a principal holding only
+            // `s3:CreateBucket` can still create a plain bucket. This matters
+            // more now that these settings PERSIST -- a bucket created
+            // `public-read` by a caller with no `s3:PutBucketAcl` used to lose
+            // the grant on restart, and now keeps it.
+            let mut extra = Vec::new();
             let body = std::str::from_utf8(&request.body).unwrap_or("");
             if !create_bucket_configuration_tags(body).is_empty() {
-                let tag_resource = fakecloud_core::auth::IamAction {
-                    service: "s3",
-                    action: "TagResource",
-                    resource: action.resource.clone(),
-                };
-                return vec![action, tag_resource];
+                extra.push("TagResource");
+            }
+            // Per the CreateBucket permissions in the vendored model: an ACL set
+            // to public-read, public-read-write, authenticated-read "or any
+            // other custom ACLs" needs s3:PutBucketAcl, while "if you set the
+            // ACL to private, or if you don't specify any ACLs, only the
+            // s3:CreateBucket permission is required". Judged by the grants the
+            // request resolves to, so the two spellings of an owner-only ACL
+            // agree -- and so a least-privilege caller that always sends
+            // `--acl private` is not refused.
+            let reaches_past_owner = request
+                .headers
+                .get("x-amz-acl")
+                .and_then(|v| v.to_str().ok())
+                // Blank counts as absent here too. It resolves to owner-only today
+                // only because `canned_acl_grants` falls through to the owner for
+                // any unrecognized value -- so without this, an arm that ever made
+                // an unknown value resolve past the owner would silently start
+                // demanding `s3:PutBucketAcl` for an empty header.
+                .filter(|acl| !acl.trim().is_empty())
+                .is_some_and(|acl| acl_reaches_past_owner(acl, &request.account_id));
+            if reaches_past_owner || has_grant_headers(&request.headers) {
+                extra.push("PutBucketAcl");
+            }
+            // Presence, but blank counts as absent -- the same rule the ACL
+            // headers and the condition keys follow. Otherwise a blank value
+            // demands a permission whose condition key is deliberately not
+            // emitted, so a `StringEquals`-gated Allow 403s a request the handler
+            // would have answered with a 400.
+            if request
+                .headers
+                .get("x-amz-object-ownership")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| !v.trim().is_empty())
+            {
+                extra.push("PutBucketOwnershipControls");
+            }
+            if request
+                .headers
+                .get("x-amz-bucket-object-lock-enabled")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+            {
+                // Object lock forces versioning on, so AWS wants both.
+                extra.push("PutBucketObjectLockConfiguration");
+                extra.push("PutBucketVersioning");
+            }
+            if !extra.is_empty() {
+                let mut actions = Vec::with_capacity(extra.len() + 1);
+                let resource = action.resource.clone();
+                actions.push(action);
+                for name in extra {
+                    actions.push(fakecloud_core::auth::IamAction {
+                        service: "s3",
+                        action: name,
+                        resource: resource.clone(),
+                    });
+                }
+                return actions;
             }
         }
         vec![action]
@@ -1710,7 +1771,7 @@ impl AwsService for S3Service {
         request: &AwsRequest,
         action: &fakecloud_core::auth::IamAction,
     ) -> std::collections::BTreeMap<String, Vec<String>> {
-        s3_condition_keys(action.action, &request.query_params)
+        s3_condition_keys(action.action, &request.query_params, &request.headers)
     }
 
     fn resource_tags_for(
@@ -1733,15 +1794,77 @@ impl AwsService for S3Service {
 
 /// Extract service-specific IAM condition keys from an S3 request.
 ///
-/// Today only `ListObjects` / `ListObjectsV2` expose keys (`s3:prefix`,
-/// `s3:delimiter`, `s3:max-keys`) via their query params. Other actions
-/// return an empty map so the evaluator's safe-fail semantics treat any
-/// policy condition referencing an unknown key as "doesn't apply".
+/// `ListObjects` / `ListObjectsV2` expose `s3:prefix`, `s3:delimiter` and
+/// `s3:max-keys` from their query params, and any request carrying the ACL,
+/// object-ownership or object-lock headers exposes the matching `s3:x-amz-*`
+/// keys. An action with nothing to expose returns an empty map, so the
+/// evaluator's safe-fail semantics treat a policy condition on an unknown key
+/// as "doesn't apply".
 fn s3_condition_keys(
     action: &str,
     query: &std::collections::HashMap<String, String>,
+    headers: &HeaderMap,
 ) -> std::collections::BTreeMap<String, Vec<String>> {
     let mut out = std::collections::BTreeMap::new();
+    // `s3:x-amz-acl` and the `s3:x-amz-grant-*` family are how a policy pins
+    // down which ACL a write may ask for -- a guardrail like
+    // `Deny s3:CreateBucket when s3:x-amz-acl != private` is useless while they
+    // are never populated. AWS exposes them on every ACL-accepting write, so
+    // they are emitted whenever the request carries them rather than being
+    // gated on an action list that would drift.
+    if let Some(acl) = headers
+        .get("x-amz-acl")
+        .and_then(|v| v.to_str().ok())
+        // Blank is skipped for consistency with every other key family here (the
+        // grant headers, object ownership): a present-but-empty header names no
+        // value, and a key emitted as `""` matches nothing a policy can sensibly
+        // write. Note this does NOT mean the request succeeds -- three of the four
+        // canned-ACL paths answer 400 for a blank value; it means the policy
+        // decision is not made on an empty string.
+        .filter(|v| !v.trim().is_empty())
+    {
+        out.insert("s3:x-amz-acl".to_string(), vec![acl.to_string()]);
+    }
+    for (header, _) in &GRANT_HEADER_PERMISSIONS {
+        // Blank values are skipped for the same reason `has_grant_headers`
+        // treats them as absent: a present-but-empty header asks for no grant,
+        // and emitting the key would make a `Null`-based guardrail read it as
+        // present and deny the request.
+        let values: Vec<String> = headers
+            .get_all(*header)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .filter(|v| !v.trim().is_empty())
+            .map(|v| v.to_string())
+            .collect();
+        if !values.is_empty() {
+            out.insert(format!("s3:{header}"), values);
+        }
+    }
+    // The ACL is not the only setting `iam_actions_for` gates: object ownership is
+    // too, and `Deny CreateBucket unless s3:x-amz-object-ownership ==
+    // BucketOwnerEnforced` is just as useless while its key is never populated.
+    //
+    // Object lock is deliberately NOT here. AWS defines no condition key for the
+    // `x-amz-bucket-object-lock-enabled` header -- its object-lock keys are
+    // `s3:object-lock-mode`, `-legal-hold`, `-remaining-retention-days` and
+    // `-retain-until-date`, all about an object's retention rather than a bucket's
+    // creation. Emitting `s3:x-amz-bucket-object-lock-enabled` would invert the
+    // point of populating keys at all: a guardrail written against it would work
+    // here and be a permanent no-op against AWS. The permission the lock header
+    // requires is unaffected -- that comes from the model's Permissions text.
+    if let Some(value) = headers
+        .get("x-amz-object-ownership")
+        .and_then(|v| v.to_str().ok())
+        // Blank is skipped like the grant family: present but empty asks for
+        // nothing, and emitting the key would make a `Null` check read it as set.
+        .filter(|v| !v.trim().is_empty())
+    {
+        out.insert(
+            "s3:x-amz-object-ownership".to_string(),
+            vec![value.to_string()],
+        );
+    }
     if matches!(action, "ListObjects" | "ListObjectsV2") {
         // Both list variants share the same query param shape.
         if let Some(prefix) = query.get("prefix") {
@@ -1824,11 +1947,20 @@ fn s3_request_tags(
             let tags = parse_tagging_xml(body);
             Some(tags.into_iter().collect())
         }
-        // CreateBucket carries its tag set inside CreateBucketConfiguration,
-        // and the `s3:TagResource` authorization it requires alongside
-        // `s3:CreateBucket` is evaluated against the same tags — so both see
-        // `aws:RequestTag/*` and `aws:TagKeys`.
-        "CreateBucket" | "TagResource" => {
+        // CreateBucket carries its tag set inside CreateBucketConfiguration, and
+        // every authorization it requires alongside `s3:CreateBucket` is
+        // evaluated against the same tags -- AWS builds one request context for
+        // the whole request, so an `aws:RequestTag/*` guardrail that permits the
+        // create must not then deny the ACL or object-lock action it implies.
+        // The extra names are harmless on their own operations: a real
+        // PutBucketAcl body is not a `CreateBucketConfiguration`, so it yields
+        // the same empty map the catch-all arm would.
+        "CreateBucket"
+        | "TagResource"
+        | "PutBucketAcl"
+        | "PutBucketOwnershipControls"
+        | "PutBucketObjectLockConfiguration"
+        | "PutBucketVersioning" => {
             let body = std::str::from_utf8(&request.body).unwrap_or("");
             let tags = create_bucket_configuration_tags(body);
             Some(tags.into_iter().collect())
@@ -2568,9 +2700,10 @@ pub(crate) const OBJECT_OWNERSHIP_VALUES: [&str; 3] = [
 /// `AWS::S3::Bucket` `AccessControl: AwsExecRead` maps to it), and AWS answers
 /// 200, so refusing it would turn a working call into a hard failure. Its grant
 /// is a READ to the EC2 service's canonical user, which this build cannot
-/// reproduce, so it resolves to owner-only -- `create_bucket` special-cases it
-/// when checking the BucketOwnerEnforced conflict, since the request does ask
-/// for an ACL reaching past the owner.
+/// reproduce, so it resolves to owner-only -- [`acl_reaches_past_owner`] special-
+/// cases it, since the request does ask for an ACL reaching past the owner. That
+/// drives both the BucketOwnerEnforced conflict check and the `s3:PutBucketAcl`
+/// authorization a create carrying it requires.
 ///
 /// `bucket-owner-read` and `bucket-owner-full-control` are object-scoped, and
 /// the canned-ACL table says S3 IGNORES them when they are given on a bucket
@@ -2589,6 +2722,38 @@ pub(crate) const BUCKET_CANNED_ACLS: [&str; 8] = [
     "bucket-owner-read",
     "bucket-owner-full-control",
 ];
+
+/// Whether the ACL a request asks for reaches past the bucket owner.
+///
+/// Both the `BucketOwnerEnforced` conflict check and the `s3:PutBucketAcl`
+/// authorization turn on this one question, so they share the answer rather
+/// than each re-deriving it -- they disagreed once already, and the IAM side
+/// silently authorized an ACL the conflict check treats as reaching outside the
+/// owner.
+///
+/// `aws-exec-read` is the case that needs saying out loud: its READ grant to
+/// the EC2 service's canonical user is not modeled, so [`canned_acl_grants`]
+/// resolves it to owner-only -- but the request does ask for an ACL reaching
+/// outside the owner.
+///
+/// NOT the same question as the object-write check in
+/// [`S3Service::resolve_write_acl_headers`], which asks whether the request names
+/// bucket-owner-full-control specifically. The two look alike and must not be
+/// unified: a BucketOwnerEnforced BUCKET rejects an ACL that grants another
+/// account anything, so `private` is fine there, while a BucketOwnerEnforced
+/// bucket accepts an object PUT only when it specifies no ACL at all or
+/// bucket-owner-full-control -- a value that is object-scoped in the model
+/// (`com.amazonaws.s3#BucketCannedACL` omits it), so the bucket-side question
+/// never has this answer. The header is still accepted on a bucket, resolving to
+/// the owner's FULL_CONTROL, which is what S3 ignoring it produces.
+pub(crate) fn acl_reaches_past_owner(acl: &str, owner_id: &str) -> bool {
+    acl == "aws-exec-read"
+        || !canned_acl_grants(acl, owner_id).iter().all(|g| {
+            g.permission == "FULL_CONTROL"
+                && g.grantee_type == "CanonicalUser"
+                && g.grantee_id.as_deref() == Some(owner_id)
+        })
+}
 
 pub(crate) fn canned_acl_grants(acl: &str, owner_id: &str) -> Vec<AclGrant> {
     let owner_grant = AclGrant {

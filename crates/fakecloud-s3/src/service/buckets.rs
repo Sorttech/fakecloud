@@ -299,21 +299,10 @@ impl S3Service {
         // cased value here would refuse an ACL at create that the very next
         // PutBucketAcl would then happily set.
         let ownership_enforced = ownership_header == Some("BucketOwnerEnforced");
-        let owner_only = |grants: &[crate::state::AclGrant]| {
-            grants.iter().all(|g| {
-                g.permission == "FULL_CONTROL"
-                    && g.grantee_type == "CanonicalUser"
-                    && g.grantee_id.as_deref() == Some(req.account_id.as_str())
-            })
-        };
+        // Shared with the `s3:PutBucketAcl` authorization in `iam_actions_for`,
+        // which asks the same question and must not answer it differently.
         let acl_requests_grants = grant_headers_present
-            || acl_header.is_some_and(|a| {
-                // `aws-exec-read` grants READ to the EC2 service's canonical
-                // user. That grantee is not modeled, so the resolved grants
-                // look owner-only -- but the request still asks for an ACL
-                // reaching outside the owner, which is what conflicts.
-                a == "aws-exec-read" || !owner_only(&canned_acl_grants(a, &req.account_id))
-            });
+            || acl_header.is_some_and(|a| super::acl_reaches_past_owner(a, &req.account_id));
         if ownership_enforced && acl_requests_grants {
             return Err(AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
