@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -355,49 +355,79 @@ fn validate_str(
     }
 }
 
-// Cached regexes for the most common patterns
-fn re_session_identifier() -> Regex {
-    Regex::new(r"^(arn:aws(-[^:]+)?:bedrock:[a-z0-9-]+:[0-9]{12}:session/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})|([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$").unwrap()
+// Identifier patterns, compiled once on first use. They mirror the Smithy
+// model's patterns byte-for-byte (ECMA semantics), so keep them verbatim.
+fn re_session_identifier() -> &'static Regex {
+    static RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^(arn:aws(-[^:]+)?:bedrock:[a-z0-9-]+:[0-9]{12}:session/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})|([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$").unwrap()
+    });
+    &RE
 }
-fn re_agent_id() -> Regex {
-    Regex::new(r"^[0-9a-zA-Z]+$").unwrap()
+fn re_agent_id() -> &'static Regex {
+    static RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[0-9a-zA-Z]+$").unwrap());
+    &RE
 }
-fn re_session_id() -> Regex {
-    Regex::new(r"^[0-9a-zA-Z._:-]+$").unwrap()
+fn re_session_id() -> &'static Regex {
+    static RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[0-9a-zA-Z._:-]+$").unwrap());
+    &RE
 }
-fn re_uuid() -> Regex {
-    Regex::new(r"^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$").unwrap()
+fn re_uuid() -> &'static Regex {
+    static RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$").unwrap()
+    });
+    &RE
 }
-fn re_memory_id() -> Regex {
-    Regex::new(r"^[0-9a-zA-Z._:-]+$").unwrap()
+fn re_memory_id() -> &'static Regex {
+    static RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[0-9a-zA-Z._:-]+$").unwrap());
+    &RE
 }
-fn re_flow_execution_id() -> Regex {
+fn re_flow_execution_id() -> &'static Regex {
     // FlowExecutionIdentifier: max 2048, no pattern in model
-    Regex::new(r"^[\x21-\x7e]+$").unwrap()
+    static RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[\x21-\x7e]+$").unwrap());
+    &RE
 }
-fn re_taggable_arn() -> Regex {
+fn re_taggable_arn() -> &'static Regex {
     // TaggableResourcesArn: lenient; reject literal {placeholder}
-    Regex::new(r"^arn:[a-zA-Z0-9-]+:[a-zA-Z0-9-]+:[a-z0-9-]*:[0-9]{12}:.+$").unwrap()
+    static RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^arn:[a-zA-Z0-9-]+:[a-zA-Z0-9-]+:[a-z0-9-]*:[0-9]{12}:.+$").unwrap()
+    });
+    &RE
 }
-fn re_flow_identifier() -> Regex {
-    Regex::new(
-        r"^(arn:aws:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:flow/[0-9a-zA-Z]{10})|([0-9a-zA-Z]{10})$",
-    )
-    .unwrap()
+fn re_flow_identifier() -> &'static Regex {
+    static RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"^(arn:aws:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:flow/[0-9a-zA-Z]{10})|([0-9a-zA-Z]{10})$",
+        )
+        .unwrap()
+    });
+    &RE
 }
-fn re_flow_alias_identifier() -> Regex {
-    Regex::new(r"^(arn:aws:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:flow/[0-9a-zA-Z]{10}/alias/[0-9a-zA-Z]{10})|(\bTSTALIASID\b|[0-9a-zA-Z]+)$").unwrap()
+fn re_flow_alias_identifier() -> &'static Regex {
+    static RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^(arn:aws:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:flow/[0-9a-zA-Z]{10}/alias/[0-9a-zA-Z]{10})|(\bTSTALIASID\b|[0-9a-zA-Z]+)$").unwrap()
+    });
+    &RE
 }
-fn re_no_whitespace() -> Regex {
+fn re_no_whitespace() -> &'static Regex {
     // NextToken: ^\S*$
-    Regex::new(r"^\S*$").unwrap()
+    static RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\S*$").unwrap());
+    &RE
 }
-fn re_aws_arn() -> Regex {
+fn re_aws_arn() -> &'static Regex {
     // Generic AWS resource ARN
-    Regex::new(r"^arn:aws(-[^:]+)?:[a-zA-Z0-9-]+:[a-z0-9-]*:[0-9]{12}:.+$").unwrap()
+    static RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^arn:aws(-[^:]+)?:[a-zA-Z0-9-]+:[a-z0-9-]*:[0-9]{12}:.+$").unwrap()
+    });
+    &RE
 }
-fn re_flow_execution_name() -> Regex {
-    Regex::new(r"^[a-zA-Z0-9-]+$").unwrap()
+fn re_flow_execution_name() -> &'static Regex {
+    static RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9-]+$").unwrap());
+    &RE
+}
+fn re_knowledge_base_id() -> &'static Regex {
+    // KnowledgeBaseId: alphanumeric; the length bound is checked separately.
+    static RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[0-9a-zA-Z]+$").unwrap());
+    &RE
 }
 
 /// Validate optional integer field against a range.
@@ -429,7 +459,7 @@ fn validate_next_token(req: &AwsRequest, body: &Value) -> Result<(), AwsServiceE
         validate_str(
             Some(&t),
             "nextToken",
-            Some(&re_no_whitespace()),
+            Some(re_no_whitespace()),
             Some(1),
             Some(2048),
             false,
@@ -539,7 +569,7 @@ async fn handle_invoke_agent(
     validate_str(
         agent_id.as_deref(),
         "agentId",
-        Some(&re_agent_id()),
+        Some(re_agent_id()),
         Some(1),
         Some(10),
         true,
@@ -547,7 +577,7 @@ async fn handle_invoke_agent(
     validate_str(
         agent_alias_id.as_deref(),
         "agentAliasId",
-        Some(&re_agent_id()),
+        Some(re_agent_id()),
         Some(1),
         Some(10),
         true,
@@ -555,7 +585,7 @@ async fn handle_invoke_agent(
     validate_str(
         session_id.as_deref(),
         "sessionId",
-        Some(&re_session_id()),
+        Some(re_session_id()),
         Some(2),
         Some(100),
         true,
@@ -565,7 +595,7 @@ async fn handle_invoke_agent(
         validate_str(
             Some(m),
             "memoryId",
-            Some(&re_memory_id()),
+            Some(re_memory_id()),
             Some(2),
             Some(100),
             false,
@@ -582,7 +612,7 @@ async fn handle_invoke_agent(
         validate_str(
             Some(s),
             "sourceArn",
-            Some(&re_aws_arn()),
+            Some(re_aws_arn()),
             Some(1),
             Some(2048),
             false,
@@ -653,7 +683,7 @@ async fn handle_invoke_flow(
     validate_str(
         flow_id.as_deref(),
         "flowIdentifier",
-        Some(&re_flow_identifier()),
+        Some(re_flow_identifier()),
         Some(1),
         Some(2048),
         true,
@@ -661,7 +691,7 @@ async fn handle_invoke_flow(
     validate_str(
         flow_alias_id.as_deref(),
         "flowAliasIdentifier",
-        Some(&re_flow_alias_identifier()),
+        Some(re_flow_alias_identifier()),
         Some(1),
         Some(2048),
         true,
@@ -675,7 +705,7 @@ async fn handle_invoke_flow(
         validate_str(
             Some(s),
             "executionId",
-            Some(&re_session_id()),
+            Some(re_session_id()),
             Some(2),
             Some(100),
             false,
@@ -749,7 +779,7 @@ async fn handle_invoke_inline_agent(
     validate_str(
         session_id.as_deref(),
         "sessionId",
-        Some(&re_session_id()),
+        Some(re_session_id()),
         Some(2),
         Some(100),
         true,
@@ -879,7 +909,7 @@ async fn handle_retrieve(
     validate_str(
         kb_id.as_deref(),
         "knowledgeBaseId",
-        Some(&Regex::new(r"^[0-9a-zA-Z]+$").unwrap()),
+        Some(re_knowledge_base_id()),
         Some(0),
         Some(10),
         true,
@@ -950,7 +980,7 @@ async fn handle_retrieve_and_generate(
         validate_str(
             Some(s),
             "sessionId",
-            Some(&re_session_id()),
+            Some(re_session_id()),
             Some(2),
             Some(100),
             false,
@@ -1021,7 +1051,7 @@ async fn handle_retrieve_and_generate_stream(
         validate_str(
             Some(s),
             "sessionId",
-            Some(&re_session_id()),
+            Some(re_session_id()),
             Some(2),
             Some(100),
             false,
@@ -1156,7 +1186,7 @@ async fn handle_delete_session(
     validate_str(
         session_ident.as_deref(),
         "sessionIdentifier",
-        Some(&re_session_identifier()),
+        Some(re_session_identifier()),
         None,
         None,
         true,
@@ -1194,7 +1224,7 @@ async fn handle_end_session(
     validate_str(
         session_ident.as_deref(),
         "sessionIdentifier",
-        Some(&re_session_identifier()),
+        Some(re_session_identifier()),
         None,
         None,
         true,
@@ -1242,7 +1272,7 @@ async fn handle_get_session(
     validate_str(
         session_ident.as_deref(),
         "sessionIdentifier",
-        Some(&re_session_identifier()),
+        Some(re_session_identifier()),
         None,
         None,
         true,
@@ -1318,7 +1348,7 @@ async fn handle_update_session(
     validate_str(
         session_ident.as_deref(),
         "sessionIdentifier",
-        Some(&re_session_identifier()),
+        Some(re_session_identifier()),
         None,
         None,
         true,
@@ -1372,7 +1402,7 @@ async fn handle_create_invocation(
     validate_str(
         session_ident.as_deref(),
         "sessionIdentifier",
-        Some(&re_session_identifier()),
+        Some(re_session_identifier()),
         None,
         None,
         true,
@@ -1442,7 +1472,7 @@ async fn handle_get_invocation_step(
     validate_str(
         session_ident.as_deref(),
         "sessionIdentifier",
-        Some(&re_session_identifier()),
+        Some(re_session_identifier()),
         None,
         None,
         true,
@@ -1451,7 +1481,7 @@ async fn handle_get_invocation_step(
     validate_str(
         step_id.as_deref(),
         "invocationStepId",
-        Some(&re_uuid()),
+        Some(re_uuid()),
         None,
         None,
         true,
@@ -1460,7 +1490,7 @@ async fn handle_get_invocation_step(
     validate_str(
         invocation_id.as_deref(),
         "invocationIdentifier",
-        Some(&re_uuid()),
+        Some(re_uuid()),
         None,
         None,
         true,
@@ -1503,7 +1533,7 @@ async fn handle_list_invocation_steps(
     validate_str(
         session_ident.as_deref(),
         "sessionIdentifier",
-        Some(&re_session_identifier()),
+        Some(re_session_identifier()),
         None,
         None,
         true,
@@ -1564,7 +1594,7 @@ async fn handle_list_invocations(
     validate_str(
         session_ident.as_deref(),
         "sessionIdentifier",
-        Some(&re_session_identifier()),
+        Some(re_session_identifier()),
         None,
         None,
         true,
@@ -1611,7 +1641,7 @@ async fn handle_put_invocation_step(
     validate_str(
         session_ident.as_deref(),
         "sessionIdentifier",
-        Some(&re_session_identifier()),
+        Some(re_session_identifier()),
         None,
         None,
         true,
@@ -1620,7 +1650,7 @@ async fn handle_put_invocation_step(
     validate_str(
         invocation_id.as_deref(),
         "invocationIdentifier",
-        Some(&re_uuid()),
+        Some(re_uuid()),
         None,
         None,
         true,
@@ -1695,7 +1725,7 @@ async fn handle_get_flow_execution(
     validate_str(
         flow_id.as_deref(),
         "flowIdentifier",
-        Some(&re_flow_identifier()),
+        Some(re_flow_identifier()),
         Some(1),
         Some(2048),
         true,
@@ -1703,7 +1733,7 @@ async fn handle_get_flow_execution(
     validate_str(
         flow_alias_id.as_deref(),
         "flowAliasIdentifier",
-        Some(&re_flow_alias_identifier()),
+        Some(re_flow_alias_identifier()),
         Some(1),
         Some(2048),
         true,
@@ -1711,7 +1741,7 @@ async fn handle_get_flow_execution(
     validate_str(
         exec_id.as_deref(),
         "executionIdentifier",
-        Some(&re_flow_execution_id()),
+        Some(re_flow_execution_id()),
         None,
         Some(2048),
         true,
@@ -1761,7 +1791,7 @@ async fn handle_list_flow_execution_events(
     validate_str(
         flow_id.as_deref(),
         "flowIdentifier",
-        Some(&re_flow_identifier()),
+        Some(re_flow_identifier()),
         Some(1),
         Some(2048),
         true,
@@ -1769,7 +1799,7 @@ async fn handle_list_flow_execution_events(
     validate_str(
         flow_alias_id.as_deref(),
         "flowAliasIdentifier",
-        Some(&re_flow_alias_identifier()),
+        Some(re_flow_alias_identifier()),
         Some(1),
         Some(2048),
         true,
@@ -1777,7 +1807,7 @@ async fn handle_list_flow_execution_events(
     validate_str(
         exec_id.as_deref(),
         "executionIdentifier",
-        Some(&re_flow_execution_id()),
+        Some(re_flow_execution_id()),
         None,
         Some(2048),
         true,
@@ -1809,7 +1839,7 @@ async fn handle_list_flow_executions(
     validate_str(
         flow_id.as_deref(),
         "flowIdentifier",
-        Some(&re_flow_identifier()),
+        Some(re_flow_identifier()),
         Some(1),
         Some(2048),
         true,
@@ -1819,7 +1849,7 @@ async fn handle_list_flow_executions(
         validate_str(
             Some(a),
             "flowAliasIdentifier",
-            Some(&re_flow_alias_identifier()),
+            Some(re_flow_alias_identifier()),
             Some(1),
             Some(2048),
             false,
@@ -1868,7 +1898,7 @@ async fn handle_start_flow_execution(
     validate_str(
         flow_id.as_deref(),
         "flowIdentifier",
-        Some(&re_flow_identifier()),
+        Some(re_flow_identifier()),
         Some(1),
         Some(2048),
         true,
@@ -1876,7 +1906,7 @@ async fn handle_start_flow_execution(
     validate_str(
         flow_alias_id.as_deref(),
         "flowAliasIdentifier",
-        Some(&re_flow_alias_identifier()),
+        Some(re_flow_alias_identifier()),
         Some(1),
         Some(2048),
         true,
@@ -1889,7 +1919,7 @@ async fn handle_start_flow_execution(
         validate_str(
             Some(n),
             "flowExecutionName",
-            Some(&re_flow_execution_name()),
+            Some(re_flow_execution_name()),
             Some(1),
             Some(36),
             false,
@@ -1935,7 +1965,7 @@ async fn handle_stop_flow_execution(
     validate_str(
         flow_id.as_deref(),
         "flowIdentifier",
-        Some(&re_flow_identifier()),
+        Some(re_flow_identifier()),
         Some(1),
         Some(2048),
         true,
@@ -1943,7 +1973,7 @@ async fn handle_stop_flow_execution(
     validate_str(
         flow_alias_id.as_deref(),
         "flowAliasIdentifier",
-        Some(&re_flow_alias_identifier()),
+        Some(re_flow_alias_identifier()),
         Some(1),
         Some(2048),
         true,
@@ -1951,7 +1981,7 @@ async fn handle_stop_flow_execution(
     validate_str(
         exec_id.as_deref(),
         "executionIdentifier",
-        Some(&re_flow_execution_id()),
+        Some(re_flow_execution_id()),
         None,
         Some(2048),
         true,
@@ -1997,7 +2027,7 @@ async fn handle_get_execution_flow_snapshot(
     validate_str(
         flow_id.as_deref(),
         "flowIdentifier",
-        Some(&re_flow_identifier()),
+        Some(re_flow_identifier()),
         Some(1),
         Some(2048),
         true,
@@ -2005,7 +2035,7 @@ async fn handle_get_execution_flow_snapshot(
     validate_str(
         flow_alias_id.as_deref(),
         "flowAliasIdentifier",
-        Some(&re_flow_alias_identifier()),
+        Some(re_flow_alias_identifier()),
         Some(1),
         Some(2048),
         true,
@@ -2013,7 +2043,7 @@ async fn handle_get_execution_flow_snapshot(
     validate_str(
         exec_id.as_deref(),
         "executionIdentifier",
-        Some(&re_flow_execution_id()),
+        Some(re_flow_execution_id()),
         None,
         Some(2048),
         true,
@@ -2128,7 +2158,7 @@ async fn handle_delete_agent_memory(
     validate_str(
         agent_id.as_deref(),
         "agentId",
-        Some(&re_agent_id()),
+        Some(re_agent_id()),
         Some(1),
         Some(10),
         true,
@@ -2136,7 +2166,7 @@ async fn handle_delete_agent_memory(
     validate_str(
         agent_alias_id.as_deref(),
         "agentAliasId",
-        Some(&re_agent_id()),
+        Some(re_agent_id()),
         Some(1),
         Some(10),
         true,
@@ -2155,7 +2185,7 @@ async fn handle_delete_agent_memory(
         validate_str(
             Some(m),
             "memoryId",
-            Some(&re_memory_id()),
+            Some(re_memory_id()),
             Some(2),
             Some(100),
             false,
@@ -2165,7 +2195,7 @@ async fn handle_delete_agent_memory(
         validate_str(
             Some(s),
             "sessionId",
-            Some(&re_session_id()),
+            Some(re_session_id()),
             Some(2),
             Some(100),
             false,
@@ -2185,7 +2215,7 @@ async fn handle_get_agent_memory(
     validate_str(
         agent_id.as_deref(),
         "agentId",
-        Some(&re_agent_id()),
+        Some(re_agent_id()),
         Some(1),
         Some(10),
         true,
@@ -2193,7 +2223,7 @@ async fn handle_get_agent_memory(
     validate_str(
         agent_alias_id.as_deref(),
         "agentAliasId",
-        Some(&re_agent_id()),
+        Some(re_agent_id()),
         Some(1),
         Some(10),
         true,
@@ -2213,7 +2243,7 @@ async fn handle_get_agent_memory(
     validate_str(
         Some(&memory_id),
         "memoryId",
-        Some(&re_memory_id()),
+        Some(re_memory_id()),
         Some(2),
         Some(100),
         true,
@@ -2235,7 +2265,7 @@ async fn handle_tag_resource(
     validate_str(
         resource_arn.as_deref(),
         "resourceArn",
-        Some(&re_taggable_arn()),
+        Some(re_taggable_arn()),
         Some(1),
         Some(1011),
         true,
@@ -2268,7 +2298,7 @@ async fn handle_untag_resource(
     validate_str(
         resource_arn.as_deref(),
         "resourceArn",
-        Some(&re_taggable_arn()),
+        Some(re_taggable_arn()),
         Some(1),
         Some(1011),
         true,
@@ -2336,7 +2366,7 @@ async fn handle_list_tags_for_resource(
     validate_str(
         resource_arn.as_deref(),
         "resourceArn",
-        Some(&re_taggable_arn()),
+        Some(re_taggable_arn()),
         Some(1),
         Some(1011),
         true,
