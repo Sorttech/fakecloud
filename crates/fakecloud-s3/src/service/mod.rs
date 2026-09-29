@@ -268,11 +268,28 @@ impl S3Service {
                 "Specifying both Canned ACLs and Header Grants is not allowed",
             ));
         }
+        // The bucket's ACL owner, which is who "bucket owner full control" means
+        // -- not the caller. They coincide for a bucket this account created, and
+        // diverge for one persisted by another account and hydrated into the
+        // default account on restart, where comparing against the caller accepted
+        // a grant to somebody who is not the owner and refused the grant to the
+        // owner that AWS accepts.
+        //
+        // Looked up only when the request actually names an ACL: the overwhelming
+        // majority of object writes carry none, and this takes the global read
+        // lock. Resolved once and used for both the grants below and the exception
+        // check, so the two cannot derive the owner differently.
+        let bucket_owner = (canned.is_some() || grants.is_some())
+            .then(|| self.bucket_acl_owner_id(account_id, bucket))
+            .flatten();
+        let owner_id = bucket_owner.as_deref().unwrap_or(account_id);
+
         // The grants the request resolves to, which is what the public-ACL check
-        // below has to judge.
+        // below has to judge. Resolved against the bucket's owner, which is what
+        // the write paths store them under.
         let requested = match (&grants, canned.as_deref()) {
             (Some(g), _) => Some(g.clone()),
-            (None, Some(acl)) => Some(canned_acl_grants_for_object(acl, account_id)),
+            (None, Some(acl)) => Some(canned_acl_grants_for_object(acl, owner_id)),
             (None, None) => None,
         };
 
@@ -289,15 +306,6 @@ impl S3Service {
         // collapse onto an owner-only grant only because their real grantees
         // are not modeled. `private` in particular is neither "no ACL" nor
         // "bucket owner full control".
-        // The BUCKET OWNER, which is who the exception is about -- not the
-        // caller. They coincide for a bucket this account created, and diverge
-        // for one persisted by another account and hydrated into the default
-        // account on restart, where comparing against the caller accepted a
-        // grant to somebody who is not the owner and refused the grant to the
-        // owner that AWS actually accepts.
-        let owner_id = self
-            .bucket_acl_owner_id(account_id, bucket)
-            .unwrap_or_else(|| account_id.to_string());
         let asks_for_owner_full_control = match (&grants, canned.as_deref()) {
             // "an equivalent form of this ACL": explicit grants that give the
             // owner full control and nobody anything. `resolved_grant_headers`
@@ -306,7 +314,7 @@ impl S3Service {
             (Some(g), _) => g.iter().all(|grant| {
                 grant.permission == "FULL_CONTROL"
                     && grant.grantee_type == "CanonicalUser"
-                    && grant.grantee_id.as_deref() == Some(owner_id.as_str())
+                    && grant.grantee_id.as_deref() == Some(owner_id)
             }),
             (None, Some(acl)) => acl == "bucket-owner-full-control",
             (None, None) => false,
