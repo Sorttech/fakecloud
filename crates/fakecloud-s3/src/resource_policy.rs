@@ -16,6 +16,7 @@
 
 use std::sync::Arc;
 
+use fakecloud_aws::arn::arn_resource;
 use fakecloud_core::auth::ResourcePolicyProvider;
 
 use crate::state::SharedS3State;
@@ -132,7 +133,7 @@ impl ResourcePolicyProvider for S3ResourcePolicyProvider {
 /// like `arn:aws:s3:::bucket/path/to/key`. Returns `None` for bucket-level
 /// ARNs that carry no key.
 fn object_key(arn: &str) -> Option<&str> {
-    let rest = arn.strip_prefix("arn:aws:s3:::")?;
+    let rest = arn_resource(arn, "s3")?.strip_prefix("::")?;
     rest.split_once('/')
         .map(|(_, key)| key)
         .filter(|k| !k.is_empty())
@@ -161,7 +162,7 @@ fn grants_all_users_read(grants: &[crate::state::AclGrant]) -> bool {
 /// caller treats that as "no resource policy attached," which falls
 /// through to identity-only evaluation rather than silently allowing.
 fn parse_bucket_name(arn: &str) -> Option<&str> {
-    let rest = arn.strip_prefix("arn:aws:s3:::")?;
+    let rest = arn_resource(arn, "s3")?.strip_prefix("::")?;
     if rest.is_empty() {
         return None;
     }
@@ -279,6 +280,19 @@ mod tests {
             parse_bucket_name("arn:aws:s3:::my-bucket/some/key"),
             Some("my-bucket")
         );
+    }
+
+    #[test]
+    fn parsers_accept_china_partition_arns() {
+        assert_eq!(
+            parse_bucket_name("arn:aws-cn:s3:::my-bucket/some/key"),
+            Some("my-bucket")
+        );
+        assert_eq!(
+            object_key("arn:aws-cn:s3:::my-bucket/some/key"),
+            Some("some/key")
+        );
+        assert_eq!(parse_bucket_name("arn:bogus:s3:::my-bucket"), None);
     }
 
     #[test]

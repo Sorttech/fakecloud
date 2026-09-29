@@ -371,6 +371,13 @@ pub struct AlarmHistoryItem {
     pub history_data: String,
 }
 
+/// The ARN of alarm `name` (metric, composite or log alarm) in `region`'s
+/// partition.
+pub fn alarm_arn(region: &str, account_id: &str, name: &str) -> String {
+    fakecloud_aws::arn::Arn::regional("cloudwatch", region, account_id, &format!("alarm:{name}"))
+        .to_string()
+}
+
 /// A composite alarm (defined by an `AlarmRule` expression over other alarms).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompositeAlarm {

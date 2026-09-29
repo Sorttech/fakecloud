@@ -37,7 +37,7 @@ impl AthenaService {
             creation_time: Utc::now(),
             engine_version,
         };
-        let arn = workgroup_arn(&req.account_id, &req.region, &name);
+        let arn = athena_arn(&req.region, &req.account_id, &format!("workgroup/{name}"));
         account.work_groups.insert(name, wg);
         if !tags.is_empty() {
             account.tags.insert(arn, tags);

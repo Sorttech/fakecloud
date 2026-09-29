@@ -334,6 +334,56 @@ pub struct TrustStoreRevocation {
     pub content: Vec<u8>,
 }
 
+/// An Elastic Load Balancing ARN in `region`'s partition.
+fn elb_arn(region: &str, account_id: &str, resource: &str) -> String {
+    fakecloud_aws::arn::Arn::regional("elasticloadbalancing", region, account_id, resource)
+        .to_string()
+}
+
+/// The ARN of a load balancer of `lb_type` (`application`, `network` or
+/// `gateway`).
+pub fn load_balancer_arn(
+    region: &str,
+    account_id: &str,
+    lb_type: &str,
+    name: &str,
+    suffix: &str,
+) -> String {
+    let prefix = match lb_type {
+        "network" => "net",
+        "gateway" => "gwy",
+        _ => "app",
+    };
+    elb_arn(
+        region,
+        account_id,
+        &format!("loadbalancer/{prefix}/{name}/{suffix}"),
+    )
+}
+
+/// The ARN of a target group.
+pub fn target_group_arn(region: &str, account_id: &str, name: &str, suffix: &str) -> String {
+    elb_arn(region, account_id, &format!("targetgroup/{name}/{suffix}"))
+}
+
+/// The ARN of a listener on `load_balancer_arn`: the load balancer's ARN with
+/// its `loadbalancer/` resource type swapped for `listener/` and `suffix`
+/// appended, so it keeps the load balancer's partition, region and account.
+pub fn listener_arn(load_balancer_arn: &str, suffix: &str) -> String {
+    format!("{load_balancer_arn}/{suffix}").replace(":loadbalancer/", ":listener/")
+}
+
+/// The ARN of a rule on `listener_arn`, derived the same way as
+/// [`listener_arn`].
+pub fn listener_rule_arn(listener_arn: &str, suffix: &str) -> String {
+    format!("{listener_arn}/{suffix}").replace(":listener/", ":listener-rule/")
+}
+
+/// The ARN of a trust store.
+pub fn trust_store_arn(region: &str, account_id: &str, name: &str, suffix: &str) -> String {
+    elb_arn(region, account_id, &format!("truststore/{name}/{suffix}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

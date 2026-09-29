@@ -44,18 +44,13 @@ pub(crate) fn start_async_invoke(
     })?;
 
     let invocation_id = Uuid::new_v4().to_string();
-    let invocation_arn = format!(
-        "arn:aws:bedrock:{}:{}:async-invoke/{}",
-        req.region, req.account_id, invocation_id
-    );
+    let invocation_arn =
+        crate::arns::async_invoke_arn(&req.region, &req.account_id, &invocation_id);
 
     let model_arn = if model_id.starts_with("arn:") {
         model_id.to_string()
     } else {
-        format!(
-            "arn:aws:bedrock:{}::foundation-model/{}",
-            req.region, model_id
-        )
+        crate::arns::foundation_model_arn(&req.region, model_id)
     };
 
     let now = Utc::now();

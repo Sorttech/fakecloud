@@ -1828,14 +1828,14 @@ fn no_such_resource(arn: &str) -> AwsServiceError {
     )
 }
 
-fn synth_certificate_arn(account_id: &str, region: &str) -> String {
+pub fn synth_certificate_arn(account_id: &str, region: &str) -> String {
     let region = if region.is_empty() {
         "us-east-1"
     } else {
         region
     };
     let id = Uuid::new_v4();
-    Arn::new("acm", region, account_id, &format!("certificate/{id}")).to_string()
+    Arn::regional("acm", region, account_id, &format!("certificate/{id}")).to_string()
 }
 
 /// Extract the trailing UUID portion of a certificate ARN
@@ -2485,6 +2485,38 @@ mod tests {
             .unwrap();
         let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
         body["CertificateArn"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn china_region_certificate_arn_uses_aws_cn_and_resolves() {
+        let svc = AcmService::default();
+        let in_cn = |action: &str, body: Value| {
+            let mut r = acm_request(action, body);
+            r.region = "cn-north-1".to_string();
+            r
+        };
+        let resp = svc
+            .handle(in_cn(
+                "RequestCertificate",
+                json!({ "DomainName": "cn.example.com" }),
+            ))
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        let arn = body["CertificateArn"].as_str().unwrap().to_string();
+        assert!(
+            arn.starts_with("arn:aws-cn:acm:cn-north-1:123456789012:certificate/"),
+            "{arn}"
+        );
+        let resp = svc
+            .handle(in_cn(
+                "DescribeCertificate",
+                json!({ "CertificateArn": arn }),
+            ))
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        assert_eq!(body["Certificate"]["CertificateArn"], json!(arn));
     }
 
     #[tokio::test]

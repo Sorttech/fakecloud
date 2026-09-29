@@ -48,7 +48,7 @@ async fn bootstrap(client: &aws_sdk_ecs::Client, cluster: &str, family: &str, ta
         .container_definitions(
             ContainerDefinition::builder()
                 .name("app")
-                .image("public.ecr.aws/library/alpine:latest")
+                .image("public.ecr.aws/docker/library/alpine:latest")
                 .essential(true)
                 .build(),
         );
@@ -487,7 +487,7 @@ async fn codedeploy_service_creates_primary_task_set() {
         .container_definitions(
             ContainerDefinition::builder()
                 .name("app")
-                .image("public.ecr.aws/library/alpine:latest")
+                .image("public.ecr.aws/docker/library/alpine:latest")
                 .essential(true)
                 .build(),
         )
@@ -560,7 +560,7 @@ async fn codedeploy_update_service_flips_primary_task_set() {
         .container_definitions(
             ContainerDefinition::builder()
                 .name("app")
-                .image("public.ecr.aws/library/alpine:latest")
+                .image("public.ecr.aws/docker/library/alpine:latest")
                 .essential(true)
                 .build(),
         )
@@ -573,7 +573,7 @@ async fn codedeploy_update_service_flips_primary_task_set() {
         .container_definitions(
             ContainerDefinition::builder()
                 .name("app")
-                .image("public.ecr.aws/library/alpine:latest")
+                .image("public.ecr.aws/docker/library/alpine:latest")
                 .essential(true)
                 .build(),
         )

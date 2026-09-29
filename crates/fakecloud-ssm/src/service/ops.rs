@@ -82,8 +82,9 @@ impl SsmService {
             tags,
             created_time: now,
             last_modified_time: now,
-            created_by: Arn::global("iam", &state.account_id, "root").to_string(),
-            last_modified_by: Arn::global("iam", &state.account_id, "root").to_string(),
+            created_by: Arn::global_in(&req.region, "iam", &state.account_id, "root").to_string(),
+            last_modified_by: Arn::global_in(&req.region, "iam", &state.account_id, "root")
+                .to_string(),
             ops_item_type,
             // Previously hardcoded None + never rendered, so change-management
             // SLA timelines were lost on round-trip (bug-hunt 2026-06-24, 1.13).
@@ -178,7 +179,7 @@ impl SsmService {
         }
 
         item.last_modified_time = Utc::now();
-        item.last_modified_by = Arn::global("iam", &account_id, "root").to_string();
+        item.last_modified_by = Arn::global_in(&req.region, "iam", &account_id, "root").to_string();
 
         Ok(AwsResponse::ok_json(json!({})))
     }
@@ -297,9 +298,9 @@ impl SsmService {
             resource_type,
             resource_uri,
             created_time: now,
-            created_by: Arn::global("iam", &account_id, "root").to_string(),
+            created_by: Arn::global_in(&req.region, "iam", &account_id, "root").to_string(),
             last_modified_time: now,
-            last_modified_by: Arn::global("iam", &account_id, "root").to_string(),
+            last_modified_by: Arn::global_in(&req.region, "iam", &account_id, "root").to_string(),
         });
 
         Ok(AwsResponse::ok_json(
@@ -435,12 +436,13 @@ impl SsmService {
         // ARN carries the request's credential-scope region (req.region). It is
         // also the storage key, but Get/Update/Delete look up by the exact ARN
         // string the client received here, so keying stays consistent.
-        let arn = format!(
-            "arn:aws:ssm:{}:{}:opsmetadata/{}",
-            req.region.as_str(),
-            state.account_id,
-            resource_id
-        );
+        let arn = Arn::regional(
+            "ssm",
+            &req.region,
+            &state.account_id,
+            &format!("opsmetadata/{resource_id}"),
+        )
+        .to_string();
 
         if state.ops_metadata.contains_key(&arn) {
             return Err(AwsServiceError::aws_error(

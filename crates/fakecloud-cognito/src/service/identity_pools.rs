@@ -24,6 +24,7 @@ use http::StatusCode;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use fakecloud_aws::arn::{partition_of, Arn};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_iam::xml_responses::{generate_role_id, StsCredentials};
 use fakecloud_iam::{CredentialIdentity, SharedIamState, StsTempCredential};
@@ -858,8 +859,13 @@ impl CognitoIdentityService {
                 .unwrap_or_else(generate_role_id)
         };
         let session_name = format!("CognitoIdentityCredentials-{}", identity_id);
-        let assumed_role_arn =
-            format!("arn:aws:sts::{target_account}:assumed-role/{role_name}/{session_name}");
+        let assumed_role_arn = Arn::global(
+            "sts",
+            &target_account,
+            &format!("assumed-role/{role_name}/{session_name}"),
+        )
+        .with_partition(partition_of(&role_arn))
+        .to_string();
         let assumed_role_id = format!("{role_id}:{session_name}");
         let expiration = Utc::now() + chrono::Duration::hours(1);
 
@@ -1300,6 +1306,50 @@ mod merge_tests {
     // M1: MergeDeveloperIdentities where source == destination previously
     // panicked (remove() the identity, then unwrap a None get_mut on the same
     // key). It must be a no-op success now.
+    #[test]
+    fn credentials_for_an_aws_cn_role_carry_an_aws_cn_session_arn() {
+        let svc = svc();
+        let in_cn = |action: &str, body: Value| {
+            let mut r = req(action, body);
+            r.region = "cn-north-1".to_string();
+            r
+        };
+        let create = block_on(svc.handle(in_cn(
+            "CreateIdentityPool",
+            json!({ "IdentityPoolName": "cnpool", "AllowUnauthenticatedIdentities": true }),
+        )))
+        .unwrap();
+        let cb: Value = serde_json::from_slice(create.body.expect_bytes()).unwrap();
+        let pool_id = cb["IdentityPoolId"].as_str().unwrap().to_string();
+        block_on(svc.handle(in_cn(
+            "SetIdentityPoolRoles",
+            json!({
+                "IdentityPoolId": pool_id,
+                "Roles": { "unauthenticated": "arn:aws-cn:iam::123456789012:role/unauth" }
+            }),
+        )))
+        .unwrap();
+        let id =
+            block_on(svc.handle(in_cn("GetId", json!({ "IdentityPoolId": pool_id })))).unwrap();
+        let id: Value = serde_json::from_slice(id.body.expect_bytes()).unwrap();
+        let creds = block_on(svc.handle(in_cn(
+            "GetCredentialsForIdentity",
+            json!({ "IdentityId": id["IdentityId"] }),
+        )))
+        .unwrap();
+        let creds: Value = serde_json::from_slice(creds.body.expect_bytes()).unwrap();
+        let key = creds["Credentials"]["AccessKeyId"].as_str().unwrap();
+        let iam = svc.iam_state.read();
+        let identity = &iam.get("123456789012").unwrap().credential_identities[key];
+        assert!(
+            identity
+                .arn
+                .starts_with("arn:aws-cn:sts::123456789012:assumed-role/unauth/"),
+            "{}",
+            identity.arn
+        );
+    }
+
     #[test]
     fn merge_developer_identities_self_merge_is_noop() {
         let svc = svc();

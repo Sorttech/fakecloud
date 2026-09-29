@@ -47,9 +47,10 @@ impl ResourceProvisioner {
             creation_time: Utc::now(),
             engine_version: Some("AUTO".to_string()),
         };
-        let arn = format!(
-            "arn:aws:athena:{}:{}:workgroup/{}",
-            self.region, self.account_id, name
+        let arn = fakecloud_athena::athena_arn(
+            &self.region,
+            &self.account_id,
+            &format!("workgroup/{}", name),
         );
         account.work_groups.insert(name.clone(), wg);
         if !tags.is_empty() {
@@ -71,9 +72,10 @@ impl ResourceProvisioner {
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
         let name = existing.physical_id.clone();
-        let arn = format!(
-            "arn:aws:athena:{}:{}:workgroup/{}",
-            self.region, self.account_id, name
+        let arn = fakecloud_athena::athena_arn(
+            &self.region,
+            &self.account_id,
+            &format!("workgroup/{}", name),
         );
         let tags = Self::parse_athena_tags(props.get("Tags"));
 
@@ -129,9 +131,10 @@ impl ResourceProvisioner {
             .or_default();
         let wg = account.work_groups.get(physical_id)?;
         match attribute {
-            "Arn" => Some(format!(
-                "arn:aws:athena:{}:{}:workgroup/{}",
-                self.region, self.account_id, wg.name
+            "Arn" => Some(fakecloud_athena::athena_arn(
+                &self.region,
+                &self.account_id,
+                &format!("workgroup/{}", wg.name),
             )),
             "Name" => Some(wg.name.clone()),
             _ => None,
@@ -191,9 +194,10 @@ impl ResourceProvisioner {
             connection_type,
             error: None,
         };
-        let arn = format!(
-            "arn:aws:athena:{}:{}:datacatalog/{}",
-            self.region, self.account_id, name
+        let arn = fakecloud_athena::athena_arn(
+            &self.region,
+            &self.account_id,
+            &format!("datacatalog/{}", name),
         );
         account.data_catalogs.insert(name.clone(), cat);
         if !tags.is_empty() {
@@ -214,9 +218,10 @@ impl ResourceProvisioner {
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
         let name = existing.physical_id.clone();
-        let arn = format!(
-            "arn:aws:athena:{}:{}:datacatalog/{}",
-            self.region, self.account_id, name
+        let arn = fakecloud_athena::athena_arn(
+            &self.region,
+            &self.account_id,
+            &format!("datacatalog/{}", name),
         );
         let tags = Self::parse_athena_tags(props.get("Tags"));
 
@@ -275,9 +280,10 @@ impl ResourceProvisioner {
             .or_default();
         let cat = account.data_catalogs.get(physical_id)?;
         match attribute {
-            "Arn" => Some(format!(
-                "arn:aws:athena:{}:{}:datacatalog/{}",
-                self.region, self.account_id, cat.name
+            "Arn" => Some(fakecloud_athena::athena_arn(
+                &self.region,
+                &self.account_id,
+                &format!("datacatalog/{}", cat.name),
             )),
             "Name" => Some(cat.name.clone()),
             _ => None,

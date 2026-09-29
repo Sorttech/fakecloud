@@ -176,11 +176,11 @@ impl ElastiCacheService {
             let accounts = self.state.read();
             let empty = ElastiCacheState::new(&request.account_id, &request.region);
             let state = accounts.get(&request.account_id).unwrap_or(&empty);
-            let arn = format!(
-                "arn:aws:elasticache:{}:{}:replicationgroup:{}",
+            let arn = elasticache_arn(
                 request.region.as_str(),
-                state.account_id,
-                replication_group_id
+                &state.account_id,
+                "replicationgroup",
+                &replication_group_id,
             );
             (arn, request.region.clone())
         };
@@ -406,9 +406,11 @@ impl ElastiCacheService {
                 status: "associated".to_string(),
             }],
             cluster_enabled: primary_group.cluster_enabled,
-            arn: format!(
-                "arn:aws:elasticache:{}:{}:globalreplicationgroup:{}",
-                region, account_id, global_replication_group_id
+            arn: elasticache_arn(
+                &region,
+                &account_id,
+                "globalreplicationgroup",
+                &global_replication_group_id,
             ),
             num_node_groups: primary_group.num_node_groups.max(1),
         };

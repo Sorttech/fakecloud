@@ -15,7 +15,10 @@ pub(crate) mod service;
 pub(crate) mod state;
 mod validate;
 
-pub use service::{CodeDeployService, CODEDEPLOY_ACTIONS};
+pub use service::{
+    application_arn, deployment_config_arn, deployment_group_arn, CodeDeployService,
+    CODEDEPLOY_ACTIONS,
+};
 pub use state::{
     CodeDeploySnapshot, CodeDeployState, SharedCodeDeployState, CODEDEPLOY_SNAPSHOT_SCHEMA_VERSION,
 };

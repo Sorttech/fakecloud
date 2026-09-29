@@ -54,32 +54,20 @@ impl ResourceProvisioner {
                 .and_then(|x| x.as_bool()),
         });
 
-        let arn = format!(
-            "arn:aws:application-autoscaling:{}:{}:scalable-target/{}",
-            self.region,
-            self.account_id,
-            fakecloud_core::ids::short_id(10)
+        let arn = fakecloud_application_autoscaling::scalable_target_arn(
+            &self.region,
+            &self.account_id,
+            &fakecloud_core::ids::short_id(10),
         );
-        let role = role_arn.unwrap_or_else(|| {
-            let suffix = match service_namespace.as_str() {
-                "ecs" => "ECSService",
-                "elasticmapreduce" => "EMRContainerService",
-                "ec2" => "EC2SpotFleetRequest",
-                "appstream" => "ApplicationAutoScaling_AppStreamFleet",
-                "dynamodb" => "DynamoDBTable",
-                "rds" => "RDSCluster",
-                "sagemaker" => "SageMakerEndpoint",
-                "lambda" => "LambdaConcurrency",
-                "elasticache" => "ElastiCacheRG",
-                "cassandra" => "CassandraTable",
-                "kafka" => "KafkaCluster",
-                _ => "ApplicationAutoScaling_Default",
-            };
-            format!(
-                "arn:aws:iam::{}:role/aws-service-role/applicationautoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_{}",
-                self.account_id, suffix
+        let role = match role_arn {
+            Some(role) => role,
+            None => fakecloud_application_autoscaling::default_service_linked_role(
+                &self.region,
+                &self.account_id,
+                &service_namespace,
             )
-        });
+            .ok_or_else(|| format!("Unsupported ServiceNamespace {service_namespace}"))?,
+        };
 
         let mut state = self.app_autoscaling_state.write();
         let account = state.accounts.entry(self.account_id.clone()).or_default();
@@ -164,14 +152,13 @@ impl ResourceProvisioner {
                 service_namespace, resource_id, scalable_dimension
             ));
         }
-        let arn = format!(
-            "arn:aws:autoscaling:{}:{}:scalingPolicy:{}:resource/{}/{}:policyName/{}",
-            self.region,
-            self.account_id,
-            Uuid::new_v4(),
-            service_namespace,
-            resource_id,
-            policy_name
+        let arn = fakecloud_application_autoscaling::scaling_policy_arn(
+            &self.region,
+            &self.account_id,
+            &Uuid::new_v4().to_string(),
+            &service_namespace,
+            &resource_id,
+            &policy_name,
         );
         let policy = AppasScalingPolicy {
             arn: arn.clone(),

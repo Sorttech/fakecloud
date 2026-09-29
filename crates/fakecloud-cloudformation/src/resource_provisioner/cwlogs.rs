@@ -42,8 +42,8 @@ impl ResourceProvisioner {
         let mut logs_accounts = self.logs_state.write();
         let state = logs_accounts.get_or_create(&self.account_id);
         let arn = format!(
-            "arn:aws:logs:{}:{}:log-group:{}:*",
-            self.region, state.account_id, log_group_name
+            "{}:*",
+            fakecloud_logs::log_group_arn(&self.region, &self.account_id, log_group_name)
         );
 
         let log_group = fakecloud_logs::LogGroup {
@@ -152,8 +152,9 @@ impl ResourceProvisioner {
             .get_mut(&log_group_name)
             .ok_or_else(|| format!("Log group {log_group_name} does not exist"))?;
         let arn = format!(
-            "arn:aws:logs:{}:{}:log-group:{}:log-stream:{}",
-            self.region, self.account_id, log_group_name, log_stream_name
+            "{}:log-stream:{}",
+            fakecloud_logs::log_group_arn(&self.region, &self.account_id, &log_group_name),
+            log_stream_name
         );
         if group.log_streams.contains_key(&log_stream_name) {
             return Err(format!(

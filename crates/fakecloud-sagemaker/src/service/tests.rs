@@ -1555,3 +1555,48 @@ fn cluster_software_inference_runtime_alert_and_pipeline_version_resolve_parent(
     assert_eq!(pv["PipelineVersionId"], 1);
     assert!(pv["PipelineArn"].as_str().unwrap().contains("pipeline/"));
 }
+
+#[test]
+fn china_region_arns_use_aws_cn_partition_and_resolve() {
+    let s = svc();
+    let run_cn = |action: &str, body: Value| {
+        let mut req = mk_req(action, body);
+        req.region = "cn-north-1".into();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        resp_json(&rt.block_on(s.handle(req)).unwrap())
+    };
+
+    let created = run_cn(
+        "CreateModel",
+        json!({"ModelName": "cn-model", "ExecutionRoleArn": "arn:aws-cn:iam::000000000000:role/r"}),
+    );
+    let arn = created["ModelArn"].as_str().unwrap().to_string();
+    assert_eq!(
+        arn,
+        "arn:aws-cn:sagemaker:cn-north-1:000000000000:model/cn-model"
+    );
+
+    let started = run_cn(
+        "StartPipelineExecution",
+        json!({"PipelineName": "p1", "ClientRequestToken": "a".repeat(32)}),
+    );
+    let exec_arn = started["PipelineExecutionArn"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        exec_arn.starts_with("arn:aws-cn:sagemaker:cn-north-1:000000000000:pipeline/p1/execution/"),
+        "{exec_arn}"
+    );
+    let described = run_cn(
+        "DescribePipelineExecution",
+        json!({"PipelineExecutionArn": exec_arn}),
+    );
+    assert_eq!(
+        described["PipelineArn"],
+        "arn:aws-cn:sagemaker:cn-north-1:000000000000:pipeline/p1"
+    );
+}

@@ -311,8 +311,14 @@ fn hex17() -> String {
         .collect()
 }
 
+/// The ARN of the Transfer Family resource at `path` (`server/s-...`,
+/// `user/s-.../name`, ...) in `region`'s partition.
+pub fn resource_arn(region: &str, account: &str, path: &str) -> String {
+    fakecloud_aws::arn::Arn::regional("transfer", region, account, path).to_string()
+}
+
 fn arn(ctx: &Ctx, path: &str) -> String {
-    format!("arn:aws:transfer:{}:{}:{}", ctx.region, ctx.account, path)
+    resource_arn(&ctx.region, &ctx.account, path)
 }
 
 /// Copy the given fields verbatim from `src` into `dst` when present.

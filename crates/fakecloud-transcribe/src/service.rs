@@ -1876,6 +1876,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn china_region_job_tags_resolve_by_aws_cn_arn() {
+        let svc = service();
+        let cn = |action: &str, body: Value| {
+            let mut r = req(action, body);
+            r.region = "cn-north-1".to_string();
+            r
+        };
+        svc.handle(cn(
+            "StartTranscriptionJob",
+            json!({
+                "TranscriptionJobName": "cn-job",
+                "LanguageCode": "en-US",
+                "Media": { "MediaFileUri": "s3://bucket/audio.wav" },
+                "Tags": [{ "Key": "team", "Value": "asr" }]
+            }),
+        ))
+        .await
+        .unwrap();
+        let tags = svc
+            .handle(cn(
+                "ListTagsForResource",
+                json!({ "ResourceArn": "arn:aws-cn:transcribe:cn-north-1:000000000000:transcription-job/cn-job" }),
+            ))
+            .await
+            .unwrap();
+        let tv: Value = serde_json::from_slice(tags.body.expect_bytes()).unwrap();
+        assert_eq!(tv["Tags"][0]["Key"], "team");
+    }
+
+    #[tokio::test]
     async fn vocabulary_and_tagging_round_trip() {
         let svc = service();
         svc.handle(req(

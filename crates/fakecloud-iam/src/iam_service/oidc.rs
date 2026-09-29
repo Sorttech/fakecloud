@@ -139,8 +139,23 @@ impl IamService {
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
 
-        let arn =
-            Arn::global("iam", &state.account_id, &format!("saml-provider/{name}")).to_string();
+        let arn = Arn::global_in(
+            &req.region,
+            "iam",
+            &state.account_id,
+            &format!("saml-provider/{name}"),
+        )
+        .to_string();
+
+        // Names are unique per account; a second create must not replace the
+        // existing provider's metadata, tags and creation date.
+        if state.saml_providers.values().any(|p| p.name == name) {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::CONFLICT,
+                "EntityAlreadyExists",
+                format!("SAMLProvider {name} already exists."),
+            ));
+        }
 
         let provider = SamlProvider {
             arn: arn.clone(),
@@ -174,7 +189,7 @@ impl IamService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let arn = required_param(&req.query_params, "SAMLProviderArn")?;
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         let provider = state.saml_providers.get(&arn).ok_or_else(|| {
@@ -234,7 +249,7 @@ impl IamService {
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         let members: String = state
@@ -344,24 +359,17 @@ impl IamService {
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
 
-        // Store URL without scheme for responses (AWS behavior)
-        let url_without_scheme = url
-            .strip_prefix("https://")
-            .or_else(|| url.strip_prefix("http://"))
-            .unwrap_or(&url)
-            .to_string();
-
-        // ARN uses URL path without query string
-        let url_for_arn = url_without_scheme
-            .split('?')
-            .next()
-            .unwrap_or(&url_without_scheme);
+        // Stored without the scheme (AWS behavior); the ARN also drops the
+        // query string.
+        let (url_without_scheme, url_for_arn) = crate::state::oidc_url_parts(&url);
         let arn = format!(
-            "arn:aws:iam::{}:oidc-provider/{}",
-            state.account_id, url_for_arn
+            "arn:{}:iam::{}:oidc-provider/{}",
+            fakecloud_aws::arn::partition_for(&req.region),
+            state.account_id,
+            url_for_arn
         );
 
-        if state.oidc_providers.contains_key(&arn) {
+        if state.has_oidc_provider_for(&url_for_arn) {
             return Err(AwsServiceError::aws_error(
                 StatusCode::CONFLICT,
                 "EntityAlreadyExists",
@@ -401,7 +409,7 @@ impl IamService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let arn = required_param(&req.query_params, "OpenIDConnectProviderArn")?;
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         let provider = state.oidc_providers.get(&arn).ok_or_else(|| {
@@ -476,7 +484,7 @@ impl IamService {
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         let members: String = state
@@ -646,7 +654,7 @@ impl IamService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let arn = required_param(&req.query_params, "OpenIDConnectProviderArn")?;
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         let provider = state.oidc_providers.get(&arn).ok_or_else(|| {
@@ -693,7 +701,8 @@ impl IamService {
         let cert = ServerCertificate {
             server_certificate_id: format!("ASCA{}", generate_id()),
             arn: format!(
-                "arn:aws:iam::{}:server-certificate{}{}",
+                "arn:{}:iam::{}:server-certificate{}{}",
+                fakecloud_aws::arn::partition_for(&req.region),
                 state.account_id,
                 if path == "/" { "/" } else { &path },
                 name
@@ -747,7 +756,7 @@ impl IamService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let name = required_param(&req.query_params, "ServerCertificateName")?;
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         let cert = state.server_certificates.get(&name).ok_or_else(|| {
@@ -828,7 +837,7 @@ impl IamService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let _ = super::validate_list_pagination(req)?;
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         let members: String = state

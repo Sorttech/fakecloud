@@ -1,6 +1,6 @@
 +++
 title = "Cognito emulator for tests"
-description = "Run AWS Cognito User Pools locally for integration tests with fakecloud. 122 operations, full auth flows (USER_PASSWORD_AUTH, USER_SRP_AUTH, CUSTOM_AUTH), MFA, identity providers, triggers."
+description = "Run AWS Cognito User Pools locally for integration tests with fakecloud. 132 operations, full auth flows (USER_PASSWORD_AUTH, USER_SRP_AUTH, CUSTOM_AUTH), MFA, identity providers, triggers."
 template = "page.html"
 +++
 

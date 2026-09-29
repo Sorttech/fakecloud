@@ -4,6 +4,18 @@
 
 use super::*;
 
+/// An Organizations API error as a CloudFormation resource failure
+/// (`<Code>: <message>`).
+fn aws_failure(err: fakecloud_core::service::AwsServiceError) -> String {
+    format!("{}: {}", err.code(), err.message())
+}
+
+/// A failed organization state mutation as a CloudFormation resource
+/// failure, carrying the error code the Organizations API maps it to.
+fn org_failure(err: fakecloud_organizations::OrgError) -> String {
+    aws_failure(fakecloud_organizations::org_error_to_aws(err))
+}
+
 impl ResourceProvisioner {
     pub(crate) fn create_organization(
         &self,
@@ -35,7 +47,7 @@ impl ResourceProvisioner {
                 "The email address {management_email} is already associated with another account"
             ));
         }
-        let mut state = OrganizationState::bootstrap(&self.account_id);
+        let mut state = OrganizationState::bootstrap_in(&self.region, &self.account_id);
         state.feature_set = feature_set;
         let org_id = state.org_id.clone();
         let org_arn = state.org_arn.clone();
@@ -79,35 +91,10 @@ impl ResourceProvisioner {
         let org = org_lock
             .org_of_account_mut(&self.account_id)
             .ok_or_else(|| "Organization not yet created".to_string())?;
-        // Accept root id, OU id, or `Ref`-resolved logical id (we map to root).
-        let resolved_parent_id = if parent_id == org.root_id || org.ous.contains_key(&parent_id) {
-            parent_id
-        } else {
-            return Err(format!("Parent {parent_id} does not exist"));
-        };
-        let id_suffix: String = Uuid::new_v4()
-            .simple()
-            .to_string()
-            .chars()
-            .take(8)
-            .collect();
-        let id = format!("ou-{}-{}", &org.root_id[2..], id_suffix);
-        let arn = format!(
-            "arn:aws:organizations::{}:ou/{}/{}",
-            org.management_account_id, org.org_id, id
-        );
-        org.ous.insert(
-            id.clone(),
-            OrganizationalUnit {
-                id: id.clone(),
-                arn: arn.clone(),
-                name: name.clone(),
-                parent_id: resolved_parent_id,
-            },
-        );
-        Ok(ProvisionResult::new(id.clone())
-            .with("Id", id)
-            .with("Arn", arn)
+        let ou = org.create_ou(&parent_id, &name).map_err(org_failure)?;
+        Ok(ProvisionResult::new(ou.id.clone())
+            .with("Id", ou.id)
+            .with("Arn", ou.arn)
             .with("Name", name))
     }
 
@@ -309,45 +296,26 @@ impl ResourceProvisioner {
             })
             .unwrap_or_default();
 
+        fakecloud_organizations::check_create_policy_type(&policy_type).map_err(aws_failure)?;
         let mut org_lock = self.organizations_state.write();
         let org = org_lock
             .org_of_account_mut(&self.account_id)
             .ok_or_else(|| "Organization not yet created".to_string())?;
-        let id_suffix: String = Uuid::new_v4()
-            .simple()
-            .to_string()
-            .chars()
-            .take(8)
-            .collect();
-        let id = format!("p-{}", id_suffix);
-        let arn = format!(
-            "arn:aws:organizations::{}:policy/{}/{}/{}",
-            org.management_account_id,
-            org.org_id,
-            policy_type.to_lowercase(),
-            id
-        );
-        org.policies.insert(
-            id.clone(),
-            OrgPolicy {
-                id: id.clone(),
-                arn: arn.clone(),
-                name: name.clone(),
-                description,
-                policy_type,
-                aws_managed: false,
-                content,
-            },
-        );
-        for target in target_ids {
-            org.attachments
-                .entry(target)
-                .or_default()
-                .insert(id.clone());
+        let policy = org
+            .create_policy(&name, &description, &content, &policy_type)
+            .map_err(org_failure)?;
+        for target in &target_ids {
+            if let Err(e) = org.attach_policy(&policy.id, target) {
+                org.policies.remove(&policy.id);
+                for attachments in org.attachments.values_mut() {
+                    attachments.remove(&policy.id);
+                }
+                return Err(org_failure(e));
+            }
         }
-        Ok(ProvisionResult::new(id.clone())
-            .with("Id", id)
-            .with("Arn", arn)
+        Ok(ProvisionResult::new(policy.id.clone())
+            .with("Id", policy.id)
+            .with("Arn", policy.arn)
             .with("Name", name))
     }
 
@@ -378,16 +346,19 @@ impl ResourceProvisioner {
             })
             .ok_or_else(|| "Content is required".to_string())?;
 
+        if serde_json::from_str::<serde_json::Value>(&content).is_err() {
+            return Err("InvalidInputException: Content must be valid JSON".to_string());
+        }
         let mut org_lock = self.organizations_state.write();
         let org = org_lock
             .org_of_account_mut(&self.account_id)
             .ok_or_else(|| "Organization not yet created".to_string())?;
         org.resource_policy = Some(content);
-        let arn = format!(
-            "arn:aws:organizations::{}:resourcepolicy/{}/rp",
-            org.management_account_id, org.org_id
-        );
-        Ok(ProvisionResult::new(arn.clone()).with("Arn", arn))
+        let arn = org.resource_policy_arn();
+        Ok(ProvisionResult::new(arn.clone()).with("Arn", arn).with(
+            "Id",
+            fakecloud_organizations::RESOURCE_POLICY_ID.to_string(),
+        ))
     }
 
     pub(crate) fn delete_organization_resource_policy(

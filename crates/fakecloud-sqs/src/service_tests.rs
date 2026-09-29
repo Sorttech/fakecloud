@@ -3473,3 +3473,61 @@ fn attribute_name_enumeration_stops_at_first_gap() {
     let out = parsed["AttributeNames"].as_array().unwrap();
     assert_eq!(out.len(), 2);
 }
+
+#[test]
+fn china_region_queue_arns_and_policy_use_the_aws_cn_partition() {
+    use fakecloud_core::auth::ResourcePolicyProvider;
+
+    let state: SharedSqsState = Arc::new(RwLock::new(
+        fakecloud_core::multi_account::MultiAccountState::new(
+            "123456789012",
+            "cn-north-1",
+            "http://localhost:4566",
+        ),
+    ));
+    let svc = SqsService::new(state.clone());
+    let in_china = |action: &str, body: Value| {
+        let mut req = make_request(action, body);
+        req.region = "cn-north-1".to_string();
+        req
+    };
+    let url = body_json(
+        svc.create_queue(&in_china("CreateQueue", json!({ "QueueName": "cn-q" })))
+            .unwrap(),
+    )["QueueUrl"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    svc.add_permission(&in_china(
+        "AddPermission",
+        json!({
+            "QueueUrl": url,
+            "Label": "AllowSend",
+            "Actions": ["SendMessage"],
+            "AWSAccountIds": ["111111111111"]
+        }),
+    ))
+    .unwrap();
+    let attrs = body_json(
+        svc.get_queue_attributes(&in_china(
+            "GetQueueAttributes",
+            json!({ "QueueUrl": url, "AttributeNames": ["QueueArn", "Policy"] }),
+        ))
+        .unwrap(),
+    );
+    let queue_arn = attrs["Attributes"]["QueueArn"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(queue_arn, "arn:aws-cn:sqs:cn-north-1:123456789012:cn-q");
+    let policy: Value =
+        serde_json::from_str(attrs["Attributes"]["Policy"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        policy["Statement"][0]["Principal"]["AWS"],
+        json!("arn:aws-cn:iam::111111111111:root")
+    );
+    assert_eq!(policy["Statement"][0]["Resource"], json!(queue_arn));
+
+    let provider = crate::resource_policy::SqsResourcePolicyProvider::new(state);
+    assert!(provider.resource_policy("sqs", &queue_arn).is_some());
+}

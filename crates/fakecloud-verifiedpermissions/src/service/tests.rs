@@ -513,3 +513,39 @@ fn batch_get_policy_mixes_found_and_errors() {
     assert_eq!(errors[0]["code"], json!("POLICY_NOT_FOUND"));
     assert_eq!(errors[1]["code"], json!("POLICY_STORE_NOT_FOUND"));
 }
+
+#[test]
+fn china_region_arns_use_the_aws_cn_partition() {
+    let s = svc();
+    let in_cn = |action: &str, body: Value| -> Value {
+        let mut r = req(action, body);
+        r.region = "cn-north-1".into();
+        let resp = dispatch(&s, &r).expect("op ok");
+        serde_json::from_slice(resp.body.expect_bytes()).unwrap()
+    };
+    let created = in_cn(
+        "CreatePolicyStore",
+        json!({ "validationSettings": { "mode": "OFF" } }),
+    );
+    let id = created["policyStoreId"].as_str().unwrap().to_string();
+    let arn = created["arn"].as_str().unwrap().to_string();
+    assert_eq!(
+        arn,
+        format!("arn:aws-cn:verifiedpermissions::000000000000:policy-store/{id}")
+    );
+    in_cn(
+        "TagResource",
+        json!({ "resourceArn": arn, "tags": { "team": "sec" } }),
+    );
+    let got = in_cn("ListTagsForResource", json!({ "resourceArn": arn }));
+    assert_eq!(got["tags"]["team"], json!("sec"));
+
+    let alias = in_cn(
+        "CreatePolicyStoreAlias",
+        json!({ "aliasName": "policy-store-alias/cn", "policyStoreId": id }),
+    );
+    assert_eq!(
+        alias["aliasArn"],
+        json!("arn:aws-cn:verifiedpermissions:cn-north-1:000000000000:policy-store-alias/cn")
+    );
+}

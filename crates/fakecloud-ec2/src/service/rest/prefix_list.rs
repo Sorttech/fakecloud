@@ -3,6 +3,7 @@
 #![allow(clippy::too_many_lines)]
 
 use super::*;
+use crate::service_helpers::ec2_arn;
 
 /// Collect `<prefix>.N.Cidr` (+ optional `.Description`) into prefix-list entries.
 fn parse_prefix_list_entries(req: &AwsRequest, prefix: &str) -> Vec<PrefixListEntry> {
@@ -40,10 +41,7 @@ fn managed_prefix_list_xml(
         ec2_elem("state", &p.state),
         ec2_elem(
             "prefixListArn",
-            &format!(
-                "arn:aws:ec2:{region}:{owner}:prefix-list/{}",
-                p.prefix_list_id
-            )
+            &ec2_arn(region, owner, &format!("prefix-list/{}", p.prefix_list_id))
         ),
         ec2_elem("prefixListName", &p.prefix_list_name),
         ec2_elem("maxEntries", &p.max_entries.to_string()),

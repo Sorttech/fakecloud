@@ -43,15 +43,14 @@ impl ResourcePolicyProvider for KmsResourcePolicyProvider {
 
 /// Extract the key UUID from a KMS key ARN.
 ///
-/// KMS key ARNs have the form `arn:aws:kms:REGION:ACCOUNT:key/KEY_ID`.
+/// KMS key ARNs have the form `arn:PARTITION:kms:REGION:ACCOUNT:key/KEY_ID`.
 /// Returns `None` for wildcard (`*`) or malformed ARNs.
 fn parse_key_id_from_arn(arn: &str) -> Option<String> {
     if arn == "*" {
         return None;
     }
-    // arn:aws:kms:us-east-1:123456789012:key/UUID
-    let rest = arn.strip_prefix("arn:aws:kms:")?;
-    let key_id = rest.rsplit_once(":key/")?.1;
+    let (_region, _account, resource) = crate::state::parse_kms_arn(arn)?;
+    let key_id = resource.strip_prefix("key/")?;
     if key_id.is_empty() {
         return None;
     }
@@ -105,9 +104,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_key_id_wrong_partition() {
+    fn parse_key_id_other_partition() {
         assert_eq!(
             parse_key_id_from_arn("arn:aws-cn:kms:cn-north-1:123:key/abc"),
+            Some("abc".to_string())
+        );
+        assert_eq!(
+            parse_key_id_from_arn("arn:bogus:kms:cn-north-1:123:key/abc"),
             None
         );
     }

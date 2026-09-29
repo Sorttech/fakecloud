@@ -166,7 +166,7 @@ async fn ecs_register_task_definition() {
         .container_definitions(
             ContainerDefinition::builder()
                 .name("app")
-                .image("public.ecr.aws/library/alpine:latest")
+                .image("public.ecr.aws/docker/library/alpine:latest")
                 .essential(true)
                 .build(),
         )
@@ -187,7 +187,7 @@ async fn ecs_describe_task_definition() {
         .container_definitions(
             ContainerDefinition::builder()
                 .name("app")
-                .image("public.ecr.aws/library/alpine:latest")
+                .image("public.ecr.aws/docker/library/alpine:latest")
                 .essential(true)
                 .build(),
         )
@@ -217,7 +217,7 @@ async fn ecs_deregister_task_definition() {
         .container_definitions(
             ContainerDefinition::builder()
                 .name("app")
-                .image("public.ecr.aws/library/alpine:latest")
+                .image("public.ecr.aws/docker/library/alpine:latest")
                 .essential(true)
                 .build(),
         )
@@ -249,7 +249,7 @@ async fn ecs_delete_task_definitions() {
         .container_definitions(
             ContainerDefinition::builder()
                 .name("app")
-                .image("public.ecr.aws/library/alpine:latest")
+                .image("public.ecr.aws/docker/library/alpine:latest")
                 .essential(true)
                 .build(),
         )
@@ -282,7 +282,7 @@ async fn ecs_list_task_definitions() {
         .container_definitions(
             ContainerDefinition::builder()
                 .name("app")
-                .image("public.ecr.aws/library/alpine:latest")
+                .image("public.ecr.aws/docker/library/alpine:latest")
                 .essential(true)
                 .build(),
         )
@@ -304,7 +304,7 @@ async fn ecs_list_task_definition_families() {
         .container_definitions(
             ContainerDefinition::builder()
                 .name("app")
-                .image("public.ecr.aws/library/alpine:latest")
+                .image("public.ecr.aws/docker/library/alpine:latest")
                 .essential(true)
                 .build(),
         )
@@ -471,7 +471,7 @@ async fn register_conformance_task_def(client: &aws_sdk_ecs::Client, family: &st
         .container_definitions(
             ContainerDefinition::builder()
                 .name("app")
-                .image("public.ecr.aws/library/alpine:latest")
+                .image("public.ecr.aws/docker/library/alpine:latest")
                 .essential(true)
                 .build(),
         )
@@ -642,7 +642,7 @@ async fn bootstrap_service_fixtures(client: &aws_sdk_ecs::Client, cluster: &str,
         .container_definitions(
             ContainerDefinition::builder()
                 .name("app")
-                .image("public.ecr.aws/library/alpine:latest")
+                .image("public.ecr.aws/docker/library/alpine:latest")
                 .essential(true)
                 .build(),
         )

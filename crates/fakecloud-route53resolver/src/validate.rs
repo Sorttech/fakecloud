@@ -8,6 +8,7 @@ use http::StatusCode;
 use serde_json::Value;
 use uuid::Uuid;
 
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::service::AwsServiceError;
 
 use crate::state::{Tag, TargetAddress};
@@ -63,9 +64,9 @@ pub fn now_rfc3339() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
-/// `arn:aws:route53resolver:<region>:<account>:<kind>/<id>`.
+/// `arn:<partition>:route53resolver:<region>:<account>:<kind>/<id>`.
 pub fn arn(region: &str, account: &str, kind: &str, id: &str) -> String {
-    format!("arn:aws:route53resolver:{region}:{account}:{kind}/{id}")
+    Arn::regional("route53resolver", region, account, &format!("{kind}/{id}")).to_string()
 }
 
 /// FNV-1a hash of a string, used to derive stable deterministic ids/suffixes.

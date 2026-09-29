@@ -188,7 +188,7 @@ pub(crate) fn record_pre_token_gen_invocation(
     invoked_at: chrono::DateTime<Utc>,
     duration_ms: u64,
 ) {
-    let user_pool_arn = format!("arn:aws:cognito-idp:{region}:{account_id}:userpool/{pool_id}");
+    let user_pool_arn = crate::user_pool_arn(region, account_id, pool_id);
 
     let mut claims_added: Vec<String> = Vec::new();
     let mut claims_overridden: Vec<String> = Vec::new();

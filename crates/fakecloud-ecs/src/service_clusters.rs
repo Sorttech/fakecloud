@@ -95,12 +95,7 @@ impl EcsService {
         } else {
             for name in &names {
                 failures.push(json!({
-                    "arn": format!(
-                        "arn:aws:ecs:{}:{}:cluster/{}",
-                        request.region.as_str(),
-                        account,
-                        name
-                    ),
+                    "arn": crate::state::ecs_arn(request.region.as_str(), &account, &format!("cluster/{}", name)),
                     "reason": "MISSING",
                 }));
             }

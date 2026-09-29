@@ -58,12 +58,12 @@ impl ResourcePolicyProvider for SnsResourcePolicyProvider {
 }
 
 /// A very light validity check on an SNS topic ARN. Accepts the
-/// `arn:aws:sns:REGION:ACCOUNT:NAME` shape and nothing else — anything
+/// `arn:PARTITION:sns:REGION:ACCOUNT:NAME` shape and nothing else — anything
 /// that doesn't look like an SNS ARN short-circuits to `None` before
 /// we reach the state map so we never accidentally hand out a policy
 /// belonging to some unrelated ARN that happens to be a map key.
 fn is_sns_topic_arn(arn: &str) -> bool {
-    let Some(rest) = arn.strip_prefix("arn:aws:sns:") else {
+    let Some(rest) = fakecloud_aws::arn::arn_resource(arn, "sns") else {
         return false;
     };
     // Expect exactly 3 colon-separated segments after the prefix:

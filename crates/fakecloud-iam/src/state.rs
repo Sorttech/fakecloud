@@ -434,7 +434,19 @@ pub struct OrganizationsAccessReport {
 }
 
 impl IamState {
+    /// A fresh account in the `aws` partition.
     pub fn new(account_id: &str) -> Self {
+        Self::new_in_partition(account_id, "aws")
+    }
+
+    /// A fresh account in the partition `region` belongs to. The account's
+    /// seeded service-linked roles carry that partition. Accounts are created
+    /// for the server's configured region (`MultiAccountState::region`).
+    pub fn new_in_region(account_id: &str, region: &str) -> Self {
+        Self::new_in_partition(account_id, fakecloud_aws::arn::partition_for(region))
+    }
+
+    fn new_in_partition(account_id: &str, partition: &str) -> Self {
         let mut state = Self {
             account_id: account_id.to_string(),
             users: BTreeMap::new(),
@@ -472,14 +484,14 @@ impl IamState {
             delegation_requests: BTreeMap::new(),
             outbound_web_identity_federation_enabled: false,
         };
-        state.seed_default_service_linked_roles();
+        state.seed_default_service_linked_roles(partition);
         state
     }
 
     /// AWS accounts ship with a handful of service-linked roles created
     /// automatically (Support, Trusted Advisor, ...). `aws_iam_roles` and other
     /// callers expect a non-empty `ListRoles` on a fresh account, so seed them.
-    fn seed_default_service_linked_roles(&mut self) {
+    fn seed_default_service_linked_roles(&mut self, partition: &str) {
         let now = Utc::now();
         for (service, name) in [
             ("support.amazonaws.com", "AWSServiceRoleForSupport"),
@@ -489,7 +501,10 @@ impl IamState {
             ),
         ] {
             let path = format!("/aws-service-role/{service}/");
-            let arn = format!("arn:aws:iam::{}:role{}{}", self.account_id, path, name);
+            let arn = format!(
+                "arn:{partition}:iam::{}:role{}{}",
+                self.account_id, path, name
+            );
             self.roles.insert(
                 name.to_string(),
                 IamRole {
@@ -510,9 +525,21 @@ impl IamState {
         }
     }
 
-    pub fn reset(&mut self) {
+    /// Whether this account already has an OIDC provider for `url_for_arn`
+    /// (see [`oidc_url_parts`]). An account has one provider per URL, whichever
+    /// partition the ARN it was created under names.
+    pub fn has_oidc_provider_for(&self, url_for_arn: &str) -> bool {
+        self.oidc_providers.keys().any(|arn| {
+            arn.split_once(":oidc-provider/")
+                .is_some_and(|(_, url)| url == url_for_arn)
+        })
+    }
+
+    /// Empty the account, reseeding it for `region` (the server's configured
+    /// region, as when the account was created).
+    pub fn reset(&mut self, region: &str) {
         let account_id = self.account_id.clone();
-        *self = Self::new(&account_id);
+        *self = Self::new_in_region(&account_id, region);
     }
 
     /// Look up the secret access key, session token, and resolved principal
@@ -647,8 +674,8 @@ impl IamState {
 }
 
 impl AccountState for IamState {
-    fn new_for_account(account_id: &str, _region: &str, _endpoint: &str) -> Self {
-        Self::new(account_id)
+    fn new_for_account(account_id: &str, region: &str, _endpoint: &str) -> Self {
+        Self::new_in_region(account_id, region)
     }
 }
 
@@ -672,10 +699,38 @@ pub struct IamSnapshot {
 
 pub const IAM_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 
+/// An OIDC provider URL split the way `CreateOpenIDConnectProvider` stores it:
+/// the URL without its scheme, and the part of that the ARN is built from (no
+/// query string).
+pub fn oidc_url_parts(url: &str) -> (String, String) {
+    let without_scheme = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    let for_arn = without_scheme.split('?').next().unwrap_or(without_scheme);
+    (without_scheme.to_string(), for_arn.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use fakecloud_aws::arn::Arn;
+
+    #[test]
+    fn seeded_service_linked_roles_take_the_region_partition() {
+        use fakecloud_core::multi_account::AccountState;
+        let support = |s: &IamState| s.roles["AWSServiceRoleForSupport"].arn.clone();
+        let mut cn = IamState::new_for_account("123456789012", "cn-north-1", "");
+        assert_eq!(
+            support(&cn),
+            "arn:aws-cn:iam::123456789012:role/aws-service-role/support.amazonaws.com/AWSServiceRoleForSupport"
+        );
+        cn.reset("cn-north-1");
+        assert!(support(&cn).starts_with("arn:aws-cn:iam::"));
+
+        let commercial = IamState::new_for_account("123456789012", "us-east-1", "");
+        assert!(support(&commercial).starts_with("arn:aws:iam::"));
+    }
 
     fn iam_user(name: &str, account_id: &str) -> IamUser {
         IamUser {

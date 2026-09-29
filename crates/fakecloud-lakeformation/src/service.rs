@@ -20,6 +20,7 @@ use serde_json::{json, Map, Value};
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 
+use fakecloud_aws::arn::{partition_of, Arn};
 use fakecloud_core::pagination::paginate_checked;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_persistence::SnapshotStore;
@@ -486,7 +487,7 @@ impl LakeFormationService {
                     .principal
                     .as_ref()
                     .map(|p| p.arn.clone())
-                    .unwrap_or_else(|| format!("arn:aws:iam::{}:root", req.account_id)),
+                    .unwrap_or_else(|| Arn::global_in(&req.region, "iam", &req.account_id, "root").to_string()),
             }))),
             // Query planning
             "StartQueryPlanning" => self.start_query_planning(req, &body),
@@ -889,10 +890,15 @@ impl LakeFormationService {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let role_arn = str_field(body, "RoleArn").or(if use_slr {
-            Some(format!(
-                "arn:aws:iam::{}:role/aws-service-role/lakeformation.amazonaws.com/AWSServiceRoleForLakeFormationDataAccess",
-                req.account_id
-            ))
+            Some(
+                Arn::global(
+                    "iam",
+                    &req.account_id,
+                    "role/aws-service-role/lakeformation.amazonaws.com/AWSServiceRoleForLakeFormationDataAccess",
+                )
+                .with_partition(partition_of(&arn))
+                .to_string(),
+            )
         } else {
             None
         });
@@ -1176,7 +1182,7 @@ impl LakeFormationService {
                             "Resource": o.resource,
                             "Principal": o.principal,
                             "LastModified": ts(o.last_modified),
-                            "LastUpdatedBy": format!("arn:aws:iam::{}:root", req.account_id),
+                            "LastUpdatedBy": Arn::global_in(&req.region, "iam", &req.account_id, "root").to_string(),
                         });
                         if let Some(c) = &o.condition {
                             m["Condition"] = c.clone();
@@ -1348,12 +1354,13 @@ impl LakeFormationService {
 
     fn create_idc(&self, req: &AwsRequest, body: &Value) -> Result<AwsResponse, AwsServiceError> {
         let catalog = catalog_id(body, &req.account_id);
-        let application_arn = format!(
-            "arn:aws:sso::{}:application/ssoins-{}/apl-{}",
-            req.account_id,
-            alphanum(16),
-            alphanum(16)
-        );
+        let application_arn = Arn::global_in(
+            &req.region,
+            "sso",
+            &req.account_id,
+            &format!("application/ssoins-{}/apl-{}", alphanum(16), alphanum(16)),
+        )
+        .to_string();
         let record = IdentityCenterRecord {
             catalog_id: catalog.clone(),
             instance_arn: str_field(body, "InstanceArn"),
@@ -2181,6 +2188,41 @@ mod tests {
             "210987654321"
         );
         assert_eq!(out["ResourceInfo"]["WithPrivilegedAccess"], true);
+    }
+
+    #[test]
+    fn china_region_arns_use_the_aws_cn_partition() {
+        let svc = svc();
+        let in_cn = |body: Value| {
+            let mut r = req(body);
+            r.region = "cn-north-1".to_string();
+            r
+        };
+        let arn = "arn:aws-cn:s3:::cn-lake";
+        let reg = json!({ "ResourceArn": arn, "UseServiceLinkedRole": true });
+        svc.register_resource(&in_cn(reg.clone()), &reg).unwrap();
+        let desc = json!({ "ResourceArn": arn });
+        let out = body_of(svc.describe_resource(&in_cn(desc.clone()), &desc).unwrap());
+        assert_eq!(
+            out["ResourceInfo"]["RoleArn"],
+            "arn:aws-cn:iam::123456789012:role/aws-service-role/lakeformation.amazonaws.com/AWSServiceRoleForLakeFormationDataAccess"
+        );
+
+        let out = body_of(
+            svc.dispatch("GetDataLakePrincipal", &in_cn(json!({})))
+                .unwrap(),
+        );
+        assert_eq!(out["Identity"], "arn:aws-cn:iam::123456789012:root");
+
+        let idc = json!({});
+        let out = body_of(svc.create_idc(&in_cn(idc.clone()), &idc).unwrap());
+        assert!(
+            out["ApplicationArn"]
+                .as_str()
+                .unwrap()
+                .starts_with("arn:aws-cn:sso::123456789012:application/ssoins-"),
+            "{out}"
+        );
     }
 
     #[test]

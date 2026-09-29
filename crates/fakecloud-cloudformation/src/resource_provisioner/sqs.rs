@@ -92,10 +92,7 @@ impl ResourceProvisioner {
         let mut __sqs_mas = self.sqs_state.write();
         let state = __sqs_mas.get_or_create(&self.account_id);
         let queue_url = format!("{}/{}/{}", state.endpoint, state.account_id, queue_name);
-        let arn = format!(
-            "arn:aws:sqs:{}:{}:{}",
-            self.region, state.account_id, queue_name
-        );
+        let arn = self.regional_arn("sqs", queue_name);
 
         let is_fifo = queue_name.ends_with(".fifo");
         let mut attributes = std::collections::BTreeMap::new();

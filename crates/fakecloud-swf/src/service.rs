@@ -2338,6 +2338,30 @@ mod tests {
     }
 
     #[test]
+    fn china_region_domain_arn_uses_aws_cn_partition_and_tags_by_it() {
+        let svc = service();
+        let cn = |action: &str, body: Value| {
+            let mut r = req(action, body);
+            r.region = "cn-north-1".to_string();
+            let resp = svc.dispatch(action, &r).unwrap();
+            serde_json::from_slice::<Value>(resp.body.expect_bytes()).unwrap_or(Value::Null)
+        };
+        cn(
+            "RegisterDomain",
+            json!({
+                "name": "cn-d",
+                "workflowExecutionRetentionPeriodInDays": "1",
+                "tags": [{ "key": "k", "value": "v" }]
+            }),
+        );
+        let out = cn("DescribeDomain", json!({ "name": "cn-d" }));
+        let arn = out["domainInfo"]["arn"].as_str().unwrap().to_string();
+        assert_eq!(arn, "arn:aws-cn:swf:cn-north-1:000000000000:/domain/cn-d");
+        let tags = cn("ListTagsForResource", json!({ "resourceArn": arn }));
+        assert_eq!(tags["tags"][0]["key"], "k");
+    }
+
+    #[test]
     fn duplicate_domain_rejected() {
         let svc = service();
         let body = json!({ "name": "d1", "workflowExecutionRetentionPeriodInDays": "1" });

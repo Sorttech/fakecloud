@@ -7,7 +7,6 @@ use http::StatusCode;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
-use fakecloud_aws::arn::Arn;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use crate::service::{generate_id, ApiGatewayV2Service};
@@ -545,7 +544,7 @@ impl ApiGatewayV2Service {
                 );
                 let mut entry = json!({
                     "DomainName": name,
-                    "DomainNameArn": Arn::new("apigateway", req.region.as_str(), "", &format!("/domainnames/{name}")).to_string(),
+                    "DomainNameArn": crate::state::apigateway_arn(&req.region, "", &format!("/domainnames/{name}")),
                     "DomainNameConfigurations": configs,
                     "ApiMappingSelectionExpression": "$request.basepath",
                     "RoutingMode": "API_MAPPING_ONLY",
@@ -809,10 +808,7 @@ impl ApiGatewayV2Service {
                 let id = rand_id();
                 let entry = json!({
                     "RoutingRuleId": id,
-                    "RoutingRuleArn": format!(
-                        "arn:aws:apigateway:{}::/domainnames/{}/routingrules/{}",
-                        req.region, domain, id
-                    ),
+                    "RoutingRuleArn": crate::state::apigateway_arn(&req.region, "", &format!("/domainnames/{}/routingrules/{}", domain, id)),
                     "Priority": priority,
                     "Conditions": conditions,
                     "Actions": actions,
@@ -842,10 +838,7 @@ impl ApiGatewayV2Service {
                     .ok_or_else(|| missing("Priority"))?;
                 let entry = json!({
                     "RoutingRuleId": id,
-                    "RoutingRuleArn": format!(
-                        "arn:aws:apigateway:{}::/domainnames/{}/routingrules/{}",
-                        req.region, domain, id
-                    ),
+                    "RoutingRuleArn": crate::state::apigateway_arn(&req.region, "", &format!("/domainnames/{}/routingrules/{}", domain, id)),
                     "Priority": priority,
                     "Conditions": conditions,
                     "Actions": actions,
@@ -1868,7 +1861,7 @@ impl ApiGatewayV2Service {
                 }
                 json!({
                     id_field: id,
-                    "PortalArn": Arn::new("apigateway", req.region.as_str(), "", &format!("/portals/{id}")).to_string(),
+                    "PortalArn": crate::state::apigateway_arn(&req.region, "", &format!("/portals/{id}")),
                     "LastModified": now,
                     "LastPublished": now,
                     "LastPublishedDescription": "",
@@ -1884,7 +1877,7 @@ impl ApiGatewayV2Service {
             }
             "portal_products" => json!({
                 id_field: id,
-                "PortalProductArn": Arn::new("apigateway", req.region.as_str(), "", &format!("/portalproducts/{id}")).to_string(),
+                "PortalProductArn": crate::state::apigateway_arn(&req.region, "", &format!("/portalproducts/{id}")),
                 "LastModified": now,
                 "Description": input.get("Description").and_then(|x| x.as_str()).unwrap_or(""),
                 "DisplayName": input.get("DisplayName").and_then(|x| x.as_str()).unwrap_or(&id),
@@ -2005,10 +1998,7 @@ impl ApiGatewayV2Service {
                     .to_string();
                 json!({
                     "ProductPageId": id,
-                    "ProductPageArn": format!(
-                        "arn:aws:apigateway:{}::/portalproducts/{}/productpages/{}",
-                        req.region, parent, id
-                    ),
+                    "ProductPageArn": crate::state::apigateway_arn(&req.region, "", &format!("/portalproducts/{}/productpages/{}", parent, id)),
                     // Internal-only: the summary shape requires pageTitle
                     // but Create/Update responses don't carry it. We
                     // strip this before returning the response below.
@@ -2047,10 +2037,7 @@ impl ApiGatewayV2Service {
                     .unwrap_or_else(|| json!({}));
                 json!({
                     "ProductRestEndpointPageId": id,
-                    "ProductRestEndpointPageArn": format!(
-                        "arn:aws:apigateway:{}::/portalproducts/{}/productrestendpointpages/{}",
-                        req.region, parent, id
-                    ),
+                    "ProductRestEndpointPageArn": crate::state::apigateway_arn(&req.region, "", &format!("/portalproducts/{}/productrestendpointpages/{}", parent, id)),
                     // Internal-only: summary shape requires endpoint at
                     // root but Create/Update responses don't carry it.
                     "_summary_endpoint": id.clone(),

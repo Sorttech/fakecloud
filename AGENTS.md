@@ -5,9 +5,9 @@ Local AWS cloud emulator. Part of the faisca project family.
 ## Product Context
 
 - FakeCloud is a local AWS emulator focused on high-fidelity behavior and AWS-compatible responses.
-- Current project state: 105 AWS services, 7,508 operations, 248,557/248,557 Smithy conformance variants pass — true 100% across every implemented service, no flake margin. See [the parity matrix](website/content/docs/parity.md) for the full service-by-service breakdown of control-plane vs data-plane coverage and known limitations.
+- Current project state: 105 AWS services, 7,509 operations, 248,557/248,557 Smithy conformance variants pass — true 100% across every implemented service, no flake margin. See [the parity matrix](website/content/docs/parity.md) for the full service-by-service breakdown of control-plane vs data-plane coverage and known limitations.
 - The broader roadmap prioritizes services that LocalStack keeps behind paid tiers, especially ECS, ELB/ALB, CloudFront, CloudWatch Metrics, and EC2.
-- Introspection SDKs (Rust, Python, TypeScript, Go, PHP, Java) are already built and maintained for the `/_fakecloud/*` endpoints.
+- Introspection SDKs (Rust, Python, TypeScript, Go, PHP, Java, .NET) are already built and maintained for the `/_fakecloud/*` endpoints.
 
 ## Build And Run
 
@@ -45,6 +45,7 @@ cargo fmt --check                        # format check
 - SDK tests should use official `aws-sdk-rust` crates.
 - CLI tests should use `TestServer::aws_cli()`.
 - Conformance coverage and E2E coverage serve different purposes; do not mix them.
+- DynamoDB behavior is also gated by the independent paritysuite suite (expectations recorded against live DynamoDB): `scripts/dynamodb-conformance.sh [path/to/fakecloud]` (needs node 24, npm, jq), run in CI by `dynamodb-conformance.yml`. Any failing test outside `scripts/dynamodb-conformance-known-failures.txt` fails CI; fix the behavior, never add a line to hide a regression.
 
 ### Behavior And Fidelity
 

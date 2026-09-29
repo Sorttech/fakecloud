@@ -98,12 +98,7 @@ impl CognitoService {
         // pool's region; the ARN and every issuer/discovery derivation read the
         // region back out of the pool id. Storage is keyed by pool id, unchanged.
         let pool_id = generate_pool_id(req.region.as_str());
-        let arn = format!(
-            "arn:aws:cognito-idp:{}:{}:userpool/{}",
-            req.region.as_str(),
-            state.account_id,
-            pool_id
-        );
+        let arn = crate::user_pool_arn(req.region.as_str(), &state.account_id, &pool_id);
 
         let now = Utc::now();
 
@@ -406,13 +401,13 @@ impl CognitoService {
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
 
-        if state.user_pools.remove(pool_id).is_none() {
+        let Some(pool) = state.user_pools.remove(pool_id) else {
             return Err(AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
                 "ResourceNotFoundException",
                 format!("User pool {pool_id} does not exist."),
             ));
-        }
+        };
 
         // Remove associated users
         state.users.remove(pool_id);
@@ -438,15 +433,8 @@ impl CognitoService {
         // Remove associated domains
         state.domains.retain(|_, d| d.user_pool_id != pool_id);
 
-        // Remove associated tags (match by pool ARN). Derive the region from the
-        // pool id prefix so it matches the ARN minted at CreateUserPool time,
-        // regardless of the current server default region.
-        let arn_region = pool_id.split('_').next().unwrap_or(&state.region);
-        let arn_prefix = format!(
-            "arn:aws:cognito-idp:{}:{}:userpool/{}",
-            arn_region, state.account_id, pool_id
-        );
-        state.tags.remove(&arn_prefix);
+        // Remove the tags stored under the pool's ARN.
+        state.tags.remove(&pool.arn);
 
         // Remove associated import jobs
         state.import_jobs.remove(pool_id);

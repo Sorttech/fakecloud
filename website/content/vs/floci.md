@@ -32,14 +32,14 @@ Run your actual test suite against both. Numbers published on landing pages are 
 | Distribution | Single static binary (~19 MB) + Docker image |
 | Startup | ~300ms |
 | Idle memory | ~10 MiB |
-| Services covered today | 49 (3,966 ops) at true 100% conformance (248,557/248,557 variants), incl. ECR + ECS + ELBv2 |
-| Lambda execution | Real code in 13 Docker runtime containers |
+| Services covered today | 105 (7,509 ops) at true 100% conformance (248,557/248,557 variants), incl. ECR + ECS + ELBv2 |
+| Lambda execution | Real code in 23 Docker runtime containers |
 | RDS | Real PostgreSQL/MySQL/MariaDB via Docker |
 | ElastiCache | Real Redis/Valkey/Memcached via Docker |
 | Cross-service wiring | S3 -> Lambda, SNS fan-out, EventBridge -> Step Functions, SES inbound -> S3/SNS/Lambda, 15+ more fire end-to-end |
 | Conformance methodology | Smithy-validated, 248,557/248,557 test variants pass on every commit |
 | Terraform TestAcc CI | Yes (upstream suites run against fakecloud) |
-| Test-assertion SDKs | TypeScript, Python, Go, PHP, Java, Rust |
+| Test-assertion SDKs | TypeScript, Python, Go, PHP, Java, Rust, .NET |
 | Multi-account, SCPs, ABAC | Yes |
 | License | AGPL-3.0 |
 

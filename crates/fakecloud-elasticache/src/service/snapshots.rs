@@ -123,11 +123,11 @@ impl ElastiCacheService {
             })?;
 
         // ARN carries the request's credential-scope region (req.region).
-        let arn = format!(
-            "arn:aws:elasticache:{}:{}:serverlesssnapshot:{}",
+        let arn = elasticache_arn(
             request.region.as_str(),
-            state.account_id,
-            serverless_cache_snapshot_name
+            &state.account_id,
+            "serverlesssnapshot",
+            &serverless_cache_snapshot_name,
         );
         let snapshot = ServerlessCacheSnapshot {
             serverless_cache_snapshot_name: serverless_cache_snapshot_name.clone(),
@@ -353,11 +353,11 @@ impl ElastiCacheService {
                 )
             })?;
 
-            let arn = format!(
-                "arn:aws:elasticache:{}:{}:snapshot:{}",
+            let arn = elasticache_arn(
                 request.region.as_str(),
-                state.account_id,
-                snapshot_name
+                &state.account_id,
+                "snapshot",
+                &snapshot_name,
             );
 
             // `creating` when a runtime is wired (the redis RDB dump runs in the
@@ -549,11 +549,11 @@ impl ElastiCacheService {
             ));
         }
         snap.snapshot_name = target.clone();
-        snap.arn = format!(
-            "arn:aws:elasticache:{}:{}:snapshot:{}",
+        snap.arn = elasticache_arn(
             request.region.as_str(),
-            state.account_id,
-            target
+            &state.account_id,
+            "snapshot",
+            &target,
         );
         // A copy duplicates an already-complete snapshot, so it is available
         // immediately — there is nothing to dump. (Previously it was left
@@ -614,11 +614,11 @@ impl ElastiCacheService {
                 )
             })?;
         snap.serverless_cache_snapshot_name = target.clone();
-        snap.arn = format!(
-            "arn:aws:elasticache:{}:{}:serverlesssnapshot:{}",
+        snap.arn = elasticache_arn(
             request.region.as_str(),
-            state.account_id,
-            target
+            &state.account_id,
+            "serverlesssnapshot",
+            &target,
         );
         // A copy of an already-complete serverless snapshot is available
         // immediately; it was previously stuck `creating` with no finalizer.

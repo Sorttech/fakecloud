@@ -81,16 +81,16 @@ CRATES=(
   fakecloud-eks              # only core/persistence/aws deps
   fakecloud-efs              # depends on ec2 (subnet AZ/VPC resolution)
   fakecloud-mq               # only core/persistence/aws deps
-  fakecloud-kafka            # only core/persistence deps
+  fakecloud-kafka            # only core/persistence/aws deps
   fakecloud-mwaa             # only core/persistence deps
   fakecloud-fis              # only core/persistence deps
-  fakecloud-xray             # only core/persistence deps
-  fakecloud-appsync          # only core/persistence deps
+  fakecloud-xray             # only core/persistence/aws deps
+  fakecloud-appsync          # only core/persistence/aws deps
   fakecloud-amplify          # only core/persistence deps
   fakecloud-mediaconvert     # only core/persistence deps
   fakecloud-serverlessrepo   # only core/persistence deps
   fakecloud-iotdata          # only core/persistence deps
-  fakecloud-pinpoint         # only core/persistence deps
+  fakecloud-pinpoint         # only core/persistence/aws deps
   fakecloud-iot              # only core/persistence deps
   fakecloud-iotwireless      # only core/persistence deps
   fakecloud-sagemaker        # only core/persistence deps

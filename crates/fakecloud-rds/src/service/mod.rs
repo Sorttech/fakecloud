@@ -15,9 +15,9 @@ use fakecloud_persistence::SnapshotStore;
 
 use crate::runtime::{RdsRuntime, RuntimeError};
 use crate::state::{
-    default_engine_versions, default_orderable_options, DbInstance, DbParameterGroup, DbSnapshot,
-    DbSubnetGroup, EngineVersionInfo, OrderableDbInstanceOption, RdsSnapshot, RdsState, RdsTag,
-    SharedRdsState, RDS_SNAPSHOT_SCHEMA_VERSION,
+    default_engine_versions, default_orderable_options, rds_arn, DbInstance, DbParameterGroup,
+    DbSnapshot, DbSubnetGroup, EngineVersionInfo, OrderableDbInstanceOption, RdsSnapshot, RdsState,
+    RdsTag, SharedRdsState, RDS_SNAPSHOT_SCHEMA_VERSION,
 };
 
 const RDS_NS: &str = "http://rds.amazonaws.com/doc/2014-10-31/";
