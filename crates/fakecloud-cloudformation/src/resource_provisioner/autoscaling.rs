@@ -56,11 +56,12 @@ fn str_list(p: &Value, k: &str) -> Vec<String> {
 
 impl ResourceProvisioner {
     fn asg_arn(&self, kind: &str, name: &str) -> String {
-        format!(
-            "arn:aws:autoscaling:{}:{}:{kind}:{}:{kind}Name/{name}",
-            self.region,
-            self.account_id,
-            Uuid::new_v4()
+        fakecloud_autoscaling::autoscaling_arn(
+            &self.region,
+            &self.account_id,
+            kind,
+            &Uuid::new_v4().to_string(),
+            name,
         )
     }
 
@@ -182,9 +183,9 @@ impl ResourceProvisioner {
             instances,
             tags: Vec::new(),
             status: None,
-            service_linked_role_arn: format!(
-                "arn:aws:iam::{}:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling",
-                self.account_id
+            service_linked_role_arn: fakecloud_autoscaling::service_linked_role_arn(
+                &self.region,
+                &self.account_id,
             ),
         };
         self.autoscaling_state

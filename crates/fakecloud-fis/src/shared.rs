@@ -2,29 +2,34 @@
 //! id generation, timestamps, and client-token minting. Kept in one place so the
 //! create/get/start paths cannot diverge on wire format.
 
+use fakecloud_aws::arn::Arn;
 use uuid::Uuid;
+
+fn fis_arn(region: &str, account: &str, resource: &str) -> String {
+    Arn::regional("fis", region, account, resource).to_string()
+}
 
 /// The FIS experiment-template ARN
 /// (`arn:aws:fis:{region}:{account}:experiment-template/{id}`).
 pub fn experiment_template_arn(region: &str, account: &str, id: &str) -> String {
-    format!("arn:aws:fis:{region}:{account}:experiment-template/{id}")
+    fis_arn(region, account, &format!("experiment-template/{id}"))
 }
 
 /// The FIS experiment ARN (`arn:aws:fis:{region}:{account}:experiment/{id}`).
 pub fn experiment_arn(region: &str, account: &str, id: &str) -> String {
-    format!("arn:aws:fis:{region}:{account}:experiment/{id}")
+    fis_arn(region, account, &format!("experiment/{id}"))
 }
 
 /// The FIS safety-lever ARN
 /// (`arn:aws:fis:{region}:{account}:safety-lever/{id}`).
 pub fn safety_lever_arn(region: &str, account: &str, id: &str) -> String {
-    format!("arn:aws:fis:{region}:{account}:safety-lever/{id}")
+    fis_arn(region, account, &format!("safety-lever/{id}"))
 }
 
 /// The FIS action ARN. Actions are AWS-owned, so the account field is empty:
 /// `arn:aws:fis:{region}::action/{actionId}`.
 pub fn action_arn(region: &str, action_id: &str) -> String {
-    format!("arn:aws:fis:{region}::action/{action_id}")
+    fis_arn(region, "", &format!("action/{action_id}"))
 }
 
 /// The experiment-template `id` embedded in an experiment-template ARN (the

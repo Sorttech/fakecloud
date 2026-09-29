@@ -19,7 +19,7 @@ mod e2e_tests;
 pub use persistence::save_config_snapshot;
 pub use service::ConfigService;
 pub use state::{
-    ConfigAccounts, ConfigSnapshot, ConfigurationItem, SharedConfigState,
-    CONFIG_SNAPSHOT_SCHEMA_VERSION,
+    config_arn, config_service_linked_role_arn, ConfigAccounts, ConfigSnapshot, ConfigurationItem,
+    SharedConfigState, CONFIG_SNAPSHOT_SCHEMA_VERSION,
 };
 pub use validate::CrossServiceStates;

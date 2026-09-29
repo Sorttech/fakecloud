@@ -135,14 +135,14 @@ pub(super) fn expand_function_extras(
 /// role is still created (assume-role works) so the function is no longer
 /// role-less.
 fn build_execution_role(policies: Option<&Value>) -> Value {
-    let mut managed_arns: Vec<Value> = vec![json!(
-        "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+    let mut managed_arns: Vec<Value> = vec![managed_policy_arn(
+        "service-role/AWSLambdaBasicExecutionRole",
     )];
     let mut inline: Vec<Value> = Vec::new();
 
     let mut handle = |p: &Value| {
         if let Some(name) = p.as_str() {
-            managed_arns.push(json!(managed_policy_arn(name)));
+            managed_arns.push(managed_policy_arn(name));
         } else if let Some(obj) = p.as_object() {
             // An inline statement document: {Statement: [...]} or a full policy.
             if obj.contains_key("Statement") {
@@ -179,13 +179,13 @@ fn build_execution_role(policies: Option<&Value>) -> Value {
 }
 
 /// Resolve a managed-policy reference to a full ARN. A bare name (e.g.
-/// `AmazonS3ReadOnlyAccess`) becomes the AWS-managed ARN; anything already in
-/// `arn:` form passes through.
-fn managed_policy_arn(name: &str) -> String {
+/// `AmazonS3ReadOnlyAccess`) becomes the AWS-managed ARN in the stack's
+/// partition; anything already in `arn:` form passes through.
+fn managed_policy_arn(name: &str) -> Value {
     if name.starts_with("arn:") {
-        name.to_string()
+        json!(name)
     } else {
-        format!("arn:aws:iam::aws:policy/{name}")
+        json!({ "Fn::Sub": format!("arn:${{AWS::Partition}}:iam::aws:policy/{name}") })
     }
 }
 
@@ -350,7 +350,7 @@ fn sanitize(s: &str) -> String {
 fn lambda_integration_uri(function_id: &str) -> Value {
     json!({
         "Fn::Sub": format!(
-            "arn:aws:apigateway:${{AWS::Region}}:lambda:path/2015-03-31/functions/${{{function_id}.Arn}}/invocations"
+            "arn:${{AWS::Partition}}:apigateway:${{AWS::Region}}:lambda:path/2015-03-31/functions/${{{function_id}.Arn}}/invocations"
         )
     })
 }
@@ -450,7 +450,7 @@ pub(super) fn synthesize_api_resources(routes: &[ApiRoute]) -> Vec<(String, Valu
                 lambda_permission(
                     &route.function_id,
                     "apigateway.amazonaws.com",
-                    json!({ "Fn::Sub": format!("arn:aws:execute-api:${{AWS::Region}}:${{AWS::AccountId}}:${{{api_id}}}/*") }),
+                    json!({ "Fn::Sub": format!("arn:${{AWS::Partition}}:execute-api:${{AWS::Region}}:${{AWS::AccountId}}:${{{api_id}}}/*") }),
                 ),
             ));
         }
@@ -529,7 +529,7 @@ pub(super) fn synthesize_api_resources(routes: &[ApiRoute]) -> Vec<(String, Valu
                 lambda_permission(
                     &route.function_id,
                     "apigateway.amazonaws.com",
-                    json!({ "Fn::Sub": format!("arn:aws:execute-api:${{AWS::Region}}:${{AWS::AccountId}}:${{{api_id}}}/*") }),
+                    json!({ "Fn::Sub": format!("arn:${{AWS::Partition}}:execute-api:${{AWS::Region}}:${{AWS::AccountId}}:${{{api_id}}}/*") }),
                 ),
             ));
         }
@@ -787,7 +787,7 @@ fn sfn_api_resources(
                 "Integration": {
                     "Type": "AWS",
                     "IntegrationHttpMethod": "POST",
-                    "Uri": { "Fn::Sub": "arn:aws:apigateway:${AWS::Region}:states:action/StartExecution" },
+                    "Uri": { "Fn::Sub": "arn:${AWS::Partition}:apigateway:${AWS::Region}:states:action/StartExecution" },
                     "Credentials": { "Fn::GetAtt": [role_id, "Arn"] },
                 }
             }
@@ -1096,6 +1096,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn synthesized_api_arns_take_the_stack_partition() {
+        let uri = lambda_integration_uri("Fn");
+        assert!(
+            uri["Fn::Sub"]
+                .as_str()
+                .unwrap()
+                .starts_with("arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:"),
+            "{uri}"
+        );
+    }
+
+    #[test]
+    fn managed_policy_arns_take_the_stack_partition() {
+        assert_eq!(
+            managed_policy_arn("AmazonS3ReadOnlyAccess"),
+            json!({ "Fn::Sub": "arn:${AWS::Partition}:iam::aws:policy/AmazonS3ReadOnlyAccess" })
+        );
+        assert_eq!(
+            managed_policy_arn("arn:aws-cn:iam::123456789012:policy/mine"),
+            json!("arn:aws-cn:iam::123456789012:policy/mine")
+        );
+        let role = build_execution_role(None);
+        assert_eq!(
+            role["Properties"]["ManagedPolicyArns"][0],
+            json!({ "Fn::Sub": "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole" })
+        );
+    }
+
+    #[test]
     fn policies_become_execution_role() {
         let mut props = serde_json::from_value::<Map<String, Value>>(json!({
             "Handler": "index.handler",
@@ -1109,9 +1138,9 @@ mod tests {
         let (rid, role) = extras.iter().find(|(id, _)| id == "MyFnRole").unwrap();
         assert_eq!(rid, "MyFnRole");
         let arns = role["Properties"]["ManagedPolicyArns"].as_array().unwrap();
-        assert!(arns
-            .iter()
-            .any(|a| a == "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"));
+        assert!(arns.iter().any(
+            |a| a["Fn::Sub"] == "arn:${AWS::Partition}:iam::aws:policy/AmazonS3ReadOnlyAccess"
+        ));
         assert!(role["Properties"]["Policies"].as_array().unwrap().len() == 1);
     }
 

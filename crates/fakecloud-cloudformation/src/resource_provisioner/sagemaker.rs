@@ -67,9 +67,13 @@ impl ResourceProvisioner {
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| self.physical_name(resource));
-        let region = &self.region;
         let account = &self.account_id;
-        let arn = format!("arn:aws:sagemaker:{region}:{account}:{arn_path}/{name}");
+        let arn = fakecloud_sagemaker::service::sagemaker_arn(
+            &self.region,
+            &self.account_id,
+            arn_path,
+            &name,
+        );
         let arn_member = format!("{family}Arn");
         let now = json!(sagemaker_now());
 

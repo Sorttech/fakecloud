@@ -33,10 +33,11 @@ impl ResourceProvisioner {
         let logging_configuration = props.get("LoggingConfiguration").cloned();
         let tracing_configuration = props.get("TracingConfiguration").cloned();
 
-        let arn = format!(
-            "arn:aws:states:{}:{}:stateMachine:{}",
-            self.region, self.account_id, name
-        );
+        let arn = self
+            .stepfunctions_state
+            .write()
+            .get_or_create(&self.account_id)
+            .state_machine_arn(&self.region, &name);
         let now = Utc::now();
         let revision_id = Uuid::new_v4().to_string();
 
@@ -186,10 +187,7 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .ok_or("Name is required")?
             .to_string();
-        let arn = format!(
-            "arn:aws:states:{}:{}:activity:{}",
-            self.region, self.account_id, name
-        );
+        let arn = fakecloud_stepfunctions::activity_arn(&self.region, &self.account_id, &name);
         let activity = SfnActivity {
             name: name.clone(),
             arn: arn.clone(),
@@ -317,9 +315,10 @@ impl ResourceProvisioner {
             .rsplit_once(':')
             .map(|(root, _)| root.to_string())
             .unwrap_or_else(|| {
-                format!(
-                    "arn:aws:states:{}:{}:stateMachine:unknown",
-                    self.region, self.account_id
+                fakecloud_stepfunctions::state_machine_arn(
+                    &self.region,
+                    &self.account_id,
+                    "unknown",
                 )
             });
         let arn = format!("{sm_arn_root}:{name}");

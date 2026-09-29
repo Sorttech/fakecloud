@@ -1488,3 +1488,51 @@ async fn describe_alarms_accepts_the_log_alarm_type() {
     .await;
     assert_eq!(err.code(), "InvalidParameterValue");
 }
+
+#[tokio::test]
+async fn china_region_alarm_and_dashboard_arns_use_the_aws_cn_partition() {
+    let svc = service();
+    let in_china = |action: &str, params: &[(&str, &str)]| AwsRequest {
+        region: "cn-north-1".to_string(),
+        ..req(action, params)
+    };
+    svc.handle(in_china(
+        "PutMetricAlarm",
+        &[
+            ("AlarmName", "cn-alarm"),
+            ("Namespace", "Test/App"),
+            ("MetricName", "CPU"),
+            ("ComparisonOperator", "GreaterThanThreshold"),
+            ("Threshold", "50"),
+            ("EvaluationPeriods", "1"),
+            ("Period", "60"),
+            ("Statistic", "Average"),
+        ],
+    ))
+    .await
+    .expect("put alarm");
+    let desc = svc
+        .handle(in_china(
+            "DescribeAlarms",
+            &[("AlarmNames.member.1", "cn-alarm")],
+        ))
+        .await
+        .expect("describe alarms");
+    let arn = "arn:aws-cn:cloudwatch:cn-north-1:123456789012:alarm:cn-alarm";
+    assert!(body_of(&desc).contains(&format!("<AlarmArn>{arn}</AlarmArn>")));
+
+    svc.handle(in_china(
+        "PutDashboard",
+        &[
+            ("DashboardName", "cn-dash"),
+            ("DashboardBody", "{\"widgets\":[]}"),
+        ],
+    ))
+    .await
+    .expect("put dashboard");
+    let dash = svc
+        .handle(in_china("GetDashboard", &[("DashboardName", "cn-dash")]))
+        .await
+        .expect("get dashboard");
+    assert!(body_of(&dash).contains("arn:aws-cn:cloudwatch::123456789012:dashboard/cn-dash"));
+}

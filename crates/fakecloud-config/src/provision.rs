@@ -105,9 +105,10 @@ pub fn provision_config_rule(
         name.clone(),
         ConfigRule {
             name: name.clone(),
-            arn: format!(
-                "arn:aws:config:{region}:{account}:config-rule/config-rule-{}",
-                short_id()
+            arn: config_arn(
+                region,
+                account,
+                &format!("config-rule/config-rule-{}", short_id()),
             ),
             rule_id: format!("config-rule-{}", short_id()),
             description: props
@@ -154,9 +155,10 @@ pub fn provision_aggregator(
         name.clone(),
         ConfigurationAggregator {
             name: name.clone(),
-            arn: format!(
-                "arn:aws:config:{region}:{account}:config-aggregator/config-aggregator-{}",
-                short_id()
+            arn: config_arn(
+                region,
+                account,
+                &format!("config-aggregator/config-aggregator-{}", short_id()),
             ),
             account_aggregation_sources: props
                 .get("AccountAggregationSources")
@@ -189,7 +191,11 @@ pub fn provision_aggregation_authorization(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let arn = format!("arn:aws:config:{region}:{account}:aggregation-authorization/{authorized_account}/{authorized_region}");
+    let arn = config_arn(
+        region,
+        account,
+        &format!("aggregation-authorization/{authorized_account}/{authorized_region}"),
+    );
     let key = format!("{authorized_account}\u{1}{authorized_region}");
     let acc = accounts.account_mut(account);
     acc.aggregation_authorizations.insert(
@@ -221,9 +227,10 @@ pub fn provision_conformance_pack(
         name.clone(),
         ConformancePack {
             name: name.clone(),
-            arn: format!(
-                "arn:aws:config:{region}:{account}:conformance-pack/{name}-{}",
-                short_id()
+            arn: config_arn(
+                region,
+                account,
+                &format!("conformance-pack/{name}-{}", short_id()),
             ),
             id: format!("conformance-pack-{}", short_id()),
             delivery_s3_bucket: props
@@ -273,9 +280,10 @@ pub fn provision_org_config_rule(
         name.clone(),
         OrganizationConfigRule {
             name: name.clone(),
-            arn: format!(
-                "arn:aws:config:{region}:{account}:organization-config-rule/{name}-{}",
-                short_id()
+            arn: config_arn(
+                region,
+                account,
+                &format!("organization-config-rule/{name}-{}", short_id()),
             ),
             managed_rule_metadata: props.get("OrganizationManagedRuleMetadata").cloned(),
             custom_rule_metadata: props.get("OrganizationCustomRuleMetadata").cloned(),

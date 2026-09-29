@@ -1,6 +1,6 @@
 +++
 title = "Bedrock emulator"
-description = "Bedrock emulator for tests: 214 operations across Bedrock, Bedrock Runtime, Bedrock Agent, and Bedrock Agent Runtime. Real wire protocol, fault injection, configurable responses. Deterministic, offline, free. Not a mock library, not a real LLM."
+description = "Bedrock emulator for tests: 216 operations across Bedrock, Bedrock Runtime, Bedrock Agent, and Bedrock Agent Runtime. Real wire protocol, fault injection, configurable responses. Deterministic, offline, free. Not a mock library, not a real LLM."
 template = "page.html"
 aliases = [
     "/features/local-bedrock/",
@@ -31,7 +31,7 @@ Tests want the third one. You're testing your code, not whether the model happen
 
 ## What fakecloud Bedrock does
 
-**214 operations across the full Bedrock family** (Bedrock + Bedrock Runtime + Bedrock Agent + Bedrock Agent Runtime), not just the runtime:
+**216 operations across the full Bedrock family** (Bedrock + Bedrock Runtime + Bedrock Agent + Bedrock Agent Runtime), not just the runtime:
 
 - **Runtime**: `InvokeModel`, `InvokeModelWithResponseStream`, `Converse`, `ConverseStream` — EventStream binary encoded, same as real AWS.
 - **Guardrails**: full CRUD + versioning + apply + content evaluation. Test your guardrail config locally before deploying.

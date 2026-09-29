@@ -1,6 +1,6 @@
 +++
 title = "Free, open-source LocalStack alternative"
-description = "fakecloud is a free, open-source local AWS emulator: 105 services, 7,508 operations, 248,557/248,557 Smithy variants pass (true 100% conformance), 6 test-assertion SDKs. No account, no token, no paid tier. Drop-in replacement for LocalStack Community."
+description = "fakecloud is a free, open-source local AWS emulator: 105 services, 7,509 operations, 248,557/248,557 Smithy variants pass (true 100% conformance), 7 test-assertion SDKs. No account, no token, no paid tier. Drop-in replacement for LocalStack Community."
 template = "page.html"
 aliases = [
     "/alternative/localstack/",
@@ -30,14 +30,14 @@ This is why fakecloud runs real Lambda code in real runtime containers, runs rea
 
 ## What fakecloud gives you
 
-- **105 AWS services.** S3, SQS, SNS, EventBridge, EventBridge Pipes, EventBridge Scheduler, Lambda, EC2, DynamoDB, IAM, STS, Organizations, SSM, Secrets Manager, CloudWatch Logs, CloudWatch (Metrics & Alarms), KMS, CloudFormation, Cloud Control API, SES (v2 + v1 inbound), Cognito User Pools, Cognito Identity, Kinesis, Firehose, RDS, RDS Data API, Aurora DSQL, Resource Groups, Resource Groups Tagging API, ElastiCache, Step Functions, API Gateway v1 (REST), API Gateway v2 (HTTP), Bedrock, Bedrock Agent, Bedrock Agent Runtime, Bedrock Runtime, ECR, ECS, Elastic Load Balancing v2, CloudFront, Route 53, WAF v2, Application Auto Scaling, Athena, ACM, Glue.
-- **7,508 API operations. True 100% conformance** across every implemented service — 248,557/248,557 Smithy-model-generated test variants pass on every commit.
+- **105 AWS services.** S3, SQS, SNS, EventBridge, EventBridge Pipes, EventBridge Scheduler, Lambda, EC2, DynamoDB, IAM, STS, Organizations, SSM, Secrets Manager, CloudWatch Logs, CloudWatch (Metrics & Alarms), KMS, CloudFormation, Cloud Control API, SES (v2 + v1 inbound), Cognito User Pools, Cognito Identity, Kinesis, Firehose, RDS, RDS Data API, Aurora DSQL, Resource Groups, Resource Groups Tagging API, ElastiCache, Step Functions, API Gateway v1 (REST), API Gateway v2 (HTTP), Bedrock, Bedrock Agent, Bedrock Agent Runtime, Bedrock Runtime, ECR, ECS, Elastic Load Balancing v2, CloudFront, Route 53, WAF v2, Application Auto Scaling, Athena, ACM, Glue, and more — see the [parity matrix](@/docs/parity.md).
+- **7,509 API operations. True 100% conformance** across every implemented service — 248,557/248,557 Smithy-model-generated test variants pass on every commit.
 - **Tested against upstream Terraform acceptance tests.** CI runs `hashicorp/terraform-provider-aws` `TestAcc*` suites against fakecloud, catching waiter and field-presence drift that pure SDK tests miss.
 - **Real Lambda execution.** 23 runtimes in Docker containers. Not a mock, not a stub. Node, Python, Java, Go, .NET, Ruby, custom runtimes.
 - **Real stateful services.** RDS runs real PostgreSQL/MySQL/MariaDB/Oracle/SQL Server/Db2. ElastiCache runs real Redis/Valkey/Memcached. Your Lambda talking to RDS is talking to a real Postgres (or Oracle, or SQL Server).
 - **Real cross-service wiring.** EventBridge -> Step Functions, S3 -> Lambda, SES inbound -> S3/SNS/Lambda, 15+ more end-to-end integrations.
 - **Fast.** ~300ms startup. ~10 MiB idle memory. ~19 MB binary. No Docker required to run fakecloud itself.
-- **Test-assertion SDKs** for TypeScript, Python, Go, PHP, Java, and Rust. Assert that an email was sent, an SNS message published, a Lambda invoked, without writing raw HTTP.
+- **Test-assertion SDKs** for TypeScript, Python, Go, PHP, Java, Rust, and .NET. Assert that an email was sent, an SNS message published, a Lambda invoked, without writing raw HTTP.
 - **Multi-account, SCPs, ABAC.** Cross-account delivery on SQS/SNS/Lambda/S3/EventBridge/Step Functions. STS trust policies with `sts:ExternalId`, session tags, permission boundaries, and session policies all enforced.
 - **IAM, KMS key policies, bucket policies, SCPs.** Opt-in strict enforcement with the full Allow/Deny/NotPrincipal semantics AWS uses.
 
@@ -53,15 +53,15 @@ This is why fakecloud runs real Lambda code in real runtime containers, runs rea
 | Idle memory | ~10 MiB | ~150 MiB |
 | Install size | ~19 MB binary | ~1 GB image |
 | Conformance methodology | Smithy-model-validated, 248,557/248,557 variants pass | Not published |
-| Test-assertion SDKs | TypeScript, Python, Go, PHP, Java, Rust | Python, Java |
-| Cognito User Pools | 122 operations | [Paid only](https://docs.localstack.cloud/references/licensing/) |
-| SES v2 | 110 operations, full send + templates + DKIM | [Paid only](https://docs.localstack.cloud/references/licensing/) |
+| Test-assertion SDKs | TypeScript, Python, Go, PHP, Java, Rust, .NET | Python, Java |
+| Cognito User Pools | 132 operations | [Paid only](https://docs.localstack.cloud/references/licensing/) |
+| SES v2 | 116 operations, full send + templates + DKIM | [Paid only](https://docs.localstack.cloud/references/licensing/) |
 | SES inbound email | Real receipt rule action execution | [Stored but never executed](https://docs.localstack.cloud/user-guide/aws/ses/) |
 | RDS | 163 ops, real PostgreSQL/MySQL/MariaDB/Oracle/SQL Server/Db2 via Docker | [Paid only](https://docs.localstack.cloud/references/licensing/) |
 | ElastiCache | 75 ops, real Redis/Valkey/Memcached via Docker | [Paid only](https://docs.localstack.cloud/references/licensing/) |
 | API Gateway v1 | 124 ops, REST APIs incl. real Lambda proxy data plane | [Paid only](https://docs.localstack.cloud/references/licensing/) |
 | API Gateway v2 | 103 ops, HTTP APIs + developer portals + JWT/Lambda authorizers | [Paid only](https://docs.localstack.cloud/references/licensing/) |
-| Bedrock | 214 ops across Bedrock + Bedrock Runtime + Bedrock Agent + Bedrock Agent Runtime | Not available |
+| Bedrock | 216 ops across Bedrock + Bedrock Runtime + Bedrock Agent + Bedrock Agent Runtime | Not available |
 | EMR (Elastic MapReduce) | 65 ops, full control plane free (clusters/job flows, steps, instance groups/fleets, Studio, notebooks, scaling policies) | [Paid only](https://docs.localstack.cloud/references/licensing/) |
 | AWS Shield / Shield Advanced | 36 ops, full control plane free (protections, protection groups, subscription, emergency contacts, DRT access, proactive engagement, app-layer auto response, tags) | [Paid only](https://docs.localstack.cloud/references/licensing/) |
 
@@ -113,7 +113,7 @@ Moto is a Python library that patches boto3 inside a test process. fakecloud is 
 
 **How is fakecloud different from SAM Local / serverless-offline?**
 
-SAM Local and serverless-offline only run Lambda (and a limited HTTP/API Gateway surface in front of it). fakecloud runs Lambda plus 22 other services, with real cross-service integrations. If your function calls SQS, fans out over SNS, or reads from DynamoDB, fakecloud has those services wired up.
+SAM Local and serverless-offline only run Lambda (and a limited HTTP/API Gateway surface in front of it). fakecloud runs Lambda plus 104 other services, with real cross-service integrations. If your function calls SQS, fans out over SNS, or reads from DynamoDB, fakecloud has those services wired up.
 
 **Does fakecloud run on CI?**
 

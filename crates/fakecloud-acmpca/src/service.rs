@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use uuid::Uuid;
 
+use fakecloud_aws::arn::{arn_resource, Arn};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_persistence::SnapshotStore;
 use fakecloud_s3::{memory_body, S3Object, SharedS3State};
@@ -473,7 +474,7 @@ impl AcmPcaService {
         }
 
         let ca_id = Uuid::new_v4().to_string();
-        let arn = format!("arn:aws:acm-pca:{region}:{account}:certificate-authority/{ca_id}");
+        let arn = ca_arn(&region, &account, &ca_id);
 
         // Every CA — ROOT included — is reported PENDING_CERTIFICATE immediately
         // (matching AWS, which reaches that state within seconds), while its
@@ -1553,8 +1554,19 @@ fn region(req: &AwsRequest) -> String {
     }
 }
 
+/// A certificate authority's ARN, in the partition of `region`.
+pub fn ca_arn(region: &str, account: &str, ca_id: &str) -> String {
+    Arn::regional(
+        "acm-pca",
+        region,
+        account,
+        &format!("certificate-authority/{ca_id}"),
+    )
+    .to_string()
+}
+
 fn is_ca_arn(arn: &str) -> bool {
-    arn.starts_with("arn:aws:acm-pca:") && arn.contains(":certificate-authority/")
+    arn_resource(arn, "acm-pca").is_some() && arn.contains(":certificate-authority/")
 }
 
 /// AWS's IdempotencyToken de-duplication window for both
@@ -2100,6 +2112,46 @@ mod tests {
             json!({ "IdempotencyToken": "tok-2" }),
         );
         assert_ne!(first, third, "a different token must create a new CA");
+    }
+
+    #[tokio::test]
+    async fn china_region_ca_arn_uses_aws_cn_and_is_accepted_back() {
+        let svc = AcmPcaService::default();
+        let in_cn = |action: &str, body: Value| {
+            let mut r = req(action, body);
+            r.region = "cn-north-1".to_string();
+            r
+        };
+        let created = svc
+            .create_certificate_authority(&in_cn(
+                "CreateCertificateAuthority",
+                json!({
+                    "CertificateAuthorityConfiguration": {
+                        "KeyAlgorithm": "EC_prime256v1",
+                        "SigningAlgorithm": "SHA256WITHECDSA",
+                        "Subject": { "CommonName": "cn.example.com" }
+                    },
+                    "CertificateAuthorityType": "ROOT"
+                }),
+            ))
+            .unwrap();
+        let arn = body_json(&created)["CertificateAuthorityArn"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            arn.starts_with("arn:aws-cn:acm-pca:cn-north-1:123456789012:certificate-authority/"),
+            "{arn}"
+        );
+        svc.put_policy(&in_cn(
+            "PutPolicy",
+            json!({ "ResourceArn": arn, "Policy": "{}" }),
+        ))
+        .unwrap();
+        let got = svc
+            .get_policy(&in_cn("GetPolicy", json!({ "ResourceArn": arn })))
+            .unwrap();
+        assert_eq!(body_json(&got)["Policy"], "{}");
     }
 
     /// Finding 1: repeated IssueCertificate with the same IdempotencyToken

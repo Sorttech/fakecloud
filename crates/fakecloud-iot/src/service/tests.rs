@@ -112,6 +112,31 @@ fn unknown_route_is_not_found() {
 // ---------- things lifecycle ----------
 
 #[test]
+fn china_region_thing_arn_uses_aws_cn_partition_and_tags_by_it() {
+    let s = svc();
+    let run_cn = |method: &str, path: &str, body: Value| {
+        let mut req = mk_req(method, path, &[], body);
+        req.region = "cn-north-1".into();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(s.handle(req))
+    };
+    let created = body_of(&run_cn("POST", "/things/cn-thing", json!({})).unwrap());
+    let arn = created["thingArn"].as_str().unwrap().to_string();
+    assert_eq!(arn, "arn:aws-cn:iot:cn-north-1:000000000000:thing/cn-thing");
+
+    run_cn(
+        "POST",
+        "/tags",
+        json!({"resourceArn": arn, "tags": [{"Key": "env", "Value": "cn"}]}),
+    )
+    .unwrap();
+    let listed = body_of(&run_cn("GET", &format!("/tags?resourceArn={arn}"), Value::Null).unwrap());
+    assert_eq!(listed["tags"][0]["Value"], "cn");
+}
+
+#[test]
 fn thing_create_get_list_delete() {
     let s = svc();
     let created = run(
@@ -247,6 +272,48 @@ fn thing_type_group_billing_lifecycle() {
 }
 
 // ---------- policies + versions + attachment ----------
+
+#[test]
+fn attached_policies_report_the_arn_the_policy_was_created_with() {
+    let s = svc();
+    let mut create = mk_req(
+        "POST",
+        "/policies/cn-p",
+        &[],
+        json!({"policyDocument": "{\"Version\":\"2012-10-17\"}"}),
+    );
+    create.region = "cn-north-1".into();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let pol = body_of(&rt.block_on(s.handle(create)).unwrap());
+    let policy_arn = pol["policyArn"].as_str().unwrap().to_string();
+    assert_eq!(
+        policy_arn,
+        "arn:aws-cn:iot:cn-north-1:000000000000:policy/cn-p"
+    );
+
+    let target = "arn:aws-cn:iot:cn-north-1:000000000000:cert/abc";
+    run(
+        &s,
+        "PUT",
+        "/target-policies/cn-p",
+        &[],
+        json!({"target": target}),
+    )
+    .unwrap();
+    let attached = body_of(
+        &run(
+            &s,
+            "POST",
+            "/attached-policies/arn:aws-cn:iot:cn-north-1:000000000000:cert%2Fabc",
+            &[],
+            json!({}),
+        )
+        .unwrap(),
+    );
+    assert_eq!(attached["policies"][0]["policyArn"], policy_arn);
+}
 
 #[test]
 fn policy_create_and_attach() {

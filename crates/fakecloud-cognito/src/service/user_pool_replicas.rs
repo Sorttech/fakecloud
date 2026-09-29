@@ -37,7 +37,7 @@ fn replica_json(account_id: &str, pool_id: &str, region: &str, status: &str, rol
         "RegionName": region,
         "Status": status,
         "Role": role,
-        "UserPoolArn": format!("arn:aws:cognito-idp:{region}:{account_id}:userpool/{pool_id}"),
+        "UserPoolArn": crate::user_pool_arn(region, account_id, pool_id),
     })
 }
 

@@ -275,7 +275,7 @@ impl Wafv2Service {
         let body = req.json_body();
         let _scope = require_scope(&body)?;
         Ok(AwsResponse::ok_json(json!({
-            "ManagedProducts": managed_products(),
+            "ManagedProducts": managed_products(&req.region),
         })))
     }
 
@@ -286,7 +286,7 @@ impl Wafv2Service {
         let body = req.json_body();
         let vendor = require_str_len(&body, "VendorName", 1, 128)?;
         let _scope = require_scope(&body)?;
-        let products: Vec<Value> = managed_products()
+        let products: Vec<Value> = managed_products(&req.region)
             .into_iter()
             .filter(|p| p.get("VendorName").and_then(Value::as_str) == Some(vendor.as_str()))
             .collect();
@@ -319,7 +319,7 @@ impl Wafv2Service {
             .collect();
         Ok(AwsResponse::ok_json(json!({
             "VersionName": version,
-            "SnsTopicArn": Arn::new("sns", "us-east-1", "", &format!("{vendor}-{name}-notifications")).to_string(),
+            "SnsTopicArn": managed_sns_topic_arn(&req.region, &format!("{vendor}-{name}")),
             "Capacity": def.capacity,
             "Rules": managed_rule_summaries(&vendor, &name),
             "LabelNamespace": format!("awswaf:managed:{vendor}:{name}:"),
@@ -369,7 +369,7 @@ impl Wafv2Service {
         managed.insert("Id".to_string(), json!(set.id));
         managed.insert(
             "ARN".to_string(),
-            json!(Arn::new(
+            json!(Arn::regional(
                 "wafv2",
                 &req.region,
                 &req.account_id,

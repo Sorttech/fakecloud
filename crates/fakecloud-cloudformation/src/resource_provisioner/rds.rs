@@ -134,10 +134,7 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let arn = format!(
-            "arn:aws:rds:{}:{}:cluster-pg:{}",
-            self.region, self.account_id, name
-        );
+        let arn = fakecloud_rds::rds_arn(&self.region, &self.account_id, "cluster-pg", &name);
         let entry = serde_json::json!({
             "DBClusterParameterGroupName": name,
             "DBClusterParameterGroupArn": arn,
@@ -188,10 +185,7 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let arn = format!(
-            "arn:aws:rds:{}:{}:og:{}",
-            self.region, self.account_id, name
-        );
+        let arn = fakecloud_rds::rds_arn(&self.region, &self.account_id, "og", &name);
         let entry = serde_json::json!({
             "OptionGroupName": name,
             "OptionGroupArn": arn,
@@ -303,10 +297,7 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .unwrap_or("POSTGRESQL")
             .to_string();
-        let arn = format!(
-            "arn:aws:rds:{}:{}:db-proxy:{}",
-            self.region, self.account_id, name
-        );
+        let arn = fakecloud_rds::rds_arn(&self.region, &self.account_id, "db-proxy", &name);
         let endpoint = format!("{name}.proxy-default.{}.rds.amazonaws.com", self.region);
         let entry = serde_json::json!({
             "DBProxyName": name,
@@ -468,13 +459,7 @@ impl ResourceProvisioner {
         let state = accounts.get_or_create(&self.account_id);
         // Build the instance ARN from the stack's request region (self.region),
         // not the RDS sub-service state's frozen startup region.
-        let arn = Arn::new(
-            "rds",
-            &self.region,
-            &state.account_id,
-            &format!("db:{identifier}"),
-        )
-        .to_string();
+        let arn = fakecloud_rds::rds_arn(&self.region, &state.account_id, "db", &identifier);
         let endpoint_address = format!(
             "{identifier}.cluster-fakecloud.{}.rds.amazonaws.com",
             self.region
@@ -822,10 +807,7 @@ impl ResourceProvisioner {
         let port = props.get("Port").and_then(|v| v.as_i64()).unwrap_or(5432);
         let mut accounts = self.rds_state.write();
         let state = accounts.get_or_create(&self.account_id);
-        let arn = format!(
-            "arn:aws:rds:{}:{}:cluster:{}",
-            self.region, state.account_id, identifier
-        );
+        let arn = fakecloud_rds::rds_arn(&self.region, &self.account_id, "cluster", &identifier);
         let cluster_resource_id = format!("cluster-{}", Uuid::new_v4().simple());
         let endpoint = format!(
             "{identifier}.cluster-fakecloud.{}.rds.amazonaws.com",

@@ -10,6 +10,7 @@ use percent_encoding::percent_decode_str;
 use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_persistence::SnapshotStore;
 
@@ -1097,11 +1098,14 @@ fn short_id() -> String {
         .collect()
 }
 
-fn group_arn(region: &str, account: &str, name: &str) -> String {
-    format!(
-        "arn:aws:resource-groups:{region}:{account}:group/{name}/{}",
-        short_id()
+pub fn group_arn(region: &str, account: &str, name: &str) -> String {
+    Arn::regional(
+        "resource-groups",
+        region,
+        account,
+        &format!("group/{name}/{}", short_id()),
     )
+    .to_string()
 }
 
 /// Tag-sync-task ARN nests under the group ARN:
@@ -1250,6 +1254,41 @@ mod query_tests {
             ids[0]["ResourceArn"],
             "arn:aws:ec2:us-east-1:123456789012:instance/i-1"
         );
+    }
+
+    #[tokio::test]
+    async fn china_region_group_arn_uses_aws_cn_and_resolves() {
+        let s = svc_with(vec![]);
+        let in_cn = |path: &str, body: Value| {
+            let mut r = req(path, body);
+            r.region = "cn-north-1".into();
+            r
+        };
+        let resp = s
+            .handle(in_cn(
+                "/groups",
+                json!({
+                    "Name": "cn-group",
+                    "ResourceQuery": tag_query(
+                        json!(["AWS::AllSupported"]),
+                        json!([{ "Key": "stage", "Values": ["test"] }])
+                    )
+                }),
+            ))
+            .await
+            .unwrap();
+        let out: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        let arn = out["Group"]["GroupArn"].as_str().unwrap().to_string();
+        assert!(
+            arn.starts_with("arn:aws-cn:resource-groups:cn-north-1:123456789012:group/cn-group/"),
+            "{arn}"
+        );
+        let resp = s
+            .handle(in_cn("/get-group", json!({ "Group": arn })))
+            .await
+            .unwrap();
+        let got: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        assert_eq!(got["Group"]["Name"], "cn-group");
     }
 
     #[tokio::test]

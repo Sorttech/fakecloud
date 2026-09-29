@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use http::StatusCode;
 use serde_json::{json, Value};
 
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::service::{AwsRequest, AwsServiceError};
 
 use crate::service::LOG_TYPES;
@@ -814,19 +815,21 @@ pub(crate) fn addon_configuration_schema(addon_name: &str) -> String {
 
 /// The recommended pod-identity configuration for an add-on, returned by
 /// `DescribeAddonConfiguration` as `podIdentityConfiguration`.
-pub(crate) fn pod_identity_configuration(addon_name: &str) -> Value {
+pub(crate) fn pod_identity_configuration(region: &str, addon_name: &str) -> Value {
+    let policy =
+        |name: &str| Arn::global_in(region, "iam", "aws", &format!("policy/{name}")).to_string();
     match addon_name {
         "vpc-cni" => json!([{
             "serviceAccount": "aws-node",
-            "recommendedManagedPolicies": ["arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"],
+            "recommendedManagedPolicies": [policy("AmazonEKS_CNI_Policy")],
         }]),
         "aws-ebs-csi-driver" => json!([{
             "serviceAccount": "ebs-csi-controller-sa",
-            "recommendedManagedPolicies": ["arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy"],
+            "recommendedManagedPolicies": [policy("service-role/AmazonEBSCSIDriverPolicy")],
         }]),
         "aws-efs-csi-driver" => json!([{
             "serviceAccount": "efs-csi-controller-sa",
-            "recommendedManagedPolicies": ["arn:aws:iam::aws:policy/service-role/AmazonEFSCSIDriverPolicy"],
+            "recommendedManagedPolicies": [policy("service-role/AmazonEFSCSIDriverPolicy")],
         }]),
         _ => json!([]),
     }
@@ -856,7 +859,12 @@ pub(crate) fn principal_parts(principal_arn: &str) -> (String, String) {
 pub(crate) fn default_username(principal_arn: &str) -> String {
     let (type_seg, name) = principal_parts(principal_arn);
     match type_seg.as_str() {
-        "role" => format!("arn:aws:sts::{{{{AccountID}}}}:assumed-role/{name}/{{{{SessionName}}}}"),
+        "role" => {
+            let partition = fakecloud_aws::arn::partition_of(principal_arn);
+            format!(
+                "arn:{partition}:sts::{{{{AccountID}}}}:assumed-role/{name}/{{{{SessionName}}}}"
+            )
+        }
         _ => principal_arn.to_string(),
     }
 }
@@ -976,7 +984,7 @@ pub(crate) fn pod_identity_association_summary_json(a: &PodIdentityAssociation) 
 /// The real AWS EKS cluster access-policy catalogue returned by
 /// `ListAccessPolicies`. Every entry is an `arn:aws:eks::aws:cluster-access-policy/*`
 /// managed policy.
-pub(crate) fn access_policy_catalog() -> Vec<Value> {
+pub(crate) fn access_policy_catalog(region: &str) -> Vec<Value> {
     const POLICIES: &[&str] = &[
         "AmazonEKSClusterAdminPolicy",
         "AmazonEKSAdminPolicy",
@@ -994,7 +1002,7 @@ pub(crate) fn access_policy_catalog() -> Vec<Value> {
         .map(|name| {
             json!({
                 "name": name,
-                "arn": format!("arn:aws:eks::aws:cluster-access-policy/{name}"),
+                "arn": Arn::global_in(region, "eks", "aws", &format!("cluster-access-policy/{name}")).to_string(),
             })
         })
         .collect()

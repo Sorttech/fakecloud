@@ -6,7 +6,10 @@ use fakecloud_core::validation::*;
 
 use crate::state::IamGroup;
 
-use super::{empty_response, generate_id, url_encode, validate_list_pagination, IamService};
+use super::{
+    empty_response, existing_arn_partition, generate_id, url_encode, validate_list_pagination,
+    IamService,
+};
 use fakecloud_core::query::required_param;
 
 use fakecloud_aws::xml::xml_escape;
@@ -37,7 +40,8 @@ impl IamService {
         let group = IamGroup {
             group_id: format!("AGPA{}", generate_id()),
             arn: format!(
-                "arn:aws:iam::{}:group{}{}",
+                "arn:{}:iam::{}:group{}{}",
+                fakecloud_aws::arn::partition_for(&req.region),
                 state.account_id,
                 if path == "/" { "/" } else { &path },
                 group_name
@@ -82,7 +86,7 @@ impl IamService {
         let group_name = required_param(&req.query_params, "GroupName")?;
         validate_string_length("groupName", &group_name, 1, 128)?;
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         let group = state.groups.get(&group_name).ok_or_else(|| {
@@ -253,7 +257,7 @@ impl IamService {
         let max_items = validate_list_pagination(req)? as usize;
         let marker = req.query_params.get("Marker").cloned();
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
         let path_prefix = req.query_params.get("PathPrefix").cloned();
         let mut groups: Vec<&IamGroup> = state.groups.values().collect();
@@ -357,7 +361,8 @@ impl IamService {
         let actual_new_name = new_group_name.unwrap_or_else(|| group_name.clone());
         group.group_name = actual_new_name.clone();
         group.arn = format!(
-            "arn:aws:iam::{}:group{}{}",
+            "arn:{}:iam::{}:group{}{}",
+            existing_arn_partition(&group.arn, &req.region),
             state.account_id,
             if group.path == "/" { "/" } else { &group.path },
             actual_new_name
@@ -442,7 +447,7 @@ impl IamService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let user_name = required_param(&req.query_params, "UserName")?;
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         if !state.users.contains_key(&user_name) {
@@ -533,7 +538,7 @@ impl IamService {
         let group_name = required_param(&req.query_params, "GroupName")?;
         let policy_name = required_param(&req.query_params, "PolicyName")?;
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         let group = state.groups.get(&group_name).ok_or_else(|| {
@@ -602,7 +607,7 @@ impl IamService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let group_name = required_param(&req.query_params, "GroupName")?;
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         let group = state.groups.get(&group_name).ok_or_else(|| {
@@ -730,7 +735,7 @@ impl IamService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let group_name = required_param(&req.query_params, "GroupName")?;
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         let group = state.groups.get(&group_name).ok_or_else(|| {

@@ -15,10 +15,7 @@ pub struct FoundationModel {
 
 impl FoundationModel {
     pub(crate) fn to_summary_json(&self, region: &str) -> Value {
-        let arn = format!(
-            "arn:aws:bedrock:{}::foundation-model/{}",
-            region, self.model_id
-        );
+        let arn = crate::arns::foundation_model_arn(region, self.model_id);
         json!({
             "modelArn": arn,
             "modelId": self.model_id,
@@ -36,10 +33,7 @@ impl FoundationModel {
     }
 
     pub(crate) fn to_detail_json(&self, region: &str, account_id: &str) -> Value {
-        let arn = format!(
-            "arn:aws:bedrock:{}::foundation-model/{}",
-            region, self.model_id
-        );
+        let arn = crate::arns::foundation_model_arn(region, self.model_id);
         let _ = account_id; // ARN uses :: (no account) for foundation models
         json!({
             "modelDetails": {

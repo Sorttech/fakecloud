@@ -4,7 +4,7 @@ description = "AWS Config — configuration recorder, real cross-service config-
 weight = 70
 +++
 
-fakecloud implements AWS Config's full JSON 1.1 API: 97 operations covering the configuration recorder, configuration items, config rules with real evaluation, compliance, remediation, conformance packs, organization rules, aggregators, retention, stored queries, and resource evaluations. 100% Smithy conformance.
+fakecloud implements AWS Config's full JSON 1.1 API: 102 operations covering the configuration recorder, configuration items, config rules with real evaluation, compliance, remediation, conformance packs, organization rules, aggregators, retention, stored queries, and resource evaluations. 100% Smithy conformance.
 
 **Status: 100% coverage with a real recording + rule-evaluation data plane.**
 

@@ -31,17 +31,12 @@ impl ResourceProvisioner {
             return Err(format!("Event bus does not exist: {event_bus_name}"));
         }
 
-        let arn = if event_bus_name == "default" {
-            format!(
-                "arn:aws:events:{}:{}:rule/{}",
-                self.region, state.account_id, rule_name
-            )
-        } else {
-            format!(
-                "arn:aws:events:{}:{}:rule/{}/{}",
-                self.region, state.account_id, event_bus_name, rule_name
-            )
-        };
+        let arn = fakecloud_eventbridge::rule_arn(
+            &self.region,
+            &self.account_id,
+            event_bus_name,
+            rule_name,
+        );
 
         let rule = EventRule {
             name: rule_name.to_string(),
@@ -204,19 +199,17 @@ impl ResourceProvisioner {
             return Err(format!("Connection {name} already exists"));
         }
         let now = Utc::now();
-        let arn = format!(
-            "arn:aws:events:{}:{}:connection/{}/{}",
-            self.region,
-            state.account_id,
-            name,
-            Uuid::new_v4().as_simple()
+        let arn = self.regional_arn(
+            "events",
+            &format!("connection/{}/{}", name, Uuid::new_v4().as_simple()),
         );
-        let secret_arn = format!(
-            "arn:aws:secretsmanager:{}:{}:secret:events!connection/{}-{}",
-            self.region,
-            state.account_id,
-            name,
-            Uuid::new_v4().as_simple()
+        let secret_arn = self.regional_arn(
+            "secretsmanager",
+            &format!(
+                "secret:events!connection/{}-{}",
+                name,
+                Uuid::new_v4().as_simple()
+            ),
         );
         let connection = Connection {
             name: name.clone(),
@@ -284,12 +277,9 @@ impl ResourceProvisioner {
             return Err(format!("ApiDestination {name} already exists"));
         }
         let now = Utc::now();
-        let arn = format!(
-            "arn:aws:events:{}:{}:api-destination/{}/{}",
-            self.region,
-            state.account_id,
-            name,
-            Uuid::new_v4().as_simple()
+        let arn = self.regional_arn(
+            "events",
+            &format!("api-destination/{}/{}", name, Uuid::new_v4().as_simple()),
         );
         state.api_destinations.insert(
             name.clone(),
@@ -357,10 +347,7 @@ impl ResourceProvisioner {
         if state.archives.contains_key(&name) {
             return Err(format!("Archive {name} already exists"));
         }
-        let arn = format!(
-            "arn:aws:events:{}:{}:archive/{}",
-            self.region, state.account_id, name
-        );
+        let arn = self.regional_arn("events", &format!("archive/{}", name));
         state.archives.insert(
             name.clone(),
             Archive {
@@ -408,10 +395,7 @@ impl ResourceProvisioner {
             .map(String::from);
         let dead_letter_config = props.get("DeadLetterConfig").cloned();
         let policy = props.get("Policy").cloned();
-        let arn = format!(
-            "arn:aws:events:{}:{}:event-bus/{name}",
-            self.region, self.account_id
-        );
+        let arn = fakecloud_eventbridge::bus_arn(&self.region, &self.account_id, &name);
         let now = Utc::now();
         let bus = EventBus {
             name: name.clone(),
@@ -472,10 +456,7 @@ impl ResourceProvisioner {
             let condition = props.get("Condition").cloned();
             let mut obj = serde_json::json!({
                 "Effect": "Allow",
-                "Resource": format!(
-                    "arn:aws:events:{}:{}:event-bus/{bus_name}",
-                    self.region, self.account_id
-                ),
+                "Resource": fakecloud_eventbridge::bus_arn(&self.region, &self.account_id, &bus_name),
             });
             if let (Some(sid), Some(obj)) = (sid, obj.as_object_mut()) {
                 obj.insert("Sid".to_string(), serde_json::Value::String(sid));
@@ -570,10 +551,7 @@ impl ResourceProvisioner {
             .map(String::from);
 
         let endpoint_id = fakecloud_core::ids::short_id(16).to_string();
-        let arn = format!(
-            "arn:aws:events:{}:{}:endpoint/{name}",
-            self.region, self.account_id
-        );
+        let arn = self.regional_arn("events", &format!("endpoint/{name}"));
         let endpoint_url = format!("https://{endpoint_id}.endpoint.events.amazonaws.com");
         let now = Utc::now();
         let endpoint = Endpoint {

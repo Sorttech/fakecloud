@@ -6,7 +6,8 @@ use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use crate::service::Ec2Service;
 use crate::service_helpers::{
-    gen_id, require, validate_enum, validate_int_range, validate_length, validate_max_results,
+    ec2_arn, gen_id, require, validate_enum, validate_int_range, validate_length,
+    validate_max_results,
 };
 use crate::state::{
     Ec2State, NetworkInsightsAccessScope, NetworkInsightsAccessScopeAnalysis,
@@ -27,10 +28,7 @@ fn path_xml(p: &NetworkInsightsPath, tags: &[Tag], owner: &str, region: &str) ->
         ec2_elem("networkInsightsPathId", &p.id),
         ec2_elem(
             "networkInsightsPathArn",
-            &format!(
-                "arn:aws:ec2:{region}:{owner}:network-insights-path/{}",
-                p.id
-            )
+            &ec2_arn(region, owner, &format!("network-insights-path/{}", p.id))
         ),
         FIXED_TIME,
         ec2_elem("source", &p.source),
@@ -136,7 +134,7 @@ fn analysis_xml(a: &NetworkInsightsAnalysis, tags: &[Tag], owner: &str, region: 
     format!(
         "{}{}{}<startDate>{}</startDate><status>succeeded</status><networkPathFound>true</networkPathFound>{}",
         ec2_elem("networkInsightsAnalysisId", &a.id),
-        ec2_elem("networkInsightsAnalysisArn", &format!("arn:aws:ec2:{region}:{owner}:network-insights-analysis/{}", a.id)),
+        ec2_elem("networkInsightsAnalysisArn", &ec2_arn(region, owner, &format!("network-insights-analysis/{}", a.id))),
         ec2_elem("networkInsightsPathId", &a.path_id),
         FIXED_TIME,
         super::tags::tag_set_xml(tags),
@@ -226,9 +224,10 @@ fn scope_xml(sc: &NetworkInsightsAccessScope, tags: &[Tag], owner: &str, region:
         ec2_elem("networkInsightsAccessScopeId", &sc.id),
         ec2_elem(
             "networkInsightsAccessScopeArn",
-            &format!(
-                "arn:aws:ec2:{region}:{owner}:network-insights-access-scope/{}",
-                sc.id
+            &ec2_arn(
+                region,
+                owner,
+                &format!("network-insights-access-scope/{}", sc.id)
             )
         ),
         FIXED_TIME,
@@ -338,7 +337,7 @@ fn scope_analysis_xml(
     format!(
         "{}{}{}<status>succeeded</status><startDate>{}</startDate><findingsFound>true</findingsFound><analyzedEniCount>0</analyzedEniCount>{}",
         ec2_elem("networkInsightsAccessScopeAnalysisId", &a.id),
-        ec2_elem("networkInsightsAccessScopeAnalysisArn", &format!("arn:aws:ec2:{region}:{owner}:network-insights-access-scope-analysis/{}", a.id)),
+        ec2_elem("networkInsightsAccessScopeAnalysisArn", &ec2_arn(region, owner, &format!("network-insights-access-scope-analysis/{}", a.id))),
         ec2_elem("networkInsightsAccessScopeId", &a.scope_id),
         FIXED_TIME,
         super::tags::tag_set_xml(tags),

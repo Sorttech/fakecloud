@@ -9,7 +9,7 @@ impl BedrockAgentService {
         let id = short_id();
         let now_dt = now();
         let variants = opt_array(&body, "variants");
-        let arn = prompt_arn(&id, &req.region, &req.account_id);
+        let arn = prompt_arn(&req.region, &req.account_id, &id);
         let prompt = Prompt {
             prompt_id: id.clone(),
             name: name.clone(),
@@ -18,6 +18,7 @@ impl BedrockAgentService {
             version: "DRAFT".to_string(),
             created_at: now_dt,
             updated_at: now_dt,
+            arn: arn.clone(),
         };
         let mut accts = self.state.write();
         let state = accts.get_or_create(&req.account_id, &req.region);
@@ -85,10 +86,7 @@ impl BedrockAgentService {
             variants: prompt.variants.clone(),
         };
         versions.push(pv);
-        let arn = format!(
-            "{}:{version_num}",
-            prompt_arn(&id, &req.region, &req.account_id)
-        );
+        let arn = format!("{}:{version_num}", prompt.arn);
         let mut out = json!({
             "name": prompt.name,
             "id": id,
@@ -108,12 +106,7 @@ impl BedrockAgentService {
         let accts = self.state.read();
         let list: Vec<Value> = accts
             .get(&req.account_id)
-            .map(|s| {
-                s.prompts
-                    .values()
-                    .map(|p| prompt_summary_json(p, &req.region, &req.account_id))
-                    .collect()
-            })
+            .map(|s| s.prompts.values().map(prompt_summary_json).collect())
             .unwrap_or_default();
         Ok(AwsResponse::ok_json(json!({ "promptSummaries": list })))
     }
@@ -163,16 +156,16 @@ impl BedrockAgentService {
         let state = accts
             .get(&req.account_id)
             .ok_or_else(|| not_found(format!("Prompt {id} not found")))?;
-        let versions: Vec<Value> = state
-            .prompt_versions
-            .get(&id)
-            .map(|vs| {
+        let prompt_arn = state.prompts.get(&id).map(|p| p.arn.as_str());
+        let versions: Vec<Value> = prompt_arn
+            .zip(state.prompt_versions.get(&id))
+            .map(|(prompt_arn, vs)| {
                 vs.iter()
                     .map(|v| {
                         let mut o = json!({
                             "id": v.prompt_id,
                             "version": v.prompt_version,
-                            "arn": format!("{}:{}", prompt_arn(&v.prompt_id, &req.region, &req.account_id), v.prompt_version),
+                            "arn": format!("{prompt_arn}:{}", v.prompt_version),
                             "createdAt": v.created_at.to_rfc3339(),
                             "updatedAt": v.updated_at.to_rfc3339(),
                         });
@@ -198,6 +191,10 @@ impl BedrockAgentService {
         let state = accts
             .get(&req.account_id)
             .ok_or_else(|| not_found(format!("Prompt {id} not found")))?;
+        let prompt = state
+            .prompts
+            .get(&id)
+            .ok_or_else(|| not_found(format!("Prompt {id} not found")))?;
         let v = state
             .prompt_versions
             .get(&id)
@@ -206,7 +203,7 @@ impl BedrockAgentService {
         let mut out = json!({
             "id": v.prompt_id,
             "version": v.prompt_version,
-            "arn": format!("{}:{}", prompt_arn(&v.prompt_id, &req.region, &req.account_id), v.prompt_version),
+            "arn": format!("{}:{}", prompt.arn, v.prompt_version),
             "createdAt": v.created_at.to_rfc3339(),
             "updatedAt": v.updated_at.to_rfc3339(),
             "variants": v.variants,

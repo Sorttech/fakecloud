@@ -49,7 +49,7 @@ impl OrganizationsService {
                 ),
             ));
         }
-        let mut org = OrganizationState::bootstrap(&req.account_id);
+        let mut org = OrganizationState::bootstrap_in(&req.region, &req.account_id);
         // A CONSOLIDATED_BILLING org has no policy management; reflect the
         // requested feature set and drop the auto-enabled SCP type.
         if feature_set == FEATURE_SET_CONSOLIDATED_BILLING {

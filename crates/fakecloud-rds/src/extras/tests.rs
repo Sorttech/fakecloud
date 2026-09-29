@@ -6563,3 +6563,29 @@ fn describe_db_cluster_snapshots_filters_by_snapshot_type_and_cluster() {
     assert!(body.contains("<DBClusterSnapshotIdentifier>auto-snap</DBClusterSnapshotIdentifier>"));
     assert!(body.contains("<DBClusterSnapshotIdentifier>manual-snap</DBClusterSnapshotIdentifier>"));
 }
+
+/// A bare key id or alias echoed back as `KmsKeyId` must be the ARN KMS
+/// itself mints for that key in the caller's region, partition included.
+#[test]
+fn kms_key_id_is_expanded_in_the_regions_partition() {
+    let key = super::format_kms_arn("1234abcd", "cn-north-1", "000000000000");
+    assert_eq!(key, "arn:aws-cn:kms:cn-north-1:000000000000:key/1234abcd");
+    assert_eq!(
+        key,
+        fakecloud_kms::kms_key_arn("cn-north-1", "000000000000", "1234abcd")
+    );
+    let alias = super::format_kms_arn("alias/aws/rds", "cn-north-1", "000000000000");
+    assert_eq!(
+        alias,
+        "arn:aws-cn:kms:cn-north-1:000000000000:alias/aws/rds"
+    );
+    assert_eq!(
+        alias,
+        fakecloud_kms::kms_alias_arn("cn-north-1", "000000000000", "alias/aws/rds")
+    );
+    // Commercial output is unchanged.
+    assert_eq!(
+        super::format_kms_arn("1234abcd", "us-east-1", "000000000000"),
+        "arn:aws:kms:us-east-1:000000000000:key/1234abcd"
+    );
+}

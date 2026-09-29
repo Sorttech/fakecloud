@@ -466,8 +466,7 @@ impl AwsService for ConfigService {
                 self.describe_config_rule_evaluation_status(&account, &body)
             }
             "StartConfigRulesEvaluation" => {
-                self.start_config_rules_evaluation(&account, &region, &body)
-                    .await
+                self.start_config_rules_evaluation(&account, &body).await
             }
             "PutEvaluations" => self.put_evaluations(&account, &body),
             "PutExternalEvaluation" => self.put_external_evaluation(&account, &body),
@@ -900,14 +899,18 @@ impl ConfigService {
             "AWSConfigurationRecorderForServiceLinkedConfigurationRecorder-{}",
             &Uuid::new_v4().to_string()[..8]
         );
-        let arn = format!("arn:aws:config:{region}:{account}:configuration-recorder/{name}");
+        let arn = config_arn(region, account, &format!("configuration-recorder/{name}"));
         let mut st = self.state.write();
         let acc = st.account_mut(account);
         acc.recorders.insert(
             name.clone(),
             ConfigurationRecorder {
                 name: name.clone(),
-                role_arn: format!("arn:aws:iam::{account}:role/aws-service-role/config.amazonaws.com/AWSServiceRoleForConfig"),
+                role_arn: config_service_linked_role_arn(
+                    region,
+                    account,
+                    "AWSServiceRoleForConfig",
+                ),
                 recording_group: None,
                 recording_mode: None,
                 arn: Some(arn.clone()),
@@ -1268,8 +1271,10 @@ impl ConfigService {
                 "OK".into()
             },
             configuration_state_id: state_id,
-            arn: format!(
-                "arn:aws:config:{region}:{account}:resource/{resource_type}/{resource_id}"
+            arn: config_arn(
+                region,
+                account,
+                &format!("resource/{resource_type}/{resource_id}"),
             ),
             resource_type,
             resource_id,
@@ -1538,7 +1543,7 @@ impl ConfigService {
 
         let id = short_id();
         let connector = crate::state::Connector {
-            arn: format!("arn:aws:config:{region}:{account}:connector/{id}"),
+            arn: config_arn(region, account, &format!("connector/{id}")),
             name: format!("connector-{id}"),
             provider: "AZURE".to_string(),
             tenant_identifier: tenant,
@@ -1707,7 +1712,7 @@ impl ConfigService {
                 ));
             }
         }
-        let arn = format!("arn:aws:config:{region}:{account}:configuration-recorder/{name}",);
+        let arn = config_arn(region, account, &format!("configuration-recorder/{name}",));
         // A third-party recorder is a real recorder: describe, list and delete
         // all read `recorders`, so it lives there rather than in a map of its
         // own that nothing can see.
@@ -1715,7 +1720,11 @@ impl ConfigService {
             name.clone(),
             ConfigurationRecorder {
                 name: name.clone(),
-                role_arn: format!("arn:aws:iam::{account}:role/aws-service-role/config.amazonaws.com/AWSServiceRoleForConfigThirdParty"),
+                role_arn: config_service_linked_role_arn(
+                    region,
+                    account,
+                    "AWSServiceRoleForConfigThirdParty",
+                ),
                 recording_group: None,
                 recording_mode: None,
                 arn: Some(arn.clone()),
@@ -1782,9 +1791,10 @@ impl ConfigService {
         let acc = st.account_mut(account);
         let existing = acc.rules.get(&name);
         let arn = existing.map(|r| r.arn.clone()).unwrap_or_else(|| {
-            format!(
-                "arn:aws:config:{region}:{account}:config-rule/config-rule-{}",
-                short_id()
+            config_arn(
+                region,
+                account,
+                &format!("config-rule/config-rule-{}", short_id()),
             )
         });
         let rule_id = existing
@@ -1955,13 +1965,12 @@ impl ConfigService {
     async fn start_config_rules_evaluation(
         &self,
         account: &str,
-        region: &str,
         body: &Value,
     ) -> Result<AwsResponse, AwsServiceError> {
         self.ensure_evaluated(account);
         // For custom-Lambda rules, invoke the referenced function.
         let names = string_list(body, "ConfigRuleNames");
-        let custom_rules: Vec<(String, String, Option<String>)> = {
+        let custom_rules: Vec<(String, String, String, Option<String>)> = {
             let st = self.state.read();
             st.account(account)
                 .map(|a| {
@@ -1978,17 +1987,22 @@ impl ConfigService {
                                 .get("SourceIdentifier")
                                 .and_then(Value::as_str)?
                                 .to_string();
-                            Some((r.name.clone(), lambda_arn, r.input_parameters.clone()))
+                            Some((
+                                r.name.clone(),
+                                r.arn.clone(),
+                                lambda_arn,
+                                r.input_parameters.clone(),
+                            ))
                         })
                         .collect()
                 })
                 .unwrap_or_default()
         };
-        for (rule_name, lambda_arn, input_parameters) in custom_rules {
+        for (rule_name, rule_arn, lambda_arn, input_parameters) in custom_rules {
             self.invoke_custom_rule(
                 account,
-                region,
                 &rule_name,
+                &rule_arn,
                 &lambda_arn,
                 input_parameters.as_deref(),
             )
@@ -2004,8 +2018,8 @@ impl ConfigService {
     async fn invoke_custom_rule(
         &self,
         account: &str,
-        region: &str,
         rule_name: &str,
+        rule_arn: &str,
         lambda_arn: &str,
         input_parameters: Option<&str>,
     ) {
@@ -2020,7 +2034,13 @@ impl ConfigService {
             .unwrap_or(lambda_arn)
             .to_string();
         let result_token = format!("{rule_name}#{}", Uuid::new_v4());
-        let event = custom_rule_event(account, region, rule_name, input_parameters, &result_token);
+        let event = custom_rule_event(
+            account,
+            rule_name,
+            rule_arn,
+            input_parameters,
+            &result_token,
+        );
         // Resolve the Lambda in the rule's own account (not just the default
         // account) so a custom rule in a non-default account finds its function.
         let resolved = {
@@ -2579,15 +2599,35 @@ impl ConfigService {
                 rule_name.clone(),
                 RemediationConfiguration {
                     config_rule_name: rule_name.clone(),
-                    arn: format!("arn:aws:config:{region}:{account}:remediation-configuration/{rule_name}/{}", short_id()),
-                    target_type: c.get("TargetType").and_then(Value::as_str).unwrap_or("SSM_DOCUMENT").to_string(),
-                    target_id: c.get("TargetId").and_then(Value::as_str).unwrap_or_default().to_string(),
-                    target_version: c.get("TargetVersion").and_then(Value::as_str).map(String::from),
+                    arn: config_arn(
+                        region,
+                        account,
+                        &format!("remediation-configuration/{rule_name}/{}", short_id()),
+                    ),
+                    target_type: c
+                        .get("TargetType")
+                        .and_then(Value::as_str)
+                        .unwrap_or("SSM_DOCUMENT")
+                        .to_string(),
+                    target_id: c
+                        .get("TargetId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    target_version: c
+                        .get("TargetVersion")
+                        .and_then(Value::as_str)
+                        .map(String::from),
                     parameters: c.get("Parameters").cloned(),
-                    resource_type: c.get("ResourceType").and_then(Value::as_str).map(String::from),
+                    resource_type: c
+                        .get("ResourceType")
+                        .and_then(Value::as_str)
+                        .map(String::from),
                     automatic: c.get("Automatic").and_then(Value::as_bool).unwrap_or(false),
                     execution_controls: c.get("ExecutionControls").cloned(),
-                    maximum_automatic_attempts: c.get("MaximumAutomaticAttempts").and_then(Value::as_i64),
+                    maximum_automatic_attempts: c
+                        .get("MaximumAutomaticAttempts")
+                        .and_then(Value::as_i64),
                     retry_attempt_seconds: c.get("RetryAttemptSeconds").and_then(Value::as_i64),
                     created_by_service: None,
                 },
@@ -2942,9 +2982,10 @@ impl ConfigService {
             ));
         }
         let now = Utc::now();
-        let arn = format!(
-            "arn:aws:config:{region}:{account}:conformance-pack/{name}-{}",
-            short_id()
+        let arn = config_arn(
+            region,
+            account,
+            &format!("conformance-pack/{name}-{}", short_id()),
         );
         let id = format!("conformance-pack-{}", short_id());
         let rule_names = extract_pack_rule_names(template_body.as_deref());
@@ -3077,7 +3118,7 @@ impl ConfigService {
                             "ConformancePackId": p.id,
                             "ConformancePackArn": p.arn,
                             "ConformancePackState": "CREATE_COMPLETE",
-                            "StackArn": format!("arn:aws:cloudformation:{region}:{account}:stack/awsconfigconforms-{}/{}", p.name, short_id()),
+                            "StackArn": fakecloud_aws::arn::Arn::regional("cloudformation", region, account, &format!("stack/awsconfigconforms-{}/{}", p.name, short_id())).to_string(),
                             "LastUpdateRequestedTime": now,
                             "LastUpdateCompletedTime": now,
                         })
@@ -3275,9 +3316,10 @@ impl ConfigService {
         body: &Value,
     ) -> Result<AwsResponse, AwsServiceError> {
         let name = require_str(body, "OrganizationConfigRuleName")?;
-        let arn = format!(
-            "arn:aws:config:{region}:{account}:organization-config-rule/{name}-{}",
-            short_id()
+        let arn = config_arn(
+            region,
+            account,
+            &format!("organization-config-rule/{name}-{}", short_id()),
         );
         let mut st = self.state.write();
         let acc = st.account_mut(account);
@@ -3434,9 +3476,10 @@ impl ConfigService {
         body: &Value,
     ) -> Result<AwsResponse, AwsServiceError> {
         let name = require_str(body, "OrganizationConformancePackName")?;
-        let arn = format!(
-            "arn:aws:config:{region}:{account}:organization-conformance-pack/{name}-{}",
-            short_id()
+        let arn = config_arn(
+            region,
+            account,
+            &format!("organization-conformance-pack/{name}-{}", short_id()),
         );
         let mut st = self.state.write();
         let acc = st.account_mut(account);
@@ -3593,9 +3636,10 @@ impl ConfigService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let name = require_str(body, "ConfigurationAggregatorName")?;
         let now = Utc::now();
-        let arn = format!(
-            "arn:aws:config:{region}:{account}:config-aggregator/config-aggregator-{}",
-            short_id()
+        let arn = config_arn(
+            region,
+            account,
+            &format!("config-aggregator/config-aggregator-{}", short_id()),
         );
         let mut st = self.state.write();
         let acc = st.account_mut(account);
@@ -3747,7 +3791,11 @@ impl ConfigService {
         let authorized_account = require_str(body, "AuthorizedAccountId")?;
         let authorized_region = require_str(body, "AuthorizedAwsRegion")?;
         let now = Utc::now();
-        let arn = format!("arn:aws:config:{region}:{account}:aggregation-authorization/{authorized_account}/{authorized_region}");
+        let arn = config_arn(
+            region,
+            account,
+            &format!("aggregation-authorization/{authorized_account}/{authorized_region}"),
+        );
         let key = format!("{authorized_account}\u{1}{authorized_region}");
         let auth = AggregationAuthorization {
             arn: arn.clone(),
@@ -4212,9 +4260,9 @@ impl ConfigService {
         let id = existing
             .map(|s| s.id.clone())
             .unwrap_or_else(|| Uuid::new_v4().to_string());
-        let arn = existing.map(|s| s.arn.clone()).unwrap_or_else(|| {
-            format!("arn:aws:config:{region}:{account}:stored-query/{name}/{id}")
-        });
+        let arn = existing
+            .map(|s| s.arn.clone())
+            .unwrap_or_else(|| config_arn(region, account, &format!("stored-query/{name}/{id}")));
         acc.stored_queries.insert(
             name.clone(),
             StoredQuery {
@@ -4732,8 +4780,8 @@ fn paged_response(field: &str, items: Vec<Value>, body: &Value, token_field: &st
 /// declared none — a custom rule that reads its parameters must see them.
 fn custom_rule_event(
     account: &str,
-    region: &str,
     rule_name: &str,
+    rule_arn: &str,
     input_parameters: Option<&str>,
     result_token: &str,
 ) -> Value {
@@ -4752,7 +4800,7 @@ fn custom_rule_event(
         "invokingEvent": invoking_event,
         "ruleParameters": rule_parameters,
         "resultToken": result_token,
-        "configRuleArn": format!("arn:aws:config:{region}:{account}:config-rule/{rule_name}"),
+        "configRuleArn": rule_arn,
         "configRuleName": rule_name,
         "accountId": account,
     })
@@ -4782,10 +4830,11 @@ mod unit_tests {
     #[test]
     fn custom_rule_event_passes_stored_input_parameters() {
         let params = r#"{"maxAccessKeyAge":"90"}"#;
+        let rule_arn = "arn:aws:config:eu-west-1:111122223333:config-rule/config-rule-abc123";
         let event = custom_rule_event(
             "111122223333",
-            "eu-west-1",
             "my-rule",
+            rule_arn,
             Some(params),
             "my-rule#tok",
         );
@@ -4795,19 +4844,16 @@ mod unit_tests {
         assert_eq!(event["configRuleName"], json!("my-rule"));
         assert_eq!(event["accountId"], json!("111122223333"));
         assert_eq!(event["resultToken"], json!("my-rule#tok"));
-        // The event's configRuleArn must carry the rule's region so it matches
-        // the ARN DescribeConfigRules returns, not a hardcoded us-east-1.
-        assert_eq!(
-            event["configRuleArn"],
-            json!("arn:aws:config:eu-west-1:111122223333:config-rule/my-rule")
-        );
+        // The event's configRuleArn is the rule's stored ARN, the one
+        // DescribeConfigRules returns.
+        assert_eq!(event["configRuleArn"], json!(rule_arn));
     }
 
     #[test]
     fn custom_rule_event_defaults_empty_parameters_to_empty_object() {
-        let none = custom_rule_event("111122223333", "us-west-2", "r", None, "r#t");
+        let none = custom_rule_event("111122223333", "r", "arn", None, "r#t");
         assert_eq!(none["ruleParameters"], json!("{}"));
-        let empty = custom_rule_event("111122223333", "us-west-2", "r", Some(""), "r#t");
+        let empty = custom_rule_event("111122223333", "r", "arn", Some(""), "r#t");
         assert_eq!(empty["ruleParameters"], json!("{}"));
     }
 

@@ -1186,7 +1186,30 @@ async fn dynamodb_export_import_roundtrip() {
         export_output.stderr_text()
     );
     let export_json = export_output.stdout_json();
-    let item_count = export_json["ExportDescription"]["ItemCount"]
+    // The start call reports the export as accepted; its counts come from
+    // DescribeExport once it has finished.
+    assert_eq!(
+        export_json["ExportDescription"]["ExportStatus"],
+        "IN_PROGRESS"
+    );
+    let export_arn = export_json["ExportDescription"]["ExportArn"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let describe_output = server
+        .aws_cli(&["dynamodb", "describe-export", "--export-arn", &export_arn])
+        .await;
+    assert!(
+        describe_output.success(),
+        "describe-export failed: {}",
+        describe_output.stderr_text()
+    );
+    let describe_json = describe_output.stdout_json();
+    assert_eq!(
+        describe_json["ExportDescription"]["ExportStatus"],
+        "COMPLETED"
+    );
+    let item_count = describe_json["ExportDescription"]["ItemCount"]
         .as_i64()
         .unwrap_or(0);
     assert_eq!(item_count, 3, "Expected 3 items exported");
@@ -1225,7 +1248,23 @@ async fn dynamodb_export_import_roundtrip() {
         import_output.stderr_text()
     );
     let import_json = import_output.stdout_json();
-    let processed = import_json["ImportTableDescription"]["ProcessedItemCount"]
+    assert_eq!(
+        import_json["ImportTableDescription"]["ImportStatus"],
+        "IN_PROGRESS"
+    );
+    let import_arn = import_json["ImportTableDescription"]["ImportArn"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let describe_output = server
+        .aws_cli(&["dynamodb", "describe-import", "--import-arn", &import_arn])
+        .await;
+    assert!(
+        describe_output.success(),
+        "describe-import failed: {}",
+        describe_output.stderr_text()
+    );
+    let processed = describe_output.stdout_json()["ImportTableDescription"]["ProcessedItemCount"]
         .as_i64()
         .unwrap_or(0);
     assert_eq!(processed, 3, "Expected 3 items imported");
@@ -1562,7 +1601,19 @@ async fn dynamodb_import_table_skips_invalid_keys_and_dedupes() {
         .send()
         .await
         .unwrap();
-    let desc = resp.import_table_description().unwrap();
+    let import_arn = resp
+        .import_table_description()
+        .unwrap()
+        .import_arn()
+        .unwrap()
+        .to_string();
+    let described = ddb
+        .describe_import()
+        .import_arn(import_arn)
+        .send()
+        .await
+        .unwrap();
+    let desc = described.import_table_description().unwrap();
     assert_eq!(desc.processed_item_count(), 7);
     assert_eq!(desc.imported_item_count(), 2);
     assert_eq!(desc.error_count(), 4);

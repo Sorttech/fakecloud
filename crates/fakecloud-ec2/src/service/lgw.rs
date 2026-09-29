@@ -5,7 +5,7 @@ use fakecloud_aws::ec2query::{ec2_elem, ec2_list};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use crate::service::Ec2Service;
-use crate::service_helpers::{gen_id, require, validate_enum, validate_max_results};
+use crate::service_helpers::{ec2_arn, gen_id, require, validate_enum, validate_max_results};
 use crate::state::{
     CarrierGateway, CoipPool, Ec2State, LocalGatewayRouteTable, LocalGatewayRouteTableVifgAssoc,
     LocalGatewayRouteTableVpcAssoc, LocalGatewayVif, LocalGatewayVifGroup, Tag,
@@ -16,7 +16,7 @@ fn mr(req: &AwsRequest) -> Result<(), AwsServiceError> {
 }
 
 fn owner_arn(region: &str, owner: &str, kind: &str, id: &str) -> String {
-    format!("arn:aws:ec2:{region}:{owner}:{kind}/{id}")
+    ec2_arn(region, owner, &format!("{kind}/{id}"))
 }
 
 // ---- carrier gateways ----
@@ -305,13 +305,17 @@ pub(crate) fn get_coip_pool_usage(
 
 fn lgrt_xml(rt: &LocalGatewayRouteTable, tags: &[Tag], owner: &str, region: &str) -> String {
     format!(
-        "{}{}{}<outpostArn>arn:aws:outposts:{region}:{owner}:outpost/op-0</outpostArn>{}<state>available</state><mode>{}</mode>{}",
+        "{}{}{}<outpostArn>{outpost_arn}</outpostArn>{}<state>available</state><mode>{}</mode>{}",
         ec2_elem("localGatewayRouteTableId", &rt.id),
-        ec2_elem("localGatewayRouteTableArn", &owner_arn(region, owner, "local-gateway-route-table", &rt.id)),
+        ec2_elem(
+            "localGatewayRouteTableArn",
+            &owner_arn(region, owner, "local-gateway-route-table", &rt.id)
+        ),
         ec2_elem("localGatewayId", &rt.local_gateway_id),
         ec2_elem("ownerId", owner),
         rt.mode,
         super::tags::tag_set_xml(tags),
+        outpost_arn = fakecloud_aws::arn::Arn::regional("outposts", region, owner, "outpost/op-0"),
     )
 }
 

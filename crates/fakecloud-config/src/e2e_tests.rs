@@ -539,6 +539,61 @@ async fn put_config_rule_persists_create_time_tags() {
 }
 
 #[tokio::test]
+async fn china_region_config_arns_use_the_aws_cn_partition() {
+    let svc = service();
+    let acct = "111111111111";
+    let call_cn = |action: &str, body: Value| {
+        let mut r = req(action, acct, body);
+        r.region = "cn-north-1".to_string();
+        let svc = &svc;
+        async move { body_of(&svc.handle(r).await.expect("handler returned an error")) }
+    };
+
+    let mut body = managed_rule_body("cn-rule", "S3_BUCKET_VERSIONING_ENABLED");
+    body["Tags"] = json!([{"Key": "team", "Value": "sec"}]);
+    call_cn("PutConfigRule", body).await;
+    let desc = call_cn("DescribeConfigRules", json!({})).await;
+    let rule_arn = desc["ConfigRules"][0]["ConfigRuleArn"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        rule_arn.starts_with("arn:aws-cn:config:cn-north-1:111111111111:config-rule/"),
+        "{rule_arn}"
+    );
+    let tags = call_cn("ListTagsForResource", json!({ "ResourceArn": rule_arn })).await;
+    assert_eq!(tags["Tags"][0]["Key"], "team");
+
+    let agg = call_cn(
+        "PutConfigurationAggregator",
+        json!({
+            "ConfigurationAggregatorName": "agg",
+            "AccountAggregationSources": [{"AccountIds": [acct], "AllAwsRegions": true}]
+        }),
+    )
+    .await;
+    assert!(agg["ConfigurationAggregator"]["ConfigurationAggregatorArn"]
+        .as_str()
+        .unwrap()
+        .starts_with("arn:aws-cn:config:cn-north-1:111111111111:config-aggregator/"));
+
+    let recorder = call_cn(
+        "PutServiceLinkedConfigurationRecorder",
+        json!({ "ServicePrincipal": "config-conforms.amazonaws.com" }),
+    )
+    .await;
+    assert!(recorder["Arn"]
+        .as_str()
+        .unwrap()
+        .starts_with("arn:aws-cn:config:cn-north-1:111111111111:configuration-recorder/"));
+    let recorders = call_cn("DescribeConfigurationRecorders", json!({})).await;
+    assert_eq!(
+        recorders["ConfigurationRecorders"][0]["roleARN"],
+        "arn:aws-cn:iam::111111111111:role/aws-service-role/config.amazonaws.com/AWSServiceRoleForConfig"
+    );
+}
+
+#[tokio::test]
 async fn put_configuration_aggregator_persists_create_time_tags() {
     let svc = service();
     let acct = "111111111111";
