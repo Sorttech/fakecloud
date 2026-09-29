@@ -277,10 +277,6 @@ pub fn build_pod_spec(
     })
 }
 
-/// Build a deterministic, DNS-1123-safe Pod name for the given
-/// function + deploy_id. Truncated/lowercased so it fits the 63-char
-/// label limit. The suffix is a stable hash of `deploy_id` so a new
-/// deploy gets a fresh, non-colliding Pod name.
 /// The Secret carrying one instance's execution-role credentials, named
 /// `name` (the instance's Pod name) and labelled like the Pod so the same
 /// ownership rules apply. The Pod references it through `secretKeyRef`, so
@@ -314,6 +310,10 @@ pub fn build_credentials_secret(
     }
 }
 
+/// Build a deterministic, DNS-1123-safe Pod name for the given
+/// function + deploy_id. Truncated/lowercased so it fits the 63-char
+/// label limit. The suffix is a stable hash of `deploy_id` so a new
+/// deploy gets a fresh, non-colliding Pod name.
 pub fn pod_name_for(function_name: &str, deploy_id: &str) -> String {
     fakecloud_k8s::names::pod_name("fakecloud-lambda", function_name, deploy_id)
 }

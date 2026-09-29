@@ -110,13 +110,18 @@ impl K8sBackend {
 /// Extract the account ID from a function ARN
 /// (`arn:aws:lambda:<region>:<account>:function:<name>[:<qual>]`).
 fn account_id_from_arn(arn: &str) -> &str {
-    arn.split(':').nth(4).unwrap_or("000000000000")
+    fakecloud_aws::arn::account_of(arn).unwrap_or("000000000000")
 }
 
 #[async_trait]
 impl LambdaBackend for K8sBackend {
     fn name(&self) -> &str {
         "kubernetes"
+    }
+
+    /// Per-function tags carry scheduling overrides (`K8sPodConfig::from_tags`).
+    fn launch_uses_tags(&self) -> bool {
+        true
     }
 
     async fn launch(

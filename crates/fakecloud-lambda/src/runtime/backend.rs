@@ -97,6 +97,12 @@ pub trait LambdaBackend: Send + Sync + 'static {
         credentials: Option<&SessionCredentials>,
     ) -> Result<WarmInstance, RuntimeError>;
 
+    /// Whether a function's tags shape the instances this backend launches
+    /// (k8s scheduling overrides), so a tag change needs a fresh instance.
+    fn launch_uses_tags(&self) -> bool {
+        false
+    }
+
     /// Tear down one instance. Must be idempotent — the facade may call
     /// this against an already-gone instance during cleanup races.
     async fn terminate(&self, handle: &BackendHandle);

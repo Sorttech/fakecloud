@@ -333,11 +333,11 @@ impl LambdaService {
                 .get(function_name)
                 .map(|f| f.function_arn.clone());
             drop(accounts);
-            // Stop the deleted version's warm instances (same snapshot-then-
-            // terminate discipline as the whole-function delete below).
+            // Stop the deleted version's warm instances: free ones now, busy
+            // ones once their in-flight invocation completes.
             if let (Some(runtime), Some(live_arn)) = (&self.runtime, live_arn) {
                 let rt = runtime.clone();
-                let pool = rt.take_warm_instances(&live_arn, Some(q));
+                let pool = rt.retire_version(&live_arn, q);
                 tokio::spawn(async move { rt.terminate_instances(pool).await });
             }
             return Ok(AwsResponse::json(StatusCode::NO_CONTENT, ""));

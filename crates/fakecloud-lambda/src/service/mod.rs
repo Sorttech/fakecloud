@@ -582,39 +582,44 @@ pub(crate) fn validate_environment(
 /// run before accepting a role, shared with CloudFormation's
 /// `AWS::Lambda::Function`:
 ///
-/// - With IAM enforcement on (`--iam soft|strict`), `iam:PassRole` is
-///   same-account only, as on AWS: a role owned by another account is refused
-///   with `AccessDeniedException`, whatever its trust policy says. With it off
-///   (the default) such a role is accepted, so templates carrying another
-///   emulator's default account (`000000000000`) keep working; nothing is
-///   enforced in that mode anyway.
+/// - `iam:PassRole` is same-account only on AWS. Under `--iam strict` a role
+///   owned by another account is refused with `AccessDeniedException`,
+///   whatever its trust policy says; `--iam soft` logs the would-be denial to
+///   the IAM audit target and allows it; with IAM off (the default) it is
+///   accepted, so templates carrying another emulator's default account
+///   (`000000000000`) keep working. The execution session is then minted in
+///   the function's account.
 /// - The role's trust policy must let `lambda.amazonaws.com` assume it,
-///   looked up in the account that owns the role. Always applied, as it
-///   always was on `CreateFunction`.
+///   looked up in the caller's (function's) account, where the session is
+///   minted. Always applied, as it always was on `CreateFunction`.
 pub fn validate_execution_role(
     caller_account: &str,
     role_arn: &str,
     validator: Option<&dyn fakecloud_core::auth::RoleTrustValidator>,
     iam_mode: fakecloud_core::auth::IamMode,
 ) -> Result<(), AwsServiceError> {
-    let role_account = role_arn
-        .strip_prefix("arn:")
-        .and_then(|rest| rest.split(':').nth(3))
-        .filter(|a| !a.is_empty());
-    if iam_mode.is_enabled() && role_account.is_some_and(|a| a != caller_account) {
-        return Err(AwsServiceError::aws_error(
-            StatusCode::FORBIDDEN,
-            "AccessDeniedException",
-            "Cross-account pass role is not allowed.",
-        ));
+    let cross_account =
+        fakecloud_aws::arn::account_of(role_arn).is_some_and(|a| a != caller_account);
+    if cross_account && iam_mode.is_enabled() {
+        tracing::warn!(
+            target: "fakecloud::iam::audit",
+            action = "iam:PassRole",
+            resource = %role_arn,
+            account = %caller_account,
+            mode = %iam_mode,
+            "cross-account pass role denied"
+        );
+        if iam_mode.is_strict() {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::FORBIDDEN,
+                "AccessDeniedException",
+                "Cross-account pass role is not allowed.",
+            ));
+        }
     }
     if let Some(validator) = validator {
         validator
-            .validate(
-                role_account.unwrap_or(caller_account),
-                role_arn,
-                "lambda.amazonaws.com",
-            )
+            .validate(caller_account, role_arn, "lambda.amazonaws.com")
             .map_err(|err| {
                 AwsServiceError::aws_error(
                     StatusCode::BAD_REQUEST,

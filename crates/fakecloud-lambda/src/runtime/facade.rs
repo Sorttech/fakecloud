@@ -33,13 +33,10 @@ pub(crate) struct WarmEntry {
     /// The execution role's session credentials exported into this
     /// instance's environment; revoked when the instance is torn down.
     credentials: Option<SessionCredentials>,
-    /// When the instance was launched. Its credentials were minted then for
-    /// [`EXECUTION_CREDENTIALS_LIFETIME`], so it stops taking new
-    /// invocations once one could outlive them.
-    launched_at: Instant,
     /// Set when the instance must not take another invocation (its
-    /// credentials were dropped by an IAM reset). A busy instance finishes
-    /// its current invocation and is retired once free.
+    /// credentials were dropped by an IAM reset, or its version deleted). A
+    /// busy instance finishes its current invocation and is retired once
+    /// free.
     retiring: AtomicBool,
     /// Held for the duration of a single invocation against this
     /// instance. The AWS Runtime Interface Emulator (and real Lambda)
@@ -93,7 +90,7 @@ fn pool_key_function_name(key: &str) -> &str {
 
 /// Account inside a pool key.
 fn pool_key_account(key: &str) -> &str {
-    key.split(':').nth(4).unwrap_or_default()
+    fakecloud_aws::arn::account_of(key).unwrap_or_default()
 }
 
 /// Whether `key` is a pool of the function whose unqualified ARN is
@@ -104,30 +101,58 @@ fn pool_key_belongs_to(key: &str, function_arn: &str) -> bool {
 }
 
 /// The role the execution session is minted for: the function's role, in the
-/// function's account. The two only differ when IAM enforcement is off and a
+/// function's account. The two only differ when IAM is not strict and a
 /// template names another account's role (commonly another emulator's
 /// default `000000000000`); minting there would send the function's SDK calls
 /// to an empty account instead of the one holding its resources.
 fn session_role_arn(role_arn: &str, function_arn: &str) -> String {
-    let function_account = function_arn.split(':').nth(4).unwrap_or_default();
-    let parts: Vec<&str> = role_arn.split(':').collect();
-    if parts.len() < 6 || parts[0] != "arn" || function_account.is_empty() {
+    let (Some(function_account), Some(role_account)) = (
+        fakecloud_aws::arn::account_of(function_arn),
+        fakecloud_aws::arn::account_of(role_arn),
+    ) else {
         return role_arn.to_string();
+    };
+    let mut parts: Vec<&str> = role_arn.split(':').collect();
+    if role_account != function_account {
+        parts[4] = function_account;
     }
-    let mut parts = parts;
-    parts[4] = function_account;
     parts.join(":")
 }
 
 /// Whether `entry` can take a new invocation of `deploy_id`: same code +
-/// launch configuration, not being retired, and young enough that an
-/// invocation cannot outlive its credentials. Cheap: no locks beyond the
-/// entry's own fields.
+/// launch configuration, not being retired, and credentials that outlive a
+/// full invocation (judged from their own expiration, not the launch time).
+/// Cheap: no locks beyond the entry's own fields.
 fn is_current(entry: &WarmEntry, deploy_id: &str) -> bool {
+    let headroom = chrono::Duration::from_std(INVOCATION_HEADROOM).expect("headroom fits");
     entry.deploy_id == deploy_id
         && !entry.retiring.load(Ordering::Acquire)
-        && (entry.credentials.is_none()
-            || entry.launched_at.elapsed() + INVOCATION_HEADROOM < EXECUTION_CREDENTIALS_LIFETIME)
+        && entry
+            .credentials
+            .as_ref()
+            .is_none_or(|c| c.expiration - chrono::Utc::now() > headroom)
+}
+
+/// Execution-role credentials minted for an instance that is still being
+/// launched. Revoked on drop (a failed launch, or the launching future being
+/// cancelled) unless [`disarm`](Self::disarm)ed once the instance is pooled.
+struct PendingCredentials<'a> {
+    issuer: Option<&'a Arc<dyn SessionCredentialIssuer>>,
+    credentials: Option<SessionCredentials>,
+}
+
+impl PendingCredentials<'_> {
+    fn disarm(mut self) {
+        self.credentials = None;
+    }
+}
+
+impl Drop for PendingCredentials<'_> {
+    fn drop(&mut self) {
+        if let (Some(issuer), Some(creds)) = (self.issuer, &self.credentials) {
+            issuer.revoke(creds);
+        }
+    }
 }
 
 /// A reserved invocation slot: a warm instance plus the held busy guard
@@ -147,17 +172,20 @@ struct Slot {
 /// `fakecloud-deploy-id` Pod label; standard base64's `/` would grow an
 /// extra URL path segment, break the axum route match, and wedge the Pod
 /// in a cold-start loop for ~49% of deploys (issue #1643).
-fn deploy_id_for(func: &LambdaFunction, layers: &[Vec<u8>]) -> String {
-    deploy_id_from(&func.code_sha256, &launch_config(func), layers)
+///
+/// `with_tags` folds the function's tags in, for backends whose instances
+/// are shaped by them (k8s scheduling); elsewhere TagResource must not
+/// cold-start the function.
+fn deploy_id_for(func: &LambdaFunction, layers: &[Vec<u8>], with_tags: bool) -> String {
+    deploy_id_from(&func.code_sha256, &launch_config(func, with_tags), layers)
 }
 
 /// The function configuration an instance is started with: everything that
-/// ends up in its environment, command, sandbox limits, or scheduling (k8s
-/// reads per-function tags). A change to any of it (UpdateFunctionConfiguration,
-/// TagResource) must start a fresh instance rather than reuse one configured
-/// for something else. Identity (account, version) is the pool key, not
-/// part of this.
-fn launch_config(func: &LambdaFunction) -> String {
+/// ends up in its environment, command, sandbox limits, or (with `with_tags`)
+/// scheduling. A change to any of it must start a fresh instance rather than
+/// reuse one configured for something else. Identity (account, version) is
+/// the pool key, not part of this.
+fn launch_config(func: &LambdaFunction, with_tags: bool) -> String {
     serde_json::json!([
         func.role,
         func.runtime,
@@ -170,8 +198,8 @@ fn launch_config(func: &LambdaFunction) -> String {
         func.image_config,
         func.ephemeral_storage_size,
         func.logging_config,
-        func.tags,
         func.architectures,
+        with_tags.then_some(&func.tags),
     ])
     .to_string()
 }
@@ -271,39 +299,63 @@ impl LambdaRuntime {
         }
     }
 
-    /// Stop handing new invocations to every instance holding credentials
-    /// registered in `account_id` (all accounts when `None`), because an IAM
-    /// reset just dropped them. Free instances are retired now; busy ones
-    /// finish their current invocation and are retired once free.
-    pub async fn retire_credentialed_instances(&self, account_id: Option<&str>) {
-        let free: Vec<(String, Arc<WarmEntry>)> = {
-            let mut map = self.instances.write();
-            let mut out = Vec::new();
-            for (key, pool) in map.iter_mut() {
-                pool.retain(|e| {
-                    let affected = e
-                        .credentials
-                        .as_ref()
-                        .is_some_and(|c| account_id.is_none_or(|a| c.account_id == a));
-                    if !affected {
-                        return true;
-                    }
-                    e.retiring.store(true, Ordering::Release);
-                    if e.busy.try_lock().is_ok() {
-                        out.push((key.clone(), e.clone()));
-                        false
-                    } else {
-                        true
-                    }
-                });
-            }
-            map.retain(|_, pool| !pool.is_empty());
-            out
-        };
-        for (key, entry) in free {
-            tracing::info!(pool = %key, "retiring Lambda runtime instance after IAM reset");
-            self.retire(&entry).await;
+    /// Mark every pooled instance matching `pred` as retiring so it takes no
+    /// further invocation. With `detach_free`, the free ones are also removed
+    /// from the pool and returned for teardown; busy ones always stay until
+    /// released (then the idle sweep or the next launch retires them).
+    fn mark_retiring(
+        &self,
+        pred: impl Fn(&str, &WarmEntry) -> bool,
+        detach_free: bool,
+    ) -> Vec<Arc<WarmEntry>> {
+        let mut map = self.instances.write();
+        let mut detached = Vec::new();
+        for (key, pool) in map.iter_mut() {
+            pool.retain(|e| {
+                if !pred(key, e) {
+                    return true;
+                }
+                e.retiring.store(true, Ordering::Release);
+                if detach_free && e.busy.try_lock().is_ok() {
+                    detached.push(e.clone());
+                    false
+                } else {
+                    true
+                }
+            });
         }
+        map.retain(|_, pool| !pool.is_empty());
+        detached
+    }
+
+    /// Synchronously stop handing invocations to every instance holding
+    /// credentials registered in `account_id` (all accounts when `None`).
+    /// Called in step with an IAM reset that drops those credentials, so no
+    /// invocation can start with them afterwards; tear the instances down
+    /// with [`Self::retire_released`].
+    pub fn mark_credentials_revoked(&self, account_id: Option<&str>) {
+        self.mark_retiring(
+            |_, e| {
+                e.credentials
+                    .as_ref()
+                    .is_some_and(|c| account_id.is_none_or(|a| c.account_id == a))
+            },
+            false,
+        );
+    }
+
+    /// Retire every free instance already marked retiring.
+    pub async fn retire_released(&self) {
+        let free = self.mark_retiring(|_, e| e.retiring.load(Ordering::Acquire), true);
+        self.terminate_instances(free).await;
+    }
+
+    /// DeleteFunction with a Qualifier: stop the version's instances without
+    /// cutting off an in-flight invocation. Free instances are detached and
+    /// returned for teardown; busy ones are marked retiring and go once free.
+    pub(crate) fn retire_version(&self, function_arn: &str, version: &str) -> Vec<Arc<WarmEntry>> {
+        let key = format!("{function_arn}:{version}");
+        self.mark_retiring(|k, _| k == key, true)
     }
 
     /// Auto-detect Docker or Podman. Returns `None` if neither is available.
@@ -605,7 +657,7 @@ impl LambdaRuntime {
             return Err(RuntimeError::NoCodeZip(func.function_name.clone()));
         }
 
-        let deploy_id = deploy_id_for(func, layers);
+        let deploy_id = deploy_id_for(func, layers, self.backend.launch_uses_tags());
         let key = pool_key(func);
 
         loop {
@@ -690,30 +742,25 @@ impl LambdaRuntime {
         key: &str,
         deploy_id: String,
     ) -> Result<Slot, RuntimeError> {
-        let credentials = self.issue_credentials(func);
-        let instance = match self
+        let pending = PendingCredentials {
+            issuer: self.credential_issuer.get(),
+            credentials: self.issue_credentials(func),
+        };
+        let instance = self
             .backend
             .launch(
                 func,
                 func.code_zip.as_deref(),
                 layers,
                 &deploy_id,
-                credentials.as_ref(),
+                pending.credentials.as_ref(),
             )
-            .await
-        {
-            Ok(instance) => instance,
-            Err(e) => {
-                self.revoke(credentials.as_ref());
-                return Err(e);
-            }
-        };
+            .await?;
         let entry = Arc::new(WarmEntry {
             instance,
             last_used: RwLock::new(Instant::now()),
             deploy_id,
-            credentials,
-            launched_at: Instant::now(),
+            credentials: pending.credentials.clone(),
             retiring: AtomicBool::new(false),
             busy: Arc::new(tokio::sync::Mutex::new(())),
         });
@@ -727,6 +774,9 @@ impl LambdaRuntime {
             .entry(key.to_string())
             .or_default()
             .push(entry.clone());
+        // Pooled: the entry owns the credentials now and revokes them on
+        // retirement.
+        pending.disarm();
         Ok(Slot { entry, guard })
     }
 
@@ -979,7 +1029,8 @@ impl LambdaRuntime {
             for (name, pool) in map.iter_mut() {
                 let mut i = 0;
                 while i < pool.len() {
-                    let idle = pool[i].last_used.read().elapsed() > ttl;
+                    let idle = pool[i].last_used.read().elapsed() > ttl
+                        || pool[i].retiring.load(Ordering::Acquire);
                     let free = pool[i].busy.try_lock().is_ok();
                     if idle && free {
                         out.push((name.clone(), pool.remove(i)));
@@ -1395,7 +1446,6 @@ mod tests {
                 last_used: RwLock::new(std::time::Instant::now()),
                 deploy_id: "d".to_string(),
                 credentials: None,
-                launched_at: std::time::Instant::now(),
                 retiring: std::sync::atomic::AtomicBool::new(false),
                 busy: Arc::new(tokio::sync::Mutex::new(())),
             })
@@ -1532,7 +1582,20 @@ mod tests {
         };
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        rt.retire_credentialed_instances(Some("123456789012")).await;
+        // Marking is synchronous: from here on no invocation can land on
+        // either instance, before any teardown has run.
+        rt.mark_credentials_revoked(Some("123456789012"));
+        assert!(rt
+            .instances
+            .read()
+            .get(&key("reset"))
+            .unwrap()
+            .iter()
+            .all(|e| e.retiring.load(std::sync::atomic::Ordering::Acquire)));
+        assert_eq!(backend.terminates.load(SeqCst), 0);
+        // Another account's reset marks nothing further.
+        rt.mark_credentials_revoked(Some("999999999999"));
+        rt.retire_released().await;
         assert_eq!(
             backend.terminates.load(SeqCst),
             1,
@@ -1591,7 +1654,7 @@ mod tests {
         // Next launch-path sweep reaps the now-free stale instance.
         rt.evict_stale_deploy(
             &key("busy"),
-            &super::deploy_id_for(&test_func("busy", "sha-B"), &[]),
+            &super::deploy_id_for(&test_func("busy", "sha-B"), &[], false),
         )
         .await;
         assert_eq!(backend.terminates.load(SeqCst), 1);
@@ -1654,5 +1717,137 @@ mod tests {
             "arn:aws:iam::123456789012:role/path/r"
         );
         assert_eq!(super::session_role_arn("not-an-arn", f), "not-an-arn");
+    }
+
+    /// Backend double whose launches fail, or never finish.
+    struct BrokenBackend {
+        hang: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl LambdaBackend for BrokenBackend {
+        fn name(&self) -> &str {
+            "broken"
+        }
+        async fn launch(
+            &self,
+            _func: &LambdaFunction,
+            _code_zip: Option<&[u8]>,
+            _layers: &[Vec<u8>],
+            _deploy_id: &str,
+            _credentials: Option<&SessionCredentials>,
+        ) -> Result<WarmInstance, RuntimeError> {
+            if self.hang {
+                std::future::pending::<()>().await;
+            }
+            Err(RuntimeError::ContainerStartFailed("boom".into()))
+        }
+        async fn terminate(&self, _handle: &BackendHandle) {}
+    }
+
+    fn broken_runtime(hang: bool) -> Arc<LambdaRuntime> {
+        Arc::new(LambdaRuntime {
+            backend: Arc::new(BrokenBackend { hang }),
+            instances: RwLock::new(HashMap::new()),
+            starting: RwLock::new(HashMap::new()),
+            max_concurrency: 2,
+            credential_issuer: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// Credentials minted for a launch that fails, or whose launching future
+    /// is dropped mid-launch, are revoked rather than left registered.
+    #[tokio::test]
+    async fn credentials_of_an_unfinished_launch_are_revoked() {
+        let func = test_func("broken", "sha-A");
+
+        let rt = broken_runtime(false);
+        let issuer = RecordingIssuer::new(chrono::Duration::hours(12));
+        rt.set_credential_issuer(issuer.clone());
+        assert!(rt.invoke(&func, b"{}", &[]).await.is_err());
+        assert_eq!(*issuer.revoked.lock().unwrap(), vec!["KEY0".to_string()]);
+
+        let rt = broken_runtime(true);
+        let issuer = RecordingIssuer::new(chrono::Duration::hours(12));
+        rt.set_credential_issuer(issuer.clone());
+        let cancelled =
+            tokio::time::timeout(Duration::from_millis(100), rt.invoke(&func, b"{}", &[])).await;
+        assert!(cancelled.is_err(), "the launch never finishes");
+        assert_eq!(*issuer.revoked.lock().unwrap(), vec!["KEY0".to_string()]);
+    }
+
+    /// An instance stops taking invocations once its credentials could lapse
+    /// during one, judged from the credentials' own expiration.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn instance_whose_credentials_near_expiry_is_replaced() {
+        let peak = Arc::new(AtomicUsize::new(0));
+        let endpoint = spawn_rie(Duration::from_millis(5), peak).await;
+        let backend = CountingBackend::new(endpoint);
+        let rt = runtime_with(backend.clone(), 2);
+        // Minted with less than the invocation headroom left.
+        let issuer = RecordingIssuer::new(chrono::Duration::minutes(10));
+        rt.set_credential_issuer(issuer.clone());
+
+        let func = test_func("aging", "sha-A");
+        rt.invoke(&func, b"{}", &[]).await.unwrap();
+        rt.invoke(&func, b"{}", &[]).await.unwrap();
+        assert_eq!(backend.launches.load(SeqCst), 2);
+        // The first (free) one was retired on the second launch.
+        assert_eq!(*issuer.revoked.lock().unwrap(), vec!["KEY0".to_string()]);
+    }
+
+    /// Deleting a version stops its free instances now and leaves a busy one
+    /// to finish, retiring it once released; other versions are untouched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deleting_a_version_spares_its_busy_instance() {
+        let peak = Arc::new(AtomicUsize::new(0));
+        let endpoint = spawn_rie(Duration::from_millis(300), peak).await;
+        let backend = CountingBackend::new(endpoint);
+        let rt = runtime_with(backend.clone(), 2);
+
+        let latest = test_func("delv", "sha-A");
+        let mut v1 = latest.clone();
+        v1.version = "1".into();
+        rt.invoke(&latest, b"{}", &[]).await.unwrap();
+        let in_flight = {
+            let rt = rt.clone();
+            let v1 = v1.clone();
+            tokio::spawn(async move { rt.invoke(&v1, b"{}", &[]).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let detached = rt.retire_version(&arn("delv"), "1");
+        assert!(detached.is_empty(), "the busy instance is not detached");
+        rt.terminate_instances(detached).await;
+        assert_eq!(backend.terminates.load(SeqCst), 0);
+        in_flight
+            .await
+            .unwrap()
+            .expect("in-flight invocation completes");
+
+        rt.retire_released().await;
+        assert_eq!(backend.terminates.load(SeqCst), 1);
+        assert!(rt
+            .instances
+            .read()
+            .get(&format!("{}:1", arn("delv")))
+            .is_none());
+        assert!(rt.instances.read().contains_key(&key("delv")));
+    }
+
+    /// Tags only change the deploy fingerprint for backends that read them.
+    #[test]
+    fn tags_change_the_deploy_only_when_the_backend_uses_them() {
+        let plain = test_func("tagged", "sha-A");
+        let mut tagged = plain.clone();
+        tagged.tags.insert("team".into(), "a".into());
+        assert_eq!(
+            super::deploy_id_for(&plain, &[], false),
+            super::deploy_id_for(&tagged, &[], false)
+        );
+        assert_ne!(
+            super::deploy_id_for(&plain, &[], true),
+            super::deploy_id_for(&tagged, &[], true)
+        );
     }
 }

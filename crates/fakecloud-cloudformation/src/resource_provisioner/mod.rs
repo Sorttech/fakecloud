@@ -533,7 +533,8 @@ fn parse_lambda_function_props(props: &serde_json::Value) -> Result<LambdaFuncti
     if let Some(message) =
         fakecloud_lambda::runtime::environment::reserved_keys_message(&environment)
     {
-        return Err(message);
+        // Same `<code>: <message>` shape as the execution-role failures.
+        return Err(format!("InvalidParameterValueException: {message}"));
     }
 
     // CFN tags ride as `[{Key, Value}, ...]`; flatten to the map shape
@@ -8186,6 +8187,17 @@ mod tests {
         // default), refused like AWS with it on.
         prov.create_resource(&func("arn:aws:iam::999999999999:role/elsewhere"))
             .expect("default mode accepts another account's role");
+        // Reserved environment keys fail with the Lambda error code too.
+        let mut reserved = func("arn:aws:iam::123456789012:role/r");
+        reserved.properties["FunctionName"] = serde_json::json!("reserved-fn");
+        reserved.properties["Environment"] =
+            serde_json::json!({"Variables": {"AWS_REGION": "eu-west-1"}});
+        let err = prov.create_resource(&reserved).unwrap_err();
+        assert!(
+            err.starts_with("InvalidParameterValueException: ")
+                && err.ends_with("Reserved keys used in this request: AWS_REGION"),
+            "{err}"
+        );
         let mut enforcing = make_provisioner();
         enforcing.iam_mode = fakecloud_core::auth::IamMode::Strict;
         let err = enforcing

@@ -127,6 +127,13 @@ pub fn arn_resource<'a>(arn: &'a str, service: &str) -> Option<&'a str> {
     rest.strip_prefix(service)?.strip_prefix(':')
 }
 
+/// The account an ARN names (`arn:<partition>:<service>:<region>:<account>:...`),
+/// `None` when `arn` is not an ARN or names no account.
+pub fn account_of(arn: &str) -> Option<&str> {
+    let rest = arn.strip_prefix("arn:")?;
+    rest.split(':').nth(3).filter(|a| !a.is_empty())
+}
+
 /// The partition an ARN names (`arn:<partition>:...`), `aws` when it names
 /// none.
 pub fn partition_of(arn: &str) -> &str {
@@ -337,5 +344,19 @@ mod tests {
         assert_eq!(partition_for("us-isob-east-1"), "aws-iso-b");
         assert_eq!(partition_for("us-isof-south-1"), "aws-iso-f");
         assert_eq!(partition_for("eu-isoe-west-1"), "aws-iso-e");
+    }
+
+    #[test]
+    fn account_of_reads_the_account_field() {
+        assert_eq!(
+            account_of("arn:aws:iam::123456789012:role/r"),
+            Some("123456789012")
+        );
+        assert_eq!(
+            account_of("arn:aws-cn:lambda:cn-north-1:000000000000:function:f:1"),
+            Some("000000000000")
+        );
+        assert_eq!(account_of("arn:aws:s3:::bucket"), None);
+        assert_eq!(account_of("not-an-arn"), None);
     }
 }

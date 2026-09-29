@@ -523,7 +523,6 @@ impl LambdaBackend for DockerBackend {
     }
 }
 
-/// Map AWS runtime identifier to a Docker image tag.
 /// `-e` arguments for a container environment, plus the variables to set on
 /// the container CLI's own process. Credentials go by name only (`-e KEY`),
 /// which makes the CLI copy the value from its environment, so secrets never
@@ -543,6 +542,7 @@ fn docker_env_args(env: Vec<(String, String)>) -> (Vec<String>, Vec<(String, Str
     (args, child_env)
 }
 
+/// Map AWS runtime identifier to a Docker image tag.
 pub fn runtime_to_image(runtime: &str) -> Option<String> {
     let (base, tag) = match runtime {
         "python3.14" => ("python", "3.14"),
