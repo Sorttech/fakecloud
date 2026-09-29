@@ -1933,3 +1933,79 @@ mod snapshot_hook_tests {
         hook().await;
     }
 }
+
+#[cfg(test)]
+mod china_partition_tests {
+    use super::super::EcrService;
+    use crate::state::{EcrState, SharedEcrState};
+    use bytes::Bytes;
+    use fakecloud_core::multi_account::MultiAccountState;
+    use fakecloud_core::service::{AwsRequest, AwsService};
+    use http::{HeaderMap, Method};
+    use parking_lot::RwLock;
+    use serde_json::{json, Value};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    const ACCOUNT: &str = "111111111111";
+
+    fn cn_request(action: &str, body: Value) -> AwsRequest {
+        AwsRequest {
+            service: "ecr".into(),
+            action: action.into(),
+            region: "cn-north-1".into(),
+            account_id: ACCOUNT.into(),
+            request_id: "req-1".into(),
+            headers: HeaderMap::new(),
+            query_params: HashMap::new(),
+            body: Bytes::from(serde_json::to_vec(&body).unwrap()),
+            body_stream: parking_lot::Mutex::new(None),
+            path_segments: vec![],
+            raw_path: "/".into(),
+            raw_query: String::new(),
+            method: Method::POST,
+            is_query_protocol: false,
+            access_key_id: None,
+            principal: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn china_region_repository_arn_round_trips() {
+        let state: SharedEcrState = Arc::new(RwLock::new(MultiAccountState::<EcrState>::new(
+            ACCOUNT,
+            "cn-north-1",
+            "http://fakecloud:4566",
+        )));
+        let svc = EcrService::new(state);
+        let resp = svc
+            .handle(cn_request(
+                "CreateRepository",
+                json!({"repositoryName": "app"}),
+            ))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        let arn = v["repository"]["repositoryArn"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(arn, "arn:aws-cn:ecr:cn-north-1:111111111111:repository/app");
+
+        svc.handle(cn_request(
+            "TagResource",
+            json!({"resourceArn": arn, "tags": [{"Key": "env", "Value": "cn"}]}),
+        ))
+        .await
+        .unwrap();
+        let resp = svc
+            .handle(cn_request(
+                "ListTagsForResource",
+                json!({"resourceArn": arn}),
+            ))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        assert_eq!(v["tags"], json!([{"Key": "env", "Value": "cn"}]));
+    }
+}

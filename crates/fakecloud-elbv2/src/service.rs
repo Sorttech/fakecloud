@@ -432,7 +432,8 @@ impl Elbv2Service {
         }
 
         let suffix = alphanumeric_id(16);
-        let arn = build_lb_arn(&req.region, &req.account_id, &lb_type, &name, &suffix);
+        let arn =
+            crate::state::load_balancer_arn(&req.region, &req.account_id, &lb_type, &name, &suffix);
         let dns_name = build_dns_name(&name, &lb_type, &scheme, &req.region, &suffix);
         let canonical_hosted_zone_id = "Z2P70J7EXAMPLE".to_string();
         let availability_zones: Vec<AvailabilityZone> = subnets
@@ -1025,10 +1026,7 @@ impl Elbv2Service {
         }
 
         let suffix = alphanumeric_id(16);
-        let arn = format!(
-            "arn:aws:elasticloadbalancing:{}:{}:targetgroup/{}/{}",
-            req.region, req.account_id, name, suffix
-        );
+        let arn = crate::state::target_group_arn(&req.region, &req.account_id, &name, &suffix);
         let tg = crate::state::TargetGroup {
             arn: arn.clone(),
             name,
@@ -1985,10 +1983,7 @@ impl Elbv2Service {
             ));
         }
         let suffix = alphanumeric_id(16);
-        let arn = format!(
-            "arn:aws:elasticloadbalancing:{}:{}:truststore/{}/{}",
-            req.region, req.account_id, name, suffix
-        );
+        let arn = crate::state::trust_store_arn(&req.region, &req.account_id, &name, &suffix);
         let ts = crate::state::TrustStore {
             arn: arn.clone(),
             name,

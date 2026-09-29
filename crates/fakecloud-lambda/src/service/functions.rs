@@ -72,10 +72,7 @@ impl LambdaService {
         // eu-central-1 ARN; fakecloud's own lookups are region-insensitive
         // (see `normalize_function_name`), so follow-up calls still resolve,
         // but Terraform / cross-service IAM compare the ARN region.
-        let function_arn = format!(
-            "arn:aws:lambda:{}:{}:function:{}",
-            req.region, state.account_id, input.function_name
-        );
+        let function_arn = function_arn(&req.region, &state.account_id, &input.function_name);
         let now = Utc::now();
 
         let func = LambdaFunction {
@@ -176,8 +173,8 @@ impl LambdaService {
                 StatusCode::NOT_FOUND,
                 "ResourceNotFoundException",
                 format!(
-                    "Function not found: arn:aws:lambda:{}:{}:function:{}",
-                    req.region, state.account_id, function_name
+                    "Function not found: {}",
+                    function_arn(&req.region, &state.account_id, function_name)
                 ),
             )
         })?;
@@ -199,8 +196,8 @@ impl LambdaService {
                             StatusCode::NOT_FOUND,
                             "ResourceNotFoundException",
                             format!(
-                                "Function not found: arn:aws:lambda:{}:{}:function:{}:{v}",
-                                req.region, state.account_id, function_name
+                                "Function not found: {}:{v}",
+                                function_arn(&req.region, &state.account_id, function_name)
                             ),
                         )
                     })?;
@@ -288,7 +285,8 @@ impl LambdaService {
                     StatusCode::NOT_FOUND,
                     "ResourceNotFoundException",
                     format!(
-                        "Function not found: arn:aws:lambda:{region}:{account_id_owned}:function:{function_name}:{q}"
+                        "Function not found: {}:{q}",
+                        function_arn(region, &account_id_owned, function_name)
                     ),
                 ));
             }
@@ -327,7 +325,8 @@ impl LambdaService {
                     StatusCode::NOT_FOUND,
                     "ResourceNotFoundException",
                     format!(
-                        "Function not found: arn:aws:lambda:{region}:{account_id_owned}:function:{function_name}:{q}"
+                        "Function not found: {}:{q}",
+                        function_arn(region, &account_id_owned, function_name)
                     ),
                 ));
             }
@@ -344,7 +343,8 @@ impl LambdaService {
                 StatusCode::NOT_FOUND,
                 "ResourceNotFoundException",
                 format!(
-                    "Function not found: arn:aws:lambda:{region}:{account_id_owned}:function:{function_name}"
+                    "Function not found: {}",
+                    function_arn(region, &account_id_owned, function_name)
                 ),
             ));
         }
