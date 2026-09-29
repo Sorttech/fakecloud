@@ -307,7 +307,12 @@ async fn retry_strategy_reattempts_a_failing_job() {
     expect_terminal(&batch, &job_id, "FAILED").await;
     // Two attempts were made: one recorded retry + the final.
     let d = batch.describe_jobs().jobs(&job_id).send().await.unwrap();
-    assert_eq!(d.jobs()[0].attempts().len(), 1);
+    assert_eq!(
+        d.jobs()[0].attempts().len(),
+        1,
+        "{}",
+        job_failure_detail(&d.jobs()[0])
+    );
     assert_eq!(
         d.jobs()[0].container().and_then(|c| c.exit_code()),
         Some(4),

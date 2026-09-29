@@ -269,18 +269,6 @@ jobs:
           echo "=== ~/.cargo ==="
           du -sh ~/.cargo 2>/dev/null || true
 
-      # Warm the container-image cache ONCE per job. The container-backed tests
-      # in this partition launch many tasks from a handful of small images, and
-      # the runtime now reuses a cached image instead of re-pulling per launch --
-      # so a single pull here covers all of them, and a later throttled pull has
-      # a cached copy to fall back on (`container_image::pull_image`).
-      #
-      # Non-fatal on purpose: this is a traffic optimization, not a dependency.
-      # A registry that refuses us here leaves the tests exactly as they were,
-      # pulling for themselves. `docker images` records what actually landed so a
-      # capped run is diagnosable from the log rather than looking like a code
-      # failure (the symptom is a container that never starts, so the assertion
-      # that fails names an exit code or a missing log line, not a registry).
       # Run the prebuilt test binaries straight from the archive — no compilation.
       # --workspace-remap . points runtime workspace lookups at this checkout (the
       # path matches the build runner on GitHub-hosted runners).
