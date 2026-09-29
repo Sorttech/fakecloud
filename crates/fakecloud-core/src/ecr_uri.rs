@@ -5,9 +5,11 @@
 //! fakecloud can't pull from AWS — there is no AWS account. Instead we
 //! translate the URI to `127.0.0.1:<server-port>/<repo>:<tag>` and pull
 //! from fakecloud's own OCI v2 registry (which is just another route on
-//! the same HTTP server). Docker treats `127.0.0.1:<port>` as an insecure
-//! registry automatically on both Linux and Docker Desktop, so no daemon
-//! config is required.
+//! the same HTTP server), which serves plain HTTP. Docker treats
+//! `127.0.0.1:<port>` as an insecure registry automatically on both Linux and
+//! Docker Desktop, so no daemon config is required; Podman does not, so its
+//! pulls are told explicitly (see
+//! [`crate::container_image::RegistryTransport`]).
 
 /// Detect whether `image` is an AWS private-ECR URI. Match shape:
 /// `<any>.dkr.ecr.<any>.amazonaws.com/<path>[:<tag>|@sha256:<digest>]`.
@@ -27,7 +29,9 @@ pub fn is_aws_ecr_uri(image: &str) -> bool {
 /// go straight to the upstream daemon.
 ///
 /// Docker's localhost-registry behaviour means the daemon on both Linux
-/// and macOS Docker Desktop accepts `127.0.0.1:<port>` over plain HTTP.
+/// and macOS Docker Desktop accepts `127.0.0.1:<port>` over plain HTTP;
+/// Podman needs `--tls-verify=false`, which
+/// [`crate::container_image::pull_image`] adds for a rewritten reference.
 pub fn translate_to_local(image: &str, server_port: u16) -> Option<String> {
     translate_to_local_at(image, "127.0.0.1", server_port)
 }

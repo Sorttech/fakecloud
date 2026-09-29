@@ -116,6 +116,9 @@ impl EcsRuntime {
                 &self.cli,
                 self.docker_config_path().as_deref(),
                 pull_uri,
+                fakecloud_core::container_image::RegistryTransport::for_local_rewrite(
+                    local_pull_uri.is_some(),
+                ),
             )
             .await
             .map_err(RuntimeError::ImagePull)?;
