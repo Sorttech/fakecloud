@@ -1408,7 +1408,7 @@ impl Elbv2Service {
             }
         }
         let suffix = alphanumeric_id(16);
-        let arn = format!("{lb_arn}/{suffix}").replace(":loadbalancer/", ":listener/");
+        let arn = crate::state::listener_arn(&lb_arn, &suffix);
         // Mark referenced target groups as attached to this LB.
         let referenced_tgs: HashSet<String> = actions
             .iter()
@@ -1742,7 +1742,7 @@ impl Elbv2Service {
             ));
         }
         let suffix = alphanumeric_id(16);
-        let arn = format!("{listener_arn}/{suffix}").replace(":listener/", ":listener-rule/");
+        let arn = crate::state::listener_rule_arn(&listener_arn, &suffix);
         let rule = crate::state::Rule {
             arn: arn.clone(),
             listener_arn,

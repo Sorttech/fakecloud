@@ -28,16 +28,7 @@ impl ResourceProvisioner {
 
         let mut accounts = self.ssm_state.write();
         let state = accounts.get_or_create(&self.account_id);
-        let arn = format!(
-            "arn:aws:ssm:{}:{}:parameter{}",
-            self.region,
-            self.account_id,
-            if name.starts_with('/') {
-                name.to_string()
-            } else {
-                format!("/{name}")
-            }
-        );
+        let arn = fakecloud_ssm::param_arn(&self.region, &self.account_id, name);
 
         let parameter = SsmParameter {
             name: name.to_string(),

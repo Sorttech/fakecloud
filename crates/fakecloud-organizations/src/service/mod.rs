@@ -702,6 +702,31 @@ fn required_str<'a>(body: &'a Value, key: &str) -> Result<&'a str, AwsServiceErr
     })
 }
 
+/// The `Type` checks `CreatePolicy` runs before touching the organization:
+/// an out-of-enum type is a malformed request (`InvalidInputException`); a
+/// valid enum value fakecloud doesn't manage isn't enabled for the
+/// organization (`PolicyTypeNotAvailableForOrganizationException`). Both are
+/// the AWS-documented responses (CreatePolicy declares no
+/// PolicyTypeNotSupportedException -- that isn't a real Organizations error
+/// code).
+pub fn check_create_policy_type(policy_type: &str) -> Result<(), AwsServiceError> {
+    if !is_valid_policy_type(policy_type) {
+        return Err(AwsServiceError::aws_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidInputException",
+            format!("You specified an invalid value for the Type parameter: {policy_type}"),
+        ));
+    }
+    if !is_known_policy_type(policy_type) {
+        return Err(AwsServiceError::aws_error(
+            StatusCode::BAD_REQUEST,
+            "PolicyTypeNotAvailableForOrganizationException",
+            format!("The {policy_type} policy type is not available for this organization."),
+        ));
+    }
+    Ok(())
+}
+
 fn is_known_policy_type(t: &str) -> bool {
     matches!(
         t,
@@ -748,7 +773,8 @@ pub(super) fn invalid_input(msg: &str) -> AwsServiceError {
     AwsServiceError::aws_error(StatusCode::BAD_REQUEST, "InvalidInputException", msg)
 }
 
-fn org_error_to_aws(err: OrgError) -> AwsServiceError {
+/// The AWS error a failed organization state mutation surfaces as.
+pub fn org_error_to_aws(err: OrgError) -> AwsServiceError {
     match err {
         OrgError::ParentNotFound(id) => AwsServiceError::aws_error(
             StatusCode::BAD_REQUEST,

@@ -4,6 +4,7 @@ use http::StatusCode;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use fakecloud_aws::arn::partition_for;
 use fakecloud_core::delivery::DeliveryBus;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_dynamodb::SharedDynamoDbState;
@@ -1840,7 +1841,8 @@ impl CloudFormationService {
         // Seed AWS::* pseudo-parameters with stack-context values so
         // resolve_refs can substitute them into resource properties.
         let stack_id = format!(
-            "arn:aws:cloudformation:{}:{}:stack/{}/{}",
+            "arn:{}:cloudformation:{}:{}:stack/{}/{}",
+            partition_for(&req.region),
             req.region,
             req.account_id,
             stack_name,
@@ -1860,7 +1862,7 @@ impl CloudFormationService {
             .or_insert_with(|| stack_name.clone());
         parameters
             .entry("AWS::Partition".to_string())
-            .or_insert_with(|| template::partition_for_region(&req.region).to_string());
+            .or_insert_with(|| partition_for(&req.region).to_string());
         parameters
             .entry("AWS::URLSuffix".to_string())
             .or_insert_with(|| template::url_suffix_for_region(&req.region).to_string());
@@ -2791,7 +2793,7 @@ impl CloudFormationService {
         input
             .parameters
             .entry("AWS::Partition".to_string())
-            .or_insert_with(|| template::partition_for_region(&req.region).to_string());
+            .or_insert_with(|| partition_for(&req.region).to_string());
         input
             .parameters
             .entry("AWS::URLSuffix".to_string())
@@ -2930,7 +2932,8 @@ impl CloudFormationService {
             if !stack_exists {
                 let stack_id = if found_stack_id.is_empty() {
                     format!(
-                        "arn:aws:cloudformation:{}:{}:stack/{}/{}",
+                        "arn:{}:cloudformation:{}:{}:stack/{}/{}",
+                        partition_for(&req.region),
                         req.region,
                         req.account_id,
                         input.stack_name,
@@ -4704,6 +4707,47 @@ mod tests {
         svc.create_stack(&req).await.unwrap();
         let req = make_request("CreateStack", params);
         assert!(svc.create_stack(&req).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn create_stack_in_china_uses_the_aws_cn_partition() {
+        let svc = make_service();
+        let mut params = HashMap::new();
+        params.insert("StackName".to_string(), "cn-stack".to_string());
+        params.insert(
+            "TemplateBody".to_string(),
+            r#"{"Resources":{"Q":{"Type":"AWS::SQS::Queue","Properties":{"QueueName":"cn-q"}}},
+                "Outputs":{"QueueArn":{"Value":{"Fn::GetAtt":["Q","Arn"]}}}}"#
+                .to_string(),
+        );
+        let mut req = make_request("CreateStack", params);
+        req.region = "cn-north-1".to_string();
+        svc.create_stack(&req).await.unwrap();
+        let (stack_id, output) = {
+            let accounts = svc.state.read();
+            let stack = accounts
+                .get("123456789012")
+                .unwrap()
+                .stacks
+                .get("cn-stack")
+                .unwrap()
+                .clone();
+            (stack.stack_id, stack.outputs[0].value.clone())
+        };
+        assert!(
+            stack_id
+                .starts_with("arn:aws-cn:cloudformation:cn-north-1:123456789012:stack/cn-stack/"),
+            "{stack_id}"
+        );
+        assert_eq!(output, "arn:aws-cn:sqs:cn-north-1:123456789012:cn-q");
+
+        let mut params = HashMap::new();
+        params.insert("StackName".to_string(), stack_id.clone());
+        let mut req = make_request("DescribeStacks", params);
+        req.region = "cn-north-1".to_string();
+        let resp = svc.describe_stacks(&req).unwrap();
+        let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
+        assert!(body.contains(&stack_id), "{body}");
     }
 
     #[tokio::test]

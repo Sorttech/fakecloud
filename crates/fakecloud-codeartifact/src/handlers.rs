@@ -133,6 +133,11 @@ fn revision() -> String {
     base64::engine::general_purpose::STANDARD.encode(uuid::Uuid::new_v4().as_bytes())
 }
 
+/// The S3 bucket a domain's package assets live in, in `region`'s partition.
+pub fn asset_bucket_arn(region: &str, owner: &str) -> String {
+    Arn::s3_in(region, &format!("assets-{owner}-{region}")).to_string()
+}
+
 pub fn domain_arn(region: &str, owner: &str, name: &str) -> String {
     Arn::regional("codeartifact", region, owner, &format!("domain/{name}")).to_string()
 }
@@ -289,7 +294,7 @@ impl CodeArtifactService {
             "encryptionKey": encryption_key,
             "repositoryCount": 0,
             "assetSizeBytes": 0,
-            "s3BucketArn": Arn::s3_in(&region, &format!("assets-{owner}-{region}")).to_string(),
+            "s3BucketArn": asset_bucket_arn(&region, &owner),
         });
         let tags = parse_tags(b.get("tags"));
         let mut guard = self.state.write();

@@ -235,9 +235,15 @@ impl ApplicationAutoScalingService {
                 return Err(invalid_param("MinCapacity must be <= MaxCapacity"));
             }
             let arn = synth_scalable_target_arn(&req.account_id, &req.region);
-            let role = role_arn.unwrap_or_else(|| {
-                default_service_linked_role(&req.region, &req.account_id, &service_namespace)
-            });
+            let role = match role_arn {
+                Some(role) => role,
+                None => {
+                    default_service_linked_role(&req.region, &req.account_id, &service_namespace)
+                        .ok_or_else(|| {
+                            invalid_param("RoleARN is required for this service namespace")
+                        })?
+                }
+            };
             let target = ScalableTarget {
                 arn: arn.clone(),
                 service_namespace: service_namespace.clone(),
@@ -1180,30 +1186,41 @@ fn synth_scheduled_action_arn(
     scheduled_action_arn(region, account_id, &id, namespace, resource_id, name)
 }
 
-/// The service-linked role Application Auto Scaling uses for `namespace` when
-/// a scalable target is registered without a `RoleARN`.
-pub fn default_service_linked_role(region: &str, account_id: &str, namespace: &str) -> String {
-    let suffix = match namespace {
-        "ecs" => "ECSService",
-        "elasticmapreduce" => "EMRContainerService",
-        "ec2" => "EC2SpotFleetRequest",
-        "appstream" => "ApplicationAutoScaling_AppStreamFleet",
-        "dynamodb" => "DynamoDBTable",
-        "rds" => "RDSCluster",
-        "sagemaker" => "SageMakerEndpoint",
-        "lambda" => "LambdaConcurrency",
-        "elasticache" => "ElastiCacheRG",
-        "cassandra" => "CassandraTable",
-        "kafka" => "KafkaCluster",
-        _ => "ApplicationAutoScaling_Default",
+/// The role Application Auto Scaling assumes for `namespace` when a scalable
+/// target is registered without a `RoleARN`: the namespace's service-linked
+/// role, or for Amazon EMR (which has none) its documented default
+/// `EMR_AutoScaling_DefaultRole`. `None` for a namespace outside the
+/// `ServiceNamespace` enum.
+pub fn default_service_linked_role(
+    region: &str,
+    account_id: &str,
+    namespace: &str,
+) -> Option<String> {
+    let resource = if namespace == "elasticmapreduce" {
+        "role/EMR_AutoScaling_DefaultRole".to_string()
+    } else {
+        let suffix = match namespace {
+            "appstream" => "AppStreamFleet",
+            "cassandra" => "CassandraTable",
+            "comprehend" => "ComprehendEndpoint",
+            "custom-resource" => "CustomResource",
+            "dynamodb" => "DynamoDBTable",
+            "ec2" => "EC2SpotFleetRequest",
+            "ecs" => "ECSService",
+            "elasticache" => "ElastiCacheRG",
+            "kafka" => "KafkaCluster",
+            "lambda" => "LambdaConcurrency",
+            "neptune" => "NeptuneCluster",
+            "rds" => "RDSCluster",
+            "sagemaker" => "SageMakerEndpoint",
+            "workspaces" => "WorkSpacesPool",
+            _ => return None,
+        };
+        format!(
+            "role/aws-service-role/applicationautoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_{suffix}"
+        )
     };
-    Arn::global_in(
-        region,
-        "iam",
-        account_id,
-        &format!("role/aws-service-role/applicationautoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_{suffix}"),
-    )
-    .to_string()
+    Some(Arn::global_in(region, "iam", account_id, &resource).to_string())
 }
 
 fn synth_forecast(start: DateTime<Utc>, end: DateTime<Utc>) -> Vec<(DateTime<Utc>, i32)> {
@@ -1400,6 +1417,42 @@ mod tests {
     use super::*;
     use http::Method;
     use std::collections::HashMap;
+
+    #[test]
+    fn default_roles_are_the_documented_service_linked_roles() {
+        let slr = |ns: &str| default_service_linked_role("us-east-1", "123456789012", ns);
+        let prefix = "arn:aws:iam::123456789012:role/aws-service-role/applicationautoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_";
+        for (ns, suffix) in [
+            ("appstream", "AppStreamFleet"),
+            ("cassandra", "CassandraTable"),
+            ("comprehend", "ComprehendEndpoint"),
+            ("custom-resource", "CustomResource"),
+            ("dynamodb", "DynamoDBTable"),
+            ("ec2", "EC2SpotFleetRequest"),
+            ("ecs", "ECSService"),
+            ("elasticache", "ElastiCacheRG"),
+            ("kafka", "KafkaCluster"),
+            ("lambda", "LambdaConcurrency"),
+            ("neptune", "NeptuneCluster"),
+            ("rds", "RDSCluster"),
+            ("sagemaker", "SageMakerEndpoint"),
+            ("workspaces", "WorkSpacesPool"),
+        ] {
+            assert_eq!(slr(ns), Some(format!("{prefix}{suffix}")), "{ns}");
+        }
+        assert_eq!(
+            slr("elasticmapreduce").as_deref(),
+            Some("arn:aws:iam::123456789012:role/EMR_AutoScaling_DefaultRole")
+        );
+        for ns in VALID_SERVICE_NAMESPACES {
+            assert!(slr(ns).is_some(), "{ns}");
+        }
+        assert_eq!(slr("bogus"), None);
+        assert_eq!(
+            default_service_linked_role("cn-north-1", "123456789012", "appstream").as_deref(),
+            Some("arn:aws-cn:iam::123456789012:role/aws-service-role/applicationautoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_AppStreamFleet")
+        );
+    }
 
     fn make_req(action: &str, body: Value) -> AwsRequest {
         AwsRequest {

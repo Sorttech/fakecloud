@@ -59,7 +59,7 @@ impl ResourceProvisioner {
         st.application_order.push(name.clone());
         let tags = cfn_tag_list_pascal(props);
         if !tags.is_empty() {
-            let arn = format!("arn:aws:codedeploy:{region}:{account}:application:{name}");
+            let arn = fakecloud_codedeploy::application_arn(region, account, &name);
             st.tags.insert(arn, tags);
         }
 
@@ -74,8 +74,10 @@ impl ResourceProvisioner {
         st.applications.remove(physical_id);
         st.application_order.retain(|n| n != physical_id);
         st.deployment_groups.remove(physical_id);
-        st.tags.remove(&format!(
-            "arn:aws:codedeploy:{region}:{account}:application:{physical_id}"
+        st.tags.remove(&fakecloud_codedeploy::application_arn(
+            region,
+            account,
+            physical_id,
         ));
         Ok(())
     }
@@ -154,8 +156,7 @@ impl ResourceProvisioner {
         groups.insert(dg_name.clone(), Value::Object(group));
         let tags = cfn_tag_list_pascal(props);
         if !tags.is_empty() {
-            let arn =
-                format!("arn:aws:codedeploy:{region}:{account}:deploymentgroup:{app}/{dg_name}");
+            let arn = fakecloud_codedeploy::deployment_group_arn(region, account, &app, &dg_name);
             st.tags.insert(arn, tags);
         }
 
@@ -178,8 +179,8 @@ impl ResourceProvisioner {
         if let Some(groups) = st.deployment_groups.get_mut(app) {
             groups.remove(dg_name);
         }
-        st.tags.remove(&format!(
-            "arn:aws:codedeploy:{region}:{account}:deploymentgroup:{app}/{dg_name}"
+        st.tags.remove(&fakecloud_codedeploy::deployment_group_arn(
+            region, account, app, dg_name,
         ));
         Ok(())
     }
@@ -225,7 +226,7 @@ impl ResourceProvisioner {
         if !st.applications.contains_key(&name) {
             return Err(format!("Application {name} not yet provisioned"));
         }
-        let arn = format!("arn:aws:codedeploy:{region}:{account}:application:{name}");
+        let arn = fakecloud_codedeploy::application_arn(region, account, &name);
         let tags = cfn_tag_list_pascal(props);
         if tags.is_empty() {
             st.tags.remove(&arn);
@@ -308,7 +309,7 @@ impl ResourceProvisioner {
         let groups = st.deployment_groups.entry(app.to_string()).or_default();
         groups.insert(dg_name.to_string(), Value::Object(group));
 
-        let arn = format!("arn:aws:codedeploy:{region}:{account}:deploymentgroup:{app}/{dg_name}");
+        let arn = fakecloud_codedeploy::deployment_group_arn(region, account, app, dg_name);
         let tags = cfn_tag_list_pascal(props);
         if tags.is_empty() {
             st.tags.remove(&arn);

@@ -1199,6 +1199,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn layer_version_numbers_are_never_reused() {
+        let s = svc();
+        let publish = || {
+            run(
+                &s,
+                "PublishLayerVersion",
+                r#"{"Content":{"ZipFile":""}}"#,
+                Some("layer1"),
+                &["2018-10-31", "layers", "layer1", "versions"],
+            )
+        };
+        publish().await;
+        publish().await;
+        run(
+            &s,
+            "DeleteLayerVersion",
+            "",
+            Some("layer1"),
+            &["2018-10-31", "layers", "layer1", "versions", "1"],
+        )
+        .await;
+        publish().await;
+        let versions: Vec<i64> = s.state.read().get("000000000000").unwrap().layers["layer1"]
+            .versions
+            .iter()
+            .map(|v| v.version)
+            .collect();
+        assert_eq!(versions, vec![2, 3]);
+    }
+
+    #[tokio::test]
     async fn code_signing_lifecycle() {
         let s = svc();
         run(

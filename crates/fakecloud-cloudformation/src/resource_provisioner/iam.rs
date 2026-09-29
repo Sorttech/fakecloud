@@ -1095,9 +1095,13 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .ok_or("SamlMetadataDocument is required")?
             .to_string();
-        let arn = Arn::global("iam", &self.account_id, &format!("saml-provider/{name}"))
-            .with_partition(fakecloud_aws::arn::partition_for(&self.region))
-            .to_string();
+        let arn = Arn::global_in(
+            &self.region,
+            "iam",
+            &self.account_id,
+            &format!("saml-provider/{name}"),
+        )
+        .to_string();
         let now = Utc::now();
         let valid_until = now + chrono::Duration::days(365 * 10);
         let provider = SamlProvider {
@@ -1194,9 +1198,13 @@ impl ResourceProvisioner {
             None => format!("AWSServiceRoleFor{service_short}"),
         };
         let path = format!("/aws-service-role/{aws_service_name}/");
-        let arn = Arn::global("iam", &self.account_id, &format!("role{path}{role_name}"))
-            .with_partition(fakecloud_aws::arn::partition_for(&self.region))
-            .to_string();
+        let arn = Arn::global_in(
+            &self.region,
+            "iam",
+            &self.account_id,
+            &format!("role{path}{role_name}"),
+        )
+        .to_string();
         // Service-linked roles get a trust policy specific to the service.
         let assume_role_policy_document = serde_json::json!({
             "Version": "2012-10-17",
@@ -1250,9 +1258,13 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .unwrap_or("/")
             .to_string();
-        let serial_number = Arn::global("iam", &self.account_id, &format!("mfa{path}{name}"))
-            .with_partition(fakecloud_aws::arn::partition_for(&self.region))
-            .to_string();
+        let serial_number = Arn::global_in(
+            &self.region,
+            "iam",
+            &self.account_id,
+            &format!("mfa{path}{name}"),
+        )
+        .to_string();
         // Real AWS returns a base32 seed + a PNG QR code; we synthesize
         // deterministic placeholders so callers can read them back.
         let seed = format!("BASE32SEED{}", Uuid::new_v4().simple());

@@ -341,6 +341,35 @@ pub struct Layer {
     pub layer_name: String,
     pub layer_arn: String,
     pub versions: Vec<LayerVersion>,
+    /// Highest version number ever published, so a deleted version's number
+    /// is never handed out again.
+    #[serde(default)]
+    pub last_version: i64,
+}
+
+impl Layer {
+    pub fn new(layer_name: &str, layer_arn: String) -> Self {
+        Self {
+            layer_name: layer_name.to_string(),
+            layer_arn,
+            versions: Vec::new(),
+            last_version: 0,
+        }
+    }
+
+    /// Reserve the number of the next published version. Versions are
+    /// numbered from 1 and never reused, even after deletions.
+    pub fn next_version(&mut self) -> i64 {
+        let highest = self
+            .versions
+            .iter()
+            .map(|v| v.version)
+            .max()
+            .unwrap_or(0)
+            .max(self.last_version);
+        self.last_version = highest + 1;
+        self.last_version
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
