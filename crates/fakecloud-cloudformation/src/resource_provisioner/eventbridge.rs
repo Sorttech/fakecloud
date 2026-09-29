@@ -31,11 +31,12 @@ impl ResourceProvisioner {
             return Err(format!("Event bus does not exist: {event_bus_name}"));
         }
 
-        let arn = if event_bus_name == "default" {
-            self.regional_arn("events", &format!("rule/{}", rule_name))
-        } else {
-            self.regional_arn("events", &format!("rule/{}/{}", event_bus_name, rule_name))
-        };
+        let arn = fakecloud_eventbridge::rule_arn(
+            &self.region,
+            &self.account_id,
+            event_bus_name,
+            rule_name,
+        );
 
         let rule = EventRule {
             name: rule_name.to_string(),
@@ -394,7 +395,7 @@ impl ResourceProvisioner {
             .map(String::from);
         let dead_letter_config = props.get("DeadLetterConfig").cloned();
         let policy = props.get("Policy").cloned();
-        let arn = self.regional_arn("events", &format!("event-bus/{name}"));
+        let arn = fakecloud_eventbridge::bus_arn(&self.region, &self.account_id, &name);
         let now = Utc::now();
         let bus = EventBus {
             name: name.clone(),
@@ -455,7 +456,7 @@ impl ResourceProvisioner {
             let condition = props.get("Condition").cloned();
             let mut obj = serde_json::json!({
                 "Effect": "Allow",
-                "Resource": self.regional_arn("events", &format!("event-bus/{bus_name}")),
+                "Resource": fakecloud_eventbridge::bus_arn(&self.region, &self.account_id, &bus_name),
             });
             if let (Some(sid), Some(obj)) = (sid, obj.as_object_mut()) {
                 obj.insert("Sid".to_string(), serde_json::Value::String(sid));

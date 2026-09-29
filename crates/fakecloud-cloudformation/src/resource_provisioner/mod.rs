@@ -7733,6 +7733,116 @@ mod tests {
     }
 
     #[test]
+    fn china_stack_arns_match_the_service_builders() {
+        const CN: &str = "cn-north-1";
+        const ACCT: &str = "123456789012";
+        let prov = cn_provisioner();
+        let create = |ty: &str, logical: &str, props: serde_json::Value| {
+            prov.create_resource(&make_resource(ty, logical, props))
+                .unwrap()
+        };
+
+        let topic = create(
+            "AWS::SNS::Topic",
+            "T",
+            serde_json::json!({"TopicName": "cn-topic"}),
+        );
+        assert_eq!(
+            topic.physical_id,
+            fakecloud_sns::topic_arn(CN, ACCT, "cn-topic")
+        );
+        assert!(topic.physical_id.starts_with("arn:aws-cn:sns:cn-north-1:"));
+
+        let rule = create(
+            "AWS::Events::Rule",
+            "R",
+            serde_json::json!({"Name": "cn-rule", "ScheduleExpression": "rate(1 day)"}),
+        );
+        assert_eq!(
+            rule.attributes["Arn"],
+            fakecloud_eventbridge::rule_arn(CN, ACCT, "default", "cn-rule")
+        );
+        assert!(rule.attributes["Arn"].starts_with("arn:aws-cn:events:cn-north-1:"));
+
+        let alarm = create(
+            "AWS::CloudWatch::Alarm",
+            "A",
+            serde_json::json!({
+                "AlarmName": "cn-alarm",
+                "MetricName": "CPUUtilization",
+                "Namespace": "AWS/EC2",
+                "Statistic": "Average",
+                "Period": 60,
+                "EvaluationPeriods": 1,
+                "Threshold": 80,
+                "ComparisonOperator": "GreaterThanThreshold",
+            }),
+        );
+        assert_eq!(
+            alarm.attributes["Arn"],
+            fakecloud_cloudwatch::alarm_arn(CN, ACCT, "cn-alarm")
+        );
+        assert!(alarm.attributes["Arn"].starts_with("arn:aws-cn:cloudwatch:cn-north-1:"));
+
+        create(
+            "AWS::SSM::Parameter",
+            "P",
+            serde_json::json!({"Name": "/cn/param", "Value": "v", "Type": "String"}),
+        );
+        let param_arn = prov.ssm_state.read().get(ACCT).unwrap().parameters["/cn/param"]
+            .arn
+            .clone();
+        assert_eq!(param_arn, fakecloud_ssm::param_arn(CN, ACCT, "/cn/param"));
+        assert_eq!(
+            param_arn,
+            "arn:aws-cn:ssm:cn-north-1:123456789012:parameter/cn/param"
+        );
+
+        let wg = create(
+            "AWS::Athena::WorkGroup",
+            "Wg",
+            serde_json::json!({"Name": "cn-wg"}),
+        );
+        let wg_arn = prov.get_att(&wg, "Arn").unwrap();
+        assert_eq!(
+            wg_arn,
+            fakecloud_athena::athena_arn(CN, ACCT, "workgroup/cn-wg")
+        );
+        assert!(wg_arn.starts_with("arn:aws-cn:athena:cn-north-1:"));
+
+        let fs = create(
+            "AWS::EFS::FileSystem",
+            "Fs",
+            serde_json::json!({"Encrypted": true}),
+        );
+        let kms = prov.efs_state.read().get(ACCT).unwrap().file_systems[&fs.physical_id]
+            ["KmsKeyId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let key_id = kms.rsplit_once(":key/").unwrap().1;
+        assert_eq!(
+            kms,
+            fakecloud_aws::arn::Arn::regional("kms", CN, ACCT, &format!("key/{key_id}"))
+                .to_string()
+        );
+        assert!(kms.starts_with("arn:aws-cn:kms:cn-north-1:123456789012:key/"));
+
+        create(
+            "AWS::Timestream::Database",
+            "Db",
+            serde_json::json!({"DatabaseName": "cndb"}),
+        );
+        let ts_kms = prov.timestream_state.read().get(ACCT).unwrap().databases["cndb"]
+            .kms_key_id
+            .clone();
+        assert_eq!(
+            ts_kms.as_deref(),
+            Some("arn:aws-cn:kms:cn-north-1:123456789012:key/timestream-default")
+        );
+    }
+
+    #[test]
     fn application_autoscaling_scaling_policy_requires_target() {
         let prov = make_provisioner();
         let res = make_resource(

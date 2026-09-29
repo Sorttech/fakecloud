@@ -157,7 +157,8 @@ impl ResourceProvisioner {
 
         let mut accounts = self.cloudwatch_state.write();
         let state = accounts.get_or_create(&self.account_id);
-        let alarm_arn = self.regional_arn("cloudwatch", &format!("alarm:{}", alarm_name));
+        let alarm_arn =
+            fakecloud_cloudwatch::alarm_arn(&self.region, &self.account_id, &alarm_name);
         let now = Utc::now();
         let alarm = MetricAlarm {
             alarm_name: alarm_name.clone(),

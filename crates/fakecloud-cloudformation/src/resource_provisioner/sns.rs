@@ -114,7 +114,7 @@ impl ResourceProvisioner {
 
         let mut __sns_mas = self.sns_state.write();
         let state = __sns_mas.get_or_create(&self.account_id);
-        let topic_arn = self.regional_arn("sns", topic_name);
+        let topic_arn = fakecloud_sns::topic_arn(&self.region, &self.account_id, topic_name);
 
         // Carry the topic configuration attributes a CFN topic can set, so
         // GetTopicAttributes round-trips them instead of returning defaults.
