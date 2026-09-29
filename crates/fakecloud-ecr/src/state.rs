@@ -25,6 +25,17 @@ pub struct EcrSnapshot {
     pub accounts: Option<fakecloud_core::multi_account::MultiAccountState<EcrState>>,
 }
 
+/// The ARN of an ECR repository, in `region`'s partition.
+pub fn repository_arn(region: &str, account_id: &str, repository_name: &str) -> String {
+    fakecloud_aws::arn::Arn::regional(
+        "ecr",
+        region,
+        account_id,
+        &format!("repository/{repository_name}"),
+    )
+    .to_string()
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct EcrState {
     pub account_id: String,
@@ -103,10 +114,7 @@ impl EcrState {
     // ARN carries the request's credential-scope region (req.region), not the
     // frozen server default. Repositories are keyed by name, so keying is unchanged.
     pub fn repository_arn(&self, region: &str, repository_name: &str) -> String {
-        format!(
-            "arn:aws:ecr:{}:{}:repository/{}",
-            region, self.account_id, repository_name
-        )
+        repository_arn(region, &self.account_id, repository_name)
     }
 
     pub fn registry_id(&self) -> &str {

@@ -25,7 +25,7 @@ impl GlueService {
         tgt: &str,
         body: &Value,
     ) -> Value {
-        let arn = resource_arn(account, region, "integration", name);
+        let arn = resource_arn(region, account, "integration", name);
         let mut v = json!({
             "SourceArn": src, "TargetArn": tgt, "IntegrationName": name,
             "IntegrationArn": arn, "Status": "ACTIVE", "CreateTime": now_ts(),
@@ -372,7 +372,7 @@ impl GlueService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let body = req.json_body();
         let instance = req_str(&body, "InstanceArn")?.to_string();
-        let app_arn = resource_arn(&req.account_id, &req.region, "application", "glue-idc");
+        let app_arn = resource_arn(&req.region, &req.account_id, "application", "glue-idc");
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id, &req.region);
         st.identity_center = Some(json!({

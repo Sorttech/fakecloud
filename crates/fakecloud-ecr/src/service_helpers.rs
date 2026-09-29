@@ -201,7 +201,7 @@ pub(crate) fn encryption_config_json(cfg: &EncryptionConfiguration) -> Value {
 /// Accepts either a full ARN (`arn:aws:ecr:region:account:repository/name`)
 /// or a bare repository name for request bodies that accept both.
 pub(crate) fn decode_resource_arn(arn: &str) -> Result<(Option<String>, String), AwsServiceError> {
-    if let Some(rest) = arn.strip_prefix("arn:aws:ecr:") {
+    if let Some(rest) = fakecloud_aws::arn::arn_resource(arn, "ecr") {
         let mut parts = rest.splitn(4, ':');
         let _region = parts
             .next()
@@ -862,7 +862,9 @@ pub(crate) fn repository_policy_decision(
     use fakecloud_core::auth::{Principal, PrincipalType};
     use fakecloud_iam::evaluator::{evaluate, Decision, EvalRequest, PolicyDocument};
     let parsed = PolicyDocument::parse(doc);
-    let principal_arn = Arn::global("iam", caller_account, "root").to_string();
+    let principal_arn = Arn::global("iam", caller_account, "root")
+        .with_partition(fakecloud_aws::arn::partition_of(repo_arn))
+        .to_string();
     let principal = Principal {
         arn: principal_arn.clone(),
         user_id: principal_arn,

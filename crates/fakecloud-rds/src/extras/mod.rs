@@ -15,11 +15,12 @@ use http::StatusCode;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
-use fakecloud_aws::arn::{partition_for, Arn};
+use fakecloud_aws::arn::Arn;
 use fakecloud_aws::xml::xml_escape;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use crate::service::{RdsService, RdsSourceType};
+use crate::state::{global_cluster_arn, rds_arn};
 
 use crate::filters::{
     addresses_own_account, identifier_account, identifier_matches_type, normalized_identifier,
@@ -444,14 +445,10 @@ fn missing(name: &str) -> AwsServiceError {
 /// Smithy error set).
 /// Builds a cluster snapshot's ARN in the region's own partition.
 ///
-/// `Arn::new` hardcodes `aws`, so a China or GovCloud region would
-/// otherwise get an `arn:aws:` ARN -- wrong on the wire, and, since
-/// pagination keys on this string, inconsistent with the ARN a row
-/// stored at create time if the two were built differently.
+/// Pagination keys on this string, so it must match the ARN a row stored
+/// at create time.
 fn cluster_snapshot_arn(region: &str, account_id: &str, id: &str) -> String {
-    Arn::new("rds", region, account_id, &format!("cluster-snapshot:{id}"))
-        .with_partition(partition_for(region))
-        .to_string()
+    rds_arn(region, account_id, "cluster-snapshot", id)
 }
 
 /// Stamps the owning account's ARN onto a cluster-snapshot row that
@@ -513,7 +510,7 @@ impl RdsService {
             // ── DB Clusters ──
             "CreateDBCluster" => {
                 let id = get_param(req, "DBClusterIdentifier").ok_or_else(|| missing("DBClusterIdentifier"))?;
-                let arn = Arn::new("rds", region, &aid, &format!("cluster:{id}")).to_string();
+                let arn = rds_arn(region, &aid, "cluster", &id);
                 let engine = get_param(req, "Engine").unwrap_or_else(|| "aurora-postgresql".to_string());
                 let port = get_param(req, "Port")
                     .and_then(|p| p.parse::<i64>().ok())
@@ -569,7 +566,7 @@ impl RdsService {
                     &aid,
                 )
                 .ok_or_else(|| missing("DBClusterIdentifier"))?;
-                let arn = Arn::new("rds", region, &aid, &format!("cluster:{id}")).to_string();
+                let arn = rds_arn(region, &aid, "cluster", &id);
                 {
                     let mut accounts = write_state!();
                     let state = accounts.get_or_create(&aid);
@@ -629,7 +626,7 @@ impl RdsService {
             "PromoteReadReplicaDBCluster" => {
                 let id = get_param(req, "DBClusterIdentifier")
                     .ok_or_else(|| missing("DBClusterIdentifier"))?;
-                let arn = Arn::new("rds", region, &aid, &format!("cluster:{id}")).to_string();
+                let arn = rds_arn(region, &aid, "cluster", &id);
                 let mut accounts = write_state!();
                 let state = accounts.get_or_create(&aid);
                 if let Some(map) = state.extras.get_mut("clusters") {
@@ -1475,7 +1472,7 @@ impl RdsService {
             "CreateDBClusterParameterGroup" | "CopyDBClusterParameterGroup" => {
                 let name = get_param(req, "DBClusterParameterGroupName").or_else(|| get_param(req, "TargetDBClusterParameterGroupIdentifier"))
                     .ok_or_else(|| missing("DBClusterParameterGroupName"))?;
-                let arn = Arn::new("rds", region, &aid, &format!("cluster-pg:{name}")).to_string();
+                let arn = rds_arn(region, &aid, "cluster-pg", &name);
                 let family = get_param(req, "DBParameterGroupFamily").unwrap_or_else(|| "aurora-postgresql15".to_string());
                 let description = get_param(req, "Description").unwrap_or_default();
                 let entry = json!({"DBClusterParameterGroupName": name, "DBClusterParameterGroupArn": arn, "DBParameterGroupFamily": family, "Description": description});
@@ -1708,7 +1705,7 @@ impl RdsService {
                 // caller.
                 let custom_kind =
                     get_param(req, "EndpointType").unwrap_or_else(|| "READER".to_string());
-                let mut entry = json!({"DBClusterEndpointIdentifier": id, "DBClusterIdentifier": cluster, "Endpoint": format!("{id}.cluster-custom.{region}.rds.amazonaws.com"), "EndpointType": "CUSTOM", "CustomEndpointType": custom_kind, "Status": "available", "DBClusterEndpointResourceIdentifier": format!("cluster-endpoint-{}", uuid::Uuid::new_v4().simple()), "DBClusterEndpointArn": Arn::new("rds", region, &aid, &format!("cluster-endpoint:{id}")).with_partition(partition_for(region)).to_string()});
+                let mut entry = json!({"DBClusterEndpointIdentifier": id, "DBClusterIdentifier": cluster, "Endpoint": format!("{id}.cluster-custom.{region}.rds.amazonaws.com"), "EndpointType": "CUSTOM", "CustomEndpointType": custom_kind, "Status": "available", "DBClusterEndpointResourceIdentifier": format!("cluster-endpoint-{}", uuid::Uuid::new_v4().simple()), "DBClusterEndpointArn": rds_arn(region, &aid, "cluster-endpoint", &id)});
                 // `db-cluster-endpoint-custom-type` filters on this, and
                 // the members define what a CUSTOM endpoint routes to --
                 // dropping them left the endpoint unreadable.
@@ -1913,7 +1910,7 @@ impl RdsService {
             // ── DB Proxies ──
             "CreateDBProxy" => {
                 let name = get_param(req, "DBProxyName").ok_or_else(|| missing("DBProxyName"))?;
-                let arn = Arn::new("rds", region, &aid, &format!("db-proxy:{name}")).to_string();
+                let arn = rds_arn(region, &aid, "db-proxy", &name);
                 let entry = json!({"DBProxyName": name, "DBProxyArn": arn, "Status": "available", "EngineFamily": get_param(req, "EngineFamily").unwrap_or_else(|| "POSTGRESQL".to_string())});
                 let mut accounts = write_state!();
                 let state = accounts.get_or_create(&aid);
@@ -2232,7 +2229,7 @@ impl RdsService {
             "CreateOptionGroup" | "CopyOptionGroup" => {
                 let name = get_param(req, "OptionGroupName").or_else(|| get_param(req, "TargetOptionGroupIdentifier"))
                     .ok_or_else(|| missing("OptionGroupName"))?;
-                let arn = Arn::new("rds", region, &aid, &format!("og:{name}")).to_string();
+                let arn = rds_arn(region, &aid, "og", &name);
                 let entry = json!({"OptionGroupName": name, "OptionGroupArn": arn, "EngineName": get_param(req, "EngineName").unwrap_or_else(|| "mysql".to_string()), "MajorEngineVersion": get_param(req, "MajorEngineVersion").unwrap_or_else(|| "8.0".to_string()), "OptionGroupDescription": get_param(req, "OptionGroupDescription").unwrap_or_default()});
                 let mut accounts = write_state!();
                 let state = accounts.get_or_create(&aid);
@@ -2340,7 +2337,7 @@ impl RdsService {
             // ── Event subscriptions ──
             "CreateEventSubscription" => {
                 let name = get_param(req, "SubscriptionName").ok_or_else(|| missing("SubscriptionName"))?;
-                let arn = Arn::new("rds", region, &aid, &format!("es:{name}")).to_string();
+                let arn = rds_arn(region, &aid, "es", &name);
                 let source_ids = parse_member_list(req, "SourceIds");
                 let event_categories = parse_member_list(req, "EventCategories");
                 let entry = json!({"CustSubscriptionId": name, "CustomerAwsId": aid, "EventSubscriptionArn": arn, "SnsTopicArn": get_param(req, "SnsTopicArn").unwrap_or_default(), "SourceType": get_param(req, "SourceType").unwrap_or_default(), "Status": "active", "Enabled": true, "SourceIdsList": source_ids, "EventCategoriesList": event_categories});
@@ -2424,7 +2421,7 @@ impl RdsService {
             // ── Global clusters ──
             "CreateGlobalCluster" => {
                 let id = get_param(req, "GlobalClusterIdentifier").ok_or_else(|| missing("GlobalClusterIdentifier"))?;
-                let arn = Arn::global("rds", &aid, &format!("global-cluster:{id}")).to_string();
+                let arn = global_cluster_arn(region, &aid, &id);
                 let entry = json!({
                     "GlobalClusterIdentifier": id,
                     "GlobalClusterArn": arn,
@@ -2513,7 +2510,7 @@ impl RdsService {
             // ── Integrations ──
             "CreateIntegration" => {
                 let name = get_param(req, "IntegrationName").ok_or_else(|| missing("IntegrationName"))?;
-                let arn = Arn::new("rds", region, &aid, &format!("integration:{name}")).to_string();
+                let arn = rds_arn(region, &aid, "integration", &name);
                 let entry = json!({"IntegrationName": name, "IntegrationArn": arn, "Status": "active"});
                 let mut accounts = write_state!();
                 let state = accounts.get_or_create(&aid);
@@ -2583,8 +2580,7 @@ impl RdsService {
                 // uuid, and the green identifier built from one below
                 // has to stay inside the 63-character limit.
                 let id = format!("bgd-{}", &uuid::Uuid::new_v4().simple().to_string()[..17]);
-                let arn = Arn::new("rds", region, &aid, &format!("blue-green-deployment:{id}"))
-                    .to_string();
+                let arn = rds_arn(region, &aid, "blue-green-deployment", &id);
                 let source_arn = get_param(req, "Source")
                     .ok_or_else(|| missing("Source"))?;
                 let source_id = source_arn
@@ -2637,8 +2633,7 @@ impl RdsService {
                         .cloned();
                     if let Some(mut green_cluster) = source_cluster {
                         let green_arn =
-                            Arn::new("rds", region, &aid, &format!("cluster:{target_id}"))
-                                .to_string();
+                            rds_arn(region, &aid, "cluster", &target_id);
                         if let Some(obj) = green_cluster.as_object_mut() {
                             obj.insert(
                                 "DBClusterIdentifier".to_string(),
@@ -3689,7 +3684,7 @@ impl RdsService {
             "RestoreDBClusterFromS3" => {
                 let id = get_param(req, "DBClusterIdentifier")
                     .ok_or_else(|| missing("DBClusterIdentifier"))?;
-                let arn = Arn::new("rds", region, &aid, &format!("cluster:{id}")).to_string();
+                let arn = rds_arn(region, &aid, "cluster", &id);
                 let engine =
                     get_param(req, "Engine").unwrap_or_else(|| "aurora-mysql".to_string());
                 let port = get_param(req, "Port")

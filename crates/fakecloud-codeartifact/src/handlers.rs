@@ -11,6 +11,7 @@ use percent_encoding::percent_decode_str;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::pagination::paginate_checked;
 
 // ------------------------------------------------------------------ helpers
@@ -132,16 +133,17 @@ fn revision() -> String {
     base64::engine::general_purpose::STANDARD.encode(uuid::Uuid::new_v4().as_bytes())
 }
 
-fn domain_arn(region: &str, owner: &str, name: &str) -> String {
-    format!("arn:aws:codeartifact:{region}:{owner}:domain/{name}")
+pub fn domain_arn(region: &str, owner: &str, name: &str) -> String {
+    Arn::regional("codeartifact", region, owner, &format!("domain/{name}")).to_string()
 }
 
-fn repo_arn(region: &str, owner: &str, domain: &str, repo: &str) -> String {
-    format!("arn:aws:codeartifact:{region}:{owner}:repository/{domain}/{repo}")
+pub fn repo_arn(region: &str, owner: &str, domain: &str, repo: &str) -> String {
+    Arn::regional("codeartifact", region, owner, &format!("repository/{domain}/{repo}")).to_string()
 }
 
-fn package_group_arn(region: &str, owner: &str, domain: &str, pattern: &str) -> String {
-    format!("arn:aws:codeartifact:{region}:{owner}:package-group/{domain}{pattern}")
+pub fn package_group_arn(region: &str, owner: &str, domain: &str, pattern: &str) -> String {
+    Arn::regional("codeartifact", region, owner, &format!("package-group/{domain}{pattern}"))
+        .to_string()
 }
 
 /// Build the repository endpoint URL a package manager is pointed at. Prefer the
@@ -273,7 +275,10 @@ impl CodeArtifactService {
         let region = req.region.clone();
         let arn = domain_arn(&region, &owner, &name);
         let encryption_key = body_str(&b, "encryptionKey")
-            .unwrap_or_else(|| format!("arn:aws:kms:{region}:{owner}:key/{}", uuid::Uuid::new_v4()));
+            .unwrap_or_else(|| {
+                Arn::regional("kms", &region, &owner, &format!("key/{}", uuid::Uuid::new_v4()))
+                    .to_string()
+            });
         let now = Utc::now();
         let desc = json!({
             "name": name,
@@ -284,7 +289,7 @@ impl CodeArtifactService {
             "encryptionKey": encryption_key,
             "repositoryCount": 0,
             "assetSizeBytes": 0,
-            "s3BucketArn": format!("arn:aws:s3:::assets-{owner}-{region}"),
+            "s3BucketArn": Arn::s3_in(&region, &format!("assets-{owner}-{region}")).to_string(),
         });
         let tags = parse_tags(b.get("tags"));
         let mut guard = self.state.write();
@@ -2153,6 +2158,37 @@ mod handler_tests {
             HeaderMap::new(),
         ))
         .unwrap();
+    }
+
+    #[test]
+    fn domain_arns_carry_china_partition() {
+        let svc = svc();
+        let cn = |action: &str, q: &str| {
+            let mut r = mkreq(action, q, jbody(json!({})), HeaderMap::new());
+            r.region = "cn-north-1".into();
+            r
+        };
+        let out = body_json(&svc.create_domain(&cn("CreateDomain", "domain=cnd")).unwrap());
+        let d = &out["domain"];
+        assert_eq!(d["arn"], "arn:aws-cn:codeartifact:cn-north-1:123456789012:domain/cnd");
+        assert!(d["encryptionKey"]
+            .as_str()
+            .unwrap()
+            .starts_with("arn:aws-cn:kms:cn-north-1:123456789012:key/"));
+        assert_eq!(d["s3BucketArn"], "arn:aws-cn:s3:::assets-123456789012-cn-north-1");
+        let out = body_json(
+            &svc.create_repository(&cn("CreateRepository", "domain=cnd&repository=cnrepo"))
+                .unwrap(),
+        );
+        let arn = out["repository"]["arn"].as_str().unwrap().to_string();
+        assert_eq!(arn, "arn:aws-cn:codeartifact:cn-north-1:123456789012:repository/cnd/cnrepo");
+        let q = format!(
+            "resourceArn={}",
+            percent_encoding::utf8_percent_encode(&arn, percent_encoding::NON_ALPHANUMERIC)
+        );
+        assert!(svc
+            .list_tags_for_resource(&cn("ListTagsForResource", &q))
+            .is_ok());
     }
 
     fn publish(

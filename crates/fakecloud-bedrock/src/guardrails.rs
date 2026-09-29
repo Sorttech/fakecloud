@@ -40,10 +40,7 @@ pub(crate) fn create_guardrail(
         .to_string();
 
     let guardrail_id = crate::short_uuid();
-    let guardrail_arn = format!(
-        "arn:aws:bedrock:{}:{}:guardrail/{}",
-        req.region, req.account_id, guardrail_id
-    );
+    let guardrail_arn = crate::arns::guardrail_arn(&req.region, &req.account_id, &guardrail_id);
 
     let now = Utc::now();
     let guardrail = Guardrail {

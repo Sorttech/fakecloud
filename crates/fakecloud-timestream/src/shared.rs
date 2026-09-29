@@ -3,6 +3,7 @@
 //! `database\u{1}table` key. Kept in one place so the write and query paths
 //! cannot diverge on wire format.
 
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::service::AwsRequest;
 
 /// Current time as awsJson1_0 epoch-seconds (a floating-point number).
@@ -15,19 +16,31 @@ pub fn now_epoch() -> f64 {
 /// Amazon Timestream database ARN,
 /// `arn:aws:timestream:{region}:{account}:database/{name}`.
 pub fn database_arn(region: &str, account: &str, name: &str) -> String {
-    format!("arn:aws:timestream:{region}:{account}:database/{name}")
+    Arn::regional("timestream", region, account, &format!("database/{name}")).to_string()
 }
 
 /// Amazon Timestream table ARN,
 /// `arn:aws:timestream:{region}:{account}:database/{db}/table/{name}`.
 pub fn table_arn(region: &str, account: &str, database: &str, table: &str) -> String {
-    format!("arn:aws:timestream:{region}:{account}:database/{database}/table/{table}")
+    Arn::regional(
+        "timestream",
+        region,
+        account,
+        &format!("database/{database}/table/{table}"),
+    )
+    .to_string()
 }
 
 /// Amazon Timestream scheduled-query ARN,
 /// `arn:aws:timestream:{region}:{account}:scheduled-query/{name}-{suffix}`.
 pub fn scheduled_query_arn(region: &str, account: &str, name: &str, suffix: &str) -> String {
-    format!("arn:aws:timestream:{region}:{account}:scheduled-query/{name}-{suffix}")
+    Arn::regional(
+        "timestream",
+        region,
+        account,
+        &format!("scheduled-query/{name}-{suffix}"),
+    )
+    .to_string()
 }
 
 /// A fresh opaque id (query id, batch-load task id, ARN suffix). Clients treat
@@ -66,6 +79,22 @@ mod tests {
         assert_eq!(
             database_arn("us-east-1", "000000000000", "metrics"),
             "arn:aws:timestream:us-east-1:000000000000:database/metrics"
+        );
+    }
+
+    #[test]
+    fn arns_take_the_region_partition() {
+        assert_eq!(
+            database_arn("cn-north-1", "000000000000", "metrics"),
+            "arn:aws-cn:timestream:cn-north-1:000000000000:database/metrics"
+        );
+        assert_eq!(
+            table_arn("cn-north-1", "000000000000", "metrics", "cpu"),
+            "arn:aws-cn:timestream:cn-north-1:000000000000:database/metrics/table/cpu"
+        );
+        assert_eq!(
+            scheduled_query_arn("cn-north-1", "000000000000", "q", "ABC"),
+            "arn:aws-cn:timestream:cn-north-1:000000000000:scheduled-query/q-ABC"
         );
     }
 

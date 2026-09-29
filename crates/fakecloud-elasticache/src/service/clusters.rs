@@ -161,11 +161,11 @@ impl ElastiCacheService {
                     .unwrap_or_else(|| format!("{}a", request.region));
             // ARN carries the request's credential-scope region (req.region), not
             // the frozen server default.
-            let arn = format!(
-                "arn:aws:elasticache:{}:{}:cluster:{}",
+            let arn = elasticache_arn(
                 request.region.as_str(),
-                state.account_id,
-                cache_cluster_id
+                &state.account_id,
+                "cluster",
+                &cache_cluster_id,
             );
             (preferred_availability_zone, arn, rdb_path)
         };

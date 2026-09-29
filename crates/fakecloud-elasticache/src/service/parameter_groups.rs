@@ -154,9 +154,11 @@ impl ElastiCacheService {
                 format!("CacheParameterGroup {name} already exists."),
             ));
         }
-        let arn = format!(
-            "arn:aws:elasticache:{}:{}:parametergroup:{}",
-            request.region, request.account_id, name
+        let arn = elasticache_arn(
+            &request.region,
+            &request.account_id,
+            "parametergroup",
+            &name,
         );
         let group = CacheParameterGroup {
             cache_parameter_group_name: name.clone(),

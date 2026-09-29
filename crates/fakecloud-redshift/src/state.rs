@@ -7,6 +7,14 @@ use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
+use fakecloud_aws::arn::Arn;
+
+/// A Redshift ARN (`arn:<partition>:redshift:<region>:<account>:<kind>:<name>`),
+/// in the region's partition.
+pub fn redshift_arn(region: &str, account: &str, kind: &str, name: &str) -> String {
+    Arn::regional("redshift", region, account, &format!("{kind}:{name}")).to_string()
+}
+
 pub type SharedRedshiftState = Arc<RwLock<RedshiftAccounts>>;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]

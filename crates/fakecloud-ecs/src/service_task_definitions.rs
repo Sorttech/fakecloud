@@ -153,7 +153,7 @@ impl EcsService {
             requires_attributes: Vec::new(),
             registered_at: Utc::now(),
             registered_by: request.principal.as_ref().map(|p| p.arn.clone()).or(Some(
-                Arn::global("iam", &state.account_id, "root").to_string(),
+                Arn::global_in(&request.region, "iam", &state.account_id, "root").to_string(),
             )),
             deregistered_at: None,
             tags: tags.clone(),

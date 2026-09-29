@@ -44,18 +44,13 @@ pub(crate) fn create_provisioned_model_throughput(
     }
 
     let provisioned_model_id = Uuid::new_v4().to_string()[..12].to_string();
-    let provisioned_model_arn = format!(
-        "arn:aws:bedrock:{}:{}:provisioned-model/{}",
-        req.region, req.account_id, provisioned_model_id
-    );
+    let provisioned_model_arn =
+        crate::arns::provisioned_model_arn(&req.region, &req.account_id, &provisioned_model_id);
 
     let model_arn = if model_id.contains(':') {
         model_id.to_string()
     } else {
-        format!(
-            "arn:aws:bedrock:{}::foundation-model/{}",
-            req.region, model_id
-        )
+        crate::arns::foundation_model_arn(&req.region, model_id)
     };
 
     let now = Utc::now();

@@ -1446,4 +1446,28 @@ mod create_table_metadata_tests {
             "no metadata supplied -> no seeded location: {loc}"
         );
     }
+
+    #[tokio::test]
+    async fn table_bucket_arn_carries_china_partition() {
+        let s = svc();
+        let in_cn = |method: Method, path: &str, body: Value| {
+            let mut r = request(method, path, body);
+            r.region = "cn-north-1".to_string();
+            r
+        };
+        let resp = s
+            .handle(in_cn(Method::PUT, "/buckets", json!({ "name": "cnb" })))
+            .await
+            .unwrap();
+        let created: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        let arn = created["arn"].as_str().unwrap().to_string();
+        assert_eq!(arn, "arn:aws-cn:s3tables:cn-north-1:123456789012:bucket/cnb");
+
+        let resp = s
+            .handle(in_cn(Method::GET, &format!("/buckets/{}", enc(&arn)), json!({})))
+            .await
+            .unwrap();
+        let got: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        assert_eq!(got["arn"], arn);
+    }
 }

@@ -343,8 +343,11 @@ fn trail_key(name: &str) -> &str {
 
 fn trail_arn(ctx: &Ctx, name: &str) -> String {
     format!(
-        "arn:aws:cloudtrail:{}:{}:trail/{}",
-        ctx.region, ctx.account, name
+        "arn:{}:cloudtrail:{}:{}:trail/{}",
+        fakecloud_aws::arn::partition_for(&ctx.region),
+        ctx.region,
+        ctx.account,
+        name
     )
 }
 
@@ -447,8 +450,11 @@ impl CloudTrailService {
             t.insert(
                 "SnsTopicARN".into(),
                 json!(format!(
-                    "arn:aws:sns:{}:{}:{}",
-                    ctx.region, ctx.account, sns
+                    "arn:{}:sns:{}:{}:{}",
+                    fakecloud_aws::arn::partition_for(&ctx.region),
+                    ctx.region,
+                    ctx.account,
+                    sns
                 )),
             );
         }
@@ -869,7 +875,8 @@ impl CloudTrailService {
             ));
         }
         let arn = format!(
-            "arn:aws:cloudtrail:{}:{}:eventdatastore/{}",
+            "arn:{}:cloudtrail:{}:{}:eventdatastore/{}",
+            fakecloud_aws::arn::partition_for(&ctx.region),
             ctx.region,
             ctx.account,
             new_uuid()
@@ -1128,7 +1135,8 @@ impl CloudTrailService {
             ));
         }
         let arn = format!(
-            "arn:aws:cloudtrail:{}:{}:channel/{}",
+            "arn:{}:cloudtrail:{}:{}:channel/{}",
+            fakecloud_aws::arn::partition_for(&ctx.region),
             ctx.region,
             ctx.account,
             new_uuid()
@@ -1533,8 +1541,11 @@ impl CloudTrailService {
         let mut guard = self.state.write();
         let data = guard.get_or_create(&ctx.account);
         let arn = format!(
-            "arn:aws:cloudtrail:{}:{}:dashboard/{}",
-            ctx.region, ctx.account, name
+            "arn:{}:cloudtrail:{}:{}:dashboard/{}",
+            fakecloud_aws::arn::partition_for(&ctx.region),
+            ctx.region,
+            ctx.account,
+            name
         );
         if data.dashboards.contains_key(&arn) {
             return Err(err(

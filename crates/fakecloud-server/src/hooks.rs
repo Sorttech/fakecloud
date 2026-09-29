@@ -98,6 +98,25 @@ impl fakecloud_core::delivery::KmsHook for KmsHookAdapter {
             )
             .map_err(|e| e.to_string())
     }
+
+    fn resolve_key_arn(
+        &self,
+        account_id: &str,
+        region: &str,
+        key_id: &str,
+        service_principal: &str,
+    ) -> Result<String, String> {
+        let before = self.key_count();
+        let result = self
+            .inner
+            .resolve_key_arn(account_id, region, key_id, service_principal)
+            .map_err(|e| e.to_string());
+        // Persist an AWS-managed key minted on first use, as `encrypt` does.
+        if result.is_ok() && self.key_count() > before {
+            self.save_snapshot_blocking();
+        }
+        result
+    }
 }
 
 pub(crate) struct SesEmailDispatcher {

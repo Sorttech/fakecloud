@@ -57,10 +57,7 @@ impl LambdaService {
         // request's credential-scope region (`req.region`), matching the
         // function's own ARN, not the server default (`state.region`). Both
         // are persisted and re-emitted by Get/Update/List.
-        let function_arn = format!(
-            "arn:aws:lambda:{}:{}:function:{}",
-            req.region, state.account_id, function_name
-        );
+        let function_arn = function_arn(&req.region, &state.account_id, function_name);
         let cfg = FunctionUrlConfig {
             function_arn: function_arn.clone(),
             function_url: format!("https://{function_name}.lambda-url.{}.on.aws/", req.region),

@@ -10,7 +10,7 @@
 pub mod service;
 pub mod state;
 
-pub use service::BatchService;
+pub use service::{batch_arn, BatchService};
 pub use state::{
     BatchAccounts, BatchSnapshot, BatchState, SharedBatchState, BATCH_SNAPSHOT_SCHEMA_VERSION,
 };

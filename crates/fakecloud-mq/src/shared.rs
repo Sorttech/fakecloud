@@ -8,6 +8,7 @@
 //! `DescribeBroker`.
 
 use base64::Engine as _;
+use fakecloud_aws::arn::Arn;
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
@@ -68,11 +69,11 @@ pub fn now_iso() -> String {
 }
 
 pub fn broker_arn(region: &str, account: &str, name: &str, id: &str) -> String {
-    format!("arn:aws:mq:{region}:{account}:broker:{name}:{id}")
+    Arn::regional("mq", region, account, &format!("broker:{name}:{id}")).to_string()
 }
 
 pub fn config_arn(region: &str, account: &str, id: &str) -> String {
-    format!("arn:aws:mq:{region}:{account}:configuration:{id}")
+    Arn::regional("mq", region, account, &format!("configuration:{id}")).to_string()
 }
 
 /// The region embedded in a broker/configuration ARN (the 4th colon-delimited

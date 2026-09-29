@@ -42,7 +42,9 @@ pub struct EcsState {
     /// setting name (e.g. `serviceLongArnFormat`).
     pub account_setting_defaults: BTreeMap<String, String>,
     /// Per-principal account settings (PutAccountSetting). Keyed by
-    /// principal ARN, then setting name.
+    /// [`principal_settings_key`] of the principal ARN, then setting name.
+    /// Keys persisted before that normalization are rewritten on load.
+    #[serde(deserialize_with = "deserialize_principal_settings")]
     pub principal_account_settings: BTreeMap<String, BTreeMap<String, String>>,
     /// Tasks keyed by task ID (the trailing segment of the task ARN).
     #[serde(default)]
@@ -200,28 +202,28 @@ impl EcsState {
     pub fn service_arn(&self, region: &str, cluster_name: &str, service_name: &str) -> String {
         if self.arn_format_disabled("serviceLongArnFormat") {
             // Pre-Nov-2018 short form: no cluster segment.
-            format!(
-                "arn:aws:ecs:{}:{}:service/{}",
-                region, self.account_id, service_name
+            ecs_arn(
+                region,
+                &self.account_id,
+                &format!("service/{}", service_name),
             )
         } else {
-            format!(
-                "arn:aws:ecs:{}:{}:service/{}/{}",
-                region, self.account_id, cluster_name, service_name
+            ecs_arn(
+                region,
+                &self.account_id,
+                &format!("service/{}/{}", cluster_name, service_name),
             )
         }
     }
 
     pub fn task_arn(&self, region: &str, cluster_name: &str, task_id: &str) -> String {
         if self.arn_format_disabled("taskLongArnFormat") {
-            format!(
-                "arn:aws:ecs:{}:{}:task/{}",
-                region, self.account_id, task_id
-            )
+            ecs_arn(region, &self.account_id, &format!("task/{}", task_id))
         } else {
-            format!(
-                "arn:aws:ecs:{}:{}:task/{}/{}",
-                region, self.account_id, cluster_name, task_id
+            ecs_arn(
+                region,
+                &self.account_id,
+                &format!("task/{}/{}", cluster_name, task_id),
             )
         }
     }
@@ -233,14 +235,16 @@ impl EcsState {
         instance_id: &str,
     ) -> String {
         if self.arn_format_disabled("containerInstanceLongArnFormat") {
-            format!(
-                "arn:aws:ecs:{}:{}:container-instance/{}",
-                region, self.account_id, instance_id
+            ecs_arn(
+                region,
+                &self.account_id,
+                &format!("container-instance/{}", instance_id),
             )
         } else {
-            format!(
-                "arn:aws:ecs:{}:{}:container-instance/{}/{}",
-                region, self.account_id, cluster_name, instance_id
+            ecs_arn(
+                region,
+                &self.account_id,
+                &format!("container-instance/{}/{}", cluster_name, instance_id),
             )
         }
     }
@@ -255,7 +259,10 @@ impl EcsState {
         principal_arn: Option<&str>,
     ) -> Option<String> {
         if let Some(arn) = principal_arn {
-            if let Some(p) = self.principal_account_settings.get(arn) {
+            if let Some(p) = self
+                .principal_account_settings
+                .get(&principal_settings_key(arn))
+            {
                 if let Some(v) = p.get(name) {
                     return Some(v.clone());
                 }
@@ -286,16 +293,18 @@ impl EcsState {
     }
 
     pub fn cluster_arn(&self, region: &str, cluster_name: &str) -> String {
-        format!(
-            "arn:aws:ecs:{}:{}:cluster/{}",
-            region, self.account_id, cluster_name
+        ecs_arn(
+            region,
+            &self.account_id,
+            &format!("cluster/{}", cluster_name),
         )
     }
 
     pub fn task_definition_arn(&self, region: &str, family: &str, revision: i32) -> String {
-        format!(
-            "arn:aws:ecs:{}:{}:task-definition/{}:{}",
-            region, self.account_id, family, revision
+        ecs_arn(
+            region,
+            &self.account_id,
+            &format!("task-definition/{}:{}", family, revision),
         )
     }
 
@@ -893,35 +902,29 @@ impl EcsState {
     /// Build a daemon ARN for a (cluster, name) pair under this account.
     /// `region` is the request's credential-scope region (req.region).
     pub fn daemon_arn(&self, region: &str, cluster: &str, name: &str) -> String {
-        fakecloud_aws::arn::Arn::new(
-            "ecs",
+        ecs_arn(
             region,
             &self.account_id,
             &format!("daemon/{}/{}", cluster, name),
         )
-        .to_string()
     }
 
     /// Build an express-gateway service ARN.
     pub fn express_gateway_arn(&self, region: &str, cluster: &str, name: &str) -> String {
-        fakecloud_aws::arn::Arn::new(
-            "ecs",
+        ecs_arn(
             region,
             &self.account_id,
             &format!("express-gateway-service/{}/{}", cluster, name),
         )
-        .to_string()
     }
 
     /// Build a daemon task definition ARN for a `family:revision` pair.
     pub fn daemon_task_definition_arn(&self, region: &str, family: &str, revision: i32) -> String {
-        fakecloud_aws::arn::Arn::new(
-            "ecs",
+        ecs_arn(
             region,
             &self.account_id,
             &format!("daemon-task-definition/{}:{}", family, revision),
         )
-        .to_string()
     }
 
     /// Build a daemon deployment ARN.
@@ -931,14 +934,55 @@ impl EcsState {
         daemon_name: &str,
         deployment_id: &str,
     ) -> String {
-        fakecloud_aws::arn::Arn::new(
-            "ecs",
+        ecs_arn(
             region,
             &self.account_id,
             &format!("daemon-deployment/{}/{}", daemon_name, deployment_id),
         )
-        .to_string()
     }
+}
+
+/// An ECS ARN (`arn:<partition>:ecs:<region>:<account>:<resource>`) in
+/// `region`'s partition.
+pub fn ecs_arn(region: &str, account_id: &str, resource: &str) -> String {
+    fakecloud_aws::arn::Arn::regional("ecs", region, account_id, resource).to_string()
+}
+
+/// Principal settings are per account and shared by every region, so they are
+/// stored under the principal ARN with its partition normalized to `aws`: a
+/// setting written from one partition's region is read back from any other.
+pub fn principal_settings_key(principal_arn: &str) -> String {
+    with_arn_partition(principal_arn, "aws")
+}
+
+/// `arn` rewritten into `partition`; anything that is not an ARN is returned
+/// unchanged.
+pub fn with_arn_partition(arn: &str, partition: &str) -> String {
+    match arn.parse::<fakecloud_aws::arn::Arn>() {
+        Ok(parsed) => parsed.with_partition(partition).to_string(),
+        Err(_) => arn.to_string(),
+    }
+}
+
+/// Load principal settings keyed by [`principal_settings_key`]. Snapshots
+/// written by older builds keyed them by the raw principal ARN (for example
+/// `arn:aws-cn:iam::123:role/r`), which the normalized lookups would never
+/// find; entries whose keys collapse onto the same principal are merged.
+fn deserialize_principal_settings<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, BTreeMap<String, String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = BTreeMap::<String, BTreeMap<String, String>>::deserialize(deserializer)?;
+    let mut normalized: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    for (principal, settings) in raw {
+        normalized
+            .entry(principal_settings_key(&principal))
+            .or_default()
+            .extend(settings);
+    }
+    Ok(normalized)
 }
 
 #[cfg(test)]
@@ -1032,6 +1076,61 @@ mod tests {
             s.container_instance_arn("us-east-1", "prod", "i-abc"),
             "arn:aws:ecs:us-east-1:111122223333:container-instance/i-abc"
         );
+    }
+
+    #[test]
+    fn raw_principal_setting_keys_are_normalized_on_load() {
+        // A snapshot from a build that keyed settings by the raw principal ARN.
+        let mut old = EcsState::new("111122223333", "cn-north-1");
+        let mut role = BTreeMap::new();
+        role.insert("containerInsights".to_string(), "enabled".to_string());
+        old.principal_account_settings
+            .insert("arn:aws-cn:iam::111122223333:role/r".to_string(), role);
+        let mut root = BTreeMap::new();
+        root.insert("awsvpcTrunking".to_string(), "enabled".to_string());
+        old.principal_account_settings
+            .insert("arn:aws-cn:iam::111122223333:root".to_string(), root);
+        let mut root_aws = BTreeMap::new();
+        root_aws.insert("guardDutyActivate".to_string(), "on".to_string());
+        old.principal_account_settings
+            .insert("arn:aws:iam::111122223333:root".to_string(), root_aws);
+
+        let loaded: EcsState = serde_json::from_str(&serde_json::to_string(&old).unwrap()).unwrap();
+        assert_eq!(
+            loaded
+                .principal_account_settings
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![
+                "arn:aws:iam::111122223333:role/r".to_string(),
+                "arn:aws:iam::111122223333:root".to_string(),
+            ]
+        );
+        assert_eq!(
+            loaded
+                .effective_account_setting(
+                    "containerInsights",
+                    Some("arn:aws-cn:iam::111122223333:role/r")
+                )
+                .as_deref(),
+            Some("enabled")
+        );
+        let root_settings = &loaded.principal_account_settings["arn:aws:iam::111122223333:root"];
+        assert_eq!(root_settings.len(), 2);
+    }
+
+    #[test]
+    fn with_arn_partition_rewrites_only_arns() {
+        assert_eq!(
+            with_arn_partition("arn:aws:iam::1:role/r", "aws-cn"),
+            "arn:aws-cn:iam::1:role/r"
+        );
+        assert_eq!(
+            principal_settings_key("arn:aws-us-gov:iam::1:root"),
+            "arn:aws:iam::1:root"
+        );
+        assert_eq!(with_arn_partition("not-an-arn", "aws-cn"), "not-an-arn");
     }
 
     #[test]

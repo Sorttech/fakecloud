@@ -16,6 +16,7 @@ use http::StatusCode;
 use serde_json::{Map, Value};
 use tokio::sync::Mutex as AsyncMutex;
 
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_persistence::SnapshotStore;
 
@@ -204,11 +205,42 @@ pub(crate) fn now_epoch() -> Value {
     Value::from(millis as f64 / 1000.0)
 }
 
-pub(crate) fn mint_arn(ctx: &Ctx, arn_path: &str, name: &str) -> String {
-    format!(
-        "arn:aws:sagemaker:{}:{}:{}/{}",
-        ctx.region, ctx.account, arn_path, name
+/// The ARN of the SageMaker resource `<arn_path>/<name>` (`model/m1`,
+/// `pipeline/p`, ...) in `region`'s partition.
+pub fn sagemaker_arn(region: &str, account_id: &str, arn_path: &str, name: &str) -> String {
+    Arn::regional(
+        "sagemaker",
+        region,
+        account_id,
+        &format!("{arn_path}/{name}"),
     )
+    .to_string()
+}
+
+pub fn pipeline_arn(region: &str, account_id: &str, pipeline_name: &str) -> String {
+    sagemaker_arn(region, account_id, "pipeline", pipeline_name)
+}
+
+pub fn pipeline_execution_arn(
+    region: &str,
+    account_id: &str,
+    pipeline_name: &str,
+    execution_id: &str,
+) -> String {
+    sagemaker_arn(
+        region,
+        account_id,
+        "pipeline",
+        &format!("{pipeline_name}/execution/{execution_id}"),
+    )
+}
+
+pub fn hub_arn(region: &str, account_id: &str, hub_name: &str) -> String {
+    sagemaker_arn(region, account_id, "hub", hub_name)
+}
+
+pub(crate) fn mint_arn(ctx: &Ctx, arn_path: &str, name: &str) -> String {
+    sagemaker_arn(&ctx.region, &ctx.account, arn_path, name)
 }
 
 /// Deterministic UUID-shaped id derived from account + family + seed.

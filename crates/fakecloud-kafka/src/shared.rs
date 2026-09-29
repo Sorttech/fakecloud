@@ -2,6 +2,7 @@
 //! deterministic broker-node / bootstrap-broker synthesis, the supported Kafka
 //! version catalog, and timestamp helpers.
 
+use fakecloud_aws::arn::Arn;
 use serde_json::{json, Value};
 
 /// FNV-1a hash for deterministic synthesis of ids / IPs from a cluster's ARN.
@@ -20,21 +21,25 @@ pub fn now_iso() -> String {
         .to_string()
 }
 
+fn kafka_arn(region: &str, account: &str, resource: &str) -> String {
+    Arn::regional("kafka", region, account, resource).to_string()
+}
+
 /// MSK cluster ARN: `arn:aws:kafka:{region}:{account}:cluster/{name}/{uuid}-{n}`.
 pub fn cluster_arn(region: &str, account: &str, name: &str, uuid: &str, n: u64) -> String {
-    format!("arn:aws:kafka:{region}:{account}:cluster/{name}/{uuid}-{n}")
+    kafka_arn(region, account, &format!("cluster/{name}/{uuid}-{n}"))
 }
 
 /// MSK configuration ARN:
 /// `arn:aws:kafka:{region}:{account}:configuration/{name}/{uuid}-{n}`.
 pub fn config_arn(region: &str, account: &str, name: &str, uuid: &str, n: u64) -> String {
-    format!("arn:aws:kafka:{region}:{account}:configuration/{name}/{uuid}-{n}")
+    kafka_arn(region, account, &format!("configuration/{name}/{uuid}-{n}"))
 }
 
 /// MSK channel ARN:
 /// `arn:aws:kafka:{region}:{account}:channel/{name}/{uuid}-{n}`.
 pub fn channel_arn(region: &str, account: &str, name: &str, uuid: &str, n: u64) -> String {
-    format!("arn:aws:kafka:{region}:{account}:channel/{name}/{uuid}-{n}")
+    kafka_arn(region, account, &format!("channel/{name}/{uuid}-{n}"))
 }
 
 /// MSK cluster-operation ARN, derived from the cluster ARN by swapping the
@@ -48,7 +53,7 @@ pub fn operation_arn_from_cluster(cluster_arn: &str, op_uuid: &str) -> String {
 /// MSK replicator ARN:
 /// `arn:aws:kafka:{region}:{account}:replicator/{name}/{uuid}-{n}`.
 pub fn replicator_arn(region: &str, account: &str, name: &str, uuid: &str, n: u64) -> String {
-    format!("arn:aws:kafka:{region}:{account}:replicator/{name}/{uuid}-{n}")
+    kafka_arn(region, account, &format!("replicator/{name}/{uuid}-{n}"))
 }
 
 /// MSK VPC-connection ARN. Real MSK embeds the TARGET cluster's account, name,
@@ -65,8 +70,10 @@ pub fn vpc_connection_arn(
     uuid: &str,
     n: u64,
 ) -> String {
-    format!(
-        "arn:aws:kafka:{region}:{account}:vpc-connection/{target_account}/{target_cluster_name}/{uuid}-{n}"
+    kafka_arn(
+        region,
+        account,
+        &format!("vpc-connection/{target_account}/{target_cluster_name}/{uuid}-{n}"),
     )
 }
 
@@ -176,9 +183,7 @@ pub fn synthesize_nodes(cluster_arn: &str, num_brokers: i64, kafka_version: &str
         nodes.push(json!({
             "addedToClusterTime": now_iso(),
             "instanceType": "kafka.m5.large",
-            "nodeARN": format!(
-                "arn:aws:kafka:{region}:{account}:cluster/{name}/broker/{id}"
-            ),
+            "nodeARN": kafka_arn(region, account, &format!("cluster/{name}/broker/{id}")),
             "nodeType": "BROKER",
             "brokerNodeInfo": {
                 "attachedENIId": format!("eni-{:012x}", h.wrapping_add(id as u64) & 0xffff_ffff_ffff),

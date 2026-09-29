@@ -239,7 +239,7 @@ impl IamService {
             128,
         )?;
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         // If no UserName specified, GetUser returns the user that owns the
@@ -268,7 +268,8 @@ impl IamService {
                 // calls and follow-ups by the returned name are consistent.
                 let default_user = IamUser {
                     user_id: format!("AIDA{}DEFLT", state.account_id),
-                    arn: Arn::global("iam", &state.account_id, "user/default_user").to_string(),
+                    arn: Arn::global_in(&req.region, "iam", &state.account_id, "user/default_user")
+                        .to_string(),
                     user_name: "default_user".to_string(),
                     path: "/".to_string(),
                     created_at: chrono::DateTime::from_timestamp(1_577_836_800, 0)
@@ -348,7 +349,7 @@ impl IamService {
         )?;
 
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
         let path_prefix = req.query_params.get("PathPrefix").cloned();
         let max_items: usize = req
@@ -525,7 +526,7 @@ impl IamService {
         let user_name = required_param_with_code(&req.query_params, "UserName", "NoSuchEntity")?;
         validate_string_length_with_code("userName", &user_name, 1, 64, "NoSuchEntity")?;
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         let user = state.users.get(&user_name).ok_or_else(|| {
@@ -873,7 +874,7 @@ impl IamService {
         // Declared: NoSuchEntity, ServiceFailure -> NoSuchEntity for missing param.
         let user_name = required_param_with_code(&req.query_params, "UserName", "NoSuchEntity")?;
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         if !state.users.contains_key(&user_name) {
@@ -1085,7 +1086,7 @@ impl IamService {
             "NoSuchEntity",
         )?;
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
         let user_name = req
             .query_params
@@ -1340,7 +1341,7 @@ impl IamService {
         let ssh_public_key_id = required_param(&req.query_params, "SSHPublicKeyId")?;
 
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         let key = state
@@ -1400,7 +1401,7 @@ impl IamService {
             "NoSuchEntity",
         )?;
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
         let user_name = req
             .query_params
@@ -1533,7 +1534,7 @@ impl IamService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let access_key_id = required_param(&req.query_params, "AccessKeyId")?;
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         // Find the user that owns this access key
@@ -1688,7 +1689,7 @@ impl IamService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let user_name = required_param(&req.query_params, "UserName")?;
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         if !state.users.contains_key(&user_name) {
@@ -1768,7 +1769,7 @@ impl IamService {
         let user_name = required_param(&req.query_params, "UserName")?;
         let policy_name = required_param(&req.query_params, "PolicyName")?;
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         let doc = state
@@ -1835,7 +1836,7 @@ impl IamService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let user_name = required_param(&req.query_params, "UserName")?;
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         if !state.users.contains_key(&user_name) {

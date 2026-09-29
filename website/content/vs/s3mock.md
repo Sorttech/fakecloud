@@ -1,12 +1,12 @@
 +++
 title = "fakecloud vs S3Mock"
-description = "How fakecloud compares to adobe/S3Mock. Both local S3 emulators; fakecloud adds cross-service wiring and 22 other AWS services."
+description = "How fakecloud compares to adobe/S3Mock. Both local S3 emulators; fakecloud adds cross-service wiring and 104 other AWS services."
 template = "page.html"
 +++
 
 [adobe/S3Mock](https://github.com/adobe/S3Mock) is a lightweight S3-only mock for integration tests, written in Java and distributed as a JAR or Docker image. Simple, focused, well-maintained.
 
-fakecloud does S3 (107 operations) plus 22 other AWS services end-to-end.
+fakecloud does S3 (107 operations) plus 104 other AWS services end-to-end.
 
 ## When to pick S3Mock
 
@@ -33,7 +33,7 @@ fakecloud does S3 (107 operations) plus 22 other AWS services end-to-end.
 | S3 notifications fire subscribers (real) | **Yes** (SNS/SQS/Lambda) | **No** (no other services) |
 | Bucket policy enforcement | Yes (opt-in `--iam strict`) | No |
 | Non-JVM SDKs | Any | Any (S3 SDK only) |
-| Other AWS services | 22 more | None |
+| Other AWS services | 104 more | None |
 | Startup | ~300ms | ~2s (JVM) |
 | Runtime | Rust binary (~19 MB) | JAR / Docker |
 

@@ -64,8 +64,10 @@ impl CloudWatchService {
         let expire_date = parse_ts(req, "ExpireDate");
 
         let arn = format!(
-            "arn:aws:cloudwatch:{}:{}:alarm-mute-rule/{name}",
-            req.region, req.account_id
+            "arn:{}:cloudwatch:{}:{}:alarm-mute-rule/{name}",
+            fakecloud_aws::arn::partition_for(&req.region),
+            req.region,
+            req.account_id
         );
         let mute_rule = AlarmMuteRule {
             name: name.clone(),

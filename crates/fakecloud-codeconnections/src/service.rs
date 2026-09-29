@@ -17,6 +17,7 @@ use http::StatusCode;
 use serde_json::{json, Map, Value};
 use tokio::sync::Mutex as AsyncMutex;
 
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_persistence::SnapshotStore;
 
@@ -270,13 +271,25 @@ fn gen_uuid() -> String {
 }
 
 fn connection_arn(region: &str, account: &str, id: &str) -> String {
-    format!("arn:aws:codeconnections:{region}:{account}:connection/{id}")
+    Arn::regional(
+        "codeconnections",
+        region,
+        account,
+        &format!("connection/{id}"),
+    )
+    .to_string()
 }
 fn host_arn(region: &str, account: &str, id: &str) -> String {
-    format!("arn:aws:codeconnections:{region}:{account}:host/{id}")
+    Arn::regional("codeconnections", region, account, &format!("host/{id}")).to_string()
 }
 fn repository_link_arn(region: &str, account: &str, id: &str) -> String {
-    format!("arn:aws:codeconnections:{region}:{account}:repository-link/{id}")
+    Arn::regional(
+        "codeconnections",
+        region,
+        account,
+        &format!("repository-link/{id}"),
+    )
+    .to_string()
 }
 
 /// Parse a `Tags` list (`[{Key,Value}]`) into a map.
@@ -1255,6 +1268,29 @@ mod tests {
             json!({ "ConnectionName": "conn", "ProviderType": "GitHub" }),
         );
         out["ConnectionArn"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn connection_arn_carries_china_partition() {
+        let s = svc();
+        let cn = |action: &str, body: Value| {
+            let mut r = req(action, body);
+            r.region = "cn-north-1".into();
+            dispatch(&s, &r).expect("op ok")
+        };
+        let resp = cn(
+            "CreateConnection",
+            json!({ "ConnectionName": "cn", "ProviderType": "GitHub" }),
+        );
+        let out: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        let arn = out["ConnectionArn"].as_str().unwrap().to_string();
+        assert!(
+            arn.starts_with("arn:aws-cn:codeconnections:cn-north-1:000000000000:connection/"),
+            "{arn}"
+        );
+        let resp = cn("GetConnection", json!({ "ConnectionArn": arn }));
+        let got: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        assert_eq!(got["Connection"]["ConnectionArn"], json!(arn));
     }
 
     // ---- Defect 3: CreateConnection must resolve a provider type ----

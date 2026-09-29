@@ -19,10 +19,7 @@ impl LambdaService {
         // Persist the FunctionArn under the request's credential-scope region
         // (`req.region`), consistent with the function's own ARN, not the
         // server default. Get/Update/List re-emit this stored value.
-        let function_arn = format!(
-            "arn:aws:lambda:{}:{}:function:{}",
-            req.region, req.account_id, function_name
-        );
+        let function_arn = function_arn(&req.region, &req.account_id, function_name);
         // Validate Smithy ranges before persisting:
         //   MaximumEventAgeInSeconds: 60..=21600
         //   MaximumRetryAttempts:     0..=2
