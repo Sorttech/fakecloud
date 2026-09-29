@@ -389,9 +389,14 @@ pub trait S3Store: Send + Sync {
         false
     }
 
-    /// Whether the last [`S3Store::load`] REFUSED this bucket -- a corrupt
-    /// object meta, a missing part body: data still on disk and recoverable by
-    /// repairing the one bad file.
+    /// Whether this bucket was REFUSED at load: data still on disk and
+    /// recoverable by repairing the one bad file.
+    ///
+    /// Covers both layers that can refuse one. [`S3Store::load`] records the
+    /// buckets whose OBJECTS it could not read (a corrupt object meta, a missing
+    /// part body); the layer that parses a bucket's own files reports the rest
+    /// through [`S3Store::mark_bucket_load_refused`], since the store reads those
+    /// as opaque text and sees nothing wrong.
     ///
     /// Recorded at load, not probed per call, so a caller cannot confuse "the
     /// loader could not read this" with "this is simply not in memory".
@@ -407,8 +412,8 @@ pub trait S3Store: Send + Sync {
     /// `CreateBucket` clears the directory, objects included.
     fn mark_bucket_load_refused(&self, _bucket: &str) {}
 
-    /// Forget that [`S3Store::load`] refused `bucket`, because the name now
-    /// belongs to a bucket that loaded.
+    /// Forget that `bucket` was refused at load, because the name now belongs to
+    /// a bucket that loaded.
     ///
     /// The refusal is recorded at load and consulted long afterwards, so it has
     /// to be dropped when it stops being true, or a name whose unreadable data
@@ -917,8 +922,9 @@ impl S3Store for DiskS3Store {
                     tracing::warn!(
                         bucket = %bdir.display(),
                         error = %e,
-                        "skipping unreadable S3 bucket during load; its name is refused until it \
-                         is repaired and the server restarted, or the bucket is deleted"
+                        "skipping unreadable S3 bucket during load; its name is refused until \
+                         the bad file is repaired and the server restarted, or the bucket's \
+                         directory is removed -- no API call discards it"
                     );
                 }
             }
@@ -1398,6 +1404,44 @@ mod disk_tests {
             size,
             ..Default::default()
         }
+    }
+
+    /// The refusal set is written by two layers that name a bucket differently:
+    /// `load` inserts the on-disk directory name, while the sidecar layer above
+    /// the store hands `mark_bucket_load_refused` a bucket NAME. Both readers
+    /// escape. A name that escapes to itself -- which every name in the e2e
+    /// suites happens to be -- cannot tell the two key spaces apart, so pin it
+    /// with one that does not.
+    #[test]
+    fn a_refusal_is_found_under_the_escaped_directory_name() {
+        let tmp = TempDir::new().unwrap();
+        let store = new_store(&tmp);
+
+        let name = "odd:name";
+        let escaped = crate::key_escape::escape_key_segment(name);
+        assert_ne!(escaped, name, "pick a name that actually escapes");
+
+        assert!(!store.bucket_load_refused(name));
+        store.mark_bucket_load_refused(name);
+        assert!(
+            store.bucket_load_refused(name),
+            "marked by name, read back by name"
+        );
+
+        // The directory the store creates for it is the escaped one, so `load`'s
+        // raw-directory-name insert lands on the same key this reader uses.
+        let meta = BucketMeta {
+            name: name.to_string(),
+            ..Default::default()
+        };
+        store.put_bucket_meta(name, &meta).unwrap();
+        assert!(
+            tmp.path().join("buckets").join(&escaped).is_dir(),
+            "expected the bucket directory under the escaped name"
+        );
+
+        store.clear_bucket_load_refusal(name).unwrap();
+        assert!(!store.bucket_load_refused(name));
     }
 
     #[test]

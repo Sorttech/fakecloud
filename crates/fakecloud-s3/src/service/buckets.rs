@@ -362,9 +362,10 @@ impl S3Service {
                 "BucketAlreadyExists",
                 format!(
                     "The requested bucket name is not available: {bucket} holds persisted data \
-                     that could not be read at load (an unreadable object, or a delete that \
-                     stopped partway). Repair its directory in the data path and restart to get \
-                     the bucket back, or remove the directory to free the name."
+                     that could not be read at load -- an unreadable object, one of the bucket's \
+                     own files (tags.toml, acl.toml, inventory.toml), or a delete that stopped \
+                     partway. The server logged which file it was. Repair it in the data path and \
+                     restart to get the bucket back, or remove the directory to free the name."
                 ),
                 vec![("BucketName".to_string(), bucket.to_string())],
             ));

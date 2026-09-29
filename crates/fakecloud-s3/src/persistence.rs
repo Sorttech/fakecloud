@@ -463,14 +463,6 @@ pub fn s3_bucket_from_snapshot(
     Ok(b)
 }
 
-pub fn hydrate_s3_state(
-    snapshot: S3StateSnapshot,
-    account_id: &str,
-    region: &str,
-) -> Result<S3State, String> {
-    hydrate_s3_state_reporting(snapshot, account_id, region, &mut |_, _| {})
-}
-
 /// Hydrate a loaded snapshot, reporting each bucket that cannot be used instead
 /// of failing the whole load.
 ///
@@ -504,7 +496,9 @@ pub fn hydrate_s3_state_reporting(
                 tracing::warn!(
                     bucket = %name,
                     error = %e,
-                    "skipping S3 bucket whose stored configuration could not be read",
+                    "skipping S3 bucket whose stored configuration could not be read; its name is \
+                     refused until the bad file is repaired and the server restarted, or the \
+                     bucket's directory is removed",
                 );
                 refused(&name, &e);
             }
@@ -662,7 +656,12 @@ permission = "READ"
                 ..Default::default()
             },
         );
-        let state = hydrate_s3_state(snapshot, "123", "us-east-1").unwrap();
+        // The no-op reporter is spelled out here on purpose: production must wire
+        // this to the store's `mark_bucket_load_refused`, and a convenience
+        // wrapper that defaulted to discarding refusals is what let the
+        // sidecar-refusal hole ship in the first place.
+        let state =
+            hydrate_s3_state_reporting(snapshot, "123", "us-east-1", &mut |_, _| {}).unwrap();
         assert!(state.buckets.contains_key("b"));
     }
 }
