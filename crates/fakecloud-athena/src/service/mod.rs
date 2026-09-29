@@ -664,7 +664,7 @@ fn workgroup_arn(account_id: &str, region: &str, name: &str) -> String {
     } else {
         region
     };
-    Arn::new("athena", region, account_id, &format!("workgroup/{name}")).to_string()
+    Arn::regional("athena", region, account_id, &format!("workgroup/{name}")).to_string()
 }
 
 fn datacatalog_arn(account_id: &str, region: &str, name: &str) -> String {
@@ -673,7 +673,7 @@ fn datacatalog_arn(account_id: &str, region: &str, name: &str) -> String {
     } else {
         region
     };
-    Arn::new("athena", region, account_id, &format!("datacatalog/{name}")).to_string()
+    Arn::regional("athena", region, account_id, &format!("datacatalog/{name}")).to_string()
 }
 
 fn capacity_reservation_arn(account_id: &str, region: &str, name: &str) -> String {
@@ -682,7 +682,7 @@ fn capacity_reservation_arn(account_id: &str, region: &str, name: &str) -> Strin
     } else {
         region
     };
-    Arn::new(
+    Arn::regional(
         "athena",
         region,
         account_id,
@@ -2003,6 +2003,44 @@ mod tests {
         assert_eq!(deleted["DataCatalog"]["Name"], "cat1");
         assert_eq!(deleted["DataCatalog"]["Type"], "GLUE");
         assert_eq!(deleted["DataCatalog"]["Status"], "DELETE_COMPLETE");
+    }
+
+    /// Athena ARNs take the partition of the region they are minted in, so a
+    /// resource created in a China region is tagged and looked up under its
+    /// `aws-cn` ARN.
+    #[test]
+    fn arns_use_the_regions_partition() {
+        assert_eq!(
+            super::workgroup_arn("123456789012", "cn-north-1", "wg"),
+            "arn:aws-cn:athena:cn-north-1:123456789012:workgroup/wg"
+        );
+        assert_eq!(
+            super::datacatalog_arn("123456789012", "cn-north-1", "cat"),
+            "arn:aws-cn:athena:cn-north-1:123456789012:datacatalog/cat"
+        );
+        assert_eq!(
+            super::capacity_reservation_arn("123456789012", "us-gov-west-1", "cr"),
+            "arn:aws-us-gov:athena:us-gov-west-1:123456789012:capacity-reservation/cr"
+        );
+        assert_eq!(
+            super::workgroup_arn("123456789012", "us-east-1", "wg"),
+            "arn:aws:athena:us-east-1:123456789012:workgroup/wg"
+        );
+
+        let svc = AthenaService::new(SharedAthenaState::default());
+        let mut create = req(
+            "CreateWorkGroup",
+            json!({ "Name": "cnwg", "Tags": [{ "Key": "team", "Value": "data" }] }),
+        );
+        create.region = "cn-north-1".to_string();
+        svc.create_work_group(&create).unwrap();
+        let mut list = req(
+            "ListTagsForResource",
+            json!({ "ResourceARN": "arn:aws-cn:athena:cn-north-1:123456789012:workgroup/cnwg" }),
+        );
+        list.region = "cn-north-1".to_string();
+        let tags = parse_json(&svc.list_tags_for_resource(&list).unwrap());
+        assert_eq!(tags["Tags"], json!([{ "Key": "team", "Value": "data" }]));
     }
 }
 

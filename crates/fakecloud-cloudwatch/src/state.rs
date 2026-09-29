@@ -373,7 +373,7 @@ pub struct AlarmHistoryItem {
 
 /// The ARN of alarm `name` (metric, composite or log alarm) in `region`'s
 /// partition.
-pub(crate) fn alarm_arn(region: &str, account_id: &str, name: &str) -> String {
+pub fn alarm_arn(region: &str, account_id: &str, name: &str) -> String {
     fakecloud_aws::arn::Arn::regional("cloudwatch", region, account_id, &format!("alarm:{name}"))
         .to_string()
 }

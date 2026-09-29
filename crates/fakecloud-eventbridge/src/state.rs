@@ -49,13 +49,13 @@ pub(crate) fn arn_with_request_region(arn: &str, region: &str) -> String {
 }
 
 /// The ARN of the event bus `name` in `region`'s partition.
-pub(crate) fn bus_arn(region: &str, account_id: &str, name: &str) -> String {
+pub fn bus_arn(region: &str, account_id: &str, name: &str) -> String {
     Arn::regional("events", region, account_id, &format!("event-bus/{name}")).to_string()
 }
 
 /// The ARN of rule `name` on bus `bus`. Rules on the default bus leave the bus
 /// out of the resource path, as AWS does.
-pub(crate) fn rule_arn(region: &str, account_id: &str, bus: &str, name: &str) -> String {
+pub fn rule_arn(region: &str, account_id: &str, bus: &str, name: &str) -> String {
     let resource = if bus == "default" {
         format!("rule/{name}")
     } else {

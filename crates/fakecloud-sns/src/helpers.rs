@@ -38,7 +38,7 @@ pub(crate) fn is_mutating_action(action: &str) -> bool {
 }
 
 /// The ARN of topic `name` in `region`'s partition.
-pub(crate) fn topic_arn(region: &str, account_id: &str, name: &str) -> String {
+pub fn topic_arn(region: &str, account_id: &str, name: &str) -> String {
     fakecloud_aws::arn::Arn::regional("sns", region, account_id, name).to_string()
 }
 

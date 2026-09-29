@@ -21,7 +21,7 @@ mod tests;
 pub use delivery::CloudwatchDeliveryImpl;
 pub use service::CloudWatchService;
 pub use state::{
-    AlarmMetricQuery, AlarmMetricStat, AlarmState, CloudWatchAccounts, CloudWatchSnapshot,
-    CloudWatchState, Dashboard, MetricAlarm, MetricDatum, SharedCloudWatchState,
-    CLOUDWATCH_SNAPSHOT_SCHEMA_VERSION,
+    alarm_arn, AlarmMetricQuery, AlarmMetricStat, AlarmState, CloudWatchAccounts,
+    CloudWatchSnapshot, CloudWatchState, Dashboard, MetricAlarm, MetricDatum,
+    SharedCloudWatchState, CLOUDWATCH_SNAPSHOT_SCHEMA_VERSION,
 };
