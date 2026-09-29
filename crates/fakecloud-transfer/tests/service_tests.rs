@@ -100,6 +100,50 @@ Lljq\n\
 -----END CERTIFICATE-----\n";
 
 #[tokio::test]
+async fn china_region_server_arn_uses_aws_cn_partition_and_tags_by_it() {
+    let s = svc();
+    let cn = |action: &str, body: Value| {
+        let mut r = request(action, body);
+        r.region = "cn-north-1".into();
+        r
+    };
+    let body_of = |resp: fakecloud_core::service::AwsResponse| -> Value {
+        serde_json::from_slice(resp.body.expect_bytes()).unwrap()
+    };
+    let created = body_of(
+        s.handle(cn(
+            "CreateServer",
+            json!({ "IdentityProviderType": "SERVICE_MANAGED" }),
+        ))
+        .await
+        .unwrap(),
+    );
+    let server_id = created["ServerId"].as_str().unwrap().to_string();
+    let desc = body_of(
+        s.handle(cn("DescribeServer", json!({ "ServerId": server_id })))
+            .await
+            .unwrap(),
+    );
+    let arn = desc["Server"]["Arn"].as_str().unwrap().to_string();
+    assert_eq!(
+        arn,
+        format!("arn:aws-cn:transfer:cn-north-1:000000000000:server/{server_id}")
+    );
+    s.handle(cn(
+        "TagResource",
+        json!({ "Arn": arn, "Tags": [{ "Key": "k", "Value": "v" }] }),
+    ))
+    .await
+    .unwrap();
+    let tags = body_of(
+        s.handle(cn("ListTagsForResource", json!({ "Arn": arn })))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(tags["Tags"][0]["Value"], "v");
+}
+
+#[tokio::test]
 async fn server_crud_and_state_transitions() {
     let s = svc();
     let server_id = new_server(&s).await;

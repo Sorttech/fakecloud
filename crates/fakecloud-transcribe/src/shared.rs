@@ -28,7 +28,13 @@ pub fn hash_str(s: &str) -> u64 {
 /// `medical-transcription-job`, `medical-vocabulary`, `call-analytics-job`,
 /// `call-analytics-category`, `medical-scribe-job`).
 pub fn resource_arn(region: &str, account: &str, resource_type: &str, name: &str) -> String {
-    format!("arn:aws:transcribe:{region}:{account}:{resource_type}/{name}")
+    fakecloud_aws::arn::Arn::regional(
+        "transcribe",
+        region,
+        account,
+        &format!("{resource_type}/{name}"),
+    )
+    .to_string()
 }
 
 /// Split a Transcribe ARN into `(resource_type, name)`.

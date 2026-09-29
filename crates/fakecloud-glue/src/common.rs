@@ -138,9 +138,10 @@ pub(crate) fn entity(src: &Value, allowed: &[&str], extra: Vec<(&str, Value)>) -
     Value::Object(obj)
 }
 
-/// Deterministic-ish fake ARN for a resource.
-pub(crate) fn resource_arn(account: &str, region: &str, kind: &str, name: &str) -> String {
-    format!("arn:aws:glue:{region}:{account}:{kind}/{name}")
+/// The ARN of the Glue resource `<kind>/<name>` in `region`'s partition.
+pub fn resource_arn(region: &str, account: &str, kind: &str, name: &str) -> String {
+    fakecloud_aws::arn::Arn::regional("glue", region, account, &format!("{kind}/{name}"))
+        .to_string()
 }
 
 /// Paginate a Glue list op using the request's `MaxResults`/`NextToken`.
