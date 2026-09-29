@@ -132,8 +132,7 @@ Every operator supports the `...IfExists` suffix (missing key evaluates to `true
 | `s3:max-keys` | `s3:ListObjects`, `s3:ListObjectsV2` | `?max-keys=` query param |
 | `s3:x-amz-acl` | any request carrying the header (`CreateBucket`, `PutObject`, `CopyObject`, `CreateMultipartUpload`, `PutBucketAcl`, `PutObjectAcl`) | `x-amz-acl` header |
 | `s3:x-amz-grant-read`, `-write`, `-read-acp`, `-write-acp`, `-full-control` | any request carrying the header | matching `x-amz-grant-*` header |
-| `s3:x-amz-object-ownership` | `CreateBucket` | `x-amz-object-ownership` header (`PutBucketOwnershipControls` carries the value in its XML body, not a header, so the key is not populated there) |
-| `s3:x-amz-bucket-object-lock-enabled` | `CreateBucket` | `x-amz-bucket-object-lock-enabled` header |
+| `s3:x-amz-object-ownership` | any request carrying the header, which in practice is `CreateBucket` | `x-amz-object-ownership` header. AWS defines this key for `CreateBucket` only; `PutBucketOwnershipControls` carries the value in its XML body rather than a header, so no key is populated there |
 | `sns:Protocol` | `sns:Subscribe` | `Protocol` request parameter |
 | `sns:Endpoint` | `sns:Subscribe` | `Endpoint` request parameter |
 | `lambda:FunctionArn` | `lambda:AddPermission` | Target function ARN resolved from the path |

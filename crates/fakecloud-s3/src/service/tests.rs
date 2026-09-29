@@ -4836,10 +4836,10 @@ fn acl_condition_keys_are_populated_from_the_request_headers() {
         keys.get("s3:x-amz-object-ownership"),
         Some(&vec!["BucketOwnerEnforced".to_string()])
     );
-    assert_eq!(
-        keys.get("s3:x-amz-bucket-object-lock-enabled"),
-        Some(&vec!["true".to_string()])
-    );
+    // AWS defines no condition key for the object-lock header, so emitting one
+    // would give policy authors a guardrail that works here and silently does
+    // nothing on AWS.
+    assert_eq!(keys.get("s3:x-amz-bucket-object-lock-enabled"), None);
 
     // Absent headers emit nothing, so a policy condition on them safe-fails to
     // "does not apply" rather than matching an empty value.
