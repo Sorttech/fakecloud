@@ -5,7 +5,7 @@ use fakecloud_aws::ec2query::{ec2_elem, ec2_list};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use crate::service::Ec2Service;
-use crate::service_helpers::{gen_id, indexed_list, require, validate_max_results};
+use crate::service_helpers::{ec2_arn, gen_id, indexed_list, require, validate_max_results};
 use crate::state::{
     Ec2State, Tag, TgwAttachment, TgwRoute, TgwRouteTable, TransitGateway, TransitGatewayOptions,
 };
@@ -31,7 +31,7 @@ fn tgw_xml(t: &TransitGateway, tags: &[Tag], owner: &str, region: &str) -> Strin
         ec2_elem("state", &t.state),
         ec2_elem(
             "transitGatewayArn",
-            &format!("arn:aws:ec2:{region}:{owner}:transit-gateway/{}", t.id)
+            &ec2_arn(region, owner, &format!("transit-gateway/{}", t.id))
         ),
         ec2_elem("ownerId", owner),
         ec2_elem("description", &t.description),

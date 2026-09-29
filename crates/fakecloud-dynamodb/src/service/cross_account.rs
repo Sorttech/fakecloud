@@ -43,7 +43,7 @@ pub(crate) const STREAMS_CROSS_ACCOUNT_OPERATIONS: &[&str] =
 
 /// The region and account of a DynamoDB ARN (`arn:aws:dynamodb:REGION:ACCOUNT:...`).
 pub(crate) fn arn_scope(arn: &str) -> Option<(&str, &str)> {
-    let rest = arn.strip_prefix("arn:aws:dynamodb:")?;
+    let rest = fakecloud_aws::arn::arn_resource(arn, "dynamodb")?;
     let mut parts = rest.splitn(3, ':');
     let region = parts.next()?;
     let account = parts.next()?;

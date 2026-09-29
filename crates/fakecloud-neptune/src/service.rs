@@ -15,10 +15,10 @@ use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceErr
 use fakecloud_persistence::SnapshotStore;
 
 use crate::state::{
-    ClusterMember, ClusterRole, DbCluster, DbClusterEndpoint, DbClusterParameterGroup,
-    DbClusterSnapshot, DbInstance, DbParameterGroup, DbSubnetGroup, EventSubscription,
-    GlobalCluster, NeptuneSnapshot, NeptuneState, ParameterValue, SharedNeptuneState, Subnet, Tag,
-    NEPTUNE_SNAPSHOT_SCHEMA_VERSION,
+    global_cluster_arn, rds_arn, ClusterMember, ClusterRole, DbCluster, DbClusterEndpoint,
+    DbClusterParameterGroup, DbClusterSnapshot, DbInstance, DbParameterGroup, DbSubnetGroup,
+    EventSubscription, GlobalCluster, NeptuneSnapshot, NeptuneState, ParameterValue,
+    SharedNeptuneState, Subnet, Tag, NEPTUNE_SNAPSHOT_SCHEMA_VERSION,
 };
 use crate::xml;
 
@@ -366,7 +366,7 @@ fn endpoint_suffix() -> String {
 }
 
 fn cluster_arn(region: &str, account: &str, id: &str) -> String {
-    format!("arn:aws:rds:{region}:{account}:cluster:{id}")
+    rds_arn(region, account, "cluster", id)
 }
 
 /// Collect a Query-protocol list under `base`, trying each candidate member
@@ -951,9 +951,11 @@ impl NeptuneService {
             custom_endpoint_type: endpoint_type,
             static_members: collect_list(req, "StaticMembers", &["member"]),
             excluded_members: collect_list(req, "ExcludedMembers", &["member"]),
-            db_cluster_endpoint_arn: format!(
-                "arn:aws:rds:{}:{}:cluster-endpoint:{endpoint_id}",
-                req.region, req.account_id
+            db_cluster_endpoint_arn: rds_arn(
+                &req.region,
+                &req.account_id,
+                "cluster-endpoint",
+                &endpoint_id,
             ),
             tags: parse_tags(req),
         };
@@ -1122,7 +1124,7 @@ impl NeptuneService {
         let suffix = endpoint_suffix();
         let instance = DbInstance {
             db_instance_identifier: id.clone(),
-            db_instance_arn: format!("arn:aws:rds:{}:{}:db:{id}", req.region, req.account_id),
+            db_instance_arn: rds_arn(&req.region, &req.account_id, "db", &id),
             db_instance_class: class,
             engine,
             engine_version: optional_query_param(req, "EngineVersion")
@@ -1224,8 +1226,7 @@ impl NeptuneService {
             optional_query_param(req, "NewDBInstanceIdentifier").filter(|n| n != &id)
         {
             inst.db_instance_identifier = new_id.clone();
-            inst.db_instance_arn =
-                format!("arn:aws:rds:{}:{}:db:{new_id}", req.region, req.account_id);
+            inst.db_instance_arn = rds_arn(&req.region, &req.account_id, "db", &new_id);
             st.instances.remove(&id);
             st.instances.insert(new_id, inst.clone());
         } else {
@@ -1336,10 +1337,8 @@ impl NeptuneService {
             .ok_or_else(|| snapshot_not_found(&source))?;
         snap.source_db_cluster_snapshot_arn = Some(snap.db_cluster_snapshot_arn.clone());
         snap.db_cluster_snapshot_identifier = target.clone();
-        snap.db_cluster_snapshot_arn = format!(
-            "arn:aws:rds:{}:{}:cluster-snapshot:{target}",
-            req.region, req.account_id
-        );
+        snap.db_cluster_snapshot_arn =
+            rds_arn(&req.region, &req.account_id, "cluster-snapshot", &target);
         snap.snapshot_type = "manual".to_string();
         snap.snapshot_create_time = Utc::now();
         snap.tags = parse_tags(req);
@@ -1620,9 +1619,11 @@ impl NeptuneService {
         }
         let group = DbClusterParameterGroup {
             db_cluster_parameter_group_name: name.clone(),
-            db_cluster_parameter_group_arn: format!(
-                "arn:aws:rds:{}:{}:cluster-pg:{name}",
-                req.region, req.account_id
+            db_cluster_parameter_group_arn: rds_arn(
+                &req.region,
+                &req.account_id,
+                "cluster-pg",
+                &name,
             ),
             db_parameter_group_family: family,
             description,
@@ -1658,10 +1659,8 @@ impl NeptuneService {
             .cloned()
             .ok_or_else(|| param_group_not_found(&source))?;
         group.db_cluster_parameter_group_name = target.clone();
-        group.db_cluster_parameter_group_arn = format!(
-            "arn:aws:rds:{}:{}:cluster-pg:{target}",
-            req.region, req.account_id
-        );
+        group.db_cluster_parameter_group_arn =
+            rds_arn(&req.region, &req.account_id, "cluster-pg", &target);
         group.description = target_desc;
         group.tags = parse_tags(req);
         st.cluster_parameter_groups.insert(target, group.clone());
@@ -1830,10 +1829,7 @@ impl NeptuneService {
         }
         let group = DbParameterGroup {
             db_parameter_group_name: name.clone(),
-            db_parameter_group_arn: format!(
-                "arn:aws:rds:{}:{}:pg:{name}",
-                req.region, req.account_id
-            ),
+            db_parameter_group_arn: rds_arn(&req.region, &req.account_id, "pg", &name),
             db_parameter_group_family: family,
             description,
             parameters: Default::default(),
@@ -1865,8 +1861,7 @@ impl NeptuneService {
             .cloned()
             .ok_or_else(|| param_group_not_found(&source))?;
         group.db_parameter_group_name = target.clone();
-        group.db_parameter_group_arn =
-            format!("arn:aws:rds:{}:{}:pg:{target}", req.region, req.account_id);
+        group.db_parameter_group_arn = rds_arn(&req.region, &req.account_id, "pg", &target);
         group.description = target_desc;
         group.tags = parse_tags(req);
         st.parameter_groups.insert(target, group.clone());
@@ -2028,10 +2023,7 @@ impl NeptuneService {
             .collect();
         let group = DbSubnetGroup {
             db_subnet_group_name: name.clone(),
-            db_subnet_group_arn: format!(
-                "arn:aws:rds:{}:{}:subgrp:{name}",
-                req.region, req.account_id
-            ),
+            db_subnet_group_arn: rds_arn(&req.region, &req.account_id, "subgrp", &name),
             db_subnet_group_description: description,
             vpc_id: format!("vpc-{}", resource_token()[..12].to_lowercase()),
             subnet_group_status: "Complete".to_string(),
@@ -2157,7 +2149,7 @@ impl NeptuneService {
         };
         let global = GlobalCluster {
             global_cluster_identifier: id.clone(),
-            global_cluster_arn: format!("arn:aws:rds::{}:global-cluster:{id}", req.account_id),
+            global_cluster_arn: global_cluster_arn(&req.region, &req.account_id, &id),
             global_cluster_resource_id: format!("cluster-{}", resource_token()),
             status: "available".to_string(),
             engine,
@@ -2202,8 +2194,7 @@ impl NeptuneService {
             optional_query_param(req, "NewGlobalClusterIdentifier").filter(|n| n != &id)
         {
             global.global_cluster_identifier = new_id.clone();
-            global.global_cluster_arn =
-                format!("arn:aws:rds::{}:global-cluster:{new_id}", req.account_id);
+            global.global_cluster_arn = global_cluster_arn(&req.region, &req.account_id, &new_id);
             st.global_clusters.remove(&id);
             st.global_clusters.insert(new_id, global.clone());
         } else {
@@ -2343,10 +2334,7 @@ impl NeptuneService {
         }
         let sub = EventSubscription {
             subscription_name: name.clone(),
-            event_subscription_arn: format!(
-                "arn:aws:rds:{}:{}:es:{name}",
-                req.region, req.account_id
-            ),
+            event_subscription_arn: rds_arn(&req.region, &req.account_id, "es", &name),
             customer_aws_id: req.account_id.clone(),
             sns_topic_arn: topic,
             status: "active".to_string(),
@@ -2751,9 +2739,7 @@ fn snapshot_from_cluster(
 ) -> DbClusterSnapshot {
     DbClusterSnapshot {
         db_cluster_snapshot_identifier: snap_id.to_string(),
-        db_cluster_snapshot_arn: format!(
-            "arn:aws:rds:{region}:{account}:cluster-snapshot:{snap_id}"
-        ),
+        db_cluster_snapshot_arn: rds_arn(region, account, "cluster-snapshot", snap_id),
         db_cluster_identifier: c.db_cluster_identifier.clone(),
         status: "available".to_string(),
         engine: c.engine.clone(),

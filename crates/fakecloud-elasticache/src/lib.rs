@@ -5,7 +5,8 @@ pub(crate) mod state;
 
 pub use service::ElastiCacheService;
 pub use state::{
-    CacheCluster, CacheParameterGroup, CacheSecurityGroup, CacheSubnetGroup, ElastiCacheSnapshot,
-    ElastiCacheState, ElastiCacheUser, ElastiCacheUserGroup, ReplicationGroup, ServerlessCache,
-    ServiceUpdate, SharedElastiCacheState, UpdateAction, ELASTICACHE_SNAPSHOT_SCHEMA_VERSION,
+    elasticache_arn, CacheCluster, CacheParameterGroup, CacheSecurityGroup, CacheSubnetGroup,
+    ElastiCacheSnapshot, ElastiCacheState, ElastiCacheUser, ElastiCacheUserGroup, ReplicationGroup,
+    ServerlessCache, ServiceUpdate, SharedElastiCacheState, UpdateAction,
+    ELASTICACHE_SNAPSHOT_SCHEMA_VERSION,
 };

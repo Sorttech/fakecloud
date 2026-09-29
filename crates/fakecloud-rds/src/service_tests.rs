@@ -1151,6 +1151,66 @@ fn create_subnet_group(svc: &RdsService, name: &str) {
     svc.create_db_subnet_group(&req).unwrap();
 }
 
+#[tokio::test]
+async fn china_region_arns_use_the_china_partition_and_resolve_for_tagging() {
+    let svc = make_service();
+    let in_cn = |action: &str, params: &[(&str, &str)]| {
+        let mut r = request(action, params);
+        r.region = "cn-north-1".to_string();
+        r
+    };
+    let xml = body_of(
+        svc.handle(in_cn(
+            "CreateDBSubnetGroup",
+            &[
+                ("DBSubnetGroupName", "cn-sg"),
+                ("DBSubnetGroupDescription", "test"),
+                ("SubnetIds.SubnetIdentifier.1", "subnet-aaa"),
+                ("SubnetIds.SubnetIdentifier.2", "subnet-bbb"),
+            ],
+        ))
+        .await
+        .unwrap(),
+    );
+    let arn = "arn:aws-cn:rds:cn-north-1:123456789012:subgrp:cn-sg";
+    assert!(
+        xml.contains(&format!("<DBSubnetGroupArn>{arn}</DBSubnetGroupArn>")),
+        "{xml}"
+    );
+    svc.handle(in_cn(
+        "AddTagsToResource",
+        &[
+            ("ResourceName", arn),
+            ("Tags.Tag.1.Key", "team"),
+            ("Tags.Tag.1.Value", "db"),
+        ],
+    ))
+    .await
+    .unwrap();
+    let xml = body_of(
+        svc.handle(in_cn("ListTagsForResource", &[("ResourceName", arn)]))
+            .await
+            .unwrap(),
+    );
+    assert!(xml.contains("<Key>team</Key>"), "{xml}");
+
+    let xml = body_of(
+        svc.handle(in_cn(
+            "CreateGlobalCluster",
+            &[
+                ("GlobalClusterIdentifier", "cn-glob"),
+                ("Engine", "aurora-postgresql"),
+            ],
+        ))
+        .await
+        .unwrap(),
+    );
+    assert!(
+        xml.contains("arn:aws-cn:rds::123456789012:global-cluster:cn-glob"),
+        "{xml}"
+    );
+}
+
 #[test]
 fn create_db_subnet_group_requires_two_subnets() {
     let svc = make_service();

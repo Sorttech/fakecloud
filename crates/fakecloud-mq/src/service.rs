@@ -2085,6 +2085,33 @@ mod tests {
     }
 
     #[test]
+    fn china_broker_arn_is_in_the_china_partition_and_taggable() {
+        let s = svc();
+        let c = ctx("cn-north-1");
+        let created = json_of(s.create_broker(&c, &active_body("cn")).unwrap());
+        let arn = created["brokerArn"].as_str().unwrap().to_string();
+        assert!(arn.starts_with("arn:aws-cn:mq:cn-north-1:"), "{arn}");
+
+        s.create_tags(&c, &arn, &json!({ "tags": { "team": "mq" } }))
+            .expect("create tags");
+        let tags = json_of(s.list_tags(&c, &arn).unwrap());
+        assert_eq!(tags["tags"]["team"].as_str(), Some("mq"));
+
+        let cfg = json_of(
+            s.create_configuration(
+                &c,
+                &json!({ "name": "cfg", "engineType": "ACTIVEMQ", "engineVersion": "5.18" }),
+            )
+            .unwrap(),
+        );
+        let cfg_arn = cfg["arn"].as_str().unwrap();
+        assert!(
+            cfg_arn.starts_with("arn:aws-cn:mq:cn-north-1:"),
+            "{cfg_arn}"
+        );
+    }
+
+    #[test]
     fn create_tags_then_describe_broker_shows_the_tag() {
         let s = svc();
         let c = ctx("us-east-1");
