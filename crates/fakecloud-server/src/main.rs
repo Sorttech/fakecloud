@@ -2547,10 +2547,20 @@ async fn main() {
                     let bucket_count = snapshot.buckets.len();
                     let object_count: usize =
                         snapshot.buckets.values().map(|b| b.objects.len()).sum();
-                    let hydrated = match fakecloud_s3::persistence::hydrate_s3_state(
+                    // Report each bucket the sidecar layer cannot read into the
+                    // store's refusal set. Its objects loaded fine, so nothing
+                    // below this layer knows the bucket is unusable -- and a name
+                    // absent from both memory and that set is one CreateBucket
+                    // clears the directory of, objects included.
+                    let mut refused = |bucket: &str, _err: &str| {
+                        <fakecloud_persistence::s3::DiskS3Store as fakecloud_persistence::S3Store>::
+                            mark_bucket_load_refused(&disk, bucket);
+                    };
+                    let hydrated = match fakecloud_s3::persistence::hydrate_s3_state_reporting(
                         snapshot,
                         &cli.account_id,
                         &cli.region,
+                        &mut refused,
                     ) {
                         Ok(h) => h,
                         Err(err) => fatal_exit(format_args!(
