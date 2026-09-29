@@ -10,7 +10,6 @@ version.workspace = true
 [dependencies]
 fakecloud-aws = { workspace = true }
 fakecloud-core = { workspace = true }
-fakecloud-kms = { workspace = true }
 fakecloud-persistence = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
@@ -25,5 +24,6 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+fakecloud-kms = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 bytes = { workspace = true }

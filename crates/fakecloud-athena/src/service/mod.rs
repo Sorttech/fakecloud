@@ -658,37 +658,16 @@ fn synth_uuid() -> String {
     Uuid::new_v4().to_string()
 }
 
-fn workgroup_arn(account_id: &str, region: &str, name: &str) -> String {
+/// An Athena ARN (`resource` is e.g. `workgroup/<name>`,
+/// `datacatalog/<name>` or `capacity-reservation/<name>`), in `region`'s
+/// partition. An empty region falls back to `us-east-1`.
+pub fn athena_arn(region: &str, account_id: &str, resource: &str) -> String {
     let region = if region.is_empty() {
         "us-east-1"
     } else {
         region
     };
-    Arn::regional("athena", region, account_id, &format!("workgroup/{name}")).to_string()
-}
-
-fn datacatalog_arn(account_id: &str, region: &str, name: &str) -> String {
-    let region = if region.is_empty() {
-        "us-east-1"
-    } else {
-        region
-    };
-    Arn::regional("athena", region, account_id, &format!("datacatalog/{name}")).to_string()
-}
-
-fn capacity_reservation_arn(account_id: &str, region: &str, name: &str) -> String {
-    let region = if region.is_empty() {
-        "us-east-1"
-    } else {
-        region
-    };
-    Arn::regional(
-        "athena",
-        region,
-        account_id,
-        &format!("capacity-reservation/{name}"),
-    )
-    .to_string()
+    Arn::regional("athena", region, account_id, resource).to_string()
 }
 
 fn parse_string_list(value: Option<&Value>) -> Vec<String> {
@@ -2011,19 +1990,19 @@ mod tests {
     #[test]
     fn arns_use_the_regions_partition() {
         assert_eq!(
-            super::workgroup_arn("123456789012", "cn-north-1", "wg"),
+            super::athena_arn("cn-north-1", "123456789012", "workgroup/wg"),
             "arn:aws-cn:athena:cn-north-1:123456789012:workgroup/wg"
         );
         assert_eq!(
-            super::datacatalog_arn("123456789012", "cn-north-1", "cat"),
+            super::athena_arn("cn-north-1", "123456789012", "datacatalog/cat"),
             "arn:aws-cn:athena:cn-north-1:123456789012:datacatalog/cat"
         );
         assert_eq!(
-            super::capacity_reservation_arn("123456789012", "us-gov-west-1", "cr"),
+            super::athena_arn("us-gov-west-1", "123456789012", "capacity-reservation/cr"),
             "arn:aws-us-gov:athena:us-gov-west-1:123456789012:capacity-reservation/cr"
         );
         assert_eq!(
-            super::workgroup_arn("123456789012", "us-east-1", "wg"),
+            super::athena_arn("us-east-1", "123456789012", "workgroup/wg"),
             "arn:aws:athena:us-east-1:123456789012:workgroup/wg"
         );
 

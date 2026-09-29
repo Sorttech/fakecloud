@@ -15,6 +15,7 @@ use http::StatusCode;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
+use fakecloud_aws::arn::Arn;
 use fakecloud_aws::xml::xml_escape;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 

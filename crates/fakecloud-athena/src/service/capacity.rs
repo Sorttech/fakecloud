@@ -31,7 +31,11 @@ impl AthenaService {
             last_allocation: Some(Utc::now()),
             last_successful_allocation_time: Some(Utc::now()),
         };
-        let arn = capacity_reservation_arn(&req.account_id, &req.region, &name);
+        let arn = athena_arn(
+            &req.region,
+            &req.account_id,
+            &format!("capacity-reservation/{name}"),
+        );
         account.capacity_reservations.insert(name, cr);
         if !tags.is_empty() {
             account.tags.insert(arn, tags);

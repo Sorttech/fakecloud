@@ -10,7 +10,6 @@ version.workspace = true
 [dependencies]
 fakecloud-aws = { workspace = true }
 fakecloud-core = { workspace = true }
-fakecloud-kms = { workspace = true }
 fakecloud-k8s = { workspace = true }
 fakecloud-persistence = { workspace = true }
 k8s-openapi = { workspace = true }
@@ -31,6 +30,7 @@ tracing = { workspace = true }
 tempfile = { workspace = true }
 
 [dev-dependencies]
+fakecloud-kms = { workspace = true }
 # The opt-in k8s-integration test drives a real cluster directly.
 kube = { workspace = true }
 

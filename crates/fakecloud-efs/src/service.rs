@@ -683,7 +683,13 @@ impl EfsService {
                         &hex17()[..4],
                         &hex17()[..12.min(hex17().len())]
                     );
-                    fakecloud_kms::kms_key_arn(&ctx.region, &ctx.account, &key_id)
+                    fakecloud_aws::arn::Arn::regional(
+                        "kms",
+                        &ctx.region,
+                        &ctx.account,
+                        &format!("key/{key_id}"),
+                    )
+                    .to_string()
                 });
             fs.insert("KmsKeyId".into(), json!(kms));
         }

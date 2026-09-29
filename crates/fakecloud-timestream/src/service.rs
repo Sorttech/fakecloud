@@ -323,11 +323,15 @@ impl TimestreamService {
                 name: name.clone(),
                 arn: arn.clone(),
                 kms_key_id: kms.or_else(|| {
-                    Some(fakecloud_kms::kms_key_arn(
-                        &region,
-                        &account,
-                        "timestream-default",
-                    ))
+                    Some(
+                        fakecloud_aws::arn::Arn::regional(
+                            "kms",
+                            &region,
+                            &account,
+                            "key/timestream-default",
+                        )
+                        .to_string(),
+                    )
                 }),
                 table_count: 0,
                 creation_time: now,

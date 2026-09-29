@@ -71,9 +71,9 @@ pub(crate) fn get_prompt_router(
         "promptRouterArn": router.prompt_router_arn,
         "promptRouterName": router.prompt_router_name,
         "description": router.description,
-        "models": ensure_router_models(&router.models, &router.prompt_router_arn),
+        "models": ensure_router_models(&router.models, &router.prompt_router_arn, &req.region),
         "routingCriteria": ensure_routing_criteria(&router.routing_criteria),
-        "fallbackModel": ensure_fallback_model(&router.fallback_model, &router.prompt_router_arn),
+        "fallbackModel": ensure_fallback_model(&router.fallback_model, &router.prompt_router_arn, &req.region),
         "status": router.status,
         "type": router.prompt_router_type,
         "createdAt": router.created_at.to_rfc3339(),
@@ -118,8 +118,8 @@ pub(crate) fn list_prompt_routers(
                 "promptRouterName": r.prompt_router_name,
                 "description": r.description,
                 "routingCriteria": ensure_routing_criteria(&r.routing_criteria),
-                "models": ensure_router_models(&r.models, &r.prompt_router_arn),
-                "fallbackModel": ensure_fallback_model(&r.fallback_model, &r.prompt_router_arn),
+                "models": ensure_router_models(&r.models, &r.prompt_router_arn, &req.region),
+                "fallbackModel": ensure_fallback_model(&r.fallback_model, &r.prompt_router_arn, &req.region),
                 "status": r.status,
                 "type": r.prompt_router_type,
                 "createdAt": r.created_at.to_rfc3339(),
@@ -149,34 +149,36 @@ fn ensure_routing_criteria(criteria: &Value) -> Value {
 }
 
 /// The foundation model a router defaults to, in the router's own region and
-/// partition.
-fn default_router_model_arn(router_arn: &str) -> String {
-    let region = router_arn
-        .split(':')
-        .nth(3)
+/// partition. The router's stored ARN names that region; `request_region` is
+/// the source of truth only when the ARN does not parse.
+fn default_router_model_arn(router_arn: &str, request_region: &str) -> String {
+    let parsed = router_arn.parse::<fakecloud_aws::arn::Arn>().ok();
+    let region = parsed
+        .as_ref()
+        .map(|a| a.region.as_str())
         .filter(|r| !r.is_empty())
-        .unwrap_or("us-east-1");
+        .unwrap_or(request_region);
     crate::arns::foundation_model_arn(region, "amazon.titan-text-express-v1")
 }
 
 /// Default the router's target models to a single Titan entry when none were
 /// supplied at create time, matching the required Smithy field.
-fn ensure_router_models(models: &Value, router_arn: &str) -> Value {
+fn ensure_router_models(models: &Value, router_arn: &str, request_region: &str) -> Value {
     if let Some(arr) = models.as_array() {
         if !arr.is_empty() {
             return models.clone();
         }
     }
-    json!([{ "modelArn": default_router_model_arn(router_arn) }])
+    json!([{ "modelArn": default_router_model_arn(router_arn, request_region) }])
 }
 
 /// Default the fallback model when not provided. `fallbackModel` is required
 /// in the summary even though it's optional on create.
-fn ensure_fallback_model(fallback: &Value, router_arn: &str) -> Value {
+fn ensure_fallback_model(fallback: &Value, router_arn: &str, request_region: &str) -> Value {
     if fallback.get("modelArn").is_some() {
         return fallback.clone();
     }
-    json!({ "modelArn": default_router_model_arn(router_arn) })
+    json!({ "modelArn": default_router_model_arn(router_arn, request_region) })
 }
 
 pub(crate) fn delete_prompt_router(
@@ -312,6 +314,23 @@ mod tests {
         assert_eq!(
             g["fallbackModel"]["modelArn"],
             "arn:aws:bedrock:us-east-1::foundation-model/amazon.titan-text-express-v1"
+        );
+    }
+
+    /// The router's stored ARN names the region; only an ARN that does not
+    /// parse falls back to the request's region, never to a fixed one.
+    #[test]
+    fn default_model_region_comes_from_the_router_arn_then_the_request() {
+        assert_eq!(
+            default_router_model_arn(
+                "arn:aws-us-gov:bedrock:us-gov-west-1:123456789012:prompt-router/x",
+                "cn-north-1"
+            ),
+            "arn:aws-us-gov:bedrock:us-gov-west-1::foundation-model/amazon.titan-text-express-v1"
+        );
+        assert_eq!(
+            default_router_model_arn("not-an-arn", "cn-north-1"),
+            "arn:aws-cn:bedrock:cn-north-1::foundation-model/amazon.titan-text-express-v1"
         );
     }
 
