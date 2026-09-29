@@ -323,8 +323,10 @@ impl TimestreamService {
                 name: name.clone(),
                 arn: arn.clone(),
                 kms_key_id: kms.or_else(|| {
-                    Some(format!(
-                        "arn:aws:kms:{region}:{account}:key/timestream-default"
+                    Some(fakecloud_kms::kms_key_arn(
+                        &region,
+                        &account,
+                        "timestream-default",
                     ))
                 }),
                 table_count: 0,
@@ -1477,6 +1479,32 @@ mod tests {
         call(&s, "DeleteDatabase", json!({ "DatabaseName": "metrics" })).unwrap();
         let e = call(&s, "DescribeDatabase", json!({ "DatabaseName": "metrics" })).unwrap_err();
         assert_eq!(e.code(), "ResourceNotFoundException");
+    }
+
+    /// The default database key is the ARN KMS itself mints for that key id
+    /// in the caller's region, partition included.
+    #[test]
+    fn default_database_key_uses_the_regions_partition() {
+        let s = svc();
+        let mut r = req("CreateDatabase", json!({ "DatabaseName": "cn" }));
+        r.region = "cn-north-1".to_string();
+        let resp = s.dispatch("CreateDatabase", &r).unwrap();
+        let out: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        let kms = out["Database"]["KmsKeyId"].as_str().unwrap();
+        assert_eq!(
+            kms,
+            "arn:aws-cn:kms:cn-north-1:000000000000:key/timestream-default"
+        );
+        assert_eq!(
+            kms,
+            fakecloud_kms::kms_key_arn("cn-north-1", "000000000000", "timestream-default")
+        );
+        // Commercial output is unchanged.
+        let out = call(&s, "CreateDatabase", json!({ "DatabaseName": "us" })).unwrap();
+        assert_eq!(
+            out["Database"]["KmsKeyId"],
+            "arn:aws:kms:us-east-1:000000000000:key/timestream-default"
+        );
     }
 
     #[test]
