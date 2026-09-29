@@ -2399,6 +2399,12 @@ impl CloudFormationService {
                     entries.retain(|s| s != &stack_name_for_notif);
                 }
                 state.imports.retain(|_, v| !v.is_empty());
+                // A stack's change sets go with it. Left behind, they would
+                // still answer DescribeChangeSet, and a re-created stack of
+                // the same name would find them by name.
+                if let Some(change_sets) = state.extras.get_mut("change_sets") {
+                    change_sets.retain(|_, v| v["StackId"].as_str() != Some(stack_id.as_str()));
+                }
                 drop(accounts);
 
                 Self::send_stack_notification(

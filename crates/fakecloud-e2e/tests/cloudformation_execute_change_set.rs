@@ -688,3 +688,102 @@ async fn describe_change_set_reports_unknown_change_set_as_not_found() {
         .expect_err("ExecuteChangeSet on an unknown change set must fail");
     assert!(err.into_service_error().is_change_set_not_found_exception());
 }
+
+/// The CDK CLI gives every stack's change set the same name
+/// (`cdk-deploy-change-set`). Deleting one stack's change set must leave the
+/// other stack's in place and executable, and deleting a stack takes its
+/// change sets with it.
+#[tokio::test]
+async fn change_sets_sharing_a_name_stay_scoped_to_their_stack() {
+    let server = TestServer::start().await;
+    let cf = server.cloudformation_client().await;
+
+    let template = |queue: &str| {
+        format!(
+            r#"{{"Resources":{{"Q":{{"Type":"AWS::SQS::Queue","Properties":{{"QueueName":"{queue}"}}}}}}}}"#
+        )
+    };
+    for stack in ["scoped-a", "scoped-b"] {
+        cf.create_stack()
+            .stack_name(stack)
+            .template_body(template(&format!("{stack}-q1")))
+            .send()
+            .await
+            .unwrap();
+    }
+    let mut ids = Vec::new();
+    for stack in ["scoped-a", "scoped-b"] {
+        let out = cf
+            .create_change_set()
+            .stack_name(stack)
+            .change_set_name("cdk-deploy-change-set")
+            .change_set_type(ChangeSetType::Update)
+            .template_body(template(&format!("{stack}-q2")))
+            .send()
+            .await
+            .unwrap();
+        ids.push(out.id().unwrap().to_string());
+    }
+
+    // Names are unique per stack.
+    let err = cf
+        .create_change_set()
+        .stack_name("scoped-b")
+        .change_set_name("cdk-deploy-change-set")
+        .change_set_type(ChangeSetType::Update)
+        .template_body(template("scoped-b-q3"))
+        .send()
+        .await
+        .expect_err("a second same-named change set on one stack must be rejected");
+    assert!(err.into_service_error().is_already_exists_exception());
+
+    cf.delete_change_set()
+        .stack_name("scoped-a")
+        .change_set_name("cdk-deploy-change-set")
+        .send()
+        .await
+        .unwrap();
+
+    // Stack B's change set survived the delete and still executes.
+    cf.execute_change_set()
+        .stack_name("scoped-b")
+        .change_set_name("cdk-deploy-change-set")
+        .send()
+        .await
+        .unwrap();
+    let described = cf
+        .describe_change_set()
+        .change_set_name(&ids[1])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        described.execution_status().map(|s| s.as_str()),
+        Some("EXECUTE_COMPLETE")
+    );
+    let listed = cf
+        .list_change_sets()
+        .stack_name("scoped-a")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        listed.summaries().is_empty(),
+        "stack A has no change sets left, got {:?}",
+        listed.summaries()
+    );
+
+    // Deleting the stack deletes its change sets.
+    cf.delete_stack()
+        .stack_name("scoped-b")
+        .send()
+        .await
+        .unwrap();
+    let err = cf
+        .describe_change_set()
+        .change_set_name(&ids[1])
+        .send()
+        .await
+        .expect_err("a deleted stack's change set must be gone");
+    assert!(err.into_service_error().is_change_set_not_found_exception());
+}
