@@ -9,6 +9,10 @@ pub(crate) struct Consumed {
     pub(crate) table: f64,
     pub(crate) gsi: BTreeMap<String, f64>,
     pub(crate) lsi: BTreeMap<String, f64>,
+    /// `VectorWriteRequestBytes` per vector index. Metered in bytes rather
+    /// than capacity units, so it is reported beside the aggregate and never
+    /// folded into it.
+    pub(crate) vector: BTreeMap<String, f64>,
 }
 
 impl Consumed {
@@ -33,6 +37,9 @@ impl Consumed {
         }
         for (name, units) in &other.lsi {
             *self.lsi.entry(name.clone()).or_default() += units;
+        }
+        for (name, bytes) in &other.vector {
+            *self.vector.entry(name.clone()).or_default() += bytes;
         }
     }
 
@@ -148,6 +155,7 @@ pub(crate) fn item_write_consumed(
         .max(new.map(item_size).unwrap_or(0));
     let mut consumed = index_write_units(table, old, new);
     consumed.table = write_units(bytes);
+    consumed.vector = crate::service::vectors::vector_write_charges(table, old, new);
     consumed
 }
 
@@ -196,6 +204,14 @@ pub(crate) fn build_capacity(
                 .map(|(name, units)| (name.clone(), arm(*units)))
                 .collect();
             cc["LocalSecondaryIndexes"] = Value::Object(map);
+        }
+        if !consumed.vector.is_empty() {
+            let map: serde_json::Map<String, Value> = consumed
+                .vector
+                .iter()
+                .map(|(name, bytes)| (name.clone(), json!({ "VectorWriteRequestBytes": bytes })))
+                .collect();
+            cc["VectorIndexes"] = Value::Object(map);
         }
     }
     cc

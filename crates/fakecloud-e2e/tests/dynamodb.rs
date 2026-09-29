@@ -3608,6 +3608,55 @@ async fn dynamodb_sse_specification_kms() {
 }
 
 #[tokio::test]
+async fn dynamodb_sse_aws_managed_key_reports_its_arn() {
+    // SSE enabled without a KMSMasterKeyId uses the account's AWS-managed
+    // `aws/dynamodb` key, and DescribeTable reports that key's ARN.
+    let server = TestServer::start().await;
+    let client = server.dynamodb_client().await;
+    client
+        .create_table()
+        .table_name("ManagedSseTable")
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("pk")
+                .key_type(KeyType::Hash)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("pk")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .billing_mode(BillingMode::PayPerRequest)
+        .sse_specification(SseSpecification::builder().enabled(true).build())
+        .send()
+        .await
+        .unwrap();
+
+    let desc = client
+        .describe_table()
+        .table_name("ManagedSseTable")
+        .send()
+        .await
+        .unwrap();
+    let sse = desc.table().unwrap().sse_description().unwrap();
+    assert_eq!(sse.sse_type().unwrap().as_str(), "KMS");
+    let key_arn = sse.kms_master_key_arn().unwrap();
+
+    let kms = server.kms_client().await;
+    let managed = kms
+        .describe_key()
+        .key_id("alias/aws/dynamodb")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(managed.key_metadata().unwrap().arn().unwrap(), key_arn);
+}
+
+#[tokio::test]
 async fn dynamodb_sse_default_omitted() {
     let server = TestServer::start().await;
     let client = server.dynamodb_client().await;
@@ -5682,11 +5731,11 @@ async fn create_pk_table(client: &aws_sdk_dynamodb::Client, name: &str) {
 async fn dynamodb_query_legacy_key_conditions_eq() {
     let server = TestServer::start().await;
     let client = server.dynamodb_client().await;
-    create_pk_table(&client, "t").await;
+    create_pk_table(&client, "tbl").await;
 
     client
         .put_item()
-        .table_name("t")
+        .table_name("tbl")
         .item("pk", AttributeValue::S("a".to_string()))
         .item("v", AttributeValue::S("1".to_string()))
         .send()
@@ -5694,7 +5743,7 @@ async fn dynamodb_query_legacy_key_conditions_eq() {
         .unwrap();
     client
         .put_item()
-        .table_name("t")
+        .table_name("tbl")
         .item("pk", AttributeValue::S("b".to_string()))
         .item("v", AttributeValue::S("2".to_string()))
         .send()
@@ -5706,7 +5755,7 @@ async fn dynamodb_query_legacy_key_conditions_eq() {
             "dynamodb",
             "query",
             "--table-name",
-            "t",
+            "tbl",
             "--key-conditions",
             r#"{"pk":{"AttributeValueList":[{"S":"a"}],"ComparisonOperator":"EQ"}}"#,
         ])
@@ -5807,12 +5856,12 @@ async fn dynamodb_query_legacy_key_conditions_begins_with() {
 async fn dynamodb_query_legacy_query_filter() {
     let server = TestServer::start().await;
     let client = server.dynamodb_client().await;
-    create_pk_table(&client, "t").await;
+    create_pk_table(&client, "tbl").await;
 
     for (pk, color) in [("a", "red"), ("b", "red"), ("c", "blue")] {
         client
             .put_item()
-            .table_name("t")
+            .table_name("tbl")
             .item("pk", AttributeValue::S(pk.to_string()))
             .item("color", AttributeValue::S(color.to_string()))
             .send()
@@ -5825,7 +5874,7 @@ async fn dynamodb_query_legacy_query_filter() {
             "dynamodb",
             "query",
             "--table-name",
-            "t",
+            "tbl",
             "--key-conditions",
             r#"{"pk":{"AttributeValueList":[{"S":"a"}],"ComparisonOperator":"EQ"}}"#,
             "--query-filter",
@@ -5848,12 +5897,12 @@ async fn dynamodb_query_legacy_query_filter() {
 async fn dynamodb_scan_legacy_scan_filter() {
     let server = TestServer::start().await;
     let client = server.dynamodb_client().await;
-    create_pk_table(&client, "t").await;
+    create_pk_table(&client, "tbl").await;
 
     for (pk, color) in [("a", "red"), ("b", "blue"), ("c", "red")] {
         client
             .put_item()
-            .table_name("t")
+            .table_name("tbl")
             .item("pk", AttributeValue::S(pk.to_string()))
             .item("color", AttributeValue::S(color.to_string()))
             .send()
@@ -5866,7 +5915,7 @@ async fn dynamodb_scan_legacy_scan_filter() {
             "dynamodb",
             "scan",
             "--table-name",
-            "t",
+            "tbl",
             "--scan-filter",
             r#"{"color":{"AttributeValueList":[{"S":"red"}],"ComparisonOperator":"EQ"}}"#,
         ])
@@ -5886,14 +5935,14 @@ async fn dynamodb_scan_legacy_scan_filter() {
 async fn dynamodb_query_rejects_mixed_key_condition_forms() {
     let server = TestServer::start().await;
     let client = server.dynamodb_client().await;
-    create_pk_table(&client, "t").await;
+    create_pk_table(&client, "tbl").await;
 
     let output = server
         .aws_cli(&[
             "dynamodb",
             "query",
             "--table-name",
-            "t",
+            "tbl",
             "--key-condition-expression",
             "pk = :v",
             "--expression-attribute-values",

@@ -87,6 +87,11 @@ impl DynamoDbService {
             super::validate_index_keys_in_item(table, &item)?;
             normalize_item_numbers(&mut item);
             check_put_item_size(&item)?;
+            super::vectors::validate_vector_item(
+                &table.vector_indexes,
+                &table.attribute_definitions,
+                &item,
+            )?;
 
             let key = extract_key(table, &item);
             table.ensure_key_index();
@@ -598,6 +603,13 @@ impl DynamoDbService {
         let index_keys = super::index_key_specs(table);
         // Where each SET's value ended up once the whole expression ran.
         let mut written_paths: Vec<(usize, DocPath)> = Vec::new();
+        // A vector index judges the item the update leaves behind.
+        let vector_indexes = table.vector_indexes.clone();
+        let vector_defs = if vector_indexes.is_empty() {
+            Vec::new()
+        } else {
+            table.attribute_definitions.clone()
+        };
         let applied = table.update_item_at(idx, |item| {
             let before = (!index_keys.is_empty()).then(|| item.clone());
             if let Some(expr) = update_expression {
@@ -620,7 +632,8 @@ impl DynamoDbService {
             if let Some(fault) = super::index_key_fault(&index_keys, item, before.as_ref()) {
                 return Err(fault.update_error());
             }
-            charge.check(item)
+            charge.check(item)?;
+            super::vectors::validate_vector_item(&vector_indexes, &vector_defs, item)
         });
         if let Err(err) = applied {
             // An upsert that fails must not leave behind the key-only row it

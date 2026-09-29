@@ -263,60 +263,55 @@ pub fn parse_vector_indexes(
 }
 
 pub fn parse_vector_index(v: &Value, table_arn: &str) -> Result<VectorIndex, AwsServiceError> {
-    let invalid = |msg: String| {
-        AwsServiceError::aws_error(StatusCode::BAD_REQUEST, "ValidationException", msg)
-    };
+    // The request-model layer (`validate_*_table_model`) has already checked
+    // every member; this only guards against a caller that skipped it.
+    let invalid =
+        |msg: &str| AwsServiceError::aws_error(StatusCode::BAD_REQUEST, "ValidationException", msg);
     let index_name = v["IndexName"]
         .as_str()
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| invalid("VectorIndex.IndexName is required".to_string()))?
+        .ok_or_else(|| invalid("VectorIndex.IndexName is required"))?
         .to_string();
     let vector_attribute = v["VectorAttribute"]["AttributeName"]
         .as_str()
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            invalid("VectorIndex.VectorAttribute.AttributeName is required".to_string())
-        })?
+        .ok_or_else(|| invalid("VectorIndex.VectorAttribute.AttributeName is required"))?
         .to_string();
     let dimensions = v["Dimensions"]
         .as_i64()
         .filter(|d| *d > 0)
-        .ok_or_else(|| invalid("VectorIndex.Dimensions must be a positive integer".to_string()))?;
+        .ok_or_else(|| invalid("VectorIndex.Dimensions must be a positive integer"))?;
     let distance_function = v["DistanceFunction"]
         .as_str()
-        .unwrap_or("COSINE")
+        .filter(|f| VECTOR_DISTANCE_FUNCTIONS.contains(f))
+        .ok_or_else(|| invalid("VectorIndex.DistanceFunction is invalid"))?
         .to_string();
-    if !VECTOR_DISTANCE_FUNCTIONS.contains(&distance_function.as_str()) {
-        return Err(invalid(format!(
-            "VectorIndex.DistanceFunction has an invalid value '{distance_function}'"
-        )));
-    }
     let search_schema = v["SearchSchema"]
         .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|e| {
-                    Some((
-                        e["AttributeName"].as_str()?.to_string(),
-                        e["SearchSchemaElementType"]
-                            .as_str()
-                            .unwrap_or("FILTERABLE")
-                            .to_string(),
-                    ))
-                })
-                .collect()
+        .into_iter()
+        .flatten()
+        .map(|e| {
+            match (
+                e["AttributeName"].as_str(),
+                e["SearchSchemaElementType"].as_str(),
+            ) {
+                (Some(name), Some(kind)) => Ok((name.to_string(), kind.to_string())),
+                _ => Err(invalid(
+                    "VectorIndex.SearchSchema elements require AttributeName and \
+                     SearchSchemaElementType",
+                )),
+            }
         })
-        .unwrap_or_default();
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(VectorIndex {
-        index_arn: format!("{table_arn}/vector-index/{index_name}"),
+        index_arn: format!("{table_arn}/index/{index_name}"),
         index_name,
         vector_attribute,
         dimensions,
         distance_function,
         search_schema,
         projection: parse_projection(&v["Projection"]),
-        // Creation is synchronous here, so the index is queryable immediately.
-        status: "ACTIVE".to_string(),
+        online_created_at: None,
     })
 }
 

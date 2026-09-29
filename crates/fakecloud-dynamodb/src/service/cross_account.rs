@@ -215,6 +215,49 @@ pub(crate) fn single_resource_owner(
     (!account.is_empty() && account != req.account_id).then(|| account.to_string())
 }
 
+/// Refuse a request served in `owner`'s account for a table that account does
+/// not hold. Access to another account's table is granted only by that table's
+/// resource-based policy, and a table that does not exist has none: AWS answers
+/// AccessDeniedException, never that the table is missing, since authorization
+/// is decided before existence is looked up.
+pub(crate) fn check_foreign_table_exists(
+    accounts: &MultiAccountState<DynamoDbState>,
+    req: &AwsRequest,
+    body: &Value,
+    owner: &str,
+) -> Result<(), AwsServiceError> {
+    let reference = match req.action.as_str() {
+        "ListTagsOfResource" | "TagResource" | "UntagResource" => body["ResourceArn"].as_str(),
+        _ => body["TableName"].as_str(),
+    };
+    let Some(reference) = reference else {
+        return Ok(());
+    };
+    let exists = accounts
+        .get(owner)
+        .is_some_and(|s| s.tables.contains_key(super::resolve_table_name(reference)));
+    if exists {
+        return Ok(());
+    }
+    let caller = req
+        .principal
+        .as_ref()
+        .map(|p| p.arn.clone())
+        .unwrap_or_else(|| {
+            fakecloud_aws::arn::Arn::global_in(&req.region, "iam", &req.account_id, "root")
+                .to_string()
+        });
+    let action = format!("dynamodb:{}", req.action);
+    Err(AwsServiceError::aws_error(
+        StatusCode::BAD_REQUEST,
+        "AccessDeniedException",
+        format!(
+            "User: {caller} is not authorized to perform: {action} on resource: {reference} \
+             because no resource-based policy allows the {action} action"
+        ),
+    ))
+}
+
 /// A table's identity across accounts: its owner account and resolved name.
 pub(crate) fn table_id(req: &AwsRequest, name_or_arn: &str) -> (String, String) {
     (

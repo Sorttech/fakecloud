@@ -136,6 +136,7 @@ impl DynamoDbService {
                     .map(|k| k.attribute_name.clone());
                 (&table.items, hk, rk)
             } else {
+                super::vectors::reject_vector_index_read(table, idx_name, "Query")?;
                 return Err(AwsServiceError::aws_error(
                     http::StatusCode::BAD_REQUEST,
                     "ValidationException",
@@ -149,6 +150,29 @@ impl DynamoDbService {
                 table.range_key_name().map(|s| s.to_string()),
             )
         };
+
+        // On an index query the starting key names a position in the index,
+        // so it must carry the index key as well as the table's primary key.
+        if let (Some(_), Some(start_key)) = (index_name, exclusive_start_key.as_ref()) {
+            let required = [
+                Some(table.hash_key_name()),
+                table.range_key_name(),
+                Some(hash_key_name.as_str()),
+                range_key_name.as_deref(),
+            ];
+            if required
+                .into_iter()
+                .flatten()
+                .any(|attr| !start_key.contains_key(attr))
+            {
+                return Err(AwsServiceError::aws_error(
+                    http::StatusCode::BAD_REQUEST,
+                    "ValidationException",
+                    "The provided starting key is invalid: The provided key element does not \
+                     match the schema",
+                ));
+            }
+        }
 
         // The partition key MUST be constrained with `=`. Without this check a
         // condition that omits the partition key (or uses a range operator on
@@ -564,10 +588,11 @@ impl DynamoDbService {
                             .collect(),
                     )
                 } else {
+                    super::vectors::reject_vector_index_read(table, idx, "Scan")?;
                     return Err(AwsServiceError::aws_error(
                         StatusCode::BAD_REQUEST,
                         "ValidationException",
-                        format!("Index '{idx}' does not exist on the table"),
+                        format!("The table does not have the specified index: {idx}"),
                     ));
                 }
             } else {

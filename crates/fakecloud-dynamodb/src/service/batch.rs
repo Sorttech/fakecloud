@@ -423,6 +423,11 @@ impl DynamoDbService {
                     let mut item = item;
                     normalize_item_numbers(&mut item);
                     check_put_item_size(&item)?;
+                    super::vectors::validate_vector_item(
+                        &table.vector_indexes,
+                        &table.attribute_definitions,
+                        &item,
+                    )?;
                     extract_key(table, &item)
                 } else if let Some(del_req) = request.get("DeleteRequest") {
                     let key: HashMap<String, AttributeValue> =
@@ -870,6 +875,12 @@ impl DynamoDbService {
                 // A Put's size is known from the request alone, so an item
                 // over the limit is refused before the transaction opens.
                 check_put_item_size(&item)?;
+                // Vector indexes judge the item last, in PutItem's order.
+                super::vectors::validate_vector_item(
+                    &table.vector_indexes,
+                    &table.attribute_definitions,
+                    &item,
+                )?;
                 transaction_bytes += DynamoTable::estimate_item_size(&item);
             } else {
                 let key: HashMap<String, AttributeValue> =
@@ -1204,6 +1215,8 @@ impl DynamoDbService {
                     // size depends on the stored item, so one over the limit
                     // is measured here, flat against the finished item, and
                     // cancels rather than failing up front.
+                    let vector_indexes = table.vector_indexes.clone();
+                    let vector_defs = table.attribute_definitions.clone();
                     table
                         .update_item_at(idx, |item| {
                             if let Some(expr) = update_expression {
@@ -1214,7 +1227,12 @@ impl DynamoDbService {
                                     &expr_attr_values,
                                 )?;
                             }
-                            check_update_item_size(item)
+                            check_update_item_size(item)?;
+                            super::vectors::validate_vector_item(
+                                &vector_indexes,
+                                &vector_defs,
+                                item,
+                            )
                         })
                         .map_err(|e| (op_idx, e))?;
                     let new_image = table.items[idx].clone();
