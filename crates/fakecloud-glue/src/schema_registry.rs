@@ -10,6 +10,19 @@ use crate::common::{
 use crate::generic;
 use crate::service::GlueService;
 
+/// The registry a schema goes into when `CreateSchema` names none.
+const DEFAULT_REGISTRY: &str = "default-registry";
+
+/// The `RegistryArn` the registry `name` was created with, `null` when it does
+/// not exist.
+fn stored_registry_arn(st: &crate::state::GlueState, name: &str) -> Value {
+    st.registries
+        .get(name)
+        .and_then(|r| r.get("RegistryArn"))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
 /// Resolve the registry name from a `RegistryId` input shape (by name or ARN).
 fn registry_name(id: &Value) -> Option<String> {
     if let Some(n) = id.get("RegistryName").and_then(|v| v.as_str()) {
@@ -50,7 +63,7 @@ fn schema_key(id: &Value) -> Option<String> {
         let reg = id
             .get("RegistryName")
             .and_then(|v| v.as_str())
-            .unwrap_or("default-registry");
+            .unwrap_or(DEFAULT_REGISTRY);
         return Some(format!("{reg}\u{1f}{name}"));
     }
     let arn = id.get("SchemaArn").and_then(|v| v.as_str())?;
@@ -136,7 +149,7 @@ impl GlueService {
     pub(crate) fn create_registry(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let body = req.json_body();
         let name = req_str(&body, "RegistryName")?.to_string();
-        let arn = resource_arn(&req.account_id, &req.region, "registry", &name);
+        let arn = resource_arn(&req.region, &req.account_id, "registry", &name);
         let desc = body.get("Description").cloned().unwrap_or(Value::Null);
         let tags = body.get("Tags").cloned().unwrap_or(json!({}));
         let now = now_ts();
@@ -185,7 +198,7 @@ impl GlueService {
                 ("UpdatedTime", json!(now_ts().to_string())),
             ],
         )?;
-        let arn = resource_arn(&req.account_id, &req.region, "registry", &name);
+        let arn = stored_registry_arn(st, &name);
         Ok(AwsResponse::ok_json(json!({
             "RegistryName": name, "RegistryArn": arn,
         })))
@@ -195,9 +208,9 @@ impl GlueService {
         let body = req.json_body();
         let id = req_present(&body, "RegistryId")?;
         let name = registry_name(id).ok_or_else(|| invalid_input("RegistryId required"))?;
-        let arn = resource_arn(&req.account_id, &req.region, "registry", &name);
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id, &req.region);
+        let arn = stored_registry_arn(st, &name);
         generic::delete(&mut st.registries, &name, "Registry")?;
         Ok(AwsResponse::ok_json(json!({
             "RegistryName": name, "RegistryArn": arn, "Status": "DELETING",
@@ -219,18 +232,11 @@ impl GlueService {
         let body = req.json_body();
         let name = req_str(&body, "SchemaName")?.to_string();
         let data_format = req_str(&body, "DataFormat")?.to_string();
-        let reg = body
-            .get("RegistryId")
-            .and_then(registry_name)
-            .unwrap_or_else(|| "default-registry".to_string());
+        let named_registry = body.get("RegistryId").and_then(registry_name);
+        let reg = named_registry
+            .clone()
+            .unwrap_or_else(|| DEFAULT_REGISTRY.to_string());
         let key = format!("{reg}\u{1f}{name}");
-        let schema_arn = resource_arn(
-            &req.account_id,
-            &req.region,
-            "schema",
-            &format!("{reg}/{name}"),
-        );
-        let reg_arn = resource_arn(&req.account_id, &req.region, "registry", &reg);
         let compat = body
             .get("Compatibility")
             .and_then(|v| v.as_str())
@@ -245,6 +251,33 @@ impl GlueService {
 
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id, &req.region);
+        // A named registry must exist; without one the schema goes into the
+        // account's default registry, which is created on first use.
+        let reg_arn = match (stored_registry_arn(st, &reg), named_registry) {
+            (Value::String(arn), _) => arn,
+            (_, Some(_)) => return Err(entity_not_found(format!("Registry {reg} not found"))),
+            (_, None) => {
+                let arn = resource_arn(&req.region, &req.account_id, "registry", &reg);
+                st.registries.insert(
+                    reg.clone(),
+                    json!({
+                        "RegistryName": reg, "RegistryArn": arn, "Description": Value::Null,
+                        "Status": "AVAILABLE", "CreatedTime": now.to_string(),
+                        "UpdatedTime": now.to_string(),
+                    }),
+                );
+                arn
+            }
+        };
+        // The schema lives where its registry does, so both ARNs share one
+        // region and partition.
+        let registry_region = reg_arn.split(':').nth(3).unwrap_or(&req.region);
+        let schema_arn = resource_arn(
+            registry_region,
+            &req.account_id,
+            "schema",
+            &format!("{reg}/{name}"),
+        );
         let schema = json!({
             "RegistryName": reg, "RegistryArn": reg_arn, "SchemaName": name, "SchemaArn": schema_arn,
             "Description": desc, "DataFormat": data_format, "Compatibility": compat,
@@ -261,7 +294,7 @@ impl GlueService {
             st.schema_versions.insert(
                 vid.clone(),
                 json!({
-                    "SchemaVersionId": vid, "SchemaArn": resource_arn(&req.account_id,&req.region,"schema",&format!("{reg}/{name}")),
+                    "SchemaVersionId": vid, "SchemaArn": schema_arn,
                     "SchemaName": name, "RegistryName": reg,
                     "SchemaDefinition": body["SchemaDefinition"].clone(),
                     "DataFormat": data_format, "VersionNumber": 1,
@@ -270,8 +303,8 @@ impl GlueService {
             );
         }
         let mut out = json!({
-            "RegistryName": reg, "RegistryArn": resource_arn(&req.account_id,&req.region,"registry",&reg),
-            "SchemaName": name, "SchemaArn": resource_arn(&req.account_id,&req.region,"schema",&format!("{reg}/{name}")),
+            "RegistryName": reg, "RegistryArn": reg_arn,
+            "SchemaName": name, "SchemaArn": schema_arn,
             "Description": desc, "DataFormat": data_format, "Compatibility": compat,
             "SchemaCheckpoint": 1, "LatestSchemaVersion": if has_def {1} else {0},
             "NextSchemaVersion": if has_def {2} else {1}, "SchemaStatus": "AVAILABLE",

@@ -20,6 +20,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::multi_account::{AccountState, MultiAccountState};
 
 pub const BACKUP_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
@@ -198,39 +199,68 @@ pub struct BackupSnapshot {
 // ARN builders
 // ---------------------------------------------------------------------------
 
+fn backup_arn(region: &str, account_id: &str, resource: &str) -> String {
+    Arn::regional("backup", region, account_id, resource).to_string()
+}
+
 pub fn vault_arn(region: &str, account_id: &str, name: &str) -> String {
-    format!("arn:aws:backup:{region}:{account_id}:backup-vault:{name}")
+    backup_arn(region, account_id, &format!("backup-vault:{name}"))
 }
 
 pub fn plan_arn(region: &str, account_id: &str, id: &str) -> String {
-    format!("arn:aws:backup:{region}:{account_id}:backup-plan:{id}")
+    backup_arn(region, account_id, &format!("backup-plan:{id}"))
 }
 
 pub fn recovery_point_arn(region: &str, account_id: &str, id: &str) -> String {
-    format!("arn:aws:backup:{region}:{account_id}:recovery-point:{id}")
+    backup_arn(region, account_id, &format!("recovery-point:{id}"))
 }
 
 pub fn framework_arn(region: &str, account_id: &str, name: &str, id: &str) -> String {
-    format!("arn:aws:backup:{region}:{account_id}:framework:{name}-{id}")
+    backup_arn(region, account_id, &format!("framework:{name}-{id}"))
 }
 /// `AccessPointArn` — the model's pattern is
 /// `arn:aws...:backup:<region>:<account>:accesspoint/<name>`.
 pub fn access_point_arn(region: &str, account_id: &str, name: &str) -> String {
-    format!("arn:aws:backup:{region}:{account_id}:accesspoint/{name}")
+    backup_arn(region, account_id, &format!("accesspoint/{name}"))
 }
 
 pub fn report_plan_arn(region: &str, account_id: &str, name: &str, id: &str) -> String {
-    format!("arn:aws:backup:{region}:{account_id}:report-plan:{name}-{id}")
+    backup_arn(region, account_id, &format!("report-plan:{name}-{id}"))
 }
 
 pub fn legal_hold_arn(region: &str, account_id: &str, id: &str) -> String {
-    format!("arn:aws:backup:{region}:{account_id}:legal-hold:{id}")
+    backup_arn(region, account_id, &format!("legal-hold:{id}"))
 }
 
 pub fn restore_testing_plan_arn(region: &str, account_id: &str, name: &str) -> String {
-    format!("arn:aws:backup:{region}:{account_id}:restore-testing-plan:{name}")
+    backup_arn(region, account_id, &format!("restore-testing-plan:{name}"))
 }
 
 pub fn tiering_configuration_arn(region: &str, account_id: &str, name: &str) -> String {
-    format!("arn:aws:backup:{region}:{account_id}:tiering-configuration:{name}")
+    backup_arn(region, account_id, &format!("tiering-configuration:{name}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arns_take_the_region_partition() {
+        assert_eq!(
+            vault_arn("us-east-1", "123456789012", "v"),
+            "arn:aws:backup:us-east-1:123456789012:backup-vault:v"
+        );
+        assert_eq!(
+            vault_arn("cn-north-1", "123456789012", "v"),
+            "arn:aws-cn:backup:cn-north-1:123456789012:backup-vault:v"
+        );
+        assert_eq!(
+            plan_arn("cn-north-1", "123456789012", "p"),
+            "arn:aws-cn:backup:cn-north-1:123456789012:backup-plan:p"
+        );
+        assert_eq!(
+            tiering_configuration_arn("us-gov-west-1", "123456789012", "t"),
+            "arn:aws-us-gov:backup:us-gov-west-1:123456789012:tiering-configuration:t"
+        );
+    }
 }

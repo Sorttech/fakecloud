@@ -1966,6 +1966,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn china_region_flywheel_arn_uses_aws_cn_partition() {
+        let svc = service();
+        let cn = |action: &str, body: Value| {
+            let mut r = req(action, body);
+            r.region = "cn-north-1".to_string();
+            r
+        };
+        let cv = body_of(
+            svc.handle(cn(
+                "CreateFlywheel",
+                json!({
+                    "FlywheelName": "fw-cn",
+                    "DataAccessRoleArn": "arn:aws-cn:iam::000000000000:role/r",
+                    "DataLakeS3Uri": "s3://lake/"
+                }),
+            ))
+            .await
+            .unwrap(),
+        )
+        .await;
+        let arn = cv["FlywheelArn"].as_str().unwrap().to_string();
+        assert_eq!(
+            arn,
+            "arn:aws-cn:comprehend:cn-north-1:000000000000:flywheel/fw-cn"
+        );
+        let dv = body_of(
+            svc.handle(cn("DescribeFlywheel", json!({ "FlywheelArn": arn })))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(dv["FlywheelProperties"]["FlywheelArn"], arn);
+    }
+
+    #[tokio::test]
     async fn flywheel_and_tagging_round_trip() {
         let svc = service();
         let create = svc

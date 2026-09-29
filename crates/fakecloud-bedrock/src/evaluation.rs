@@ -16,10 +16,7 @@ pub(crate) fn create_evaluation_job(
     let role_arn = body["roleArn"].as_str().unwrap_or_default();
 
     let job_id = Uuid::new_v4().to_string();
-    let job_arn = format!(
-        "arn:aws:bedrock:{}:{}:evaluation-job/{}",
-        req.region, req.account_id, job_id
-    );
+    let job_arn = crate::arns::evaluation_job_arn(&req.region, &req.account_id, &job_id);
 
     let now = Utc::now();
     let job = EvaluationJob {

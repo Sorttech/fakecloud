@@ -16,6 +16,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::multi_account::{AccountState, MultiAccountState};
 
 pub const EFS_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
@@ -87,6 +88,28 @@ impl AccountState for EfsData {
     fn new_for_account(_account_id: &str, _region: &str, _endpoint: &str) -> Self {
         Self::default()
     }
+}
+
+/// A file system's ARN, in the region's partition.
+pub fn file_system_arn(region: &str, account: &str, fsid: &str) -> String {
+    Arn::regional(
+        "elasticfilesystem",
+        region,
+        account,
+        &format!("file-system/{fsid}"),
+    )
+    .to_string()
+}
+
+/// An access point's ARN, in the region's partition.
+pub fn access_point_arn(region: &str, account: &str, apid: &str) -> String {
+    Arn::regional(
+        "elasticfilesystem",
+        region,
+        account,
+        &format!("access-point/{apid}"),
+    )
+    .to_string()
 }
 
 pub type SharedEfsState = Arc<RwLock<MultiAccountState<EfsData>>>;

@@ -318,7 +318,10 @@ impl ManagedBlockchainService {
         );
         net.insert("Status".into(), json!("AVAILABLE"));
         net.insert("CreationDate".into(), json!(now));
-        net.insert("Arn".into(), json!(shared::network_arn(&network_id)));
+        net.insert(
+            "Arn".into(),
+            json!(shared::network_arn(&ctx.region, &network_id)),
+        );
         net.insert(
             "VpcEndpointServiceName".into(),
             json!(format!(
@@ -337,7 +340,7 @@ impl ManagedBlockchainService {
 
         let mut guard = self.state.write();
         let data = guard.get_or_create(&ctx.account);
-        store_tags(data, &shared::network_arn(&network_id), body);
+        store_tags(data, &shared::network_arn(&ctx.region, &network_id), body);
         data.networks.insert(network_id.clone(), Value::Object(net));
 
         // Hyperledger Fabric networks atomically create the requested first
@@ -363,10 +366,7 @@ impl ManagedBlockchainService {
         let guard = self.state.read();
         let data = guard.get(&ctx.account);
         match data.and_then(|d| d.networks.get(network_id)) {
-            Some(n) => {
-                let arn = shared::network_arn(network_id);
-                ok(json!({ "Network": with_tags(data.unwrap(), &arn, n) }))
-            }
+            Some(n) => ok(json!({ "Network": with_tags(data.unwrap(), n) })),
             None => Err(not_found(&format!("Network {network_id} was not found."))),
         }
     }
@@ -473,10 +473,7 @@ impl ManagedBlockchainService {
         let guard = self.state.read();
         let data = guard.get(&ctx.account);
         match data.and_then(|d| d.members.get(member_id)) {
-            Some(m) => {
-                let arn = shared::member_arn(&ctx.region, &ctx.account, member_id);
-                ok(json!({ "Member": with_tags(data.unwrap(), &arn, m) }))
-            }
+            Some(m) => ok(json!({ "Member": with_tags(data.unwrap(), m) })),
             None => Err(not_found(&format!("Member {member_id} was not found."))),
         }
     }
@@ -609,10 +606,7 @@ impl ManagedBlockchainService {
         let guard = self.state.read();
         let data = guard.get(&ctx.account);
         match data.and_then(|d| d.nodes.get(node_id)) {
-            Some(n) => {
-                let arn = shared::node_arn(&ctx.region, &ctx.account, node_id);
-                ok(json!({ "Node": with_tags(data.unwrap(), &arn, n) }))
-            }
+            Some(n) => ok(json!({ "Node": with_tags(data.unwrap(), n) })),
             None => Err(not_found(&format!("Node {node_id} was not found."))),
         }
     }
@@ -763,10 +757,7 @@ impl ManagedBlockchainService {
         let guard = self.state.read();
         let data = guard.get(&ctx.account);
         match data.and_then(|d| d.proposals.get(proposal_id)) {
-            Some(p) => {
-                let arn = shared::proposal_arn(&ctx.region, &ctx.account, proposal_id);
-                ok(json!({ "Proposal": with_tags(data.unwrap(), &arn, p) }))
-            }
+            Some(p) => ok(json!({ "Proposal": with_tags(data.unwrap(), p) })),
             None => Err(not_found(&format!("Proposal {proposal_id} was not found."))),
         }
     }
@@ -1017,10 +1008,7 @@ impl ManagedBlockchainService {
         let guard = self.state.read();
         let data = guard.get(&ctx.account);
         match data.and_then(|d| d.accessors.get(accessor_id)) {
-            Some(a) => {
-                let arn = shared::accessor_arn(&ctx.region, &ctx.account, accessor_id);
-                ok(json!({ "Accessor": with_tags(data.unwrap(), &arn, a) }))
-            }
+            Some(a) => ok(json!({ "Accessor": with_tags(data.unwrap(), a) })),
             None => Err(not_found(&format!("Accessor {accessor_id} was not found."))),
         }
     }
@@ -1596,9 +1584,15 @@ fn store_tags(data: &mut ManagedBlockchainData, arn: &str, body: &Value) {
 
 /// Attach the resource's `Tags` (from the ARN-keyed tag store) to a clone of its
 /// wire object for a read response.
-fn with_tags(data: &ManagedBlockchainData, arn: &str, obj: &Value) -> Value {
+/// `obj` with the tags stored under its own `Arn` spliced in.
+fn with_tags(data: &ManagedBlockchainData, obj: &Value) -> Value {
     let mut out = obj.clone();
-    let tags = data.tags.get(arn).cloned().unwrap_or_default();
+    let tags = obj
+        .get("Arn")
+        .and_then(Value::as_str)
+        .and_then(|arn| data.tags.get(arn))
+        .cloned()
+        .unwrap_or_default();
     if let Some(o) = out.as_object_mut() {
         o.insert("Tags".into(), json!(tags));
     }
@@ -1770,9 +1764,13 @@ mod tests {
     }
 
     fn fabric_network(s: &ManagedBlockchainService) -> (String, String) {
+        fabric_network_in(s, &ctx())
+    }
+
+    fn fabric_network_in(s: &ManagedBlockchainService, c: &Ctx) -> (String, String) {
         let resp = s
             .create_network(
-                &ctx(),
+                c,
                 &json!({
                     "ClientRequestToken": "t",
                     "Name": "net",
@@ -1799,6 +1797,53 @@ mod tests {
             out["NetworkId"].as_str().unwrap().to_string(),
             out["MemberId"].as_str().unwrap().to_string(),
         )
+    }
+
+    #[test]
+    fn china_region_arns_use_aws_cn_partition_and_tag_by_them() {
+        let s = svc();
+        let c = Ctx {
+            account: "000000000000".to_string(),
+            region: "cn-north-1".to_string(),
+        };
+        let (net_id, member_id) = fabric_network_in(&s, &c);
+        let net = body_of(&s.get_network(&c, &net_id).unwrap());
+        let arn = net["Network"]["Arn"].as_str().unwrap().to_string();
+        assert_eq!(
+            arn,
+            format!("arn:aws-cn:managedblockchain:::networks/{net_id}")
+        );
+        let member = body_of(&s.get_member(&c, &net_id, &member_id).unwrap());
+        assert_eq!(
+            member["Member"]["Arn"],
+            format!("arn:aws-cn:managedblockchain:cn-north-1:000000000000:members/{member_id}")
+        );
+        s.tag_resource(&c, &arn, &json!({ "Tags": { "k": "v" } }))
+            .unwrap();
+        let listed = body_of(&s.list_tags(&c, &arn).unwrap());
+        assert_eq!(listed["Tags"]["k"], "v");
+    }
+
+    #[test]
+    fn get_reports_tags_stored_under_the_resource_arn_from_any_region() {
+        let s = svc();
+        let cn = Ctx {
+            account: "000000000000".to_string(),
+            region: "cn-north-1".to_string(),
+        };
+        let (net_id, member_id) = fabric_network_in(&s, &cn);
+        let net_arn = shared::network_arn(&cn.region, &net_id);
+        let member_arn = shared::member_arn(&cn.region, &cn.account, &member_id);
+        for arn in [&net_arn, &member_arn] {
+            s.tag_resource(&cn, arn, &json!({ "Tags": { "k": "v" } }))
+                .unwrap();
+        }
+        let elsewhere = ctx();
+        let net = body_of(&s.get_network(&elsewhere, &net_id).unwrap());
+        assert_eq!(net["Network"]["Arn"], net_arn);
+        assert_eq!(net["Network"]["Tags"]["k"], "v");
+        let member = body_of(&s.get_member(&elsewhere, &net_id, &member_id).unwrap());
+        assert_eq!(member["Member"]["Tags"]["k"], "v");
     }
 
     #[test]
@@ -2046,7 +2091,7 @@ mod tests {
     fn tag_untag_round_trips() {
         let s = svc();
         let (net_id, _m) = fabric_network(&s);
-        let arn = shared::network_arn(&net_id);
+        let arn = shared::network_arn(&ctx().region, &net_id);
         s.tag_resource(&ctx(), &arn, &json!({ "Tags": { "k": "v" } }))
             .unwrap();
         let listed = body_of(&s.list_tags(&ctx(), &arn).unwrap());

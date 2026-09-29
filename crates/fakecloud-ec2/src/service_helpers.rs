@@ -111,6 +111,18 @@ pub fn malformed_instance_profile_arn(arn: &str) -> AwsServiceError {
     )
 }
 
+/// An EC2 ARN (`arn:<partition>:ec2:<region>:<owner>:<resource>`) in the
+/// region's partition.
+pub fn ec2_arn(region: &str, owner: &str, resource: &str) -> String {
+    fakecloud_aws::arn::Arn::regional("ec2", region, owner, resource).to_string()
+}
+
+/// A region-less EC2 ARN (IPAM resources: `arn:<partition>:ec2::<owner>:...`)
+/// in the partition of `region`.
+pub fn ec2_global_arn(region: &str, owner: &str, resource: &str) -> String {
+    fakecloud_aws::arn::Arn::global_in(region, "ec2", owner, resource).to_string()
+}
+
 /// Whether `arn` is a well-formed IAM instance-profile ARN:
 /// `arn:<partition>:iam::<account>:instance-profile/<path><name>`.
 pub fn is_instance_profile_arn(arn: &str) -> bool {

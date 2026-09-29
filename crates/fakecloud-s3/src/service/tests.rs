@@ -6495,7 +6495,10 @@ fn iam_action_for_maps_access_point_control_ops() {
         ))
         .expect("access-point PUT must map to an IAM action");
     assert_eq!(a.action, "CreateAccessPoint");
-    assert_eq!(a.resource, "arn:aws:s3:::accesspoint/my-ap");
+    assert_eq!(
+        a.resource,
+        "arn:aws:s3:us-east-1:000000000000:accesspoint/my-ap"
+    );
 
     let g = service
         .iam_action_for(&s3_control_req(

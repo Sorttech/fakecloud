@@ -236,8 +236,9 @@ impl ResetState {
         match service {
             "iam" | "sts" => {
                 let mut mas = self.iam.write();
+                let region = mas.region().to_string();
                 if let Some(state) = mas.get_mut(account_id) {
-                    state.reset();
+                    state.reset(&region);
                 }
             }
             "sqs" => {

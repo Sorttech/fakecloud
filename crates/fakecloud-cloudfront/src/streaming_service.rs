@@ -87,9 +87,10 @@ impl CloudFrontService {
         let now = Utc::now();
         let etag = generate_etag();
         let domain = format!("{}.cloudfront.net", id.to_lowercase());
-        let arn = format!(
-            "arn:aws:cloudfront::{}:streaming-distribution/{}",
-            DEFAULT_ACCOUNT, id
+        let arn = crate::service::cloudfront_arn(
+            &req.region,
+            DEFAULT_ACCOUNT,
+            &format!("streaming-distribution/{id}"),
         );
 
         let stored = StoredStreamingDistribution {

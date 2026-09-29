@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use tokio::sync::Mutex as AsyncMutex;
 
-use fakecloud_aws::arn::{partition_for, Arn};
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::pagination::paginate_checked;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_persistence::{SnapshotHook, SnapshotStore};
@@ -236,7 +236,7 @@ impl ApplicationAutoScalingService {
             }
             let arn = synth_scalable_target_arn(&req.account_id, &req.region);
             let role = role_arn.unwrap_or_else(|| {
-                default_service_linked_role(&req.account_id, &service_namespace)
+                default_service_linked_role(&req.region, &req.account_id, &service_namespace)
             });
             let target = ScalableTarget {
                 arn: arn.clone(),
@@ -1094,15 +1094,58 @@ fn synth_scalable_target_arn(account_id: &str, region: &str) -> String {
         region
     };
     let id = Uuid::new_v4().simple().to_string();
-    let id = &id[..10];
-    Arn::new(
+    scalable_target_arn(region, account_id, &id[..10])
+}
+
+/// The ARN of a scalable target.
+pub fn scalable_target_arn(region: &str, account_id: &str, id: &str) -> String {
+    Arn::regional(
         "application-autoscaling",
         region,
         account_id,
         &format!("scalable-target/{id}"),
     )
-    .with_partition(partition_for(region))
     .to_string()
+}
+
+/// A scaling policy or scheduled action ARN, which Application Auto Scaling
+/// mints under the `autoscaling` service namespace.
+fn autoscaling_arn(region: &str, account_id: &str, resource: &str) -> String {
+    Arn::regional("autoscaling", region, account_id, resource).to_string()
+}
+
+/// The ARN of a scaling policy on `namespace`/`resource_id`.
+pub fn scaling_policy_arn(
+    region: &str,
+    account_id: &str,
+    id: &str,
+    namespace: &str,
+    resource_id: &str,
+    name: &str,
+) -> String {
+    autoscaling_arn(
+        region,
+        account_id,
+        &format!("scalingPolicy:{id}:resource/{namespace}/{resource_id}:policyName/{name}"),
+    )
+}
+
+/// The ARN of a scheduled action on `namespace`/`resource_id`.
+pub fn scheduled_action_arn(
+    region: &str,
+    account_id: &str,
+    id: &str,
+    namespace: &str,
+    resource_id: &str,
+    name: &str,
+) -> String {
+    autoscaling_arn(
+        region,
+        account_id,
+        &format!(
+            "scheduledAction:{id}:resource/{namespace}/{resource_id}:scheduledActionName/{name}"
+        ),
+    )
 }
 
 fn synth_policy_arn(
@@ -1117,10 +1160,8 @@ fn synth_policy_arn(
     } else {
         region
     };
-    let id = Uuid::new_v4();
-    format!(
-        "arn:aws:autoscaling:{region}:{account_id}:scalingPolicy:{id}:resource/{namespace}/{resource_id}:policyName/{name}"
-    )
+    let id = Uuid::new_v4().to_string();
+    scaling_policy_arn(region, account_id, &id, namespace, resource_id, name)
 }
 
 fn synth_scheduled_action_arn(
@@ -1135,13 +1176,13 @@ fn synth_scheduled_action_arn(
     } else {
         region
     };
-    let id = Uuid::new_v4();
-    format!(
-        "arn:aws:autoscaling:{region}:{account_id}:scheduledAction:{id}:resource/{namespace}/{resource_id}:scheduledActionName/{name}"
-    )
+    let id = Uuid::new_v4().to_string();
+    scheduled_action_arn(region, account_id, &id, namespace, resource_id, name)
 }
 
-fn default_service_linked_role(account_id: &str, namespace: &str) -> String {
+/// The service-linked role Application Auto Scaling uses for `namespace` when
+/// a scalable target is registered without a `RoleARN`.
+pub fn default_service_linked_role(region: &str, account_id: &str, namespace: &str) -> String {
     let suffix = match namespace {
         "ecs" => "ECSService",
         "elasticmapreduce" => "EMRContainerService",
@@ -1156,7 +1197,8 @@ fn default_service_linked_role(account_id: &str, namespace: &str) -> String {
         "kafka" => "KafkaCluster",
         _ => "ApplicationAutoScaling_Default",
     };
-    Arn::global(
+    Arn::global_in(
+        region,
         "iam",
         account_id,
         &format!("role/aws-service-role/applicationautoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_{suffix}"),
@@ -1378,6 +1420,80 @@ mod tests {
             access_key_id: None,
             principal: None,
         }
+    }
+
+    #[tokio::test]
+    async fn china_region_arns_use_the_aws_cn_partition() {
+        let svc = ApplicationAutoScalingService::new(Arc::new(RwLock::new(
+            ApplicationAutoScalingAccounts::new(),
+        )));
+        let call = |action: &str, body: Value| {
+            let mut req = make_req(action, body);
+            req.region = "cn-north-1".to_string();
+            let svc = &svc;
+            async move {
+                let resp = svc.handle(req).await.unwrap();
+                serde_json::from_slice::<Value>(resp.body.expect_bytes()).unwrap()
+            }
+        };
+        let target = call(
+            "RegisterScalableTarget",
+            json!({
+                "ServiceNamespace": "ecs",
+                "ResourceId": "service/cluster1/svc1",
+                "ScalableDimension": "ecs:service:DesiredCount",
+                "MinCapacity": 1,
+                "MaxCapacity": 5,
+            }),
+        )
+        .await;
+        let target_arn = target["ScalableTargetARN"].as_str().unwrap().to_string();
+        assert!(
+            target_arn.starts_with(
+                "arn:aws-cn:application-autoscaling:cn-north-1:123456789012:scalable-target/"
+            ),
+            "{target_arn}"
+        );
+
+        let described = call(
+            "DescribeScalableTargets",
+            json!({"ServiceNamespace": "ecs"}),
+        )
+        .await;
+        assert_eq!(
+            described["ScalableTargets"][0]["RoleARN"],
+            "arn:aws-cn:iam::123456789012:role/aws-service-role/applicationautoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService"
+        );
+
+        let policy = call(
+            "PutScalingPolicy",
+            json!({
+                "PolicyName": "p1",
+                "ServiceNamespace": "ecs",
+                "ResourceId": "service/cluster1/svc1",
+                "ScalableDimension": "ecs:service:DesiredCount",
+                "PolicyType": "TargetTrackingScaling",
+                "TargetTrackingScalingPolicyConfiguration": {
+                    "TargetValue": 50.0,
+                    "PredefinedMetricSpecification": {
+                        "PredefinedMetricType": "ECSServiceAverageCPUUtilization"
+                    }
+                }
+            }),
+        )
+        .await;
+        assert!(policy["PolicyARN"]
+            .as_str()
+            .unwrap()
+            .starts_with("arn:aws-cn:autoscaling:cn-north-1:123456789012:scalingPolicy:"));
+
+        call(
+            "TagResource",
+            json!({"ResourceARN": target_arn, "Tags": {"env": "cn"}}),
+        )
+        .await;
+        let tags = call("ListTagsForResource", json!({"ResourceARN": target_arn})).await;
+        assert_eq!(tags["Tags"]["env"], "cn");
     }
 
     #[tokio::test]

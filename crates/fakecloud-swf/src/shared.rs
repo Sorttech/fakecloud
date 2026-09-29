@@ -33,7 +33,8 @@ pub fn new_task_token() -> String {
 
 /// Amazon SWF domain ARN, `arn:aws:swf:{region}:{account}:/domain/{name}`.
 pub fn domain_arn(region: &str, account: &str, name: &str) -> String {
-    format!("arn:aws:swf:{region}:{account}:/domain/{name}")
+    fakecloud_aws::arn::Arn::regional("swf", region, account, &format!("/domain/{name}"))
+        .to_string()
 }
 
 /// Internal storage key for an activity or workflow type: `name` + a unit

@@ -6,8 +6,8 @@ use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use crate::service::Ec2Service;
 use crate::service_helpers::{
-    filter_value_matches, gen_id, indexed_list, not_found, paginate, parse_filters, require,
-    validate_enum, validate_max_results, Filter,
+    ec2_arn, filter_value_matches, gen_id, indexed_list, not_found, paginate, parse_filters,
+    require, validate_enum, validate_max_results, Filter,
 };
 use crate::state::{Ec2State, Subnet, SubnetCidrReservation, Tag};
 
@@ -52,7 +52,7 @@ pub(crate) fn subnet_xml(s: &Subnet, tags: &[Tag], owner: &str, region: &str) ->
         ec2_elem("ownerId", owner),
         ec2_elem(
             "subnetArn",
-            &format!("arn:aws:ec2:{region}:{owner}:subnet/{}", s.subnet_id),
+            &ec2_arn(region, owner, &format!("subnet/{}", s.subnet_id)),
         ),
         format_args!("<enableDns64>{}</enableDns64>", s.enable_dns64),
         // The `aws_subnet` resource reads `private_dns_hostname_type_on_launch`
@@ -247,7 +247,7 @@ pub(crate) fn create_secondary_subnet(
         ec2_elem("secondarySubnetId", &id),
         ec2_elem(
             "secondarySubnetArn",
-            &format!("arn:aws:ec2:{}:{owner}:subnet/{id}", req.region)
+            &ec2_arn(&req.region, owner, &format!("subnet/{id}"))
         ),
         ec2_elem("secondaryNetworkId", &network),
         ec2_elem("ownerId", owner),
@@ -618,6 +618,49 @@ mod tests {
             .and_then(|s| s.split("</subnetId>").next())
             .unwrap()
             .to_string()
+    }
+
+    #[test]
+    fn china_region_arns_use_the_china_partition() {
+        let svc = Ec2Service::new();
+        let in_cn = |action: &str, params: &[(&str, &str)]| {
+            let mut r = req(action, params);
+            r.region = "cn-north-1".to_string();
+            r
+        };
+        let subnet = body_of(
+            create_subnet(
+                &svc,
+                &in_cn(
+                    "CreateSubnet",
+                    &[("VpcId", "vpc-test"), ("CidrBlock", "10.0.9.0/24")],
+                ),
+            )
+            .unwrap(),
+        );
+        assert!(
+            subnet.contains("<subnetArn>arn:aws-cn:ec2:cn-north-1:"),
+            "{subnet}"
+        );
+
+        let lt = body_of(
+            crate::service::fleet::create_launch_template(
+                &svc,
+                &in_cn(
+                    "CreateLaunchTemplate",
+                    &[
+                        ("LaunchTemplateName", "cn-lt"),
+                        ("LaunchTemplateData.ImageId", "ami-12345678"),
+                    ],
+                ),
+            )
+            .unwrap(),
+        );
+        assert!(lt.contains("<createdBy>arn:aws-cn:iam::"), "{lt}");
+
+        let ipam =
+            body_of(crate::service::ipam::create_ipam(&svc, &in_cn("CreateIpam", &[])).unwrap());
+        assert!(ipam.contains("<ipamArn>arn:aws-cn:ec2::"), "{ipam}");
     }
 
     #[test]

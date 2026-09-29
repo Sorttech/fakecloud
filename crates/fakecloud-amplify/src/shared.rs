@@ -4,36 +4,53 @@
 //! diverge on wire format.
 
 use base64::Engine as _;
+use fakecloud_aws::arn::Arn;
 use uuid::Uuid;
 
-/// The AWS Amplify app ARN, `arn:aws:amplify:{region}:{account}:apps/{app_id}`.
+fn amplify_arn(region: &str, account: &str, resource: &str) -> String {
+    Arn::regional("amplify", region, account, resource).to_string()
+}
+
+/// The AWS Amplify app ARN, `arn:<partition>:amplify:{region}:{account}:apps/{app_id}`.
 pub fn app_arn(region: &str, account: &str, app_id: &str) -> String {
-    format!("arn:aws:amplify:{region}:{account}:apps/{app_id}")
+    amplify_arn(region, account, &format!("apps/{app_id}"))
 }
 
 /// The branch ARN, `.../apps/{app_id}/branches/{branch}`.
 pub fn branch_arn(region: &str, account: &str, app_id: &str, branch: &str) -> String {
-    format!("arn:aws:amplify:{region}:{account}:apps/{app_id}/branches/{branch}")
+    amplify_arn(region, account, &format!("apps/{app_id}/branches/{branch}"))
 }
 
 /// The domain-association ARN, `.../apps/{app_id}/domains/{domain}`.
 pub fn domain_arn(region: &str, account: &str, app_id: &str, domain: &str) -> String {
-    format!("arn:aws:amplify:{region}:{account}:apps/{app_id}/domains/{domain}")
+    amplify_arn(region, account, &format!("apps/{app_id}/domains/{domain}"))
 }
 
 /// The webhook ARN, `.../apps/{app_id}/webhooks/{webhook_id}`.
 pub fn webhook_arn(region: &str, account: &str, app_id: &str, webhook_id: &str) -> String {
-    format!("arn:aws:amplify:{region}:{account}:apps/{app_id}/webhooks/{webhook_id}")
+    amplify_arn(
+        region,
+        account,
+        &format!("apps/{app_id}/webhooks/{webhook_id}"),
+    )
 }
 
 /// The backend-environment ARN, `.../apps/{app_id}/backendenvironments/{name}`.
 pub fn backend_environment_arn(region: &str, account: &str, app_id: &str, name: &str) -> String {
-    format!("arn:aws:amplify:{region}:{account}:apps/{app_id}/backendenvironments/{name}")
+    amplify_arn(
+        region,
+        account,
+        &format!("apps/{app_id}/backendenvironments/{name}"),
+    )
 }
 
 /// The job ARN, `.../apps/{app_id}/branches/{branch}/jobs/{job_id}`.
 pub fn job_arn(region: &str, account: &str, app_id: &str, branch: &str, job_id: &str) -> String {
-    format!("arn:aws:amplify:{region}:{account}:apps/{app_id}/branches/{branch}/jobs/{job_id}")
+    amplify_arn(
+        region,
+        account,
+        &format!("apps/{app_id}/branches/{branch}/jobs/{job_id}"),
+    )
 }
 
 /// FNV-1a hash for deterministic synthesis of ids / hosts from a seed so a
@@ -149,7 +166,7 @@ pub fn now_epoch() -> f64 {
 /// Parse an Amplify `ResourceArn` into `(app_id, Option<branch>)` for the
 /// tagging operations. Only apps and branches carry tags in the model.
 ///
-/// - `arn:aws:amplify:{region}:{account}:apps/{app_id}` -> `(app_id, None)`
+/// - `arn:<partition>:amplify:{region}:{account}:apps/{app_id}` -> `(app_id, None)`
 /// - `.../apps/{app_id}/branches/{branch}` -> `(app_id, Some(branch))`
 pub fn parse_resource_arn(arn: &str) -> Option<(String, Option<String>)> {
     let (_, rest) = arn.split_once(":apps/")?;

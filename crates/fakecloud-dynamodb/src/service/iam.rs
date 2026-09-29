@@ -23,6 +23,7 @@
 
 use std::collections::HashMap;
 
+use fakecloud_aws::arn::arn_resource;
 use fakecloud_core::auth::IamAction;
 use fakecloud_core::service::AwsRequest;
 use serde_json::Value;
@@ -90,10 +91,7 @@ impl Scope<'_> {
         }
         match table_arn_of(name_or_arn) {
             Some(arn) => arn,
-            None => format!(
-                "arn:aws:dynamodb:{}:{}:table/{name_or_arn}",
-                self.region, self.account
-            ),
+            None => crate::state::table_arn(self.region, self.account, name_or_arn),
         }
     }
 
@@ -102,17 +100,18 @@ impl Scope<'_> {
     }
 
     fn global_table(&self, name: &str) -> String {
-        format!("arn:aws:dynamodb::{}:global-table/{name}", self.account)
+        crate::state::global_table_arn(self.region, self.account, name)
     }
 }
 
 /// `arn:aws:dynamodb:REGION:ACCOUNT:table/NAME` for an ARN naming a table or
 /// one of its sub-resources, or `None` for anything else.
 fn table_arn_of(arn: &str) -> Option<String> {
-    let rest = arn.strip_prefix("arn:aws:dynamodb:")?;
-    let (scope, resource) = rest.split_once(":table/")?;
+    let rest = arn_resource(arn, "dynamodb")?;
+    let (_, resource) = rest.split_once(":table/")?;
     let name = resource.split('/').next().filter(|n| !n.is_empty())?;
-    Some(format!("arn:aws:dynamodb:{scope}:table/{name}"))
+    let prefix_len = arn.len() - resource.len();
+    Some(format!("{}{name}", &arn[..prefix_len]))
 }
 
 fn action(name: &'static str, resource: String) -> IamAction {

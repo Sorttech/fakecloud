@@ -857,13 +857,12 @@ impl RedshiftService {
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let name = param(req, "IntegrationName").unwrap_or_default();
-        let arn = Arn::new(
-            "redshift",
+        let arn = crate::state::redshift_arn(
             &req.region,
             &req.account_id,
-            &format!("integration:{}", fakecloud_core::ids::short_id(12)),
-        )
-        .to_string();
+            "integration",
+            &fakecloud_core::ids::short_id(12),
+        );
         let mut guard = self.state.write();
         let acct = guard.account(&req.account_id);
         if acct
@@ -987,16 +986,12 @@ impl RedshiftService {
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let name = param(req, "RedshiftIdcApplicationName").unwrap_or_default();
-        let arn = Arn::new(
-            "redshift",
+        let arn = crate::state::redshift_arn(
             &req.region,
             &req.account_id,
-            &format!(
-                "redshiftidcapplication:{}",
-                fakecloud_core::ids::short_id(12)
-            ),
-        )
-        .to_string();
+            "redshiftidcapplication",
+            &fakecloud_core::ids::short_id(12),
+        );
         let mut guard = self.state.write();
         let acct = guard.account(&req.account_id);
         if acct
@@ -1013,10 +1008,13 @@ impl RedshiftService {
             idc_instance_arn: param(req, "IdcInstanceArn").unwrap_or_default(),
             idc_display_name: param(req, "IdcDisplayName").unwrap_or_default(),
             iam_role_arn: param(req, "IamRoleArn").unwrap_or_default(),
-            idc_managed_application_arn: format!(
-                "arn:aws:sso::{}:application/fakecloud",
-                req.account_id
-            ),
+            idc_managed_application_arn: Arn::global_in(
+                &req.region,
+                "sso",
+                &req.account_id,
+                "application/fakecloud",
+            )
+            .to_string(),
             authorized_token_issuer_list: Vec::new(),
             service_integrations: Vec::new(),
         };

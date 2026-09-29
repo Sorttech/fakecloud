@@ -23,7 +23,7 @@ use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceErr
 use fakecloud_persistence::SnapshotStore;
 
 use crate::persistence::save_snapshot;
-use crate::state::{EfsData, SharedEfsState};
+use crate::state::{access_point_arn, file_system_arn, EfsData, SharedEfsState};
 
 /// Every operation name in the EFS Smithy model (31 operations).
 pub const EFS_ACTIONS: &[&str] = &[
@@ -454,10 +454,7 @@ fn now_ts() -> f64 {
 }
 
 fn fs_arn(ctx: &Ctx, fsid: &str) -> String {
-    format!(
-        "arn:aws:elasticfilesystem:{}:{}:file-system/{}",
-        ctx.region, ctx.account, fsid
-    )
+    file_system_arn(&ctx.region, &ctx.account, fsid)
 }
 
 /// Build the FileSystem record for a replication destination EFS provisions on
@@ -470,10 +467,7 @@ fn destination_file_system(ctx: &Ctx, fsid: &str, region: &str, az: Option<&str>
     fs.insert("FileSystemId".into(), json!(fsid));
     fs.insert(
         "FileSystemArn".into(),
-        json!(format!(
-            "arn:aws:elasticfilesystem:{}:{}:file-system/{}",
-            region, ctx.account, fsid
-        )),
+        json!(file_system_arn(region, &ctx.account, fsid)),
     );
     fs.insert("CreationTime".into(), json!(now_ts()));
     // Transient state; reconcile_lifecycle settles it to `available` on describe.
@@ -505,10 +499,7 @@ fn destination_file_system(ctx: &Ctx, fsid: &str, region: &str, az: Option<&str>
 }
 
 fn ap_arn(ctx: &Ctx, apid: &str) -> String {
-    format!(
-        "arn:aws:elasticfilesystem:{}:{}:access-point/{}",
-        ctx.region, ctx.account, apid
-    )
+    access_point_arn(&ctx.region, &ctx.account, apid)
 }
 
 /// Normalize a `FileSystemId` label/field that may arrive as a bare `fs-...`
@@ -1866,6 +1857,35 @@ mod tests {
 
     fn body_value(resp: &AwsResponse) -> Value {
         serde_json::from_slice(resp.body.expect_bytes()).unwrap()
+    }
+
+    #[test]
+    fn china_file_system_and_access_point_arns_use_the_china_partition() {
+        let s = svc();
+        let c = Ctx {
+            account: "000000000000".to_string(),
+            region: "cn-north-1".to_string(),
+        };
+        let fs = body_value(
+            &s.create_file_system(&c, &json!({ "CreationToken": "cn" }))
+                .unwrap(),
+        );
+        let arn = fs["FileSystemArn"].as_str().unwrap();
+        assert!(
+            arn.starts_with("arn:aws-cn:elasticfilesystem:cn-north-1:000000000000:file-system/"),
+            "{arn}"
+        );
+        let fsid = fs["FileSystemId"].as_str().unwrap();
+        let ap = body_value(
+            &s.create_access_point(&c, &json!({ "FileSystemId": fsid, "ClientToken": "t" }))
+                .unwrap(),
+        );
+        let ap_arn = ap["AccessPointArn"].as_str().unwrap();
+        assert!(
+            ap_arn
+                .starts_with("arn:aws-cn:elasticfilesystem:cn-north-1:000000000000:access-point/"),
+            "{ap_arn}"
+        );
     }
 
     // Defect #1: a nonexistent subnet must be rejected with SubnetNotFound once

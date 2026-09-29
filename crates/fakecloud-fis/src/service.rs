@@ -1368,6 +1368,33 @@ mod tests {
     }
 
     #[test]
+    fn china_region_template_arn_uses_aws_cn_partition_and_tags_by_it() {
+        let s = svc();
+        let c = Ctx {
+            account: "000000000000".into(),
+            region: "cn-north-1".into(),
+        };
+        let id = create_template(&s, &c);
+        let got = body_json(&s.get_experiment_template(&c, &id).unwrap());
+        let arn = got["experimentTemplate"]["arn"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            arn,
+            format!("arn:aws-cn:fis:cn-north-1:000000000000:experiment-template/{id}")
+        );
+        s.tag_resource(&c, &arn, &json!({ "tags": { "team": "chaos" } }))
+            .unwrap();
+        let tags = body_json(&s.list_tags_for_resource(&c, &arn).unwrap());
+        assert_eq!(tags["tags"]["team"], "chaos");
+        assert_eq!(
+            shared::action_arn("cn-north-1", "aws:ec2:stop-instances"),
+            "arn:aws-cn:fis:cn-north-1::action/aws:ec2:stop-instances"
+        );
+    }
+
+    #[test]
     fn get_missing_template_is_not_found() {
         let s = svc();
         let err = err_of(s.get_experiment_template(&ctx(), "EXTmissing"));

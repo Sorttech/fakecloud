@@ -786,6 +786,35 @@ fn orderable_instances_reflect_request_region() {
 }
 
 #[test]
+fn china_replication_instance_arn_uses_the_china_partition() {
+    let s = svc();
+    let out = call_region(
+        &s,
+        "CreateReplicationInstance",
+        "cn-north-1",
+        json!({ "ReplicationInstanceIdentifier": "ri-cn", "ReplicationInstanceClass": "dms.t3.micro" }),
+    );
+    let arn = out["ReplicationInstance"]["ReplicationInstanceArn"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        arn.starts_with("arn:aws-cn:dms:cn-north-1:000000000000:rep:"),
+        "{arn}"
+    );
+    let deleted = call_region(
+        &s,
+        "DeleteReplicationInstance",
+        "cn-north-1",
+        json!({ "ReplicationInstanceArn": arn }),
+    );
+    assert_eq!(
+        deleted["ReplicationInstance"]["ReplicationInstanceArn"],
+        json!(arn)
+    );
+}
+
+#[test]
 fn unknown_filter_name_ignored() {
     let s = svc();
     new_endpoint(&s, "m", "source");

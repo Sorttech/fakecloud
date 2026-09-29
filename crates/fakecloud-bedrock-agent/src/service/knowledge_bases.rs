@@ -14,16 +14,10 @@ impl BedrockAgentService {
         let kb = KnowledgeBase {
             knowledge_base_id: id.clone(),
             name,
-            knowledge_base_arn: format!(
-                "arn:aws:bedrock:{}:{}:knowledge-base/{}",
-                req.region, req.account_id, id
-            ),
+            knowledge_base_arn: crate::arns::knowledge_base_arn(&req.region, &req.account_id, &id),
             description: opt_str(&body, "description"),
             role_arn: opt_str(&body, "roleArn").unwrap_or_else(|| {
-                format!(
-                    "arn:aws:iam::{}:role/fakecloud-bedrock-kb-role",
-                    req.account_id
-                )
+                crate::arns::default_knowledge_base_role_arn(&req.region, &req.account_id)
             }),
             knowledge_base_configuration: opt_json(&body, "knowledgeBaseConfiguration")
                 .unwrap_or_else(|| json!({"type": "VECTOR"})),

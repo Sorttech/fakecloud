@@ -159,7 +159,7 @@ impl StsService {
             let caller_principal = match req.principal.as_ref() {
                 Some(p) => p.clone(),
                 None => Principal {
-                    arn: Arn::global("iam", &req.account_id, "root").to_string(),
+                    arn: Arn::global_in(&req.region, "iam", &req.account_id, "root").to_string(),
                     user_id: req.account_id.clone(),
                     account_id: req.account_id.clone(),
                     principal_type: PrincipalType::Root,
@@ -250,7 +250,9 @@ impl StsService {
                 .principal
                 .as_ref()
                 .map(|p| p.arn.clone())
-                .unwrap_or_else(|| Arn::global("iam", &req.account_id, "root").to_string());
+                .unwrap_or_else(|| {
+                    Arn::global_in(&req.region, "iam", &req.account_id, "root").to_string()
+                });
             return Err(AwsServiceError::aws_error(
                 StatusCode::FORBIDDEN,
                 "AccessDenied",

@@ -7,10 +7,10 @@ use http::StatusCode;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use fakecloud_aws::arn::Arn;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use crate::service::LambdaService;
+use crate::state::{function_arn, qualified_function_arn};
 use crate::state::{
     AccountSettings, AttachedLayer, CodeSigningConfig, EventInvokeConfig, FunctionAlias,
     FunctionScalingConfig, FunctionUrlConfig, LambdaState, Layer, LayerVersion,
@@ -76,7 +76,7 @@ fn body(req: &AwsRequest) -> Value {
 /// function ARNs in this implementation, so non-function ARNs are
 /// rejected by callers as `InvalidParameterValueException`.
 fn function_name_from_arn(arn: &str) -> Option<String> {
-    let rest = arn.strip_prefix("arn:aws:lambda:")?;
+    let rest = fakecloud_aws::arn::arn_resource(arn, "lambda")?;
     let mut parts = rest.splitn(5, ':');
     let _region = parts.next()?;
     let _account = parts.next()?;
@@ -947,10 +947,7 @@ impl LambdaService {
             esm.batch_size = b;
         }
         if let Some(name) = body["FunctionName"].as_str() {
-            esm.function_arn = format!(
-                "arn:aws:lambda:{}:{}:function:{}",
-                req.region, state.account_id, name
-            );
+            esm.function_arn = function_arn(&req.region, &state.account_id, name);
         }
         if let Some(filters) = body
             .get("FilterCriteria")

@@ -413,7 +413,8 @@ fn int_range(
 }
 
 pub(crate) fn arn(region: &str, account: &str, name: &str) -> String {
-    format!("arn:aws:kinesisanalytics:{region}:{account}:application/{name}")
+    let partition = fakecloud_aws::arn::partition_for(region);
+    format!("arn:{partition}:kinesisanalytics:{region}:{account}:application/{name}")
 }
 
 pub(crate) fn new_token() -> String {
@@ -3628,5 +3629,40 @@ mod tests {
         );
         assert_eq!(v["ApplicationSummaries"].as_array().unwrap().len(), 2);
         assert!(v.get("NextToken").is_some());
+    }
+
+    #[test]
+    fn china_region_application_arn_uses_the_aws_cn_partition() {
+        let s = svc();
+        let in_china = |action: &str, body: Value| AwsRequest {
+            region: "cn-north-1".to_string(),
+            ..req(action, body)
+        };
+        let v = body_of(
+            s.create_application(&in_china(
+                "CreateApplication",
+                json!({
+                    "ApplicationName": "cn-app",
+                    "RuntimeEnvironment": "FLINK-1_20",
+                    "ServiceExecutionRole": "arn:aws-cn:iam::000000000000:role/r"
+                }),
+            ))
+            .unwrap(),
+        );
+        let arn = "arn:aws-cn:kinesisanalytics:cn-north-1:000000000000:application/cn-app";
+        assert_eq!(v["ApplicationDetail"]["ApplicationARN"], arn);
+        s.tag_resource(&in_china(
+            "TagResource",
+            json!({ "ResourceARN": arn, "Tags": [{ "Key": "env", "Value": "cn" }] }),
+        ))
+        .unwrap();
+        let tags = body_of(
+            s.list_tags_for_resource(&in_china(
+                "ListTagsForResource",
+                json!({ "ResourceARN": arn }),
+            ))
+            .unwrap(),
+        );
+        assert_eq!(tags["Tags"][0]["Value"], "cn");
     }
 }

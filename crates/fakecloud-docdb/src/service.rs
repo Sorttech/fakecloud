@@ -7,6 +7,7 @@ use chrono::Utc;
 use http::StatusCode;
 use tokio::sync::Mutex as AsyncMutex;
 
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::query::{optional_query_param, query_response_xml, required_query_param};
 use fakecloud_core::query_filters::{
     parse_filters, requested_identifier, sibling_rds_arn, warn_unknown_filters, QueryFilter,
@@ -15,9 +16,9 @@ use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceErr
 use fakecloud_persistence::SnapshotStore;
 
 use crate::state::{
-    ClusterMember, DbCluster, DbClusterParameterGroup, DbClusterSnapshot, DbInstance,
-    DbSubnetGroup, DocDbSnapshot, DocDbState, EventSubscription, GlobalCluster,
-    GlobalClusterMember, ParameterValue, SharedDocDbState, Subnet, Tag,
+    global_cluster_arn, rds_arn, ClusterMember, DbCluster, DbClusterParameterGroup,
+    DbClusterSnapshot, DbInstance, DbSubnetGroup, DocDbSnapshot, DocDbState, EventSubscription,
+    GlobalCluster, GlobalClusterMember, ParameterValue, SharedDocDbState, Subnet, Tag,
     DOCDB_SNAPSHOT_SCHEMA_VERSION,
 };
 use crate::xml;
@@ -322,7 +323,7 @@ fn endpoint_suffix() -> String {
 }
 
 fn cluster_arn(region: &str, account: &str, id: &str) -> String {
-    format!("arn:aws:rds:{region}:{account}:cluster:{id}")
+    rds_arn(region, account, "cluster", id)
 }
 
 /// Collect a Query-protocol list under `base`, trying each candidate member
@@ -853,7 +854,7 @@ impl DocDbService {
         let suffix = endpoint_suffix();
         let instance = DbInstance {
             db_instance_identifier: id.clone(),
-            db_instance_arn: format!("arn:aws:rds:{}:{}:db:{id}", req.region, req.account_id),
+            db_instance_arn: rds_arn(&req.region, &req.account_id, "db", &id),
             db_instance_class: class,
             engine,
             engine_version: optional_query_param(req, "EngineVersion")
@@ -949,8 +950,7 @@ impl DocDbService {
             optional_query_param(req, "NewDBInstanceIdentifier").filter(|n| n != &id)
         {
             inst.db_instance_identifier = new_id.clone();
-            inst.db_instance_arn =
-                format!("arn:aws:rds:{}:{}:db:{new_id}", req.region, req.account_id);
+            inst.db_instance_arn = rds_arn(&req.region, &req.account_id, "db", &new_id);
             st.instances.remove(&id);
             st.instances.insert(new_id, inst.clone());
         } else {
@@ -1040,10 +1040,8 @@ impl DocDbService {
             .ok_or_else(|| snapshot_not_found(&source))?;
         snap.source_db_cluster_snapshot_arn = Some(snap.db_cluster_snapshot_arn.clone());
         snap.db_cluster_snapshot_identifier = target.clone();
-        snap.db_cluster_snapshot_arn = format!(
-            "arn:aws:rds:{}:{}:cluster-snapshot:{target}",
-            req.region, req.account_id
-        );
+        snap.db_cluster_snapshot_arn =
+            rds_arn(&req.region, &req.account_id, "cluster-snapshot", &target);
         snap.snapshot_type = "manual".to_string();
         snap.snapshot_create_time = Utc::now();
         snap.tags = parse_tags(req);
@@ -1316,9 +1314,11 @@ impl DocDbService {
         }
         let group = DbClusterParameterGroup {
             db_cluster_parameter_group_name: name.clone(),
-            db_cluster_parameter_group_arn: format!(
-                "arn:aws:rds:{}:{}:cluster-pg:{name}",
-                req.region, req.account_id
+            db_cluster_parameter_group_arn: rds_arn(
+                &req.region,
+                &req.account_id,
+                "cluster-pg",
+                &name,
             ),
             db_parameter_group_family: family,
             description,
@@ -1354,10 +1354,8 @@ impl DocDbService {
             .cloned()
             .ok_or_else(|| param_group_not_found(&source))?;
         group.db_cluster_parameter_group_name = target.clone();
-        group.db_cluster_parameter_group_arn = format!(
-            "arn:aws:rds:{}:{}:cluster-pg:{target}",
-            req.region, req.account_id
-        );
+        group.db_cluster_parameter_group_arn =
+            rds_arn(&req.region, &req.account_id, "cluster-pg", &target);
         group.description = target_desc;
         group.tags = parse_tags(req);
         st.cluster_parameter_groups.insert(target, group.clone());
@@ -1535,10 +1533,7 @@ impl DocDbService {
             .collect();
         let group = DbSubnetGroup {
             db_subnet_group_name: name.clone(),
-            db_subnet_group_arn: format!(
-                "arn:aws:rds:{}:{}:subgrp:{name}",
-                req.region, req.account_id
-            ),
+            db_subnet_group_arn: rds_arn(&req.region, &req.account_id, "subgrp", &name),
             db_subnet_group_description: description,
             vpc_id: format!("vpc-{}", resource_token()[..12].to_lowercase()),
             subnet_group_status: "Complete".to_string(),
@@ -1703,7 +1698,7 @@ impl DocDbService {
         };
         let global = GlobalCluster {
             global_cluster_identifier: id.clone(),
-            global_cluster_arn: format!("arn:aws:rds::{}:global-cluster:{id}", req.account_id),
+            global_cluster_arn: global_cluster_arn(&req.region, &req.account_id, &id),
             global_cluster_resource_id: format!("cluster-{}", resource_token()),
             status: "available".to_string(),
             engine,
@@ -1748,8 +1743,7 @@ impl DocDbService {
             optional_query_param(req, "NewGlobalClusterIdentifier").filter(|n| n != &id)
         {
             global.global_cluster_identifier = new_id.clone();
-            global.global_cluster_arn =
-                format!("arn:aws:rds::{}:global-cluster:{new_id}", req.account_id);
+            global.global_cluster_arn = global_cluster_arn(&req.region, &req.account_id, &new_id);
             st.global_clusters.remove(&id);
             st.global_clusters.insert(new_id, global.clone());
         } else {
@@ -1930,10 +1924,7 @@ impl DocDbService {
         }
         let sub = EventSubscription {
             subscription_name: name.clone(),
-            event_subscription_arn: format!(
-                "arn:aws:rds:{}:{}:es:{name}",
-                req.region, req.account_id
-            ),
+            event_subscription_arn: rds_arn(&req.region, &req.account_id, "es", &name),
             customer_aws_id: req.account_id.clone(),
             sns_topic_arn: topic,
             status: "active".to_string(),
@@ -2135,11 +2126,18 @@ impl DocDbService {
     // --- read-only catalog ops ---
 
     fn describe_certificates(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
-        let inner = "<Certificates>\
-            <Certificate><CertificateIdentifier>rds-ca-2019</CertificateIdentifier><CertificateType>CA</CertificateType><Thumbprint>0000000000000000000000000000000000000000</Thumbprint><ValidFrom>2019-08-22T17:08:50Z</ValidFrom><ValidTill>2024-08-22T17:08:50Z</ValidTill><CertificateArn>arn:aws:rds:us-east-1::cert:rds-ca-2019</CertificateArn></Certificate>\
-            <Certificate><CertificateIdentifier>rds-ca-rsa2048-g1</CertificateIdentifier><CertificateType>CA</CertificateType><Thumbprint>1111111111111111111111111111111111111111</Thumbprint><ValidFrom>2021-05-25T00:00:00Z</ValidFrom><ValidTill>2061-05-25T00:00:00Z</ValidTill><CertificateArn>arn:aws:rds:us-east-1::cert:rds-ca-rsa2048-g1</CertificateArn></Certificate>\
-            </Certificates>"
-            .to_string();
+        // Certificates carry no account; they are reported in the queried
+        // region and its partition.
+        let cert_arn =
+            |id: &str| Arn::regional("rds", &req.region, "", &format!("cert:{id}")).to_string();
+        let inner = format!(
+            "<Certificates>\
+            <Certificate><CertificateIdentifier>rds-ca-2019</CertificateIdentifier><CertificateType>CA</CertificateType><Thumbprint>0000000000000000000000000000000000000000</Thumbprint><ValidFrom>2019-08-22T17:08:50Z</ValidFrom><ValidTill>2024-08-22T17:08:50Z</ValidTill><CertificateArn>{}</CertificateArn></Certificate>\
+            <Certificate><CertificateIdentifier>rds-ca-rsa2048-g1</CertificateIdentifier><CertificateType>CA</CertificateType><Thumbprint>1111111111111111111111111111111111111111</Thumbprint><ValidFrom>2021-05-25T00:00:00Z</ValidFrom><ValidTill>2061-05-25T00:00:00Z</ValidTill><CertificateArn>{}</CertificateArn></Certificate>\
+            </Certificates>",
+            cert_arn("rds-ca-2019"),
+            cert_arn("rds-ca-rsa2048-g1"),
+        );
         Ok(ok_xml("DescribeCertificates", inner, &req.request_id))
     }
 
@@ -2323,9 +2321,7 @@ fn snapshot_from_cluster(
 ) -> DbClusterSnapshot {
     DbClusterSnapshot {
         db_cluster_snapshot_identifier: snap_id.to_string(),
-        db_cluster_snapshot_arn: format!(
-            "arn:aws:rds:{region}:{account}:cluster-snapshot:{snap_id}"
-        ),
+        db_cluster_snapshot_arn: rds_arn(region, account, "cluster-snapshot", snap_id),
         db_cluster_identifier: c.db_cluster_identifier.clone(),
         status: "available".to_string(),
         engine: c.engine.clone(),

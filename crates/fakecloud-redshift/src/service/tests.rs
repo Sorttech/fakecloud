@@ -870,3 +870,47 @@ fn update_partner_status_existing_partner_persists() {
         "DescribePartners should reflect the updated status: {listed}"
     );
 }
+
+#[test]
+fn china_region_arns_use_the_china_partition_and_resolve_for_tagging() {
+    let svc = service();
+    let in_cn = |action: &str, params: &[(&str, &str)]| {
+        let mut r = req(action, params);
+        r.region = "cn-north-1".to_string();
+        let resp = svc
+            .dispatch(&r)
+            .unwrap_or_else(|e| panic!("{action}: {}", e.code()));
+        body(&resp)
+    };
+    in_cn(
+        "CreateCluster",
+        &[
+            ("ClusterIdentifier", "cnc"),
+            ("NodeType", "ra3.xlplus"),
+            ("MasterUsername", "admin"),
+            ("MasterUserPassword", "Passw0rd123"),
+        ],
+    );
+    let snap = in_cn(
+        "CreateClusterSnapshot",
+        &[("SnapshotIdentifier", "s1"), ("ClusterIdentifier", "cnc")],
+    );
+    assert!(snap.contains(
+        "<SnapshotArn>arn:aws-cn:redshift:cn-north-1:123456789012:snapshot:cnc/s1</SnapshotArn>"
+    ));
+    let arn = "arn:aws-cn:redshift:cn-north-1:123456789012:cluster:cnc";
+    in_cn(
+        "CreateTags",
+        &[
+            ("ResourceName", arn),
+            ("Tags.Tag.1.Key", "team"),
+            ("Tags.Tag.1.Value", "data"),
+        ],
+    );
+    let listed = in_cn("DescribeTags", &[("ResourceName", arn)]);
+    assert!(
+        listed.contains(&format!("<ResourceName>{arn}</ResourceName>")),
+        "{listed}"
+    );
+    assert!(listed.contains("<Key>team</Key>"));
+}

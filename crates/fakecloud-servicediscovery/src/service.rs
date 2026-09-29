@@ -25,6 +25,7 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_persistence::SnapshotStore;
 
@@ -262,8 +263,14 @@ fn new_hosted_zone_id() -> String {
     format!("Z{}", rand_frag(21).to_uppercase())
 }
 
-fn namespace_arn(region: &str, account: &str, id: &str) -> String {
-    format!("arn:aws:servicediscovery:{region}:{account}:namespace/{id}")
+pub fn namespace_arn(region: &str, account: &str, id: &str) -> String {
+    Arn::regional(
+        "servicediscovery",
+        region,
+        account,
+        &format!("namespace/{id}"),
+    )
+    .to_string()
 }
 
 /// `srv-...` service id (AWS uses a lowercase alphanumeric suffix).
@@ -271,8 +278,14 @@ fn new_service_id() -> String {
     format!("srv-{}", rand_frag(17))
 }
 
-fn service_arn(region: &str, account: &str, id: &str) -> String {
-    format!("arn:aws:servicediscovery:{region}:{account}:service/{id}")
+pub fn service_arn(region: &str, account: &str, id: &str) -> String {
+    Arn::regional(
+        "servicediscovery",
+        region,
+        account,
+        &format!("service/{id}"),
+    )
+    .to_string()
 }
 
 /// Cloud Map accepts either a bare resource id (`ns-...`/`srv-...`) or a full
@@ -2329,6 +2342,51 @@ mod tests {
         assert_eq!(ns_service_count(&s, &ns_id), 0);
         let err = expect_err(s.get_service(&req("GetService", json!({ "Id": srv_id }))));
         assert_eq!(err.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn namespace_arn_carries_china_partition() {
+        let s = svc();
+        let cn = |action: &str, body: Value| {
+            let mut r = req(action, body);
+            r.region = "cn-north-1".to_string();
+            r
+        };
+        let resp = s
+            .create_http_namespace(&cn("CreateHttpNamespace", json!({ "Name": "cnns" })))
+            .unwrap();
+        let op_id = body_of(&resp)["OperationId"].as_str().unwrap().to_string();
+        let resp = s
+            .get_operation(&cn("GetOperation", json!({ "OperationId": op_id })))
+            .unwrap();
+        let ns_id = body_of(&resp)["Operation"]["Targets"]["NAMESPACE"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let resp = s
+            .get_namespace(&cn("GetNamespace", json!({ "Id": ns_id })))
+            .unwrap();
+        let ns_arn = body_of(&resp)["Namespace"]["Arn"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            ns_arn,
+            format!("arn:aws-cn:servicediscovery:cn-north-1:000000000000:namespace/{ns_id}")
+        );
+        let resp = s
+            .create_service(&cn(
+                "CreateService",
+                json!({ "Name": "s1", "NamespaceId": ns_arn }),
+            ))
+            .unwrap();
+        let svc_arn = body_of(&resp)["Service"]["Arn"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            svc_arn.starts_with("arn:aws-cn:servicediscovery:cn-north-1:000000000000:service/srv-")
+        );
     }
 
     #[test]

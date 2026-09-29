@@ -2736,3 +2736,70 @@ async fn only_the_most_recently_demoted_ca_is_the_rollback_target() {
         .collect();
     assert_eq!(in_use, vec![c.as_str()]);
 }
+
+#[tokio::test]
+async fn china_region_arns_use_the_aws_cn_partition() {
+    let svc = EksService::new(make_state());
+    let in_china = |method: Method, path: &str, body: &str| {
+        let mut r = make_request(method, path, body);
+        r.region = "cn-north-1".to_string();
+        r
+    };
+    let body_of =
+        |resp: AwsResponse| -> Value { serde_json::from_slice(resp.body.expect_bytes()).unwrap() };
+
+    let v = body_of(
+        svc.handle(in_china(Method::POST, "/clusters", &create_body("cn")))
+            .await
+            .unwrap(),
+    );
+    let arn = v["cluster"]["arn"].as_str().unwrap().to_string();
+    assert_eq!(arn, "arn:aws-cn:eks:cn-north-1:111122223333:cluster/cn");
+
+    let encoded = url_encode(&arn);
+    svc.handle(in_china(
+        Method::POST,
+        &format!("/tags/{encoded}"),
+        &json!({ "tags": { "env": "cn" } }).to_string(),
+    ))
+    .await
+    .unwrap();
+    let v = body_of(
+        svc.handle(in_china(Method::GET, &format!("/tags/{encoded}"), ""))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(v["tags"]["env"], "cn");
+
+    let v = body_of(
+        svc.handle(in_china(
+            Method::POST,
+            "/clusters/cn/access-entries",
+            &json!({ "principalArn": "arn:aws-cn:iam::111122223333:role/dev" }).to_string(),
+        ))
+        .await
+        .unwrap(),
+    );
+    assert!(v["accessEntry"]["accessEntryArn"]
+        .as_str()
+        .unwrap()
+        .starts_with("arn:aws-cn:eks:cn-north-1:111122223333:access-entry/cn/role/"));
+    assert_eq!(
+        v["accessEntry"]["username"],
+        "arn:aws-cn:sts::{{AccountID}}:assumed-role/dev/{{SessionName}}"
+    );
+
+    let v = body_of(
+        svc.handle(in_china(Method::GET, "/access-policies", ""))
+            .await
+            .unwrap(),
+    );
+    assert!(v["accessPolicies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|p| p["arn"]
+            .as_str()
+            .unwrap()
+            .starts_with("arn:aws-cn:eks::aws:cluster-access-policy/")));
+}
