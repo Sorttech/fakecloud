@@ -485,22 +485,9 @@ pub async fn dispatch(
     // sees a uniform path-style request. SigV4 verification above already
     // ran against the wire path, so this rewrite is signature-safe.
     let wire_path = parts.uri.path();
-    let path = if detected.service == "s3" {
-        if let Some(bucket) = host_info.as_ref().and_then(|h| h.bucket.as_deref()) {
-            let prefix_with_slash = format!("/{bucket}/");
-            let is_bucket_root = wire_path.trim_end_matches('/') == format!("/{bucket}");
-            if wire_path.starts_with(&prefix_with_slash) || is_bucket_root {
-                wire_path.to_string()
-            } else if wire_path == "/" || wire_path.is_empty() {
-                format!("/{bucket}")
-            } else {
-                format!("/{bucket}{wire_path}")
-            }
-        } else {
-            wire_path.to_string()
-        }
-    } else {
-        wire_path.to_string()
+    let path = match host_info.as_ref().and_then(|h| h.bucket.as_deref()) {
+        Some(bucket) if detected.service == "s3" => virtual_hosted_s3_path(bucket, wire_path),
+        _ => wire_path.to_string(),
     };
     let raw_query = parts.uri.query().unwrap_or("").to_string();
     let path_segments: Vec<String> = path
@@ -1413,6 +1400,19 @@ fn sha256_hex_lower(bytes: &[u8]) -> String {
     out
 }
 
+/// Rewrite a virtual-hosted-style S3 request path (bucket in the `Host`) to
+/// the path-style form the S3 handler routes on. The whole wire path is the
+/// object key, so it is always prefixed with the bucket: on
+/// `docs.s3.<region>.amazonaws.com`, `GET /docs/intro.html` addresses the key
+/// `docs/intro.html`, not `intro.html`.
+fn virtual_hosted_s3_path(bucket: &str, wire_path: &str) -> String {
+    if wire_path == "/" || wire_path.is_empty() {
+        format!("/{bucket}")
+    } else {
+        format!("/{bucket}{wire_path}")
+    }
+}
+
 fn anonymous_s3_bucket(uri: &http::Uri, config: &DispatchConfig) -> Option<String> {
     let provider = config.resource_policy_provider.as_ref()?;
     let segment = uri.path().split('/').find(|s| !s.is_empty())?.to_string();
@@ -1995,6 +1995,25 @@ mod tests {
             streaming_route(&http::Method::PUT, "/my-bucket", &headers, &HashMap::new(),),
             None,
         );
+    }
+
+    #[test]
+    fn virtual_hosted_s3_path_prefixes_the_bucket() {
+        assert_eq!(virtual_hosted_s3_path("b", "/"), "/b");
+        assert_eq!(virtual_hosted_s3_path("b", ""), "/b");
+        assert_eq!(virtual_hosted_s3_path("b", "/k.txt"), "/b/k.txt");
+        assert_eq!(virtual_hosted_s3_path("a.b", "/dir/k"), "/a.b/dir/k");
+    }
+
+    #[test]
+    fn virtual_hosted_s3_path_keeps_a_key_that_starts_with_the_bucket_name() {
+        // The wire path is the whole key on a virtual-hosted request, so a key
+        // whose first segment equals the bucket name must keep it.
+        assert_eq!(
+            virtual_hosted_s3_path("docs", "/docs/intro.html"),
+            "/docs/docs/intro.html"
+        );
+        assert_eq!(virtual_hosted_s3_path("docs", "/docs"), "/docs/docs");
     }
 
     #[test]
