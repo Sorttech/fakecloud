@@ -283,9 +283,10 @@ pub(crate) async fn test_invoke_authorizer_eval(
             // TestInvokeAuthorizer has no concrete method; build a wildcard
             // method ARN against the API so the returned policy can be
             // evaluated for clientStatus.
-            let method_arn = format!(
-                "arn:aws:execute-api:{}:{}:{}/*/*/*",
-                synthetic.region, synthetic.account_id, api_id,
+            let method_arn = crate::state::execute_api_arn(
+                &synthetic.region,
+                &synthetic.account_id,
+                &format!("{api_id}/*/*/*"),
             );
             let event = if authorizer.authorizer_type == "TOKEN" {
                 json!({
@@ -452,14 +453,13 @@ pub(super) fn build_method_arn(
     resource_path: &str,
 ) -> String {
     let trimmed = resource_path.trim_start_matches('/');
-    format!(
-        "arn:aws:execute-api:{}:{}:{}/{}/{}/{}",
-        req.region,
-        req.account_id,
-        api_id,
-        stage,
-        req.method.as_str().to_uppercase(),
-        trimmed,
+    crate::state::execute_api_arn(
+        &req.region,
+        &req.account_id,
+        &format!(
+            "{api_id}/{stage}/{}/{trimmed}",
+            req.method.as_str().to_uppercase()
+        ),
     )
 }
 

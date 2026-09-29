@@ -15,6 +15,7 @@ use serde_json::{json, Map, Value};
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_persistence::SnapshotStore;
 
@@ -142,6 +143,7 @@ fn dispatch(s: &CeService, req: &AwsRequest) -> Result<AwsResponse, AwsServiceEr
     validate_input(req.action.as_str(), &b)?;
     let ctx = Ctx {
         account: req.account_id.clone(),
+        region: req.region.clone(),
     };
     match req.action.as_str() {
         // anomaly monitors
@@ -214,6 +216,7 @@ fn dispatch(s: &CeService, req: &AwsRequest) -> Result<AwsResponse, AwsServiceEr
 /// service, so its ARNs carry an empty region segment.
 struct Ctx {
     account: String,
+    region: String,
 }
 
 fn ok(v: Value) -> Result<AwsResponse, AwsServiceError> {
@@ -299,16 +302,34 @@ fn new_uuid() -> String {
     Uuid::new_v4().to_string()
 }
 
-fn monitor_arn(account: &str) -> String {
-    format!("arn:aws:ce::{account}:anomalymonitor/{}", new_uuid())
+fn monitor_arn(ctx: &Ctx) -> String {
+    Arn::global_in(
+        &ctx.region,
+        "ce",
+        &ctx.account,
+        &format!("anomalymonitor/{}", new_uuid()),
+    )
+    .to_string()
 }
 
-fn subscription_arn(account: &str) -> String {
-    format!("arn:aws:ce::{account}:anomalysubscription/{}", new_uuid())
+fn subscription_arn(ctx: &Ctx) -> String {
+    Arn::global_in(
+        &ctx.region,
+        "ce",
+        &ctx.account,
+        &format!("anomalysubscription/{}", new_uuid()),
+    )
+    .to_string()
 }
 
-fn cost_category_arn(account: &str) -> String {
-    format!("arn:aws:ce::{account}:costcategory/{}", new_uuid())
+fn cost_category_arn(ctx: &Ctx) -> String {
+    Arn::global_in(
+        &ctx.region,
+        "ce",
+        &ctx.account,
+        &format!("costcategory/{}", new_uuid()),
+    )
+    .to_string()
 }
 
 /// Start/End bounds of an input `DateInterval`, defaulting when absent so the
@@ -461,7 +482,7 @@ fn store_resource_tags(data: &mut CeData, key: &str, b: &Value) {
 impl CeService {
     fn create_anomaly_monitor(&self, ctx: &Ctx, b: &Value) -> Result<AwsResponse, AwsServiceError> {
         req_present(b, "AnomalyMonitor")?;
-        let arn = monitor_arn(&ctx.account);
+        let arn = monitor_arn(ctx);
         let mut mon = b
             .get("AnomalyMonitor")
             .and_then(Value::as_object)
@@ -543,7 +564,7 @@ impl CeService {
         b: &Value,
     ) -> Result<AwsResponse, AwsServiceError> {
         req_present(b, "AnomalySubscription")?;
-        let arn = subscription_arn(&ctx.account);
+        let arn = subscription_arn(ctx);
         let mut sub = b
             .get("AnomalySubscription")
             .and_then(Value::as_object)
@@ -729,7 +750,7 @@ impl CeService {
         req_str(b, "Name")?;
         req_str(b, "RuleVersion")?;
         req_present(b, "Rules")?;
-        let arn = cost_category_arn(&ctx.account);
+        let arn = cost_category_arn(ctx);
         let effective_start = opt_str(b, "EffectiveStart")
             .map(str::to_string)
             .unwrap_or_else(now_zoned);

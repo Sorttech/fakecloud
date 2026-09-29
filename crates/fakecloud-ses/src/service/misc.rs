@@ -10,6 +10,9 @@ use crate::state::{
     SubscribedDomain, Tenant, TenantResourceAssociation, VdmRecommendation,
 };
 
+use super::helpers::{
+    custom_verification_email_template_arn, dedicated_ip_pool_arn, identity_arn, tenant_arn,
+};
 use super::SesV2Service;
 
 impl SesV2Service {
@@ -240,10 +243,8 @@ impl SesV2Service {
         // rather than merge so a Create after Delete (or a Create that
         // omits Tags) doesn't inherit stale entries from a previous
         // incarnation of the ARN.
-        let arn = format!(
-            "arn:aws:ses:{}:{}:custom-verification-email-template/{}",
-            req.region, req.account_id, template_name
-        );
+        let arn =
+            custom_verification_email_template_arn(&req.region, &req.account_id, &template_name);
         if let Some(tags_arr) = body["Tags"].as_array() {
             let mut tag_map = std::collections::BTreeMap::new();
             for tag in tags_arr {
@@ -287,10 +288,7 @@ impl SesV2Service {
             "FailureRedirectionURL": tmpl.failure_redirection_url,
         });
 
-        let arn = format!(
-            "arn:aws:ses:{}:{}:custom-verification-email-template/{}",
-            req.region, req.account_id, name
-        );
+        let arn = custom_verification_email_template_arn(&req.region, &req.account_id, name);
         if let Some(tag_map) = state.tags.get(&arn) {
             response["Tags"] =
                 Value::Array(fakecloud_core::tags::tags_to_json(tag_map, "Key", "Value"));
@@ -420,10 +418,7 @@ impl SesV2Service {
             ));
         }
 
-        let arn = format!(
-            "arn:aws:ses:{}:{}:custom-verification-email-template/{}",
-            req.region, req.account_id, name
-        );
+        let arn = custom_verification_email_template_arn(&req.region, &req.account_id, name);
         state.tags.remove(&arn);
 
         Ok(AwsResponse::json(StatusCode::OK, "{}"))
@@ -572,10 +567,7 @@ impl SesV2Service {
 
         // Persist create-time Tags under the pool ARN so ListTagsForResource
         // returns them, matching the other taggable SESv2 resources.
-        let arn = format!(
-            "arn:aws:ses:{}:{}:dedicated-ip-pool/{}",
-            req.region, req.account_id, pool_name
-        );
+        let arn = dedicated_ip_pool_arn(&req.region, &req.account_id, &pool_name);
         if let Some(tags_arr) = body["Tags"].as_array() {
             let mut tag_map = std::collections::BTreeMap::new();
             for tag in tags_arr {
@@ -1422,10 +1414,7 @@ impl SesV2Service {
         }
 
         let tenant_id = uuid::Uuid::new_v4().to_string();
-        let tenant_arn = format!(
-            "arn:aws:ses:{}:{}:tenant/{}",
-            req.region, req.account_id, tenant_id
-        );
+        let tenant_arn = tenant_arn(&req.region, &req.account_id, &tenant_id);
         let now = Utc::now();
 
         let tags = body
@@ -2532,10 +2521,7 @@ impl SesV2Service {
             // schema.
             let now = Utc::now();
             state.vdm_recommendations.push(VdmRecommendation {
-                resource_arn: format!(
-                    "arn:aws:ses:{}:{}:identity/example.com",
-                    req.region, req.account_id
-                ),
+                resource_arn: identity_arn(&req.region, &req.account_id, "example.com"),
                 recommendation_type: "DKIM".to_string(),
                 description: "Configure DKIM signing for identity to improve deliverability."
                     .to_string(),

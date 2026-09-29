@@ -12,8 +12,8 @@ pub mod websocket_dispatch;
 
 pub use service::ApiGatewayV2Service;
 pub use state::{
-    AccessLogSettings, ApiGatewayV2Snapshot, ApiGatewayV2State, Authorizer, ConnectionInfo,
-    CorsConfiguration, Deployment, HttpApi, Integration, JwtConfiguration, Route,
-    SharedApiGatewayV2State, SharedWebSocketRegistry, Stage, WebSocketRegistry,
-    APIGATEWAYV2_SNAPSHOT_SCHEMA_VERSION,
+    apigateway_arn, execute_api_arn, AccessLogSettings, ApiGatewayV2Snapshot, ApiGatewayV2State,
+    Authorizer, ConnectionInfo, CorsConfiguration, Deployment, HttpApi, Integration,
+    JwtConfiguration, Route, SharedApiGatewayV2State, SharedWebSocketRegistry, Stage,
+    WebSocketRegistry, APIGATEWAYV2_SNAPSHOT_SCHEMA_VERSION,
 };

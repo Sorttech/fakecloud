@@ -133,7 +133,7 @@ test('enqueue and process', async () => {
 afterEach(() => fc.reset());
 ```
 
-SDKs available in TypeScript, Python, Go, PHP, Java, Rust.
+SDKs available in TypeScript, Python, Go, PHP, Java, Rust, .NET.
 
 ## How it differs from alternatives
 

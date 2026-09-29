@@ -14,6 +14,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::multi_account::{AccountState, MultiAccountState};
 
 pub const DMS_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
@@ -92,6 +93,12 @@ impl AccountState for DmsData {
     fn new_for_account(_account_id: &str, _region: &str, _endpoint: &str) -> Self {
         Self::default()
     }
+}
+
+/// A DMS ARN (`arn:<partition>:dms:<region>:<account>:<kind>:<id>`), in the
+/// region's partition.
+pub fn dms_arn(region: &str, account: &str, kind: &str, id: &str) -> String {
+    Arn::regional("dms", region, account, &format!("{kind}:{id}")).to_string()
 }
 
 pub type SharedDmsState = Arc<RwLock<MultiAccountState<DmsData>>>;

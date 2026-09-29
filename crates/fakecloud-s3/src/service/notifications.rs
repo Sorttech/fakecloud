@@ -463,7 +463,7 @@ pub(crate) fn build_s3_event_notification(
         "bucket": {
             "name": event.bucket_name,
             "ownerIdentity": { "principalId": owner_account },
-            "arn": Arn::s3(event.bucket_name).to_string()
+            "arn": Arn::s3_in(event.region, event.bucket_name).to_string()
         },
         "object": object
     });

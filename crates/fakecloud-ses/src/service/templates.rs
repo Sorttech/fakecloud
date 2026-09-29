@@ -9,6 +9,7 @@ use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 use crate::state::EmailTemplate;
 use crate::state::SesState;
 
+use super::helpers::template_arn;
 use super::SesV2Service;
 
 impl SesV2Service {
@@ -67,10 +68,7 @@ impl SesV2Service {
         // on Create is a real input-drop bug. Replace rather than merge
         // so a Create after Delete (or a Create that omits Tags) doesn't
         // inherit stale entries from a previous incarnation of the ARN.
-        let arn = format!(
-            "arn:aws:ses:{}:{}:template/{}",
-            req.region, req.account_id, template_name
-        );
+        let arn = template_arn(&req.region, &req.account_id, &template_name);
         if let Some(tags_arr) = body["Tags"].as_array() {
             let mut tag_map = std::collections::BTreeMap::new();
             for tag in tags_arr {
@@ -139,10 +137,7 @@ impl SesV2Service {
             },
         });
 
-        let arn = format!(
-            "arn:aws:ses:{}:{}:template/{}",
-            req.region, req.account_id, name
-        );
+        let arn = template_arn(&req.region, &req.account_id, name);
         if let Some(tag_map) = state.tags.get(&arn) {
             response["Tags"] =
                 Value::Array(fakecloud_core::tags::tags_to_json(tag_map, "Key", "Value"));
@@ -200,10 +195,7 @@ impl SesV2Service {
             ));
         }
 
-        let arn = format!(
-            "arn:aws:ses:{}:{}:template/{}",
-            req.region, req.account_id, name
-        );
+        let arn = template_arn(&req.region, &req.account_id, name);
         state.tags.remove(&arn);
 
         Ok(AwsResponse::json(StatusCode::OK, "{}"))

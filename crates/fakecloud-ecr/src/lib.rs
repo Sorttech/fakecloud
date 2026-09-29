@@ -9,7 +9,8 @@ pub(crate) mod state;
 pub use lifecycle_ticker::LifecycleTicker;
 pub use service::{evaluate_lifecycle_policy, EcrService};
 pub use state::{
-    EcrSnapshot, EcrState, Image, PullThroughCacheRule, RegistryScanningConfiguration,
-    RegistryScanningRule, ReplicationConfiguration, ReplicationDestination, ReplicationRule,
-    Repository, RepositoryFilter, SharedEcrState, ECR_SNAPSHOT_SCHEMA_VERSION,
+    repository_arn, EcrSnapshot, EcrState, Image, PullThroughCacheRule,
+    RegistryScanningConfiguration, RegistryScanningRule, ReplicationConfiguration,
+    ReplicationDestination, ReplicationRule, Repository, RepositoryFilter, SharedEcrState,
+    ECR_SNAPSHOT_SCHEMA_VERSION,
 };

@@ -423,7 +423,8 @@ fn resolve_policy_target_mut<'a>(
                 StatusCode::NOT_FOUND,
                 "ResourceNotFoundException",
                 format!(
-                    "Function not found: arn:aws:lambda:{region}:{account_id}:function:{function_name}"
+                    "Function not found: {}",
+                    function_arn(region, &account_id, function_name)
                 ),
             )
         }),
@@ -436,7 +437,8 @@ fn resolve_policy_target_mut<'a>(
                     StatusCode::NOT_FOUND,
                     "ResourceNotFoundException",
                     format!(
-                        "Function not found: arn:aws:lambda:{region}:{account_id}:function:{function_name}:{v}"
+                        "Function not found: {}:{v}",
+                        function_arn(region, &account_id, function_name)
                     ),
                 )
             }),
@@ -457,8 +459,8 @@ fn resolve_policy_target_ref<'a>(
                 StatusCode::NOT_FOUND,
                 "ResourceNotFoundException",
                 format!(
-                    "Function not found: arn:aws:lambda:{}:{}:function:{}",
-                    region, state.account_id, function_name
+                    "Function not found: {}",
+                    function_arn(region, &state.account_id, function_name)
                 ),
             )
         }),
@@ -471,8 +473,8 @@ fn resolve_policy_target_ref<'a>(
                     StatusCode::NOT_FOUND,
                     "ResourceNotFoundException",
                     format!(
-                        "Function not found: arn:aws:lambda:{}:{}:function:{}:{v}",
-                        region, state.account_id, function_name
+                        "Function not found: {}:{v}",
+                        function_arn(region, &state.account_id, function_name)
                     ),
                 )
             }),

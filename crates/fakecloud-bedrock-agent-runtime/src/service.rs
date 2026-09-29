@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 
+use crate::arns::{flow_execution_arn, flow_execution_role_arn, session_arn};
 use crate::state::{
     FlowExecution, InvocationRecord, InvocationStep, Session, SessionInvocation,
     SharedBedrockAgentRuntimeState,
@@ -462,33 +463,6 @@ fn merge_path_params(body: Value, path_params: &[(String, String)]) -> Value {
     Value::Object(out)
 }
 
-fn session_arn(account_id: &str, region: &str, session_id: &str) -> String {
-    format!(
-        "arn:aws:bedrock:{}:{}:session/{}",
-        if region.is_empty() {
-            "us-east-1"
-        } else {
-            region
-        },
-        account_id,
-        session_id
-    )
-}
-
-fn flow_execution_arn(account_id: &str, region: &str, flow_id: &str, execution_id: &str) -> String {
-    format!(
-        "arn:aws:bedrock:{}:{}:flow/{}/execution/{}",
-        if region.is_empty() {
-            "us-east-1"
-        } else {
-            region
-        },
-        account_id,
-        flow_id,
-        execution_id
-    )
-}
-
 #[async_trait]
 impl AwsService for BedrockAgentRuntimeService {
     fn service_name(&self) -> &'static str {
@@ -708,7 +682,7 @@ async fn handle_invoke_flow(
         )?;
     }
 
-    let flow_id = flow_id.unwrap();
+    let flow_id = bare_flow_id(&flow_id.unwrap()).to_string();
     let execution_id = uuid::Uuid::new_v4().to_string();
     let input = req_str(body, "input").unwrap_or_default();
 
@@ -723,8 +697,8 @@ async fn handle_invoke_flow(
             FlowExecution {
                 execution_id: execution_id.clone(),
                 execution_arn: flow_execution_arn(
-                    &req.account_id,
                     &req.region,
+                    &req.account_id,
                     &flow_id,
                     &execution_id,
                 ),
@@ -1124,7 +1098,7 @@ async fn handle_create_session(
     let session_id = uuid::Uuid::new_v4().to_string();
     // Force into UUID format
     let now = Utc::now();
-    let arn = session_arn(&req.account_id, &req.region, &session_id);
+    let arn = session_arn(&req.region, &req.account_id, &session_id);
 
     let metadata: std::collections::BTreeMap<String, String> = body
         .get("sessionMetadata")
@@ -1853,7 +1827,7 @@ async fn handle_list_flow_executions(
     }
     validate_int_range(extract_int(req, body, "maxResults"), "maxResults", 1, 1000)?;
     validate_next_token(req, body)?;
-    let flow_id = flow_id.unwrap();
+    let flow_id = bare_flow_id(&flow_id.unwrap()).to_string();
 
     let accts = svc.state.read();
     let summaries: Vec<Value> = accts
@@ -1922,10 +1896,10 @@ async fn handle_start_flow_execution(
         )?;
     }
 
-    let flow_id = flow_id.unwrap();
+    let flow_id = bare_flow_id(&flow_id.unwrap()).to_string();
     let flow_alias_id = flow_alias_id.unwrap();
     let execution_id = uuid::Uuid::new_v4().to_string();
-    let arn = flow_execution_arn(&req.account_id, &req.region, &flow_id, &execution_id);
+    let arn = flow_execution_arn(&req.region, &req.account_id, &flow_id, &execution_id);
     let now = Utc::now();
 
     {
@@ -2001,7 +1975,7 @@ async fn handle_stop_flow_execution(
     } else {
         // Allow stop on unknown execution: still return Aborted with synthetic ARN
         (
-            flow_execution_arn(&req.account_id, &req.region, "unknown", &exec_id),
+            flow_execution_arn(&req.region, &req.account_id, "unknown", &exec_id),
             "Aborted".to_string(),
         )
     };
@@ -2045,13 +2019,10 @@ async fn handle_get_execution_flow_snapshot(
         true,
     )?;
 
-    let flow_id = flow_id.unwrap();
+    let flow_id = bare_flow_id(&flow_id.unwrap()).to_string();
     let flow_alias_id = flow_alias_id.unwrap();
 
-    let role_arn = format!(
-        "arn:aws:iam::{}:role/service-role/AmazonBedrockExecutionRoleForFlow_{}",
-        req.account_id, flow_id
-    );
+    let role_arn = flow_execution_role_arn(&req.region, &req.account_id, &flow_id);
 
     let definition = serde_json::to_string(&json!({
         "nodes": [
@@ -2072,6 +2043,14 @@ async fn handle_get_execution_flow_snapshot(
         "executionRoleArn": role_arn,
         "definition": definition,
     })))
+}
+
+/// The bare flow id a `flowIdentifier` names: the identifier itself, or the id
+/// inside a flow ARN (`arn:<partition>:bedrock:<region>:<account>:flow/<id>`).
+fn bare_flow_id(identifier: &str) -> &str {
+    fakecloud_aws::arn::arn_resource(identifier, "bedrock")
+        .and_then(|rest| rest.split_once(":flow/"))
+        .map_or(identifier, |(_, id)| id.split('/').next().unwrap_or(id))
 }
 
 // ── Other handlers ──────────────────────────────────────────────────
@@ -2376,4 +2355,140 @@ async fn handle_list_tags_for_resource(
         .unwrap_or_default();
 
     Ok(AwsResponse::ok_json(json!({ "tags": tags })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::BedrockAgentRuntimeAccounts;
+    use http::HeaderMap;
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+
+    fn cn_request() -> AwsRequest {
+        AwsRequest {
+            service: "bedrock-agent-runtime".to_string(),
+            action: String::new(),
+            region: "cn-north-1".to_string(),
+            account_id: "123456789012".to_string(),
+            request_id: "test-id".to_string(),
+            headers: HeaderMap::new(),
+            query_params: HashMap::new(),
+            body: Default::default(),
+            body_stream: parking_lot::Mutex::new(None),
+            path_segments: Vec::new(),
+            raw_path: String::new(),
+            raw_query: String::new(),
+            method: Method::POST,
+            is_query_protocol: false,
+            access_key_id: None,
+            principal: None,
+        }
+    }
+
+    fn body(resp: AwsResponse) -> Value {
+        serde_json::from_slice(resp.body.expect_bytes()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn china_region_session_arn_round_trips() {
+        let svc = BedrockAgentRuntimeService::new(Arc::new(RwLock::new(
+            BedrockAgentRuntimeAccounts::new(),
+        )));
+        let req = cn_request();
+        let created = body(handle_create_session(&svc, &req, &json!({})).await.unwrap());
+        let arn = created["sessionArn"].as_str().unwrap();
+        assert!(
+            arn.starts_with("arn:aws-cn:bedrock:cn-north-1:123456789012:session/"),
+            "{arn}"
+        );
+
+        let got = body(
+            handle_get_session(&svc, &req, &json!({"sessionIdentifier": arn}))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(got["sessionId"], created["sessionId"]);
+    }
+
+    #[tokio::test]
+    async fn flow_snapshot_role_uses_the_region_partition_and_bare_flow_id() {
+        let svc = BedrockAgentRuntimeService::new(Arc::new(RwLock::new(
+            BedrockAgentRuntimeAccounts::new(),
+        )));
+        let snapshot = body(
+            handle_get_execution_flow_snapshot(
+                &svc,
+                &cn_request(),
+                &json!({
+                    "flowIdentifier": "arn:aws-cn:bedrock:cn-north-1:123456789012:flow/ABCDEFGHIJ",
+                    "flowAliasIdentifier": "TSTALIASID",
+                    "executionIdentifier": "exec-1",
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(snapshot["flowIdentifier"], "ABCDEFGHIJ");
+        assert_eq!(
+            snapshot["executionRoleArn"],
+            "arn:aws-cn:iam::123456789012:role/service-role/AmazonBedrockExecutionRoleForFlow_ABCDEFGHIJ"
+        );
+    }
+
+    #[tokio::test]
+    async fn flow_arn_identifier_yields_a_flat_execution_arn() {
+        let svc = BedrockAgentRuntimeService::new(Arc::new(RwLock::new(
+            BedrockAgentRuntimeAccounts::new(),
+        )));
+        let flow_arn = "arn:aws-cn:bedrock:cn-north-1:123456789012:flow/ABCDEFGHIJ";
+        let expected_prefix =
+            "arn:aws-cn:bedrock:cn-north-1:123456789012:flow/ABCDEFGHIJ/execution/";
+
+        let started = body(
+            handle_start_flow_execution(
+                &svc,
+                &cn_request(),
+                &json!({
+                    "flowIdentifier": flow_arn,
+                    "flowAliasIdentifier": "TSTALIASID",
+                    "inputs": [],
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        let arn = started["executionArn"].as_str().unwrap();
+        assert!(arn.starts_with(expected_prefix), "{arn}");
+
+        let listed = body(
+            handle_list_flow_executions(&svc, &cn_request(), &json!({"flowIdentifier": flow_arn}))
+                .await
+                .unwrap(),
+        );
+        let summaries = listed["flowExecutionSummaries"].as_array().unwrap();
+        assert_eq!(summaries.len(), 1, "{listed}");
+        assert_eq!(summaries[0]["flowIdentifier"], "ABCDEFGHIJ");
+
+        handle_invoke_flow(
+            &svc,
+            &cn_request(),
+            &json!({
+                "flowIdentifier": flow_arn,
+                "flowAliasIdentifier": "TSTALIASID",
+                "inputs": [],
+            }),
+        )
+        .await
+        .unwrap();
+        let accts = svc.state.read();
+        for exec in accts.accounts["123456789012"].flow_executions.values() {
+            assert_eq!(exec.flow_id, "ABCDEFGHIJ");
+            assert!(
+                exec.execution_arn.starts_with(expected_prefix),
+                "{}",
+                exec.execution_arn
+            );
+        }
+    }
 }

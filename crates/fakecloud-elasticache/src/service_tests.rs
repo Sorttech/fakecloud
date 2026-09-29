@@ -3081,6 +3081,47 @@ fn subnet_group_create_describe_delete() {
     .unwrap();
 }
 
+#[test]
+fn china_subnet_group_arn_uses_the_china_partition_and_is_taggable() {
+    let shared = std::sync::Arc::new(parking_lot::RwLock::new(
+        fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+    ));
+    let svc = ElastiCacheService::new(shared);
+    let in_cn = |action: &str, params: &[(&str, &str)]| {
+        let mut r = request(action, params);
+        r.region = "cn-north-1".to_string();
+        r
+    };
+    let resp = svc
+        .create_cache_subnet_group(&in_cn(
+            "CreateCacheSubnetGroup",
+            &[
+                ("CacheSubnetGroupName", "cn-sn"),
+                ("CacheSubnetGroupDescription", "desc"),
+                ("SubnetIds.SubnetIdentifier.1", "subnet-123"),
+            ],
+        ))
+        .unwrap();
+    let xml = std::str::from_utf8(resp.body.expect_bytes()).unwrap();
+    let arn = "arn:aws-cn:elasticache:cn-north-1:123456789012:subnetgroup:cn-sn";
+    assert!(xml.contains(&format!("<ARN>{arn}</ARN>")), "{xml}");
+
+    svc.add_tags_to_resource(&in_cn(
+        "AddTagsToResource",
+        &[
+            ("ResourceName", arn),
+            ("Tags.Tag.1.Key", "team"),
+            ("Tags.Tag.1.Value", "cache"),
+        ],
+    ))
+    .unwrap();
+    let resp = svc
+        .list_tags_for_resource(&in_cn("ListTagsForResource", &[("ResourceName", arn)]))
+        .unwrap();
+    let xml = std::str::from_utf8(resp.body.expect_bytes()).unwrap();
+    assert!(xml.contains("<Key>team</Key>"), "{xml}");
+}
+
 // ── Global replication group operations ──
 
 #[test]

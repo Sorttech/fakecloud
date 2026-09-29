@@ -2279,7 +2279,11 @@ pub(crate) fn parse_log_group_arn(arn: &str) -> Option<(String, String, String)>
     let account = parts.next()?;
     let p5 = parts.next()?;
     let group_with_optional_suffix = parts.next()?;
-    if p0 != "arn" || p1 != "aws" || p2 != "logs" || p5 != "log-group" {
+    if p0 != "arn"
+        || !fakecloud_aws::arn::PARTITIONS.contains(&p1)
+        || p2 != "logs"
+        || p5 != "log-group"
+    {
         return None;
     }
     // Trim a trailing `:*` if the caller used the wildcard form.
@@ -2318,6 +2322,18 @@ mod log_arn_tests {
     fn rejects_non_logs_arn() {
         assert!(parse_log_group_arn("arn:aws:s3:::my-bucket").is_none());
         assert!(parse_log_group_arn("not-an-arn").is_none());
+    }
+
+    #[test]
+    fn parses_china_partition_arn() {
+        let parsed =
+            parse_log_group_arn("arn:aws-cn:logs:cn-north-1:000000000000:log-group:/route53/qlog")
+                .unwrap();
+        assert_eq!(parsed.1, "cn-north-1");
+        assert_eq!(parsed.2, "/route53/qlog");
+        assert!(
+            parse_log_group_arn("arn:bogus:logs:cn-north-1:000000000000:log-group:/g").is_none()
+        );
     }
 }
 

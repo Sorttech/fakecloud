@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::arns::{flow_arn, prompt_arn};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use fakecloud_aws::arn::Arn;
 use http::{Method, StatusCode};
 use parking_lot::RwLock;
 use serde_json::{json, Value};
@@ -1249,9 +1249,9 @@ fn agent_summary_json(a: &Agent) -> Value {
 /// `FlowSummary` shape: requires `arn`, `id`, `name`, `status`, `createdAt`,
 /// `updatedAt`, and `version`. The full `flow_json` exposes `flowId`,
 /// `executionRoleArn`, and `definition`, none of which appear on the summary.
-fn flow_summary_json(f: &Flow, region: &str, account_id: &str) -> Value {
+fn flow_summary_json(f: &Flow) -> Value {
     let mut o = json!({
-        "arn": flow_arn(&f.flow_id, region, account_id),
+        "arn": f.arn,
         "id": f.flow_id,
         "name": f.name,
         "status": f.status,
@@ -1283,9 +1283,9 @@ fn knowledge_base_summary_json(k: &KnowledgeBase) -> Value {
 
 /// `PromptSummary`: `arn`, `id`, `name`, `version`, `createdAt`, `updatedAt`.
 /// The full prompt JSON keys `promptId` (not `id`) and surfaces `variants`.
-fn prompt_summary_json(p: &Prompt, region: &str, account_id: &str) -> Value {
+fn prompt_summary_json(p: &Prompt) -> Value {
     let mut o = json!({
-        "arn": prompt_arn(&p.prompt_id, region, account_id),
+        "arn": p.arn,
         "id": p.prompt_id,
         "name": p.name,
         "version": p.version,
@@ -1296,20 +1296,6 @@ fn prompt_summary_json(p: &Prompt, region: &str, account_id: &str) -> Value {
         o["description"] = json!(d);
     }
     o
-}
-
-fn flow_arn(flow_id: &str, region: &str, account_id: &str) -> String {
-    Arn::new("bedrock", region, account_id, &format!("flow/{flow_id}")).to_string()
-}
-
-fn prompt_arn(prompt_id: &str, region: &str, account_id: &str) -> String {
-    Arn::new(
-        "bedrock",
-        region,
-        account_id,
-        &format!("prompt/{prompt_id}"),
-    )
-    .to_string()
 }
 
 fn flow_json(f: &Flow) -> Value {
@@ -1427,3 +1413,148 @@ fn agent_collaborator_json(c: &AgentCollaborator) -> Value {
 }
 
 impl BedrockAgentService {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http::HeaderMap;
+    use std::collections::HashMap;
+
+    fn cn_request(body: Value) -> AwsRequest {
+        AwsRequest {
+            service: "bedrock-agent".to_string(),
+            action: String::new(),
+            region: "cn-north-1".to_string(),
+            account_id: "123456789012".to_string(),
+            request_id: "test-id".to_string(),
+            headers: HeaderMap::new(),
+            query_params: HashMap::new(),
+            body: body.to_string().into(),
+            body_stream: parking_lot::Mutex::new(None),
+            path_segments: Vec::new(),
+            raw_path: String::new(),
+            raw_query: String::new(),
+            method: Method::POST,
+            is_query_protocol: false,
+            access_key_id: None,
+            principal: None,
+        }
+    }
+
+    fn body(resp: AwsResponse) -> Value {
+        serde_json::from_slice(resp.body.expect_bytes()).unwrap()
+    }
+
+    #[test]
+    fn listed_flow_and_prompt_arns_are_the_ones_they_were_created_with() {
+        let svc = BedrockAgentService::new(Arc::new(RwLock::new(BedrockAgentAccounts::new())));
+        let flow = body(svc.create_flow(&cn_request(json!({"name": "f"}))).unwrap());
+        let prompt = body(
+            svc.create_prompt(&cn_request(json!({"name": "p"})))
+                .unwrap(),
+        );
+        let version = body(
+            svc.create_prompt_version(&cn_request(
+                json!({"promptIdentifier": prompt["id"].clone()}),
+            ))
+            .unwrap(),
+        );
+        assert_eq!(
+            version["arn"],
+            format!("{}:1", prompt["arn"].as_str().unwrap())
+        );
+
+        let mut elsewhere = cn_request(json!({"promptIdentifier": prompt["id"].clone()}));
+        elsewhere.region = "us-east-1".to_string();
+        let flows = body(svc.list_flows(&elsewhere).unwrap());
+        assert_eq!(flows["flowSummaries"][0]["arn"], flow["arn"]);
+        let prompts = body(svc.list_prompts(&elsewhere).unwrap());
+        assert_eq!(prompts["promptSummaries"][0]["arn"], prompt["arn"]);
+        let versions = body(svc.list_prompt_versions(&elsewhere).unwrap());
+        assert_eq!(versions["promptSummaries"][0]["arn"], version["arn"]);
+    }
+
+    #[test]
+    fn loading_a_snapshot_without_arns_backfills_them_from_the_state_region() {
+        let svc = BedrockAgentService::new(Arc::new(RwLock::new(BedrockAgentAccounts::new())));
+        let flow = body(svc.create_flow(&cn_request(json!({"name": "f"}))).unwrap());
+        let prompt = body(
+            svc.create_prompt(&cn_request(json!({"name": "p"})))
+                .unwrap(),
+        );
+
+        // A snapshot written before flows and prompts stored their ARN.
+        let mut raw = serde_json::to_value(&*svc.state.read()).unwrap();
+        let account = &mut raw["accounts"]["123456789012"];
+        for collection in ["flows", "prompts"] {
+            for record in account[collection].as_object_mut().unwrap().values_mut() {
+                record.as_object_mut().unwrap().remove("arn");
+            }
+        }
+        let loaded: BedrockAgentAccounts = serde_json::from_value(raw).unwrap();
+        let state = loaded.get("123456789012").unwrap();
+        let flow_id = flow["id"].as_str().unwrap();
+        let prompt_id = prompt["id"].as_str().unwrap();
+        assert_eq!(state.flows[flow_id].arn, flow["arn"].as_str().unwrap());
+        assert_eq!(
+            state.prompts[prompt_id].arn,
+            prompt["arn"].as_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn china_region_resources_and_default_roles_use_aws_cn_partition() {
+        let svc = BedrockAgentService::new(Arc::new(RwLock::new(BedrockAgentAccounts::new())));
+
+        let agent = body(
+            svc.create_agent(&cn_request(json!({"agentName": "a"})))
+                .unwrap(),
+        );
+        let agent = &agent["agent"];
+        let agent_id = agent["agentId"].as_str().unwrap();
+        assert_eq!(
+            agent["agentArn"],
+            format!("arn:aws-cn:bedrock:cn-north-1:123456789012:agent/{agent_id}")
+        );
+        assert_eq!(
+            agent["agentResourceRoleArn"],
+            "arn:aws-cn:iam::123456789012:role/fakecloud-bedrock-agent-role"
+        );
+
+        let kb = body(
+            svc.create_knowledge_base(&cn_request(json!({"name": "kb"})))
+                .unwrap(),
+        );
+        let kb = &kb["knowledgeBase"];
+        assert!(kb["knowledgeBaseArn"]
+            .as_str()
+            .unwrap()
+            .starts_with("arn:aws-cn:bedrock:cn-north-1:123456789012:knowledge-base/"));
+        assert_eq!(
+            kb["roleArn"],
+            "arn:aws-cn:iam::123456789012:role/fakecloud-bedrock-kb-role"
+        );
+
+        let flow = body(svc.create_flow(&cn_request(json!({"name": "f"}))).unwrap());
+        let flow_id = flow["id"].as_str().unwrap();
+        assert_eq!(
+            flow["arn"],
+            format!("arn:aws-cn:bedrock:cn-north-1:123456789012:flow/{flow_id}")
+        );
+        assert_eq!(
+            flow["executionRoleArn"],
+            format!(
+                "arn:aws-cn:iam::123456789012:role/service-role/AmazonBedrockExecutionRoleForFlows_{flow_id}"
+            )
+        );
+
+        let prompt = body(
+            svc.create_prompt(&cn_request(json!({"name": "p"})))
+                .unwrap(),
+        );
+        assert!(prompt["arn"]
+            .as_str()
+            .unwrap()
+            .starts_with("arn:aws-cn:bedrock:cn-north-1:123456789012:prompt/"));
+    }
+}

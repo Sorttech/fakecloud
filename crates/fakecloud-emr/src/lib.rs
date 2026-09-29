@@ -18,5 +18,5 @@ pub(crate) mod service;
 pub(crate) mod state;
 pub(crate) mod validate;
 
-pub use service::EmrService;
+pub use service::{cluster_arn, notebook_execution_arn, session_arn, studio_arn, EmrService};
 pub use state::{EmrSnapshot, EmrState, SharedEmrState, EMR_SNAPSHOT_SCHEMA_VERSION};

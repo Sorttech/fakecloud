@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use fakecloud_aws::arn::Arn;
+use fakecloud_aws::arn::{partition_for, Arn};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -17,6 +17,62 @@ pub struct EventBus {
     pub dead_letter_config: Option<Value>,
     pub creation_time: DateTime<Utc>,
     pub last_modified_time: DateTime<Utc>,
+}
+
+/// Re-stamp the region and partition of an ARN with the caller's request
+/// region.
+///
+/// The default event bus is created at account-state bootstrap, which only
+/// has access to the server's frozen startup region, not the caller's
+/// credential-scope region. Custom buses created through `CreateEventBus`
+/// already carry the request region, so this rewrite is idempotent for them
+/// and only corrects the bootstrap default bus when a client is configured
+/// for another region (and, for a `cn-`/`us-gov-`/iso region, another
+/// partition). ARNs that don't have the expected
+/// `arn:partition:service:region:account:resource` shape are returned
+/// unchanged.
+pub(crate) fn arn_with_request_region(arn: &str, region: &str) -> String {
+    let parts: Vec<&str> = arn.splitn(6, ':').collect();
+    if parts.len() == 6 && parts[0] == "arn" {
+        format!(
+            "{}:{}:{}:{}:{}:{}",
+            parts[0],
+            partition_for(region),
+            parts[2],
+            region,
+            parts[4],
+            parts[5]
+        )
+    } else {
+        arn.to_string()
+    }
+}
+
+/// The ARN of the event bus `name` in `region`'s partition.
+pub(crate) fn bus_arn(region: &str, account_id: &str, name: &str) -> String {
+    Arn::regional("events", region, account_id, &format!("event-bus/{name}")).to_string()
+}
+
+/// The ARN of rule `name` on bus `bus`. Rules on the default bus leave the bus
+/// out of the resource path, as AWS does.
+pub(crate) fn rule_arn(region: &str, account_id: &str, bus: &str, name: &str) -> String {
+    let resource = if bus == "default" {
+        format!("rule/{name}")
+    } else {
+        format!("rule/{bus}/{name}")
+    };
+    Arn::regional("events", region, account_id, &resource).to_string()
+}
+
+impl EventBus {
+    /// Whether `arn` names this bus: either the stored ARN or the ARN a client
+    /// in another region was handed by [`arn_with_request_region`].
+    pub fn answers_to(&self, arn: &str) -> bool {
+        self.arn == arn
+            || arn
+                .parse::<Arn>()
+                .is_ok_and(|given| arn_with_request_region(&self.arn, &given.region) == arn)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -245,8 +301,7 @@ pub struct EventBridgeState {
 impl EventBridgeState {
     pub fn new(account_id: &str, region: &str) -> Self {
         let now = Utc::now();
-        let default_bus_arn =
-            Arn::new("events", region, account_id, "event-bus/default").to_string();
+        let default_bus_arn = bus_arn(region, account_id, "default");
         let mut buses = BTreeMap::new();
         buses.insert(
             "default".to_string(),
@@ -308,11 +363,10 @@ impl EventBridgeState {
         // server region rather than the request's credential-scope region. This
         // seed remains the storage key/existence record; handlers that RETURN the
         // default-bus ARN (DescribeEventBus / ListEventBuses / etc.) restamp the
-        // region from req.region at read time via `arn_with_request_region`.
-        let default_bus_arn = format!(
-            "arn:aws:events:{}:{}:event-bus/default",
-            self.region, self.account_id
-        );
+        // region and partition from req.region at read time via
+        // `arn_with_request_region`, and ARN lookups match either form through
+        // `EventBus::answers_to`.
+        let default_bus_arn = bus_arn(&self.region, &self.account_id, "default");
         self.buses.insert(
             "default".to_string(),
             EventBus {

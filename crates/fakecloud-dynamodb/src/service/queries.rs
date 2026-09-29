@@ -8,23 +8,51 @@ use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 use crate::state::{AttributeValue, Projection};
 
 use super::{
-    build_consumed_capacity, compare_attribute_values, evaluate_filter_expression,
-    evaluate_key_condition, extract_key_for_schema, get_table, item_matches_key,
-    parse_expression_attribute_names, parse_expression_attribute_values, parse_key_map,
-    project_item, require_str, resolve_attr_name, return_consumed_mode, split_on_and,
-    strip_outer_parens, translate_legacy_conditions, DynamoDbService, LegacyConditionRole,
+    build_capacity, compare_attribute_values, eval_cond, evaluate_filter_expression,
+    evaluate_key_condition, extract_key_for_schema, framework_validation_error, get_data_table,
+    item_matches_key, item_size, parse_condition_lenient, parse_expression_attribute_names,
+    parse_expression_attribute_values, parse_key_map, project_item, read_units,
+    request_enum_violations, resolve_attr_name, return_consumed_mode, split_on_and,
+    strip_outer_parens, translate_legacy_conditions, validate_data_table_name,
+    validate_request_enums, validate_request_expressions, value_type, CapacitySplit, Consumed,
+    DynamoDbService, DynamoTable, ExprOp, LegacyConditionRole, RETURN_CONSUMED_CAPACITY_VALUES,
 };
 
 impl DynamoDbService {
     pub(super) fn query(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let body = Self::parse_body(req)?;
-        let table_name = require_str(&body, "TableName")?;
+        let table_name = validate_data_table_name(&body)?;
+        validate_request_enums(
+            &body,
+            &[
+                ("Select", "select", SELECT_VALUES),
+                (
+                    "ReturnConsumedCapacity",
+                    "returnConsumedCapacity",
+                    RETURN_CONSUMED_CAPACITY_VALUES,
+                ),
+                ("ConditionalOperator", "conditionalOperator", &["AND", "OR"]),
+            ],
+        )?;
+        // Query's Limit error really differs from Scan's: AWS names the
+        // member `Limit` (capitalised) and echoes no value, where Scan says
+        // `Value '0' at 'limit'`. Both forms are pinned from live captures.
+        if body["Limit"].as_i64().is_some_and(|l| l < 1) {
+            return Err(framework_validation_error(&[
+                "Value at 'Limit' failed to satisfy constraint: Member must have value greater \
+                 than or equal to 1"
+                    .to_string(),
+            ]));
+        }
+        let index_name = body["IndexName"].as_str();
+        let count_only = resolve_select(&body, index_name.is_some(), true)?;
+        validate_request_expressions(&body, ExprOp::Query)?;
         let return_consumed = return_consumed_mode(&body).to_string();
 
         let accounts = self.state.read();
         let empty_ddb = crate::state::DynamoDbState::new(&req.account_id, &req.region);
         let state = accounts.get(&req.account_id).unwrap_or(&empty_ddb);
-        let table = get_table(&state.tables, table_name)?;
+        let table = get_data_table(&state.tables, table_name)?;
 
         let mut expr_attr_names = parse_expression_attribute_names(&body);
         let mut expr_attr_values = parse_expression_attribute_values(&body);
@@ -65,8 +93,6 @@ impl DynamoDbService {
         )?;
         let scan_forward = body["ScanIndexForward"].as_bool().unwrap_or(true);
         let limit = validate_limit(&body)?;
-        let index_name = body["IndexName"].as_str();
-        let count_only = resolve_select(&body, index_name.is_some())?;
         let exclusive_start_key: Option<HashMap<String, AttributeValue>> =
             parse_key_map(&body["ExclusiveStartKey"]);
 
@@ -110,6 +136,7 @@ impl DynamoDbService {
                     .map(|k| k.attribute_name.clone());
                 (&table.items, hk, rk)
             } else {
+                super::vectors::reject_vector_index_read(table, idx_name, "Query")?;
                 return Err(AwsServiceError::aws_error(
                     http::StatusCode::BAD_REQUEST,
                     "ValidationException",
@@ -124,12 +151,60 @@ impl DynamoDbService {
             )
         };
 
+        // On an index query the starting key names a position in the index,
+        // so it must carry the index key as well as the table's primary key.
+        if let (Some(_), Some(start_key)) = (index_name, exclusive_start_key.as_ref()) {
+            let required = [
+                Some(table.hash_key_name()),
+                table.range_key_name(),
+                Some(hash_key_name.as_str()),
+                range_key_name.as_deref(),
+            ];
+            if required
+                .into_iter()
+                .flatten()
+                .any(|attr| !start_key.contains_key(attr))
+            {
+                return Err(AwsServiceError::aws_error(
+                    http::StatusCode::BAD_REQUEST,
+                    "ValidationException",
+                    "The provided starting key is invalid: The provided key element does not \
+                     match the schema",
+                ));
+            }
+        }
+
         // The partition key MUST be constrained with `=`. Without this check a
         // condition that omits the partition key (or uses a range operator on
         // it, e.g. `sk = :v` or `pk > :v`) would fall through to a generic
         // filter over EVERY partition and silently return cross-partition
         // matches (bug-hunt 2026-07-01).
         validate_partition_key_condition(&key_condition, &hash_key_name, &expr_attr_names)?;
+        if let Some(esk) = exclusive_start_key.as_ref() {
+            let index_keys: Vec<&str> = std::iter::once(hash_key_name.as_str())
+                .chain(range_key_name.as_deref())
+                .collect();
+            if !start_key_matches_schema(table, esk, &index_keys) {
+                return Err(AwsServiceError::aws_error(
+                    StatusCode::BAD_REQUEST,
+                    "ValidationException",
+                    "The provided starting key is invalid",
+                ));
+            }
+        }
+        // Parse once, evaluate per row.
+        let key_cond_ast =
+            parse_condition_lenient(&key_condition, &expr_attr_names, &expr_attr_values);
+        let filter_ast = filter_expression
+            .as_deref()
+            .and_then(|f| parse_condition_lenient(f, &expr_attr_names, &expr_attr_values));
+        let filter_matches =
+            |item: &HashMap<String, AttributeValue>, filter: &str| match &filter_ast {
+                Some(ast) => eval_cond(ast, item, &expr_attr_values),
+                None => {
+                    evaluate_filter_expression(filter, item, &expr_attr_names, &expr_attr_values)
+                }
+            };
 
         let mut matched: Vec<&HashMap<String, AttributeValue>> = items_to_scan
             .iter()
@@ -149,7 +224,15 @@ impl DynamoDbService {
                         }
                     }
                 }
-                evaluate_key_condition(&key_condition, item, &expr_attr_names, &expr_attr_values)
+                match &key_cond_ast {
+                    Some(ast) => eval_cond(ast, item, &expr_attr_values),
+                    None => evaluate_key_condition(
+                        &key_condition,
+                        item,
+                        &expr_attr_names,
+                        &expr_attr_values,
+                    ),
+                }
             })
             .collect();
 
@@ -245,16 +328,11 @@ impl DynamoDbService {
         // dropped it. Without this ordering a paginating client never
         // converges: the filter would shrink the set before the
         // truncation tracked progress.
-        let has_more;
-        let last_examined_idx;
-        if let Some(lim) = limit {
-            has_more = matched.len() > lim;
-            last_examined_idx = if has_more { Some(lim - 1) } else { None };
-            matched.truncate(lim);
-        } else {
-            has_more = false;
-            last_examined_idx = None;
-        }
+        // A page also ends once it has read 1MB of data.
+        let page_len = page_length(matched.iter().copied(), limit);
+        let has_more = matched.len() > page_len;
+        let last_examined_idx = if has_more { Some(page_len - 1) } else { None };
+        matched.truncate(page_len);
 
         // Snapshot the key of the last examined item before the filter
         // can drop it.
@@ -273,6 +351,10 @@ impl DynamoDbService {
                 });
 
         let scanned_count = matched.len();
+        // Sizing the examined rows (projecting each one for an index read) is
+        // only worth doing when the caller asked for the figure.
+        let consumed = (return_consumed != "NONE")
+            .then(|| read_consumed(table, index_name, &matched, consistent_read));
 
         if let Some(filter) = filter_expression.as_deref() {
             matched.retain(|item| {
@@ -289,15 +371,10 @@ impl DynamoDbService {
                             &table_pk_hash,
                             table_pk_range.as_deref(),
                         );
-                        return evaluate_filter_expression(
-                            filter,
-                            &projected,
-                            &expr_attr_names,
-                            &expr_attr_values,
-                        );
+                        return filter_matches(&projected, filter);
                     }
                 }
-                evaluate_filter_expression(filter, item, &expr_attr_names, &expr_attr_values)
+                filter_matches(item, filter)
             });
         }
 
@@ -353,14 +430,11 @@ impl DynamoDbService {
             result["LastEvaluatedKey"] = json!(lek);
         }
 
-        let cc = build_consumed_capacity(
-            &return_consumed,
-            table_name,
-            (scanned_count.max(1) as f64) * 0.5,
-            0.0,
-        );
-        if !cc.is_null() {
-            result["ConsumedCapacity"] = cc;
+        if let Some(consumed) = consumed {
+            let cc = build_capacity(&return_consumed, table_name, &consumed, CapacitySplit::None);
+            if !cc.is_null() {
+                result["ConsumedCapacity"] = cc;
+            }
         }
 
         drop(accounts);
@@ -387,13 +461,85 @@ impl DynamoDbService {
 
     pub(super) fn scan(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let body = Self::parse_body(req)?;
-        let table_name = require_str(&body, "TableName")?;
+        let table_name = validate_data_table_name(&body)?;
+        let mut errors = request_enum_violations(
+            &body,
+            &[
+                ("Select", "select", SELECT_VALUES),
+                (
+                    "ReturnConsumedCapacity",
+                    "returnConsumedCapacity",
+                    RETURN_CONSUMED_CAPACITY_VALUES,
+                ),
+                ("ConditionalOperator", "conditionalOperator", &["AND", "OR"]),
+            ],
+        )?;
+        let int_member = |field: &str| body[field].as_i64();
+        if let Some(l) = int_member("Limit").filter(|l| *l < 1) {
+            errors.push(format!(
+                "Value '{l}' at 'limit' failed to satisfy constraint: Member must have value \
+                 greater than or equal to 1"
+            ));
+        }
+        if let Some(seg) = int_member("Segment").filter(|s| *s < 0) {
+            errors.push(format!(
+                "Value '{seg}' at 'segment' failed to satisfy constraint: Member must have value \
+                 greater than or equal to 0"
+            ));
+        }
+        match int_member("TotalSegments") {
+            Some(t) if t < 1 => errors.push(format!(
+                "Value '{t}' at 'totalSegments' failed to satisfy constraint: Member must have \
+                 value greater than or equal to 1"
+            )),
+            Some(t) if t > MAX_TOTAL_SEGMENTS => errors.push(format!(
+                "Value '{t}' at 'totalSegments' failed to satisfy constraint: Member must have \
+                 value less than or equal to {MAX_TOTAL_SEGMENTS}"
+            )),
+            _ => {}
+        }
+        if !errors.is_empty() {
+            return Err(framework_validation_error(&errors));
+        }
+        let total_segments = int_member("TotalSegments").map(|v| v as usize);
+        let segment = int_member("Segment").map(|v| v as usize);
+        match (segment, total_segments) {
+            (Some(_), None) => {
+                return Err(AwsServiceError::aws_error(
+                    StatusCode::BAD_REQUEST,
+                    "ValidationException",
+                    "The TotalSegments parameter is required but was not present in the request \
+                     when Segment parameter is present",
+                ))
+            }
+            (None, Some(_)) => {
+                return Err(AwsServiceError::aws_error(
+                    StatusCode::BAD_REQUEST,
+                    "ValidationException",
+                    "The Segment parameter is required but was not present in the request when \
+                     parameter TotalSegments is present",
+                ))
+            }
+            (Some(seg), Some(total)) if seg >= total => {
+                return Err(AwsServiceError::aws_error(
+                    StatusCode::BAD_REQUEST,
+                    "ValidationException",
+                    format!(
+                        "The Segment parameter is zero-based and must be less than parameter \
+                         TotalSegments: Segment: {seg} is not less than TotalSegments: {total}"
+                    ),
+                ))
+            }
+            _ => {}
+        }
+        let count_only = resolve_select(&body, body["IndexName"].as_str().is_some(), false)?;
+        validate_request_expressions(&body, ExprOp::Scan)?;
         let return_consumed = return_consumed_mode(&body).to_string();
 
         let accounts = self.state.read();
         let empty_ddb = crate::state::DynamoDbState::new(&req.account_id, &req.region);
         let state = accounts.get(&req.account_id).unwrap_or(&empty_ddb);
-        let table = get_table(&state.tables, table_name)?;
+        let table = get_data_table(&state.tables, table_name)?;
 
         let mut expr_attr_names = parse_expression_attribute_names(&body);
         let mut expr_attr_values = parse_expression_attribute_values(&body);
@@ -410,7 +556,6 @@ impl DynamoDbService {
         let limit = validate_limit(&body)?;
         let exclusive_start_key: Option<HashMap<String, AttributeValue>> =
             parse_key_map(&body["ExclusiveStartKey"]);
-        let count_only = resolve_select(&body, body["IndexName"].as_str().is_some())?;
 
         // IndexName: when present, items still come from the base
         // table (fakecloud doesn't keep separate per-index storage)
@@ -443,10 +588,11 @@ impl DynamoDbService {
                             .collect(),
                     )
                 } else {
+                    super::vectors::reject_vector_index_read(table, idx, "Scan")?;
                     return Err(AwsServiceError::aws_error(
                         StatusCode::BAD_REQUEST,
                         "ValidationException",
-                        format!("Index '{idx}' does not exist on the table"),
+                        format!("The table does not have the specified index: {idx}"),
                     ));
                 }
             } else {
@@ -459,27 +605,30 @@ impl DynamoDbService {
         // Parallel Scan: Segment / TotalSegments split the table into
         // disjoint shards by hashing the partition key. Real DDB
         // doesn't document the hash function, so we use stdlib
-        // `DefaultHasher` over the rendered hash-key value — stable
+        // `DefaultHasher` over the rendered hash-key value -- stable
         // across a single fakecloud run, which is enough for the
         // disjoint-shard contract clients depend on.
-        let total_segments = body["TotalSegments"].as_i64().map(|v| v as usize);
-        let segment = body["Segment"].as_i64().map(|v| v as usize);
-        if total_segments.is_some() != segment.is_some() {
-            return Err(AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "ValidationException",
-                "Both Segment and TotalSegments must be supplied together",
-            ));
-        }
-        if let (Some(seg), Some(total)) = (segment, total_segments) {
-            if total == 0 || seg >= total {
+        if let Some(esk) = exclusive_start_key.as_ref() {
+            let index_keys: Vec<&str> = index_key_attrs.iter().map(String::as_str).collect();
+            if !start_key_matches_schema(table, esk, &index_keys) {
                 return Err(AwsServiceError::aws_error(
                     StatusCode::BAD_REQUEST,
                     "ValidationException",
-                    "Segment must be less than TotalSegments and TotalSegments must be > 0",
+                    "The provided starting key is invalid: The provided key element does not \
+                     match the schema",
                 ));
             }
         }
+        let filter_ast = filter_expression
+            .as_deref()
+            .and_then(|f| parse_condition_lenient(f, &expr_attr_names, &expr_attr_values));
+        let filter_matches =
+            |item: &HashMap<String, AttributeValue>, filter: &str| match &filter_ast {
+                Some(ast) => eval_cond(ast, item, &expr_attr_values),
+                None => {
+                    evaluate_filter_expression(filter, item, &expr_attr_names, &expr_attr_values)
+                }
+            };
 
         // Rows come in Scan order starting just after ExclusiveStartKey. That
         // order depends only on key values, so the page resumes in the right
@@ -512,26 +661,29 @@ impl DynamoDbService {
                 }
                 _ => true,
             });
-        // Limit caps the items examined, so only one more than that is
-        // needed to know whether another page follows.
-        let mut matched: Vec<&HashMap<String, AttributeValue>> = match limit {
-            Some(lim) => candidates.take(lim.saturating_add(1)).collect(),
-            None => candidates.collect(),
-        };
-
-        // Same Limit-before-Filter ordering as Query (see comment
-        // there): pagination only converges if `LastEvaluatedKey`
-        // tracks examined items, not surviving items.
-        let has_more;
-        let last_examined_idx;
-        if let Some(lim) = limit {
-            has_more = matched.len() > lim;
-            last_examined_idx = if has_more { Some(lim - 1) } else { None };
-            matched.truncate(lim);
-        } else {
-            has_more = false;
-            last_examined_idx = None;
+        // A page ends at Limit items or 1MB of data read, whichever comes
+        // first; only one more row is needed to know whether another page
+        // follows. Same Limit-before-Filter ordering as Query (see comment
+        // there): pagination only converges if `LastEvaluatedKey` tracks
+        // examined items, not surviving items.
+        let mut candidates = candidates.peekable();
+        let mut matched: Vec<&HashMap<String, AttributeValue>> = Vec::new();
+        let mut bytes = 0usize;
+        let mut has_more = false;
+        while let Some(item) = candidates.next() {
+            matched.push(item);
+            bytes += item_bytes(item);
+            if limit.is_some_and(|l| matched.len() >= l) || bytes >= MAX_PAGE_BYTES {
+                has_more = candidates.peek().is_some();
+                break;
+            }
         }
+        drop(candidates);
+        let last_examined_idx = if has_more {
+            Some(matched.len() - 1)
+        } else {
+            None
+        };
         // The cursor resumes by the table's primary key, which is always in
         // it. On an index scan AWS also includes the index's key attributes.
         let last_examined_key =
@@ -549,6 +701,10 @@ impl DynamoDbService {
                 });
 
         let scanned_count = matched.len();
+        // Sizing the examined rows (projecting each one for an index read) is
+        // only worth doing when the caller asked for the figure.
+        let consumed = (return_consumed != "NONE")
+            .then(|| read_consumed(table, index_name, &matched, consistent_read));
 
         if let Some(filter) = filter_expression.as_deref() {
             matched.retain(|item| {
@@ -565,15 +721,10 @@ impl DynamoDbService {
                             &hash_key_name,
                             range_key_name.as_deref(),
                         );
-                        return evaluate_filter_expression(
-                            filter,
-                            &projected,
-                            &expr_attr_names,
-                            &expr_attr_values,
-                        );
+                        return filter_matches(&projected, filter);
                     }
                 }
-                evaluate_filter_expression(filter, item, &expr_attr_names, &expr_attr_values)
+                filter_matches(item, filter)
             });
         }
 
@@ -629,14 +780,11 @@ impl DynamoDbService {
             result["LastEvaluatedKey"] = json!(lek);
         }
 
-        let cc = build_consumed_capacity(
-            &return_consumed,
-            table_name,
-            (scanned_count.max(1) as f64) * 0.5,
-            0.0,
-        );
-        if !cc.is_null() {
-            result["ConsumedCapacity"] = cc;
+        if let Some(consumed) = consumed {
+            let cc = build_capacity(&return_consumed, table_name, &consumed, CapacitySplit::None);
+            if !cc.is_null() {
+                result["ConsumedCapacity"] = cc;
+            }
         }
 
         drop(accounts);
@@ -793,75 +941,177 @@ fn validate_partition_key_condition(
     Ok(())
 }
 
-/// Validate the `Select` parameter for a Query/Scan and decide whether
-/// the operation returns only a count. `is_index_query` is true when an
-/// IndexName is present (only then is ALL_PROJECTED_ATTRIBUTES legal).
-///
-/// AWS rules enforced here:
-/// - `Select` must be one of the four documented enum values.
-/// - `SPECIFIC_ATTRIBUTES` requires a ProjectionExpression or
-///   AttributesToGet, and conversely any projection forces
-///   SPECIFIC_ATTRIBUTES (any other explicit Select is rejected).
-/// - `ALL_PROJECTED_ATTRIBUTES` is only valid on an index query.
-fn resolve_select(body: &Value, is_index_query: bool) -> Result<bool, AwsServiceError> {
-    let select = body["Select"].as_str();
-    let has_projection = body["ProjectionExpression"]
-        .as_str()
-        .is_some_and(|p| !p.is_empty())
-        || body["AttributesToGet"]
-            .as_array()
-            .is_some_and(|a| !a.is_empty());
+/// The `Select` enum set, in the order AWS lists it.
+const SELECT_VALUES: &[&str] = &[
+    "SPECIFIC_ATTRIBUTES",
+    "COUNT",
+    "ALL_ATTRIBUTES",
+    "ALL_PROJECTED_ATTRIBUTES",
+];
 
-    if let Some(sel) = select {
-        if !matches!(
-            sel,
-            "ALL_ATTRIBUTES" | "ALL_PROJECTED_ATTRIBUTES" | "SPECIFIC_ATTRIBUTES" | "COUNT"
-        ) {
-            return Err(AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "ValidationException",
-                format!(
-                    "1 validation error detected: Value '{sel}' at 'select' failed to satisfy \
-                     constraint: Member must satisfy enum value set: \
-                     [SPECIFIC_ATTRIBUTES, COUNT, ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES]"
-                ),
-            ));
+/// Check `Select` against the projection parameters and decide whether the
+/// operation returns only a count. `is_index_query` is true when an IndexName
+/// is present (only then is ALL_PROJECTED_ATTRIBUTES legal). The Select enum
+/// itself is validated with the other enum members.
+fn resolve_select(
+    body: &Value,
+    is_index_query: bool,
+    is_query: bool,
+) -> Result<bool, AwsServiceError> {
+    let invalid =
+        |m: String| AwsServiceError::aws_error(StatusCode::BAD_REQUEST, "ValidationException", m);
+    let projection_param = ["ProjectionExpression", "AttributesToGet"]
+        .into_iter()
+        .find(|p| !body[*p].is_null());
+    let Some(select) = body["Select"].as_str() else {
+        return Ok(false);
+    };
+    if let Some(param) = projection_param {
+        let target = match select {
+            "ALL_ATTRIBUTES" => Some("ALL_ATTRIBUTES"),
+            "ALL_PROJECTED_ATTRIBUTES" => Some("ALL_PROJECTED_ATTRIBUTES"),
+            "COUNT" => Some("only the Count"),
+            _ => None,
+        };
+        if let Some(target) = target {
+            return Err(invalid(format!(
+                "Cannot specify the {param} when choosing to get {target}"
+            )));
         }
-        if sel == "ALL_PROJECTED_ATTRIBUTES" && !is_index_query {
-            return Err(AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "ValidationException",
-                "Select type ALL_PROJECTED_ATTRIBUTES is not supported for queries on the table; \
-                 it is only supported on index queries",
-            ));
-        }
-        if sel == "SPECIFIC_ATTRIBUTES" && !has_projection {
-            return Err(AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "ValidationException",
-                "Select type SPECIFIC_ATTRIBUTES requires a ProjectionExpression or AttributesToGet",
-            ));
-        }
-        if has_projection && sel != "SPECIFIC_ATTRIBUTES" {
-            return Err(AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "ValidationException",
-                format!(
-                    "Cannot use both Select and ProjectionExpression/AttributesToGet unless \
-                     Select is SPECIFIC_ATTRIBUTES (got {sel})"
-                ),
-            ));
-        }
-        Ok(sel == "COUNT")
-    } else {
-        Ok(false)
     }
+    if select == "ALL_PROJECTED_ATTRIBUTES" && !is_index_query {
+        return Err(invalid(
+            "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName".into(),
+        ));
+    }
+    if select == "SPECIFIC_ATTRIBUTES" && projection_param.is_none() {
+        let message = "Must specify the AttributesToGet or ProjectionExpression when choosing \
+                       to get SPECIFIC_ATTRIBUTES";
+        return Err(if is_query {
+            framework_validation_error(&[message.to_string()])
+        } else {
+            invalid(message.to_string())
+        });
+    }
+    Ok(select == "COUNT")
+}
+
+/// The largest page Query and Scan return before paginating.
+const MAX_PAGE_BYTES: usize = 1024 * 1024;
+
+/// The largest TotalSegments a parallel Scan accepts.
+const MAX_TOTAL_SEGMENTS: i64 = 1_000_000;
+
+fn item_bytes(item: &HashMap<String, AttributeValue>) -> usize {
+    item_size(item)
+}
+
+/// How many of `rows` fit in one page: at most `limit` rows, ending with the
+/// row that brings the data read to 1MB. Always at least one row when any
+/// exist.
+fn page_length<'a>(
+    rows: impl Iterator<Item = &'a HashMap<String, AttributeValue>>,
+    limit: Option<usize>,
+) -> usize {
+    let mut count = 0;
+    let mut bytes = 0;
+    for row in rows {
+        count += 1;
+        bytes += item_bytes(row);
+        if limit.is_some_and(|l| count >= l) || bytes >= MAX_PAGE_BYTES {
+            break;
+        }
+    }
+    count
+}
+
+/// Whether an ExclusiveStartKey names exactly the table's key attributes
+/// plus the queried index's (`index_keys`), each with its declared type.
+fn start_key_matches_schema(
+    table: &DynamoTable,
+    esk: &HashMap<String, AttributeValue>,
+    index_keys: &[&str],
+) -> bool {
+    let mut required: Vec<&str> = std::iter::once(table.hash_key_name())
+        .chain(table.range_key_name())
+        .collect();
+    for k in index_keys {
+        if !required.contains(k) {
+            required.push(k);
+        }
+    }
+    if esk.len() != required.len() {
+        return false;
+    }
+    required.iter().all(|attr| {
+        let Some(v) = esk.get(*attr) else {
+            return false;
+        };
+        let declared = table
+            .attribute_definitions
+            .iter()
+            .find(|d| d.attribute_name == *attr)
+            .map(|d| d.attribute_type.as_str());
+        match declared {
+            Some(t) => value_type(v) == Some(t),
+            None => true,
+        }
+    })
 }
 
 /// Apply a GSI/LSI projection to an item already projected via the
 /// caller's `ProjectionExpression`. AWS retains the table's primary key
 /// plus the index key; INCLUDE adds the listed non-key attributes;
 /// KEYS_ONLY drops everything else; ALL leaves the item alone.
+/// The read capacity a Query or Scan consumed.
+///
+/// Capacity is charged on every row the read examined -- before the filter
+/// drops any and whatever the projection returns -- summed and then rounded up
+/// to the next 4KB, not per row. A read served by a secondary index is charged
+/// to that index, on the entries it stores, and costs the base table nothing.
+fn read_consumed(
+    table: &crate::state::DynamoTable,
+    index_name: Option<&str>,
+    examined: &[&HashMap<String, AttributeValue>],
+    consistent: bool,
+) -> Consumed {
+    let gsi = index_name.and_then(|n| table.gsi.iter().find(|g| g.index_name == n));
+    let lsi = index_name.and_then(|n| table.lsi.iter().find(|l| l.index_name == n));
+    let index = gsi
+        .map(|g| (&g.index_name, &g.key_schema, &g.projection))
+        .or_else(|| lsi.map(|l| (&l.index_name, &l.key_schema, &l.projection)));
+    let Some((name, key_schema, projection)) = index else {
+        let bytes = examined.iter().map(|item| item_size(item)).sum();
+        return Consumed::table(read_units(bytes, consistent));
+    };
+    let key_attrs: Vec<String> = key_schema
+        .iter()
+        .map(|k| k.attribute_name.clone())
+        .collect();
+    let table_hash = table.hash_key_name();
+    let table_range = table.range_key_name();
+    let bytes = examined
+        .iter()
+        .map(|item| {
+            item_size(&apply_index_projection(
+                (*item).clone(),
+                projection,
+                &key_attrs,
+                table_hash,
+                table_range,
+            ))
+        })
+        .sum();
+    let mut consumed = Consumed::table(0.0);
+    let units = read_units(bytes, consistent);
+    if gsi.is_some() {
+        consumed.gsi.insert(name.clone(), units);
+    } else {
+        consumed.lsi.insert(name.clone(), units);
+    }
+    consumed
+}
+
 pub(crate) fn apply_index_projection(
     item: HashMap<String, AttributeValue>,
     projection: &Projection,
@@ -1074,7 +1324,11 @@ mod tests {
             ))
             .err()
             .expect("Limit=0 rejected");
-        assert!(format!("{err:?}").contains("ValidationException"));
+        assert_eq!(
+            err.message(),
+            "1 validation error detected: Value at 'Limit' failed to satisfy constraint: Member \
+             must have value greater than or equal to 1"
+        );
     }
 
     /// 1.13: Scan Select=SPECIFIC_ATTRIBUTES with a ProjectionExpression
@@ -1292,6 +1546,9 @@ mod tests {
             .scan(&req_for("Scan", json!({"TableName": "T", "Segment": 0})))
             .err()
             .expect("should reject Segment without TotalSegments");
-        assert!(format!("{err:?}").contains("Segment and TotalSegments"));
+        assert!(format!("{err:?}").contains(
+            "The TotalSegments parameter is required but was not present in the request when \
+             Segment parameter is present"
+        ));
     }
 }

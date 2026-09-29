@@ -19,6 +19,7 @@ use percent_encoding::percent_decode_str;
 use serde_json::{Map, Value};
 use tokio::sync::Mutex as AsyncMutex;
 
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_persistence::SnapshotStore;
 
@@ -403,14 +404,20 @@ pub(crate) fn arn_resource(rtype: &str) -> &'static str {
     }
 }
 
-pub(crate) fn mint_arn(ctx: &Ctx, rtype: &str, id: &str) -> String {
-    format!(
-        "arn:aws:iotwireless:{}:{}:{}/{}",
-        ctx.region,
-        ctx.account,
-        arn_resource(rtype),
-        id
+/// The ARN of the resource `id` of the REST collection `rtype`
+/// (`wireless-devices`, `destinations`, ...), in `region`'s partition.
+pub fn resource_arn(region: &str, account: &str, rtype: &str, id: &str) -> String {
+    Arn::regional(
+        "iotwireless",
+        region,
+        account,
+        &format!("{}/{}", arn_resource(rtype), id),
     )
+    .to_string()
+}
+
+pub(crate) fn mint_arn(ctx: &Ctx, rtype: &str, id: &str) -> String {
+    resource_arn(&ctx.region, &ctx.account, rtype, id)
 }
 
 /// Deterministic UUID-shaped id derived from a seed string.

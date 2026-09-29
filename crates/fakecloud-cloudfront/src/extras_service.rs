@@ -4,7 +4,6 @@
 use chrono::Utc;
 use http::{HeaderMap, StatusCode};
 
-use fakecloud_aws::arn::Arn;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use crate::extras::{
@@ -79,8 +78,11 @@ impl CloudFrontService {
         let id = generate_id_with_prefix("VO");
         let etag = generate_id_with_prefix("E");
         let now = Utc::now();
-        let arn =
-            Arn::global("cloudfront", DEFAULT_ACCOUNT, &format!("vpc-origin/{id}")).to_string();
+        let arn = crate::service::cloudfront_arn(
+            &req.region,
+            DEFAULT_ACCOUNT,
+            &format!("vpc-origin/{id}"),
+        );
         let stored = StoredVpcOrigin {
             id: id.clone(),
             arn: arn.clone(),
@@ -264,9 +266,10 @@ impl CloudFrontService {
             ));
         }
         let id = generate_id_with_prefix("AIL");
-        let arn = format!(
-            "arn:aws:cloudfront::{}:anycast-ip-list/{}",
-            DEFAULT_ACCOUNT, id
+        let arn = crate::service::cloudfront_arn(
+            &req.region,
+            DEFAULT_ACCOUNT,
+            &format!("anycast-ip-list/{id}"),
         );
         // Synthesize deterministic ipv4 addresses for the list.
         let anycast_ips: Vec<String> = (0..cfg.ip_count)
@@ -438,8 +441,11 @@ impl CloudFrontService {
             ));
         }
         let id = generate_id_with_prefix("TS");
-        let arn =
-            Arn::global("cloudfront", DEFAULT_ACCOUNT, &format!("trust-store/{id}")).to_string();
+        let arn = crate::service::cloudfront_arn(
+            &req.region,
+            DEFAULT_ACCOUNT,
+            &format!("trust-store/{id}"),
+        );
         let etag = generate_id_with_prefix("E");
         let tags = tags_to_state(&cfg.tags);
         let stored = StoredTrustStore {

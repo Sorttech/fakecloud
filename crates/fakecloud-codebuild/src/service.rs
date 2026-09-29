@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 
+use fakecloud_aws::arn::{arn_resource, Arn};
 use fakecloud_core::delivery::S3Delivery;
 use fakecloud_core::pagination::paginate_checked;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
@@ -392,7 +393,12 @@ fn str_list(b: &Value, key: &str) -> Vec<String> {
 }
 
 fn arn(region: &str, account: &str, resource: &str) -> String {
-    format!("arn:aws:codebuild:{region}:{account}:{resource}")
+    Arn::regional("codebuild", region, account, resource).to_string()
+}
+
+/// `arn:<partition>:codebuild:<region>:<account>:project/<name>`.
+pub fn project_arn(region: &str, account: &str, name: &str) -> String {
+    arn(region, account, &format!("project/{name}"))
 }
 
 /// Validate a required string field is present and within `[min, max]`
@@ -733,7 +739,7 @@ impl CodeBuildService {
         let name = req_len(&b, "name", 2, 150)?;
         check_name_pattern("name", &name)?;
         let (region, account) = self.region_account(req);
-        let arn_str = arn(&region, &account, &format!("project/{name}"));
+        let arn_str = project_arn(&region, &account, &name);
         let now = Utc::now();
         let mut guard = self.state.write();
         let st = guard.get_or_create(&account);
@@ -1110,14 +1116,14 @@ fn resolve_env_value(
 
 /// Split a CodeBuild `SECRETS_MANAGER` env `value` into a secret reference (bare
 /// name or full ARN) and an optional json key. Because a full secret ARN
-/// (`arn:aws:secretsmanager:region:account:secret:name-suffix`) contains colons,
+/// (`arn:<partition>:secretsmanager:region:account:secret:name-suffix`) contains colons,
 /// a naive `split_once(':')` would truncate the ARN at `arn`. Secret names never
 /// contain `:`, so for a non-ARN input the first colon (if any) separates the
 /// json key; for an ARN input the json key is only the 8th colon-delimited
 /// segment (everything up to and including `secret:name-suffix` is the ARN).
 fn split_secret_ref(value: &str) -> (String, Option<String>) {
-    if value.starts_with("arn:aws:secretsmanager:") {
-        // arn(0) aws(1) secretsmanager(2) region(3) account(4) secret(5)
+    if arn_resource(value, "secretsmanager").is_some() {
+        // arn(0) partition(1) secretsmanager(2) region(3) account(4) secret(5)
         // name-suffix(6) [json-key(7)]
         let parts: Vec<&str> = value.splitn(8, ':').collect();
         if parts.len() >= 7 {
@@ -1136,51 +1142,28 @@ fn split_secret_ref(value: &str) -> (String, Option<String>) {
     }
 }
 
-/// Strip the trailing `-<6 alphanumeric>` suffix AWS appends to a secret ARN's
-/// name segment (`prod-config-AbCdEf` -> `prod-config`). Only a segment that is
-/// exactly six alphanumeric characters is treated as the suffix, so a hyphenated
-/// user-supplied name is never mangled.
-fn strip_arn_secret_suffix(name_with_suffix: &str) -> &str {
-    match name_with_suffix.rsplit_once('-') {
-        Some((base, suffix))
-            if suffix.len() == 6 && suffix.chars().all(|c| c.is_ascii_alphanumeric()) =>
-        {
-            base
-        }
-        _ => name_with_suffix,
-    }
-}
-
 /// Resolve a secret by name or ARN against a Secrets Manager account state,
-/// mirroring Secrets Manager's own lookup: exact name key, then full/partial ARN
-/// match, then the ARN's name segment (with the 6-char suffix stripped). A bare
-/// plaintext name is looked up verbatim and is never suffix-stripped, so a
-/// hyphenated name like `prod-config` cannot collide with a secret named `prod`.
+/// mirroring Secrets Manager's own lookup. A plain name is looked up verbatim
+/// (never suffix-stripped, so `prod-config` cannot collide with `prod`). An
+/// ARN resolves only to the secret whose ARN it is, or whose ARN it is a
+/// partial form of (missing just the `-XXXXXX` random suffix); since the whole
+/// stored ARN is compared, its partition, region and account must match too.
 fn find_secret<'a>(
     st: &'a fakecloud_secretsmanager::SecretsManagerState,
     secret_ref: &str,
 ) -> Option<&'a fakecloud_secretsmanager::Secret> {
-    if let Some(secret) = st.secrets.get(secret_ref) {
+    if arn_resource(secret_ref, "secretsmanager").is_none() {
+        return st.secrets.get(secret_ref);
+    }
+    if let Some(secret) = st.secrets.values().find(|s| s.arn == secret_ref) {
         return Some(secret);
     }
-    if secret_ref.starts_with("arn:aws:secretsmanager:") {
-        for secret in st.secrets.values() {
-            if secret.arn == secret_ref || secret.arn.starts_with(secret_ref) {
-                return Some(secret);
-            }
-        }
-        // Fall back to the name embedded in the ARN tail.
-        if let Some(tail) = secret_ref.rsplit(":secret:").next() {
-            let name = strip_arn_secret_suffix(tail);
-            if let Some(secret) = st.secrets.get(name) {
-                return Some(secret);
-            }
-            if let Some(secret) = st.secrets.get(tail) {
-                return Some(secret);
-            }
-        }
-    }
-    None
+    let is_partial_of = |arn: &str| {
+        arn.strip_prefix(secret_ref)
+            .and_then(|rest| rest.strip_prefix('-'))
+            .is_some_and(|suffix| suffix.chars().count() == 6)
+    };
+    st.secrets.values().find(|s| is_partial_of(&s.arn))
 }
 
 /// Next per-project `buildBatchNumber`, with the same monotonic semantics.
@@ -2496,7 +2479,7 @@ impl CodeBuildService {
         opt_len(&b, "username", 1, usize::MAX)?;
         let (region, account) = self.region_account(req);
         // AWS renders the server type lowercase in the token ARN
-        // (`arn:aws:codebuild:...:token/github`) even though the `serverType`
+        // (`arn:<partition>:codebuild:...:token/github`) even though the `serverType`
         // field echoes the uppercase enum value.
         let arn_str = arn(
             &region,
@@ -3798,6 +3781,27 @@ mod tests {
     }
 
     #[test]
+    fn project_arn_carries_china_partition() {
+        let s = svc();
+        let mut r = req("CreateProject", minimal_project("cnp"));
+        r.region = "cn-north-1".to_string();
+        let out = body_of(s.create_project(&r).unwrap());
+        assert_eq!(
+            out["project"]["arn"],
+            "arn:aws-cn:codebuild:cn-north-1:000000000000:project/cnp"
+        );
+    }
+
+    #[test]
+    fn split_secret_ref_china_arn_and_key() {
+        let arn = "arn:aws-cn:secretsmanager:cn-north-1:000000000000:secret:prod-config-AbCdEf";
+        assert_eq!(
+            split_secret_ref(&format!("{arn}:password")),
+            (arn.to_string(), Some("password".to_string()))
+        );
+    }
+
+    #[test]
     fn split_secret_ref_full_arn() {
         let arn = "arn:aws:secretsmanager:us-east-1:000000000000:secret:prod-config-AbCdEf";
         assert_eq!(split_secret_ref(arn), (arn.to_string(), None));
@@ -3810,18 +3814,6 @@ mod tests {
             split_secret_ref(&format!("{arn}:username")),
             (arn.to_string(), Some("username".to_string()))
         );
-    }
-
-    #[test]
-    fn strip_arn_secret_suffix_only_strips_six_char_suffix() {
-        // ARN tails always carry the `-<6 alnum>` suffix AWS appends; it is
-        // stripped even when the real name itself contains hyphens.
-        assert_eq!(strip_arn_secret_suffix("prod-config-AbCdEf"), "prod-config");
-        assert_eq!(strip_arn_secret_suffix("mysecret-A1b2C3"), "mysecret");
-        // A trailing segment that is not exactly six alphanumeric chars is not a
-        // suffix and is left intact (e.g. a name with no random tail).
-        assert_eq!(strip_arn_secret_suffix("prod-settings"), "prod-settings");
-        assert_eq!(strip_arn_secret_suffix("prod"), "prod");
     }
 
     #[test]
@@ -3890,6 +3882,57 @@ mod tests {
         ]);
         assert_eq!(resolve_secret(&st, "prod-config"), "RIGHT");
         assert_eq!(resolve_secret(&st, "prod"), "WRONG");
+    }
+
+    #[test]
+    fn partial_secret_arn_matches_only_the_random_suffix() {
+        let prod = (
+            "prod",
+            "arn:aws:secretsmanager:us-east-1:000000000000:secret:prod-AbCdEf",
+            "PROD",
+        );
+        let prod_config = (
+            "prod-config",
+            "arn:aws:secretsmanager:us-east-1:000000000000:secret:prod-config-XyZ123",
+            "CONFIG",
+        );
+        let partial = "arn:aws:secretsmanager:us-east-1:000000000000:secret:prod";
+        let st = secrets_state(&[prod, prod_config]);
+        assert_eq!(resolve_secret(&st, partial), "PROD");
+        assert_eq!(
+            resolve_secret(
+                &st,
+                "arn:aws:secretsmanager:us-east-1:000000000000:secret:prod-config"
+            ),
+            "CONFIG"
+        );
+        // `prod` is not a partial ARN of `prod-config-XyZ123`.
+        let st = secrets_state(&[prod_config]);
+        assert_eq!(resolve_secret(&st, partial), "");
+    }
+
+    #[test]
+    fn secret_arn_never_falls_back_to_a_stripped_name() {
+        let st = secrets_state(&[(
+            "prod",
+            "arn:aws:secretsmanager:us-east-1:000000000000:secret:prod-AbCdEf",
+            "PROD",
+        )]);
+        assert_eq!(
+            resolve_secret(
+                &st,
+                "arn:aws:secretsmanager:us-east-1:000000000000:secret:prod-config"
+            ),
+            ""
+        );
+        // Same name, different region: not the same secret.
+        assert_eq!(
+            resolve_secret(
+                &st,
+                "arn:aws:secretsmanager:eu-west-1:000000000000:secret:prod-AbCdEf"
+            ),
+            ""
+        );
     }
 
     #[test]

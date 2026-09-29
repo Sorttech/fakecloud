@@ -1,14 +1,14 @@
 +++
 title = "AWS Service Coverage & API Conformance"
-description = "fakecloud provides 100% API conformance across 7,508 operations. Explore our supported AWS services for local development."
+description = "fakecloud provides 100% API conformance across 7,509 operations. Explore our supported AWS services for local development."
 template = "page.html"
 +++
 
-fakecloud provides 100% API conformance across 7,508 operations. Unlike mocks, fakecloud is built against official AWS Smithy models to ensure wire-protocol compatibility and deterministic behavior for local development.
+fakecloud provides 100% API conformance across 7,509 operations. Unlike mocks, fakecloud is built against official AWS Smithy models to ensure wire-protocol compatibility and deterministic behavior for local development.
 
 ## Coverage Summary
 - **Total Services**: 105
-- **Total Operations**: 7,506
+- **Total Operations**: 7,509
 - **Conformance Engine**: 248,557 Smithy-based test variants
 - **Startup Time**: ~300ms
 
@@ -22,7 +22,7 @@ fakecloud provides 100% API conformance across 7,508 operations. Unlike mocks, f
 
 ### Storage & Databases
 - **S3**: 107 operations. Bucket lifecycle, Object tagging, Multipart uploads, real `SelectObjectContent` EventStream.
-- **DynamoDB**: 57 operations. TTL, GSI/LSI, and DynamoDB Streams.
+- **DynamoDB**: 58 operations. TTL, GSI/LSI, and DynamoDB Streams.
 - **RDS**: 163 operations. Real Postgres, MySQL, MariaDB, Oracle, SQL Server, and Db2 via Docker.
 - **RDS Data API**: 6 operations. Real SQL (`ExecuteStatement`/`BatchExecuteStatement`) on the backing Postgres/MySQL container with typed parameters and results, plus transactions (`BeginTransaction`/`CommitTransaction`/`RollbackTransaction`).
 - **Redshift**: 141 operations. Full control plane — clusters, snapshots, parameter/subnet/security groups, snapshot schedules and copy grants, endpoint access, per-cluster logging, cross-region snapshot-copy config, and tagging. No SQL data plane (that is the separate `redshift-data` API).
@@ -42,7 +42,7 @@ fakecloud provides 100% API conformance across 7,508 operations. Unlike mocks, f
 - **AWS Backup**: 109 operations (complete). Full AWS Backup control plane: backup plans (with versions) + selections, backup vaults (standard / logically-air-gapped / restore-access) with notifications, access policies, and lock configuration, recovery points, backup / copy / restore / scan jobs (progressed synthetically to a terminal state so Describe/List show completed work; `StartBackupJob` records a synthetic recovery point that `DescribeRecoveryPoint` resolves), frameworks, report plans + jobs, legal holds, restore-testing plans + selections, tiering configurations, protected resources, tags, and account-scoped global / region settings, with persistence. No real backup engine runs (control-plane emulation, matching LocalStack Community).
 
 ### AI & Machine Learning
-- **Bedrock**: 214 operations across 4 APIs (Bedrock 101, Bedrock Runtime 10, Bedrock Agent 72, Bedrock Agent Runtime 31). Guardrails, Model Customization, Provisioned Throughput, Agents, Knowledge Bases.
+- **Bedrock**: 216 operations across 4 APIs (Bedrock 103, Bedrock Runtime 10, Bedrock Agent 72, Bedrock Agent Runtime 31). Guardrails, Model Customization, Provisioned Throughput, Agents, Knowledge Bases.
 - **Bedrock Runtime**: Deterministic `InvokeModel`, `InvokeModelWithResponseStream`, and `Converse` APIs (echo / configurable-response mode; no real inference).
 
 ### Messaging & Integration
@@ -64,6 +64,7 @@ fakecloud provides 100% API conformance across 7,508 operations. Unlike mocks, f
 - **IAM**: 180 operations. Policy evaluation including permission boundaries, session policies, ABAC, NotPrincipal, and KMS key policies.
 - **STS**: 11 operations. Local token generation and session management.
 - **SSM**: 152 operations. Parameter Store; Secrets Manager (23 operations) is a separate service.
+- **Every remaining service** — the full per-service list with operation counts lives in the [parity matrix](@/docs/parity.md).
 
 ## Technical Conformance Data
 fakecloud is validated against the same Smithy models used by the official AWS SDKs. This ensures that every request and response matches the expected wire format exactly, eliminating 'works on my machine' bugs caused by shallow mocks.

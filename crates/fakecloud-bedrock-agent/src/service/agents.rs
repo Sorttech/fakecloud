@@ -11,16 +11,10 @@ impl BedrockAgentService {
         let agent = Agent {
             agent_id: id.clone(),
             agent_name: name,
-            agent_arn: format!(
-                "arn:aws:bedrock:{}:{}:agent/{}",
-                req.region, req.account_id, id
-            ),
+            agent_arn: crate::arns::agent_arn(&req.region, &req.account_id, &id),
             agent_version: "DRAFT".to_string(),
             agent_resource_role_arn: opt_str(&body, "agentResourceRoleArn").unwrap_or_else(|| {
-                format!(
-                    "arn:aws:iam::{}:role/fakecloud-bedrock-agent-role",
-                    req.account_id
-                )
+                crate::arns::default_agent_role_arn(&req.region, &req.account_id)
             }),
             description: opt_str(&body, "description"),
             instruction: opt_str(&body, "instruction"),
@@ -215,9 +209,11 @@ impl BedrockAgentService {
             agent_version: opt_str(&body, "agentVersion").unwrap_or_else(|| "DRAFT".to_string()),
             routing_configuration,
             description: opt_str(&body, "description"),
-            alias_arn: format!(
-                "arn:aws:bedrock:{}:{}:agent-alias/{}/{}",
-                req.region, req.account_id, agent_id, alias_id
+            alias_arn: crate::arns::agent_alias_arn(
+                &req.region,
+                &req.account_id,
+                &agent_id,
+                &alias_id,
             ),
             agent_alias_status: "PREPARED".to_string(),
             failure_reasons: Vec::new(),

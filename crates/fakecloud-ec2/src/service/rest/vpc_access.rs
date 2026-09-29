@@ -3,6 +3,7 @@
 #![allow(clippy::too_many_lines)]
 
 use super::*;
+use crate::service_helpers::ec2_arn;
 
 fn vpc_bpa_exclusion_xml(e: &VpcBpaExclusion, tags: &[Tag]) -> String {
     format!(
@@ -34,12 +35,12 @@ pub(crate) fn create_vpc_block_public_access_exclusion(
         .query_params
         .get("SubnetId")
         .filter(|v| !v.is_empty())
-        .map(|s| format!("arn:aws:ec2:{region}:{}:subnet/{s}", req.account_id))
+        .map(|s| ec2_arn(&region, &req.account_id, &format!("subnet/{s}")))
         .or_else(|| {
             req.query_params
                 .get("VpcId")
                 .filter(|v| !v.is_empty())
-                .map(|v| format!("arn:aws:ec2:{region}:{}:vpc/{v}", req.account_id))
+                .map(|v| ec2_arn(&region, &req.account_id, &format!("vpc/{v}")))
         });
     let id = gen_id("vpcbpa-exclude");
     let e = VpcBpaExclusion {

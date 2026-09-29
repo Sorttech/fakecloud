@@ -19,6 +19,7 @@ use percent_encoding::percent_decode_str;
 use serde_json::{Map, Value};
 use tokio::sync::Mutex as AsyncMutex;
 
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_persistence::SnapshotStore;
 
@@ -409,14 +410,28 @@ pub(crate) fn arn_path(rtype: &str) -> &'static str {
     }
 }
 
+/// An IoT ARN, `arn:<partition>:iot:<region>:<account>:<resource>`, in
+/// `region`'s partition.
+pub fn iot_arn(region: &str, account: &str, resource: &str) -> String {
+    Arn::regional("iot", region, account, resource).to_string()
+}
+
+/// The ARN of the resource `name` of the REST collection `rtype` (`things`,
+/// `policies`, `thing-groups`, ...).
+pub fn resource_arn(region: &str, account: &str, rtype: &str, name: &str) -> String {
+    iot_arn(region, account, &format!("{}{}", arn_path(rtype), name))
+}
+
+pub fn cert_arn(region: &str, account: &str, cert_id: &str) -> String {
+    iot_arn(region, account, &format!("cert/{cert_id}"))
+}
+
+pub fn rule_destination_arn(region: &str, account: &str, kind: &str, uid: &str) -> String {
+    iot_arn(region, account, &format!("ruledestination/{kind}/{uid}"))
+}
+
 pub(crate) fn mint_arn(ctx: &Ctx, rtype: &str, name: &str) -> String {
-    format!(
-        "arn:aws:iot:{}:{}:{}{}",
-        ctx.region,
-        ctx.account,
-        arn_path(rtype),
-        name
-    )
+    resource_arn(&ctx.region, &ctx.account, rtype, name)
 }
 
 /// Deterministic UUID-shaped id derived from a seed string.

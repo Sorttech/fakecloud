@@ -35,8 +35,10 @@ impl CloudWatchService {
             .or_insert_with(|| Dataset {
                 id: Uuid::new_v4().to_string(),
                 arn: format!(
-                    "arn:aws:cloudwatch:{}:{}:dataset/{identifier}",
-                    req.region, req.account_id
+                    "arn:{}:cloudwatch:{}:{}:dataset/{identifier}",
+                    fakecloud_aws::arn::partition_for(&req.region),
+                    req.region,
+                    req.account_id
                 ),
                 kms_key_arn: None,
             });

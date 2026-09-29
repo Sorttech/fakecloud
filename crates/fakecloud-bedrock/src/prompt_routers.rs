@@ -16,10 +16,7 @@ pub(crate) fn create_prompt_router(
     let router_name = body["promptRouterName"].as_str().unwrap_or(&default_name);
 
     let router_id = Uuid::new_v4().to_string();
-    let router_arn = format!(
-        "arn:aws:bedrock:{}:{}:prompt-router/{}",
-        req.region, req.account_id, router_id
-    );
+    let router_arn = crate::arns::prompt_router_arn(&req.region, &req.account_id, &router_id);
 
     let now = Utc::now();
     let router = PromptRouter {
