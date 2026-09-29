@@ -43,7 +43,7 @@ impl ResourceProvisioner {
         env.insert("WebserverUrl".to_string(), json!(webserver.clone()));
         env.insert(
             "ServiceRoleArn".to_string(),
-            json!(service_role_arn(account)),
+            json!(service_role_arn(region, account)),
         );
         env.insert(
             "CeleryExecutorQueue".to_string(),

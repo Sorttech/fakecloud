@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
-use fakecloud_aws::arn::Arn;
+use fakecloud_aws::arn::{arn_resource, implicit_global_region, partition_for, partition_of, Arn};
 use fakecloud_core::pagination::paginate_checked;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_persistence::SnapshotStore;
@@ -547,7 +547,7 @@ fn normalize_resource_arn(arn: &str) -> String {
     //   arn:aws:elasticloadbalancing:<region>:<acct>:listener/<type>/<name>/<lb-suffix>/<listener-suffix>
     // LoadBalancer ARN:
     //   arn:aws:elasticloadbalancing:<region>:<acct>:loadbalancer/<type>/<name>/<lb-suffix>
-    if let Some(rest) = arn.strip_prefix("arn:aws:elasticloadbalancing:") {
+    if let Some(rest) = arn_resource(arn, "elasticloadbalancing") {
         if let Some((before, after)) = rest.split_once(":listener/") {
             // Listener path has 4 segments (<type>/<name>/<lb-suffix>/<listener-suffix>);
             // drop the trailing listener suffix to recover the lb ARN.
@@ -557,7 +557,8 @@ fn normalize_resource_arn(arn: &str) -> String {
             let lb_suffix = parts.next();
             if let (Some(ty), Some(name), Some(lb_suffix)) = (ty, name, lb_suffix) {
                 return format!(
-                    "arn:aws:elasticloadbalancing:{before}:loadbalancer/{ty}/{name}/{lb_suffix}"
+                    "arn:{}:elasticloadbalancing:{before}:loadbalancer/{ty}/{name}/{lb_suffix}",
+                    partition_of(arn)
                 );
             }
         }
@@ -589,7 +590,7 @@ fn synth_uuid() -> String {
     Uuid::new_v4().to_string()
 }
 
-fn synth_arn(
+pub fn synth_arn(
     account_id: &str,
     region: &str,
     scope: &str,
@@ -606,12 +607,13 @@ fn synth_arn(
     // region segment plus a `global/...` resource path. REGIONAL ARNs use the
     // caller's region with the literal `regional` scope prefix in the resource
     // path (e.g. `arn:aws:wafv2:us-east-1:acct:regional/ipset/name/id`).
+    // In another partition the global region is that partition's own.
     let (region_in_arn, scope_seg) = if scope == "CLOUDFRONT" {
-        ("us-east-1", "global")
+        (implicit_global_region(partition_for(region)), "global")
     } else {
         (region, "regional")
     };
-    Arn::new(
+    Arn::regional(
         "wafv2",
         region_in_arn,
         account_id,
@@ -804,7 +806,14 @@ pub(super) fn managed_group_def(vendor: &str, name: &str) -> Option<&'static Man
         .find(|d| d.vendor == vendor && d.name == name)
 }
 
-fn managed_products() -> Vec<Value> {
+/// The SNS topic an AWS managed rule group publishes version updates to:
+/// account-less, in the global region of the caller's partition.
+fn managed_sns_topic_arn(region: &str, product: &str) -> String {
+    let global = implicit_global_region(partition_for(region));
+    Arn::regional("sns", global, "", &format!("{product}-notifications")).to_string()
+}
+
+fn managed_products(region: &str) -> Vec<Value> {
     managed_rule_group_catalog()
         .iter()
         .map(|d| {
@@ -815,7 +824,7 @@ fn managed_products() -> Vec<Value> {
                 "ProductLink": "https://docs.aws.amazon.com/waf/latest/developerguide/aws-managed-rule-groups-list.html",
                 "ProductTitle": d.product_title,
                 "ProductDescription": d.description,
-                "SnsTopicArn": format!("arn:aws:sns:us-east-1::{}-notifications", d.product_id),
+                "SnsTopicArn": managed_sns_topic_arn(region, d.product_id),
                 "IsVersioningSupported": true,
                 "IsAdvancedManagedRuleSet": false,
             })
@@ -1066,6 +1075,82 @@ mod arn_norm_tests {
         assert_eq!(
             normalize_resource_arn(listener),
             "arn:aws:elasticloadbalancing:eu-west-1:123456789012:loadbalancer/net/wire/abc"
+        );
+    }
+
+    #[test]
+    fn aws_cn_listener_arn_collapses_within_its_partition() {
+        let listener =
+            "arn:aws-cn:elasticloadbalancing:cn-north-1:123456789012:listener/app/web/abc/xyz";
+        assert_eq!(
+            normalize_resource_arn(listener),
+            "arn:aws-cn:elasticloadbalancing:cn-north-1:123456789012:loadbalancer/app/web/abc"
+        );
+    }
+
+    #[test]
+    fn china_region_arns_use_the_aws_cn_partition_and_its_global_region() {
+        use super::*;
+        let svc = Wafv2Service::default();
+        let call = |action: &str, body: Value| -> Value {
+            let req = AwsRequest {
+                service: "wafv2".into(),
+                action: action.into(),
+                method: http::Method::POST,
+                raw_path: "/".into(),
+                raw_query: String::new(),
+                path_segments: Vec::new(),
+                query_params: std::collections::HashMap::new(),
+                headers: http::HeaderMap::new(),
+                body: serde_json::to_vec(&body).unwrap().into(),
+                body_stream: parking_lot::Mutex::new(None),
+                account_id: "123456789012".into(),
+                region: "cn-north-1".into(),
+                request_id: "r".into(),
+                is_query_protocol: false,
+                access_key_id: None,
+                principal: None,
+            };
+            let resp = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(svc.handle(req))
+                .unwrap_or_else(|e| panic!("{action}: {}", e.code()));
+            serde_json::from_slice(resp.body.expect_bytes()).unwrap()
+        };
+        let regional = call(
+            "CreateIPSet",
+            json!({ "Name": "r", "Scope": "REGIONAL", "IPAddressVersion": "IPV4", "Addresses": [] }),
+        );
+        let regional_arn = regional["Summary"]["ARN"].as_str().unwrap().to_string();
+        assert!(
+            regional_arn.starts_with("arn:aws-cn:wafv2:cn-north-1:123456789012:regional/ipset/r/"),
+            "{regional_arn}"
+        );
+        let global = call(
+            "CreateIPSet",
+            json!({ "Name": "g", "Scope": "CLOUDFRONT", "IPAddressVersion": "IPV4", "Addresses": [] }),
+        );
+        let global_arn = global["Summary"]["ARN"].as_str().unwrap().to_string();
+        assert!(
+            global_arn.starts_with("arn:aws-cn:wafv2:cn-northwest-1:123456789012:global/ipset/g/"),
+            "{global_arn}"
+        );
+        call(
+            "TagResource",
+            json!({ "ResourceARN": global_arn, "Tags": [{ "Key": "k", "Value": "v" }] }),
+        );
+        let tags = call("ListTagsForResource", json!({ "ResourceARN": global_arn }));
+        assert_eq!(tags["TagInfoForResource"]["TagList"][0]["Key"], "k");
+
+        let products = call("DescribeAllManagedProducts", json!({ "Scope": "REGIONAL" }));
+        let topic = products["ManagedProducts"][0]["SnsTopicArn"]
+            .as_str()
+            .unwrap();
+        assert!(
+            topic.starts_with("arn:aws-cn:sns:cn-northwest-1::"),
+            "{topic}"
         );
     }
 

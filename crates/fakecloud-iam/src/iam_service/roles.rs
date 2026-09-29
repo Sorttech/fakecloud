@@ -171,7 +171,7 @@ impl IamService {
         let role_name = required_param(&req.query_params, "RoleName")?;
         validate_string_length("roleName", &role_name, 1, 64)?;
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         let role = state.roles.get(&role_name).ok_or_else(|| {
@@ -233,7 +233,7 @@ impl IamService {
             1000,
         )?;
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
         let path_prefix = req.query_params.get("PathPrefix").cloned();
         let max_items: usize = req
@@ -482,7 +482,7 @@ impl IamService {
         let role_name = required_param(&req.query_params, "RoleName")?;
         validate_string_length("roleName", &role_name, 1, 64)?;
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         let role = state.roles.get(&role_name).ok_or_else(|| {
@@ -669,7 +669,7 @@ impl IamService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let role_name = required_param(&req.query_params, "RoleName")?;
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         if !state.roles.contains_key(&role_name) {
@@ -753,7 +753,7 @@ impl IamService {
         let role_name = required_param(&req.query_params, "RoleName")?;
         let policy_name = required_param(&req.query_params, "PolicyName")?;
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         if !state.roles.contains_key(&role_name) {
@@ -841,7 +841,7 @@ impl IamService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let role_name = required_param(&req.query_params, "RoleName")?;
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         if !state.roles.contains_key(&role_name) {
@@ -1009,7 +1009,7 @@ impl IamService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let task_id = required_param(&req.query_params, "DeletionTaskId")?;
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         let task = state

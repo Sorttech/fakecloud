@@ -37,8 +37,10 @@ impl ResourceProvisioner {
             .and_then(Value::as_str)
             .map(str::to_string)
             .or_else(|| {
-                Some(format!(
-                    "arn:aws:kms:{region}:{account}:key/timestream-default"
+                Some(fakecloud_kms::kms_key_arn(
+                    &self.region,
+                    &self.account_id,
+                    "timestream-default",
                 ))
             });
 

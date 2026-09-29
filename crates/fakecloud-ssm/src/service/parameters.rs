@@ -4,7 +4,7 @@ use chrono::Utc;
 use http::StatusCode;
 use serde_json::{json, Value};
 
-use fakecloud_aws::arn::Arn;
+use fakecloud_aws::arn::{arn_resource, partition_for, Arn};
 use fakecloud_core::pagination::paginate_checked;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 use fakecloud_core::validation::*;
@@ -1068,7 +1068,8 @@ impl SsmService {
 
         let value = version.secret_string.as_deref().unwrap_or("").to_string();
 
-        let arn = Arn::new("ssm", region, account_id, &format!("parameter{raw_name}")).to_string();
+        let arn =
+            Arn::regional("ssm", region, account_id, &format!("parameter{raw_name}")).to_string();
 
         Ok(AwsResponse::ok_json(json!({
             "Parameter": {
@@ -1116,7 +1117,7 @@ impl SsmService {
         tick_policy_notifications(state);
 
         // Handle ARN-style names directly (they contain many colons)
-        if raw_name.starts_with("arn:aws:ssm:") {
+        if arn_resource(raw_name, "ssm").is_some() {
             let param = resolve_param_by_name_or_arn(state, raw_name)?;
             return Ok(AwsResponse::ok_json(json!({
                 "Parameter": self.render_param_to_json(param, true, with_decryption, &req.region, &req.account_id),
@@ -1238,7 +1239,7 @@ impl SsmService {
                 // ParamSelector::Invalid, landing the parameter in
                 // InvalidParameters even though GetParameter accepts the same
                 // ARN. Apply the same ARN->name normalization here.
-                if raw_name.starts_with("arn:aws:ssm:") {
+                if arn_resource(raw_name, "ssm").is_some() {
                     match resolve_param_by_name_or_arn(state, raw_name) {
                         Ok(param) => parameters.push(self.render_param_to_json(
                             param,
@@ -1870,22 +1871,28 @@ pub(super) fn remove_param(
     parameters.remove(&alt)
 }
 
-pub(super) fn param_arn(region: &str, account_id: &str, name: &str) -> String {
+pub fn param_arn(region: &str, account_id: &str, name: &str) -> String {
     let resource = if name.starts_with('/') {
         format!("parameter{name}")
     } else {
         format!("parameter/{name}")
     };
-    Arn::new("ssm", region, account_id, &resource).to_string()
+    Arn::regional("ssm", region, account_id, &resource).to_string()
 }
 
-/// Rewrite the region component of a parameter ARN.
+/// Rewrite the region component of a parameter ARN, and its partition to
+/// that region's.
 pub(super) fn rewrite_arn_region(arn: &str, region: &str) -> String {
     let parts: Vec<&str> = arn.splitn(6, ':').collect();
     if parts.len() == 6 {
         format!(
             "{}:{}:{}:{}:{}:{}",
-            parts[0], parts[1], parts[2], region, parts[4], parts[5]
+            parts[0],
+            partition_for(region),
+            parts[2],
+            region,
+            parts[4],
+            parts[5]
         )
     } else {
         arn.to_string()
@@ -2555,8 +2562,8 @@ pub(super) fn resolve_param_by_name_or_arn<'a>(
         return Ok(p);
     }
 
-    // ARN lookup: arn:aws:ssm:REGION:ACCOUNT:parameter/NAME
-    if name.starts_with("arn:aws:ssm:") {
+    // ARN lookup: arn:PARTITION:ssm:REGION:ACCOUNT:parameter/NAME
+    if arn_resource(name, "ssm").is_some() {
         if let Some(param_part) = name.split(":parameter").nth(1) {
             if let Some(p) = lookup_param(&state.parameters, param_part) {
                 return Ok(p);

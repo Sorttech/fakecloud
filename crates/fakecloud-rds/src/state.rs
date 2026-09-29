@@ -7,6 +7,19 @@ use fakecloud_aws::arn::Arn;
 use parking_lot::RwLock;
 use uuid::Uuid;
 
+/// An RDS ARN (`arn:<partition>:rds:<region>:<account>:<kind>:<id>`) in the
+/// region's partition. Every RDS resource kind (`db`, `cluster`, `snapshot`,
+/// `cluster-snapshot`, `pg`, `cluster-pg`, `subgrp`, `og`, `es`, `db-proxy`,
+/// ...) is built through here so the API and CloudFormation agree.
+pub fn rds_arn(region: &str, account_id: &str, kind: &str, id: &str) -> String {
+    Arn::regional("rds", region, account_id, &format!("{kind}:{id}")).to_string()
+}
+
+/// A global cluster's ARN: no region field, in the partition of `region`.
+pub fn global_cluster_arn(region: &str, account_id: &str, id: &str) -> String {
+    Arn::global_in(region, "rds", account_id, &format!("global-cluster:{id}")).to_string()
+}
+
 pub type SharedRdsState = Arc<RwLock<fakecloud_core::multi_account::MultiAccountState<RdsState>>>;
 
 impl fakecloud_core::multi_account::AccountState for RdsState {
@@ -759,43 +772,19 @@ impl RdsState {
     // ARN carries the request's credential-scope region (req.region), not the
     // frozen server default. Storage keying is by account/identifier, unchanged.
     pub fn db_instance_arn(&self, region: &str, db_instance_identifier: &str) -> String {
-        Arn::new(
-            "rds",
-            region,
-            &self.account_id,
-            &format!("db:{db_instance_identifier}"),
-        )
-        .to_string()
+        rds_arn(region, &self.account_id, "db", db_instance_identifier)
     }
 
     pub fn db_snapshot_arn(&self, region: &str, db_snapshot_identifier: &str) -> String {
-        Arn::new(
-            "rds",
-            region,
-            &self.account_id,
-            &format!("snapshot:{db_snapshot_identifier}"),
-        )
-        .to_string()
+        rds_arn(region, &self.account_id, "snapshot", db_snapshot_identifier)
     }
 
     pub fn db_subnet_group_arn(&self, region: &str, db_subnet_group_name: &str) -> String {
-        Arn::new(
-            "rds",
-            region,
-            &self.account_id,
-            &format!("subgrp:{db_subnet_group_name}"),
-        )
-        .to_string()
+        rds_arn(region, &self.account_id, "subgrp", db_subnet_group_name)
     }
 
     pub fn db_parameter_group_arn(&self, region: &str, db_parameter_group_name: &str) -> String {
-        Arn::new(
-            "rds",
-            region,
-            &self.account_id,
-            &format!("pg:{db_parameter_group_name}"),
-        )
-        .to_string()
+        rds_arn(region, &self.account_id, "pg", db_parameter_group_name)
     }
 
     pub fn next_dbi_resource_id(&self) -> String {
@@ -1059,13 +1048,7 @@ pub fn default_parameter_groups(
         let group_name = format!("default.{}", family);
         let group = DbParameterGroup {
             db_parameter_group_name: group_name.clone(),
-            db_parameter_group_arn: Arn::new(
-                "rds",
-                region,
-                account_id,
-                &format!("pg:{group_name}"),
-            )
-            .to_string(),
+            db_parameter_group_arn: rds_arn(region, account_id, "pg", &group_name),
             db_parameter_group_family: family.to_string(),
             description: description.to_string(),
             parameters: BTreeMap::new(),

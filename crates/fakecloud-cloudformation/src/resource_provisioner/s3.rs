@@ -11,7 +11,7 @@ impl ResourceProvisioner {
         let state = accounts.get_or_create(&self.account_id);
         let bucket = state.buckets.get(physical_id)?;
         match attribute {
-            "Arn" => Some(Arn::s3(&bucket.name).to_string()),
+            "Arn" => Some(Arn::s3_in(&bucket.region, &bucket.name).to_string()),
             "DomainName" => Some(format!("{}.s3.amazonaws.com", bucket.name)),
             "RegionalDomainName" => {
                 Some(format!("{}.s3.{}.amazonaws.com", bucket.name, self.region))
@@ -62,7 +62,7 @@ impl ResourceProvisioner {
             .put_bucket_meta(bucket_name, &meta)
             .map_err(|e| format!("failed to persist bucket {bucket_name}: {e}"))?;
 
-        let arn = Arn::s3(bucket_name).to_string();
+        let arn = Arn::s3_in(&region, bucket_name).to_string();
         let domain_name = format!("{bucket_name}.s3.amazonaws.com");
         let regional_domain_name = format!("{bucket_name}.s3.{region}.amazonaws.com");
         let dual_stack_domain_name = format!("{bucket_name}.s3.dualstack.{region}.amazonaws.com");
@@ -101,7 +101,7 @@ impl ResourceProvisioner {
             )?;
         }
 
-        let arn = Arn::s3(bucket_name).to_string();
+        let arn = Arn::s3_in(&region, bucket_name).to_string();
         let domain_name = format!("{bucket_name}.s3.amazonaws.com");
         let regional_domain_name = format!("{bucket_name}.s3.{region}.amazonaws.com");
         let dual_stack_domain_name = format!("{bucket_name}.s3.dualstack.{region}.amazonaws.com");

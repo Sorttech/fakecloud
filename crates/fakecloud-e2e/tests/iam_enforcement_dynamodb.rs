@@ -781,3 +781,89 @@ async fn fine_grained_access_by_partition_and_attribute() {
             .await
     ));
 }
+
+/// PartiQL writes are authorized on exactly what they write: an INSERT whose
+/// item arrives as a bound map parameter, and an UPDATE that equates the key
+/// twice (the first equality pins the item), are read the way the executor
+/// runs them; a tuple naming an attribute twice is refused outright.
+#[tokio::test]
+async fn partiql_writes_are_authorized_on_what_they_write() {
+    let server = start_strict().await;
+    let admin = admin(&server).await;
+    create_table(&admin, "Orders").await;
+    admin
+        .put_item()
+        .table_name("Orders")
+        .item("pk", AttributeValue::S("bob".into()))
+        .send()
+        .await
+        .unwrap();
+    let alice = user_with_policy(
+        &server,
+        "alice",
+        &serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": ["dynamodb:PartiQLInsert", "dynamodb:PartiQLUpdate"],
+                    "Resource": table_arn("Orders"),
+                    "Condition": {"ForAllValues:StringEquals": {"dynamodb:LeadingKeys": ["alice"]}}
+                },
+                {
+                    "Effect": "Deny",
+                    "Action": ["dynamodb:PartiQLInsert", "dynamodb:PartiQLUpdate"],
+                    "Resource": table_arn("Orders"),
+                    "Condition": {"ForAnyValue:StringEquals": {"dynamodb:Attributes": ["ssn"]}}
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .await;
+
+    let as_map = |pairs: &[(&str, &str)]| {
+        AttributeValue::M(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), AttributeValue::S(v.to_string())))
+                .collect(),
+        )
+    };
+    let insert = |item: AttributeValue| {
+        alice
+            .execute_statement()
+            .statement("INSERT INTO \"Orders\" VALUE ?")
+            .parameters(item)
+            .send()
+    };
+    assert!(denied(insert(as_map(&[("pk", "bob-2")])).await));
+    assert!(
+        denied(insert(as_map(&[("pk", "alice"), ("ssn", "1")])).await),
+        "a denied attribute inside a map parameter"
+    );
+    insert(as_map(&[("pk", "alice"), ("label", "x")]))
+        .await
+        .expect("own partition, allowed attributes");
+
+    assert!(
+        denied(
+            alice
+                .execute_statement()
+                .statement("UPDATE \"Orders\" SET label = 'x' WHERE pk = 'bob' AND pk = 'alice'")
+                .send()
+                .await
+        ),
+        "the first key equality is the item written"
+    );
+    let err = admin
+        .execute_statement()
+        .statement("INSERT INTO \"Orders\" VALUE {'pk': 'alice', 'pk': 'bob'}")
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.into_service_error().meta().code(),
+        Some("ValidationException")
+    );
+}

@@ -5,7 +5,7 @@ use fakecloud_aws::ec2query::{ec2_elem, ec2_list, ec2_return};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use crate::service::Ec2Service;
-use crate::service_helpers::{gen_id, require, validate_enum, validate_max_results};
+use crate::service_helpers::{ec2_arn, gen_id, require, validate_enum, validate_max_results};
 use crate::state::{Ec2State, InstanceConnectEndpoint, Tag};
 
 const FIXED_TIME: &str = "2024-01-01T00:00:00.000Z";
@@ -17,7 +17,7 @@ fn ice_xml(e: &InstanceConnectEndpoint, tags: &[Tag], owner: &str, region: &str)
     format!(
         "{}{}{}<state>create-complete</state>{}<createdAt>{}</createdAt><preserveClientIp>true</preserveClientIp>{}",
         ec2_elem("instanceConnectEndpointId", &e.id),
-        ec2_elem("instanceConnectEndpointArn", &format!("arn:aws:ec2:{region}:{owner}:instance-connect-endpoint/{}", e.id)),
+        ec2_elem("instanceConnectEndpointArn", &ec2_arn(region, owner, &format!("instance-connect-endpoint/{}", e.id))),
         ec2_elem("ownerId", owner),
         ec2_elem("subnetId", &e.subnet_id),
         FIXED_TIME,

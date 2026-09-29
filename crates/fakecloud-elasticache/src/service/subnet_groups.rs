@@ -47,11 +47,11 @@ impl ElastiCacheService {
 
         // ARN carries the request's credential-scope region (req.region), not the
         // frozen server default.
-        let arn = format!(
-            "arn:aws:elasticache:{}:{}:subnetgroup:{}",
+        let arn = elasticache_arn(
             request.region.as_str(),
-            state.account_id,
-            name
+            &state.account_id,
+            "subnetgroup",
+            &name,
         );
         let vpc_id = format!(
             "vpc-{:08x}",

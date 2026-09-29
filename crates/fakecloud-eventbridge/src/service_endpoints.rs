@@ -40,10 +40,13 @@ impl EventBridgeService {
         }
 
         let endpoint_id = format!("{}.abc123", name);
-        let arn = format!(
-            "arn:aws:events:{}:{}:endpoint/{}",
-            req.region, state.account_id, name
-        );
+        let arn = Arn::regional(
+            "events",
+            &req.region,
+            &state.account_id,
+            &format!("endpoint/{name}"),
+        )
+        .to_string();
         let endpoint_url = format!(
             "https://{}.endpoint.events.{}.amazonaws.com",
             endpoint_id, req.region

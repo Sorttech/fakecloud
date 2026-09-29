@@ -258,7 +258,7 @@ fn str_list(b: &Value, f: &str) -> Vec<String> {
 }
 
 fn arn(kind: &str, region: &str, account: &str, name: &str) -> String {
-    format!("arn:aws:memorydb:{region}:{account}:{kind}/{name}")
+    crate::state::memorydb_arn(kind, region, account, name)
 }
 
 /// Read an optional integer request field, defaulting when absent and
@@ -2084,6 +2084,51 @@ mod tests {
             users["Users"][0]["ARN"],
             "arn:aws:memorydb:us-east-1:123456789012:user/default"
         );
+    }
+
+    #[tokio::test]
+    async fn china_region_arns_use_the_china_partition_and_are_taggable() {
+        let s = service();
+        let in_cn = |action: &str, body: Value| {
+            let mut r = req(action, body);
+            r.region = "cn-north-1".to_string();
+            r
+        };
+        let resp = s
+            .handle(in_cn("DescribeUsers", json!({"UserName": "default"})))
+            .await
+            .unwrap();
+        let users: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        assert_eq!(
+            users["Users"][0]["ARN"],
+            "arn:aws-cn:memorydb:cn-north-1:123456789012:user/default"
+        );
+
+        let resp = s
+            .handle(in_cn(
+                "CreateACL",
+                json!({"ACLName": "cn-acl", "UserNames": ["default"]}),
+            ))
+            .await
+            .unwrap();
+        let acl: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        let arn = acl["ACL"]["ARN"].as_str().unwrap().to_string();
+        assert_eq!(
+            arn,
+            "arn:aws-cn:memorydb:cn-north-1:123456789012:acl/cn-acl"
+        );
+        s.handle(in_cn(
+            "TagResource",
+            json!({"ResourceArn": arn, "Tags": [{"Key": "k", "Value": "v"}]}),
+        ))
+        .await
+        .unwrap();
+        let resp = s
+            .handle(in_cn("ListTags", json!({"ResourceArn": arn})))
+            .await
+            .unwrap();
+        let tags: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        assert_eq!(tags["TagList"][0]["Key"], "k");
     }
 
     #[tokio::test]

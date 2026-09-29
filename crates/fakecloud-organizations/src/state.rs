@@ -6,6 +6,8 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use fakecloud_aws::arn::{partition_of, Arn};
+
 /// Shared, cross-account registry of every organization in the process.
 /// An AWS org is not per-account state (it spans accounts), so this is
 /// NOT wrapped in `MultiAccountState` — but it is not a singleton
@@ -22,9 +24,9 @@ pub struct OrganizationsRegistry {
     orgs: BTreeMap<String, OrganizationState>,
 }
 
-/// A GovCloud mirror lives in the `aws-us-gov` partition.
+/// A GovCloud mirror created by `CreateGovCloudAccount`.
 fn is_gov_cloud(account: &MemberAccount) -> bool {
-    account.arn.starts_with("arn:aws-us-gov:")
+    account.gov_cloud_mirror
 }
 
 /// Resolve a handshake or transfer target to an account id.
@@ -65,6 +67,28 @@ impl From<OrganizationState> for OrganizationsRegistry {
 impl OrganizationsRegistry {
     pub fn is_empty(&self) -> bool {
         self.orgs.is_empty()
+    }
+
+    /// Does any organization hold a handshake that is past due?
+    ///
+    /// Cheap enough to run under the read lock on every request, so the
+    /// write lock the sweep needs is only ever taken when there is
+    /// something to expire.
+    pub fn has_stale_handshakes(&self, now: DateTime<Utc>) -> bool {
+        self.orgs.values().any(|org| {
+            org.handshakes.values().any(|h| {
+                matches!(h.state.as_str(), "OPEN" | "REQUESTED") && h.expiration_timestamp <= now
+            })
+        })
+    }
+
+    /// Expire every past-due handshake in every organization, and
+    /// return how many moved.
+    pub fn expire_stale_handshakes(&mut self, now: DateTime<Utc>) -> usize {
+        self.orgs
+            .values_mut()
+            .map(|org| org.expire_stale_handshakes(now))
+            .sum()
     }
 
     pub fn len(&self) -> usize {
@@ -462,6 +486,9 @@ impl OrganizationsSnapshot {
         if let Some(org) = self.organization {
             registry.insert(org);
         }
+        for org in registry.orgs.values_mut() {
+            org.mark_legacy_gov_cloud_mirrors();
+        }
         registry
     }
 }
@@ -540,6 +567,54 @@ impl OrganizationState {
     /// `FullAWSAccess` SCP, and auto-attaches it to root (matching AWS's
     /// default behavior).
     pub fn bootstrap(management_account_id: &str) -> Self {
+        Self::bootstrap_in("", management_account_id)
+    }
+
+    /// An ARN for `resource` owned by this organization's management
+    /// account (`arn:<p>:organizations::<mgmt>:<resource>`), in the
+    /// organization's partition.
+    pub fn resource_arn(&self, resource: &str) -> String {
+        Arn::global("organizations", &self.management_account_id, resource)
+            .with_partition(partition_of(&self.org_arn))
+            .to_string()
+    }
+
+    /// The ARN of this organization's resource policy.
+    pub fn resource_policy_arn(&self) -> String {
+        self.resource_arn(&format!(
+            "resourcepolicy/{}/{RESOURCE_POLICY_ID}",
+            self.org_id
+        ))
+    }
+
+    /// The partition this organization lives in.
+    pub fn partition(&self) -> &str {
+        partition_of(&self.org_arn)
+    }
+
+    /// Flag the GovCloud mirrors of a snapshot written before accounts
+    /// carried `gov_cloud_mirror`: in a commercial organization, the only
+    /// `aws-us-gov` accounts are the ones `CreateGovCloudAccount` paired.
+    fn mark_legacy_gov_cloud_mirrors(&mut self) {
+        if self.partition() != "aws" {
+            return;
+        }
+        for account in self.accounts.values_mut() {
+            if partition_of(&account.arn) == "aws-us-gov" {
+                account.gov_cloud_mirror = true;
+            }
+        }
+    }
+
+    /// The ARN of `account_id` as a member of this organization.
+    pub fn account_arn(&self, account_id: &str) -> String {
+        self.resource_arn(&format!("account/{}/{account_id}", self.org_id))
+    }
+
+    /// [`OrganizationState::bootstrap`] for an organization created in
+    /// `region`: every ARN of the organization, its accounts, OUs, policies
+    /// and handshakes is in that region's partition.
+    pub fn bootstrap_in(region: &str, management_account_id: &str) -> Self {
         let now = Utc::now();
         let org_id = format!("o-{}", random_id(10));
         // AWS root ids are 4-32 chars. Four was fine while only one
@@ -547,28 +622,40 @@ impl OrganizationState {
         // 1/65536, which would let one organization's root id validate as
         // a target in another.
         let root_id = format!("r-{}", random_id(12));
-        let org_arn = format!(
-            "arn:aws:organizations::{}:organization/{}",
-            management_account_id, org_id
-        );
-        let root_arn = format!(
-            "arn:aws:organizations::{}:root/{}/{}",
-            management_account_id, org_id, root_id
-        );
-        let mgmt_arn = format!(
-            "arn:aws:organizations::{}:account/{}/{}",
-            management_account_id, org_id, management_account_id
-        );
+        let org_arn = Arn::global_in(
+            region,
+            "organizations",
+            management_account_id,
+            &format!("organization/{org_id}"),
+        )
+        .to_string();
+        let root_arn = Arn::global_in(
+            region,
+            "organizations",
+            management_account_id,
+            &format!("root/{org_id}/{root_id}"),
+        )
+        .to_string();
+        let mgmt_arn = Arn::global_in(
+            region,
+            "organizations",
+            management_account_id,
+            &format!("account/{org_id}/{management_account_id}"),
+        )
+        .to_string();
 
         let mut policies = BTreeMap::new();
         policies.insert(
             FULL_AWS_ACCESS_POLICY_ID.to_string(),
             Policy {
                 id: FULL_AWS_ACCESS_POLICY_ID.to_string(),
-                arn: format!(
-                    "arn:aws:organizations::aws:policy/service_control_policy/{}",
-                    FULL_AWS_ACCESS_POLICY_ID
-                ),
+                arn: Arn::global_in(
+                    region,
+                    "organizations",
+                    "aws",
+                    &format!("policy/service_control_policy/{FULL_AWS_ACCESS_POLICY_ID}"),
+                )
+                .to_string(),
                 name: FULL_AWS_ACCESS_POLICY_NAME.to_string(),
                 description: FULL_AWS_ACCESS_POLICY_DESCRIPTION.to_string(),
                 policy_type: POLICY_TYPE_SCP.to_string(),
@@ -595,6 +682,7 @@ impl OrganizationState {
                 joined_method: "INVITED".to_string(),
                 joined_timestamp: now,
                 parent_id: root_id.clone(),
+                gov_cloud_mirror: false,
             },
         );
 
@@ -822,10 +910,7 @@ impl OrganizationState {
         };
 
         // Enroll the commercial account.
-        let arn = format!(
-            "arn:aws:organizations::{}:account/{}/{}",
-            self.management_account_id, self.org_id, account_id
-        );
+        let arn = self.account_arn(&account_id);
         self.accounts.insert(
             account_id.clone(),
             MemberAccount {
@@ -837,6 +922,7 @@ impl OrganizationState {
                 joined_method: "CREATED".to_string(),
                 joined_timestamp: now,
                 parent_id: self.root_id.clone(),
+                gov_cloud_mirror: false,
             },
         );
 
@@ -864,6 +950,7 @@ impl OrganizationState {
                     joined_method: "CREATED".to_string(),
                     joined_timestamp: now,
                     parent_id: self.root_id.clone(),
+                    gov_cloud_mirror: true,
                 },
             );
         }
@@ -965,10 +1052,7 @@ impl OrganizationState {
         }
         let now = Utc::now();
         let id = format!("h-{}", random_id(32));
-        let arn = format!(
-            "arn:aws:organizations::{}:handshake/{}/invite/{}",
-            self.management_account_id, self.org_id, id
-        );
+        let arn = self.resource_arn(&format!("handshake/{}/invite/{id}", self.org_id));
         let kind = target_kind.to_string();
         let handshake = Handshake {
             id: id.clone(),
@@ -1036,10 +1120,7 @@ impl OrganizationState {
         };
         if let Some(target) = enrolling {
             let now = Utc::now();
-            let arn = format!(
-                "arn:aws:organizations::{}:account/{}/{}",
-                self.management_account_id, self.org_id, target
-            );
+            let arn = self.account_arn(&target);
             // The caller supplies the address: an account's address must
             // be unique across the whole registry, which this organization
             // cannot see on its own.
@@ -1058,6 +1139,7 @@ impl OrganizationState {
                     joined_method: "INVITED".to_string(),
                     joined_timestamp: now,
                     parent_id: self.root_id.clone(),
+                    gov_cloud_mirror: false,
                 },
             );
         }
@@ -1082,6 +1164,49 @@ impl OrganizationState {
             }
         }
         Ok(snapshot)
+    }
+
+    /// Flip every handshake past its `ExpirationTimestamp` to
+    /// `EXPIRED`, and return how many moved.
+    ///
+    /// AWS gives a handshake 15 days and expires it on its own; nothing
+    /// here ever did, so an overdue invitation stayed `OPEN` and
+    /// acceptable forever, and the `ExpirationTimestamp` fakecloud
+    /// reported was decoration. Expiry runs through `resolve_handshake`
+    /// like every other terminal transition, so a responsibility
+    /// transfer riding an expired handshake ends with it.
+    pub fn expire_stale_handshakes(&mut self, now: DateTime<Utc>) -> usize {
+        let stale: Vec<(String, DateTime<Utc>)> = self
+            .handshakes
+            .values()
+            .filter(|h| {
+                matches!(h.state.as_str(), "OPEN" | "REQUESTED") && h.expiration_timestamp <= now
+            })
+            .map(|h| (h.id.clone(), h.expiration_timestamp))
+            .collect();
+        for (id, deadline) in &stale {
+            // Bind the transfer BEFORE resolving: `resolve_handshake`
+            // clears the `active_handshake_id` that identifies it.
+            let riding = self
+                .responsibility_transfers
+                .values()
+                .find(|t| t.active_handshake_id.as_deref() == Some(id.as_str()))
+                .map(|t| t.id.clone());
+            // The state check above is exactly the one `resolve_handshake`
+            // re-applies, so this cannot fail.
+            let _ = self.resolve_handshake(id, "EXPIRED", None, None);
+            // A transfer ends when its handshake lapsed, not when the
+            // sweep noticed. `resolve_handshake` stamps "now", which is
+            // right for a decline or a cancel -- somebody acted at that
+            // instant -- but an idle process would otherwise report an
+            // `EndTimestamp` days after the `ExpirationTimestamp` on the
+            // same record.
+            if let Some(transfer) = riding.and_then(|id| self.responsibility_transfers.get_mut(&id))
+            {
+                transfer.end_timestamp = Some(*deadline);
+            }
+        }
+        stale.len()
     }
 
     /// Every handshake this organization holds.
@@ -1304,10 +1429,7 @@ impl OrganizationState {
         if self.accounts.contains_key(account_id) {
             return;
         }
-        let arn = format!(
-            "arn:aws:organizations::{}:account/{}/{}",
-            self.management_account_id, self.org_id, account_id
-        );
+        let arn = self.account_arn(account_id);
         self.accounts.insert(
             account_id.to_string(),
             MemberAccount {
@@ -1319,6 +1441,7 @@ impl OrganizationState {
                 joined_method: "INVITED".to_string(),
                 joined_timestamp: Utc::now(),
                 parent_id: self.root_id.clone(),
+                gov_cloud_mirror: false,
             },
         );
     }
@@ -1348,10 +1471,7 @@ impl OrganizationState {
         }
         let root_suffix = self.root_id.strip_prefix("r-").unwrap_or(&self.root_id);
         let id = format!("ou-{}-{}", root_suffix, random_id(8));
-        let arn = format!(
-            "arn:aws:organizations::{}:ou/{}/{}",
-            self.management_account_id, self.org_id, id
-        );
+        let arn = self.resource_arn(&format!("ou/{}/{id}", self.org_id));
         let ou = OrganizationalUnit {
             id: id.clone(),
             arn,
@@ -1462,13 +1582,11 @@ impl OrganizationState {
             return Err(OrgError::DuplicatePolicy(name.to_string()));
         }
         let id = format!("p-{}", random_id(8));
-        let arn = format!(
-            "arn:aws:organizations::{}:policy/{}/{}/{}",
-            self.management_account_id,
+        let arn = self.resource_arn(&format!(
+            "policy/{}/{}/{id}",
             self.org_id,
             policy_type_path_segment(policy_type),
-            id,
-        );
+        ));
         let policy = Policy {
             id: id.clone(),
             arn,
@@ -1659,6 +1777,9 @@ impl OrganizationState {
     }
 }
 
+/// The id of an organization's (single) resource policy.
+pub const RESOURCE_POLICY_ID: &str = "rp-fakecloud";
+
 /// Typed errors used by organization state mutations so the service
 /// layer can translate each into the correct AWS exception code.
 #[derive(Debug)]
@@ -1742,6 +1863,10 @@ pub struct MemberAccount {
     pub joined_method: String,
     pub joined_timestamp: DateTime<Utc>,
     pub parent_id: String,
+    /// The GovCloud account `CreateGovCloudAccount` pairs with a commercial
+    /// one: it shares its twin's address, so address resolution skips it.
+    #[serde(default)]
+    pub gov_cloud_mirror: bool,
 }
 
 /// `InviteAccountToOrganization` handshake. Captures both parties so
@@ -1927,6 +2052,94 @@ mod tests {
         let registry = snapshot.into_registry();
         assert_eq!(registry.len(), 1);
         assert!(registry.org_of_account("111111111111").is_some());
+    }
+
+    /// In an organization created in GovCloud every member lives in
+    /// `aws-us-gov`; none of them is a GovCloud mirror, so an address still
+    /// names its account.
+    #[test]
+    fn a_govcloud_organization_member_is_not_a_mirror() {
+        let mut org = OrganizationState::bootstrap_in("us-gov-west-1", "111111111111");
+        assert!(org
+            .org_arn
+            .starts_with("arn:aws-us-gov:organizations::111111111111:"));
+        org.enroll_account_if_missing("222222222222");
+        let member = org.accounts.get_mut("222222222222").unwrap();
+        assert!(member.arn.starts_with("arn:aws-us-gov:organizations::"));
+        member.email = "member@corp.example".to_string();
+        let mut registry = OrganizationsRegistry::default();
+        registry.insert(org);
+        assert_eq!(
+            registry.account_registered_with("member@corp.example"),
+            Some("222222222222".to_string())
+        );
+    }
+
+    /// `CreateGovCloudAccount` flags its paired account as the mirror, so the
+    /// shared address names the commercial twin.
+    #[test]
+    fn a_created_gov_cloud_pair_flags_only_the_mirror() {
+        let mut org = OrganizationState::bootstrap("111111111111");
+        let status = org.begin_create_account(
+            "pair@corp.example",
+            "Pair",
+            "222222222222".to_string(),
+            Some("333333333333".to_string()),
+        );
+        org.complete_create_account(&status.id).unwrap();
+        assert!(!org.accounts["222222222222"].gov_cloud_mirror);
+        let mirror = &org.accounts["333333333333"];
+        assert!(mirror.gov_cloud_mirror);
+        assert!(mirror.arn.starts_with("arn:aws-us-gov:organizations::"));
+        let mut registry = OrganizationsRegistry::default();
+        registry.insert(org);
+        assert_eq!(
+            registry.account_registered_with("pair@corp.example"),
+            Some("222222222222".to_string())
+        );
+    }
+
+    /// A snapshot written before the flag existed: an `aws-us-gov` account
+    /// in a commercial organization is a mirror, while the members of a
+    /// GovCloud organization are not.
+    #[test]
+    fn loading_an_old_snapshot_flags_legacy_gov_cloud_mirrors() {
+        let mut commercial = OrganizationState::bootstrap("111111111111");
+        commercial.enroll_account_if_missing("333333333333");
+        commercial.accounts.get_mut("333333333333").unwrap().arn = format!(
+            "arn:aws-us-gov:organizations::111111111111:account/{}/333333333333",
+            commercial.org_id
+        );
+        let mut gov = OrganizationState::bootstrap_in("us-gov-west-1", "444444444444");
+        gov.enroll_account_if_missing("555555555555");
+        let mut registry = OrganizationsRegistry::default();
+        registry.insert(commercial);
+        registry.insert(gov);
+        let mut raw = serde_json::to_value(OrganizationsSnapshot {
+            schema_version: ORGANIZATIONS_SNAPSHOT_SCHEMA_VERSION,
+            organization: None,
+            organizations: registry,
+        })
+        .unwrap();
+        fn strip_flag(v: &mut serde_json::Value) {
+            match v {
+                serde_json::Value::Object(map) => {
+                    map.remove("gov_cloud_mirror");
+                    map.values_mut().for_each(strip_flag);
+                }
+                serde_json::Value::Array(items) => items.iter_mut().for_each(strip_flag),
+                _ => {}
+            }
+        }
+        strip_flag(&mut raw);
+        let loaded = serde_json::from_value::<OrganizationsSnapshot>(raw)
+            .unwrap()
+            .into_registry();
+        let commercial = loaded.org_of_account("111111111111").unwrap();
+        assert!(commercial.accounts["333333333333"].gov_cloud_mirror);
+        assert!(!commercial.accounts["111111111111"].gov_cloud_mirror);
+        let gov = loaded.org_of_account("444444444444").unwrap();
+        assert!(!gov.accounts["555555555555"].gov_cloud_mirror);
     }
 
     /// A v2 snapshot round-trips every organization, and the legacy

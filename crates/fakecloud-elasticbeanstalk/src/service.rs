@@ -9,6 +9,7 @@ use http::StatusCode;
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::query::{optional_query_param, query_response_xml, required_query_param};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_persistence::{SnapshotHook, SnapshotStore};
@@ -540,20 +541,37 @@ fn validate_params(req: &AwsRequest) -> Result<(), AwsServiceError> {
 // ARN + identifier helpers
 // ---------------------------------------------------------------------------
 
-fn application_arn(region: &str, account: &str, name: &str) -> String {
-    format!("arn:aws:elasticbeanstalk:{region}:{account}:application/{name}")
+fn eb_arn(region: &str, account: &str, resource: &str) -> String {
+    Arn::regional("elasticbeanstalk", region, account, resource).to_string()
 }
 
-fn application_version_arn(region: &str, account: &str, app: &str, label: &str) -> String {
-    format!("arn:aws:elasticbeanstalk:{region}:{account}:applicationversion/{app}/{label}")
+pub fn application_arn(region: &str, account: &str, name: &str) -> String {
+    eb_arn(region, account, &format!("application/{name}"))
 }
 
-fn environment_arn(region: &str, account: &str, app: &str, env: &str) -> String {
-    format!("arn:aws:elasticbeanstalk:{region}:{account}:environment/{app}/{env}")
+pub fn application_version_arn(region: &str, account: &str, app: &str, label: &str) -> String {
+    eb_arn(
+        region,
+        account,
+        &format!("applicationversion/{app}/{label}"),
+    )
 }
 
-fn configuration_template_arn(region: &str, account: &str, app: &str, template: &str) -> String {
-    format!("arn:aws:elasticbeanstalk:{region}:{account}:configurationtemplate/{app}/{template}")
+pub fn environment_arn(region: &str, account: &str, app: &str, env: &str) -> String {
+    eb_arn(region, account, &format!("environment/{app}/{env}"))
+}
+
+pub fn configuration_template_arn(
+    region: &str,
+    account: &str,
+    app: &str,
+    template: &str,
+) -> String {
+    eb_arn(
+        region,
+        account,
+        &format!("configurationtemplate/{app}/{template}"),
+    )
 }
 
 fn gen_environment_id() -> String {
@@ -1981,9 +1999,10 @@ impl ElasticBeanstalkService {
         required_query_param(req, "PlatformDefinitionBundle.S3Bucket")
             .or_else(|_| required_query_param(req, "PlatformDefinitionBundle.S3Key"))
             .map_err(|_| missing_parameter("PlatformDefinitionBundle"))?;
-        let arn = format!(
-            "arn:aws:elasticbeanstalk:{}:{}:platform/{name}/{version}",
-            req.region, req.account_id
+        let arn = eb_arn(
+            &req.region,
+            &req.account_id,
+            &format!("platform/{name}/{version}"),
         );
         let now = Utc::now();
         let platform = CustomPlatform {
@@ -2449,7 +2468,7 @@ fn render_event(e: &Event) -> String {
 }
 
 fn render_platform_summary(stack: &str, region: &str) -> String {
-    let arn = format!("arn:aws:elasticbeanstalk:{region}::platform/{stack}");
+    let arn = eb_arn(region, "", &format!("platform/{stack}"));
     format!(
         "<member>{}{}{}{}<SupportedTierList><member>WebServer/Standard</member><member>Worker/SQS/HTTP</member></SupportedTierList></member>",
         el("PlatformArn", &arn),

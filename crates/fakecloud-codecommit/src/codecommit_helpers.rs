@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use http::StatusCode;
 use serde_json::{json, Map, Value};
 
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use crate::state::*;
@@ -36,7 +37,7 @@ pub(crate) fn caller_arn(req: &AwsRequest) -> String {
     req.principal
         .as_ref()
         .map(|p| p.arn.clone())
-        .unwrap_or_else(|| format!("arn:aws:iam::{}:root", req.account_id))
+        .unwrap_or_else(|| Arn::global_in(&req.region, "iam", &req.account_id, "root").to_string())
 }
 
 /// SHA-1 hex of the given bytes.
@@ -135,12 +136,12 @@ pub(crate) fn check_enum(
     Ok(())
 }
 
-/// A single ARN component: `arn:aws:codecommit:<region>:<account>:<name>`.
-pub(crate) fn repo_arn(region: &str, account: &str, name: &str) -> String {
-    format!("arn:aws:codecommit:{region}:{account}:{name}")
+/// A single ARN component: `arn:<partition>:codecommit:<region>:<account>:<name>`.
+pub fn repo_arn(region: &str, account: &str, name: &str) -> String {
+    Arn::regional("codecommit", region, account, name).to_string()
 }
 
-/// Validate a CodeCommit resource ARN (`arn:aws:codecommit:...`).
+/// Validate a CodeCommit resource ARN (`arn:<partition>:codecommit:...`).
 pub(crate) fn is_codecommit_arn(s: &str) -> bool {
     let parts: Vec<&str> = s.splitn(6, ':').collect();
     parts.len() == 6 && parts[0] == "arn" && parts[2] == "codecommit"

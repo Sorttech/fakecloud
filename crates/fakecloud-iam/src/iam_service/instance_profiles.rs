@@ -72,7 +72,7 @@ impl IamService {
         let name = required_param(&req.query_params, "InstanceProfileName")?;
         validate_string_length("instanceProfileName", &name, 1, 128)?;
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         let ip = state.instance_profiles.get(&name).ok_or_else(|| {
@@ -124,7 +124,7 @@ impl IamService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let max_items = super::validate_list_pagination(req)? as usize;
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
         let path_prefix = req.query_params.get("PathPrefix").cloned();
 
@@ -248,7 +248,7 @@ impl IamService {
         let role_name = required_param(&req.query_params, "RoleName")?;
         let max_items = super::validate_list_pagination(req)? as usize;
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         if !state.roles.contains_key(&role_name) {
@@ -365,7 +365,7 @@ impl IamService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let name = required_param(&req.query_params, "InstanceProfileName")?;
         let accounts = self.state.read();
-        let empty = crate::state::IamState::new(&req.account_id);
+        let empty = crate::state::IamState::new_in_region(&req.account_id, accounts.region());
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         let ip = state.instance_profiles.get(&name).ok_or_else(|| {

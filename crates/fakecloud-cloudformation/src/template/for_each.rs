@@ -704,10 +704,11 @@ mod tests {
         let arns = role_arns.as_array().unwrap();
         assert!(arns
             .iter()
-            .any(|a| a == "arn:aws:iam::aws:policy/AWSLambdaBasicExecutionRole"));
-        assert!(arns
-            .iter()
-            .any(|a| a == "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"));
+            .any(|a| a["Fn::Sub"]
+                == "arn:${AWS::Partition}:iam::aws:policy/AWSLambdaBasicExecutionRole"));
+        assert!(arns.iter().any(
+            |a| a["Fn::Sub"] == "arn:${AWS::Partition}:iam::aws:policy/AmazonS3ReadOnlyAccess"
+        ));
     }
 
     // Globals on the non-Function sections (Api/HttpApi/SimpleTable/StateMachine)

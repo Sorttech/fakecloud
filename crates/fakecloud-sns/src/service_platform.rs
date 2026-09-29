@@ -21,10 +21,13 @@ impl SnsService {
 
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
-        let arn = format!(
-            "arn:aws:sns:{}:{}:app/{}/{}",
-            req.region, state.account_id, platform, name
-        );
+        let arn = Arn::regional(
+            "sns",
+            &req.region,
+            &state.account_id,
+            &format!("app/{platform}/{name}"),
+        )
+        .to_string();
 
         state.platform_applications.insert(
             arn.clone(),
@@ -264,10 +267,13 @@ impl SnsService {
         }
 
         let endpoint_id = uuid::Uuid::new_v4().to_string().replace('-', "");
-        let endpoint_arn = format!(
-            "arn:aws:sns:{}:{}:endpoint/{}/{}/{}",
-            req.region, account_id, app.platform, app.name, endpoint_id
-        );
+        let endpoint_arn = Arn::regional(
+            "sns",
+            &req.region,
+            &account_id,
+            &format!("endpoint/{}/{}/{}", app.platform, app.name, endpoint_id),
+        )
+        .to_string();
 
         let mut endpoint_attrs = attrs;
         endpoint_attrs

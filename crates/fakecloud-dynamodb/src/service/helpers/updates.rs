@@ -2,93 +2,65 @@
 
 use super::*;
 
-/// Write `value` at a dotted path inside an M-typed attribute.
+/// Write `value` at a document path (`a`, `a.b`, `a.l[2]`, `l[0][1]`),
+/// returning the list index written when the final step is a list index.
 ///
-/// Resolves each `#name` segment through `expr_attr_names`. The top-level
-/// attribute and every intermediate segment must already exist as a Map —
-/// DynamoDB rejects writes through missing parents with ValidationException.
+/// The path is parsed with the expression grammar's own segmentation, so
+/// `#name` placeholders resolve to whole names (an alias holding a `.` is one
+/// attribute). A nested write needs the top-level attribute and every
+/// intermediate step to exist with the right type (a Map for a key, a List
+/// holding the index) -- DynamoDB rejects writes through missing parents with
+/// ValidationException. A final list index past the end appends, as AWS does.
 pub(crate) fn assign_nested_path(
     item: &mut HashMap<String, AttributeValue>,
     path: &str,
     expr_attr_names: &HashMap<String, String>,
     value: Value,
-) -> Result<(), AwsServiceError> {
-    let mut segments: Vec<String> = path
-        .split('.')
-        .map(|seg| resolve_attr_name(seg.trim(), expr_attr_names))
-        .collect();
-    if segments.len() < 2 {
+) -> Result<Option<usize>, AwsServiceError> {
+    let segments = parse_document_path(path, expr_attr_names).ok_or_else(invalid_document_path)?;
+    let Some(PathElem::Attr(top)) = segments.first() else {
         return Err(invalid_document_path());
-    }
-
-    let leaf = segments.pop().expect("len >= 2");
-    let top = segments.remove(0);
-
-    let top_attr = item.get_mut(&top).ok_or_else(invalid_document_path)?;
-    let mut current = top_attr
-        .get_mut("M")
-        .and_then(|m| m.as_object_mut())
+    };
+    let Some((leaf, middle)) = segments[1..].split_last() else {
+        item.insert(top.clone(), value);
+        return Ok(None);
+    };
+    let mut current = item.get_mut(top).ok_or_else(invalid_document_path)?;
+    for seg in middle {
+        current = match seg {
+            PathElem::Attr(k) => current
+                .get_mut("M")
+                .and_then(Value::as_object_mut)
+                .and_then(|m| m.get_mut(k)),
+            PathElem::Index(i) => current
+                .get_mut("L")
+                .and_then(Value::as_array_mut)
+                .and_then(|l| l.get_mut(*i)),
+        }
         .ok_or_else(invalid_document_path)?;
-
-    for seg in &segments {
-        current = current
-            .get_mut(seg)
-            .and_then(|v| v.get_mut("M"))
-            .and_then(|m| m.as_object_mut())
-            .ok_or_else(invalid_document_path)?;
     }
-
-    current.insert(leaf, value);
-    Ok(())
-}
-
-/// One step of a document path: a map key or a list index.
-enum PathSeg {
-    Key(String),
-    Index(usize),
-}
-
-/// Strip a trailing `[N]` list index off a single path segment, returning the
-/// name and the index. `name` may itself be a `#placeholder`.
-fn strip_trailing_index(part: &str) -> Option<(&str, usize)> {
-    let part = part.trim();
-    if !part.ends_with(']') {
-        return None;
-    }
-    let open = part.rfind('[')?;
-    let idx: usize = part[open + 1..part.len() - 1].parse().ok()?;
-    let name = part[..open].trim();
-    if name.is_empty() {
-        return None;
-    }
-    Some((name, idx))
-}
-
-/// Parse a document path (`a`, `#a`, `a.b.c`, `a.b[2].c`, `tags[0]`) into
-/// resolved segments. Returns `None` for an empty/invalid path.
-fn parse_path_segments(
-    path: &str,
-    expr_attr_names: &HashMap<String, String>,
-) -> Option<Vec<PathSeg>> {
-    let mut segs = Vec::new();
-    for part in path.split('.') {
-        let part = part.trim();
-        let (name, idx) = match strip_trailing_index(part) {
-            Some((n, i)) => (n, Some(i)),
-            None => (part, None),
-        };
-        if name.is_empty() {
-            return None;
+    match leaf {
+        PathElem::Attr(k) => {
+            current
+                .get_mut("M")
+                .and_then(Value::as_object_mut)
+                .ok_or_else(invalid_document_path)?
+                .insert(k.clone(), value);
+            Ok(None)
         }
-        segs.push(PathSeg::Key(resolve_attr_name(name, expr_attr_names)));
-        if let Some(i) = idx {
-            segs.push(PathSeg::Index(i));
+        PathElem::Index(i) => {
+            let list = current
+                .get_mut("L")
+                .and_then(Value::as_array_mut)
+                .ok_or_else(invalid_document_path)?;
+            if *i < list.len() {
+                list[*i] = value;
+                Ok(Some(*i))
+            } else {
+                list.push(value);
+                Ok(Some(list.len() - 1))
+            }
         }
-    }
-    if segs.is_empty() {
-        None
-    } else {
-        Some(segs)
     }
 }
 
@@ -101,17 +73,17 @@ pub(crate) fn remove_path(
     path: &str,
     expr_attr_names: &HashMap<String, String>,
 ) {
-    let Some(segs) = parse_path_segments(path, expr_attr_names) else {
+    let Some(segs) = parse_document_path(path, expr_attr_names) else {
         return;
     };
     // Top-level attribute: remove the key directly.
     if segs.len() == 1 {
-        if let PathSeg::Key(k) = &segs[0] {
+        if let PathElem::Attr(k) = &segs[0] {
             item.remove(k);
         }
         return;
     }
-    let PathSeg::Key(top) = &segs[0] else {
+    let PathElem::Attr(top) = &segs[0] else {
         return;
     };
     let Some(mut cur) = item.get_mut(top) else {
@@ -120,11 +92,11 @@ pub(crate) fn remove_path(
     // Descend to the parent of the leaf.
     for seg in &segs[1..segs.len() - 1] {
         cur = match seg {
-            PathSeg::Key(k) => match cur.get_mut("M").and_then(|m| m.get_mut(k)) {
+            PathElem::Attr(k) => match cur.get_mut("M").and_then(|m| m.get_mut(k)) {
                 Some(v) => v,
                 None => return,
             },
-            PathSeg::Index(i) => match cur.get_mut("L").and_then(|l| l.get_mut(*i)) {
+            PathElem::Index(i) => match cur.get_mut("L").and_then(|l| l.get_mut(*i)) {
                 Some(v) => v,
                 None => return,
             },
@@ -132,12 +104,12 @@ pub(crate) fn remove_path(
     }
     // Remove the leaf from its parent container.
     match segs.last().expect("len >= 2") {
-        PathSeg::Key(k) => {
+        PathElem::Attr(k) => {
             if let Some(map) = cur.get_mut("M").and_then(|m| m.as_object_mut()) {
                 map.remove(k);
             }
         }
-        PathSeg::Index(i) => {
+        PathElem::Index(i) => {
             if let Some(list) = cur.get_mut("L").and_then(|l| l.as_array_mut()) {
                 if *i < list.len() {
                     list.remove(*i);
@@ -200,6 +172,7 @@ pub(crate) fn apply_add_assignment(
             ) {
                 // Arbitrary-precision decimal add — f64 rounds past 2^53.
                 if let Some(num_str) = decimal_add_sub(existing_num, add_num, true) {
+                    check_number_range(&num_str)?;
                     item.insert(attr, json!({"N": num_str}));
                 }
             } else if let Some(set_type) = set_types

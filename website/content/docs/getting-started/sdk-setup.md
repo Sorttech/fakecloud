@@ -1,6 +1,6 @@
 +++
 title = "SDK setup"
-description = "Install the first-party fakecloud SDK in TypeScript, Python, Go, PHP, Java, Rust, or C#/.NET."
+description = "Install the first-party fakecloud SDK in TypeScript, Python, Go, PHP, Java, Rust, .NET, or C#/.NET."
 weight = 3
 +++
 

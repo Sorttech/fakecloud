@@ -354,11 +354,13 @@ fn job_summary(j: &Value) -> Value {
     Value::Object(s)
 }
 
-impl BatchService {
-    fn arn(&self, account: &str, region: &str, resource: &str) -> String {
-        Arn::new("batch", region, account, resource).to_string()
-    }
+/// A Batch ARN (`arn:<partition>:batch:<region>:<account>:<resource>`) in
+/// `region`'s partition.
+pub fn batch_arn(region: &str, account_id: &str, resource: &str) -> String {
+    Arn::regional("batch", region, account_id, resource).to_string()
+}
 
+impl BatchService {
     // ---- Compute environments ----
 
     fn create_compute_environment(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
@@ -368,9 +370,9 @@ impl BatchService {
             .and_then(Value::as_str)
             .ok_or_else(|| client_error("ClientException", "computeEnvironmentName is required"))?
             .to_string();
-        let arn = self.arn(
-            &req.account_id,
+        let arn = batch_arn(
             &req.region,
+            &req.account_id,
             &format!("compute-environment/{name}"),
         );
         let mut stored = obj(&body);
@@ -385,10 +387,13 @@ impl BatchService {
         // returns its ARN and the provider (and ECS console) read it back.
         stored.insert(
             "ecsClusterArn".into(),
-            json!(format!(
-                "arn:aws:ecs:{}:{}:cluster/AWSBatch-{name}-{uuid}",
-                req.region, req.account_id
-            )),
+            json!(Arn::regional(
+                "ecs",
+                &req.region,
+                &req.account_id,
+                &format!("cluster/AWSBatch-{name}-{uuid}"),
+            )
+            .to_string()),
         );
         stored.insert("uuid".into(), json!(uuid));
 
@@ -466,7 +471,7 @@ impl BatchService {
             .and_then(Value::as_str)
             .ok_or_else(|| client_error("ClientException", "jobQueueName is required"))?
             .to_string();
-        let arn = self.arn(&req.account_id, &req.region, &format!("job-queue/{name}"));
+        let arn = batch_arn(&req.region, &req.account_id, &format!("job-queue/{name}"));
         let mut stored = obj(&body);
         stored.insert("jobQueueArn".into(), json!(arn));
         stored.insert("status".into(), json!("VALID"));
@@ -533,9 +538,9 @@ impl BatchService {
         let revision = st.job_def_revisions.entry(name.clone()).or_insert(0);
         *revision += 1;
         let revision = *revision;
-        let arn = self.arn(
-            &req.account_id,
+        let arn = batch_arn(
             &req.region,
+            &req.account_id,
             &format!("job-definition/{name}:{revision}"),
         );
         let mut stored = obj(&body);
@@ -696,9 +701,9 @@ impl BatchService {
             .and_then(Value::as_str)
             .ok_or_else(|| client_error("ClientException", "name is required"))?
             .to_string();
-        let arn = self.arn(
-            &req.account_id,
+        let arn = batch_arn(
             &req.region,
+            &req.account_id,
             &format!("scheduling-policy/{name}"),
         );
         let mut stored = obj(&body);
@@ -818,7 +823,7 @@ impl BatchService {
             .ok_or_else(|| client_error("ClientException", "jobDefinition is required"))?
             .to_string();
         let job_id = Uuid::new_v4().to_string();
-        let arn = self.arn(&req.account_id, &req.region, &format!("job/{job_id}"));
+        let arn = batch_arn(&req.region, &req.account_id, &format!("job/{job_id}"));
         let now = chrono::Utc::now().timestamp_millis();
         // AWS Batch caps an array job at 2..=10000 children; reject out-of-range
         // sizes rather than synchronously spawning an unbounded number of
@@ -874,7 +879,7 @@ impl BatchService {
             }
             for index in 0..size {
                 let child_id = format!("{job_id}:{index}");
-                let child_arn = self.arn(&req.account_id, &req.region, &format!("job/{child_id}"));
+                let child_arn = batch_arn(&req.region, &req.account_id, &format!("job/{child_id}"));
                 let mut child = serde_json::Map::new();
                 child.insert("jobId".into(), json!(child_id));
                 child.insert("jobArn".into(), json!(child_arn));
@@ -2100,6 +2105,35 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(d2["computeEnvironments"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn china_region_arns_use_the_aws_cn_partition() {
+        let s = svc();
+        let mut create = req(
+            "/v1/createcomputeenvironment",
+            json!({"computeEnvironmentName": "ce-cn", "type": "MANAGED"}),
+        );
+        create.region = "cn-north-1".into();
+        let v = body_of(s.handle(create).await.unwrap());
+        let arn = v["computeEnvironmentArn"].as_str().unwrap().to_string();
+        assert_eq!(
+            arn,
+            "arn:aws-cn:batch:cn-north-1:123456789012:compute-environment/ce-cn"
+        );
+
+        let mut describe = req(
+            "/v1/describecomputeenvironments",
+            json!({"computeEnvironments": [arn]}),
+        );
+        describe.region = "cn-north-1".into();
+        let d = body_of(s.handle(describe).await.unwrap());
+        let ces = d["computeEnvironments"].as_array().unwrap();
+        assert_eq!(ces.len(), 1);
+        assert!(ces[0]["ecsClusterArn"]
+            .as_str()
+            .unwrap()
+            .starts_with("arn:aws-cn:ecs:cn-north-1:123456789012:cluster/AWSBatch-ce-cn-"));
     }
 
     #[tokio::test]

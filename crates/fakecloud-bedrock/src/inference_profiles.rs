@@ -2,6 +2,7 @@ use chrono::Utc;
 use http::StatusCode;
 use serde_json::{json, Value};
 
+use fakecloud_aws::arn::partition_for;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use crate::state::{InferenceProfile, SharedBedrockState};
@@ -20,10 +21,8 @@ pub(crate) fn create_inference_profile(
     // `application-inference-profile/<id>` ARN (system-defined profiles use the
     // bare `inference-profile/` resource); the provider asserts this shape.
     let profile_id = fakecloud_core::ids::short_id(12).to_string();
-    let profile_arn = format!(
-        "arn:aws:bedrock:{}:{}:application-inference-profile/{}",
-        req.region, req.account_id, profile_id
-    );
+    let profile_arn =
+        crate::arns::application_inference_profile_arn(&req.region, &req.account_id, &profile_id);
 
     let now = Utc::now();
     let profile = InferenceProfile {
@@ -83,8 +82,7 @@ pub(crate) fn get_inference_profile(
         None => {
             // Fall back to the AWS-managed system-defined catalogue, resolving
             // by profile id or ARN suffix.
-            if let Some((id, model)) = SYSTEM_INFERENCE_PROFILES
-                .iter()
+            if let Some((id, model)) = system_profiles_in_partition(req)
                 .find(|(id, _)| *id == identifier || identifier.ends_with(&format!("/{id}")))
             {
                 return Ok(AwsResponse::ok_json(system_profile_json(req, id, model)));
@@ -105,7 +103,10 @@ pub(crate) fn get_inference_profile(
         "inferenceProfileId": profile_id_from_arn(&profile.inference_profile_arn),
         "inferenceProfileName": profile.inference_profile_name,
         "description": profile.description,
-        "models": profile_models(&profile.model_source, &req.region),
+        "models": profile_models(
+            &profile.model_source,
+            profile_region(&profile.inference_profile_arn, &req.region),
+        ),
         "status": profile.status,
         "type": profile.inference_profile_type,
         "createdAt": profile.created_at.to_rfc3339(),
@@ -160,7 +161,10 @@ pub(crate) fn list_inference_profiles(
                 "inferenceProfileId": profile_id_from_arn(&p.inference_profile_arn),
                 "inferenceProfileName": p.inference_profile_name,
                 "description": p.description,
-                "models": profile_models(&p.model_source, &req.region),
+                "models": profile_models(
+                    &p.model_source,
+                    profile_region(&p.inference_profile_arn, &req.region),
+                ),
                 "status": p.status,
                 "type": p.inference_profile_type,
                 "createdAt": p.created_at.to_rfc3339(),
@@ -184,6 +188,16 @@ pub(crate) fn list_inference_profiles(
     }
 
     Ok(AwsResponse::ok_json(resp))
+}
+
+/// The region an inference profile was created in (the region field of its
+/// ARN), `fallback` for a malformed ARN.
+fn profile_region<'a>(profile_arn: &'a str, fallback: &'a str) -> &'a str {
+    profile_arn
+        .split(':')
+        .nth(3)
+        .filter(|r| !r.is_empty())
+        .unwrap_or(fallback)
 }
 
 /// The last segment of the inference-profile ARN is the unique ID Bedrock
@@ -255,19 +269,27 @@ const SYSTEM_INFERENCE_PROFILES: &[(&str, &str)] = &[
 /// The US commercial regions a `us.`-scoped system profile routes across.
 const SYSTEM_PROFILE_REGIONS: &[&str] = &["us-east-1", "us-west-2"];
 
+/// The system-defined profiles a caller in `req.region` can see. They route
+/// across fixed geographic regions, so they exist only in the partition those
+/// regions belong to (none in China, GovCloud or the isolated regions).
+fn system_profiles_in_partition(
+    req: &AwsRequest,
+) -> impl Iterator<Item = &'static (&'static str, &'static str)> {
+    let partition = partition_for(&req.region);
+    let available = SYSTEM_PROFILE_REGIONS
+        .iter()
+        .any(|region| partition_for(region) == partition);
+    SYSTEM_INFERENCE_PROFILES.iter().filter(move |_| available)
+}
+
 /// Build the JSON summary for one system-defined inference profile.
 fn system_profile_json(req: &AwsRequest, profile_id: &str, model_id: &str) -> Value {
-    let arn = format!(
-        "arn:aws:bedrock:{}:{}:inference-profile/{}",
-        req.region, req.account_id, profile_id
-    );
+    let arn = crate::arns::inference_profile_arn(&req.region, &req.account_id, profile_id);
+    let partition = partition_for(&req.region);
     let models: Vec<Value> = SYSTEM_PROFILE_REGIONS
         .iter()
-        .map(|region| {
-            json!({
-                "modelArn": format!("arn:aws:bedrock:{region}::foundation-model/{model_id}")
-            })
-        })
+        .filter(|region| partition_for(region) == partition)
+        .map(|region| json!({ "modelArn": crate::arns::foundation_model_arn(region, model_id) }))
         .collect();
     json!({
         "inferenceProfileArn": arn,
@@ -284,8 +306,7 @@ fn system_profile_json(req: &AwsRequest, profile_id: &str, model_id: &str) -> Va
 
 /// All system-defined inference-profile summaries, keyed for lookup by id/arn.
 fn system_profiles(req: &AwsRequest) -> Vec<Value> {
-    SYSTEM_INFERENCE_PROFILES
-        .iter()
+    system_profiles_in_partition(req)
         .map(|(id, model)| system_profile_json(req, id, model))
         .collect()
 }
@@ -299,7 +320,7 @@ fn profile_models(model_source: &Value, region: &str) -> Value {
         return json!([{ "modelArn": copy_from }]);
     }
     json!([{
-        "modelArn": format!("arn:aws:bedrock:{region}::foundation-model/amazon.titan-text-express-v1")
+        "modelArn": crate::arns::foundation_model_arn(region, "amazon.titan-text-express-v1")
     }])
 }
 
@@ -439,21 +460,76 @@ mod tests {
     }
 
     #[test]
-    fn fallback_model_arn_uses_request_region() {
+    fn fallback_model_arn_uses_the_profile_region() {
         // A profile created without a copyFrom modelSource synthesizes a
-        // foundation-model ARN. It must carry the request region, not a frozen
-        // us-east-1, so cross-region clients see a consistent ARN.
+        // foundation-model ARN. It carries the region the profile was created
+        // in, not a frozen us-east-1 or whichever region the reader calls from.
         let s = shared();
-        create(&s, "p-region", false);
         let mut r = req();
         r.region = "eu-west-1".to_string();
-        let resp = get_inference_profile(&s, &r, "p-region").unwrap();
+        create_inference_profile(&s, &r, &json!({"inferenceProfileName": "p-region"})).unwrap();
+        let resp = get_inference_profile(&s, &req(), "p-region").unwrap();
         let v: Value =
             serde_json::from_str(std::str::from_utf8(resp.body.expect_bytes()).unwrap()).unwrap();
         let model_arn = v["models"][0]["modelArn"].as_str().unwrap();
         assert_eq!(
             model_arn, "arn:aws:bedrock:eu-west-1::foundation-model/amazon.titan-text-express-v1",
             "fallback modelArn not request-scoped: {model_arn}"
+        );
+    }
+
+    fn list_json(s: &SharedBedrockState, region: &str) -> Value {
+        let mut r = req();
+        r.region = region.to_string();
+        r.query_params
+            .insert("maxResults".to_string(), "1000".to_string());
+        let resp = list_inference_profiles(s, &r).unwrap();
+        serde_json::from_slice(resp.body.expect_bytes()).unwrap()
+    }
+
+    #[test]
+    fn china_region_lists_no_system_profile_from_another_partition() {
+        let s = shared();
+        let mut r = req();
+        r.region = "cn-north-1".to_string();
+        create_inference_profile(&s, &r, &json!({"inferenceProfileName": "cn"})).unwrap();
+
+        let v = list_json(&s, "cn-north-1");
+        let summaries = v["inferenceProfileSummaries"].as_array().unwrap();
+        assert_eq!(summaries.len(), 1, "{summaries:?}");
+        for summary in summaries {
+            assert!(summary["inferenceProfileArn"]
+                .as_str()
+                .unwrap()
+                .starts_with("arn:aws-cn:bedrock:cn-north-1:"));
+            for model in summary["models"].as_array().unwrap() {
+                let arn = model["modelArn"].as_str().unwrap();
+                let region = arn.split(':').nth(3).unwrap();
+                assert_eq!(partition_for(region), "aws-cn", "{arn}");
+                assert!(arn.starts_with("arn:aws-cn:"), "{arn}");
+            }
+        }
+        let system_id = SYSTEM_INFERENCE_PROFILES[0].0;
+        let err = get_inference_profile(&s, &r, system_id).err().unwrap();
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn us_east_1_lists_system_profiles_across_us_regions() {
+        let v = list_json(&shared(), "us-east-1");
+        let summaries = v["inferenceProfileSummaries"].as_array().unwrap();
+        assert_eq!(summaries.len(), SYSTEM_INFERENCE_PROFILES.len());
+        let (id, model) = SYSTEM_INFERENCE_PROFILES[0];
+        assert_eq!(
+            summaries[0]["inferenceProfileArn"],
+            format!("arn:aws:bedrock:us-east-1:123456789012:inference-profile/{id}")
+        );
+        assert_eq!(
+            summaries[0]["models"],
+            json!([
+                { "modelArn": format!("arn:aws:bedrock:us-east-1::foundation-model/{model}") },
+                { "modelArn": format!("arn:aws:bedrock:us-west-2::foundation-model/{model}") },
+            ])
         );
     }
 

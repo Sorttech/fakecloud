@@ -144,9 +144,9 @@ pub(super) fn format_kms_arn(input: &str, region: &str, account_id: &str) -> Str
         return input.to_string();
     }
     if input.starts_with("alias/") {
-        return Arn::new("kms", region, account_id, input).to_string();
+        return Arn::regional("kms", region, account_id, input).to_string();
     }
-    Arn::new("kms", region, account_id, &format!("key/{input}")).to_string()
+    Arn::regional("kms", region, account_id, &format!("key/{input}")).to_string()
 }
 
 /// Render a whole extras category as a Describe list response.

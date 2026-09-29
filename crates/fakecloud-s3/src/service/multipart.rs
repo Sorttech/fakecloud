@@ -13,8 +13,8 @@ use md5::{Digest, Md5};
 
 use super::{
     canned_acl_grants, compute_md5, extract_user_metadata, no_such_bucket, no_such_key,
-    no_such_upload, parse_complete_multipart_xml, parse_grant_headers, parse_url_encoded_tags,
-    precondition_failed, resolve_object, s3_xml, xml_escape, S3Service,
+    no_such_upload, parse_complete_multipart_xml, parse_url_encoded_tags, precondition_failed,
+    resolve_object, s3_xml, xml_escape, S3Service,
 };
 
 /// Build the `CompleteMultipartUploadResult` XML response for an object that
@@ -95,23 +95,7 @@ impl S3Service {
             .get("x-amz-tagging")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
-        let acl_header = req
-            .headers
-            .get("x-amz-acl")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        let has_grant_headers = req
-            .headers
-            .keys()
-            .any(|k| k.as_str().starts_with("x-amz-grant-"));
-
-        if acl_header.is_some() && has_grant_headers {
-            return Err(AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "InvalidRequest",
-                "Specifying both Canned ACLs and Header Grants is not allowed",
-            ));
-        }
+        let write_acl = self.resolve_write_acl_headers(account_id, bucket, &req.headers)?;
 
         let checksum_algorithm = req
             .headers
@@ -127,12 +111,9 @@ impl S3Service {
             .get_mut(bucket)
             .ok_or_else(|| no_such_bucket(bucket))?;
 
-        let acl_grants = if has_grant_headers {
-            parse_grant_headers(&req.headers)
-        } else {
-            let acl = acl_header.as_deref().unwrap_or("private");
-            canned_acl_grants(acl, &b.acl_owner_id)
-        };
+        let acl_grants = write_acl
+            .grants_for(&b.acl_owner_id)
+            .unwrap_or_else(|| canned_acl_grants("private", &b.acl_owner_id));
 
         let upload = MultipartUpload {
             upload_id: upload_id.clone(),

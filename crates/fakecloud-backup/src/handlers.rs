@@ -1678,12 +1678,16 @@ impl BackupService {
             {
                 obj.insert(
                     "CreatedResourceArn".to_string(),
-                    json!(format!(
-                        "arn:aws:ec2:{}:{}:volume/vol-{}",
-                        req.region,
-                        req.account_id,
-                        gen_id().replace('-', "").get(0..17).unwrap_or("0")
-                    )),
+                    json!(fakecloud_aws::arn::Arn::regional(
+                        "ec2",
+                        &req.region,
+                        &req.account_id,
+                        &format!(
+                            "volume/vol-{}",
+                            gen_id().replace('-', "").get(0..17).unwrap_or("0")
+                        ),
+                    )
+                    .to_string()),
                 );
             }
         }

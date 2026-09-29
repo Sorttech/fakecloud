@@ -571,3 +571,28 @@ fn test_request() -> AwsRequest {
         principal: None,
     }
 }
+
+#[test]
+fn china_region_arns_use_the_aws_cn_partition() {
+    let svc = service();
+    let cn = Ctx {
+        account: "000000000000".to_string(),
+        region: "cn-north-1".to_string(),
+    };
+    let created = body_of(&svc.create_app(&cn, &json!({ "Name": "cn-app" })).unwrap());
+    let id = created["Id"].as_str().unwrap();
+    let arn = format!("arn:aws-cn:mobiletargeting:cn-north-1:000000000000:apps/{id}");
+    assert_eq!(created["Arn"], json!(arn));
+    svc.tag_resource(&cn, &arn, &json!({ "tags": { "env": "cn" } }))
+        .unwrap();
+    let tags = body_of(&svc.list_tags_for_resource(&cn, &arn).unwrap());
+    assert_eq!(tags["tags"]["env"], "cn");
+
+    svc.create_template(&cn, "cn-tmpl", "EMAIL", &json!({ "Subject": "hi" }))
+        .unwrap();
+    let tmpl = body_of(&svc.get_template(&cn, "cn-tmpl", "EMAIL", &[]).unwrap());
+    assert_eq!(
+        tmpl["Arn"],
+        "arn:aws-cn:mobiletargeting:cn-north-1:000000000000:templates/cn-tmpl/EMAIL"
+    );
+}

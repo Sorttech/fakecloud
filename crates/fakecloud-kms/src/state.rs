@@ -5,6 +5,27 @@ use parking_lot::RwLock;
 
 pub type SharedKmsState = Arc<RwLock<fakecloud_core::multi_account::MultiAccountState<KmsState>>>;
 
+/// A KMS key's ARN, in the partition of `region`.
+pub fn kms_key_arn(region: &str, account_id: &str, key_id: &str) -> String {
+    fakecloud_aws::arn::Arn::regional("kms", region, account_id, &format!("key/{key_id}"))
+        .to_string()
+}
+
+/// A KMS alias's ARN (`alias_name` is the full `alias/<name>`), in the
+/// partition of `region`.
+pub fn kms_alias_arn(region: &str, account_id: &str, alias_name: &str) -> String {
+    fakecloud_aws::arn::Arn::regional("kms", region, account_id, alias_name).to_string()
+}
+
+/// The `<region>:<account>:<resource>` part of a KMS ARN in any partition,
+/// split into its fields. `None` when `arn` is not a KMS ARN.
+pub fn parse_kms_arn(arn: &str) -> Option<(&str, &str, &str)> {
+    let rest = fakecloud_aws::arn::arn_resource(arn, "kms")?;
+    let (region, after_region) = rest.split_once(':')?;
+    let (account, resource) = after_region.split_once(':')?;
+    Some((region, account, resource))
+}
+
 impl fakecloud_core::multi_account::AccountState for KmsState {
     fn new_for_account(account_id: &str, region: &str, _endpoint: &str) -> Self {
         Self::new(account_id, region)

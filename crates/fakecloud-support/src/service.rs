@@ -34,6 +34,7 @@ use http::StatusCode;
 use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_persistence::SnapshotStore;
 
@@ -252,7 +253,7 @@ impl SupportService {
             .unwrap_or_else(|| json!([]));
         let attachment_set_id = str_member(body, "attachmentSetId").map(str::to_string);
         let upload_ids = string_list(body, "uploadIds");
-        let submitted_by = format!("arn:aws:iam::{account}:root");
+        let submitted_by = Arn::global_in(&req.region, "iam", &account, "root").to_string();
         let now = iso_now();
 
         self.with_account_mut(req, |d| {
@@ -450,7 +451,7 @@ impl SupportService {
             .to_string();
         let attachment_set_id = str_member(body, "attachmentSetId").map(str::to_string);
         let upload_ids = string_list(body, "uploadIds");
-        let submitted_by = format!("arn:aws:iam::{account}:root");
+        let submitted_by = Arn::global_in(&req.region, "iam", &account, "root").to_string();
         let now = iso_now();
 
         self.with_account_mut(req, |d| {
@@ -2495,5 +2496,37 @@ mod tests {
         );
         assert_eq!(page2["cases"].as_array().unwrap().len(), 1);
         assert!(page2.get("nextToken").is_none());
+    }
+
+    #[test]
+    fn china_region_case_is_submitted_by_an_aws_cn_principal() {
+        let svc = service();
+        let mut create = req("CreateCase", json!({}));
+        create.region = "cn-north-1".to_string();
+        let created = svc
+            .create_case(
+                &create,
+                &json!({ "subject": "s", "communicationBody": "b" }),
+            )
+            .unwrap();
+        let case_id = body_of(&created)["caseId"].as_str().unwrap().to_string();
+        let mut add = req("AddCommunicationToCase", json!({}));
+        add.region = "cn-north-1".to_string();
+        svc.add_communication_to_case(
+            &add,
+            &json!({ "caseId": case_id, "communicationBody": "c" }),
+        )
+        .unwrap();
+        let mut describe = req("DescribeCommunications", json!({}));
+        describe.region = "cn-north-1".to_string();
+        let comms = body_of(
+            &svc.describe_communications(&describe, &json!({ "caseId": case_id }))
+                .unwrap(),
+        );
+        let comms = comms["communications"].as_array().unwrap();
+        assert_eq!(comms.len(), 2);
+        for comm in comms {
+            assert_eq!(comm["submittedBy"], "arn:aws-cn:iam::000000000000:root");
+        }
     }
 }

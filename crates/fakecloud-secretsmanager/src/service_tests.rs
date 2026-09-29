@@ -2446,6 +2446,123 @@ async fn cross_account_get_secret_value_allowed_with_matching_policy() {
     assert_eq!(body["SecretString"].as_str().unwrap(), "shhh");
 }
 
+#[tokio::test]
+async fn china_region_secret_arn_round_trips_across_accounts() {
+    let svc = SecretsManagerService::new(make_state());
+    let in_cn = |action: &str, account: &str, body: &str| {
+        let mut req = make_request_for(action, account, body);
+        req.region = "cn-north-1".to_string();
+        req
+    };
+
+    let resp = svc
+        .handle(in_cn(
+            "CreateSecret",
+            "111111111111",
+            r#"{"Name": "cn/secret", "SecretString": "shhh"}"#,
+        ))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    let arn = body["ARN"].as_str().unwrap().to_string();
+    assert!(
+        arn.starts_with("arn:aws-cn:secretsmanager:cn-north-1:111111111111:secret:cn/secret-"),
+        "{arn}"
+    );
+
+    // A partial ARN (without the random suffix) resolves the same secret.
+    let partial = arn.rsplit_once('-').unwrap().0;
+    let resp = svc
+        .handle(in_cn(
+            "DescribeSecret",
+            "111111111111",
+            &format!(r#"{{"SecretId": "{partial}"}}"#),
+        ))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(body["ARN"], arn);
+
+    let policy = serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"AWS": "arn:aws-cn:iam::222222222222:root"},
+            "Action": "secretsmanager:GetSecretValue",
+            "Resource": "*"
+        }]
+    });
+    svc.handle(in_cn(
+        "PutResourcePolicy",
+        "111111111111",
+        &format!(
+            r#"{{"SecretId": "{arn}", "ResourcePolicy": {}}}"#,
+            serde_json::to_string(&policy.to_string()).unwrap()
+        ),
+    ))
+    .await
+    .unwrap();
+
+    let resp = svc
+        .handle(in_cn(
+            "GetSecretValue",
+            "222222222222",
+            &format!(r#"{{"SecretId": "{arn}"}}"#),
+        ))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(body["SecretString"], "shhh");
+}
+
+#[tokio::test]
+async fn partial_arn_resolves_only_the_secret_it_names() {
+    let svc = SecretsManagerService::new(make_state());
+    let mut arns = HashMap::new();
+    for name in ["app-db", "app"] {
+        let resp = svc
+            .handle(make_request(
+                "CreateSecret",
+                &format!(r#"{{"Name": "{name}", "SecretString": "{name}-value"}}"#),
+            ))
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        arns.insert(name, body["ARN"].as_str().unwrap().to_string());
+        if name == "app-db" {
+            // With only `app-db` present, the partial ARN of `app` names
+            // nothing.
+            let app_partial = arns["app-db"]
+                .rsplit_once(":secret:")
+                .unwrap()
+                .0
+                .to_string()
+                + ":secret:app";
+            let err = expect_err(
+                svc.handle(make_request(
+                    "GetSecretValue",
+                    &format!(r#"{{"SecretId": "{app_partial}"}}"#),
+                ))
+                .await,
+            );
+            assert_eq!(err.code(), "ResourceNotFoundException");
+        }
+    }
+    for name in ["app", "app-db"] {
+        let partial = arns[name].rsplit_once('-').unwrap().0.to_string();
+        let resp = svc
+            .handle(make_request(
+                "GetSecretValue",
+                &format!(r#"{{"SecretId": "{partial}"}}"#),
+            ))
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        assert_eq!(body["Name"], name, "partial {partial}");
+        assert_eq!(body["SecretString"], format!("{name}-value"));
+    }
+}
+
 #[test]
 fn secret_owner_account_extracts_from_arn() {
     assert_eq!(

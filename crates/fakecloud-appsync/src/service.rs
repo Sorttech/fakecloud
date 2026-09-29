@@ -19,6 +19,7 @@ use serde_json::{json, Map, Value};
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_persistence::SnapshotStore;
 
@@ -1721,9 +1722,9 @@ impl AppSyncService {
         assoc.insert("associationId".into(), json!(assoc_id));
         assoc.insert(
             "associationArn".into(),
-            json!(format!(
-                "arn:aws:appsync:{}:{}:apis/{merged_id}/sourceApiAssociations/{assoc_id}",
-                ctx.region, ctx.account
+            json!(appsync_arn(
+                ctx,
+                &format!("apis/{merged_id}/sourceApiAssociations/{assoc_id}")
             )),
         );
         assoc.insert("sourceApiId".into(), json!(source_id));
@@ -2068,9 +2069,9 @@ fn build_data_source(ctx: &Ctx, api_id: &str, name: &str, body: &Value) -> Value
     let mut ds = Map::new();
     ds.insert(
         "dataSourceArn".into(),
-        json!(format!(
-            "arn:aws:appsync:{}:{}:apis/{api_id}/datasources/{name}",
-            ctx.region, ctx.account
+        json!(appsync_arn(
+            ctx,
+            &format!("apis/{api_id}/datasources/{name}")
         )),
     );
     ds.insert("name".into(), json!(name));
@@ -2100,9 +2101,9 @@ fn build_resolver(ctx: &Ctx, api_id: &str, type_name: &str, field: &str, body: &
     r.insert("fieldName".into(), json!(field));
     r.insert(
         "resolverArn".into(),
-        json!(format!(
-            "arn:aws:appsync:{}:{}:apis/{api_id}/types/{type_name}/resolvers/{field}",
-            ctx.region, ctx.account
+        json!(appsync_arn(
+            ctx,
+            &format!("apis/{api_id}/types/{type_name}/resolvers/{field}")
         )),
     );
     r.insert(
@@ -2133,9 +2134,9 @@ fn build_function(ctx: &Ctx, api_id: &str, function_id: &str, body: &Value) -> V
     f.insert("functionId".into(), json!(function_id));
     f.insert(
         "functionArn".into(),
-        json!(format!(
-            "arn:aws:appsync:{}:{}:apis/{api_id}/functions/{function_id}",
-            ctx.region, ctx.account
+        json!(appsync_arn(
+            ctx,
+            &format!("apis/{api_id}/functions/{function_id}")
         )),
     );
     f.insert(
@@ -2166,7 +2167,7 @@ fn build_function(ctx: &Ctx, api_id: &str, function_id: &str, body: &Value) -> V
 fn build_type(ctx: &Ctx, api_id: &str, name: &str, definition: &str, format: &str) -> Value {
     json!({
         "name": name,
-        "arn": format!("arn:aws:appsync:{}:{}:apis/{api_id}/types/{name}", ctx.region, ctx.account),
+        "arn": appsync_arn(ctx, &format!("apis/{api_id}/types/{name}")),
         "definition": definition,
         "format": format,
     })
@@ -2204,10 +2205,7 @@ fn build_domain_name(ctx: &Ctx, domain: &str, body: &Value) -> Value {
     c.insert("hostedZoneId".into(), json!("Z2FDTNDATAQYW2"));
     c.insert(
         "domainNameArn".into(),
-        json!(format!(
-            "arn:aws:appsync:{}:{}:domainnames/{domain}",
-            ctx.region, ctx.account
-        )),
+        json!(appsync_arn(ctx, &format!("domainnames/{domain}"))),
     );
     copy_keys(&mut c, body, &["description", "certificateArn", "tags"]);
     Value::Object(c)
@@ -2218,10 +2216,7 @@ fn build_event_api(ctx: &Ctx, api_id: &str, body: &Value) -> Value {
     api.insert("apiId".into(), json!(api_id));
     api.insert(
         "apiArn".into(),
-        json!(format!(
-            "arn:aws:appsync:{}:{}:apis/{api_id}",
-            ctx.region, ctx.account
-        )),
+        json!(appsync_arn(ctx, &format!("apis/{api_id}"))),
     );
     api.insert("created".into(), json!(now_epoch()));
     api.insert("xrayEnabled".into(), json!(false));
@@ -2246,9 +2241,9 @@ fn build_channel_namespace(ctx: &Ctx, api_id: &str, name: &str, body: &Value) ->
     ns.insert("name".into(), json!(name));
     ns.insert(
         "channelNamespaceArn".into(),
-        json!(format!(
-            "arn:aws:appsync:{}:{}:apis/{api_id}/channelNamespace/{name}",
-            ctx.region, ctx.account
+        json!(appsync_arn(
+            ctx,
+            &format!("apis/{api_id}/channelNamespace/{name}")
         )),
     );
     ns.insert("created".into(), json!(now_epoch()));
@@ -2357,8 +2352,19 @@ fn string_map(obj: &Map<String, Value>) -> std::collections::BTreeMap<String, St
         .collect()
 }
 
-fn graphql_api_arn(region: &str, account: &str, api_id: &str) -> String {
-    format!("arn:aws:appsync:{region}:{account}:apis/{api_id}")
+/// The ARN of a GraphQL API.
+pub fn graphql_api_arn(region: &str, account: &str, api_id: &str) -> String {
+    appsync_arn_in(region, account, &format!("apis/{api_id}"))
+}
+
+/// An AppSync ARN (`arn:<partition>:appsync:<region>:<account>:<resource>`) in
+/// `region`'s partition.
+pub fn appsync_arn_in(region: &str, account: &str, resource: &str) -> String {
+    Arn::regional("appsync", region, account, resource).to_string()
+}
+
+fn appsync_arn(ctx: &Ctx, resource: &str) -> String {
+    appsync_arn_in(&ctx.region, &ctx.account, resource)
 }
 
 /// Whether an API reference (a bare `apiId` or an `...:apis/<id>` ARN) names a
@@ -2579,6 +2585,42 @@ mod tests {
             .to_string();
         let got = body_json(&s.get_function(&ctx(), &api_id, &fid).unwrap());
         assert_eq!(got["functionConfiguration"]["name"], json!("fn1"));
+    }
+
+    #[test]
+    fn china_region_arns_use_the_aws_cn_partition() {
+        let s = svc();
+        let cn = Ctx {
+            account: "000000000000".to_string(),
+            region: "cn-north-1".to_string(),
+        };
+        let created = body_json(
+            &s.create_graphql_api(
+                &cn,
+                &json!({ "name": "demo", "authenticationType": "API_KEY" }),
+            )
+            .unwrap(),
+        );
+        let api_id = created["graphqlApi"]["apiId"].as_str().unwrap().to_string();
+        let api_arn = created["graphqlApi"]["arn"].as_str().unwrap().to_string();
+        assert_eq!(
+            api_arn,
+            format!("arn:aws-cn:appsync:cn-north-1:000000000000:apis/{api_id}")
+        );
+        let ds = body_json(
+            &s.create_data_source(&cn, &api_id, &json!({ "name": "src", "type": "NONE" }))
+                .unwrap(),
+        );
+        assert_eq!(
+            ds["dataSource"]["dataSourceArn"],
+            json!(format!(
+                "arn:aws-cn:appsync:cn-north-1:000000000000:apis/{api_id}/datasources/src"
+            ))
+        );
+        s.tag_resource(&cn, &api_arn, &json!({ "tags": { "team": "cn" } }))
+            .unwrap();
+        let listed = body_json(&s.list_tags_for_resource(&cn, &api_arn).unwrap());
+        assert_eq!(listed["tags"]["team"], json!("cn"));
     }
 
     #[test]

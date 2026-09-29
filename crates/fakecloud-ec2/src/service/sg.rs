@@ -8,8 +8,8 @@ use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use crate::service::Ec2Service;
 use crate::service_helpers::{
-    filter_value_matches, gen_id, indexed_list, invalid_parameter_value, missing_parameter,
-    parse_filters, require, validate_max_results, Filter,
+    ec2_arn, filter_value_matches, gen_id, indexed_list, invalid_parameter_value,
+    missing_parameter, parse_filters, require, validate_max_results, Filter,
 };
 use crate::state::{Ec2State, SecurityGroup, SecurityGroupRule, SecurityGroupVpcAssociation, Tag};
 
@@ -26,10 +26,7 @@ fn rule_xml(r: &SecurityGroupRule, owner: &str, region: &str) -> String {
         ec2_elem("description", &r.description),
         ec2_elem(
             "securityGroupRuleArn",
-            &format!(
-                "arn:aws:ec2:{region}:{owner}:security-group-rule/{}",
-                r.rule_id
-            ),
+            &ec2_arn(region, owner, &format!("security-group-rule/{}", r.rule_id)),
         ),
     );
     if let Some(c) = &r.cidr_ipv4 {
@@ -159,10 +156,7 @@ fn sg_xml(sg: &SecurityGroup, tags: &[Tag], owner: &str, region: &str) -> String
         ec2_elem("vpcId", &sg.vpc_id),
         ec2_elem(
             "securityGroupArn",
-            &format!(
-                "arn:aws:ec2:{region}:{owner}:security-group/{}",
-                sg.group_id
-            )
+            &ec2_arn(region, owner, &format!("security-group/{}", sg.group_id))
         ),
         format_args!(
             "{}{}",
@@ -402,7 +396,7 @@ pub(crate) fn create_security_group(
         ec2_elem("groupId", &group_id),
         ec2_elem(
             "securityGroupArn",
-            &format!("arn:aws:ec2:{region}:{owner}:security-group/{group_id}")
+            &ec2_arn(&region, &owner, &format!("security-group/{group_id}"))
         ),
         super::tags::tag_set_xml(&tags),
     );

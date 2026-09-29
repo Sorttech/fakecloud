@@ -25,4 +25,4 @@ pub(crate) mod service;
 pub(crate) mod state;
 
 pub use service::DmsService;
-pub use state::{DmsData, SharedDmsState, DMS_SNAPSHOT_SCHEMA_VERSION};
+pub use state::{dms_arn, DmsData, SharedDmsState, DMS_SNAPSHOT_SCHEMA_VERSION};

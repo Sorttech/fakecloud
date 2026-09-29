@@ -5,7 +5,9 @@ use fakecloud_aws::ec2query::{ec2_elem, ec2_list, ec2_return};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use crate::service::Ec2Service;
-use crate::service_helpers::{gen_id, require, validate_enum, validate_max_results};
+use crate::service_helpers::{
+    ec2_global_arn, gen_id, require, validate_enum, validate_max_results,
+};
 use crate::state::{
     Ec2State, IpamPolicy, IpamPrefixListResolver, IpamPrefixListResolverTarget, Tag,
 };
@@ -32,7 +34,7 @@ fn policy_xml(p: &IpamPolicy, tags: &[Tag], owner: &str, region: &str) -> String
         ec2_elem("ipamPolicyId", &p.id),
         ec2_elem(
             "ipamPolicyArn",
-            &format!("arn:aws:ec2::{owner}:ipam-policy/{}", p.id)
+            &ec2_global_arn(region, owner, &format!("ipam-policy/{}", p.id))
         ),
         ec2_elem("ipamPolicyRegion", region),
         ec2_elem("ipamId", &p.ipam_id) + &ec2_elem("ownerId", owner),
@@ -269,11 +271,15 @@ fn resolver_xml(r: &IpamPrefixListResolver, tags: &[Tag], owner: &str, region: &
         ec2_elem("ipamPrefixListResolverId", &r.id),
         ec2_elem(
             "ipamPrefixListResolverArn",
-            &format!("arn:aws:ec2::{owner}:ipam-prefix-list-resolver/{}", r.id)
+            &ec2_global_arn(
+                region,
+                owner,
+                &format!("ipam-prefix-list-resolver/{}", r.id)
+            )
         ),
         ec2_elem(
             "ipamArn",
-            &format!("arn:aws:ec2::{owner}:ipam/{}", r.ipam_id)
+            &ec2_global_arn(region, owner, &format!("ipam/{}", r.ipam_id))
         ),
         ec2_elem("ipamRegion", region) + &ec2_elem("ownerId", owner),
         ec2_elem("description", &r.description),
@@ -416,15 +422,16 @@ pub(crate) fn modify_ipam_prefix_list_resolver(
     ))
 }
 
-fn target_xml(t: &IpamPrefixListResolverTarget, tags: &[Tag], owner: &str) -> String {
+fn target_xml(t: &IpamPrefixListResolverTarget, tags: &[Tag], owner: &str, region: &str) -> String {
     format!(
         "{}{}{}{}{}<trackLatestVersion>{}</trackLatestVersion><state>create-complete</state>{}",
         ec2_elem("ipamPrefixListResolverTargetId", &t.id),
         ec2_elem(
             "ipamPrefixListResolverTargetArn",
-            &format!(
-                "arn:aws:ec2::{owner}:ipam-prefix-list-resolver-target/{}",
-                t.id
+            &ec2_global_arn(
+                region,
+                owner,
+                &format!("ipam-prefix-list-resolver-target/{}", t.id)
             )
         ),
         ec2_elem("ipamPrefixListResolverId", &t.resolver_id),
@@ -470,7 +477,7 @@ pub(crate) fn create_ipam_prefix_list_resolver_target(
         &req.request_id,
         &format!(
             "<ipamPrefixListResolverTarget>{}</ipamPrefixListResolverTarget>",
-            target_xml(&t, &tags, &owner)
+            target_xml(&t, &tags, &owner, &req.region)
         ),
     ))
 }
@@ -500,7 +507,7 @@ pub(crate) fn delete_ipam_prefix_list_resolver_target(
         &req.request_id,
         &format!(
             "<ipamPrefixListResolverTarget>{}</ipamPrefixListResolverTarget>",
-            target_xml(&t, &tags, &owner)
+            target_xml(&t, &tags, &owner, &req.region)
         ),
     ))
 }
@@ -517,7 +524,7 @@ pub(crate) fn describe_ipam_prefix_list_resolver_targets(
     let mut items: Vec<String> = state
         .ipam_pl_resolver_targets
         .values()
-        .map(|t| target_xml(t, state.tags_for(&t.id), &owner))
+        .map(|t| target_xml(t, state.tags_for(&t.id), &owner, &req.region))
         .collect();
     items.sort();
     Ok(Ec2Service::respond(
@@ -553,7 +560,7 @@ pub(crate) fn modify_ipam_prefix_list_resolver_target(
         &req.request_id,
         &format!(
             "<ipamPrefixListResolverTarget>{}</ipamPrefixListResolverTarget>",
-            target_xml(&t, &tags, &owner)
+            target_xml(&t, &tags, &owner, &req.region)
         ),
     ))
 }

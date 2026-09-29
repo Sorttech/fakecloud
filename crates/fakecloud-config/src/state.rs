@@ -20,6 +20,25 @@ pub fn resource_key(resource_type: &str, resource_id: &str) -> String {
     format!("{resource_type}\u{1}{resource_id}")
 }
 
+/// An AWS Config ARN for `resource` (`config-rule/...`,
+/// `configuration-recorder/...`, ...), in the partition of `region`.
+pub fn config_arn(region: &str, account: &str, resource: &str) -> String {
+    fakecloud_aws::arn::Arn::regional("config", region, account, resource).to_string()
+}
+
+/// The service-linked role AWS Config records with (`AWSServiceRoleForConfig`,
+/// or `AWSServiceRoleForConfigThirdParty` for a third-party recorder), in the
+/// partition of `region`.
+pub fn config_service_linked_role_arn(region: &str, account: &str, role_name: &str) -> String {
+    fakecloud_aws::arn::Arn::global_in(
+        region,
+        "iam",
+        account,
+        &format!("role/aws-service-role/config.amazonaws.com/{role_name}"),
+    )
+    .to_string()
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ConfigAccounts {
     pub accounts: BTreeMap<String, AccountState>,

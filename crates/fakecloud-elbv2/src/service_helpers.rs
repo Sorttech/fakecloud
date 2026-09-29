@@ -254,23 +254,6 @@ pub(crate) fn lb_not_found(arn: &str) -> AwsServiceError {
     )
 }
 
-pub(crate) fn build_lb_arn(
-    region: &str,
-    account_id: &str,
-    lb_type: &str,
-    name: &str,
-    suffix: &str,
-) -> String {
-    let prefix = match lb_type {
-        "network" => "net",
-        "gateway" => "gwy",
-        _ => "app",
-    };
-    format!(
-        "arn:aws:elasticloadbalancing:{region}:{account_id}:loadbalancer/{prefix}/{name}/{suffix}"
-    )
-}
-
 pub(crate) fn build_dns_name(
     name: &str,
     _lb_type: &str,

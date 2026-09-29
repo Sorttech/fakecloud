@@ -26,7 +26,8 @@ impl ResourceProvisioner {
         let region = &self.region;
         let account = &self.account_id;
         let api_id = gen_api_id();
-        let arn = format!("arn:aws:appsync:{region}:{account}:apis/{api_id}");
+        let arn =
+            fakecloud_appsync::service::graphql_api_arn(&self.region, &self.account_id, &api_id);
         let graphql_url = format!("https://{api_id}.appsync-api.{region}.amazonaws.com/graphql");
         let realtime_url =
             format!("wss://{api_id}.appsync-realtime-api.{region}.amazonaws.com/graphql");
@@ -193,9 +194,12 @@ impl ResourceProvisioner {
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| self.physical_name(resource));
-        let region = &self.region;
         let account = &self.account_id;
-        let arn = format!("arn:aws:appsync:{region}:{account}:apis/{api_id}/datasources/{name}");
+        let arn = fakecloud_appsync::service::appsync_arn_in(
+            &self.region,
+            &self.account_id,
+            &format!("apis/{api_id}/datasources/{name}"),
+        );
 
         let mut ds = match cfn_props_to_camel(props, &[]) {
             Value::Object(m) => m,
@@ -321,10 +325,11 @@ impl ResourceProvisioner {
             .and_then(Value::as_str)
             .ok_or("AWS::AppSync::Resolver requires FieldName")?
             .to_string();
-        let region = &self.region;
         let account = &self.account_id;
-        let arn = format!(
-            "arn:aws:appsync:{region}:{account}:apis/{api_id}/types/{type_name}/resolvers/{field}"
+        let arn = fakecloud_appsync::service::appsync_arn_in(
+            &self.region,
+            &self.account_id,
+            &format!("apis/{api_id}/types/{type_name}/resolvers/{field}"),
         );
 
         let mut r = match cfn_props_to_camel(props, &[]) {

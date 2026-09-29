@@ -188,9 +188,10 @@ impl ApiGatewayService {
     pub(super) fn create_dnaa(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let body = req.json_body();
         let id = make_id();
-        let arn = format!(
-            "arn:aws:apigateway:{}:{}:/domainnameaccessassociations/{}",
-            req.region, req.account_id, id
+        let arn = crate::state::apigateway_arn(
+            &req.region,
+            &req.account_id,
+            &format!("/domainnameaccessassociations/{id}"),
         );
         let mut entry = body.clone();
         if let Some(obj) = entry.as_object_mut() {

@@ -29,10 +29,8 @@ pub(crate) fn create_marketplace_model_endpoint(
     })?;
 
     let endpoint_id = Uuid::new_v4().to_string();
-    let endpoint_arn = format!(
-        "arn:aws:bedrock:{}:{}:marketplace-model-endpoint/{}",
-        req.region, req.account_id, endpoint_id
-    );
+    let endpoint_arn =
+        crate::arns::marketplace_model_endpoint_arn(&req.region, &req.account_id, &endpoint_id);
 
     let now = Utc::now();
     let endpoint = MarketplaceModelEndpoint {
