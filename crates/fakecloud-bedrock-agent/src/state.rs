@@ -83,6 +83,39 @@ impl BedrockAgentAccounts {
             for prompt in state.prompts.values_mut().filter(|p| p.arn.is_empty()) {
                 prompt.arn = crate::arns::prompt_arn(region, account_id, &prompt.prompt_id);
             }
+            state.rekey_encoded_tags();
+        }
+    }
+}
+
+impl BedrockAgentState {
+    /// Tags are keyed by the resource ARN as the caller wrote it. Builds that
+    /// did not decode the `{resourceArn}` path label stored TagResource calls
+    /// under the percent-encoded ARN (`arn%3Aaws%3Abedrock...`); move those
+    /// entries to the decoded ARN. When both forms exist, the decoded entry
+    /// was written later, so its values win and the encoded entry only
+    /// contributes keys the decoded one lacks.
+    fn rekey_encoded_tags(&mut self) {
+        let encoded: Vec<String> = self
+            .tags
+            .keys()
+            .filter(|k| k.contains('%'))
+            .cloned()
+            .collect();
+        for key in encoded {
+            let decoded = percent_encoding::percent_decode_str(&key)
+                .decode_utf8_lossy()
+                .into_owned();
+            if decoded == key {
+                continue;
+            }
+            let Some(old) = self.tags.remove(&key) else {
+                continue;
+            };
+            let entry = self.tags.entry(decoded).or_default();
+            for (k, v) in old {
+                entry.entry(k).or_insert(v);
+            }
         }
     }
 }

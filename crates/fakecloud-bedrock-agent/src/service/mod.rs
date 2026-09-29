@@ -2415,6 +2415,52 @@ mod tests {
         assert_eq!(versions["promptSummaries"][1]["arn"], version["arn"]);
     }
 
+    #[tokio::test]
+    async fn loading_a_snapshot_rekeys_percent_encoded_tag_arns() {
+        let arn = "arn:aws:bedrock:us-east-1:123456789012:flow/ABCDEFGHIJ";
+        let other = "arn:aws:bedrock:us-east-1:123456789012:prompt/KLMNOPQRST";
+        // An older build stored TagResource-over-the-wire tags under the
+        // still-encoded path label. One ARN has only the encoded entry; the
+        // other has both, the decoded one written later by a newer build.
+        let raw = json!({"accounts": {"123456789012": {
+            "account_id": "123456789012",
+            "region": "us-east-1",
+            "agents": {}, "agent_aliases": {}, "agent_versions": {},
+            "knowledge_bases": {}, "data_sources": {}, "agent_knowledge_bases": {},
+            "agent_collaborators": {}, "flows": {}, "flow_aliases": {},
+            "flow_versions": {}, "prompts": {}, "prompt_versions": {},
+            "ingestion_jobs": {},
+            "tags": {
+                encode(arn): {"team": "a", "env": "dev"},
+                encode(other): {"team": "old", "cost": "1"},
+                other: {"team": "new"}
+            }
+        }}});
+        let loaded: BedrockAgentAccounts = serde_json::from_value(raw).unwrap();
+        let tags = &loaded.get("123456789012").unwrap().tags;
+        assert_eq!(
+            tags.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec![arn, other],
+            "every encoded key is re-keyed, none is left behind"
+        );
+        assert_eq!(tags[other]["team"], "new", "the later decoded value wins");
+        assert_eq!(tags[other]["cost"], "1", "encoded-only keys are merged in");
+
+        let svc = BedrockAgentService::new(Arc::new(RwLock::new(loaded)));
+        let path = format!("/tags/{}", encode(arn));
+        let (_, listed) = call(&svc, Method::GET, &path, &[], json!({})).await;
+        assert_eq!(listed, json!({"tags": {"team": "a", "env": "dev"}}));
+
+        let mut untag = cn_request(json!({}));
+        untag.region = "us-east-1".to_string();
+        untag.method = Method::DELETE;
+        untag.raw_path = path.clone();
+        untag.raw_query = "tagKeys=team&tagKeys=env".to_string();
+        svc.handle(untag).await.unwrap();
+        let (_, listed) = call(&svc, Method::GET, &path, &[], json!({})).await;
+        assert_eq!(listed, json!({"tags": {}}));
+    }
+
     #[test]
     fn loading_a_snapshot_without_arns_backfills_them_from_the_state_region() {
         let svc = BedrockAgentService::new(Arc::new(RwLock::new(BedrockAgentAccounts::new())));
