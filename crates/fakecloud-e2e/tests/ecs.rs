@@ -143,7 +143,7 @@ async fn register_describe_deregister_task_definition() {
         .container_definitions(
             ContainerDefinition::builder()
                 .name("app")
-                .image("public.ecr.aws/library/alpine:latest")
+                .image("public.ecr.aws/docker/library/alpine:latest")
                 .essential(true)
                 .build(),
         )
@@ -164,7 +164,7 @@ async fn register_describe_deregister_task_definition() {
         .container_definitions(
             ContainerDefinition::builder()
                 .name("app")
-                .image("public.ecr.aws/library/alpine:3.19")
+                .image("public.ecr.aws/docker/library/alpine:3.19")
                 .essential(true)
                 .build(),
         )
@@ -219,7 +219,7 @@ async fn list_task_definitions_and_families() {
             .container_definitions(
                 ContainerDefinition::builder()
                     .name("app")
-                    .image("public.ecr.aws/library/alpine:latest")
+                    .image("public.ecr.aws/docker/library/alpine:latest")
                     .essential(true)
                     .build(),
             )
@@ -263,7 +263,7 @@ async fn delete_task_definitions_requires_inactive() {
         .container_definitions(
             ContainerDefinition::builder()
                 .name("app")
-                .image("public.ecr.aws/library/alpine:latest")
+                .image("public.ecr.aws/docker/library/alpine:latest")
                 .essential(true)
                 .build(),
         )
@@ -518,7 +518,7 @@ async fn register_runnable_task_def(client: &aws_sdk_ecs::Client, family: &str) 
         .container_definitions(
             ContainerDefinition::builder()
                 .name("app")
-                .image("public.ecr.aws/library/alpine:latest")
+                .image("public.ecr.aws/docker/library/alpine:latest")
                 .essential(true)
                 .build(),
         )
@@ -730,7 +730,7 @@ async fn bootstrap_service_fixtures(client: &aws_sdk_ecs::Client, cluster: &str,
         .container_definitions(
             ContainerDefinition::builder()
                 .name("app")
-                .image("public.ecr.aws/library/alpine:latest")
+                .image("public.ecr.aws/docker/library/alpine:latest")
                 .essential(true)
                 .build(),
         )
@@ -1029,7 +1029,7 @@ async fn update_service_new_task_definition_triggers_rolling_deployment() {
         .container_definitions(
             ContainerDefinition::builder()
                 .name("app")
-                .image("public.ecr.aws/library/alpine:3.19")
+                .image("public.ecr.aws/docker/library/alpine:3.19")
                 .essential(true)
                 .build(),
         )
@@ -1209,14 +1209,14 @@ async fn run_task_with_two_containers_records_both_per_container() {
         .container_definitions(
             ContainerDefinition::builder()
                 .name("app")
-                .image("public.ecr.aws/library/alpine:latest")
+                .image("public.ecr.aws/docker/library/alpine:latest")
                 .essential(true)
                 .build(),
         )
         .container_definitions(
             ContainerDefinition::builder()
                 .name("sidecar")
-                .image("public.ecr.aws/library/alpine:latest")
+                .image("public.ecr.aws/docker/library/alpine:latest")
                 .essential(false)
                 .build(),
         )
@@ -1275,14 +1275,14 @@ async fn stop_task_with_two_containers_marks_all_stopped() {
         .container_definitions(
             ContainerDefinition::builder()
                 .name("app")
-                .image("public.ecr.aws/library/alpine:latest")
+                .image("public.ecr.aws/docker/library/alpine:latest")
                 .essential(true)
                 .build(),
         )
         .container_definitions(
             ContainerDefinition::builder()
                 .name("sidecar")
-                .image("public.ecr.aws/library/alpine:latest")
+                .image("public.ecr.aws/docker/library/alpine:latest")
                 .essential(false)
                 .build(),
         )
@@ -1356,14 +1356,14 @@ async fn describe_tasks_emits_per_container_aws_shape_fields() {
         .container_definitions(
             ContainerDefinition::builder()
                 .name("app")
-                .image("public.ecr.aws/library/alpine:latest")
+                .image("public.ecr.aws/docker/library/alpine:latest")
                 .essential(true)
                 .build(),
         )
         .container_definitions(
             ContainerDefinition::builder()
                 .name("sidecar")
-                .image("public.ecr.aws/library/alpine:latest")
+                .image("public.ecr.aws/docker/library/alpine:latest")
                 .essential(false)
                 .build(),
         )

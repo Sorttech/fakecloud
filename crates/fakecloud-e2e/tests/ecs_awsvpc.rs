@@ -83,7 +83,13 @@ async fn ecs_awsvpc_task_gets_eni_attachment() {
             let attachments = t.attachments();
             assert!(
                 attachments.iter().any(|a| a.r#type() == Some("eni")),
-                "expected ENI attachment for awsvpc task; got {attachments:?}"
+                "expected ENI attachment for awsvpc task; got {attachments:?}. \
+                 stopCode={:?} stoppedReason={:?} containers={:?} -- a task that \
+                 never started (image pull refused, registry allowance exhausted) \
+                 reports no attachments, so check the reason before the ENI code",
+                t.stop_code(),
+                t.stopped_reason(),
+                t.containers()
             );
             let eni = attachments
                 .iter()

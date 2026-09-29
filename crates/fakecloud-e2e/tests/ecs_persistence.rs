@@ -51,7 +51,7 @@ async fn persistence_running_tasks_reconciled_to_stopped_after_restart() {
         .container_definitions(
             ContainerDefinition::builder()
                 .name("app")
-                .image("public.ecr.aws/library/alpine:latest")
+                .image("public.ecr.aws/docker/library/alpine:latest")
                 .essential(true)
                 .build(),
         )
