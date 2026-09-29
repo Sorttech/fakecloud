@@ -4,6 +4,10 @@
 
 use super::*;
 
+mod distribution_config;
+
+use distribution_config::cfn_distribution_config;
+
 impl ResourceProvisioner {
     pub(crate) fn create_cf_origin_access_identity(
         &self,
@@ -53,134 +57,9 @@ impl ResourceProvisioner {
         Ok(())
     }
 
-    /// Translate the CFN-flat `DistributionConfig` members that the create /
-    /// update paths would otherwise drop -- Aliases, CacheBehaviors,
-    /// CustomErrorResponses, Logging, Restrictions -- into the CloudFront wire
-    /// shape and apply them. CFN spells these as flat lists / a bare object;
-    /// the service model nests them under Quantity+Items, mirroring the Origins
-    /// translation. Only members present in the template are set, so an absent
-    /// one stays `None` (create) / is cleared on update.
-    fn apply_cfn_distribution_extras(config: &mut DistributionConfig, cfg: &serde_json::Value) {
-        // Aliases: flat ["a.example.com", ...].
-        config.aliases = cfg.get("Aliases").and_then(|v| v.as_array()).map(|arr| {
-            let cname: Vec<String> = arr
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
-            Aliases {
-                quantity: cname.len() as i32,
-                items: Some(AliasItems { cname }),
-            }
-        });
-        // CacheBehaviors: flat [{ PathPattern, ... }, ...].
-        config.cache_behaviors = cfg
-            .get("CacheBehaviors")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                let cache_behavior: Vec<CacheBehavior> = arr
-                    .iter()
-                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
-                    .collect();
-                CacheBehaviors {
-                    quantity: cache_behavior.len() as i32,
-                    items: Some(CacheBehaviorItems { cache_behavior }),
-                }
-            });
-        // CustomErrorResponses: flat [{ ErrorCode, ... }, ...].
-        //
-        // Mapped field by field rather than through `serde_json::from_value`:
-        // CloudFormation types `ResponseCode` as an Integer while the CloudFront
-        // API carries it as a string, so deserializing the CFN shape into the
-        // wire struct fails and every rule was silently dropped -- a SPA
-        // distribution came out with `Quantity: 0` and no deep-link fallback.
-        config.custom_error_responses = cfg
-            .get("CustomErrorResponses")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                let custom_error_response: Vec<CustomErrorResponse> = arr
-                    .iter()
-                    .filter_map(|v| {
-                        Some(CustomErrorResponse {
-                            // Required by CloudFormation. A rule without it is
-                            // skipped rather than defaulted to a code that
-                            // would match nothing.
-                            error_code: cfn_i64(v.get("ErrorCode"))? as i32,
-                            response_page_path: v
-                                .get("ResponsePagePath")
-                                .and_then(|p| p.as_str())
-                                .map(String::from),
-                            response_code: cfn_number_as_string(v.get("ResponseCode")),
-                            error_caching_min_ttl: cfn_i64(v.get("ErrorCachingMinTTL")),
-                        })
-                    })
-                    .collect();
-                CustomErrorResponses {
-                    quantity: custom_error_response.len() as i32,
-                    items: Some(CustomErrorResponseItems {
-                        custom_error_response,
-                    }),
-                }
-            });
-        // Logging: { Bucket, IncludeCookies, Prefix } -- CFN has no Enabled, so
-        // presence of the block means logging is on.
-        config.logging = cfg
-            .get("Logging")
-            .filter(|v| v.is_object())
-            .map(|log| LoggingConfig {
-                enabled: true,
-                include_cookies: log
-                    .get("IncludeCookies")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false),
-                bucket: log
-                    .get("Bucket")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                prefix: log
-                    .get("Prefix")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-            });
-        // Restrictions: { GeoRestriction: { RestrictionType, Locations: [..] } }.
-        config.restrictions = cfg
-            .get("Restrictions")
-            .and_then(|v| v.get("GeoRestriction"))
-            .map(|geo| {
-                let location: Vec<String> = geo
-                    .get("Locations")
-                    .and_then(|v| v.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                Restrictions {
-                    geo_restriction: GeoRestriction {
-                        restriction_type: geo
-                            .get("RestrictionType")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("none")
-                            .to_string(),
-                        quantity: location.len() as i32,
-                        items: if location.is_empty() {
-                            None
-                        } else {
-                            Some(LocationList { location })
-                        },
-                    },
-                }
-            });
-    }
-
-    /// Provision an `AWS::CloudFront::Distribution`. Reads
-    /// DistributionConfig.Origins/DefaultCacheBehavior/etc. and persists a
-    /// StoredDistribution in CloudFront state. CFN's Origins property is a flat
-    /// array, so we wrap it back into the wire shape with a quantity +
-    /// Items.Origin nesting; `apply_cfn_distribution_extras` does the same for
-    /// Aliases / CacheBehaviors / CustomErrorResponses / Logging / Restrictions.
+    /// Provision an `AWS::CloudFront::Distribution`: translate the CFN
+    /// `DistributionConfig` into the wire shape (see `distribution_config`) and
+    /// persist a StoredDistribution in CloudFront state.
     pub(crate) fn create_cf_distribution(
         &self,
         resource: &ResourceDefinition,
@@ -190,85 +69,8 @@ impl ResourceProvisioner {
             .get("DistributionConfig")
             .ok_or_else(|| "DistributionConfig is required".to_string())?;
 
-        // CFN Origins is a flat JSON array; the wire shape is
-        // { Quantity, Items: { Origin: [...] } }. Translate. CustomOriginConfig
-        // uses AWS's HTTPPort/HTTPSPort casing, which the model now accepts
-        // natively (see CustomOriginConfig in fakecloud-cloudfront::model), so no
-        // field patching is needed here.
-        let origin_entries: Vec<Origin> = cfg
-            .get("Origins")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| "DistributionConfig.Origins is required".to_string())?
-            .iter()
-            .map(|o| {
-                serde_json::from_value::<Origin>(o.clone())
-                    .map_err(|e| format!("Invalid Origin entry: {e}"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if origin_entries.is_empty() {
-            return Err("DistributionConfig.Origins must contain at least one origin".to_string());
-        }
-        let origins = Origins {
-            quantity: origin_entries.len() as i32,
-            items: Some(OriginItems {
-                origin: origin_entries,
-            }),
-        };
-
-        let dcb_value = cfg
-            .get("DefaultCacheBehavior")
-            .ok_or_else(|| "DistributionConfig.DefaultCacheBehavior is required".to_string())?;
-        let default_cache_behavior: DefaultCacheBehavior =
-            serde_json::from_value(dcb_value.clone())
-                .map_err(|e| format!("Invalid DefaultCacheBehavior: {e}"))?;
-
-        let comment = cfg
-            .get("Comment")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let enabled = cfg.get("Enabled").and_then(|v| v.as_bool()).unwrap_or(true);
-        let price_class = cfg
-            .get("PriceClass")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let http_version = cfg
-            .get("HttpVersion")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let is_ipv6_enabled = cfg.get("IPV6Enabled").and_then(|v| v.as_bool());
-        let default_root_object = cfg
-            .get("DefaultRootObject")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let web_acl_id = cfg
-            .get("WebACLId")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        let viewer_certificate: Option<ViewerCertificate> = cfg
-            .get("ViewerCertificate")
-            .map(|v| serde_json::from_value(v.clone()))
-            .transpose()
-            .map_err(|e| format!("Invalid ViewerCertificate: {e}"))?;
-
         let caller_reference = format!("cfn-{}-{}", resource.logical_id, Uuid::new_v4().simple());
-
-        let mut config = DistributionConfig {
-            caller_reference,
-            comment,
-            enabled,
-            origins,
-            default_cache_behavior,
-            ..Default::default()
-        };
-        config.price_class = price_class;
-        config.http_version = http_version;
-        config.is_ipv6_enabled = is_ipv6_enabled;
-        config.default_root_object = default_root_object;
-        config.web_acl_id = web_acl_id;
-        config.viewer_certificate = viewer_certificate;
-        Self::apply_cfn_distribution_extras(&mut config, cfg);
+        let config = cfn_distribution_config(cfg, caller_reference)?;
 
         // Mint distribution id + ARN + domain in the same shape the
         // CloudFront service uses.
@@ -337,73 +139,6 @@ impl ResourceProvisioner {
             .get("DistributionConfig")
             .ok_or_else(|| "DistributionConfig is required".to_string())?;
 
-        let origin_entries: Vec<Origin> = cfg
-            .get("Origins")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| "DistributionConfig.Origins is required".to_string())?
-            .iter()
-            .map(|o| {
-                serde_json::from_value::<Origin>(o.clone())
-                    .map_err(|e| format!("Invalid Origin entry: {e}"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if origin_entries.is_empty() {
-            return Err("DistributionConfig.Origins must contain at least one origin".to_string());
-        }
-        let origins = Origins {
-            quantity: origin_entries.len() as i32,
-            items: Some(OriginItems {
-                origin: origin_entries,
-            }),
-        };
-
-        let dcb_value = cfg
-            .get("DefaultCacheBehavior")
-            .ok_or_else(|| "DistributionConfig.DefaultCacheBehavior is required".to_string())?;
-        let default_cache_behavior: DefaultCacheBehavior =
-            serde_json::from_value(dcb_value.clone())
-                .map_err(|e| format!("Invalid DefaultCacheBehavior: {e}"))?;
-
-        let comment = cfg
-            .get("Comment")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let enabled = cfg.get("Enabled").and_then(|v| v.as_bool()).unwrap_or(true);
-        let viewer_certificate: Option<ViewerCertificate> = cfg
-            .get("ViewerCertificate")
-            .map(|v| serde_json::from_value(v.clone()))
-            .transpose()
-            .map_err(|e| format!("Invalid ViewerCertificate: {e}"))?;
-
-        let mut config = DistributionConfig {
-            caller_reference: String::new(), // preserved from the stored config below
-            comment,
-            enabled,
-            origins,
-            default_cache_behavior,
-            ..Default::default()
-        };
-        config.price_class = cfg
-            .get("PriceClass")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        config.http_version = cfg
-            .get("HttpVersion")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        config.is_ipv6_enabled = cfg.get("IPV6Enabled").and_then(|v| v.as_bool());
-        config.default_root_object = cfg
-            .get("DefaultRootObject")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        config.web_acl_id = cfg
-            .get("WebACLId")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        config.viewer_certificate = viewer_certificate;
-        Self::apply_cfn_distribution_extras(&mut config, cfg);
-
         let etag_suffix: String = Uuid::new_v4()
             .simple()
             .to_string()
@@ -419,8 +154,7 @@ impl ResourceProvisioner {
             .get_mut(&existing.physical_id)
             .ok_or_else(|| format!("Distribution {} not yet provisioned", existing.physical_id))?;
         // CallerReference is immutable across an update; keep the stored one.
-        config.caller_reference = dist.config.caller_reference.clone();
-        dist.config = config;
+        dist.config = cfn_distribution_config(cfg, dist.config.caller_reference.clone())?;
         dist.status = "InProgress".to_string();
         dist.last_modified_time = Utc::now();
         dist.etag = format!("E{etag_suffix}");
@@ -1241,104 +975,5 @@ impl ResourceProvisioner {
         Ok(ProvisionResult::new(id.clone())
             .with("FunctionARN", function_arn)
             .with("Stage", "DEVELOPMENT"))
-    }
-}
-
-/// Read a CloudFormation numeric property. Templates carry these as JSON
-/// numbers, but YAML templates and resolved intrinsics quote them, and both are
-/// valid CloudFormation.
-fn cfn_i64(value: Option<&serde_json::Value>) -> Option<i64> {
-    match value? {
-        serde_json::Value::Number(n) => n.as_i64(),
-        serde_json::Value::String(s) => s.parse().ok(),
-        _ => None,
-    }
-}
-
-/// Read a CloudFormation numeric property that the AWS API carries as a string
-/// (CloudFront's `ResponseCode`).
-fn cfn_number_as_string(value: Option<&serde_json::Value>) -> Option<String> {
-    match value? {
-        serde_json::Value::Number(n) => Some(n.to_string()),
-        serde_json::Value::String(s) => Some(s.clone()),
-        _ => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The `CustomErrorResponses` block CDK synthesizes for a SPA distribution.
-    /// CloudFormation types `ResponseCode` and `ErrorCachingMinTTL` as Integer;
-    /// the CloudFront API carries `ResponseCode` as a string.
-    fn cdk_spa_config() -> serde_json::Value {
-        serde_json::json!({
-            "CustomErrorResponses": [
-                {"ErrorCode": 403, "ResponseCode": 200, "ResponsePagePath": "/index.html", "ErrorCachingMinTTL": 300},
-                {"ErrorCode": 404, "ResponseCode": 200, "ResponsePagePath": "/index.html", "ErrorCachingMinTTL": 300}
-            ]
-        })
-    }
-
-    #[test]
-    fn cfn_custom_error_responses_survive_translation() {
-        let mut config = DistributionConfig::default();
-        ResourceProvisioner::apply_cfn_distribution_extras(&mut config, &cdk_spa_config());
-
-        let rules = config
-            .custom_error_responses
-            .expect("CustomErrorResponses translated");
-        assert_eq!(rules.quantity, 2);
-        let items = rules.items.expect("items");
-        let codes: Vec<i32> = items
-            .custom_error_response
-            .iter()
-            .map(|r| r.error_code)
-            .collect();
-        assert_eq!(codes, vec![403, 404]);
-        for rule in &items.custom_error_response {
-            // The integer CFN gives must reach the wire model as a string,
-            // not be dropped for failing to deserialize into Option<String>.
-            assert_eq!(rule.response_code.as_deref(), Some("200"));
-            assert_eq!(rule.response_page_path.as_deref(), Some("/index.html"));
-            assert_eq!(rule.error_caching_min_ttl, Some(300));
-        }
-    }
-
-    #[test]
-    fn cfn_custom_error_responses_accept_stringified_numbers() {
-        // YAML templates and `Fn::Sub` outputs quote numbers; both shapes are
-        // valid CloudFormation.
-        let cfg = serde_json::json!({
-            "CustomErrorResponses": [
-                {"ErrorCode": "404", "ResponseCode": "200", "ResponsePagePath": "/index.html"}
-            ]
-        });
-        let mut config = DistributionConfig::default();
-        ResourceProvisioner::apply_cfn_distribution_extras(&mut config, &cfg);
-
-        let items = config
-            .custom_error_responses
-            .expect("translated")
-            .items
-            .expect("items");
-        let rule = items.custom_error_response.first().expect("one rule");
-        assert_eq!(rule.error_code, 404);
-        assert_eq!(rule.response_code.as_deref(), Some("200"));
-    }
-
-    #[test]
-    fn a_rule_without_an_error_code_is_skipped_not_defaulted() {
-        // ErrorCode is required by CloudFormation; inventing a 0 would silently
-        // install a rule that matches nothing.
-        let cfg = serde_json::json!({
-            "CustomErrorResponses": [{"ResponsePagePath": "/index.html"}]
-        });
-        let mut config = DistributionConfig::default();
-        ResourceProvisioner::apply_cfn_distribution_extras(&mut config, &cfg);
-
-        let rules = config.custom_error_responses.expect("translated");
-        assert_eq!(rules.quantity, 0);
     }
 }

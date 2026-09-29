@@ -273,7 +273,7 @@ async fn cfn_provisions_cloudfront_distribution() {
 /// 403/404 to `/index.html` with a 200. CloudFormation types `ResponseCode` as
 /// an Integer while the CloudFront API carries it as a string, so translating
 /// the CFN block through the wire struct dropped every rule and the
-/// distribution came out with none — deep links 404'd instead of serving the
+/// distribution came out with none, so deep links 404'd instead of serving the
 /// app shell.
 const SPA_ERROR_TEMPLATE: &str = r#"{
   "Resources": {
@@ -358,4 +358,237 @@ async fn cfn_provisions_spa_custom_error_responses() {
         assert_eq!(rule.response_page_path(), Some("/index.html"));
         assert_eq!(rule.error_caching_min_ttl(), Some(300));
     }
+}
+
+/// A distribution in the shape CDK synthesizes: flat `AllowedMethods` /
+/// `CachedMethods` lists, `FunctionAssociations`, CFN member names
+/// (`OriginSSLProtocols`, `OriginCustomHeaders`, `AcmCertificateArn`,
+/// `IPV6Enabled`), a custom origin without explicit ports, an S3 origin with an
+/// empty `S3OriginConfig`, and a boolean handed over as a string by a parameter
+/// `Ref`. Each of these used to fail the stack or vanish in translation.
+fn cdk_shaped_template(error_page: &str, api_max_ttl: u32) -> String {
+    format!(
+        r#"{{
+  "Parameters": {{
+    "Ipv6": {{"Type": "String", "Default": "true"}}
+  }},
+  "Resources": {{
+    "Dist": {{
+      "Type": "AWS::CloudFront::Distribution",
+      "Properties": {{
+        "DistributionConfig": {{
+          "Enabled": true,
+          "IPV6Enabled": {{"Ref": "Ipv6"}},
+          "HttpVersion": "http2and3",
+          "Origins": [
+            {{"Id": "api", "DomainName": "api.example.com",
+             "OriginCustomHeaders": [{{"HeaderName": "X-Origin-Secret", "HeaderValue": "s3cr3t"}}],
+             "CustomOriginConfig": {{"OriginProtocolPolicy": "https-only", "OriginSSLProtocols": ["TLSv1.2"]}}}},
+            {{"Id": "site", "DomainName": "site.s3.us-east-1.amazonaws.com", "S3OriginConfig": {{}}}}
+          ],
+          "DefaultCacheBehavior": {{
+            "TargetOriginId": "site",
+            "ViewerProtocolPolicy": "redirect-to-https",
+            "Compress": true,
+            "CachePolicyId": "658327ea-f89d-4fab-a63d-7e88639e58f6",
+            "FunctionAssociations": [
+              {{"EventType": "viewer-request", "FunctionARN": "arn:aws:cloudfront::123456789012:function/rewrite"}}
+            ]
+          }},
+          "CacheBehaviors": [{{
+            "PathPattern": "/api/*",
+            "TargetOriginId": "api",
+            "ViewerProtocolPolicy": "https-only",
+            "AllowedMethods": ["GET", "HEAD", "OPTIONS", "PUT", "PATCH", "POST", "DELETE"],
+            "CachedMethods": ["GET", "HEAD"],
+            "ForwardedValues": {{"QueryString": true, "Headers": ["Authorization"]}},
+            "MinTTL": 0,
+            "DefaultTTL": 0,
+            "MaxTTL": {api_max_ttl}
+          }}],
+          "CustomErrorResponses": [
+            {{"ErrorCode": 404, "ResponseCode": 200, "ResponsePagePath": "{error_page}", "ErrorCachingMinTTL": 10}}
+          ],
+          "ViewerCertificate": {{
+            "AcmCertificateArn": "arn:aws:acm:us-east-1:123456789012:certificate/abc",
+            "SslSupportMethod": "sni-only",
+            "MinimumProtocolVersion": "TLSv1.2_2021"
+          }}
+        }}
+      }}
+    }}
+  }},
+  "Outputs": {{
+    "DistId": {{"Value": {{"Ref": "Dist"}}}}
+  }}
+}}"#
+    )
+}
+
+#[tokio::test]
+async fn cfn_provisions_and_updates_a_cdk_shaped_distribution() {
+    let server = TestServer::start().await;
+    let cfn = server.cloudformation_client().await;
+    let cf = aws_sdk_cloudfront::Client::new(&server.aws_config().await);
+
+    cfn.create_stack()
+        .stack_name("cf-cdk-shaped")
+        .template_body(cdk_shaped_template("/index.html", 60))
+        .send()
+        .await
+        .expect("create_stack");
+    let described = cfn
+        .describe_stacks()
+        .stack_name("cf-cdk-shaped")
+        .send()
+        .await
+        .expect("describe_stacks");
+    let stack = described.stacks().first().unwrap();
+    assert_eq!(
+        stack.stack_status().unwrap().as_str(),
+        "CREATE_COMPLETE",
+        "{:?}",
+        stack.stack_status_reason()
+    );
+    let dist_id = stack
+        .outputs()
+        .iter()
+        .find(|o| o.output_key() == Some("DistId"))
+        .and_then(|o| o.output_value())
+        .map(|s| s.to_string())
+        .expect("DistId");
+
+    let got = cf
+        .get_distribution_config()
+        .id(&dist_id)
+        .send()
+        .await
+        .expect("get_distribution_config");
+    let dcfg = got.distribution_config().expect("config");
+
+    assert_eq!(dcfg.is_ipv6_enabled(), Some(true));
+
+    let origins = dcfg.origins().unwrap().items();
+    let api = origins.iter().find(|o| o.id() == "api").unwrap();
+    let custom = api.custom_origin_config().unwrap();
+    assert_eq!((custom.http_port(), custom.https_port()), (80, 443));
+    let ssl: Vec<&str> = custom
+        .origin_ssl_protocols()
+        .unwrap()
+        .items()
+        .iter()
+        .map(|p| p.as_str())
+        .collect();
+    assert_eq!(ssl, vec!["TLSv1.2"]);
+    let headers = api.custom_headers().unwrap();
+    assert_eq!(headers.quantity(), 1);
+    assert_eq!(headers.items()[0].header_name(), "X-Origin-Secret");
+    let site = origins.iter().find(|o| o.id() == "site").unwrap();
+    assert_eq!(
+        site.s3_origin_config().unwrap().origin_access_identity(),
+        ""
+    );
+
+    let dcb = dcfg.default_cache_behavior().unwrap();
+    assert_eq!(dcb.compress(), Some(true));
+    let fa = dcb.function_associations().unwrap();
+    assert_eq!(fa.quantity(), 1);
+    assert_eq!(
+        fa.items()[0].function_arn(),
+        "arn:aws:cloudfront::123456789012:function/rewrite"
+    );
+
+    let behaviors = dcfg.cache_behaviors().expect("cache behaviors kept");
+    assert_eq!(behaviors.quantity(), 1);
+    let api_behavior = &behaviors.items()[0];
+    assert_eq!(api_behavior.path_pattern(), "/api/*");
+    let allowed = api_behavior.allowed_methods().unwrap();
+    assert_eq!(allowed.quantity(), 7);
+    assert_eq!(allowed.cached_methods().unwrap().quantity(), 2);
+    #[allow(deprecated)]
+    {
+        assert_eq!(api_behavior.min_ttl(), Some(0));
+        assert_eq!(api_behavior.max_ttl(), Some(60));
+        assert!(api_behavior.forwarded_values().unwrap().query_string());
+    }
+
+    let vc = dcfg.viewer_certificate().unwrap();
+    assert_eq!(
+        vc.acm_certificate_arn(),
+        Some("arn:aws:acm:us-east-1:123456789012:certificate/abc")
+    );
+    assert_eq!(
+        vc.ssl_support_method().map(|m| m.as_str()),
+        Some("sni-only")
+    );
+
+    let rules = dcfg.custom_error_responses().unwrap();
+    assert_eq!(rules.items()[0].response_page_path(), Some("/index.html"));
+
+    // UpdateStack goes through the same translation.
+    cfn.update_stack()
+        .stack_name("cf-cdk-shaped")
+        .template_body(cdk_shaped_template("/fallback.html", 120))
+        .send()
+        .await
+        .expect("update_stack");
+    let described = cfn
+        .describe_stacks()
+        .stack_name("cf-cdk-shaped")
+        .send()
+        .await
+        .expect("describe_stacks after update");
+    let stack = described.stacks().first().unwrap();
+    assert_eq!(
+        stack.stack_status().unwrap().as_str(),
+        "UPDATE_COMPLETE",
+        "{:?}",
+        stack.stack_status_reason()
+    );
+
+    let got = cf
+        .get_distribution_config()
+        .id(&dist_id)
+        .send()
+        .await
+        .expect("get_distribution_config after update");
+    let dcfg = got.distribution_config().expect("config");
+    let rules = dcfg.custom_error_responses().unwrap();
+    assert_eq!(rules.quantity(), 1);
+    assert_eq!(rules.items()[0].response_code(), Some("200"));
+    assert_eq!(
+        rules.items()[0].response_page_path(),
+        Some("/fallback.html")
+    );
+    let api_behavior = &dcfg.cache_behaviors().unwrap().items()[0];
+    #[allow(deprecated)]
+    {
+        assert_eq!(api_behavior.max_ttl(), Some(120));
+    }
+}
+
+/// A rule CloudFormation's schema would reject fails the resource rather than
+/// silently producing a distribution without it.
+#[tokio::test]
+async fn cfn_rejects_a_custom_error_response_without_an_error_code() {
+    let server = TestServer::start().await;
+    let cfn = server.cloudformation_client().await;
+    let template = SPA_ERROR_TEMPLATE.replace(r#""ErrorCode": 404, "#, "");
+
+    cfn.create_stack()
+        .stack_name("cf-bad-errors")
+        .template_body(template)
+        .send()
+        .await
+        .expect("create_stack");
+    let described = cfn
+        .describe_stacks()
+        .stack_name("cf-bad-errors")
+        .send()
+        .await
+        .expect("describe_stacks");
+    let stack = described.stacks().first().unwrap();
+    assert_eq!(stack.stack_status().unwrap().as_str(), "CREATE_FAILED");
+    let reason = stack.stack_status_reason().unwrap_or_default();
+    assert!(reason.contains("ErrorCode is required"), "reason: {reason}");
 }

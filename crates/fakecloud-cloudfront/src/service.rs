@@ -23,6 +23,7 @@ use crate::state::{
     CloudFrontAccounts, CloudFrontSnapshot, SharedCloudFrontState, StoredDistribution,
     StoredInvalidation, Tag, CLOUDFRONT_SNAPSHOT_SCHEMA_VERSION,
 };
+use crate::validate::validate_distribution_config;
 use crate::xml_io;
 
 /// CloudFront mutating actions share these prefixes; everything else
@@ -695,8 +696,7 @@ impl CloudFrontService {
             (parsed, Vec::new())
         };
 
-        validate_caller_reference(&config.caller_reference)?;
-        validate_origins(&config)?;
+        validate_distribution_config(&config)?;
 
         let mut state = self.state.write();
         let account = state.entry(account_id(req));
@@ -936,8 +936,7 @@ impl CloudFrontService {
             .to_string();
         let new_config: DistributionConfig = xml_io::from_xml_root(&req.body)
             .map_err(|e| invalid_argument(format!("invalid DistributionConfig XML: {e}")))?;
-        validate_caller_reference(&new_config.caller_reference)?;
-        validate_origins(&new_config)?;
+        validate_distribution_config(&new_config)?;
 
         let mut state = self.state.write();
         let account = state
@@ -2116,15 +2115,6 @@ fn render_inline<T: serde::Serialize>(root: &str, value: &T) -> String {
 fn validate_caller_reference(s: &str) -> Result<(), AwsServiceError> {
     if s.is_empty() {
         return Err(invalid_argument("CallerReference is required"));
-    }
-    Ok(())
-}
-
-fn validate_origins(config: &DistributionConfig) -> Result<(), AwsServiceError> {
-    if config.origins.quantity < 1 {
-        return Err(invalid_argument(
-            "DistributionConfig.Origins must contain at least one origin",
-        ));
     }
     Ok(())
 }
