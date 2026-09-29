@@ -10,6 +10,7 @@ mod maintenance;
 mod misc;
 mod ops;
 mod parameters;
+pub use parameters::param_arn;
 mod patches;
 mod resource_sync;
 mod sessions;

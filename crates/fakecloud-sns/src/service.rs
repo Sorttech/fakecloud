@@ -1903,6 +1903,7 @@ mod service_sms;
 
 #[path = "helpers.rs"]
 mod helpers;
+pub use helpers::topic_arn;
 pub(crate) use helpers::*;
 
 #[cfg(test)]

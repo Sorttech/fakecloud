@@ -25,5 +25,6 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+fakecloud-kms = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 bytes = { workspace = true }

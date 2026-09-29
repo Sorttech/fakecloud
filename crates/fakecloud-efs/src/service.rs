@@ -675,16 +675,21 @@ impl EfsService {
                 .and_then(Value::as_str)
                 .map(str::to_string)
                 .unwrap_or_else(|| {
-                    format!(
-                        "arn:aws:kms:{}:{}:key/{}-{}-{}-{}-{}",
-                        ctx.region,
-                        ctx.account,
+                    let key_id = format!(
+                        "{}-{}-{}-{}-{}",
                         &hex17()[..8],
                         &hex17()[..4],
                         &hex17()[..4],
                         &hex17()[..4],
                         &hex17()[..12.min(hex17().len())]
+                    );
+                    fakecloud_aws::arn::Arn::regional(
+                        "kms",
+                        &ctx.region,
+                        &ctx.account,
+                        &format!("key/{key_id}"),
                     )
+                    .to_string()
                 });
             fs.insert("KmsKeyId".into(), json!(kms));
         }
@@ -1886,6 +1891,38 @@ mod tests {
                 .starts_with("arn:aws-cn:elasticfilesystem:cn-north-1:000000000000:access-point/"),
             "{ap_arn}"
         );
+    }
+
+    /// An encrypted file system's default key is the ARN KMS itself mints for
+    /// that key id in the caller's region, partition included.
+    #[test]
+    fn default_kms_key_uses_the_regions_partition() {
+        let s = svc();
+        let c = Ctx {
+            account: "000000000000".to_string(),
+            region: "cn-north-1".to_string(),
+        };
+        let fs = body_value(
+            &s.create_file_system(&c, &json!({ "CreationToken": "enc", "Encrypted": true }))
+                .unwrap(),
+        );
+        let kms = fs["KmsKeyId"].as_str().unwrap();
+        let key_id = kms
+            .strip_prefix("arn:aws-cn:kms:cn-north-1:000000000000:key/")
+            .unwrap_or_else(|| panic!("{kms}"));
+        assert_eq!(
+            kms,
+            fakecloud_kms::kms_key_arn("cn-north-1", "000000000000", key_id)
+        );
+        // Commercial output keeps the `aws` partition.
+        let fs = body_value(
+            &s.create_file_system(&ctx(), &json!({ "CreationToken": "us", "Encrypted": true }))
+                .unwrap(),
+        );
+        assert!(fs["KmsKeyId"]
+            .as_str()
+            .unwrap()
+            .starts_with("arn:aws:kms:us-east-1:000000000000:key/"));
     }
 
     // Defect #1: a nonexistent subnet must be rejected with SubnetNotFound once

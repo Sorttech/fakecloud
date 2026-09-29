@@ -45,7 +45,7 @@ impl AthenaService {
             connection_type,
             error: None,
         };
-        let arn = datacatalog_arn(&req.account_id, &req.region, &name);
+        let arn = athena_arn(&req.region, &req.account_id, &format!("datacatalog/{name}"));
         account.data_catalogs.insert(name, cat);
         if !tags.is_empty() {
             account.tags.insert(arn, tags);

@@ -1871,7 +1871,7 @@ pub(super) fn remove_param(
     parameters.remove(&alt)
 }
 
-pub(super) fn param_arn(region: &str, account_id: &str, name: &str) -> String {
+pub fn param_arn(region: &str, account_id: &str, name: &str) -> String {
     let resource = if name.starts_with('/') {
         format!("parameter{name}")
     } else {
