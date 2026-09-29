@@ -66,10 +66,7 @@ impl LogsService {
             ));
         }
 
-        let arn = format!(
-            "{}:*",
-            crate::state::log_group_arn(&req.region, &state.account_id, &name)
-        );
+        let arn = crate::state::log_group_stored_arn(&req.region, &state.account_id, &name);
         let now = Utc::now().timestamp_millis();
 
         let tags = body["tags"]
@@ -208,7 +205,7 @@ impl LogsService {
         let log_groups: Vec<Value> = page
             .iter()
             .map(|g| {
-                let log_group_arn = g.arn.trim_end_matches(":*").to_string();
+                let log_group_arn = g.log_group_arn();
                 let metric_filter_count = state
                     .metric_filters
                     .iter()
@@ -216,7 +213,7 @@ impl LogsService {
                     .count();
                 let mut obj = json!({
                     "logGroupName": g.name,
-                    "arn": g.arn,
+                    "arn": g.wildcard_arn(),
                     "logGroupArn": log_group_arn,
                     "creationTime": g.creation_time,
                     "storedBytes": g.stored_bytes,
@@ -706,7 +703,7 @@ impl LogsService {
         let log_groups: Vec<Value> = page
             .iter()
             .map(|g| {
-                let log_group_arn = g.arn.trim_end_matches(":*").to_string();
+                let log_group_arn = g.log_group_arn();
                 json!({
                     "logGroupName": g.name,
                     "logGroupArn": log_group_arn,
@@ -762,6 +759,75 @@ mod tests {
         assert_eq!(names.len(), 2);
         assert!(names.contains(&"/app/web"));
         assert!(names.contains(&"/app/api"));
+    }
+
+    #[test]
+    fn created_and_implicit_log_groups_describe_identically() {
+        let svc = make_service();
+        create_group(&svc, "explicit");
+        let event = [crate::ingest::IngestEvent {
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+            message: "m".into(),
+        }];
+        // Ingest into the created group, and into a group ingest creates.
+        for group in ["explicit", "implicit"] {
+            crate::ingest::append_events(
+                &svc.state,
+                "123456789012",
+                "us-east-1",
+                group,
+                "s",
+                &event,
+            );
+        }
+
+        let resp = svc
+            .describe_log_groups(&make_request("DescribeLogGroups", json!({})))
+            .unwrap();
+        let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        let groups = body["logGroups"].as_array().unwrap();
+        assert_eq!(groups.len(), 2);
+        for g in groups {
+            let name = g["logGroupName"].as_str().unwrap();
+            let base = format!("arn:aws:logs:us-east-1:123456789012:log-group:{name}");
+            assert_eq!(g["arn"], format!("{base}:*"), "{name}");
+            assert_eq!(g["logGroupArn"], base, "{name}");
+
+            let resp = svc
+                .describe_log_streams(&make_request(
+                    "DescribeLogStreams",
+                    json!({ "logGroupName": name }),
+                ))
+                .unwrap();
+            let streams: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+            assert_eq!(
+                streams["logStreams"][0]["arn"],
+                format!("{base}:log-stream:s"),
+                "{name}"
+            );
+        }
+        let strip = |g: &Value| {
+            let mut g = g.clone();
+            let obj = g.as_object_mut().unwrap();
+            for k in [
+                "logGroupName",
+                "arn",
+                "logGroupArn",
+                "creationTime",
+                "storedBytes",
+            ] {
+                obj.remove(k);
+            }
+            g
+        };
+        assert_eq!(strip(&groups[0]), strip(&groups[1]));
+
+        let mas = svc.state.read();
+        let state = mas.default_ref();
+        assert_eq!(
+            state.log_groups["implicit"].arn,
+            "arn:aws:logs:us-east-1:123456789012:log-group:implicit:*"
+        );
     }
 
     #[test]
