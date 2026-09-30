@@ -301,7 +301,7 @@ struct RouteResolution {
     default_upstream: UpstreamTarget,
     /// CustomErrorResponses that have a response page path.
     error_rules: Vec<ErrorRule>,
-    /// `DefaultRootObject` as an origin path (`/index.html`), set only when this
+    /// `DefaultRootObject` as a percent-encoded path (`/index.html`), set only when this
     /// request is for the distribution root and the distribution configures one.
     root_object: Option<String>,
 }
@@ -310,7 +310,8 @@ struct RouteResolution {
 /// header to send.
 #[derive(Clone)]
 struct UpstreamTarget {
-    /// `scheme://authority` (no trailing slash); the request path is appended.
+    /// `scheme://authority` plus the origin's `OriginPath` (no trailing slash);
+    /// the request path is appended.
     url_base: String,
     /// `Host` header sent upstream (the origin domain name).
     host_header: String,
@@ -336,13 +337,13 @@ fn resolve_route(
         .origin
         .iter()
         .find(|o| o.id == target)
-        .map(|o| upstream_for(o, s3_endpoint))?;
+        .map(|o| origin_target(o, s3_endpoint))?;
     let default_target = cfg.default_cache_behavior.target_origin_id.as_str();
     let default_upstream = items
         .origin
         .iter()
         .find(|o| o.id == default_target)
-        .map(|o| upstream_for(o, s3_endpoint))
+        .map(|o| origin_target(o, s3_endpoint))
         .unwrap_or_else(|| upstream.clone());
     let error_rules = cfg
         .custom_error_responses
@@ -361,22 +362,103 @@ fn resolve_route(
                 .collect()
         })
         .unwrap_or_default();
-    // DefaultRootObject: a request for the distribution ROOT is served the named
-    // object from the origin. AWS applies this to the root only -- a request for a
-    // subdirectory is never rewritten to `<dir>/<object>` -- so the rewrite is
-    // decided here, from the original viewer path, and the cache behavior is still
-    // selected on that original path.
-    let root_object = matches!(path, "" | "/")
-        .then(|| cfg.default_root_object.as_deref().map(str::trim))
-        .flatten()
-        .filter(|o| !o.is_empty())
-        .map(|o| format!("/{}", o.trim_start_matches('/')));
+    let root_object = root_object_path(cfg, path);
     Some(RouteResolution {
         upstream,
         default_upstream,
         error_rules,
         root_object,
     })
+}
+
+/// The origin path to fetch in place of the viewer's `path` when it names the
+/// distribution root and a `DefaultRootObject` is configured.
+///
+/// AWS applies the default root object to the root only: a subdirectory request
+/// (`/about/`) is never rewritten to `<dir>/<object>`, and `///` is not treated as
+/// the root either (the origin makes that comparison). The cache behavior is still
+/// selected on the original viewer path: the substitution happens after behavior
+/// selection, which is why a viewer-request function on the matched behavior still
+/// sees `/` as the URI.
+///
+/// An empty value is how the API clears the setting, so it means "none". Any
+/// other value is appended verbatim after `/`: AWS does not strip a leading
+/// slash, so `/index.html` is requested as `//index.html` (which is why AWS warns
+/// that such a value "can lead to a 403 Access Denied error").
+fn root_object_path(cfg: &DistributionConfig, path: &str) -> Option<String> {
+    // `""` only arises for a request-target with no path at all, which HTTP
+    // treats as `/`.
+    if !matches!(path, "" | "/") {
+        return None;
+    }
+    cfg.default_root_object
+        .as_deref()
+        .filter(|o| !o.is_empty())
+        .map(|o| format!("/{}", encode_path(o)))
+}
+
+/// Resolve `origin` to its upstream and apply its `OriginPath`.
+///
+/// CloudFront prefixes every request it sends to an origin (viewer requests,
+/// the default root object, custom error pages) with that origin's
+/// `OriginPath`: OriginPath `/prod` + viewer `/img/a.png` fetches
+/// `/prod/img/a.png`. It is folded into `url_base`, so every path appended to
+/// it is prefixed. AWS requires the value to start with `/` and not end with
+/// one; since only the leading `/` is structurally required to keep the value
+/// out of the URL authority, it is added if missing and trailing slashes are
+/// dropped so `/prod/` cannot produce `/prod//img`.
+fn origin_target(origin: &crate::model::Origin, s3_endpoint: &str) -> UpstreamTarget {
+    let mut target = upstream_for(origin, s3_endpoint);
+    let prefix = origin
+        .origin_path
+        .as_deref()
+        .map(|p| p.trim_end_matches('/'))
+        .unwrap_or_default();
+    if !prefix.is_empty() {
+        if !prefix.starts_with('/') {
+            target.url_base.push('/');
+        }
+        target.url_base.push_str(&encode_path(prefix));
+    }
+    target
+}
+
+/// Percent-encode a configured path (a `DefaultRootObject` or `OriginPath`) for
+/// use as a URL path. The value names an object literally, so every byte that
+/// is not a valid path-segment character (RFC 3986 `pchar`) is escaped --
+/// including `#`, `?`, space, `%` and non-ASCII -- while `/` is kept so folder
+/// values like `app/index.html` still address that folder.
+fn encode_path(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for b in raw.bytes() {
+        let keep = b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'/' | b'-'
+                    | b'.'
+                    | b'_'
+                    | b'~'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b';'
+                    | b'='
+                    | b':'
+                    | b'@'
+            );
+        if keep {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// First custom-error rule whose error code matches the origin status.
@@ -665,26 +747,149 @@ mod tests {
     #[test]
     fn default_root_object_does_not_apply_below_the_root() {
         // AWS serves the default root object for the distribution root ONLY; a
-        // subdirectory request is never rewritten to `<dir>/<object>`.
+        // subdirectory request is never rewritten to `<dir>/<object>`, and extra
+        // slashes are left for the origin to interpret.
         let cfg = cfg_with_root(Some("index.html"));
-        assert_eq!(root_object_for(&cfg, "/about/"), None);
-        assert_eq!(root_object_for(&cfg, "/about"), None);
-        assert_eq!(root_object_for(&cfg, "/index.html"), None);
+        for path in ["/about/", "/about", "/index.html", "//", "///"] {
+            assert_eq!(root_object_for(&cfg, path), None, "{path}");
+        }
     }
 
     #[test]
-    fn default_root_object_unset_or_blank_leaves_the_root_alone() {
-        for root in [None, Some(""), Some("   ")] {
+    fn default_root_object_unset_or_empty_leaves_the_root_alone() {
+        for root in [None, Some("")] {
             assert_eq!(root_object_for(&cfg_with_root(root), "/"), None, "{root:?}");
         }
     }
 
     #[test]
-    fn default_root_object_is_normalized_to_a_single_leading_slash() {
-        // AWS rejects a leading slash in the config, but accept one defensively
-        // rather than proxying a `//index.html` path to the origin.
+    fn default_root_object_path_is_used_as_given() {
+        // A folder path is fetched from that folder.
+        let cfg = cfg_with_root(Some("app/index.html"));
+        assert_eq!(
+            root_object_for(&cfg, "/").as_deref(),
+            Some("/app/index.html")
+        );
+        // AWS does not strip a leading slash: the origin is asked for
+        // `//index.html`, the documented cause of a 403 with such a value.
         let cfg = cfg_with_root(Some("/index.html"));
-        assert_eq!(root_object_for(&cfg, "/").as_deref(), Some("/index.html"));
+        assert_eq!(root_object_for(&cfg, "/").as_deref(), Some("//index.html"));
+    }
+
+    #[test]
+    fn root_request_still_selects_the_cache_behavior_on_the_viewer_path() {
+        // A behavior for the object's own path does not capture the root request.
+        let mut cfg = cfg_with_root(Some("index.html"));
+        cfg.origins.items.as_mut().unwrap().origin.push(Origin {
+            id: "other".into(),
+            ..origin("other.example.com", None)
+        });
+        cfg.cache_behaviors = Some(crate::model::CacheBehaviors {
+            quantity: 1,
+            items: Some(crate::model::CacheBehaviorItems {
+                cache_behavior: vec![crate::model::CacheBehavior {
+                    path_pattern: "index.html".into(),
+                    target_origin_id: "other".into(),
+                    ..Default::default()
+                }],
+            }),
+        });
+        let route = resolve_route(&cfg, "/", "127.0.0.1:4566").expect("route resolves");
+        assert_eq!(route.root_object.as_deref(), Some("/index.html"));
+        assert_eq!(route.upstream.host_header, "b.s3.us-east-1.amazonaws.com");
+    }
+
+    #[test]
+    fn default_root_object_is_percent_encoded_for_the_origin_url() {
+        // The value names an object literally: `#` and `?` must not become a
+        // fragment or query, and space / `%` / non-ASCII must be escaped.
+        for (root, want) in [
+            ("report#v2.html", "/report%23v2.html"),
+            ("a?b.html", "/a%3Fb.html"),
+            ("my page.html", "/my%20page.html"),
+            ("100%.html", "/100%25.html"),
+            ("caf\u{e9}.html", "/caf%C3%A9.html"),
+            ("app/index.html", "/app/index.html"),
+            ("a-b_c.~!$&'()*+,;=:@.html", "/a-b_c.~!$&'()*+,;=:@.html"),
+        ] {
+            let cfg = cfg_with_root(Some(root));
+            assert_eq!(root_object_for(&cfg, "/").as_deref(), Some(want), "{root}");
+        }
+    }
+
+    fn cfg_with_origin_path(origin_path: Option<&str>, domain: &str) -> DistributionConfig {
+        let mut cfg = cfg_with_root(Some("index.html"));
+        let o = &mut cfg.origins.items.as_mut().unwrap().origin[0];
+        o.domain_name = domain.into();
+        o.origin_path = origin_path.map(Into::into);
+        cfg
+    }
+
+    #[test]
+    fn origin_path_prefixes_the_upstream_url_for_every_origin_kind() {
+        for (domain, custom, base) in [
+            (
+                "site.s3-website-us-east-1.amazonaws.com",
+                None,
+                "http://127.0.0.1:4566",
+            ),
+            (
+                "b.s3.us-east-1.amazonaws.com",
+                None,
+                "http://b.s3.us-east-1.amazonaws.com",
+            ),
+            (
+                "api.example.com",
+                Some(custom("https-only", 80, 8443)),
+                "https://api.example.com:8443",
+            ),
+        ] {
+            let mut cfg = cfg_with_origin_path(Some("/prod"), domain);
+            cfg.origins.items.as_mut().unwrap().origin[0].custom_origin_config = custom;
+            let route = resolve_route(&cfg, "/img/a.png", "127.0.0.1:4566").unwrap();
+            assert_eq!(route.upstream.url_base, format!("{base}/prod"), "{domain}");
+            assert_eq!(route.upstream.host_header, domain);
+            // Custom error pages come from the default origin, prefixed too.
+            assert_eq!(route.default_upstream.url_base, format!("{base}/prod"));
+        }
+    }
+
+    #[test]
+    fn origin_path_composes_with_the_default_root_object() {
+        let cfg = cfg_with_origin_path(Some("/prod"), "b.s3.us-east-1.amazonaws.com");
+        let route = resolve_route(&cfg, "/", "127.0.0.1:4566").unwrap();
+        let url = format!("{}{}", route.upstream.url_base, route.root_object.unwrap());
+        assert_eq!(url, "http://b.s3.us-east-1.amazonaws.com/prod/index.html");
+    }
+
+    #[test]
+    fn origin_path_unset_or_empty_adds_nothing() {
+        for p in [None, Some(""), Some("/")] {
+            let cfg = cfg_with_origin_path(p, "b.s3.us-east-1.amazonaws.com");
+            let route = resolve_route(&cfg, "/x", "127.0.0.1:4566").unwrap();
+            assert_eq!(
+                route.upstream.url_base, "http://b.s3.us-east-1.amazonaws.com",
+                "{p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn origin_path_is_normalized_and_encoded() {
+        for (p, want) in [
+            ("/prod/", "/prod"),
+            ("prod", "/prod"),
+            ("/v 1/a#b", "/v%201/a%23b"),
+            ("/a/b", "/a/b"),
+        ] {
+            let cfg = cfg_with_origin_path(Some(p), "b.s3.us-east-1.amazonaws.com");
+            let route = resolve_route(&cfg, "/x", "127.0.0.1:4566").unwrap();
+            assert_eq!(
+                route.upstream.url_base,
+                format!("http://b.s3.us-east-1.amazonaws.com{want}"),
+                "{p}"
+            );
+        }
     }
 
     #[test]
