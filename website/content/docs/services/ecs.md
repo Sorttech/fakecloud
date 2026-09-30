@@ -117,11 +117,11 @@ Task state transitions fire `aws.ecs` / `ECS Task State Change` events on the de
 
 ### Task role credentials
 
-Tasks registered with a `taskRoleArn` get `AWS_CONTAINER_CREDENTIALS_FULL_URI` injected into every container. The URL points at a fakecloud-local endpoint — `http://host.docker.internal:<port>/_fakecloud/ecs/creds/<task-id>` — that returns IMDS-format credentials:
+Tasks whose task definition (or a `RunTask` `overrides.taskRoleArn`) names a `taskRoleArn` get `AWS_CONTAINER_CREDENTIALS_FULL_URI` injected into every container, pointing at `http://host.docker.internal:<port>/_fakecloud/ecs/creds/<task-id>` (the in-cluster fakecloud URL on the Kubernetes backend). Tasks without a task role get no credentials URI, as on AWS. The endpoint returns the container-credentials JSON the ECS agent serves:
 
 ```json
 {
-  "AccessKeyId": "ASIA...",
+  "AccessKeyId": "FSIA...",
   "SecretAccessKey": "...",
   "Token": "...",
   "Expiration": "2026-04-24T12:00:00Z",
@@ -129,7 +129,11 @@ Tasks registered with a `taskRoleArn` get `AWS_CONTAINER_CREDENTIALS_FULL_URI` i
 }
 ```
 
-AWS SDKs pick this up via the default credential-provider chain, so `aws sts get-caller-identity` (and any other SDK call) from inside the container works out of the box. fakecloud's STS accepts any `AccessKeyId`, so no pre-registration of the role is needed.
+The credentials are a real session for the task role, named after the task ID like on AWS: `GetCallerIdentity` returns `arn:aws:sts::<account>:assumed-role/<role>/<task-id>`. They are minted and registered like an `AssumeRole` session, so they verify under `--verify-sigv4` and, under `--iam`, are evaluated against the role's policies. Refetches return the same set until it nears expiry, then a fresh one. When the task stops its credentials are revoked, and the endpoint answers a stopped, unknown or role-less task the way the ECS agent does: HTTP 400 with `{"code":"InvalidIdInRequest","message":"CredentialsV2Request: Credentials not found","HTTPErrorCode":400}`.
+
+The AWS SDKs' container-credentials providers only accept a plain-HTTP `AWS_CONTAINER_CREDENTIALS_FULL_URI` whose host is a loopback address or an ECS link-local address (`169.254.170.2`), so an SDK inside the container refuses the `host.docker.internal` URI; code that fetches the URI directly (or a test driving the endpoint from the host) gets the credentials. With `--imds-link-local`, the same credentials are also served at the agent's own relative URI, `http://169.254.170.2/v2/credentials/<task-id>`.
+
+`RegisterTaskDefinition` (and `RunTask` role overrides, and CloudFormation `AWS::ECS::TaskDefinition`) refuses a `taskRoleArn` or `executionRoleArn` whose trust policy does not let `ecs-tasks.amazonaws.com` assume it with ECS's `ClientException` ("ECS was unable to assume the role '...' that was provided for this task. ..."). Under `--iam strict` a role from another account is refused the same way; `--iam soft` logs it to the IAM audit target and allows it.
 
 ### Volumes + mount points
 

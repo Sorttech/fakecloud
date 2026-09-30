@@ -10636,6 +10636,51 @@ mod tests {
     }
 
     #[test]
+    fn task_definition_roles_run_the_register_task_definition_checks() {
+        let prov = make_provisioner();
+        let untrusted = prov
+            .create_resource(&make_resource(
+                "AWS::IAM::Role",
+                "Untrusted",
+                serde_json::json!({
+                    "RoleName": "untrusted-task-role",
+                    "AssumeRolePolicyDocument": {"Version": "2012-10-17", "Statement": []}
+                }),
+            ))
+            .unwrap();
+        let def = |props: serde_json::Value| {
+            let mut p = serde_json::json!({
+                "ContainerDefinitions": [{"Name": "app", "Image": "nginx", "Memory": 256}]
+            });
+            p.as_object_mut()
+                .unwrap()
+                .extend(props.as_object().unwrap().clone());
+            make_resource("AWS::ECS::TaskDefinition", "Task", p)
+        };
+        for key in ["TaskRoleArn", "ExecutionRoleArn"] {
+            let err = prov
+                .create_resource(&def(serde_json::json!({ key: untrusted.physical_id })))
+                .unwrap_err();
+            assert!(
+                err.contains("ClientException")
+                    && err.contains("ECS was unable to assume the role"),
+                "{key}: {err}"
+            );
+        }
+
+        // Another account's role: accepted with IAM enforcement off (the
+        // default), refused like AWS with it on.
+        let foreign =
+            serde_json::json!({"TaskRoleArn": "arn:aws:iam::999999999999:role/elsewhere"});
+        prov.create_resource(&def(foreign.clone()))
+            .expect("default mode accepts another account's role");
+        let mut enforcing = make_provisioner();
+        enforcing.iam_mode = fakecloud_core::auth::IamMode::Strict;
+        let err = enforcing.create_resource(&def(foreign)).unwrap_err();
+        assert!(err.contains("ClientException"), "{err}");
+    }
+
+    #[test]
     fn an_unnamed_task_definition_update_registers_the_next_revision() {
         let prov = make_provisioner();
         let def = |image: &str| {

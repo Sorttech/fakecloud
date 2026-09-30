@@ -103,9 +103,10 @@ func (c *ECSClient) GetTaskMetadata(ctx context.Context, taskArn string) (*EcsTa
 	return &out, nil
 }
 
-// GetTaskCredentials returns the IAM task-role credentials that the ECS
-// agent's metadata server would hand out at the path advertised in
-// AWS_CONTAINER_CREDENTIALS_RELATIVE_URI.
+// GetTaskCredentials returns the task-role credentials fakecloud hands a
+// running task's containers via AWS_CONTAINER_CREDENTIALS_FULL_URI (a
+// session for the task role named after the task ID). It errors once the
+// task has stopped, or for a task without a task role.
 func (c *ECSClient) GetTaskCredentials(ctx context.Context, taskID string) (*EcsTaskCredentials, error) {
 	var out EcsTaskCredentials
 	path := fmt.Sprintf("/_fakecloud/ecs/creds/%s", taskID)

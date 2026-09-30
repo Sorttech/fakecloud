@@ -102,6 +102,64 @@ pub struct EcsService {
     snapshot_lock: Arc<AsyncMutex<()>>,
     runtime: Option<Arc<crate::runtime::EcsRuntime>>,
     role_trust_validator: Option<Arc<dyn fakecloud_core::auth::RoleTrustValidator>>,
+    /// IAM enforcement mode; a role owned by another account is refused only
+    /// while it is on (see [`validate_task_role`]).
+    iam_mode: fakecloud_core::auth::IamMode,
+}
+
+/// The message ECS answers a role it cannot pass to a task with, whether the
+/// role's trust policy leaves out `ecs-tasks.amazonaws.com` or the caller may
+/// not pass it (another account's role).
+pub fn unable_to_assume_role_message(role_arn: &str) -> String {
+    format!(
+        "ECS was unable to assume the role '{role_arn}' that was provided for this task. \
+         Please verify that the role being passed has the proper trust relationship and \
+         permissions and that your IAM user has permissions to pass this role."
+    )
+}
+
+/// The checks `RegisterTaskDefinition` (and `RunTask` role overrides) run on a
+/// `taskRoleArn` / `executionRoleArn`, shared with CloudFormation's
+/// `AWS::ECS::TaskDefinition`:
+///
+/// - `iam:PassRole` is same-account only on AWS. Under `--iam strict` a role
+///   owned by another account is refused whatever its trust policy says;
+///   `--iam soft` logs the would-be denial to the IAM audit target and allows
+///   it; with IAM off (the default) it is accepted, so templates carrying
+///   another emulator's default account keep working.
+/// - The role's trust policy must let `ecs-tasks.amazonaws.com` assume it,
+///   looked up in the caller's account. Always applied.
+///
+/// Both fail as ECS does: `ClientException` naming the role.
+pub fn validate_task_role(
+    caller_account: &str,
+    role_arn: &str,
+    validator: Option<&dyn fakecloud_core::auth::RoleTrustValidator>,
+    iam_mode: fakecloud_core::auth::IamMode,
+) -> Result<(), AwsServiceError> {
+    let cross_account =
+        fakecloud_aws::arn::account_of(role_arn).is_some_and(|a| a != caller_account);
+    if cross_account && iam_mode.is_enabled() {
+        tracing::warn!(
+            target: "fakecloud::iam::audit",
+            action = "iam:PassRole",
+            resource = %role_arn,
+            account = %caller_account,
+            mode = %iam_mode,
+            "cross-account pass role denied"
+        );
+        if iam_mode.is_strict() {
+            return Err(helpers::client_exception(unable_to_assume_role_message(
+                role_arn,
+            )));
+        }
+    }
+    if let Some(validator) = validator {
+        validator
+            .validate(caller_account, role_arn, "ecs-tasks.amazonaws.com")
+            .map_err(|_| helpers::client_exception(unable_to_assume_role_message(role_arn)))?;
+    }
+    Ok(())
 }
 
 impl EcsService {
@@ -112,6 +170,7 @@ impl EcsService {
             snapshot_lock: Arc::new(AsyncMutex::new(())),
             runtime: None,
             role_trust_validator: None,
+            iam_mode: fakecloud_core::auth::IamMode::Off,
         }
     }
 
@@ -133,18 +192,19 @@ impl EcsService {
         self
     }
 
+    /// Apply the server's IAM enforcement mode to the task-role checks.
+    pub fn with_iam_mode(mut self, mode: fakecloud_core::auth::IamMode) -> Self {
+        self.iam_mode = mode;
+        self
+    }
+
     fn check_pass_role(&self, account_id: &str, role_arn: &str) -> Result<(), AwsServiceError> {
-        let Some(ref validator) = self.role_trust_validator else {
-            return Ok(());
-        };
-        if let Err(err) = validator.validate(account_id, role_arn, "ecs-tasks.amazonaws.com") {
-            return Err(AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "InvalidParameterException",
-                err.to_string(),
-            ));
-        }
-        Ok(())
+        validate_task_role(
+            account_id,
+            role_arn,
+            self.role_trust_validator.as_deref(),
+            self.iam_mode,
+        )
     }
 
     pub fn state_handle(&self) -> &SharedEcsState {

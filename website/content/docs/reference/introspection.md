@@ -215,7 +215,7 @@ curl http://localhost:4566/_fakecloud/health
 | `/_fakecloud/ecs/tasks/{task_id}/force-stop` | POST | Force-stop a running task. |
 | `/_fakecloud/ecs/tasks/{task_id}/mark-failed` | POST | Mark a task as failed for testing failure handling. |
 | `/_fakecloud/ecs/events` | GET | List ECS service/task lifecycle events. |
-| `/_fakecloud/ecs/creds/{task_id}` | GET | Task IAM credentials (used by the ECS Exec data plane). |
+| `/_fakecloud/ecs/creds/{task_id}` | GET | Task-role credentials for a running task (the URL injected as `AWS_CONTAINER_CREDENTIALS_FULL_URI`): a session for the task's `taskRoleArn` named after the task ID, registered so it verifies under `--verify-sigv4`; revoked once the task stops. A stopped, unknown or role-less task gets the ECS agent's HTTP 400 `InvalidIdInRequest`. |
 | `/_fakecloud/ecs/v3/{task_id}` | GET | **NEW** -- ECS metadata v3 endpoint exposed to task containers. |
 | `/_fakecloud/ecs/v4/{task_id}` | GET | **NEW** -- ECS metadata v4 endpoint exposed to task containers. |
 | `/_fakecloud/ecs/metadata/{task_arn}` | GET | Aggregated v4 metadata dump keyed by full task ARN (URL-encoded). Same shape as `ECS_CONTAINER_METADATA_URI_V4`, addressable from tests holding a RunTask response. |

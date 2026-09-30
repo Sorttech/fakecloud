@@ -205,8 +205,17 @@ impl EcsService {
         let td_revision = td.revision;
         let td_cpu = td.cpu.clone();
         let td_memory = td.memory.clone();
-        let td_task_role = td.task_role_arn.clone();
-        let td_exec_role = td.execution_role_arn.clone();
+        // `overrides.taskRoleArn` / `overrides.executionRoleArn` replace the
+        // task definition's roles for this task (checked above), so the task
+        // runs -- and its credentials endpoint vends -- the overriding role.
+        let role_override = |key: &str| {
+            body.get("overrides")
+                .and_then(|o| opt_str(o, key))
+                .map(String::from)
+        };
+        let td_task_role = role_override("taskRoleArn").or_else(|| td.task_role_arn.clone());
+        let td_exec_role =
+            role_override("executionRoleArn").or_else(|| td.execution_role_arn.clone());
         let td_containers = td.container_definitions.clone();
         // RunTask supports propagateTags=TASK_DEFINITION to copy the
         // TaskDefinition's tags onto each spawned task, in addition to
@@ -663,7 +672,7 @@ impl EcsService {
 }
 
 #[cfg(test)]
-mod multi_container_tests {
+pub(super) mod multi_container_tests {
     use super::*;
     use crate::EcsService;
     use bytes::Bytes;
@@ -688,7 +697,7 @@ mod multi_container_tests {
         svc
     }
 
-    pub(super) fn make_request(action: &str, body: Value) -> AwsRequest {
+    pub(crate) fn make_request(action: &str, body: Value) -> AwsRequest {
         let body_bytes = Bytes::from(serde_json::to_vec(&body).unwrap());
         AwsRequest {
             service: "ecs".into(),
@@ -894,6 +903,49 @@ mod multi_container_tests {
         let d2body: Value = serde_json::from_slice(d2.body.expect_bytes()).unwrap();
         assert_eq!(d2body["serviceRevisions"].as_array().unwrap().len(), 0);
         assert_eq!(d2body["failures"][0]["reason"], "MISSING");
+    }
+
+    #[test]
+    fn run_task_role_overrides_replace_the_task_definition_roles() {
+        let svc = fresh_service();
+        svc.register_task_definition(&make_request(
+            "RegisterTaskDefinition",
+            json!({
+                "family": "roles",
+                "taskRoleArn": "arn:aws:iam::000000000000:role/td-task",
+                "executionRoleArn": "arn:aws:iam::000000000000:role/td-exec",
+                "containerDefinitions": [{"name": "app", "image": "alpine"}]
+            }),
+        ))
+        .unwrap();
+        let run = |overrides: Value| {
+            let resp = svc
+                .run_task(&make_request(
+                    "RunTask",
+                    json!({"cluster": "default", "taskDefinition": "roles", "overrides": overrides}),
+                ))
+                .unwrap();
+            let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+            let arn = body["tasks"][0]["taskArn"].as_str().unwrap().to_string();
+            let id = arn.rsplit('/').next().unwrap().to_string();
+            let accounts = svc.state.read();
+            let task = &accounts.get("000000000000").unwrap().tasks[&id];
+            (task.task_role_arn.clone(), task.execution_role_arn.clone())
+        };
+        assert_eq!(
+            run(json!({})),
+            (
+                Some("arn:aws:iam::000000000000:role/td-task".into()),
+                Some("arn:aws:iam::000000000000:role/td-exec".into())
+            )
+        );
+        assert_eq!(
+            run(json!({"taskRoleArn": "arn:aws:iam::000000000000:role/override"})),
+            (
+                Some("arn:aws:iam::000000000000:role/override".into()),
+                Some("arn:aws:iam::000000000000:role/td-exec".into())
+            )
+        );
     }
 
     #[test]

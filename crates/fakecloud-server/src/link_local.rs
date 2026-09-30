@@ -9,8 +9,11 @@
 //! 80) so such apps resolve credentials unmodified:
 //! - `169.254.169.254:80` serves **only** the IMDS `/latest/*` surface (not the
 //!   rest of the app), returning 404 for anything else.
-//! - `169.254.170.2:80` serves container credentials at a single fixed path
-//!   (`/creds`); set `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI=/creds`.
+//! - `169.254.170.2:80` serves the server's container credentials at a fixed
+//!   path (`/creds`; set `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI=/creds`), and
+//!   an ECS task's role credentials at the ECS agent's own relative URI,
+//!   `/v2/credentials/<task-id>` (the same credentials as
+//!   `/_fakecloud/ecs/creds/<task-id>`).
 //!
 //! This needs privileged host setup that fakecloud deliberately does NOT perform
 //! itself: the operator assigns the addresses to the loopback interface up front
@@ -29,6 +32,7 @@ use std::sync::Arc;
 
 use axum::{extract::State, routing::get, Json, Router};
 
+use crate::ecs_creds::EcsTaskCredentials;
 use crate::imds::ImdsContext;
 
 /// IMDS link-local address.
@@ -38,6 +42,8 @@ const ECS_CREDS_IP: &str = "169.254.170.2";
 /// The fixed path the ECS-credentials listener serves (set
 /// `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` to this).
 const ECS_CREDS_PATH: &str = "/creds";
+/// The ECS agent's task-credentials relative URI, keyed by task ID here.
+const ECS_TASK_CREDS_PATH: &str = "/v2/credentials/{task_id}";
 /// Both services listen on port 80, as on real AWS.
 const PORT: u16 = 80;
 
@@ -93,16 +99,34 @@ async fn ecs_credentials(State(ctx): State<Arc<ImdsContext>>) -> Json<serde_json
     Json(ctx.credentials().to_container_json())
 }
 
+/// The `169.254.170.2` surface: the server's container credentials at `/creds`
+/// and each ECS task's role credentials at `/v2/credentials/<task-id>`.
+fn ecs_creds_router(ctx: Arc<ImdsContext>, tasks: Arc<EcsTaskCredentials>) -> Router {
+    // Both routes hold a refcounted clone of the one shared context rather
+    // than a second copy of its string fields.
+    let task_creds = Router::new()
+        .route(
+            ECS_TASK_CREDS_PATH,
+            get(
+                |State(tasks): State<Arc<EcsTaskCredentials>>,
+                 axum::extract::Path(task_id): axum::extract::Path<String>| async move {
+                    tasks.respond(&task_id)
+                },
+            ),
+        )
+        .with_state(tasks);
+    Router::new()
+        .route(ECS_CREDS_PATH, get(ecs_credentials))
+        .with_state(ctx)
+        .merge(task_creds)
+}
+
 /// Bring up the link-local listeners. Runs to completion in a detached task
 /// spawned by `main`, so it never delays startup. `ctx` is the IMDS context; the
 /// IMDS IP serves an IMDS-only router built from it, the ECS IP the `/creds`
 /// surface built from the same context.
-pub async fn run(ctx: Arc<ImdsContext>) {
-    // Both routers hold a refcounted clone of the one shared context rather than
-    // a second copy of its string fields.
-    let creds_router = Router::new()
-        .route(ECS_CREDS_PATH, get(ecs_credentials))
-        .with_state(ctx.clone());
+pub async fn run(ctx: Arc<ImdsContext>, tasks: Arc<EcsTaskCredentials>) {
+    let creds_router = ecs_creds_router(ctx.clone(), tasks);
 
     // Bring both addresses up concurrently; the two binds share no state.
     tokio::join!(
@@ -166,11 +190,22 @@ mod tests {
             role_arn: "arn:aws:iam::123456789012:role/fakecloud".to_string(),
             instance_id: "i-0123456789abcdef0".to_string(),
         });
-        let router = Router::new()
-            .route(ECS_CREDS_PATH, get(ecs_credentials))
-            .with_state(ctx);
+        let ecs: fakecloud_ecs::SharedEcsState = Arc::new(RwLock::new(MultiAccountState::new(
+            "123456789012",
+            "us-east-1",
+            "",
+        )));
+        crate::ecs_creds::test_support::add_task(
+            &ecs,
+            "123456789012",
+            "task1",
+            Some("arn:aws:iam::123456789012:role/app"),
+        );
+        let tasks = EcsTaskCredentials::new(ecs, ctx.iam.clone(), "123456789012");
+        let router = ecs_creds_router(ctx, tasks);
 
         let resp = router
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri(ECS_CREDS_PATH)
@@ -196,5 +231,33 @@ mod tests {
             json["RoleArn"].as_str(),
             Some("arn:aws:iam::123456789012:role/fakecloud")
         );
+
+        // The agent's task relative URI serves that task's role session.
+        let get_json = |uri: &'static str| {
+            let router = router.clone();
+            async move {
+                let resp = router
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                let status = resp.status();
+                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                (
+                    status,
+                    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+                )
+            }
+        };
+        let (status, task) = get_json("/v2/credentials/task1").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            task["RoleArn"].as_str(),
+            Some("arn:aws:iam::123456789012:role/app")
+        );
+        let (status, missing) = get_json("/v2/credentials/nope").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(missing["code"], "InvalidIdInRequest");
     }
 }
