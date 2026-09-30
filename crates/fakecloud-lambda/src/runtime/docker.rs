@@ -128,6 +128,9 @@ impl DockerBackend {
             &self.cli,
             self.docker_config_path().as_deref(),
             pull_uri,
+            fakecloud_core::container_image::RegistryTransport::for_local_rewrite(
+                local_pull_uri.is_some(),
+            ),
         )
         .await
         .map_err(|e| RuntimeError::ContainerStartFailed(format!("docker pull failed: {e}")))?;
@@ -499,6 +502,9 @@ impl LambdaBackend for DockerBackend {
             &self.cli,
             self.docker_config_path().as_deref(),
             pull_uri,
+            fakecloud_core::container_image::RegistryTransport::for_local_rewrite(
+                local_uri.is_some(),
+            ),
         )
         .await
         .map_err(|e| {

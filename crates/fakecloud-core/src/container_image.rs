@@ -32,6 +32,32 @@ const MAX_PULL_ATTEMPTS: u32 = 5;
 /// Delay before the first retry; doubles on each further retry.
 const BASE_RETRY_DELAY: Duration = Duration::from_secs(1);
 
+/// How the registry a pulled reference names is reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistryTransport {
+    /// TLS, as every upstream registry (ECR Public, Docker Hub, ...) serves.
+    Https,
+    /// Plain HTTP: fakecloud's own OCI registry, which an AWS ECR URI is
+    /// rewritten to. Docker treats a loopback registry as insecure on its
+    /// own, but Podman insists on TLS for every registry unless told
+    /// otherwise, so its pull fails with "server gave HTTP response to HTTPS
+    /// client" without `--tls-verify=false`.
+    PlainHttp,
+}
+
+impl RegistryTransport {
+    /// The transport for a pull whose reference was (`true`) or was not
+    /// rewritten to fakecloud's registry by
+    /// [`crate::ecr_uri::translate_to_local_at`].
+    pub fn for_local_rewrite(rewritten: bool) -> Self {
+        if rewritten {
+            Self::PlainHttp
+        } else {
+            Self::Https
+        }
+    }
+}
+
 /// How an image became available for a launch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PulledImage {
@@ -48,15 +74,17 @@ pub enum PulledImage {
 /// falls back to a locally cached copy, or is retried with backoff when
 /// nothing is cached; any other failure is returned at once. `docker_config`
 /// is exported as `DOCKER_CONFIG` for the pull so registry credentials
-/// resolve.
+/// resolve. `transport` says whether the registry is fakecloud's own
+/// plain-HTTP one.
 ///
 /// Returns the pull's stderr as the error.
 pub async fn pull_image(
     cli: &str,
     docker_config: Option<&Path>,
     reference: &str,
+    transport: RegistryTransport,
 ) -> Result<PulledImage, String> {
-    pull_image_with(cli, docker_config, reference, BASE_RETRY_DELAY).await
+    pull_image_with(cli, docker_config, reference, transport, BASE_RETRY_DELAY).await
 }
 
 /// Make `reference` available locally, pulling it only when it is not
@@ -81,13 +109,21 @@ async fn ensure_image_with(
     if image_cached(cli, docker_config, reference).await {
         return Ok(PulledImage::Present);
     }
-    pull_image_with(cli, docker_config, reference, base_delay).await
+    pull_image_with(
+        cli,
+        docker_config,
+        reference,
+        RegistryTransport::Https,
+        base_delay,
+    )
+    .await
 }
 
 async fn pull_image_with(
     cli: &str,
     docker_config: Option<&Path>,
     reference: &str,
+    transport: RegistryTransport,
     base_delay: Duration,
 ) -> Result<PulledImage, String> {
     let mut delay = base_delay;
@@ -98,7 +134,7 @@ async fn pull_image_with(
             cmd.env("DOCKER_CONFIG", p);
         }
         let out = cmd
-            .args(["pull", reference])
+            .args(pull_args(cli, reference, transport))
             .output()
             .await
             .map_err(|e| format!("{cli} pull: {e}"))?;
@@ -130,6 +166,18 @@ async fn pull_image_with(
         delay *= 2;
         attempt += 1;
     }
+}
+
+/// The `pull` arguments for `cli`. Only Podman needs telling that a
+/// plain-HTTP registry is one: Docker accepts it for a loopback registry, and
+/// its `pull` has no `--tls-verify` flag at all.
+fn pull_args(cli: &str, reference: &str, transport: RegistryTransport) -> Vec<String> {
+    let mut args = vec!["pull".to_string()];
+    if transport == RegistryTransport::PlainHttp && crate::container_net::is_podman_binary(cli) {
+        args.push("--tls-verify=false".to_string());
+    }
+    args.push(reference.to_string());
+    args
 }
 
 /// Whether `reference` resolves to an image in the local cache. Runs with
@@ -276,10 +324,17 @@ mod tests {
     /// when `cached`. Every invocation is appended to `calls.log`.
     struct FakeCli {
         dir: tempfile::TempDir,
+        name: String,
     }
 
     impl FakeCli {
         fn new(pull_failures: u32, pull_stderr: &str, cached: bool) -> Self {
+            Self::named("cli", pull_failures, pull_stderr, cached)
+        }
+
+        /// A fake installed under `name`, which is what decides whether
+        /// fakecloud drives it as Podman.
+        fn named(name: &str, pull_failures: u32, pull_stderr: &str, cached: bool) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let script = format!(
                 r#"#!/bin/sh
@@ -304,7 +359,7 @@ exit 2
 "#,
                 dir = dir.path().display(),
             );
-            let path = dir.path().join("cli");
+            let path = dir.path().join(name);
             std::fs::write(&path, script).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             // Executing a file that another process holds open for writing
@@ -327,11 +382,14 @@ exit 2
                 }
             }
             let _ = std::fs::remove_file(dir.path().join("calls.log"));
-            Self { dir }
+            Self {
+                dir,
+                name: name.to_string(),
+            }
         }
 
         fn cli(&self) -> String {
-            self.dir.path().join("cli").display().to_string()
+            self.dir.path().join(&self.name).display().to_string()
         }
 
         fn calls(&self) -> Vec<String> {
@@ -347,7 +405,22 @@ exit 2
         }
 
         async fn pull_ref(&self, reference: &str) -> Result<PulledImage, String> {
-            pull_image_with(&self.cli(), None, reference, Duration::from_millis(1)).await
+            self.pull_via(reference, RegistryTransport::Https).await
+        }
+
+        async fn pull_via(
+            &self,
+            reference: &str,
+            transport: RegistryTransport,
+        ) -> Result<PulledImage, String> {
+            pull_image_with(
+                &self.cli(),
+                None,
+                reference,
+                transport,
+                Duration::from_millis(1),
+            )
+            .await
         }
 
         async fn ensure(&self) -> Result<PulledImage, String> {
@@ -382,6 +455,61 @@ exit 2
             "Error response from daemon: manifest for alpine:3.20 not found: manifest unknown";
         let cli = FakeCli::new(u32::MAX, missing, false);
         assert_eq!(cli.ensure().await, Err(missing.to_string()));
+    }
+
+    #[tokio::test]
+    async fn podman_pulls_fakecloud_registry_over_plain_http() {
+        // Podman defaults to TLS even for a loopback registry, and fakecloud's
+        // serves plain HTTP (issue #2585).
+        let cli = FakeCli::named("podman", 0, "", false);
+        let got = cli
+            .pull_via("127.0.0.1:4566/test:healthy", RegistryTransport::PlainHttp)
+            .await;
+        assert_eq!(got, Ok(PulledImage::Pulled));
+        assert_eq!(
+            cli.calls(),
+            ["pull --tls-verify=false 127.0.0.1:4566/test:healthy"]
+        );
+    }
+
+    #[tokio::test]
+    async fn podman_keeps_tls_for_upstream_registries() {
+        let cli = FakeCli::named("podman", 0, "", false);
+        let got = cli
+            .pull_via(
+                "public.ecr.aws/docker/library/alpine:3.20",
+                RegistryTransport::Https,
+            )
+            .await;
+        assert_eq!(got, Ok(PulledImage::Pulled));
+        assert_eq!(
+            cli.calls(),
+            ["pull public.ecr.aws/docker/library/alpine:3.20"]
+        );
+    }
+
+    #[tokio::test]
+    async fn docker_pulls_fakecloud_registry_without_a_tls_flag() {
+        // `docker pull` has no --tls-verify; the daemon already treats a
+        // loopback registry as insecure.
+        let cli = FakeCli::named("docker", 0, "", false);
+        let got = cli
+            .pull_via("127.0.0.1:4566/test:healthy", RegistryTransport::PlainHttp)
+            .await;
+        assert_eq!(got, Ok(PulledImage::Pulled));
+        assert_eq!(cli.calls(), ["pull 127.0.0.1:4566/test:healthy"]);
+    }
+
+    #[test]
+    fn transport_follows_the_local_rewrite() {
+        assert_eq!(
+            RegistryTransport::for_local_rewrite(true),
+            RegistryTransport::PlainHttp
+        );
+        assert_eq!(
+            RegistryTransport::for_local_rewrite(false),
+            RegistryTransport::Https
+        );
     }
 
     #[tokio::test]

@@ -7,6 +7,12 @@ use serde_json::{json, Value};
 
 const PACKAGE: &str = "fakecloud-e2e";
 const USAGE: &str = "usage: e2e_nextest_partitions [matrix|check]";
+// Everything outside the Lambda binaries and the podman-only ECS binary, which
+// needs the podman install only the podman partition pays for.
+const GENERAL_FILTER: &str = concat!(
+    "package(fakecloud-e2e) and not binary(lambda) and not binary(lambda_invoke) ",
+    "and not binary(ecs_podman_ecr)",
+);
 const LAMBDA_RUNTIME_FAMILY_PARTITIONS: [&str; 6] = [
     "lambda-runtimes-python",
     "lambda-runtimes-nodejs",
@@ -90,49 +96,49 @@ struct Partition {
 const PARTITIONS: [Partition; 19] = [
     Partition {
         name: "general-1",
-        filter: "package(fakecloud-e2e) and not binary(lambda) and not binary(lambda_invoke)",
+        filter: GENERAL_FILTER,
         partition: Some("hash:1/8"),
         install_podman: false,
     },
     Partition {
         name: "general-2",
-        filter: "package(fakecloud-e2e) and not binary(lambda) and not binary(lambda_invoke)",
+        filter: GENERAL_FILTER,
         partition: Some("hash:2/8"),
         install_podman: false,
     },
     Partition {
         name: "general-3",
-        filter: "package(fakecloud-e2e) and not binary(lambda) and not binary(lambda_invoke)",
+        filter: GENERAL_FILTER,
         partition: Some("hash:3/8"),
         install_podman: false,
     },
     Partition {
         name: "general-4",
-        filter: "package(fakecloud-e2e) and not binary(lambda) and not binary(lambda_invoke)",
+        filter: GENERAL_FILTER,
         partition: Some("hash:4/8"),
         install_podman: false,
     },
     Partition {
         name: "general-5",
-        filter: "package(fakecloud-e2e) and not binary(lambda) and not binary(lambda_invoke)",
+        filter: GENERAL_FILTER,
         partition: Some("hash:5/8"),
         install_podman: false,
     },
     Partition {
         name: "general-6",
-        filter: "package(fakecloud-e2e) and not binary(lambda) and not binary(lambda_invoke)",
+        filter: GENERAL_FILTER,
         partition: Some("hash:6/8"),
         install_podman: false,
     },
     Partition {
         name: "general-7",
-        filter: "package(fakecloud-e2e) and not binary(lambda) and not binary(lambda_invoke)",
+        filter: GENERAL_FILTER,
         partition: Some("hash:7/8"),
         install_podman: false,
     },
     Partition {
         name: "general-8",
-        filter: "package(fakecloud-e2e) and not binary(lambda) and not binary(lambda_invoke)",
+        filter: GENERAL_FILTER,
         partition: Some("hash:8/8"),
         install_podman: false,
     },
@@ -199,7 +205,7 @@ const PARTITIONS: [Partition; 19] = [
     },
     Partition {
         name: "lambda-container-podman",
-        filter: "binary(lambda) and test(lambda_invoke_podman)",
+        filter: "(binary(lambda) and test(lambda_invoke_podman)) or binary(ecs_podman_ecr)",
         partition: None,
         install_podman: true,
     },
