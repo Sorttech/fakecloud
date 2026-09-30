@@ -27,6 +27,7 @@ pub mod streaming;
 pub mod streaming_service;
 pub mod tenants;
 pub mod tenants_service;
+pub mod validate;
 pub mod xml_io;
 
 pub const API_VERSION: &str = "2020-05-31";
@@ -35,6 +36,7 @@ pub const NAMESPACE: &str = "http://cloudfront.amazonaws.com/doc/2020-05-31/";
 
 pub use service::{cloudfront_arn, distribution_arn, CloudFrontService};
 pub use state::{
-    CloudFrontAccounts, CloudFrontSnapshot, SharedCloudFrontState, StoredDistribution,
-    CLOUDFRONT_SNAPSHOT_SCHEMA_VERSION,
+    parse_cloudfront_snapshot, CloudFrontAccounts, CloudFrontSnapshot, SharedCloudFrontState,
+    StoredDistribution, CLOUDFRONT_SNAPSHOT_SCHEMA_VERSION,
 };
+pub use validate::validate_distribution_config;

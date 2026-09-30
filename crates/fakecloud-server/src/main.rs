@@ -3621,33 +3621,30 @@ async fn main() {
             let path = data_path.join("cloudfront").join("snapshot.json");
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
-                Ok(Some(bytes)) => {
-                    match serde_json::from_slice::<fakecloud_cloudfront::CloudFrontSnapshot>(&bytes)
-                    {
-                        Ok(snapshot) => {
-                            if snapshot.schema_version
-                                > fakecloud_cloudfront::CLOUDFRONT_SNAPSHOT_SCHEMA_VERSION
-                            {
-                                fatal_exit(format_args!(
+                Ok(Some(bytes)) => match fakecloud_cloudfront::parse_cloudfront_snapshot(&bytes) {
+                    Ok(snapshot) => {
+                        if snapshot.schema_version
+                            > fakecloud_cloudfront::CLOUDFRONT_SNAPSHOT_SCHEMA_VERSION
+                        {
+                            fatal_exit(format_args!(
                                     "cloudfront persistence schema too new: on-disk={}, max supported={}",
                                     snapshot.schema_version,
                                     fakecloud_cloudfront::CLOUDFRONT_SNAPSHOT_SCHEMA_VERSION,
                                 ));
-                            }
-                            if let Some(accounts) = snapshot.accounts {
-                                let account_count = accounts.account_count();
-                                *cloudfront_state.write() = accounts;
-                                tracing::info!(
-                                    accounts = account_count,
-                                    "loaded cloudfront persistence snapshot"
-                                );
-                            }
                         }
-                        Err(err) => fatal_exit(format_args!(
-                            "failed to parse cloudfront persistence snapshot: {err}"
-                        )),
+                        if let Some(accounts) = snapshot.accounts {
+                            let account_count = accounts.account_count();
+                            *cloudfront_state.write() = accounts;
+                            tracing::info!(
+                                accounts = account_count,
+                                "loaded cloudfront persistence snapshot"
+                            );
+                        }
                     }
-                }
+                    Err(err) => fatal_exit(format_args!(
+                        "failed to parse cloudfront persistence snapshot: {err}"
+                    )),
+                },
                 Ok(None) => {
                     tracing::info!("no cloudfront persistence snapshot found; starting empty");
                 }

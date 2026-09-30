@@ -406,4 +406,15 @@ async fn cloudfront_complex_config_roundtrips() {
         &GeoRestrictionType::Whitelist
     );
     assert_eq!(cfg.price_class(), Some(&PriceClass::PriceClass100));
+    // Members AWS spells with an upper-case acronym (MinTTL, IsIPV6Enabled,
+    // ErrorCachingMinTTL) must survive the parse and the render.
+    assert_eq!(cfg.is_ipv6_enabled(), Some(true));
+    let dcb = cfg.default_cache_behavior().unwrap();
+    assert_eq!(dcb.min_ttl(), Some(0));
+    assert_eq!(dcb.default_ttl(), Some(86400));
+    assert_eq!(dcb.max_ttl(), Some(31536000));
+    assert_eq!(
+        cfg.custom_error_responses().unwrap().items()[0].error_caching_min_ttl(),
+        Some(10)
+    );
 }
