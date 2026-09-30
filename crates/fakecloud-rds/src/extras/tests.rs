@@ -7013,8 +7013,20 @@ async fn failing_db_snapshot_copy_mints_no_key() {
             "taken".to_string(),
             local_snapshot("taken", "my-db", "000000000000"),
         );
+        // Another account's snapshot, never shared with this one.
+        accounts.get_or_create("999999999999").snapshots.insert(
+            "theirs".to_string(),
+            local_snapshot("theirs", "their-db", "999999999999"),
+        );
     }
-    for (source, target) in [("missing", "fresh"), ("src", "taken")] {
+    for (source, target) in [
+        ("missing", "fresh"),
+        ("src", "taken"),
+        (
+            "arn:aws:rds:us-east-1:999999999999:snapshot:theirs",
+            "fresh",
+        ),
+    ] {
         let result = svc
             .handle(req(
                 "CopyDBSnapshot",

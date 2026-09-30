@@ -3394,10 +3394,18 @@ impl RdsService {
                         .get(&aid)
                         .is_none_or(|s| !s.snapshots.contains_key(&target_id));
                     let owner = source_owner.as_deref().unwrap_or(&aid);
-                    target_free
-                        && accounts
-                            .get(owner)
-                            .is_some_and(|s| s.snapshots.contains_key(&source_key))
+                    // Another account's snapshot is copyable only when it was
+                    // shared with this caller, as the copy below requires.
+                    let source_usable = accounts
+                        .get(owner)
+                        .and_then(|s| s.snapshots.get(&source_key))
+                        .is_some_and(|snapshot| {
+                            owner == aid
+                                || snapshot.snapshot_attributes.get("restore").is_some_and(
+                                    |targets| targets.iter().any(|t| *t == aid || t == "all"),
+                                )
+                        });
+                    target_free && source_usable
                 };
                 let kms_key_id = get_param(req, "KmsKeyId")
                     .filter(|k| !k.is_empty() && copy_possible)
