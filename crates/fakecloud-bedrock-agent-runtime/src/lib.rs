@@ -5,4 +5,7 @@ pub(crate) mod service;
 pub(crate) mod state;
 
 pub use service::BedrockAgentRuntimeService;
-pub use state::{BedrockAgentRuntimeAccounts, InvocationRecord, SharedBedrockAgentRuntimeState};
+pub use state::{
+    BedrockAgentRuntimeAccounts, BedrockAgentRuntimeSnapshot, InvocationRecord,
+    SharedBedrockAgentRuntimeState, BEDROCK_AGENT_RUNTIME_SNAPSHOT_SCHEMA_VERSION,
+};
