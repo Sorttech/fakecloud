@@ -326,9 +326,11 @@ impl Ec2Runtime {
     /// CLI is available — callers then run in metadata-only mode.
     pub fn new() -> Option<Self> {
         let cli = fakecloud_core::container_net::detect_container_cli()?;
+        let podman = fakecloud_core::container_net::is_podman(&cli);
         Some(Self {
             backend: InstanceBackend::Docker(DockerInstances {
                 cli,
+                podman,
                 instance_id: format!("fakecloud-{}", std::process::id()),
             }),
             instances: Arc::new(RwLock::new(HashMap::new())),
@@ -393,11 +395,7 @@ impl Ec2Runtime {
     pub fn network_isolation_summary(&self) -> NetworkIsolationSummary {
         match &self.backend {
             InstanceBackend::Docker(d) => NetworkIsolationSummary {
-                backend: if fakecloud_core::container_net::is_podman_binary(&d.cli) {
-                    "podman"
-                } else {
-                    "docker"
-                },
+                backend: if d.podman { "podman" } else { "docker" },
                 sg_enforcement: match self.firewall.mode() {
                     EnforcementMode::Nftables => "nftables",
                     EnforcementMode::Disabled => "disabled",
@@ -686,6 +684,9 @@ fn boot_command(user_data: Option<&str>) -> Vec<String> {
 #[derive(Debug, Clone)]
 struct DockerInstances {
     cli: String,
+    /// Whether `cli` drives Podman, probed once at construction (by engine,
+    /// so the `podman-docker` shim counts) for the introspection summary.
+    podman: bool,
     instance_id: String,
 }
 

@@ -310,16 +310,123 @@ pub fn owned_by_dead_process(label: &str, is_alive: impl Fn(u32) -> bool) -> boo
     pid != std::process::id() && !is_alive(pid)
 }
 
-/// True when `cli` is podman or a podman-compatible binary. Matches on the
-/// filename component so absolute paths (`/opt/homebrew/bin/podman`) and
-/// wrappers (`podman-remote`) both register as podman. Docker Desktop's
-/// compatibility CLI is named `docker`, so this check is safe.
-pub fn is_podman_binary(cli: &str) -> bool {
+/// Which container engine a CLI actually drives. Decides the podman-only
+/// code paths: `host.containers.internal` without `--add-host`, and
+/// `--tls-verify=false` when pulling from fakecloud's plain-HTTP registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerEngine {
+    Docker,
+    Podman,
+}
+
+/// Process-global memo of [`is_podman`] results, keyed by CLI name/path. The
+/// engine behind a CLI is fixed for the life of the process, and the probe
+/// runs a subprocess, so every runtime constructor and image pull after the
+/// first reads the answer from here.
+static PODMAN_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, bool>>,
+> = std::sync::OnceLock::new();
+
+fn podman_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, bool>> {
+    PODMAN_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// True when `cli` drives podman -- including podman installed *as* `docker`.
+///
+/// The file name alone can't answer that: the `podman-docker` package
+/// (Fedora, RHEL, CentOS Stream, ...) ships a `docker` shim that execs podman,
+/// and a user may point `FAKECLOUD_CONTAINER_CLI` at any wrapper. So:
+///
+/// 1. fast path: a name containing `podman` (`podman`, `podman-remote`,
+///    `/opt/homebrew/bin/podman`) is podman without running anything;
+/// 2. otherwise ask the CLI: `<cli> --version` prints `podman version X.Y.Z`
+///    through the shim and `Docker version X.Y.Z, build ...` for Docker;
+/// 3. when that answers with something neither (a custom wrapper), look for
+///    podman-only fields in `<cli> info`.
+///
+/// Every call is bounded by [`CLI_PROBE_TIMEOUT`] (a wedged CLI costs one
+/// bound, then reads as Docker, the historical default) and the answer is
+/// memoized per CLI. Blocking: from async code use [`is_podman_async`].
+pub fn is_podman(cli: &str) -> bool {
+    if name_indicates_podman(cli) {
+        return true;
+    }
+    if let Some(&cached) = podman_cache().lock().unwrap().get(cli) {
+        return cached;
+    }
+    let podman = probe_engine(cli) == Some(ContainerEngine::Podman);
+    podman_cache()
+        .lock()
+        .unwrap()
+        .insert(cli.to_string(), podman);
+    podman
+}
+
+/// [`is_podman`] for async callers: a cached (or name-matched) answer returns
+/// at once, and a first-time probe runs on the blocking pool so it can't stall
+/// a runtime worker for up to [`CLI_PROBE_TIMEOUT`].
+pub async fn is_podman_async(cli: &str) -> bool {
+    if name_indicates_podman(cli) {
+        return true;
+    }
+    if let Some(&cached) = podman_cache().lock().unwrap().get(cli) {
+        return cached;
+    }
+    let owned = cli.to_string();
+    tokio::task::spawn_blocking(move || is_podman(&owned))
+        .await
+        .unwrap_or(false)
+}
+
+/// The name-only fast path: the file name component contains `podman`, so
+/// absolute paths and `podman-remote` register. Docker's CLI and the
+/// `podman-docker` shim are both named `docker` and fall through to the probe.
+fn name_indicates_podman(cli: &str) -> bool {
     std::path::Path::new(cli)
         .file_name()
         .and_then(|n| n.to_str())
         .map(|n| n.contains("podman"))
         .unwrap_or(false)
+}
+
+/// Ask the CLI what it is (uncached). `None` when it can't tell -- the CLI
+/// failed, timed out, or answered with neither engine's markers.
+fn probe_engine(cli: &str) -> Option<ContainerEngine> {
+    // A failed or timed-out `--version` means the CLI isn't answering at
+    // all; don't spend a second bound on `info` against it.
+    let version = bounded_output(cli, &["--version"])?;
+    classify_version_output(&version).or_else(|| {
+        bounded_output(cli, &["info", "--format", "{{json .}}"])
+            .and_then(|info| classify_info_output(&info))
+    })
+}
+
+/// Classify `<cli> --version` output. Podman prints `podman version 5.2.0`
+/// (also through the `podman-docker` shim), Docker `Docker version 27.3.1,
+/// build ce12230`. Podman is checked first: the shim is podman whatever else
+/// the output mentions.
+pub fn classify_version_output(stdout: &str) -> Option<ContainerEngine> {
+    let lower = stdout.to_ascii_lowercase();
+    if lower.contains("podman") {
+        Some(ContainerEngine::Podman)
+    } else if lower.contains("docker") {
+        Some(ContainerEngine::Docker)
+    } else {
+        None
+    }
+}
+
+/// Classify `<cli> info --format '{{json .}}'` output by engine-specific
+/// fields: podman's host section carries `buildahVersion` / `ociRuntime`
+/// (camelCase), Docker's top level `ServerVersion`.
+pub fn classify_info_output(stdout: &str) -> Option<ContainerEngine> {
+    if stdout.contains("\"buildahVersion\"") || stdout.contains("\"ociRuntime\"") {
+        Some(ContainerEngine::Podman)
+    } else if stdout.contains("\"ServerVersion\"") {
+        Some(ContainerEngine::Docker)
+    } else {
+        None
+    }
 }
 
 /// Detect the Docker bridge gateway IP on Linux. Returns `None` if
@@ -455,7 +562,7 @@ fn preserve_native_host_alias(
 /// for the bridge-gateway daemon probe on Linux docker, so the macOS /
 /// podman branches are unit-testable without a daemon.
 pub fn resolve_host_alias(cli: &str) -> (String, Option<String>) {
-    if is_podman_binary(cli) {
+    if is_podman(cli) {
         // Podman provides `host.containers.internal` natively on every
         // supported platform; injecting `host-gateway` on macOS fails
         // because rootless podman's gvproxy doesn't expose the magic alias.
@@ -576,12 +683,6 @@ mod tests {
     }
 
     #[test]
-    fn is_podman_binary_matches_bare_name() {
-        assert!(is_podman_binary("podman"));
-        assert!(is_podman_binary("podman-remote"));
-    }
-
-    #[test]
     fn registry_auth_hosts_includes_podman_alias() {
         // The podman sibling alias (host.containers.internal) must be authorized
         // or image-based Lambda/ECS pulls 401 under podman-in-a-container (0.B2).
@@ -596,16 +697,174 @@ mod tests {
     }
 
     #[test]
-    fn is_podman_binary_matches_absolute_path() {
-        assert!(is_podman_binary("/opt/homebrew/bin/podman"));
-        assert!(is_podman_binary("/usr/local/bin/podman-remote"));
+    fn name_fast_path_matches_podman_names() {
+        assert!(name_indicates_podman("podman"));
+        assert!(name_indicates_podman("podman-remote"));
+        assert!(name_indicates_podman("/opt/homebrew/bin/podman"));
+        assert!(name_indicates_podman("/usr/local/bin/podman-remote"));
+        assert!(!name_indicates_podman("docker"));
+        assert!(!name_indicates_podman("/usr/local/bin/docker"));
+        assert!(!name_indicates_podman("docker-credential-helper"));
     }
 
     #[test]
-    fn is_podman_binary_rejects_docker() {
-        assert!(!is_podman_binary("docker"));
-        assert!(!is_podman_binary("/usr/local/bin/docker"));
-        assert!(!is_podman_binary("docker-credential-helper"));
+    fn name_fast_path_needs_no_probe() {
+        // No binary by this name exists: a podman-named CLI is podman without
+        // running anything.
+        assert!(is_podman("/nonexistent-dir-fc-2599/podman"));
+        assert!(is_podman("podman-remote-definitely-missing-xyz"));
+    }
+
+    #[test]
+    fn version_output_classifies_the_engine() {
+        assert_eq!(
+            classify_version_output("podman version 5.2.0\n"),
+            Some(ContainerEngine::Podman)
+        );
+        assert_eq!(
+            classify_version_output("Docker version 27.3.1, build ce12230\n"),
+            Some(ContainerEngine::Docker)
+        );
+        // The podman-docker shim's notice mentions Docker; it is still podman.
+        assert_eq!(
+            classify_version_output(
+                "Emulate Docker CLI using podman. Create /etc/containers/nodocker to quiet msg.\npodman version 4.9.4\n"
+            ),
+            Some(ContainerEngine::Podman)
+        );
+        assert_eq!(classify_version_output("my-wrapper 1.0\n"), None);
+        assert_eq!(classify_version_output(""), None);
+    }
+
+    #[test]
+    fn info_output_classifies_the_engine() {
+        assert_eq!(
+            classify_info_output(
+                r#"{"host":{"buildahVersion":"1.37.0","ociRuntime":{"name":"crun"}}}"#
+            ),
+            Some(ContainerEngine::Podman)
+        );
+        assert_eq!(
+            classify_info_output(r#"{"ID":"abc","ServerVersion":"27.3.1","Driver":"overlay2"}"#),
+            Some(ContainerEngine::Docker)
+        );
+        assert_eq!(classify_info_output("{}"), None);
+    }
+
+    /// Write an executable fake CLI named `name` in a fresh temp dir, and run
+    /// it once so a concurrent fork can't leave it ETXTBSY for the probe.
+    #[cfg(unix)]
+    fn fake_cli(name: &str, body: &str) -> (tempfile::TempDir, String) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut attempts = 0;
+        loop {
+            match std::process::Command::new(&path).arg("warmup").output() {
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 200 => {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                _ => break,
+            }
+        }
+        let cli = path.display().to_string();
+        (dir, cli)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn podman_docker_shim_is_detected_as_podman() {
+        // What `podman-docker` installs: a `docker` that is podman.
+        let (_dir, cli) = fake_cli(
+            "docker",
+            "[ \"$1\" = --version ] && { echo 'podman version 5.2.0'; exit 0; }\nexit 1\n",
+        );
+        assert!(is_podman(&cli));
+        assert_eq!(probe_engine(&cli), Some(ContainerEngine::Podman));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_docker_cli_is_not_podman() {
+        let (_dir, cli) = fake_cli(
+            "docker",
+            "[ \"$1\" = --version ] && { echo 'Docker version 27.3.1, build ce12230'; exit 0; }\nexit 1\n",
+        );
+        assert!(!is_podman(&cli));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wrapper_with_opaque_version_falls_back_to_info() {
+        let (_dir, cli) = fake_cli(
+            "container-cli",
+            "case \"$1\" in\n  --version) echo 'wrapper 1.0' ;;\n  info) echo '{\"host\":{\"buildahVersion\":\"1.37.0\"}}' ;;\n  *) exit 1 ;;\nesac\n",
+        );
+        assert!(is_podman(&cli));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn engine_probe_is_cached_per_cli() {
+        // Each run appends to a log; a second lookup must not run the CLI again.
+        let (dir, cli) = fake_cli(
+            "docker",
+            "echo \"$*\" >> \"$(dirname \"$0\")/calls.log\"\n[ \"$1\" = --version ] && { echo 'podman version 5.2.0'; exit 0; }\nexit 1\n",
+        );
+        let log = dir.path().join("calls.log");
+        let _ = std::fs::remove_file(&log);
+        assert!(is_podman(&cli));
+        assert!(is_podman(&cli));
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert_eq!(calls.lines().collect::<Vec<_>>(), ["--version"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn async_probe_detects_the_shim() {
+        let (_dir, cli) = fake_cli(
+            "docker",
+            "[ \"$1\" = --version ] && { echo 'podman version 5.2.0'; exit 0; }\nexit 1\n",
+        );
+        assert!(is_podman_async(&cli).await);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn engine_probe_bounds_a_hanging_cli() {
+        // A CLI that never answers must not hang detection: one bounded call,
+        // no `info` fallback against it, and it reads as Docker.
+        let (_dir, cli) = fake_cli("docker", "sleep 600\n");
+        let start = std::time::Instant::now();
+        assert!(!is_podman(&cli));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < CLI_PROBE_TIMEOUT + std::time::Duration::from_secs(5),
+            "probe took {elapsed:?}, expected one bound near {CLI_PROBE_TIMEOUT:?}"
+        );
+    }
+
+    #[test]
+    fn missing_cli_is_not_podman() {
+        // `FAKECLOUD_CONTAINER_CLI=false`-style sentinels and missing binaries
+        // read as not-podman without error.
+        assert!(!is_podman("definitely-not-a-real-cli-binary-fc-2599"));
+        assert!(!is_podman("false"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_host_alias_treats_the_shim_as_podman() {
+        let (_dir, cli) = fake_cli(
+            "docker",
+            "[ \"$1\" = --version ] && { echo 'podman version 5.2.0'; exit 0; }\nexit 1\n",
+        );
+        let (alias, add_host) = resolve_host_alias(&cli);
+        assert_eq!(alias, "host.containers.internal");
+        assert_eq!(add_host, None);
     }
 
     #[test]
@@ -619,8 +878,15 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn resolve_host_alias_docker_emits_add_host() {
-        let (alias, add_host) = resolve_host_alias("docker");
+        // A fake Docker CLI, so a host whose `docker` is the podman-docker shim
+        // can't flip this test.
+        let (_dir, cli) = fake_cli(
+            "docker",
+            "[ \"$1\" = --version ] && { echo 'Docker version 27.3.1, build ce12230'; exit 0; }\nexit 1\n",
+        );
+        let (alias, add_host) = resolve_host_alias(&cli);
         assert_eq!(alias, "host.docker.internal");
         // On macOS this is host-gateway; on Linux it's a bridge IP. Either
         // way docker must get an explicit --add-host.
