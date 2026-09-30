@@ -70,11 +70,51 @@ impl BedrockAgentAccounts {
             } else {
                 state.region.as_str()
             };
-            for flow in state.flows.values_mut().filter(|f| f.arn.is_empty()) {
-                flow.arn = crate::arns::flow_arn(region, account_id, &flow.flow_id);
+            for flow in state.flows.values_mut() {
+                if flow.arn.is_empty() {
+                    flow.arn = crate::arns::flow_arn(region, account_id, &flow.flow_id);
+                }
+                // PrepareFlow used to store the enum name instead of its wire
+                // value; FlowStatus serializes as `Prepared`.
+                if flow.status == "PREPARED" {
+                    flow.status = "Prepared".to_string();
+                }
             }
             for prompt in state.prompts.values_mut().filter(|p| p.arn.is_empty()) {
                 prompt.arn = crate::arns::prompt_arn(region, account_id, &prompt.prompt_id);
+            }
+            state.rekey_encoded_tags();
+        }
+    }
+}
+
+impl BedrockAgentState {
+    /// Tags are keyed by the resource ARN as the caller wrote it. Builds that
+    /// did not decode the `{resourceArn}` path label stored TagResource calls
+    /// under the percent-encoded ARN (`arn%3Aaws%3Abedrock...`); move those
+    /// entries to the decoded ARN. When both forms exist, the decoded entry
+    /// was written later, so its values win and the encoded entry only
+    /// contributes keys the decoded one lacks.
+    fn rekey_encoded_tags(&mut self) {
+        let encoded: Vec<String> = self
+            .tags
+            .keys()
+            .filter(|k| k.contains('%'))
+            .cloned()
+            .collect();
+        for key in encoded {
+            let decoded = percent_encoding::percent_decode_str(&key)
+                .decode_utf8_lossy()
+                .into_owned();
+            if decoded == key {
+                continue;
+            }
+            let Some(old) = self.tags.remove(&key) else {
+                continue;
+            };
+            let entry = self.tags.entry(decoded).or_default();
+            for (k, v) in old {
+                entry.entry(k).or_insert(v);
             }
         }
     }
@@ -267,6 +307,12 @@ pub struct Flow {
     /// it backfilled on load (see [`BedrockAgentAccounts::backfill_arns`]).
     #[serde(default)]
     pub arn: String,
+    #[serde(default)]
+    pub customer_encryption_key_arn: Option<String>,
+    /// The highest version number ever minted for this flow, so a deleted
+    /// version's number is never handed out again.
+    #[serde(default)]
+    pub latest_version: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -278,8 +324,13 @@ pub struct FlowAlias {
     pub description: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub concurrency_configuration: Option<serde_json::Value>,
 }
 
+/// A numbered, immutable snapshot of a flow. The flow-level fields are
+/// captured at CreateFlowVersion time; snapshots written before they were
+/// captured leave them `None`, and readers fall back to the parent flow.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlowVersion {
     pub flow_version: String,
@@ -288,6 +339,14 @@ pub struct FlowVersion {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub definition: Option<serde_json::Value>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub execution_role_arn: Option<String>,
+    #[serde(default)]
+    pub customer_encryption_key_arn: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -302,8 +361,19 @@ pub struct Prompt {
     /// The ARN minted at creation; backfilled on load like [`Flow::arn`].
     #[serde(default)]
     pub arn: String,
+    #[serde(default)]
+    pub customer_encryption_key_arn: Option<String>,
+    #[serde(default)]
+    pub default_variant: Option<String>,
+    /// The highest version number ever minted for this prompt; see
+    /// [`Flow::latest_version`].
+    #[serde(default)]
+    pub latest_version: u64,
 }
 
+/// A numbered snapshot of a prompt. `name`, `default_variant` and
+/// `customer_encryption_key_arn` are captured at CreatePromptVersion time;
+/// older snapshots fall back to the prompt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PromptVersion {
     pub prompt_version: String,
@@ -312,6 +382,12 @@ pub struct PromptVersion {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub variants: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub default_variant: Option<String>,
+    #[serde(default)]
+    pub customer_encryption_key_arn: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
