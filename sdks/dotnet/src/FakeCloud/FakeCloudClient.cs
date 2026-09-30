@@ -865,9 +865,12 @@ public sealed class FakeCloudClient : IDisposable
                 "/_fakecloud/ecs/metadata/" + HttpTransport.EncodePath(taskArn), ct);
 
         /// <summary>
-        /// Return short-lived IAM credentials for a task. Matches the wire
-        /// shape ECS exposes via the task metadata credentials endpoint
-        /// (PascalCase keys).
+        /// Return the task-role credentials a running task's containers get
+        /// from <c>AWS_CONTAINER_CREDENTIALS_FULL_URI</c>: a session for the
+        /// task role named after the task ID, in the ECS credentials wire
+        /// shape (PascalCase keys). Throws once the task has stopped, or for
+        /// an unknown task or one without a task role (HTTP 400
+        /// <c>InvalidIdInRequest</c>, as the ECS agent answers).
         /// </summary>
         public Task<EcsTaskCredentialsResponse> GetCredentialsAsync(
             string taskId, CancellationToken ct = default) =>

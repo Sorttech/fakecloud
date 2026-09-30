@@ -877,3 +877,49 @@ fn register_task_definition_checks_both_roles() {
         assert_eq!(err.message(), unable_to_assume_role_message(bad));
     }
 }
+
+/// Trust decided per account: the role named `app` trusts ECS tasks only in
+/// account 999999999999; the caller's own `app` role does not.
+struct TrustsOnlyIn(&'static str);
+
+impl fakecloud_core::auth::RoleTrustValidator for TrustsOnlyIn {
+    fn validate(
+        &self,
+        account_id: &str,
+        role_arn: &str,
+        service_principal: &str,
+    ) -> Result<(), fakecloud_core::auth::PassRoleError> {
+        if account_id == self.0 {
+            Ok(())
+        } else {
+            Err(fakecloud_core::auth::PassRoleError::TrustPolicyDenies {
+                role_arn: role_arn.to_string(),
+                service_principal: service_principal.to_string(),
+            })
+        }
+    }
+}
+
+#[test]
+fn another_accounts_role_is_checked_against_its_own_trust_policy() {
+    use fakecloud_core::auth::IamMode;
+    let validator = TrustsOnlyIn("999999999999");
+    // The role's own account trusts ECS tasks; a same-named role in the
+    // caller's account that does not must not decide the outcome.
+    validate_task_role(
+        "123456789012",
+        "arn:aws:iam::999999999999:role/app",
+        Some(&validator),
+        IamMode::Off,
+    )
+    .expect("checked in the role's account");
+    let Err(err) = validate_task_role(
+        "123456789012",
+        "arn:aws:iam::123456789012:role/app",
+        Some(&validator),
+        IamMode::Off,
+    ) else {
+        panic!("caller's own untrusted role accepted");
+    };
+    assert_eq!(err.code(), "ClientException");
+}

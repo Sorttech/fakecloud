@@ -128,7 +128,8 @@ pub fn unable_to_assume_role_message(role_arn: &str) -> String {
 ///   it; with IAM off (the default) it is accepted, so templates carrying
 ///   another emulator's default account keep working.
 /// - The role's trust policy must let `ecs-tasks.amazonaws.com` assume it,
-///   looked up in the caller's account. Always applied.
+///   looked up in the account that owns the role (where the task's session
+///   is minted), or the caller's when the ARN names none. Always applied.
 ///
 /// Both fail as ECS does: `ClientException` naming the role.
 pub fn validate_task_role(
@@ -155,8 +156,9 @@ pub fn validate_task_role(
         }
     }
     if let Some(validator) = validator {
+        let role_account = fakecloud_aws::arn::account_of(role_arn).unwrap_or(caller_account);
         validator
-            .validate(caller_account, role_arn, "ecs-tasks.amazonaws.com")
+            .validate(role_account, role_arn, "ecs-tasks.amazonaws.com")
             .map_err(|_| helpers::client_exception(unable_to_assume_role_message(role_arn)))?;
     }
     Ok(())

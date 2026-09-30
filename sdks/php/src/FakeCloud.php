@@ -1196,10 +1196,13 @@ final class EcsClient
     }
 
     /**
-     * Fetch the IAM credentials fakecloud minted for a task. Mirrors
-     * what `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` exposes inside a
-     * real ECS task container. Field casing is PascalCase on the wire;
-     * the returned object exposes camelCase properties.
+     * Fetch the task-role credentials a running task's containers get
+     * from `AWS_CONTAINER_CREDENTIALS_FULL_URI`: a session for the task
+     * role named after the task ID. Throws once the task has stopped, or
+     * for an unknown task or one without a task role (HTTP 400
+     * `InvalidIdInRequest`, as the ECS agent answers). Field casing is
+     * PascalCase on the wire; the returned object exposes camelCase
+     * properties.
      */
     public function getTaskCredentials(string $taskId): EcsTaskCredentialsResponse
     {

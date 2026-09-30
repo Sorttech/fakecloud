@@ -125,22 +125,27 @@ impl EcsTaskCredentials {
     }
 
     /// Revoke the credentials of every task that has stopped (or is gone).
+    ///
+    /// The ECS read lock is held until the revocation is done, so a task
+    /// started (and handed credentials) while the sweep runs is never judged
+    /// against a snapshot that predates it. Lock order: ECS state, then the
+    /// cache, then IAM; `credentials` releases the ECS lock before touching
+    /// the cache, so the two never wait on each other in reverse.
     pub fn revoke_stopped(&self) {
-        let running: HashSet<String> = {
-            let accounts = self.ecs.read();
-            accounts
-                .iter()
-                .flat_map(|(account_id, state)| {
-                    state
-                        .tasks
-                        .iter()
-                        .filter(|(_, t)| t.last_status != "STOPPED")
-                        .map(move |(task_id, _)| cache_key(account_id, task_id))
-                })
-                .collect()
-        };
+        let accounts = self.ecs.read();
+        let running: HashSet<String> = accounts
+            .iter()
+            .flat_map(|(account_id, state)| {
+                state
+                    .tasks
+                    .iter()
+                    .filter(|(_, t)| t.last_status != "STOPPED")
+                    .map(move |(task_id, _)| cache_key(account_id, task_id))
+            })
+            .collect();
         self.cache
             .revoke_unless(&self.iam, |key| running.contains(key));
+        drop(accounts);
     }
 
     /// The endpoint response for `task_id`.

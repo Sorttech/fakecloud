@@ -1618,9 +1618,11 @@ export class EcsClient {
   }
 
   /**
-   * Return the IMDS-style temporary credentials fakecloud minted for an
-   * ECS task — the same payload a container reads from the credentials
-   * provider URL when running under Fargate.
+   * Return the task-role credentials a running ECS task's containers get
+   * from `AWS_CONTAINER_CREDENTIALS_FULL_URI`: a session for the task role
+   * named after the task ID. Throws once the task has stopped, or for an
+   * unknown task or one without a task role (HTTP 400 `InvalidIdInRequest`,
+   * as the ECS agent answers).
    */
   async getTaskCredentials(taskId: string): Promise<EcsTaskCredentials> {
     const resp = await fetch(

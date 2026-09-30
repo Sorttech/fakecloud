@@ -437,8 +437,11 @@ class EcsClient:
         return EcsTaskMetadataResponse.from_dict(resp.json())
 
     async def get_task_credentials(self, task_id: str) -> EcsTaskCredentials:
-        """Fetch the IAM credentials a running ECS task would see at
-        ``$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI``."""
+        """Fetch the task-role credentials a running ECS task's containers
+        get from ``$AWS_CONTAINER_CREDENTIALS_FULL_URI``: a session for the
+        task role named after the task ID. Raises once the task has stopped,
+        or for an unknown task or one without a task role (HTTP 400
+        ``InvalidIdInRequest``, as the ECS agent answers)."""
         resp = await self._client.get(f"{self._base}/_fakecloud/ecs/creds/{task_id}")
         _check(resp)
         return EcsTaskCredentials.from_dict(resp.json())
@@ -522,6 +525,11 @@ class _SyncEcsClient:
         return EcsTaskMetadataResponse.from_dict(resp.json())
 
     def get_task_credentials(self, task_id: str) -> EcsTaskCredentials:
+        """Fetch the task-role credentials a running ECS task's containers
+        get from ``$AWS_CONTAINER_CREDENTIALS_FULL_URI``: a session for the
+        task role named after the task ID. Raises once the task has stopped,
+        or for an unknown task or one without a task role (HTTP 400
+        ``InvalidIdInRequest``, as the ECS agent answers)."""
         resp = self._client.get(f"{self._base}/_fakecloud/ecs/creds/{task_id}")
         _check(resp)
         return EcsTaskCredentials.from_dict(resp.json())
