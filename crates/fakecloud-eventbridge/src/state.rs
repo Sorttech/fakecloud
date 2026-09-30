@@ -64,6 +64,54 @@ pub fn rule_arn(region: &str, account_id: &str, bus: &str, name: &str) -> String
     Arn::regional("events", region, account_id, &resource).to_string()
 }
 
+/// The ARNs of a new connection `name`: the connection ARN and the ARN of the
+/// Secrets Manager secret EventBridge keeps its credentials in. Both carry the
+/// same freshly minted UUID, as AWS does
+/// (`connection/<name>/<uuid>` and `secret:events!connection/<name>/<uuid>`),
+/// so the API and CloudFormation paths report byte-identical shapes.
+pub fn new_connection_arns(region: &str, account_id: &str, name: &str) -> (String, String) {
+    let id = uuid::Uuid::new_v4();
+    (
+        Arn::regional(
+            "events",
+            region,
+            account_id,
+            &format!("connection/{name}/{id}"),
+        )
+        .to_string(),
+        connection_secret_arn(region, account_id, name, &id),
+    )
+}
+
+/// The ARN of the Secrets Manager secret backing connection `name` whose
+/// connection ARN carries `id`.
+pub fn connection_secret_arn(
+    region: &str,
+    account_id: &str,
+    name: &str,
+    id: &uuid::Uuid,
+) -> String {
+    Arn::regional(
+        "secretsmanager",
+        region,
+        account_id,
+        &format!("secret:events!connection/{name}/{id}"),
+    )
+    .to_string()
+}
+
+/// The ARN of a new API destination `name`, with a freshly minted UUID.
+pub fn new_api_destination_arn(region: &str, account_id: &str, name: &str) -> String {
+    let id = uuid::Uuid::new_v4();
+    Arn::regional(
+        "events",
+        region,
+        account_id,
+        &format!("api-destination/{name}/{id}"),
+    )
+    .to_string()
+}
+
 impl EventBus {
     /// Whether `arn` names this bus: either the stored ARN or the ARN a client
     /// in another region was handed by [`arn_with_request_region`].
@@ -396,6 +444,41 @@ impl fakecloud_core::multi_account::AccountState for EventBridgeState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_arns_share_the_connection_uuid() {
+        let (arn, secret) = new_connection_arns("us-east-1", "123456789012", "my-conn");
+        let id = arn
+            .strip_prefix("arn:aws:events:us-east-1:123456789012:connection/my-conn/")
+            .expect("connection ARN shape");
+        assert!(uuid::Uuid::parse_str(id).is_ok());
+        assert_eq!(id.len(), 36, "hyphenated UUID");
+        assert_eq!(
+            secret,
+            format!(
+                "arn:aws:secretsmanager:us-east-1:123456789012:secret:events!connection/my-conn/{id}"
+            )
+        );
+    }
+
+    #[test]
+    fn connection_arns_follow_region_partition() {
+        let (arn, secret) = new_connection_arns("cn-north-1", "123456789012", "c");
+        assert!(arn.starts_with("arn:aws-cn:events:cn-north-1:123456789012:connection/c/"));
+        assert!(secret.starts_with(
+            "arn:aws-cn:secretsmanager:cn-north-1:123456789012:secret:events!connection/c/"
+        ));
+    }
+
+    #[test]
+    fn api_destination_arn_uses_hyphenated_uuid() {
+        let arn = new_api_destination_arn("us-gov-west-1", "123456789012", "dest");
+        let id = arn
+            .strip_prefix("arn:aws-us-gov:events:us-gov-west-1:123456789012:api-destination/dest/")
+            .expect("api destination ARN shape");
+        assert!(uuid::Uuid::parse_str(id).is_ok());
+        assert_eq!(id.len(), 36);
+    }
 
     #[test]
     fn new_creates_default_bus() {

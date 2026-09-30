@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex as AsyncMutex;
 
-use fakecloud_aws::arn::{partition_for, Arn};
+use fakecloud_aws::arn::Arn;
 use fakecloud_core::delivery::DeliveryBus;
 use fakecloud_core::pagination::paginate;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};

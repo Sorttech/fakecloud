@@ -10,6 +10,7 @@ use fakecloud_core::pagination::paginate;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use super::*;
+use crate::state::{new_api_destination_arn, new_connection_arns};
 
 impl EventBridgeService {
     pub(super) fn deauthorize_connection(
@@ -92,22 +93,7 @@ impl EventBridgeService {
         }
 
         let now = Utc::now();
-        let conn_uuid = uuid::Uuid::new_v4();
-        let arn = Arn::regional(
-            "events",
-            &req.region,
-            &state.account_id,
-            &format!("connection/{name}/{conn_uuid}"),
-        )
-        .to_string();
-        let secret_arn = format!(
-            "arn:{}:secretsmanager:{}:{}:secret:events!connection/{}/{}",
-            partition_for(&req.region),
-            req.region,
-            state.account_id,
-            name,
-            conn_uuid
-        );
+        let (arn, secret_arn) = new_connection_arns(&req.region, &state.account_id, &name);
 
         let conn = Connection {
             name: name.clone(),
@@ -370,14 +356,7 @@ impl EventBridgeService {
         }
 
         let now = Utc::now();
-        let dest_uuid = uuid::Uuid::new_v4();
-        let arn = Arn::regional(
-            "events",
-            &req.region,
-            &state.account_id,
-            &format!("api-destination/{name}/{dest_uuid}"),
-        )
-        .to_string();
+        let arn = new_api_destination_arn(&req.region, &state.account_id, &name);
 
         let dest = ApiDestination {
             name: name.clone(),

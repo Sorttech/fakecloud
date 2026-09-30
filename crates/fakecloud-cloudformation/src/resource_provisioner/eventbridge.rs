@@ -199,18 +199,8 @@ impl ResourceProvisioner {
             return Err(format!("Connection {name} already exists"));
         }
         let now = Utc::now();
-        let arn = self.regional_arn(
-            "events",
-            &format!("connection/{}/{}", name, Uuid::new_v4().as_simple()),
-        );
-        let secret_arn = self.regional_arn(
-            "secretsmanager",
-            &format!(
-                "secret:events!connection/{}-{}",
-                name,
-                Uuid::new_v4().as_simple()
-            ),
-        );
+        let (arn, secret_arn) =
+            fakecloud_eventbridge::new_connection_arns(&self.region, &self.account_id, &name);
         let connection = Connection {
             name: name.clone(),
             arn: arn.clone(),
@@ -277,10 +267,8 @@ impl ResourceProvisioner {
             return Err(format!("ApiDestination {name} already exists"));
         }
         let now = Utc::now();
-        let arn = self.regional_arn(
-            "events",
-            &format!("api-destination/{}/{}", name, Uuid::new_v4().as_simple()),
-        );
+        let arn =
+            fakecloud_eventbridge::new_api_destination_arn(&self.region, &self.account_id, &name);
         state.api_destinations.insert(
             name.clone(),
             ApiDestination {
