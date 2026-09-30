@@ -630,7 +630,7 @@ impl CloudFormationService {
                 .secretsmanager
                 .read()
                 .get(aid)
-                .map(|s| s.secrets.contains_key(&resource.physical_id))
+                .map(|s| s.secret_key(&resource.physical_id).is_some())
                 .unwrap_or(false),
             _ => return None,
         };

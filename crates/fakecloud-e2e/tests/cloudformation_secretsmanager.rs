@@ -69,6 +69,37 @@ async fn cfn_provisions_and_deletes_secrets_manager_secret() {
         .expect("get_secret_value");
     assert_eq!(value.secret_string(), Some("hunter2"));
 
+    // Same ARN form CreateSecret mints: `secret:<name>-` + six random chars.
+    let suffix = arn
+        .split_once(":secret:cfn-test-token-")
+        .map(|(_, s)| s)
+        .unwrap_or_else(|| panic!("no random suffix on {arn}"));
+    assert_eq!(suffix.len(), 6, "suffix of {arn}");
+
+    // The stack secret resolves by name and by partial ARN like any other.
+    let by_name = sm
+        .get_secret_value()
+        .secret_id("cfn-test-token")
+        .send()
+        .await
+        .expect("get_secret_value by name");
+    assert_eq!(by_name.arn(), Some(arn.as_str()));
+    let partial = &arn[..arn.len() - 7];
+    let by_partial = sm
+        .describe_secret()
+        .secret_id(partial)
+        .send()
+        .await
+        .expect("describe_secret by partial ARN");
+    assert_eq!(by_partial.arn(), Some(arn.as_str()));
+    // A secret the API mutates by ARN (the name-keyed path) works too.
+    sm.put_secret_value()
+        .secret_id(arn.clone())
+        .secret_string("rotated")
+        .send()
+        .await
+        .expect("put_secret_value by ARN");
+
     cfn.delete_stack()
         .stack_name("secret-stack")
         .send()

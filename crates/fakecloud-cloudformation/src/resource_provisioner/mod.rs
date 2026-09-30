@@ -8293,7 +8293,19 @@ mod tests {
         let sr = prov.create_resource(&res).unwrap();
         let arn = prov.get_att(&sr, "Arn").expect("Arn should resolve");
         assert!(arn.starts_with("arn:aws:secretsmanager:"));
-        assert!(arn.ends_with(":secret:my-secret"));
+        // Same ARN form CreateSecret mints: name + `-` + six random chars.
+        let suffix = arn
+            .strip_prefix("arn:aws:secretsmanager:us-east-1:123456789012:secret:my-secret-")
+            .unwrap_or_else(|| panic!("unexpected secret ARN {arn}"));
+        assert_eq!(suffix.len(), 6, "{arn}");
+        assert_eq!(sr.physical_id, arn);
+        // Keyed by name like API-created secrets, so name lookups resolve it.
+        let sm = prov.secretsmanager_state.read();
+        let acct = sm.get("123456789012").unwrap();
+        assert_eq!(
+            acct.secrets.get("my-secret").map(|s| s.arn.as_str()),
+            Some(arn.as_str())
+        );
     }
 
     #[test]
@@ -9417,7 +9429,8 @@ mod tests {
         .expect("AWS::SecretsManager::Secret is updatable");
         let sm = prov.secretsmanager_state.read();
         let acct = sm.get("123456789012").unwrap();
-        let secret = acct.secrets.get(&created.physical_id).unwrap();
+        let key = acct.secret_key(&created.physical_id).unwrap();
+        let secret = acct.secrets.get(&key).unwrap();
         let current = secret
             .current_version_id
             .as_ref()

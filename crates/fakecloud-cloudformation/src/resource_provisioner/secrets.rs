@@ -13,7 +13,8 @@ impl ResourceProvisioner {
     ) -> Option<String> {
         let mut accounts = self.secretsmanager_state.write();
         let state = accounts.get_or_create(&self.account_id);
-        let secret = state.secrets.get(physical_id)?;
+        let key = state.secret_key(physical_id)?;
+        let secret = state.secrets.get(&key)?;
         match attribute {
             // Secrets Manager's CFN doc treats Id and Arn interchangeably —
             // both resolve to the secret ARN.
@@ -46,11 +47,13 @@ impl ResourceProvisioner {
 
         let mut accounts = self.secretsmanager_state.write();
         let state = accounts.get_or_create(&self.account_id);
-        let arn = self.regional_arn("secretsmanager", &format!("secret:{}", name));
-
-        if state.secrets.contains_key(&arn) {
+        // Same ARN form Secrets Manager's CreateSecret mints: the name plus
+        // the random six-character suffix. The secret is keyed by name, like
+        // every secret the service itself creates.
+        if state.secrets.contains_key(&name) {
             return Err(format!("Secret {name} already exists"));
         }
+        let arn = fakecloud_secretsmanager::secret_arn(&self.region, &self.account_id, &name);
 
         let now = Utc::now();
         let mut versions = BTreeMap::new();
@@ -112,7 +115,7 @@ impl ResourceProvisioner {
             resource_policy: None,
             replica_regions: Vec::new(),
         };
-        state.secrets.insert(arn.clone(), secret);
+        state.secrets.insert(name.clone(), secret);
 
         Ok(ProvisionResult::new(arn.clone())
             .with("Id", arn.clone())
@@ -137,8 +140,8 @@ impl ResourceProvisioner {
         let mut accounts = self.secretsmanager_state.write();
         let state = accounts.get_or_create(&self.account_id);
         let secret = state
-            .secrets
-            .get_mut(arn)
+            .secret_key(arn)
+            .and_then(|key| state.secrets.get_mut(&key))
             .ok_or_else(|| format!("Secret {arn} not yet provisioned"))?;
 
         if let Some(desc) = props.get("Description").and_then(|v| v.as_str()) {
@@ -199,7 +202,9 @@ impl ResourceProvisioner {
     pub(super) fn delete_secrets_manager_secret(&self, physical_id: &str) -> Result<(), String> {
         let mut accounts = self.secretsmanager_state.write();
         let state = accounts.get_or_create(&self.account_id);
-        state.secrets.remove(physical_id);
+        if let Some(key) = state.secret_key(physical_id) {
+            state.secrets.remove(&key);
+        }
         Ok(())
     }
 
@@ -235,20 +240,11 @@ impl ResourceProvisioner {
             .map(String::from);
         let mut accounts = self.secretsmanager_state.write();
         let state = accounts.get_or_create(&self.account_id);
-        let secret_arn = if state.secrets.contains_key(&secret_id) {
-            secret_id.clone()
-        } else {
-            let candidate = self.regional_arn("secretsmanager", &format!("secret:{}", secret_id));
-            if state.secrets.contains_key(&candidate) {
-                candidate
-            } else {
-                return Err(format!("Secret {secret_id} not yet provisioned"));
-            }
-        };
         let secret = state
-            .secrets
-            .get_mut(&secret_arn)
-            .ok_or_else(|| format!("Secret {secret_arn} not found"))?;
+            .secret_key(&secret_id)
+            .and_then(|key| state.secrets.get_mut(&key))
+            .ok_or_else(|| format!("Secret {secret_id} not yet provisioned"))?;
+        let secret_arn = secret.arn.clone();
         secret.rotation_enabled = Some(true);
         secret.rotation_lambda_arn = rotation_lambda_arn;
         secret.rotation_rules = Some(RotationRules {
@@ -266,7 +262,10 @@ impl ResourceProvisioner {
     ) -> Result<(), String> {
         let mut accounts = self.secretsmanager_state.write();
         let state = accounts.get_or_create(&self.account_id);
-        if let Some(secret) = state.secrets.get_mut(physical_id) {
+        if let Some(secret) = state
+            .secret_key(physical_id)
+            .and_then(|key| state.secrets.get_mut(&key))
+        {
             secret.rotation_enabled = Some(false);
             secret.rotation_lambda_arn = None;
             secret.rotation_rules = None;
@@ -294,20 +293,11 @@ impl ResourceProvisioner {
         };
         let mut accounts = self.secretsmanager_state.write();
         let state = accounts.get_or_create(&self.account_id);
-        let secret_arn = if state.secrets.contains_key(&secret_id) {
-            secret_id.clone()
-        } else {
-            let candidate = self.regional_arn("secretsmanager", &format!("secret:{}", secret_id));
-            if state.secrets.contains_key(&candidate) {
-                candidate
-            } else {
-                return Err(format!("Secret {secret_id} not yet provisioned"));
-            }
-        };
         let secret = state
-            .secrets
-            .get_mut(&secret_arn)
-            .ok_or_else(|| format!("Secret {secret_arn} not found"))?;
+            .secret_key(&secret_id)
+            .and_then(|key| state.secrets.get_mut(&key))
+            .ok_or_else(|| format!("Secret {secret_id} not yet provisioned"))?;
+        let secret_arn = secret.arn.clone();
         secret.resource_policy = Some(policy_str);
         secret.last_changed_at = Utc::now();
         Ok(ProvisionResult::new(secret_arn.clone()).with("SecretArn", secret_arn))
@@ -319,7 +309,10 @@ impl ResourceProvisioner {
     ) -> Result<(), String> {
         let mut accounts = self.secretsmanager_state.write();
         let state = accounts.get_or_create(&self.account_id);
-        if let Some(secret) = state.secrets.get_mut(physical_id) {
+        if let Some(secret) = state
+            .secret_key(physical_id)
+            .and_then(|key| state.secrets.get_mut(&key))
+        {
             secret.resource_policy = None;
             secret.last_changed_at = Utc::now();
         }
@@ -346,20 +339,11 @@ impl ResourceProvisioner {
             .ok_or("TargetId is required")?;
         let mut accounts = self.secretsmanager_state.write();
         let state = accounts.get_or_create(&self.account_id);
-        let secret_arn = if state.secrets.contains_key(&secret_id) {
-            secret_id.clone()
-        } else {
-            let candidate = self.regional_arn("secretsmanager", &format!("secret:{}", secret_id));
-            if state.secrets.contains_key(&candidate) {
-                candidate
-            } else {
-                return Err(format!("Secret {secret_id} not yet provisioned"));
-            }
-        };
         let secret = state
-            .secrets
-            .get_mut(&secret_arn)
-            .ok_or_else(|| format!("Secret {secret_arn} not found"))?;
+            .secret_key(&secret_id)
+            .and_then(|key| state.secrets.get_mut(&key))
+            .ok_or_else(|| format!("Secret {secret_id} not yet provisioned"))?;
+        let secret_arn = secret.arn.clone();
         // Patch the AWSCURRENT version with engine/host/dbInstanceIdentifier
         // so it shows as "attached" via the RDS-style schema CFN expects.
         // If the secret has no version yet (created without SecretString or

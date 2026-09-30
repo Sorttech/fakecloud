@@ -2121,19 +2121,7 @@ impl SecretsManagerService {
         state: &crate::state::SecretsManagerState,
         secret_id: &str,
     ) -> Result<String, AwsServiceError> {
-        let key = if state.secrets.contains_key(secret_id) {
-            Some(secret_id.to_string())
-        } else if let Some(secret) = state.secrets.values().find(|s| s.arn == secret_id) {
-            Some(secret.name.clone())
-        } else if arn_resource(secret_id, "secretsmanager").is_some() {
-            state
-                .secrets
-                .values()
-                .find(|s| is_partial_secret_arn(&s.arn, secret_id))
-                .map(|s| s.name.clone())
-        } else {
-            None
-        };
+        let key = state.secret_key(secret_id);
 
         match key {
             // A secret whose recovery window has elapsed is treated as gone.
@@ -2158,19 +2146,8 @@ impl SecretsManagerService {
         secret_id: &str,
     ) -> Result<&'a Secret, AwsServiceError> {
         let secret = state
-            .secrets
-            .get(secret_id)
-            .or_else(|| state.secrets.values().find(|s| s.arn == secret_id))
-            .or_else(|| {
-                if arn_resource(secret_id, "secretsmanager").is_some() {
-                    state
-                        .secrets
-                        .values()
-                        .find(|s| is_partial_secret_arn(&s.arn, secret_id))
-                } else {
-                    None
-                }
-            });
+            .secret_key(secret_id)
+            .and_then(|key| state.secrets.get(&key));
 
         match secret {
             // A secret whose recovery window has elapsed is treated as gone.
@@ -2434,16 +2411,6 @@ fn remap_validation_error(err: AwsServiceError) -> AwsServiceError {
         },
         other => other,
     }
-}
-
-/// True when `partial` is `stored` without its `-XXXXXX` random suffix, the
-/// partial-ARN form AWS accepts. A bare prefix does not count: the partial
-/// ARN of `app` must not resolve `app-db`.
-fn is_partial_secret_arn(stored: &str, partial: &str) -> bool {
-    stored
-        .strip_prefix(partial)
-        .and_then(|rest| rest.strip_prefix('-'))
-        .is_some_and(|suffix| suffix.chars().count() == 6)
 }
 
 /// A new secret's ARN: its name plus AWS's random six-character suffix, in the

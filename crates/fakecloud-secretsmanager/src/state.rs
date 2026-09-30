@@ -69,6 +69,36 @@ impl SecretsManagerState {
     pub fn reset(&mut self) {
         self.secrets.clear();
     }
+
+    /// The `secrets` map key (the secret name) for a `SecretId`: a name, a
+    /// full ARN, or a partial ARN (the full ARN without its random
+    /// six-character suffix). Does not apply recovery-window expiry.
+    pub fn secret_key(&self, secret_id: &str) -> Option<String> {
+        if self.secrets.contains_key(secret_id) {
+            return Some(secret_id.to_string());
+        }
+        if let Some((key, _)) = self.secrets.iter().find(|(_, s)| s.arn == secret_id) {
+            return Some(key.clone());
+        }
+        if fakecloud_aws::arn::arn_resource(secret_id, "secretsmanager").is_some() {
+            return self
+                .secrets
+                .iter()
+                .find(|(_, s)| is_partial_secret_arn(&s.arn, secret_id))
+                .map(|(key, _)| key.clone());
+        }
+        None
+    }
+}
+
+/// Whether `partial` is `stored` minus its `-XXXXXX` random suffix: the
+/// partial-ARN form AWS accepts. A bare prefix does not count: the partial
+/// ARN of `app` must not resolve `app-db`.
+fn is_partial_secret_arn(stored: &str, partial: &str) -> bool {
+    stored
+        .strip_prefix(partial)
+        .and_then(|rest| rest.strip_prefix('-'))
+        .is_some_and(|suffix| suffix.chars().count() == 6)
 }
 
 pub type SharedSecretsManagerState =
@@ -134,5 +164,65 @@ mod tests {
         );
         state.reset();
         assert!(state.secrets.is_empty());
+    }
+
+    fn secret(name: &str, arn: &str) -> Secret {
+        Secret {
+            name: name.to_string(),
+            arn: arn.to_string(),
+            description: None,
+            kms_key_id: None,
+            versions: BTreeMap::new(),
+            current_version_id: None,
+            tags: vec![],
+            tags_ever_set: false,
+            deleted: false,
+            deletion_date: None,
+            created_at: Utc::now(),
+            last_changed_at: Utc::now(),
+            last_accessed_at: None,
+            rotation_enabled: None,
+            rotation_lambda_arn: None,
+            rotation_rules: None,
+            last_rotated_at: None,
+            resource_policy: None,
+            replica_regions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn secret_key_resolves_name_full_and_partial_arn() {
+        let mut state = SecretsManagerState::new("123456789012", "us-east-1");
+        let app = "arn:aws:secretsmanager:us-east-1:123456789012:secret:app-AbC123";
+        let app_db = "arn:aws:secretsmanager:us-east-1:123456789012:secret:app-db-XyZ789";
+        state.secrets.insert("app".into(), secret("app", app));
+        state
+            .secrets
+            .insert("app-db".into(), secret("app-db", app_db));
+        // A legacy entry keyed by its ARN still resolves to its real key.
+        let legacy = "arn:aws:secretsmanager:us-east-1:123456789012:secret:old-QwErTy";
+        state.secrets.insert(legacy.into(), secret("old", legacy));
+
+        assert_eq!(state.secret_key("app").as_deref(), Some("app"));
+        assert_eq!(state.secret_key(app).as_deref(), Some("app"));
+        assert_eq!(state.secret_key(app_db).as_deref(), Some("app-db"));
+        assert_eq!(
+            state
+                .secret_key("arn:aws:secretsmanager:us-east-1:123456789012:secret:app")
+                .as_deref(),
+            Some("app")
+        );
+        assert_eq!(
+            state
+                .secret_key("arn:aws:secretsmanager:us-east-1:123456789012:secret:app-db")
+                .as_deref(),
+            Some("app-db")
+        );
+        assert_eq!(state.secret_key(legacy).as_deref(), Some(legacy));
+        assert_eq!(state.secret_key("missing"), None);
+        assert_eq!(
+            state.secret_key("arn:aws:secretsmanager:us-east-1:123456789012:secret:ap"),
+            None
+        );
     }
 }
