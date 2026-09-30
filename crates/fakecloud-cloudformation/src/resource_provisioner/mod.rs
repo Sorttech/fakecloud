@@ -2400,10 +2400,8 @@ impl ResourceProvisioner {
     }
 
     fn get_att_cf_distribution(&self, physical_id: &str, attribute: &str) -> Option<String> {
-        // CloudFront state is keyed under a fixed "000000000000" account in the
-        // fakecloud_cloudfront crate; matching create_cf_distribution above.
         let accounts = self.cloudfront_state.read();
-        let state = accounts.get("000000000000")?;
+        let state = accounts.get(&self.account_id)?;
         let dist = state.distributions.get(physical_id)?;
         match attribute {
             "DomainName" => Some(dist.domain_name.clone()),
@@ -4860,7 +4858,7 @@ mod tests {
         );
 
         let accounts = prov.cloudfront_state.read();
-        let state = accounts.get("000000000000").unwrap();
+        let state = accounts.get(&prov.account_id).unwrap();
         let d = state
             .distributions
             .get(&id)
@@ -4896,7 +4894,7 @@ mod tests {
             ))
             .expect("distribution provisions");
         let accounts = prov.cloudfront_state.read();
-        let d = &accounts.get("000000000000").unwrap().distributions[&dist.physical_id];
+        let d = &accounts.get(&prov.account_id).unwrap().distributions[&dist.physical_id];
         let aliases = d.config.aliases.as_ref().expect("aliases persisted");
         assert_eq!(aliases.quantity, 2);
         assert_eq!(
@@ -5534,7 +5532,7 @@ mod tests {
         );
 
         let accounts = prov.cloudfront_state.read();
-        let state = accounts.get("000000000000").unwrap();
+        let state = accounts.get(&prov.account_id).unwrap();
         assert_eq!(
             state.cache_policies.get(&cp_id).map(|p| p.config.min_ttl),
             Some(200),
@@ -5652,7 +5650,7 @@ mod tests {
         assert_eq!(fn_up.physical_id, fn_id, "function id preserved");
 
         let accounts = prov.cloudfront_state.read();
-        let state = accounts.get("000000000000").unwrap();
+        let state = accounts.get(&prov.account_id).unwrap();
         assert_eq!(
             state
                 .public_keys

@@ -21,7 +21,6 @@ use crate::policies::{
 use crate::router::Route;
 use crate::service::{
     aws_error, esc, generate_id_with_prefix, invalid_argument, xml_response, CloudFrontService,
-    DEFAULT_ACCOUNT,
 };
 use crate::xml_io;
 
@@ -40,10 +39,7 @@ impl CloudFrontService {
         }
 
         let mut state = self.state.write();
-        let account = state
-            .accounts
-            .entry(DEFAULT_ACCOUNT.to_string())
-            .or_default();
+        let account = state.accounts.entry(req.account_id.clone()).or_default();
         if account.functions.contains_key(&parsed.name) {
             return Err(aws_error(
                 StatusCode::CONFLICT,
@@ -55,7 +51,7 @@ impl CloudFrontService {
         let etag = generate_id_with_prefix("E");
         let function_arn = crate::service::cloudfront_arn(
             &req.region,
-            DEFAULT_ACCOUNT,
+            &req.account_id,
             &format!("function/{}", parsed.name),
         );
         let stored = StoredFunction {
@@ -90,7 +86,7 @@ impl CloudFrontService {
         let state = self.state.read();
         let f = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&req.account_id)
             .and_then(|a| a.functions.get(&name).cloned())
             .ok_or_else(|| not_found("Function", &name))?;
         drop(state);
@@ -109,7 +105,7 @@ impl CloudFrontService {
         let state = self.state.read();
         let f = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&req.account_id)
             .and_then(|a| a.functions.get(&name).cloned())
             .ok_or_else(|| not_found("Function", &name))?;
         drop(state);
@@ -144,7 +140,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("Function", &name))?;
         let f = account
             .functions
@@ -183,7 +179,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("Function", &name))?;
         let f = account
             .functions
@@ -202,7 +198,7 @@ impl CloudFrontService {
         let state = self.state.read();
         let mut items: Vec<StoredFunction> = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&req.account_id)
             .map(|a| a.functions.values().cloned().collect())
             .unwrap_or_default();
         drop(state);
@@ -234,7 +230,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("Function", &name))?;
         let f = account
             .functions
@@ -275,7 +271,7 @@ impl CloudFrontService {
             let state = self.state.read();
             state
                 .accounts
-                .get(DEFAULT_ACCOUNT)
+                .get(&req.account_id)
                 .and_then(|a| a.functions.get(&name).cloned())
                 .ok_or_else(|| {
                     aws_error(
@@ -350,10 +346,7 @@ impl CloudFrontService {
             return Err(invalid_argument("PublicKeyConfig.EncodedKey is required"));
         }
         let mut state = self.state.write();
-        let account = state
-            .accounts
-            .entry(DEFAULT_ACCOUNT.to_string())
-            .or_default();
+        let account = state.accounts.entry(req.account_id.clone()).or_default();
         if let Some(existing) = account
             .public_keys
             .values()
@@ -387,7 +380,7 @@ impl CloudFrontService {
         let state = self.state.read();
         let p = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.public_keys.get(&id).cloned())
             .ok_or_else(|| not_found("PublicKey", &id))?;
         drop(state);
@@ -403,7 +396,7 @@ impl CloudFrontService {
         let state = self.state.read();
         let p = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.public_keys.get(&id).cloned())
             .ok_or_else(|| not_found("PublicKey", &id))?;
         drop(state);
@@ -426,7 +419,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("PublicKey", &id))?;
         let p = account
             .public_keys
@@ -459,7 +452,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("PublicKey", &id))?;
         let p = account
             .public_keys
@@ -475,12 +468,12 @@ impl CloudFrontService {
 
     pub(crate) fn list_public_keys(
         &self,
-        _req: &AwsRequest,
+        req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let state = self.state.read();
         let mut items: Vec<StoredPublicKey> = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&req.account_id)
             .map(|a| a.public_keys.values().cloned().collect())
             .unwrap_or_default();
         drop(state);
@@ -529,10 +522,7 @@ impl CloudFrontService {
             return Err(invalid_argument("KeyGroupConfig.Name is required"));
         }
         let mut state = self.state.write();
-        let account = state
-            .accounts
-            .entry(DEFAULT_ACCOUNT.to_string())
-            .or_default();
+        let account = state.accounts.entry(req.account_id.clone()).or_default();
         let id = generate_id_with_prefix("K");
         let etag = generate_id_with_prefix("E");
         let stored = StoredKeyGroup {
@@ -552,7 +542,7 @@ impl CloudFrontService {
         let state = self.state.read();
         let g = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.key_groups.get(&id).cloned())
             .ok_or_else(|| not_found("KeyGroup", &id))?;
         drop(state);
@@ -568,7 +558,7 @@ impl CloudFrontService {
         let state = self.state.read();
         let g = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.key_groups.get(&id).cloned())
             .ok_or_else(|| not_found("KeyGroup", &id))?;
         drop(state);
@@ -591,7 +581,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("KeyGroup", &id))?;
         let g = account
             .key_groups
@@ -619,7 +609,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("KeyGroup", &id))?;
         let g = account
             .key_groups
@@ -633,14 +623,11 @@ impl CloudFrontService {
         Ok(crate::policies::empty(StatusCode::NO_CONTENT))
     }
 
-    pub(crate) fn list_key_groups(
-        &self,
-        _req: &AwsRequest,
-    ) -> Result<AwsResponse, AwsServiceError> {
+    pub(crate) fn list_key_groups(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let state = self.state.read();
         let mut items: Vec<StoredKeyGroup> = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&req.account_id)
             .map(|a| a.key_groups.values().cloned().collect())
             .unwrap_or_default();
         drop(state);
@@ -679,10 +666,7 @@ impl CloudFrontService {
             return Err(invalid_argument("Name is required"));
         }
         let mut state = self.state.write();
-        let account = state
-            .accounts
-            .entry(DEFAULT_ACCOUNT.to_string())
-            .or_default();
+        let account = state.accounts.entry(req.account_id.clone()).or_default();
         if account.key_value_stores.contains_key(&parsed.name) {
             return Err(aws_error(
                 StatusCode::CONFLICT,
@@ -695,7 +679,7 @@ impl CloudFrontService {
         let etag = generate_id_with_prefix("E");
         let arn = crate::service::cloudfront_arn(
             &req.region,
-            DEFAULT_ACCOUNT,
+            &req.account_id,
             &format!("key-value-store/{id}"),
         );
         let stored = StoredKeyValueStore {
@@ -725,7 +709,7 @@ impl CloudFrontService {
         let state = self.state.read();
         let kvs = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.key_value_stores.get(&name).cloned())
             .ok_or_else(|| not_found("KeyValueStore", &name))?;
         drop(state);
@@ -745,7 +729,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("KeyValueStore", &name))?;
         let kvs = account
             .key_value_stores
@@ -773,7 +757,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("KeyValueStore", &name))?;
         let kvs = account
             .key_value_stores
@@ -789,12 +773,12 @@ impl CloudFrontService {
 
     pub(crate) fn list_key_value_stores(
         &self,
-        _req: &AwsRequest,
+        req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let state = self.state.read();
         let mut items: Vec<StoredKeyValueStore> = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&req.account_id)
             .map(|a| a.key_value_stores.values().cloned().collect())
             .unwrap_or_default();
         drop(state);
@@ -828,10 +812,7 @@ impl CloudFrontService {
             return Err(invalid_argument("CallerReference is required"));
         }
         let mut state = self.state.write();
-        let account = state
-            .accounts
-            .entry(DEFAULT_ACCOUNT.to_string())
-            .or_default();
+        let account = state.accounts.entry(req.account_id.clone()).or_default();
         if let Some(existing) = account
             .origin_access_identities
             .values()
@@ -874,7 +855,7 @@ impl CloudFrontService {
         let state = self.state.read();
         let oai = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.origin_access_identities.get(&id).cloned())
             .ok_or_else(|| not_found("CloudFrontOriginAccessIdentity", &id))?;
         drop(state);
@@ -887,7 +868,7 @@ impl CloudFrontService {
         let state = self.state.read();
         let oai = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.origin_access_identities.get(&id).cloned())
             .ok_or_else(|| not_found("CloudFrontOriginAccessIdentity", &id))?;
         drop(state);
@@ -907,7 +888,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("CloudFrontOriginAccessIdentity", &id))?;
         let oai = account
             .origin_access_identities
@@ -939,7 +920,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("CloudFrontOriginAccessIdentity", &id))?;
         let oai = account
             .origin_access_identities
@@ -953,11 +934,11 @@ impl CloudFrontService {
         Ok(crate::policies::empty(StatusCode::NO_CONTENT))
     }
 
-    pub(crate) fn list_oai(&self, _req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
+    pub(crate) fn list_oai(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let state = self.state.read();
         let mut items: Vec<StoredOriginAccessIdentity> = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&req.account_id)
             .map(|a| a.origin_access_identities.values().cloned().collect())
             .unwrap_or_default();
         drop(state);
@@ -1006,7 +987,7 @@ impl CloudFrontService {
             let state = self.state.read();
             let has_dist = state
                 .accounts
-                .get(DEFAULT_ACCOUNT)
+                .get(&req.account_id)
                 .is_some_and(|a| a.distributions.contains_key(&dist_id));
             if !has_dist {
                 return Err(not_found("Distribution", &dist_id));
@@ -1015,10 +996,7 @@ impl CloudFrontService {
         let parsed: MonitoringSubscriptionBody = xml_io::from_xml_root(&req.body)
             .map_err(|e| invalid_argument(format!("invalid MonitoringSubscription XML: {e}")))?;
         let mut state = self.state.write();
-        let account = state
-            .accounts
-            .entry(DEFAULT_ACCOUNT.to_string())
-            .or_default();
+        let account = state.accounts.entry(req.account_id.clone()).or_default();
         if !account.distributions.contains_key(&dist_id) {
             return Err(not_found("Distribution", &dist_id));
         }
@@ -1042,7 +1020,7 @@ impl CloudFrontService {
         let state = self.state.read();
         let m = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.monitoring_subscriptions.get(&dist_id).cloned())
             .ok_or_else(|| {
                 aws_error(
@@ -1064,7 +1042,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&route.account)
             .ok_or_else(|| not_found("Distribution", &dist_id))?;
         if account.monitoring_subscriptions.remove(&dist_id).is_none() {
             return Err(aws_error(
@@ -1365,6 +1343,7 @@ fn render_monitoring(m: &StoredMonitoringSubscription) -> String {
 mod tests {
     use super::*;
     use crate::service::CloudFrontService;
+    use crate::service::DEFAULT_ACCOUNT;
     use crate::state::CloudFrontAccounts;
     use bytes::Bytes;
     use fakecloud_core::service::AwsService;

@@ -418,10 +418,8 @@ impl ResetState {
                 state.accounts.remove(account_id);
             }
             "cloudfront" => {
-                // CloudFront is a global service in AWS; per-account resets
-                // simply drop that account's distribution / invalidation /
-                // tag map, matching the multi-account semantics other
-                // services use here.
+                // CloudFront is global (no region) but its resources are
+                // owned by the creating account; drop only that account's.
                 let mut state = self.cloudfront.write();
                 state.accounts.remove(account_id);
             }

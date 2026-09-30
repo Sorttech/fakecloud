@@ -17,7 +17,7 @@ use crate::policies::{
 use crate::router::Route;
 use crate::service::{
     aws_error, esc, extract_body_field, generate_id_with_prefix, invalid_argument, xml_response,
-    CloudFrontService, DEFAULT_ACCOUNT,
+    CloudFrontService,
 };
 use crate::xml_io;
 
@@ -59,10 +59,7 @@ impl CloudFrontService {
             return Err(invalid_argument("Name is required"));
         }
         let mut state = self.state.write();
-        let account = state
-            .accounts
-            .entry(DEFAULT_ACCOUNT.to_string())
-            .or_default();
+        let account = state.accounts.entry(req.account_id.clone()).or_default();
         if account.connection_functions.contains_key(&parsed.name) {
             return Err(aws_error(
                 StatusCode::CONFLICT,
@@ -75,7 +72,7 @@ impl CloudFrontService {
         let id = generate_id_with_prefix("CF");
         let arn = crate::service::cloudfront_arn(
             &req.region,
-            DEFAULT_ACCOUNT,
+            &req.account_id,
             &format!("connection-function/{}", parsed.name),
         );
         let code = base64::engine::general_purpose::STANDARD
@@ -111,7 +108,7 @@ impl CloudFrontService {
         let state = self.state.read();
         let f = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.connection_functions.get(&name).cloned())
             .ok_or_else(|| not_found("ConnectionFunction", &name))?;
         drop(state);
@@ -127,7 +124,7 @@ impl CloudFrontService {
         let state = self.state.read();
         let f = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.connection_functions.get(&name).cloned())
             .ok_or_else(|| not_found("ConnectionFunction", &name))?;
         drop(state);
@@ -157,7 +154,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("ConnectionFunction", &name))?;
         let f = account
             .connection_functions
@@ -191,7 +188,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("ConnectionFunction", &name))?;
         let f = account
             .connection_functions
@@ -224,7 +221,7 @@ impl CloudFrontService {
         let state = self.state.read();
         let mut items: Vec<StoredConnectionFunction> = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&req.account_id)
             .map(|a| a.connection_functions.values().cloned().collect())
             .unwrap_or_default();
         drop(state);
@@ -252,7 +249,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("ConnectionFunction", &name))?;
         let f = account
             .connection_functions
@@ -294,7 +291,7 @@ impl CloudFrontService {
             let state = self.state.read();
             state
                 .accounts
-                .get(DEFAULT_ACCOUNT)
+                .get(&req.account_id)
                 .and_then(|a| a.connection_functions.get(&name).cloned())
                 .ok_or_else(|| {
                     aws_error(
@@ -403,6 +400,7 @@ fn push_summary_body(out: &mut String, f: &StoredConnectionFunction) {
 mod tests {
     use super::*;
     use crate::service::CloudFrontService;
+    use crate::service::DEFAULT_ACCOUNT;
     use crate::state::CloudFrontAccounts;
     use bytes::Bytes;
     use fakecloud_core::service::AwsService;

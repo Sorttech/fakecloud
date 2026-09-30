@@ -17,7 +17,6 @@ use crate::policies::{
 use crate::router::Route;
 use crate::service::{
     aws_error, esc, generate_id_with_prefix, invalid_argument, xml_response, CloudFrontService,
-    DEFAULT_ACCOUNT,
 };
 use crate::xml_io;
 
@@ -60,10 +59,7 @@ impl CloudFrontService {
             return Err(invalid_argument("Arn is required"));
         }
         let mut state = self.state.write();
-        let account = state
-            .accounts
-            .entry(DEFAULT_ACCOUNT.to_string())
-            .or_default();
+        let account = state.accounts.entry(req.account_id.clone()).or_default();
         if account
             .vpc_origins
             .values()
@@ -80,7 +76,7 @@ impl CloudFrontService {
         let now = Utc::now();
         let arn = crate::service::cloudfront_arn(
             &req.region,
-            DEFAULT_ACCOUNT,
+            &req.account_id,
             &format!("vpc-origin/{id}"),
         );
         let stored = StoredVpcOrigin {
@@ -106,7 +102,7 @@ impl CloudFrontService {
         let state = self.state.read();
         let v = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.vpc_origins.get(&id).cloned())
             .ok_or_else(|| not_found("VpcOrigin", &id))?;
         drop(state);
@@ -126,7 +122,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("VpcOrigin", &id))?;
         let v = account
             .vpc_origins
@@ -160,7 +156,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("VpcOrigin", &id))?;
         let v = account
             .vpc_origins
@@ -180,12 +176,12 @@ impl CloudFrontService {
 
     pub(crate) fn list_vpc_origins(
         &self,
-        _req: &AwsRequest,
+        req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let state = self.state.read();
         let mut items: Vec<StoredVpcOrigin> = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&req.account_id)
             .map(|a| a.vpc_origins.values().cloned().collect())
             .unwrap_or_default();
         drop(state);
@@ -250,10 +246,7 @@ impl CloudFrontService {
             .map(|l| l.ipam_cidr_config.clone())
             .unwrap_or_default();
         let mut state = self.state.write();
-        let account = state
-            .accounts
-            .entry(DEFAULT_ACCOUNT.to_string())
-            .or_default();
+        let account = state.accounts.entry(req.account_id.clone()).or_default();
         if account
             .anycast_ip_lists
             .values()
@@ -268,7 +261,7 @@ impl CloudFrontService {
         let id = generate_id_with_prefix("AIL");
         let arn = crate::service::cloudfront_arn(
             &req.region,
-            DEFAULT_ACCOUNT,
+            &req.account_id,
             &format!("anycast-ip-list/{id}"),
         );
         // Synthesize deterministic ipv4 addresses for the list.
@@ -305,7 +298,7 @@ impl CloudFrontService {
         let state = self.state.read();
         let a = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.anycast_ip_lists.get(&id).cloned())
             .ok_or_else(|| not_found("AnycastIpList", &id))?;
         drop(state);
@@ -326,7 +319,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("AnycastIpList", &id))?;
         let a = account
             .anycast_ip_lists
@@ -359,7 +352,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("AnycastIpList", &id))?;
         let a = account
             .anycast_ip_lists
@@ -377,12 +370,12 @@ impl CloudFrontService {
 
     pub(crate) fn list_anycast_ip_lists(
         &self,
-        _req: &AwsRequest,
+        req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let state = self.state.read();
         let mut items: Vec<StoredAnycastIpList> = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&req.account_id)
             .map(|a| a.anycast_ip_lists.values().cloned().collect())
             .unwrap_or_default();
         drop(state);
@@ -429,10 +422,7 @@ impl CloudFrontService {
             ));
         }
         let mut state = self.state.write();
-        let account = state
-            .accounts
-            .entry(DEFAULT_ACCOUNT.to_string())
-            .or_default();
+        let account = state.accounts.entry(req.account_id.clone()).or_default();
         if account.trust_stores.values().any(|t| t.name == cfg.name) {
             return Err(aws_error(
                 StatusCode::CONFLICT,
@@ -443,7 +433,7 @@ impl CloudFrontService {
         let id = generate_id_with_prefix("TS");
         let arn = crate::service::cloudfront_arn(
             &req.region,
-            DEFAULT_ACCOUNT,
+            &req.account_id,
             &format!("trust-store/{id}"),
         );
         let etag = generate_id_with_prefix("E");
@@ -471,7 +461,7 @@ impl CloudFrontService {
         let state = self.state.read();
         let t = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.trust_stores.get(&id).cloned())
             .ok_or_else(|| not_found("TrustStore", &id))?;
         drop(state);
@@ -497,7 +487,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("TrustStore", &id))?;
         let t = account
             .trust_stores
@@ -525,7 +515,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("TrustStore", &id))?;
         let t = account
             .trust_stores
@@ -543,12 +533,12 @@ impl CloudFrontService {
 
     pub(crate) fn list_trust_stores(
         &self,
-        _req: &AwsRequest,
+        req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let state = self.state.read();
         let mut items: Vec<StoredTrustStore> = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&req.account_id)
             .map(|a| a.trust_stores.values().cloned().collect())
             .unwrap_or_default();
         drop(state);
@@ -591,10 +581,7 @@ impl CloudFrontService {
             .policy_document
             .ok_or_else(|| invalid_argument("PolicyDocument is required"))?;
         let mut state = self.state.write();
-        let account = state
-            .accounts
-            .entry(DEFAULT_ACCOUNT.to_string())
-            .or_default();
+        let account = state.accounts.entry(req.account_id.clone()).or_default();
         account.resource_policies.insert(
             parsed.resource_arn.clone(),
             StoredResourcePolicy {
@@ -621,7 +608,7 @@ impl CloudFrontService {
         let state = self.state.read();
         let p = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&req.account_id)
             .and_then(|a| a.resource_policies.get(&parsed.resource_arn).cloned())
             .ok_or_else(|| not_found("ResourcePolicy", &parsed.resource_arn))?;
         drop(state);
@@ -653,7 +640,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("ResourcePolicy", &parsed.resource_arn))?;
         if account
             .resource_policies
@@ -820,6 +807,7 @@ fn render_bundle_source(s: &CaCertificatesBundleSource) -> String {
 #[cfg(test)]
 mod extras_create_tests {
     use super::*;
+    use crate::service::DEFAULT_ACCOUNT;
     use crate::state::CloudFrontAccounts;
     use fakecloud_core::service::{AwsService, ResponseBody};
     use parking_lot::RwLock;

@@ -17,7 +17,6 @@ use crate::policies::{
 use crate::router::Route;
 use crate::service::{
     aws_error, esc, generate_id_with_prefix, invalid_argument, xml_response, CloudFrontService,
-    DEFAULT_ACCOUNT,
 };
 use crate::xml_io;
 
@@ -38,10 +37,7 @@ impl CloudFrontService {
             return Err(invalid_argument("CallerReference is required"));
         }
         let mut state = self.state.write();
-        let account = state
-            .accounts
-            .entry(DEFAULT_ACCOUNT.to_string())
-            .or_default();
+        let account = state.accounts.entry(req.account_id.clone()).or_default();
         if let Some(existing) = account
             .field_level_encryptions
             .values()
@@ -80,7 +76,7 @@ impl CloudFrontService {
         let state = self.state.read();
         let f = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.field_level_encryptions.get(&id).cloned())
             .ok_or_else(|| not_found("FieldLevelEncryption", &id))?;
         drop(state);
@@ -96,7 +92,7 @@ impl CloudFrontService {
         let state = self.state.read();
         let f = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.field_level_encryptions.get(&id).cloned())
             .ok_or_else(|| not_found("FieldLevelEncryption", &id))?;
         drop(state);
@@ -117,7 +113,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("FieldLevelEncryption", &id))?;
         let f = account
             .field_level_encryptions
@@ -150,7 +146,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("FieldLevelEncryption", &id))?;
         let f = account
             .field_level_encryptions
@@ -166,12 +162,12 @@ impl CloudFrontService {
 
     pub(crate) fn list_field_level_encryption_configs(
         &self,
-        _req: &AwsRequest,
+        req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let state = self.state.read();
         let mut items: Vec<StoredFieldLevelEncryption> = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&req.account_id)
             .map(|a| a.field_level_encryptions.values().cloned().collect())
             .unwrap_or_default();
         drop(state);
@@ -230,10 +226,7 @@ impl CloudFrontService {
             return Err(invalid_argument("CallerReference is required"));
         }
         let mut state = self.state.write();
-        let account = state
-            .accounts
-            .entry(DEFAULT_ACCOUNT.to_string())
-            .or_default();
+        let account = state.accounts.entry(req.account_id.clone()).or_default();
         if let Some(existing) = account
             .field_level_encryption_profiles
             .values()
@@ -272,7 +265,7 @@ impl CloudFrontService {
         let state = self.state.read();
         let p = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.field_level_encryption_profiles.get(&id).cloned())
             .ok_or_else(|| not_found("FieldLevelEncryptionProfile", &id))?;
         drop(state);
@@ -288,7 +281,7 @@ impl CloudFrontService {
         let state = self.state.read();
         let p = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.field_level_encryption_profiles.get(&id).cloned())
             .ok_or_else(|| not_found("FieldLevelEncryptionProfile", &id))?;
         drop(state);
@@ -317,7 +310,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("FieldLevelEncryptionProfile", &id))?;
         let p = account
             .field_level_encryption_profiles
@@ -350,7 +343,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("FieldLevelEncryptionProfile", &id))?;
         let p = account
             .field_level_encryption_profiles
@@ -366,12 +359,12 @@ impl CloudFrontService {
 
     pub(crate) fn list_field_level_encryption_profiles(
         &self,
-        _req: &AwsRequest,
+        req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let state = self.state.read();
         let mut items: Vec<StoredFieldLevelEncryptionProfile> = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&req.account_id)
             .map(|a| {
                 a.field_level_encryption_profiles
                     .values()
@@ -424,13 +417,10 @@ impl CloudFrontService {
             return Err(invalid_argument("Name is required"));
         }
         let mut state = self.state.write();
-        let account = state
-            .accounts
-            .entry(DEFAULT_ACCOUNT.to_string())
-            .or_default();
+        let account = state.accounts.entry(req.account_id.clone()).or_default();
         let arn = crate::service::cloudfront_arn(
             &req.region,
-            DEFAULT_ACCOUNT,
+            &req.account_id,
             &format!("realtime-log-config/{}", parsed.name),
         );
         if account
@@ -470,7 +460,7 @@ impl CloudFrontService {
         let state = self.state.read();
         let configs = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&req.account_id)
             .map(|a| &a.realtime_log_configs);
         let key = resolve_rtl_key(configs, &parsed)?;
         let r = configs
@@ -495,7 +485,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("RealtimeLogConfig", &parsed.arn))?;
         let r = account
             .realtime_log_configs
@@ -522,13 +512,13 @@ impl CloudFrontService {
         let key = resolve_rtl_key(
             state
                 .accounts
-                .get(DEFAULT_ACCOUNT)
+                .get(&req.account_id)
                 .map(|a| &a.realtime_log_configs),
             &parsed,
         )?;
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("RealtimeLogConfig", &key))?;
         if account.realtime_log_configs.remove(&key).is_none() {
             return Err(not_found("RealtimeLogConfig", &key));
@@ -539,12 +529,12 @@ impl CloudFrontService {
 
     pub(crate) fn list_realtime_log_configs(
         &self,
-        _req: &AwsRequest,
+        req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let state = self.state.read();
         let mut items: Vec<StoredRealtimeLogConfig> = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&req.account_id)
             .map(|a| a.realtime_log_configs.values().cloned().collect())
             .unwrap_or_default();
         drop(state);

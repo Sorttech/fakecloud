@@ -15,7 +15,7 @@ use crate::policies::{
 use crate::router::Route;
 use crate::service::{
     aws_error, esc, extract_body_field, generate_id_with_prefix, invalid_argument, xml_response,
-    CloudFrontService, DEFAULT_ACCOUNT,
+    CloudFrontService,
 };
 use crate::xml_io;
 
@@ -37,10 +37,11 @@ impl CloudFrontService {
         }
         let tags = crate::extras_service::tags_to_state(&cfg.tags);
         let mut state = self.state.write();
-        let account = state
-            .accounts
-            .entry(DEFAULT_ACCOUNT.to_string())
-            .or_default();
+        let id = state.unused_id(
+            || generate_id_with_prefix("CG"),
+            |a, id| a.connection_groups.contains_key(id),
+        );
+        let account = state.accounts.entry(req.account_id.clone()).or_default();
         if account
             .connection_groups
             .values()
@@ -52,10 +53,9 @@ impl CloudFrontService {
                 format!("ConnectionGroup {} already exists", cfg.name),
             ));
         }
-        let id = generate_id_with_prefix("CG");
         let arn = crate::service::cloudfront_arn(
             &req.region,
-            DEFAULT_ACCOUNT,
+            &req.account_id,
             &format!("connection-group/{id}"),
         );
         let routing_endpoint = format!("{}.cloudfront.net", id.to_lowercase());
@@ -93,7 +93,7 @@ impl CloudFrontService {
         let state = self.state.read();
         let g = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| {
                 a.connection_groups
                     .get(&id)
@@ -118,7 +118,7 @@ impl CloudFrontService {
         let state = self.state.read();
         let g = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&req.account_id)
             .and_then(|a| {
                 a.connection_groups
                     .values()
@@ -144,7 +144,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("ConnectionGroup", &id))?;
         let g = account
             .connection_groups
@@ -184,7 +184,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("ConnectionGroup", &id))?;
         let g = account
             .connection_groups
@@ -209,12 +209,12 @@ impl CloudFrontService {
 
     pub(crate) fn list_connection_groups(
         &self,
-        _req: &AwsRequest,
+        req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let state = self.state.read();
         let mut items: Vec<StoredConnectionGroup> = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&req.account_id)
             .map(|a| a.connection_groups.values().cloned().collect())
             .unwrap_or_default();
         drop(state);
@@ -304,7 +304,41 @@ impl CloudFrontService {
         };
 
         let mut state = self.state.write();
-        let account = state.entry(DEFAULT_ACCOUNT);
+        // A domain is unique across all of CloudFront. Moving it is limited
+        // to resources the caller owns: one held by another account's
+        // distribution or tenant cannot be taken over.
+        let held_elsewhere = state
+            .accounts
+            .iter()
+            .filter(|(owner, _)| **owner != req.account_id)
+            .any(|(_, a)| {
+                a.distribution_tenants.values().any(|t| {
+                    t.domains
+                        .iter()
+                        .any(|d| d.eq_ignore_ascii_case(&parsed.domain))
+                }) || a.distributions.values().any(|d| {
+                    d.config
+                        .aliases
+                        .as_ref()
+                        .and_then(|al| al.items.as_ref())
+                        .is_some_and(|i| {
+                            i.cname
+                                .iter()
+                                .any(|c| c.eq_ignore_ascii_case(&parsed.domain))
+                        })
+                })
+            });
+        if held_elsewhere {
+            return Err(aws_error(
+                StatusCode::FORBIDDEN,
+                "AccessDenied",
+                format!(
+                    "The domain {} is associated with a resource in another account",
+                    parsed.domain
+                ),
+            ));
+        }
+        let account = state.entry(&req.account_id);
 
         // The target must exist, otherwise AWS returns EntityNotFound.
         let target_ok = match &target {
@@ -323,7 +357,8 @@ impl CloudFrontService {
         // owns it, then attach it to the target. Domains are unique across
         // resources, so a plain move is correct.
         for t in account.distribution_tenants.values_mut() {
-            t.domains.retain(|d| d != &parsed.domain);
+            t.domains
+                .retain(|d| !d.eq_ignore_ascii_case(&parsed.domain));
         }
         for d in account.distributions.values_mut() {
             remove_alias(&mut d.config, &parsed.domain);
@@ -408,7 +443,7 @@ impl CloudFrontService {
                 fakecloud_aws::arn::Arn::regional(
                     "acm",
                     fakecloud_aws::arn::implicit_global_region(partition),
-                    DEFAULT_ACCOUNT,
+                    &req.account_id,
                     &format!("certificate/{id}"),
                 )
                 .to_string()
@@ -435,7 +470,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("Distribution", &id))?;
         let staging_config = account
             .distributions
@@ -454,8 +489,11 @@ impl CloudFrontService {
         // primary distribution's live config. AWS copies the config wholesale
         // and the resulting primary is no longer a staging distribution.
         // Previously this only bumped the ETag, leaving the old config live.
+        // Alternate domain names are not part of the promotion: a staging
+        // distribution carries none, and the primary keeps its own.
         let mut promoted = staging_config;
         promoted.staging = Some(false);
+        promoted.aliases = dist.config.aliases.take();
         dist.config = promoted;
         dist.etag = generate_id_with_prefix("E");
         dist.last_modified_time = Utc::now();
@@ -500,7 +538,7 @@ fn add_alias(config: &mut crate::model::DistributionConfig, domain: &str) {
 fn remove_alias(config: &mut crate::model::DistributionConfig, domain: &str) {
     if let Some(aliases) = config.aliases.as_mut() {
         if let Some(items) = aliases.items.as_mut() {
-            items.cname.retain(|c| c != domain);
+            items.cname.retain(|c| !c.eq_ignore_ascii_case(domain));
             aliases.quantity = items.cname.len() as i32;
         }
     }
@@ -568,6 +606,7 @@ fn push_connection_group_inner(out: &mut String, g: &StoredConnectionGroup) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::service::DEFAULT_ACCOUNT;
     use crate::state::CloudFrontAccounts;
     use bytes::Bytes;
     use fakecloud_core::service::{AwsService, ResponseBody};
@@ -637,6 +676,79 @@ mod tests {
             .next()
             .unwrap()
             .to_string()
+    }
+
+    #[tokio::test]
+    async fn tenant_domains_are_unique_across_accounts() {
+        let svc = svc();
+        create_tenant(&svc, "owner", "dup.example.com").await;
+        let mut create_b = req(
+            http::Method::POST,
+            "/2020-05-31/distribution-tenant",
+            &format!(
+                r#"<?xml version="1.0"?>
+<CreateDistributionTenantRequest xmlns="{NS}">
+  <DistributionId>E123</DistributionId>
+  <Name>b-tenant</Name>
+  <Domains><member><Domain>DUP.example.com</Domain></member></Domains>
+</CreateDistributionTenantRequest>"#
+            ),
+        );
+        create_b.account_id = "222222222222".into();
+        let err = match svc.handle(create_b).await {
+            Err(e) => e,
+            Ok(_) => panic!("domain held by another account's tenant"),
+        };
+        assert_eq!(err.code(), "CNAMEAlreadyExists");
+    }
+
+    #[tokio::test]
+    async fn update_domain_association_cannot_take_a_domain_from_another_account() {
+        let svc = svc();
+        let owner = create_tenant(&svc, "owner-tenant", "taken.example.com").await;
+        // Account B creates its own tenant, then tries to move A's domain.
+        let mut create_b = req(
+            http::Method::POST,
+            "/2020-05-31/distribution-tenant",
+            &format!(
+                r#"<?xml version="1.0"?>
+<CreateDistributionTenantRequest xmlns="{NS}">
+  <DistributionId>E123</DistributionId>
+  <Name>b-tenant</Name>
+  <Domains><member><Domain>b.example.com</Domain></member></Domains>
+</CreateDistributionTenantRequest>"#
+            ),
+        );
+        create_b.account_id = "222222222222".into();
+        let created = svc.handle(create_b).await.unwrap();
+        let b_xml = body_str(&created);
+        let b_tenant = b_xml
+            .split("<Id>")
+            .nth(1)
+            .and_then(|r| r.split("</Id>").next())
+            .unwrap()
+            .to_string();
+
+        let mut steal = req(
+            http::Method::POST,
+            "/2020-05-31/domain-association",
+            &format!(
+                r#"<?xml version="1.0"?>
+<UpdateDomainAssociationRequest xmlns="{NS}">
+  <Domain>taken.example.com</Domain>
+  <TargetResource><DistributionTenantId>{b_tenant}</DistributionTenantId></TargetResource>
+</UpdateDomainAssociationRequest>"#
+            ),
+        );
+        steal.account_id = "222222222222".into();
+        let err = match svc.handle(steal).await {
+            Err(e) => e,
+            Ok(_) => panic!("another account's domain must not move"),
+        };
+        assert_eq!(err.code(), "AccessDenied");
+        assert!(get_tenant_xml(&svc, &owner)
+            .await
+            .contains("taken.example.com"));
     }
 
     async fn get_tenant_xml(svc: &CloudFrontService, id: &str) -> String {

@@ -50,7 +50,11 @@ CloudFront's `ETag` model is preserved. Every successful `Create`/`Get`/`Update`
 
 ### Idempotency
 
-`CreateDistribution` rejects a second call with the same `CallerReference` with `DistributionAlreadyExists` (matches AWS).
+`CreateDistribution` rejects a second call with the same `CallerReference` with `DistributionAlreadyExists` (matches AWS). `CallerReference` is unique per account.
+
+### Accounts
+
+CloudFront is global (no region), but every resource belongs to the account that created it, as in AWS. Distributions, invalidations, policies, functions, key value stores, OACs, OAIs, tags and the rest are visible to and changeable by their owning account only; another account gets the usual `NoSuch*` error and does not see them in its listings. AWS-managed cache, origin request and response headers policies are visible to every account. Names (functions, policies, connection groups, ...) are unique per account. Identifiers that double as a global domain (a distribution's `<id>.cloudfront.net`) and alternate domain names stay unique across all accounts: `CreateDistribution`, `UpdateDistribution`, `AssociateAlias`, `CreateDistributionTenant` and `UpdateDistributionTenant` reject a domain (compared case-insensitively) held by any other distribution or tenant with `CNAMEAlreadyExists`, and `UpdateDomainAssociation` only moves a domain between resources of the caller's own account (`AccessDenied` otherwise). `CopyDistribution` does not copy the primary's alternate domain names, and promoting a staging config keeps the primary's. `POST /_fakecloud/reset/cloudfront/{account_id}` clears one account's CloudFront state. Persistence snapshots written before resources were account-scoped are split by owner on load: a resource whose ARN names an account (CloudFormation-provisioned ones) returns to that account, and the rest load into the server's default account (`--account-id`) with their ARNs rewritten to it.
 
 ## Smoke test
 
@@ -90,12 +94,12 @@ aws --endpoint-url http://localhost:4566 cloudfront list-invalidations --distrib
 
 ## Admin endpoints
 
-- `GET /_fakecloud/cloudfront/distributions` — list stored distributions with `{id, domainName, enabled, served}`. `domainName` is the distribution's `<id>.cloudfront.net` domain — send it as the `Host` header to fakecloud's main endpoint to reach the distribution (see below). `served` is `true` when the distribution is enabled and the data plane is active (`false` when disabled, or when the data plane is turned off via `FAKECLOUD_CLOUDFRONT_DISABLE_DATAPLANE`).
+- `GET /_fakecloud/cloudfront/distributions` — list stored distributions across all accounts with `{id, domainName, enabled, served}`. `domainName` is the distribution's `<id>.cloudfront.net` domain — send it as the `Host` header to fakecloud's main endpoint to reach the distribution (see below). `served` is `true` when the distribution is enabled and the data plane is active (`false` when disabled, or when the data plane is turned off via `FAKECLOUD_CLOUDFRONT_DISABLE_DATAPLANE`).
 - `POST /_fakecloud/cloudfront/distributions/{id}/status` — flip a stored distribution's reported `Status` (e.g. between `InProgress` and `Deployed`) without waiting on the auto-deploy tick. Body: `{"status": "Deployed"}`. Returns `204 No Content` on success and `404 Not Found` for an unknown id. Useful for tests that assert behavior gated on the post-deploy status.
 
 ## Local data plane
 
-fakecloud runs a single-node, in-process HTTP data plane for CloudFront. Distributions are served **on fakecloud's own main `--addr` listener**, routed by the request `Host` header — there is no separate per-distribution port. A viewer request whose `Host` matches an **enabled** distribution's `DomainName` (`<id>.cloudfront.net`) or one of its alternate domain names (`Aliases` / CNAMEs) is served by the data plane; every other request (the AWS API, `/_fakecloud/*`) is dispatched normally.
+fakecloud runs a single-node, in-process HTTP data plane for CloudFront. Distributions are served **on fakecloud's own main `--addr` listener**, routed by the request `Host` header — there is no separate per-distribution port. Viewer requests carry no account, so a distribution is served by its domain whichever account owns it. A viewer request whose `Host` matches an **enabled** distribution's `DomainName` (`<id>.cloudfront.net`) or one of its alternate domain names (`Aliases` / CNAMEs) is served by the data plane; every other request (the AWS API, `/_fakecloud/*`) is dispatched normally.
 
 Because distributions share the main port, a distribution is reachable from outside a container whenever that port is published — no second listener to expose. This matches real CloudFront, where a distribution is reached by its domain, not a port:
 

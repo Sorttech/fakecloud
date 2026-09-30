@@ -22,7 +22,6 @@ use crate::policies::{
 use crate::router::Route;
 use crate::service::{
     aws_error, esc, generate_id_with_prefix, invalid_argument, xml_response, CloudFrontService,
-    DEFAULT_ACCOUNT,
 };
 use crate::xml_io;
 
@@ -50,7 +49,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         state
             .accounts
-            .entry(DEFAULT_ACCOUNT.to_string())
+            .entry(req.account_id.clone())
             .or_default()
             .origin_access_controls
             .insert(id.clone(), stored.clone());
@@ -68,7 +67,7 @@ impl CloudFrontService {
             .shared_state()
             .read()
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.origin_access_controls.get(&id).cloned())
             .ok_or_else(|| not_found("OriginAccessControl", &id))?;
         let body = render_oac(&oac);
@@ -84,7 +83,7 @@ impl CloudFrontService {
             .shared_state()
             .read()
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.origin_access_controls.get(&id).cloned())
             .ok_or_else(|| not_found("OriginAccessControl", &id))?;
         let body = quick_xml::se::to_string_with_root("OriginAccessControlConfig", &oac.config)
@@ -129,7 +128,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("OriginAccessControl", &id))?;
         let oac = account
             .origin_access_controls
@@ -156,7 +155,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("OriginAccessControl", &id))?;
         {
             let oac = account
@@ -173,14 +172,13 @@ impl CloudFrontService {
 
     pub(crate) fn list_origin_access_controls(
         &self,
-        _req: &AwsRequest,
+        req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let state = self.state.read();
         let mut items: Vec<StoredOriginAccessControl> = state
-            .accounts
-            .values()
-            .flat_map(|a| a.origin_access_controls.values().cloned())
-            .collect();
+            .get(&req.account_id)
+            .map(|a| a.origin_access_controls.values().cloned().collect())
+            .unwrap_or_default();
         drop(state);
         items.sort_by(|a, b| a.id.cmp(&b.id));
         let mut body = String::new();
@@ -236,7 +234,7 @@ impl CloudFrontService {
         if cfg.name.is_empty() {
             return Err(invalid_argument("CachePolicyConfig.Name is required"));
         }
-        touch_account(&self.state, DEFAULT_ACCOUNT);
+        touch_account(&self.state, &req.account_id);
         let id = generate_id_with_prefix("C");
         let etag = generate_id_with_prefix("E");
         let stored = StoredCachePolicy {
@@ -249,7 +247,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         state
             .accounts
-            .entry(DEFAULT_ACCOUNT.to_string())
+            .entry(req.account_id.clone())
             .or_default()
             .cache_policies
             .insert(id.clone(), stored.clone());
@@ -260,12 +258,12 @@ impl CloudFrontService {
 
     pub(crate) fn get_cache_policy(&self, route: &Route) -> Result<AwsResponse, AwsServiceError> {
         let id = route_id(route, "CachePolicy")?;
-        touch_account(&self.state, DEFAULT_ACCOUNT);
+        touch_account(&self.state, &route.account);
         let cp = self
             .shared_state()
             .read()
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.cache_policies.get(&id).cloned())
             .ok_or_else(|| not_found("CachePolicy", &id))?;
         let body = render_simple_policy(PolicyView::from(cp.clone()), "CachePolicy");
@@ -277,12 +275,12 @@ impl CloudFrontService {
         route: &Route,
     ) -> Result<AwsResponse, AwsServiceError> {
         let id = route_id(route, "CachePolicy")?;
-        touch_account(&self.state, DEFAULT_ACCOUNT);
+        touch_account(&self.state, &route.account);
         let cp = self
             .shared_state()
             .read()
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.cache_policies.get(&id).cloned())
             .ok_or_else(|| not_found("CachePolicy", &id))?;
         let body = config_xml("CachePolicyConfig", &cp.config)?;
@@ -304,7 +302,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("CachePolicy", &id))?;
         let cp = account
             .cache_policies
@@ -339,7 +337,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("CachePolicy", &id))?;
         {
             let cp = account
@@ -365,12 +363,12 @@ impl CloudFrontService {
         &self,
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
-        touch_account(&self.state, DEFAULT_ACCOUNT);
+        touch_account(&self.state, &req.account_id);
         let filter = validate_policy_type_query(&req.raw_query)?;
         let state = self.state.read();
         let mut items: Vec<StoredCachePolicy> = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&req.account_id)
             .map(|a| a.cache_policies.values().cloned().collect())
             .unwrap_or_default();
         drop(state);
@@ -425,7 +423,7 @@ impl CloudFrontService {
                 "OriginRequestPolicyConfig.Name is required",
             ));
         }
-        touch_account(&self.state, DEFAULT_ACCOUNT);
+        touch_account(&self.state, &req.account_id);
         let id = generate_id_with_prefix("O");
         let etag = generate_id_with_prefix("E");
         let stored = StoredOriginRequestPolicy {
@@ -438,7 +436,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         state
             .accounts
-            .entry(DEFAULT_ACCOUNT.to_string())
+            .entry(req.account_id.clone())
             .or_default()
             .origin_request_policies
             .insert(id.clone(), stored.clone());
@@ -452,12 +450,12 @@ impl CloudFrontService {
         route: &Route,
     ) -> Result<AwsResponse, AwsServiceError> {
         let id = route_id(route, "OriginRequestPolicy")?;
-        touch_account(&self.state, DEFAULT_ACCOUNT);
+        touch_account(&self.state, &route.account);
         let p = self
             .shared_state()
             .read()
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.origin_request_policies.get(&id).cloned())
             .ok_or_else(|| not_found("OriginRequestPolicy", &id))?;
         let body = render_simple_policy(PolicyView::from(p.clone()), "OriginRequestPolicy");
@@ -469,12 +467,12 @@ impl CloudFrontService {
         route: &Route,
     ) -> Result<AwsResponse, AwsServiceError> {
         let id = route_id(route, "OriginRequestPolicy")?;
-        touch_account(&self.state, DEFAULT_ACCOUNT);
+        touch_account(&self.state, &route.account);
         let p = self
             .shared_state()
             .read()
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.origin_request_policies.get(&id).cloned())
             .ok_or_else(|| not_found("OriginRequestPolicy", &id))?;
         let body = config_xml("OriginRequestPolicyConfig", &p.config)?;
@@ -498,7 +496,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("OriginRequestPolicy", &id))?;
         let p = account
             .origin_request_policies
@@ -533,7 +531,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("OriginRequestPolicy", &id))?;
         {
             let p = account
@@ -559,12 +557,12 @@ impl CloudFrontService {
         &self,
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
-        touch_account(&self.state, DEFAULT_ACCOUNT);
+        touch_account(&self.state, &req.account_id);
         let filter = validate_policy_type_query(&req.raw_query)?;
         let state = self.state.read();
         let mut items: Vec<StoredOriginRequestPolicy> = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&req.account_id)
             .map(|a| a.origin_request_policies.values().cloned().collect())
             .unwrap_or_default();
         drop(state);
@@ -620,7 +618,7 @@ impl CloudFrontService {
                 "ResponseHeadersPolicyConfig.Name is required",
             ));
         }
-        touch_account(&self.state, DEFAULT_ACCOUNT);
+        touch_account(&self.state, &req.account_id);
         let id = generate_id_with_prefix("R");
         let etag = generate_id_with_prefix("E");
         let stored = StoredResponseHeadersPolicy {
@@ -633,7 +631,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         state
             .accounts
-            .entry(DEFAULT_ACCOUNT.to_string())
+            .entry(req.account_id.clone())
             .or_default()
             .response_headers_policies
             .insert(id.clone(), stored.clone());
@@ -647,12 +645,12 @@ impl CloudFrontService {
         route: &Route,
     ) -> Result<AwsResponse, AwsServiceError> {
         let id = route_id(route, "ResponseHeadersPolicy")?;
-        touch_account(&self.state, DEFAULT_ACCOUNT);
+        touch_account(&self.state, &route.account);
         let p = self
             .shared_state()
             .read()
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.response_headers_policies.get(&id).cloned())
             .ok_or_else(|| not_found("ResponseHeadersPolicy", &id))?;
         let body = render_simple_policy(PolicyView::from(p.clone()), "ResponseHeadersPolicy");
@@ -664,12 +662,12 @@ impl CloudFrontService {
         route: &Route,
     ) -> Result<AwsResponse, AwsServiceError> {
         let id = route_id(route, "ResponseHeadersPolicy")?;
-        touch_account(&self.state, DEFAULT_ACCOUNT);
+        touch_account(&self.state, &route.account);
         let p = self
             .shared_state()
             .read()
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.response_headers_policies.get(&id).cloned())
             .ok_or_else(|| not_found("ResponseHeadersPolicy", &id))?;
         let body = config_xml("ResponseHeadersPolicyConfig", &p.config)?;
@@ -694,7 +692,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("ResponseHeadersPolicy", &id))?;
         let p = account
             .response_headers_policies
@@ -730,7 +728,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("ResponseHeadersPolicy", &id))?;
         {
             let p = account
@@ -756,12 +754,12 @@ impl CloudFrontService {
         &self,
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
-        touch_account(&self.state, DEFAULT_ACCOUNT);
+        touch_account(&self.state, &req.account_id);
         let filter = validate_policy_type_query(&req.raw_query)?;
         let state = self.state.read();
         let mut items: Vec<StoredResponseHeadersPolicy> = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&req.account_id)
             .map(|a| a.response_headers_policies.values().cloned().collect())
             .unwrap_or_default();
         drop(state);
@@ -824,7 +822,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         state
             .accounts
-            .entry(DEFAULT_ACCOUNT.to_string())
+            .entry(req.account_id.clone())
             .or_default()
             .continuous_deployment_policies
             .insert(id.clone(), stored.clone());
@@ -842,7 +840,7 @@ impl CloudFrontService {
             .shared_state()
             .read()
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.continuous_deployment_policies.get(&id).cloned())
             .ok_or_else(|| not_found("ContinuousDeploymentPolicy", &id))?;
         let body =
@@ -859,7 +857,7 @@ impl CloudFrontService {
             .shared_state()
             .read()
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.continuous_deployment_policies.get(&id).cloned())
             .ok_or_else(|| not_found("ContinuousDeploymentPolicy", &id))?;
         let body = config_xml("ContinuousDeploymentPolicyConfig", &cdp.config)?;
@@ -880,7 +878,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("ContinuousDeploymentPolicy", &id))?;
         let cdp = account
             .continuous_deployment_policies
@@ -911,7 +909,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("ContinuousDeploymentPolicy", &id))?;
         {
             let cdp = account
@@ -928,14 +926,13 @@ impl CloudFrontService {
 
     pub(crate) fn list_continuous_deployment_policies(
         &self,
-        _req: &AwsRequest,
+        req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let state = self.state.read();
         let mut items: Vec<StoredContinuousDeploymentPolicy> = state
-            .accounts
-            .values()
-            .flat_map(|a| a.continuous_deployment_policies.values().cloned())
-            .collect();
+            .get(&req.account_id)
+            .map(|a| a.continuous_deployment_policies.values().cloned().collect())
+            .unwrap_or_default();
         drop(state);
         items.sort_by(|a, b| a.id.cmp(&b.id));
         let mut body = String::new();

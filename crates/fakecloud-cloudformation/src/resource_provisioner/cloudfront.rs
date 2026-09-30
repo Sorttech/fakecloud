@@ -42,7 +42,7 @@ impl ResourceProvisioner {
         };
 
         let mut accounts = self.cloudfront_state.write();
-        let state = accounts.entry("000000000000");
+        let state = accounts.entry(&self.account_id);
         state.origin_access_identities.insert(id.clone(), oai);
 
         Ok(ProvisionResult::new(id.clone())
@@ -52,7 +52,7 @@ impl ResourceProvisioner {
 
     pub(crate) fn delete_cf_origin_access_identity(&self, physical_id: &str) -> Result<(), String> {
         let mut accounts = self.cloudfront_state.write();
-        let state = accounts.entry("000000000000");
+        let state = accounts.entry(&self.account_id);
         state.origin_access_identities.remove(physical_id);
         Ok(())
     }
@@ -74,14 +74,21 @@ impl ResourceProvisioner {
 
         // Mint distribution id + ARN + domain in the same shape the
         // CloudFront service uses.
-        let id_suffix: String = Uuid::new_v4()
-            .simple()
-            .to_string()
-            .chars()
-            .take(13)
-            .collect::<String>()
-            .to_uppercase();
-        let id = format!("E{id_suffix}");
+        // Ids double as the global `<id>.cloudfront.net` domain, so they stay
+        // unique across every account.
+        let id = self.cloudfront_state.read().unused_id(
+            || {
+                let suffix: String = Uuid::new_v4()
+                    .simple()
+                    .to_string()
+                    .chars()
+                    .take(13)
+                    .collect::<String>()
+                    .to_uppercase();
+                format!("E{suffix}")
+            },
+            |a, id| a.distributions.contains_key(id),
+        );
         let etag_suffix: String = Uuid::new_v4()
             .simple()
             .to_string()
@@ -107,7 +114,7 @@ impl ResourceProvisioner {
         };
 
         let mut accounts = self.cloudfront_state.write();
-        let state = accounts.entry("000000000000");
+        let state = accounts.entry(&self.account_id);
         state.distributions.insert(id.clone(), stored);
         Ok(ProvisionResult::new(id.clone())
             .with("Id", id)
@@ -117,7 +124,7 @@ impl ResourceProvisioner {
 
     pub(crate) fn delete_cf_distribution(&self, physical_id: &str) -> Result<(), String> {
         let mut accounts = self.cloudfront_state.write();
-        let state = accounts.entry("000000000000");
+        let state = accounts.entry(&self.account_id);
         state.distributions.remove(physical_id);
         Ok(())
     }
@@ -148,7 +155,7 @@ impl ResourceProvisioner {
             .to_uppercase();
 
         let mut accounts = self.cloudfront_state.write();
-        let state = accounts.entry("000000000000");
+        let state = accounts.entry(&self.account_id);
         let dist = state
             .distributions
             .get_mut(&existing.physical_id)
@@ -213,7 +220,7 @@ impl ResourceProvisioner {
         };
 
         let mut accounts = self.cloudfront_state.write();
-        let state = accounts.entry("000000000000");
+        let state = accounts.entry(&self.account_id);
         state.origin_access_controls.insert(id.clone(), oac);
 
         Ok(ProvisionResult::new(id.clone()).with("Id", id))
@@ -221,7 +228,7 @@ impl ResourceProvisioner {
 
     pub(crate) fn delete_cf_origin_access_control(&self, physical_id: &str) -> Result<(), String> {
         let mut accounts = self.cloudfront_state.write();
-        let state = accounts.entry("000000000000");
+        let state = accounts.entry(&self.account_id);
         state.origin_access_controls.remove(physical_id);
         Ok(())
     }
@@ -275,7 +282,7 @@ impl ResourceProvisioner {
         };
 
         let mut accounts = self.cloudfront_state.write();
-        let state = accounts.entry("000000000000");
+        let state = accounts.entry(&self.account_id);
         state.public_keys.insert(id.clone(), pk);
 
         Ok(ProvisionResult::new(id.clone()).with("Id", id))
@@ -283,7 +290,7 @@ impl ResourceProvisioner {
 
     pub(crate) fn delete_cf_public_key(&self, physical_id: &str) -> Result<(), String> {
         let mut accounts = self.cloudfront_state.write();
-        let state = accounts.entry("000000000000");
+        let state = accounts.entry(&self.account_id);
         state.public_keys.remove(physical_id);
         Ok(())
     }
@@ -330,7 +337,7 @@ impl ResourceProvisioner {
         };
 
         let mut accounts = self.cloudfront_state.write();
-        let state = accounts.entry("000000000000");
+        let state = accounts.entry(&self.account_id);
         state.key_groups.insert(id.clone(), kg);
 
         Ok(ProvisionResult::new(id.clone()).with("Id", id))
@@ -338,7 +345,7 @@ impl ResourceProvisioner {
 
     pub(crate) fn delete_cf_key_group(&self, physical_id: &str) -> Result<(), String> {
         let mut accounts = self.cloudfront_state.write();
-        let state = accounts.entry("000000000000");
+        let state = accounts.entry(&self.account_id);
         state.key_groups.remove(physical_id);
         Ok(())
     }
@@ -398,7 +405,7 @@ impl ResourceProvisioner {
         };
 
         let mut accounts = self.cloudfront_state.write();
-        let state = accounts.entry("000000000000");
+        let state = accounts.entry(&self.account_id);
         // Use the function's ARN/name as the registry key so subsequent
         // operations (Get/Update/Delete) keyed by name resolve.
         state.functions.insert(name.clone(), func);
@@ -411,7 +418,7 @@ impl ResourceProvisioner {
 
     pub(crate) fn delete_cf_function(&self, physical_id: &str) -> Result<(), String> {
         let mut accounts = self.cloudfront_state.write();
-        let state = accounts.entry("000000000000");
+        let state = accounts.entry(&self.account_id);
         state.functions.remove(physical_id);
         Ok(())
     }
@@ -468,7 +475,7 @@ impl ResourceProvisioner {
         };
 
         let mut accounts = self.cloudfront_state.write();
-        let state = accounts.entry("000000000000");
+        let state = accounts.entry(&self.account_id);
         state.cache_policies.insert(id.clone(), cache_policy);
 
         Ok(ProvisionResult::new(id.clone()).with("Id", id))
@@ -476,7 +483,7 @@ impl ResourceProvisioner {
 
     pub(crate) fn delete_cf_cache_policy(&self, physical_id: &str) -> Result<(), String> {
         let mut accounts = self.cloudfront_state.write();
-        let state = accounts.entry("000000000000");
+        let state = accounts.entry(&self.account_id);
         state.cache_policies.remove(physical_id);
         Ok(())
     }
@@ -544,7 +551,7 @@ impl ResourceProvisioner {
         };
 
         let mut accounts = self.cloudfront_state.write();
-        let state = accounts.entry("000000000000");
+        let state = accounts.entry(&self.account_id);
         state.origin_request_policies.insert(id.clone(), policy);
 
         Ok(ProvisionResult::new(id.clone()).with("Id", id))
@@ -552,7 +559,7 @@ impl ResourceProvisioner {
 
     pub(crate) fn delete_cf_origin_request_policy(&self, physical_id: &str) -> Result<(), String> {
         let mut accounts = self.cloudfront_state.write();
-        let state = accounts.entry("000000000000");
+        let state = accounts.entry(&self.account_id);
         state.origin_request_policies.remove(physical_id);
         Ok(())
     }
@@ -595,7 +602,7 @@ impl ResourceProvisioner {
         };
 
         let mut accounts = self.cloudfront_state.write();
-        let state = accounts.entry("000000000000");
+        let state = accounts.entry(&self.account_id);
         state.response_headers_policies.insert(id.clone(), policy);
 
         Ok(ProvisionResult::new(id.clone()).with("Id", id))
@@ -606,7 +613,7 @@ impl ResourceProvisioner {
         physical_id: &str,
     ) -> Result<(), String> {
         let mut accounts = self.cloudfront_state.write();
-        let state = accounts.entry("000000000000");
+        let state = accounts.entry(&self.account_id);
         state.response_headers_policies.remove(physical_id);
         Ok(())
     }
@@ -657,7 +664,7 @@ impl ResourceProvisioner {
 
         let id = existing.physical_id.clone();
         let mut accounts = self.cloudfront_state.write();
-        let state = accounts.entry("000000000000");
+        let state = accounts.entry(&self.account_id);
         let p = state
             .cache_policies
             .get_mut(&id)
@@ -715,7 +722,7 @@ impl ResourceProvisioner {
 
         let id = existing.physical_id.clone();
         let mut accounts = self.cloudfront_state.write();
-        let state = accounts.entry("000000000000");
+        let state = accounts.entry(&self.account_id);
         let p = state
             .origin_request_policies
             .get_mut(&id)
@@ -763,7 +770,7 @@ impl ResourceProvisioner {
 
         let id = existing.physical_id.clone();
         let mut accounts = self.cloudfront_state.write();
-        let state = accounts.entry("000000000000");
+        let state = accounts.entry(&self.account_id);
         let p = state
             .response_headers_policies
             .get_mut(&id)
@@ -819,7 +826,7 @@ impl ResourceProvisioner {
 
         let id = existing.physical_id.clone();
         let mut accounts = self.cloudfront_state.write();
-        let state = accounts.entry("000000000000");
+        let state = accounts.entry(&self.account_id);
         let oac = state
             .origin_access_controls
             .get_mut(&id)
@@ -862,7 +869,7 @@ impl ResourceProvisioner {
 
         let id = existing.physical_id.clone();
         let mut accounts = self.cloudfront_state.write();
-        let state = accounts.entry("000000000000");
+        let state = accounts.entry(&self.account_id);
         let pk = state
             .public_keys
             .get_mut(&id)
@@ -910,7 +917,7 @@ impl ResourceProvisioner {
 
         let id = existing.physical_id.clone();
         let mut accounts = self.cloudfront_state.write();
-        let state = accounts.entry("000000000000");
+        let state = accounts.entry(&self.account_id);
         let kg = state
             .key_groups
             .get_mut(&id)
@@ -956,7 +963,7 @@ impl ResourceProvisioner {
         // back to replacement through the generic path.
         let id = existing.physical_id.clone();
         let mut accounts = self.cloudfront_state.write();
-        let state = accounts.entry("000000000000");
+        let state = accounts.entry(&self.account_id);
         let func = state
             .functions
             .get_mut(&id)
