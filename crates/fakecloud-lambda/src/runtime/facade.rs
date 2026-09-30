@@ -1234,6 +1234,28 @@ mod tests {
         format!("{}:$LATEST", arn(name))
     }
 
+    /// Wait until an invocation holds an instance of `pool` busy. A fixed
+    /// sleep races the spawned invoke under a loaded runner: it may not have
+    /// reserved its instance yet, or (with a short RIE delay) already be done.
+    async fn wait_until_busy(rt: &LambdaRuntime, pool: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let busy = rt
+                .instances
+                .read()
+                .get(pool)
+                .is_some_and(|p| p.iter().any(|e| e.busy.try_lock().is_err()));
+            if busy {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no instance of {pool} became busy"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     fn test_func(name: &str, sha: &str) -> LambdaFunction {
         serde_json::from_value(serde_json::json!({
             "function_name": name,
@@ -1563,7 +1585,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn iam_reset_retires_free_instances_and_spares_busy_ones() {
         let peak = Arc::new(AtomicUsize::new(0));
-        let endpoint = spawn_rie(Duration::from_millis(300), peak).await;
+        let endpoint = spawn_rie(Duration::from_secs(2), peak).await;
         let backend = CountingBackend::new(endpoint);
         let rt = runtime_with(backend.clone(), 2);
         let issuer = RecordingIssuer::new(chrono::Duration::hours(12));
@@ -1580,7 +1602,7 @@ mod tests {
             let func = func.clone();
             tokio::spawn(async move { rt.invoke(&func, b"{}", &[]).await })
         };
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        wait_until_busy(&rt, &key("reset")).await;
 
         // Marking is synchronous: from here on no invocation can land on
         // either instance, before any teardown has run.
@@ -1628,7 +1650,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn deploy_change_spares_busy_instance() {
         let peak = Arc::new(AtomicUsize::new(0));
-        let endpoint = spawn_rie(Duration::from_millis(300), peak).await;
+        let endpoint = spawn_rie(Duration::from_secs(2), peak).await;
         let backend = CountingBackend::new(endpoint);
         let rt = runtime_with(backend.clone(), 2);
 
@@ -1637,7 +1659,7 @@ mod tests {
             let rt = rt.clone();
             tokio::spawn(async move { rt.invoke(&old, b"{}", &[]).await })
         };
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        wait_until_busy(&rt, &key("busy")).await;
         rt.invoke(&test_func("busy", "sha-B"), b"{}", &[])
             .await
             .unwrap();
@@ -1801,7 +1823,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn deleting_a_version_spares_its_busy_instance() {
         let peak = Arc::new(AtomicUsize::new(0));
-        let endpoint = spawn_rie(Duration::from_millis(300), peak).await;
+        let endpoint = spawn_rie(Duration::from_secs(2), peak).await;
         let backend = CountingBackend::new(endpoint);
         let rt = runtime_with(backend.clone(), 2);
 
@@ -1814,7 +1836,7 @@ mod tests {
             let v1 = v1.clone();
             tokio::spawn(async move { rt.invoke(&v1, b"{}", &[]).await })
         };
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        wait_until_busy(&rt, &format!("{}:1", arn("delv"))).await;
 
         let detached = rt.retire_version(&arn("delv"), "1");
         assert!(detached.is_empty(), "the busy instance is not detached");
