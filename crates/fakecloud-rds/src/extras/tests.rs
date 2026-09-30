@@ -6855,7 +6855,7 @@ async fn restore_from_s3_rejects_bad_storage_encrypted_without_reserving() {
 #[tokio::test]
 async fn copying_an_unencrypted_cluster_snapshot_with_a_key_fails() {
     use fakecloud_core::service::AwsService;
-    let (_kms, svc) = svc_with_kms();
+    let (kms, svc) = svc_with_kms();
     handle_ok(
         &svc,
         "CreateDBCluster",
@@ -6889,6 +6889,11 @@ async fn copying_an_unencrypted_cluster_snapshot_with_a_key_fails() {
         Err(e) => e,
     };
     assert_eq!(err.code(), "InvalidParameterCombination");
+    // The rejected copy minted no AWS-managed key.
+    assert!(kms
+        .read()
+        .get("000000000000")
+        .is_none_or(|s| s.keys.is_empty()));
     assert!(svc
         .state_handle()
         .read()

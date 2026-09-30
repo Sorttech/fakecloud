@@ -1099,8 +1099,18 @@ impl DocDbService {
         let source = required_query_param(req, "SourceDBClusterSnapshotIdentifier")?;
         let target = required_query_param(req, "TargetDBClusterSnapshotIdentifier")?;
         // A copy of an encrypted snapshot that names a key is re-encrypted
-        // with it.
-        let copy_key = self.requested_kms_key(req);
+        // with it. Resolved only for an encrypted source: an unencrypted one
+        // with a key is rejected below, and must not mint an AWS-managed key.
+        let named_key = optional_query_param(req, "KmsKeyId").filter(|k| !k.is_empty());
+        let copy_key = if self.account_check(req, |st| {
+            st.cluster_snapshots
+                .get(&source)
+                .is_some_and(|s| s.storage_encrypted)
+        }) {
+            self.requested_kms_key(req)
+        } else {
+            None
+        };
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id);
         if st.cluster_snapshots.contains_key(&target) {
@@ -1116,16 +1126,16 @@ impl DocDbService {
         // returned"; `InvalidParameterCombination`, the RDS-family common
         // error for a parameter invalid only in combination, since none of
         // the modeled faults describes it).
+        if named_key.is_some() && !snap.storage_encrypted {
+            return Err(fault(
+                StatusCode::BAD_REQUEST,
+                "InvalidParameterCombination",
+                format!(
+                    "Cannot copy unencrypted DB cluster snapshot {source} with a KmsKeyId: an unencrypted DB cluster snapshot cannot be encrypted by copying it."
+                ),
+            ));
+        }
         if let Some(key) = copy_key {
-            if !snap.storage_encrypted {
-                return Err(fault(
-                    StatusCode::BAD_REQUEST,
-                    "InvalidParameterCombination",
-                    format!(
-                        "Cannot copy unencrypted DB cluster snapshot {source} with a KmsKeyId: an unencrypted DB cluster snapshot cannot be encrypted by copying it."
-                    ),
-                ));
-            }
             snap.kms_key_id = Some(key);
         }
         snap.source_db_cluster_snapshot_arn = Some(snap.db_cluster_snapshot_arn.clone());

@@ -721,11 +721,27 @@ impl RdsService {
                     .ok_or_else(|| missing("SourceDBClusterSnapshotIdentifier"))?;
                 let arn = cluster_snapshot_arn(region, &aid, &id);
                 // A copy of an encrypted snapshot that names a key is
-                // re-encrypted with it (reported as the key's ARN); resolved
-                // before the RDS lock.
-                let copy_key = get_param(req, "KmsKeyId")
-                    .filter(|k| !k.is_empty())
-                    .and_then(|k| self.storage_kms_key(Some(&k), &aid, region));
+                // re-encrypted with it (reported as the key's ARN). Resolved
+                // before the RDS lock, and only for an encrypted source: an
+                // unencrypted one with a key is rejected below, and must not
+                // mint an AWS-managed key on the way.
+                let named_key = get_param(req, "KmsKeyId").filter(|k| !k.is_empty());
+                let source_encrypted = named_key.is_some() && {
+                    let accounts = self.state_handle().read();
+                    let key = normalized_identifier(Some(source_id.clone()), "cluster-snapshot")
+                        .unwrap_or_else(|| source_id.clone());
+                    find_cluster_snapshot(
+                        &accounts,
+                        &aid,
+                        identifier_account(&source_id).as_deref(),
+                        &key,
+                    )
+                    .is_some_and(|e| e["StorageEncrypted"].as_bool() == Some(true))
+                };
+                let copy_key = named_key
+                    .as_deref()
+                    .filter(|_| source_encrypted)
+                    .and_then(|k| self.storage_kms_key(Some(k), &aid, region));
                 let mut accounts = write_state!();
                 // Guarded ARN reduction: AWS automated-snapshot ids carry
                 // a colon (`rds:mydb-...`), so only an `arn:` value is
@@ -763,7 +779,7 @@ impl RdsService {
                         })?;
                 // An unencrypted cluster snapshot cannot be encrypted by
                 // copying it: naming a key for one is an error.
-                if copy_key.is_some() && entry["StorageEncrypted"].as_bool() != Some(true) {
+                if named_key.is_some() && entry["StorageEncrypted"].as_bool() != Some(true) {
                     return Err(crate::service::service_helpers::copy_unencrypted_cluster_snapshot_with_key(
                         &source_id,
                     ));

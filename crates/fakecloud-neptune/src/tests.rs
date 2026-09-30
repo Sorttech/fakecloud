@@ -1511,7 +1511,7 @@ async fn aws_managed_rds_key_is_per_region() {
 /// succeeds unencrypted.
 #[tokio::test]
 async fn copying_an_unencrypted_cluster_snapshot_with_a_key_fails() {
-    let (_kms, hook) = fakecloud_kms::test_support::kms_hook("123456789012");
+    let (kms, hook) = fakecloud_kms::test_support::kms_hook("123456789012");
     let svc = service().with_kms_hook(hook);
     call(
         &svc,
@@ -1539,6 +1539,11 @@ async fn copying_an_unencrypted_cluster_snapshot_with_a_key_fails() {
     )
     .await;
     assert_eq!(err.code(), "InvalidParameterCombination");
+    // The rejected copy minted no AWS-managed key.
+    assert!(kms
+        .read()
+        .get("123456789012")
+        .is_none_or(|s| s.keys.is_empty()));
     let missing = call_err(
         &svc,
         "DescribeDBClusterSnapshots",
