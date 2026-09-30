@@ -304,6 +304,35 @@ impl CloudFrontService {
         };
 
         let mut state = self.state.write();
+        // A domain is unique across all of CloudFront. Moving it is limited
+        // to resources the caller owns: one held by another account's
+        // distribution or tenant cannot be taken over.
+        let held_elsewhere = state
+            .accounts
+            .iter()
+            .filter(|(owner, _)| **owner != req.account_id)
+            .any(|(_, a)| {
+                a.distribution_tenants
+                    .values()
+                    .any(|t| t.domains.iter().any(|d| d == &parsed.domain))
+                    || a.distributions.values().any(|d| {
+                        d.config
+                            .aliases
+                            .as_ref()
+                            .and_then(|al| al.items.as_ref())
+                            .is_some_and(|i| i.cname.iter().any(|c| c == &parsed.domain))
+                    })
+            });
+        if held_elsewhere {
+            return Err(aws_error(
+                StatusCode::FORBIDDEN,
+                "AccessDenied",
+                format!(
+                    "The domain {} is associated with a resource in another account",
+                    parsed.domain
+                ),
+            ));
+        }
         let account = state.entry(&req.account_id);
 
         // The target must exist, otherwise AWS returns EntityNotFound.
@@ -638,6 +667,55 @@ mod tests {
             .next()
             .unwrap()
             .to_string()
+    }
+
+    #[tokio::test]
+    async fn update_domain_association_cannot_take_a_domain_from_another_account() {
+        let svc = svc();
+        let owner = create_tenant(&svc, "owner-tenant", "taken.example.com").await;
+        // Account B creates its own tenant, then tries to move A's domain.
+        let mut create_b = req(
+            http::Method::POST,
+            "/2020-05-31/distribution-tenant",
+            &format!(
+                r#"<?xml version="1.0"?>
+<CreateDistributionTenantRequest xmlns="{NS}">
+  <DistributionId>E123</DistributionId>
+  <Name>b-tenant</Name>
+  <Domains><member><Domain>b.example.com</Domain></member></Domains>
+</CreateDistributionTenantRequest>"#
+            ),
+        );
+        create_b.account_id = "222222222222".into();
+        let created = svc.handle(create_b).await.unwrap();
+        let b_xml = body_str(&created);
+        let b_tenant = b_xml
+            .split("<Id>")
+            .nth(1)
+            .and_then(|r| r.split("</Id>").next())
+            .unwrap()
+            .to_string();
+
+        let mut steal = req(
+            http::Method::POST,
+            "/2020-05-31/domain-association",
+            &format!(
+                r#"<?xml version="1.0"?>
+<UpdateDomainAssociationRequest xmlns="{NS}">
+  <Domain>taken.example.com</Domain>
+  <TargetResource><DistributionTenantId>{b_tenant}</DistributionTenantId></TargetResource>
+</UpdateDomainAssociationRequest>"#
+            ),
+        );
+        steal.account_id = "222222222222".into();
+        let err = match svc.handle(steal).await {
+            Err(e) => e,
+            Ok(_) => panic!("another account's domain must not move"),
+        };
+        assert_eq!(err.code(), "AccessDenied");
+        assert!(get_tenant_xml(&svc, &owner)
+            .await
+            .contains("taken.example.com"));
     }
 
     async fn get_tenant_xml(svc: &CloudFrontService, id: &str) -> String {

@@ -94,50 +94,135 @@ pub fn parse_cloudfront_snapshot(
     serde_json::from_value(value)
 }
 
-/// Move the pre-v3 shared bucket into `default_account`.
+/// Split the pre-v3 shared bucket back out by owner.
 ///
-/// The API wrote the legacy account id into the ARNs it minted (and keyed
-/// tags, resource policies and realtime log configs by those ARNs), so the
-/// account segment of every CloudFront ARN in the bucket is rewritten to
-/// match its new owner. Entries already stored under `default_account` win
-/// over legacy ones with the same key.
+/// Each entry goes to the account its own CloudFront ARN names (the
+/// CloudFormation provisioner stamped the stack's account into the ARNs it
+/// minted even though it stored under the shared bucket), invalidations and
+/// monitoring subscriptions follow their distribution, tenant invalidations
+/// follow their tenant, and everything else (entries with no ARN, or ARNs the
+/// API minted under the legacy account) lands in `default_account`. The
+/// legacy account segment of every CloudFront ARN moved to `default_account`
+/// is rewritten to it, keys included (tags, resource policies and realtime
+/// log configs are keyed by ARN). Entries already stored under the owning
+/// account win over legacy ones with the same key.
 fn migrate_legacy_bucket(snapshot: &mut serde_json::Value, default_account: &str) {
-    if default_account == LEGACY_ACCOUNT {
-        return;
-    }
+    use serde_json::{Map, Value};
+
     let Some(accounts) = snapshot
         .pointer_mut("/accounts/accounts")
-        .and_then(serde_json::Value::as_object_mut)
+        .and_then(Value::as_object_mut)
     else {
         return;
     };
-    let Some(mut legacy) = accounts.remove(LEGACY_ACCOUNT) else {
+    let Some(Value::Object(legacy)) = accounts.remove(LEGACY_ACCOUNT) else {
         return;
     };
+
+    // Owner of every distribution and tenant, for the entries that only
+    // reference one by id.
+    let owners_by_id = |field: &str| -> BTreeMap<String, String> {
+        legacy
+            .get(field)
+            .and_then(Value::as_object)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|(id, e)| {
+                        let owner = e.get("arn").and_then(Value::as_str).and_then(arn_owner)?;
+                        Some((id.clone(), owner))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let distribution_owners = owners_by_id("distributions");
+    let tenant_owners = owners_by_id("distribution_tenants");
+
+    let owner_of = |field: &str, key: &str, entry: &Value| -> Option<String> {
+        if let Some(owner) = arn_owner(key) {
+            return Some(owner);
+        }
+        for arn_field in ["arn", "function_arn", "resource_arn"] {
+            if let Some(owner) = entry
+                .get(arn_field)
+                .and_then(Value::as_str)
+                .and_then(arn_owner)
+            {
+                return Some(owner);
+            }
+        }
+        match field {
+            "invalidations" => entry
+                .get("distribution_id")
+                .and_then(Value::as_str)
+                .and_then(|id| distribution_owners.get(id).cloned()),
+            "monitoring_subscriptions" => distribution_owners.get(key).cloned(),
+            "tenant_invalidations" => entry
+                .get("tenant_id")
+                .and_then(Value::as_str)
+                .and_then(|id| tenant_owners.get(id).cloned()),
+            _ => None,
+        }
+    };
+
     let from = format!(":cloudfront::{LEGACY_ACCOUNT}:");
     let to = format!(":cloudfront::{default_account}:");
-    rewrite_arn_account(&mut legacy, &from, &to);
-    let target = accounts
-        .entry(default_account.to_string())
-        .or_insert_with(|| serde_json::Value::Object(Default::default()));
-    let (Some(target_fields), serde_json::Value::Object(legacy_fields)) =
-        (target.as_object_mut(), legacy)
-    else {
-        return;
-    };
-    for (field, legacy_entries) in legacy_fields {
-        match (target_fields.get_mut(&field), legacy_entries) {
-            (Some(serde_json::Value::Object(existing)), serde_json::Value::Object(entries)) => {
-                for (key, entry) in entries {
-                    existing.entry(key).or_insert(entry);
-                }
-            }
-            (Some(_), _) => {}
-            (None, entries) => {
-                target_fields.insert(field, entries);
+    for (field, entries) in &legacy {
+        let Value::Object(entries) = entries else {
+            continue;
+        };
+        for (key, entry) in entries {
+            let owner = owner_of(field, key, entry).unwrap_or_else(|| default_account.to_string());
+            let (key, entry) = if owner == default_account {
+                let mut entry = entry.clone();
+                rewrite_arn_account(&mut entry, &from, &to);
+                (key.replace(&from, &to), entry)
+            } else {
+                (key.clone(), entry.clone())
+            };
+            let bucket = accounts
+                .entry(owner)
+                .or_insert_with(|| Value::Object(Map::new()));
+            let Some(bucket) = bucket.as_object_mut() else {
+                continue;
+            };
+            let slot = bucket
+                .entry(field.clone())
+                .or_insert_with(|| Value::Object(Map::new()));
+            if let Some(slot) = slot.as_object_mut() {
+                slot.entry(key).or_insert(entry);
             }
         }
     }
+    // Buckets created above only carry the fields they received entries for;
+    // give every bucket the full set of (possibly empty) maps.
+    accounts
+        .entry(default_account.to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    for bucket in accounts.values_mut() {
+        if let Some(bucket) = bucket.as_object_mut() {
+            for field in legacy.keys() {
+                bucket
+                    .entry(field.clone())
+                    .or_insert_with(|| Value::Object(Map::new()));
+            }
+        }
+    }
+}
+
+/// The owning account a CloudFront ARN names, unless it is the legacy shared
+/// account (which carries no ownership information).
+fn arn_owner(arn: &str) -> Option<String> {
+    let rest = arn.strip_prefix("arn:")?;
+    let mut parts = rest.splitn(5, ':');
+    let (_partition, service, _region, account) =
+        (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    (service == "cloudfront"
+        && account.len() == 12
+        && account.bytes().all(|b| b.is_ascii_digit())
+        && account != LEGACY_ACCOUNT)
+        .then(|| account.to_string())
 }
 
 fn rewrite_arn_account(value: &mut serde_json::Value, from: &str, to: &str) {
@@ -470,8 +555,7 @@ mod snapshot_migration_tests {
     #[test]
     fn a_v2_snapshot_merges_into_an_existing_default_account_bucket() {
         let bytes = v2_snapshot_bytes(|accounts| {
-            // The CloudFormation provisioner already stored under the stack's
-            // account before v3; keep what is there.
+            // An existing bucket for the default account keeps its entries.
             let dist = legacy_distribution("E2", "123456789012");
             accounts
                 .entry("123456789012")
@@ -485,6 +569,60 @@ mod snapshot_migration_tests {
         ids.sort();
         assert_eq!(ids, ["E1", "E2"]);
         assert_eq!(accounts.account_count(), 1);
+    }
+
+    #[test]
+    fn a_v2_snapshot_routes_stack_provisioned_entries_to_their_arn_account() {
+        let bytes = v2_snapshot_bytes(|accounts| {
+            // Pre-v3 CloudFormation stored in the shared bucket but minted
+            // ARNs under the stack's account.
+            let legacy = accounts.entry(LEGACY_ACCOUNT);
+            legacy
+                .distributions
+                .insert("E3".to_string(), legacy_distribution("E3", "222222222222"));
+            legacy.invalidations.insert(
+                "I1".to_string(),
+                StoredInvalidation {
+                    id: "I1".to_string(),
+                    distribution_id: "E3".to_string(),
+                    status: "Completed".to_string(),
+                    create_time: Utc::now(),
+                    batch: InvalidationBatch::default(),
+                },
+            );
+            legacy.tags.insert(
+                "arn:aws:cloudfront::222222222222:distribution/E3".to_string(),
+                vec![],
+            );
+        });
+        let parsed = parse_cloudfront_snapshot(&bytes, "123456789012").unwrap();
+        let accounts = parsed.accounts.unwrap();
+        let stack = accounts.get("222222222222").expect("stack account bucket");
+        assert!(stack.distributions.contains_key("E3"));
+        assert!(
+            stack.invalidations.contains_key("I1"),
+            "follows its distribution"
+        );
+        assert!(stack
+            .tags
+            .contains_key("arn:aws:cloudfront::222222222222:distribution/E3"));
+        let default = accounts.get("123456789012").unwrap();
+        assert!(default.distributions.contains_key("E1"));
+        assert!(!default.distributions.contains_key("E3"));
+
+        // Same split when the default account is the legacy one.
+        let parsed = parse_cloudfront_snapshot(&bytes, LEGACY_ACCOUNT).unwrap();
+        let accounts = parsed.accounts.unwrap();
+        assert!(accounts
+            .get("222222222222")
+            .unwrap()
+            .distributions
+            .contains_key("E3"));
+        assert!(accounts
+            .get(LEGACY_ACCOUNT)
+            .unwrap()
+            .distributions
+            .contains_key("E1"));
     }
 
     #[test]
