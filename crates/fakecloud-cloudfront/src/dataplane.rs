@@ -141,6 +141,13 @@ impl CloudFrontDataPlane {
             return next.run(req).await;
         };
 
+        // The viewer path with its dot segments resolved (RFC 3986), as
+        // CloudFront normalizes it: behavior matching, the default-root-object
+        // check and the origin fetch all use this one path, so `/assets/../x`
+        // is routed as `/x` and `/../x` cannot climb out of `OriginPath` --
+        // which, for a signed S3 origin, would read outside it as CloudFront.
+        let viewer_path = remove_dot_segments(req.uri().path());
+
         // Resolve the route under the read lock (owned snapshot so the guard drops
         // at the end of the block). The outer `Option` distinguishes "no
         // distribution serves this Host" (fall through) from "a distribution
@@ -153,7 +160,7 @@ impl CloudFrontDataPlane {
                     account_id,
                     account: accs.get(account_id),
                 };
-                resolve_route(&d.config, req.uri().path(), &self.s3_endpoint, &ctx)
+                resolve_route(&d.config, &viewer_path, &self.s3_endpoint, &ctx)
             })
         };
         let Some(route_opt) = matched else {
@@ -189,17 +196,10 @@ impl CloudFrontDataPlane {
                 Some(q) => format!("{object}?{q}"),
                 None => object.clone(),
             },
-            // Dot segments are resolved within the viewer's own path before
-            // the origin's `OriginPath` is prefixed, so `/../x` (or
-            // `/%2e%2e/x`) can never climb out of `OriginPath` -- which, for a
-            // signed S3 origin, would read objects as CloudFront outside it.
-            None => {
-                let path = remove_dot_segments(parts.uri.path());
-                match parts.uri.query() {
-                    Some(q) => format!("{path}?{q}"),
-                    None => path,
-                }
-            }
+            None => match parts.uri.query() {
+                Some(q) => format!("{viewer_path}?{q}"),
+                None => viewer_path.clone(),
+            },
         };
         let url = format!("{}{path_and_query}", route.upstream.url_base);
         trace!(%host, path = %parts.uri.path(), origin = %route.upstream.host_header, "CloudFront data plane: proxying");

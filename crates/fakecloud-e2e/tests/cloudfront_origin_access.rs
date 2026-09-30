@@ -16,9 +16,9 @@ mod helpers;
 
 use aws_credential_types::Credentials;
 use aws_sdk_cloudfront::types::{
-    CloudFrontOriginAccessIdentityConfig, CookiePreference, DefaultCacheBehavior,
-    DistributionConfig, ForwardedValues, Headers, ItemSelection, Origin, OriginAccessControlConfig,
-    OriginAccessControlOriginTypes, OriginAccessControlSigningBehaviors,
+    CacheBehavior, CacheBehaviors, CloudFrontOriginAccessIdentityConfig, CookiePreference,
+    DefaultCacheBehavior, DistributionConfig, ForwardedValues, Headers, ItemSelection, Origin,
+    OriginAccessControlConfig, OriginAccessControlOriginTypes, OriginAccessControlSigningBehaviors,
     OriginAccessControlSigningProtocols, Origins, S3OriginConfig, ViewerProtocolPolicy,
 };
 use helpers::TestServer;
@@ -465,8 +465,6 @@ async fn oac_reads_a_bucket_owned_by_another_account() {
 /// no client resolves the dot segments first.
 #[tokio::test]
 async fn viewer_dot_segments_stay_under_the_origin_path() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
     let server = strict_server().await;
     let s3 = server.s3_client().await;
     let cf = server.cloudfront_client().await;
@@ -486,26 +484,137 @@ async fn viewer_dot_segments_stay_under_the_origin_path() {
     assert_eq!(r.status(), 200);
     assert_eq!(r.text().await.unwrap(), "PUBLIC");
 
-    let addr = server.endpoint().trim_start_matches("http://").to_string();
     for path in [
         "/%2e%2e/index.html",
         "/../index.html",
         "/..\\index.html",
         "/a\\..\\..\\index.html",
     ] {
-        let mut sock = tokio::net::TcpStream::connect(&addr).await.unwrap();
-        let req = format!(
-            "GET {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-            dist.domain_name()
-        );
-        sock.write_all(req.as_bytes()).await.unwrap();
-        let mut resp = Vec::new();
-        sock.read_to_end(&mut resp).await.unwrap();
-        let resp = String::from_utf8_lossy(&resp);
+        let resp = raw_viewer_get(&server, dist.domain_name(), path).await;
         assert!(
             !resp.contains("PRIVATE"),
             "{path} escaped the origin path: {resp}"
         );
         assert!(resp.starts_with("HTTP/1.1 404"), "{path}: {resp}");
+    }
+}
+
+/// GET `path` through the distribution over a raw socket, so no client resolves
+/// dot segments or rewrites backslashes first. Returns the raw response text.
+async fn raw_viewer_get(server: &TestServer, host: &str, path: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let addr = server.endpoint().trim_start_matches("http://").to_string();
+    let mut sock = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    sock.write_all(req.as_bytes()).await.unwrap();
+    let mut resp = Vec::new();
+    sock.read_to_end(&mut resp).await.unwrap();
+    String::from_utf8_lossy(&resp).into_owned()
+}
+
+/// The cache behavior is chosen on the dot-resolved viewer path, the one that
+/// is fetched: `/assets/../index.html` is `/index.html`, which the default
+/// behavior serves from an unsigned origin -- not the signed `/assets/*` one.
+#[tokio::test]
+async fn cache_behavior_is_matched_on_the_resolved_viewer_path() {
+    let server = strict_server().await;
+    let s3 = server.s3_client().await;
+    let cf = server.cloudfront_client().await;
+    private_bucket(&s3).await;
+    s3.put_object()
+        .bucket(BUCKET)
+        .key("assets/app.js")
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(b"APPJS"))
+        .send()
+        .await
+        .expect("put_object");
+    let oac = create_oac(
+        &cf,
+        "oac-assets",
+        OriginAccessControlSigningBehaviors::Always,
+    )
+    .await;
+
+    let s3_origin = |id: &str, oac: Option<&str>| {
+        Origin::builder()
+            .id(id)
+            .domain_name(ORIGIN_DOMAIN)
+            .set_origin_access_control_id(oac.map(str::to_string))
+            .s3_origin_config(S3OriginConfig::builder().origin_access_identity("").build())
+            .build()
+            .unwrap()
+    };
+    let forwarded = || {
+        ForwardedValues::builder()
+            .query_string(false)
+            .cookies(
+                CookiePreference::builder()
+                    .forward(ItemSelection::None)
+                    .build()
+                    .unwrap(),
+            )
+            .headers(Headers::builder().quantity(0).build().unwrap())
+            .build()
+            .unwrap()
+    };
+    let config = DistributionConfig::builder()
+        .caller_reference(unique("behaviors"))
+        .comment("")
+        .enabled(true)
+        .origins(
+            Origins::builder()
+                .quantity(2)
+                .items(s3_origin("signed", Some(&oac)))
+                .items(s3_origin("anon", None))
+                .build()
+                .unwrap(),
+        )
+        .default_cache_behavior(
+            DefaultCacheBehavior::builder()
+                .target_origin_id("anon")
+                .viewer_protocol_policy(ViewerProtocolPolicy::AllowAll)
+                .forwarded_values(forwarded())
+                .min_ttl(0)
+                .build()
+                .unwrap(),
+        )
+        .cache_behaviors(
+            CacheBehaviors::builder()
+                .quantity(1)
+                .items(
+                    CacheBehavior::builder()
+                        .path_pattern("assets/*")
+                        .target_origin_id("signed")
+                        .viewer_protocol_policy(ViewerProtocolPolicy::AllowAll)
+                        .forwarded_values(forwarded())
+                        .min_ttl(0)
+                        .build()
+                        .unwrap(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .build()
+        .unwrap();
+    let dist = cf
+        .create_distribution()
+        .distribution_config(config)
+        .send()
+        .await
+        .expect("create_distribution")
+        .distribution()
+        .expect("distribution")
+        .clone();
+    put_policy(&s3, &oac_policy(dist.arn())).await;
+
+    let r = get_through(&server, &dist, "/assets/app.js").await;
+    assert_eq!(r.status(), 200, "the signed behavior serves its own path");
+    for path in ["/assets/../index.html", "/assets/%2e%2e/index.html"] {
+        let resp = raw_viewer_get(&server, dist.domain_name(), path).await;
+        assert!(
+            !resp.contains("PRIVATE"),
+            "{path} read through the signed origin: {resp}"
+        );
+        assert!(resp.starts_with("HTTP/1.1 403"), "{path}: {resp}");
     }
 }
