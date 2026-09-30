@@ -6848,3 +6848,145 @@ async fn restore_from_s3_rejects_bad_storage_encrypted_without_reserving() {
         .get("000000000000")
         .is_none_or(|s| !s.instances.contains_key("s3-restored")));
 }
+
+/// An unencrypted DB cluster snapshot cannot be encrypted by copying it: a
+/// copy naming a KmsKeyId fails and records nothing; an encrypted source's
+/// copy takes the named key (as its ARN).
+#[tokio::test]
+async fn copying_an_unencrypted_cluster_snapshot_with_a_key_fails() {
+    use fakecloud_core::service::AwsService;
+    let (_kms, svc) = svc_with_kms();
+    handle_ok(
+        &svc,
+        "CreateDBCluster",
+        &[
+            ("DBClusterIdentifier", "plain"),
+            ("Engine", "aurora-postgresql"),
+        ],
+    )
+    .await;
+    handle_ok(
+        &svc,
+        "CreateDBClusterSnapshot",
+        &[
+            ("DBClusterSnapshotIdentifier", "plain-snap"),
+            ("DBClusterIdentifier", "plain"),
+        ],
+    )
+    .await;
+    let err = match svc
+        .handle(req(
+            "CopyDBClusterSnapshot",
+            &[
+                ("SourceDBClusterSnapshotIdentifier", "plain-snap"),
+                ("TargetDBClusterSnapshotIdentifier", "keyed-copy"),
+                ("KmsKeyId", "alias/aws/rds"),
+            ],
+        ))
+        .await
+    {
+        Ok(_) => panic!("expected an error"),
+        Err(e) => e,
+    };
+    assert_eq!(err.code(), "InvalidParameterCombination");
+    assert!(svc
+        .state_handle()
+        .read()
+        .get("000000000000")
+        .and_then(|s| s.extras.get("cluster_snapshots"))
+        .is_none_or(|m| !m.contains_key("keyed-copy")));
+
+    // A plain copy of it is fine, and stays unencrypted.
+    let plain = handle_ok(
+        &svc,
+        "CopyDBClusterSnapshot",
+        &[
+            ("SourceDBClusterSnapshotIdentifier", "plain-snap"),
+            ("TargetDBClusterSnapshotIdentifier", "plain-copy"),
+        ],
+    )
+    .await;
+    assert_eq!(reported_kms_key(&plain), None);
+
+    // An encrypted source re-encrypts under the named key.
+    let enc = handle_ok(
+        &svc,
+        "CreateDBCluster",
+        &[
+            ("DBClusterIdentifier", "enc"),
+            ("Engine", "aurora-postgresql"),
+            ("StorageEncrypted", "true"),
+        ],
+    )
+    .await;
+    let key = reported_kms_key(&enc).unwrap();
+    handle_ok(
+        &svc,
+        "CreateDBClusterSnapshot",
+        &[
+            ("DBClusterSnapshotIdentifier", "enc-snap"),
+            ("DBClusterIdentifier", "enc"),
+        ],
+    )
+    .await;
+    let copy = handle_ok(
+        &svc,
+        "CopyDBClusterSnapshot",
+        &[
+            ("SourceDBClusterSnapshotIdentifier", "enc-snap"),
+            ("TargetDBClusterSnapshotIdentifier", "enc-copy"),
+            ("KmsKeyId", "alias/aws/rds"),
+        ],
+    )
+    .await;
+    assert_eq!(reported_kms_key(&copy).as_deref(), Some(key.as_str()));
+}
+
+/// Unlike a cluster snapshot, an unencrypted DB snapshot copied with a
+/// KmsKeyId becomes an ENCRYPTED copy under that key (reported as its ARN).
+#[tokio::test]
+async fn copying_an_unencrypted_db_snapshot_with_a_key_encrypts_the_copy() {
+    let (kms, svc) = svc_with_kms();
+    {
+        let mut accounts = svc.state_handle().write();
+        accounts.get_or_create("000000000000").snapshots.insert(
+            "plain-snap".to_string(),
+            local_snapshot("plain-snap", "my-db", "000000000000"),
+        );
+    }
+    let copy = handle_ok(
+        &svc,
+        "CopyDBSnapshot",
+        &[
+            ("SourceDBSnapshotIdentifier", "plain-snap"),
+            ("TargetDBSnapshotIdentifier", "enc-copy"),
+            ("KmsKeyId", "alias/aws/rds"),
+        ],
+    )
+    .await;
+    let key = reported_kms_key(&copy).expect("encrypted copy reports its key");
+    fakecloud_kms::test_support::assert_aws_managed_key(
+        &kms,
+        "000000000000",
+        "us-east-1",
+        &key,
+        "alias/aws/rds",
+    );
+    let stored = svc
+        .state_handle()
+        .read()
+        .get("000000000000")
+        .unwrap()
+        .snapshots["enc-copy"]
+        .clone();
+    assert!(stored.encrypted);
+    assert_eq!(stored.kms_key_id.as_deref(), Some(key.as_str()));
+    let source = svc
+        .state_handle()
+        .read()
+        .get("000000000000")
+        .unwrap()
+        .snapshots["plain-snap"]
+        .clone();
+    assert!(!source.encrypted);
+}

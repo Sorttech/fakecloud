@@ -272,6 +272,22 @@ pub(crate) fn collect_cloudwatch_log_types(req: &AwsRequest, list_name: &str) ->
     parse_string_member_list(req, &base)
 }
 
+/// Copying an unencrypted DB cluster snapshot with a `KmsKeyId`: AWS
+/// documents that "an error is returned" (you cannot encrypt a cluster
+/// snapshot by copying it). The error is RDS's common
+/// `InvalidParameterCombination`: the key is only invalid in combination with
+/// an unencrypted source, which none of the operation's modeled faults
+/// (`KMSKeyNotAccessibleFault` is for an unusable key) describe.
+pub(crate) fn copy_unencrypted_cluster_snapshot_with_key(source: &str) -> AwsServiceError {
+    AwsServiceError::aws_error(
+        StatusCode::BAD_REQUEST,
+        "InvalidParameterCombination",
+        format!(
+            "Cannot copy unencrypted DB cluster snapshot {source} with a KmsKeyId: an unencrypted DB cluster snapshot cannot be encrypted by copying it."
+        ),
+    )
+}
+
 pub(crate) fn parse_optional_bool(value: Option<&str>) -> Result<Option<bool>, AwsServiceError> {
     value
         .map(|raw| match raw {

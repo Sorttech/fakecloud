@@ -761,6 +761,13 @@ impl RdsService {
                                 format!("DBClusterSnapshot {source_id} not found."),
                             )
                         })?;
+                // An unencrypted cluster snapshot cannot be encrypted by
+                // copying it: naming a key for one is an error.
+                if copy_key.is_some() && entry["StorageEncrypted"].as_bool() != Some(true) {
+                    return Err(crate::service::service_helpers::copy_unencrypted_cluster_snapshot_with_key(
+                        &source_id,
+                    ));
+                }
                 let state = accounts.get_or_create(&aid);
                 let cluster = entry
                     .get("DBClusterIdentifier")
@@ -785,10 +792,8 @@ impl RdsService {
                     obj.insert("Status".to_string(), json!("available"));
                     obj.insert("SnapshotType".to_string(), json!("manual"));
                     obj.insert("SourceDBClusterSnapshotArn".to_string(), json!(source_arn));
-                    if obj.get("StorageEncrypted").and_then(Value::as_bool) == Some(true) {
-                        if let Some(key) = copy_key {
-                            obj.insert("KmsKeyId".to_string(), json!(key));
-                        }
+                    if let Some(key) = copy_key {
+                        obj.insert("KmsKeyId".to_string(), json!(key));
                     }
                     // The copy is created now; CopyDBSnapshot does the
                     // same, and a stale time sorts it wrongly in a

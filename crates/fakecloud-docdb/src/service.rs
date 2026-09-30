@@ -1111,12 +1111,24 @@ impl DocDbService {
             .get(&source)
             .cloned()
             .ok_or_else(|| snapshot_not_found(&source))?;
-        snap.source_db_cluster_snapshot_arn = Some(snap.db_cluster_snapshot_arn.clone());
-        if snap.storage_encrypted {
-            if let Some(key) = copy_key {
-                snap.kms_key_id = Some(key);
+        // An unencrypted cluster snapshot cannot be encrypted by copying it:
+        // naming a key for one is an error (AWS documents that "an error is
+        // returned"; `InvalidParameterCombination`, the RDS-family common
+        // error for a parameter invalid only in combination, since none of
+        // the modeled faults describes it).
+        if let Some(key) = copy_key {
+            if !snap.storage_encrypted {
+                return Err(fault(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidParameterCombination",
+                    format!(
+                        "Cannot copy unencrypted DB cluster snapshot {source} with a KmsKeyId: an unencrypted DB cluster snapshot cannot be encrypted by copying it."
+                    ),
+                ));
             }
+            snap.kms_key_id = Some(key);
         }
+        snap.source_db_cluster_snapshot_arn = Some(snap.db_cluster_snapshot_arn.clone());
         snap.db_cluster_snapshot_identifier = target.clone();
         snap.db_cluster_snapshot_arn =
             rds_arn(&req.region, &req.account_id, "cluster-snapshot", &target);

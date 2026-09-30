@@ -1435,3 +1435,61 @@ async fn aws_managed_rds_key_is_per_region() {
         "alias/aws/rds",
     );
 }
+
+/// An unencrypted cluster snapshot cannot be encrypted by copying it: a copy
+/// that names a KmsKeyId fails (and records nothing), while a plain copy
+/// succeeds unencrypted.
+#[tokio::test]
+async fn copying_an_unencrypted_cluster_snapshot_with_a_key_fails() {
+    let (_kms, hook) = fakecloud_kms::test_support::kms_hook("123456789012");
+    let svc = service().with_kms_hook(hook);
+    call(
+        &svc,
+        "CreateDBCluster",
+        &[("DBClusterIdentifier", "plain"), ("Engine", "docdb")],
+    )
+    .await;
+    call(
+        &svc,
+        "CreateDBClusterSnapshot",
+        &[
+            ("DBClusterSnapshotIdentifier", "plain-snap"),
+            ("DBClusterIdentifier", "plain"),
+        ],
+    )
+    .await;
+    let err = call_err(
+        &svc,
+        "CopyDBClusterSnapshot",
+        &[
+            ("SourceDBClusterSnapshotIdentifier", "plain-snap"),
+            ("TargetDBClusterSnapshotIdentifier", "keyed-copy"),
+            ("KmsKeyId", "alias/aws/rds"),
+        ],
+    )
+    .await;
+    assert_eq!(err.code(), "InvalidParameterCombination");
+    let missing = call_err(
+        &svc,
+        "DescribeDBClusterSnapshots",
+        &[("DBClusterSnapshotIdentifier", "keyed-copy")],
+    )
+    .await;
+    assert_eq!(missing.code(), "DBClusterSnapshotNotFoundFault");
+    let copy = body(
+        &call(
+            &svc,
+            "CopyDBClusterSnapshot",
+            &[
+                ("SourceDBClusterSnapshotIdentifier", "plain-snap"),
+                ("TargetDBClusterSnapshotIdentifier", "plain-copy"),
+            ],
+        )
+        .await,
+    );
+    assert!(
+        copy.contains("<StorageEncrypted>false</StorageEncrypted>"),
+        "{copy}"
+    );
+    assert_eq!(reported_key(&copy), None);
+}
