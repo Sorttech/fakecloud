@@ -708,19 +708,34 @@ fn remove_dot_segments(path: &str) -> String {
     format!("/{}", out.join("/"))
 }
 
-/// The origin-form request target (`/path?query`) of an assembled origin URL,
-/// percent-encoded the way an HTTP client sends it: `OriginPath` and a custom
-/// error `ResponsePagePath` are joined as configured, so they may hold bytes
-/// (a space, say) a request line cannot carry raw. `None` only for a URL no
-/// client could send.
+/// The origin-form request target (`/path?query`) of an assembled origin URL.
+///
+/// `OriginPath` and a custom error `ResponsePagePath` are joined as configured,
+/// so they may hold bytes (a space, say) a request line cannot carry raw; those
+/// are percent-encoded, as an HTTP client would. Nothing else is rewritten: the
+/// target is not re-parsed as a URL, so no `.`/`..` segment is resolved and a
+/// `\` is sent as `%5C` (a literal key byte), never treated as `/`. The viewer
+/// path's dot segments were already resolved before `OriginPath` was prefixed
+/// (see [`remove_dot_segments`]); resolving again after the join is what would
+/// let a viewer climb out of `OriginPath`. `None` for a URL with no path.
 fn local_path_and_query(url: &str) -> Option<String> {
-    let parsed = reqwest::Url::parse(url).ok()?;
-    let mut target = parsed.path().to_string();
-    if let Some(query) = parsed.query() {
-        target.push('?');
-        target.push_str(query);
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let target = &after_scheme[after_scheme.find('/')?..];
+    let mut out = String::with_capacity(target.len());
+    for b in target.bytes() {
+        let keep = b.is_ascii_graphic()
+            && !matches!(
+                b,
+                b'"' | b'<' | b'>' | b'\\' | b'^' | b'`' | b'{' | b'|' | b'}'
+            );
+        if keep {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
     }
-    Some(target)
+    out.parse::<http::uri::PathAndQuery>().ok()?;
+    Some(out)
 }
 
 /// Fetch `url` from an S3 origin this process serves, in-process through the
@@ -1574,5 +1589,21 @@ mod tests {
             local_path_and_query(&joined).as_deref(),
             Some("/public/private.txt")
         );
+    }
+
+    #[test]
+    fn backslash_is_a_key_byte_not_a_separator() {
+        // `\` never becomes `/`, so `..\x` cannot collapse a segment after
+        // the OriginPath join; it is sent as a literal key byte.
+        assert_eq!(
+            local_path_and_query("http://127.0.0.1:4566/public/..\\private.txt").as_deref(),
+            Some("/public/..%5Cprivate.txt")
+        );
+        assert_eq!(
+            local_path_and_query("http://127.0.0.1:4566/public/a/../b").as_deref(),
+            Some("/public/a/../b"),
+            "the joined target is not re-resolved"
+        );
+        assert_eq!(remove_dot_segments("/..\\private.txt"), "/..\\private.txt");
     }
 }

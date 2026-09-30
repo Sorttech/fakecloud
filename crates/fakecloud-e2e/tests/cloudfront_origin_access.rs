@@ -487,7 +487,12 @@ async fn viewer_dot_segments_stay_under_the_origin_path() {
     assert_eq!(r.text().await.unwrap(), "PUBLIC");
 
     let addr = server.endpoint().trim_start_matches("http://").to_string();
-    for path in ["/%2e%2e/index.html", "/../index.html"] {
+    for path in [
+        "/%2e%2e/index.html",
+        "/../index.html",
+        "/..\\index.html",
+        "/a\\..\\..\\index.html",
+    ] {
         let mut sock = tokio::net::TcpStream::connect(&addr).await.unwrap();
         let req = format!(
             "GET {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
