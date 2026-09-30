@@ -1133,3 +1133,72 @@ async fn kinesis_channel_resolution_is_region_tolerant() {
     .await;
     assert_eq!(status, 200, "delete detached stream: {dropped}");
 }
+
+#[test_action(
+    "kinesis",
+    "UpdateStreamRecordDistributionStrategy",
+    checksum = "48f0bdcf"
+)]
+#[tokio::test]
+async fn kinesis_update_stream_record_distribution_strategy() {
+    let server = TestServer::start().await;
+
+    let (status, _) = channel_op(
+        &server,
+        "CreateStream",
+        json!({
+            "StreamName": "rds-stream",
+            "StreamModeDetails": { "StreamMode": "ON_DEMAND" },
+        }),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (_, summary) = channel_op(
+        &server,
+        "DescribeStreamSummary",
+        json!({ "StreamName": "rds-stream" }),
+    )
+    .await;
+    let summary = &summary["StreamDescriptionSummary"];
+    assert_eq!(summary["RecordDistributionStrategy"], "USER_PARTITION_KEY");
+    let arn = summary["StreamARN"].as_str().unwrap().to_string();
+
+    let (status, _) = channel_op(
+        &server,
+        "UpdateStreamRecordDistributionStrategy",
+        json!({ "StreamARN": arn, "RecordDistributionStrategy": "AUTO" }),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (_, summary) = channel_op(
+        &server,
+        "DescribeStreamSummary",
+        json!({ "StreamName": "rds-stream" }),
+    )
+    .await;
+    assert_eq!(
+        summary["StreamDescriptionSummary"]["RecordDistributionStrategy"],
+        "AUTO"
+    );
+
+    // AUTO makes PartitionKey optional.
+    let (status, put) = channel_op(
+        &server,
+        "PutRecord",
+        json!({ "StreamName": "rds-stream", "Data": "aGk=" }),
+    )
+    .await;
+    assert_eq!(status, 200, "{put}");
+
+    let (status, err) = channel_op(
+        &server,
+        "UpdateStreamRecordDistributionStrategy",
+        json!({ "StreamARN": arn, "RecordDistributionStrategy": "BOGUS" }),
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert!(err["__type"]
+        .as_str()
+        .unwrap()
+        .contains("ValidationException"));
+}

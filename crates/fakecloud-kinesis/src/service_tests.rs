@@ -54,6 +54,8 @@ fn test_stream(name: &str) -> KinesisStream {
         enhanced_metrics: Vec::new(),
         warm_throughput_mibps: None,
         max_record_size_kib: None,
+        record_distribution_strategy: crate::state::default_record_distribution_strategy(),
+        auto_distribution_cursor: 0,
     }
 }
 
@@ -3379,4 +3381,223 @@ fn china_region_stream_arn_uses_the_aws_cn_partition() {
         .unwrap();
     let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
     assert_eq!(body["StreamDescriptionSummary"]["StreamName"], "cn-s");
+}
+
+// ── Record distribution strategy ─────────────────────────────────
+
+fn create_on_demand_stream(svc: &KinesisService, name: &str, strategy: Option<&str>) {
+    let mut body = json!({
+        "StreamName": name,
+        "StreamModeDetails": { "StreamMode": "ON_DEMAND" }
+    });
+    if let Some(strategy) = strategy {
+        body["RecordDistributionStrategy"] = json!(strategy);
+    }
+    svc.create_stream(&request("CreateStream", body)).unwrap();
+}
+
+fn summary(svc: &KinesisService, name: &str) -> Value {
+    json_response(
+        svc.describe_stream_summary(&request(
+            "DescribeStreamSummary",
+            json!({ "StreamName": name }),
+        ))
+        .unwrap(),
+    )["StreamDescriptionSummary"]
+        .clone()
+}
+
+#[test]
+fn record_distribution_strategy_defaults_and_is_on_demand_only_in_summary() {
+    let (svc, _) = make_service();
+    create_on_demand_stream(&svc, "od", None);
+    create_stream_action(&svc, "prov", 1);
+    assert_eq!(
+        summary(&svc, "od")["RecordDistributionStrategy"],
+        "USER_PARTITION_KEY"
+    );
+    assert!(summary(&svc, "prov")
+        .get("RecordDistributionStrategy")
+        .is_none());
+
+    create_on_demand_stream(&svc, "auto", Some("AUTO"));
+    assert_eq!(summary(&svc, "auto")["RecordDistributionStrategy"], "AUTO");
+}
+
+#[test]
+fn create_stream_rejects_auto_on_provisioned_and_bad_enum() {
+    let (svc, _) = make_service();
+    let err = svc
+        .create_stream(&request(
+            "CreateStream",
+            json!({ "StreamName": "p", "ShardCount": 1, "RecordDistributionStrategy": "AUTO" }),
+        ))
+        .err()
+        .expect("request should fail");
+    assert_eq!(err.code(), "InvalidArgumentException");
+    let err = svc
+        .create_stream(&request(
+            "CreateStream",
+            json!({
+                "StreamName": "p",
+                "StreamModeDetails": { "StreamMode": "ON_DEMAND" },
+                "RecordDistributionStrategy": "RANDOM"
+            }),
+        ))
+        .err()
+        .expect("request should fail");
+    assert_eq!(err.code(), "ValidationException");
+}
+
+#[test]
+fn update_record_distribution_strategy_round_trips_and_validates() {
+    let (svc, state) = make_service();
+    create_on_demand_stream(&svc, "od", None);
+    create_stream_action(&svc, "prov", 1);
+    let od_arn = state.read().default_ref().stream_arn("us-east-1", "od");
+    let prov_arn = state.read().default_ref().stream_arn("us-east-1", "prov");
+
+    svc.update_stream_record_distribution_strategy(&request(
+        "UpdateStreamRecordDistributionStrategy",
+        json!({ "StreamARN": od_arn, "RecordDistributionStrategy": "AUTO" }),
+    ))
+    .unwrap();
+    assert_eq!(summary(&svc, "od")["RecordDistributionStrategy"], "AUTO");
+
+    // AUTO on a provisioned stream is rejected.
+    let err = svc
+        .update_stream_record_distribution_strategy(&request(
+            "UpdateStreamRecordDistributionStrategy",
+            json!({ "StreamARN": prov_arn, "RecordDistributionStrategy": "AUTO" }),
+        ))
+        .err()
+        .expect("request should fail");
+    assert_eq!(err.code(), "InvalidArgumentException");
+
+    // Unknown stream.
+    let err = svc
+        .update_stream_record_distribution_strategy(&request(
+            "UpdateStreamRecordDistributionStrategy",
+            json!({
+                "StreamARN": "arn:aws:kinesis:us-east-1:123456789012:stream/ghost",
+                "RecordDistributionStrategy": "AUTO"
+            }),
+        ))
+        .err()
+        .expect("request should fail");
+    assert_eq!(err.code(), "ResourceNotFoundException");
+
+    // An AUTO stream cannot leave on-demand mode.
+    let err = svc
+        .update_stream_mode(&request(
+            "UpdateStreamMode",
+            json!({ "StreamARN": od_arn, "StreamModeDetails": { "StreamMode": "PROVISIONED" } }),
+        ))
+        .err()
+        .expect("request should fail");
+    assert_eq!(err.code(), "InvalidArgumentException");
+
+    svc.update_stream_record_distribution_strategy(&request(
+        "UpdateStreamRecordDistributionStrategy",
+        json!({ "StreamARN": od_arn, "RecordDistributionStrategy": "USER_PARTITION_KEY" }),
+    ))
+    .unwrap();
+    assert_eq!(
+        summary(&svc, "od")["RecordDistributionStrategy"],
+        "USER_PARTITION_KEY"
+    );
+}
+
+#[test]
+fn auto_strategy_ignores_partition_key_and_spreads_records() {
+    let (svc, _) = make_service();
+    create_on_demand_stream(&svc, "auto", Some("AUTO"));
+    create_on_demand_stream(&svc, "keyed", None);
+
+    // Under AUTO the same partition key (and even an explicit hash key) no
+    // longer pins every record to one shard.
+    let mut shards = std::collections::BTreeSet::new();
+    for _ in 0..8 {
+        let resp = json_response(
+            svc.put_record(&request(
+                "PutRecord",
+                json!({
+                    "StreamName": "auto",
+                    "Data": "aGk=",
+                    "PartitionKey": "same",
+                    "ExplicitHashKey": "0"
+                }),
+            ))
+            .unwrap(),
+        );
+        shards.insert(resp["ShardId"].as_str().unwrap().to_string());
+    }
+    assert_eq!(shards.len(), 4, "AUTO spreads across every open shard");
+
+    // PartitionKey is optional under AUTO...
+    let resp = json_response(
+        svc.put_records(&request(
+            "PutRecords",
+            json!({ "StreamName": "auto", "Records": [{ "Data": "aGk=" }] }),
+        ))
+        .unwrap(),
+    );
+    assert_eq!(resp["FailedRecordCount"], 0);
+    svc.put_record(&request(
+        "PutRecord",
+        json!({ "StreamName": "auto", "Data": "aGk=" }),
+    ))
+    .unwrap();
+
+    // ...but still required under USER_PARTITION_KEY.
+    let err = svc
+        .put_record(&request(
+            "PutRecord",
+            json!({ "StreamName": "keyed", "Data": "aGk=" }),
+        ))
+        .err()
+        .expect("request should fail");
+    assert_eq!(err.code(), "InvalidArgumentException");
+    let resp = json_response(
+        svc.put_records(&request(
+            "PutRecords",
+            json!({ "StreamName": "keyed", "Records": [{ "Data": "aGk=" }] }),
+        ))
+        .unwrap(),
+    );
+    assert_eq!(resp["FailedRecordCount"], 1);
+}
+
+#[test]
+fn record_without_partition_key_omits_it_on_read() {
+    let (svc, _) = make_service();
+    create_on_demand_stream(&svc, "auto", Some("AUTO"));
+    let put = json_response(
+        svc.put_record(&request(
+            "PutRecord",
+            json!({ "StreamName": "auto", "Data": "aGk=" }),
+        ))
+        .unwrap(),
+    );
+    let iterator = json_response(
+        svc.get_shard_iterator(&request(
+            "GetShardIterator",
+            json!({
+                "StreamName": "auto",
+                "ShardId": put["ShardId"],
+                "ShardIteratorType": "TRIM_HORIZON"
+            }),
+        ))
+        .unwrap(),
+    );
+    let records = json_response(
+        svc.get_records(&request(
+            "GetRecords",
+            json!({ "ShardIterator": iterator["ShardIterator"] }),
+        ))
+        .unwrap(),
+    );
+    let record = &records["Records"][0];
+    assert_eq!(record["Data"], "aGk=");
+    assert!(record.get("PartitionKey").is_none());
 }

@@ -69,6 +69,7 @@ pub(crate) fn is_mutating_action(action: &str) -> bool {
             | "DisableEnhancedMonitoring"
             | "UpdateAccountSettings"
             | "UpdateStreamMode"
+            | "UpdateStreamRecordDistributionStrategy"
             | "UpdateStreamWarmThroughput"
             | "UpdateMaxRecordSize"
             | "RegisterStreamConsumer"
@@ -204,11 +205,21 @@ pub fn build_stream_shards(shard_count: i32) -> Vec<KinesisShard> {
         .collect()
 }
 
-pub(crate) fn require_partition_key(body: &Value) -> Result<&str, AwsServiceError> {
-    let partition_key = body["PartitionKey"]
+/// PartitionKey for a PutRecord call. It is required under the default
+/// `USER_PARTITION_KEY` strategy; under `AUTO` it is optional (an omitted key
+/// is recorded as empty and never returned) and ignored for placement.
+pub(crate) fn require_partition_key<'a>(
+    body: &'a Value,
+    stream: &KinesisStream,
+) -> Result<&'a str, AwsServiceError> {
+    let supplied = body["PartitionKey"]
         .as_str()
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| invalid_argument("PartitionKey is required"))?;
+        .filter(|value| !value.is_empty());
+    let partition_key = match supplied {
+        Some(key) => key,
+        None if stream.record_distribution_strategy == RECORD_DISTRIBUTION_AUTO => return Ok(""),
+        None => return Err(invalid_argument("PartitionKey is required")),
+    };
     if partition_key.chars().count() > MAX_PARTITION_KEY_CHARS {
         return Err(validation_exception(format!(
             "1 validation error detected: Value at 'partitionKey' failed to satisfy \
@@ -351,9 +362,42 @@ pub(crate) fn select_shard_mut<'a>(
     if stream.shards.is_empty() {
         return Err(invalid_argument("Stream has no shards to route to"));
     }
+    // Under the AUTO record distribution strategy the service places records
+    // itself and ignores both PartitionKey and ExplicitHashKey; spread them
+    // evenly by rotating through the open shards.
+    if stream.record_distribution_strategy == RECORD_DISTRIBUTION_AUTO {
+        let open: Vec<usize> = stream
+            .shards
+            .iter()
+            .enumerate()
+            .filter(|(_, shard)| shard.is_open)
+            .map(|(idx, _)| idx)
+            .collect();
+        let idx = if open.is_empty() {
+            stream.shards.len() - 1
+        } else {
+            open[(stream.auto_distribution_cursor % open.len() as u64) as usize]
+        };
+        stream.auto_distribution_cursor = stream.auto_distribution_cursor.wrapping_add(1);
+        return Ok(&mut stream.shards[idx]);
+    }
     let hash = routing_hash(partition_key, explicit_hash_key)?;
     let idx = select_shard_index_for_hash(stream, hash);
     Ok(&mut stream.shards[idx])
+}
+
+/// Wire shape of a stored record for GetRecords / SubscribeToShard.
+/// `PartitionKey` is omitted when an AUTO-strategy producer supplied none.
+pub(crate) fn record_to_json(record: &KinesisRecord) -> Value {
+    let mut value = json!({
+        "ApproximateArrivalTimestamp": record.approximate_arrival_timestamp.timestamp_millis() as f64 / 1000.0,
+        "Data": base64::engine::general_purpose::STANDARD.encode(&record.data),
+        "SequenceNumber": record.sequence_number,
+    });
+    if !record.partition_key.is_empty() {
+        value["PartitionKey"] = json!(record.partition_key);
+    }
+    value
 }
 
 pub(crate) fn append_record(
@@ -381,10 +425,15 @@ pub(crate) fn put_records_entry(
     stream: &mut KinesisStream,
     entry: &Value,
 ) -> Result<(String, String), String> {
-    let partition_key = entry["PartitionKey"]
+    let auto = stream.record_distribution_strategy == RECORD_DISTRIBUTION_AUTO;
+    let partition_key = match entry["PartitionKey"]
         .as_str()
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| "PartitionKey is required".to_string())?;
+    {
+        Some(key) => key,
+        None if auto => "",
+        None => return Err("PartitionKey is required".to_string()),
+    };
     if partition_key.chars().count() > MAX_PARTITION_KEY_CHARS {
         return Err(format!(
             "PartitionKey must have length less than or equal to {MAX_PARTITION_KEY_CHARS}"
@@ -617,6 +666,28 @@ pub(crate) fn invalid_argument(message: impl Into<String>) -> AwsServiceError {
 /// AWS returns `ValidationException` (HTTP 400) for constraint violations the
 /// front end rejects before the operation runs — an oversized record payload,
 /// too-long partition key, or a PutRecords batch over its count/size limits.
+/// Validate a `RecordDistributionStrategy` value against the model enum.
+pub(crate) fn parse_record_distribution_strategy(
+    value: &Value,
+) -> Result<Option<String>, AwsServiceError> {
+    let Some(raw) = value.as_str() else {
+        return Ok(None);
+    };
+    if raw != RECORD_DISTRIBUTION_AUTO && raw != RECORD_DISTRIBUTION_USER_PARTITION_KEY {
+        return Err(validation_exception(format!(
+            "1 validation error detected: Value '{raw}' at 'recordDistributionStrategy' failed \
+             to satisfy constraint: Member must satisfy enum value set: [AUTO, USER_PARTITION_KEY]"
+        )));
+    }
+    Ok(Some(raw.to_string()))
+}
+
+pub(crate) fn auto_requires_on_demand() -> AwsServiceError {
+    invalid_argument(
+        "The AUTO record distribution strategy is only supported for streams in ON_DEMAND capacity mode",
+    )
+}
+
 pub(crate) fn validation_exception(message: impl Into<String>) -> AwsServiceError {
     AwsServiceError::aws_error(StatusCode::BAD_REQUEST, "ValidationException", message)
 }

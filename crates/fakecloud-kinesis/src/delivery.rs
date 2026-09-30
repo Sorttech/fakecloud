@@ -205,6 +205,8 @@ mod tests {
             enhanced_metrics: Vec::new(),
             warm_throughput_mibps: None,
             max_record_size_kib: None,
+            record_distribution_strategy: crate::state::default_record_distribution_strategy(),
+            auto_distribution_cursor: 0,
         }
     }
 

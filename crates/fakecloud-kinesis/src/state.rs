@@ -67,6 +67,21 @@ pub struct KinesisStream {
     pub enhanced_metrics: Vec<String>,
     pub warm_throughput_mibps: Option<i64>,
     pub max_record_size_kib: Option<i64>,
+    /// `USER_PARTITION_KEY` (default) or `AUTO`. `AUTO` is only valid on
+    /// ON_DEMAND streams; it makes PutRecord(s) ignore PartitionKey and
+    /// ExplicitHashKey and spread records evenly across the open shards.
+    #[serde(default = "default_record_distribution_strategy")]
+    pub record_distribution_strategy: String,
+    /// Round-robin cursor used to place records under the `AUTO` strategy.
+    #[serde(default)]
+    pub auto_distribution_cursor: u64,
+}
+
+pub const RECORD_DISTRIBUTION_USER_PARTITION_KEY: &str = "USER_PARTITION_KEY";
+pub const RECORD_DISTRIBUTION_AUTO: &str = "AUTO";
+
+pub fn default_record_distribution_strategy() -> String {
+    RECORD_DISTRIBUTION_USER_PARTITION_KEY.to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -583,6 +598,8 @@ mod tests {
             enhanced_metrics: Vec::new(),
             warm_throughput_mibps: None,
             max_record_size_kib: None,
+            record_distribution_strategy: crate::state::default_record_distribution_strategy(),
+            auto_distribution_cursor: 0,
         };
         state.streams.insert(name.to_string(), stream);
     }
@@ -690,6 +707,8 @@ mod tests {
             enhanced_metrics: Vec::new(),
             warm_throughput_mibps: None,
             max_record_size_kib: None,
+            record_distribution_strategy: crate::state::default_record_distribution_strategy(),
+            auto_distribution_cursor: 0,
         };
         state.streams.insert("s".to_string(), stream);
 
