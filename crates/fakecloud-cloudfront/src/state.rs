@@ -316,6 +316,28 @@ impl CloudFrontAccounts {
         }
     }
 
+    /// Whether `domain` is an alternate domain name of any distribution, or a
+    /// domain of any distribution tenant, in any account, other than the
+    /// resource `owner` names.
+    ///
+    /// Domains are unique across all of CloudFront and are matched
+    /// case-insensitively, as the data plane routes `Host` headers.
+    pub(crate) fn domain_in_use(&self, domain: &str, owner: DomainOwner<'_>) -> bool {
+        self.accounts.values().any(|a| {
+            a.distributions.values().any(|d| {
+                owner != DomainOwner::Distribution(&d.id)
+                    && d.config
+                        .aliases
+                        .as_ref()
+                        .and_then(|al| al.items.as_ref())
+                        .is_some_and(|i| i.cname.iter().any(|c| c.eq_ignore_ascii_case(domain)))
+            }) || a.distribution_tenants.values().any(|t| {
+                owner != DomainOwner::Tenant(&t.id)
+                    && t.domains.iter().any(|d| d.eq_ignore_ascii_case(domain))
+            })
+        })
+    }
+
     /// Iterate every stored distribution across all accounts, paired with the
     /// owning account id. Used by the `/_fakecloud/cloudfront/distributions`
     /// introspection route (and, later, the data-plane supervisor).
@@ -324,6 +346,16 @@ impl CloudFrontAccounts {
             state.distributions.values().map(move |d| (account_id, d))
         })
     }
+}
+
+/// The resource a domain is being attached to, excluded from
+/// [`CloudFrontAccounts::domain_in_use`] so re-submitting its own domains is
+/// not a conflict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DomainOwner<'a> {
+    New,
+    Distribution(&'a str),
+    Tenant(&'a str),
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]

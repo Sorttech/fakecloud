@@ -312,16 +312,21 @@ impl CloudFrontService {
             .iter()
             .filter(|(owner, _)| **owner != req.account_id)
             .any(|(_, a)| {
-                a.distribution_tenants
-                    .values()
-                    .any(|t| t.domains.iter().any(|d| d == &parsed.domain))
-                    || a.distributions.values().any(|d| {
-                        d.config
-                            .aliases
-                            .as_ref()
-                            .and_then(|al| al.items.as_ref())
-                            .is_some_and(|i| i.cname.iter().any(|c| c == &parsed.domain))
-                    })
+                a.distribution_tenants.values().any(|t| {
+                    t.domains
+                        .iter()
+                        .any(|d| d.eq_ignore_ascii_case(&parsed.domain))
+                }) || a.distributions.values().any(|d| {
+                    d.config
+                        .aliases
+                        .as_ref()
+                        .and_then(|al| al.items.as_ref())
+                        .is_some_and(|i| {
+                            i.cname
+                                .iter()
+                                .any(|c| c.eq_ignore_ascii_case(&parsed.domain))
+                        })
+                })
             });
         if held_elsewhere {
             return Err(aws_error(
@@ -352,7 +357,8 @@ impl CloudFrontService {
         // owns it, then attach it to the target. Domains are unique across
         // resources, so a plain move is correct.
         for t in account.distribution_tenants.values_mut() {
-            t.domains.retain(|d| d != &parsed.domain);
+            t.domains
+                .retain(|d| !d.eq_ignore_ascii_case(&parsed.domain));
         }
         for d in account.distributions.values_mut() {
             remove_alias(&mut d.config, &parsed.domain);
@@ -529,7 +535,7 @@ fn add_alias(config: &mut crate::model::DistributionConfig, domain: &str) {
 fn remove_alias(config: &mut crate::model::DistributionConfig, domain: &str) {
     if let Some(aliases) = config.aliases.as_mut() {
         if let Some(items) = aliases.items.as_mut() {
-            items.cname.retain(|c| c != domain);
+            items.cname.retain(|c| !c.eq_ignore_ascii_case(domain));
             aliases.quantity = items.cname.len() as i32;
         }
     }
@@ -667,6 +673,30 @@ mod tests {
             .next()
             .unwrap()
             .to_string()
+    }
+
+    #[tokio::test]
+    async fn tenant_domains_are_unique_across_accounts() {
+        let svc = svc();
+        create_tenant(&svc, "owner", "dup.example.com").await;
+        let mut create_b = req(
+            http::Method::POST,
+            "/2020-05-31/distribution-tenant",
+            &format!(
+                r#"<?xml version="1.0"?>
+<CreateDistributionTenantRequest xmlns="{NS}">
+  <DistributionId>E123</DistributionId>
+  <Name>b-tenant</Name>
+  <Domains><member><Domain>DUP.example.com</Domain></member></Domains>
+</CreateDistributionTenantRequest>"#
+            ),
+        );
+        create_b.account_id = "222222222222".into();
+        let err = match svc.handle(create_b).await {
+            Err(e) => e,
+            Ok(_) => panic!("domain held by another account's tenant"),
+        };
+        assert_eq!(err.code(), "CNAMEAlreadyExists");
     }
 
     #[tokio::test]

@@ -20,7 +20,7 @@ use crate::model::{
 };
 use crate::router::{route, Route};
 use crate::state::{
-    CloudFrontAccounts, CloudFrontSnapshot, SharedCloudFrontState, StoredDistribution,
+    CloudFrontAccounts, CloudFrontSnapshot, DomainOwner, SharedCloudFrontState, StoredDistribution,
     StoredInvalidation, Tag, CLOUDFRONT_SNAPSHOT_SCHEMA_VERSION,
 };
 use crate::validate::validate_distribution_config;
@@ -703,6 +703,7 @@ impl CloudFrontService {
         validate_distribution_config(&config)?;
 
         let mut state = self.state.write();
+        reject_domains_in_use(&state, config_aliases(&config), DomainOwner::New)?;
         let id = state.unused_id(generate_distribution_id, |a, id| {
             a.distributions.contains_key(id)
         });
@@ -945,6 +946,16 @@ impl CloudFrontService {
         validate_distribution_config(&new_config)?;
 
         let mut state = self.state.write();
+        if state
+            .get(&route.account)
+            .is_some_and(|a| a.distributions.contains_key(id))
+        {
+            reject_domains_in_use(
+                &state,
+                config_aliases(&new_config),
+                DomainOwner::Distribution(id),
+            )?;
+        }
         let account = state
             .accounts
             .get_mut(&req.account_id)
@@ -1506,14 +1517,7 @@ impl CloudFrontService {
         // different distribution, whichever account owns it.
         // The error never names the other distribution: it may belong to
         // another account.
-        if state.all_distributions().any(|(_, d)| {
-            d.id != id
-                && d.config
-                    .aliases
-                    .as_ref()
-                    .and_then(|a| a.items.as_ref())
-                    .is_some_and(|i| i.cname.iter().any(|c| c == &alias))
-        }) {
+        if state.domain_in_use(&alias, DomainOwner::Distribution(id)) {
             return Err(aws_error(
                 StatusCode::CONFLICT,
                 "CNAMEAlreadyExists",
@@ -1532,7 +1536,7 @@ impl CloudFrontService {
         let items = aliases
             .items
             .get_or_insert_with(crate::model::AliasItems::default);
-        if !items.cname.iter().any(|c| c == &alias) {
+        if !items.cname.iter().any(|c| c.eq_ignore_ascii_case(&alias)) {
             items.cname.push(alias.clone());
             aliases.quantity = items.cname.len() as i32;
         }
@@ -1659,6 +1663,33 @@ impl CloudFrontService {
 struct AssociateAliasRequest {
     #[serde(rename = "WebACLArn", default)]
     web_acl_arn: String,
+}
+
+/// The alternate domain names a distribution config carries.
+fn config_aliases(config: &DistributionConfig) -> &[String] {
+    config
+        .aliases
+        .as_ref()
+        .and_then(|a| a.items.as_ref())
+        .map(|i| i.cname.as_slice())
+        .unwrap_or_default()
+}
+
+/// Fail with `CNAMEAlreadyExists` if any of `domains` is held by a resource
+/// other than `owner`, in any account.
+pub(crate) fn reject_domains_in_use(
+    state: &CloudFrontAccounts,
+    domains: &[String],
+    owner: DomainOwner<'_>,
+) -> Result<(), AwsServiceError> {
+    if domains.iter().any(|d| state.domain_in_use(d, owner)) {
+        return Err(aws_error(
+            StatusCode::CONFLICT,
+            "CNAMEAlreadyExists",
+            "One or more of the CNAMEs you provided are already associated with a different resource.",
+        ));
+    }
+    Ok(())
 }
 
 // ─── XML body builders ────────────────────────────────────────────────
@@ -2803,6 +2834,114 @@ mod tests {
             .expect("alias is globally unique");
         assert_eq!(err.code(), "CNAMEAlreadyExists");
         assert!(!err.message().contains(&ids[0]), "does not leak A's id");
+    }
+
+    fn dist_config_with_alias(caller_ref: &str, alias: &str) -> String {
+        minimal_dist_config_xml(caller_ref).replace(
+            "<Comment></Comment>",
+            &format!(
+                "<Aliases><Quantity>1</Quantity><Items><CNAME>{alias}</CNAME></Items></Aliases><Comment></Comment>"
+            ),
+        )
+    }
+
+    #[tokio::test]
+    async fn config_aliases_are_unique_across_accounts_and_case() {
+        const A: &str = "111111111111";
+        const B: &str = "222222222222";
+        let svc = CloudFrontService::new(make_state());
+        let create = |account: &'static str, caller_ref: &str, alias: &str| {
+            as_account(
+                make_request(
+                    http::Method::POST,
+                    "/2020-05-31/distribution",
+                    "",
+                    &dist_config_with_alias(caller_ref, alias),
+                ),
+                account,
+            )
+        };
+        let created = svc.handle(create(A, "a", "cdn.example.com")).await.unwrap();
+        let a_xml = std::str::from_utf8(created.body.expect_bytes()).unwrap();
+        let a_id = first_tag(a_xml, "Id");
+        let a_etag = created
+            .headers
+            .get(ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // Another account, any casing: rejected.
+        let err = svc
+            .handle(create(B, "b", "CDN.Example.com"))
+            .await
+            .err()
+            .expect("alias held by A");
+        assert_eq!(err.code(), "CNAMEAlreadyExists");
+        // Same account, different distribution: rejected too.
+        let err = svc
+            .handle(create(A, "a2", "cdn.example.com"))
+            .await
+            .err()
+            .expect("alias held by another distribution");
+        assert_eq!(err.code(), "CNAMEAlreadyExists");
+
+        // Re-submitting the owner's own aliases on update is not a conflict.
+        let mut update = as_account(
+            make_request(
+                http::Method::PUT,
+                &format!("/2020-05-31/distribution/{a_id}/config"),
+                "",
+                &dist_config_with_alias("a", "cdn.example.com")
+                    .replace("<Enabled>true</Enabled>", "<Enabled>false</Enabled>"),
+            ),
+            A,
+        );
+        update.headers.insert(IF_MATCH, a_etag.parse().unwrap());
+        assert_eq!(svc.handle(update).await.unwrap().status, StatusCode::OK);
+
+        // B cannot take it on update either.
+        let b = svc.handle(create(B, "b", "b.example.com")).await.unwrap();
+        let b_xml = std::str::from_utf8(b.body.expect_bytes()).unwrap();
+        let b_id = first_tag(b_xml, "Id");
+        let mut update = as_account(
+            make_request(
+                http::Method::PUT,
+                &format!("/2020-05-31/distribution/{b_id}/config"),
+                "",
+                &dist_config_with_alias("b", "cdn.example.com"),
+            ),
+            B,
+        );
+        update.headers.insert(
+            IF_MATCH,
+            b.headers
+                .get(ETAG)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap(),
+        );
+        let err = svc.handle(update).await.err().expect("B cannot take it");
+        assert_eq!(err.code(), "CNAMEAlreadyExists");
+
+        // Nor via AssociateAlias with different casing.
+        let err = svc
+            .handle(as_account(
+                make_request(
+                    http::Method::PUT,
+                    &format!("/2020-05-31/distribution/{b_id}/associate-alias"),
+                    "Alias=CDN.EXAMPLE.COM",
+                    "",
+                ),
+                B,
+            ))
+            .await
+            .err()
+            .expect("case-insensitive");
+        assert_eq!(err.code(), "CNAMEAlreadyExists");
     }
 
     #[tokio::test]
