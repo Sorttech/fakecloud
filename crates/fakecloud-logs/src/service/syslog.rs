@@ -67,7 +67,7 @@ impl LogsService {
                 format!("The specified log group does not exist: {group_name}"),
             )
         })?;
-        let log_group_arn = group.arn.clone();
+        let log_group_arn = group.log_group_arn().to_string();
 
         let created_at = state
             .syslog_configurations

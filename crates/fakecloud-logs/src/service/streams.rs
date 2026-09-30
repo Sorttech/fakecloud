@@ -546,14 +546,18 @@ impl LogsService {
 
         // Collect delivery pipeline info: find active deliveries whose source
         // resource ARN matches this log group's ARN.
-        let group_arn = group.arn.clone();
+        let group_arn = group.log_group_arn().to_string();
         let delivery_targets: Vec<String> = state
             .deliveries
             .values()
             .filter_map(|d| {
                 // Check if the delivery source references this log group
                 if let Some(source) = state.delivery_sources.get(&d.delivery_source_name) {
-                    if source.resource_arns.contains(&group_arn) {
+                    if source
+                        .resource_arns
+                        .iter()
+                        .any(|a| a.strip_suffix(":*").unwrap_or(a) == group_arn)
+                    {
                         // Find the destination's S3 bucket configuration
                         if let Some(dest) = state
                             .delivery_destinations

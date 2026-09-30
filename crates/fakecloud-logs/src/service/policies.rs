@@ -566,7 +566,7 @@ impl LogsService {
         // the index-policy `logGroupIdentifier` reports it without the suffix so
         // the resource's `log_group_name` round-trips (otherwise the read sees a
         // `:*`-suffixed identifier and forces replacement).
-        let log_group_identifier = group.arn.trim_end_matches(":*").to_string();
+        let log_group_identifier = group.log_group_arn().to_string();
         let result = json!({
             "indexPolicy": {
                 "policyName": policy_name,
@@ -609,7 +609,7 @@ impl LogsService {
                 id.to_string()
             };
             if let Some(group) = state.log_groups.get(&group_name) {
-                let log_group_identifier = group.arn.trim_end_matches(":*");
+                let log_group_identifier = group.log_group_arn();
                 for p in &group.index_policies {
                     policies.push(json!({
                         "policyName": p.policy_name,
@@ -744,7 +744,7 @@ impl LogsService {
                     for f in fields {
                         if let Some(name) = f.as_str() {
                             field_indexes.push(json!({
-                                "logGroupIdentifier": group.arn,
+                                "logGroupIdentifier": group.log_group_arn(),
                                 "fieldIndexName": name,
                                 "lastScanTime": p.last_updated_time,
                                 "firstEventTime": p.last_updated_time,
@@ -855,7 +855,7 @@ impl LogsService {
         })?;
 
         let mut result = json!({
-            "logGroupIdentifier": group.arn,
+            "logGroupIdentifier": group.log_group_arn(),
         });
         if let Some(ref t) = group.transformer {
             result["transformerConfig"] = t.transformer_config.clone();

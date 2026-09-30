@@ -181,6 +181,15 @@ pub fn log_group_arn(region: &str, account_id: &str, name: &str) -> String {
         .to_string()
 }
 
+/// The ARN stored on [`LogGroup::arn`]: [`log_group_arn`] plus the trailing
+/// `:*`, the form `DescribeLogGroups` reports on `arn`. Every path that creates
+/// a log group (CreateLogGroup, implicit creation on ingest or EventBridge
+/// delivery) stores this form so the group describes the same way regardless
+/// of how it came to exist.
+pub fn log_group_stored_arn(region: &str, account_id: &str, name: &str) -> String {
+    format!("{}:*", log_group_arn(region, account_id, name))
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct LogGroup {
     pub name: String,
@@ -545,6 +554,23 @@ impl LogsState {
 }
 
 impl LogGroup {
+    /// The group's ARN without the trailing `:*` (the `logGroupArn` form, and
+    /// the prefix of its log streams' ARNs). Tolerates a stored ARN that lacks
+    /// the suffix, as snapshots from before the stored form was unified do.
+    pub fn log_group_arn(&self) -> &str {
+        self.arn.strip_suffix(":*").unwrap_or(&self.arn)
+    }
+
+    /// The group's ARN with the trailing `:*` (the `DescribeLogGroups` `arn`).
+    pub fn wildcard_arn(&self) -> String {
+        format!("{}:*", self.log_group_arn())
+    }
+
+    /// The ARN of log stream `stream_name` in this group.
+    pub fn stream_arn(&self, stream_name: &str) -> String {
+        format!("{}:log-stream:{stream_name}", self.log_group_arn())
+    }
+
     pub(crate) fn metadata(&self) -> Self {
         Self {
             name: self.name.clone(),

@@ -212,27 +212,7 @@ impl KinesisLambdaPoller {
             // count toward batch size and are discarded".
             let record_jsons: Vec<Value> = records
                 .iter()
-                .map(|record| {
-                    json!({
-                        "awsRegion": "us-east-1",
-                        "eventID": format!("{}:{}", shard_id, record.sequence_number),
-                        "eventName": "aws:kinesis:record",
-                        "eventSource": "aws:kinesis",
-                        "eventSourceARN": mapping.stream_arn,
-                        "eventVersion": "1.0",
-                        "invokeIdentityArn": format!(
-                            "arn:{}:iam::123456789012:role/lambda-role",
-                            fakecloud_aws::arn::partition_of(&mapping.stream_arn)
-                        ),
-                        "kinesis": {
-                            "approximateArrivalTimestamp": record.approximate_arrival_timestamp.timestamp_millis() as f64 / 1000.0,
-                            "data": base64::engine::general_purpose::STANDARD.encode(&record.data),
-                            "kinesisSchemaVersion": "1.0",
-                            "partitionKey": record.partition_key,
-                            "sequenceNumber": record.sequence_number,
-                        }
-                    })
-                })
+                .map(|record| kinesis_event_record(record, &shard_id, &mapping.stream_arn))
                 .collect();
 
             let matched: Vec<Value> = if mapping.filter.is_empty() {
@@ -336,6 +316,36 @@ impl KinesisLambdaPoller {
     }
 }
 
+/// Build the Lambda event record for one Kinesis record. `awsRegion` is the
+/// stream's region, taken from its ARN (the region the records were read
+/// from), not a fixed default.
+fn kinesis_event_record(
+    record: &fakecloud_kinesis::KinesisRecord,
+    shard_id: &str,
+    stream_arn: &str,
+) -> Value {
+    let region = stream_arn.split(':').nth(3).unwrap_or_default();
+    json!({
+        "awsRegion": region,
+        "eventID": format!("{}:{}", shard_id, record.sequence_number),
+        "eventName": "aws:kinesis:record",
+        "eventSource": "aws:kinesis",
+        "eventSourceARN": stream_arn,
+        "eventVersion": "1.0",
+        "invokeIdentityArn": format!(
+            "arn:{}:iam::123456789012:role/lambda-role",
+            fakecloud_aws::arn::partition_of(stream_arn)
+        ),
+        "kinesis": {
+            "approximateArrivalTimestamp": record.approximate_arrival_timestamp.timestamp_millis() as f64 / 1000.0,
+            "data": base64::engine::general_purpose::STANDARD.encode(&record.data),
+            "kinesisSchemaVersion": "1.0",
+            "partitionKey": record.partition_key,
+            "sequenceNumber": record.sequence_number,
+        }
+    })
+}
+
 /// Parse the Lambda response body as `{"batchItemFailures":[{"itemIdentifier":"<seqno>"}]}`
 /// and return the index in `batch_seqs` of the first failed sequence
 /// number. Returns `None` when the body doesn't decode, the failures
@@ -391,6 +401,29 @@ mod tests {
         let body = br#"{"batchItemFailures":[]}"#;
         let seqs = ["a", "b"].iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert!(first_failed_index(body, &seqs).is_none());
+    }
+
+    #[test]
+    fn event_record_carries_stream_region() {
+        let record = fakecloud_kinesis::KinesisRecord {
+            sequence_number: "49590338271490256608559692538361571095921575989136588898".into(),
+            partition_key: "pk".into(),
+            data: b"hello".to_vec(),
+            approximate_arrival_timestamp: Utc::now(),
+        };
+        let arn = "arn:aws:kinesis:eu-west-2:111122223333:stream/orders";
+        let ev = kinesis_event_record(&record, "shardId-000000000000", arn);
+        assert_eq!(ev["awsRegion"], "eu-west-2");
+        assert_eq!(ev["eventSourceARN"], arn);
+        assert_eq!(
+            ev["eventID"],
+            "shardId-000000000000:49590338271490256608559692538361571095921575989136588898"
+        );
+        assert_eq!(ev["kinesis"]["data"], "aGVsbG8=");
+
+        let cn = "arn:aws-cn:kinesis:cn-north-1:111122223333:stream/orders";
+        let ev = kinesis_event_record(&record, "shardId-000000000000", cn);
+        assert_eq!(ev["awsRegion"], "cn-north-1");
     }
 
     #[test]
