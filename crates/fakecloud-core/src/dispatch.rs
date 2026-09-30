@@ -1489,6 +1489,16 @@ impl ProtocolExt for AwsProtocol {
     }
 }
 
+/// Whether a (possibly percent-encoded) `/tags/{resourceArn}` label is the ARN
+/// of a Bedrock Agents runtime session (`...:session/<id>`).
+fn names_bedrock_session(label: &str) -> bool {
+    let decoded = label
+        .to_ascii_lowercase()
+        .replace("%3a", ":")
+        .replace("%2f", "/");
+    decoded.starts_with("arn:") && decoded.contains(":bedrock:") && decoded.contains(":session/")
+}
+
 /// Which Bedrock Agents handler a `bedrock`-scoped request belongs to:
 /// `bedrock-agent-runtime` or `bedrock-agent` for their path families, `None`
 /// for any other Bedrock (bedrock-runtime / control plane) path. Runtime and
@@ -1533,7 +1543,17 @@ fn bedrock_agent_service_for(method: &http::Method, path: &str) -> Option<&'stat
         // InvokeFlow is POST /flows/{flow}/aliases/{alias}; the same path
         // under GET / PUT / DELETE is the control plane's flow-alias CRUD.
         *method == http::Method::POST && matches!(segs.as_slice(), ["", "flows", _, "aliases", _])
-    );
+    ) || (
+        // InvokeInlineAgent is POST /agents/{sessionId}; the control plane's
+        // PrepareAgent is POST /agents/{agentId}/ (trailing slash).
+        *method == http::Method::POST
+            && matches!(segs.as_slice(), ["", "agents", id] if !id.is_empty())
+    ) || path
+        // Tagging is shared: a runtime resource (a session) is tagged through
+        // the runtime, an agent/flow/knowledge-base resource through the
+        // control plane.
+        .strip_prefix("/tags/")
+        .is_some_and(names_bedrock_session);
     Some(if is_runtime {
         "bedrock-agent-runtime"
     } else {
@@ -1580,6 +1600,35 @@ mod tests {
                 runtime,
             ),
             (Method::GET, "/agents/X", agent),
+            (Method::POST, "/agents/session-1", runtime),
+            (Method::POST, "/agents/X/", agent),
+            (Method::GET, "/agents/X/", agent),
+            (Method::PUT, "/agents/X/", agent),
+            (
+                Method::POST,
+                "/tags/arn%3Aaws%3Abedrock%3Aus-east-1%3A123456789012%3Asession%2F0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b",
+                runtime,
+            ),
+            (
+                Method::GET,
+                "/tags/arn:aws:bedrock:us-east-1:123456789012:session/0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b",
+                runtime,
+            ),
+            (
+                Method::DELETE,
+                "/tags/arn%3aaws%3abedrock%3aus-east-1%3a123456789012%3asession%2fabc",
+                runtime,
+            ),
+            (
+                Method::POST,
+                "/tags/arn%3Aaws%3Abedrock%3Aus-east-1%3A123456789012%3Aagent%2FAGENT12345",
+                agent,
+            ),
+            (
+                Method::GET,
+                "/tags/arn%3Aaws%3Abedrock%3Aus-east-1%3A123456789012%3Aflow%2FFLOW123456",
+                agent,
+            ),
             (Method::POST, "/model/m/invoke", None),
         ] {
             assert_eq!(
