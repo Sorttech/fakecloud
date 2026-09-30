@@ -4,28 +4,37 @@
 //! `s3`.
 
 use super::*;
+use fakecloud_aws::endpoint;
+
+/// The `AWS::S3::Bucket` attributes CloudFormation reports for a bucket in
+/// `region`: its ARN and the endpoint hostnames AWS publishes for it, under
+/// the region's partition DNS suffix and website endpoint form.
+fn bucket_attributes(bucket: &str, region: &str) -> ProvisionResult {
+    ProvisionResult::new(bucket)
+        .with("Arn", Arn::s3_in(region, bucket).to_string())
+        .with(
+            "DomainName",
+            endpoint::s3_bucket_domain_name(bucket, region),
+        )
+        .with(
+            "RegionalDomainName",
+            endpoint::s3_regional_domain_name(bucket, region),
+        )
+        .with(
+            "DualStackDomainName",
+            endpoint::s3_dualstack_domain_name(bucket, region),
+        )
+        .with("WebsiteURL", endpoint::s3_website_url(bucket, region))
+}
 
 impl ResourceProvisioner {
     pub(super) fn get_att_s3_bucket(&self, physical_id: &str, attribute: &str) -> Option<String> {
         let mut accounts = self.s3_state.write();
         let state = accounts.get_or_create(&self.account_id);
         let bucket = state.buckets.get(physical_id)?;
-        match attribute {
-            "Arn" => Some(Arn::s3_in(&bucket.region, &bucket.name).to_string()),
-            "DomainName" => Some(format!("{}.s3.amazonaws.com", bucket.name)),
-            "RegionalDomainName" => {
-                Some(format!("{}.s3.{}.amazonaws.com", bucket.name, self.region))
-            }
-            "DualStackDomainName" => Some(format!(
-                "{}.s3.dualstack.{}.amazonaws.com",
-                bucket.name, self.region
-            )),
-            "WebsiteURL" => Some(format!(
-                "http://{}.s3-website-{}.amazonaws.com",
-                bucket.name, self.region
-            )),
-            _ => None,
-        }
+        bucket_attributes(&bucket.name, &bucket.region)
+            .attributes
+            .remove(attribute)
     }
 
     // --- S3 ---
@@ -62,17 +71,7 @@ impl ResourceProvisioner {
             .put_bucket_meta(bucket_name, &meta)
             .map_err(|e| format!("failed to persist bucket {bucket_name}: {e}"))?;
 
-        let arn = Arn::s3_in(&region, bucket_name).to_string();
-        let domain_name = format!("{bucket_name}.s3.amazonaws.com");
-        let regional_domain_name = format!("{bucket_name}.s3.{region}.amazonaws.com");
-        let dual_stack_domain_name = format!("{bucket_name}.s3.dualstack.{region}.amazonaws.com");
-        let website_url = format!("http://{bucket_name}.s3-website-{region}.amazonaws.com");
-        Ok(ProvisionResult::new(bucket_name)
-            .with("Arn", arn)
-            .with("DomainName", domain_name)
-            .with("RegionalDomainName", regional_domain_name)
-            .with("DualStackDomainName", dual_stack_domain_name)
-            .with("WebsiteURL", website_url))
+        Ok(bucket_attributes(bucket_name, &region))
     }
 
     /// Apply a CFN stack update to an existing bucket in place. Re-runs the
@@ -88,30 +87,12 @@ impl ResourceProvisioner {
         let bucket_name = &existing.physical_id;
         let mut __s3_mas = self.s3_state.write();
         let state = __s3_mas.get_or_create(&self.account_id);
-        let region = self.region.clone();
-        {
-            let bucket = state
-                .buckets
-                .get_mut(bucket_name)
-                .ok_or_else(|| format!("Bucket {bucket_name} not yet provisioned"))?;
-            fakecloud_s3::apply_cfn_bucket_properties(
-                bucket,
-                &resource.properties,
-                &self.s3_store,
-            )?;
-        }
-
-        let arn = Arn::s3_in(&region, bucket_name).to_string();
-        let domain_name = format!("{bucket_name}.s3.amazonaws.com");
-        let regional_domain_name = format!("{bucket_name}.s3.{region}.amazonaws.com");
-        let dual_stack_domain_name = format!("{bucket_name}.s3.dualstack.{region}.amazonaws.com");
-        let website_url = format!("http://{bucket_name}.s3-website-{region}.amazonaws.com");
-        Ok(ProvisionResult::new(bucket_name.clone())
-            .with("Arn", arn)
-            .with("DomainName", domain_name)
-            .with("RegionalDomainName", regional_domain_name)
-            .with("DualStackDomainName", dual_stack_domain_name)
-            .with("WebsiteURL", website_url))
+        let bucket = state
+            .buckets
+            .get_mut(bucket_name)
+            .ok_or_else(|| format!("Bucket {bucket_name} not yet provisioned"))?;
+        fakecloud_s3::apply_cfn_bucket_properties(bucket, &resource.properties, &self.s3_store)?;
+        Ok(bucket_attributes(bucket_name, &bucket.region))
     }
 
     pub(super) fn delete_s3_bucket(&self, physical_id: &str) -> Result<(), String> {

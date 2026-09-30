@@ -935,6 +935,39 @@ mod tests {
     }
 
     #[test]
+    fn every_bucket_endpoint_fakecloud_reports_is_served_locally() {
+        // The hostnames CloudFormation reports for a bucket (DomainName,
+        // RegionalDomainName, DualStackDomainName, WebsiteURL) come from the
+        // same helpers; a template feeding any of them into an origin must be
+        // served by this process in every partition and website form.
+        use fakecloud_aws::endpoint;
+        for region in [
+            "us-east-1",
+            "eu-central-1",
+            "us-gov-west-1",
+            "us-gov-east-1",
+            "cn-north-1",
+            "us-iso-east-1",
+            "us-isob-east-1",
+            "us-isof-south-1",
+            "eu-isoe-west-1",
+        ] {
+            let website = endpoint::s3_website_url("my.site", region);
+            for domain in [
+                endpoint::s3_bucket_domain_name("my.site", region),
+                endpoint::s3_regional_domain_name("my.site", region),
+                endpoint::s3_dualstack_domain_name("my.site", region),
+                website.trim_start_matches("http://").to_string(),
+            ] {
+                let up = upstream_for(&origin(&domain, None), "127.0.0.1:4566");
+                assert_eq!(up.url_base, "http://127.0.0.1:4566", "{domain}");
+                let host = fakecloud_core::protocol::parse_routing_host(&domain).unwrap();
+                assert_eq!(host.bucket.as_deref(), Some("my.site"), "{domain}");
+            }
+        }
+    }
+
+    #[test]
     fn s3_lookalike_origin_is_not_rerouted() {
         // Not an AWS hostname: a real custom origin that must keep its own domain.
         let up = upstream_for(&origin("s3.example.com", None), "127.0.0.1:4566");
