@@ -412,9 +412,9 @@ async fn cloudwatch_managed_insight_rules() {
 // Metric streams.
 // ---------------------------------------------------------------------------
 
-#[test_action("monitoring", "PutMetricStream", checksum = "43812fcc")]
-#[test_action("monitoring", "GetMetricStream", checksum = "9edc43a8")]
-#[test_action("monitoring", "ListMetricStreams", checksum = "13f22263")]
+#[test_action("monitoring", "PutMetricStream", checksum = "5aa896b0")]
+#[test_action("monitoring", "GetMetricStream", checksum = "7471eba3")]
+#[test_action("monitoring", "ListMetricStreams", checksum = "571129cb")]
 #[test_action("monitoring", "StopMetricStreams", checksum = "9cac1038")]
 #[test_action("monitoring", "StartMetricStreams", checksum = "1049a044")]
 #[test_action("monitoring", "DeleteMetricStream", checksum = "66b6c627")]
@@ -609,8 +609,8 @@ async fn cloudwatch_tagging() {
 #[test_action("monitoring", "GetAlarmMuteRule", checksum = "f84159d3")]
 #[test_action("monitoring", "ListAlarmMuteRules", checksum = "60b6192f")]
 #[test_action("monitoring", "DeleteAlarmMuteRule", checksum = "64544862")]
-#[test_action("monitoring", "GetOTelEnrichment", checksum = "91044a67")]
-#[test_action("monitoring", "StartOTelEnrichment", checksum = "d9342b75")]
+#[test_action("monitoring", "GetOTelEnrichment", checksum = "fa552521")]
+#[test_action("monitoring", "StartOTelEnrichment", checksum = "ad4b71a4")]
 #[test_action("monitoring", "StopOTelEnrichment", checksum = "004a0bed")]
 #[test_action("monitoring", "DescribeAlarmContributors", checksum = "3c5c78c2")]
 #[tokio::test]

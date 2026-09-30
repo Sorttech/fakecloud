@@ -55,7 +55,7 @@ async fn eb_delete_event_bus() {
         .any(|b| b.name().unwrap() == "del-bus"));
 }
 
-#[test_action("events", "ListEventBuses", checksum = "3b53e660")]
+#[test_action("events", "ListEventBuses", checksum = "f4ca1720")]
 #[tokio::test]
 async fn eb_list_event_buses() {
     let server = TestServer::start().await;
@@ -68,7 +68,7 @@ async fn eb_list_event_buses() {
         .any(|b| b.name().unwrap() == "default"));
 }
 
-#[test_action("events", "DescribeEventBus", checksum = "7decb34d")]
+#[test_action("events", "DescribeEventBus", checksum = "cece6153")]
 #[tokio::test]
 async fn eb_describe_event_bus() {
     let server = TestServer::start().await;

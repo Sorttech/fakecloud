@@ -18,12 +18,12 @@ async fn create_api(client: &aws_sdk_apigateway::Client, name: &str) -> (String,
     (id, root)
 }
 
-#[test_action("apigateway", "CreateRestApi", checksum = "c6605347")]
-#[test_action("apigateway", "GetRestApi", checksum = "fddc503d")]
-#[test_action("apigateway", "GetRestApis", checksum = "d0e48360")]
-#[test_action("apigateway", "UpdateRestApi", checksum = "51e1c7b3")]
-#[test_action("apigateway", "PutRestApi", checksum = "59776aec")]
-#[test_action("apigateway", "ImportRestApi", checksum = "7c03a8c0")]
+#[test_action("apigateway", "CreateRestApi", checksum = "900d6ff2")]
+#[test_action("apigateway", "GetRestApi", checksum = "7d0dd4a2")]
+#[test_action("apigateway", "GetRestApis", checksum = "fc968b6e")]
+#[test_action("apigateway", "UpdateRestApi", checksum = "53214dc3")]
+#[test_action("apigateway", "PutRestApi", checksum = "847e6209")]
+#[test_action("apigateway", "ImportRestApi", checksum = "5000984f")]
 #[test_action("apigateway", "DeleteRestApi", checksum = "997380a3")]
 #[tokio::test]
 async fn apigateway_v1_rest_api_lifecycle() {
@@ -834,10 +834,10 @@ async fn apigateway_v1_vpc_link_lifecycle() {
         .unwrap();
 }
 
-#[test_action("apigateway", "CreateDomainName", checksum = "191200eb")]
-#[test_action("apigateway", "GetDomainName", checksum = "6889aa9b")]
-#[test_action("apigateway", "GetDomainNames", checksum = "0374de44")]
-#[test_action("apigateway", "UpdateDomainName", checksum = "b7c3d0f6")]
+#[test_action("apigateway", "CreateDomainName", checksum = "41b239e1")]
+#[test_action("apigateway", "GetDomainName", checksum = "e2e98543")]
+#[test_action("apigateway", "GetDomainNames", checksum = "4c8e8fec")]
+#[test_action("apigateway", "UpdateDomainName", checksum = "f8ac4285")]
 #[test_action("apigateway", "DeleteDomainName", checksum = "26bf612d")]
 #[test_action("apigateway", "CreateBasePathMapping", checksum = "57ece42e")]
 #[test_action("apigateway", "GetBasePathMapping", checksum = "8199b681")]

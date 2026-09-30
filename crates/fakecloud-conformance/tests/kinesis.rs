@@ -9,9 +9,9 @@ use fakecloud_conformance_macros::test_action;
 use helpers::TestServer;
 use serde_json::{json, Value};
 
-#[test_action("kinesis", "CreateStream", checksum = "d2d1a234")]
+#[test_action("kinesis", "CreateStream", checksum = "ec32a7c0")]
 #[test_action("kinesis", "DescribeStream", checksum = "833e726c")]
-#[test_action("kinesis", "DescribeStreamSummary", checksum = "4963083e")]
+#[test_action("kinesis", "DescribeStreamSummary", checksum = "d5a11feb")]
 #[test_action("kinesis", "ListStreams", checksum = "ca5dcdd7")]
 #[test_action("kinesis", "DeleteStream", checksum = "51c62afa")]
 #[tokio::test]
@@ -150,7 +150,7 @@ async fn kinesis_tags_and_retention() {
     assert!(tags.tags().is_empty());
 }
 
-#[test_action("kinesis", "PutRecord", checksum = "55718b65")]
+#[test_action("kinesis", "PutRecord", checksum = "8c678ebf")]
 #[tokio::test]
 async fn kinesis_put_record() {
     let server = TestServer::start().await;
@@ -185,7 +185,7 @@ async fn kinesis_put_record() {
     assert!(first.sequence_number() < second.sequence_number());
 }
 
-#[test_action("kinesis", "PutRecords", checksum = "a5b28725")]
+#[test_action("kinesis", "PutRecords", checksum = "d23495a3")]
 #[tokio::test]
 async fn kinesis_put_records() {
     let server = TestServer::start().await;
@@ -228,7 +228,7 @@ async fn kinesis_put_records() {
 }
 
 #[test_action("kinesis", "GetShardIterator", checksum = "02801846")]
-#[test_action("kinesis", "GetRecords", checksum = "a4dec291")]
+#[test_action("kinesis", "GetRecords", checksum = "ca527559")]
 #[tokio::test]
 async fn kinesis_get_records() {
     let server = TestServer::start().await;
@@ -751,7 +751,7 @@ async fn kinesis_update_shard_count() {
     assert_eq!(response.target_shard_count(), Some(2));
 }
 
-#[test_action("kinesis", "SubscribeToShard", checksum = "0c29998f")]
+#[test_action("kinesis", "SubscribeToShard", checksum = "15626854")]
 #[tokio::test]
 async fn kinesis_subscribe_to_shard_requires_registered_consumer() {
     let server = TestServer::start().await;
