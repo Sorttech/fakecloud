@@ -837,7 +837,12 @@ mod tests {
     fn engine_probe_bounds_a_hanging_cli() {
         // A CLI that never answers must not hang detection: one bounded call,
         // no `info` fallback against it, and it reads as Docker.
-        let (_dir, cli) = fake_cli("docker", "sleep 600\n");
+        // Only the probe's commands hang: `fake_cli`'s warmup run (no such
+        // argument) must return at once, or it eats the test's time budget.
+        let (_dir, cli) = fake_cli(
+            "docker",
+            "case \"$1\" in --version|info) sleep 600 ;; esac\nexit 1\n",
+        );
         let start = std::time::Instant::now();
         assert!(!is_podman(&cli));
         let elapsed = start.elapsed();
