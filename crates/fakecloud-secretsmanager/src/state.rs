@@ -87,7 +87,7 @@ impl SecretsManagerState {
         if !existing.deleted {
             return Ok(());
         }
-        if existing.deletion_date.is_some_and(|d| now >= d) {
+        if crate::service::secret_recovery_window_elapsed(existing, now) {
             self.secrets.remove(name);
             return Ok(());
         }
@@ -240,6 +240,19 @@ mod tests {
 
         state.clear_name_for_create("expired", now).unwrap();
         assert!(!state.secrets.contains_key("expired"));
+
+        // A secret marked deleted with no deletion date has no elapsed
+        // recovery window, so it still blocks the name (CreateSecret's
+        // behavior).
+        let mut undated = secret("undated", "arn-u");
+        undated.deleted = true;
+        undated.deletion_date = None;
+        state.secrets.insert("undated".into(), undated);
+        let err = state
+            .clear_name_for_create("undated", now)
+            .expect_err("no deletion date: still in its recovery window");
+        assert_eq!(err.code(), "InvalidRequestException");
+        assert!(state.secrets.contains_key("undated"));
 
         // Live and absent names are left for the caller.
         state.clear_name_for_create("live", now).unwrap();
