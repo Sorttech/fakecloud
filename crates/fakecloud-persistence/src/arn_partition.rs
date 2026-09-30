@@ -28,11 +28,15 @@
 //!   `arn:aws:iam::aws:policy/...`) stay as they are: fakecloud's managed-policy
 //!   catalog keeps the `aws` spelling in every partition.
 //!
-//! Payloads that are verified against a stored content hash are left alone:
+//! Payloads are left alone. Some are verified against a stored content hash:
 //! rewriting an SQS message body would break the `MD5OfBody` the SDKs check,
-//! and an ECR manifest is addressed by its digest. Bulk payloads streamed
-//! outside the snapshots (S3 object bodies, CloudWatch Logs event segments,
-//! container data volumes) are not read at all.
+//! and an ECR manifest is addressed by its digest. Others are customer data
+//! the service stores rather than describes, where a rewrite would change
+//! what the application wrote or break a lookup by it: DynamoDB items, SSM
+//! parameter values, Secrets Manager secrets, S3 object keys, user metadata
+//! and object tags, log events. Bulk payloads streamed outside the snapshots
+//! (S3 object bodies, CloudWatch Logs event segments, container data volumes)
+//! are not read at all.
 
 use std::borrow::Cow;
 use std::io;
@@ -61,23 +65,33 @@ impl ArnPartitionMigration {
 
     /// The partition the ARN starting at `arn:aws:` + `rest` moves to, or
     /// `None` when it stays in `aws` (or is not an ARN at all).
+    ///
+    /// Policy wildcards (`*`, `?`) are accepted in the service, region and
+    /// account fields, so a stored policy's patterns move with the resources
+    /// they match: a region pattern that pins a partition (`cn-*`) takes it,
+    /// one that does not (`*`) is treated like a region-less ARN.
     fn target_partition(&self, rest: &[u8]) -> Option<&'static str> {
         let (service, rest) = split_field(rest, |b| {
-            b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'
+            b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'*'
         })?;
         if service.is_empty() {
             return None;
         }
         let (region, rest) = split_field(rest, |b| {
-            b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'*' | b'?')
         })?;
-        let (account, _) = split_field(rest, |b| b.is_ascii_alphanumeric() || b == b'-')?;
-        if region.is_empty() {
-            (self.global_partition != "aws" && account != b"aws").then_some(self.global_partition)
-        } else {
-            // The field was checked to be ASCII.
-            let region = std::str::from_utf8(region).ok()?;
-            Some(partition_for(region)).filter(|p| *p != "aws")
+        let (account, _) = split_field(rest, |b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'-' | b'*' | b'?')
+        })?;
+        // The field was checked to be ASCII.
+        let region = std::str::from_utf8(region).ok()?;
+        let wildcard = region.contains(['*', '?']);
+        match partition_for(region) {
+            "aws" if region.is_empty() || wildcard => (self.global_partition != "aws"
+                && account != b"aws")
+                .then_some(self.global_partition),
+            "aws" => None,
+            partition => Some(partition),
         }
     }
 
@@ -115,18 +129,17 @@ impl ArnPartitionMigration {
         }
     }
 
-    /// Whether `bytes` holds any ARN token [`Self::rewrite_str`] would rewrite.
-    /// Serialized JSON and TOML spell ARNs verbatim (none of their characters
-    /// is escaped), so this is a cheap pre-check before parsing a file.
+    /// Whether `bytes` may hold an ARN token [`Self::rewrite_str`] would
+    /// rewrite: a cheap pre-check before parsing a file. Serialized JSON and
+    /// TOML spell ARNs verbatim (none of their characters is escaped), but the
+    /// byte before one may be the tail of an escape (`\narn:aws:...`), so
+    /// unlike [`Self::rewrite_str`] this does not require a token boundary.
+    /// It can only err towards parsing a file that needs nothing.
     pub fn needs_rewrite(&self, bytes: &[u8]) -> bool {
         let prefix = ARN_PREFIX.as_bytes();
         let mut from = 0;
         while let Some(found) = find_bytes(&bytes[from..], prefix) {
-            let start = from + found;
-            from = start + prefix.len();
-            if start > 0 && bytes[start - 1].is_ascii_alphanumeric() {
-                continue;
-            }
+            from += found + prefix.len();
             if self.target_partition(&bytes[from..]).is_some() {
                 return true;
             }
@@ -219,7 +232,8 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 /// Keys whose values are kept verbatim, per service data directory: payloads
-/// verified against a stored content hash, and log events. See the module docs.
+/// verified against a stored content hash, and customer data the service
+/// stores rather than describes. See the module docs.
 fn opaque_keys_for(service_dir: &str) -> &'static [&'static str] {
     match service_dir {
         // `md5_of_body` / `MD5OfMessageAttributes` are checked by the SDKs.
@@ -229,9 +243,20 @@ fn opaque_keys_for(service_dir: &str) -> &'static [&'static str] {
         // Log events are bulk payloads; the segmented store never rewrites
         // them, and a legacy whole-state snapshot is treated the same.
         "logs" => &["message"],
+        // Table and backup rows, and stream record images: an item keyed by
+        // an ARN string must stay reachable by the key the application wrote.
+        "dynamodb" => &["items", "keys", "new_image", "old_image"],
+        // Parameter values (current and every version).
+        "ssm" => &["value"],
+        "secretsmanager" => &["secret_string"],
         _ => &[],
     }
 }
+
+/// Object and multipart-upload sidecar fields that are customer data: the
+/// object key (its directory on disk is derived from it, so rewriting the
+/// field would strand the object), user metadata and object tags.
+const S3_OBJECT_OPAQUE_KEYS: &[&str] = &["key", "metadata", "tags"];
 
 /// What [`migrate_data_dir`] did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -241,9 +266,10 @@ pub struct MigrationReport {
     pub already_migrated: bool,
     /// Files whose contents were rewritten.
     pub rewritten: Vec<PathBuf>,
-    /// Files that held candidate ARNs but could not be parsed; left untouched
-    /// for the owning service's loader to report.
-    pub unparseable: Vec<PathBuf>,
+    /// Files that held candidate ARNs but could not be parsed, and
+    /// directories that could not be read; left untouched for the owning
+    /// service's loader to report.
+    pub skipped: Vec<PathBuf>,
 }
 
 /// Run the ARN partition migration over the persistence directory `dir` for
@@ -274,26 +300,58 @@ pub fn migrate_data_dir(
     };
 
     for entry in read_dir_sorted(dir).map_err(io_err(dir))? {
-        if !entry.is_dir() {
-            continue;
-        }
-        let Some(service_dir) = entry.file_name().and_then(|n| n.to_str()) else {
+        let Some(name) = entry.file_name() else {
             continue;
         };
-        if service_dir == "s3" {
-            migrate_s3_sidecars(&migration, &entry, &mut report).map_err(io_err(&entry))?;
+        // `lost+found`, `.snapshot` and dotfiles are filesystem artifacts,
+        // often unreadable to a non-root server; they hold no state.
+        if crate::version::is_benign_entry(name) || !entry.is_dir() {
             continue;
         }
-        let opaque = opaque_keys_for(service_dir);
-        for file in read_dir_sorted(&entry).map_err(io_err(&entry))? {
-            if file.is_file() && file.extension().is_some_and(|e| e == "json") {
-                migrate_json_file(&migration, &file, opaque, &mut report).map_err(io_err(&file))?;
+        let Some(service_dir) = name.to_str() else {
+            continue;
+        };
+        let result = if service_dir == "s3" {
+            migrate_s3_sidecars(&migration, &entry, false, &mut report)
+        } else {
+            migrate_service_dir(
+                &migration,
+                &entry,
+                opaque_keys_for(service_dir),
+                &mut report,
+            )
+        };
+        if let Err(err) = result {
+            // A directory the server cannot read is one its own loader
+            // cannot read either; it reports that, not the migration.
+            if err.kind() == io::ErrorKind::PermissionDenied {
+                tracing::warn!(
+                    path = %entry.display(),
+                    "skipping ARN partition migration of an unreadable directory: {err}"
+                );
+                report.skipped.push(entry);
+                continue;
             }
+            return Err(io_err(&entry)(err));
         }
     }
 
     crate::version::mark_arn_partitions_migrated(dir)?;
     Ok(report)
+}
+
+fn migrate_service_dir(
+    migration: &ArnPartitionMigration,
+    dir: &Path,
+    opaque_keys: &[&str],
+    report: &mut MigrationReport,
+) -> io::Result<()> {
+    for file in read_dir_sorted(dir)? {
+        if file.is_file() && file.extension().is_some_and(|e| e == "json") {
+            migrate_json_file(migration, &file, opaque_keys, report)?;
+        }
+    }
+    Ok(())
 }
 
 fn read_dir_sorted(dir: &Path) -> io::Result<Vec<PathBuf>> {
@@ -321,7 +379,7 @@ fn migrate_json_file(
                 path = %path.display(),
                 "skipping ARN partition migration of an unparseable file: {err}"
             );
-            report.unparseable.push(path.to_path_buf());
+            report.skipped.push(path.to_path_buf());
             return Ok(());
         }
     };
@@ -335,16 +393,28 @@ fn migrate_json_file(
     Ok(())
 }
 
-/// S3 sidecars are TOML. ARNs appear only inside TOML strings (or quoted keys),
-/// spelled verbatim, so the text is rewritten in place.
+/// Rewrite the S3 store's sidecars under `dir`.
+///
+/// Bucket-level files (`meta.toml`, and the subresource files such as
+/// `policy.toml` / `notification.toml`, which hold the configuration payload
+/// verbatim -- JSON, XML or TOML) spell ARNs as plain text and are rewritten
+/// as text. Below a bucket's `objects/` and `mpu/` directories each sidecar is
+/// an `ObjectMeta`-style TOML table whose [`S3_OBJECT_OPAQUE_KEYS`] must stay
+/// verbatim, so those are rewritten structurally. Object bodies (`.bin`) are
+/// never read.
 fn migrate_s3_sidecars(
     migration: &ArnPartitionMigration,
     dir: &Path,
+    in_objects: bool,
     report: &mut MigrationReport,
 ) -> io::Result<()> {
     for path in read_dir_sorted(dir)? {
         if path.is_dir() {
-            migrate_s3_sidecars(migration, &path, report)?;
+            let objects = in_objects
+                || path
+                    .file_name()
+                    .is_some_and(|n| n == "objects" || n == "mpu");
+            migrate_s3_sidecars(migration, &path, objects, report)?;
             continue;
         }
         if !path.extension().is_some_and(|e| e == "toml") {
@@ -355,15 +425,84 @@ fn migrate_s3_sidecars(
             continue;
         }
         let Ok(text) = std::str::from_utf8(&bytes) else {
-            report.unparseable.push(path);
+            report.skipped.push(path);
             continue;
         };
-        if let Cow::Owned(new) = migration.rewrite_str(text) {
-            crate::atomic::write_atomic_bytes(&path, new.as_bytes())?;
-            report.rewritten.push(path);
-        }
+        let rewritten = if in_objects {
+            let Ok(mut table) = text.parse::<toml::Table>() else {
+                tracing::warn!(
+                    path = %path.display(),
+                    "skipping ARN partition migration of an unparseable file"
+                );
+                report.skipped.push(path);
+                continue;
+            };
+            if !migration.rewrite_toml_table(&mut table, S3_OBJECT_OPAQUE_KEYS) {
+                continue;
+            }
+            toml::to_string_pretty(&table)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
+        } else {
+            match migration.rewrite_str(text) {
+                Cow::Owned(new) => new,
+                Cow::Borrowed(_) => continue,
+            }
+        };
+        crate::atomic::write_atomic_bytes(&path, rewritten.as_bytes())?;
+        report.rewritten.push(path);
     }
     Ok(())
+}
+
+impl ArnPartitionMigration {
+    /// [`Self::rewrite_json`] for a TOML table: strings, keys, arrays and
+    /// nested tables, except the values of `opaque_keys`.
+    fn rewrite_toml_table(&self, table: &mut toml::Table, opaque_keys: &[&str]) -> bool {
+        let mut changed = false;
+        let mut renamed = Vec::new();
+        for (key, mut value) in std::mem::take(table) {
+            if !opaque_keys.contains(&key.as_str()) {
+                changed |= self.rewrite_toml(&mut value, opaque_keys);
+            }
+            match self.rewrite_str(&key) {
+                Cow::Owned(new) => renamed.push((new, value)),
+                Cow::Borrowed(_) => {
+                    table.insert(key, value);
+                }
+            }
+        }
+        // As in `rewrite_object`: an entry already in the target partition
+        // wins over the legacy one it collides with.
+        for (key, value) in renamed {
+            changed = true;
+            table.entry(key).or_insert(value);
+        }
+        changed
+    }
+
+    fn rewrite_toml(&self, value: &mut toml::Value, opaque_keys: &[&str]) -> bool {
+        match value {
+            toml::Value::String(s) => match self.rewrite_str(s) {
+                Cow::Owned(new) => {
+                    *s = new;
+                    true
+                }
+                Cow::Borrowed(_) => false,
+            },
+            toml::Value::Array(items) => {
+                let mut changed = false;
+                for item in items {
+                    changed |= self.rewrite_toml(item, opaque_keys);
+                }
+                changed
+            }
+            toml::Value::Table(table) => self.rewrite_toml_table(table, opaque_keys),
+            toml::Value::Integer(_)
+            | toml::Value::Float(_)
+            | toml::Value::Boolean(_)
+            | toml::Value::Datetime(_) => false,
+        }
+    }
 }
 
 #[cfg(test)]

@@ -267,7 +267,7 @@ async fn main() {
                 Ok(report) if report.already_migrated => {}
                 Ok(report) => tracing::info!(
                     rewritten = report.rewritten.len(),
-                    unparseable = report.unparseable.len(),
+                    skipped = report.skipped.len(),
                     "migrated persisted ARNs to their region's partition"
                 ),
                 Err(err) => fatal_exit(format_args!(

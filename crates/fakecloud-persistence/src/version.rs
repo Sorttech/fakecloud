@@ -16,7 +16,7 @@ const IGNORED_DIR_ENTRIES: &[&str] = &["lost+found", ".snapshot"];
 
 /// Whether a directory entry is a benign filesystem artifact that should not make
 /// the data directory count as "non-empty".
-fn is_benign_entry(name: &OsStr) -> bool {
+pub(crate) fn is_benign_entry(name: &OsStr) -> bool {
     match name.to_str() {
         Some(s) => s.starts_with('.') || IGNORED_DIR_ENTRIES.contains(&s),
         None => false, // non-UTF8 name => treat as a real entry, be conservative

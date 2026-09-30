@@ -205,6 +205,52 @@ async fn china_server_migrates_legacy_aws_partition_arns() {
         .await
         .unwrap();
 
+    // An object whose key names an ARN, with an SSE-KMS key ARN in its
+    // metadata sidecar: the key is customer data, the KMS ARN is not.
+    let object_key = format!("exports/arn:aws:iam::{ACCOUNT}:role/x.json");
+    s3.put_object()
+        .bucket("legacy-bucket")
+        .key(&object_key)
+        .server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::AwsKms)
+        .ssekms_key_id(&key_id)
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(b"payload"))
+        .send()
+        .await
+        .unwrap();
+
+    // A DynamoDB item keyed by an ARN string stays reachable by that key.
+    let ddb = aws_sdk_dynamodb::Client::new(&config);
+    ddb.create_table()
+        .table_name("legacy-table")
+        .attribute_definitions(
+            aws_sdk_dynamodb::types::AttributeDefinition::builder()
+                .attribute_name("pk")
+                .attribute_type(aws_sdk_dynamodb::types::ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .key_schema(
+            aws_sdk_dynamodb::types::KeySchemaElement::builder()
+                .attribute_name("pk")
+                .key_type(aws_sdk_dynamodb::types::KeyType::Hash)
+                .build()
+                .unwrap(),
+        )
+        .billing_mode(aws_sdk_dynamodb::types::BillingMode::PayPerRequest)
+        .send()
+        .await
+        .unwrap();
+    let item_key = format!("arn:aws:iam::{ACCOUNT}:role/legacy-role");
+    ddb.put_item()
+        .table_name("legacy-table")
+        .item(
+            "pk",
+            aws_sdk_dynamodb::types::AttributeValue::S(item_key.clone()),
+        )
+        .send()
+        .await
+        .unwrap();
+
     let lambda = aws_sdk_lambda::Client::new(&config);
     lambda
         .create_function()
@@ -228,7 +274,7 @@ async fn china_server_migrates_legacy_aws_partition_arns() {
         sqs_snapshot.contains(r#"\"TopicArn\":\"arn:aws:sns:cn-north-1"#),
         "the message body is stored in plaintext"
     );
-    for service in ["kms", "sns", "iam", "sqs", "lambda"] {
+    for service in ["kms", "sns", "iam", "sqs", "lambda", "dynamodb"] {
         let snapshot =
             std::fs::read_to_string(tmp.path().join(service).join("snapshot.json")).unwrap();
         assert!(snapshot.contains("arn:aws:"), "{service} has no legacy ARN");
@@ -435,6 +481,40 @@ async fn china_server_migrates_legacy_aws_partition_arns() {
         "{policy}"
     );
     assert!(!policy.contains("arn:aws:"), "{policy}");
+
+    let object = s3
+        .get_object()
+        .bucket("legacy-bucket")
+        .key(&object_key)
+        .send()
+        .await
+        .expect("the object is still reachable by the key it was written with");
+    assert_eq!(object.ssekms_key_id(), Some(key_arn.as_str()));
+    let body = object.body.collect().await.unwrap().into_bytes();
+    assert_eq!(&body[..], b"payload");
+
+    let ddb = aws_sdk_dynamodb::Client::new(&config);
+    let table = ddb
+        .describe_table()
+        .table_name("legacy-table")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        table.table().unwrap().table_arn(),
+        Some(format!("arn:aws-cn:dynamodb:cn-north-1:{ACCOUNT}:table/legacy-table").as_str())
+    );
+    let item = ddb
+        .get_item()
+        .table_name("legacy-table")
+        .key(
+            "pk",
+            aws_sdk_dynamodb::types::AttributeValue::S(item_key.clone()),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert!(item.item().is_some(), "item keyed by an ARN string is kept");
 
     // Lambda: function and role ARNs; lookup by the new function ARN.
     let lambda = aws_sdk_lambda::Client::new(&config);
