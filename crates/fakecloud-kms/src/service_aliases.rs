@@ -24,9 +24,10 @@ impl KmsService {
         validate_alias_target(&target_key_id)
             .map_err(|e| recode_validation(e, "InvalidAliasNameException"))?;
 
-        let resolved = self
-            .resolve_key_id_for(&req.account_id, &req.region, &target_key_id)
-            .ok_or_else(|| {
+        let mut accounts = self.state.write();
+        let state = accounts.get_or_create(&req.account_id);
+        let resolved =
+            Self::resolve_alias_target(state, &req.region, &target_key_id).ok_or_else(|| {
                 AwsServiceError::aws_error(
                     StatusCode::BAD_REQUEST,
                     "NotFoundException",
@@ -34,11 +35,8 @@ impl KmsService {
                 )
             })?;
 
-        let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
-
-        if state.aliases.contains_key(&alias_name) {
-            let alias_arn = kms_alias_arn(&req.region, &state.account_id, &alias_name);
+        let alias_arn = kms_alias_arn(&req.region, &state.account_id, &alias_name);
+        if state.alias(&req.region, &alias_name).is_some() {
             return Err(AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
                 "AlreadyExistsException",
@@ -46,10 +44,8 @@ impl KmsService {
             ));
         }
 
-        let alias_arn = kms_alias_arn(&req.region, &state.account_id, &alias_name);
-
-        state.aliases.insert(
-            alias_name.clone(),
+        state.insert_alias(
+            &req.region,
             KmsAlias {
                 alias_name,
                 alias_arn,
@@ -84,7 +80,7 @@ impl KmsService {
 
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id);
-        if state.aliases.remove(alias_name).is_none() {
+        if state.remove_alias(&req.region, alias_name).is_none() {
             let alias_arn = kms_alias_arn(&req.region, &state.account_id, alias_name);
             return Err(AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
@@ -113,19 +109,17 @@ impl KmsService {
             )
         })?;
 
-        let resolved = self
-            .resolve_key_id_for(&req.account_id, &req.region, target_key_id)
-            .ok_or_else(|| {
+        let mut accounts = self.state.write();
+        let state = accounts.get_or_create(&req.account_id);
+        let resolved =
+            Self::resolve_alias_target(state, &req.region, target_key_id).ok_or_else(|| {
                 AwsServiceError::aws_error(
                     StatusCode::BAD_REQUEST,
                     "NotFoundException",
                     format!("Key '{target_key_id}' does not exist"),
                 )
             })?;
-
-        let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&req.account_id);
-        let alias = state.aliases.get_mut(alias_name).ok_or_else(|| {
+        let alias = state.alias_mut(&req.region, alias_name).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
                 "NotFoundException",
@@ -181,30 +175,38 @@ impl KmsService {
         let empty = KmsState::new(&req.account_id, &req.region);
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
-        // Resolve key_id_filter to actual key ID if needed
+        // Resolve key_id_filter to the stored id of the request region's key,
+        // as CreateAlias resolves a target (so a multi-region key id finds
+        // aliases on this region's replica).
         let resolved_filter =
-            key_id_filter.and_then(|kid| Self::resolve_key_id_with_state(state, kid));
+            key_id_filter.and_then(|kid| Self::resolve_alias_target(state, &req.region, kid));
 
+        // Aliases are regional: list only the request region's, in
+        // AliasName order.
         let all_aliases: Vec<Value> = state
-            .aliases
-            .values()
+            .aliases_in(&req.region)
             .filter(|a| match (&resolved_filter, key_id_filter) {
                 (Some(r), _) => a.target_key_id == *r,
                 (None, Some(_)) => false,
                 (None, None) => true,
             })
             .map(|a| {
+                // A replica is stored under `{region}:{id}`; report its key id.
+                let target = state
+                    .keys
+                    .get(&a.target_key_id)
+                    .map_or(a.target_key_id.as_str(), |k| k.key_id.as_str());
                 json!({
                     "AliasName": a.alias_name,
                     "AliasArn": a.alias_arn,
-                    "TargetKeyId": a.target_key_id,
+                    "TargetKeyId": target,
                 })
             })
             .collect();
 
         // Real Limit/Marker pagination (mirrors ListGrants): the marker is the
         // AliasName of the last item on the previous page. all_aliases is in
-        // AliasName order (BTreeMap-backed), so resume at the first alias strictly
+        // AliasName order (the region's BTreeMap), so resume at the first alias strictly
         // greater than the marker; that way a marker whose alias was deleted
         // between pages still advances instead of restarting from 0.
         let start = match marker {

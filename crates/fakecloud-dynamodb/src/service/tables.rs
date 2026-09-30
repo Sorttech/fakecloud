@@ -689,16 +689,22 @@ impl DynamoDbService {
     }
 
     /// The ARN of the KMS key encrypting a table: the customer key named by
-    /// `KMSMasterKeyId`, or the account's AWS-managed `aws/dynamodb` key when
-    /// none is named. A customer key the KMS hook cannot resolve is kept as
-    /// given.
+    /// `KMSMasterKeyId` (an alias resolving in the request's region), or the
+    /// region's AWS-managed `aws/dynamodb` key when none is named — the key
+    /// `alias/aws/dynamodb` resolves to in that region. A customer key the
+    /// KMS hook cannot resolve is kept as given.
     fn resolve_sse_key_arn(&self, req: &AwsRequest, key_id: Option<String>) -> Option<String> {
         let Some(hook) = &self.kms_hook else {
             return key_id;
         };
-        let wanted = key_id
-            .clone()
-            .unwrap_or_else(|| "alias/aws/dynamodb".to_string());
+        let Some(wanted) = key_id else {
+            return fakecloud_core::delivery::aws_managed_kms_key_arn(
+                Some(hook.as_ref()),
+                &req.account_id,
+                req.region.as_str(),
+                "dynamodb",
+            );
+        };
         match hook.resolve_key_arn(
             &req.account_id,
             req.region.as_str(),
@@ -706,7 +712,7 @@ impl DynamoDbService {
             "dynamodb.amazonaws.com",
         ) {
             Ok(arn) => Some(arn),
-            Err(_) => key_id,
+            Err(_) => Some(wanted),
         }
     }
 

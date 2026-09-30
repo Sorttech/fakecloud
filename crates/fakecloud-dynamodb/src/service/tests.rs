@@ -8897,6 +8897,16 @@ impl fakecloud_core::delivery::KmsHook for CountingKmsHook {
     }
 
     fn resolve_key_arn(&self, _: &str, _: &str, _: &str, _: &str) -> Result<String, String> {
+        self.count_resolution()
+    }
+
+    fn aws_managed_key_arn(&self, _: &str, _: &str, _: &str, _: &str) -> Result<String, String> {
+        self.count_resolution()
+    }
+}
+
+impl CountingKmsHook {
+    fn count_resolution(&self) -> Result<String, String> {
         assert!(
             self.1.try_write().is_some(),
             "the KMS key must be resolved with the DynamoDB lock released"
@@ -9089,12 +9099,12 @@ async fn transact_put_reports_a_bad_number_before_the_vector_shape() {
     assert_eq!(err_message(transact), err_message(put));
 }
 
-/// A KMS-encrypted table with no named key reports exactly the key the
-/// account's `alias/aws/dynamodb` alias resolves to, before and after other
-/// services minted per-region AWS-managed keys.
+/// A KMS-encrypted table with no named key reports its region's AWS-managed
+/// `aws/dynamodb` key: exactly the key `alias/aws/dynamodb` resolves to in
+/// that region, and a different key in every region.
 #[test]
-fn default_sse_key_is_what_the_dynamodb_alias_resolves_to() {
-    let (_kms_state, hook) = fakecloud_kms::test_support::kms_hook("123456789012");
+fn default_sse_key_is_what_the_regions_dynamodb_alias_resolves_to() {
+    let (kms_state, hook) = fakecloud_kms::test_support::kms_hook("123456789012");
     let svc = make_service().with_kms_hook(hook.clone());
     let create = |name: &str, region: &str| {
         let mut r = make_request(
@@ -9114,25 +9124,38 @@ fn default_sse_key_is_what_the_dynamodb_alias_resolves_to() {
             .unwrap()
             .to_string()
     };
-    let first = create("table-one", "us-east-1");
-    // Another region's AWS-managed dynamodb key minted through the regional
-    // path does not change what the alias (and so DynamoDB) reports.
-    hook.aws_managed_key_arn(
-        "123456789012",
-        "eu-west-1",
-        "dynamodb",
-        "dynamodb.amazonaws.com",
-    )
-    .unwrap();
-    let second = create("table-two", "eu-west-1");
-    let alias = hook
-        .resolve_key_arn(
+    let alias_in = |region: &str| {
+        hook.resolve_key_arn(
             "123456789012",
-            "us-east-1",
+            region,
             "alias/aws/dynamodb",
             "dynamodb.amazonaws.com",
         )
+        .unwrap()
+    };
+    let east = create("table-one", "us-east-1");
+    // eu-west-1's key minted first through the regional path is the one a
+    // eu-west-1 table then reports.
+    let minted = hook
+        .aws_managed_key_arn(
+            "123456789012",
+            "eu-west-1",
+            "dynamodb",
+            "dynamodb.amazonaws.com",
+        )
         .unwrap();
-    assert_eq!(first, alias);
-    assert_eq!(second, alias);
+    let west = create("table-two", "eu-west-1");
+    assert_eq!(west, minted);
+    assert_ne!(east, west);
+    assert_eq!(east, alias_in("us-east-1"));
+    assert_eq!(west, alias_in("eu-west-1"));
+    for (region, arn) in [("us-east-1", &east), ("eu-west-1", &west)] {
+        fakecloud_kms::test_support::assert_aws_managed_key(
+            &kms_state,
+            "123456789012",
+            region,
+            arn,
+            "alias/aws/dynamodb",
+        );
+    }
 }

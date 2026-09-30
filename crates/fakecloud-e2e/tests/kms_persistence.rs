@@ -169,3 +169,68 @@ async fn persistence_key_rotation_enabled_survives_restart() {
         .unwrap();
     assert!(status.key_rotation_enabled());
 }
+
+/// Regional aliases survive a restart in their own regions: the same alias
+/// name in two regions keeps pointing at each region's key, and each
+/// region's ListAliases still pages through only its own aliases.
+#[tokio::test]
+async fn persistence_regional_aliases_survive_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut server = TestServer::start_persistent(tmp.path()).await;
+    let mut keys = Vec::new();
+    for region in ["us-east-1", "eu-west-1"] {
+        let kms = aws_sdk_kms::Client::new(&server.aws_config_in(region).await);
+        let key_arn = kms
+            .create_key()
+            .send()
+            .await
+            .unwrap()
+            .key_metadata()
+            .unwrap()
+            .arn()
+            .unwrap()
+            .to_string();
+        kms.create_alias()
+            .alias_name("alias/shared-name")
+            .target_key_id(&key_arn)
+            .send()
+            .await
+            .unwrap();
+        keys.push((region, key_arn));
+    }
+
+    server.restart().await;
+
+    for (region, key_arn) in &keys {
+        let kms = aws_sdk_kms::Client::new(&server.aws_config_in(region).await);
+        let resolved = kms
+            .describe_key()
+            .key_id("alias/shared-name")
+            .send()
+            .await
+            .unwrap()
+            .key_metadata()
+            .unwrap()
+            .arn()
+            .unwrap()
+            .to_string();
+        assert_eq!(&resolved, key_arn, "{region}");
+        let listed: Vec<String> = kms
+            .list_aliases()
+            .send()
+            .await
+            .unwrap()
+            .aliases()
+            .iter()
+            .filter_map(|a| a.alias_arn().map(str::to_string))
+            .filter(|arn| arn.ends_with(":alias/shared-name"))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![format!(
+                "arn:aws:kms:{region}:123456789012:alias/shared-name"
+            )],
+            "{region}"
+        );
+    }
+}

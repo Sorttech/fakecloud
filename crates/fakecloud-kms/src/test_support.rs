@@ -21,8 +21,8 @@ pub fn kms_hook(account_id: &str) -> (SharedKmsState, Arc<dyn KmsHook>) {
 
 /// `arn` is a real key in `state`: in `account_id` and `region` (and the
 /// region's partition), AWS-managed, and the AWS-managed key `alias`
-/// (`alias/aws/<service>`) stands for in that region, so DescribeKey on the
-/// reported ARN resolves it.
+/// (`alias/aws/<service>`) stands for in that region: recorded as the
+/// region's AWS-managed key and targeted by the region's alias.
 pub fn assert_aws_managed_key(
     state: &SharedKmsState,
     account_id: &str,
@@ -47,12 +47,9 @@ pub fn assert_aws_managed_key(
     assert_eq!(key.key_manager, "AWS", "{arn} is not AWS-managed");
     let slot = crate::state::aws_managed_key_slot(region, alias);
     let recorded = s.aws_managed_keys.get(&slot) == Some(&key.key_id);
-    let aliased = s
-        .aliases
-        .get(alias)
-        .is_some_and(|a| a.target_key_id == key.key_id);
+    let aliased = s.alias_target(region, alias) == Some(key.key_id.as_str());
     assert!(
-        recorded || aliased,
-        "{arn} is not the {alias} key of {region}"
+        recorded && aliased,
+        "{arn} is not the {alias} key of {region} (recorded: {recorded}, aliased: {aliased})"
     );
 }

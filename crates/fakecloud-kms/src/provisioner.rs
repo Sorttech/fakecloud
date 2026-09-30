@@ -16,7 +16,6 @@
 use std::collections::BTreeMap;
 
 use chrono::Utc;
-use fakecloud_aws::arn::arn_resource;
 use uuid::Uuid;
 
 use super::asym;
@@ -320,9 +319,28 @@ pub fn provision_replica_key(
     Ok((replica_key_id, replica_arn))
 }
 
-/// Insert (or replace) an alias pointing at `target_key_id`. Resolves
-/// `target_input` against either a raw key id or a key ARN. Returns
-/// the alias name on success.
+/// Resolve an alias target (a key id or key ARN, never another alias) to
+/// the stored id of a key in `region`, where the alias lives.
+fn resolve_alias_target_input(
+    s: &crate::state::KmsState,
+    region: &str,
+    target_input: &str,
+) -> Result<String, String> {
+    let names_alias = target_input.starts_with("alias/")
+        || crate::state::parse_kms_arn(target_input)
+            .is_some_and(|(_, _, resource)| resource.starts_with("alias/"));
+    if names_alias {
+        return Err(format!(
+            "TargetKeyId must be a key id or key ARN; got '{target_input}'"
+        ));
+    }
+    crate::service::KmsService::resolve_alias_target(s, region, target_input)
+        .ok_or_else(|| format!("KMS key '{target_input}' does not exist"))
+}
+
+/// Insert (or replace) an alias in `region` pointing at `target_input` (a
+/// key id or key ARN of a key in that region). Returns the alias name on
+/// success.
 pub fn provision_alias(
     state: &SharedKmsState,
     account_id: &str,
@@ -337,19 +355,7 @@ pub fn provision_alias(
     }
     let mut accounts = state.write();
     let s = accounts.get_or_create(account_id);
-    let target_key_id = if s.keys.contains_key(target_input) {
-        target_input.to_string()
-    } else if let Some(id) =
-        arn_resource(target_input, "kms").and_then(|rest| rest.split(":key/").nth(1))
-    {
-        if s.keys.contains_key(id) {
-            id.to_string()
-        } else {
-            return Err(format!("KMS key '{target_input}' does not exist"));
-        }
-    } else {
-        return Err(format!("KMS key '{target_input}' does not exist"));
-    };
+    let target_key_id = resolve_alias_target_input(s, region, target_input)?;
     let alias_arn = kms_alias_arn(region, &s.account_id, alias_name);
     let alias = KmsAlias {
         alias_name: alias_name.to_string(),
@@ -357,7 +363,7 @@ pub fn provision_alias(
         target_key_id,
         creation_date: Utc::now().timestamp() as f64,
     };
-    s.aliases.insert(alias_name.to_string(), alias);
+    s.insert_alias(region, alias);
     Ok(alias_name.to_string())
 }
 
@@ -412,33 +418,21 @@ pub fn update_key_properties(
     Ok(())
 }
 
-/// Repoint an existing alias at a different target key. Used by
-/// `update_resource` for `AWS::KMS::Alias` when only `TargetKeyId`
-/// changes.
+/// Repoint the existing alias `alias_name` in `region` at a different
+/// target key. Used by `update_resource` for `AWS::KMS::Alias` when only
+/// `TargetKeyId` changes.
 pub fn update_alias_target(
     state: &SharedKmsState,
     account_id: &str,
+    region: &str,
     alias_name: &str,
     target_input: &str,
 ) -> Result<(), String> {
     let mut accounts = state.write();
     let s = accounts.get_or_create(account_id);
-    let target_key_id = if s.keys.contains_key(target_input) {
-        target_input.to_string()
-    } else if let Some(id) =
-        arn_resource(target_input, "kms").and_then(|rest| rest.split(":key/").nth(1))
-    {
-        if s.keys.contains_key(id) {
-            id.to_string()
-        } else {
-            return Err(format!("KMS key '{target_input}' does not exist"));
-        }
-    } else {
-        return Err(format!("KMS key '{target_input}' does not exist"));
-    };
+    let target_key_id = resolve_alias_target_input(s, region, target_input)?;
     let alias = s
-        .aliases
-        .get_mut(alias_name)
+        .alias_mut(region, alias_name)
         .ok_or_else(|| format!("Alias '{alias_name}' does not exist"))?;
     alias.target_key_id = target_key_id;
     Ok(())
@@ -488,7 +482,8 @@ mod tests {
         .unwrap();
         let mut accounts = state.write();
         let s = accounts.get_or_create("123456789012");
-        let alias = s.aliases.get("alias/region-test").unwrap();
+        let alias = s.alias("eu-central-1", "alias/region-test").unwrap();
+        assert!(s.alias("us-east-1", "alias/region-test").is_none());
         assert_eq!(
             alias.alias_arn,
             "arn:aws:kms:eu-central-1:123456789012:alias/region-test"

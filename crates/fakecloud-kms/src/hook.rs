@@ -239,8 +239,8 @@ impl KmsServiceHook {
 
     /// The ARN of the AWS-managed key for `service` (`alias/aws/<service>`)
     /// in `account_id` and `region`, minted on first use; the flag is `true`
-    /// when this call minted it. Unlike alias resolution, this is scoped per
-    /// region (see [`Self::aws_managed_key`]).
+    /// when this call minted it. It is the key `alias/aws/<service>`
+    /// resolves to in `region` (see [`Self::aws_managed_key`]).
     pub fn aws_managed_key_arn_tracked(
         &self,
         account_id: &str,
@@ -257,7 +257,8 @@ impl KmsServiceHook {
     }
 
     /// Resolve `key_id` to its key ARN; the flag is `true` when an
-    /// AWS-managed key had to be minted.
+    /// AWS-managed key had to be minted. Aliases resolve in `region`, or in
+    /// the region an alias ARN names.
     fn resolve_or_provision(
         &self,
         account_id: &str,
@@ -269,34 +270,26 @@ impl KmsServiceHook {
         {
             let mas = self.state.read();
             if let Some(state) = mas.get(account_id) {
-                if let Some(arn) = resolve_key(state, key_id) {
+                if let Some(arn) = resolve_key(state, region, key_id) {
                     return Ok((arn, false));
                 }
             }
         }
 
         // AWS-managed aliases (`aws/<service>`) auto-provision on
-        // first use. Customer-supplied aliases / IDs that don't
-        // resolve are an error.
+        // first use, in the region the reference names. Customer-supplied
+        // aliases / IDs that don't resolve are an error.
         let alias = normalize_alias(key_id);
         if !alias.starts_with("aws/") {
             return Err(KmsHookError::KeyNotFound(key_id.to_string()));
         }
-        let mut mas = self.state.write();
-        let state = mas.get_or_create(account_id);
-        // Re-check under the write lock in case a concurrent caller won the race.
-        if let Some(arn) = resolve_key(state, key_id) {
-            return Ok((arn, false));
-        }
-        let key_arn = provision_aws_managed_key(state, region, &alias, service_principal);
-        Ok((key_arn, true))
+        let alias_region = parse_kms_arn(key_id).map_or(region, |(r, _, _)| r);
+        Ok(self.aws_managed_key(account_id, alias_region, &alias, service_principal))
     }
 
     /// The AWS-managed key for `alias` (`aws/<service>`) in `account_id` and
-    /// `region`, minted on first use. One key exists per account AND region:
-    /// the key the account's `alias/aws/<service>` alias targets serves the
-    /// region it lives in; any other region gets its own key, recorded in
-    /// [`KmsState::aws_managed_keys`] (the account keeps a single alias entry).
+    /// `region`, minted on first use. One key exists per account AND region,
+    /// and that region's `alias/aws/<service>` alias targets it.
     fn aws_managed_key(
         &self,
         account_id: &str,
@@ -305,44 +298,20 @@ impl KmsServiceHook {
         service_principal: &str,
     ) -> (String, bool) {
         let alias_full = format!("alias/{alias}");
-        let slot = crate::state::aws_managed_key_slot(region, &alias_full);
-        let lookup = |state: &KmsState| -> Option<String> {
-            if let Some(key) = state
-                .aws_managed_keys
-                .get(&slot)
-                .and_then(|id| state.keys.get(id))
-            {
-                return Some(key.arn.clone());
-            }
-            state
-                .aliases
-                .get(&alias_full)
-                .and_then(|a| state.keys.get(&a.target_key_id))
-                .filter(|k| kms_arn_region(&k.arn) == Some(region))
-                .map(|k| k.arn.clone())
-        };
         {
             let mas = self.state.read();
-            if let Some(arn) = mas.get(account_id).and_then(lookup) {
+            if let Some(arn) = mas
+                .get(account_id)
+                .and_then(|state| existing_aws_managed_key(state, region, &alias_full))
+            {
                 return (arn, false);
             }
         }
         let mut mas = self.state.write();
         let state = mas.get_or_create(account_id);
-        // Re-check under the write lock in case a concurrent caller won the race.
-        if let Some(arn) = lookup(state) {
-            return (arn, false);
-        }
-        let arn = if state.aliases.contains_key(&alias_full) {
-            // The account's alias already names another region's key; mint
-            // this region's key without touching it.
-            mint_aws_managed_key(state, region, alias, service_principal)
-        } else {
-            provision_aws_managed_key(state, region, alias, service_principal)
-        };
-        let key_id = key_id_from_arn(&arn).to_string();
-        state.aws_managed_keys.insert(slot, key_id);
-        (arn, true)
+        // Re-check under the write lock in case a concurrent caller won the
+        // race; this also records a key/alias pair that is half-recorded.
+        ensure_aws_managed_key(state, region, alias, service_principal)
     }
 }
 
@@ -420,26 +389,16 @@ fn strip_kms_arn_prefix(key_id: &str) -> Option<&str> {
 }
 
 /// Resolve `key_id` (raw id, alias name, alias ARN, or key ARN) to the
-/// full key ARN if it currently exists in `state`.
-fn resolve_key(state: &KmsState, key_id: &str) -> Option<String> {
-    if let Some(resource) = strip_kms_arn_prefix(key_id) {
-        if let Some(short) = resource.strip_prefix("key/") {
-            return state.keys.get(short).map(|k| k.arn.clone());
-        }
-        if let Some(alias) = resource.strip_prefix("alias/") {
-            let full = format!("alias/{alias}");
-            if let Some(a) = state.aliases.get(&full) {
-                return state.keys.get(&a.target_key_id).map(|k| k.arn.clone());
-            }
-        }
-    }
-    if let Some(alias) = key_id.strip_prefix("alias/") {
-        let full = format!("alias/{alias}");
-        if let Some(a) = state.aliases.get(&full) {
-            return state.keys.get(&a.target_key_id).map(|k| k.arn.clone());
-        }
-    }
-    state.keys.get(key_id).map(|k| k.arn.clone())
+/// full key ARN if it currently exists in `state`. An alias name resolves in
+/// `region`; an alias ARN in the region it names.
+fn resolve_key(state: &KmsState, region: &str, key_id: &str) -> Option<String> {
+    state.resolve_key_arn(region, key_id).map(str::to_string)
+}
+
+/// The ARN of the key the alias `name` targets in `region`.
+fn alias_key_arn(state: &KmsState, region: &str, name: &str) -> Option<String> {
+    let target = state.alias_target(region, name)?;
+    state.keys.get(target).map(|k| k.arn.clone())
 }
 
 fn normalize_alias(key_id: &str) -> String {
@@ -481,51 +440,70 @@ pub const DEFAULT_AWS_MANAGED_ALIASES: &[&str] = &[
 ];
 
 /// Idempotently provision every [`DEFAULT_AWS_MANAGED_ALIASES`] entry that
-/// isn't already present, so `ListAliases` mirrors real AWS. Provisioning a
-/// missing alias also mints its backing AWS-managed key, matching the
-/// auto-provision-on-first-use path in [`resolve_or_provision`].
+/// isn't already present in `region`, so `ListAliases` mirrors real AWS.
+/// Provisioning a missing alias also mints its backing AWS-managed key,
+/// matching the auto-provision-on-first-use path in [`resolve_or_provision`].
 pub fn ensure_default_managed_aliases(state: &mut KmsState, region: &str) {
     for alias in DEFAULT_AWS_MANAGED_ALIASES {
-        let alias_full = format!("alias/{alias}");
-        if state.aliases.contains_key(&alias_full) {
-            continue;
-        }
         // `aws/<service>` -> `<service>.amazonaws.com`. The principal only
         // shapes the default key policy; the data source asserts on the
         // target key id, not the principal, so an approximate principal is
         // fine here.
         let service = alias.strip_prefix("aws/").unwrap_or(alias);
         let principal = format!("{service}.amazonaws.com");
-        provision_aws_managed_key(state, region, alias, &principal);
+        ensure_aws_managed_key(state, region, alias, &principal);
     }
 }
 
-/// The region a KMS ARN names.
-fn kms_arn_region(arn: &str) -> Option<&str> {
-    parse_kms_arn(arn).map(|(region, _, _)| region)
+/// The ARN of the AWS-managed key behind `alias_full` (`alias/aws/<service>`)
+/// in `region`, if one exists: the key recorded for the region, else the key
+/// the region's alias targets.
+fn existing_aws_managed_key(state: &KmsState, region: &str, alias_full: &str) -> Option<String> {
+    let slot = crate::state::aws_managed_key_slot(region, alias_full);
+    state
+        .aws_managed_keys
+        .get(&slot)
+        .and_then(|id| state.keys.get(id))
+        .map(|k| k.arn.clone())
+        .or_else(|| alias_key_arn(state, region, alias_full))
 }
 
-/// Mint the AWS-managed key protecting `alias` (`aws/<service>`) in `region`
-/// and point the account's `alias/<alias>` alias at it.
-fn provision_aws_managed_key(
+/// The AWS-managed key for `alias` (`aws/<service>`) in `region`, minting it
+/// when the region has none; the flag is `true` when this call minted it.
+/// Afterwards the region's `alias/aws/<service>` alias targets the key and
+/// [`KmsState::aws_managed_keys`] records it for the region.
+fn ensure_aws_managed_key(
     state: &mut KmsState,
     region: &str,
     alias: &str,
     service_principal: &str,
-) -> String {
-    let arn = mint_aws_managed_key(state, region, alias, service_principal);
-    let key_id = key_id_from_arn(&arn).to_string();
+) -> (String, bool) {
     let alias_full = format!("alias/{alias}");
-    state.aliases.insert(
-        alias_full.clone(),
-        crate::state::KmsAlias {
-            alias_name: alias_full,
-            alias_arn: kms_alias_arn(region, &state.account_id, &format!("alias/{alias}")),
-            target_key_id: key_id,
-            creation_date: Utc::now().timestamp() as f64,
-        },
+    let (arn, minted) = match existing_aws_managed_key(state, region, &alias_full) {
+        Some(arn) => (arn, false),
+        None => (
+            mint_aws_managed_key(state, region, alias, service_principal),
+            true,
+        ),
+    };
+    let key_id = key_id_from_arn(&arn).to_string();
+    state.aws_managed_keys.insert(
+        crate::state::aws_managed_key_slot(region, &alias_full),
+        key_id.clone(),
     );
-    arn
+    if state.alias_target(region, &alias_full) != Some(key_id.as_str()) {
+        let creation_date = Utc::now().timestamp() as f64;
+        state.insert_alias(
+            region,
+            crate::state::KmsAlias {
+                alias_arn: kms_alias_arn(region, &state.account_id, &alias_full),
+                alias_name: alias_full,
+                target_key_id: key_id,
+                creation_date,
+            },
+        );
+    }
+    (arn, minted)
 }
 
 /// Mint an AWS-managed key protecting `alias` (`aws/<service>`) in `region`.
@@ -619,8 +597,8 @@ mod tests {
 
     /// AWS-managed keys are resolved per account AND region: us-east-1,
     /// us-west-2 and cn-north-1 get three distinct keys, each in its region's
-    /// partition, each reused within its region, and the account keeps its
-    /// single `alias/aws/<service>` alias (on the first region's key).
+    /// partition, each reused within its region, and each region's
+    /// `alias/aws/<service>` alias resolves to that region's key.
     #[test]
     fn aws_managed_keys_are_minted_per_region() {
         use crate::test_support::{assert_aws_managed_key, kms_hook};
@@ -650,26 +628,97 @@ mod tests {
                 Some(arn.as_str()),
                 "{region} reuses its key"
             );
+            assert_eq!(
+                &hook
+                    .resolve_key_arn(
+                        acct,
+                        region,
+                        "alias/aws/timestream",
+                        "timestream.amazonaws.com"
+                    )
+                    .unwrap(),
+                arn,
+                "{region}'s alias names {region}'s key"
+            );
         }
-        // Alias resolution is unchanged (one alias entry per account, as
-        // before): it names the first key minted, from any region.
+        // An alias ARN resolves in the region it names, whatever the
+        // caller's region.
         assert_eq!(
             hook.resolve_key_arn(
                 acct,
-                "us-west-2",
-                "alias/aws/timestream",
+                "us-east-1",
+                "arn:aws:kms:us-west-2:123456789012:alias/aws/timestream",
                 "timestream.amazonaws.com"
             )
             .unwrap(),
-            east
+            west
         );
         let accounts = state.read();
         let s = accounts.get(acct).unwrap();
-        let alias = &s.aliases["alias/aws/timestream"];
-        assert_eq!(s.keys[&alias.target_key_id].arn, east);
+        for (region, arn) in [("us-east-1", &east), ("us-west-2", &west)] {
+            let alias = s.alias(region, "alias/aws/timestream").unwrap();
+            assert_eq!(&s.keys[&alias.target_key_id].arn, arn);
+            assert_eq!(
+                alias.alias_arn,
+                format!("arn:aws:kms:{region}:123456789012:alias/aws/timestream")
+            );
+        }
         drop(accounts);
         assert_eq!(
             aws_managed_kms_key_arn(None, acct, "us-east-1", "timestream"),
+            None
+        );
+    }
+
+    /// An `aws/<service>` alias ARN naming a region with no key yet mints the
+    /// key in that region, not the caller's.
+    #[test]
+    fn managed_alias_arn_provisions_in_its_own_region() {
+        let acct = "123456789012";
+        let (state, hook) = crate::test_support::kms_hook(acct);
+        let arn = hook
+            .resolve_key_arn(
+                acct,
+                "us-east-1",
+                "arn:aws:kms:eu-west-1:123456789012:alias/aws/s3",
+                "s3.amazonaws.com",
+            )
+            .unwrap();
+        assert!(arn.starts_with("arn:aws:kms:eu-west-1:"), "{arn}");
+        let accounts = state.read();
+        let s = accounts.get(acct).unwrap();
+        assert!(s.alias("us-east-1", "alias/aws/s3").is_none());
+        assert!(s.alias("eu-west-1", "alias/aws/s3").is_some());
+    }
+
+    /// A customer alias resolves only in its own region (or through an alias
+    /// ARN naming that region).
+    #[test]
+    fn customer_alias_resolves_only_in_its_region() {
+        let acct = "123456789012";
+        let (state, hook) = crate::test_support::kms_hook(acct);
+        let key_arn = {
+            let mut accounts = state.write();
+            let s = accounts.get_or_create(acct);
+            let arn = mint_aws_managed_key(s, "eu-west-1", "custom", "x.amazonaws.com");
+            let alias = crate::state::KmsAlias {
+                alias_name: "alias/app".into(),
+                alias_arn: kms_alias_arn("eu-west-1", acct, "alias/app"),
+                target_key_id: key_id_from_arn(&arn).to_string(),
+                creation_date: 0.0,
+            };
+            s.insert_alias("eu-west-1", alias);
+            arn
+        };
+        let resolve = |region: &str, key: &str| hook.resolve_key_arn(acct, region, key, "p").ok();
+        assert_eq!(resolve("eu-west-1", "alias/app"), Some(key_arn.clone()));
+        assert_eq!(resolve("us-east-1", "alias/app"), None);
+        assert_eq!(
+            resolve("us-east-1", "arn:aws:kms:eu-west-1:123456789012:alias/app"),
+            Some(key_arn)
+        );
+        assert_eq!(
+            resolve("eu-west-1", "arn:aws:kms:us-east-1:123456789012:alias/app"),
             None
         );
     }
@@ -688,9 +737,11 @@ mod tests {
         let listed = {
             let accounts = state.read();
             let s = accounts.get(acct).unwrap();
-            s.keys[&s.aliases["alias/aws/elasticfilesystem"].target_key_id]
-                .arn
-                .clone()
+            s.keys[s
+                .alias_target("eu-west-1", "alias/aws/elasticfilesystem")
+                .unwrap()]
+            .arn
+            .clone()
         };
         let h = Some(hook.as_ref());
         assert_eq!(
@@ -724,27 +775,36 @@ mod tests {
     #[test]
     fn china_region_managed_key_is_minted_and_resolved_in_aws_cn() {
         let mut state = KmsState::new("000000000000", "cn-north-1");
-        let arn = provision_aws_managed_key(
+        let (arn, minted) = ensure_aws_managed_key(
             &mut state,
             "cn-north-1",
             "aws/secretsmanager",
             "secretsmanager.amazonaws.com",
         );
+        assert!(minted);
         assert!(
             arn.starts_with("arn:aws-cn:kms:cn-north-1:000000000000:key/"),
             "{arn}"
         );
         assert_eq!(
-            state.aliases["alias/aws/secretsmanager"].alias_arn,
+            state
+                .alias("cn-north-1", "alias/aws/secretsmanager")
+                .unwrap()
+                .alias_arn,
             "arn:aws-cn:kms:cn-north-1:000000000000:alias/aws/secretsmanager"
         );
-        assert_eq!(resolve_key(&state, &arn), Some(arn.clone()));
+        assert_eq!(resolve_key(&state, "cn-north-1", &arn), Some(arn.clone()));
         assert_eq!(
             resolve_key(
                 &state,
+                "us-east-1",
                 "arn:aws-cn:kms:cn-north-1:000000000000:alias/aws/secretsmanager"
             ),
             Some(arn)
+        );
+        assert_eq!(
+            resolve_key(&state, "us-east-1", "alias/aws/secretsmanager"),
+            None
         );
     }
 

@@ -134,6 +134,13 @@ pub fn account_of(arn: &str) -> Option<&str> {
     rest.split(':').nth(3).filter(|a| !a.is_empty())
 }
 
+/// The region an ARN names (`arn:<partition>:<service>:<region>:...`),
+/// `None` when `arn` is not an ARN or names no region.
+pub fn region_of(arn: &str) -> Option<&str> {
+    let rest = arn.strip_prefix("arn:")?;
+    rest.split(':').nth(2).filter(|r| !r.is_empty())
+}
+
 /// The partition an ARN names (`arn:<partition>:...`), `aws` when it names
 /// none.
 pub fn partition_of(arn: &str) -> &str {
@@ -358,5 +365,19 @@ mod tests {
         );
         assert_eq!(account_of("arn:aws:s3:::bucket"), None);
         assert_eq!(account_of("not-an-arn"), None);
+    }
+
+    #[test]
+    fn region_of_reads_the_region_field() {
+        assert_eq!(
+            region_of("arn:aws:sqs:eu-west-1:123456789012:q"),
+            Some("eu-west-1")
+        );
+        assert_eq!(
+            region_of("arn:aws-cn:sns:cn-north-1:000000000000:t"),
+            Some("cn-north-1")
+        );
+        assert_eq!(region_of("arn:aws:iam::123456789012:role/r"), None);
+        assert_eq!(region_of("not-an-arn"), None);
     }
 }

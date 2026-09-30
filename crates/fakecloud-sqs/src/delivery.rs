@@ -202,9 +202,11 @@ impl SqsDelivery for SqsDeliveryImpl {
             (Some(key), Some(hook)) if !key.is_empty() => {
                 let mut ctx = HashMap::new();
                 ctx.insert("aws:sqs:arn".to_string(), queue_arn_owned.clone());
+                // The key (or alias) lives in the queue's region.
+                let key_region = fakecloud_aws::arn::region_of(&queue_arn_owned).unwrap_or(&region);
                 hook.encrypt(
                     &target_account,
-                    &region,
+                    key_region,
                     key,
                     message_body.as_bytes(),
                     "sqs.amazonaws.com",

@@ -398,10 +398,16 @@ pub(crate) fn encrypt_layer_bytes(
     let Some(ref key_ref) = repo.encryption_configuration.kms_key else {
         return (plaintext.to_vec(), None);
     };
+    // The key (and any alias naming it) lives in the repository's region.
+    let region = repo
+        .repository_arn
+        .parse::<fakecloud_aws::arn::Arn>()
+        .map(|arn| arn.region)
+        .unwrap_or_default();
     // Drop the state read guard before the KMS call.
     let key_ref = key_ref.clone();
     drop(accounts);
-    match fakecloud_kms::api::encrypt_blob(kms, account_id, &key_ref, plaintext) {
+    match fakecloud_kms::api::encrypt_blob(kms, account_id, &region, &key_ref, plaintext) {
         Ok(bytes) => (bytes, Some(key_ref)),
         Err(err) => {
             tracing::warn!(
@@ -1403,5 +1409,60 @@ mod immutability_tests {
         assert_eq!(layer.size, data.len() as u64);
         // The upload spool is consumed on a successful commit.
         assert!(guard.get(ACCT).unwrap().layer_uploads.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod kms_region_tests {
+    use crate::service::EcrService;
+    use crate::state::{EncryptionConfiguration, Repository, SharedEcrState};
+    use fakecloud_core::multi_account::MultiAccountState;
+    use parking_lot::RwLock;
+    use std::sync::Arc;
+
+    const ACCT: &str = "111111111111";
+
+    /// A KMS-encrypted repository resolves its key alias in the repository's
+    /// own region: `alias/aws/ecr` exists only in eu-west-1 here, so the
+    /// eu-west-1 repository encrypts under it and the us-east-1 one cannot.
+    #[test]
+    fn layer_key_alias_resolves_in_the_repository_region() {
+        let kms: fakecloud_kms::SharedKmsState =
+            Arc::new(RwLock::new(MultiAccountState::new(ACCT, "us-east-1", "")));
+        let hook = fakecloud_kms::hook::KmsServiceHook::new(kms.clone(), Default::default());
+        let (west_key, _) =
+            hook.aws_managed_key_arn_tracked(ACCT, "eu-west-1", "ecr", "ecr.amazonaws.com");
+
+        let mut mas: MultiAccountState<crate::state::EcrState> =
+            MultiAccountState::new(ACCT, "us-east-1", "http://fakecloud:4566");
+        let s = mas.get_or_create(ACCT);
+        for (name, region) in [("west", "eu-west-1"), ("east", "us-east-1")] {
+            let arn = s.repository_arn(region, name);
+            let mut repo = Repository::new(name, arn, ACCT, "fakecloud:4566");
+            repo.encryption_configuration = EncryptionConfiguration {
+                encryption_type: "KMS".to_string(),
+                kms_key: Some("alias/aws/ecr".to_string()),
+            };
+            s.repositories.insert(name.to_string(), repo);
+        }
+        let state: SharedEcrState = Arc::new(RwLock::new(mas));
+        let svc = EcrService::new(state).with_kms(kms.clone());
+
+        let plaintext = b"layer bytes";
+        let (stored, with) = super::encrypt_layer_bytes(&svc, ACCT, "west", plaintext);
+        assert_eq!(with.as_deref(), Some("alias/aws/ecr"));
+        assert_ne!(stored, plaintext);
+        let decrypted = fakecloud_kms::api::decrypt_blob(&kms, ACCT, &stored).unwrap();
+        assert_eq!(decrypted, plaintext);
+        // The envelope names eu-west-1's key.
+        let arn_len = u16::from_be_bytes([stored[0], stored[1]]) as usize;
+        assert_eq!(
+            std::str::from_utf8(&stored[2..2 + arn_len]).unwrap(),
+            west_key
+        );
+
+        let (stored, with) = super::encrypt_layer_bytes(&svc, ACCT, "east", plaintext);
+        assert_eq!(with, None, "no alias/aws/ecr in us-east-1");
+        assert_eq!(stored, plaintext);
     }
 }

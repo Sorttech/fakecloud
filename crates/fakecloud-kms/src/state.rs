@@ -32,12 +32,21 @@ impl fakecloud_core::multi_account::AccountState for KmsState {
     }
 }
 
+/// Aliases by region, then by alias name (`alias/<name>`). An alias is a
+/// regional resource: the same name can exist independently in every region,
+/// pointing at a key in that region. The inner map is name-ordered, which is
+/// the order `ListAliases` pages through.
+pub type RegionalAliases = BTreeMap<String, BTreeMap<String, KmsAlias>>;
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(from = "KmsStateRepr")]
 pub struct KmsState {
     pub account_id: String,
     pub region: String,
     pub keys: BTreeMap<String, KmsKey>,
-    pub aliases: BTreeMap<String, KmsAlias>,
+    /// See [`RegionalAliases`]; use the `alias*` accessors rather than the
+    /// map directly.
+    pub aliases: RegionalAliases,
     pub grants: Vec<KmsGrant>,
     pub custom_key_stores: BTreeMap<String, CustomKeyStore>,
     /// Per-account master key bytes (32 bytes for AES-256-GCM) used to
@@ -55,11 +64,61 @@ pub struct KmsState {
     pub import_wrapping_keys: BTreeMap<String, ImportWrapEntry>,
     /// AWS-managed keys minted for other services, by
     /// [`aws_managed_key_slot`] (region + `alias/aws/<service>`) -> key id.
-    /// AWS-managed keys exist once per account AND region; this records the
-    /// key for each region independently of the account's single
-    /// `alias/aws/<service>` alias entry.
+    /// AWS-managed keys exist once per account AND region; each region's
+    /// `alias/aws/<service>` alias targets the key recorded here for it.
     #[serde(default)]
     pub aws_managed_keys: BTreeMap<String, String>,
+}
+
+/// The persisted shape of [`KmsState`]. Identical except that `aliases` may
+/// also be the pre-regional form (one account-wide map keyed by alias name),
+/// which [`From`] migrates into [`RegionalAliases`].
+#[derive(serde::Deserialize)]
+struct KmsStateRepr {
+    account_id: String,
+    region: String,
+    keys: BTreeMap<String, KmsKey>,
+    aliases: PersistedAliases,
+    grants: Vec<KmsGrant>,
+    custom_key_stores: BTreeMap<String, CustomKeyStore>,
+    #[serde(default = "default_master_key_bytes_on_load")]
+    master_key_bytes: Vec<u8>,
+    #[serde(default)]
+    import_wrapping_keys: BTreeMap<String, ImportWrapEntry>,
+    #[serde(default)]
+    aws_managed_keys: BTreeMap<String, String>,
+}
+
+/// `aliases` as found in a snapshot: region -> name -> alias (schema 3+), or
+/// the account-wide name -> alias map written before aliases were regional.
+/// The two never parse as each other: a legacy value is an alias object, a
+/// regional value is a map of alias objects.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum PersistedAliases {
+    Regional(RegionalAliases),
+    Legacy(BTreeMap<String, KmsAlias>),
+}
+
+impl From<KmsStateRepr> for KmsState {
+    fn from(r: KmsStateRepr) -> Self {
+        let mut state = KmsState {
+            account_id: r.account_id,
+            region: r.region,
+            keys: r.keys,
+            aliases: RegionalAliases::new(),
+            grants: r.grants,
+            custom_key_stores: r.custom_key_stores,
+            master_key_bytes: r.master_key_bytes,
+            import_wrapping_keys: r.import_wrapping_keys,
+            aws_managed_keys: r.aws_managed_keys,
+        };
+        match r.aliases {
+            PersistedAliases::Regional(aliases) => state.aliases = aliases,
+            PersistedAliases::Legacy(aliases) => state.migrate_legacy_aliases(aliases),
+        }
+        state
+    }
 }
 
 /// The [`KmsState::aws_managed_keys`] slot of the AWS-managed key behind
@@ -118,6 +177,152 @@ impl KmsState {
             master_key_bytes: default_master_key_bytes(),
             import_wrapping_keys: BTreeMap::new(),
             aws_managed_keys: BTreeMap::new(),
+        }
+    }
+
+    /// The alias `name` (`alias/<name>`) in `region`.
+    pub fn alias(&self, region: &str, name: &str) -> Option<&KmsAlias> {
+        self.aliases.get(region)?.get(name)
+    }
+
+    pub fn alias_mut(&mut self, region: &str, name: &str) -> Option<&mut KmsAlias> {
+        self.aliases.get_mut(region)?.get_mut(name)
+    }
+
+    /// Insert (or replace) `alias` in `region`.
+    pub fn insert_alias(&mut self, region: &str, alias: KmsAlias) {
+        self.aliases
+            .entry(region.to_string())
+            .or_default()
+            .insert(alias.alias_name.clone(), alias);
+    }
+
+    pub fn remove_alias(&mut self, region: &str, name: &str) -> Option<KmsAlias> {
+        let in_region = self.aliases.get_mut(region)?;
+        let removed = in_region.remove(name);
+        if in_region.is_empty() {
+            self.aliases.remove(region);
+        }
+        removed
+    }
+
+    /// Every alias in `region`, in alias-name order.
+    pub fn aliases_in(&self, region: &str) -> impl Iterator<Item = &KmsAlias> {
+        self.aliases
+            .get(region)
+            .into_iter()
+            .flat_map(|m| m.values())
+    }
+
+    /// Drop every alias, in any region, for which `keep` returns `false`.
+    pub fn retain_aliases(&mut self, mut keep: impl FnMut(&KmsAlias) -> bool) {
+        for in_region in self.aliases.values_mut() {
+            in_region.retain(|_, a| keep(a));
+        }
+        self.aliases.retain(|_, in_region| !in_region.is_empty());
+    }
+
+    /// Resolve a key id, key ARN, alias name or alias ARN to the stored key
+    /// id. Aliases are regional: an alias name resolves in `region` (the
+    /// caller's region), an alias ARN in the region it names.
+    pub fn resolve_key_id(&self, region: &str, key_id_or_arn: &str) -> Option<String> {
+        // Direct key ID
+        if self.keys.contains_key(key_id_or_arn) {
+            return Some(key_id_or_arn.to_string());
+        }
+
+        if let Some((arn_region, _account, resource)) = parse_kms_arn(key_id_or_arn) {
+            if let Some(id) = resource.strip_prefix("key/") {
+                // Multi-region replicas are stored under a region-scoped
+                // composite key ("{region}:{id}") because the primary and
+                // every replica share the same bare id. Resolve the ARN's
+                // own region first so a DescribeKey on a replica ARN returns
+                // the replica entry, not the primary that also matches `id`.
+                let scoped = format!("{arn_region}:{id}");
+                if self.keys.contains_key(&scoped) {
+                    return Some(scoped);
+                }
+                if self.keys.contains_key(id) {
+                    return Some(id.to_string());
+                }
+            }
+            // alias ARN: arn:<partition>:kms:<region>:<account>:alias/<name>
+            if resource.starts_with("alias/") {
+                return self.alias_target(arn_region, resource).map(str::to_string);
+            }
+            return None;
+        }
+
+        if key_id_or_arn.starts_with("alias/") {
+            return self.alias_target(region, key_id_or_arn).map(str::to_string);
+        }
+
+        None
+    }
+
+    /// The ARN of the key `key_id_or_arn` resolves to (see
+    /// [`Self::resolve_key_id`]).
+    pub fn resolve_key_arn(&self, region: &str, key_id_or_arn: &str) -> Option<&str> {
+        let id = self.resolve_key_id(region, key_id_or_arn)?;
+        self.keys.get(&id).map(|k| k.arn.as_str())
+    }
+
+    /// The key id `name` resolves to in `region`.
+    pub fn alias_target(&self, region: &str, name: &str) -> Option<&str> {
+        self.alias(region, name).map(|a| a.target_key_id.as_str())
+    }
+
+    /// Move a pre-regional, account-wide alias map into [`Self::aliases`].
+    /// Each alias lands in the region of the key it targets (an alias and its
+    /// key always share a region), falling back to the region of its own ARN
+    /// and then the account's default region; its ARN is rebuilt for that
+    /// region. Every AWS-managed key recorded per region then gets its
+    /// region's `alias/aws/<service>` alias, and every migrated
+    /// `alias/aws/<service>` alias is recorded as its region's AWS-managed
+    /// key, so both lookups agree in every region.
+    fn migrate_legacy_aliases(&mut self, legacy: BTreeMap<String, KmsAlias>) {
+        for (name, mut alias) in legacy {
+            let region = self
+                .keys
+                .get(&alias.target_key_id)
+                .and_then(|k| parse_kms_arn(&k.arn))
+                .or_else(|| parse_kms_arn(&alias.alias_arn))
+                .map(|(region, _, _)| region.to_string())
+                .filter(|r| !r.is_empty())
+                .unwrap_or_else(|| self.region.clone());
+            alias.alias_name = name;
+            alias.alias_arn = kms_alias_arn(&region, &self.account_id, &alias.alias_name);
+            if alias.alias_name.starts_with("alias/aws/") {
+                // The region's recorded AWS-managed key wins: it is what
+                // services in that region have been reporting.
+                alias.target_key_id = self
+                    .aws_managed_keys
+                    .entry(aws_managed_key_slot(&region, &alias.alias_name))
+                    .or_insert_with(|| alias.target_key_id.clone())
+                    .clone();
+            }
+            self.insert_alias(&region, alias);
+        }
+        let managed: Vec<(String, String)> = self
+            .aws_managed_keys
+            .iter()
+            .map(|(slot, key_id)| (slot.clone(), key_id.clone()))
+            .collect();
+        for (slot, key_id) in managed {
+            let Some((region, name)) = slot.split_once('/') else {
+                continue;
+            };
+            if self.alias(region, name).is_some() {
+                continue;
+            }
+            let creation_date = self.keys.get(&key_id).map_or(0.0, |k| k.creation_date);
+            let alias = KmsAlias {
+                alias_name: name.to_string(),
+                alias_arn: kms_alias_arn(region, &self.account_id, name),
+                target_key_id: key_id,
+                creation_date,
+            };
+            self.insert_alias(region, alias);
         }
     }
 
@@ -229,7 +434,9 @@ pub struct KmsSnapshot {
     pub state: Option<KmsState>,
 }
 
-pub const KMS_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
+/// 3: aliases are regional (`aliases` is region -> name -> alias). Schema 2
+/// snapshots, whose `aliases` is one account-wide map, migrate on load.
+pub const KMS_SNAPSHOT_SCHEMA_VERSION: u32 = 3;
 
 #[cfg(test)]
 mod tests {
@@ -249,8 +456,8 @@ mod tests {
     #[test]
     fn reset_clears_collections() {
         let mut state = KmsState::new("123456789012", "us-east-1");
-        state.aliases.insert(
-            "alias/test".to_string(),
+        state.insert_alias(
+            "us-east-1",
             KmsAlias {
                 alias_name: "alias/test".to_string(),
                 alias_arn: "arn".to_string(),
@@ -291,5 +498,180 @@ mod tests {
         let loaded: KmsState = serde_json::from_str(json).unwrap();
         assert_eq!(loaded.master_key_bytes.len(), 32);
         assert!(loaded.import_wrapping_keys.is_empty());
+    }
+
+    fn legacy_key_json(key_id: &str, region: &str, manager: &str) -> serde_json::Value {
+        let mut key = serde_json::to_value(KmsKey {
+            key_id: key_id.to_string(),
+            arn: kms_key_arn(region, "123456789012", key_id),
+            creation_date: 1.0,
+            description: String::new(),
+            enabled: true,
+            key_usage: "ENCRYPT_DECRYPT".into(),
+            key_spec: "SYMMETRIC_DEFAULT".into(),
+            key_manager: manager.into(),
+            key_state: "Enabled".into(),
+            deletion_date: None,
+            tags: BTreeMap::new(),
+            policy: String::new(),
+            key_rotation_enabled: false,
+            rotation_period_in_days: None,
+            origin: "AWS_KMS".into(),
+            multi_region: false,
+            rotations: Vec::new(),
+            signing_algorithms: None,
+            encryption_algorithms: None,
+            mac_algorithms: None,
+            custom_key_store_id: None,
+            imported_key_material: false,
+            imported_material_bytes: None,
+            private_key_seed: Vec::new(),
+            primary_region: None,
+            asymmetric_private_key_der: None,
+            asymmetric_public_key_der: None,
+        })
+        .unwrap();
+        key.as_object_mut()
+            .unwrap()
+            .remove("rotation_period_in_days");
+        key
+    }
+
+    fn legacy_alias_json(name: &str, arn_region: &str, target: &str) -> serde_json::Value {
+        serde_json::json!({
+            "alias_name": name,
+            "alias_arn": kms_alias_arn(arn_region, "123456789012", name),
+            "target_key_id": target,
+            "creation_date": 2.0,
+        })
+    }
+
+    /// A schema-2 snapshot's account-wide alias map migrates into regional
+    /// aliases on load: each alias moves to its key's region (with its ARN
+    /// rebuilt there), the per-region AWS-managed keys recorded by #2598 gain
+    /// their region's `alias/aws/<service>` alias, and ListAliases order
+    /// (AliasName within a region) is preserved.
+    #[test]
+    fn legacy_account_wide_aliases_migrate_into_their_key_regions() {
+        let json = serde_json::json!({
+            "schema_version": 2,
+            "accounts": {
+                "default_account_id": "123456789012",
+                "region": "us-east-1",
+                "endpoint": "",
+                "accounts": {
+                    "123456789012": {
+                        "account_id": "123456789012",
+                        "region": "us-east-1",
+                        "keys": {
+                            "east": legacy_key_json("east", "us-east-1", "CUSTOMER"),
+                            "west": legacy_key_json("west", "eu-west-1", "CUSTOMER"),
+                            "managed-east": legacy_key_json("managed-east", "us-east-1", "AWS"),
+                            "managed-west": legacy_key_json("managed-west", "eu-west-1", "AWS"),
+                        },
+                        "aliases": {
+                            "alias/b-east": legacy_alias_json("alias/b-east", "us-east-1", "east"),
+                            "alias/a-east": legacy_alias_json("alias/a-east", "us-east-1", "east"),
+                            // Created through a us-east-1 client but naming a
+                            // eu-west-1 key: it belongs with its key.
+                            "alias/west": legacy_alias_json("alias/west", "us-east-1", "west"),
+                            // Target no longer exists: stays in the ARN's region.
+                            "alias/orphan": legacy_alias_json("alias/orphan", "ap-south-1", "gone"),
+                            "alias/aws/timestream": legacy_alias_json(
+                                "alias/aws/timestream", "us-east-1", "managed-east"
+                            ),
+                        },
+                        "grants": [],
+                        "custom_key_stores": {},
+                        "master_key_bytes": vec![1u8; 32],
+                        "aws_managed_keys": {
+                            "eu-west-1/alias/aws/timestream": "managed-west",
+                        },
+                    }
+                }
+            }
+        });
+        let snapshot: KmsSnapshot = serde_json::from_value(json).unwrap();
+        let accounts = snapshot.accounts.unwrap();
+        let s = accounts.get("123456789012").unwrap();
+
+        let names = |region: &str| -> Vec<String> {
+            s.aliases_in(region).map(|a| a.alias_name.clone()).collect()
+        };
+        assert_eq!(
+            names("us-east-1"),
+            vec!["alias/a-east", "alias/aws/timestream", "alias/b-east"]
+        );
+        assert_eq!(
+            names("eu-west-1"),
+            vec!["alias/aws/timestream", "alias/west"]
+        );
+        assert_eq!(names("ap-south-1"), vec!["alias/orphan"]);
+
+        let west = s.alias("eu-west-1", "alias/west").unwrap();
+        assert_eq!(west.target_key_id, "west");
+        assert_eq!(
+            west.alias_arn,
+            "arn:aws:kms:eu-west-1:123456789012:alias/west"
+        );
+        assert_eq!(west.creation_date, 2.0);
+        assert_eq!(
+            s.alias_target("us-east-1", "alias/aws/timestream"),
+            Some("managed-east")
+        );
+        let managed_west = s.alias("eu-west-1", "alias/aws/timestream").unwrap();
+        assert_eq!(managed_west.target_key_id, "managed-west");
+        assert_eq!(
+            managed_west.alias_arn,
+            "arn:aws:kms:eu-west-1:123456789012:alias/aws/timestream"
+        );
+        assert_eq!(
+            s.aws_managed_keys
+                .get(&aws_managed_key_slot("us-east-1", "alias/aws/timestream"))
+                .map(String::as_str),
+            Some("managed-east")
+        );
+        assert_eq!(
+            s.resolve_key_id("eu-west-1", "alias/west").as_deref(),
+            Some("west")
+        );
+        assert_eq!(s.resolve_key_id("us-east-1", "alias/west"), None);
+        assert_eq!(s.master_key_bytes, vec![1u8; 32]);
+
+        // The migrated state writes the regional shape, which reloads as is.
+        let written = serde_json::to_value(s).unwrap();
+        assert!(written["aliases"]["eu-west-1"]["alias/west"].is_object());
+        let reloaded: KmsState = serde_json::from_value(written).unwrap();
+        assert_eq!(
+            reloaded
+                .aliases_in("us-east-1")
+                .map(|a| a.alias_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alias/a-east", "alias/aws/timestream", "alias/b-east"]
+        );
+        assert_eq!(
+            reloaded.alias_target("eu-west-1", "alias/west"),
+            Some("west")
+        );
+    }
+
+    #[test]
+    fn regional_alias_accessors() {
+        let mut state = KmsState::new("123456789012", "us-east-1");
+        let alias = |region: &str, target: &str| KmsAlias {
+            alias_name: "alias/app".into(),
+            alias_arn: kms_alias_arn(region, "123456789012", "alias/app"),
+            target_key_id: target.into(),
+            creation_date: 0.0,
+        };
+        state.insert_alias("us-east-1", alias("us-east-1", "k1"));
+        state.insert_alias("eu-west-1", alias("eu-west-1", "k2"));
+        assert_eq!(state.alias_target("us-east-1", "alias/app"), Some("k1"));
+        assert_eq!(state.alias_target("eu-west-1", "alias/app"), Some("k2"));
+        state.retain_aliases(|a| a.target_key_id != "k1");
+        assert!(state.alias("us-east-1", "alias/app").is_none());
+        assert!(!state.aliases.contains_key("us-east-1"));
+        assert!(state.remove_alias("eu-west-1", "alias/app").is_some());
+        assert!(state.aliases.is_empty());
     }
 }

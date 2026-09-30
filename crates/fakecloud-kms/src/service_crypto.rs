@@ -191,7 +191,7 @@ impl KmsService {
         // alias / alias ARN) to its key ARN and compare against the
         // producing key's ARN.
         if let Some(caller_key_id) = body["KeyId"].as_str().filter(|s| !s.is_empty()) {
-            let resolved = Self::resolve_key_id_with_state(state, caller_key_id)
+            let resolved = Self::resolve_key_id_with_state(state, &req.region, caller_key_id)
                 .and_then(|id| state.keys.get(&id))
                 .map(|k| k.arn.clone());
             match resolved {
@@ -291,8 +291,8 @@ impl KmsService {
         let dest_ec_aad = canonical_encryption_context(&body["DestinationEncryptionContext"])?;
         let decoded = decode_ciphertext_envelope(state, ciphertext_b64, &source_ec_aad)?;
 
-        let dest_resolved =
-            Self::resolve_key_id_with_state(state, dest_key_id).ok_or_else(|| {
+        let dest_resolved = Self::resolve_key_id_with_state(state, &req.region, dest_key_id)
+            .ok_or_else(|| {
                 AwsServiceError::aws_error(
                     StatusCode::BAD_REQUEST,
                     "NotFoundException",
