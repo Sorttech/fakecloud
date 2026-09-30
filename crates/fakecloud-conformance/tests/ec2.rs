@@ -12860,6 +12860,136 @@ async fn ec2_describe_capacity_reservation_cancellation_quotes() {
     .await;
 }
 
+const DAY_SECS: i64 = 86_400;
+
+/// ISO 8601 (UTC) rendering of epoch seconds, as the EC2 query wire takes it.
+fn iso(secs: i64) -> String {
+    aws_sdk_ec2::primitives::DateTime::from_secs(secs)
+        .fmt(aws_sdk_ec2::primitives::DateTimeFormat::DateTime)
+        .unwrap()
+}
+
+/// Create a future-dated Capacity Reservation (starts in 5 days, one-day
+/// commitment) and return its id and start (epoch seconds), for the
+/// date-change quote ops.
+async fn make_future_cr(server: &TestServer) -> (String, i64) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let start = now + 5 * DAY_SECS;
+    let body = ec2_raw(
+        server,
+        &format!(
+            "Action=CreateCapacityReservation&Version=2016-11-15&InstanceType=m5.large\
+             &InstancePlatform=Linux%2FUNIX&InstanceCount=2&CommitmentDuration=86400\
+             &StartDate={}",
+            iso(start)
+        ),
+    )
+    .await
+    .text()
+    .await
+    .unwrap();
+    assert!(body.contains("<state>scheduled</state>"), "{body}");
+    (xml_text(&body, "capacityReservationId"), start)
+}
+
+fn xml_text(body: &str, tag: &str) -> String {
+    body.split(&format!("<{tag}>"))
+        .nth(1)
+        .and_then(|r| r.split(&format!("</{tag}>")).next())
+        .unwrap_or_else(|| panic!("<{tag}> missing in {body}"))
+        .to_string()
+}
+
+async fn make_date_change_quote(server: &TestServer, cr: &str, new_start: i64) -> String {
+    let body = ec2_raw(
+        server,
+        &format!(
+            "Action=CreateCapacityReservationDateChangeQuote&Version=2016-11-15\
+             &CapacityReservationId={cr}&NewStartDate={}",
+            iso(new_start)
+        ),
+    )
+    .await
+    .text()
+    .await
+    .unwrap();
+    assert_eq!(xml_text(&body, "quoteState"), "active", "{body}");
+    xml_text(&body, "capacityReservationModificationQuoteId")
+}
+
+#[test_action(
+    "ec2",
+    "CreateCapacityReservationDateChangeQuote",
+    checksum = "503d2346"
+)]
+#[tokio::test]
+async fn ec2_create_capacity_reservation_date_change_quote() {
+    let server = TestServer::start().await;
+    let (cr, start) = make_future_cr(&server).await;
+    let new_start = start + 2 * DAY_SECS;
+    let qid = make_date_change_quote(&server, &cr, new_start).await;
+    assert!(qid.starts_with("crmq-"), "{qid}");
+
+    // Accepting the quote moves the start date and records the adjustment.
+    let modified = ec2_raw(
+        &server,
+        &format!(
+            "Action=ModifyCapacityReservation&Version=2016-11-15&CapacityReservationId={cr}\
+             &QuoteId={qid}&AcceptModificationTerms=true"
+        ),
+    )
+    .await
+    .text()
+    .await
+    .unwrap();
+    assert_eq!(xml_text(&modified, "adjustmentStatus"), "applied");
+    let d = server
+        .ec2_client()
+        .await
+        .describe_capacity_reservations()
+        .capacity_reservation_ids(&cr)
+        .send()
+        .await
+        .unwrap();
+    let got = d.capacity_reservations()[0].start_date().unwrap();
+    assert_eq!(got.secs(), new_start);
+}
+
+#[test_action(
+    "ec2",
+    "DescribeCapacityReservationDateChangeQuotes",
+    checksum = "cd9821f7"
+)]
+#[tokio::test]
+async fn ec2_describe_capacity_reservation_date_change_quotes() {
+    let server = TestServer::start().await;
+    let (cr, start) = make_future_cr(&server).await;
+    let qid = make_date_change_quote(&server, &cr, start + DAY_SECS).await;
+    let body = ec2_raw(
+        &server,
+        &format!(
+            "Action=DescribeCapacityReservationDateChangeQuotes&Version=2016-11-15\
+             &Filter.1.Name=capacity-reservation-id&Filter.1.Value.1={cr}"
+        ),
+    )
+    .await
+    .text()
+    .await
+    .unwrap();
+    assert!(
+        body.contains("<capacityReservationModificationQuoteSet>"),
+        "{body}"
+    );
+    assert_eq!(
+        xml_text(&body, "capacityReservationModificationQuoteId"),
+        qid
+    );
+    assert_eq!(xml_text(&body, "capacityReservationId"), cr);
+}
+
 #[test_action("ec2", "DescribeIpamPoolAllocations", checksum = "74fcc825")]
 #[tokio::test]
 async fn ec2_describe_ipam_pool_allocations() {

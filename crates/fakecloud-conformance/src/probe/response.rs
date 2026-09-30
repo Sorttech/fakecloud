@@ -216,6 +216,7 @@ pub(super) fn service_common_errors(service_name: &str) -> &'static [&'static st
             "InvalidSpotFleetRequestId.NotFound",
             "InvalidCapacityReservationId.NotFound",
             "InvalidCapacityReservationFleetId.NotFound",
+            "InvalidCapacityReservationModificationQuoteId.NotFound",
             "InvalidTransitGatewayAttachmentID.NotFound",
             "InvalidVpcEndpointId.NotFound",
             // Same `.NotFound` family, for resources whose handlers were

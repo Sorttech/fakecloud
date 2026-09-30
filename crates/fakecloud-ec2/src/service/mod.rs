@@ -721,6 +721,8 @@ pub const SUPPORTED_ACTIONS: &[&str] = &[
     // Remainder sweep (long tail -> full 767-op parity)
     "CreateCapacityReservationCancellationQuote",
     "DescribeCapacityReservationCancellationQuotes",
+    "CreateCapacityReservationDateChangeQuote",
+    "DescribeCapacityReservationDateChangeQuotes",
     "DescribeIpamPoolAllocations",
     "ModifyIpamPoolAllocation",
     "DescribeAccountVpcEncryptionControl",
@@ -2848,6 +2850,12 @@ impl AwsService for Ec2Service {
             }
             "DescribeCapacityReservationCancellationQuotes" => {
                 rest::describe_capacity_reservation_cancellation_quotes(self, &request)
+            }
+            "CreateCapacityReservationDateChangeQuote" => {
+                capacity::create_capacity_reservation_date_change_quote(self, &request)
+            }
+            "DescribeCapacityReservationDateChangeQuotes" => {
+                capacity::describe_capacity_reservation_date_change_quotes(self, &request)
             }
             "DescribeIpamPoolAllocations" => rest::describe_ipam_pool_allocations(self, &request),
             "ModifyIpamPoolAllocation" => rest::modify_ipam_pool_allocation(self, &request),

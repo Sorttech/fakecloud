@@ -102,6 +102,9 @@ fn resource_exists(state: &Ec2State, id: &str) -> Option<bool> {
         "pcx" => state.vpc_peerings.contains_key(id),
         "nat" => state.nat_gateways.contains_key(id),
         "eipalloc" => state.elastic_ips.contains_key(id),
+        "crmq" => state
+            .capacity_reservation_modification_quotes
+            .contains_key(id),
         "asc" => state
             .application_status_checks
             .get(id)
@@ -275,6 +278,7 @@ pub(crate) fn infer_resource_type(resource_id: &str) -> String {
         "rtb" => "route-table",
         "eipalloc" => "elastic-ip",
         "asc" => "application-status-check",
+        "crmq" => "capacity-reservation-modification-quote",
         _ => "resource",
     };
     ty.to_string()
