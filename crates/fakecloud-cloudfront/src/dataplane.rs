@@ -676,6 +676,29 @@ mod tests {
     }
 
     #[test]
+    fn find_resolves_a_distribution_in_any_account() {
+        let mut accs = CloudFrontAccounts::new();
+        accs.entry("111111111111")
+            .distributions
+            .insert("E1ABC".into(), dist("E1ABC", true, &[]));
+        accs.entry("222222222222")
+            .distributions
+            .insert("E2DEF".into(), dist("E2DEF", true, &["cdn.example.com"]));
+        assert_eq!(
+            find_distribution_by_host(&accs, "e1abc.cloudfront.net").map(|d| d.id.as_str()),
+            Some("E1ABC")
+        );
+        assert_eq!(
+            find_distribution_by_host(&accs, "e2def.cloudfront.net").map(|d| d.id.as_str()),
+            Some("E2DEF")
+        );
+        assert_eq!(
+            find_distribution_by_host(&accs, "cdn.example.com").map(|d| d.id.as_str()),
+            Some("E2DEF")
+        );
+    }
+
+    #[test]
     fn find_by_domain_name() {
         let accs = accounts_with(vec![dist("E1ABC", true, &[])]);
         let found = find_distribution_by_host(&accs, "e1abc.cloudfront.net").unwrap();

@@ -45,6 +45,7 @@ fn is_mutating_action(action: &str) -> bool {
     PREFIXES.iter().any(|p| action.starts_with(p))
 }
 
+#[cfg(test)]
 pub(crate) const DEFAULT_ACCOUNT: &str = "000000000000";
 
 const SUPPORTED_ACTIONS: &[&str] = &[
@@ -438,7 +439,7 @@ impl AwsService for CloudFrontService {
     }
 
     async fn handle(&self, req: AwsRequest) -> Result<AwsResponse, AwsServiceError> {
-        let resolved = match route(&req.method, &req.raw_path, &req.raw_query) {
+        let mut resolved = match route(&req.method, &req.raw_path, &req.raw_query) {
             Some(r) => r,
             None => {
                 return Err(aws_error(
@@ -449,6 +450,9 @@ impl AwsService for CloudFrontService {
             }
         };
 
+        // CloudFront is global but every resource is owned by the caller's
+        // account; handlers that only see the route read it from here.
+        resolved.account = req.account_id.clone();
         let mutates = is_mutating_action(resolved.action);
         let result = match resolved.action {
             "CreateDistribution" => self.create_distribution(&req, false),
@@ -699,7 +703,10 @@ impl CloudFrontService {
         validate_distribution_config(&config)?;
 
         let mut state = self.state.write();
-        let account = state.entry(account_id(req));
+        let id = state.unused_id(generate_distribution_id, |a, id| {
+            a.distributions.contains_key(id)
+        });
+        let account = state.entry(&req.account_id);
 
         if let Some(existing) = account
             .distributions
@@ -716,11 +723,10 @@ impl CloudFrontService {
             ));
         }
 
-        let id = generate_distribution_id();
         let now = Utc::now();
         let etag = generate_etag();
         let domain = format!("{}.cloudfront.net", id.to_lowercase());
-        let arn = distribution_arn(&req.region, account_id(req), &id);
+        let arn = distribution_arn(&req.region, &req.account_id, &id);
 
         let stored = StoredDistribution {
             id: id.clone(),
@@ -876,7 +882,7 @@ impl CloudFrontService {
         let state = self.state.read();
         let account = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .ok_or_else(|| no_such_distribution(id))?;
         let dist = account
             .distributions
@@ -898,7 +904,7 @@ impl CloudFrontService {
         let state = self.state.read();
         let account = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .ok_or_else(|| no_such_distribution(id))?;
         let dist = account
             .distributions
@@ -941,7 +947,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| no_such_distribution(id))?;
         let dist = account
             .distributions
@@ -1005,7 +1011,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| no_such_distribution(id))?;
         {
             let dist = account
@@ -1035,10 +1041,9 @@ impl CloudFrontService {
     fn list_distributions(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let state = self.state.read();
         let mut dists: Vec<StoredDistribution> = state
-            .accounts
-            .values()
-            .flat_map(|a| a.distributions.values().cloned())
-            .collect();
+            .get(&req.account_id)
+            .map(|a| a.distributions.values().cloned().collect())
+            .unwrap_or_default();
         drop(state);
         dists.sort_by_key(|a| a.last_modified_time);
 
@@ -1136,10 +1141,9 @@ impl CloudFrontService {
         let mut all: Vec<StoredDistribution> = {
             let state = self.state.read();
             state
-                .accounts
-                .values()
-                .flat_map(|a| a.distributions.values().cloned())
-                .collect()
+                .get(&req.account_id)
+                .map(|a| a.distributions.values().cloned().collect())
+                .unwrap_or_default()
         };
         all.sort_by_key(|d| d.last_modified_time);
 
@@ -1239,9 +1243,12 @@ impl CloudFrontService {
             .map_err(|e| invalid_argument(format!("invalid request XML: {e}")))?;
         validate_caller_reference(&parsed.caller_reference)?;
         let mut state = self.state.write();
+        let new_id = state.unused_id(generate_distribution_id, |a, id| {
+            a.distributions.contains_key(id)
+        });
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| no_such_distribution(primary_id))?;
         let primary = account
             .distributions
@@ -1266,14 +1273,13 @@ impl CloudFrontService {
                 "Distribution with the same CallerReference exists",
             ));
         }
-        let new_id = generate_distribution_id();
         let mut config = primary.config.clone();
         config.caller_reference = parsed.caller_reference;
         config.enabled = parsed.enabled.unwrap_or(false);
         config.staging = parsed.staging;
         let now = Utc::now();
         let etag = generate_etag();
-        let arn = distribution_arn(&req.region, account_id(req), &new_id);
+        let arn = distribution_arn(&req.region, &req.account_id, &new_id);
         let stored = StoredDistribution {
             id: new_id.clone(),
             arn: arn.clone(),
@@ -1328,7 +1334,7 @@ impl CloudFrontService {
             ));
         }
         let mut state = self.state.write();
-        let account = state.entry(DEFAULT_ACCOUNT);
+        let account = state.entry(&req.account_id);
         if !account.distributions.contains_key(dist_id) {
             return Err(no_such_distribution(dist_id));
         }
@@ -1367,7 +1373,7 @@ impl CloudFrontService {
         let state = self.state.read();
         let account = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .ok_or_else(|| no_such_invalidation(inv_id))?;
         if !account.distributions.contains_key(dist_id) {
             return Err(no_such_distribution(dist_id));
@@ -1391,7 +1397,7 @@ impl CloudFrontService {
         let state = self.state.read();
         let account = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .ok_or_else(|| no_such_distribution(dist_id))?;
         if !account.distributions.contains_key(dist_id) {
             return Err(no_such_distribution(dist_id));
@@ -1438,7 +1444,7 @@ impl CloudFrontService {
             })
             .unwrap_or_default();
         let mut state = self.state.write();
-        let account = state.entry(DEFAULT_ACCOUNT);
+        let account = state.entry(&req.account_id);
         let entry = account.tags.entry(arn).or_default();
         for tag in new_tags {
             if let Some(existing) = entry.iter_mut().find(|t| t.key == tag.key) {
@@ -1457,7 +1463,7 @@ impl CloudFrontService {
             .map_err(|e| invalid_argument(format!("invalid TagKeys XML: {e}")))?;
         let keys: Vec<String> = parsed.items.map(|k| k.key).unwrap_or_default();
         let mut state = self.state.write();
-        let account = state.entry(DEFAULT_ACCOUNT);
+        let account = state.entry(&req.account_id);
         if let Some(existing) = account.tags.get_mut(&arn) {
             existing.retain(|t| !keys.contains(&t.key));
         }
@@ -1470,7 +1476,7 @@ impl CloudFrontService {
         let state = self.state.read();
         let tags = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&req.account_id)
             .and_then(|a| a.tags.get(&arn))
             .cloned()
             .unwrap_or_default();
@@ -1495,12 +1501,12 @@ impl CloudFrontService {
         let alias = parse_query_value(&req.raw_query, "Alias")
             .ok_or_else(|| invalid_argument("Alias query parameter is required"))?;
         let mut state = self.state.write();
-        let account = state
-            .accounts
-            .get_mut(DEFAULT_ACCOUNT)
-            .ok_or_else(|| no_such_distribution(id))?;
-        // Reject if the alias is already attached to a different distribution.
-        if let Some(other) = account.distributions.values().find(|d| {
+        // Alternate domain names are unique across all of CloudFront, not
+        // per account: reject if the alias is already attached to a
+        // different distribution, whichever account owns it.
+        // The error never names the other distribution: it may belong to
+        // another account.
+        if state.all_distributions().any(|(_, d)| {
             d.id != id
                 && d.config
                     .aliases
@@ -1511,12 +1517,13 @@ impl CloudFrontService {
             return Err(aws_error(
                 StatusCode::CONFLICT,
                 "CNAMEAlreadyExists",
-                format!(
-                    "Alias {alias} is already associated with distribution {}",
-                    other.id
-                ),
+                "One or more of the CNAMEs you provided are already associated with a different resource.",
             ));
         }
+        let account = state
+            .accounts
+            .get_mut(&req.account_id)
+            .ok_or_else(|| no_such_distribution(id))?;
         let dist = account
             .distributions
             .get_mut(id)
@@ -1589,7 +1596,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| no_such_distribution(id))?;
         let dist = account
             .distributions
@@ -1609,7 +1616,7 @@ impl CloudFrontService {
 
     fn disassociate_web_acl(
         &self,
-        _req: &AwsRequest,
+        req: &AwsRequest,
         route: &Route,
     ) -> Result<AwsResponse, AwsServiceError> {
         let id = route
@@ -1628,7 +1635,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(entity_not_found)?;
         let dist = account
             .distributions
@@ -2145,14 +2152,6 @@ pub fn distribution_arn(region: &str, account: &str, id: &str) -> String {
     cloudfront_arn(region, account, &format!("distribution/{id}"))
 }
 
-fn account_id(_req: &AwsRequest) -> &'static str {
-    // Multi-account is wired through AwsRequest.account_id elsewhere; the
-    // CloudFront control plane only uses the resolved id for the ARN
-    // suffix. Until that field stabilizes for REST-XML we use the default
-    // account ID consistently with the rest of the registered services.
-    DEFAULT_ACCOUNT
-}
-
 fn generate_distribution_id() -> String {
     // CloudFront IDs are 14-char base32-ish uppercase strings starting with E.
     let raw = Uuid::new_v4().simple().to_string().to_uppercase();
@@ -2562,6 +2561,248 @@ mod tests {
         del_req.headers.insert(IF_MATCH, new_etag.parse().unwrap());
         let del = svc.handle(del_req).await.unwrap();
         assert_eq!(del.status, StatusCode::NO_CONTENT);
+    }
+
+    fn as_account(mut req: AwsRequest, account: &str) -> AwsRequest {
+        req.account_id = account.to_string();
+        req
+    }
+
+    fn first_tag(xml: &str, tag: &str) -> String {
+        xml.split(&format!("<{tag}>"))
+            .nth(1)
+            .and_then(|r| r.split(&format!("</{tag}>")).next())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn resources_are_scoped_to_the_callers_account() {
+        const A: &str = "111111111111";
+        const B: &str = "222222222222";
+        let svc = CloudFrontService::new(make_state());
+        let create = svc
+            .handle(as_account(
+                make_request(
+                    http::Method::POST,
+                    "/2020-05-31/distribution",
+                    "",
+                    &minimal_dist_config_xml("shared-ref"),
+                ),
+                A,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(create.status, StatusCode::CREATED);
+        let xml = std::str::from_utf8(create.body.expect_bytes()).unwrap();
+        let id = first_tag(xml, "Id");
+        assert_eq!(
+            first_tag(xml, "ARN"),
+            format!("arn:aws:cloudfront::{A}:distribution/{id}")
+        );
+        let etag = create
+            .headers
+            .get(ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // B can neither read, list, update nor invalidate A's distribution.
+        let get = |account: &'static str| {
+            as_account(
+                make_request(
+                    http::Method::GET,
+                    &format!("/2020-05-31/distribution/{id}"),
+                    "",
+                    "",
+                ),
+                account,
+            )
+        };
+        let err = svc.handle(get(B)).await.err().expect("hidden from B");
+        assert_eq!(err.code(), "NoSuchDistribution");
+        assert_eq!(svc.handle(get(A)).await.unwrap().status, StatusCode::OK);
+
+        let list = |account: &'static str| {
+            as_account(
+                make_request(http::Method::GET, "/2020-05-31/distribution", "", ""),
+                account,
+            )
+        };
+        let listed = svc.handle(list(B)).await.unwrap();
+        let listed = std::str::from_utf8(listed.body.expect_bytes()).unwrap();
+        assert!(!listed.contains(&id), "{listed}");
+        let listed = svc.handle(list(A)).await.unwrap();
+        assert!(std::str::from_utf8(listed.body.expect_bytes())
+            .unwrap()
+            .contains(&id));
+
+        let mut update = as_account(
+            make_request(
+                http::Method::PUT,
+                &format!("/2020-05-31/distribution/{id}/config"),
+                "",
+                &minimal_dist_config_xml("shared-ref")
+                    .replace("<Comment></Comment>", "<Comment>b</Comment>"),
+            ),
+            B,
+        );
+        update.headers.insert(IF_MATCH, etag.parse().unwrap());
+        let err = svc.handle(update).await.err().expect("B cannot update");
+        assert_eq!(err.code(), "NoSuchDistribution");
+
+        let invalidate = as_account(
+            make_request(
+                http::Method::POST,
+                &format!("/2020-05-31/distribution/{id}/invalidation"),
+                "",
+                r#"<InvalidationBatch xmlns="http://cloudfront.amazonaws.com/doc/2020-05-31/"><Paths><Quantity>1</Quantity><Items><Path>/*</Path></Items></Paths><CallerReference>inv</CallerReference></InvalidationBatch>"#,
+            ),
+            B,
+        );
+        let err = svc
+            .handle(invalidate)
+            .await
+            .err()
+            .expect("B cannot invalidate");
+        assert_eq!(err.code(), "NoSuchDistribution");
+
+        // CallerReference uniqueness is per account: B may reuse A's.
+        let create_b = svc
+            .handle(as_account(
+                make_request(
+                    http::Method::POST,
+                    "/2020-05-31/distribution",
+                    "",
+                    &minimal_dist_config_xml("shared-ref"),
+                ),
+                B,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(create_b.status, StatusCode::CREATED);
+        let b_xml = std::str::from_utf8(create_b.body.expect_bytes()).unwrap();
+        assert_ne!(first_tag(b_xml, "Id"), id);
+
+        let state = svc.state.read();
+        assert!(state.get(A).unwrap().distributions.contains_key(&id));
+        assert!(!state.get(B).unwrap().distributions.contains_key(&id));
+    }
+
+    #[tokio::test]
+    async fn policies_and_functions_are_scoped_to_the_callers_account() {
+        const A: &str = "111111111111";
+        const B: &str = "222222222222";
+        let svc = CloudFrontService::new(make_state());
+        let oac = svc
+            .handle(as_account(
+                make_request(
+                    http::Method::POST,
+                    "/2020-05-31/origin-access-control",
+                    "",
+                    r#"<OriginAccessControlConfig xmlns="http://cloudfront.amazonaws.com/doc/2020-05-31/"><Name>oac-a</Name><SigningProtocol>sigv4</SigningProtocol><SigningBehavior>always</SigningBehavior><OriginAccessControlOriginType>s3</OriginAccessControlOriginType></OriginAccessControlConfig>"#,
+                ),
+                A,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(oac.status, StatusCode::CREATED);
+        let oac_id = first_tag(std::str::from_utf8(oac.body.expect_bytes()).unwrap(), "Id");
+
+        let get_oac = |account: &'static str| {
+            as_account(
+                make_request(
+                    http::Method::GET,
+                    &format!("/2020-05-31/origin-access-control/{oac_id}"),
+                    "",
+                    "",
+                ),
+                account,
+            )
+        };
+        assert!(
+            svc.handle(get_oac(B)).await.is_err(),
+            "B cannot see A's OAC"
+        );
+        assert_eq!(svc.handle(get_oac(A)).await.unwrap().status, StatusCode::OK);
+        let list_b = svc
+            .handle(as_account(
+                make_request(
+                    http::Method::GET,
+                    "/2020-05-31/origin-access-control",
+                    "",
+                    "",
+                ),
+                B,
+            ))
+            .await
+            .unwrap();
+        let list_b = std::str::from_utf8(list_b.body.expect_bytes()).unwrap();
+        assert!(list_b.contains("<Quantity>0</Quantity>"), "{list_b}");
+
+        // AWS-managed cache policies are visible to every account.
+        let managed = svc
+            .handle(as_account(
+                make_request(
+                    http::Method::GET,
+                    "/2020-05-31/cache-policy/658327ea-f89d-4fab-a63d-7e88639e58f6",
+                    "",
+                    "",
+                ),
+                B,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(managed.status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn an_alias_held_in_another_account_conflicts() {
+        const A: &str = "111111111111";
+        const B: &str = "222222222222";
+        let svc = CloudFrontService::new(make_state());
+        let mut ids = Vec::new();
+        for account in [A, B] {
+            let created = svc
+                .handle(as_account(
+                    make_request(
+                        http::Method::POST,
+                        "/2020-05-31/distribution",
+                        "",
+                        &minimal_dist_config_xml("ref"),
+                    ),
+                    account,
+                ))
+                .await
+                .unwrap();
+            ids.push(first_tag(
+                std::str::from_utf8(created.body.expect_bytes()).unwrap(),
+                "Id",
+            ));
+        }
+        let associate = |account: &'static str, id: &str| {
+            as_account(
+                make_request(
+                    http::Method::PUT,
+                    &format!("/2020-05-31/distribution/{id}/associate-alias"),
+                    "Alias=cdn.example.com",
+                    "",
+                ),
+                account,
+            )
+        };
+        assert_eq!(
+            svc.handle(associate(A, &ids[0])).await.unwrap().status,
+            StatusCode::OK
+        );
+        let err = svc
+            .handle(associate(B, &ids[1]))
+            .await
+            .err()
+            .expect("alias is globally unique");
+        assert_eq!(err.code(), "CNAMEAlreadyExists");
+        assert!(!err.message().contains(&ids[0]), "does not leak A's id");
     }
 
     #[tokio::test]

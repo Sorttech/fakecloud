@@ -13,7 +13,6 @@ use crate::policies::{
 use crate::router::Route;
 use crate::service::{
     aws_error, esc, generate_etag, invalid_argument, xml_response, CloudFrontService,
-    DEFAULT_ACCOUNT,
 };
 use crate::state::Tag;
 use crate::streaming::{
@@ -63,10 +62,10 @@ impl CloudFrontService {
         }
 
         let mut state = self.state.write();
-        let account = state
-            .accounts
-            .entry(DEFAULT_ACCOUNT.to_string())
-            .or_default();
+        let id = state.unused_id(generate_streaming_id, |a, id| {
+            a.streaming_distributions.contains_key(id)
+        });
+        let account = state.accounts.entry(req.account_id.clone()).or_default();
 
         if let Some(existing) = account
             .streaming_distributions
@@ -83,13 +82,12 @@ impl CloudFrontService {
             ));
         }
 
-        let id = generate_streaming_id();
         let now = Utc::now();
         let etag = generate_etag();
         let domain = format!("{}.cloudfront.net", id.to_lowercase());
         let arn = crate::service::cloudfront_arn(
             &req.region,
-            DEFAULT_ACCOUNT,
+            &req.account_id,
             &format!("streaming-distribution/{id}"),
         );
 
@@ -134,7 +132,7 @@ impl CloudFrontService {
         let state = self.state.read();
         let d = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.streaming_distributions.get(&id).cloned())
             .ok_or_else(|| not_found("StreamingDistribution", &id))?;
         drop(state);
@@ -150,7 +148,7 @@ impl CloudFrontService {
         let state = self.state.read();
         let d = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.streaming_distributions.get(&id).cloned())
             .ok_or_else(|| not_found("StreamingDistribution", &id))?;
         drop(state);
@@ -175,7 +173,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("StreamingDistribution", &id))?;
         let d = account
             .streaming_distributions
@@ -223,7 +221,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("StreamingDistribution", &id))?;
         let d = account
             .streaming_distributions
@@ -250,12 +248,12 @@ impl CloudFrontService {
 
     pub(crate) fn list_streaming_distributions(
         &self,
-        _req: &AwsRequest,
+        req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let state = self.state.read();
         let mut items: Vec<StoredStreamingDistribution> = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&req.account_id)
             .map(|a| a.streaming_distributions.values().cloned().collect())
             .unwrap_or_default();
         drop(state);

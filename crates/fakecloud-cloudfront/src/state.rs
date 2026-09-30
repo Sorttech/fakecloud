@@ -44,7 +44,13 @@ pub struct CloudFrontSnapshot {
 /// v2: distribution config members AWS spells with an upper-case acronym
 /// (`MinTTL`, `IsIPV6Enabled`, `ACMCertificateArn`, ...) are stored under that
 /// spelling; v1 wrote the PascalCase form (`MinTtl`, ...).
-pub const CLOUDFRONT_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
+///
+/// v3: resources live under the account that created them. v1/v2 kept every
+/// resource in one [`LEGACY_ACCOUNT`] bucket whatever the caller's account.
+pub const CLOUDFRONT_SNAPSHOT_SCHEMA_VERSION: u32 = 3;
+
+/// The single account bucket v1/v2 snapshots stored every resource under.
+const LEGACY_ACCOUNT: &str = "000000000000";
 
 /// Distribution config member names v1 snapshots wrote, paired with the AWS
 /// spelling v2 uses.
@@ -66,7 +72,14 @@ const V1_DISTRIBUTION_CONFIG_RENAMES: &[(&str, &str)] = &[
 /// The migration rewrites the stored JSON rather than teaching the model
 /// structs the old names, so the old spellings never become accepted on the
 /// XML wire.
-pub fn parse_cloudfront_snapshot(bytes: &[u8]) -> Result<CloudFrontSnapshot, serde_json::Error> {
+///
+/// `default_account` is the server's configured account: a pre-v3 snapshot's
+/// single shared bucket is moved there, since every resource in it was created
+/// before CloudFront state was scoped to the caller's account.
+pub fn parse_cloudfront_snapshot(
+    bytes: &[u8],
+    default_account: &str,
+) -> Result<CloudFrontSnapshot, serde_json::Error> {
     let mut value: serde_json::Value = serde_json::from_slice(bytes)?;
     let version = value
         .get("schema_version")
@@ -75,7 +88,73 @@ pub fn parse_cloudfront_snapshot(bytes: &[u8]) -> Result<CloudFrontSnapshot, ser
     if version < 2 {
         migrate_v1_distribution_configs(&mut value);
     }
+    if version < 3 {
+        migrate_legacy_bucket(&mut value, default_account);
+    }
     serde_json::from_value(value)
+}
+
+/// Move the pre-v3 shared bucket into `default_account`.
+///
+/// The API wrote the legacy account id into the ARNs it minted (and keyed
+/// tags, resource policies and realtime log configs by those ARNs), so the
+/// account segment of every CloudFront ARN in the bucket is rewritten to
+/// match its new owner. Entries already stored under `default_account` win
+/// over legacy ones with the same key.
+fn migrate_legacy_bucket(snapshot: &mut serde_json::Value, default_account: &str) {
+    if default_account == LEGACY_ACCOUNT {
+        return;
+    }
+    let Some(accounts) = snapshot
+        .pointer_mut("/accounts/accounts")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    let Some(mut legacy) = accounts.remove(LEGACY_ACCOUNT) else {
+        return;
+    };
+    let from = format!(":cloudfront::{LEGACY_ACCOUNT}:");
+    let to = format!(":cloudfront::{default_account}:");
+    rewrite_arn_account(&mut legacy, &from, &to);
+    let target = accounts
+        .entry(default_account.to_string())
+        .or_insert_with(|| serde_json::Value::Object(Default::default()));
+    let (Some(target_fields), serde_json::Value::Object(legacy_fields)) =
+        (target.as_object_mut(), legacy)
+    else {
+        return;
+    };
+    for (field, legacy_entries) in legacy_fields {
+        match (target_fields.get_mut(&field), legacy_entries) {
+            (Some(serde_json::Value::Object(existing)), serde_json::Value::Object(entries)) => {
+                for (key, entry) in entries {
+                    existing.entry(key).or_insert(entry);
+                }
+            }
+            (Some(_), _) => {}
+            (None, entries) => {
+                target_fields.insert(field, entries);
+            }
+        }
+    }
+}
+
+fn rewrite_arn_account(value: &mut serde_json::Value, from: &str, to: &str) {
+    match value {
+        serde_json::Value::String(s) if s.contains(from) => *s = s.replace(from, to),
+        serde_json::Value::Object(map) => {
+            let entries = std::mem::take(map);
+            for (key, mut v) in entries {
+                rewrite_arn_account(&mut v, from, to);
+                map.insert(key.replace(from, to), v);
+            }
+        }
+        serde_json::Value::Array(items) => items
+            .iter_mut()
+            .for_each(|v| rewrite_arn_account(v, from, to)),
+        _ => {}
+    }
 }
 
 fn migrate_v1_distribution_configs(snapshot: &mut serde_json::Value) {
@@ -130,6 +209,26 @@ impl CloudFrontAccounts {
 
     pub fn get(&self, account_id: &str) -> Option<&AccountState> {
         self.accounts.get(account_id)
+    }
+
+    /// Draw ids from `generate` until one is held by no account.
+    ///
+    /// CloudFront is global: a distribution's id is also its
+    /// `<id>.cloudfront.net` domain, and the propagation ticks, the admin
+    /// status endpoint and the data plane find resources by id or domain
+    /// without knowing the owning account. Ids therefore stay unique across
+    /// every account even though the resources themselves are per-account.
+    pub fn unused_id(
+        &self,
+        generate: impl Fn() -> String,
+        held: impl Fn(&AccountState, &str) -> bool,
+    ) -> String {
+        loop {
+            let id = generate();
+            if !self.accounts.values().any(|a| held(a, &id)) {
+                return id;
+            }
+        }
     }
 
     /// Iterate every stored distribution across all accounts, paired with the
@@ -273,7 +372,8 @@ mod snapshot_migration_tests {
 
     #[test]
     fn a_v1_snapshot_loads_with_its_pascal_case_member_names_migrated() {
-        let snapshot = parse_cloudfront_snapshot(&v1_snapshot_bytes()).expect("v1 snapshot loads");
+        let snapshot = parse_cloudfront_snapshot(&v1_snapshot_bytes(), LEGACY_ACCOUNT)
+            .expect("v1 snapshot loads");
         let accounts = snapshot.accounts.unwrap();
         let config = &accounts.get("000000000000").unwrap().distributions["E1"].config;
         let dcb = &config.default_cache_behavior;
@@ -309,10 +409,123 @@ mod snapshot_migration_tests {
         // CloudFront member names, so the required `FunctionARN` is missing.
         let mut value: serde_json::Value = serde_json::from_slice(&v1_snapshot_bytes()).unwrap();
         value["schema_version"] = serde_json::json!(2);
-        let err = parse_cloudfront_snapshot(&serde_json::to_vec(&value).unwrap())
+        let err = parse_cloudfront_snapshot(&serde_json::to_vec(&value).unwrap(), LEGACY_ACCOUNT)
             .err()
             .expect("not migrated");
         assert!(err.to_string().contains("FunctionARN"), "{err}");
+    }
+
+    fn legacy_distribution(id: &str, account: &str) -> StoredDistribution {
+        StoredDistribution {
+            id: id.to_string(),
+            arn: format!("arn:aws:cloudfront::{account}:distribution/{id}"),
+            status: "Deployed".to_string(),
+            last_modified_time: Utc::now(),
+            domain_name: format!("{}.cloudfront.net", id.to_lowercase()),
+            in_progress_invalidation_batches: 0,
+            etag: "T".to_string(),
+            config: DistributionConfig::default(),
+        }
+    }
+
+    /// A v2 snapshot: every resource in the shared legacy bucket, with ARNs
+    /// (and ARN-keyed tags) minted under the legacy account id.
+    fn v2_snapshot_bytes(extra: impl FnOnce(&mut CloudFrontAccounts)) -> Vec<u8> {
+        let mut accounts = CloudFrontAccounts::new();
+        let legacy = accounts.entry(LEGACY_ACCOUNT);
+        let dist = legacy_distribution("E1", LEGACY_ACCOUNT);
+        legacy.tags.insert(
+            dist.arn.clone(),
+            vec![Tag {
+                key: "team".to_string(),
+                value: Some("web".to_string()),
+            }],
+        );
+        legacy.distributions.insert("E1".to_string(), dist);
+        extra(&mut accounts);
+        serde_json::to_vec(&CloudFrontSnapshot {
+            schema_version: 2,
+            accounts: Some(accounts),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_v2_snapshot_moves_the_shared_bucket_into_the_default_account() {
+        let parsed = parse_cloudfront_snapshot(&v2_snapshot_bytes(|_| {}), "123456789012")
+            .expect("v2 snapshot loads");
+        let accounts = parsed.accounts.unwrap();
+        assert!(
+            accounts.get(LEGACY_ACCOUNT).is_none(),
+            "legacy bucket moved"
+        );
+        let owner = accounts.get("123456789012").expect("default account");
+        let dist = &owner.distributions["E1"];
+        assert_eq!(dist.arn, "arn:aws:cloudfront::123456789012:distribution/E1");
+        assert_eq!(dist.domain_name, "e1.cloudfront.net");
+        let tags = &owner.tags["arn:aws:cloudfront::123456789012:distribution/E1"];
+        assert_eq!(tags[0].key, "team");
+    }
+
+    #[test]
+    fn a_v2_snapshot_merges_into_an_existing_default_account_bucket() {
+        let bytes = v2_snapshot_bytes(|accounts| {
+            // The CloudFormation provisioner already stored under the stack's
+            // account before v3; keep what is there.
+            let dist = legacy_distribution("E2", "123456789012");
+            accounts
+                .entry("123456789012")
+                .distributions
+                .insert("E2".to_string(), dist);
+        });
+        let parsed = parse_cloudfront_snapshot(&bytes, "123456789012").unwrap();
+        let accounts = parsed.accounts.unwrap();
+        let owner = accounts.get("123456789012").unwrap();
+        let mut ids: Vec<&String> = owner.distributions.keys().collect();
+        ids.sort();
+        assert_eq!(ids, ["E1", "E2"]);
+        assert_eq!(accounts.account_count(), 1);
+    }
+
+    #[test]
+    fn a_v2_snapshot_stays_put_when_the_default_account_is_the_legacy_one() {
+        let parsed = parse_cloudfront_snapshot(&v2_snapshot_bytes(|_| {}), LEGACY_ACCOUNT).unwrap();
+        let accounts = parsed.accounts.unwrap();
+        let dist = &accounts.get(LEGACY_ACCOUNT).unwrap().distributions["E1"];
+        assert_eq!(dist.arn, "arn:aws:cloudfront::000000000000:distribution/E1");
+    }
+
+    #[test]
+    fn a_v3_snapshot_keeps_its_per_account_buckets() {
+        let mut accounts = CloudFrontAccounts::new();
+        accounts
+            .entry(LEGACY_ACCOUNT)
+            .distributions
+            .insert("E1".to_string(), legacy_distribution("E1", LEGACY_ACCOUNT));
+        let bytes = serde_json::to_vec(&CloudFrontSnapshot {
+            schema_version: CLOUDFRONT_SNAPSHOT_SCHEMA_VERSION,
+            accounts: Some(accounts),
+        })
+        .unwrap();
+        let parsed = parse_cloudfront_snapshot(&bytes, "123456789012").unwrap();
+        let accounts = parsed.accounts.unwrap();
+        assert!(accounts.get(LEGACY_ACCOUNT).is_some());
+        assert!(accounts.get("123456789012").is_none());
+    }
+
+    #[test]
+    fn unused_id_skips_ids_held_by_any_account() {
+        let mut accounts = CloudFrontAccounts::new();
+        accounts
+            .entry("111111111111")
+            .distributions
+            .insert("E1".to_string(), legacy_distribution("E1", "111111111111"));
+        let draws = std::cell::RefCell::new(vec!["E2", "E1"]);
+        let id = accounts.unused_id(
+            || draws.borrow_mut().pop().unwrap().to_string(),
+            |a, id| a.distributions.contains_key(id),
+        );
+        assert_eq!(id, "E2", "E1 is taken in another account");
     }
 
     #[test]
@@ -338,7 +551,7 @@ mod snapshot_migration_tests {
             accounts: Some(accounts),
         })
         .unwrap();
-        let parsed = parse_cloudfront_snapshot(&bytes).unwrap();
+        let parsed = parse_cloudfront_snapshot(&bytes, "123456789012").unwrap();
         let accounts = parsed.accounts.unwrap();
         let dist = &accounts.get("000000000000").unwrap().distributions["E2"];
         assert_eq!(dist.config.default_cache_behavior.min_ttl, Some(7));

@@ -15,7 +15,6 @@ use crate::policies::{
 use crate::router::Route;
 use crate::service::{
     aws_error, esc, generate_id_with_prefix, invalid_argument, xml_response, CloudFrontService,
-    DEFAULT_ACCOUNT,
 };
 use crate::state::Tag;
 use crate::tenants::{
@@ -201,10 +200,10 @@ impl CloudFrontService {
             return Err(invalid_argument("Name is required"));
         }
         let mut state = self.state.write();
-        let account = state
-            .accounts
-            .entry(DEFAULT_ACCOUNT.to_string())
-            .or_default();
+        let id = state.unused_id(generate_tenant_id, |a, id| {
+            a.distribution_tenants.contains_key(id)
+        });
+        let account = state.accounts.entry(req.account_id.clone()).or_default();
         if account
             .distribution_tenants
             .values()
@@ -216,10 +215,9 @@ impl CloudFrontService {
                 format!("DistributionTenant {} already exists", parsed.name),
             ));
         }
-        let id = generate_tenant_id();
         let arn = crate::service::cloudfront_arn(
             &req.region,
-            DEFAULT_ACCOUNT,
+            &req.account_id,
             &format!("distribution-tenant/{id}"),
         );
         let etag = generate_id_with_prefix("E");
@@ -283,7 +281,7 @@ impl CloudFrontService {
         let state = self.state.read();
         let t = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.distribution_tenants.get(&id).cloned())
             .ok_or_else(|| not_found("DistributionTenant", &id))?;
         drop(state);
@@ -304,7 +302,7 @@ impl CloudFrontService {
         let state = self.state.read();
         let t = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&req.account_id)
             .and_then(|a| {
                 a.distribution_tenants
                     .values()
@@ -331,7 +329,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("DistributionTenant", &id))?;
         let t = account
             .distribution_tenants
@@ -386,7 +384,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("DistributionTenant", &id))?;
         let t = account
             .distribution_tenants
@@ -414,12 +412,12 @@ impl CloudFrontService {
 
     pub(crate) fn list_distribution_tenants(
         &self,
-        _req: &AwsRequest,
+        req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let state = self.state.read();
         let mut items: Vec<StoredDistributionTenant> = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&req.account_id)
             .map(|a| a.distribution_tenants.values().cloned().collect())
             .unwrap_or_default();
         drop(state);
@@ -430,12 +428,12 @@ impl CloudFrontService {
 
     pub(crate) fn list_distribution_tenants_by_customization(
         &self,
-        _req: &AwsRequest,
+        req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let state = self.state.read();
         let mut items: Vec<StoredDistributionTenant> = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&req.account_id)
             .map(|a| a.distribution_tenants.values().cloned().collect())
             .unwrap_or_default();
         drop(state);
@@ -459,7 +457,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("DistributionTenant", &id))?;
         let t = account
             .distribution_tenants
@@ -495,7 +493,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("DistributionTenant", &id))?;
         let t = account
             .distribution_tenants
@@ -534,7 +532,7 @@ impl CloudFrontService {
             ));
         }
         let mut state = self.state.write();
-        let account = state.entry(DEFAULT_ACCOUNT);
+        let account = state.entry(&req.account_id);
         if !account.distribution_tenants.contains_key(&tenant_id) {
             return Err(not_found("DistributionTenant", &tenant_id));
         }
@@ -577,7 +575,7 @@ impl CloudFrontService {
         let state = self.state.read();
         let account = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .ok_or_else(|| not_found("Invalidation", inv_id))?;
         if !account.distribution_tenants.contains_key(tenant_id) {
             return Err(not_found("DistributionTenant", tenant_id));
@@ -604,7 +602,7 @@ impl CloudFrontService {
         let state = self.state.read();
         let account = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .ok_or_else(|| not_found("DistributionTenant", tenant_id))?;
         if !account.distribution_tenants.contains_key(tenant_id) {
             return Err(not_found("DistributionTenant", tenant_id));
@@ -841,6 +839,7 @@ fn render_tenant_invalidation_list(items: &[&StoredTenantInvalidation]) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::service::DEFAULT_ACCOUNT;
     use crate::state::CloudFrontAccounts;
     use bytes::Bytes;
     use fakecloud_core::service::AwsService;

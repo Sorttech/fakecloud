@@ -15,7 +15,7 @@ use crate::policies::{
 use crate::router::Route;
 use crate::service::{
     aws_error, esc, extract_body_field, generate_id_with_prefix, invalid_argument, xml_response,
-    CloudFrontService, DEFAULT_ACCOUNT,
+    CloudFrontService,
 };
 use crate::xml_io;
 
@@ -37,10 +37,11 @@ impl CloudFrontService {
         }
         let tags = crate::extras_service::tags_to_state(&cfg.tags);
         let mut state = self.state.write();
-        let account = state
-            .accounts
-            .entry(DEFAULT_ACCOUNT.to_string())
-            .or_default();
+        let id = state.unused_id(
+            || generate_id_with_prefix("CG"),
+            |a, id| a.connection_groups.contains_key(id),
+        );
+        let account = state.accounts.entry(req.account_id.clone()).or_default();
         if account
             .connection_groups
             .values()
@@ -52,10 +53,9 @@ impl CloudFrontService {
                 format!("ConnectionGroup {} already exists", cfg.name),
             ));
         }
-        let id = generate_id_with_prefix("CG");
         let arn = crate::service::cloudfront_arn(
             &req.region,
-            DEFAULT_ACCOUNT,
+            &req.account_id,
             &format!("connection-group/{id}"),
         );
         let routing_endpoint = format!("{}.cloudfront.net", id.to_lowercase());
@@ -93,7 +93,7 @@ impl CloudFrontService {
         let state = self.state.read();
         let g = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| {
                 a.connection_groups
                     .get(&id)
@@ -118,7 +118,7 @@ impl CloudFrontService {
         let state = self.state.read();
         let g = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&req.account_id)
             .and_then(|a| {
                 a.connection_groups
                     .values()
@@ -144,7 +144,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("ConnectionGroup", &id))?;
         let g = account
             .connection_groups
@@ -184,7 +184,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("ConnectionGroup", &id))?;
         let g = account
             .connection_groups
@@ -209,12 +209,12 @@ impl CloudFrontService {
 
     pub(crate) fn list_connection_groups(
         &self,
-        _req: &AwsRequest,
+        req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let state = self.state.read();
         let mut items: Vec<StoredConnectionGroup> = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&req.account_id)
             .map(|a| a.connection_groups.values().cloned().collect())
             .unwrap_or_default();
         drop(state);
@@ -304,7 +304,7 @@ impl CloudFrontService {
         };
 
         let mut state = self.state.write();
-        let account = state.entry(DEFAULT_ACCOUNT);
+        let account = state.entry(&req.account_id);
 
         // The target must exist, otherwise AWS returns EntityNotFound.
         let target_ok = match &target {
@@ -408,7 +408,7 @@ impl CloudFrontService {
                 fakecloud_aws::arn::Arn::regional(
                     "acm",
                     fakecloud_aws::arn::implicit_global_region(partition),
-                    DEFAULT_ACCOUNT,
+                    &req.account_id,
                     &format!("certificate/{id}"),
                 )
                 .to_string()
@@ -435,7 +435,7 @@ impl CloudFrontService {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&req.account_id)
             .ok_or_else(|| not_found("Distribution", &id))?;
         let staging_config = account
             .distributions
@@ -568,6 +568,7 @@ fn push_connection_group_inner(out: &mut String, g: &StoredConnectionGroup) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::service::DEFAULT_ACCOUNT;
     use crate::state::CloudFrontAccounts;
     use bytes::Bytes;
     use fakecloud_core::service::{AwsService, ResponseBody};
