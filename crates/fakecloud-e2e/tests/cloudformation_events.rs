@@ -39,6 +39,11 @@ const TEMPLATE: &str = r#"{
         "RetentionDays": 30
       }
     }
+  },
+  "Outputs": {
+    "ConnArn": {"Value": {"Fn::GetAtt": ["Conn", "Arn"]}},
+    "ConnSecretArn": {"Value": {"Fn::GetAtt": ["Conn", "SecretArn"]}},
+    "DestArn": {"Value": {"Fn::GetAtt": ["Dest", "Arn"]}}
   }
 }"#;
 
@@ -78,6 +83,73 @@ async fn cfn_provisions_events_connection_apidest_archive() {
         Some("API_KEY")
     );
 
+    let output = |key: &str| -> String {
+        stack
+            .outputs()
+            .iter()
+            .find(|o| o.output_key() == Some(key))
+            .and_then(|o| o.output_value())
+            .unwrap_or_else(|| panic!("stack output {key}"))
+            .to_string()
+    };
+
+    // The stack reports the same ARNs the EventBridge API does, and the
+    // connection's secret is named after the connection and its ARN's UUID,
+    // exactly like a connection created through CreateConnection.
+    let conn_arn = conn.connection_arn().expect("connection ARN");
+    assert_eq!(output("ConnArn"), conn_arn);
+    let secret_arn = conn.secret_arn().expect("secret ARN");
+    assert_eq!(output("ConnSecretArn"), secret_arn);
+    let conn_uuid = conn_arn
+        .strip_prefix("arn:aws:events:us-east-1:123456789012:connection/cfn-conn/")
+        .expect("connection ARN shape");
+    assert!(uuid::Uuid::parse_str(conn_uuid).is_ok() && conn_uuid.len() == 36);
+    assert_eq!(
+        secret_arn,
+        format!(
+            "arn:aws:secretsmanager:us-east-1:123456789012:secret:events!connection/cfn-conn/{conn_uuid}"
+        )
+    );
+
+    // Same shape as the API path.
+    let api_conn = eb
+        .create_connection()
+        .name("api-conn")
+        .authorization_type(aws_sdk_eventbridge::types::ConnectionAuthorizationType::ApiKey)
+        .auth_parameters(
+            aws_sdk_eventbridge::types::CreateConnectionAuthRequestParameters::builder()
+                .api_key_auth_parameters(
+                    aws_sdk_eventbridge::types::CreateConnectionApiKeyAuthRequestParameters::builder()
+                        .api_key_name("X-API-Key")
+                        .api_key_value("v")
+                        .build()
+                        .unwrap(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .expect("create_connection");
+    let api_arn = api_conn.connection_arn().unwrap();
+    let api_uuid = api_arn
+        .strip_prefix("arn:aws:events:us-east-1:123456789012:connection/api-conn/")
+        .expect("API connection ARN shape");
+    let api_secret = eb
+        .describe_connection()
+        .name("api-conn")
+        .send()
+        .await
+        .expect("describe api-conn")
+        .secret_arn()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        api_secret,
+        format!(
+            "arn:aws:secretsmanager:us-east-1:123456789012:secret:events!connection/api-conn/{api_uuid}"
+        )
+    );
+
     let dest = eb
         .describe_api_destination()
         .name("cfn-dest")
@@ -90,6 +162,13 @@ async fn cfn_provisions_events_connection_apidest_archive() {
         Some("https://example.com/webhook")
     );
     assert_eq!(dest.invocation_rate_limit_per_second(), Some(10));
+    let dest_arn = dest.api_destination_arn().expect("api destination ARN");
+    assert_eq!(output("DestArn"), dest_arn);
+    let dest_uuid = dest_arn
+        .strip_prefix("arn:aws:events:us-east-1:123456789012:api-destination/cfn-dest/")
+        .expect("api destination ARN shape");
+    assert!(uuid::Uuid::parse_str(dest_uuid).is_ok() && dest_uuid.len() == 36);
+    assert_eq!(dest.connection_arn(), Some(conn_arn));
 
     let archive = eb
         .describe_archive()
