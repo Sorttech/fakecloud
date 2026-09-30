@@ -9,6 +9,7 @@ use aws_sdk_bedrockagent::types::{
     FlowAliasRoutingConfigurationListItem, FlowDefinition, FlowNode, FlowNodeConfiguration,
     FlowNodeType, InputFlowNodeConfiguration,
 };
+use aws_sdk_bedrockagentruntime::error::ProvideErrorMetadata;
 use aws_sdk_bedrockagentruntime::types::FlowExecutionStatus;
 use helpers::TestServer;
 
@@ -121,6 +122,27 @@ async fn flow_executions_run_the_aliased_version_and_capture_it() {
     );
     assert!(!snapshot.definition().contains("DraftInput"));
 
+    // The edited draft must be prepared again before the test alias runs it.
+    let err = runtime
+        .start_flow_execution()
+        .flow_identifier(&flow_id)
+        .flow_alias_identifier("TSTALIASID")
+        .set_inputs(Some(Vec::new()))
+        .send()
+        .await
+        .expect_err("unprepared draft");
+    assert_eq!(
+        err.as_service_error().and_then(|e| e.code()),
+        Some("ValidationException"),
+        "{err:?}"
+    );
+    agent
+        .prepare_flow()
+        .flow_identifier(&flow_id)
+        .send()
+        .await
+        .expect("prepare edited draft");
+
     // The test alias runs the draft.
     let draft_exec = runtime
         .start_flow_execution()
@@ -164,6 +186,86 @@ async fn flow_executions_run_the_aliased_version_and_capture_it() {
     assert_eq!(got.status(), &FlowExecutionStatus::Aborted);
     assert_eq!(got.flow_version(), "1");
     assert!(got.ended_at().is_some());
+
+    // An execution belongs to its alias: it is not found under another one.
+    let err = runtime
+        .get_flow_execution()
+        .flow_identifier(&flow_id)
+        .flow_alias_identifier("TSTALIASID")
+        .execution_identifier(&exec_arn)
+        .send()
+        .await
+        .expect_err("execution under another alias");
+    assert!(is_not_found(&err), "{err:?}");
+
+    // A named execution uses its name as its id.
+    let named = runtime
+        .start_flow_execution()
+        .flow_identifier(&flow_id)
+        .flow_alias_identifier(&alias_id)
+        .flow_execution_name("nightly-run")
+        .set_inputs(Some(Vec::new()))
+        .send()
+        .await
+        .expect("start named execution")
+        .execution_arn
+        .expect("execution arn");
+    assert!(named.ends_with("/execution/nightly-run"), "{named}");
+}
+
+/// Runtime operations that share path prefixes with the control plane reach
+/// the runtime through a real SDK: InvokeInlineAgent (POST /agents/{session})
+/// and tagging a runtime session (/tags/{sessionArn}).
+#[tokio::test]
+async fn runtime_inline_agent_and_session_tags_route_to_the_runtime() {
+    let server = TestServer::start().await;
+    let runtime = server.bedrock_agent_runtime_client().await;
+
+    let session_arn = runtime
+        .create_session()
+        .send()
+        .await
+        .expect("create session")
+        .session_arn;
+    runtime
+        .tag_resource()
+        .resource_arn(&session_arn)
+        .tags("team", "flows")
+        .send()
+        .await
+        .expect("tag session");
+    let tags = runtime
+        .list_tags_for_resource()
+        .resource_arn(&session_arn)
+        .send()
+        .await
+        .expect("list session tags");
+    assert_eq!(
+        tags.tags().and_then(|t| t.get("team")).map(String::as_str),
+        Some("flows")
+    );
+    runtime
+        .untag_resource()
+        .resource_arn(&session_arn)
+        .tag_keys("team")
+        .send()
+        .await
+        .expect("untag session");
+
+    let mut stream = runtime
+        .invoke_inline_agent()
+        .session_id("inline-session-1")
+        .foundation_model("anthropic.claude-3-haiku-20240307-v1:0")
+        .instruction("You are a helpful assistant for routing tests.")
+        .input_text("hello")
+        .send()
+        .await
+        .expect("invoke inline agent");
+    let mut got_event = false;
+    while let Some(_event) = stream.completion.recv().await.expect("inline agent stream") {
+        got_event = true;
+    }
+    assert!(got_event, "inline agent returned no events");
 }
 
 #[tokio::test]

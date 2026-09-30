@@ -3,12 +3,18 @@
 //! the alias routes to, and the definition, execution role and customer key
 //! that version carries. An execution captures this at start, so its snapshot
 //! stays what actually ran even if the flow is later edited.
+//!
+//! Executions are stored under [`execution_map_key`] (flow, alias, execution
+//! id): an execution belongs to one flow alias, and an execution name only has
+//! to be unique within that alias.
 
 use http::StatusCode;
 use serde_json::Value;
 
 use fakecloud_bedrock_agent::SharedBedrockAgentState;
 use fakecloud_core::service::AwsServiceError;
+
+use crate::service::make_error;
 
 /// The built-in alias every flow has, routing to its working draft.
 pub(crate) const TEST_ALIAS_ID: &str = "TSTALIASID";
@@ -27,28 +33,28 @@ pub(crate) struct ResolvedFlow {
 }
 
 pub(crate) fn not_found(message: impl Into<String>) -> AwsServiceError {
-    AwsServiceError::aws_error(
+    make_error(
         StatusCode::NOT_FOUND,
         "ResourceNotFoundException",
-        message.into(),
+        &message.into(),
     )
 }
 
-/// The `region:account:flow/...` part of a Bedrock flow ARN, or `None` when
-/// the identifier is a bare id.
-fn flow_arn_rest(identifier: &str) -> Option<&str> {
+/// The `region:account:flow/...` part of a Bedrock ARN, or `None` when the
+/// identifier is a bare id.
+fn bedrock_arn_rest(identifier: &str) -> Option<&str> {
     fakecloud_aws::arn::arn_resource(identifier, "bedrock")
 }
 
-/// The account a flow ARN names, `None` for a bare id.
+/// The account a Bedrock ARN names, `None` for a bare id.
 fn arn_account(identifier: &str) -> Option<&str> {
-    flow_arn_rest(identifier).and_then(|rest| rest.split(':').nth(1))
+    bedrock_arn_rest(identifier).and_then(|rest| rest.split(':').nth(1))
 }
 
 /// The bare flow id a `flowIdentifier` names: the identifier itself, or the id
 /// inside a flow ARN (`arn:<partition>:bedrock:<region>:<account>:flow/<id>`).
 pub(crate) fn bare_flow_id(identifier: &str) -> &str {
-    flow_arn_rest(identifier)
+    bedrock_arn_rest(identifier)
         .and_then(|rest| rest.split_once(":flow/"))
         .map_or(identifier, |(_, id)| id.split('/').next().unwrap_or(id))
 }
@@ -56,8 +62,8 @@ pub(crate) fn bare_flow_id(identifier: &str) -> &str {
 /// The bare alias id a `flowAliasIdentifier` names for `flow_id`: the
 /// identifier itself, or the alias id inside an alias ARN
 /// (`...:flow/<flowId>/alias/<aliasId>`) whose flow is `flow_id`.
-fn bare_alias_id(identifier: &str, flow_id: &str) -> Option<String> {
-    match flow_arn_rest(identifier) {
+pub(crate) fn bare_alias_id(identifier: &str, flow_id: &str) -> Option<String> {
+    match bedrock_arn_rest(identifier) {
         None => Some(identifier.to_string()),
         Some(rest) => rest
             .split_once(":flow/")
@@ -67,26 +73,93 @@ fn bare_alias_id(identifier: &str, flow_id: &str) -> Option<String> {
     }
 }
 
+/// The flow id and alias id a `flowIdentifier` / `flowAliasIdentifier` pair
+/// names in `account_id`. `None` when either is an ARN in another account, or
+/// the alias ARN belongs to another flow.
+pub(crate) fn flow_and_alias(
+    account_id: &str,
+    flow_identifier: &str,
+    alias_identifier: &str,
+) -> Option<(String, String)> {
+    if [flow_identifier, alias_identifier]
+        .iter()
+        .any(|id| arn_account(id).is_some_and(|a| a != account_id))
+    {
+        return None;
+    }
+    let flow_id = bare_flow_id(flow_identifier).to_string();
+    let alias_id = bare_alias_id(alias_identifier, &flow_id)?;
+    Some((flow_id, alias_id))
+}
+
+/// The `flow_executions` map key of an execution.
+pub(crate) fn execution_map_key(flow_id: &str, alias_id: &str, execution_id: &str) -> String {
+    format!("{flow_id}/{alias_id}/{execution_id}")
+}
+
+/// The map key of the execution an `executionIdentifier` (an execution id, or
+/// an execution ARN `...:flow/<f>/alias/<a>/execution/<e>`) names under the
+/// labelled flow and alias. `None` when the labels or the ARN name another
+/// account, flow or alias.
+pub(crate) fn execution_key_for(
+    account_id: &str,
+    flow_identifier: &str,
+    alias_identifier: &str,
+    execution_identifier: &str,
+) -> Option<String> {
+    let (flow_id, alias_id) = flow_and_alias(account_id, flow_identifier, alias_identifier)?;
+    let execution_id = match bedrock_arn_rest(execution_identifier) {
+        None => execution_identifier.to_string(),
+        Some(rest) => {
+            if arn_account(execution_identifier) != Some(account_id) {
+                return None;
+            }
+            let path = rest.split_once(":flow/")?.1;
+            let (arn_flow, rest) = path.split_once("/alias/")?;
+            let (arn_alias, exec) = rest.split_once("/execution/")?;
+            if arn_flow != flow_id || arn_alias != alias_id || exec.is_empty() {
+                return None;
+            }
+            exec.to_string()
+        }
+    };
+    Some(execution_map_key(&flow_id, &alias_id, &execution_id))
+}
+
+/// A flow-execution status in the model's `FlowExecutionStatus` form. Earlier
+/// builds recorded non-model forms (`InProgress`, and upper-case enum names
+/// such as `SUCCEEDED`); those map to their model value.
+pub(crate) fn normalize_status(status: &str) -> String {
+    match status {
+        "InProgress" | "IN_PROGRESS" | "RUNNING" => "Running",
+        "SUCCEEDED" => "Succeeded",
+        "FAILED" => "Failed",
+        "TIMED_OUT" => "TimedOut",
+        "ABORTED" => "Aborted",
+        other => other,
+    }
+    .to_string()
+}
+
 /// Resolve the flow and alias an execution targets in `account_id`. Every
 /// miss (unknown flow, an identifier ARN in another account, unknown alias or
 /// one belonging to another flow, a routed version that no longer exists) is a
-/// `ResourceNotFoundException`, as the real service reports.
+/// `ResourceNotFoundException`, as the real service reports. Running the
+/// working draft requires the flow to be prepared since its last edit
+/// (`ValidationException` otherwise).
 pub(crate) fn resolve_flow(
     agent_state: Option<&SharedBedrockAgentState>,
     account_id: &str,
     flow_identifier: &str,
     alias_identifier: &str,
 ) -> Result<ResolvedFlow, AwsServiceError> {
-    let flow_id = bare_flow_id(flow_identifier).to_string();
     let flow_missing = || not_found(format!("Flow {flow_identifier} not found."));
+    let alias_missing = || not_found(format!("Flow alias {alias_identifier} not found."));
     if arn_account(flow_identifier).is_some_and(|a| a != account_id) {
         return Err(flow_missing());
     }
-    let alias_missing = || not_found(format!("Flow alias {alias_identifier} not found."));
-    if arn_account(alias_identifier).is_some_and(|a| a != account_id) {
-        return Err(alias_missing());
-    }
-    let alias_id = bare_alias_id(alias_identifier, &flow_id).ok_or_else(alias_missing)?;
+    let (flow_id, alias_id) =
+        flow_and_alias(account_id, flow_identifier, alias_identifier).ok_or_else(alias_missing)?;
 
     let agent_state = agent_state.ok_or_else(flow_missing)?;
     let accounts = agent_state.read();
@@ -110,6 +183,13 @@ pub(crate) fn resolve_flow(
     };
 
     let resolved = if version == DRAFT {
+        if flow.status != "Prepared" {
+            return Err(make_error(
+                StatusCode::BAD_REQUEST,
+                "ValidationException",
+                &format!("Flow {flow_id} is not prepared. Prepare the flow before running it."),
+            ));
+        }
         ResolvedFlow {
             flow_id,
             alias_id,
@@ -144,12 +224,6 @@ pub(crate) fn resolve_flow(
     Ok(resolved)
 }
 
-/// Whether `identifier` (an execution id or execution ARN) names the execution
-/// `execution_id` / `execution_arn`.
-pub(crate) fn names_execution(identifier: &str, execution_id: &str, execution_arn: &str) -> bool {
-    identifier == execution_id || identifier == execution_arn
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,5 +256,44 @@ mod tests {
             Some("111122223333")
         );
         assert_eq!(arn_account("ABCDEFGHIJ"), None);
+    }
+
+    #[test]
+    fn execution_identifiers_resolve_under_their_flow_and_alias() {
+        let acct = "123456789012";
+        let arn =
+            "arn:aws:bedrock:us-east-1:123456789012:flow/FFFFFFFFFF/alias/AAAAAAAAAA/execution/e-1";
+        assert_eq!(
+            execution_key_for(acct, "FFFFFFFFFF", "AAAAAAAAAA", arn).as_deref(),
+            Some("FFFFFFFFFF/AAAAAAAAAA/e-1")
+        );
+        assert_eq!(
+            execution_key_for(acct, "FFFFFFFFFF", "AAAAAAAAAA", "e-1").as_deref(),
+            Some("FFFFFFFFFF/AAAAAAAAAA/e-1")
+        );
+        // The ARN of another alias, flow or account names nothing here.
+        assert_eq!(
+            execution_key_for(acct, "FFFFFFFFFF", "TSTALIASID", arn),
+            None
+        );
+        assert_eq!(
+            execution_key_for(acct, "GGGGGGGGGG", "AAAAAAAAAA", arn),
+            None
+        );
+        assert_eq!(
+            execution_key_for("999999999999", "FFFFFFFFFF", "AAAAAAAAAA", arn),
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_statuses_normalize_to_the_model_enum() {
+        assert_eq!(normalize_status("InProgress"), "Running");
+        assert_eq!(normalize_status("SUCCEEDED"), "Succeeded");
+        assert_eq!(normalize_status("FAILED"), "Failed");
+        assert_eq!(normalize_status("TIMED_OUT"), "TimedOut");
+        assert_eq!(normalize_status("ABORTED"), "Aborted");
+        assert_eq!(normalize_status("Running"), "Running");
+        assert_eq!(normalize_status("Aborted"), "Aborted");
     }
 }
