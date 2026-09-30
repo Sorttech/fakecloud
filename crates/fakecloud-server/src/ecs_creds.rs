@@ -69,12 +69,6 @@ pub struct EcsTaskCredentials {
     cache: WorkloadCredentialCache,
 }
 
-/// A task that may hold credentials: its account, and its role while it runs.
-struct RunningTask {
-    account_id: String,
-    role_arn: Option<String>,
-}
-
 fn cache_key(account_id: &str, task_id: &str) -> String {
     format!("{account_id}/{task_id}")
 }
@@ -114,45 +108,42 @@ impl EcsTaskCredentials {
         }
     }
 
-    /// The not-yet-stopped task `task_id`, in whichever account runs it.
-    fn running_task(&self, task_id: &str) -> Option<RunningTask> {
-        let accounts = self.ecs.read();
-        let found = accounts.iter().find_map(|(account_id, state)| {
-            let task = state.tasks.get(task_id)?;
-            (task.last_status != "STOPPED").then(|| RunningTask {
-                account_id: account_id.to_string(),
-                role_arn: task.task_role_arn.clone(),
-            })
-        });
-        found
-    }
-
     /// Credentials for the task role of the running task `task_id`.
+    ///
+    /// The ECS read lock is held until the credentials are minted, so a task
+    /// cannot stop (and be swept) between the running check and the mint and
+    /// still walk away with a fresh session.
     pub fn credentials(&self, task_id: &str) -> Result<ContainerCredentials, CredentialsError> {
         if task_id.is_empty() {
             return Err(CredentialsError::NoId);
         }
-        let task = self
-            .running_task(task_id)
+        let accounts = self.ecs.read();
+        let (account_id, role_arn) = accounts
+            .iter()
+            .find_map(|(account_id, state)| {
+                let task = state.tasks.get(task_id)?;
+                (task.last_status != "STOPPED").then_some((account_id, task))
+            })
+            .and_then(|(account_id, task)| Some((account_id, task.task_role_arn.as_deref()?)))
             .ok_or(CredentialsError::NotFound)?;
-        let role_arn = task.role_arn.ok_or(CredentialsError::NotFound)?;
-        Ok(self.cache.get_or_mint(
+        let creds = self.cache.get_or_mint(
             &self.iam,
             &self.default_account_id,
-            &cache_key(&task.account_id, task_id),
-            &role_arn,
+            &cache_key(account_id, task_id),
+            role_arn,
             task_id,
             DEFAULT_CONTAINER_CREDENTIALS_DURATION,
-        ))
+        );
+        drop(accounts);
+        Ok(creds)
     }
 
     /// Revoke the credentials of every task that has stopped (or is gone).
     ///
     /// The ECS read lock is held until the revocation is done, so a task
     /// started (and handed credentials) while the sweep runs is never judged
-    /// against a snapshot that predates it. Lock order: ECS state, then the
-    /// cache, then IAM; `credentials` releases the ECS lock before touching
-    /// the cache, so the two never wait on each other in reverse.
+    /// against a snapshot that predates it. Lock order, here and in
+    /// `credentials`: ECS state, then the cache, then IAM.
     pub fn revoke_stopped(&self) {
         let accounts = self.ecs.read();
         let running: HashSet<String> = accounts
