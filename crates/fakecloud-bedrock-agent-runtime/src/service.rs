@@ -719,17 +719,9 @@ async fn handle_invoke_flow(
         let mut accts = svc.state.write();
         let s = accts.get_or_create(&req.account_id);
         let key = crate::flows::execution_map_key(&flow.flow_id, &flow.alias_id, &execution_id);
-        // An execution id belongs to one flow alias: continuing it through
-        // another flow or alias is rejected.
-        if let Some(other) = s.flow_executions.values().find(|e| {
-            e.execution_id == execution_id
-                && (e.flow_id != flow.flow_id || e.flow_alias_id != flow.alias_id)
-        }) {
-            return Err(validation(&format!(
-                "Execution {execution_id} belongs to flow {} alias {}, not flow {} alias {}.",
-                other.flow_id, other.flow_alias_id, flow.flow_id, flow.alias_id
-            )));
-        }
+        // An execution id is scoped to its flow alias: reusing it under the
+        // same flow and alias continues that execution; under another alias
+        // or flow it names a different execution.
         match s.flow_executions.get_mut(&key) {
             // Continue: keep its start time and captured snapshot.
             Some(existing) => {
@@ -2888,7 +2880,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invoke_flow_continues_its_own_execution_only() {
+    async fn invoke_flow_execution_ids_are_scoped_to_flow_and_alias() {
         let (svc, agent_state) = flow_svc();
         let req = cn_request();
         let invoke = |alias: &str, flow: &str| {
@@ -2921,15 +2913,23 @@ mod tests {
         assert_eq!(continued.created_at, first.created_at);
         assert_eq!(continued.definition, first.definition);
         assert_eq!(continued.execution_arn, first.execution_arn);
-        // The id cannot be continued through another alias or flow.
+        // The same id under another alias or flow is a separate execution and
+        // leaves this one untouched.
         for (alias, flow) in [("TSTALIASID", FLOW), (OTHER_ALIAS, OTHER_FLOW)] {
-            let err = handle_invoke_flow(&svc, &req, &invoke(alias, flow))
+            handle_invoke_flow(&svc, &req, &invoke(alias, flow))
                 .await
-                .err()
-                .expect("expected an error");
-            assert_eq!(code(err), "ValidationException", "{flow} {alias}");
+                .unwrap();
+            let other = crate::flows::execution_map_key(flow, alias, "conversation-1");
+            let accts = svc.state.read();
+            let e = &accts.accounts[ACCT].flow_executions[&other];
+            assert_eq!(e.flow_id, flow);
+            assert_eq!(e.flow_alias_id, alias);
         }
-        assert_eq!(svc.state.read().accounts[ACCT].flow_executions.len(), 1);
+        let accts = svc.state.read();
+        assert_eq!(accts.accounts[ACCT].flow_executions.len(), 3);
+        let still = &accts.accounts[ACCT].flow_executions[&key];
+        assert_eq!(still.created_at, first.created_at);
+        assert_eq!(still.flow_version, "1");
     }
 
     #[tokio::test]

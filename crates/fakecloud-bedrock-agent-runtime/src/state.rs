@@ -34,9 +34,6 @@ pub struct BedrockAgentRuntimeState {
     pub invocations: Vec<InvocationRecord>,
     pub sessions: BTreeMap<String, Session>,
     /// Keyed by `crate::flows::execution_map_key` (flow, alias, execution id).
-    /// Loading older state re-keys entries stored by bare execution id and
-    /// normalizes their status to the model's enum.
-    #[serde(deserialize_with = "deserialize_flow_executions")]
     pub flow_executions: BTreeMap<String, FlowExecution>,
     /// Per-session list of invocations created via `CreateInvocation`
     /// (separate from `invocations` which is the data-plane invocation log).
@@ -122,28 +119,6 @@ pub struct InvocationStep {
     pub payload: serde_json::Value,
 }
 
-/// Load flow executions, migrating older records: re-key each under its
-/// (flow, alias, execution id) key and map legacy statuses (`InProgress`,
-/// `SUCCEEDED`, ...) to the model's `FlowExecutionStatus` values, so Get and
-/// Stop treat them like executions recorded today.
-fn deserialize_flow_executions<'de, D>(
-    deserializer: D,
-) -> Result<BTreeMap<String, FlowExecution>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let stored = BTreeMap::<String, FlowExecution>::deserialize(deserializer)?;
-    Ok(stored
-        .into_values()
-        .map(|mut e| {
-            e.status = crate::flows::normalize_status(&e.status);
-            let key =
-                crate::flows::execution_map_key(&e.flow_id, &e.flow_alias_id, &e.execution_id);
-            (key, e)
-        })
-        .collect())
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlowExecution {
     pub execution_id: String,
@@ -173,47 +148,6 @@ pub struct FlowExecution {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// State saved by an older build (executions keyed by bare id, non-model
-    /// statuses) loads re-keyed with model statuses.
-    #[test]
-    fn legacy_flow_executions_migrate_on_load() {
-        let snapshot = serde_json::json!({
-            "accounts": {
-                "123456789012": {
-                    "account_id": "123456789012",
-                    "invocations": [],
-                    "sessions": {},
-                    "flow_executions": {
-                        "e-1": {
-                            "execution_id": "e-1",
-                            "execution_arn": "arn:aws:bedrock:us-east-1:123456789012:flow/FFFFFFFFFF/execution/e-1",
-                            "flow_id": "FFFFFFFFFF",
-                            "flow_alias_id": "TSTALIASID",
-                            "flow_version": "DRAFT",
-                            "status": "InProgress",
-                            "created_at": "2026-01-01T00:00:00Z",
-                            "updated_at": "2026-01-01T00:00:00Z"
-                        },
-                        "e-2": {
-                            "execution_id": "e-2",
-                            "execution_arn": "arn:aws:bedrock:us-east-1:123456789012:flow/FFFFFFFFFF/execution/e-2",
-                            "flow_id": "FFFFFFFFFF",
-                            "flow_alias_id": "TSTALIASID",
-                            "status": "SUCCEEDED",
-                            "created_at": "2026-01-01T00:00:00Z",
-                            "updated_at": "2026-01-01T00:00:00Z"
-                        }
-                    }
-                }
-            }
-        });
-        let accounts: BedrockAgentRuntimeAccounts = serde_json::from_value(snapshot).unwrap();
-        let execs = &accounts.accounts["123456789012"].flow_executions;
-        assert_eq!(execs["FFFFFFFFFF/TSTALIASID/e-1"].status, "Running");
-        assert_eq!(execs["FFFFFFFFFF/TSTALIASID/e-2"].status, "Succeeded");
-        assert!(!execs.contains_key("e-1"));
-    }
 
     #[test]
     fn invocation_record_serializes_introspection_fields() {

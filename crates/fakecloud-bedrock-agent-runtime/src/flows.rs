@@ -126,21 +126,6 @@ pub(crate) fn execution_key_for(
     Some(execution_map_key(&flow_id, &alias_id, &execution_id))
 }
 
-/// A flow-execution status in the model's `FlowExecutionStatus` form. Earlier
-/// builds recorded non-model forms (`InProgress`, and upper-case enum names
-/// such as `SUCCEEDED`); those map to their model value.
-pub(crate) fn normalize_status(status: &str) -> String {
-    match status {
-        "InProgress" | "IN_PROGRESS" | "RUNNING" => "Running",
-        "SUCCEEDED" => "Succeeded",
-        "FAILED" => "Failed",
-        "TIMED_OUT" => "TimedOut",
-        "ABORTED" => "Aborted",
-        other => other,
-    }
-    .to_string()
-}
-
 /// Resolve the flow and alias an execution targets in `account_id`. Every
 /// miss (unknown flow, an identifier ARN in another account, unknown alias or
 /// one belonging to another flow, a routed version that no longer exists) is a
@@ -284,16 +269,5 @@ mod tests {
             execution_key_for("999999999999", "FFFFFFFFFF", "AAAAAAAAAA", arn),
             None
         );
-    }
-
-    #[test]
-    fn legacy_statuses_normalize_to_the_model_enum() {
-        assert_eq!(normalize_status("InProgress"), "Running");
-        assert_eq!(normalize_status("SUCCEEDED"), "Succeeded");
-        assert_eq!(normalize_status("FAILED"), "Failed");
-        assert_eq!(normalize_status("TIMED_OUT"), "TimedOut");
-        assert_eq!(normalize_status("ABORTED"), "Aborted");
-        assert_eq!(normalize_status("Running"), "Running");
-        assert_eq!(normalize_status("Aborted"), "Aborted");
     }
 }
