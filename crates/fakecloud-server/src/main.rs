@@ -91,8 +91,9 @@ use hooks::*;
 
 /// Outer middleware that serves CloudFront viewer traffic on the main listener.
 /// If the request's `Host` matches an enabled distribution, the data plane
-/// proxies it to the resolved origin; otherwise the request is handed back for
-/// normal AWS dispatch (the common case for all API / introspection traffic).
+/// proxies it to the resolved origin (fetching an S3 origin in-process through
+/// `next`); otherwise it hands the request to `next` for normal AWS dispatch
+/// (the common case for all API / introspection traffic).
 async fn cloudfront_viewer_middleware(
     axum::extract::State(dp): axum::extract::State<
         std::sync::Arc<fakecloud_cloudfront::dataplane::CloudFrontDataPlane>,
@@ -100,10 +101,7 @@ async fn cloudfront_viewer_middleware(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    match dp.serve(req).await {
-        Ok(resp) => resp,
-        Err(req) => next.run(req).await,
-    }
+    dp.serve(req, next).await
 }
 
 /// Record types the `--dns` resolver (and this introspection endpoint) answer:

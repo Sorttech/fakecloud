@@ -8,8 +8,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::auth::{
-    is_root_bypass, ConditionContext, CredentialResolver, IamMode, IamPolicyEvaluator, Principal,
-    PrincipalType, ResourcePolicyProvider,
+    is_root_bypass, ConditionContext, CredentialResolver, IamMode, IamPolicyEvaluator,
+    InternalCaller, Principal, PrincipalType, ResourcePolicyProvider,
 };
 use crate::protocol::{self, AwsProtocol};
 use crate::registry::ServiceRegistry;
@@ -498,14 +498,32 @@ pub async fn dispatch(
         }
     }
 
+    // An in-process request fakecloud issues as an AWS-owned principal (e.g.
+    // CloudFront fetching an S3 origin through an origin access control). The
+    // identity rides a request extension that only in-process code can set,
+    // and is honored only when the request presents no credentials of its
+    // own: a request that does is authorized as that caller instead.
+    let internal_caller = if is_fully_anonymous && access_key_id.is_none() {
+        parts.extensions.get::<InternalCaller>().cloned()
+    } else {
+        None
+    };
+    let caller_principal =
+        caller_principal.or_else(|| internal_caller.as_ref().map(|c| c.principal()));
+
     let aws_request = AwsRequest {
         service: detected.service.clone(),
         action: detected.action.clone(),
         region,
-        account_id: caller_principal
-            .as_ref()
-            .map(|p| p.account_id.clone())
-            .unwrap_or_else(|| config.account_id.clone()),
+        // A service acting for a customer resource works in that resource
+        // owner's account.
+        account_id: match internal_caller.as_ref() {
+            Some(caller) => caller.acting_account().to_string(),
+            None => caller_principal
+                .as_ref()
+                .map(|p| p.account_id.clone())
+                .unwrap_or_else(|| config.account_id.clone()),
+        },
         request_id: request_id.clone(),
         headers: parts.headers,
         query_params: all_params,
@@ -541,7 +559,19 @@ pub async fn dispatch(
         && !is_root_bypass(aws_request.access_key_id.as_deref().unwrap_or(""))
     {
         if let Some(evaluator) = config.policy_evaluator.as_ref() {
-            if let Some(principal) = aws_request.principal.as_ref() {
+            if let Some(caller) = internal_caller.as_ref() {
+                if let Some(denied) = authorize_internal_caller(
+                    caller,
+                    service.as_ref(),
+                    &aws_request,
+                    evaluator.as_ref(),
+                    &config,
+                    &detected,
+                    &request_id,
+                ) {
+                    return denied;
+                }
+            } else if let Some(principal) = aws_request.principal.as_ref() {
                 if !principal.is_root() {
                     // A request can need several authorizations -- one per
                     // table in a batch, say -- and every one must allow it.
@@ -1404,6 +1434,99 @@ fn anonymous_s3_bucket(uri: &http::Uri, config: &DispatchConfig) -> Option<Strin
     provider.resource_owner_account("s3", &arn).map(|_| segment)
 }
 
+/// Authorize a request fakecloud makes in-process as an AWS-owned principal
+/// (see [`InternalCaller`]). Such a principal has no identity policies and no
+/// account, so -- as in AWS -- only the resource policy (S3 bucket policy) can
+/// grant it the action, with a public-read ACL honored the way it is for any
+/// caller. The request context carries the caller's keys (`aws:SourceArn`,
+/// `aws:SourceAccount`, ...) so a confused-deputy condition scoped to the
+/// acting resource matches. `aws:SourceIp` is absent, as AWS omits it for a
+/// request a service makes.
+///
+/// Returns the error response to send when the request is denied under
+/// strict mode; soft mode only logs.
+fn authorize_internal_caller(
+    caller: &InternalCaller,
+    service: &dyn crate::service::AwsService,
+    aws_request: &AwsRequest,
+    evaluator: &dyn IamPolicyEvaluator,
+    config: &DispatchConfig,
+    detected: &protocol::DetectedRequest,
+    request_id: &str,
+) -> Option<Response<Body>> {
+    let principal = caller.principal();
+    let denied = || {
+        config.iam_mode.is_strict().then(|| {
+            build_error_response(
+                StatusCode::FORBIDDEN,
+                "AccessDenied",
+                "Access Denied",
+                request_id,
+                detected.protocol,
+            )
+        })
+    };
+    let iam_actions = service.iam_actions_for(aws_request);
+    if iam_actions.is_empty() {
+        tracing::warn!(
+            target: "fakecloud::iam::audit",
+            service = %detected.service,
+            action = %aws_request.action,
+            principal = %principal.arn,
+            mode = %config.iam_mode,
+            request_id = %request_id,
+            "service-principal request has no IamAction mapping; denying under strict, allowing under soft"
+        );
+        return denied();
+    }
+    for iam_action in &iam_actions {
+        let now = chrono::Utc::now();
+        let mut context = ConditionContext {
+            aws_principal_arn: Some(principal.arn.clone()),
+            aws_current_time: Some(now),
+            aws_epoch_time: Some(now.timestamp()),
+            aws_secure_transport: Some(is_secure_transport(&aws_request.headers)),
+            aws_requested_region: Some(aws_request.region.clone()),
+            ..Default::default()
+        };
+        context.service_keys = service.iam_condition_keys_for(aws_request, iam_action);
+        context.service_keys.extend(caller.condition_keys());
+        let resource_policy_json = config
+            .resource_policy_provider
+            .as_ref()
+            .and_then(|p| p.resource_policy(&detected.service, &iam_action.resource));
+        let decision = evaluator.evaluate_resource_policy_only(
+            &principal,
+            iam_action,
+            &context,
+            resource_policy_json.as_deref(),
+        );
+        let explicit_deny = matches!(decision, crate::auth::IamDecision::ExplicitDeny);
+        let acl_allows = !explicit_deny
+            && config.resource_policy_provider.as_ref().is_some_and(|p| {
+                p.public_acl_allows(&detected.service, &iam_action.resource, iam_action.action)
+            });
+        if !decision.is_allow() && !acl_allows {
+            tracing::warn!(
+                target: "fakecloud::iam::audit",
+                service = %detected.service,
+                action = %iam_action.action_string(),
+                resource = %iam_action.resource,
+                principal = %principal.arn,
+                resource_policy_present = resource_policy_json.is_some(),
+                decision = ?decision,
+                mode = %config.iam_mode,
+                request_id = %request_id,
+                "service-principal request denied: the resource policy does not grant the action"
+            );
+            if let Some(resp) = denied() {
+                return Some(resp);
+            }
+        }
+    }
+    None
+}
+
 fn build_condition_context(
     principal: &Principal,
     remote_addr: Option<SocketAddr>,
@@ -1463,6 +1586,7 @@ fn principal_type_label(t: PrincipalType) -> &'static str {
         PrincipalType::FederatedUser => "FederatedUser",
         PrincipalType::Root => "Account",
         PrincipalType::Unknown => "Unknown",
+        PrincipalType::Service => "Service",
     }
 }
 

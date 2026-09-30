@@ -20,20 +20,37 @@
 //! to it, and applies CustomErrorResponses (e.g. the SPA `404 -> /index.html`
 //! served as `200`). There is no global edge network -- this is a single local
 //! origin-serving node, matching the ALB/API Gateway precedent. Deferred (not
-//! implemented): in-path CloudFront Functions / Lambda@Edge, TTL caching /
-//! invalidation, and OAC/SigV4 to private S3.
+//! implemented): in-path CloudFront Functions / Lambda@Edge and TTL caching /
+//! invalidation.
+//!
+//! S3 origins live in this same process, so they are fetched in-process through
+//! the rest of the server's middleware stack rather than over a socket. That is
+//! also how private S3 origins work: an origin with an origin access control
+//! (`OriginAccessControlId`, honoring its `SigningBehavior`) is fetched as the
+//! `cloudfront.amazonaws.com` service principal with `aws:SourceArn` = the
+//! distribution ARN and `aws:SourceAccount` = its owner, and one with a legacy
+//! origin access identity (`S3OriginConfig.OriginAccessIdentity`) as that OAI,
+//! so under IAM enforcement the bucket policy decides exactly as in AWS. The
+//! identity rides a request extension ([`InternalCaller`]) that no client can
+//! set. Origins with neither are fetched anonymously.
 
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::extract::Request;
+use axum::extract::{ConnectInfo, Request};
+use axum::middleware::Next;
 use axum::response::Response;
 use bytes::Bytes;
+use fakecloud_core::auth::InternalCaller;
 use http::{header, HeaderMap, Method, StatusCode};
 use tracing::{trace, warn};
 
 use crate::model::DistributionConfig;
-use crate::state::{CloudFrontAccounts, SharedCloudFrontState, StoredDistribution};
+use crate::state::{AccountState, CloudFrontAccounts, SharedCloudFrontState, StoredDistribution};
+
+/// The service principal CloudFront signs origin requests as under an origin
+/// access control.
+const CLOUDFRONT_SERVICE_PRINCIPAL: &str = "cloudfront.amazonaws.com";
 
 const ENV_DISABLE: &str = "FAKECLOUD_CLOUDFRONT_DISABLE_DATAPLANE";
 
@@ -53,12 +70,11 @@ pub fn dataplane_enabled() -> bool {
 /// middleware; see [`CloudFrontDataPlane::serve`].
 pub struct CloudFrontDataPlane {
     state: SharedCloudFrontState,
-    /// HTTP client used to fetch from origins (reverse-proxy).
+    /// HTTP client used to fetch from remote (custom) origins (reverse-proxy).
     upstream: reqwest::Client,
-    /// `host:port` of fakecloud's own server. An S3-website origin is served by
-    /// this same process on the main port, so those origins are reached here with
-    /// the website domain preserved in the `Host` header (real CloudFront likewise
-    /// treats an S3-website endpoint as an HTTP custom origin).
+    /// `host:port` of fakecloud's own server. S3 origins are served by this
+    /// same process; their URLs are built against it (with the bucket domain
+    /// preserved in the `Host` header) and dispatched in-process.
     s3_endpoint: String,
     /// Cached `dataplane_enabled()` at construction: when false, `serve` never
     /// intercepts and every request falls through to normal AWS dispatch.
@@ -99,20 +115,18 @@ impl CloudFrontDataPlane {
 
     /// Serve a request iff its `Host` matches an enabled distribution.
     ///
-    /// - `Ok(resp)`  -- the request was viewer traffic for a distribution and was
-    ///   proxied to the resolved origin (the body has been consumed).
-    /// - `Err(req)`  -- the `Host` matches no distribution (or the plane is
-    ///   disabled); the request is returned untouched for normal AWS dispatch.
+    /// `next` is the rest of the server's middleware stack (AWS dispatch). A
+    /// request whose `Host` matches no distribution (or any request, when the
+    /// plane is disabled) is handed to it untouched. A matched request is viewer
+    /// traffic: it is proxied to the resolved origin, and `next` is also how an
+    /// S3 origin -- served by this same process -- is fetched.
     ///
     /// The `Host` check happens on the request headers before the body is touched,
     /// so pass-through traffic (all AWS API calls, `/_fakecloud/*`) is never
     /// buffered.
-    // The Err variant IS the original request, returned untouched for
-    // pass-through dispatch; boxing it would defeat that zero-copy contract.
-    #[allow(clippy::result_large_err)]
-    pub async fn serve(&self, req: Request<Body>) -> Result<Response, Request<Body>> {
+    pub async fn serve(&self, req: Request<Body>, next: Next) -> Response {
         if !self.enabled {
-            return Err(req);
+            return next.run(req).await;
         }
         // Prefer the `Host` header (HTTP/1.1); fall back to the URI authority so
         // HTTP/2 viewer requests (which carry the domain in `:authority` and may
@@ -124,7 +138,7 @@ impl CloudFrontDataPlane {
             .map(|s| s.to_string())
             .or_else(|| req.uri().host().map(|h| h.to_string()));
         let Some(host) = host else {
-            return Err(req);
+            return next.run(req).await;
         };
 
         // Resolve the route under the read lock (owned snapshot so the guard drops
@@ -133,11 +147,17 @@ impl CloudFrontDataPlane {
         // matched but has no usable origin" (serve a 502 -- it IS our traffic).
         let matched: Option<Option<RouteResolution>> = {
             let accs = self.state.read();
-            find_distribution_by_host(&accs, &host)
-                .map(|d| resolve_route(&d.config, req.uri().path(), &self.s3_endpoint))
+            find_distribution_by_host(&accs, &host).map(|(account_id, d)| {
+                let ctx = RouteContext {
+                    distribution_arn: &d.arn,
+                    account_id,
+                    account: accs.get(account_id),
+                };
+                resolve_route(&d.config, req.uri().path(), &self.s3_endpoint, &ctx)
+            })
         };
         let Some(route_opt) = matched else {
-            return Err(req);
+            return next.run(req).await;
         };
 
         // From here the request belongs to CloudFront: consume it and proxy.
@@ -149,17 +169,17 @@ impl CloudFrontDataPlane {
         let body_bytes = match axum::body::to_bytes(body, max_body).await {
             Ok(b) => b,
             Err(_) => {
-                return Ok(canned(
+                return canned(
                     StatusCode::PAYLOAD_TOO_LARGE,
                     "viewer request body too large",
-                ))
+                )
             }
         };
         let Some(route) = route_opt else {
-            return Ok(canned(
+            return canned(
                 StatusCode::BAD_GATEWAY,
                 "distribution has no matching origin",
-            ));
+            );
         };
 
         // A root request is fetched as the distribution's DefaultRootObject; the
@@ -180,9 +200,10 @@ impl CloudFrontDataPlane {
         trace!(%host, path = %parts.uri.path(), origin = %route.upstream.host_header, "CloudFront data plane: proxying");
         let resp = self
             .fetch_origin(
+                &next,
+                &route.upstream,
                 &parts.method,
                 &url,
-                &route.upstream.host_header,
                 &parts.headers,
                 &body_bytes,
             )
@@ -197,9 +218,10 @@ impl CloudFrontDataPlane {
             let url = format!("{}{}", route.default_upstream.url_base, rule.page_path);
             let err_resp = self
                 .fetch_origin(
+                    &next,
+                    &route.default_upstream,
                     &Method::GET,
                     &url,
-                    &route.default_upstream.host_header,
                     &HeaderMap::new(),
                     &Bytes::new(),
                 )
@@ -218,22 +240,28 @@ impl CloudFrontDataPlane {
                     .and_then(|c| StatusCode::from_u16(c).ok())
                     .unwrap_or(origin_status);
                 *err_resp.status_mut() = final_status;
-                return Ok(err_resp);
+                return err_resp;
             }
-            return Ok(resp);
+            return resp;
         }
-        Ok(resp)
+        resp
     }
 
-    /// Reverse-proxy the request to the resolved origin and copy the response back.
+    /// Fetch `url` from the resolved origin: in-process through `next` for an
+    /// S3 origin this process serves, over HTTP otherwise.
     async fn fetch_origin(
         &self,
+        next: &Next,
+        target: &UpstreamTarget,
         method: &Method,
         url: &str,
-        host_header: &str,
         req_headers: &HeaderMap,
         body: &Bytes,
     ) -> Response {
+        if target.local {
+            return fetch_local(next, target, method, url, req_headers, body).await;
+        }
+        let host_header = target.host_header.as_str();
         let mut rb = self.upstream.request(reqwest_method(method), url);
         for (k, v) in req_headers.iter() {
             let n = k.as_str();
@@ -267,22 +295,22 @@ impl CloudFrontDataPlane {
 }
 
 /// Find the enabled distribution whose `DomainName` (`<id>.cloudfront.net`) or one
-/// of its alternate domain names (`Aliases`/CNAMEs) matches `host`. The port is
-/// stripped and matching is case-insensitive. Alternate domain names are exact in
-/// CloudFront (not wildcards), so this is an exact host compare, mirroring the
-/// route53 CloudFront resolver.
+/// of its alternate domain names (`Aliases`/CNAMEs) matches `host`, paired with
+/// its owning account. The port is stripped and matching is case-insensitive.
+/// Alternate domain names are exact in CloudFront (not wildcards), so this is an
+/// exact host compare, mirroring the route53 CloudFront resolver.
 pub(crate) fn find_distribution_by_host<'a>(
     accs: &'a CloudFrontAccounts,
     host: &str,
-) -> Option<&'a StoredDistribution> {
+) -> Option<(&'a str, &'a StoredDistribution)> {
     let host = host.split(':').next().unwrap_or(host).trim();
     if host.is_empty() {
         return None;
     }
     accs.all_distributions()
-        .map(|(_, d)| d)
-        .filter(|d| d.config.enabled)
-        .find(|d| {
+        .map(|(account_id, d)| (account_id.as_str(), d))
+        .filter(|(_, d)| d.config.enabled)
+        .find(|(_, d)| {
             d.domain_name.eq_ignore_ascii_case(host)
                 || d.config
                     .aliases
@@ -315,6 +343,48 @@ struct UpstreamTarget {
     url_base: String,
     /// `Host` header sent upstream (the origin domain name).
     host_header: String,
+    /// An S3 origin this process serves: fetched in-process through the rest
+    /// of the middleware stack rather than over HTTP.
+    local: bool,
+    /// Who the origin request is made as. Only local S3 origins are signed.
+    auth: OriginAuth,
+}
+
+/// Who CloudFront makes an origin request as.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum OriginAuth {
+    /// Unsigned: an origin with neither an origin access control nor an
+    /// origin access identity, or an OAC whose `SigningBehavior` is `never`.
+    Anonymous,
+    /// Always signed as the caller, replacing any viewer `Authorization`
+    /// header: OAC `SigningBehavior: always`, and a legacy OAI.
+    Always(InternalCaller),
+    /// OAC `SigningBehavior: no-override`: signed unless the viewer request
+    /// carries its own `Authorization` header, which is then forwarded as is.
+    NoOverride(InternalCaller),
+}
+
+impl OriginAuth {
+    /// The identity to make the origin request as, given the viewer's headers
+    /// (`None` = anonymous or the viewer's own credentials).
+    fn caller_for(&self, viewer_headers: &HeaderMap) -> Option<&InternalCaller> {
+        match self {
+            OriginAuth::Anonymous => None,
+            OriginAuth::Always(caller) => Some(caller),
+            OriginAuth::NoOverride(caller) => {
+                (!viewer_headers.contains_key(header::AUTHORIZATION)).then_some(caller)
+            }
+        }
+    }
+}
+
+/// What routing needs to know about the matched distribution beyond its config:
+/// its identity (for signed origin requests) and its account's resources (the
+/// origin access controls and identities its origins reference).
+struct RouteContext<'a> {
+    distribution_arn: &'a str,
+    account_id: &'a str,
+    account: Option<&'a AccountState>,
 }
 
 #[derive(Clone)]
@@ -330,6 +400,7 @@ fn resolve_route(
     cfg: &DistributionConfig,
     path: &str,
     s3_endpoint: &str,
+    ctx: &RouteContext<'_>,
 ) -> Option<RouteResolution> {
     let items = cfg.origins.items.as_ref()?;
     let target = select_target_origin(cfg, path);
@@ -337,13 +408,13 @@ fn resolve_route(
         .origin
         .iter()
         .find(|o| o.id == target)
-        .map(|o| origin_target(o, s3_endpoint))?;
+        .map(|o| origin_target(o, s3_endpoint, ctx))?;
     let default_target = cfg.default_cache_behavior.target_origin_id.as_str();
     let default_upstream = items
         .origin
         .iter()
         .find(|o| o.id == default_target)
-        .map(|o| origin_target(o, s3_endpoint))
+        .map(|o| origin_target(o, s3_endpoint, ctx))
         .unwrap_or_else(|| upstream.clone());
     let error_rules = cfg
         .custom_error_responses
@@ -407,8 +478,18 @@ fn root_object_path(cfg: &DistributionConfig, path: &str) -> Option<String> {
 /// one; since only the leading `/` is structurally required to keep the value
 /// out of the URL authority, it is added if missing and trailing slashes are
 /// dropped so `/prod/` cannot produce `/prod//img`.
-fn origin_target(origin: &crate::model::Origin, s3_endpoint: &str) -> UpstreamTarget {
+///
+/// A local S3 origin also gets the identity CloudFront makes its requests as
+/// ([`origin_auth`]).
+fn origin_target(
+    origin: &crate::model::Origin,
+    s3_endpoint: &str,
+    ctx: &RouteContext<'_>,
+) -> UpstreamTarget {
     let mut target = upstream_for(origin, s3_endpoint);
+    if target.local {
+        target.auth = origin_auth(origin, ctx);
+    }
     let prefix = origin
         .origin_path
         .as_deref()
@@ -500,6 +581,141 @@ fn is_s3_origin(domain: &str) -> bool {
         .is_some_and(|h| h.service == "s3" && h.bucket.is_some())
 }
 
+/// An S3 static-website endpoint (`<bucket>.s3-website-<region>...` or
+/// `<bucket>.s3-website.<region>...`). CloudFront treats one as a custom
+/// origin: it serves public content only, and origin access controls and
+/// identities never apply to it.
+fn is_s3_website_origin(domain: &str) -> bool {
+    let Some(bucket) = fakecloud_core::protocol::parse_routing_host(domain).and_then(|h| h.bucket)
+    else {
+        return false;
+    };
+    let domain = domain.to_ascii_lowercase();
+    domain
+        .strip_prefix(&format!("{}.", bucket.to_ascii_lowercase()))
+        .is_some_and(|endpoint| endpoint.starts_with("s3-website"))
+}
+
+/// The identity CloudFront fetches a local S3 origin as.
+///
+/// - `OriginAccessControlId` names an origin access control of the
+///   distribution's account with origin type `s3`: sign as the
+///   `cloudfront.amazonaws.com` service principal with `aws:SourceArn` = the
+///   distribution ARN and `aws:SourceAccount` = its account, per the OAC's
+///   `SigningBehavior` (`always`, `no-override`; `never` is unsigned).
+/// - Otherwise `S3OriginConfig.OriginAccessIdentity`
+///   (`origin-access-identity/cloudfront/<id>`) names an origin access
+///   identity of the account: sign as that OAI
+///   (`arn:<partition>:iam::cloudfront:user/CloudFront Origin Access Identity <id>`,
+///   canonical user = its `S3CanonicalUserId`).
+/// - Otherwise, or for an S3 website endpoint, or when the referenced OAC /
+///   OAI does not exist, anonymous: an unknown identity never grants.
+///
+/// An origin carrying both uses the OAC, as CloudFront does.
+fn origin_auth(origin: &crate::model::Origin, ctx: &RouteContext<'_>) -> OriginAuth {
+    if is_s3_website_origin(&origin.domain_name) {
+        return OriginAuth::Anonymous;
+    }
+    if let Some(oac_id) = origin
+        .origin_access_control_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+    {
+        let Some(oac) = ctx
+            .account
+            .and_then(|a| a.origin_access_controls.get(oac_id))
+            .filter(|oac| {
+                oac.config
+                    .origin_access_control_origin_type
+                    .eq_ignore_ascii_case("s3")
+            })
+        else {
+            return OriginAuth::Anonymous;
+        };
+        let caller = InternalCaller::Service {
+            service: CLOUDFRONT_SERVICE_PRINCIPAL.to_string(),
+            source_arn: ctx.distribution_arn.to_string(),
+            source_account: ctx.account_id.to_string(),
+        };
+        return match oac.config.signing_behavior.to_ascii_lowercase().as_str() {
+            "always" => OriginAuth::Always(caller),
+            "no-override" => OriginAuth::NoOverride(caller),
+            _ => OriginAuth::Anonymous,
+        };
+    }
+    let oai_id = origin
+        .s3_origin_config
+        .as_ref()
+        .map(|c| c.origin_access_identity.trim())
+        .and_then(|oai| oai.strip_prefix("origin-access-identity/cloudfront/"))
+        .filter(|id| !id.is_empty());
+    let Some(oai) =
+        oai_id.and_then(|id| ctx.account.and_then(|a| a.origin_access_identities.get(id)))
+    else {
+        return OriginAuth::Anonymous;
+    };
+    let partition = ctx
+        .distribution_arn
+        .split(':')
+        .nth(1)
+        .filter(|p| !p.is_empty())
+        .unwrap_or("aws");
+    OriginAuth::Always(InternalCaller::ServiceOwned {
+        arn: format!(
+            "arn:{partition}:iam::cloudfront:user/CloudFront Origin Access Identity {}",
+            oai.id
+        ),
+        canonical_user_id: Some(oai.s3_canonical_user_id.clone()),
+        acting_account: ctx.account_id.to_string(),
+    })
+}
+
+/// Fetch `url` from an S3 origin this process serves, in-process through the
+/// rest of the middleware stack, as the identity `target.auth` selects for this
+/// viewer request. A signed request drops the viewer's `Authorization` header
+/// (CloudFront replaces it with its own signature) and carries the identity as
+/// an [`InternalCaller`] extension, which dispatch authorizes against the
+/// bucket policy. The source address is loopback, as the connection would be.
+async fn fetch_local(
+    next: &Next,
+    target: &UpstreamTarget,
+    method: &Method,
+    url: &str,
+    req_headers: &HeaderMap,
+    body: &Bytes,
+) -> Response {
+    let path_and_query = url
+        .parse::<http::Uri>()
+        .ok()
+        .and_then(|u| u.path_and_query().map(|p| p.to_string()))
+        .unwrap_or_else(|| "/".to_string());
+    let caller = target.auth.caller_for(req_headers).cloned();
+    let mut builder = Request::builder()
+        .method(method.clone())
+        .uri(path_and_query);
+    for (k, v) in req_headers.iter() {
+        let n = k.as_str();
+        if is_hop_by_hop(n)
+            || n.eq_ignore_ascii_case("host")
+            || (caller.is_some() && n.eq_ignore_ascii_case("authorization"))
+        {
+            continue;
+        }
+        builder = builder.header(k, v);
+    }
+    builder = builder.header(header::HOST, target.host_header.as_str());
+    let mut req = match builder.body(Body::from(body.clone())) {
+        Ok(req) => req,
+        Err(e) => return canned(StatusCode::BAD_GATEWAY, &format!("origin error: {e}")),
+    };
+    req.extensions_mut()
+        .insert(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 0))));
+    if let Some(caller) = caller {
+        req.extensions_mut().insert(caller);
+    }
+    next.clone().run(req).await
+}
+
 /// Resolve an [`crate::model::Origin`] to the upstream to connect to.
 ///
 /// - S3 origins (REST or static-website endpoints naming a bucket) are served by
@@ -519,6 +735,8 @@ fn upstream_for(origin: &crate::model::Origin, s3_endpoint: &str) -> UpstreamTar
         return UpstreamTarget {
             url_base: format!("http://{s3_endpoint}"),
             host_header: domain.clone(),
+            local: true,
+            auth: OriginAuth::Anonymous,
         };
     }
     if let Some(cfg) = &origin.custom_origin_config {
@@ -544,11 +762,15 @@ fn upstream_for(origin: &crate::model::Origin, s3_endpoint: &str) -> UpstreamTar
         return UpstreamTarget {
             url_base: format!("{scheme}://{authority}"),
             host_header: domain.clone(),
+            local: false,
+            auth: OriginAuth::Anonymous,
         };
     }
     UpstreamTarget {
         url_base: format!("http://{domain}"),
         host_header: domain.clone(),
+        local: false,
+        auth: OriginAuth::Anonymous,
     }
 }
 
@@ -666,6 +888,16 @@ mod tests {
         }
     }
 
+    /// A route context for a distribution whose account holds no origin
+    /// access controls or identities.
+    fn no_ctx() -> RouteContext<'static> {
+        RouteContext {
+            distribution_arn: "arn:aws:cloudfront::123456789012:distribution/E1ABC",
+            account_id: "123456789012",
+            account: None,
+        }
+    }
+
     fn accounts_with(dists: Vec<StoredDistribution>) -> CloudFrontAccounts {
         let mut accs = CloudFrontAccounts::new();
         let acct = accs.entry("123456789012");
@@ -685,15 +917,15 @@ mod tests {
             .distributions
             .insert("E2DEF".into(), dist("E2DEF", true, &["cdn.example.com"]));
         assert_eq!(
-            find_distribution_by_host(&accs, "e1abc.cloudfront.net").map(|d| d.id.as_str()),
+            find_distribution_by_host(&accs, "e1abc.cloudfront.net").map(|(_, d)| d.id.as_str()),
             Some("E1ABC")
         );
         assert_eq!(
-            find_distribution_by_host(&accs, "e2def.cloudfront.net").map(|d| d.id.as_str()),
+            find_distribution_by_host(&accs, "e2def.cloudfront.net").map(|(_, d)| d.id.as_str()),
             Some("E2DEF")
         );
         assert_eq!(
-            find_distribution_by_host(&accs, "cdn.example.com").map(|d| d.id.as_str()),
+            find_distribution_by_host(&accs, "cdn.example.com").map(|(_, d)| d.id.as_str()),
             Some("E2DEF")
         );
     }
@@ -701,8 +933,9 @@ mod tests {
     #[test]
     fn find_by_domain_name() {
         let accs = accounts_with(vec![dist("E1ABC", true, &[])]);
-        let found = find_distribution_by_host(&accs, "e1abc.cloudfront.net").unwrap();
+        let (account, found) = find_distribution_by_host(&accs, "e1abc.cloudfront.net").unwrap();
         assert_eq!(found.id, "E1ABC");
+        assert_eq!(account, "123456789012");
     }
 
     #[test]
@@ -714,7 +947,7 @@ mod tests {
     #[test]
     fn find_by_alias_cname() {
         let accs = accounts_with(vec![dist("E1ABC", true, &["cdn.example.com"])]);
-        let found = find_distribution_by_host(&accs, "cdn.example.com").unwrap();
+        let (_, found) = find_distribution_by_host(&accs, "cdn.example.com").unwrap();
         assert_eq!(found.id, "E1ABC");
     }
 
@@ -779,7 +1012,7 @@ mod tests {
     }
 
     fn root_object_for(cfg: &DistributionConfig, path: &str) -> Option<String> {
-        resolve_route(cfg, path, "127.0.0.1:4566")
+        resolve_route(cfg, path, "127.0.0.1:4566", &no_ctx())
             .expect("route resolves")
             .root_object
     }
@@ -841,7 +1074,7 @@ mod tests {
                 }],
             }),
         });
-        let route = resolve_route(&cfg, "/", "127.0.0.1:4566").expect("route resolves");
+        let route = resolve_route(&cfg, "/", "127.0.0.1:4566", &no_ctx()).expect("route resolves");
         assert_eq!(route.root_object.as_deref(), Some("/index.html"));
         assert_eq!(route.upstream.host_header, "b.s3.us-east-1.amazonaws.com");
     }
@@ -893,7 +1126,7 @@ mod tests {
         ] {
             let mut cfg = cfg_with_origin_path(Some("/prod"), domain);
             cfg.origins.items.as_mut().unwrap().origin[0].custom_origin_config = custom;
-            let route = resolve_route(&cfg, "/img/a.png", "127.0.0.1:4566").unwrap();
+            let route = resolve_route(&cfg, "/img/a.png", "127.0.0.1:4566", &no_ctx()).unwrap();
             assert_eq!(route.upstream.url_base, format!("{base}/prod"), "{domain}");
             assert_eq!(route.upstream.host_header, domain);
             // Custom error pages come from the default origin, prefixed too.
@@ -904,7 +1137,7 @@ mod tests {
     #[test]
     fn origin_path_composes_with_the_default_root_object() {
         let cfg = cfg_with_origin_path(Some("/prod"), "b.s3.us-east-1.amazonaws.com");
-        let route = resolve_route(&cfg, "/", "127.0.0.1:4566").unwrap();
+        let route = resolve_route(&cfg, "/", "127.0.0.1:4566", &no_ctx()).unwrap();
         let url = format!("{}{}", route.upstream.url_base, route.root_object.unwrap());
         assert_eq!(url, "http://127.0.0.1:4566/prod/index.html");
     }
@@ -913,7 +1146,7 @@ mod tests {
     fn origin_path_unset_or_empty_adds_nothing() {
         for p in [None, Some(""), Some("/")] {
             let cfg = cfg_with_origin_path(p, "b.s3.us-east-1.amazonaws.com");
-            let route = resolve_route(&cfg, "/x", "127.0.0.1:4566").unwrap();
+            let route = resolve_route(&cfg, "/x", "127.0.0.1:4566", &no_ctx()).unwrap();
             assert_eq!(route.upstream.url_base, "http://127.0.0.1:4566", "{p:?}");
         }
     }
@@ -927,7 +1160,7 @@ mod tests {
             ("/a/b", "/a/b"),
         ] {
             let cfg = cfg_with_origin_path(Some(p), "b.s3.us-east-1.amazonaws.com");
-            let route = resolve_route(&cfg, "/x", "127.0.0.1:4566").unwrap();
+            let route = resolve_route(&cfg, "/x", "127.0.0.1:4566", &no_ctx()).unwrap();
             assert_eq!(
                 route.upstream.url_base,
                 format!("http://127.0.0.1:4566{want}"),
@@ -1049,5 +1282,201 @@ mod tests {
     fn bare_origin_defaults_to_http() {
         let up = upstream_for(&origin("origin.internal", None), "127.0.0.1:4566");
         assert_eq!(up.url_base, "http://origin.internal");
+    }
+
+    // ── Origin access (OAC / OAI) ────────────────────────────────────────
+
+    const DIST_ARN: &str = "arn:aws:cloudfront::123456789012:distribution/E1ABC";
+
+    fn account_with_access(oac: Option<(&str, &str, &str)>, oai: Option<&str>) -> AccountState {
+        let mut account = AccountState::default();
+        if let Some((id, behavior, origin_type)) = oac {
+            account.origin_access_controls.insert(
+                id.to_string(),
+                crate::policies::StoredOriginAccessControl {
+                    id: id.to_string(),
+                    etag: "E".into(),
+                    config: crate::policies::OriginAccessControlConfig {
+                        name: "oac".into(),
+                        description: None,
+                        signing_protocol: "sigv4".into(),
+                        signing_behavior: behavior.into(),
+                        origin_access_control_origin_type: origin_type.into(),
+                    },
+                },
+            );
+        }
+        if let Some(id) = oai {
+            account.origin_access_identities.insert(
+                id.to_string(),
+                crate::functions::StoredOriginAccessIdentity {
+                    id: id.to_string(),
+                    etag: "E".into(),
+                    s3_canonical_user_id: "0123456789abcdef0123456789abcdef".into(),
+                    config: Default::default(),
+                },
+            );
+        }
+        account
+    }
+
+    fn ctx_for<'a>(arn: &'a str, account: &'a AccountState) -> RouteContext<'a> {
+        RouteContext {
+            distribution_arn: arn,
+            account_id: "123456789012",
+            account: Some(account),
+        }
+    }
+
+    fn s3_origin(domain: &str, oac: Option<&str>, oai: Option<&str>) -> Origin {
+        Origin {
+            id: "o".into(),
+            domain_name: domain.into(),
+            origin_access_control_id: oac.map(str::to_string),
+            s3_origin_config: Some(crate::model::S3OriginConfig {
+                origin_access_identity: oai.unwrap_or_default().to_string(),
+                origin_read_timeout: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn cloudfront_caller() -> InternalCaller {
+        InternalCaller::Service {
+            service: "cloudfront.amazonaws.com".into(),
+            source_arn: DIST_ARN.into(),
+            source_account: "123456789012".into(),
+        }
+    }
+
+    #[test]
+    fn oac_signs_as_the_cloudfront_service_principal_per_signing_behavior() {
+        let origin = s3_origin("b.s3.us-east-1.amazonaws.com", Some("OAC1"), None);
+        for (behavior, want) in [
+            ("always", OriginAuth::Always(cloudfront_caller())),
+            ("no-override", OriginAuth::NoOverride(cloudfront_caller())),
+            ("never", OriginAuth::Anonymous),
+        ] {
+            let account = account_with_access(Some(("OAC1", behavior, "s3")), None);
+            let target = origin_target(&origin, "127.0.0.1:4566", &ctx_for(DIST_ARN, &account));
+            assert!(target.local);
+            assert_eq!(target.auth, want, "{behavior}");
+        }
+    }
+
+    #[test]
+    fn oac_that_is_missing_or_not_for_s3_leaves_the_fetch_unsigned() {
+        let origin = s3_origin("b.s3.us-east-1.amazonaws.com", Some("OAC1"), None);
+        let none = AccountState::default();
+        assert_eq!(
+            origin_auth(&origin, &ctx_for(DIST_ARN, &none)),
+            OriginAuth::Anonymous
+        );
+        let mediastore = account_with_access(Some(("OAC1", "always", "mediastore")), None);
+        assert_eq!(
+            origin_auth(&origin, &ctx_for(DIST_ARN, &mediastore)),
+            OriginAuth::Anonymous
+        );
+    }
+
+    #[test]
+    fn oai_signs_as_the_origin_access_identity() {
+        let origin = s3_origin(
+            "b.s3.cn-north-1.amazonaws.com.cn",
+            None,
+            Some("origin-access-identity/cloudfront/E2QWRUHAPOMQZL"),
+        );
+        let account = account_with_access(None, Some("E2QWRUHAPOMQZL"));
+        let arn = "arn:aws-cn:cloudfront::123456789012:distribution/E1ABC";
+        assert_eq!(
+            origin_auth(&origin, &ctx_for(arn, &account)),
+            OriginAuth::Always(InternalCaller::ServiceOwned {
+                arn: "arn:aws-cn:iam::cloudfront:user/CloudFront Origin Access Identity E2QWRUHAPOMQZL"
+                    .into(),
+                canonical_user_id: Some("0123456789abcdef0123456789abcdef".into()),
+                acting_account: "123456789012".into(),
+            })
+        );
+        // An OAI the account does not hold never grants.
+        let empty = AccountState::default();
+        assert_eq!(
+            origin_auth(&origin, &ctx_for(arn, &empty)),
+            OriginAuth::Anonymous
+        );
+    }
+
+    #[test]
+    fn oac_wins_over_a_leftover_oai() {
+        let origin = s3_origin(
+            "b.s3.us-east-1.amazonaws.com",
+            Some("OAC1"),
+            Some("origin-access-identity/cloudfront/E2QWRUHAPOMQZL"),
+        );
+        let account = account_with_access(Some(("OAC1", "always", "s3")), Some("E2QWRUHAPOMQZL"));
+        assert_eq!(
+            origin_auth(&origin, &ctx_for(DIST_ARN, &account)),
+            OriginAuth::Always(cloudfront_caller())
+        );
+    }
+
+    #[test]
+    fn origin_without_access_config_is_anonymous() {
+        let origin = s3_origin("b.s3.us-east-1.amazonaws.com", None, None);
+        let account = account_with_access(Some(("OAC1", "always", "s3")), Some("E1"));
+        assert_eq!(
+            origin_auth(&origin, &ctx_for(DIST_ARN, &account)),
+            OriginAuth::Anonymous
+        );
+    }
+
+    #[test]
+    fn website_endpoints_and_custom_origins_are_never_signed() {
+        let account = account_with_access(Some(("OAC1", "always", "s3")), None);
+        let website = s3_origin("b.s3-website-us-east-1.amazonaws.com", Some("OAC1"), None);
+        let target = origin_target(&website, "127.0.0.1:4566", &ctx_for(DIST_ARN, &account));
+        assert!(target.local);
+        assert_eq!(target.auth, OriginAuth::Anonymous);
+        let dotted = s3_origin("b.s3-website.eu-west-1.amazonaws.com", Some("OAC1"), None);
+        assert_eq!(
+            origin_auth(&dotted, &ctx_for(DIST_ARN, &account)),
+            OriginAuth::Anonymous
+        );
+        let mut custom_origin = origin("api.example.com", Some(custom("https-only", 80, 443)));
+        custom_origin.origin_access_control_id = Some("OAC1".into());
+        let target = origin_target(
+            &custom_origin,
+            "127.0.0.1:4566",
+            &ctx_for(DIST_ARN, &account),
+        );
+        assert!(!target.local);
+        assert_eq!(target.auth, OriginAuth::Anonymous);
+    }
+
+    #[test]
+    fn website_detection_requires_the_website_endpoint() {
+        assert!(is_s3_website_origin("b.s3-website-us-east-1.amazonaws.com"));
+        assert!(is_s3_website_origin("B.S3-Website.us-east-1.amazonaws.com"));
+        assert!(!is_s3_website_origin("b.s3.us-east-1.amazonaws.com"));
+        // A dotted bucket whose name merely contains "s3-website".
+        assert!(!is_s3_website_origin(
+            "my.s3-website.bucket.s3.us-east-1.amazonaws.com"
+        ));
+        assert!(!is_s3_website_origin("api.example.com"));
+    }
+
+    #[test]
+    fn no_override_defers_to_a_viewer_authorization_header() {
+        let auth = OriginAuth::NoOverride(cloudfront_caller());
+        assert_eq!(
+            auth.caller_for(&HeaderMap::new()),
+            Some(&cloudfront_caller())
+        );
+        let mut viewer = HeaderMap::new();
+        viewer.insert(header::AUTHORIZATION, "AWS4-HMAC-SHA256 x".parse().unwrap());
+        assert_eq!(auth.caller_for(&viewer), None);
+        // `always` replaces it.
+        let always = OriginAuth::Always(cloudfront_caller());
+        assert_eq!(always.caller_for(&viewer), Some(&cloudfront_caller()));
+        assert_eq!(OriginAuth::Anonymous.caller_for(&HeaderMap::new()), None);
     }
 }

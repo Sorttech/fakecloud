@@ -168,6 +168,12 @@ pub(crate) enum PrincipalRef {
     /// minting the trust-policy evaluation request for
     /// AssumeRoleWithSAML / AssumeRoleWithWebIdentity.
     Federated(String),
+    /// `"Principal": {"CanonicalUser": "<id>"}` -- the S3 canonical user id
+    /// form. The principals fakecloud gives a canonical user id to are
+    /// CloudFront origin access identities (their `S3CanonicalUserId`,
+    /// carried as the principal's `user_id`); see
+    /// [`principal_is_canonical_user`].
+    CanonicalUser(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -324,7 +330,7 @@ fn parse_statement(value: &Value, variables: bool) -> Option<ParsedStatement> {
 /// - `"Principal": {"AWS": "*"}` or `{"AWS": ["..."]}`
 /// - `"Principal": {"Service": "lambda.amazonaws.com"}` (string or array)
 /// - `"Principal": {"Federated": "..."}` (matched via [`principal_is_federated`])
-/// - `"Principal": {"CanonicalUser": "..."}` (unhandled — warn log, drop)
+/// - `"Principal": {"CanonicalUser": "..."}` (matched via [`principal_is_canonical_user`])
 ///
 /// Unknown shapes fall through to an empty ref list, which the matcher
 /// treats as "doesn't match" — never silently grant. The drop is logged at
@@ -357,6 +363,11 @@ fn parse_principal(value: &Value) -> Vec<PrincipalRef> {
                     "Federated" => {
                         for s in coerce_string_list(v) {
                             out.push(PrincipalRef::Federated(s));
+                        }
+                    }
+                    "CanonicalUser" => {
+                        for s in coerce_string_list(v) {
+                            out.push(PrincipalRef::CanonicalUser(s));
                         }
                     }
                     other => {
@@ -852,8 +863,7 @@ fn evaluate_inner_scoped(
 
 /// Check whether any entry in a parsed `Principal` list matches the
 /// calling principal. An empty list never matches — that's how we
-/// keep unimplemented principal types (`Federated`, `CanonicalUser`)
-/// from silently granting.
+/// keep unrecognized principal types from silently granting.
 fn principal_matches(refs: &[PrincipalRef], principal: &Principal) -> bool {
     principal_matches_scoped(refs, principal, false)
 }
@@ -875,7 +885,20 @@ fn principal_matches_scoped(
         PrincipalRef::AwsArn(arn) => &principal.arn == arn,
         PrincipalRef::Service(service) => principal_is_service(principal, service),
         PrincipalRef::Federated(provider) => principal_is_federated(principal, provider),
+        PrincipalRef::CanonicalUser(id) => principal_is_canonical_user(principal, id),
     })
+}
+
+/// Match a `"CanonicalUser"` principal. An S3 canonical user id is a
+/// lowercase-hex string; the only principals fakecloud assigns one are
+/// CloudFront origin access identities, which carry it as their `user_id`
+/// (see `fakecloud_core::auth::InternalCaller::ServiceOwned`). IAM user and
+/// role ids (`AIDA...`, `AROA...:session`) are never all-hex, so they can't
+/// satisfy the comparison by accident.
+fn principal_is_canonical_user(principal: &Principal, id: &str) -> bool {
+    !id.is_empty()
+        && id.bytes().all(|b| b.is_ascii_hexdigit())
+        && principal.user_id.eq_ignore_ascii_case(id)
 }
 
 /// Match a `"Federated"` principal. STS injects the federated provider
@@ -911,8 +934,14 @@ fn principal_is_service(principal: &Principal, service: &str) -> bool {
     // its `assumed-role/lambda.amazonaws.com/...` ARN satisfy a
     // `Principal: { Service: lambda.amazonaws.com }` trust — a privilege
     // escalation. Require the reserved service-linked-role path instead.
-    matches!(principal.principal_type, PrincipalType::AssumedRole)
-        && arn_denotes_service(&principal.arn, service)
+    match principal.principal_type {
+        // The service principal itself, acting on its own behalf (e.g.
+        // CloudFront fetching an S3 origin through an origin access
+        // control). Only fakecloud's in-process callers produce this type.
+        PrincipalType::Service => principal.arn.eq_ignore_ascii_case(service),
+        PrincipalType::AssumedRole => arn_denotes_service(&principal.arn, service),
+        _ => false,
+    }
 }
 
 fn action_matches(action: &ActionMatch, request_action: &str) -> bool {
@@ -1047,7 +1076,7 @@ pub fn collect_identity_policies(state: &IamState, principal: &Principal) -> Vec
             // Returning an empty vec means an explicit `Allow` is required,
             // which is the safe default if a caller forgets to bypass.
         }
-        PrincipalType::FederatedUser | PrincipalType::Unknown => {
+        PrincipalType::FederatedUser | PrincipalType::Unknown | PrincipalType::Service => {
             // No identity-policy story for these in Phase 1.
         }
     }
