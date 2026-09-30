@@ -69,6 +69,20 @@ pub struct EcsTaskCredentials {
     cache: WorkloadCredentialCache,
 }
 
+/// The full ARN of a task's role. ECS accepts a bare role name for
+/// `taskRoleArn`; it names a role in the task's own account and partition.
+fn task_role_arn(task: &fakecloud_ecs::Task, task_account: &str) -> Option<String> {
+    let role = task.task_role_arn.as_deref()?;
+    if role.starts_with("arn:") {
+        return Some(role.to_string());
+    }
+    Some(
+        fakecloud_aws::arn::Arn::global("iam", task_account, &format!("role/{role}"))
+            .with_partition(fakecloud_aws::arn::partition_of(&task.task_arn))
+            .to_string(),
+    )
+}
+
 fn cache_key(account_id: &str, task_id: &str) -> String {
     format!("{account_id}/{task_id}")
 }
@@ -98,9 +112,15 @@ impl EcsTaskCredentials {
             let accounts = self.ecs.read();
             accounts
                 .iter()
-                .flat_map(|(_, state)| state.tasks.iter())
-                .filter(|(_, t)| t.last_status == "STOPPED")
-                .filter_map(|(id, t)| Some((t.task_role_arn.clone()?, id.clone())))
+                .flat_map(|(account_id, state)| {
+                    state
+                        .tasks
+                        .iter()
+                        .filter(|(_, t)| t.last_status == "STOPPED")
+                        .filter_map(move |(id, t)| {
+                            Some((task_role_arn(t, account_id)?, id.clone()))
+                        })
+                })
                 .collect()
         };
         for (role_arn, task_id) in stopped {
@@ -124,13 +144,13 @@ impl EcsTaskCredentials {
                 let task = state.tasks.get(task_id)?;
                 (task.last_status != "STOPPED").then_some((account_id, task))
             })
-            .and_then(|(account_id, task)| Some((account_id, task.task_role_arn.as_deref()?)))
+            .and_then(|(account_id, task)| Some((account_id, task_role_arn(task, account_id)?)))
             .ok_or(CredentialsError::NotFound)?;
         let creds = self.cache.get_or_mint(
             &self.iam,
-            &self.default_account_id,
+            account_id,
             &cache_key(account_id, task_id),
-            role_arn,
+            &role_arn,
             task_id,
             DEFAULT_CONTAINER_CREDENTIALS_DURATION,
         );
@@ -391,5 +411,23 @@ mod tests {
             "persisted session survived restart"
         );
         assert!(resolves(&iam, &live));
+    }
+
+    #[test]
+    fn short_role_name_resolves_in_the_tasks_account() {
+        let (ecs, iam, endpoint) = setup();
+        add_task(&ecs, "222222222222", "x", Some("app-role"));
+        let creds = endpoint.credentials("x").unwrap();
+        assert_eq!(creds.role_arn, "arn:aws:iam::222222222222:role/app-role");
+        assert_eq!(
+            creds.assumed_role_arn,
+            "arn:aws:sts::222222222222:assumed-role/app-role/x"
+        );
+        assert!(resolves(&iam, &creds));
+
+        // And its persisted session is found there after a restart.
+        stop_task(&ecs, "222222222222", "x");
+        let _after_restart = EcsTaskCredentials::new(ecs.clone(), iam.clone(), ACCOUNT);
+        assert!(!resolves(&iam, &creds));
     }
 }
