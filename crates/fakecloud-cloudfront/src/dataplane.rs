@@ -189,12 +189,17 @@ impl CloudFrontDataPlane {
                 Some(q) => format!("{object}?{q}"),
                 None => object.clone(),
             },
-            None => parts
-                .uri
-                .path_and_query()
-                .map(|p| p.as_str())
-                .unwrap_or("/")
-                .to_string(),
+            // Dot segments are resolved within the viewer's own path before
+            // the origin's `OriginPath` is prefixed, so `/../x` (or
+            // `/%2e%2e/x`) can never climb out of `OriginPath` -- which, for a
+            // signed S3 origin, would read objects as CloudFront outside it.
+            None => {
+                let path = remove_dot_segments(parts.uri.path());
+                match parts.uri.query() {
+                    Some(q) => format!("{path}?{q}"),
+                    None => path,
+                }
+            }
         };
         let url = format!("{}{path_and_query}", route.upstream.url_base);
         trace!(%host, path = %parts.uri.path(), origin = %route.upstream.host_header, "CloudFront data plane: proxying");
@@ -668,6 +673,39 @@ fn origin_auth(origin: &crate::model::Origin, ctx: &RouteContext<'_>) -> OriginA
         canonical_user_id: Some(oai.s3_canonical_user_id.clone()),
         acting_account: ctx.account_id.to_string(),
     })
+}
+
+/// Resolve `.` and `..` segments in a viewer path (RFC 3986
+/// remove_dot_segments), treating a percent-encoded dot (`%2e`, any case) as a
+/// dot, as URL parsers do. `..` at the root stays at the root. The result
+/// always starts with `/`.
+fn remove_dot_segments(path: &str) -> String {
+    fn dot_value(segment: &str) -> Option<usize> {
+        let lower = segment.to_ascii_lowercase();
+        match lower.replace("%2e", ".").as_str() {
+            "." => Some(1),
+            ".." => Some(2),
+            _ => None,
+        }
+    }
+    let mut out: Vec<&str> = Vec::new();
+    let segments: Vec<&str> = path.split('/').skip(1).collect();
+    let last = segments.len().saturating_sub(1);
+    for (i, segment) in segments.iter().enumerate() {
+        match dot_value(segment) {
+            Some(dots) => {
+                if dots == 2 {
+                    out.pop();
+                }
+                // A trailing dot segment names the directory: keep the slash.
+                if i == last {
+                    out.push("");
+                }
+            }
+            None => out.push(segment),
+        }
+    }
+    format!("/{}", out.join("/"))
 }
 
 /// The origin-form request target (`/path?query`) of an assembled origin URL,
@@ -1507,6 +1545,34 @@ mod tests {
         assert_eq!(
             local_path_and_query("http://127.0.0.1:4566/prod/a.png?v=1").as_deref(),
             Some("/prod/a.png?v=1")
+        );
+    }
+
+    #[test]
+    fn viewer_dot_segments_cannot_climb_out_of_the_origin_path() {
+        for (viewer, want) in [
+            ("/../private.txt", "/private.txt"),
+            ("/%2e%2e/private.txt", "/private.txt"),
+            ("/%2E%2e/%2e%2e/private.txt", "/private.txt"),
+            ("/a/b/../c", "/a/c"),
+            ("/a/./b", "/a/b"),
+            ("/a/..", "/"),
+            ("/a/b/.", "/a/b/"),
+            ("/", "/"),
+            ("/img/a.png", "/img/a.png"),
+            ("/a//b", "/a//b"),
+            ("/..foo/x", "/..foo/x"),
+        ] {
+            assert_eq!(remove_dot_segments(viewer), want, "{viewer}");
+        }
+        // Joined under an OriginPath, the result stays below it.
+        let joined = format!(
+            "http://127.0.0.1:4566/public{}",
+            remove_dot_segments("/%2e%2e/private.txt")
+        );
+        assert_eq!(
+            local_path_and_query(&joined).as_deref(),
+            Some("/public/private.txt")
         );
     }
 }

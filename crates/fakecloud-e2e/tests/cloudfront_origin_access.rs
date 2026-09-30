@@ -97,9 +97,19 @@ async fn create_distribution(
     oac_id: Option<&str>,
     oai_id: Option<&str>,
 ) -> aws_sdk_cloudfront::types::Distribution {
+    create_distribution_with_origin_path(cf, oac_id, oai_id, None).await
+}
+
+async fn create_distribution_with_origin_path(
+    cf: &aws_sdk_cloudfront::Client,
+    oac_id: Option<&str>,
+    oai_id: Option<&str>,
+    origin_path: Option<&str>,
+) -> aws_sdk_cloudfront::types::Distribution {
     let origin = Origin::builder()
         .id("s3")
         .domain_name(ORIGIN_DOMAIN)
+        .set_origin_path(origin_path.map(str::to_string))
         .set_origin_access_control_id(oac_id.map(str::to_string))
         .s3_origin_config(
             S3OriginConfig::builder()
@@ -448,4 +458,49 @@ async fn oac_reads_a_bucket_owned_by_another_account() {
     let r = get_through(&server, &dist, "/index.html").await;
     assert_eq!(r.status(), 200);
     assert_eq!(r.text().await.unwrap(), "PRIVATE");
+}
+
+/// A viewer path with dot segments stays under the origin's `OriginPath`: a
+/// signed fetch must not reach objects outside it. Sent over a raw socket so
+/// no client resolves the dot segments first.
+#[tokio::test]
+async fn viewer_dot_segments_stay_under_the_origin_path() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let server = strict_server().await;
+    let s3 = server.s3_client().await;
+    let cf = server.cloudfront_client().await;
+    private_bucket(&s3).await; // `index.html` at the bucket root: outside /public
+    s3.put_object()
+        .bucket(BUCKET)
+        .key("public/page.html")
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(b"PUBLIC"))
+        .send()
+        .await
+        .expect("put_object");
+    let oac = create_oac(&cf, "oac-path", OriginAccessControlSigningBehaviors::Always).await;
+    let dist = create_distribution_with_origin_path(&cf, Some(&oac), None, Some("/public")).await;
+    put_policy(&s3, &oac_policy(dist.arn())).await;
+
+    let r = get_through(&server, &dist, "/page.html").await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.text().await.unwrap(), "PUBLIC");
+
+    let addr = server.endpoint().trim_start_matches("http://").to_string();
+    for path in ["/%2e%2e/index.html", "/../index.html"] {
+        let mut sock = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let req = format!(
+            "GET {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            dist.domain_name()
+        );
+        sock.write_all(req.as_bytes()).await.unwrap();
+        let mut resp = Vec::new();
+        sock.read_to_end(&mut resp).await.unwrap();
+        let resp = String::from_utf8_lossy(&resp);
+        assert!(
+            !resp.contains("PRIVATE"),
+            "{path} escaped the origin path: {resp}"
+        );
+        assert!(resp.starts_with("HTTP/1.1 404"), "{path}: {resp}");
+    }
 }
