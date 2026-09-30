@@ -283,6 +283,9 @@ impl RdsService {
         let vpc_security_group_ids = parse_vpc_security_group_ids(request);
         let tags = parse_tags(request)?;
         let db_subnet_group_name = optional_query_param(request, "DBSubnetGroupName");
+        // A malformed `StorageEncrypted` is rejected up front, before the S3
+        // read and long before the identifier is reserved.
+        parse_optional_bool(optional_query_param(request, "StorageEncrypted").as_deref())?;
 
         let bus = self.delivery_bus.as_ref().ok_or_else(|| {
             AwsServiceError::aws_error(
@@ -303,6 +306,9 @@ impl RdsService {
             })?;
 
         let runtime = self.require_runtime()?;
+        // Resolved before the identifier is reserved (an error here must not
+        // leak the reservation) and with no RDS lock held.
+        let storage_encryption = self.requested_storage_encryption(request)?;
 
         let (dbi_resource_id, db_instance_arn) = {
             let mut accounts = self.state.write();
@@ -359,8 +365,7 @@ impl RdsService {
         if let Some(ref name) = db_subnet_group_name {
             instance.db_subnet_group_name = Some(name.clone());
         }
-        (instance.storage_encrypted, instance.kms_key_id) =
-            self.requested_storage_encryption(request)?;
+        (instance.storage_encrypted, instance.kms_key_id) = storage_encryption;
 
         self.state
             .write()

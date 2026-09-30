@@ -1868,13 +1868,21 @@ pub struct Ec2State {
     /// `List*InRecycleBin` / `Restore*FromRecycleBin` ops can recover it.
     #[serde(default)]
     pub recycle_bin_retention: RecycleBinRetention,
-    /// Account-level EBS default encryption toggle.
+    /// EBS encryption by default as persisted before it was tracked per
+    /// region; applies to any region without its own setting.
     #[serde(default)]
     pub ebs_encryption_default: bool,
-    /// Account-level EBS default KMS key ARN, as `ModifyEbsDefaultKmsKeyId`
-    /// set it (None = the region's AWS-managed `aws/ebs` key).
+    /// EBS encryption by default, per region (as on AWS).
+    #[serde(default)]
+    pub ebs_encryption_default_by_region: BTreeMap<String, bool>,
+    /// The EBS default KMS key as persisted before it was tracked per region;
+    /// applies only to the region its ARN names.
     #[serde(default)]
     pub ebs_default_kms_key_id: Option<String>,
+    /// EBS default KMS key ARN per region, as `ModifyEbsDefaultKmsKeyId` set
+    /// it (absent = the region's AWS-managed `aws/ebs` key).
+    #[serde(default)]
+    pub ebs_default_kms_key_id_by_region: BTreeMap<String, String>,
     #[serde(default)]
     pub snapshots: BTreeMap<String, Snapshot>,
     /// Account-level snapshot block-public-access state.
@@ -2188,6 +2196,52 @@ pub struct Ec2State {
 }
 
 impl Ec2State {
+    /// Whether EBS encryption by default is on in `region`.
+    pub fn ebs_encryption_by_default(&self, region: &str) -> bool {
+        self.ebs_encryption_default_by_region
+            .get(region)
+            .copied()
+            .unwrap_or(self.ebs_encryption_default)
+    }
+
+    pub fn set_ebs_encryption_by_default(&mut self, region: &str, enabled: bool) {
+        self.ebs_encryption_default_by_region
+            .insert(region.to_string(), enabled);
+    }
+
+    /// The customized EBS default KMS key of `region`, if any.
+    pub fn ebs_default_kms_key(&self, region: &str) -> Option<String> {
+        self.ebs_default_kms_key_id_by_region
+            .get(region)
+            .cloned()
+            .or_else(|| {
+                self.ebs_default_kms_key_id
+                    .clone()
+                    .filter(|key| legacy_key_applies(key, region))
+            })
+    }
+
+    /// Customize (`Some`) or reset (`None`) the EBS default KMS key of
+    /// `region`.
+    pub fn set_ebs_default_kms_key(&mut self, region: &str, key: Option<String>) {
+        if self
+            .ebs_default_kms_key_id
+            .as_deref()
+            .is_some_and(|legacy| legacy_key_applies(legacy, region))
+        {
+            self.ebs_default_kms_key_id = None;
+        }
+        match key {
+            Some(key) => {
+                self.ebs_default_kms_key_id_by_region
+                    .insert(region.to_string(), key);
+            }
+            None => {
+                self.ebs_default_kms_key_id_by_region.remove(region);
+            }
+        }
+    }
+
     pub fn new(account_id: &str, region: &str) -> Self {
         let mut state = Self {
             account_id: account_id.to_string(),
@@ -2254,6 +2308,15 @@ impl Ec2State {
     /// Tags for `resource_id`, or an empty slice when none.
     pub fn tags_for(&self, resource_id: &str) -> &[Tag] {
         self.tags.get(resource_id).map(Vec::as_slice).unwrap_or(&[])
+    }
+}
+
+/// Whether a pre-per-region EBS default key applies to `region`: a KMS ARN
+/// applies to the region it names; any other form to every region.
+fn legacy_key_applies(key: &str, region: &str) -> bool {
+    match key.strip_prefix("arn:") {
+        Some(rest) => rest.split(':').nth(2) == Some(region),
+        None => true,
     }
 }
 

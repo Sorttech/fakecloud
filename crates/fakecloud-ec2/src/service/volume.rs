@@ -67,7 +67,7 @@ pub(crate) fn ebs_default_key(svc: &Ec2Service, account_id: &str, region: &str) 
         .state
         .read()
         .get(account_id)
-        .and_then(|s| s.ebs_default_kms_key_id.clone());
+        .and_then(|s| s.ebs_default_kms_key(region));
     custom.or_else(|| {
         fakecloud_core::delivery::aws_managed_kms_key_arn(
             svc.kms_hook.as_deref(),
@@ -109,7 +109,7 @@ pub(crate) fn new_volume_encryption(
         let accounts = svc.state.read();
         let state = accounts.get(account_id);
         (
-            state.is_some_and(|s| s.ebs_encryption_default),
+            state.is_some_and(|s| s.ebs_encryption_by_default(region)),
             snapshot_id
                 .and_then(|id| state.and_then(|s| s.snapshots.get(id)))
                 .map(|snap| (snap.encrypted, snap.kms_key_id.clone(), snap.volume_size)),
@@ -805,7 +805,7 @@ pub(crate) fn get_ebs_encryption_by_default(
         let accounts = svc.state.read();
         accounts
             .get(&req.account_id)
-            .map(|s| s.ebs_encryption_default)
+            .map(|s| s.ebs_encryption_by_default(&req.region))
             .unwrap_or(false)
     };
     Ok(Ec2Service::respond(
@@ -827,7 +827,7 @@ fn set_ebs_default(
         let mut accounts = svc.state.write();
         accounts
             .get_or_create(&req.account_id)
-            .ebs_encryption_default = val;
+            .set_ebs_encryption_by_default(&req.region, val);
     }
     Ok(Ec2Service::respond(
         action,
@@ -876,7 +876,7 @@ pub(crate) fn modify_ebs_default_kms_key_id(
         let mut accounts = svc.state.write();
         accounts
             .get_or_create(&req.account_id)
-            .ebs_default_kms_key_id = Some(key.clone());
+            .set_ebs_default_kms_key(&req.region, Some(key.clone()));
     }
     Ok(Ec2Service::respond(
         "ModifyEbsDefaultKmsKeyId",
@@ -893,7 +893,7 @@ pub(crate) fn reset_ebs_default_kms_key_id(
         let mut accounts = svc.state.write();
         accounts
             .get_or_create(&req.account_id)
-            .ebs_default_kms_key_id = None;
+            .set_ebs_default_kms_key(&req.region, None);
     }
     let key = ebs_default_key(svc, &req.account_id, &req.region)
         .unwrap_or_else(|| "alias/aws/ebs".to_string());
@@ -1690,5 +1690,119 @@ mod tests {
         let kept = &st.volumes[&data.volume_id];
         assert_eq!(kept.state, "available");
         assert!(kept.attachments.is_empty());
+    }
+
+    /// EBS encryption by default and the EBS default key are per region: a
+    /// customization in one region leaves every other region on its own
+    /// AWS-managed `aws/ebs` key with encryption by default off.
+    #[test]
+    fn ebs_defaults_are_per_region() {
+        let (kms, svc) = kms_svc();
+        let in_region = |action: &str, query: &[(&str, &str)], region: &str| {
+            let mut r = req(action, query);
+            r.region = region.to_string();
+            r
+        };
+        let east_key = elem(
+            &body_of(
+                modify_ebs_default_kms_key_id(
+                    &svc,
+                    &in_region(
+                        "ModifyEbsDefaultKmsKeyId",
+                        &[("KmsKeyId", "alias/aws/ebs")],
+                        "us-east-1",
+                    ),
+                )
+                .unwrap(),
+            ),
+            "kmsKeyId",
+        )
+        .unwrap();
+        enable_ebs_encryption_by_default(
+            &svc,
+            &in_region("EnableEbsEncryptionByDefault", &[], "us-east-1"),
+        )
+        .unwrap();
+
+        let west_default = elem(
+            &body_of(
+                get_ebs_default_kms_key_id(
+                    &svc,
+                    &in_region("GetEbsDefaultKmsKeyId", &[], "us-west-2"),
+                )
+                .unwrap(),
+            ),
+            "kmsKeyId",
+        )
+        .unwrap();
+        assert_ne!(west_default, east_key);
+        fakecloud_kms::test_support::assert_aws_managed_key(
+            &kms,
+            "000000000000",
+            "us-west-2",
+            &west_default,
+            "alias/aws/ebs",
+        );
+        let west_plain = body_of(
+            create_volume(
+                &svc,
+                &in_region(
+                    "CreateVolume",
+                    &[("AvailabilityZone", "us-west-2a")],
+                    "us-west-2",
+                ),
+            )
+            .unwrap(),
+        );
+        assert!(
+            west_plain.contains("<encrypted>false</encrypted>"),
+            "{west_plain}"
+        );
+        let west_enc = body_of(
+            create_volume(
+                &svc,
+                &in_region(
+                    "CreateVolume",
+                    &[("AvailabilityZone", "us-west-2a"), ("Encrypted", "true")],
+                    "us-west-2",
+                ),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            elem(&west_enc, "kmsKeyId").as_deref(),
+            Some(west_default.as_str())
+        );
+        let east_vol = body_of(
+            create_volume(
+                &svc,
+                &in_region(
+                    "CreateVolume",
+                    &[("AvailabilityZone", "us-east-1a")],
+                    "us-east-1",
+                ),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            elem(&east_vol, "kmsKeyId").as_deref(),
+            Some(east_key.as_str())
+        );
+    }
+
+    /// A default key persisted before the setting was per region keeps
+    /// applying to the region its ARN names, and only there.
+    #[test]
+    fn legacy_ebs_default_key_applies_to_its_own_region() {
+        let mut st = Ec2State::new("000000000000", "us-east-1");
+        st.ebs_default_kms_key_id =
+            Some("arn:aws:kms:us-east-1:000000000000:key/legacy".to_string());
+        assert_eq!(
+            st.ebs_default_kms_key("us-east-1").as_deref(),
+            Some("arn:aws:kms:us-east-1:000000000000:key/legacy")
+        );
+        assert_eq!(st.ebs_default_kms_key("us-west-2"), None);
+        st.set_ebs_default_kms_key("us-east-1", None);
+        assert_eq!(st.ebs_default_kms_key("us-east-1"), None);
     }
 }

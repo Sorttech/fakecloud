@@ -6818,3 +6818,33 @@ fn instance_storage_encryption_resolves_its_key() {
         (false, None)
     );
 }
+
+/// A malformed `StorageEncrypted` on RestoreDBInstanceFromS3 is rejected
+/// before anything else runs, so it can never leave the identifier reserved
+/// (which made every later create/restore of that name fail with
+/// DBInstanceAlreadyExists).
+#[tokio::test]
+async fn restore_from_s3_rejects_bad_storage_encrypted_without_reserving() {
+    use fakecloud_core::service::AwsService;
+    let (_kms, svc) = svc_with_kms();
+    let params = [
+        ("DBInstanceIdentifier", "s3-restored"),
+        ("S3BucketName", "bucket"),
+        ("Engine", "mysql"),
+        ("SourceEngine", "mysql"),
+        ("SourceEngineVersion", "8.0.36"),
+        ("S3IngestionRoleArn", "arn:aws:iam::000000000000:role/r"),
+        ("StorageEncrypted", "yes"),
+    ];
+    for _ in 0..2 {
+        let err = match svc.handle(req("RestoreDBInstanceFromS3", &params)).await {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => e,
+        };
+        assert_eq!(err.code(), "InvalidParameterValue");
+    }
+    let accounts = svc.state_handle().read();
+    assert!(accounts
+        .get("000000000000")
+        .is_none_or(|s| !s.instances.contains_key("s3-restored")));
+}
