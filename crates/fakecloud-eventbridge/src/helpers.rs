@@ -1123,7 +1123,7 @@ pub(crate) fn deliver_to_logs(
         .entry(group_name.to_string())
         .or_insert_with(|| fakecloud_logs::LogGroup {
             name: group_name.to_string(),
-            arn: fakecloud_logs::log_group_arn(&region, &account_id, group_name),
+            arn: fakecloud_logs::log_group_stored_arn(&region, &account_id, group_name),
             creation_time: ts_millis,
             retention_in_days: None,
             kms_key_id: None,
@@ -1145,6 +1145,7 @@ pub(crate) fn deliver_to_logs(
         return;
     }
 
+    let stream_arn = group.stream_arn("events");
     let stream = group
         .log_streams
         .entry(stream_name.clone())
@@ -1152,7 +1153,7 @@ pub(crate) fn deliver_to_logs(
             persistence_id: uuid::Uuid::new_v4().to_string(),
             last_sequence: 0,
             name: stream_name,
-            arn: format!("{}:log-stream:events", group.arn),
+            arn: stream_arn,
             creation_time: ts_millis,
             first_event_timestamp: None,
             last_event_timestamp: None,
@@ -1576,6 +1577,16 @@ mod logs_persist_tests {
             group.arn.contains(":eu-central-1:999999999999:"),
             "group ARN must carry the target region+account: {}",
             group.arn
+        );
+        // Stored in the same `:*` form CreateLogGroup stores, and the stream
+        // ARN hangs off the suffix-less group ARN.
+        assert_eq!(
+            group.arn,
+            "arn:aws:logs:eu-central-1:999999999999:log-group:/eb/xacct:*"
+        );
+        assert_eq!(
+            group.log_streams["events"].arn,
+            "arn:aws:logs:eu-central-1:999999999999:log-group:/eb/xacct:log-stream:events"
         );
     }
 }

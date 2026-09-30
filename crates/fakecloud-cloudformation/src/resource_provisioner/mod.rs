@@ -33,12 +33,6 @@ use fakecloud_cloudfront::{
         PublicKeyConfig, StoredFunction, StoredKeyGroup, StoredOriginAccessIdentity,
         StoredPublicKey,
     },
-    model::{
-        AliasItems, Aliases, CacheBehavior, CacheBehaviorItems, CacheBehaviors,
-        CustomErrorResponse, CustomErrorResponseItems, CustomErrorResponses, DefaultCacheBehavior,
-        DistributionConfig, GeoRestriction, LocationList, LoggingConfig, Origin, OriginItems,
-        Origins, Restrictions, ViewerCertificate,
-    },
     policies::{
         CachePolicyConfig, OriginAccessControlConfig, OriginRequestPolicyConfig,
         OriginRequestPolicyCookiesConfig, OriginRequestPolicyHeadersConfig,

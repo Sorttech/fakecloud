@@ -337,8 +337,9 @@ pub fn detect_service(
 /// `<bucket>.s3.<region>.localhost.localstack.cloud[:port]`) and real AWS
 /// service hostnames (`<service>.<region>.amazonaws.com`, S3 path-style
 /// and virtual-hosted-style including the legacy no-region
-/// `s3.amazonaws.com` / `<bucket>.s3.amazonaws.com` forms and the older
-/// dash-separated `s3-<region>.amazonaws.com` form).
+/// `s3.amazonaws.com` / `<bucket>.s3.amazonaws.com` forms, the older
+/// dash-separated `s3-<region>.amazonaws.com` form, the dualstack, FIPS and
+/// static-website endpoints), under every AWS partition's DNS suffix.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutingHost {
     pub service: String,
@@ -348,7 +349,17 @@ pub struct RoutingHost {
 }
 
 const LOCALSTACK_SUFFIX: &str = ".localhost.localstack.cloud";
-const AWS_SUFFIX: &str = ".amazonaws.com";
+/// The DNS suffix of every AWS partition: commercial and GovCloud
+/// (`amazonaws.com`), China (`amazonaws.com.cn`) and the isolated partitions.
+/// Endpoint hostnames share one shape across them, only the suffix differs.
+const AWS_SUFFIXES: &[&str] = &[
+    ".amazonaws.com",
+    ".amazonaws.com.cn",
+    ".c2s.ic.gov",
+    ".sc2s.sgov.gov",
+    ".cloud.adc-e.uk",
+    ".csp.hci.ic.gov",
+];
 
 /// Parse a `Host` header value for a LocalStack- or AWS-shaped hostname.
 /// Returns `None` for anything that doesn't match — callers fall through
@@ -362,13 +373,10 @@ pub fn parse_routing_host(host: &str) -> Option<RoutingHost> {
     if let Some(prefix) = hostname.strip_suffix(LOCALSTACK_SUFFIX) {
         return parse_localstack_prefix(prefix);
     }
-    if hostname == "amazonaws.com" {
-        return None;
-    }
-    if let Some(prefix) = hostname.strip_suffix(AWS_SUFFIX) {
-        return parse_aws_prefix(prefix);
-    }
-    None
+    AWS_SUFFIXES
+        .iter()
+        .find_map(|suffix| hostname.strip_suffix(suffix))
+        .and_then(parse_aws_prefix)
 }
 
 /// Pull the `Host` header and parse it with [`parse_routing_host`].
@@ -416,7 +424,7 @@ fn parse_localstack_prefix(prefix: &str) -> Option<RoutingHost> {
     }
 }
 
-/// Parse the prefix before `.amazonaws.com`.
+/// Parse the prefix before an AWS partition DNS suffix (`.amazonaws.com`, ...).
 ///
 /// Handles every variant AWS has shipped for the common REST/Query services:
 ///
@@ -427,6 +435,10 @@ fn parse_localstack_prefix(prefix: &str) -> Option<RoutingHost> {
 /// - `<bucket>.s3` — legacy virtual-hosted S3 (implicitly `us-east-1`).
 /// - `s3-<region>` — older dash-separated path-style S3.
 /// - `<bucket>.s3-<region>` — older dash-separated virtual-hosted S3.
+/// - `[<bucket>.]s3.dualstack.<region>`, `[<bucket>.]s3-fips[.dualstack].<region>`
+///   — dualstack and FIPS S3 endpoints.
+/// - `<bucket>.s3-website-<region>` / `<bucket>.s3-website.<region>` — S3
+///   static-website endpoints.
 fn parse_aws_prefix(prefix: &str) -> Option<RoutingHost> {
     if prefix.is_empty() {
         return None;
@@ -436,6 +448,19 @@ fn parse_aws_prefix(prefix: &str) -> Option<RoutingHost> {
         return None;
     }
     let last = *labels.last()?;
+
+    // `<bucket>.s3-website-<region>`: dash-separated S3 static-website
+    // endpoint. Checked before the generic `s3-<region>` form below, which
+    // would otherwise read the region as `website-<region>`.
+    if let Some(region) = last.strip_prefix("s3-website-") {
+        if !region.is_empty() && labels.len() >= 2 {
+            return Some(RoutingHost {
+                service: "s3".to_string(),
+                region: region.to_string(),
+                bucket: Some(labels[..labels.len() - 1].join(".")),
+            });
+        }
+    }
 
     // `s3-<region>` as the last label: dash-separated S3. Bucket, if any,
     // is whatever precedes it.
@@ -505,23 +530,33 @@ fn parse_aws_prefix(prefix: &str) -> Option<RoutingHost> {
         });
     }
 
-    match labels.len() {
-        // `<service>.<region>` — the common case. Covers `s3.<region>`
-        // path-style S3 too, since the service label falls through here.
-        2 => Some(RoutingHost {
-            service: labels[0].to_string(),
-            region: labels[1].to_string(),
+    // Region-last S3 endpoints: `[<bucket>.]<endpoint>.<region>` where the
+    // endpoint is `s3`, `s3-fips`, either of those followed by `.dualstack`,
+    // or `s3-website` (the dot-separated static-website endpoint). Whatever
+    // precedes the endpoint is the bucket (dotted names included).
+    let before_region = &labels[..labels.len() - 1];
+    let (endpoint_labels, s3_endpoint) = match before_region {
+        [rest @ .., s3, "dualstack"] if matches!(*s3, "s3" | "s3-fips") => (rest, true),
+        [rest @ .., endpoint] if matches!(*endpoint, "s3" | "s3-fips" | "s3-website") => {
+            (rest, true)
+        }
+        _ => (before_region, false),
+    };
+    if s3_endpoint {
+        return Some(RoutingHost {
+            service: "s3".to_string(),
+            region: last.to_string(),
+            bucket: (!endpoint_labels.is_empty()).then(|| endpoint_labels.join(".")),
+        });
+    }
+
+    // `<service>.<region>` — the common case for every other service.
+    match labels.as_slice() {
+        [service, region] => Some(RoutingHost {
+            service: service.to_string(),
+            region: region.to_string(),
             bucket: None,
         }),
-        // `<bucket>.s3.<region>` — modern virtual-hosted S3.
-        n if n >= 3 && labels[n - 2] == "s3" => {
-            let bucket = labels[..n - 2].join(".");
-            Some(RoutingHost {
-                service: "s3".to_string(),
-                region: labels[n - 1].to_string(),
-                bucket: Some(bucket),
-            })
-        }
         _ => None,
     }
 }
@@ -1561,6 +1596,67 @@ mod tests {
         assert_eq!(h.service, "s3");
         assert_eq!(h.region, "us-west-2");
         assert_eq!(h.bucket.as_deref(), Some("my-bucket"));
+    }
+
+    #[test]
+    fn parse_routing_host_aws_s3_dualstack_and_fips() {
+        for (host, bucket) in [
+            (
+                "my-bucket.s3.dualstack.us-east-1.amazonaws.com",
+                Some("my-bucket"),
+            ),
+            ("a.b.s3.dualstack.eu-west-2.amazonaws.com", Some("a.b")),
+            ("s3.dualstack.eu-west-2.amazonaws.com", None),
+            (
+                "my-bucket.s3-fips.us-gov-west-1.amazonaws.com",
+                Some("my-bucket"),
+            ),
+            (
+                "my-bucket.s3-fips.dualstack.us-east-1.amazonaws.com",
+                Some("my-bucket"),
+            ),
+        ] {
+            let h = parse_routing_host(host).unwrap();
+            assert_eq!(h.service, "s3", "{host}");
+            assert_eq!(h.bucket.as_deref(), bucket, "{host}");
+        }
+        let h = parse_routing_host("b.s3.dualstack.eu-west-2.amazonaws.com").unwrap();
+        assert_eq!(h.region, "eu-west-2");
+    }
+
+    #[test]
+    fn parse_routing_host_aws_s3_website_endpoints() {
+        // Dash form: the region is what follows `s3-website-`, not
+        // `website-<region>` as the generic `s3-<region>` rule would read it.
+        let h = parse_routing_host("site.s3-website-us-west-2.amazonaws.com").unwrap();
+        assert_eq!(h.service, "s3");
+        assert_eq!(h.region, "us-west-2");
+        assert_eq!(h.bucket.as_deref(), Some("site"));
+
+        // Dot form (every region launched since 2014).
+        let h = parse_routing_host("my.site.s3-website.eu-central-1.amazonaws.com").unwrap();
+        assert_eq!(h.service, "s3");
+        assert_eq!(h.region, "eu-central-1");
+        assert_eq!(h.bucket.as_deref(), Some("my.site"));
+    }
+
+    #[test]
+    fn parse_routing_host_other_partition_suffixes() {
+        let h = parse_routing_host("my-bucket.s3.cn-north-1.amazonaws.com.cn").unwrap();
+        assert_eq!(h.service, "s3");
+        assert_eq!(h.region, "cn-north-1");
+        assert_eq!(h.bucket.as_deref(), Some("my-bucket"));
+
+        let h = parse_routing_host("sqs.cn-northwest-1.amazonaws.com.cn").unwrap();
+        assert_eq!(h.service, "sqs");
+        assert_eq!(h.region, "cn-northwest-1");
+
+        let h = parse_routing_host("b.s3.us-iso-east-1.c2s.ic.gov").unwrap();
+        assert_eq!(h.region, "us-iso-east-1");
+        assert_eq!(h.bucket.as_deref(), Some("b"));
+
+        assert!(parse_routing_host("amazonaws.com.cn").is_none());
+        assert!(parse_routing_host(".amazonaws.com.cn").is_none());
     }
 
     #[test]

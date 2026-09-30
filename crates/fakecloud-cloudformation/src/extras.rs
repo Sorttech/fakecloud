@@ -201,6 +201,52 @@ fn record_hook_results(
     }
 }
 
+/// `ChangeSetNotFoundException` — declared on `DescribeChangeSet`,
+/// `DescribeChangeSetHooks` and `ExecuteChangeSet`, awsQueryError code
+/// `ChangeSetNotFound`, HTTP 404 (aws-models/cloudformation.json).
+fn change_set_not_found(cs: &str) -> AwsServiceError {
+    AwsServiceError::aws_error(
+        StatusCode::NOT_FOUND,
+        "ChangeSetNotFound",
+        format!("ChangeSet [{cs}] does not exist"),
+    )
+}
+
+/// Whether a stored change set is the one `cs` (a name or ARN) names,
+/// optionally scoped to `stack` (a stack name or id).
+fn change_set_matches(v: &Value, cs: &str, stack: Option<&str>) -> bool {
+    let id_match = v["Id"].as_str() == Some(cs) || v["ChangeSetName"].as_str() == Some(cs);
+    id_match && stack.is_none_or(|sf| change_set_on_stack(v, sf))
+}
+
+/// Whether a stored change set belongs to `stack` (a stack name or id).
+fn change_set_on_stack(v: &Value, stack: &str) -> bool {
+    v["StackName"].as_str() == Some(stack) || v["StackId"].as_str() == Some(stack)
+}
+
+/// Executing a change set invalidates every other change set on the same
+/// stack, since they were computed against the template it just replaced, so
+/// CloudFormation deletes them. The executed one stays, `EXECUTE_COMPLETE`.
+fn retire_sibling_change_sets(
+    change_sets: &mut BTreeMap<String, Value>,
+    executed: &str,
+    stack_id: &str,
+) {
+    change_sets.retain(|id, v| id == executed || v["StackId"].as_str() != Some(stack_id));
+}
+
+/// The stack name a `StackName` parameter refers to: the name itself, or the
+/// name segment of a stack ARN (`arn:...:stack/<name>/<uuid>`).
+fn stack_name_from_ref(stack: &str) -> &str {
+    if !stack.starts_with("arn:") {
+        return stack;
+    }
+    stack
+        .split_once(":stack/")
+        .and_then(|(_, rest)| rest.split('/').next())
+        .unwrap_or(stack)
+}
+
 fn missing(name: &str) -> AwsServiceError {
     AwsServiceError::aws_error(
         StatusCode::BAD_REQUEST,
@@ -637,6 +683,25 @@ impl CloudFormationService {
         Some(exists)
     }
 
+    /// Look a change set up by name or ARN, optionally constrained to a stack.
+    ///
+    /// Every caller previously inlined this and then fabricated a
+    /// `CREATE_COMPLETE` stub on a miss. That made `cdk deploy`/`cdk bootstrap`
+    /// hang against an existing stack: the CLI deletes its change set and polls
+    /// `DescribeChangeSet` until it 404s (`waitForGone`), so a stubbed success
+    /// never terminates. Callers now map `None` to `change_set_not_found`.
+    fn find_change_set(&self, account_id: &str, cs: &str, stack: Option<&str>) -> Option<Value> {
+        let accounts = self.state.read();
+        accounts
+            .get(account_id)
+            .and_then(|s| s.extras.get("change_sets"))
+            .and_then(|m| {
+                m.values()
+                    .find(|v| change_set_matches(v, cs, stack))
+                    .cloned()
+            })
+    }
+
     pub(crate) fn handle_extra_action(
         &self,
         req: &AwsRequest,
@@ -886,19 +951,6 @@ impl CloudFormationService {
                     &format!("changeSet/{cs_name}/{}", rand_id()),
                 )
                 .to_string();
-                let stack_id_str = stack_lookup
-                    .as_ref()
-                    .map(|(s, _)| s.clone())
-                    .unwrap_or_else(|| {
-                        Arn::regional(
-                            "cloudformation",
-                            &req.region,
-                            &aid,
-                            &format!("stack/{stack_name}/{}", rand_id()),
-                        )
-                        .to_string()
-                    });
-
                 // Snapshot the currently-activated hooks onto the change
                 // set so DescribeChangeSetHooks reflects what will run and
                 // ExecuteChangeSet records results against them (bug-audit
@@ -912,11 +964,9 @@ impl CloudFormationService {
                         .unwrap_or_default()
                 };
 
-                let entry = json!({
+                let mut entry = json!({
                     "Id": id,
                     "ChangeSetName": cs_name,
-                    "StackId": stack_id_str,
-                    "StackName": stack_name,
                     "Status": "CREATE_COMPLETE",
                     "ExecutionStatus": "AVAILABLE",
                     "TemplateBody": template_body,
@@ -928,6 +978,72 @@ impl CloudFormationService {
                 });
                 let mut accounts = self.state.write();
                 let state = accounts.get_or_create(&aid);
+                // Re-resolve the target stack under the write lock: a
+                // concurrent CREATE change set may have put the
+                // `REVIEW_IN_PROGRESS` placeholder in place since the read
+                // above, and this change set must carry that stack's id, not
+                // the one minted speculatively. Store the stack's real name
+                // too, so a later name-or-ARN filter matches either way.
+                let live = state
+                    .stacks
+                    .values()
+                    .find(|s| {
+                        (s.name == stack_name || s.stack_id == stack_name)
+                            && s.status != "DELETE_COMPLETE"
+                    })
+                    .map(|s| (s.stack_id.clone(), s.name.clone(), s.status.clone()));
+                let (stack_id_str, stack_name) = match &live {
+                    Some((sid, name, _)) => (sid.clone(), name.clone()),
+                    None => {
+                        let name = stack_name_from_ref(&stack_name).to_string();
+                        // No live stack. A stack ARN names its own id.
+                        // For a plain name, change sets already aimed at the
+                        // same missing stack share one id, so the
+                        // name-uniqueness check below and every by-stack
+                        // filter treat them as one stack; the first gets a
+                        // fresh id.
+                        let sid = if name != stack_name {
+                            stack_name.clone()
+                        } else {
+                            state
+                                .extras
+                                .get("change_sets")
+                                .and_then(|m| {
+                                    m.values()
+                                        .find(|v| v["StackName"].as_str() == Some(name.as_str()))
+                                        .and_then(|v| v["StackId"].as_str())
+                                        .map(str::to_string)
+                                })
+                                .unwrap_or_else(|| {
+                                    Arn::regional(
+                                        "cloudformation",
+                                        &req.region,
+                                        &aid,
+                                        &format!("stack/{name}/{}", rand_id()),
+                                    )
+                                    .to_string()
+                                })
+                        };
+                        (sid, name)
+                    }
+                };
+                entry["StackId"] = json!(stack_id_str);
+                entry["StackName"] = json!(stack_name);
+                // Change set names are unique per stack. Without this a
+                // second same-named change set would make every by-name
+                // lookup pick one of the two arbitrarily.
+                if state.extras.get("change_sets").is_some_and(|m| {
+                    m.values().any(|v| {
+                        v["ChangeSetName"].as_str() == Some(cs_name.as_str())
+                            && v["StackId"].as_str() == Some(stack_id_str.as_str())
+                    })
+                }) {
+                    return Err(AwsServiceError::aws_error(
+                        StatusCode::BAD_REQUEST,
+                        "AlreadyExistsException",
+                        format!("ChangeSet [{cs_name}] already exists"),
+                    ));
+                }
                 // A `CREATE`-type change set leaves the stack in
                 // `REVIEW_IN_PROGRESS` on AWS; executing it is what actually
                 // creates the stack. Materialize that placeholder now so
@@ -939,15 +1055,7 @@ impl CloudFormationService {
                     // (otherwise a CREATE against an existing stack referenced
                     // by id slips past the AlreadyExists check). A
                     // `DELETE_COMPLETE` leftover counts as absent.
-                    let live_status = state
-                        .stacks
-                        .values()
-                        .find(|s| {
-                            (s.name == stack_name || s.stack_id == stack_name)
-                                && s.status != "DELETE_COMPLETE"
-                        })
-                        .map(|s| s.status.clone());
-                    match live_status.as_deref() {
+                    match live.as_ref().map(|(_, _, status)| status.as_str()) {
                         // Fresh name, or a stale DELETE_COMPLETE entry to
                         // replace: insert the placeholder.
                         None => {
@@ -1018,20 +1126,9 @@ impl CloudFormationService {
                     .ok_or_else(|| missing("ChangeSetName"))?
                     .clone();
                 let stack_filter = params.get("StackName").cloned();
-                let accounts = self.state.read();
-                let entry = accounts.get(&aid)
-                    .and_then(|s| s.extras.get("change_sets"))
-                    .and_then(|m| m.values().find(|v| {
-                        let id_match = v["Id"].as_str() == Some(&cs)
-                            || v["ChangeSetName"].as_str() == Some(&cs);
-                        let stack_match = stack_filter.as_deref().is_none_or(|sf| {
-                            v["StackName"].as_str() == Some(sf)
-                                || v["StackId"].as_str() == Some(sf)
-                        });
-                        id_match && stack_match
-                    }))
-                    .cloned()
-                    .unwrap_or_else(|| json!({"ChangeSetName": cs.clone(), "Status": "CREATE_COMPLETE", "ExecutionStatus": "AVAILABLE"}));
+                let entry = self
+                    .find_change_set(&aid, &cs, stack_filter.as_deref())
+                    .ok_or_else(|| change_set_not_found(&cs))?;
                 let changes_xml = entry["Changes"]
                     .as_array()
                     .map(|arr| {
@@ -1096,41 +1193,16 @@ impl CloudFormationService {
                 // Read the hooks snapshotted onto the change set at
                 // CreateChangeSet time instead of always returning empty
                 // (bug-audit 2026-06-13, 1.8).
-                let entry = {
-                    let accounts = self.state.read();
-                    accounts
-                        .get(&aid)
-                        .and_then(|s| s.extras.get("change_sets"))
-                        .and_then(|m| {
-                            m.values()
-                                .find(|v| {
-                                    let id_match = v["Id"].as_str() == Some(&cs)
-                                        || v["ChangeSetName"].as_str() == Some(&cs);
-                                    let stack_match = stack_filter.as_deref().is_none_or(|sf| {
-                                        v["StackName"].as_str() == Some(sf)
-                                            || v["StackId"].as_str() == Some(sf)
-                                    });
-                                    id_match && stack_match
-                                })
-                                .cloned()
-                        })
-                };
-                let (cs_id, cs_name, stack_id, stack_name, hooks) = match &entry {
-                    Some(e) => (
-                        e["Id"].as_str().unwrap_or("").to_string(),
-                        e["ChangeSetName"].as_str().unwrap_or("").to_string(),
-                        e["StackId"].as_str().unwrap_or("").to_string(),
-                        e["StackName"].as_str().unwrap_or("").to_string(),
-                        e["Hooks"].as_array().cloned().unwrap_or_default(),
-                    ),
-                    None => (
-                        cs.clone(),
-                        cs.clone(),
-                        String::new(),
-                        String::new(),
-                        Vec::new(),
-                    ),
-                };
+                let entry = self
+                    .find_change_set(&aid, &cs, stack_filter.as_deref())
+                    .ok_or_else(|| change_set_not_found(&cs))?;
+                let (cs_id, cs_name, stack_id, stack_name, hooks) = (
+                    entry["Id"].as_str().unwrap_or("").to_string(),
+                    entry["ChangeSetName"].as_str().unwrap_or("").to_string(),
+                    entry["StackId"].as_str().unwrap_or("").to_string(),
+                    entry["StackName"].as_str().unwrap_or("").to_string(),
+                    entry["Hooks"].as_array().cloned().unwrap_or_default(),
+                );
                 let logical_filter = params.get("LogicalResourceId").cloned();
                 let hooks_xml = if hooks.is_empty() {
                     "    <Hooks/>".to_string()
@@ -1167,12 +1239,16 @@ impl CloudFormationService {
                     .get("ChangeSetName")
                     .ok_or_else(|| missing("ChangeSetName"))?
                     .clone();
+                // Scope the delete to `StackName` when one is given. Tools
+                // reuse one change set name across stacks (the CDK CLI names
+                // every stack's `cdk-deploy-change-set`), so an unscoped delete
+                // would take out another stack's in-flight change set and its
+                // ExecuteChangeSet would then fail with ChangeSetNotFound.
+                let stack_filter = params.get("StackName").cloned();
                 let mut accounts = self.state.write();
                 let state = accounts.get_or_create(&aid);
                 if let Some(m) = state.extras.get_mut("change_sets") {
-                    m.retain(|_, v| {
-                        v["Id"].as_str() != Some(&cs) && v["ChangeSetName"].as_str() != Some(&cs)
-                    });
+                    m.retain(|_, v| !change_set_matches(v, &cs, stack_filter.as_deref()));
                 }
                 Ok(xml_response("DeleteChangeSet", String::new(), &rid))
             }
@@ -1183,31 +1259,9 @@ impl CloudFormationService {
                     .ok_or_else(|| missing("ChangeSetName"))?;
                 let stack_filter = params.get("StackName").cloned();
 
-                let entry = {
-                    let accounts = self.state.read();
-                    accounts
-                        .get(&aid)
-                        .and_then(|s| s.extras.get("change_sets"))
-                        .and_then(|m| {
-                            m.values()
-                                .find(|v| {
-                                    let id_match = v["Id"].as_str() == Some(&cs)
-                                        || v["ChangeSetName"].as_str() == Some(&cs);
-                                    let stack_match = stack_filter.as_deref().is_none_or(|sf| {
-                                        v["StackName"].as_str() == Some(sf)
-                                            || v["StackId"].as_str() == Some(sf)
-                                    });
-                                    id_match && stack_match
-                                })
-                                .cloned()
-                        })
-                };
-                let Some(entry) = entry else {
-                    // Unknown change set: pass-through success rather than
-                    // hard-fail to preserve route-coverage semantics for
-                    // callers that don't first call CreateChangeSet.
-                    return Ok(xml_response("ExecuteChangeSet", String::new(), &rid));
-                };
+                let entry = self
+                    .find_change_set(&aid, &cs, stack_filter.as_deref())
+                    .ok_or_else(|| change_set_not_found(&cs))?;
 
                 if entry["ExecutionStatus"].as_str() != Some("AVAILABLE") {
                     return Err(AwsServiceError::aws_error(
@@ -1285,6 +1339,9 @@ impl CloudFormationService {
                     if let Some(m) = state.extras.get_mut("change_sets") {
                         if let Some(e) = m.get_mut(&cs_id) {
                             e["ExecutionStatus"] = json!("EXECUTE_COMPLETE");
+                        }
+                        if let Some(sid) = &found {
+                            retire_sibling_change_sets(m, &cs_id, sid);
                         }
                     }
                     if !cs_hooks.is_empty() {
@@ -1478,6 +1535,9 @@ impl CloudFormationService {
                             "EXECUTE_COMPLETE"
                         });
                     }
+                    if update_result.is_ok() {
+                        retire_sibling_change_sets(m, &cs_id, &sid);
+                    }
                 }
 
                 // Record a hook result per configured hook. A FAIL-mode
@@ -1570,11 +1630,17 @@ impl CloudFormationService {
             }
             "ListChangeSets" => {
                 require_scalar(&params, "StackName")?;
+                let stack = params.get("StackName").cloned().unwrap_or_default();
                 let accounts = self.state.read();
                 let items: Vec<Value> = accounts
                     .get(&aid)
                     .and_then(|s| s.extras.get("change_sets"))
-                    .map(|m| m.values().cloned().collect())
+                    .map(|m| {
+                        m.values()
+                            .filter(|v| change_set_on_stack(v, &stack))
+                            .cloned()
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let inner = format!(
                     "    <Summaries>\n{}\n    </Summaries>",
@@ -2638,6 +2704,7 @@ pub(crate) mod tests {
     use fakecloud_core::multi_account::MultiAccountState;
     use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
     use http::Method;
+    use http::StatusCode;
     use parking_lot::RwLock;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -3447,15 +3514,364 @@ pub(crate) mod tests {
 
     #[test]
     fn change_sets() {
-        ok(
+        // One service for the whole lifecycle: the reads only succeed because
+        // the change set really is there, not because a miss is stubbed out.
+        let svc = svc();
+        ok_on(
+            &svc,
             "CreateChangeSet",
             &[("StackName", "s"), ("ChangeSetName", "cs")],
         );
-        ok("DescribeChangeSet", &[("ChangeSetName", "cs")]);
-        ok("DescribeChangeSetHooks", &[("ChangeSetName", "cs")]);
-        ok("ListChangeSets", &[("StackName", "s")]);
-        ok("ExecuteChangeSet", &[("ChangeSetName", "cs")]);
-        ok("DeleteChangeSet", &[("ChangeSetName", "cs")]);
+        ok_on(&svc, "DescribeChangeSet", &[("ChangeSetName", "cs")]);
+        ok_on(&svc, "DescribeChangeSetHooks", &[("ChangeSetName", "cs")]);
+        ok_on(&svc, "ListChangeSets", &[("StackName", "s")]);
+        ok_on(&svc, "ExecuteChangeSet", &[("ChangeSetName", "cs")]);
+        // DeleteChangeSet declares no not-found error: AWS succeeds either way.
+        ok_on(&svc, "DeleteChangeSet", &[("ChangeSetName", "cs")]);
+        ok_on(
+            &svc,
+            "DeleteChangeSet",
+            &[("ChangeSetName", "never-existed")],
+        );
+    }
+
+    /// The reads must 404 once the change set is gone. CDK's `waitForGone`
+    /// polls `DescribeChangeSet` until it does, so a stubbed success hangs
+    /// `cdk deploy` and `cdk bootstrap` against an existing stack forever.
+    #[test]
+    fn change_set_reads_report_not_found() {
+        let svc = svc();
+        for action in [
+            "DescribeChangeSet",
+            "DescribeChangeSetHooks",
+            "ExecuteChangeSet",
+        ] {
+            let Err(err) = svc.handle_extra_action(&req(action, &[("ChangeSetName", "cs")])) else {
+                panic!("{action} on an unknown change set must fail");
+            };
+            let AwsServiceError::AwsError { status, code, .. } = &err else {
+                panic!("{action}: unexpected error {err:?}");
+            };
+            assert_eq!(*status, StatusCode::NOT_FOUND, "{action}");
+            assert_eq!(code, "ChangeSetNotFound", "{action}");
+        }
+    }
+
+    fn error_code(res: Result<AwsResponse, AwsServiceError>) -> String {
+        match res {
+            Err(AwsServiceError::AwsError { code, .. }) => code,
+            Err(other) => panic!("unexpected error {other:?}"),
+            Ok(_) => panic!("expected an error"),
+        }
+    }
+
+    fn create_change_set_id(svc: &CloudFormationService, stack: &str, name: &str) -> String {
+        let resp = svc
+            .handle_extra_action(&req(
+                "CreateChangeSet",
+                &[("StackName", stack), ("ChangeSetName", name)],
+            ))
+            .expect("CreateChangeSet");
+        let xml = body_str(&resp);
+        let start = xml.find("<Id>").expect("Id") + "<Id>".len();
+        let end = xml[start..].find("</Id>").expect("/Id") + start;
+        xml[start..end].to_string()
+    }
+
+    /// The CDK CLI names every stack's change set `cdk-deploy-change-set`, so
+    /// a delete scoped to one stack must leave the other stack's alone.
+    #[test]
+    fn delete_change_set_is_scoped_to_its_stack() {
+        let svc = svc();
+        create_change_set_id(&svc, "a", "shared");
+        create_change_set_id(&svc, "b", "shared");
+        ok_on(
+            &svc,
+            "DeleteChangeSet",
+            &[("StackName", "a"), ("ChangeSetName", "shared")],
+        );
+        assert_eq!(
+            error_code(svc.handle_extra_action(&req(
+                "DescribeChangeSet",
+                &[("StackName", "a"), ("ChangeSetName", "shared")],
+            ))),
+            "ChangeSetNotFound"
+        );
+        ok_on(
+            &svc,
+            "DescribeChangeSet",
+            &[("StackName", "b"), ("ChangeSetName", "shared")],
+        );
+    }
+
+    #[test]
+    fn describe_change_set_by_arn_needs_no_stack_name() {
+        let svc = svc();
+        let arn = create_change_set_id(&svc, "s", "cs");
+        let resp = svc
+            .handle_extra_action(&req("DescribeChangeSet", &[("ChangeSetName", &arn)]))
+            .expect("DescribeChangeSet by ARN");
+        assert!(body_str(&resp).contains("<ChangeSetName>cs</ChangeSetName>"));
+        ok_on(&svc, "DeleteChangeSet", &[("ChangeSetName", &arn)]);
+        assert_eq!(
+            error_code(
+                svc.handle_extra_action(&req("DescribeChangeSet", &[("ChangeSetName", &arn)]))
+            ),
+            "ChangeSetNotFound"
+        );
+    }
+
+    #[test]
+    fn create_change_set_rejects_a_name_already_used_on_the_stack() {
+        let svc = svc();
+        let create = [
+            ("StackName", "s"),
+            ("ChangeSetName", "cs"),
+            ("ChangeSetType", "CREATE"),
+        ];
+        ok_on(&svc, "CreateChangeSet", &create);
+        assert_eq!(
+            error_code(svc.handle_extra_action(&req("CreateChangeSet", &create))),
+            "AlreadyExistsException"
+        );
+        // The same name on another stack is a different change set.
+        create_change_set_id(&svc, "other", "cs");
+    }
+
+    #[test]
+    fn list_change_sets_is_scoped_to_its_stack() {
+        let svc = svc();
+        create_change_set_id(&svc, "a", "cs-a");
+        create_change_set_id(&svc, "b", "cs-b");
+        let xml = body_str(
+            &svc.handle_extra_action(&req("ListChangeSets", &[("StackName", "a")]))
+                .expect("ListChangeSets"),
+        );
+        assert!(xml.contains("<ChangeSetName>cs-a</ChangeSetName>"), "{xml}");
+        assert!(!xml.contains("cs-b"), "{xml}");
+    }
+
+    fn xml_field(xml: &str, tag: &str) -> String {
+        let open = format!("<{tag}>");
+        let start = xml.find(&open).expect(tag) + open.len();
+        let end = xml[start..].find(&format!("</{tag}>")).expect(tag) + start;
+        xml[start..end].to_string()
+    }
+
+    /// A stack ARN for a stack that does not exist yet is used as the stack
+    /// id as given, not nested inside a freshly minted one.
+    #[test]
+    fn change_set_on_missing_stack_arn_keeps_that_arn() {
+        let svc = svc();
+        let arn = "arn:aws:cloudformation:us-east-1:000000000000:stack/ghost/abc-123";
+        let created = body_str(
+            &svc.handle_extra_action(&req(
+                "CreateChangeSet",
+                &[("StackName", arn), ("ChangeSetName", "cs")],
+            ))
+            .expect("CreateChangeSet"),
+        );
+        assert_eq!(xml_field(&created, "StackId"), arn);
+        let described = body_str(
+            &svc.handle_extra_action(&req(
+                "DescribeChangeSet",
+                &[("StackName", arn), ("ChangeSetName", "cs")],
+            ))
+            .expect("DescribeChangeSet by the original ARN"),
+        );
+        assert_eq!(xml_field(&described, "StackName"), "ghost");
+        for filter in [arn, "ghost"] {
+            let xml = body_str(
+                &svc.handle_extra_action(&req("ListChangeSets", &[("StackName", filter)]))
+                    .expect("ListChangeSets"),
+            );
+            assert!(
+                xml.contains("<ChangeSetName>cs</ChangeSetName>"),
+                "{filter}: {xml}"
+            );
+        }
+    }
+
+    /// UPDATE-type change sets aimed at the same missing stack share its id,
+    /// so the per-stack name-uniqueness check still applies to them.
+    #[test]
+    fn change_sets_on_one_missing_stack_share_an_id_and_unique_names() {
+        let svc = svc();
+        let first = create_change_set_id(&svc, "absent", "one");
+        let second = body_str(
+            &svc.handle_extra_action(&req(
+                "CreateChangeSet",
+                &[("StackName", "absent"), ("ChangeSetName", "two")],
+            ))
+            .expect("CreateChangeSet"),
+        );
+        let first_stack = xml_field(
+            &body_str(
+                &svc.handle_extra_action(&req("DescribeChangeSet", &[("ChangeSetName", &first)]))
+                    .expect("DescribeChangeSet"),
+            ),
+            "StackId",
+        );
+        assert_eq!(xml_field(&second, "StackId"), first_stack);
+        assert_eq!(
+            error_code(svc.handle_extra_action(&req(
+                "CreateChangeSet",
+                &[("StackName", "absent"), ("ChangeSetName", "one")],
+            ))),
+            "AlreadyExistsException"
+        );
+    }
+
+    /// `StackName` accepts a stack name or its ARN, so a change set created
+    /// through one form is listed and deleted through the other.
+    #[test]
+    fn change_set_stack_filter_matches_name_and_arn() {
+        let svc = svc();
+        let created = body_str(
+            &svc.handle_extra_action(&req(
+                "CreateChangeSet",
+                &[
+                    ("StackName", "s"),
+                    ("ChangeSetName", "by-name"),
+                    ("ChangeSetType", "CREATE"),
+                ],
+            ))
+            .expect("CreateChangeSet"),
+        );
+        let stack_arn = xml_field(&created, "StackId");
+        ok_on(
+            &svc,
+            "CreateChangeSet",
+            &[("StackName", &stack_arn), ("ChangeSetName", "by-arn")],
+        );
+
+        for filter in ["s", stack_arn.as_str()] {
+            let xml = body_str(
+                &svc.handle_extra_action(&req("ListChangeSets", &[("StackName", filter)]))
+                    .expect("ListChangeSets"),
+            );
+            assert!(
+                xml.contains("<ChangeSetName>by-name</ChangeSetName>"),
+                "{filter}: {xml}"
+            );
+            assert!(
+                xml.contains("<ChangeSetName>by-arn</ChangeSetName>"),
+                "{filter}: {xml}"
+            );
+        }
+
+        // Created by ARN, deleted by name; created by name, deleted by ARN.
+        ok_on(
+            &svc,
+            "DeleteChangeSet",
+            &[("StackName", "s"), ("ChangeSetName", "by-arn")],
+        );
+        ok_on(
+            &svc,
+            "DeleteChangeSet",
+            &[("StackName", &stack_arn), ("ChangeSetName", "by-name")],
+        );
+        let xml = body_str(
+            &svc.handle_extra_action(&req("ListChangeSets", &[("StackName", "s")]))
+                .expect("ListChangeSets"),
+        );
+        assert!(!xml.contains("<ChangeSetName>"), "{xml}");
+    }
+
+    #[test]
+    fn stack_name_from_ref_takes_the_arn_name_segment() {
+        assert_eq!(super::stack_name_from_ref("plain"), "plain");
+        assert_eq!(
+            super::stack_name_from_ref(
+                "arn:aws:cloudformation:us-east-1:123456789012:stack/my-stack/abc-123"
+            ),
+            "my-stack"
+        );
+    }
+
+    /// Concurrent CREATE change sets for one new stack all attach to the
+    /// single `REVIEW_IN_PROGRESS` placeholder, not to ids minted before the
+    /// write lock was taken.
+    #[test]
+    fn concurrent_create_change_sets_share_the_stack_id() {
+        let svc = svc();
+        let threads = 16;
+        let barrier = std::sync::Barrier::new(threads);
+        let ids: Vec<String> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..threads)
+                .map(|i| {
+                    let (svc, barrier) = (&svc, &barrier);
+                    scope.spawn(move || {
+                        let name = format!("cs-{i}");
+                        barrier.wait();
+                        let resp = svc
+                            .handle_extra_action(&req(
+                                "CreateChangeSet",
+                                &[
+                                    ("StackName", "racy"),
+                                    ("ChangeSetName", &name),
+                                    ("ChangeSetType", "CREATE"),
+                                ],
+                            ))
+                            .expect("CreateChangeSet");
+                        xml_field(&body_str(&resp), "StackId")
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let accounts = svc.state.read();
+        let state = accounts.get("000000000000").expect("account");
+        let live: Vec<&str> = state
+            .stacks
+            .values()
+            .filter(|s| s.name == "racy")
+            .map(|s| s.stack_id.as_str())
+            .collect();
+        assert_eq!(live.len(), 1, "{live:?}");
+        assert!(ids.iter().all(|id| id == live[0]), "{ids:?} vs {live:?}");
+        let stored = state.extras.get("change_sets").expect("change sets");
+        assert!(stored
+            .values()
+            .all(|v| v["StackId"].as_str() == Some(live[0])));
+    }
+
+    /// Executing a change set deletes the stack's other change sets; the
+    /// executed one stays, `EXECUTE_COMPLETE`.
+    #[test]
+    fn execute_change_set_retires_its_siblings() {
+        let svc = svc();
+        for (name, kind) in [("first", "CREATE"), ("second", "CREATE")] {
+            ok_on(
+                &svc,
+                "CreateChangeSet",
+                &[
+                    ("StackName", "s"),
+                    ("ChangeSetName", name),
+                    ("ChangeSetType", kind),
+                ],
+            );
+        }
+        ok_on(
+            &svc,
+            "ExecuteChangeSet",
+            &[("StackName", "s"), ("ChangeSetName", "first")],
+        );
+        let xml = body_str(
+            &svc.handle_extra_action(&req(
+                "DescribeChangeSet",
+                &[("StackName", "s"), ("ChangeSetName", "first")],
+            ))
+            .expect("executed change set is still described"),
+        );
+        assert!(xml.contains("EXECUTE_COMPLETE"), "{xml}");
+        assert_eq!(
+            error_code(svc.handle_extra_action(&req(
+                "DescribeChangeSet",
+                &[("StackName", "s"), ("ChangeSetName", "second")],
+            ))),
+            "ChangeSetNotFound"
+        );
     }
 
     fn body_str(resp: &fakecloud_core::service::AwsResponse) -> String {

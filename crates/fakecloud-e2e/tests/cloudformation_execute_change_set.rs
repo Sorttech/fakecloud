@@ -605,3 +605,185 @@ async fn create_type_change_set_rejected_for_existing_stack() {
         "CREATE change set against an existing stack must be rejected, got {err:?}"
     );
 }
+
+/// An unknown change set must report `ChangeSetNotFound`, not a fabricated
+/// `CREATE_COMPLETE`. The CDK CLI deletes its change set and then polls
+/// `DescribeChangeSet` until the call 404s (`waitForGone`), so a stubbed
+/// success makes `cdk deploy`/`cdk bootstrap` against an existing stack hang
+/// forever.
+#[tokio::test]
+async fn describe_change_set_reports_unknown_change_set_as_not_found() {
+    let server = TestServer::start().await;
+    let cf = server.cloudformation_client().await;
+
+    let template = r#"{
+        "Resources": {
+            "QueueGone": {
+                "Type": "AWS::SQS::Queue",
+                "Properties": {"QueueName": "cs-gone-queue"}
+            }
+        }
+    }"#;
+
+    cf.create_stack()
+        .stack_name("cs-gone-stack")
+        .template_body(template)
+        .send()
+        .await
+        .unwrap();
+
+    // Never created.
+    let err = cf
+        .describe_change_set()
+        .stack_name("cs-gone-stack")
+        .change_set_name("never-created")
+        .send()
+        .await
+        .expect_err("DescribeChangeSet on an unknown change set must fail");
+    assert!(err.into_service_error().is_change_set_not_found_exception());
+
+    // Created, then deleted: this is the exact sequence the CDK CLI runs.
+    cf.create_change_set()
+        .stack_name("cs-gone-stack")
+        .change_set_name("cs-transient")
+        .change_set_type(ChangeSetType::Update)
+        .template_body(template)
+        .send()
+        .await
+        .unwrap();
+
+    // DeleteChangeSet declares no not-found error: AWS succeeds either way.
+    cf.delete_change_set()
+        .stack_name("cs-gone-stack")
+        .change_set_name("cs-transient")
+        .send()
+        .await
+        .unwrap();
+
+    let err = cf
+        .describe_change_set()
+        .stack_name("cs-gone-stack")
+        .change_set_name("cs-transient")
+        .send()
+        .await
+        .expect_err("DescribeChangeSet after DeleteChangeSet must fail");
+    assert!(err.into_service_error().is_change_set_not_found_exception());
+
+    // Same for the hooks view and for execution.
+    let err = cf
+        .describe_change_set_hooks()
+        .stack_name("cs-gone-stack")
+        .change_set_name("cs-transient")
+        .send()
+        .await
+        .expect_err("DescribeChangeSetHooks on an unknown change set must fail");
+    assert!(err.into_service_error().is_change_set_not_found_exception());
+
+    let err = cf
+        .execute_change_set()
+        .stack_name("cs-gone-stack")
+        .change_set_name("cs-transient")
+        .send()
+        .await
+        .expect_err("ExecuteChangeSet on an unknown change set must fail");
+    assert!(err.into_service_error().is_change_set_not_found_exception());
+}
+
+/// The CDK CLI gives every stack's change set the same name
+/// (`cdk-deploy-change-set`). Deleting one stack's change set must leave the
+/// other stack's in place and executable, and deleting a stack takes its
+/// change sets with it.
+#[tokio::test]
+async fn change_sets_sharing_a_name_stay_scoped_to_their_stack() {
+    let server = TestServer::start().await;
+    let cf = server.cloudformation_client().await;
+
+    let template = |queue: &str| {
+        format!(
+            r#"{{"Resources":{{"Q":{{"Type":"AWS::SQS::Queue","Properties":{{"QueueName":"{queue}"}}}}}}}}"#
+        )
+    };
+    for stack in ["scoped-a", "scoped-b"] {
+        cf.create_stack()
+            .stack_name(stack)
+            .template_body(template(&format!("{stack}-q1")))
+            .send()
+            .await
+            .unwrap();
+    }
+    let mut ids = Vec::new();
+    for stack in ["scoped-a", "scoped-b"] {
+        let out = cf
+            .create_change_set()
+            .stack_name(stack)
+            .change_set_name("cdk-deploy-change-set")
+            .change_set_type(ChangeSetType::Update)
+            .template_body(template(&format!("{stack}-q2")))
+            .send()
+            .await
+            .unwrap();
+        ids.push(out.id().unwrap().to_string());
+    }
+
+    // Names are unique per stack.
+    let err = cf
+        .create_change_set()
+        .stack_name("scoped-b")
+        .change_set_name("cdk-deploy-change-set")
+        .change_set_type(ChangeSetType::Update)
+        .template_body(template("scoped-b-q3"))
+        .send()
+        .await
+        .expect_err("a second same-named change set on one stack must be rejected");
+    assert!(err.into_service_error().is_already_exists_exception());
+
+    cf.delete_change_set()
+        .stack_name("scoped-a")
+        .change_set_name("cdk-deploy-change-set")
+        .send()
+        .await
+        .unwrap();
+
+    // Stack B's change set survived the delete and still executes.
+    cf.execute_change_set()
+        .stack_name("scoped-b")
+        .change_set_name("cdk-deploy-change-set")
+        .send()
+        .await
+        .unwrap();
+    let described = cf
+        .describe_change_set()
+        .change_set_name(&ids[1])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        described.execution_status().map(|s| s.as_str()),
+        Some("EXECUTE_COMPLETE")
+    );
+    let listed = cf
+        .list_change_sets()
+        .stack_name("scoped-a")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        listed.summaries().is_empty(),
+        "stack A has no change sets left, got {:?}",
+        listed.summaries()
+    );
+
+    // Deleting the stack deletes its change sets.
+    cf.delete_stack()
+        .stack_name("scoped-b")
+        .send()
+        .await
+        .unwrap();
+    let err = cf
+        .describe_change_set()
+        .change_set_name(&ids[1])
+        .send()
+        .await
+        .expect_err("a deleted stack's change set must be gone");
+    assert!(err.into_service_error().is_change_set_not_found_exception());
+}

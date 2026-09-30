@@ -361,8 +361,23 @@ jobs:
           fi
           echo "bridge-nf-call-iptables=$got (bridge netfilter active)"
 
+      # Docker Hub's anonymous pull (and its auth.docker.io token endpoint)
+      # intermittently fails on shared runner IPs, failing the job before any
+      # test runs. Pull the same official image from Google's Docker Hub
+      # mirror and tag it under the name the test uses, falling back to
+      # Docker Hub, with retries.
       - name: Pre-pull the instance base image
-        run: docker pull alpine:3
+        run: |
+          for attempt in 1 2 3; do
+            if docker pull -q mirror.gcr.io/library/alpine:3 \
+              && docker tag mirror.gcr.io/library/alpine:3 alpine:3; then
+              exit 0
+            fi
+            if docker pull -q alpine:3; then exit 0; fi
+            sleep $((attempt * 10))
+          done
+          echo "::error::could not pull alpine:3 from mirror.gcr.io or Docker Hub"
+          exit 1
 
       - name: Build fakecloud + the enforcement test
         run: |

@@ -41,7 +41,7 @@ pub fn append_events(
         .entry(group_name.to_string())
         .or_insert_with(|| LogGroup {
             name: group_name.to_string(),
-            arn: crate::state::log_group_arn(region, account_id, group_name),
+            arn: crate::state::log_group_stored_arn(region, account_id, group_name),
             creation_time: now,
             retention_in_days: None,
             kms_key_id: None,
@@ -55,6 +55,7 @@ pub fn append_events(
             deletion_protection: false,
             log_group_class: Some("STANDARD".into()),
         });
+    let stream_arn = group.stream_arn(stream_name);
     let stream = group
         .log_streams
         .entry(stream_name.to_string())
@@ -62,7 +63,7 @@ pub fn append_events(
             persistence_id: uuid::Uuid::new_v4().to_string(),
             last_sequence: 0,
             name: stream_name.to_string(),
-            arn: format!("{}:log-stream:{}", group.arn, stream_name),
+            arn: stream_arn,
             creation_time: now,
             first_event_timestamp: None,
             last_event_timestamp: None,

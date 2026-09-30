@@ -483,6 +483,80 @@ async fn serves_static_from_s3_website_origin_and_routes_api() {
     assert_eq!(r.text().await.unwrap(), "ECHO /api/orders");
 }
 
+/// Regression: an `S3OriginConfig` origin carries the bucket's REST domain
+/// (`<bucket>.s3.<region>.amazonaws.com` — what CDK's `S3BucketOrigin` emits),
+/// which resolves in real DNS. Before the fix the data plane proxied it to real
+/// AWS S3 instead of this process, so the distribution never served the bucket.
+#[tokio::test]
+async fn serves_static_from_s3_rest_origin() {
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+    s3.create_bucket()
+        .bucket("restsite")
+        .send()
+        .await
+        .expect("create_bucket");
+    put_object(
+        &s3,
+        "restsite",
+        "assets/app.js",
+        "application/javascript",
+        b"APPJS",
+    )
+    .await;
+
+    let cf = server.cloudfront_client().await;
+    let dist = make_spa_distribution(&cf, "restsite.s3.us-east-1.amazonaws.com", None).await;
+    assert!(wait_for_served(&server, dist.id(), Duration::from_secs(10)).await);
+
+    let r = viewer_get(&server, dist.domain_name(), "/assets/app.js").await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.text().await.unwrap(), "APPJS");
+}
+
+/// The other S3 REST domain forms (here the bucket's `DualStackDomainName`)
+/// are served locally too, and the viewer path is the whole object key even
+/// when its first segment repeats the bucket name: `/docs/intro.html` on the
+/// `docs` bucket is the key `docs/intro.html`, not `intro.html`. A REST origin
+/// naming a bucket that does not exist gets the local S3's 404, not a fetch
+/// against real AWS.
+#[tokio::test]
+async fn serves_s3_rest_origin_dualstack_key_prefixed_by_bucket_name() {
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+    s3.create_bucket()
+        .bucket("docs")
+        .send()
+        .await
+        .expect("create_bucket");
+    put_object(&s3, "docs", "docs/intro.html", "text/html", b"NESTED").await;
+    put_object(&s3, "docs", "intro.html", "text/html", b"TOP").await;
+
+    let cf = server.cloudfront_client().await;
+    let dist = make_spa_distribution(&cf, "docs.s3.dualstack.eu-west-2.amazonaws.com", None).await;
+    assert!(wait_for_served(&server, dist.id(), Duration::from_secs(10)).await);
+
+    let r = viewer_get(&server, dist.domain_name(), "/docs/intro.html").await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.text().await.unwrap(), "NESTED");
+    let r = viewer_get(&server, dist.domain_name(), "/intro.html").await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.text().await.unwrap(), "TOP");
+
+    let missing =
+        make_spa_distribution(&cf, "no-such-bucket.s3.us-east-1.amazonaws.com", None).await;
+    assert!(wait_for_served(&server, missing.id(), Duration::from_secs(10)).await);
+    let r = viewer_get(&server, missing.domain_name(), "/x.html").await;
+    // The local S3 answers the missing bucket with a 404 S3 error document
+    // (GetObject reports it as `NoSuchKey`), not a proxy error or real AWS.
+    assert_eq!(r.status(), 404);
+    let body = r.text().await.unwrap();
+    assert!(
+        body.contains("<Error>") && body.contains("<Key>x.html</Key>"),
+        "{body}"
+    );
+}
+
 #[tokio::test]
 async fn stays_served_after_restart_persistent() {
     let tmp = tempfile::tempdir().unwrap();

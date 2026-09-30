@@ -48,7 +48,12 @@ pub struct DistributionConfig {
     pub web_acl_id: Option<String>,
     #[serde(default, skip_serializing_if = "skip_if_none")]
     pub http_version: Option<String>,
-    #[serde(default, skip_serializing_if = "skip_if_none")]
+    // AWS spells this `IsIPV6Enabled`; PascalCase would give `IsIpv6Enabled`.
+    #[serde(
+        default,
+        rename = "IsIPV6Enabled",
+        skip_serializing_if = "skip_if_none"
+    )]
     pub is_ipv6_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "skip_if_none")]
     pub continuous_deployment_policy_id: Option<String>,
@@ -60,6 +65,49 @@ pub struct DistributionConfig {
     pub tenant_config: Option<TenantConfig>,
     #[serde(default, skip_serializing_if = "skip_if_none")]
     pub connection_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "skip_if_none")]
+    pub viewer_mtls_config: Option<ViewerMtlsConfig>,
+    #[serde(default, skip_serializing_if = "skip_if_none")]
+    pub connection_function_association: Option<ConnectionFunctionAssociation>,
+    #[serde(default, skip_serializing_if = "skip_if_none")]
+    pub cache_tag_config: Option<CacheTagConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "PascalCase")]
+pub struct ViewerMtlsConfig {
+    #[serde(default, skip_serializing_if = "skip_if_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "skip_if_none")]
+    pub trust_store_config: Option<TrustStoreConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "PascalCase")]
+pub struct TrustStoreConfig {
+    pub trust_store_id: String,
+    #[serde(default, skip_serializing_if = "skip_if_none")]
+    pub advertise_trust_store_ca_names: Option<bool>,
+    #[serde(default, skip_serializing_if = "skip_if_none")]
+    pub ignore_certificate_expiry: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "PascalCase")]
+pub struct ConnectionFunctionAssociation {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "PascalCase")]
+pub struct CacheTagConfig {
+    pub header_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "PascalCase")]
+pub struct OriginMtlsConfig {
+    pub client_certificate_arn: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -145,6 +193,8 @@ pub struct OriginCustomHeader {
 #[serde(rename_all = "PascalCase")]
 pub struct S3OriginConfig {
     pub origin_access_identity: String,
+    #[serde(default, skip_serializing_if = "skip_if_none")]
+    pub origin_read_timeout: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -164,6 +214,10 @@ pub struct CustomOriginConfig {
     pub origin_read_timeout: Option<i32>,
     #[serde(default, skip_serializing_if = "skip_if_none")]
     pub origin_keepalive_timeout: Option<i32>,
+    #[serde(default, skip_serializing_if = "skip_if_none")]
+    pub ip_address_type: Option<String>,
+    #[serde(default, skip_serializing_if = "skip_if_none")]
+    pub origin_mtls_config: Option<OriginMtlsConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -184,6 +238,8 @@ pub struct SslProtocolItems {
 #[serde(rename_all = "PascalCase")]
 pub struct VpcOriginConfig {
     pub vpc_origin_id: String,
+    #[serde(default, skip_serializing_if = "skip_if_none")]
+    pub owner_account_id: Option<String>,
     #[serde(default, skip_serializing_if = "skip_if_none")]
     pub origin_read_timeout: Option<i32>,
     #[serde(default, skip_serializing_if = "skip_if_none")]
@@ -296,11 +352,13 @@ pub struct DefaultCacheBehavior {
     pub grpc_config: Option<GrpcConfig>,
     #[serde(default, skip_serializing_if = "skip_if_none")]
     pub forwarded_values: Option<ForwardedValues>,
-    #[serde(default, skip_serializing_if = "skip_if_none")]
+    // AWS spells the TTLs `MinTTL` / `DefaultTTL` / `MaxTTL`; PascalCase would
+    // give `MinTtl`, dropping them from real SDK requests.
+    #[serde(default, rename = "MinTTL", skip_serializing_if = "skip_if_none")]
     pub min_ttl: Option<i64>,
-    #[serde(default, skip_serializing_if = "skip_if_none")]
+    #[serde(default, rename = "DefaultTTL", skip_serializing_if = "skip_if_none")]
     pub default_ttl: Option<i64>,
-    #[serde(default, skip_serializing_if = "skip_if_none")]
+    #[serde(default, rename = "MaxTTL", skip_serializing_if = "skip_if_none")]
     pub max_ttl: Option<i64>,
 }
 
@@ -377,6 +435,7 @@ pub struct LambdaFunctionAssociationItems {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "PascalCase")]
 pub struct LambdaFunctionAssociation {
+    #[serde(rename = "LambdaFunctionARN")]
     pub lambda_function_arn: String,
     pub event_type: String,
     #[serde(default, skip_serializing_if = "skip_if_none")]
@@ -401,6 +460,7 @@ pub struct FunctionAssociationItems {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "PascalCase")]
 pub struct FunctionAssociation {
+    #[serde(rename = "FunctionARN")]
     pub function_arn: String,
     pub event_type: String,
 }
@@ -524,12 +584,63 @@ pub struct CacheBehavior {
     pub grpc_config: Option<GrpcConfig>,
     #[serde(default, skip_serializing_if = "skip_if_none")]
     pub forwarded_values: Option<ForwardedValues>,
-    #[serde(default, skip_serializing_if = "skip_if_none")]
+    // AWS spells the TTLs `MinTTL` / `DefaultTTL` / `MaxTTL`; PascalCase would
+    // give `MinTtl`, dropping them from real SDK requests.
+    #[serde(default, rename = "MinTTL", skip_serializing_if = "skip_if_none")]
     pub min_ttl: Option<i64>,
-    #[serde(default, skip_serializing_if = "skip_if_none")]
+    #[serde(default, rename = "DefaultTTL", skip_serializing_if = "skip_if_none")]
     pub default_ttl: Option<i64>,
-    #[serde(default, skip_serializing_if = "skip_if_none")]
+    #[serde(default, rename = "MaxTTL", skip_serializing_if = "skip_if_none")]
     pub max_ttl: Option<i64>,
+}
+
+impl CacheBehavior {
+    /// A path-scoped behavior carrying the same settings as `default`.
+    pub fn from_default(path_pattern: String, default: DefaultCacheBehavior) -> Self {
+        let DefaultCacheBehavior {
+            target_origin_id,
+            trusted_signers,
+            trusted_key_groups,
+            viewer_protocol_policy,
+            allowed_methods,
+            smooth_streaming,
+            compress,
+            lambda_function_associations,
+            function_associations,
+            field_level_encryption_id,
+            realtime_log_config_arn,
+            cache_policy_id,
+            origin_request_policy_id,
+            response_headers_policy_id,
+            grpc_config,
+            forwarded_values,
+            min_ttl,
+            default_ttl,
+            max_ttl,
+        } = default;
+        Self {
+            path_pattern,
+            target_origin_id,
+            trusted_signers,
+            trusted_key_groups,
+            viewer_protocol_policy,
+            allowed_methods,
+            smooth_streaming,
+            compress,
+            lambda_function_associations,
+            function_associations,
+            field_level_encryption_id,
+            realtime_log_config_arn,
+            cache_policy_id,
+            origin_request_policy_id,
+            response_headers_policy_id,
+            grpc_config,
+            forwarded_values,
+            min_ttl,
+            default_ttl,
+            max_ttl,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -555,7 +666,15 @@ pub struct CustomErrorResponse {
     pub response_page_path: Option<String>,
     #[serde(default, skip_serializing_if = "skip_if_none")]
     pub response_code: Option<String>,
-    #[serde(default, skip_serializing_if = "skip_if_none")]
+    // AWS spells this `ErrorCachingMinTTL` (upper-case TTL). The default
+    // PascalCase rule would emit `ErrorCachingMinTtl`, which drops the field on
+    // parse from real SDK requests and mis-names it on the wire. Pin the exact
+    // name, as `WebACLId` above does.
+    #[serde(
+        default,
+        rename = "ErrorCachingMinTTL",
+        skip_serializing_if = "skip_if_none"
+    )]
     pub error_caching_min_ttl: Option<i64>,
 }
 
@@ -573,11 +692,25 @@ pub struct LoggingConfig {
 pub struct ViewerCertificate {
     #[serde(default, skip_serializing_if = "skip_if_none")]
     pub cloud_front_default_certificate: Option<bool>,
-    #[serde(default, skip_serializing_if = "skip_if_none")]
+    // AWS spells these `IAMCertificateId` / `ACMCertificateArn` /
+    // `SSLSupportMethod`, not the PascalCase `IamCertificateId` etc.
+    #[serde(
+        default,
+        rename = "IAMCertificateId",
+        skip_serializing_if = "skip_if_none"
+    )]
     pub iam_certificate_id: Option<String>,
-    #[serde(default, skip_serializing_if = "skip_if_none")]
+    #[serde(
+        default,
+        rename = "ACMCertificateArn",
+        skip_serializing_if = "skip_if_none"
+    )]
     pub acm_certificate_arn: Option<String>,
-    #[serde(default, skip_serializing_if = "skip_if_none")]
+    #[serde(
+        default,
+        rename = "SSLSupportMethod",
+        skip_serializing_if = "skip_if_none"
+    )]
     pub ssl_support_method: Option<String>,
     #[serde(default, skip_serializing_if = "skip_if_none")]
     pub minimum_protocol_version: Option<String>,
@@ -716,4 +849,174 @@ pub struct Paths {
 pub struct PathList {
     #[serde(default, rename = "Path")]
     pub path: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A config whose acronym members PascalCase would mis-spell.
+    fn acronym_config_xml() -> &'static str {
+        r#"<DistributionConfig>
+  <CallerReference>ref</CallerReference>
+  <Origins><Quantity>0</Quantity></Origins>
+  <DefaultCacheBehavior>
+    <TargetOriginId>o1</TargetOriginId>
+    <ViewerProtocolPolicy>allow-all</ViewerProtocolPolicy>
+    <FunctionAssociations><Quantity>1</Quantity><Items><FunctionAssociation>
+      <FunctionARN>arn:f</FunctionARN><EventType>viewer-request</EventType>
+    </FunctionAssociation></Items></FunctionAssociations>
+    <LambdaFunctionAssociations><Quantity>1</Quantity><Items><LambdaFunctionAssociation>
+      <LambdaFunctionARN>arn:l</LambdaFunctionARN><EventType>origin-request</EventType>
+    </LambdaFunctionAssociation></Items></LambdaFunctionAssociations>
+    <MinTTL>1</MinTTL><DefaultTTL>2</DefaultTTL><MaxTTL>3</MaxTTL>
+  </DefaultCacheBehavior>
+  <CustomErrorResponses><Quantity>1</Quantity><Items><CustomErrorResponse>
+    <ErrorCode>404</ErrorCode><ErrorCachingMinTTL>10</ErrorCachingMinTTL>
+  </CustomErrorResponse></Items></CustomErrorResponses>
+  <Comment></Comment>
+  <Enabled>true</Enabled>
+  <ViewerCertificate>
+    <IAMCertificateId>iam-1</IAMCertificateId>
+    <ACMCertificateArn>arn:c</ACMCertificateArn>
+    <SSLSupportMethod>sni-only</SSLSupportMethod>
+  </ViewerCertificate>
+  <IsIPV6Enabled>true</IsIPV6Enabled>
+</DistributionConfig>"#
+    }
+
+    #[test]
+    fn acronym_members_parse_and_render_under_aws_spelling() {
+        let config: DistributionConfig = quick_xml::de::from_str(acronym_config_xml()).unwrap();
+        let dcb = &config.default_cache_behavior;
+        assert_eq!(
+            (dcb.min_ttl, dcb.default_ttl, dcb.max_ttl),
+            (Some(1), Some(2), Some(3))
+        );
+        let fa = &dcb
+            .function_associations
+            .as_ref()
+            .unwrap()
+            .items
+            .as_ref()
+            .unwrap();
+        assert_eq!(fa.function_association[0].function_arn, "arn:f");
+        let la = &dcb.lambda_function_associations.as_ref().unwrap();
+        assert_eq!(
+            la.items.as_ref().unwrap().lambda_function_association[0].lambda_function_arn,
+            "arn:l"
+        );
+        let rule = &config.custom_error_responses.as_ref().unwrap();
+        assert_eq!(
+            rule.items.as_ref().unwrap().custom_error_response[0].error_caching_min_ttl,
+            Some(10)
+        );
+        let vc = config.viewer_certificate.as_ref().unwrap();
+        assert_eq!(vc.iam_certificate_id.as_deref(), Some("iam-1"));
+        assert_eq!(vc.acm_certificate_arn.as_deref(), Some("arn:c"));
+        assert_eq!(vc.ssl_support_method.as_deref(), Some("sni-only"));
+        assert_eq!(config.is_ipv6_enabled, Some(true));
+
+        let xml = quick_xml::se::to_string_with_root("DistributionConfig", &config).unwrap();
+        for tag in [
+            "<MinTTL>1</MinTTL>",
+            "<DefaultTTL>2</DefaultTTL>",
+            "<MaxTTL>3</MaxTTL>",
+            "<FunctionARN>arn:f</FunctionARN>",
+            "<LambdaFunctionARN>arn:l</LambdaFunctionARN>",
+            "<ErrorCachingMinTTL>10</ErrorCachingMinTTL>",
+            "<IAMCertificateId>iam-1</IAMCertificateId>",
+            "<ACMCertificateArn>arn:c</ACMCertificateArn>",
+            "<SSLSupportMethod>sni-only</SSLSupportMethod>",
+            "<IsIPV6Enabled>true</IsIPV6Enabled>",
+        ] {
+            assert!(xml.contains(tag), "missing {tag} in {xml}");
+        }
+    }
+
+    #[test]
+    fn old_pascal_case_spellings_are_not_accepted_on_the_wire() {
+        // `MinTtl` is not a CloudFront member name; it must not be read as
+        // `MinTTL`.
+        let xml = acronym_config_xml()
+            .replace("<MinTTL>1</MinTTL>", "<MinTtl>1</MinTtl>")
+            .replace(
+                "<ACMCertificateArn>arn:c</ACMCertificateArn>",
+                "<AcmCertificateArn>arn:c</AcmCertificateArn>",
+            );
+        let config: DistributionConfig = quick_xml::de::from_str(&xml).unwrap();
+        assert_eq!(config.default_cache_behavior.min_ttl, None);
+        assert_eq!(config.viewer_certificate.unwrap().acm_certificate_arn, None);
+    }
+
+    #[test]
+    fn mtls_connection_function_and_cache_tag_members_round_trip() {
+        let xml = r#"<DistributionConfig>
+  <CallerReference>ref</CallerReference>
+  <Origins><Quantity>1</Quantity><Items><Origin>
+    <Id>o1</Id><DomainName>o.example.com</DomainName>
+    <CustomOriginConfig>
+      <HTTPPort>80</HTTPPort><HTTPSPort>443</HTTPSPort>
+      <OriginProtocolPolicy>https-only</OriginProtocolPolicy>
+      <OriginMtlsConfig><ClientCertificateArn>arn:cert</ClientCertificateArn></OriginMtlsConfig>
+    </CustomOriginConfig>
+  </Origin></Items></Origins>
+  <DefaultCacheBehavior>
+    <TargetOriginId>o1</TargetOriginId>
+    <ViewerProtocolPolicy>allow-all</ViewerProtocolPolicy>
+  </DefaultCacheBehavior>
+  <Comment></Comment>
+  <Enabled>true</Enabled>
+  <ViewerMtlsConfig>
+    <Mode>required</Mode>
+    <TrustStoreConfig>
+      <TrustStoreId>ts-1</TrustStoreId>
+      <AdvertiseTrustStoreCaNames>true</AdvertiseTrustStoreCaNames>
+      <IgnoreCertificateExpiry>false</IgnoreCertificateExpiry>
+    </TrustStoreConfig>
+  </ViewerMtlsConfig>
+  <ConnectionFunctionAssociation><Id>cf-1</Id></ConnectionFunctionAssociation>
+  <CacheTagConfig><HeaderName>Cache-Tag</HeaderName></CacheTagConfig>
+</DistributionConfig>"#;
+        let config: DistributionConfig = quick_xml::de::from_str(xml).unwrap();
+        let mtls = config.viewer_mtls_config.as_ref().unwrap();
+        assert_eq!(mtls.mode.as_deref(), Some("required"));
+        let ts = mtls.trust_store_config.as_ref().unwrap();
+        assert_eq!(ts.trust_store_id, "ts-1");
+        assert_eq!(ts.advertise_trust_store_ca_names, Some(true));
+        assert_eq!(ts.ignore_certificate_expiry, Some(false));
+        assert_eq!(
+            config.connection_function_association.as_ref().unwrap().id,
+            "cf-1"
+        );
+        assert_eq!(
+            config.cache_tag_config.as_ref().unwrap().header_name,
+            "Cache-Tag"
+        );
+        let origin = &config.origins.items.as_ref().unwrap().origin[0];
+        assert_eq!(
+            origin
+                .custom_origin_config
+                .as_ref()
+                .unwrap()
+                .origin_mtls_config
+                .as_ref()
+                .unwrap()
+                .client_certificate_arn,
+            "arn:cert"
+        );
+
+        let rendered = quick_xml::se::to_string_with_root("DistributionConfig", &config).unwrap();
+        for tag in [
+            "<Mode>required</Mode>",
+            "<TrustStoreId>ts-1</TrustStoreId>",
+            "<AdvertiseTrustStoreCaNames>true</AdvertiseTrustStoreCaNames>",
+            "<IgnoreCertificateExpiry>false</IgnoreCertificateExpiry>",
+            "<ConnectionFunctionAssociation><Id>cf-1</Id></ConnectionFunctionAssociation>",
+            "<CacheTagConfig><HeaderName>Cache-Tag</HeaderName></CacheTagConfig>",
+            "<OriginMtlsConfig><ClientCertificateArn>arn:cert</ClientCertificateArn></OriginMtlsConfig>",
+        ] {
+            assert!(rendered.contains(tag), "missing {tag} in {rendered}");
+        }
+    }
 }

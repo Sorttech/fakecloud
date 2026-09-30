@@ -89,7 +89,7 @@ impl EventBridgeService {
 
         // Create the archive rule
         let rule_name = format!("Events-Archive-{name}");
-        let rule_arn = rule_arn(&req.region, &state.account_id, "default", &rule_name);
+        let rule_arn = rule_arn(&req.region, &state.account_id, &bus_name, &rule_name);
         // Merge archive event pattern with replay-name filter
         let rule_event_pattern = {
             let mut merged = if let Some(ref ep) = event_pattern {
