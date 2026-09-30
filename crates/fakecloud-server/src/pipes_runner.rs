@@ -76,6 +76,9 @@ struct RunningPipe {
     /// `...StreamParameters.DeadLetterConfig.Arn` — where an exhausted batch is
     /// sent so a poison record can't wedge the stream forever.
     dlq_arn: Option<String>,
+    /// The pipe's `RoleArn`: the identity it reads the source with, reported
+    /// as a Kinesis record's `invokeIdentityArn`.
+    role_arn: Option<String>,
 }
 
 pub struct PipesRunner {
@@ -303,6 +306,10 @@ impl PipesRunner {
                     starting_position_timestamp,
                     max_retry_attempts,
                     dlq_arn,
+                    role_arn: pipe
+                        .get("RoleArn")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
                 });
             }
         }
@@ -569,7 +576,15 @@ impl PipesRunner {
             let events: Vec<Value> = window
                 .records
                 .iter()
-                .map(|r| kinesis_source_event(r, &window.shard_id, &pipe.source_arn, &region))
+                .map(|r| {
+                    kinesis_source_event(
+                        r,
+                        &window.shard_id,
+                        &pipe.source_arn,
+                        &region,
+                        pipe.role_arn.as_deref(),
+                    )
+                })
                 .collect();
             let key = format!("{}#{}", pipe.arn, window.shard_id);
             self.deliver_stream_window(&account, &key, window.last_seq, pipe, events)
@@ -1174,21 +1189,21 @@ fn sqs_source_event(
 }
 
 /// Build the AWS Pipes Kinesis-source event envelope for one record.
+/// `invokeIdentityArn` is the pipe's execution role (`RoleArn`), the identity
+/// the pipe reads the stream with.
 fn kinesis_source_event(
     record: &fakecloud_kinesis::KinesisRecord,
     shard_id: &str,
     source_arn: &str,
     region: &str,
+    role_arn: Option<&str>,
 ) -> Value {
     json!({
         "eventSource": "aws:kinesis",
         "eventVersion": "1.0",
         "eventID": format!("{}:{}", shard_id, record.sequence_number),
         "eventName": "aws:kinesis:record",
-        "invokeIdentityArn": format!(
-            "arn:{}:iam::123456789012:role/pipes-role",
-            fakecloud_aws::arn::partition_of(source_arn)
-        ),
+        "invokeIdentityArn": role_arn.unwrap_or_default(),
         "awsRegion": region,
         "eventSourceARN": source_arn,
         "kinesis": {
@@ -1303,6 +1318,26 @@ mod tests {
         assert!(enrichment_output(b"null").is_empty());
         assert!(enrichment_output(b"\"\"").is_empty());
         assert!(enrichment_output(b"not json").is_empty());
+    }
+
+    #[test]
+    fn kinesis_source_event_reports_pipe_role_as_invoke_identity() {
+        let record = fakecloud_kinesis::KinesisRecord {
+            sequence_number: "7".into(),
+            partition_key: "pk".into(),
+            data: b"x".to_vec(),
+            approximate_arrival_timestamp: chrono::Utc::now(),
+        };
+        let role = "arn:aws-us-gov:iam::444455556666:role/pipe-exec";
+        let ev = kinesis_source_event(
+            &record,
+            "shardId-000000000000",
+            "arn:aws-us-gov:kinesis:us-gov-west-1:444455556666:stream/s",
+            "us-gov-west-1",
+            Some(role),
+        );
+        assert_eq!(ev["invokeIdentityArn"], role);
+        assert_eq!(ev["eventID"], "shardId-000000000000:7");
     }
 
     #[test]

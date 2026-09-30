@@ -33,6 +33,10 @@ struct Mapping {
     /// checkpoint advances only past the first failed sequence number;
     /// records at or after that point are retried on the next poll.
     report_batch_item_failures: bool,
+    /// The function's execution role ARN, reported as each record's
+    /// `invokeIdentityArn` (the identity Lambda polls the stream with).
+    /// `None` when the mapped function no longer exists.
+    invoke_identity_arn: Option<String>,
 }
 
 pub struct KinesisLambdaPoller {
@@ -84,32 +88,7 @@ impl KinesisLambdaPoller {
     }
 
     async fn poll(&self) {
-        let mappings: Vec<Mapping> = {
-            let lambda_accounts = self.lambda_state.read();
-            lambda_accounts
-                .iter()
-                .flat_map(|(_, lambda)| {
-                    lambda
-                        .event_source_mappings
-                        .values()
-                        .filter(|m| m.enabled && m.event_source_arn.contains(":kinesis:"))
-                        .map(|m| Mapping {
-                            uuid: m.uuid.clone(),
-                            function_arn: m.function_arn.clone(),
-                            stream_arn: m.event_source_arn.clone(),
-                            batch_size: m.batch_size,
-                            filter: FilterSet::from_strings(m.filter_patterns.iter()),
-                            starting_position: m.starting_position.clone(),
-                            starting_position_timestamp: m.starting_position_timestamp,
-                            report_batch_item_failures: m
-                                .function_response_types
-                                .iter()
-                                .any(|t| t.eq_ignore_ascii_case("ReportBatchItemFailures")),
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .collect()
-        };
+        let mappings = self.collect_mappings();
 
         if mappings.is_empty() {
             return;
@@ -118,6 +97,40 @@ impl KinesisLambdaPoller {
         for mapping in mappings {
             self.process_mapping(&mapping).await;
         }
+    }
+
+    /// Snapshot every enabled Kinesis-source event source mapping.
+    fn collect_mappings(&self) -> Vec<Mapping> {
+        let lambda_accounts = self.lambda_state.read();
+        lambda_accounts
+            .iter()
+            .flat_map(|(_, lambda)| {
+                lambda
+                    .event_source_mappings
+                    .values()
+                    .filter(|m| m.enabled && m.event_source_arn.contains(":kinesis:"))
+                    .map(|m| Mapping {
+                        uuid: m.uuid.clone(),
+                        function_arn: m.function_arn.clone(),
+                        stream_arn: m.event_source_arn.clone(),
+                        batch_size: m.batch_size,
+                        filter: FilterSet::from_strings(m.filter_patterns.iter()),
+                        starting_position: m.starting_position.clone(),
+                        starting_position_timestamp: m.starting_position_timestamp,
+                        report_batch_item_failures: m
+                            .function_response_types
+                            .iter()
+                            .any(|t| t.eq_ignore_ascii_case("ReportBatchItemFailures")),
+                        invoke_identity_arn: m
+                            .function_arn
+                            .split(':')
+                            .nth(6)
+                            .and_then(|name| lambda.functions.get(name))
+                            .map(|f| f.role.clone()),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     async fn process_mapping(&self, mapping: &Mapping) {
@@ -212,7 +225,14 @@ impl KinesisLambdaPoller {
             // count toward batch size and are discarded".
             let record_jsons: Vec<Value> = records
                 .iter()
-                .map(|record| kinesis_event_record(record, &shard_id, &mapping.stream_arn))
+                .map(|record| {
+                    kinesis_event_record(
+                        record,
+                        &shard_id,
+                        &mapping.stream_arn,
+                        mapping.invoke_identity_arn.as_deref(),
+                    )
+                })
                 .collect();
 
             let matched: Vec<Value> = if mapping.filter.is_empty() {
@@ -318,24 +338,22 @@ impl KinesisLambdaPoller {
 
 /// Build the Lambda event record for one Kinesis record. `awsRegion` is the
 /// stream's region, taken from its ARN (the region the records were read
-/// from), not a fixed default.
+/// from), not a fixed default. `invokeIdentityArn` is the function's
+/// execution role, the identity the mapping reads the stream with.
 fn kinesis_event_record(
     record: &fakecloud_kinesis::KinesisRecord,
     shard_id: &str,
     stream_arn: &str,
+    invoke_identity_arn: Option<&str>,
 ) -> Value {
     let region = stream_arn.split(':').nth(3).unwrap_or_default();
-    json!({
+    let mut event = json!({
         "awsRegion": region,
         "eventID": format!("{}:{}", shard_id, record.sequence_number),
         "eventName": "aws:kinesis:record",
         "eventSource": "aws:kinesis",
         "eventSourceARN": stream_arn,
         "eventVersion": "1.0",
-        "invokeIdentityArn": format!(
-            "arn:{}:iam::123456789012:role/lambda-role",
-            fakecloud_aws::arn::partition_of(stream_arn)
-        ),
         "kinesis": {
             "approximateArrivalTimestamp": record.approximate_arrival_timestamp.timestamp_millis() as f64 / 1000.0,
             "data": base64::engine::general_purpose::STANDARD.encode(&record.data),
@@ -343,7 +361,11 @@ fn kinesis_event_record(
             "partitionKey": record.partition_key,
             "sequenceNumber": record.sequence_number,
         }
-    })
+    });
+    if let Some(role) = invoke_identity_arn {
+        event["invokeIdentityArn"] = json!(role);
+    }
+    event
 }
 
 /// Parse the Lambda response body as `{"batchItemFailures":[{"itemIdentifier":"<seqno>"}]}`
@@ -412,7 +434,7 @@ mod tests {
             approximate_arrival_timestamp: Utc::now(),
         };
         let arn = "arn:aws:kinesis:eu-west-2:111122223333:stream/orders";
-        let ev = kinesis_event_record(&record, "shardId-000000000000", arn);
+        let ev = kinesis_event_record(&record, "shardId-000000000000", arn, None);
         assert_eq!(ev["awsRegion"], "eu-west-2");
         assert_eq!(ev["eventSourceARN"], arn);
         assert_eq!(
@@ -422,8 +444,113 @@ mod tests {
         assert_eq!(ev["kinesis"]["data"], "aGVsbG8=");
 
         let cn = "arn:aws-cn:kinesis:cn-north-1:111122223333:stream/orders";
-        let ev = kinesis_event_record(&record, "shardId-000000000000", cn);
+        let ev = kinesis_event_record(&record, "shardId-000000000000", cn, None);
         assert_eq!(ev["awsRegion"], "cn-north-1");
+    }
+
+    fn esm(
+        uuid: &str,
+        function_arn: &str,
+        stream_arn: &str,
+    ) -> fakecloud_lambda::EventSourceMapping {
+        fakecloud_lambda::EventSourceMapping {
+            uuid: uuid.to_string(),
+            function_arn: function_arn.to_string(),
+            event_source_arn: stream_arn.to_string(),
+            batch_size: 100,
+            enabled: true,
+            state: "Enabled".to_string(),
+            last_modified: Utc::now(),
+            filter_patterns: Vec::new(),
+            maximum_batching_window_in_seconds: None,
+            starting_position: Some("TRIM_HORIZON".to_string()),
+            starting_position_timestamp: None,
+            parallelization_factor: None,
+            function_response_types: Vec::new(),
+            kms_key_arn: None,
+            metrics_config: None,
+            destination_config: None,
+            maximum_retry_attempts: None,
+            maximum_record_age_in_seconds: None,
+            bisect_batch_on_function_error: None,
+            tumbling_window_in_seconds: None,
+            topics: Vec::new(),
+            queues: Vec::new(),
+            source_access_configurations: Vec::new(),
+        }
+    }
+
+    /// `invokeIdentityArn` is the mapped function's execution role in the
+    /// function's own account and partition, not a fixed placeholder.
+    #[test]
+    fn invoke_identity_arn_is_the_function_execution_role() {
+        use fakecloud_core::multi_account::MultiAccountState;
+        use fakecloud_lambda::{LambdaFunction, LambdaState};
+        use parking_lot::RwLock;
+
+        let account = "444455556666";
+        let region = "cn-north-1";
+        let role = format!("arn:aws-cn:iam::{account}:role/service-role/orders-consumer");
+        let fn_arn = format!("arn:aws-cn:lambda:{region}:{account}:function:orders");
+        let stream_arn = format!("arn:aws-cn:kinesis:{region}:{account}:stream/orders");
+
+        let mut lambda: MultiAccountState<LambdaState> =
+            MultiAccountState::new(account, region, "http://localhost:4566");
+        {
+            let l = lambda.default_mut();
+            l.functions.insert(
+                "orders".to_string(),
+                LambdaFunction {
+                    function_name: "orders".to_string(),
+                    function_arn: fn_arn.clone(),
+                    role: role.clone(),
+                    ..Default::default()
+                },
+            );
+            // A mapping on a qualified (alias) ARN still resolves the function.
+            l.event_source_mappings.insert(
+                "esm-1".to_string(),
+                esm("esm-1", &format!("{fn_arn}:live"), &stream_arn),
+            );
+            // A mapping whose function is gone reports no identity.
+            l.event_source_mappings.insert(
+                "esm-2".to_string(),
+                esm(
+                    "esm-2",
+                    &format!("arn:aws-cn:lambda:{region}:{account}:function:gone"),
+                    &stream_arn,
+                ),
+            );
+        }
+        let kinesis: fakecloud_kinesis::SharedKinesisState = Arc::new(RwLock::new(
+            MultiAccountState::new(account, region, "http://localhost:4566"),
+        ));
+        let poller = KinesisLambdaPoller::new(kinesis, Arc::new(RwLock::new(lambda)));
+
+        let mut mappings = poller.collect_mappings();
+        mappings.sort_by(|a, b| a.uuid.cmp(&b.uuid));
+        assert_eq!(mappings.len(), 2);
+        assert_eq!(
+            mappings[0].invoke_identity_arn.as_deref(),
+            Some(role.as_str())
+        );
+        assert_eq!(mappings[1].invoke_identity_arn, None);
+
+        let record = fakecloud_kinesis::KinesisRecord {
+            sequence_number: "1".into(),
+            partition_key: "pk".into(),
+            data: b"x".to_vec(),
+            approximate_arrival_timestamp: Utc::now(),
+        };
+        let ev = kinesis_event_record(
+            &record,
+            "shardId-000000000000",
+            &stream_arn,
+            mappings[0].invoke_identity_arn.as_deref(),
+        );
+        assert_eq!(ev["invokeIdentityArn"], role.as_str());
+        let ev = kinesis_event_record(&record, "shardId-000000000000", &stream_arn, None);
+        assert!(ev.get("invokeIdentityArn").is_none());
     }
 
     #[test]
