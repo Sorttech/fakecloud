@@ -4373,3 +4373,61 @@ fn default_bus_arn_handed_to_a_china_region_caller_resolves() {
         )
         .is_some());
 }
+
+#[test]
+fn update_archive_pattern_updates_managed_rule_and_archiving() {
+    let svc = make_service();
+    svc.create_archive(&make_request(
+        "CreateArchive",
+        json!({
+            "ArchiveName": "repatterned",
+            "EventSourceArn": "arn:aws:events:us-east-1:123456789012:event-bus/default",
+            "EventPattern": "{\"source\":[\"old.source\"]}"
+        }),
+    ))
+    .unwrap();
+    svc.update_archive(&make_request(
+        "UpdateArchive",
+        json!({
+            "ArchiveName": "repatterned",
+            "EventPattern": "{\"source\":[\"new.source\"]}"
+        }),
+    ))
+    .unwrap();
+
+    // The managed rule now carries the new pattern (plus the replay guard).
+    let resp = svc
+        .describe_rule(&make_request(
+            "DescribeRule",
+            json!({"Name": "Events-Archive-repatterned"}),
+        ))
+        .unwrap();
+    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    let pattern: Value = serde_json::from_str(body["EventPattern"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        pattern,
+        json!({"source": ["new.source"], "replay-name": [{"exists": false}]})
+    );
+
+    // Events matching only the new pattern are archived; the old one no longer is.
+    for source in ["new.source", "old.source"] {
+        svc.put_events(&make_request(
+            "PutEvents",
+            json!({"Entries": [{
+                "Source": source,
+                "DetailType": "t",
+                "Detail": "{}",
+                "EventBusName": "default"
+            }]}),
+        ))
+        .unwrap();
+    }
+    let resp = svc
+        .describe_archive(&make_request(
+            "DescribeArchive",
+            json!({"ArchiveName": "repatterned"}),
+        ))
+        .unwrap();
+    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(body["EventCount"], 1);
+}

@@ -90,18 +90,7 @@ impl EventBridgeService {
         // Create the archive rule
         let rule_name = format!("Events-Archive-{name}");
         let rule_arn = rule_arn(&req.region, &state.account_id, &bus_name, &rule_name);
-        // Merge archive event pattern with replay-name filter
-        let rule_event_pattern = {
-            let mut merged = if let Some(ref ep) = event_pattern {
-                serde_json::from_str::<Value>(ep).unwrap_or_else(|_| json!({}))
-            } else {
-                json!({})
-            };
-            if let Some(obj) = merged.as_object_mut() {
-                obj.insert("replay-name".to_string(), json!([{"exists": false}]));
-            }
-            serde_json::to_string(&merged).unwrap_or_default()
-        };
+        let rule_event_pattern = archive_rule_pattern(event_pattern.as_deref());
 
         // Build the archive target with InputTransformer
         let archive_target = EventTarget {
@@ -303,12 +292,25 @@ impl EventBridgeService {
         if let Some(days) = body["RetentionDays"].as_i64() {
             archive.retention_days = days;
         }
-
-        Ok(AwsResponse::ok_json(json!({
+        let response = json!({
             "ArchiveArn": archive.arn,
             "CreationTime": archive.creation_time.timestamp() as f64,
             "State": archive.state,
-        })))
+        });
+        let event_source_arn = archive.event_source_arn.clone();
+
+        // The archive's managed rule carries the archive pattern, so a
+        // pattern change has to reach it too or DescribeRule/ListRules keep
+        // reporting (and replays keep matching against) the old pattern.
+        if let Some(pattern) = body["EventPattern"].as_str() {
+            let bus_name = state.resolve_bus_name(&event_source_arn);
+            let key = (bus_name, format!("Events-Archive-{name}"));
+            if let Some(rule) = state.rules.get_mut(&key) {
+                rule.event_pattern = Some(archive_rule_pattern(Some(pattern)));
+            }
+        }
+
+        Ok(AwsResponse::ok_json(response))
     }
 
     pub(super) fn delete_archive(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
@@ -731,4 +733,17 @@ impl EventBridgeService {
             "State": "CANCELLING",
         })))
     }
+}
+
+/// The event pattern of an archive's managed `Events-Archive-<name>` rule: the
+/// archive's own pattern (or match-all when it has none) plus a
+/// `replay-name` exists:false clause so replayed events are not re-archived.
+fn archive_rule_pattern(archive_pattern: Option<&str>) -> String {
+    let mut merged = archive_pattern
+        .and_then(|ep| serde_json::from_str::<Value>(ep).ok())
+        .unwrap_or_else(|| json!({}));
+    if let Some(obj) = merged.as_object_mut() {
+        obj.insert("replay-name".to_string(), json!([{"exists": false}]));
+    }
+    serde_json::to_string(&merged).unwrap_or_default()
 }

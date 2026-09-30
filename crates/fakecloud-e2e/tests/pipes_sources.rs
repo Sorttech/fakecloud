@@ -134,6 +134,8 @@ async fn pipe_kinesis_source_to_sqs_target() {
     let event: serde_json::Value = serde_json::from_str(&body).expect("event is JSON");
     assert_eq!(event["eventSource"], "aws:kinesis");
     assert_eq!(event["eventSourceARN"], stream_arn);
+    // The identity the pipe reads the stream with is its own execution role.
+    assert_eq!(event["invokeIdentityArn"], ROLE);
     // The record data rides through base64-encoded in the Pipes envelope.
     let data_b64 = event["kinesis"]["data"].as_str().unwrap();
     let decoded = base64_decode(data_b64);
