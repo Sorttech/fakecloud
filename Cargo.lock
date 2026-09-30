@@ -4805,6 +4805,7 @@ dependencies = [
  "fakecloud-aws",
  "fakecloud-bedrock-agent",
  "fakecloud-core",
+ "fakecloud-persistence",
  "fakecloud-testkit",
  "http 1.4.0",
  "parking_lot",

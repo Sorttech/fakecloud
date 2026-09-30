@@ -7,10 +7,21 @@ use serde::{Deserialize, Serialize};
 
 pub type SharedBedrockAgentRuntimeState = Arc<RwLock<BedrockAgentRuntimeAccounts>>;
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct BedrockAgentRuntimeAccounts {
     pub accounts: BTreeMap<String, BedrockAgentRuntimeState>,
 }
+
+/// On-disk snapshot envelope for Bedrock Agent Runtime state. Versioned so
+/// format changes fail loudly on upgrade rather than silently mis-parsing.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct BedrockAgentRuntimeSnapshot {
+    pub schema_version: u32,
+    #[serde(default)]
+    pub accounts: Option<BedrockAgentRuntimeAccounts>,
+}
+
+pub const BEDROCK_AGENT_RUNTIME_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 
 impl BedrockAgentRuntimeAccounts {
     pub fn new() -> Self {
@@ -26,11 +37,40 @@ impl BedrockAgentRuntimeAccounts {
     pub fn reset(&mut self) {
         self.accounts.clear();
     }
+
+    /// A copy of the persisted state, leaving out the introspection
+    /// invocation log (which is never written to disk) so a save does not
+    /// clone an ever-growing buffer.
+    pub fn persisted_copy(&self) -> Self {
+        Self {
+            accounts: self
+                .accounts
+                .iter()
+                .map(|(id, s)| {
+                    let copy = BedrockAgentRuntimeState {
+                        account_id: s.account_id.clone(),
+                        invocations: Vec::new(),
+                        sessions: s.sessions.clone(),
+                        flow_executions: s.flow_executions.clone(),
+                        session_invocations: s.session_invocations.clone(),
+                        invocation_steps: s.invocation_steps.clone(),
+                        tags: s.tags.clone(),
+                    };
+                    (id.clone(), copy)
+                })
+                .collect(),
+        }
+    }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct BedrockAgentRuntimeState {
     pub account_id: String,
+    /// Data-plane invocation log served by the
+    /// `/_fakecloud/bedrock-agent-runtime/invocations` introspection endpoint.
+    /// Like every introspection buffer it is not persisted: it resets on
+    /// restart.
+    #[serde(skip)]
     pub invocations: Vec<InvocationRecord>,
     pub sessions: BTreeMap<String, Session>,
     /// Keyed by `crate::flows::execution_map_key` (flow, alias, execution id).
@@ -148,6 +188,126 @@ pub struct FlowExecution {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_round_trips_persisted_state_but_not_the_invocation_log() {
+        let now = Utc::now();
+        let mut accounts = BedrockAgentRuntimeAccounts::new();
+        let st = accounts.get_or_create("123456789012");
+        st.sessions.insert(
+            "sess-1".into(),
+            Session {
+                session_id: "sess-1".into(),
+                session_arn: "arn:aws:bedrock:us-east-1:123456789012:session/sess-1".into(),
+                status: "ACTIVE".into(),
+                created_at: now,
+                updated_at: now,
+                metadata: BTreeMap::from([("k".to_string(), "v".to_string())]),
+                encryption_key_arn: Some("arn:aws:kms:us-east-1:123456789012:key/k".into()),
+            },
+        );
+        st.session_invocations.insert(
+            "sess-1".into(),
+            vec![SessionInvocation {
+                invocation_id: "inv-1".into(),
+                session_id: "sess-1".into(),
+                description: Some("first".into()),
+                created_at: now,
+            }],
+        );
+        st.invocation_steps.insert(
+            "step-1".into(),
+            InvocationStep {
+                session_id: "sess-1".into(),
+                invocation_id: "inv-1".into(),
+                invocation_step_id: "step-1".into(),
+                invocation_step_time: now,
+                payload: serde_json::json!({"contentBlocks": [{"text": "hi"}]}),
+            },
+        );
+        st.flow_executions.insert(
+            "FLOW/ALIAS/exec-1".into(),
+            FlowExecution {
+                execution_id: "exec-1".into(),
+                execution_arn:
+                    "arn:aws:bedrock:us-east-1:123456789012:flow/F/alias/A/execution/exec-1".into(),
+                flow_id: "F".into(),
+                flow_alias_id: "A".into(),
+                flow_version: "1".into(),
+                status: "Aborted".into(),
+                created_at: now,
+                updated_at: now,
+                ended_at: Some(now),
+                definition: Some(serde_json::json!({"nodes": []})),
+                execution_role_arn: Some("arn:aws:iam::123456789012:role/r".into()),
+                customer_encryption_key_arn: None,
+            },
+        );
+        st.tags.insert(
+            "arn:aws:bedrock:us-east-1:123456789012:session/sess-1".into(),
+            BTreeMap::from([("env".to_string(), "test".to_string())]),
+        );
+        st.invocations.push(InvocationRecord {
+            invocation_id: "log-1".into(),
+            op: "invoke_agent".into(),
+            agent_id: None,
+            flow_id: None,
+            session_id: None,
+            input: String::new(),
+            output: String::new(),
+            output_chunks: 1,
+            trace: None,
+            citations: Vec::new(),
+            timestamp: now,
+            duration_ms: 0,
+        });
+
+        let snapshot = BedrockAgentRuntimeSnapshot {
+            schema_version: BEDROCK_AGENT_RUNTIME_SNAPSHOT_SCHEMA_VERSION,
+            accounts: Some(accounts.persisted_copy()),
+        };
+        let bytes = serde_json::to_vec(&snapshot).unwrap();
+        let loaded: BedrockAgentRuntimeSnapshot = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            loaded.schema_version,
+            BEDROCK_AGENT_RUNTIME_SNAPSHOT_SCHEMA_VERSION
+        );
+        let loaded = loaded.accounts.unwrap();
+        let st = &loaded.accounts["123456789012"];
+        assert_eq!(st.account_id, "123456789012");
+        let sess = &st.sessions["sess-1"];
+        assert_eq!(sess.created_at, now);
+        assert_eq!(sess.metadata["k"], "v");
+        assert!(sess.encryption_key_arn.is_some());
+        assert_eq!(
+            st.session_invocations["sess-1"][0].description.as_deref(),
+            Some("first")
+        );
+        assert_eq!(
+            st.invocation_steps["step-1"].payload,
+            serde_json::json!({"contentBlocks": [{"text": "hi"}]})
+        );
+        let exec = &st.flow_executions["FLOW/ALIAS/exec-1"];
+        assert_eq!(exec.status, "Aborted");
+        assert_eq!(exec.ended_at, Some(now));
+        assert_eq!(exec.definition, Some(serde_json::json!({"nodes": []})));
+        assert_eq!(
+            st.tags["arn:aws:bedrock:us-east-1:123456789012:session/sess-1"]["env"],
+            "test"
+        );
+        // The introspection log is not persisted, even from a full clone.
+        assert!(st.invocations.is_empty());
+        let full: BedrockAgentRuntimeAccounts =
+            serde_json::from_slice(&serde_json::to_vec(&accounts).unwrap()).unwrap();
+        assert!(full.accounts["123456789012"].invocations.is_empty());
+    }
+
+    #[test]
+    fn snapshot_without_accounts_loads_as_none() {
+        let snap: BedrockAgentRuntimeSnapshot =
+            serde_json::from_str(r#"{"schema_version": 1}"#).unwrap();
+        assert!(snap.accounts.is_none());
+    }
 
     #[test]
     fn invocation_record_serializes_introspection_fields() {

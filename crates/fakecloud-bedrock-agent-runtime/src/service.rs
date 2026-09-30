@@ -6,13 +6,38 @@ use http::{Method, StatusCode};
 use regex::Regex;
 use serde_json::{json, Value};
 
+use tokio::sync::Mutex as AsyncMutex;
+
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
+use fakecloud_persistence::SnapshotStore;
 
 use crate::arns::{flow_execution_arn, session_arn};
 use crate::state::{
-    FlowExecution, InvocationRecord, InvocationStep, Session, SessionInvocation,
-    SharedBedrockAgentRuntimeState,
+    BedrockAgentRuntimeSnapshot, FlowExecution, InvocationRecord, InvocationStep, Session,
+    SessionInvocation, SharedBedrockAgentRuntimeState,
+    BEDROCK_AGENT_RUNTIME_SNAPSHOT_SCHEMA_VERSION,
 };
+
+/// Whether `action` changes persisted state. Reads start with `Get` or `List`;
+/// the rest listed here only append to the invocation log (an introspection
+/// buffer that is not persisted) or touch no state at all. Every other action
+/// is a mutation, so a newly added one is persisted by default.
+fn is_mutating_action(action: &str) -> bool {
+    !(action.starts_with("Get")
+        || action.starts_with("List")
+        || matches!(
+            action,
+            "InvokeAgent"
+                | "InvokeInlineAgent"
+                | "Retrieve"
+                | "RetrieveAndGenerate"
+                | "RetrieveAndGenerateStream"
+                | "OptimizePrompt"
+                | "GenerateQuery"
+                | "Rerank"
+                | "DeleteAgentMemory"
+        ))
+}
 
 const SUPPORTED_ACTIONS: &[&str] = &[
     "InvokeAgent",
@@ -51,6 +76,8 @@ const SUPPORTED_ACTIONS: &[&str] = &[
 pub struct BedrockAgentRuntimeService {
     state: SharedBedrockAgentRuntimeState,
     agent_state: Option<fakecloud_bedrock_agent::SharedBedrockAgentState>,
+    snapshot_store: Option<Arc<dyn SnapshotStore>>,
+    snapshot_lock: AsyncMutex<()>,
 }
 
 impl BedrockAgentRuntimeService {
@@ -58,7 +85,26 @@ impl BedrockAgentRuntimeService {
         Self {
             state,
             agent_state: None,
+            snapshot_store: None,
+            snapshot_lock: AsyncMutex::new(()),
         }
+    }
+
+    pub fn with_snapshot_store(mut self, store: Arc<dyn SnapshotStore>) -> Self {
+        self.snapshot_store = Some(store);
+        self
+    }
+
+    /// Persist current state as a snapshot. Held across the
+    /// clone-serialize-write sequence to prevent stale-last writes, with serde
+    /// + file I/O offloaded to the blocking pool.
+    async fn save_snapshot(&self) {
+        save_bedrock_agent_runtime_snapshot(
+            &self.state,
+            self.snapshot_store.clone(),
+            &self.snapshot_lock,
+        )
+        .await;
     }
 
     pub fn with_agent_state(
@@ -519,7 +565,8 @@ impl AwsService for BedrockAgentRuntimeService {
 
         let body = merge_path_params(parse_body(&req), &path_params);
 
-        match action {
+        let mutates = is_mutating_action(action);
+        let result = match action {
             "InvokeAgent" => handle_invoke_agent(self, &req, &body).await,
             "InvokeFlow" => handle_invoke_flow(self, &req, &body).await,
             "InvokeInlineAgent" => handle_invoke_inline_agent(self, &req, &body).await,
@@ -556,7 +603,40 @@ impl AwsService for BedrockAgentRuntimeService {
             "UntagResource" => handle_untag_resource(self, &req, &body).await,
             "ListTagsForResource" => handle_list_tags_for_resource(self, &req, &body).await,
             _ => Err(validation(&format!("Unknown action: {}", action))),
+        };
+        if mutates && matches!(result.as_ref(), Ok(resp) if resp.status.is_success()) {
+            self.save_snapshot().await;
         }
+        result
+    }
+}
+
+/// Persist the current Bedrock Agent Runtime state as a snapshot. Offloads the
+/// serde + blocking file write to the Tokio blocking pool. Noop when `store` is
+/// `None` (memory mode).
+async fn save_bedrock_agent_runtime_snapshot(
+    state: &SharedBedrockAgentRuntimeState,
+    store: Option<Arc<dyn SnapshotStore>>,
+    lock: &AsyncMutex<()>,
+) {
+    let Some(store) = store else {
+        return;
+    };
+    let _guard = lock.lock().await;
+    let snapshot = BedrockAgentRuntimeSnapshot {
+        schema_version: BEDROCK_AGENT_RUNTIME_SNAPSHOT_SCHEMA_VERSION,
+        accounts: Some(state.read().persisted_copy()),
+    };
+    let join = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        let bytes = serde_json::to_vec(&snapshot)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        store.save(&bytes)
+    })
+    .await;
+    match join {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => tracing::error!(%err, "failed to write bedrock-agent-runtime snapshot"),
+        Err(err) => tracing::error!(%err, "bedrock-agent-runtime snapshot task panicked"),
     }
 }
 
@@ -1134,10 +1214,22 @@ async fn handle_create_session(
                 .collect()
         })
         .unwrap_or_default();
+    let tags: std::collections::BTreeMap<String, String> = body
+        .get("tags")
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
 
     {
         let mut accts = svc.state.write();
         let s = accts.get_or_create(&req.account_id);
+        if !tags.is_empty() {
+            s.tags.insert(arn.clone(), tags);
+        }
         s.sessions.insert(
             session_id.clone(),
             Session {
@@ -1199,7 +1291,12 @@ async fn handle_delete_session(
             .map(|(k, _)| k.clone())
     };
     if let Some(k) = key {
-        s.sessions.remove(&k);
+        // The session's invocations, their steps and its tags go with it.
+        if let Some(session) = s.sessions.remove(&k) {
+            s.tags.remove(&session.session_arn);
+        }
+        s.session_invocations.remove(&k);
+        s.invocation_steps.retain(|_, step| step.session_id != k);
     } else {
         return Err(make_error(
             StatusCode::NOT_FOUND,
@@ -2525,6 +2622,225 @@ mod tests {
 
     fn exec_body(flow: &str, alias: &str, exec: &str) -> Value {
         json!({"flowIdentifier": flow, "flowAliasIdentifier": alias, "executionIdentifier": exec})
+    }
+
+    /// Captures every snapshot the service writes.
+    #[derive(Default)]
+    struct CapturingStore {
+        saves: parking_lot::Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl SnapshotStore for CapturingStore {
+        fn load(&self) -> std::io::Result<Option<Vec<u8>>> {
+            Ok(self.saves.lock().last().cloned())
+        }
+
+        fn save(&self, bytes: &[u8]) -> std::io::Result<()> {
+            self.saves.lock().push(bytes.to_vec());
+            Ok(())
+        }
+    }
+
+    fn routed(method: Method, segs: &[&str], body: Value) -> AwsRequest {
+        let mut req = cn_request();
+        req.method = method;
+        req.path_segments = segs.iter().map(|s| s.to_string()).collect();
+        req.raw_path = format!("/{}", segs.join("/"));
+        req.body = serde_json::to_vec(&body).unwrap().into();
+        req
+    }
+
+    #[tokio::test]
+    async fn mutations_write_a_snapshot_and_reads_do_not() {
+        let store = Arc::new(CapturingStore::default());
+        let (svc, _) = flow_svc();
+        let svc = svc.with_snapshot_store(store.clone());
+
+        let created = body(
+            svc.handle(routed(Method::PUT, &["sessions"], json!({})))
+                .await
+                .unwrap(),
+        );
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+        assert_eq!(store.saves.lock().len(), 1, "CreateSession persists");
+
+        svc.handle(routed(Method::GET, &["sessions", &session_id], json!({})))
+            .await
+            .unwrap();
+        assert_eq!(store.saves.lock().len(), 1, "GetSession does not persist");
+
+        // A failed mutation writes nothing.
+        assert!(svc
+            .handle(routed(
+                Method::GET,
+                &["sessions", "missing-session"],
+                json!({})
+            ))
+            .await
+            .is_err());
+        assert!(svc
+            .handle(routed(
+                Method::DELETE,
+                &["sessions", "missing-session"],
+                json!({})
+            ))
+            .await
+            .is_err());
+        assert_eq!(store.saves.lock().len(), 1);
+
+        // InvokeFlow records a (completed) flow execution, so it persists.
+        svc.handle(routed(
+            Method::POST,
+            &["flows", FLOW, "aliases", ALIAS_V1],
+            json!({"inputs": [{"nodeName": "Input", "nodeOutputName": "document", "content": {"document": "hi"}}]}),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(store.saves.lock().len(), 2, "InvokeFlow persists");
+
+        let arn = start(&svc, FLOW, ALIAS_V1).await;
+        // `start` calls the handler directly; persist via a routed StopFlowExecution.
+        let exec_id = arn.rsplit('/').next().unwrap().to_string();
+        svc.handle(routed(
+            Method::POST,
+            &[
+                "flows",
+                FLOW,
+                "aliases",
+                ALIAS_V1,
+                "executions",
+                &exec_id,
+                "stop",
+            ],
+            json!({}),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(store.saves.lock().len(), 3, "StopFlowExecution persists");
+
+        let last = store.saves.lock().last().cloned().unwrap();
+        let snap: BedrockAgentRuntimeSnapshot = serde_json::from_slice(&last).unwrap();
+        assert_eq!(
+            snap.schema_version,
+            BEDROCK_AGENT_RUNTIME_SNAPSHOT_SCHEMA_VERSION
+        );
+        let st = &snap.accounts.unwrap().accounts[ACCT];
+        assert!(st.sessions.contains_key(&session_id));
+        assert_eq!(st.flow_executions.len(), 2);
+        assert!(st
+            .flow_executions
+            .values()
+            .any(|e| e.execution_id == exec_id && e.status == "Aborted"));
+        // The introspection invocation log is never written to disk.
+        assert!(st.invocations.is_empty());
+        assert!(!svc.state.read().accounts[ACCT].invocations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_session_tags_and_delete_session_drops_its_children() {
+        let svc = BedrockAgentRuntimeService::new(Arc::new(RwLock::new(
+            BedrockAgentRuntimeAccounts::new(),
+        )));
+        let req = cn_request();
+        let created = body(
+            handle_create_session(&svc, &req, &json!({"tags": {"team": "flows"}}))
+                .await
+                .unwrap(),
+        );
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+        let arn = created["sessionArn"].as_str().unwrap().to_string();
+        let tags = body(
+            handle_list_tags_for_resource(&svc, &req, &json!({"resourceArn": arn}))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(tags["tags"]["team"], "flows");
+
+        let inv = body(
+            handle_create_invocation(&svc, &req, &json!({"sessionIdentifier": session_id}))
+                .await
+                .unwrap(),
+        );
+        handle_put_invocation_step(
+            &svc,
+            &req,
+            &json!({
+                "sessionIdentifier": session_id,
+                "invocationIdentifier": inv["invocationId"],
+                "invocationStepTime": "2026-01-01T00:00:00Z",
+                "payload": {"contentBlocks": [{"text": "hi"}]},
+            }),
+        )
+        .await
+        .unwrap();
+        // Another session's step survives the delete.
+        let other = body(handle_create_session(&svc, &req, &json!({})).await.unwrap());
+        let other_id = other["sessionId"].as_str().unwrap().to_string();
+        let other_inv = body(
+            handle_create_invocation(&svc, &req, &json!({"sessionIdentifier": other_id}))
+                .await
+                .unwrap(),
+        );
+        handle_put_invocation_step(
+            &svc,
+            &req,
+            &json!({
+                "sessionIdentifier": other_id,
+                "invocationIdentifier": other_inv["invocationId"],
+                "invocationStepTime": "2026-01-01T00:00:00Z",
+                "payload": {"contentBlocks": [{"text": "keep"}]},
+            }),
+        )
+        .await
+        .unwrap();
+
+        handle_delete_session(&svc, &req, &json!({"sessionIdentifier": arn}))
+            .await
+            .unwrap();
+        let accts = svc.state.read();
+        let st = &accts.accounts[&req.account_id];
+        assert!(!st.tags.contains_key(&arn));
+        assert!(!st.session_invocations.contains_key(&session_id));
+        assert!(st
+            .invocation_steps
+            .values()
+            .all(|s| s.session_id == other_id));
+        assert_eq!(st.invocation_steps.len(), 1);
+        assert!(st.session_invocations.contains_key(&other_id));
+    }
+
+    #[test]
+    fn introspection_only_actions_are_not_mutations() {
+        for action in [
+            "InvokeAgent",
+            "InvokeInlineAgent",
+            "Retrieve",
+            "RetrieveAndGenerate",
+            "RetrieveAndGenerateStream",
+            "OptimizePrompt",
+            "GenerateQuery",
+            "Rerank",
+            "DeleteAgentMemory",
+            "GetSession",
+            "ListFlowExecutions",
+        ] {
+            assert!(!is_mutating_action(action), "{action}");
+        }
+        for action in [
+            "InvokeFlow",
+            "CreateSession",
+            "UpdateSession",
+            "EndSession",
+            "DeleteSession",
+            "CreateInvocation",
+            "PutInvocationStep",
+            "StartFlowExecution",
+            "StopFlowExecution",
+            "TagResource",
+            "UntagResource",
+        ] {
+            assert!(is_mutating_action(action), "{action}");
+        }
     }
 
     #[test]

@@ -58,7 +58,8 @@ The eventstream encoder produces AWS-compliant binary frames: 12-byte prelude (t
 
 - InvokeAgent canned responses default to a single-chunk echo of the input, with traces for `preProcessingTrace`, `orchestrationTrace`, and (when knowledge bases are attached) `knowledgeBaseLookupTrace`. The first call on a fresh session returns a `sessionId` matching the path segment.
 - RetrieveAndGenerate canned responses include a citation back to the first knowledge-base document returned by Retrieve, so RAG round-trip tests assert on citation plumbing.
-- Sessions persist `sessionMetadata` and `encryptionKeyArn`. Invocation steps persist the verbatim payload.
+- Sessions persist `sessionMetadata` and `encryptionKeyArn`. Invocation steps persist the verbatim payload. `DeleteSession` also removes the session's invocations, invocation steps and tags.
+- State is account-partitioned. In persistent mode (`--storage-mode persistent`) sessions, invocations, invocation steps, flow executions and tags are snapshotted to `<data-path>/bedrock-agent-runtime/snapshot.json` on every mutation and reloaded on startup; the introspection invocation log below resets on restart.
 
 ## Limitations
 
