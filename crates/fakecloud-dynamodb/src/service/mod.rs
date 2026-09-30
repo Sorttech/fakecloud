@@ -237,9 +237,11 @@ impl DynamoDbService {
             "aws:dynamodb:subscriberId".to_string(),
             account_id.to_string(),
         );
+        // The key (or alias) lives in the table's region.
+        let region = fakecloud_aws::arn::region_of(table_arn).unwrap_or(&self.region);
         let envelope = match hook.encrypt(
             account_id,
-            &self.region,
+            region,
             key,
             b"ddb-item",
             "dynamodb.amazonaws.com",

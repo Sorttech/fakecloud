@@ -352,3 +352,65 @@ async fn s3_sse_kms_resolves_alias_in_the_bucket_region() {
         .into_bytes();
     assert_eq!(got.as_ref(), b"secret");
 }
+
+/// SSE-KMS queues and topics outside the server's default region resolve a
+/// customer alias in their own region: sending to the queue and publishing
+/// to the topic succeed, and the message round-trips decrypted.
+#[tokio::test]
+async fn sqs_and_sns_resolve_alias_in_the_resource_region() {
+    let server = TestServer::start().await;
+    let cfg = server.aws_config_in("eu-west-1").await;
+    let kms = aws_sdk_kms::Client::new(&cfg);
+    let (key_id, _) = create_key(&kms).await;
+    kms.create_alias()
+        .alias_name("alias/messaging")
+        .target_key_id(&key_id)
+        .send()
+        .await
+        .unwrap();
+
+    let sqs = aws_sdk_sqs::Client::new(&cfg);
+    let queue_url = sqs
+        .create_queue()
+        .queue_name("regional-kms-queue")
+        .attributes(
+            aws_sdk_sqs::types::QueueAttributeName::KmsMasterKeyId,
+            "alias/messaging",
+        )
+        .send()
+        .await
+        .expect("CreateQueue")
+        .queue_url
+        .expect("queue url");
+    sqs.send_message()
+        .queue_url(&queue_url)
+        .message_body("hello from eu-west-1")
+        .send()
+        .await
+        .expect("SendMessage to a eu-west-1 SSE-KMS queue");
+    let received = sqs
+        .receive_message()
+        .queue_url(&queue_url)
+        .wait_time_seconds(1)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(received.messages()[0].body(), Some("hello from eu-west-1"));
+
+    let sns = aws_sdk_sns::Client::new(&cfg);
+    let topic_arn = sns
+        .create_topic()
+        .name("regional-kms-topic")
+        .attributes("KmsMasterKeyId", "alias/messaging")
+        .send()
+        .await
+        .expect("CreateTopic")
+        .topic_arn
+        .expect("topic arn");
+    sns.publish()
+        .topic_arn(&topic_arn)
+        .message("hello")
+        .send()
+        .await
+        .expect("Publish to a eu-west-1 SSE-KMS topic");
+}

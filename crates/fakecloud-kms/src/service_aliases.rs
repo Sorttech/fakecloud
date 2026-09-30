@@ -175,9 +175,11 @@ impl KmsService {
         let empty = KmsState::new(&req.account_id, &req.region);
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
-        // Resolve key_id_filter to actual key ID if needed
+        // Resolve key_id_filter to the stored id of the request region's key,
+        // as CreateAlias resolves a target (so a multi-region key id finds
+        // aliases on this region's replica).
         let resolved_filter =
-            key_id_filter.and_then(|kid| Self::resolve_key_id_with_state(state, &req.region, kid));
+            key_id_filter.and_then(|kid| Self::resolve_alias_target(state, &req.region, kid));
 
         // Aliases are regional: list only the request region's, in
         // AliasName order.
@@ -189,10 +191,15 @@ impl KmsService {
                 (None, None) => true,
             })
             .map(|a| {
+                // A replica is stored under `{region}:{id}`; report its key id.
+                let target = state
+                    .keys
+                    .get(&a.target_key_id)
+                    .map_or(a.target_key_id.as_str(), |k| k.key_id.as_str());
                 json!({
                     "AliasName": a.alias_name,
                     "AliasArn": a.alias_arn,
-                    "TargetKeyId": a.target_key_id,
+                    "TargetKeyId": target,
                 })
             })
             .collect();

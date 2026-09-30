@@ -75,9 +75,11 @@ impl SnsService {
         };
         let mut ctx = std::collections::HashMap::new();
         ctx.insert("aws:sns:arn".to_string(), topic_arn.to_string());
+        // The key (or alias) lives in the topic's region.
+        let region = fakecloud_aws::arn::region_of(topic_arn).unwrap_or(&self.region);
         let envelope = match hook.encrypt(
             account_id,
-            &self.region,
+            region,
             key,
             message.as_bytes(),
             "sns.amazonaws.com",

@@ -28,9 +28,11 @@ impl SqsService {
         };
         let mut ctx = std::collections::HashMap::new();
         ctx.insert("aws:sqs:arn".to_string(), queue_arn.to_string());
+        // The key (or alias) lives in the queue's region.
+        let region = fakecloud_aws::arn::region_of(queue_arn).unwrap_or(&self.region);
         match hook.encrypt(
             account_id,
-            &self.region,
+            region,
             key,
             plaintext.as_bytes(),
             "sqs.amazonaws.com",

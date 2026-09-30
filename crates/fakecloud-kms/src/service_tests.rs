@@ -4324,4 +4324,24 @@ fn alias_in_replica_region_targets_the_replica() {
         body["KeyMetadata"]["Arn"],
         format!("arn:aws:kms:eu-west-1:123456789012:key/{key_id}")
     );
+    // ListAliases reports the key id (not the replica's storage key), and a
+    // KeyId filter of the shared id finds the alias on the replica.
+    for filter in [None, Some(key_id.clone())] {
+        let mut body = json!({});
+        if let Some(f) = &filter {
+            body["KeyId"] = json!(f);
+        }
+        let resp = svc
+            .list_aliases(&regional_request("ListAliases", "eu-west-1", body))
+            .unwrap();
+        let listed: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        let mrk: Vec<&Value> = listed["Aliases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|a| a["AliasName"] == "alias/mrk")
+            .collect();
+        assert_eq!(mrk.len(), 1, "filter {filter:?}");
+        assert_eq!(mrk[0]["TargetKeyId"], json!(key_id), "filter {filter:?}");
+    }
 }
