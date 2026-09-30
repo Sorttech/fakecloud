@@ -618,3 +618,97 @@ async fn cache_behavior_is_matched_on_the_resolved_viewer_path() {
         assert!(resp.starts_with("HTTP/1.1 403"), "{path}: {resp}");
     }
 }
+
+/// A viewer request through an S3 origin only ever reaches the S3 service:
+/// every path, however encoded, is an object key in the origin bucket, never
+/// one of fakecloud's own routes (introspection, reset, IMDS, container
+/// credentials, Cognito hosted endpoints).
+#[tokio::test]
+async fn s3_origin_paths_never_reach_fakecloud_internal_routes() {
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+    let cf = server.cloudfront_client().await;
+    private_bucket(&s3).await;
+    let dist = create_distribution(&cf, None, None).await;
+    assert!(wait_for_served(&server, dist.id(), Duration::from_secs(10)).await);
+    let host = dist.domain_name();
+
+    for path in [
+        "/_fakecloud/cloudfront/distributions",
+        "/%5ffakecloud/cloudfront/distributions",
+        "/%5Ffakecloud/cloudfront/distributions",
+        "//_fakecloud/cloudfront/distributions",
+        "/./_fakecloud/cloudfront/distributions",
+        "/x/../_fakecloud/cloudfront/distributions",
+        "/_fakecloud/health",
+        "/latest/meta-data/iam/security-credentials/",
+        "/latest/meta-data/instance-id",
+        "/latest/dynamic/instance-identity/document",
+        "/v2/credentials/x",
+        "/creds",
+        "/us-east-1_abc/.well-known/jwks.json",
+    ] {
+        let resp = raw_viewer_get(&server, host, path).await;
+        assert!(resp.starts_with("HTTP/1.1 404"), "{path}: {resp}");
+        assert!(
+            resp.contains("NoSuchKey"),
+            "{path} was not served by S3: {resp}"
+        );
+        assert!(
+            !resp.contains("distributions\""),
+            "{path} reached introspection: {resp}"
+        );
+    }
+
+    // POST /_reset through the distribution is an S3 request, not a reset.
+    let resp = reqwest::Client::new()
+        .post(format!("{}/_reset", server.endpoint()))
+        .header(reqwest::header::HOST, host)
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(resp.status(), 200, "POST /_reset through a distribution");
+    let r = viewer_get(&server, host, "/index.html").await;
+    assert_eq!(r.status(), 200, "state survived");
+    assert_eq!(r.text().await.unwrap(), "PRIVATE");
+
+    // An object that really lives under such a key is served normally.
+    s3.put_object()
+        .bucket(BUCKET)
+        .key("_fakecloud/x")
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(b"OBJECT"))
+        .send()
+        .await
+        .expect("put_object");
+    let r = viewer_get(&server, host, "/_fakecloud/x").await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.text().await.unwrap(), "OBJECT");
+}
+
+/// Viewer headers cannot steer an S3 origin fetch to another service: the
+/// request is pinned to S3 whatever `X-Amz-Target` or `?Action=` say.
+#[tokio::test]
+async fn s3_origin_fetch_ignores_service_selecting_viewer_headers() {
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+    let cf = server.cloudfront_client().await;
+    private_bucket(&s3).await;
+    let dist = create_distribution(&cf, None, None).await;
+    assert!(wait_for_served(&server, dist.id(), Duration::from_secs(10)).await);
+
+    let r = reqwest::Client::new()
+        .post(format!("{}/", server.endpoint()))
+        .header(reqwest::header::HOST, dist.domain_name())
+        .header("x-amz-target", "DynamoDB_20120810.ListTables")
+        .header("content-type", "application/x-amz-json-1.0")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    let body = r.text().await.unwrap();
+    assert!(!body.contains("TableNames"), "reached DynamoDB: {body}");
+
+    let r = viewer_get(&server, dist.domain_name(), "/index.html?Action=ListUsers").await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.text().await.unwrap(), "PRIVATE");
+}

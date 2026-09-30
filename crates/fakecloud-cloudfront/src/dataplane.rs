@@ -23,8 +23,10 @@
 //! implemented): in-path CloudFront Functions / Lambda@Edge and TTL caching /
 //! invalidation.
 //!
-//! S3 origins live in this same process, so they are fetched in-process through
-//! the rest of the server's middleware stack rather than over a socket. That is
+//! S3 origins live in this same process, so they are fetched in-process,
+//! dispatched straight into the S3 service rather than over a socket or through
+//! the HTTP router: a viewer path is always an object key in the origin bucket,
+//! never one of fakecloud's own routes (`/_fakecloud/*`, IMDS, ...). That is
 //! also how private S3 origins work: an origin with an origin access control
 //! (`OriginAccessControlId`, honoring its `SigningBehavior`) is fetched as the
 //! `cloudfront.amazonaws.com` service principal with `aws:SourceArn` = the
@@ -37,12 +39,15 @@
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::extract::{ConnectInfo, Request};
+use axum::extract::Request;
 use axum::middleware::Next;
 use axum::response::Response;
 use bytes::Bytes;
 use fakecloud_core::auth::InternalCaller;
+use fakecloud_core::dispatch::DispatchConfig;
+use fakecloud_core::registry::ServiceRegistry;
 use http::{header, HeaderMap, Method, StatusCode};
+use std::sync::{Arc, OnceLock};
 use tracing::{trace, warn};
 
 use crate::model::DistributionConfig;
@@ -79,6 +84,18 @@ pub struct CloudFrontDataPlane {
     /// Cached `dataplane_enabled()` at construction: when false, `serve` never
     /// intercepts and every request falls through to normal AWS dispatch.
     enabled: bool,
+    /// Where S3 origin fetches are dispatched: straight into the S3 service
+    /// (see [`fakecloud_core::dispatch::dispatch_to_service`]), never through
+    /// the HTTP router, so no viewer path can reach one of fakecloud's own
+    /// routes. Set once the service registry is final
+    /// ([`CloudFrontDataPlane::set_s3_dispatch`]).
+    s3_dispatch: OnceLock<S3Dispatch>,
+}
+
+/// The finalized registry and dispatch config S3 origin fetches run against.
+struct S3Dispatch {
+    registry: Arc<ServiceRegistry>,
+    config: Arc<DispatchConfig>,
 }
 
 impl CloudFrontDataPlane {
@@ -110,7 +127,15 @@ impl CloudFrontDataPlane {
             upstream,
             s3_endpoint: format!("127.0.0.1:{server_port}"),
             enabled,
+            s3_dispatch: OnceLock::new(),
         })
+    }
+
+    /// Hand the data plane the finalized service registry and dispatch config
+    /// its S3 origin fetches are dispatched against. Called once at startup;
+    /// a second call is ignored. Until it is called an S3 origin answers 502.
+    pub fn set_s3_dispatch(&self, registry: Arc<ServiceRegistry>, config: Arc<DispatchConfig>) {
+        let _ = self.s3_dispatch.set(S3Dispatch { registry, config });
     }
 
     /// Serve a request iff its `Host` matches an enabled distribution.
@@ -118,8 +143,9 @@ impl CloudFrontDataPlane {
     /// `next` is the rest of the server's middleware stack (AWS dispatch). A
     /// request whose `Host` matches no distribution (or any request, when the
     /// plane is disabled) is handed to it untouched. A matched request is viewer
-    /// traffic: it is proxied to the resolved origin, and `next` is also how an
-    /// S3 origin -- served by this same process -- is fetched.
+    /// traffic: it is proxied to the resolved origin. An S3 origin, served by
+    /// this same process, is fetched straight from the S3 service, not through
+    /// `next`.
     ///
     /// The `Host` check happens on the request headers before the body is touched,
     /// so pass-through traffic (all AWS API calls, `/_fakecloud/*`) is never
@@ -205,7 +231,6 @@ impl CloudFrontDataPlane {
         trace!(%host, path = %parts.uri.path(), origin = %route.upstream.host_header, "CloudFront data plane: proxying");
         let resp = self
             .fetch_origin(
-                &next,
                 &route.upstream,
                 &parts.method,
                 &url,
@@ -223,7 +248,6 @@ impl CloudFrontDataPlane {
             let url = format!("{}{}", route.default_upstream.url_base, rule.page_path);
             let err_resp = self
                 .fetch_origin(
-                    &next,
                     &route.default_upstream,
                     &Method::GET,
                     &url,
@@ -252,11 +276,12 @@ impl CloudFrontDataPlane {
         resp
     }
 
-    /// Fetch `url` from the resolved origin: in-process through `next` for an
-    /// S3 origin this process serves, over HTTP otherwise.
+    /// Fetch `url` from the resolved origin: straight from the S3 service for
+    /// an S3 origin this process serves, over HTTP otherwise (a custom origin
+    /// goes over the network as configured, even one naming fakecloud's own
+    /// port).
     async fn fetch_origin(
         &self,
-        next: &Next,
         target: &UpstreamTarget,
         method: &Method,
         url: &str,
@@ -264,7 +289,10 @@ impl CloudFrontDataPlane {
         body: &Bytes,
     ) -> Response {
         if target.local {
-            return fetch_local(next, target, method, url, req_headers, body).await;
+            let Some(dispatch) = self.s3_dispatch.get() else {
+                return canned(StatusCode::BAD_GATEWAY, "S3 origin dispatch not ready");
+            };
+            return fetch_local(dispatch, target, method, url, req_headers, body).await;
         }
         let host_header = target.host_header.as_str();
         let mut rb = self.upstream.request(reqwest_method(method), url);
@@ -738,14 +766,17 @@ fn local_path_and_query(url: &str) -> Option<String> {
     Some(out)
 }
 
-/// Fetch `url` from an S3 origin this process serves, in-process through the
-/// rest of the middleware stack, as the identity `target.auth` selects for this
-/// viewer request. A signed request drops the viewer's `Authorization` header
-/// (CloudFront replaces it with its own signature) and carries the identity as
-/// an [`InternalCaller`] extension, which dispatch authorizes against the
-/// bucket policy. The source address is loopback, as the connection would be.
+/// Fetch `url` from an S3 origin this process serves, dispatched straight to
+/// the S3 service as a request addressed to the origin bucket (its domain is
+/// the `Host`), as the identity `target.auth` selects for this viewer request.
+/// The HTTP router is never involved, so the viewer path is always an object
+/// key: `/_fakecloud/x` is the key `_fakecloud/x`, not an internal route. A
+/// signed request drops the viewer's `Authorization` header (CloudFront
+/// replaces it with its own signature) and carries the identity as an
+/// [`InternalCaller`] extension, which dispatch authorizes against the bucket
+/// policy. The source address is loopback, as the connection would be.
 async fn fetch_local(
-    next: &Next,
+    dispatch: &S3Dispatch,
     target: &UpstreamTarget,
     method: &Method,
     url: &str,
@@ -777,12 +808,16 @@ async fn fetch_local(
         Ok(req) => req,
         Err(e) => return canned(StatusCode::BAD_GATEWAY, &format!("origin error: {e}")),
     };
-    req.extensions_mut()
-        .insert(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 0))));
     if let Some(caller) = caller {
         req.extensions_mut().insert(caller);
     }
-    next.clone().run(req).await
+    fakecloud_core::dispatch::dispatch_to_service(
+        "s3",
+        dispatch.registry.clone(),
+        dispatch.config.clone(),
+        req,
+    )
+    .await
 }
 
 /// Resolve an [`crate::model::Origin`] to the upstream to connect to.
@@ -1345,6 +1380,9 @@ mod tests {
             "127.0.0.1:4566",
         );
         assert_eq!(up.url_base, "http://127.0.0.1:52111");
+        // A custom origin naming fakecloud's own address still goes over the
+        // network as configured; only S3 origins are dispatched in-process.
+        assert!(!up.local);
     }
 
     #[test]

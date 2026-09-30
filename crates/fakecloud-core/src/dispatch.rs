@@ -15,6 +15,56 @@ use crate::protocol::{self, AwsProtocol};
 use crate::registry::ServiceRegistry;
 use crate::service::{AwsRequest, ResponseBody};
 
+/// Pins an in-process request to one REST service; see [`dispatch_to_service`].
+/// Private, so only this module can attach it.
+#[derive(Clone, Copy, Debug)]
+struct PinnedService(&'static str);
+
+/// Dispatch an in-process request straight to one REST-protocol service
+/// (`"s3"`), bypassing the HTTP router and service detection.
+///
+/// The CloudFront data plane fetches an S3 origin this way: the request is by
+/// construction an S3 request addressed to the origin bucket (via its `Host`),
+/// so no viewer path (`/_fakecloud/*`, `/latest/*`, ...) can reach one of
+/// fakecloud's own routes, and no viewer header (`X-Amz-Target`, an
+/// `Authorization` scoped to another service, `?Action=`) can steer it to
+/// another service. Authentication and IAM enforcement run exactly as for any
+/// request, including an [`InternalCaller`] extension. The source address is
+/// the request's `ConnectInfo<SocketAddr>` extension, or loopback.
+pub async fn dispatch_to_service(
+    service: &'static str,
+    registry: Arc<ServiceRegistry>,
+    config: Arc<DispatchConfig>,
+    mut request: Request<Body>,
+) -> Response<Body> {
+    let remote_addr = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0)
+        .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0)));
+    let query = match Query::<HashMap<String, String>>::try_from_uri(request.uri()) {
+        Ok(q) => q,
+        Err(e) => {
+            return build_error_response(
+                StatusCode::BAD_REQUEST,
+                "InvalidArgument",
+                &format!("Invalid query string: {e}"),
+                &uuid::Uuid::new_v4().to_string(),
+                AwsProtocol::Rest,
+            )
+        }
+    };
+    request.extensions_mut().insert(PinnedService(service));
+    dispatch(
+        ConnectInfo(remote_addr),
+        Extension(registry),
+        Extension(config),
+        query,
+        request,
+    )
+    .await
+}
+
 /// The main dispatch handler. All HTTP requests come through here.
 pub async fn dispatch(
     ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
@@ -27,6 +77,9 @@ pub async fn dispatch(
     let request_id = uuid::Uuid::new_v4().to_string();
 
     let (parts, body) = request.into_parts();
+    // Set only by [`dispatch_to_service`]: the request is for this service,
+    // whatever its headers or query say.
+    let pinned = parts.extensions.get::<PinnedService>().map(|p| p.0);
 
     // Streaming opt-in: if the route is a known large-body S3 / ECR
     // upload, we skip the buffered `to_bytes` step entirely and hand
@@ -41,6 +94,9 @@ pub async fn dispatch(
     );
     let header_only = protocol::detect_service_headers_only(&parts.headers, &query_params);
     let stream_dispatch = match (&stream_route, &header_only) {
+        // A pinned request is always buffered: its caller already holds the
+        // whole body, and header detection must not pick its service.
+        _ if pinned.is_some() => None,
         // Header-only detection agrees with the URL match — covers S3
         // PUT object (SigV4 service=s3 in Authorization).
         (Some(sr), Some(detected)) if sr.0 == detected.service => Some(detected.clone()),
@@ -80,7 +136,13 @@ pub async fn dispatch(
     };
 
     // Detect service and action
-    let detected = if let Some(d) = stream_dispatch {
+    let detected = if let Some(service) = pinned {
+        protocol::DetectedRequest {
+            service: service.to_string(),
+            action: String::new(),
+            protocol: AwsProtocol::Rest,
+        }
+    } else if let Some(d) = stream_dispatch {
         d
     } else {
         match protocol::detect_service(&parts.headers, &query_params, &body_bytes) {
