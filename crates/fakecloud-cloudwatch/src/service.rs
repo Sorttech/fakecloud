@@ -104,6 +104,12 @@ const SUPPORTED_ACTIONS: &[&str] = &[
     "GetOTelEnrichment",
     "StartOTelEnrichment",
     "StopOTelEnrichment",
+    "UpdateOTelEnrichment",
+    // Resource metrics configurations.
+    "CreateResourceMetricsConfiguration",
+    "GetResourceMetricsConfiguration",
+    "UpdateResourceMetricsConfiguration",
+    "DeleteResourceMetricsConfiguration",
     // Dataset KMS key management.
     "AssociateDatasetKmsKey",
     "DisassociateDatasetKmsKey",
@@ -241,6 +247,10 @@ impl AwsService for CloudWatchService {
                 | "DeleteAlarmMuteRule"
                 | "StartOTelEnrichment"
                 | "StopOTelEnrichment"
+                | "UpdateOTelEnrichment"
+                | "CreateResourceMetricsConfiguration"
+                | "UpdateResourceMetricsConfiguration"
+                | "DeleteResourceMetricsConfiguration"
                 | "AssociateDatasetKmsKey"
                 | "DisassociateDatasetKmsKey"
                 | "TagResource"
@@ -295,6 +305,18 @@ impl AwsService for CloudWatchService {
             "GetOTelEnrichment" => self.get_otel_enrichment(&req),
             "StartOTelEnrichment" => self.start_otel_enrichment(&req),
             "StopOTelEnrichment" => self.stop_otel_enrichment(&req),
+            "UpdateOTelEnrichment" => self.update_otel_enrichment(&req),
+            // Resource metrics configurations.
+            "CreateResourceMetricsConfiguration" => {
+                self.create_resource_metrics_configuration(&req)
+            }
+            "GetResourceMetricsConfiguration" => self.get_resource_metrics_configuration(&req),
+            "UpdateResourceMetricsConfiguration" => {
+                self.update_resource_metrics_configuration(&req)
+            }
+            "DeleteResourceMetricsConfiguration" => {
+                self.delete_resource_metrics_configuration(&req)
+            }
             // Dataset KMS key management.
             "AssociateDatasetKmsKey" => self.associate_dataset_kms_key(&req),
             "DisassociateDatasetKmsKey" => self.disassociate_dataset_kms_key(&req),
@@ -363,6 +385,16 @@ pub(crate) fn not_found(message: impl Into<String>) -> AwsServiceError {
     AwsServiceError::aws_error(StatusCode::NOT_FOUND, "ResourceNotFoundException", message)
 }
 
+/// `ValidationException` — awsQueryError wire code is `ValidationError`.
+pub(crate) fn validation_error(message: impl Into<String>) -> AwsServiceError {
+    AwsServiceError::aws_error(StatusCode::BAD_REQUEST, "ValidationError", message)
+}
+
+/// `ConflictException` — no awsQueryError trait, so the shape name is the code.
+pub(crate) fn conflict(message: impl Into<String>) -> AwsServiceError {
+    AwsServiceError::aws_error(StatusCode::CONFLICT, "ConflictException", message)
+}
+
 /// `MissingRequiredParameterException` — awsQueryError wire code is
 /// `MissingParameter`.
 pub(crate) fn missing_param(name: &str) -> AwsServiceError {
@@ -395,6 +427,21 @@ pub(crate) fn collect_indexed(req: &AwsRequest, prefix: &str) -> Vec<HashMap<Str
 
 /// Collect an indexed `<prefix>.member.N` numeric array out of a flattened
 /// MetricData member (e.g. `Values.member.1`, `Counts.member.1`).
+/// The `<prefix>.member.N` strings of one indexed-list member, in index order.
+pub(crate) fn collect_member_strings(
+    member: &HashMap<String, String>,
+    prefix: &str,
+) -> Vec<String> {
+    let needle = format!("{prefix}.member.");
+    let mut by_index: BTreeMap<u32, String> = BTreeMap::new();
+    for (k, v) in member {
+        if let Some(idx) = k.strip_prefix(&needle).and_then(|i| i.parse::<u32>().ok()) {
+            by_index.insert(idx, v.clone());
+        }
+    }
+    by_index.into_values().collect()
+}
+
 fn collect_member_numbers(
     member: &HashMap<String, String>,
     prefix: &str,
@@ -643,17 +690,7 @@ pub(crate) fn validate_enum(
 
 /// Collect repeated `<Prefix>.member.N` scalar values, ordered by index.
 pub(crate) fn collect_member_values(req: &AwsRequest, prefix: &str) -> Vec<String> {
-    let needle = format!("{prefix}.member.");
-    let mut by_index: BTreeMap<u32, String> = BTreeMap::new();
-    for (k, v) in req.query_params.iter() {
-        let Some(rest) = k.strip_prefix(&needle) else {
-            continue;
-        };
-        if let Ok(idx) = rest.parse::<u32>() {
-            by_index.insert(idx, v.clone());
-        }
-    }
-    by_index.into_values().collect()
+    collect_member_strings(&req.query_params, prefix)
 }
 
 /// Parse a `Tags.member.N.Key` / `Tags.member.N.Value` list into a map.

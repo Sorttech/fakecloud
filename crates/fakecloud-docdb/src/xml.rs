@@ -96,6 +96,7 @@ pub(crate) fn db_cluster(c: &DbCluster) -> String {
          <StorageEncrypted>{enc}</StorageEncrypted>\
          {kms}\
          <DeletionProtection>{del}</DeletionProtection>\
+         <CopyTagsToSnapshot>{ctts}</CopyTagsToSnapshot>\
          <BackupRetentionPeriod>{brp}</BackupRetentionPeriod>\
          <PreferredBackupWindow>{pbw}</PreferredBackupWindow>\
          <PreferredMaintenanceWindow>{pmw}</PreferredMaintenanceWindow>\
@@ -122,6 +123,7 @@ pub(crate) fn db_cluster(c: &DbCluster) -> String {
         pg = xml_escape(&c.db_cluster_parameter_group),
         enc = c.storage_encrypted,
         del = c.deletion_protection,
+        ctts = c.copy_tags_to_snapshot,
         brp = c.backup_retention_period,
         pbw = xml_escape(&c.preferred_backup_window),
         pmw = xml_escape(&c.preferred_maintenance_window),

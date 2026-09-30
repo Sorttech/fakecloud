@@ -874,7 +874,7 @@ pub struct Fleet {
 }
 
 /// An on-demand capacity reservation.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CapacityReservation {
     pub id: String,
     pub instance_type: String,
@@ -894,6 +894,69 @@ pub struct CapacityReservation {
     pub ebs_optimized: bool,
     #[serde(default)]
     pub ephemeral_storage: bool,
+    /// Requested `StartDate` (RFC 3339, millisecond precision). `None` for an
+    /// immediate reservation, which renders the fixed creation time.
+    #[serde(default)]
+    pub start_date: Option<String>,
+    /// `EndDate` for a `limited` reservation.
+    #[serde(default)]
+    pub end_date: Option<String>,
+    /// The start date a future-dated reservation was first requested with;
+    /// unchanged by date-change quotes, it anchors the 30-day pushout limit.
+    #[serde(default)]
+    pub original_start_date: Option<String>,
+    /// Commitment for a future-dated reservation (`CommitmentDuration`).
+    #[serde(default)]
+    pub commitment: Option<CapacityReservationCommitment>,
+    /// `requested` | `applied` | `rejected` for the most recent modification;
+    /// `None` until the reservation is first modified.
+    #[serde(default)]
+    pub adjustment_status: Option<String>,
+    #[serde(default)]
+    pub adjustment_details: Option<CapacityReservationAdjustment>,
+}
+
+/// `CapacityReservationCommitmentInfo` of a future-dated reservation.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CapacityReservationCommitment {
+    pub committed_instance_count: i64,
+    /// Seconds.
+    pub commitment_duration: i64,
+    pub commitment_end_date: String,
+}
+
+/// `CapacityReservationAdjustmentDetails`: the configuration a modification
+/// leaves the reservation in.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CapacityReservationAdjustment {
+    pub start_date: Option<String>,
+    pub end_date: Option<String>,
+    pub commitment_end_date: Option<String>,
+    pub end_date_type: String,
+    pub commitment_duration: Option<i64>,
+}
+
+/// A `CreateCapacityReservationDateChangeQuote` result: the priced terms for
+/// pushing out a future-dated reservation's start date.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CapacityReservationModificationQuote {
+    pub id: String,
+    pub capacity_reservation_id: String,
+    pub create_time: String,
+    pub expiration_time: String,
+    /// Set once the quote is accepted by `ModifyCapacityReservation`; a quote
+    /// can be used only once, after which it reports `expired`.
+    #[serde(default)]
+    pub used: bool,
+    #[serde(default)]
+    pub client_token: Option<String>,
+    pub current_instance_count: i64,
+    pub current_reservation_state: String,
+    pub current_start_date: String,
+    pub original_start_date: String,
+    pub new_start_date: String,
+    pub new_commitment_end_date: Option<String>,
+    pub new_commitment_duration: Option<i64>,
 }
 
 /// A Reserved Instance purchase.
@@ -1865,6 +1928,10 @@ pub struct Ec2State {
     pub spot_datafeed: Option<(String, String)>,
     #[serde(default)]
     pub capacity_reservations: BTreeMap<String, CapacityReservation>,
+    /// quote id -> date change quote.
+    #[serde(default)]
+    pub capacity_reservation_modification_quotes:
+        BTreeMap<String, CapacityReservationModificationQuote>,
     /// Capacity reservation fleet ids (metadata-only).
     #[serde(default)]
     pub capacity_reservation_fleets: BTreeMap<String, String>,

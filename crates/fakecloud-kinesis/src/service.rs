@@ -19,7 +19,8 @@ use crate::state::{
     KinesisChannelEncryption, KinesisChannelLogging, KinesisChannelPartitionField,
     KinesisChannelS3Storage, KinesisChannelS3Table, KinesisChannelStream, KinesisConsumer,
     KinesisRecord, KinesisShard, KinesisSnapshot, KinesisState, KinesisStream, SharedKinesisState,
-    KINESIS_SNAPSHOT_SCHEMA_VERSION,
+    KINESIS_SNAPSHOT_SCHEMA_VERSION, RECORD_DISTRIBUTION_AUTO,
+    RECORD_DISTRIBUTION_USER_PARTITION_KEY,
 };
 
 const SUPPORTED_ACTIONS: &[&str] = &[
@@ -66,6 +67,7 @@ const SUPPORTED_ACTIONS: &[&str] = &[
     "UpdateMaxRecordSize",
     "UpdateShardCount",
     "UpdateStreamMode",
+    "UpdateStreamRecordDistributionStrategy",
     "UpdateStreamWarmThroughput",
 ];
 
@@ -189,6 +191,9 @@ impl AwsService for KinesisService {
             "UpdateAccountSettings" => self.update_account_settings(&request),
             "DescribeLimits" => self.describe_limits(&request),
             "UpdateStreamMode" => self.update_stream_mode(&request),
+            "UpdateStreamRecordDistributionStrategy" => {
+                self.update_stream_record_distribution_strategy(&request)
+            }
             "UpdateStreamWarmThroughput" => self.update_stream_warm_throughput(&request),
             "UpdateMaxRecordSize" => self.update_max_record_size(&request),
             "RegisterStreamConsumer" => self.register_stream_consumer(&request),
@@ -249,6 +254,14 @@ impl KinesisService {
         // ON_DEMAND seeds a small fixed shard count; the surface still
         // exposes shards through GetShardIterator/GetRecords so callers
         // can read/write while we no-op the per-shard provisioning.
+        // RecordDistributionStrategy defaults to USER_PARTITION_KEY; AUTO is
+        // only supported in ON_DEMAND capacity mode.
+        let record_distribution_strategy =
+            parse_record_distribution_strategy(&body["RecordDistributionStrategy"])?
+                .unwrap_or_else(|| RECORD_DISTRIBUTION_USER_PARTITION_KEY.to_string());
+        if record_distribution_strategy == RECORD_DISTRIBUTION_AUTO && stream_mode != "ON_DEMAND" {
+            return Err(auto_requires_on_demand());
+        }
         let effective_shard_count = if stream_mode == "ON_DEMAND" {
             4
         } else {
@@ -298,6 +311,8 @@ impl KinesisService {
             enhanced_metrics: Vec::new(),
             warm_throughput_mibps: None,
             max_record_size_kib: None,
+            record_distribution_strategy,
+            auto_distribution_cursor: 0,
         };
         state.streams.insert(stream_name.to_string(), stream);
 
@@ -410,6 +425,10 @@ impl KinesisService {
         }
         if let Some(max_size) = stream.max_record_size_kib {
             summary["MaxRecordSizeInKiB"] = json!(max_size);
+        }
+        // Only on-demand streams carry a record distribution strategy.
+        if stream.stream_mode == "ON_DEMAND" {
+            summary["RecordDistributionStrategy"] = json!(stream.record_distribution_strategy);
         }
 
         Ok(AwsResponse::ok_json(json!({
@@ -661,14 +680,7 @@ impl KinesisService {
         }
         let records: Vec<Value> = shard.records[start_index..end_index]
             .iter()
-            .map(|record| {
-                json!({
-                    "ApproximateArrivalTimestamp": record.approximate_arrival_timestamp.timestamp_millis() as f64 / 1000.0,
-                    "Data": base64::engine::general_purpose::STANDARD.encode(&record.data),
-                    "PartitionKey": record.partition_key,
-                    "SequenceNumber": record.sequence_number,
-                })
-            })
+            .map(record_to_json)
             .collect();
 
         // Capture the shard fields before the borrow ends so the mutable
@@ -758,7 +770,7 @@ impl KinesisService {
             .get_mut(&stream_name)
             .ok_or_else(|| stream_not_found(&account_id, &stream_name))?;
 
-        let partition_key = require_partition_key(&body)?;
+        let partition_key = require_partition_key(&body, stream)?;
         let data = decode_record_data(&body["Data"])?;
         // Data + PartitionKey must fit the per-record ceiling (1 MiB, or the
         // stream's configured MaxRecordSizeInKiB). AWS rejects an oversized
@@ -1313,7 +1325,55 @@ impl KinesisService {
             .stream_name_from_arn(stream_arn)
             .ok_or_else(|| resource_not_found_arn(stream_arn))?;
         let stream = state.streams.get_mut(&stream_name).unwrap();
+        // A provisioned stream cannot carry the AUTO strategy; the caller must
+        // switch it back to USER_PARTITION_KEY before leaving on-demand mode.
+        if stream_mode == "PROVISIONED"
+            && stream.record_distribution_strategy == RECORD_DISTRIBUTION_AUTO
+        {
+            return Err(auto_requires_on_demand());
+        }
         stream.stream_mode = stream_mode.to_string();
+
+        Ok(AwsResponse::ok_json(json!({})))
+    }
+
+    fn update_stream_record_distribution_strategy(
+        &self,
+        request: &AwsRequest,
+    ) -> Result<AwsResponse, AwsServiceError> {
+        let body = request.json_body();
+        validate_stream_id(&body)?;
+        let stream_arn = body["StreamARN"]
+            .as_str()
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| invalid_argument("StreamARN is required"))?;
+        validate_string_length("StreamARN", stream_arn, 1, 2048)?;
+        let strategy = parse_record_distribution_strategy(&body["RecordDistributionStrategy"])?
+            .ok_or_else(|| invalid_argument("RecordDistributionStrategy is required"))?;
+
+        let mut accounts = self.state.write();
+        let state = accounts.get_or_create(&request.account_id);
+        let stream_name = state
+            .stream_name_from_arn(stream_arn)
+            .ok_or_else(|| resource_not_found_arn(stream_arn))?;
+        let stream = state
+            .streams
+            .get_mut(&stream_name)
+            .ok_or_else(|| resource_not_found_arn(stream_arn))?;
+        if stream.stream_status != "ACTIVE" {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "ResourceInUseException",
+                format!(
+                    "Stream {stream_name} is not ACTIVE (current status: {})",
+                    stream.stream_status
+                ),
+            ));
+        }
+        if strategy == RECORD_DISTRIBUTION_AUTO && stream.stream_mode != "ON_DEMAND" {
+            return Err(auto_requires_on_demand());
+        }
+        stream.record_distribution_strategy = strategy;
 
         Ok(AwsResponse::ok_json(json!({})))
     }
@@ -2076,14 +2136,7 @@ impl KinesisService {
         let end_index = shard.records.len().min(start_index.saturating_add(1000));
         let records: Vec<Value> = shard.records[start_index..end_index]
             .iter()
-            .map(|record| {
-                json!({
-                    "ApproximateArrivalTimestamp": record.approximate_arrival_timestamp.timestamp_millis() as f64 / 1000.0,
-                    "Data": base64::engine::general_purpose::STANDARD.encode(&record.data),
-                    "PartitionKey": record.partition_key,
-                    "SequenceNumber": record.sequence_number,
-                })
-            })
+            .map(record_to_json)
             .collect();
 
         let continuation = shard

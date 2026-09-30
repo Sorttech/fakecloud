@@ -3238,6 +3238,14 @@ pub(crate) fn constraints_for(action: &str) -> &'static [FieldConstraint] {
                 range_max: None,
                 enum_values: &[],
             },
+            FieldConstraint {
+                field: "ResourceShareType",
+                len_min: None,
+                len_max: None,
+                range_min: None,
+                range_max: None,
+                enum_values: &["FEDERATED", "ALL"],
+            },
         ],
         "GetTags" => &[FieldConstraint {
             field: "ResourceArn",

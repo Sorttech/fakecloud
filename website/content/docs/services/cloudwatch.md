@@ -17,7 +17,8 @@ fakecloud implements Amazon CloudWatch's metrics-and-alarms surface (the `monito
 - **Insight rules** — `PutInsightRule`, `DescribeInsightRules`, `EnableInsightRules`, `DisableInsightRules`, `DeleteInsightRules`, `GetInsightRuleReport`, plus managed rules (`PutManagedInsightRules`, `ListManagedInsightRules`).
 - **Metric streams** — `PutMetricStream`, `GetMetricStream`, `ListMetricStreams`, `StartMetricStreams`, `StopMetricStreams`, `DeleteMetricStream`. State flips between `running` and `stopped`.
 - **Alarm mute rules** — `PutAlarmMuteRule`, `GetAlarmMuteRule`, `ListAlarmMuteRules`, `DeleteAlarmMuteRule`.
-- **OTel enrichment** — `GetOTelEnrichment`, `StartOTelEnrichment`, `StopOTelEnrichment`.
+- **OTel enrichment** — `GetOTelEnrichment`, `StartOTelEnrichment`, `UpdateOTelEnrichment`, `StopOTelEnrichment`, with per-namespace include / exclude metric filters (`UpdateOTelEnrichment` replaces both lists and requires enrichment to be running).
+- **Resource metrics configurations**: `CreateResourceMetricsConfiguration`, `GetResourceMetricsConfiguration`, `UpdateResourceMetricsConfiguration`, `DeleteResourceMetricsConfiguration`: one configuration per resource ARN with an optional metric selection; a duplicate create is `ConflictException`.
 - **Tagging** — `TagResource`, `UntagResource`, `ListTagsForResource`.
 
 ## Introspection

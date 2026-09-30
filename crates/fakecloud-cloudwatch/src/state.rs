@@ -93,6 +93,45 @@ pub struct CloudWatchState {
     /// OTel enrichment is on when true (per account).
     #[serde(default)]
     pub otel_enrichment_running: bool,
+    /// Filters and timestamps stored while OTel enrichment is running.
+    #[serde(default)]
+    pub otel_enrichment: OTelEnrichmentConfig,
+    /// region -> resource_arn -> ResourceMetricsConfiguration
+    #[serde(default)]
+    pub resource_metrics_configurations:
+        BTreeMap<String, BTreeMap<String, ResourceMetricsConfiguration>>,
+}
+
+/// One `OTelEnrichmentMetricSelector`: a namespace plus optional metric names
+/// (an empty list selects every metric in the namespace).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct OTelMetricSelector {
+    pub namespace: String,
+    pub metric_names: Vec<String>,
+}
+
+/// The account's stored OTel enrichment configuration. Empty filter lists mean
+/// "every supported namespace" (include) and "nothing excluded" (exclude).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OTelEnrichmentConfig {
+    #[serde(default)]
+    pub include_filters: Vec<OTelMetricSelector>,
+    #[serde(default)]
+    pub exclude_filters: Vec<OTelMetricSelector>,
+    #[serde(default)]
+    pub created_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+/// Detailed-metrics collection config for one AWS resource. `include_metrics`
+/// is `None` when every available detailed metric is collected.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceMetricsConfiguration {
+    pub resource_arn: String,
+    pub include_metrics: Option<Vec<String>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,6 +256,22 @@ impl CloudWatchState {
 
     pub fn mute_rules_in_mut(&mut self, region: &str) -> &mut BTreeMap<String, AlarmMuteRule> {
         self.mute_rules.entry(region.to_string()).or_default()
+    }
+
+    pub fn resource_metrics_in(
+        &self,
+        region: &str,
+    ) -> Option<&BTreeMap<String, ResourceMetricsConfiguration>> {
+        self.resource_metrics_configurations.get(region)
+    }
+
+    pub fn resource_metrics_in_mut(
+        &mut self,
+        region: &str,
+    ) -> &mut BTreeMap<String, ResourceMetricsConfiguration> {
+        self.resource_metrics_configurations
+            .entry(region.to_string())
+            .or_default()
     }
 
     pub fn datasets_in(&self, region: &str) -> Option<&BTreeMap<String, Dataset>> {

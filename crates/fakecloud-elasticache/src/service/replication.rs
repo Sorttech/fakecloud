@@ -350,6 +350,7 @@ impl ElastiCacheService {
             required_query_param(request, "PrimaryReplicationGroupId")?;
         let description =
             optional_query_param(request, "GlobalReplicationGroupDescription").unwrap_or_default();
+        let tags = parse_tags(request)?;
 
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&request.account_id);
@@ -416,6 +417,9 @@ impl ElastiCacheService {
         };
 
         let xml = global_replication_group_xml(&group, true);
+        if !tags.is_empty() {
+            merge_tags(state.tags.entry(group.arn.clone()).or_default(), &tags);
+        }
         state
             .global_replication_groups
             .insert(global_replication_group_id, group);
@@ -574,6 +578,7 @@ impl ElastiCacheService {
                     format!("GlobalReplicationGroup {global_replication_group_id} not found."),
                 )
             })?;
+        state.tags.remove(&group.arn);
 
         // Stop runtime containers for any primary we're about to drop —
         // otherwise the Docker containers + their port bindings leak

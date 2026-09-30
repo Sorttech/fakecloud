@@ -199,7 +199,7 @@ async fn elasticache_create_replication_group() {
     assert_eq!(group.status(), Some("creating"));
 }
 
-#[test_action("elasticache", "CreateGlobalReplicationGroup", checksum = "5a6b779c")]
+#[test_action("elasticache", "CreateGlobalReplicationGroup", checksum = "9c2baa8a")]
 #[tokio::test]
 async fn elasticache_create_global_replication_group() {
     let server = TestServer::start().await;
@@ -489,7 +489,7 @@ async fn elasticache_delete_cache_cluster() {
     assert_eq!(cluster.cache_cluster_status(), Some("deleting"));
 }
 
-#[test_action("elasticache", "AddTagsToResource", checksum = "cf656420")]
+#[test_action("elasticache", "AddTagsToResource", checksum = "31fd2641")]
 #[tokio::test]
 async fn elasticache_add_tags_to_resource() {
     let server = TestServer::start().await;
@@ -528,7 +528,7 @@ async fn elasticache_add_tags_to_resource() {
     assert_eq!(tags[0].value(), Some("dev"));
 }
 
-#[test_action("elasticache", "ListTagsForResource", checksum = "a3fcc3e4")]
+#[test_action("elasticache", "ListTagsForResource", checksum = "36d56407")]
 #[tokio::test]
 async fn elasticache_list_tags_for_resource() {
     let server = TestServer::start().await;
@@ -580,7 +580,7 @@ async fn elasticache_list_tags_for_resource() {
     assert_eq!(tags[1].key(), Some("team"));
 }
 
-#[test_action("elasticache", "RemoveTagsFromResource", checksum = "7e9e103c")]
+#[test_action("elasticache", "RemoveTagsFromResource", checksum = "9d571ed7")]
 #[tokio::test]
 async fn elasticache_remove_tags_from_resource() {
     let server = TestServer::start().await;

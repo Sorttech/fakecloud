@@ -980,6 +980,114 @@ async fn describe_events_rejects_invalid_source_type() {
     assert!(body(&resp).contains("<Events/>"));
 }
 
+/// `CopyTagsToSnapshot` is stored, rendered, toggled by ModifyDBCluster,
+/// and hands the cluster's tags to a snapshot taken without its own tags.
+#[tokio::test]
+async fn copy_tags_to_snapshot_copies_cluster_tags() {
+    let svc = service();
+    let resp = call(
+        &svc,
+        "CreateDBCluster",
+        &[
+            ("DBClusterIdentifier", "ctts"),
+            ("Engine", "docdb"),
+            ("CopyTagsToSnapshot", "true"),
+            ("Tags.Tag.1.Key", "team"),
+            ("Tags.Tag.1.Value", "data"),
+        ],
+    )
+    .await;
+    assert!(body(&resp).contains("<CopyTagsToSnapshot>true</CopyTagsToSnapshot>"));
+
+    call(
+        &svc,
+        "CreateDBClusterSnapshot",
+        &[
+            ("DBClusterSnapshotIdentifier", "ctts-inherit"),
+            ("DBClusterIdentifier", "ctts"),
+        ],
+    )
+    .await;
+    let arn = "arn:aws:rds:us-east-1:123456789012:cluster-snapshot:ctts-inherit";
+    let tags = body(&call(&svc, "ListTagsForResource", &[("ResourceName", arn)]).await);
+    assert!(tags.contains("<Key>team</Key>"), "{tags}");
+
+    // Tags on the snapshot request replace the cluster's.
+    call(
+        &svc,
+        "CreateDBClusterSnapshot",
+        &[
+            ("DBClusterSnapshotIdentifier", "ctts-own"),
+            ("DBClusterIdentifier", "ctts"),
+            ("Tags.Tag.1.Key", "own"),
+            ("Tags.Tag.1.Value", "yes"),
+        ],
+    )
+    .await;
+    let arn = "arn:aws:rds:us-east-1:123456789012:cluster-snapshot:ctts-own";
+    let tags = body(&call(&svc, "ListTagsForResource", &[("ResourceName", arn)]).await);
+    assert!(tags.contains("<Key>own</Key>") && !tags.contains("<Key>team</Key>"));
+
+    let resp = call(
+        &svc,
+        "ModifyDBCluster",
+        &[
+            ("DBClusterIdentifier", "ctts"),
+            ("CopyTagsToSnapshot", "false"),
+        ],
+    )
+    .await;
+    assert!(body(&resp).contains("<CopyTagsToSnapshot>false</CopyTagsToSnapshot>"));
+    call(
+        &svc,
+        "CreateDBClusterSnapshot",
+        &[
+            ("DBClusterSnapshotIdentifier", "ctts-off"),
+            ("DBClusterIdentifier", "ctts"),
+        ],
+    )
+    .await;
+    let arn = "arn:aws:rds:us-east-1:123456789012:cluster-snapshot:ctts-off";
+    let tags = body(&call(&svc, "ListTagsForResource", &[("ResourceName", arn)]).await);
+    assert!(!tags.contains("<Key>team</Key>"));
+
+    let resp = call(
+        &svc,
+        "RestoreDBClusterFromSnapshot",
+        &[
+            ("DBClusterIdentifier", "ctts-restored"),
+            ("SnapshotIdentifier", "ctts-own"),
+            ("Engine", "docdb"),
+            ("CopyTagsToSnapshot", "true"),
+        ],
+    )
+    .await;
+    assert!(body(&resp).contains("<CopyTagsToSnapshot>true</CopyTagsToSnapshot>"));
+
+    // The final snapshot DeleteDBCluster takes honors the flag too.
+    call(
+        &svc,
+        "ModifyDBCluster",
+        &[
+            ("DBClusterIdentifier", "ctts"),
+            ("CopyTagsToSnapshot", "true"),
+        ],
+    )
+    .await;
+    call(
+        &svc,
+        "DeleteDBCluster",
+        &[
+            ("DBClusterIdentifier", "ctts"),
+            ("FinalDBSnapshotIdentifier", "ctts-final"),
+        ],
+    )
+    .await;
+    let arn = "arn:aws:rds:us-east-1:123456789012:cluster-snapshot:ctts-final";
+    let tags = body(&call(&svc, "ListTagsForResource", &[("ResourceName", arn)]).await);
+    assert!(tags.contains("<Key>team</Key>"), "{tags}");
+}
+
 #[tokio::test]
 async fn tagging_roundtrip() {
     let svc = service();

@@ -1422,6 +1422,7 @@ This is a surface listing, not an implementation manifest. For fakecloud's per-s
 - `UpdateMaxRecordSize`
 - `UpdateShardCount`
 - `UpdateStreamMode`
+- `UpdateStreamRecordDistributionStrategy`
 - `UpdateStreamWarmThroughput`
 
 ## [RDS](@/docs/services/rds.md)
@@ -6316,12 +6317,14 @@ This is a surface listing, not an implementation manifest. For fakecloud's per-s
 ## [CloudWatch (Metrics & Alarms)](@/docs/services/cloudwatch.md)
 
 - `AssociateDatasetKmsKey`
+- `CreateResourceMetricsConfiguration`
 - `DeleteAlarmMuteRule`
 - `DeleteAlarms`
 - `DeleteAnomalyDetector`
 - `DeleteDashboards`
 - `DeleteInsightRules`
 - `DeleteMetricStream`
+- `DeleteResourceMetricsConfiguration`
 - `DescribeAlarmContributors`
 - `DescribeAlarmHistory`
 - `DescribeAlarms`
@@ -6342,6 +6345,7 @@ This is a surface listing, not an implementation manifest. For fakecloud's per-s
 - `GetMetricStream`
 - `GetMetricWidgetImage`
 - `GetOTelEnrichment`
+- `GetResourceMetricsConfiguration`
 - `ListAlarmMuteRules`
 - `ListDashboards`
 - `ListManagedInsightRules`
@@ -6365,6 +6369,8 @@ This is a surface listing, not an implementation manifest. For fakecloud's per-s
 - `StopOTelEnrichment`
 - `TagResource`
 - `UntagResource`
+- `UpdateOTelEnrichment`
+- `UpdateResourceMetricsConfiguration`
 
 ## [Firehose](@/docs/services/firehose.md)
 
@@ -7216,6 +7222,7 @@ This is a surface listing, not an implementation manifest. For fakecloud's per-s
 - `CreateCapacityReservation`
 - `CreateCapacityReservationBySplitting`
 - `CreateCapacityReservationCancellationQuote`
+- `CreateCapacityReservationDateChangeQuote`
 - `CreateCapacityReservationFleet`
 - `CreateCarrierGateway`
 - `CreateClientVpnEndpoint`
@@ -7446,6 +7453,7 @@ This is a surface listing, not an implementation manifest. For fakecloud's per-s
 - `DescribeCapacityManagerDataExports`
 - `DescribeCapacityReservationBillingRequests`
 - `DescribeCapacityReservationCancellationQuotes`
+- `DescribeCapacityReservationDateChangeQuotes`
 - `DescribeCapacityReservationFleets`
 - `DescribeCapacityReservationTopology`
 - `DescribeCapacityReservations`

@@ -346,6 +346,68 @@ pub struct Table {
     pub parameters: BTreeMap<String, String>,
     /// Partitions keyed by joined partition values ("v1/v2").
     pub partitions: BTreeMap<String, Partition>,
+    /// `TableInput` members Glue stores as given and reads back unchanged.
+    #[serde(default)]
+    pub extensions: TableExtensions,
+}
+
+/// The structured `TableInput` members beyond the core table metadata:
+/// resource-link target, federated source, multi-dialect view definition
+/// and the last-analyzed timestamp.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TableExtensions {
+    #[serde(default)]
+    pub last_analyzed_time: Option<Value>,
+    /// `TargetTable` (`TableIdentifier`) for a resource link.
+    #[serde(default)]
+    pub target_table: Option<Value>,
+    /// `FederatedTable` for a table backed by an external metastore.
+    #[serde(default)]
+    pub federated_table: Option<Value>,
+    /// `ViewDefinition`, already in its read (`ViewDefinition`) shape.
+    #[serde(default)]
+    pub view_definition: Option<Value>,
+}
+
+impl TableExtensions {
+    /// Read the extension members from a `TableInput`.
+    pub fn from_input(input: &Value) -> Self {
+        let mut ext = Self::default();
+        ext.apply_input(input);
+        ext
+    }
+
+    /// Overwrite the members present on `input`, leaving absent ones as they
+    /// were (UpdateTable semantics for optional members).
+    pub fn apply_input(&mut self, input: &Value) {
+        let obj = |k: &str| input.get(k).filter(|v| v.is_object()).cloned();
+        if let Some(v) = input.get("LastAnalyzedTime").filter(|v| v.is_number()) {
+            self.last_analyzed_time = Some(v.clone());
+        }
+        if let Some(v) = obj("TargetTable") {
+            self.target_table = Some(v);
+        }
+        if let Some(v) = obj("FederatedTable") {
+            self.federated_table = Some(v);
+        }
+        if let Some(v) = obj("ViewDefinition") {
+            self.view_definition = Some(view_definition_from_input(v));
+        }
+    }
+}
+
+/// `ViewDefinitionInput` -> `ViewDefinition`: every member carries over, and
+/// each representation gains the read-only `IsStale` flag (a freshly stored
+/// definition is current).
+fn view_definition_from_input(mut v: Value) -> Value {
+    if let Some(reps) = v.get_mut("Representations").and_then(|r| r.as_array_mut()) {
+        for rep in reps.iter_mut().filter(|r| r.is_object()) {
+            if rep.get("IsStale").is_none() {
+                rep["IsStale"] = Value::Bool(false);
+            }
+        }
+    }
+    v
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

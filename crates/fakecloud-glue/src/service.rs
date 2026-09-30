@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use http::StatusCode;
 use parking_lot::RwLock;
 use serde_json::{json, Value};
@@ -13,7 +13,7 @@ use fakecloud_persistence::SnapshotStore;
 
 use crate::state::{
     Column, Database, GlueAccounts, GlueSnapshot, Partition, SerdeInfo, SharedGlueState,
-    StorageDescriptor, Table, GLUE_SNAPSHOT_SCHEMA_VERSION,
+    StorageDescriptor, Table, TableExtensions, GLUE_SNAPSHOT_SCHEMA_VERSION,
 };
 
 /// Glue read actions all start with one of these verbs; every other action is
@@ -1019,7 +1019,25 @@ pub(crate) fn table_json(t: &Table) -> Value {
     if let Some(la) = t.last_access_time {
         o["LastAccessTime"] = json!(la.timestamp() as f64);
     }
+    let ext = &t.extensions;
+    if let Some(ref v) = ext.last_analyzed_time {
+        o["LastAnalyzedTime"] = v.clone();
+    }
+    if let Some(ref v) = ext.target_table {
+        o["TargetTable"] = v.clone();
+    }
+    if let Some(ref v) = ext.federated_table {
+        o["FederatedTable"] = v.clone();
+    }
+    if let Some(ref v) = ext.view_definition {
+        o["ViewDefinition"] = v.clone();
+        o["IsMultiDialectView"] = json!(true);
+    }
     o
+}
+
+fn epoch_to_utc(secs: f64) -> Option<DateTime<Utc>> {
+    DateTime::from_timestamp_millis((secs * 1000.0) as i64)
 }
 
 /// The current (latest) archived VersionId for a table, defaulting to "1" for
@@ -1220,7 +1238,7 @@ impl GlueService {
             owner: input["Owner"].as_str().map(|s| s.to_string()),
             create_time: now,
             update_time: now,
-            last_access_time: None,
+            last_access_time: input["LastAccessTime"].as_f64().and_then(epoch_to_utc),
             retention: input["Retention"].as_i64().unwrap_or(0),
             storage_descriptor: parse_storage_descriptor(&input["StorageDescriptor"]),
             partition_keys: parse_columns(&input["PartitionKeys"]),
@@ -1229,6 +1247,7 @@ impl GlueService {
             table_type: input["TableType"].as_str().map(|s| s.to_string()),
             parameters: parse_string_map(&input["Parameters"]),
             partitions: BTreeMap::new(),
+            extensions: TableExtensions::from_input(input),
         };
         let tv_json = table_json(&table);
         db.tables.insert(name.clone(), table);
@@ -1274,11 +1293,26 @@ impl GlueService {
             .as_str()
             .filter(|e| !e.is_empty())
             .and_then(|e| regex::Regex::new(e).ok());
+        // ResourceShareType=FEDERATED narrows the listing to tables that
+        // reference an external metastore; ALL (and the default) lists every
+        // table.
+        let federated_only = match body["ResourceShareType"].as_str() {
+            None | Some("ALL") => false,
+            Some("FEDERATED") => true,
+            Some(other) => {
+                return Err(crate::common::invalid_input(format!(
+                    "Invalid ResourceShareType: {other}. Valid values are FEDERATED, ALL."
+                )))
+            }
+        };
         let accounts = self.state.read();
         let mut tables: Vec<Value> = Vec::new();
         if let Some(s) = accounts.get(&req.account_id) {
             if let Some(db) = s.dbs_in(&req.region).and_then(|dbs| dbs.get(db_name)) {
                 for t in db.tables.values() {
+                    if federated_only && t.extensions.federated_table.is_none() {
+                        continue;
+                    }
                     if name_filter.as_ref().is_none_or(|re| re.is_match(&t.name)) {
                         let mut tj = table_json(t);
                         tj["VersionId"] = json!(current_table_version(s, db_name, &t.name));
@@ -1344,6 +1378,10 @@ impl GlueService {
         if let Some(r) = input["Retention"].as_i64() {
             t.retention = r;
         }
+        if let Some(la) = input["LastAccessTime"].as_f64().and_then(epoch_to_utc) {
+            t.last_access_time = Some(la);
+        }
+        t.extensions.apply_input(input);
         // Snapshot the mutated table as a new archived version (Glue bumps the
         // VersionId on every UpdateTable).
         let tv_json = table_json(t);

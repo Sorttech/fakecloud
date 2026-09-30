@@ -90,18 +90,18 @@ async fn database_lifecycle() {
     assert!(glue.get_database().name("db1").send().await.is_err());
 }
 
-#[test_action("glue", "CreateTable", checksum = "b649615f")]
-#[test_action("glue", "GetTable", checksum = "245821b2")]
-#[test_action("glue", "GetTables", checksum = "90a23b06")]
-#[test_action("glue", "UpdateTable", checksum = "74530955")]
+#[test_action("glue", "CreateTable", checksum = "df3e16e2")]
+#[test_action("glue", "GetTable", checksum = "3a08f5e9")]
+#[test_action("glue", "GetTables", checksum = "bc9e57ca")]
+#[test_action("glue", "UpdateTable", checksum = "20496b98")]
 #[test_action("glue", "DeleteTable", checksum = "6e87f081")]
-#[test_action("glue", "SearchTables", checksum = "26491a2e")]
-#[test_action("glue", "GetTableVersion", checksum = "a000b683")]
-#[test_action("glue", "GetTableVersions", checksum = "731e89e7")]
+#[test_action("glue", "SearchTables", checksum = "157c668b")]
+#[test_action("glue", "GetTableVersion", checksum = "8e3049a2")]
+#[test_action("glue", "GetTableVersions", checksum = "e2a41398")]
 #[test_action("glue", "DeleteTableVersion", checksum = "6b333c1a")]
 #[test_action("glue", "BatchDeleteTableVersion", checksum = "4ee84752")]
 #[test_action("glue", "BatchDeleteTable", checksum = "aa2ccbd9")]
-#[test_action("glue", "GetUnfilteredTableMetadata", checksum = "bfeddeb0")]
+#[test_action("glue", "GetUnfilteredTableMetadata", checksum = "109f842b")]
 #[tokio::test]
 async fn table_lifecycle() {
     let server = TestServer::start().await;

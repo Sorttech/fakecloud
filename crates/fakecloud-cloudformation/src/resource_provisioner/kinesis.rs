@@ -60,6 +60,8 @@ impl ResourceProvisioner {
             enhanced_metrics: Vec::new(),
             warm_throughput_mibps: None,
             max_record_size_kib: None,
+            record_distribution_strategy: fakecloud_kinesis::default_record_distribution_strategy(),
+            auto_distribution_cursor: 0,
         };
         state.streams.insert(stream_name.clone(), stream);
 

@@ -196,6 +196,7 @@ impl ResourceProvisioner {
                     .map(fakecloud_glue::parse_string_map)
                     .unwrap_or_default(),
                 partitions: BTreeMap::new(),
+                extensions: fakecloud_glue::TableExtensions::from_input(input),
             },
         );
         let physical_id = format!("{db_name}|{name}");

@@ -9,13 +9,13 @@
 //! drives it from there.
 
 use chrono::Utc;
-use http::StatusCode;
 
 use fakecloud_core::query::{optional_query_param, required_query_param};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use crate::service::{
-    collect_member_values, empty_metadata_response, validate_len, xml_escape, CloudWatchService,
+    collect_member_values, empty_metadata_response, validate_len, validation_error, xml_escape,
+    CloudWatchService,
 };
 use crate::state::{AlarmState, LogAlarm};
 
@@ -31,10 +31,6 @@ pub(crate) const COMPARISON_OPERATORS: &[&str] = &[
     "GreaterThanUpperThreshold",
 ];
 
-fn validation(msg: impl Into<String>) -> AwsServiceError {
-    AwsServiceError::aws_error(StatusCode::BAD_REQUEST, "ValidationError", msg)
-}
-
 /// Read a required positive integer member, rejecting a missing, non-numeric
 /// or below-minimum value. `QueryResultsToEvaluate` and `QueryResultsToAlarm`
 /// are both modeled with `min: 1`.
@@ -42,9 +38,9 @@ fn required_positive_i64(req: &AwsRequest, key: &str) -> Result<i64, AwsServiceE
     let raw = required_query_param(req, key)?;
     let n = raw
         .parse::<i64>()
-        .map_err(|_| validation(format!("{key} must be an integer")))?;
+        .map_err(|_| validation_error(format!("{key} must be an integer")))?;
     if n < 1 {
-        return Err(validation(format!("{key} must be at least 1")));
+        return Err(validation_error(format!("{key} must be at least 1")));
     }
     Ok(n)
 }
@@ -53,6 +49,7 @@ impl CloudWatchService {
     pub(crate) fn put_log_alarm(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         validate_len(req, "AlarmName", 1, 255)?;
         validate_len(req, "AlarmDescription", 0, 1024)?;
+        validate_len(req, "TreatMissingData", 1, 255)?;
         let alarm_name = required_query_param(req, "AlarmName")?;
 
         // ScheduledQueryConfiguration's required members arrive flattened.
@@ -68,7 +65,7 @@ impl CloudWatchService {
             "ScheduledQueryConfiguration.ScheduleConfiguration.ScheduleExpression",
         );
         if schedule_expression.is_none() {
-            return Err(validation(
+            return Err(validation_error(
                 "ScheduledQueryConfiguration.ScheduleConfiguration is required",
             ));
         }
@@ -77,17 +74,17 @@ impl CloudWatchService {
         let query_results_to_alarm = required_positive_i64(req, "QueryResultsToAlarm")?;
         // A log alarm cannot need more datapoints to alarm than it evaluates.
         if query_results_to_alarm > query_results_to_evaluate {
-            return Err(validation(
+            return Err(validation_error(
                 "QueryResultsToAlarm cannot exceed QueryResultsToEvaluate",
             ));
         }
 
         let threshold = required_query_param(req, "Threshold")?
             .parse::<f64>()
-            .map_err(|_| validation("Threshold must be a number"))?;
+            .map_err(|_| validation_error("Threshold must be a number"))?;
         let comparison_operator = required_query_param(req, "ComparisonOperator")?;
         if !COMPARISON_OPERATORS.contains(&comparison_operator.as_str()) {
-            return Err(validation(format!(
+            return Err(validation_error(format!(
                 "ComparisonOperator has an invalid value '{comparison_operator}'"
             )));
         }
@@ -97,7 +94,7 @@ impl CloudWatchService {
                 t.as_str(),
                 "breaching" | "notBreaching" | "ignore" | "missing"
             ) {
-                return Err(validation(format!(
+                return Err(validation_error(format!(
                     "TreatMissingData has an invalid value '{t}'"
                 )));
             }

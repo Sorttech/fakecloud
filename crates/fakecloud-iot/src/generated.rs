@@ -10505,6 +10505,7 @@ pub static OPS: &[OpMeta] = &[
             ("statusReason", K::Str),
             ("httpUrlSummary", K::Struct),
             ("vpcDestinationSummary", K::Struct),
+            ("influxDBSummary", K::Struct),
         ],
         list_scalar: false,
         req_payload: false,

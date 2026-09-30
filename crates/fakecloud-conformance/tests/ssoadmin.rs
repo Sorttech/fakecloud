@@ -54,7 +54,7 @@ use helpers::TestServer;
 #[test_action("sso", "DescribeApplication", checksum = "04bfbb96")]
 #[test_action("sso", "DescribeApplicationAssignment", checksum = "6da00b39")]
 #[test_action("sso", "DescribeApplicationProvider", checksum = "bc843c7f")]
-#[test_action("sso", "DescribeInstance", checksum = "507505c2")]
+#[test_action("sso", "DescribeInstance", checksum = "c4a17e28")]
 #[test_action(
     "sso",
     "DescribeInstanceAccessControlAttributeConfiguration",
@@ -102,7 +102,7 @@ use helpers::TestServer;
     "ListCustomerManagedPolicyReferencesInPermissionSet",
     checksum = "93ff10bc"
 )]
-#[test_action("sso", "ListInstances", checksum = "cd19bc86")]
+#[test_action("sso", "ListInstances", checksum = "1220afd3")]
 #[test_action("sso", "ListManagedPoliciesInPermissionSet", checksum = "5ff82f40")]
 #[test_action("sso", "ListPermissionSetProvisioningStatus", checksum = "9a229c19")]
 #[test_action("sso", "ListPermissionSets", checksum = "f7c54322")]

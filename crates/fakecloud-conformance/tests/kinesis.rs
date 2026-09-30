@@ -9,9 +9,9 @@ use fakecloud_conformance_macros::test_action;
 use helpers::TestServer;
 use serde_json::{json, Value};
 
-#[test_action("kinesis", "CreateStream", checksum = "d2d1a234")]
+#[test_action("kinesis", "CreateStream", checksum = "ec32a7c0")]
 #[test_action("kinesis", "DescribeStream", checksum = "833e726c")]
-#[test_action("kinesis", "DescribeStreamSummary", checksum = "4963083e")]
+#[test_action("kinesis", "DescribeStreamSummary", checksum = "d5a11feb")]
 #[test_action("kinesis", "ListStreams", checksum = "ca5dcdd7")]
 #[test_action("kinesis", "DeleteStream", checksum = "51c62afa")]
 #[tokio::test]
@@ -150,7 +150,7 @@ async fn kinesis_tags_and_retention() {
     assert!(tags.tags().is_empty());
 }
 
-#[test_action("kinesis", "PutRecord", checksum = "55718b65")]
+#[test_action("kinesis", "PutRecord", checksum = "8c678ebf")]
 #[tokio::test]
 async fn kinesis_put_record() {
     let server = TestServer::start().await;
@@ -185,7 +185,7 @@ async fn kinesis_put_record() {
     assert!(first.sequence_number() < second.sequence_number());
 }
 
-#[test_action("kinesis", "PutRecords", checksum = "a5b28725")]
+#[test_action("kinesis", "PutRecords", checksum = "d23495a3")]
 #[tokio::test]
 async fn kinesis_put_records() {
     let server = TestServer::start().await;
@@ -228,7 +228,7 @@ async fn kinesis_put_records() {
 }
 
 #[test_action("kinesis", "GetShardIterator", checksum = "02801846")]
-#[test_action("kinesis", "GetRecords", checksum = "a4dec291")]
+#[test_action("kinesis", "GetRecords", checksum = "ca527559")]
 #[tokio::test]
 async fn kinesis_get_records() {
     let server = TestServer::start().await;
@@ -751,7 +751,7 @@ async fn kinesis_update_shard_count() {
     assert_eq!(response.target_shard_count(), Some(2));
 }
 
-#[test_action("kinesis", "SubscribeToShard", checksum = "0c29998f")]
+#[test_action("kinesis", "SubscribeToShard", checksum = "15626854")]
 #[tokio::test]
 async fn kinesis_subscribe_to_shard_requires_registered_consumer() {
     let server = TestServer::start().await;
@@ -1132,4 +1132,73 @@ async fn kinesis_channel_resolution_is_region_tolerant() {
     )
     .await;
     assert_eq!(status, 200, "delete detached stream: {dropped}");
+}
+
+#[test_action(
+    "kinesis",
+    "UpdateStreamRecordDistributionStrategy",
+    checksum = "48f0bdcf"
+)]
+#[tokio::test]
+async fn kinesis_update_stream_record_distribution_strategy() {
+    let server = TestServer::start().await;
+
+    let (status, _) = channel_op(
+        &server,
+        "CreateStream",
+        json!({
+            "StreamName": "rds-stream",
+            "StreamModeDetails": { "StreamMode": "ON_DEMAND" },
+        }),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (_, summary) = channel_op(
+        &server,
+        "DescribeStreamSummary",
+        json!({ "StreamName": "rds-stream" }),
+    )
+    .await;
+    let summary = &summary["StreamDescriptionSummary"];
+    assert_eq!(summary["RecordDistributionStrategy"], "USER_PARTITION_KEY");
+    let arn = summary["StreamARN"].as_str().unwrap().to_string();
+
+    let (status, _) = channel_op(
+        &server,
+        "UpdateStreamRecordDistributionStrategy",
+        json!({ "StreamARN": arn, "RecordDistributionStrategy": "AUTO" }),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (_, summary) = channel_op(
+        &server,
+        "DescribeStreamSummary",
+        json!({ "StreamName": "rds-stream" }),
+    )
+    .await;
+    assert_eq!(
+        summary["StreamDescriptionSummary"]["RecordDistributionStrategy"],
+        "AUTO"
+    );
+
+    // AUTO makes PartitionKey optional.
+    let (status, put) = channel_op(
+        &server,
+        "PutRecord",
+        json!({ "StreamName": "rds-stream", "Data": "aGk=" }),
+    )
+    .await;
+    assert_eq!(status, 200, "{put}");
+
+    let (status, err) = channel_op(
+        &server,
+        "UpdateStreamRecordDistributionStrategy",
+        json!({ "StreamARN": arn, "RecordDistributionStrategy": "BOGUS" }),
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert!(err["__type"]
+        .as_str()
+        .unwrap()
+        .contains("ValidationException"));
 }
