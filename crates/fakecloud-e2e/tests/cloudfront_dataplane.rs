@@ -69,6 +69,33 @@ pub async fn make_spa_distribution(
         .clone()
 }
 
+/// Create a SPA distribution that also sets `DefaultRootObject`.
+pub async fn make_spa_distribution_with_root_object(
+    cf: &aws_sdk_cloudfront::Client,
+    default_origin_domain: &str,
+    root_object: &str,
+) -> aws_sdk_cloudfront::types::Distribution {
+    let mut config = spa_config(
+        default_origin_domain,
+        None,
+        &format!("spa-{}", uuid_like()),
+        true,
+        true,
+        &[],
+    );
+    config.default_root_object = Some(root_object.to_string());
+    let create = cf
+        .create_distribution()
+        .distribution_config(config)
+        .send()
+        .await
+        .expect("create_distribution");
+    create
+        .distribution()
+        .expect("distribution returned")
+        .clone()
+}
+
 /// Build the SPA distribution config. Shared by create (enabled=true) and the
 /// disable-via-update path (enabled=false) so both use an identical shape; the
 /// `caller_reference` must be preserved across an UpdateDistribution.
@@ -717,4 +744,161 @@ async fn api_traffic_is_not_intercepted() {
         .send()
         .await
         .expect("s3 list_buckets must pass through the viewer middleware");
+}
+
+/// Regression: `DefaultRootObject` was stored on the model but never applied, so a
+/// viewer request for the distribution root reached the bucket root and returned
+/// S3's `ListBucketResult` XML instead of the SPA shell.
+#[tokio::test]
+async fn serves_default_root_object_at_the_distribution_root() {
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+    s3.create_bucket()
+        .bucket("rootsite")
+        .send()
+        .await
+        .expect("create_bucket");
+    put_object(&s3, "rootsite", "index.html", "text/html", b"SHELL").await;
+    put_object(&s3, "rootsite", "nested/index.html", "text/html", b"NESTED").await;
+
+    let cf = server.cloudfront_client().await;
+    let dist = make_spa_distribution_with_root_object(
+        &cf,
+        "rootsite.s3-website-us-east-1.amazonaws.com",
+        "index.html",
+    )
+    .await;
+    assert!(wait_for_served(&server, dist.id(), Duration::from_secs(10)).await);
+    let host = dist.domain_name();
+
+    // The root serves the default root object, not a bucket listing.
+    let r = viewer_get(&server, host, "/").await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.text().await.unwrap(), "SHELL");
+
+    // The query string does not stop the root from being the root.
+    let r = viewer_get(&server, host, "/?v=1").await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.text().await.unwrap(), "SHELL");
+
+    // A subdirectory is NOT rewritten to `nested/index.html`: AWS applies the
+    // default root object to the distribution root only. Here the miss falls
+    // through to the SPA CustomErrorResponse rule instead.
+    let r = viewer_get(&server, host, "/nested/").await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.text().await.unwrap(), "SHELL");
+
+    // UpdateDistribution takes effect for the next request: a folder path is
+    // served from that folder.
+    let got = cf
+        .get_distribution_config()
+        .id(dist.id())
+        .send()
+        .await
+        .expect("get_distribution_config");
+    let etag = got.e_tag().expect("etag").to_string();
+    let mut cfg = got.distribution_config().expect("config").clone();
+    cfg.default_root_object = Some("nested/index.html".to_string());
+    cf.update_distribution()
+        .id(dist.id())
+        .if_match(etag)
+        .distribution_config(cfg)
+        .send()
+        .await
+        .expect("update_distribution");
+    let r = viewer_get(&server, host, "/").await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.text().await.unwrap(), "NESTED");
+}
+
+/// Regression: `OriginPath` was stored on the model but never applied, so every
+/// request reached the bucket root instead of the configured prefix. CloudFront
+/// prefixes each origin request with it, including the default root object and
+/// custom error pages. Also covers a `DefaultRootObject` that needs
+/// percent-encoding (a raw `#` would otherwise truncate the origin path).
+#[tokio::test]
+async fn origin_path_prefixes_every_origin_request() {
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+    s3.create_bucket()
+        .bucket("prefixed")
+        .send()
+        .await
+        .expect("create_bucket");
+    put_object(&s3, "prefixed", "index.html", "text/html", b"UNPREFIXED").await;
+    put_object(&s3, "prefixed", "prod/index.html", "text/html", b"PROD").await;
+    put_object(&s3, "prefixed", "prod/img/a.png", "image/png", b"PNG").await;
+    put_object(&s3, "prefixed", "img/a.png", "image/png", b"ROOTPNG").await;
+    put_object(
+        &s3,
+        "prefixed",
+        "prod/report#v2.html",
+        "text/html",
+        b"REPORT",
+    )
+    .await;
+
+    let cf = server.cloudfront_client().await;
+    let mut config = spa_config(
+        "prefixed.s3-website-us-east-1.amazonaws.com",
+        None,
+        &format!("prefixed-{}", uuid_like()),
+        true,
+        true,
+        &[],
+    );
+    config.default_root_object = Some("index.html".to_string());
+    config
+        .origins
+        .as_mut()
+        .map(|o| &mut o.items)
+        .expect("origins")[0]
+        .origin_path = Some("/prod".to_string());
+    let dist = cf
+        .create_distribution()
+        .distribution_config(config)
+        .send()
+        .await
+        .expect("create_distribution")
+        .distribution()
+        .expect("distribution returned")
+        .clone();
+    assert!(wait_for_served(&server, dist.id(), Duration::from_secs(10)).await);
+    let host = dist.domain_name();
+
+    // A viewer path is fetched under the origin path.
+    let r = viewer_get(&server, host, "/img/a.png").await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.text().await.unwrap(), "PNG");
+
+    // The root is the default root object under the origin path.
+    let r = viewer_get(&server, host, "/").await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.text().await.unwrap(), "PROD");
+
+    // The custom error page (404 -> /index.html) is fetched under it too.
+    let r = viewer_get(&server, host, "/missing/route").await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.text().await.unwrap(), "PROD");
+
+    // A default root object with a `#` addresses that exact key.
+    let got = cf
+        .get_distribution_config()
+        .id(dist.id())
+        .send()
+        .await
+        .expect("get_distribution_config");
+    let etag = got.e_tag().expect("etag").to_string();
+    let mut cfg = got.distribution_config().expect("config").clone();
+    cfg.default_root_object = Some("report#v2.html".to_string());
+    cf.update_distribution()
+        .id(dist.id())
+        .if_match(etag)
+        .distribution_config(cfg)
+        .send()
+        .await
+        .expect("update_distribution");
+    let r = viewer_get(&server, host, "/").await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.text().await.unwrap(), "REPORT");
 }
