@@ -149,11 +149,19 @@ Container definitions can pull secrets from SecretsManager or SSM Parameter Stor
 ```json
 "secrets": [
   { "name": "DB_PASSWORD", "valueFrom": "arn:aws:secretsmanager:us-east-1:123456789012:secret:db-password-AbCdEf" },
-  { "name": "API_KEY",     "valueFrom": "arn:aws:ssm:us-east-1:123456789012:parameter/app/api-key" }
+  { "name": "DB_USER",     "valueFrom": "arn:aws:secretsmanager:us-east-1:123456789012:secret:db-creds-AbCdEf:username::" },
+  { "name": "OLD_TOKEN",   "valueFrom": "arn:aws:secretsmanager:us-east-1:123456789012:secret:token:value:AWSPREVIOUS:" },
+  { "name": "API_KEY",     "valueFrom": "arn:aws:ssm:us-east-1:123456789012:parameter/app/api-key" },
+  { "name": "FEATURE",     "valueFrom": "/app/feature-flag:2" }
 ]
 ```
 
-The runtime resolves both kinds of ARN synchronously against the in-process state and injects the values as environment variables before `docker run`. A missing secret or parameter fails the task with `stopCode=TaskFailedToStart`, matching real ECS's "failed to retrieve secret" behaviour.
+The runtime resolves each reference at task start, the way the ECS container agent does, and injects the values as environment variables:
+
+- **Secrets Manager**: `valueFrom` is the secret's full ARN or partial ARN (without the random 6-character suffix), resolved in the account and region the ARN names. Append `:json-key:version-stage:version-id` (all three positions, empty ones unset) to pick a field out of a JSON secret and/or a version by staging label (`AWSCURRENT`, `AWSPREVIOUS`, custom) or version ID. A non-string JSON field is injected the way the agent renders it (`5432`, `true`, `1e+08`). A secret in another account is readable when its resource policy allows the task's account.
+- **SSM Parameter Store**: `valueFrom` is a parameter name (in the task's account) or ARN (in the ARN's account; a parameter owned by another account must be shared with a resource policy), optionally with a `:version` or `:label` selector. `SecureString` values are injected decrypted.
+
+A reference that does not resolve (missing secret, version or JSON key, missing parameter, access denied) fails the task with `stopCode=TaskFailedToStart` and a `stoppedReason` in ECS's form, for example `ResourceInitializationError: unable to pull secrets or registry auth: execution resource retrieval failed: unable to retrieve secret from asm: retrieved secret from Secrets Manager did not contain json key password`.
 
 ## Protocol
 

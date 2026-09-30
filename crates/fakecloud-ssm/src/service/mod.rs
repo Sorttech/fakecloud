@@ -10,7 +10,7 @@ mod maintenance;
 mod misc;
 mod ops;
 mod parameters;
-pub use parameters::param_arn;
+pub use parameters::{param_arn, read_parameter_value, ParameterValue};
 mod patches;
 mod resource_sync;
 mod sessions;

@@ -6869,6 +6869,7 @@ dependencies = [
  "chrono",
  "fakecloud-aws",
  "fakecloud-core",
+ "fakecloud-iam",
  "fakecloud-persistence",
  "fakecloud-secretsmanager",
  "http 1.4.0",

@@ -354,3 +354,185 @@ async fn ecs_task_with_missing_secret_fails_fast() {
         "expected TaskFailedToStart; got {stop_code:?}"
     );
 }
+
+/// `valueFrom` selectors: a json-key out of a JSON secret, a previous
+/// version by staging label, a partial ARN, and an SSM SecureString, all
+/// injected as their resolved (decrypted) values.
+#[tokio::test]
+async fn ecs_task_resolves_secret_selectors_and_secure_string() {
+    if !require_docker_or_skip("ecs_task_resolves_secret_selectors_and_secure_string") {
+        return;
+    }
+    let server = TestServer::start().await;
+    let secrets = server.secretsmanager_client().await;
+    let ssm = server.ssm_client().await;
+    let ecs = server.ecs_client().await;
+
+    let arn = secrets
+        .create_secret()
+        .name("ecs/db/creds")
+        .secret_string(r#"{"username":"admin","password":"first","port":5432}"#)
+        .send()
+        .await
+        .unwrap()
+        .arn()
+        .unwrap()
+        .to_string();
+    secrets
+        .put_secret_value()
+        .secret_id(&arn)
+        .secret_string(r#"{"username":"admin","password":"second","port":5432}"#)
+        .send()
+        .await
+        .unwrap();
+    // A sibling whose name extends this one must not shadow it.
+    secrets
+        .create_secret()
+        .name("ecs/db/creds-old")
+        .secret_string("wrong")
+        .send()
+        .await
+        .unwrap();
+    ssm.put_parameter()
+        .name("/ecs/app/token")
+        .value("secure-token")
+        .r#type(ParameterType::SecureString)
+        .send()
+        .await
+        .unwrap();
+    let partial_arn = &arn[..arn.len() - 7];
+
+    let secret = |name: &str, value_from: String| {
+        Secret::builder()
+            .name(name)
+            .value_from(value_from)
+            .build()
+            .unwrap()
+    };
+    ecs.create_cluster()
+        .cluster_name("selectors-cluster")
+        .send()
+        .await
+        .unwrap();
+    ecs.register_task_definition()
+        .family("selectors-family")
+        .container_definitions(
+            ContainerDefinition::builder()
+                .name("reader")
+                .image("public.ecr.aws/docker/library/alpine:3.20")
+                .essential(true)
+                .secrets(secret("CUR_PW", format!("{arn}:password::")))
+                .secrets(secret("PREV_PW", format!("{arn}:password:AWSPREVIOUS:")))
+                .secrets(secret("PORT", format!("{arn}:port::")))
+                .secrets(secret("WHOLE", partial_arn.to_string()))
+                .secrets(secret("TOKEN", "/ecs/app/token".to_string()))
+                .command("sh")
+                .command("-c")
+                .command(
+                    "echo CUR=$CUR_PW PREV=$PREV_PW PORT=$PORT TOKEN=$TOKEN; echo WHOLE=$WHOLE",
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    let run = ecs
+        .run_task()
+        .cluster("selectors-cluster")
+        .task_definition("selectors-family")
+        .send()
+        .await
+        .unwrap();
+    let task_arn = run.tasks()[0].task_arn().unwrap().to_string();
+    wait_stopped(&ecs, "selectors-cluster", &task_arn).await;
+    let task_id = task_arn.rsplit('/').next().unwrap();
+    let logs = task_logs(server.endpoint(), task_id).await;
+    assert!(
+        logs.contains("CUR=second PREV=first PORT=5432 TOKEN=secure-token"),
+        "selectors not resolved: {logs}"
+    );
+    assert!(
+        logs.contains(r#"WHOLE={"username":"admin","password":"second","port":5432}"#),
+        "partial ARN not resolved to its own secret: {logs}"
+    );
+}
+
+/// A json-key the secret lacks stops the task with ECS's
+/// ResourceInitializationError reason.
+#[tokio::test]
+async fn ecs_task_with_missing_json_key_fails_with_resource_initialization_error() {
+    if !require_docker_or_skip(
+        "ecs_task_with_missing_json_key_fails_with_resource_initialization_error",
+    ) {
+        return;
+    }
+    let server = TestServer::start().await;
+    let secrets = server.secretsmanager_client().await;
+    let ecs = server.ecs_client().await;
+
+    let arn = secrets
+        .create_secret()
+        .name("ecs/no-key")
+        .secret_string(r#"{"username":"admin"}"#)
+        .send()
+        .await
+        .unwrap()
+        .arn()
+        .unwrap()
+        .to_string();
+    ecs.create_cluster()
+        .cluster_name("json-key-cluster")
+        .send()
+        .await
+        .unwrap();
+    ecs.register_task_definition()
+        .family("json-key-family")
+        .container_definitions(
+            ContainerDefinition::builder()
+                .name("reader")
+                .image("public.ecr.aws/docker/library/alpine:3.20")
+                .essential(true)
+                .secrets(
+                    Secret::builder()
+                        .name("PW")
+                        .value_from(format!("{arn}:password::"))
+                        .build()
+                        .unwrap(),
+                )
+                .command("true")
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let run = ecs
+        .run_task()
+        .cluster("json-key-cluster")
+        .task_definition("json-key-family")
+        .send()
+        .await
+        .unwrap();
+    let task_arn = run.tasks()[0].task_arn().unwrap().to_string();
+    wait_stopped(&ecs, "json-key-cluster", &task_arn).await;
+    let desc = ecs
+        .describe_tasks()
+        .cluster("json-key-cluster")
+        .tasks(&task_arn)
+        .send()
+        .await
+        .unwrap();
+    let task = &desc.tasks()[0];
+    assert_eq!(
+        task.stop_code().map(|c| c.as_str()),
+        Some("TaskFailedToStart")
+    );
+    assert_eq!(
+        task.stopped_reason(),
+        Some(
+            "ResourceInitializationError: unable to pull secrets or registry auth: execution \
+             resource retrieval failed: unable to retrieve secret from asm: retrieved secret \
+             from Secrets Manager did not contain json key password"
+        )
+    );
+}

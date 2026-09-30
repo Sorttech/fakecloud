@@ -32,6 +32,10 @@ pub enum RuntimeError {
     ImagePull(String),
     #[error("container start failed: {0}")]
     ContainerStart(String),
+    /// A `secrets[].valueFrom` reference could not be resolved at task
+    /// start: ECS stops the task with this `ResourceInitializationError`.
+    #[error("ResourceInitializationError: unable to pull secrets or registry auth: execution resource retrieval failed: {0}")]
+    SecretRetrieval(String),
     #[error("docker wait failed: {0}")]
     Wait(String),
 }
@@ -73,6 +77,9 @@ pub struct EcsRuntime {
     /// SSM Parameter Store state for resolving `secrets[]` entries whose
     /// `valueFrom` is an SSM parameter ARN.
     ssm_state: Option<SharedSsmState>,
+    /// KMS hook for decrypting secret values Secrets Manager and SSM store
+    /// KMS-encrypted (a `SecureString`, a secret with a KMS key).
+    kms_hook: Option<Arc<dyn fakecloud_core::delivery::KmsHook>>,
     /// `Some` when running on the Kubernetes backend; `run_task` then maps
     /// each task to a Pod instead of `docker run`. `None` is the default
     /// Docker/Podman backend, and the fields above drive it.
@@ -116,6 +123,7 @@ impl EcsRuntime {
             logs_state: None,
             secretsmanager_state: None,
             ssm_state: None,
+            kms_hook: None,
             k8s: None,
             snapshot_hook: std::sync::OnceLock::new(),
         })
@@ -143,6 +151,7 @@ impl EcsRuntime {
             logs_state: None,
             secretsmanager_state: None,
             ssm_state: None,
+            kms_hook: None,
             k8s: Some(backend),
             snapshot_hook: std::sync::OnceLock::new(),
         })
@@ -1872,6 +1881,31 @@ pub async fn sleep(duration: Duration) {
 }
 
 #[cfg(test)]
+impl EcsRuntime {
+    /// A runtime with no container CLI or wired services, for unit tests.
+    pub(super) fn bare_for_tests() -> EcsRuntime {
+        EcsRuntime {
+            cli: String::new(),
+            net: fakecloud_core::container_net::HostNetworking {
+                host_alias: String::new(),
+                add_host_arg: None,
+                sibling_host: String::new(),
+            },
+            server_port: 0,
+            docker_config: None,
+            containers: RwLock::new(std::collections::HashMap::new()),
+            delivery_bus: None,
+            logs_state: None,
+            secretsmanager_state: None,
+            ssm_state: None,
+            kms_hook: None,
+            k8s: None,
+            snapshot_hook: std::sync::OnceLock::new(),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::state::{EcsState, Task};
@@ -2001,23 +2035,7 @@ mod tests {
     }
 
     fn bare_runtime() -> EcsRuntime {
-        EcsRuntime {
-            cli: String::new(),
-            net: fakecloud_core::container_net::HostNetworking {
-                host_alias: String::new(),
-                add_host_arg: None,
-                sibling_host: String::new(),
-            },
-            server_port: 0,
-            docker_config: None,
-            containers: RwLock::new(std::collections::HashMap::new()),
-            delivery_bus: None,
-            logs_state: None,
-            secretsmanager_state: None,
-            ssm_state: None,
-            k8s: None,
-            snapshot_hook: std::sync::OnceLock::new(),
-        }
+        EcsRuntime::bare_for_tests()
     }
 
     /// The PENDING->RUNNING transition (`mark_running_multi`) must be flushed
