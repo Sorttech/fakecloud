@@ -1198,7 +1198,7 @@ fn kinesis_source_event(
     region: &str,
     role_arn: Option<&str>,
 ) -> Value {
-    json!({
+    let mut event = json!({
         "eventSource": "aws:kinesis",
         "eventVersion": "1.0",
         "eventID": format!("{}:{}", shard_id, record.sequence_number),
@@ -1208,13 +1208,17 @@ fn kinesis_source_event(
         "eventSourceARN": source_arn,
         "kinesis": {
             "kinesisSchemaVersion": "1.0",
-            "partitionKey": record.partition_key,
             "sequenceNumber": record.sequence_number,
             "data": base64::engine::general_purpose::STANDARD.encode(&record.data),
             "approximateArrivalTimestamp":
                 record.approximate_arrival_timestamp.timestamp_millis() as f64 / 1000.0,
         }
-    })
+    });
+    // Keyless AUTO-distributed records carry no partitionKey (as GetRecords).
+    if !record.partition_key.is_empty() {
+        event["kinesis"]["partitionKey"] = json!(record.partition_key);
+    }
+    event
 }
 
 /// Build the AWS Pipes DynamoDB-stream-source event envelope for one record.
@@ -1338,6 +1342,15 @@ mod tests {
         );
         assert_eq!(ev["invokeIdentityArn"], role);
         assert_eq!(ev["eventID"], "shardId-000000000000:7");
+        assert_eq!(ev["kinesis"]["partitionKey"], "pk");
+
+        // A keyless (AUTO-distributed) record carries no partitionKey.
+        let keyless = fakecloud_kinesis::KinesisRecord {
+            partition_key: String::new(),
+            ..record
+        };
+        let ev = kinesis_source_event(&keyless, "shardId-000000000000", "a", "r", None);
+        assert!(ev["kinesis"].get("partitionKey").is_none());
     }
 
     #[test]

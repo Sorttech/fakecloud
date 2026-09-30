@@ -212,13 +212,14 @@ pub(crate) fn require_partition_key<'a>(
     body: &'a Value,
     stream: &KinesisStream,
 ) -> Result<&'a str, AwsServiceError> {
-    let supplied = body["PartitionKey"]
-        .as_str()
-        .filter(|value| !value.is_empty());
-    let partition_key = match supplied {
-        Some(key) => key,
-        None if stream.record_distribution_strategy == RECORD_DISTRIBUTION_AUTO => return Ok(""),
-        None => return Err(invalid_argument("PartitionKey is required")),
+    let auto = stream.record_distribution_strategy == RECORD_DISTRIBUTION_AUTO;
+    let partition_key = match body["PartitionKey"].as_str() {
+        // Optional under AUTO means omitted, not empty: the member still
+        // carries its length >= 1 constraint.
+        None if auto => return Ok(""),
+        Some("") if auto => return Err(empty_partition_key()),
+        Some(key) if !key.is_empty() => key,
+        _ => return Err(invalid_argument("PartitionKey is required")),
     };
     if partition_key.chars().count() > MAX_PARTITION_KEY_CHARS {
         return Err(validation_exception(format!(
@@ -227,6 +228,13 @@ pub(crate) fn require_partition_key<'a>(
         )));
     }
     Ok(partition_key)
+}
+
+fn empty_partition_key() -> AwsServiceError {
+    validation_exception(
+        "1 validation error detected: Value at 'partitionKey' failed to satisfy \
+         constraint: Member must have length greater than or equal to 1",
+    )
 }
 
 pub(crate) fn require_shard_id(body: &Value) -> Result<&str, AwsServiceError> {
@@ -366,6 +374,8 @@ pub(crate) fn select_shard_mut<'a>(
     // itself and ignores both PartitionKey and ExplicitHashKey; spread them
     // evenly by rotating through the open shards.
     if stream.record_distribution_strategy == RECORD_DISTRIBUTION_AUTO {
+        // Ignored for placement, but a malformed hash key is still rejected.
+        routing_hash(partition_key, explicit_hash_key)?;
         let open: Vec<usize> = stream
             .shards
             .iter()
@@ -426,13 +436,11 @@ pub(crate) fn put_records_entry(
     entry: &Value,
 ) -> Result<(String, String), String> {
     let auto = stream.record_distribution_strategy == RECORD_DISTRIBUTION_AUTO;
-    let partition_key = match entry["PartitionKey"]
-        .as_str()
-        .filter(|value| !value.is_empty())
-    {
-        Some(key) => key,
+    let partition_key = match entry["PartitionKey"].as_str() {
         None if auto => "",
-        None => return Err("PartitionKey is required".to_string()),
+        Some("") if auto => return Err(empty_partition_key().message()),
+        Some(key) if !key.is_empty() => key,
+        _ => return Err("PartitionKey is required".to_string()),
     };
     if partition_key.chars().count() > MAX_PARTITION_KEY_CHARS {
         return Err(format!(

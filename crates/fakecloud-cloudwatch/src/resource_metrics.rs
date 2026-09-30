@@ -5,16 +5,14 @@
 //! most one selection whose `IncludeMetrics` names the metrics to collect;
 //! omitting it collects every available detailed metric.
 
-use std::collections::BTreeMap;
-
 use chrono::Utc;
 use fakecloud_core::query::optional_query_param;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use crate::otel::fmt_ts;
 use crate::service::{
-    collect_indexed, conflict, empty_metadata_response, missing_param, not_found, validation_error,
-    xml_escape, xml_response, CloudWatchService,
+    collect_indexed, collect_member_strings, conflict, empty_metadata_response, missing_param,
+    not_found, validation_error, xml_escape, xml_response, CloudWatchService,
 };
 use crate::state::ResourceMetricsConfiguration;
 
@@ -64,15 +62,7 @@ fn parse_metric_selections(req: &AwsRequest) -> Result<Option<Vec<String>>, AwsS
             "MetricSelections must contain exactly one selection",
         ));
     }
-    let mut indexed: BTreeMap<u32, String> = BTreeMap::new();
-    for (k, v) in &selections[0] {
-        if let Some(idx) = k.strip_prefix("IncludeMetrics.member.") {
-            if let Ok(i) = idx.parse::<u32>() {
-                indexed.insert(i, v.clone());
-            }
-        }
-    }
-    let names: Vec<String> = indexed.into_values().collect();
+    let names = collect_member_strings(&selections[0], "IncludeMetrics");
     if names.is_empty() || names.len() > 500 {
         return Err(validation_error(
             "MetricSelections.IncludeMetrics must contain between 1 and 500 metric names",

@@ -9,7 +9,6 @@
 //! undeclared error on a well-formed (Success-class) request.
 
 use chrono::Utc;
-use http::StatusCode;
 
 use fakecloud_core::query::{optional_query_param, required_query_param};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
@@ -34,11 +33,9 @@ impl CloudWatchService {
         // ALARM/OK/INSUFFICIENT_DATA predicates; reject a malformed rule rather
         // than storing an inert one that never evaluates.
         if let Err(e) = crate::alarm_eval::parse_alarm_rule(&alarm_rule) {
-            return Err(AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "ValidationError",
-                format!("Invalid AlarmRule: {e}"),
-            ));
+            return Err(crate::service::validation_error(format!(
+                "Invalid AlarmRule: {e}"
+            )));
         }
         let alarm_description = optional_query_param(req, "AlarmDescription");
         let actions_enabled = optional_query_param(req, "ActionsEnabled")

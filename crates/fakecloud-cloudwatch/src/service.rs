@@ -427,6 +427,21 @@ pub(crate) fn collect_indexed(req: &AwsRequest, prefix: &str) -> Vec<HashMap<Str
 
 /// Collect an indexed `<prefix>.member.N` numeric array out of a flattened
 /// MetricData member (e.g. `Values.member.1`, `Counts.member.1`).
+/// The `<prefix>.member.N` strings of one indexed-list member, in index order.
+pub(crate) fn collect_member_strings(
+    member: &HashMap<String, String>,
+    prefix: &str,
+) -> Vec<String> {
+    let needle = format!("{prefix}.member.");
+    let mut by_index: BTreeMap<u32, String> = BTreeMap::new();
+    for (k, v) in member {
+        if let Some(idx) = k.strip_prefix(&needle).and_then(|i| i.parse::<u32>().ok()) {
+            by_index.insert(idx, v.clone());
+        }
+    }
+    by_index.into_values().collect()
+}
+
 fn collect_member_numbers(
     member: &HashMap<String, String>,
     prefix: &str,
@@ -675,17 +690,7 @@ pub(crate) fn validate_enum(
 
 /// Collect repeated `<Prefix>.member.N` scalar values, ordered by index.
 pub(crate) fn collect_member_values(req: &AwsRequest, prefix: &str) -> Vec<String> {
-    let needle = format!("{prefix}.member.");
-    let mut by_index: BTreeMap<u32, String> = BTreeMap::new();
-    for (k, v) in req.query_params.iter() {
-        let Some(rest) = k.strip_prefix(&needle) else {
-            continue;
-        };
-        if let Ok(idx) = rest.parse::<u32>() {
-            by_index.insert(idx, v.clone());
-        }
-    }
-    by_index.into_values().collect()
+    collect_member_strings(&req.query_params, prefix)
 }
 
 /// Parse a `Tags.member.N.Key` / `Tags.member.N.Value` list into a map.

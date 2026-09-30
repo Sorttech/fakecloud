@@ -358,10 +358,14 @@ fn kinesis_event_record(
             "approximateArrivalTimestamp": record.approximate_arrival_timestamp.timestamp_millis() as f64 / 1000.0,
             "data": base64::engine::general_purpose::STANDARD.encode(&record.data),
             "kinesisSchemaVersion": "1.0",
-            "partitionKey": record.partition_key,
             "sequenceNumber": record.sequence_number,
         }
     });
+    // A record written without a key (AUTO record distribution) carries no
+    // partitionKey, matching what GetRecords returns for it.
+    if !record.partition_key.is_empty() {
+        event["kinesis"]["partitionKey"] = json!(record.partition_key);
+    }
     if let Some(role) = invoke_identity_arn {
         event["invokeIdentityArn"] = json!(role);
     }
@@ -446,6 +450,15 @@ mod tests {
         let cn = "arn:aws-cn:kinesis:cn-north-1:111122223333:stream/orders";
         let ev = kinesis_event_record(&record, "shardId-000000000000", cn, None);
         assert_eq!(ev["awsRegion"], "cn-north-1");
+        assert_eq!(ev["kinesis"]["partitionKey"], "pk");
+
+        // A keyless (AUTO-distributed) record carries no partitionKey.
+        let keyless = fakecloud_kinesis::KinesisRecord {
+            partition_key: String::new(),
+            ..record
+        };
+        let ev = kinesis_event_record(&keyless, "shardId-000000000000", arn, None);
+        assert!(ev["kinesis"].get("partitionKey").is_none());
     }
 
     fn esm(

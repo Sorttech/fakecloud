@@ -3569,6 +3569,41 @@ fn auto_strategy_ignores_partition_key_and_spreads_records() {
 }
 
 #[test]
+fn auto_strategy_still_validates_supplied_keys() {
+    let (svc, _) = make_service();
+    create_on_demand_stream(&svc, "auto", Some("AUTO"));
+    // Optional means omitted: an explicitly empty key still breaks min length.
+    let err = svc
+        .put_record(&request(
+            "PutRecord",
+            json!({ "StreamName": "auto", "Data": "aGk=", "PartitionKey": "" }),
+        ))
+        .err()
+        .expect("empty key rejected");
+    assert_eq!(err.code(), "ValidationException");
+    // A malformed ExplicitHashKey is rejected even though AUTO ignores it.
+    let err = svc
+        .put_record(&request(
+            "PutRecord",
+            json!({ "StreamName": "auto", "Data": "aGk=", "ExplicitHashKey": "abc" }),
+        ))
+        .err()
+        .expect("bad hash key rejected");
+    assert_eq!(err.code(), "InvalidArgumentException");
+    let resp = json_response(
+        svc.put_records(&request(
+            "PutRecords",
+            json!({ "StreamName": "auto", "Records": [
+                { "Data": "aGk=", "PartitionKey": "" },
+                { "Data": "aGk=", "ExplicitHashKey": "abc" },
+            ] }),
+        ))
+        .unwrap(),
+    );
+    assert_eq!(resp["FailedRecordCount"], 2);
+}
+
+#[test]
 fn record_without_partition_key_omits_it_on_read() {
     let (svc, _) = make_service();
     create_on_demand_stream(&svc, "auto", Some("AUTO"));

@@ -1341,6 +1341,23 @@ fn create_global_replication_group_stores_request_tags() {
         .get("arn:aws:elasticache:us-east-1:123456789012:globalreplicationgroup:fc-us-east-1-global-t")
         .expect("global replication group tags stored");
     assert!(tags.iter().any(|(k, v)| k == "env" && v == "prod"));
+    drop(__a);
+
+    // Deleting the group drops its tags, so a recreate under the same id
+    // doesn't inherit them.
+    service
+        .delete_global_replication_group(&request(
+            "DeleteGlobalReplicationGroup",
+            &[
+                ("GlobalReplicationGroupId", "fc-us-east-1-global-t"),
+                ("RetainPrimaryReplicationGroup", "true"),
+            ],
+        ))
+        .unwrap();
+    let __a = service.state.read();
+    assert!(!__a.default_ref().tags.contains_key(
+        "arn:aws:elasticache:us-east-1:123456789012:globalreplicationgroup:fc-us-east-1-global-t"
+    ));
 }
 
 #[test]

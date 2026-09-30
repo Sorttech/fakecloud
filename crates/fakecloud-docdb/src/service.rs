@@ -752,8 +752,11 @@ impl DocDbService {
         // Optional final snapshot.
         if let Some(snap_id) = optional_query_param(req, "FinalDBSnapshotIdentifier") {
             if let Some(c) = st.clusters.get(&id) {
-                let snap =
+                let mut snap =
                     snapshot_from_cluster(c, &snap_id, &req.region, &req.account_id, "manual");
+                if c.copy_tags_to_snapshot {
+                    snap.tags = c.tags.clone();
+                }
                 st.cluster_snapshots.insert(snap_id, snap);
             }
         }

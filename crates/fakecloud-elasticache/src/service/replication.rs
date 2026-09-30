@@ -578,6 +578,7 @@ impl ElastiCacheService {
                     format!("GlobalReplicationGroup {global_replication_group_id} not found."),
                 )
             })?;
+        state.tags.remove(&group.arn);
 
         // Stop runtime containers for any primary we're about to drop —
         // otherwise the Docker containers + their port bindings leak

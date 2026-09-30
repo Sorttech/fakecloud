@@ -1063,6 +1063,29 @@ async fn copy_tags_to_snapshot_copies_cluster_tags() {
     )
     .await;
     assert!(body(&resp).contains("<CopyTagsToSnapshot>true</CopyTagsToSnapshot>"));
+
+    // The final snapshot DeleteDBCluster takes honors the flag too.
+    call(
+        &svc,
+        "ModifyDBCluster",
+        &[
+            ("DBClusterIdentifier", "ctts"),
+            ("CopyTagsToSnapshot", "true"),
+        ],
+    )
+    .await;
+    call(
+        &svc,
+        "DeleteDBCluster",
+        &[
+            ("DBClusterIdentifier", "ctts"),
+            ("FinalDBSnapshotIdentifier", "ctts-final"),
+        ],
+    )
+    .await;
+    let arn = "arn:aws:rds:us-east-1:123456789012:cluster-snapshot:ctts-final";
+    let tags = body(&call(&svc, "ListTagsForResource", &[("ResourceName", arn)]).await);
+    assert!(tags.contains("<Key>team</Key>"), "{tags}");
 }
 
 #[tokio::test]

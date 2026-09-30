@@ -1,14 +1,12 @@
 //! OTel enrichment (start/stop/update with metric filters), alarm contributors, and metric widget image.
 
-use std::collections::BTreeMap;
-
 use chrono::{DateTime, Utc};
 use fakecloud_core::query::optional_query_param;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use crate::service::{
-    collect_indexed, missing_param, not_found, validation_error, xml_escape, xml_response,
-    CloudWatchService,
+    collect_indexed, collect_member_strings, missing_param, not_found, validation_error,
+    xml_escape, xml_response, CloudWatchService,
 };
 use crate::state::{OTelEnrichmentConfig, OTelMetricSelector};
 
@@ -46,15 +44,7 @@ fn parse_selectors(
                 "{prefix}.Namespace '{namespace}' is invalid: must be 1-255 characters and not start with ':'"
             )));
         }
-        let mut indexed: BTreeMap<u32, String> = BTreeMap::new();
-        for (k, v) in &member {
-            if let Some(idx) = k.strip_prefix("MetricNames.member.") {
-                if let Ok(i) = idx.parse::<u32>() {
-                    indexed.insert(i, v.clone());
-                }
-            }
-        }
-        let metric_names: Vec<String> = indexed.into_values().collect();
+        let metric_names = collect_member_strings(&member, "MetricNames");
         if metric_names.len() > MAX_OTEL_METRIC_NAMES {
             return Err(validation_error(format!(
                 "A maximum of {MAX_OTEL_METRIC_NAMES} metric names is allowed for each selector"

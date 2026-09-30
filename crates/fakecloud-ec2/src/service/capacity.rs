@@ -381,9 +381,10 @@ pub(crate) fn modify_capacity_reservation(
     let result = {
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(&req.account_id);
-        if !state.capacity_reservations.contains_key(&id) {
-            return Err(cr_not_found(&id));
-        }
+        let r = state
+            .capacity_reservations
+            .get_mut(&id)
+            .ok_or_else(|| cr_not_found(&id))?;
         let quoted_start = match &quote_id {
             None => None,
             Some(qid) => {
@@ -402,19 +403,17 @@ pub(crate) fn modify_capacity_reservation(
                     )));
                 }
                 let new_start = parse_ts(&q.new_start_date).unwrap_or(now);
-                if start.is_some_and(|s| s != new_start) {
+                // Quote dates are stored at millisecond precision; compare the
+                // caller's StartDate at the same precision.
+                if start.is_some_and(|s| fmt_ts(s) != q.new_start_date) {
                     return Err(invalid_parameter_value(format!(
                         "StartDate does not match the start date quoted by '{qid}'"
                     )));
                 }
-                Some((qid.clone(), new_start))
+                Some(new_start)
             }
         };
-        let r = state
-            .capacity_reservations
-            .get_mut(&id)
-            .ok_or_else(|| cr_not_found(&id))?;
-        if let Some((_, new_start)) = quoted_start {
+        if let Some(new_start) = quoted_start {
             if current_state(r, now) != "scheduled" {
                 return Err(incorrect_state(format!(
                     "The start date of Capacity Reservation '{id}' can't be changed because it has already been delivered"
@@ -443,6 +442,10 @@ pub(crate) fn modify_capacity_reservation(
         // modifiable per AWS; honor them.
         if let Some(t) = req.query_params.get("EndDateType") {
             r.end_date_type = t.clone();
+            // An unlimited reservation has no end date.
+            if t == "unlimited" {
+                r.end_date = None;
+            }
         }
         if let Some(m) = req.query_params.get("InstanceMatchCriteria") {
             r.instance_match_criteria = m.clone();
@@ -458,8 +461,14 @@ pub(crate) fn modify_capacity_reservation(
             commitment_duration: r.commitment.as_ref().map(|c| c.commitment_duration),
         });
         let result = adjustment_fields_xml(r);
-        if let Some((qid, _)) = quoted_start {
-            if let Some(q) = state.capacity_reservation_modification_quotes.get_mut(&qid) {
+        // Accepting a quote changes the reservation the other outstanding
+        // quotes were priced against, so every quote for it is spent.
+        if quoted_start.is_some() {
+            for q in state
+                .capacity_reservation_modification_quotes
+                .values_mut()
+                .filter(|q| q.capacity_reservation_id == id)
+            {
                 q.used = true;
             }
         }
@@ -519,7 +528,6 @@ pub(crate) fn create_capacity_reservation_date_change_quote(
     req: &AwsRequest,
 ) -> Result<AwsResponse, AwsServiceError> {
     let id = require(&req.query_params, "CapacityReservationId")?;
-    require(&req.query_params, "NewStartDate")?;
     let new_start =
         ts_param(req, "NewStartDate")?.ok_or_else(|| missing_parameter("NewStartDate"))?;
     let client_token = req
@@ -537,7 +545,7 @@ pub(crate) fn create_capacity_reservation_date_change_quote(
             .values()
             .find(|q| q.client_token.as_deref() == Some(token.as_str()))
         {
-            if q.capacity_reservation_id != id {
+            if q.capacity_reservation_id != id || q.new_start_date != fmt_ts(new_start) {
                 return Err(AwsServiceError::aws_error(
                     http::StatusCode::BAD_REQUEST,
                     "IdempotentParameterMismatch",
@@ -1499,6 +1507,116 @@ mod date_change_quote_tests {
             ),
         ));
         assert_eq!(err.code(), "IncorrectState");
+    }
+
+    #[test]
+    fn applying_a_quote_spends_the_other_quotes_for_the_reservation() {
+        let svc = Ec2Service::new();
+        let (cr, start) = future_cr(&svc, 5);
+        let early = quote(&svc, &cr, start + Duration::days(1));
+        let late_start = start + Duration::days(3);
+        let late = quote(&svc, &cr, late_start);
+        // StartDate at microsecond precision (as boto3 sends it) still
+        // matches the millisecond-precision quoted date.
+        let micro = format!("{}Z", late_start.format("%Y-%m-%dT%H:%M:%S%.6f"));
+        modify_capacity_reservation(
+            &svc,
+            &req(
+                "ModifyCapacityReservation",
+                &[
+                    ("CapacityReservationId", &cr),
+                    ("QuoteId", &late),
+                    ("StartDate", &micro),
+                    ("AcceptModificationTerms", "true"),
+                ],
+            ),
+        )
+        .unwrap();
+        // The earlier quote can no longer pull the start date back.
+        let err = err_of(modify_capacity_reservation(
+            &svc,
+            &req(
+                "ModifyCapacityReservation",
+                &[
+                    ("CapacityReservationId", &cr),
+                    ("QuoteId", &early),
+                    ("AcceptModificationTerms", "true"),
+                ],
+            ),
+        ));
+        assert_eq!(err.code(), "IncorrectState");
+        let desc = body(
+            describe_capacity_reservations(&svc, &req("DescribeCapacityReservations", &[]))
+                .unwrap(),
+        );
+        assert_eq!(between(&desc, "startDate"), fmt_ts(late_start));
+    }
+
+    #[test]
+    fn quote_client_token_reuse_with_a_different_date_is_a_mismatch() {
+        let svc = Ec2Service::new();
+        let (cr, start) = future_cr(&svc, 5);
+        let call = |days: i64| {
+            create_capacity_reservation_date_change_quote(
+                &svc,
+                &req(
+                    "CreateCapacityReservationDateChangeQuote",
+                    &[
+                        ("CapacityReservationId", &cr),
+                        ("NewStartDate", &fmt_ts(start + Duration::days(days))),
+                        ("ClientToken", "tok-1"),
+                    ],
+                ),
+            )
+        };
+        let first = between(
+            &body(call(1).unwrap()),
+            "capacityReservationModificationQuoteId",
+        )
+        .to_string();
+        let again = between(
+            &body(call(1).unwrap()),
+            "capacityReservationModificationQuoteId",
+        )
+        .to_string();
+        assert_eq!(first, again);
+        assert_eq!(err_of(call(2)).code(), "IdempotentParameterMismatch");
+    }
+
+    #[test]
+    fn switching_to_unlimited_drops_the_end_date() {
+        let svc = Ec2Service::new();
+        let (cr, start) = future_cr(&svc, 5);
+        let end = fmt_ts(start + Duration::days(30));
+        let out = body(
+            modify_capacity_reservation(
+                &svc,
+                &req(
+                    "ModifyCapacityReservation",
+                    &[
+                        ("CapacityReservationId", &cr),
+                        ("EndDateType", "limited"),
+                        ("EndDate", &end),
+                    ],
+                ),
+            )
+            .unwrap(),
+        );
+        assert!(out.contains(&format!("<endDate>{end}</endDate>")), "{out}");
+        modify_capacity_reservation(
+            &svc,
+            &req(
+                "ModifyCapacityReservation",
+                &[("CapacityReservationId", &cr), ("EndDateType", "unlimited")],
+            ),
+        )
+        .unwrap();
+        let desc = body(
+            describe_capacity_reservations(&svc, &req("DescribeCapacityReservations", &[]))
+                .unwrap(),
+        );
+        assert!(!desc.contains("<endDate>"), "{desc}");
+        assert_eq!(between(&desc, "endDateType"), "unlimited");
     }
 
     #[test]
