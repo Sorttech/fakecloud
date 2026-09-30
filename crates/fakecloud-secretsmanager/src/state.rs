@@ -70,6 +70,34 @@ impl SecretsManagerState {
         self.secrets.clear();
     }
 
+    /// Make `name` available to a new secret, as CreateSecret does before
+    /// minting one. A secret of that name that is scheduled for deletion and
+    /// whose recovery window has passed is purged; one still inside its
+    /// recovery window blocks the create with AWS's `InvalidRequestException`.
+    /// A live secret of that name is left in place for the caller to handle
+    /// (CreateSecret's idempotency path, or a name-conflict error).
+    pub fn clear_name_for_create(
+        &mut self,
+        name: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), fakecloud_core::service::AwsServiceError> {
+        let Some(existing) = self.secrets.get(name) else {
+            return Ok(());
+        };
+        if !existing.deleted {
+            return Ok(());
+        }
+        if existing.deletion_date.is_some_and(|d| now >= d) {
+            self.secrets.remove(name);
+            return Ok(());
+        }
+        Err(fakecloud_core::service::AwsServiceError::aws_error(
+            http::StatusCode::BAD_REQUEST,
+            "InvalidRequestException",
+            "You can't create this secret because a secret with this name is already scheduled for deletion.",
+        ))
+    }
+
     /// The `secrets` map key (the secret name) for a `SecretId`: a name, a
     /// full ARN, or a partial ARN (the full ARN without its random
     /// six-character suffix). Does not apply recovery-window expiry.
@@ -188,6 +216,35 @@ mod tests {
             resource_policy: None,
             replica_regions: Vec::new(),
         }
+    }
+
+    #[test]
+    fn clear_name_for_create_purges_expired_and_blocks_pending() {
+        let mut state = SecretsManagerState::new("123456789012", "us-east-1");
+        let now = Utc::now();
+        let mut pending = secret("pending", "arn-p");
+        pending.deleted = true;
+        pending.deletion_date = Some(now + chrono::Duration::days(1));
+        let mut expired = secret("expired", "arn-e");
+        expired.deleted = true;
+        expired.deletion_date = Some(now - chrono::Duration::seconds(1));
+        state.secrets.insert("pending".into(), pending);
+        state.secrets.insert("expired".into(), expired);
+        state.secrets.insert("live".into(), secret("live", "arn-l"));
+
+        let err = state
+            .clear_name_for_create("pending", now)
+            .expect_err("recovery window still open");
+        assert_eq!(err.code(), "InvalidRequestException");
+        assert!(state.secrets.contains_key("pending"));
+
+        state.clear_name_for_create("expired", now).unwrap();
+        assert!(!state.secrets.contains_key("expired"));
+
+        // Live and absent names are left for the caller.
+        state.clear_name_for_create("live", now).unwrap();
+        assert!(state.secrets.contains_key("live"));
+        state.clear_name_for_create("absent", now).unwrap();
     }
 
     #[test]

@@ -8280,6 +8280,81 @@ mod tests {
         );
     }
 
+    /// A stack secret follows CreateSecret's name rules for a name scheduled
+    /// for deletion: still in its recovery window -> InvalidRequestException;
+    /// window passed -> the old secret is purged and the create proceeds.
+    #[test]
+    fn stack_secret_name_scheduled_for_deletion() {
+        let prov = make_provisioner();
+        let seed = |name: &str, deletion_date: chrono::DateTime<Utc>| {
+            let mut sm = prov.secretsmanager_state.write();
+            let st = sm.get_or_create("123456789012");
+            let now = Utc::now();
+            st.secrets.insert(
+                name.to_string(),
+                Secret {
+                    name: name.to_string(),
+                    arn: format!(
+                        "arn:aws:secretsmanager:us-east-1:123456789012:secret:{name}-OldOld"
+                    ),
+                    description: None,
+                    kms_key_id: None,
+                    versions: BTreeMap::new(),
+                    current_version_id: None,
+                    tags: vec![],
+                    tags_ever_set: false,
+                    deleted: true,
+                    deletion_date: Some(deletion_date),
+                    created_at: now,
+                    last_changed_at: now,
+                    last_accessed_at: None,
+                    rotation_enabled: None,
+                    rotation_lambda_arn: None,
+                    rotation_rules: None,
+                    last_rotated_at: None,
+                    resource_policy: None,
+                    replica_regions: Vec::new(),
+                },
+            );
+        };
+        seed("pending", Utc::now() + chrono::Duration::days(7));
+        seed("expired", Utc::now() - chrono::Duration::seconds(1));
+
+        let err = prov
+            .create_resource(&make_resource(
+                "AWS::SecretsManager::Secret",
+                "Pending",
+                serde_json::json!({"Name": "pending", "SecretString": "x"}),
+            ))
+            .expect_err("a secret in its recovery window blocks the name");
+        assert!(err.contains("InvalidRequestException"), "{err}");
+        assert!(err.contains("already scheduled for deletion"), "{err}");
+
+        let created = prov
+            .create_resource(&make_resource(
+                "AWS::SecretsManager::Secret",
+                "Expired",
+                serde_json::json!({"Name": "expired", "SecretString": "x"}),
+            ))
+            .expect("an expired recovery window frees the name");
+        assert!(!created.physical_id.ends_with("-OldOld"));
+        let sm = prov.secretsmanager_state.read();
+        let secret = &sm.get("123456789012").unwrap().secrets["expired"];
+        assert!(!secret.deleted);
+        assert_eq!(secret.arn, created.physical_id);
+
+        // A live secret of that name is a conflict, as in CreateSecret.
+        drop(sm);
+        let err = prov
+            .create_resource(&make_resource(
+                "AWS::SecretsManager::Secret",
+                "Again",
+                serde_json::json!({"Name": "expired", "SecretString": "y"}),
+            ))
+            .expect_err("live name conflicts");
+        assert!(err.contains("ResourceExistsException"), "{err}");
+    }
+
     #[test]
     fn getatt_secrets_manager_arn_resolves_via_live_state() {
         // Secrets create handler captures Id but not Arn; live-state

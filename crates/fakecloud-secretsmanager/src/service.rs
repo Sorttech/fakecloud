@@ -237,23 +237,7 @@ impl SecretsManagerService {
         // (not ResourceExistsException). Once the recovery window has elapsed
         // the secret is treated as purged, so lazily remove it here and allow
         // the create to proceed with a fresh secret.
-        if let Some((deleted, elapsed)) = state
-            .secrets
-            .get(&input.name)
-            .map(|s| (s.deleted, secret_recovery_window_elapsed(s, Utc::now())))
-        {
-            if deleted {
-                if elapsed {
-                    state.secrets.remove(&input.name);
-                } else {
-                    return Err(AwsServiceError::aws_error(
-                        StatusCode::BAD_REQUEST,
-                        "InvalidRequestException",
-                        "You can't create this secret because a secret with this name is already scheduled for deletion.",
-                    ));
-                }
-            }
-        }
+        state.clear_name_for_create(&input.name, Utc::now())?;
 
         if let Some(existing) = state.secrets.get(&input.name) {
             if let Some(ref token) = input.client_request_token {

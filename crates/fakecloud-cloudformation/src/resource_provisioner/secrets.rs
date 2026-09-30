@@ -50,8 +50,15 @@ impl ResourceProvisioner {
         // Same ARN form Secrets Manager's CreateSecret mints: the name plus
         // the random six-character suffix. The secret is keyed by name, like
         // every secret the service itself creates.
+        // Same name rules as CreateSecret: a secret whose recovery window has
+        // passed is purged, one still scheduled for deletion blocks the create.
+        state
+            .clear_name_for_create(&name, Utc::now())
+            .map_err(|e| format!("{}: {}", e.code(), e.message()))?;
         if state.secrets.contains_key(&name) {
-            return Err(format!("Secret {name} already exists"));
+            return Err(format!(
+                "ResourceExistsException: The operation failed because the secret {name} already exists."
+            ));
         }
         let arn = fakecloud_secretsmanager::secret_arn(&self.region, &self.account_id, &name);
 
