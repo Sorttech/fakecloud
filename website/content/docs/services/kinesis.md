@@ -14,6 +14,7 @@ fakecloud implements **44 of 44** Kinesis operations at 100% Smithy conformance.
 - **Retention** — IncreaseStreamRetentionPeriod, DecreaseStreamRetentionPeriod
 - **Tags** — AddTagsToStream, RemoveTagsFromStream, ListTagsForStream
 - **Stream modes** — ON_DEMAND and PROVISIONED
+- **Record distribution**: `RecordDistributionStrategy` on CreateStream and UpdateStreamRecordDistributionStrategy: `USER_PARTITION_KEY` routes by partition key, `AUTO` (on-demand streams only) spreads records evenly across open shards and makes the partition key optional
 - **Encryption** — StartStreamEncryption, StopStreamEncryption
 - **Consumers** — EnableEnhancedMonitoring, DisableEnhancedMonitoring
 - **Cross-stream** — MergeShards, SplitShard
