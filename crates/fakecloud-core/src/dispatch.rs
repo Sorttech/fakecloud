@@ -164,52 +164,12 @@ pub async fn dispatch(
     // credential scope, but bedrock-agent has its own service handler.
     // Disambiguate based on the request path.
     let detected = if detected.service == "bedrock" {
-        let first_seg = parts.uri.path().split('/').nth(1);
-        if matches!(
-            first_seg,
-            Some(
-                "agents"
-                    | "knowledgebases"
-                    | "flows"
-                    | "prompts"
-                    | "tags"
-                    | "retrieveAndGenerate"
-                    | "retrieveAndGenerateStream"
-                    | "optimize-prompt"
-                    | "sessions"
-                    | "invocations"
-                    | "generate-query"
-                    | "rerank"
-            )
-        ) {
-            // Further disambiguate runtime vs control plane for agents/flows paths
-            let segs: Vec<&str> = parts.uri.path().split('/').collect();
-            let is_runtime = matches!(
-                segs.as_slice(),
-                ["", "agents", _, "agentAliases", _, ..]  // InvokeAgent
-                    | ["", "flows", _, "aliases", _]   // InvokeFlow
-                    | ["", "knowledgebases", _, "retrieve"] // Retrieve
-                    | ["", "retrieveAndGenerate"]
-                    | ["", "retrieveAndGenerateStream"]
-                    | ["", "optimize-prompt"]
-                    | ["", "sessions", ..]
-                    | ["", "invocations", ..]
-                    | ["", "generate-query"]
-                    | ["", "rerank"]
-            );
-            if is_runtime {
-                protocol::DetectedRequest {
-                    service: "bedrock-agent-runtime".to_string(),
-                    ..detected
-                }
-            } else {
-                protocol::DetectedRequest {
-                    service: "bedrock-agent".to_string(),
-                    ..detected
-                }
-            }
-        } else {
-            detected
+        match bedrock_agent_service_for(&parts.method, parts.uri.path()) {
+            Some(service) => protocol::DetectedRequest {
+                service: service.to_string(),
+                ..detected
+            },
+            None => detected,
         }
     } else {
         detected
@@ -1529,8 +1489,107 @@ impl ProtocolExt for AwsProtocol {
     }
 }
 
+/// Which Bedrock Agents handler a `bedrock`-scoped request belongs to:
+/// `bedrock-agent-runtime` or `bedrock-agent` for their path families, `None`
+/// for any other Bedrock (bedrock-runtime / control plane) path. Runtime and
+/// control plane share `/agents/...` and `/flows/...` prefixes, so the split
+/// is by path shape and, where the shapes coincide, by method.
+fn bedrock_agent_service_for(method: &http::Method, path: &str) -> Option<&'static str> {
+    let first_seg = path.split('/').nth(1);
+    if !matches!(
+        first_seg,
+        Some(
+            "agents"
+                | "knowledgebases"
+                | "flows"
+                | "prompts"
+                | "tags"
+                | "retrieveAndGenerate"
+                | "retrieveAndGenerateStream"
+                | "optimize-prompt"
+                | "sessions"
+                | "invocations"
+                | "generate-query"
+                | "rerank"
+        )
+    ) {
+        return None;
+    }
+    let segs: Vec<&str> = path.split('/').collect();
+    let is_runtime = matches!(
+        segs.as_slice(),
+        ["", "agents", _, "agentAliases", _, ..]  // InvokeAgent
+            | ["", "flows", _, "executions"] // ListFlowExecutions
+            | ["", "flows", _, "aliases", _, "executions", ..] // flow executions
+            | ["", "knowledgebases", _, "retrieve"] // Retrieve
+            | ["", "retrieveAndGenerate"]
+            | ["", "retrieveAndGenerateStream"]
+            | ["", "optimize-prompt"]
+            | ["", "sessions", ..]
+            | ["", "invocations", ..]
+            | ["", "generate-query"]
+            | ["", "rerank"]
+    ) || (
+        // InvokeFlow is POST /flows/{flow}/aliases/{alias}; the same path
+        // under GET / PUT / DELETE is the control plane's flow-alias CRUD.
+        *method == http::Method::POST && matches!(segs.as_slice(), ["", "flows", _, "aliases", _])
+    );
+    Some(if is_runtime {
+        "bedrock-agent-runtime"
+    } else {
+        "bedrock-agent"
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bedrock_agent_paths_split_between_runtime_and_control_plane() {
+        use http::Method;
+        let runtime = Some("bedrock-agent-runtime");
+        let agent = Some("bedrock-agent");
+        for (method, path, want) in [
+            (Method::POST, "/flows/F/aliases/A", runtime),
+            (Method::GET, "/flows/F/aliases/A", agent),
+            (Method::PUT, "/flows/F/aliases/A", agent),
+            (Method::DELETE, "/flows/F/aliases/A", agent),
+            (Method::POST, "/flows/F/aliases/A/executions", runtime),
+            (Method::GET, "/flows/F/aliases/A/executions/E", runtime),
+            (
+                Method::POST,
+                "/flows/F/aliases/A/executions/E/stop",
+                runtime,
+            ),
+            (
+                Method::GET,
+                "/flows/F/aliases/A/executions/E/events",
+                runtime,
+            ),
+            (
+                Method::GET,
+                "/flows/F/aliases/A/executions/E/flowsnapshot",
+                runtime,
+            ),
+            (Method::GET, "/flows/F/executions", runtime),
+            (Method::GET, "/flows/F/aliases", agent),
+            (Method::POST, "/flows/F/versions", agent),
+            (Method::GET, "/flows/F", agent),
+            (
+                Method::POST,
+                "/agents/X/agentAliases/Y/sessions/S/text",
+                runtime,
+            ),
+            (Method::GET, "/agents/X", agent),
+            (Method::POST, "/model/m/invoke", None),
+        ] {
+            assert_eq!(
+                bedrock_agent_service_for(&method, path),
+                want,
+                "{method} {path}"
+            );
+        }
+    }
+
     use super::*;
 
     #[test]
