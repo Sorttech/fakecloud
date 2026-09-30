@@ -1285,6 +1285,11 @@ impl CloudFrontService {
             ));
         }
         let mut config = primary.config.clone();
+        // The copy does not take the primary's alternate domain names: they
+        // are unique across CloudFront and stay with the primary.
+        if let Some(aliases) = config.aliases.as_mut() {
+            *aliases = Default::default();
+        }
         config.caller_reference = parsed.caller_reference;
         config.enabled = parsed.enabled.unwrap_or(false);
         config.staging = parsed.staging;
@@ -2942,6 +2947,69 @@ mod tests {
             .err()
             .expect("case-insensitive");
         assert_eq!(err.code(), "CNAMEAlreadyExists");
+    }
+
+    #[tokio::test]
+    async fn staging_copies_leave_alternate_domain_names_with_the_primary() {
+        let svc = CloudFrontService::new(make_state());
+        let etag_of = |r: &AwsResponse| r.headers.get(ETAG).unwrap().to_str().unwrap().to_string();
+        let created = svc
+            .handle(make_request(
+                http::Method::POST,
+                "/2020-05-31/distribution",
+                "",
+                &dist_config_with_alias("p", "cdn.example.com"),
+            ))
+            .await
+            .unwrap();
+        let p = first_tag(
+            std::str::from_utf8(created.body.expect_bytes()).unwrap(),
+            "Id",
+        );
+        let mut copy = make_request(
+            http::Method::POST,
+            &format!("/2020-05-31/distribution/{p}/copy"),
+            "",
+            r#"<CopyDistributionRequest xmlns="http://cloudfront.amazonaws.com/doc/2020-05-31/"><CallerReference>s</CallerReference><Staging>true</Staging></CopyDistributionRequest>"#,
+        );
+        copy.headers
+            .insert(IF_MATCH, etag_of(&created).parse().unwrap());
+        let copied = svc.handle(copy).await.unwrap();
+        let copied_xml = std::str::from_utf8(copied.body.expect_bytes()).unwrap();
+        let staging = first_tag(copied_xml, "Id");
+        assert!(!copied_xml.contains("cdn.example.com"), "{copied_xml}");
+
+        // The primary can still be updated with its own aliases.
+        let mut update = make_request(
+            http::Method::PUT,
+            &format!("/2020-05-31/distribution/{p}/config"),
+            "",
+            &dist_config_with_alias("p", "cdn.example.com")
+                .replace("<Comment></Comment>", "<Comment>v2</Comment>"),
+        );
+        update
+            .headers
+            .insert(IF_MATCH, etag_of(&created).parse().unwrap());
+        let updated = svc.handle(update).await.unwrap();
+        assert_eq!(updated.status, StatusCode::OK);
+
+        // Promoting the staging config keeps the primary's aliases.
+        let mut promote = make_request(
+            http::Method::PUT,
+            &format!("/2020-05-31/distribution/{p}/promote-staging-config"),
+            &format!("StagingDistributionId={staging}"),
+            "",
+        );
+        promote
+            .query_params
+            .insert("StagingDistributionId".into(), staging.clone());
+        promote
+            .headers
+            .insert(IF_MATCH, etag_of(&updated).parse().unwrap());
+        svc.handle(promote).await.expect("promote");
+        let state = svc.state.read();
+        let primary = &state.get(DEFAULT_ACCOUNT).unwrap().distributions[&p];
+        assert_eq!(config_aliases(&primary.config), ["cdn.example.com"]);
     }
 
     #[tokio::test]

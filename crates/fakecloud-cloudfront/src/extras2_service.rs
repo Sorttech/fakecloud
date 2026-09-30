@@ -489,8 +489,11 @@ impl CloudFrontService {
         // primary distribution's live config. AWS copies the config wholesale
         // and the resulting primary is no longer a staging distribution.
         // Previously this only bumped the ETag, leaving the old config live.
+        // Alternate domain names are not part of the promotion: a staging
+        // distribution carries none, and the primary keeps its own.
         let mut promoted = staging_config;
         promoted.staging = Some(false);
+        promoted.aliases = dist.config.aliases.take();
         dist.config = promoted;
         dist.etag = generate_id_with_prefix("E");
         dist.last_modified_time = Utc::now();
