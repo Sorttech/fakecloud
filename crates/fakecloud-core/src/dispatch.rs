@@ -515,10 +515,13 @@ pub async fn dispatch(
         service: detected.service.clone(),
         action: detected.action.clone(),
         region,
-        // A service acting for a customer resource works in that resource
-        // owner's account.
+        // A service acting for a customer works on the target resource in its
+        // owner's account: an S3 origin bucket may belong to another account
+        // than the distribution fetching it.
         account_id: match internal_caller.as_ref() {
-            Some(caller) => caller.acting_account().to_string(),
+            Some(caller) => {
+                internal_caller_account(caller, &detected.service, &path_segments, &config)
+            }
             None => caller_principal
                 .as_ref()
                 .map(|p| p.account_id.clone())
@@ -1432,6 +1435,29 @@ fn anonymous_s3_bucket(uri: &http::Uri, config: &DispatchConfig) -> Option<Strin
     let segment = uri.path().split('/').find(|s| !s.is_empty())?.to_string();
     let arn = fakecloud_aws::arn::Arn::s3(&segment).to_string();
     provider.resource_owner_account("s3", &arn).map(|_| segment)
+}
+
+/// The account an [`InternalCaller`] request works in: for S3, the owner of
+/// the addressed bucket (bucket names are global, and a bucket policy can
+/// grant a service acting for another account's resource); otherwise, or
+/// when the bucket does not exist, the account the caller acts for.
+fn internal_caller_account(
+    caller: &InternalCaller,
+    service: &str,
+    path_segments: &[String],
+    config: &DispatchConfig,
+) -> String {
+    let bucket_owner = (service == "s3")
+        .then(|| path_segments.first())
+        .flatten()
+        .and_then(|bucket| {
+            let arn = fakecloud_aws::arn::Arn::s3(bucket).to_string();
+            config
+                .resource_policy_provider
+                .as_ref()?
+                .resource_owner_account("s3", &arn)
+        });
+    bucket_owner.unwrap_or_else(|| caller.acting_account().to_string())
 }
 
 /// Authorize a request fakecloud makes in-process as an AWS-owned principal

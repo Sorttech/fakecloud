@@ -14,6 +14,7 @@
 
 mod helpers;
 
+use aws_credential_types::Credentials;
 use aws_sdk_cloudfront::types::{
     CloudFrontOriginAccessIdentityConfig, CookiePreference, DefaultCacheBehavior,
     DistributionConfig, ForwardedValues, Headers, ItemSelection, Origin, OriginAccessControlConfig,
@@ -414,4 +415,37 @@ async fn default_mode_serves_private_origins_with_or_without_oac() {
         assert_eq!(r.status(), 200, "{}", dist.id());
         assert_eq!(r.text().await.unwrap(), "PRIVATE");
     }
+}
+
+/// A distribution in one account reading a private bucket another account owns
+/// through an OAC: the bucket owner's policy grants the other account's
+/// distribution, and the fetch is served from the bucket's account, not the
+/// distribution's.
+#[tokio::test]
+async fn oac_reads_a_bucket_owned_by_another_account() {
+    let server = strict_server().await;
+    let s3 = server.s3_client().await;
+    private_bucket(&s3).await;
+
+    let (akid, secret) = server.create_admin("222222222222", "cdn-admin").await;
+    let cfg = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .endpoint_url(server.endpoint())
+        .region(aws_config::Region::new("us-east-1"))
+        .credentials_provider(Credentials::new(akid, secret, None, None, "cdn-account"))
+        .load()
+        .await;
+    let cf = aws_sdk_cloudfront::Client::new(&cfg);
+    let oac = create_oac(
+        &cf,
+        "oac-cross",
+        OriginAccessControlSigningBehaviors::Always,
+    )
+    .await;
+    let dist = create_distribution(&cf, Some(&oac), None).await;
+    assert!(dist.arn().contains(":222222222222:"), "{}", dist.arn());
+    put_policy(&s3, &oac_policy(dist.arn())).await;
+
+    let r = get_through(&server, &dist, "/index.html").await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.text().await.unwrap(), "PRIVATE");
 }

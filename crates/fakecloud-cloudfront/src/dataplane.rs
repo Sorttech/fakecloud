@@ -670,6 +670,21 @@ fn origin_auth(origin: &crate::model::Origin, ctx: &RouteContext<'_>) -> OriginA
     })
 }
 
+/// The origin-form request target (`/path?query`) of an assembled origin URL,
+/// percent-encoded the way an HTTP client sends it: `OriginPath` and a custom
+/// error `ResponsePagePath` are joined as configured, so they may hold bytes
+/// (a space, say) a request line cannot carry raw. `None` only for a URL no
+/// client could send.
+fn local_path_and_query(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let mut target = parsed.path().to_string();
+    if let Some(query) = parsed.query() {
+        target.push('?');
+        target.push_str(query);
+    }
+    Some(target)
+}
+
 /// Fetch `url` from an S3 origin this process serves, in-process through the
 /// rest of the middleware stack, as the identity `target.auth` selects for this
 /// viewer request. A signed request drops the viewer's `Authorization` header
@@ -684,11 +699,12 @@ async fn fetch_local(
     req_headers: &HeaderMap,
     body: &Bytes,
 ) -> Response {
-    let path_and_query = url
-        .parse::<http::Uri>()
-        .ok()
-        .and_then(|u| u.path_and_query().map(|p| p.to_string()))
-        .unwrap_or_else(|| "/".to_string());
+    let Some(path_and_query) = local_path_and_query(url) else {
+        return canned(
+            StatusCode::BAD_GATEWAY,
+            &format!("invalid origin URL: {url}"),
+        );
+    };
     let caller = target.auth.caller_for(req_headers).cloned();
     let mut builder = Request::builder()
         .method(method.clone())
@@ -1478,5 +1494,19 @@ mod tests {
         let always = OriginAuth::Always(cloudfront_caller());
         assert_eq!(always.caller_for(&viewer), Some(&cloudfront_caller()));
         assert_eq!(OriginAuth::Anonymous.caller_for(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn local_request_target_is_percent_encoded_not_dropped() {
+        // A custom error page path with a space is joined raw; the in-process
+        // fetch must request that object, not fall back to the bucket root.
+        assert_eq!(
+            local_path_and_query("http://127.0.0.1:4566/errors/not found.html").as_deref(),
+            Some("/errors/not%20found.html")
+        );
+        assert_eq!(
+            local_path_and_query("http://127.0.0.1:4566/prod/a.png?v=1").as_deref(),
+            Some("/prod/a.png?v=1")
+        );
     }
 }
