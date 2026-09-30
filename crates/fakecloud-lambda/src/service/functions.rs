@@ -26,21 +26,14 @@ impl LambdaService {
             ));
         }
 
-        // PassRole trust-policy check: the supplied execution role must
-        // have a trust policy that allows lambda.amazonaws.com to call
-        // sts:AssumeRole. Real AWS rejects with InvalidParameterValueException
-        // when the trust policy doesn't include the service principal.
-        if let Some(ref validator) = self.role_trust_validator {
-            if let Err(err) =
-                validator.validate(&req.account_id, &input.role, "lambda.amazonaws.com")
-            {
-                return Err(AwsServiceError::aws_error(
-                    StatusCode::BAD_REQUEST,
-                    "InvalidParameterValueException",
-                    err.to_string(),
-                ));
-            }
-        }
+        // PassRole: a role whose trust policy lets Lambda assume it, and (under
+        // IAM enforcement) in the caller's account.
+        super::validate_execution_role(
+            &req.account_id,
+            &input.role,
+            self.role_trust_validator.as_deref(),
+            self.iam_mode,
+        )?;
 
         let mut accounts = self.state.write();
         // Pre-resolve layer attachments before re-borrowing accounts mutably.
@@ -335,10 +328,22 @@ impl LambdaService {
             if let Some(list) = state.function_versions.get_mut(function_name) {
                 list.retain(|v| v != q);
             }
+            let live_arn = state
+                .functions
+                .get(function_name)
+                .map(|f| f.function_arn.clone());
+            drop(accounts);
+            // Stop the deleted version's warm instances: free ones now, busy
+            // ones once their in-flight invocation completes.
+            if let (Some(runtime), Some(live_arn)) = (&self.runtime, live_arn) {
+                let rt = runtime.clone();
+                let pool = rt.retire_version(&live_arn, q);
+                tokio::spawn(async move { rt.terminate_instances(pool).await });
+            }
             return Ok(AwsResponse::json(StatusCode::NO_CONTENT, ""));
         }
 
-        if state.functions.remove(function_name).is_none() {
+        let Some(removed) = state.functions.remove(function_name) else {
             return Err(AwsServiceError::aws_error(
                 StatusCode::NOT_FOUND,
                 "ResourceNotFoundException",
@@ -347,7 +352,7 @@ impl LambdaService {
                     function_arn(region, &account_id_owned, function_name)
                 ),
             ));
-        }
+        };
         // Drop all numbered versions + their snapshots so the function
         // is gone end-to-end (AWS deletes everything when no Qualifier
         // is supplied).
@@ -374,7 +379,7 @@ impl LambdaService {
         // function keeps its new container.
         if let Some(ref runtime) = self.runtime {
             let rt = runtime.clone();
-            let pool = rt.take_warm_instances(function_name);
+            let pool = rt.take_warm_instances(&removed.function_arn, None);
             tokio::spawn(async move { rt.terminate_instances(pool).await });
         }
 

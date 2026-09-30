@@ -7,7 +7,7 @@ pub(crate) mod service;
 pub(crate) mod state;
 pub(crate) mod workflows;
 
-pub use service::LambdaService;
+pub use service::{validate_execution_role, LambdaService};
 pub use state::{
     function_arn, layer_arn, qualified_function_arn, AttachedLayer, EventSourceMapping,
     FunctionAlias, FunctionUrlConfig, LambdaFunction, LambdaInvocation, LambdaSnapshot,

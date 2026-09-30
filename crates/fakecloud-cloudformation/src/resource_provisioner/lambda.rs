@@ -43,6 +43,7 @@ impl ResourceProvisioner {
             .unwrap_or_else(|| self.physical_name(resource));
 
         let cfg = parse_lambda_function_props(props)?;
+        self.validate_lambda_execution_role(&cfg.role)?;
         let function_arn =
             fakecloud_lambda::function_arn(&self.region, &self.account_id, &function_name);
 
@@ -169,6 +170,21 @@ impl ResourceProvisioner {
             .with("Version", "$LATEST"))
     }
 
+    /// The same execution-role checks `CreateFunction` runs: a role whose
+    /// trust policy lets Lambda assume it, in the stack's account under IAM
+    /// enforcement.
+    fn validate_lambda_execution_role(&self, role_arn: &str) -> Result<(), String> {
+        let validator =
+            fakecloud_iam::pass_role::IamRoleTrustValidator::new(self.iam_state.clone());
+        fakecloud_lambda::validate_execution_role(
+            &self.account_id,
+            role_arn,
+            Some(&validator),
+            self.iam_mode,
+        )
+        .map_err(|e| e.to_string())
+    }
+
     /// Apply a CFN template-driven update to an existing Lambda function.
     /// Mirrors `UpdateFunctionConfiguration` + `UpdateFunctionCode`:
     /// rewrite mutable configuration fields from the new template, re-hash
@@ -184,6 +200,7 @@ impl ResourceProvisioner {
         let props = &resource.properties;
         let function_name = existing.physical_id.clone();
         let cfg = parse_lambda_function_props(props)?;
+        self.validate_lambda_execution_role(&cfg.role)?;
 
         let new_code_zip = if cfg.code_zip.is_some() {
             cfg.code_zip.clone()

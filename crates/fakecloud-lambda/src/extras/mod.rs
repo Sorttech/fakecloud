@@ -373,6 +373,23 @@ impl LambdaService {
             Some(size) => Some(crate::service::validate_ephemeral_storage(size)?),
             None => None,
         };
+        let environment: Option<std::collections::BTreeMap<String, String>> =
+            body["Environment"]["Variables"].as_object().map(|env| {
+                env.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            });
+        if let Some(env) = &environment {
+            crate::service::validate_environment(env)?;
+        }
+        if let Some(role) = body["Role"].as_str() {
+            crate::service::validate_execution_role(
+                &req.account_id,
+                role,
+                self.role_trust_validator.as_deref(),
+                self.iam_mode,
+            )?;
+        }
         let mut accounts = self.state.write();
         // Pre-resolve layer attachments before re-borrowing accounts mutably
         // for the function. Layer ARNs may live in sibling accounts.
@@ -406,11 +423,8 @@ impl LambdaService {
         if let Some(rt) = body["Runtime"].as_str() {
             func.runtime = rt.to_string();
         }
-        if let Some(env) = body["Environment"]["Variables"].as_object() {
-            func.environment = env
-                .iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                .collect();
+        if let Some(env) = environment {
+            func.environment = env;
         }
         if let Some(mode) = body["TracingConfig"]["Mode"].as_str() {
             func.tracing_mode = Some(mode.to_string());

@@ -9,10 +9,10 @@
 
 use std::time::{Duration, Instant};
 
-use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::api::core::v1::{Pod, Secret};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Status;
-use kube::api::{Api, AttachParams, DeleteParams, ListParams, PostParams};
+use kube::api::{Api, AttachParams, DeleteParams, ListParams, Patch, PatchParams, PostParams};
 use kube::Client;
 use tokio::io::AsyncReadExt;
 
@@ -377,6 +377,72 @@ impl K8sClient {
             tracing::info!(service, reaped, "k8s reap_stale: removed orphan Pods");
         }
         reaped
+    }
+
+    /// Namespaced Secret API handle.
+    pub fn secrets(&self) -> Api<Secret> {
+        Api::namespaced(self.client.clone(), &self.namespace)
+    }
+
+    /// Create `secret`, replacing a same-named one left behind by a previous
+    /// process (delete-then-create, like [`create_pod`](Self::create_pod)).
+    pub async fn create_secret(&self, secret: &Secret) -> Result<(), K8sError> {
+        let name = secret
+            .metadata
+            .name
+            .clone()
+            .ok_or_else(|| K8sError::Other("secret has no metadata.name".into()))?;
+        let api = self.secrets();
+        let _ = api.delete(&name, &DeleteParams::default()).await;
+        api.create(&PostParams::default(), secret)
+            .await
+            .map(|_| ())
+            .map_err(K8sError::Kube)
+    }
+
+    /// Make the Pod `pod` the owner of Secret `secret`, so Kubernetes garbage
+    /// collection deletes the Secret along with the Pod however the Pod goes
+    /// away (teardown, a reaper, a manual `kubectl delete`). Best-effort:
+    /// explicit deletion on teardown still applies if this fails.
+    pub async fn adopt_secret(&self, secret: &str, pod: &str) {
+        let uid = match self.pods().get(pod).await {
+            Ok(p) => p.metadata.uid,
+            Err(e) => {
+                tracing::warn!(secret, pod, error = %e, "k8s adopt secret: get pod failed");
+                return;
+            }
+        };
+        let Some(uid) = uid else {
+            return;
+        };
+        let patch = serde_json::json!({
+            "metadata": {
+                "ownerReferences": [{
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "name": pod,
+                    "uid": uid,
+                }]
+            }
+        });
+        if let Err(e) = self
+            .secrets()
+            .patch(secret, &PatchParams::default(), &Patch::Merge(&patch))
+            .await
+        {
+            tracing::warn!(secret, pod, error = %e, "k8s adopt secret: patch failed");
+        }
+    }
+
+    /// Delete a Secret by name. Idempotent; a `404` is success and other
+    /// errors are logged, since teardown is best-effort.
+    pub async fn delete_secret(&self, name: &str) {
+        if let Err(e) = self.secrets().delete(name, &DeleteParams::default()).await {
+            if matches!(&e, kube::Error::Api(a) if a.code == 404) {
+                return;
+            }
+            tracing::warn!(secret = %name, namespace = %self.namespace, error = %e, "k8s delete secret failed");
+        }
     }
 
     /// Namespaced NetworkPolicy API handle.

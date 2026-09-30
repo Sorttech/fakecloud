@@ -20,8 +20,10 @@
 //! unauthenticated endpoint to roughly one live temp credential per role.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
+use fakecloud_core::auth::{SessionCredentialIssuer, SessionCredentials};
 use parking_lot::Mutex;
 
 use super::{
@@ -161,6 +163,25 @@ pub fn mint_container_credentials(
     role_arn: &str,
     duration: Duration,
 ) -> ContainerCredentials {
+    mint_session_credentials(
+        iam,
+        default_account_id,
+        role_arn,
+        CONTAINER_CREDENTIALS_SESSION_NAME,
+        duration,
+    )
+}
+
+/// [`mint_container_credentials`] with a caller-chosen role session name, for
+/// surfaces whose real counterpart names the session after the workload (a
+/// Lambda execution role's session is named after the function).
+pub fn mint_session_credentials(
+    iam: &SharedIamState,
+    default_account_id: &str,
+    role_arn: &str,
+    session_name: &str,
+    duration: Duration,
+) -> ContainerCredentials {
     let creds = StsCredentials::generate();
     let issued_at = Utc::now();
     let expiration = issued_at + duration;
@@ -168,7 +189,6 @@ pub fn mint_container_credentials(
     let account_id =
         extract_account_from_arn(role_arn).unwrap_or_else(|| default_account_id.to_string());
     let role_name = assumed_role_name(role_arn);
-    let session_name = CONTAINER_CREDENTIALS_SESSION_NAME;
     let assumed_role_arn = format_assumed_role_arn(partition, &account_id, role_name, session_name);
     let user_id = format!("{}:{}", deterministic_role_id(role_arn), session_name);
 
@@ -226,10 +246,72 @@ fn credential_registered(iam: &SharedIamState, creds: &ContainerCredentials) -> 
 /// Remove a minted container credential from IAM state (both maps). Idempotent
 /// -- a no-op if the key is already gone (e.g. after a reset).
 fn evict_container_credentials(iam: &SharedIamState, creds: &ContainerCredentials) {
-    let mut accounts = iam.write();
-    let state = accounts.get_or_create(&creds.account_id);
-    state.credential_identities.remove(&creds.access_key_id);
-    state.sts_temp_credentials.remove(&creds.access_key_id);
+    unregister_credentials(iam, &creds.account_id, &creds.access_key_id);
+}
+
+fn unregister_credentials(iam: &SharedIamState, account_id: &str, access_key_id: &str) {
+    // `get_mut`, not `get_or_create`: after a reset the account may be gone,
+    // and revoking must not bring it back.
+    if let Some(state) = iam.write().get_mut(account_id) {
+        state.credential_identities.remove(access_key_id);
+        state.sts_temp_credentials.remove(access_key_id);
+    }
+}
+
+impl From<ContainerCredentials> for SessionCredentials {
+    fn from(c: ContainerCredentials) -> Self {
+        Self {
+            access_key_id: c.access_key_id,
+            secret_access_key: c.secret_access_key,
+            session_token: c.session_token,
+            expiration: c.expiration,
+            account_id: c.account_id,
+        }
+    }
+}
+
+/// [`SessionCredentialIssuer`] over IAM state: every set it issues is minted
+/// and registered exactly like [`mint_session_credentials`], so the code it
+/// is handed to signs requests as the assumed role, and is unregistered again
+/// on [`SessionCredentialIssuer::revoke`].
+pub struct IamSessionCredentialIssuer {
+    iam: SharedIamState,
+    default_account_id: String,
+}
+
+impl IamSessionCredentialIssuer {
+    /// `default_account_id` registers sessions for role ARNs that carry no
+    /// account of their own.
+    pub fn shared(
+        iam: SharedIamState,
+        default_account_id: impl Into<String>,
+    ) -> Arc<dyn SessionCredentialIssuer> {
+        Arc::new(Self {
+            iam,
+            default_account_id: default_account_id.into(),
+        })
+    }
+}
+
+impl SessionCredentialIssuer for IamSessionCredentialIssuer {
+    fn issue(&self, role_arn: &str, session_name: &str, duration: Duration) -> SessionCredentials {
+        mint_session_credentials(
+            &self.iam,
+            &self.default_account_id,
+            role_arn,
+            session_name,
+            duration,
+        )
+        .into()
+    }
+
+    fn revoke(&self, credentials: &SessionCredentials) {
+        unregister_credentials(
+            &self.iam,
+            &credentials.account_id,
+            &credentials.access_key_id,
+        );
+    }
 }
 
 /// The live + recently-superseded credentials for one role.
@@ -548,5 +630,36 @@ mod tests {
         );
         let iso = minted.expiration_iso8601();
         assert!(iso.ends_with('Z') && iso.len() == 20, "{iso}");
+    }
+
+    #[test]
+    fn issued_session_is_named_after_the_caller_and_revocable() {
+        let iam = shared();
+        let issuer = IamSessionCredentialIssuer::shared(iam.clone(), "123456789012");
+        let creds = issuer.issue(
+            "arn:aws:iam::999999999999:role/service-role/exec",
+            "my-function",
+            Duration::hours(1),
+        );
+        assert_eq!(creds.account_id, "999999999999");
+
+        let resolver = IamCredentialResolver::new(iam.clone());
+        let resolved = resolver
+            .resolve(&creds.access_key_id)
+            .expect("issued key resolves");
+        assert_eq!(
+            resolved.principal.arn,
+            "arn:aws:sts::999999999999:assumed-role/exec/my-function"
+        );
+        assert_eq!(
+            resolved.session_token.as_deref(),
+            Some(creds.session_token.as_str())
+        );
+
+        issuer.revoke(&creds);
+        assert!(resolver.resolve(&creds.access_key_id).is_none());
+        assert_eq!(temp_cred_count(&iam, "999999999999"), 0);
+        // Revoking twice is a no-op.
+        issuer.revoke(&creds);
     }
 }

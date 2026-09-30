@@ -58,7 +58,17 @@ impl ResetState {
     pub(crate) fn reset_service(&self, service: &str) -> Result<(), String> {
         match service {
             "iam" | "sts" => {
+                // The reset drops the execution-role sessions warm Lambda
+                // instances hold: stop handing them invocations in the same
+                // step, then tear the free ones down in the background.
+                if let Some(ref rt) = self.container_runtime {
+                    rt.mark_credentials_revoked(None);
+                }
                 self.iam.write().reset();
+                if let Some(ref rt) = self.container_runtime {
+                    let rt = rt.clone();
+                    tokio::spawn(async move { rt.retire_released().await });
+                }
             }
             "sqs" => {
                 self.sqs.write().reset();
@@ -235,10 +245,19 @@ impl ResetState {
     ) -> Result<(), String> {
         match service {
             "iam" | "sts" => {
-                let mut mas = self.iam.write();
-                let region = mas.region().to_string();
-                if let Some(state) = mas.get_mut(account_id) {
-                    state.reset(&region);
+                if let Some(ref rt) = self.container_runtime {
+                    rt.mark_credentials_revoked(Some(account_id));
+                }
+                {
+                    let mut mas = self.iam.write();
+                    let region = mas.region().to_string();
+                    if let Some(state) = mas.get_mut(account_id) {
+                        state.reset(&region);
+                    }
+                }
+                if let Some(ref rt) = self.container_runtime {
+                    let rt = rt.clone();
+                    tokio::spawn(async move { rt.retire_released().await });
                 }
             }
             "sqs" => {

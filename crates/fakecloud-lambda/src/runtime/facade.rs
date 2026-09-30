@@ -5,10 +5,12 @@
 //! whatever [`LambdaBackend`] it was constructed with.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
+use fakecloud_core::auth::{SessionCredentialIssuer, SessionCredentials};
 use parking_lot::RwLock;
 use sha2::{Digest, Sha256};
 
@@ -22,11 +24,20 @@ use crate::state::LambdaFunction;
 pub(crate) struct WarmEntry {
     instance: WarmInstance,
     last_used: RwLock<Instant>,
-    /// Combined fingerprint of the function's code SHA-256 plus the
-    /// SHA-256 of every attached layer's ZIP bytes, joined in attach
+    /// Combined fingerprint of the function's code SHA-256, the launch
+    /// configuration baked into the instance (see [`launch_config`]), and
+    /// the SHA-256 of every attached layer's ZIP bytes, joined in attach
     /// order. Layers mutate `/opt`, so a layer change invalidates the
     /// warm instance even when the function code is unchanged.
     deploy_id: String,
+    /// The execution role's session credentials exported into this
+    /// instance's environment; revoked when the instance is torn down.
+    credentials: Option<SessionCredentials>,
+    /// Set when the instance must not take another invocation (its
+    /// credentials were dropped by an IAM reset, or its version deleted). A
+    /// busy instance finishes its current invocation and is retired once
+    /// free.
+    retiring: AtomicBool,
     /// Held for the duration of a single invocation against this
     /// instance. The AWS Runtime Interface Emulator (and real Lambda)
     /// handles exactly one event per execution environment at a time;
@@ -56,6 +67,94 @@ const MAX_INVOKE_ATTEMPTS: u32 = 5;
 /// so the state-machine retry can succeed within its window.
 const REACHABILITY_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 
+/// Lifetime of the execution-role session minted for each instance: the
+/// longest an IAM role session can last.
+const EXECUTION_CREDENTIALS_LIFETIME: Duration = Duration::from_secs(12 * 60 * 60);
+
+/// Instances stop taking new invocations this long before their session
+/// expires: Lambda's maximum function timeout plus a minute, so an
+/// invocation never runs past its credentials.
+const INVOCATION_HEADROOM: Duration = Duration::from_secs(16 * 60);
+
+/// Key of a function's warm pool: its qualified ARN (`<function-arn>:<version>`).
+/// Accounts, regions and versions never share or evict each other's instances.
+fn pool_key(func: &LambdaFunction) -> String {
+    format!("{}:{}", func.function_arn, func.version)
+}
+
+/// Function name inside a pool key
+/// (`arn:<p>:lambda:<region>:<account>:function:<name>:<version>`).
+fn pool_key_function_name(key: &str) -> &str {
+    key.split(':').nth(6).unwrap_or(key)
+}
+
+/// Account inside a pool key.
+fn pool_key_account(key: &str) -> &str {
+    fakecloud_aws::arn::account_of(key).unwrap_or_default()
+}
+
+/// Whether `key` is a pool of the function whose unqualified ARN is
+/// `function_arn` (any version).
+fn pool_key_belongs_to(key: &str, function_arn: &str) -> bool {
+    key.strip_prefix(function_arn)
+        .is_some_and(|rest| rest.starts_with(':'))
+}
+
+/// The role the execution session is minted for: the function's role, in the
+/// function's account. The two only differ when IAM is not strict and a
+/// template names another account's role (commonly another emulator's
+/// default `000000000000`); minting there would send the function's SDK calls
+/// to an empty account instead of the one holding its resources.
+fn session_role_arn(role_arn: &str, function_arn: &str) -> String {
+    let (Some(function_account), Some(role_account)) = (
+        fakecloud_aws::arn::account_of(function_arn),
+        fakecloud_aws::arn::account_of(role_arn),
+    ) else {
+        return role_arn.to_string();
+    };
+    let mut parts: Vec<&str> = role_arn.split(':').collect();
+    if role_account != function_account {
+        parts[4] = function_account;
+    }
+    parts.join(":")
+}
+
+/// Whether `entry` can take a new invocation of `deploy_id`: same code +
+/// launch configuration, not being retired, and credentials that outlive a
+/// full invocation (judged from their own expiration, not the launch time).
+/// Cheap: no locks beyond the entry's own fields.
+fn is_current(entry: &WarmEntry, deploy_id: &str) -> bool {
+    let headroom = chrono::Duration::from_std(INVOCATION_HEADROOM).expect("headroom fits");
+    entry.deploy_id == deploy_id
+        && !entry.retiring.load(Ordering::Acquire)
+        && entry
+            .credentials
+            .as_ref()
+            .is_none_or(|c| c.expiration - chrono::Utc::now() > headroom)
+}
+
+/// Execution-role credentials minted for an instance that is still being
+/// launched. Revoked on drop (a failed launch, or the launching future being
+/// cancelled) unless [`disarm`](Self::disarm)ed once the instance is pooled.
+struct PendingCredentials<'a> {
+    issuer: Option<&'a Arc<dyn SessionCredentialIssuer>>,
+    credentials: Option<SessionCredentials>,
+}
+
+impl PendingCredentials<'_> {
+    fn disarm(mut self) {
+        self.credentials = None;
+    }
+}
+
+impl Drop for PendingCredentials<'_> {
+    fn drop(&mut self) {
+        if let (Some(issuer), Some(creds)) = (self.issuer, &self.credentials) {
+            issuer.revoke(creds);
+        }
+    }
+}
+
 /// A reserved invocation slot: a warm instance plus the held busy guard
 /// that grants exclusive use of it until the guard drops.
 struct Slot {
@@ -73,15 +172,45 @@ struct Slot {
 /// `fakecloud-deploy-id` Pod label; standard base64's `/` would grow an
 /// extra URL path segment, break the axum route match, and wedge the Pod
 /// in a cold-start loop for ~49% of deploys (issue #1643).
-fn deploy_id_for(func: &LambdaFunction, layers: &[Vec<u8>]) -> String {
-    deploy_id_from(&func.code_sha256, layers)
+///
+/// `with_tags` folds the function's tags in, for backends whose instances
+/// are shaped by them (k8s scheduling); elsewhere TagResource must not
+/// cold-start the function.
+fn deploy_id_for(func: &LambdaFunction, layers: &[Vec<u8>], with_tags: bool) -> String {
+    deploy_id_from(&func.code_sha256, &launch_config(func, with_tags), layers)
+}
+
+/// The function configuration an instance is started with: everything that
+/// ends up in its environment, command, sandbox limits, or (with `with_tags`)
+/// scheduling. A change to any of it must start a fresh instance rather than
+/// reuse one configured for something else. Identity (account, version) is
+/// the pool key, not part of this.
+fn launch_config(func: &LambdaFunction, with_tags: bool) -> String {
+    serde_json::json!([
+        func.role,
+        func.runtime,
+        func.handler,
+        func.timeout,
+        func.memory_size,
+        func.environment,
+        func.package_type,
+        func.image_uri,
+        func.image_config,
+        func.ephemeral_storage_size,
+        func.logging_config,
+        func.architectures,
+        with_tags.then_some(&func.tags),
+    ])
+    .to_string()
 }
 
 /// Pure core of [`deploy_id_for`], split out so the URL-path-safety
 /// invariant can be tested without constructing a full `LambdaFunction`.
-fn deploy_id_from(code_sha256: &str, layers: &[Vec<u8>]) -> String {
+fn deploy_id_from(code_sha256: &str, launch_config: &str, layers: &[Vec<u8>]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(code_sha256.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(launch_config.as_bytes());
     for bytes in layers {
         let mut layer_hasher = Sha256::new();
         layer_hasher.update(bytes);
@@ -115,6 +244,9 @@ pub struct LambdaRuntime {
     starting: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Cap on warm instances per function.
     max_concurrency: usize,
+    /// Mints the execution-role credentials each instance is started with.
+    /// Unset (no credentials exported) until the server wires IAM in.
+    credential_issuer: OnceLock<Arc<dyn SessionCredentialIssuer>>,
 }
 
 impl LambdaRuntime {
@@ -132,7 +264,98 @@ impl LambdaRuntime {
             instances: RwLock::new(HashMap::new()),
             starting: RwLock::new(HashMap::new()),
             max_concurrency,
+            credential_issuer: OnceLock::new(),
         }
+    }
+
+    /// Give instances execution-role credentials: each launch mints a
+    /// session for the function's role (named after the function, as on
+    /// AWS) and exports it into the instance environment. Set once at
+    /// server startup; later calls are ignored.
+    pub fn set_credential_issuer(&self, issuer: Arc<dyn SessionCredentialIssuer>) {
+        let _ = self.credential_issuer.set(issuer);
+    }
+
+    fn issue_credentials(&self, func: &LambdaFunction) -> Option<SessionCredentials> {
+        let issuer = self.credential_issuer.get()?;
+        if func.role.is_empty() {
+            return None;
+        }
+        let lifetime = chrono::Duration::from_std(EXECUTION_CREDENTIALS_LIFETIME)
+            .expect("session lifetime fits chrono::Duration");
+        let role = session_role_arn(&func.role, &func.function_arn);
+        Some(issuer.issue(&role, &func.function_name, lifetime))
+    }
+
+    /// Tear down one instance and revoke the credentials it was given.
+    async fn retire(&self, entry: &WarmEntry) {
+        self.backend.terminate(&entry.instance.handle).await;
+        self.revoke(entry.credentials.as_ref());
+    }
+
+    fn revoke(&self, credentials: Option<&SessionCredentials>) {
+        if let (Some(issuer), Some(creds)) = (self.credential_issuer.get(), credentials) {
+            issuer.revoke(creds);
+        }
+    }
+
+    /// Mark every pooled instance matching `pred` as retiring so it takes no
+    /// further invocation. With `detach_free`, the free ones are also removed
+    /// from the pool and returned for teardown; busy ones always stay until
+    /// released (then the idle sweep or the next launch retires them).
+    fn mark_retiring(
+        &self,
+        pred: impl Fn(&str, &WarmEntry) -> bool,
+        detach_free: bool,
+    ) -> Vec<Arc<WarmEntry>> {
+        let mut map = self.instances.write();
+        let mut detached = Vec::new();
+        for (key, pool) in map.iter_mut() {
+            pool.retain(|e| {
+                if !pred(key, e) {
+                    return true;
+                }
+                e.retiring.store(true, Ordering::Release);
+                if detach_free && e.busy.try_lock().is_ok() {
+                    detached.push(e.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        map.retain(|_, pool| !pool.is_empty());
+        detached
+    }
+
+    /// Synchronously stop handing invocations to every instance holding
+    /// credentials registered in `account_id` (all accounts when `None`).
+    /// Called in step with an IAM reset that drops those credentials, so no
+    /// invocation can start with them afterwards; tear the instances down
+    /// with [`Self::retire_released`].
+    pub fn mark_credentials_revoked(&self, account_id: Option<&str>) {
+        self.mark_retiring(
+            |_, e| {
+                e.credentials
+                    .as_ref()
+                    .is_some_and(|c| account_id.is_none_or(|a| c.account_id == a))
+            },
+            false,
+        );
+    }
+
+    /// Retire every free instance already marked retiring.
+    pub async fn retire_released(&self) {
+        let free = self.mark_retiring(|_, e| e.retiring.load(Ordering::Acquire), true);
+        self.terminate_instances(free).await;
+    }
+
+    /// DeleteFunction with a Qualifier: stop the version's instances without
+    /// cutting off an in-flight invocation. Free instances are detached and
+    /// returned for teardown; busy ones are marked retiring and go once free.
+    pub(crate) fn retire_version(&self, function_arn: &str, version: &str) -> Vec<Arc<WarmEntry>> {
+        let key = format!("{function_arn}:{version}");
+        self.mark_retiring(|k, _| k == key, true)
     }
 
     /// Auto-detect Docker or Podman. Returns `None` if neither is available.
@@ -257,7 +480,7 @@ impl LambdaRuntime {
             {
                 let entry = slot.entry.clone();
                 drop(slot);
-                self.evict_entry(&func.function_name, &entry).await;
+                self.evict_entry(&pool_key(func), &entry).await;
                 if attempt < MAX_INVOKE_ATTEMPTS {
                     tracing::warn!(
                         function = %func.function_name,
@@ -305,7 +528,7 @@ impl LambdaRuntime {
                             // function already ran and may have side effects.
                             let entry = slot.entry.clone();
                             drop(slot);
-                            self.evict_entry(&func.function_name, &entry).await;
+                            self.evict_entry(&pool_key(func), &entry).await;
                             Err(RuntimeError::InvocationFailed(e.to_string()))
                         }
                     };
@@ -321,7 +544,7 @@ impl LambdaRuntime {
                     // duplicate invoke.
                     let entry = slot.entry.clone();
                     drop(slot);
-                    self.evict_entry(&func.function_name, &entry).await;
+                    self.evict_entry(&pool_key(func), &entry).await;
                     if attempt < MAX_INVOKE_ATTEMPTS && e.is_connect() {
                         tracing::warn!(
                             function = %func.function_name,
@@ -367,7 +590,7 @@ impl LambdaRuntime {
             {
                 let entry = slot.entry.clone();
                 drop(slot);
-                self.evict_entry(&func.function_name, &entry).await;
+                self.evict_entry(&pool_key(func), &entry).await;
                 if attempt < MAX_INVOKE_ATTEMPTS {
                     continue;
                 }
@@ -405,7 +628,7 @@ impl LambdaRuntime {
                     // half-run handler isn't invoked twice.
                     let entry = slot.entry.clone();
                     drop(slot);
-                    self.evict_entry(&func.function_name, &entry).await;
+                    self.evict_entry(&pool_key(func), &entry).await;
                     if attempt < MAX_INVOKE_ATTEMPTS && e.is_connect() {
                         continue;
                     }
@@ -434,106 +657,144 @@ impl LambdaRuntime {
             return Err(RuntimeError::NoCodeZip(func.function_name.clone()));
         }
 
-        let deploy_id = deploy_id_for(func, layers);
+        let deploy_id = deploy_id_for(func, layers, self.backend.launch_uses_tags());
+        let key = pool_key(func);
 
-        // (1) Fast path: a free instance already running the right deploy.
-        if let Some(slot) = self.try_take_free(&func.function_name, &deploy_id) {
-            return Ok(slot);
-        }
+        loop {
+            // (1) Fast path: a free instance already running the right deploy.
+            if let Some(slot) = self.try_take_free(&key, &deploy_id) {
+                return Ok(slot);
+            }
 
-        // Serialize launch decisions per function so a burst of cold
-        // invokes doesn't each push the pool past the cap.
-        let startup_lock = {
-            let mut starting = self.starting.write();
-            starting
-                .entry(func.function_name.clone())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                .clone()
-        };
-        let startup_guard = startup_lock.lock().await;
+            // Serialize launch decisions per pool so a burst of cold
+            // invokes doesn't each push the pool past the cap.
+            let startup_lock = {
+                let mut starting = self.starting.write();
+                starting
+                    .entry(key.clone())
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                    .clone()
+            };
+            let startup_guard = startup_lock.lock().await;
 
-        // Re-check under the startup lock — another task may have freed or
-        // launched an instance while we waited.
-        if let Some(slot) = self.try_take_free(&func.function_name, &deploy_id) {
-            return Ok(slot);
-        }
+            // Re-check under the startup lock: another task may have freed or
+            // launched an instance while we waited.
+            if let Some(slot) = self.try_take_free(&key, &deploy_id) {
+                return Ok(slot);
+            }
 
-        // Tear down any instances left over from a previous deploy.
-        self.evict_stale_deploy(&func.function_name, &deploy_id)
-            .await;
+            // Tear down free instances left over from a previous deploy.
+            self.evict_stale_deploy(&key, &deploy_id).await;
 
-        let pool_len = self
-            .instances
-            .read()
-            .get(&func.function_name)
-            .map_or(0, |v| v.len());
-
-        // (2) Room to grow: launch a fresh instance and reserve it.
-        if pool_len < self.max_concurrency {
-            let instance = self
-                .backend
-                .launch(func, func.code_zip.as_deref(), layers, &deploy_id)
-                .await?;
-            let entry = Arc::new(WarmEntry {
-                instance,
-                last_used: RwLock::new(Instant::now()),
-                deploy_id,
-                busy: Arc::new(tokio::sync::Mutex::new(())),
+            // Size against current instances only: stale ones still busy
+            // finishing an invocation are on their way out.
+            let current_len = self.instances.read().get(&key).map_or(0, |pool| {
+                pool.iter().filter(|e| is_current(e, &deploy_id)).count()
             });
-            let guard = entry
-                .busy
-                .clone()
-                .try_lock_owned()
-                .expect("freshly created busy lock is uncontended");
-            self.instances
-                .write()
-                .entry(func.function_name.clone())
-                .or_default()
-                .push(entry.clone());
-            return Ok(Slot { entry, guard });
-        }
 
-        // (3) At capacity: release the startup lock and wait for whichever
-        // current instance frees up *first*. Racing every instance's lock
-        // (rather than blocking on a fixed one) avoids convoying every
-        // queued caller onto pool[0] while a different instance goes idle.
-        drop(startup_guard);
-        let candidates: Vec<Arc<WarmEntry>> = {
-            let map = self.instances.read();
-            map.get(&func.function_name)
-                .map(|pool| {
-                    pool.iter()
-                        .filter(|e| e.deploy_id == deploy_id)
-                        .cloned()
-                        .collect()
+            // (2) Room to grow: launch a fresh instance and reserve it.
+            if current_len < self.max_concurrency {
+                return self.launch_slot(func, layers, &key, deploy_id).await;
+            }
+
+            // (3) At capacity: release the startup lock and wait for whichever
+            // current instance frees up *first*. Racing every instance's lock
+            // (rather than blocking on a fixed one) avoids convoying every
+            // queued caller onto pool[0] while a different instance goes idle.
+            drop(startup_guard);
+            let candidates: Vec<Arc<WarmEntry>> = {
+                let map = self.instances.read();
+                map.get(&key)
+                    .map(|pool| {
+                        pool.iter()
+                            .filter(|e| is_current(e, &deploy_id))
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            if candidates.is_empty() {
+                // Every instance went away while we sized the pool; start over.
+                continue;
+            }
+            let waiters = candidates.into_iter().map(|entry| {
+                Box::pin(async move {
+                    let guard = entry.busy.clone().lock_owned().await;
+                    Slot { entry, guard }
                 })
-                .unwrap_or_default()
-        };
-        if candidates.is_empty() {
-            return Err(RuntimeError::InvocationFailed(format!(
-                "no warm instance available for {}",
-                func.function_name
-            )));
+            });
+            let (slot, _idx, _rest) = futures_util::future::select_all(waiters).await;
+            // The instance may have been retired or evicted while we waited.
+            if !is_current(&slot.entry, &deploy_id) || !self.in_pool(&key, &slot.entry) {
+                continue;
+            }
+            *slot.entry.last_used.write() = Instant::now();
+            return Ok(slot);
         }
-        let waiters = candidates.into_iter().map(|entry| {
-            Box::pin(async move {
-                let guard = entry.busy.clone().lock_owned().await;
-                Slot { entry, guard }
-            })
+    }
+
+    /// Launch a fresh instance for `func`, with freshly minted execution-role
+    /// credentials, and reserve it for the caller.
+    async fn launch_slot(
+        &self,
+        func: &LambdaFunction,
+        layers: &[Vec<u8>],
+        key: &str,
+        deploy_id: String,
+    ) -> Result<Slot, RuntimeError> {
+        let pending = PendingCredentials {
+            issuer: self.credential_issuer.get(),
+            credentials: self.issue_credentials(func),
+        };
+        let instance = self
+            .backend
+            .launch(
+                func,
+                func.code_zip.as_deref(),
+                layers,
+                &deploy_id,
+                pending.credentials.as_ref(),
+            )
+            .await?;
+        let entry = Arc::new(WarmEntry {
+            instance,
+            last_used: RwLock::new(Instant::now()),
+            deploy_id,
+            credentials: pending.credentials.clone(),
+            retiring: AtomicBool::new(false),
+            busy: Arc::new(tokio::sync::Mutex::new(())),
         });
-        let (slot, _idx, _rest) = futures_util::future::select_all(waiters).await;
-        *slot.entry.last_used.write() = Instant::now();
-        Ok(slot)
+        let guard = entry
+            .busy
+            .clone()
+            .try_lock_owned()
+            .expect("freshly created busy lock is uncontended");
+        self.instances
+            .write()
+            .entry(key.to_string())
+            .or_default()
+            .push(entry.clone());
+        // Pooled: the entry owns the credentials now and revokes them on
+        // retirement.
+        pending.disarm();
+        Ok(Slot { entry, guard })
+    }
+
+    fn in_pool(&self, key: &str, entry: &Arc<WarmEntry>) -> bool {
+        self.instances
+            .read()
+            .get(key)
+            .is_some_and(|pool| pool.iter().any(|e| Arc::ptr_eq(e, entry)))
     }
 
     /// Try to reserve a free, current-deploy instance without launching.
     /// Returns `None` if every matching instance is busy (or there are
     /// none).
-    fn try_take_free(&self, function_name: &str, deploy_id: &str) -> Option<Slot> {
+    fn try_take_free(&self, key: &str, deploy_id: &str) -> Option<Slot> {
         let map = self.instances.read();
-        let pool = map.get(function_name)?;
+        let pool = map.get(key)?;
         for entry in pool {
-            if entry.deploy_id != deploy_id {
+            if !is_current(entry, deploy_id) {
                 continue;
             }
             if let Ok(guard) = entry.busy.clone().try_lock_owned() {
@@ -549,17 +810,17 @@ impl LambdaRuntime {
 
     /// Remove one specific instance from a function's pool and terminate
     /// it. Used when an invocation finds the instance unreachable.
-    async fn evict_entry(&self, function_name: &str, target: &Arc<WarmEntry>) {
+    async fn evict_entry(&self, key: &str, target: &Arc<WarmEntry>) {
         let removed = {
             let mut map = self.instances.write();
-            match map.get_mut(function_name) {
+            match map.get_mut(key) {
                 Some(pool) => {
                     let removed = pool
                         .iter()
                         .position(|e| Arc::ptr_eq(e, target))
                         .map(|pos| pool.remove(pos));
                     if pool.is_empty() {
-                        map.remove(function_name);
+                        map.remove(key);
                     }
                     removed
                 }
@@ -568,24 +829,26 @@ impl LambdaRuntime {
         };
         if let Some(entry) = removed {
             tracing::info!(
-                function = %function_name,
+                pool = %key,
                 handle = ?entry.instance.handle,
                 "evicting unreachable Lambda runtime instance"
             );
-            self.backend.terminate(&entry.instance.handle).await;
+            self.retire(&entry).await;
         }
     }
 
-    /// Tear down every instance in a function's pool whose `deploy_id`
-    /// no longer matches the current code+layers fingerprint.
-    async fn evict_stale_deploy(&self, function_name: &str, deploy_id: &str) {
+    /// Tear down every *free* instance in a pool that can no longer take an
+    /// invocation of the current deploy (see [`is_current`]). A busy one is
+    /// mid-invocation and is never cut off: it is left in place, takes no
+    /// new work, and goes on a later sweep once free.
+    async fn evict_stale_deploy(&self, key: &str, deploy_id: &str) {
         let stale: Vec<Arc<WarmEntry>> = {
             let mut map = self.instances.write();
-            match map.get_mut(function_name) {
+            match map.get_mut(key) {
                 Some(pool) => {
                     let mut stale = Vec::new();
                     pool.retain(|e| {
-                        if e.deploy_id == deploy_id {
+                        if is_current(e, deploy_id) || e.busy.try_lock().is_err() {
                             true
                         } else {
                             stale.push(e.clone());
@@ -593,7 +856,7 @@ impl LambdaRuntime {
                         }
                     });
                     if pool.is_empty() {
-                        map.remove(function_name);
+                        map.remove(key);
                     }
                     stale
                 }
@@ -602,11 +865,11 @@ impl LambdaRuntime {
         };
         for entry in stale {
             tracing::info!(
-                function = %function_name,
+                pool = %key,
                 handle = ?entry.instance.handle,
                 "stopping stale-deploy Lambda runtime instance"
             );
-            self.backend.terminate(&entry.instance.handle).await;
+            self.retire(&entry).await;
         }
     }
 
@@ -617,11 +880,27 @@ impl LambdaRuntime {
     /// identically) is not reaped by the deferred stop. Synchronous so the
     /// caller can take the snapshot while still ordered before any recreate
     /// (bug-hunt 2026-06-13, finding 4.2).
-    pub(crate) fn take_warm_instances(&self, function_name: &str) -> Vec<Arc<WarmEntry>> {
-        self.instances
-            .write()
-            .remove(function_name)
-            .unwrap_or_default()
+    ///
+    /// `function_arn` is the unqualified function ARN; `version` limits the
+    /// snapshot to one version's pool (DeleteFunction with a Qualifier),
+    /// `None` takes every version's.
+    pub(crate) fn take_warm_instances(
+        &self,
+        function_arn: &str,
+        version: Option<&str>,
+    ) -> Vec<Arc<WarmEntry>> {
+        let mut map = self.instances.write();
+        let keys: Vec<String> = map
+            .keys()
+            .filter(|k| match version {
+                Some(v) => k.as_str() == format!("{function_arn}:{v}"),
+                None => pool_key_belongs_to(k, function_arn),
+            })
+            .cloned()
+            .collect();
+        keys.into_iter()
+            .flat_map(|k| map.remove(&k).unwrap_or_default())
+            .collect()
     }
 
     /// Terminate a previously-snapshotted set of warm instances. Pairs with
@@ -632,13 +911,14 @@ impl LambdaRuntime {
                 handle = ?entry.instance.handle,
                 "stopping Lambda runtime instance"
             );
-            self.backend.terminate(&entry.instance.handle).await;
+            self.retire(&entry).await;
         }
     }
 
-    /// Stop and remove every warm instance for a specific function.
-    pub async fn stop_container(&self, function_name: &str) {
-        let pool = self.take_warm_instances(function_name);
+    /// Stop and remove every warm instance (all versions) of the function
+    /// with unqualified ARN `function_arn`.
+    pub async fn stop_container(&self, function_arn: &str) {
+        let pool = self.take_warm_instances(function_arn, None);
         self.terminate_instances(pool).await;
     }
 
@@ -653,7 +933,7 @@ impl LambdaRuntime {
                     handle = ?entry.instance.handle,
                     "stopping Lambda runtime instance (cleanup)"
                 );
-                self.backend.terminate(&entry.instance.handle).await;
+                self.retire(&entry).await;
             }
         }
     }
@@ -668,10 +948,12 @@ impl LambdaRuntime {
         let entries = self.instances.read();
         let accounts = lambda_state.read();
         let mut rows = Vec::new();
-        for (name, pool) in entries.iter() {
+        for (key, pool) in entries.iter() {
+            let name = pool_key_function_name(key);
             let runtime = accounts
-                .iter()
-                .find_map(|(_, state)| state.functions.get(name).map(|f| f.runtime.clone()))
+                .get(pool_key_account(key))
+                .and_then(|state| state.functions.get(name))
+                .map(|f| f.runtime.clone())
                 .unwrap_or_default();
             for entry in pool {
                 let idle_secs = entry.last_used.read().elapsed().as_secs();
@@ -700,14 +982,21 @@ impl LambdaRuntime {
         rows
     }
 
-    /// Evict (stop and remove) every warm instance for a specific
-    /// function. Returns true if at least one instance was evicted.
+    /// Evict (stop and remove) every warm instance of every function named
+    /// `function_name` (any account, any version). Returns true if at least
+    /// one instance was evicted.
     pub async fn evict_container(&self, function_name: &str) -> bool {
-        let pool = self
-            .instances
-            .write()
-            .remove(function_name)
-            .unwrap_or_default();
+        let pool: Vec<Arc<WarmEntry>> = {
+            let mut map = self.instances.write();
+            let keys: Vec<String> = map
+                .keys()
+                .filter(|k| pool_key_function_name(k) == function_name)
+                .cloned()
+                .collect();
+            keys.into_iter()
+                .flat_map(|k| map.remove(&k).unwrap_or_default())
+                .collect()
+        };
         let found = !pool.is_empty();
         for entry in pool {
             tracing::info!(
@@ -715,7 +1004,7 @@ impl LambdaRuntime {
                 handle = ?entry.instance.handle,
                 "evicting Lambda runtime instance via simulation API"
             );
-            self.backend.terminate(&entry.instance.handle).await;
+            self.retire(&entry).await;
         }
         found
     }
@@ -740,7 +1029,8 @@ impl LambdaRuntime {
             for (name, pool) in map.iter_mut() {
                 let mut i = 0;
                 while i < pool.len() {
-                    let idle = pool[i].last_used.read().elapsed() > ttl;
+                    let idle = pool[i].last_used.read().elapsed() > ttl
+                        || pool[i].retiring.load(Ordering::Acquire);
                     let free = pool[i].busy.try_lock().is_ok();
                     if idle && free {
                         out.push((name.clone(), pool.remove(i)));
@@ -754,7 +1044,7 @@ impl LambdaRuntime {
         };
         for (name, entry) in expired {
             tracing::info!(function = %name, "stopping idle Lambda runtime instance");
-            self.backend.terminate(&entry.instance.handle).await;
+            self.retire(&entry).await;
         }
     }
 }
@@ -779,7 +1069,7 @@ mod tests {
             } else {
                 vec![]
             };
-            let id = deploy_id_from(&code_sha256, &layers);
+            let id = deploy_id_from(&code_sha256, "{}", &layers);
             assert!(
                 !id.contains('/') && !id.contains('+') && !id.contains('='),
                 "deploy id {id:?} (seed {i}) is not URL-path-safe"
@@ -792,11 +1082,12 @@ mod tests {
     #[test]
     fn deploy_id_is_stable() {
         let layers = vec![b"layer-a".to_vec(), b"layer-b".to_vec()];
-        let a = deploy_id_from("abc123", &layers);
-        let b = deploy_id_from("abc123", &layers);
+        let a = deploy_id_from("abc123", "cfg", &layers);
+        let b = deploy_id_from("abc123", "cfg", &layers);
         assert_eq!(a, b);
-        assert_ne!(a, deploy_id_from("abc124", &layers));
-        assert_ne!(a, deploy_id_from("abc123", &[]));
+        assert_ne!(a, deploy_id_from("abc124", "cfg", &layers));
+        assert_ne!(a, deploy_id_from("abc123", "cfg", &[]));
+        assert_ne!(a, deploy_id_from("abc123", "cfg2", &layers));
     }
 
     // ---- warm-pool concurrency + eviction (issue #1644) ----
@@ -804,6 +1095,7 @@ mod tests {
     use super::LambdaRuntime;
     use crate::runtime::backend::{BackendHandle, LambdaBackend, RuntimeError, WarmInstance};
     use crate::state::LambdaFunction;
+    use fakecloud_core::auth::{SessionCredentialIssuer, SessionCredentials};
     use parking_lot::RwLock;
     use std::collections::{HashMap, VecDeque};
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
@@ -819,6 +1111,8 @@ mod tests {
         default_endpoint: String,
         launches: AtomicUsize,
         terminates: AtomicUsize,
+        /// Access key id of the credentials each launch was handed.
+        launched_with: StdMutex<Vec<Option<String>>>,
     }
 
     impl CountingBackend {
@@ -828,6 +1122,7 @@ mod tests {
                 default_endpoint: default_endpoint.into(),
                 launches: AtomicUsize::new(0),
                 terminates: AtomicUsize::new(0),
+                launched_with: StdMutex::new(Vec::new()),
             })
         }
         fn with_queue(default_endpoint: impl Into<String>, queue: Vec<String>) -> Arc<Self> {
@@ -836,6 +1131,7 @@ mod tests {
                 default_endpoint: default_endpoint.into(),
                 launches: AtomicUsize::new(0),
                 terminates: AtomicUsize::new(0),
+                launched_with: StdMutex::new(Vec::new()),
             })
         }
     }
@@ -851,7 +1147,12 @@ mod tests {
             _code_zip: Option<&[u8]>,
             _layers: &[Vec<u8>],
             _deploy_id: &str,
+            credentials: Option<&SessionCredentials>,
         ) -> Result<WarmInstance, RuntimeError> {
+            self.launched_with
+                .lock()
+                .unwrap()
+                .push(credentials.map(|c| c.access_key_id.clone()));
             let n = self.launches.fetch_add(1, SeqCst);
             let endpoint = self
                 .endpoints
@@ -921,7 +1222,16 @@ mod tests {
             instances: RwLock::new(HashMap::new()),
             starting: RwLock::new(HashMap::new()),
             max_concurrency,
+            credential_issuer: std::sync::OnceLock::new(),
         })
+    }
+
+    fn arn(name: &str) -> String {
+        format!("arn:aws:lambda:us-east-1:123456789012:function:{name}")
+    }
+
+    fn key(name: &str) -> String {
+        format!("{}:$LATEST", arn(name))
     }
 
     fn test_func(name: &str, sha: &str) -> LambdaFunction {
@@ -1114,7 +1424,7 @@ mod tests {
             "the stale-deploy instance should have been torn down"
         );
         // Exactly one current instance remains in the pool.
-        let pool_len = rt.instances.read().get("upd").map_or(0, |v| v.len());
+        let pool_len = rt.instances.read().get(&key("upd")).map_or(0, |v| v.len());
         assert_eq!(pool_len, 1);
     }
 
@@ -1135,25 +1445,23 @@ mod tests {
                 },
                 last_used: RwLock::new(std::time::Instant::now()),
                 deploy_id: "d".to_string(),
+                credentials: None,
+                retiring: std::sync::atomic::AtomicBool::new(false),
                 busy: Arc::new(tokio::sync::Mutex::new(())),
             })
         };
 
         // A function "f" with one warm instance.
-        rt.instances
-            .write()
-            .insert("f".to_string(), vec![mk("old")]);
+        rt.instances.write().insert(key("f"), vec![mk("old")]);
 
         // Delete snapshots the pool synchronously and removes it from the map.
-        let snapshot = rt.take_warm_instances("f");
+        let snapshot = rt.take_warm_instances(&arn("f"), None);
         assert_eq!(snapshot.len(), 1);
-        assert!(rt.instances.read().get("f").is_none());
+        assert!(rt.instances.read().get(&key("f")).is_none());
 
         // A recreate + warm-up of the same name wins the race ahead of the
         // deferred terminate.
-        rt.instances
-            .write()
-            .insert("f".to_string(), vec![mk("new")]);
+        rt.instances.write().insert(key("f"), vec![mk("new")]);
 
         // Terminating the snapshot must touch only the old instance.
         rt.terminate_instances(snapshot).await;
@@ -1165,7 +1473,381 @@ mod tests {
 
         // The recreated function keeps its fresh warm instance.
         let pool = rt.instances.read();
-        let f = pool.get("f").expect("recreated function pool must survive");
+        let f = pool
+            .get(&key("f"))
+            .expect("recreated function pool must survive");
         assert_eq!(f.len(), 1);
+    }
+
+    /// Issuer double: mints sequential keys with a configurable lifetime
+    /// and records what was issued and revoked.
+    struct RecordingIssuer {
+        lifetime: chrono::Duration,
+        issued: StdMutex<Vec<(String, String, String)>>,
+        revoked: StdMutex<Vec<String>>,
+    }
+
+    impl RecordingIssuer {
+        fn new(lifetime: chrono::Duration) -> Arc<Self> {
+            Arc::new(Self {
+                lifetime,
+                issued: StdMutex::new(Vec::new()),
+                revoked: StdMutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl SessionCredentialIssuer for RecordingIssuer {
+        fn issue(
+            &self,
+            role_arn: &str,
+            session_name: &str,
+            _duration: chrono::Duration,
+        ) -> SessionCredentials {
+            let mut issued = self.issued.lock().unwrap();
+            let key = format!("KEY{}", issued.len());
+            issued.push((key.clone(), role_arn.to_string(), session_name.to_string()));
+            SessionCredentials {
+                access_key_id: key,
+                secret_access_key: "s".into(),
+                session_token: "t".into(),
+                expiration: chrono::Utc::now() + self.lifetime,
+                account_id: "123456789012".into(),
+            }
+        }
+        fn revoke(&self, credentials: &SessionCredentials) {
+            self.revoked
+                .lock()
+                .unwrap()
+                .push(credentials.access_key_id.clone());
+        }
+    }
+
+    /// Each instance is launched with a session for the function's execution
+    /// role, named after the function, and the session is revoked when the
+    /// instance goes away.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn instances_get_execution_role_credentials_revoked_on_teardown() {
+        let peak = Arc::new(AtomicUsize::new(0));
+        let endpoint = spawn_rie(Duration::from_millis(5), peak).await;
+        let backend = CountingBackend::new(endpoint);
+        let rt = runtime_with(backend.clone(), 2);
+        let issuer = RecordingIssuer::new(chrono::Duration::hours(1));
+        rt.set_credential_issuer(issuer.clone());
+
+        let func = test_func("creds", "sha-A");
+        rt.invoke(&func, b"{}", &[]).await.unwrap();
+        rt.invoke(&func, b"{}", &[]).await.unwrap();
+
+        assert_eq!(
+            *issuer.issued.lock().unwrap(),
+            vec![(
+                "KEY0".to_string(),
+                "arn:aws:iam::123456789012:role/r".to_string(),
+                "creds".to_string()
+            )],
+            "a warm instance keeps its credentials across invocations"
+        );
+        assert_eq!(
+            *backend.launched_with.lock().unwrap(),
+            vec![Some("KEY0".to_string())]
+        );
+
+        rt.stop_container(&arn("creds")).await;
+        assert_eq!(*issuer.revoked.lock().unwrap(), vec!["KEY0".to_string()]);
+    }
+
+    /// An IAM reset drops the credentials warm instances hold: free ones are
+    /// retired (and replaced on the next invoke), busy ones finish their
+    /// invocation untouched and take no new work.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn iam_reset_retires_free_instances_and_spares_busy_ones() {
+        let peak = Arc::new(AtomicUsize::new(0));
+        let endpoint = spawn_rie(Duration::from_millis(300), peak).await;
+        let backend = CountingBackend::new(endpoint);
+        let rt = runtime_with(backend.clone(), 2);
+        let issuer = RecordingIssuer::new(chrono::Duration::hours(12));
+        rt.set_credential_issuer(issuer.clone());
+
+        // Two instances: one left free, one kept busy across the reset.
+        let func = test_func("reset", "sha-A");
+        let (a, b) = tokio::join!(rt.invoke(&func, b"{}", &[]), rt.invoke(&func, b"{}", &[]));
+        a.unwrap();
+        b.unwrap();
+        assert_eq!(backend.launches.load(SeqCst), 2);
+        let busy = {
+            let rt = rt.clone();
+            let func = func.clone();
+            tokio::spawn(async move { rt.invoke(&func, b"{}", &[]).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Marking is synchronous: from here on no invocation can land on
+        // either instance, before any teardown has run.
+        rt.mark_credentials_revoked(Some("123456789012"));
+        assert!(rt
+            .instances
+            .read()
+            .get(&key("reset"))
+            .unwrap()
+            .iter()
+            .all(|e| e.retiring.load(std::sync::atomic::Ordering::Acquire)));
+        assert_eq!(backend.terminates.load(SeqCst), 0);
+        // Another account's reset marks nothing further.
+        rt.mark_credentials_revoked(Some("999999999999"));
+        rt.retire_released().await;
+        assert_eq!(
+            backend.terminates.load(SeqCst),
+            1,
+            "only the free instance is retired"
+        );
+        busy.await
+            .unwrap()
+            .expect("the in-flight invocation completes");
+
+        // The next invoke never lands on the retiring instance: it gets a
+        // fresh one with new credentials, and the now-free survivor goes.
+        rt.invoke(&func, b"{}", &[]).await.unwrap();
+        assert_eq!(backend.launches.load(SeqCst), 3);
+        assert_eq!(
+            backend
+                .launched_with
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .flatten(),
+            Some("KEY2".to_string())
+        );
+        assert_eq!(backend.terminates.load(SeqCst), 2);
+        assert_eq!(issuer.revoked.lock().unwrap().len(), 2);
+    }
+
+    /// A deploy change never terminates an instance mid-invocation: the busy
+    /// stale instance finishes and is only reaped once free.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deploy_change_spares_busy_instance() {
+        let peak = Arc::new(AtomicUsize::new(0));
+        let endpoint = spawn_rie(Duration::from_millis(300), peak).await;
+        let backend = CountingBackend::new(endpoint);
+        let rt = runtime_with(backend.clone(), 2);
+
+        let old = test_func("busy", "sha-A");
+        let in_flight = {
+            let rt = rt.clone();
+            tokio::spawn(async move { rt.invoke(&old, b"{}", &[]).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        rt.invoke(&test_func("busy", "sha-B"), b"{}", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.terminates.load(SeqCst),
+            0,
+            "the busy stale instance must not be terminated"
+        );
+        in_flight
+            .await
+            .unwrap()
+            .expect("in-flight invocation completes");
+
+        // Next launch-path sweep reaps the now-free stale instance.
+        rt.evict_stale_deploy(
+            &key("busy"),
+            &super::deploy_id_for(&test_func("busy", "sha-B"), &[], false),
+        )
+        .await;
+        assert_eq!(backend.terminates.load(SeqCst), 1);
+    }
+
+    /// Versions (and accounts) have their own pools and never evict each
+    /// other, even with identical code.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn versions_do_not_evict_each_other() {
+        let peak = Arc::new(AtomicUsize::new(0));
+        let endpoint = spawn_rie(Duration::from_millis(5), peak).await;
+        let backend = CountingBackend::new(endpoint);
+        let rt = runtime_with(backend.clone(), 2);
+
+        let latest = test_func("ver", "sha-A");
+        let mut v1 = latest.clone();
+        v1.version = "1".into();
+        for _ in 0..2 {
+            rt.invoke(&latest, b"{}", &[]).await.unwrap();
+            rt.invoke(&v1, b"{}", &[]).await.unwrap();
+        }
+        assert_eq!(backend.launches.load(SeqCst), 2);
+        assert_eq!(backend.terminates.load(SeqCst), 0);
+
+        // Deleting one version's pool leaves the other's.
+        let taken = rt.take_warm_instances(&arn("ver"), Some("1"));
+        assert_eq!(taken.len(), 1);
+        assert!(rt.instances.read().contains_key(&key("ver")));
+        assert_eq!(rt.take_warm_instances(&arn("ver"), None).len(), 1);
+    }
+
+    /// A configuration change that reaches the instance environment (here
+    /// the function's variables) starts a fresh instance even though the
+    /// code is unchanged.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn configuration_change_replaces_the_warm_instance() {
+        let peak = Arc::new(AtomicUsize::new(0));
+        let endpoint = spawn_rie(Duration::from_millis(5), peak).await;
+        let backend = CountingBackend::new(endpoint);
+        let rt = runtime_with(backend.clone(), 2);
+
+        let mut func = test_func("cfg", "sha-A");
+        rt.invoke(&func, b"{}", &[]).await.unwrap();
+        func.environment.insert("MODE".into(), "b".into());
+        rt.invoke(&func, b"{}", &[]).await.unwrap();
+
+        assert_eq!(backend.launches.load(SeqCst), 2);
+        assert_eq!(backend.terminates.load(SeqCst), 1);
+    }
+
+    #[test]
+    fn session_is_minted_in_the_function_account() {
+        let f = "arn:aws:lambda:us-east-1:123456789012:function:f";
+        assert_eq!(
+            super::session_role_arn("arn:aws:iam::123456789012:role/r", f),
+            "arn:aws:iam::123456789012:role/r"
+        );
+        assert_eq!(
+            super::session_role_arn("arn:aws:iam::000000000000:role/path/r", f),
+            "arn:aws:iam::123456789012:role/path/r"
+        );
+        assert_eq!(super::session_role_arn("not-an-arn", f), "not-an-arn");
+    }
+
+    /// Backend double whose launches fail, or never finish.
+    struct BrokenBackend {
+        hang: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl LambdaBackend for BrokenBackend {
+        fn name(&self) -> &str {
+            "broken"
+        }
+        async fn launch(
+            &self,
+            _func: &LambdaFunction,
+            _code_zip: Option<&[u8]>,
+            _layers: &[Vec<u8>],
+            _deploy_id: &str,
+            _credentials: Option<&SessionCredentials>,
+        ) -> Result<WarmInstance, RuntimeError> {
+            if self.hang {
+                std::future::pending::<()>().await;
+            }
+            Err(RuntimeError::ContainerStartFailed("boom".into()))
+        }
+        async fn terminate(&self, _handle: &BackendHandle) {}
+    }
+
+    fn broken_runtime(hang: bool) -> Arc<LambdaRuntime> {
+        Arc::new(LambdaRuntime {
+            backend: Arc::new(BrokenBackend { hang }),
+            instances: RwLock::new(HashMap::new()),
+            starting: RwLock::new(HashMap::new()),
+            max_concurrency: 2,
+            credential_issuer: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// Credentials minted for a launch that fails, or whose launching future
+    /// is dropped mid-launch, are revoked rather than left registered.
+    #[tokio::test]
+    async fn credentials_of_an_unfinished_launch_are_revoked() {
+        let func = test_func("broken", "sha-A");
+
+        let rt = broken_runtime(false);
+        let issuer = RecordingIssuer::new(chrono::Duration::hours(12));
+        rt.set_credential_issuer(issuer.clone());
+        assert!(rt.invoke(&func, b"{}", &[]).await.is_err());
+        assert_eq!(*issuer.revoked.lock().unwrap(), vec!["KEY0".to_string()]);
+
+        let rt = broken_runtime(true);
+        let issuer = RecordingIssuer::new(chrono::Duration::hours(12));
+        rt.set_credential_issuer(issuer.clone());
+        let cancelled =
+            tokio::time::timeout(Duration::from_millis(100), rt.invoke(&func, b"{}", &[])).await;
+        assert!(cancelled.is_err(), "the launch never finishes");
+        assert_eq!(*issuer.revoked.lock().unwrap(), vec!["KEY0".to_string()]);
+    }
+
+    /// An instance stops taking invocations once its credentials could lapse
+    /// during one, judged from the credentials' own expiration.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn instance_whose_credentials_near_expiry_is_replaced() {
+        let peak = Arc::new(AtomicUsize::new(0));
+        let endpoint = spawn_rie(Duration::from_millis(5), peak).await;
+        let backend = CountingBackend::new(endpoint);
+        let rt = runtime_with(backend.clone(), 2);
+        // Minted with less than the invocation headroom left.
+        let issuer = RecordingIssuer::new(chrono::Duration::minutes(10));
+        rt.set_credential_issuer(issuer.clone());
+
+        let func = test_func("aging", "sha-A");
+        rt.invoke(&func, b"{}", &[]).await.unwrap();
+        rt.invoke(&func, b"{}", &[]).await.unwrap();
+        assert_eq!(backend.launches.load(SeqCst), 2);
+        // The first (free) one was retired on the second launch.
+        assert_eq!(*issuer.revoked.lock().unwrap(), vec!["KEY0".to_string()]);
+    }
+
+    /// Deleting a version stops its free instances now and leaves a busy one
+    /// to finish, retiring it once released; other versions are untouched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deleting_a_version_spares_its_busy_instance() {
+        let peak = Arc::new(AtomicUsize::new(0));
+        let endpoint = spawn_rie(Duration::from_millis(300), peak).await;
+        let backend = CountingBackend::new(endpoint);
+        let rt = runtime_with(backend.clone(), 2);
+
+        let latest = test_func("delv", "sha-A");
+        let mut v1 = latest.clone();
+        v1.version = "1".into();
+        rt.invoke(&latest, b"{}", &[]).await.unwrap();
+        let in_flight = {
+            let rt = rt.clone();
+            let v1 = v1.clone();
+            tokio::spawn(async move { rt.invoke(&v1, b"{}", &[]).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let detached = rt.retire_version(&arn("delv"), "1");
+        assert!(detached.is_empty(), "the busy instance is not detached");
+        rt.terminate_instances(detached).await;
+        assert_eq!(backend.terminates.load(SeqCst), 0);
+        in_flight
+            .await
+            .unwrap()
+            .expect("in-flight invocation completes");
+
+        rt.retire_released().await;
+        assert_eq!(backend.terminates.load(SeqCst), 1);
+        assert!(rt
+            .instances
+            .read()
+            .get(&format!("{}:1", arn("delv")))
+            .is_none());
+        assert!(rt.instances.read().contains_key(&key("delv")));
+    }
+
+    /// Tags only change the deploy fingerprint for backends that read them.
+    #[test]
+    fn tags_change_the_deploy_only_when_the_backend_uses_them() {
+        let plain = test_func("tagged", "sha-A");
+        let mut tagged = plain.clone();
+        tagged.tags.insert("team".into(), "a".into());
+        assert_eq!(
+            super::deploy_id_for(&plain, &[], false),
+            super::deploy_id_for(&tagged, &[], false)
+        );
+        assert_ne!(
+            super::deploy_id_for(&plain, &[], true),
+            super::deploy_id_for(&tagged, &[], true)
+        );
     }
 }

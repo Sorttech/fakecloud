@@ -3487,6 +3487,7 @@ impl crate::runtime::LambdaBackend for PrepullSpy {
         _code_zip: Option<&[u8]>,
         _layers: &[Vec<u8>],
         _deploy_id: &str,
+        _credentials: Option<&fakecloud_core::auth::SessionCredentials>,
     ) -> Result<crate::runtime::WarmInstance, crate::runtime::RuntimeError> {
         unreachable!("prepull regression test never invokes launch")
     }
@@ -4339,4 +4340,61 @@ async fn china_region_arns_use_the_aws_cn_partition() {
         "{}",
         resp.message()
     );
+}
+
+/// Trust validator double that records the account each lookup ran in.
+#[derive(Default)]
+struct RecordingTrustValidator {
+    accounts: parking_lot::Mutex<Vec<String>>,
+}
+
+impl fakecloud_core::auth::RoleTrustValidator for RecordingTrustValidator {
+    fn validate(
+        &self,
+        account_id: &str,
+        _role_arn: &str,
+        _service_principal: &str,
+    ) -> Result<(), fakecloud_core::auth::PassRoleError> {
+        self.accounts.lock().push(account_id.to_string());
+        Ok(())
+    }
+}
+
+#[test]
+fn cross_account_execution_role_is_refused_only_under_strict_iam() {
+    use fakecloud_core::auth::IamMode;
+    let foreign = "arn:aws:iam::000000000000:role/r";
+    for mode in [IamMode::Off, IamMode::Soft] {
+        validate_execution_role("123456789012", foreign, None, mode)
+            .unwrap_or_else(|e| panic!("{mode} must allow (soft only audits): {e}"));
+    }
+    let err = validate_execution_role("123456789012", foreign, None, IamMode::Strict)
+        .expect_err("strict refuses a cross-account role");
+    assert_eq!(
+        err.to_string(),
+        "AccessDeniedException: Cross-account pass role is not allowed."
+    );
+    // A same-account role is fine in every mode.
+    validate_execution_role(
+        "123456789012",
+        "arn:aws:iam::123456789012:role/r",
+        None,
+        IamMode::Strict,
+    )
+    .unwrap();
+}
+
+#[test]
+fn trust_check_runs_in_the_function_account() {
+    let validator = RecordingTrustValidator::default();
+    validate_execution_role(
+        "123456789012",
+        "arn:aws:iam::000000000000:role/r",
+        Some(&validator),
+        fakecloud_core::auth::IamMode::Off,
+    )
+    .unwrap();
+    // The session is minted in the function's account, so that is where
+    // the role's trust policy is looked up.
+    assert_eq!(*validator.accounts.lock(), vec!["123456789012".to_string()]);
 }

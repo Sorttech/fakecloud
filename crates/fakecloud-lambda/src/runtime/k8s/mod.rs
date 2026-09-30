@@ -18,11 +18,12 @@ pub mod spec;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use fakecloud_core::auth::SessionCredentials;
 use fakecloud_k8s::{K8sClient, K8sEnv, K8sEnvError, K8sPodConfig, K8sPodConfigError};
 
 use super::backend::{BackendHandle, LambdaBackend, RuntimeError, WarmInstance};
 use crate::state::LambdaFunction;
-use spec::{build_pod_spec, unique_pod_name, PodSpecContext};
+use spec::{build_credentials_secret, build_pod_spec, unique_pod_name, PodSpecContext};
 
 /// Which `fakecloud-service` label Lambda Pods carry, so reaping only
 /// touches Lambda Pods.
@@ -109,7 +110,7 @@ impl K8sBackend {
 /// Extract the account ID from a function ARN
 /// (`arn:aws:lambda:<region>:<account>:function:<name>[:<qual>]`).
 fn account_id_from_arn(arn: &str) -> &str {
-    arn.split(':').nth(4).unwrap_or("000000000000")
+    fakecloud_aws::arn::account_of(arn).unwrap_or("000000000000")
 }
 
 #[async_trait]
@@ -118,14 +119,25 @@ impl LambdaBackend for K8sBackend {
         "kubernetes"
     }
 
+    /// Per-function tags carry scheduling overrides (`K8sPodConfig::from_tags`).
+    fn launch_uses_tags(&self) -> bool {
+        true
+    }
+
     async fn launch(
         &self,
         func: &LambdaFunction,
         _code_zip: Option<&[u8]>,
         _layers: &[Vec<u8>],
         deploy_id: &str,
+        credentials: Option<&SessionCredentials>,
     ) -> Result<WarmInstance, RuntimeError> {
         let account_id = account_id_from_arn(&func.function_arn);
+        // A per-launch unique name (instead of the deterministic
+        // function+deploy one) so concurrent instances of the same function
+        // don't collide and a terminating Pod never blocks its replacement
+        // (see `unique_pod_name`). The credentials Secret shares it.
+        let pod_name = unique_pod_name(&func.function_name, deploy_id);
         let ctx = PodSpecContext {
             instance_id: self.client.instance_id(),
             namespace: self.client.namespace(),
@@ -136,14 +148,10 @@ impl LambdaBackend for K8sBackend {
             internal_token: &self.internal_token,
             account_id,
             pull_secret: self.pull_secret.as_deref(),
+            credentials_secret: credentials.map(|_| pod_name.as_str()),
         };
         let mut pod =
             build_pod_spec(func, deploy_id, &ctx).map_err(RuntimeError::ContainerStartFailed)?;
-        // Override the deterministic function+deploy name with a per-launch
-        // unique one so concurrent instances of the same function don't collide
-        // and a terminating Pod never blocks its replacement (see
-        // `unique_pod_name`).
-        let pod_name = unique_pod_name(&func.function_name, deploy_id);
         pod.metadata.name = Some(pod_name.clone());
 
         // Apply operator-configured scheduling/metadata: global +
@@ -154,10 +162,26 @@ impl LambdaBackend for K8sBackend {
             .merge(K8sPodConfig::from_tags(&func.tags))
             .apply(&mut pod);
 
-        self.client
-            .create_pod(&pod)
-            .await
-            .map_err(|e| RuntimeError::ContainerStartFailed(format!("k8s create pod: {e}")))?;
+        // The Secret goes first so the Pod's secretKeyRefs resolve at start.
+        if let Some(creds) = credentials {
+            let secret = build_credentials_secret(&pod_name, creds, self.client.instance_id());
+            self.client.create_secret(&secret).await.map_err(|e| {
+                RuntimeError::ContainerStartFailed(format!(
+                    "k8s create credentials secret (the ServiceAccount needs \
+                     create/delete/patch on secrets): {e}"
+                ))
+            })?;
+        }
+        if let Err(e) = self.client.create_pod(&pod).await {
+            self.client.delete_secret(&pod_name).await;
+            return Err(RuntimeError::ContainerStartFailed(format!(
+                "k8s create pod: {e}"
+            )));
+        }
+        if credentials.is_some() {
+            // Owned by the Pod: garbage-collected with it however it goes.
+            self.client.adopt_secret(&pod_name, &pod_name).await;
+        }
 
         // Tear the Pod down again if it never becomes ready, so a failed
         // launch doesn't leak a Pod.
@@ -169,6 +193,7 @@ impl LambdaBackend for K8sBackend {
             Ok(ip) => ip,
             Err(e) => {
                 self.client.delete_pod(&pod_name).await;
+                self.client.delete_secret(&pod_name).await;
                 return Err(RuntimeError::ContainerStartFailed(e.to_string()));
             }
         };
@@ -176,6 +201,7 @@ impl LambdaBackend for K8sBackend {
         // is listening yet — TCP-handshake the invoke port like Docker.
         if let Err(e) = K8sClient::wait_for_tcp(&pod_ip, 8080, Duration::from_secs(10)).await {
             self.client.delete_pod(&pod_name).await;
+            self.client.delete_secret(&pod_name).await;
             return Err(RuntimeError::ContainerStartFailed(format!(
                 "RIE on {pod_ip}:8080 not ready: {e}"
             )));
@@ -200,7 +226,12 @@ impl LambdaBackend for K8sBackend {
 
     async fn terminate(&self, handle: &BackendHandle) {
         match handle {
-            BackendHandle::Pod { name, .. } => self.client.delete_pod(name).await,
+            BackendHandle::Pod { name, .. } => {
+                self.client.delete_pod(name).await;
+                // Also garbage-collected with the Pod; deleting explicitly
+                // drops the credentials without waiting on the collector.
+                self.client.delete_secret(name).await;
+            }
             // Docker handles aren't ours to manage — defensive no-op.
             BackendHandle::Container { .. } => {}
         }

@@ -12,8 +12,9 @@ use base64::Engine;
 use tempfile::TempDir;
 
 use super::backend::{BackendHandle, LambdaBackend, RuntimeError, WarmInstance};
-use super::env_rewrite::rewrite_localhost_envs;
+use super::environment::{function_environment, CREDENTIAL_ENV_KEYS};
 use crate::state::LambdaFunction;
+use fakecloud_core::auth::SessionCredentials;
 
 /// Docker/Podman-based Lambda execution backend.
 pub struct DockerBackend {
@@ -96,6 +97,25 @@ impl DockerBackend {
         }
     }
 
+    /// Export the function's execution environment into the container. The
+    /// container reaches fakecloud through the host alias, since `localhost`
+    /// inside it is the container itself.
+    fn apply_function_env(
+        &self,
+        cmd: &mut tokio::process::Command,
+        func: &LambdaFunction,
+        credentials: Option<&SessionCredentials>,
+    ) {
+        let endpoint_url = format!("http://{}:{}", self.host_alias, self.server_port);
+        let (args, child_env) = docker_env_args(function_environment(
+            func,
+            &endpoint_url,
+            &self.host_alias,
+            credentials,
+        ));
+        cmd.args(args).envs(child_env);
+    }
+
     fn docker_config_path(&self) -> Option<PathBuf> {
         self.docker_config.as_ref().map(|d| d.path().to_path_buf())
     }
@@ -109,6 +129,7 @@ impl DockerBackend {
         &self,
         func: &LambdaFunction,
         layers: &[Vec<u8>],
+        credentials: Option<&SessionCredentials>,
     ) -> Result<WarmInstance, RuntimeError> {
         let image = func.image_uri.as_deref().ok_or_else(|| {
             RuntimeError::ContainerStartFailed("PackageType=Image function has no ImageUri".into())
@@ -162,11 +183,7 @@ impl DockerBackend {
             .arg(format!("fakecloud-instance={}", self.instance_id));
         self.apply_host_alias(&mut cmd);
 
-        for (key, value) in rewrite_localhost_envs(&func.environment, &self.host_alias) {
-            cmd.arg("-e").arg(format!("{key}={value}"));
-        }
-        cmd.arg("-e")
-            .arg(format!("AWS_LAMBDA_FUNCTION_TIMEOUT={}", func.timeout));
+        self.apply_function_env(&mut cmd, func, credentials);
 
         let tmpfs_arg = ephemeral_storage_tmpfs_arg(func.ephemeral_storage_size);
         cmd.arg("--tmpfs").arg(tmpfs_arg);
@@ -224,6 +241,7 @@ impl DockerBackend {
         func: &LambdaFunction,
         zip_bytes: &[u8],
         layers: &[Vec<u8>],
+        credentials: Option<&SessionCredentials>,
     ) -> Result<WarmInstance, RuntimeError> {
         let image = runtime_to_image(&func.runtime)
             .ok_or_else(|| RuntimeError::UnsupportedRuntime(func.runtime.clone()))?;
@@ -249,12 +267,7 @@ impl DockerBackend {
             .arg(format!("fakecloud-instance={}", self.instance_id));
         self.apply_host_alias(&mut cmd);
 
-        for (key, value) in rewrite_localhost_envs(&func.environment, &self.host_alias) {
-            cmd.arg("-e").arg(format!("{key}={value}"));
-        }
-
-        cmd.arg("-e")
-            .arg(format!("AWS_LAMBDA_FUNCTION_TIMEOUT={}", func.timeout));
+        self.apply_function_env(&mut cmd, func, credentials);
 
         let tmpfs_arg = ephemeral_storage_tmpfs_arg(func.ephemeral_storage_size);
         cmd.arg("--tmpfs").arg(tmpfs_arg);
@@ -447,13 +460,15 @@ impl LambdaBackend for DockerBackend {
         code_zip: Option<&[u8]>,
         layers: &[Vec<u8>],
         _deploy_id: &str,
+        credentials: Option<&SessionCredentials>,
     ) -> Result<WarmInstance, RuntimeError> {
         if func.package_type == "Image" {
-            self.start_image_container(func, layers).await
+            self.start_image_container(func, layers, credentials).await
         } else {
             let bytes =
                 code_zip.ok_or_else(|| RuntimeError::NoCodeZip(func.function_name.clone()))?;
-            self.start_zip_container(func, bytes, layers).await
+            self.start_zip_container(func, bytes, layers, credentials)
+                .await
         }
     }
 
@@ -512,6 +527,25 @@ impl LambdaBackend for DockerBackend {
         })?;
         Ok(())
     }
+}
+
+/// `-e` arguments for a container environment, plus the variables to set on
+/// the container CLI's own process. Credentials go by name only (`-e KEY`),
+/// which makes the CLI copy the value from its environment, so secrets never
+/// appear in argv (`ps`, audit logs, `docker events`).
+fn docker_env_args(env: Vec<(String, String)>) -> (Vec<String>, Vec<(String, String)>) {
+    let mut args = Vec::with_capacity(env.len() * 2);
+    let mut child_env = Vec::new();
+    for (key, value) in env {
+        args.push("-e".to_string());
+        if CREDENTIAL_ENV_KEYS.contains(&key.as_str()) {
+            args.push(key.clone());
+            child_env.push((key, value));
+        } else {
+            args.push(format!("{key}={value}"));
+        }
+    }
+    (args, child_env)
 }
 
 /// Map AWS runtime identifier to a Docker image tag.
@@ -749,5 +783,40 @@ mod tests {
         // clamping to a 64 MiB floor that Docker still accepts.
         assert_eq!(ephemeral_storage_tmpfs_arg(Some(0)), "/tmp:size=64m,exec");
         assert_eq!(ephemeral_storage_tmpfs_arg(Some(32)), "/tmp:size=64m,exec");
+    }
+
+    #[test]
+    fn credentials_stay_off_the_command_line() {
+        let env = vec![
+            ("AWS_REGION".to_string(), "us-east-1".to_string()),
+            ("AWS_ACCESS_KEY_ID".to_string(), "FSIAKEY".to_string()),
+            ("AWS_SECRET_ACCESS_KEY".to_string(), "s3cr3t".to_string()),
+            ("AWS_SESSION_TOKEN".to_string(), "tok".to_string()),
+        ];
+        let (args, child_env) = docker_env_args(env);
+        assert_eq!(
+            args,
+            vec![
+                "-e",
+                "AWS_REGION=us-east-1",
+                "-e",
+                "AWS_ACCESS_KEY_ID",
+                "-e",
+                "AWS_SECRET_ACCESS_KEY",
+                "-e",
+                "AWS_SESSION_TOKEN"
+            ]
+        );
+        assert!(args
+            .iter()
+            .all(|a| !a.contains("s3cr3t") && !a.contains("tok") && !a.contains("FSIAKEY")));
+        assert_eq!(
+            child_env,
+            vec![
+                ("AWS_ACCESS_KEY_ID".to_string(), "FSIAKEY".to_string()),
+                ("AWS_SECRET_ACCESS_KEY".to_string(), "s3cr3t".to_string()),
+                ("AWS_SESSION_TOKEN".to_string(), "tok".to_string()),
+            ]
+        );
     }
 }
