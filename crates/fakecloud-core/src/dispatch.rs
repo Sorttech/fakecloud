@@ -1088,22 +1088,15 @@ impl DispatchConfig {
 /// bucket-level operation was dispatched unbuffered, so the handler and IAM
 /// enforcement saw an empty body.
 ///
-/// Known limitation: under virtual-hosted addressing the whole path is the
-/// key on real S3, so an object key that begins with `<bucket>/` (or a key
-/// that IS the bucket name) is not representable here — the passthrough reads
-/// it as a client that put the bucket in the path, and the prefix is dropped.
-/// Nothing in a single request distinguishes the two, so this resolves the
-/// ambiguity in favor of the mixed-addressing client. Keys shaped like their
-/// own bucket name are the cost.
+/// Under virtual-hosted addressing the whole wire path is the object key, as
+/// on real S3, so the bucket is always prefixed: on
+/// `docs.s3.<region>.amazonaws.com`, `GET /docs/intro.html` addresses the key
+/// `docs/intro.html`, not `intro.html`.
 fn s3_routing_path(wire_path: &str, host_bucket: Option<&str>) -> String {
     let Some(bucket) = host_bucket else {
         return wire_path.to_string();
     };
-    let prefix_with_slash = format!("/{bucket}/");
-    let is_bucket_root = wire_path.trim_end_matches('/') == format!("/{bucket}");
-    if wire_path.starts_with(&prefix_with_slash) || is_bucket_root {
-        wire_path.to_string()
-    } else if wire_path == "/" || wire_path.is_empty() {
+    if wire_path == "/" || wire_path.is_empty() {
         format!("/{bucket}")
     } else {
         format!("/{bucket}{wire_path}")
@@ -2061,6 +2054,26 @@ mod tests {
     }
 
     #[test]
+    fn s3_routing_path_prefixes_the_host_bucket() {
+        assert_eq!(s3_routing_path("/", Some("b")), "/b");
+        assert_eq!(s3_routing_path("", Some("b")), "/b");
+        assert_eq!(s3_routing_path("/k.txt", Some("b")), "/b/k.txt");
+        assert_eq!(s3_routing_path("/dir/k", Some("a.b")), "/a.b/dir/k");
+        assert_eq!(s3_routing_path("/b/k", None), "/b/k");
+    }
+
+    #[test]
+    fn s3_routing_path_keeps_a_key_that_starts_with_the_bucket_name() {
+        // The wire path is the whole key on a virtual-hosted request, so a key
+        // whose first segment equals the bucket name must keep it.
+        assert_eq!(
+            s3_routing_path("/docs/intro.html", Some("docs")),
+            "/docs/docs/intro.html"
+        );
+        assert_eq!(s3_routing_path("/docs", Some("docs")), "/docs/docs");
+    }
+
+    #[test]
     fn streaming_route_path_style_create_bucket_with_trailing_slash_skipped() {
         // The AWS SDKs send CreateBucket as `PUT /<bucket>/`. The trailing
         // slash must not make it look like an object upload: the body carries
@@ -2127,36 +2140,23 @@ mod tests {
     }
 
     #[test]
-    fn streaming_route_virtual_hosted_bucket_in_path_skipped() {
-        // `Host: my-bucket.s3...` with the bucket ALSO in the path is the
-        // router's bucket-root shape (dispatch collapses it to CreateBucket),
-        // so it must not stream -- with or without the trailing slash.
+    fn streaming_route_virtual_hosted_path_naming_the_bucket_streams() {
+        // Under virtual-hosted addressing the whole path is the key, as on
+        // real S3: `PUT /my-bucket` on `Host: my-bucket.s3...` uploads the
+        // object `my-bucket`, not a CreateBucket, so every one of these
+        // streams.
         let mut headers = s3_sigv4_headers();
         headers.insert(
             "host",
             "my-bucket.s3.us-east-1.amazonaws.com".parse().unwrap(),
         );
-        assert_eq!(
-            streaming_route(&http::Method::PUT, "/my-bucket", &headers, &HashMap::new()),
-            None,
-        );
-        assert_eq!(
-            streaming_route(&http::Method::PUT, "/my-bucket/", &headers, &HashMap::new()),
-            None,
-        );
-        // ...but a path the router reads as a key under that bucket still
-        // streams. (Per the `s3_routing_path` limitation, a virtual-hosted key
-        // that genuinely begins with `my-bucket/` is indistinguishable from
-        // this and is routed the same way.)
-        assert_eq!(
-            streaming_route(
-                &http::Method::PUT,
-                "/my-bucket/key.txt",
-                &headers,
-                &HashMap::new(),
-            ),
-            Some(("s3", "")),
-        );
+        for path in ["/my-bucket", "/my-bucket/", "/my-bucket/key.txt"] {
+            assert_eq!(
+                streaming_route(&http::Method::PUT, path, &headers, &HashMap::new()),
+                Some(("s3", "")),
+                "{path}",
+            );
+        }
     }
 
     #[test]
