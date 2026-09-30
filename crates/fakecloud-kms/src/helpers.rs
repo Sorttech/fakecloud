@@ -250,14 +250,16 @@ pub(crate) fn kms_resource_for(
             let accts = state.read();
             let empty = KmsState::new(&request.account_id, &request.region);
             let s = accts.get(&request.account_id).unwrap_or(&empty);
-            if let Some(alias) = s.aliases.get(alias_name) {
+            if let Some(alias) = s.alias(&request.region, alias_name) {
                 if let Some(key) = s.keys.get(&alias.target_key_id) {
                     return key.arn.clone();
                 }
             }
             // For CreateAlias the target may be in TargetKeyId.
             if let Some(target) = body["TargetKeyId"].as_str() {
-                if let Some(key_id) = KmsService::resolve_key_id_with_state(s, target) {
+                if let Some(key_id) =
+                    KmsService::resolve_key_id_with_state(s, &request.region, target)
+                {
                     if let Some(key) = s.keys.get(&key_id) {
                         return key.arn.clone();
                     }
@@ -273,7 +275,9 @@ pub(crate) fn kms_resource_for(
         let accts = state.read();
         let empty = KmsState::new(&request.account_id, &request.region);
         let s = accts.get(&request.account_id).unwrap_or(&empty);
-        if let Some(key_id) = KmsService::resolve_key_id_with_state(s, key_id_input) {
+        if let Some(key_id) =
+            KmsService::resolve_key_id_with_state(s, &request.region, key_id_input)
+        {
             if let Some(key) = s.keys.get(&key_id) {
                 return key.arn.clone();
             }

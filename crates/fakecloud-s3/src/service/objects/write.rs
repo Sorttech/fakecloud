@@ -72,6 +72,7 @@ impl S3Service {
             object_lock_config,
             notification_config,
             region,
+            bucket_region,
         ) = {
             let accts = self.state.read();
             let __empty = crate::state::S3State::new(account_id, "us-east-1");
@@ -125,6 +126,7 @@ impl S3Service {
                 b.object_lock_config.clone(),
                 b.notification_config.clone(),
                 state.region.clone(),
+                b.region.clone(),
             )
         }; // read lock dropped
 
@@ -319,35 +321,17 @@ impl S3Service {
                     let kms_state = kms_accounts
                         .get(&req.account_id)
                         .unwrap_or(kms_accounts.default_ref());
-                    let key_exists = kms_state
-                        .keys
-                        .values()
-                        .any(|k| k.key_id == *key_id || k.arn == *key_id)
-                        || kms_state
-                            .aliases
-                            .values()
-                            .any(|a| a.alias_name == *key_id || a.alias_arn == *key_id);
-                    if !key_exists {
-                        // Still allow it — AWS doesn't always reject unknown keys
-                        // for emulation purposes, just set the key ID
-                        tracing::debug!(
-                            key_id = %key_id,
-                            "KMS key not found in state, proceeding anyway"
-                        );
-                    } else {
-                        // Resolve alias to key ARN if needed
-                        if let Some(alias) = kms_state
-                            .aliases
-                            .values()
-                            .find(|a| a.alias_name == *key_id || a.alias_arn == *key_id)
-                        {
-                            if let Some(key) = kms_state.keys.get(&alias.target_key_id) {
-                                sse_kms_key_id = Some(key.arn.clone());
-                            }
-                        } else if let Some(key) =
-                            kms_state.keys.values().find(|k| k.key_id == *key_id)
-                        {
-                            sse_kms_key_id = Some(key.arn.clone());
+                    // The key (or alias) lives in the bucket's region; an
+                    // alias ARN names its own region.
+                    match kms_state.resolve_key_arn(&bucket_region, key_id) {
+                        Some(arn) => sse_kms_key_id = Some(arn.to_string()),
+                        None => {
+                            // Still allow it — AWS doesn't always reject unknown keys
+                            // for emulation purposes, just set the key ID
+                            tracing::debug!(
+                                key_id = %key_id,
+                                "KMS key not found in state, proceeding anyway"
+                            );
                         }
                     }
                 }
@@ -473,7 +457,7 @@ impl S3Service {
             let _ = tokio::fs::remove_file(&spooled.path).await;
             let cipher = self.encrypt_object_body(
                 account_id,
-                &region,
+                &bucket_region,
                 bucket,
                 &Bytes::from(bytes),
                 sse_kms_key_id.as_deref(),
@@ -1094,8 +1078,12 @@ impl S3Service {
         };
         // Re-encrypt for the destination if it lands as SSE-KMS, so the
         // stored body is a fresh envelope with the dest's encryption
-        // context (bucket arn).
-        let dest_region = state.region.clone();
+        // context (bucket arn), under a key in the destination bucket's
+        // region.
+        let dest_region = state
+            .buckets
+            .get(dest_bucket)
+            .map_or_else(|| state.region.clone(), |b| b.region.clone());
         let dest_stored_bytes = if new_sse.as_deref() == Some("aws:kms") && self.kms_hook.is_some()
         {
             self.encrypt_object_body(

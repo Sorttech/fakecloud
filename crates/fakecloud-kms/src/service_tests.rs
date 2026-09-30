@@ -1684,7 +1684,7 @@ fn update_alias_points_to_different_key() {
     {
         let _accts = svc.state.read();
         let state = _accts.default_ref();
-        let alias = state.aliases.get("alias/switchable").unwrap();
+        let alias = state.alias("us-east-1", "alias/switchable").unwrap();
         assert_eq!(alias.target_key_id, key_a);
     }
 
@@ -1699,7 +1699,7 @@ fn update_alias_points_to_different_key() {
     {
         let _accts = svc.state.read();
         let state = _accts.default_ref();
-        let alias = state.aliases.get("alias/switchable").unwrap();
+        let alias = state.alias("us-east-1", "alias/switchable").unwrap();
         assert_eq!(alias.target_key_id, key_b);
     }
 }
@@ -4014,9 +4014,10 @@ async fn rsa_key_generation_does_not_hold_the_state_lock() {
     assert!(!body["PublicKey"].as_str().unwrap().is_empty());
 }
 
-/// ListAliases pagination walks every alias exactly once when customer
-/// aliases and the pre-listed AWS-managed aliases are mixed, including after
-/// services minted AWS-managed keys in other regions (which add no aliases).
+/// ListAliases pagination walks every alias of the request region exactly
+/// once, in AliasName order, when customer aliases and the pre-listed
+/// AWS-managed aliases are mixed, including after services minted
+/// AWS-managed keys in other regions (whose aliases live in those regions).
 #[test]
 fn list_aliases_pagination_covers_customer_and_managed_aliases() {
     let svc = make_service();
@@ -4032,49 +4033,295 @@ fn list_aliases_pagination_covers_customer_and_managed_aliases() {
             "timestream.amazonaws.com",
         );
     }
-    let list = |body: Value| -> Value {
-        serde_json::from_slice(
-            svc.list_aliases(&make_request("ListAliases", body))
-                .unwrap()
-                .body
-                .expect_bytes(),
-        )
-        .unwrap()
+    let list = |region: &str, body: Value| -> Value {
+        let mut req = make_request("ListAliases", body);
+        req.region = region.to_string();
+        serde_json::from_slice(svc.list_aliases(&req).unwrap().body.expect_bytes()).unwrap()
     };
-    let all: Vec<String> = list(json!({}))["Aliases"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|a| a["AliasName"].as_str().unwrap().to_string())
-        .collect();
+    let names = |page: &Value| -> Vec<String> {
+        page["Aliases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["AliasName"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let all = names(&list("us-east-1", json!({})));
     assert!(all.iter().any(|n| n == "alias/aaa-first"));
     assert!(all.iter().any(|n| n == "alias/zzz-last"));
     assert!(all.iter().any(|n| n == "alias/aws/s3"));
+    assert!(
+        !all.iter().any(|n| n == "alias/aws/timestream"),
+        "other regions' managed aliases are not listed here"
+    );
+    let mut sorted = all.clone();
+    sorted.sort();
+    assert_eq!(all, sorted, "listed in AliasName order");
+
+    let west = names(&list("us-west-2", json!({})));
     assert_eq!(
-        all.iter().filter(|n| *n == "alias/aws/timestream").count(),
+        west.iter().filter(|n| *n == "alias/aws/timestream").count(),
         1,
-        "one managed alias entry per account"
+        "one managed alias entry per region"
+    );
+    assert!(
+        !west.iter().any(|n| n == "alias/aaa-first"),
+        "customer aliases stay in their region"
     );
 
-    let mut paged: Vec<String> = Vec::new();
-    let mut marker: Option<String> = None;
-    loop {
-        let mut body = json!({ "Limit": 3 });
-        if let Some(m) = &marker {
-            body["Marker"] = json!(m);
+    for (region, expected) in [("us-east-1", &all), ("us-west-2", &west)] {
+        let mut paged: Vec<String> = Vec::new();
+        let mut marker: Option<String> = None;
+        loop {
+            let mut body = json!({ "Limit": 3 });
+            if let Some(m) = &marker {
+                body["Marker"] = json!(m);
+            }
+            let page = list(region, body);
+            paged.extend(names(&page));
+            if page["Truncated"] != json!(true) {
+                break;
+            }
+            marker = page["NextMarker"].as_str().map(str::to_string);
         }
-        let page = list(body);
-        paged.extend(
-            page["Aliases"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|a| a["AliasName"].as_str().unwrap().to_string()),
+        assert_eq!(
+            &paged, expected,
+            "{region}: pages cover every alias once, in order"
         );
-        if page["Truncated"] != json!(true) {
-            break;
-        }
-        marker = page["NextMarker"].as_str().map(str::to_string);
     }
-    assert_eq!(paged, all, "pages cover every alias once, in order");
+}
+
+fn regional_request(action: &str, region: &str, body: Value) -> AwsRequest {
+    let mut req = make_request(action, body);
+    req.region = region.to_string();
+    req
+}
+
+fn create_key_in(svc: &KmsService, region: &str) -> String {
+    let resp = svc
+        .create_key(&regional_request("CreateKey", region, json!({})))
+        .unwrap();
+    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    body["KeyMetadata"]["KeyId"].as_str().unwrap().to_string()
+}
+
+fn describe_key_id_in(svc: &KmsService, region: &str, key: &str) -> Result<String, String> {
+    svc.describe_key(&regional_request(
+        "DescribeKey",
+        region,
+        json!({ "KeyId": key }),
+    ))
+    .map(|resp| {
+        let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        body["KeyMetadata"]["KeyId"].as_str().unwrap().to_string()
+    })
+    .map_err(|e| e.code().to_string())
+}
+
+fn customer_alias_names_in(svc: &KmsService, region: &str) -> Vec<(String, String)> {
+    let resp = svc
+        .list_aliases(&regional_request("ListAliases", region, json!({})))
+        .unwrap();
+    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    body["Aliases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|a| !a["AliasName"].as_str().unwrap().starts_with("alias/aws/"))
+        .map(|a| {
+            (
+                a["AliasName"].as_str().unwrap().to_string(),
+                a["AliasArn"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// An alias is regional: the same name exists independently in two regions,
+/// each pointing at its own region's key, listed and resolved only there,
+/// while an alias ARN resolves in the region it names from anywhere.
+#[test]
+fn same_alias_name_is_independent_per_region() {
+    let svc = make_service();
+    let east_key = create_key_in(&svc, "us-east-1");
+    let west_key = create_key_in(&svc, "eu-west-1");
+    for (region, key) in [("us-east-1", &east_key), ("eu-west-1", &west_key)] {
+        svc.create_alias(&regional_request(
+            "CreateAlias",
+            region,
+            json!({ "AliasName": "alias/app", "TargetKeyId": key }),
+        ))
+        .unwrap_or_else(|e| panic!("CreateAlias in {region}: {}", e.code()));
+    }
+    // A second CreateAlias of the name in the same region still conflicts.
+    let dup = svc
+        .create_alias(&regional_request(
+            "CreateAlias",
+            "eu-west-1",
+            json!({ "AliasName": "alias/app", "TargetKeyId": west_key }),
+        ))
+        .err()
+        .expect("expected an error");
+    assert_eq!(dup.code(), "AlreadyExistsException");
+
+    assert_eq!(
+        describe_key_id_in(&svc, "us-east-1", "alias/app").unwrap(),
+        east_key
+    );
+    assert_eq!(
+        describe_key_id_in(&svc, "eu-west-1", "alias/app").unwrap(),
+        west_key
+    );
+    assert_eq!(
+        describe_key_id_in(
+            &svc,
+            "us-east-1",
+            "arn:aws:kms:eu-west-1:123456789012:alias/app"
+        )
+        .unwrap(),
+        west_key
+    );
+    assert_eq!(
+        describe_key_id_in(&svc, "ap-south-1", "alias/app").unwrap_err(),
+        "NotFoundException"
+    );
+
+    assert_eq!(
+        customer_alias_names_in(&svc, "us-east-1"),
+        vec![(
+            "alias/app".to_string(),
+            "arn:aws:kms:us-east-1:123456789012:alias/app".to_string()
+        )]
+    );
+    assert_eq!(
+        customer_alias_names_in(&svc, "eu-west-1"),
+        vec![(
+            "alias/app".to_string(),
+            "arn:aws:kms:eu-west-1:123456789012:alias/app".to_string()
+        )]
+    );
+    assert!(customer_alias_names_in(&svc, "ap-south-1").is_empty());
+
+    // Encrypt under the alias uses the request region's key.
+    let resp = svc
+        .encrypt(&regional_request(
+            "Encrypt",
+            "eu-west-1",
+            json!({ "KeyId": "alias/app", "Plaintext": "aGk=" }),
+        ))
+        .unwrap();
+    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert!(body["KeyId"].as_str().unwrap().ends_with(&west_key));
+
+    // Deleting one region's alias leaves the other.
+    svc.delete_alias(&regional_request(
+        "DeleteAlias",
+        "us-east-1",
+        json!({ "AliasName": "alias/app" }),
+    ))
+    .unwrap();
+    assert!(customer_alias_names_in(&svc, "us-east-1").is_empty());
+    assert_eq!(
+        describe_key_id_in(&svc, "eu-west-1", "alias/app").unwrap(),
+        west_key
+    );
+    let gone = svc
+        .delete_alias(&regional_request(
+            "DeleteAlias",
+            "us-east-1",
+            json!({ "AliasName": "alias/app" }),
+        ))
+        .err()
+        .expect("expected an error");
+    assert_eq!(gone.code(), "NotFoundException");
+}
+
+/// An alias and its key share a region: CreateAlias / UpdateAlias reject a
+/// key from another region, and UpdateAlias only sees the request region's
+/// alias.
+#[test]
+fn alias_target_must_be_in_the_alias_region() {
+    let svc = make_service();
+    let east_key = create_key_in(&svc, "us-east-1");
+    let west_key = create_key_in(&svc, "eu-west-1");
+    let east_arn = format!("arn:aws:kms:us-east-1:123456789012:key/{east_key}");
+    for target in [east_key.as_str(), east_arn.as_str()] {
+        let err = svc
+            .create_alias(&regional_request(
+                "CreateAlias",
+                "eu-west-1",
+                json!({ "AliasName": "alias/cross", "TargetKeyId": target }),
+            ))
+            .err()
+            .expect("expected an error");
+        assert_eq!(err.code(), "NotFoundException", "target {target}");
+    }
+    svc.create_alias(&regional_request(
+        "CreateAlias",
+        "eu-west-1",
+        json!({ "AliasName": "alias/cross", "TargetKeyId": west_key }),
+    ))
+    .unwrap();
+    let err = svc
+        .update_alias(&regional_request(
+            "UpdateAlias",
+            "eu-west-1",
+            json!({ "AliasName": "alias/cross", "TargetKeyId": east_key }),
+        ))
+        .err()
+        .expect("expected an error");
+    assert_eq!(err.code(), "NotFoundException");
+    let err = svc
+        .update_alias(&regional_request(
+            "UpdateAlias",
+            "us-east-1",
+            json!({ "AliasName": "alias/cross", "TargetKeyId": east_key }),
+        ))
+        .err()
+        .expect("expected an error");
+    assert_eq!(
+        err.code(),
+        "NotFoundException",
+        "no alias/cross in us-east-1"
+    );
+}
+
+/// A multi-region key's replica stands in for the primary when an alias in
+/// the replica's region names the shared key id.
+#[test]
+fn alias_in_replica_region_targets_the_replica() {
+    let svc = make_service();
+    let resp = svc
+        .create_key(&regional_request(
+            "CreateKey",
+            "us-east-1",
+            json!({ "MultiRegion": true }),
+        ))
+        .unwrap();
+    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    let key_id = body["KeyMetadata"]["KeyId"].as_str().unwrap().to_string();
+    svc.replicate_key(&regional_request(
+        "ReplicateKey",
+        "us-east-1",
+        json!({ "KeyId": key_id, "ReplicaRegion": "eu-west-1" }),
+    ))
+    .unwrap();
+    svc.create_alias(&regional_request(
+        "CreateAlias",
+        "eu-west-1",
+        json!({ "AliasName": "alias/mrk", "TargetKeyId": key_id }),
+    ))
+    .unwrap();
+    let resp = svc
+        .describe_key(&regional_request(
+            "DescribeKey",
+            "eu-west-1",
+            json!({ "KeyId": "alias/mrk" }),
+        ))
+        .unwrap();
+    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(
+        body["KeyMetadata"]["Arn"],
+        format!("arn:aws:kms:eu-west-1:123456789012:key/{key_id}")
+    );
 }

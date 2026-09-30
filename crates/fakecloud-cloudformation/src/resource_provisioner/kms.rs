@@ -86,7 +86,7 @@ impl ResourceProvisioner {
         let mut accounts = self.kms_state.write();
         let state = accounts.get_or_create(&self.account_id);
         state.keys.remove(physical_id);
-        state.aliases.retain(|_, a| a.target_key_id != physical_id);
+        state.retain_aliases(|a| a.target_key_id != physical_id);
         Ok(())
     }
 
@@ -256,6 +256,7 @@ impl ResourceProvisioner {
         kms_provisioner::update_alias_target(
             &self.kms_state,
             &self.account_id,
+            &self.region,
             &existing.physical_id,
             target_input,
         )?;
@@ -265,7 +266,7 @@ impl ResourceProvisioner {
     pub(super) fn delete_kms_alias(&self, physical_id: &str) -> Result<(), String> {
         let mut accounts = self.kms_state.write();
         let state = accounts.get_or_create(&self.account_id);
-        state.aliases.remove(physical_id);
+        state.remove_alias(&self.region, physical_id);
         Ok(())
     }
 }

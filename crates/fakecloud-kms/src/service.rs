@@ -9,14 +9,14 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
-use fakecloud_aws::arn::{arn_resource, partition_for, partition_of, Arn};
+use fakecloud_aws::arn::{partition_for, partition_of, Arn};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_core::validation::*;
 use fakecloud_persistence::SnapshotStore;
 
 use crate::state::{
-    kms_alias_arn, kms_key_arn, CustomKeyStore, KeyRotation, KmsAlias, KmsGrant, KmsKey,
-    KmsSnapshot, KmsState, SharedKmsState, KMS_SNAPSHOT_SCHEMA_VERSION,
+    kms_alias_arn, kms_key_arn, parse_kms_arn, CustomKeyStore, KeyRotation, KmsAlias, KmsGrant,
+    KmsKey, KmsSnapshot, KmsState, SharedKmsState, KMS_SNAPSHOT_SCHEMA_VERSION,
 };
 
 const FAKE_ENVELOPE_PREFIX: &str = "fakecloud-kms:";
@@ -459,56 +459,35 @@ impl KmsService {
         let accounts = self.state.read();
         let empty = KmsState::new(account_id, region);
         let state = accounts.get(account_id).unwrap_or(&empty);
-        Self::resolve_key_id_with_state(state, key_id_or_arn)
+        Self::resolve_key_id_with_state(state, region, key_id_or_arn)
     }
 
+    /// Resolve a key id, key ARN, alias name or alias ARN to the stored key
+    /// id; see [`KmsState::resolve_key_id`].
     pub(crate) fn resolve_key_id_with_state(
         state: &crate::state::KmsState,
+        region: &str,
         key_id_or_arn: &str,
     ) -> Option<String> {
-        // Direct key ID
-        if state.keys.contains_key(key_id_or_arn) {
-            return Some(key_id_or_arn.to_string());
-        }
+        state.resolve_key_id(region, key_id_or_arn)
+    }
 
-        // ARN for key
-        if arn_resource(key_id_or_arn, "kms").is_some() {
-            // Could be key ARN or alias ARN
-            if key_id_or_arn.contains(":key/") {
-                if let Some(id) = key_id_or_arn.rsplit('/').next() {
-                    // Multi-region replicas are stored under a region-scoped
-                    // composite key ("{region}:{id}") because the primary and
-                    // every replica share the same bare id. Resolve the ARN's
-                    // own region first so a DescribeKey on a replica ARN returns
-                    // the replica entry, not the primary that also matches `id`.
-                    let region = key_id_or_arn.split(':').nth(3).unwrap_or("");
-                    let scoped = format!("{region}:{id}");
-                    if state.keys.contains_key(&scoped) {
-                        return Some(scoped);
-                    }
-                    if state.keys.contains_key(id) {
-                        return Some(id.to_string());
-                    }
-                }
-            }
-            // alias ARN: arn:aws:kms:region:account:alias/name
-            if key_id_or_arn.contains(":alias/") {
-                if let Some(alias_part) = key_id_or_arn.split(':').next_back() {
-                    if let Some(alias) = state.aliases.get(alias_part) {
-                        return Some(alias.target_key_id.clone());
-                    }
-                }
-            }
+    /// Resolve `target` (a key id or key ARN) to the stored id of the key an
+    /// alias in `region` may point at. An alias and its key share a region,
+    /// so a key elsewhere does not resolve; for a multi-region key the
+    /// replica in `region` stands in for the primary.
+    pub(crate) fn resolve_alias_target(
+        state: &crate::state::KmsState,
+        region: &str,
+        target: &str,
+    ) -> Option<String> {
+        let resolved = Self::resolve_key_id_with_state(state, region, target)?;
+        let key = state.keys.get(&resolved)?;
+        if parse_kms_arn(&key.arn).map(|(r, _, _)| r) == Some(region) {
+            return Some(resolved);
         }
-
-        // Alias name
-        if key_id_or_arn.starts_with("alias/") {
-            if let Some(alias) = state.aliases.get(key_id_or_arn) {
-                return Some(alias.target_key_id.clone());
-            }
-        }
-
-        None
+        let replica = format!("{region}:{}", key.key_id);
+        state.keys.contains_key(&replica).then_some(replica)
     }
 
     fn require_key_id(body: &Value) -> Result<String, AwsServiceError> {
@@ -708,13 +687,14 @@ impl KmsService {
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
         // Check key policy for Deny rules
-        let resolved = Self::resolve_key_id_with_state(state, key_id_input).ok_or_else(|| {
-            AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "NotFoundException",
-                format!("Key '{key_id_input}' does not exist"),
-            )
-        })?;
+        let resolved = Self::resolve_key_id_with_state(state, &req.region, key_id_input)
+            .ok_or_else(|| {
+                AwsServiceError::aws_error(
+                    StatusCode::BAD_REQUEST,
+                    "NotFoundException",
+                    format!("Key '{key_id_input}' does not exist"),
+                )
+            })?;
 
         let key = state.keys.get(&resolved).ok_or_else(|| {
             AwsServiceError::aws_error(
@@ -748,13 +728,14 @@ impl KmsService {
         let empty = KmsState::new(&req.account_id, &req.region);
         let state = accounts.get(&req.account_id).unwrap_or(&empty);
 
-        let resolved = Self::resolve_key_id_with_state(state, key_id_input).ok_or_else(|| {
-            AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "NotFoundException",
-                format!("Key '{key_id_input}' does not exist"),
-            )
-        })?;
+        let resolved = Self::resolve_key_id_with_state(state, &req.region, key_id_input)
+            .ok_or_else(|| {
+                AwsServiceError::aws_error(
+                    StatusCode::BAD_REQUEST,
+                    "NotFoundException",
+                    format!("Key '{key_id_input}' does not exist"),
+                )
+            })?;
         let key = state.keys.get(&resolved).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,

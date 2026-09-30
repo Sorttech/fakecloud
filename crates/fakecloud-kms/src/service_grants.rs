@@ -241,7 +241,7 @@ impl KmsService {
         let idx = if let Some(token) = grant_token {
             state.grants.iter().position(|g| g.grant_token == token)
         } else if let (Some(kid), Some(gid)) = (key_id, grant_id) {
-            let resolved = Self::resolve_key_id_with_state(state, kid);
+            let resolved = Self::resolve_key_id_with_state(state, &req.region, kid);
             resolved.and_then(|r| {
                 state
                     .grants

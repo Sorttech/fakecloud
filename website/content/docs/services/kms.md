@@ -13,7 +13,7 @@ fakecloud implements **53 of 53** KMS operations at 100% Smithy conformance.
   - **RSA** — RSA_2048, RSA_3072, RSA_4096 with real RSA Sign/Verify/GetPublicKey
   - **ECC** — ECC_NIST_P256, ECC_NIST_P384, ECC_NIST_P521, and ECC_SECG_P256K1 with real ECDSA Sign/Verify/GetPublicKey
 - **Key management** — DescribeKey, EnableKey, DisableKey, ScheduleKeyDeletion, CancelKeyDeletion
-- **Aliases** — CRUD with `alias/` prefix validation. Accepted anywhere a key id/ARN is accepted (Encrypt, Decrypt, Sign, Verify, GenerateDataKey, ReEncrypt, grants, key policies, cross-service KmsKeyId).
+- **Aliases** — CRUD with `alias/` prefix validation. Aliases are regional, as in AWS: the same alias name can exist independently in every region, `ListAliases` pages through the request region's aliases only, and an alias must point at a key in its own region. An alias name resolves in the caller's region and an alias ARN in the region it names, anywhere a key id/ARN is accepted (Encrypt, Decrypt, Sign, Verify, GenerateDataKey, ReEncrypt, grants, key policies, cross-service KmsKeyId, which resolves in the resource's region).
 - **Grants** — CreateGrant, RetireGrant, RevokeGrant, ListGrants
 - **Key rotation** — automatic rotation flag (tracked), on-demand rotation
 - **Key policies** — PutKeyPolicy, GetKeyPolicy, ListKeyPolicies
@@ -22,7 +22,7 @@ fakecloud implements **53 of 53** KMS operations at 100% Smithy conformance.
 - **Key import** — GetParametersForImport, ImportKeyMaterial with real key material handling
 - **Custom key stores** — CRUD (records only)
 - **Key replica** — ReplicateKey
-- **Cross-service KMS hook** — S3 (SSE-KMS), SQS, SNS, DynamoDB, Secrets Manager, and SSM SecureString call into KMS for real encrypt/decrypt under the hood. Every call is recorded at `/_fakecloud/kms/usage` so test code can assert which service principal triggered which operation on which key with which encryption context. AWS-managed aliases (`aws/s3`, `aws/sqs`, `aws/sns`, `aws/dynamodb`, `aws/secretsmanager`, `aws/ssm`, ...) auto-provision on first use.
+- **Cross-service KMS hook** — S3 (SSE-KMS), SQS, SNS, DynamoDB, Secrets Manager, and SSM SecureString call into KMS for real encrypt/decrypt under the hood. Every call is recorded at `/_fakecloud/kms/usage` so test code can assert which service principal triggered which operation on which key with which encryption context. AWS-managed aliases (`aws/s3`, `aws/sqs`, `aws/sns`, `aws/dynamodb`, `aws/secretsmanager`, `aws/ssm`, ...) auto-provision on first use, one AWS-managed key per account and region, which that region's `alias/aws/<service>` names.
 
 ## Introspection
 
