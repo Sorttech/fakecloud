@@ -12134,7 +12134,7 @@ async fn ec2_get_capacity_manager_attributes() {
     c.get_capacity_manager_attributes().send().await.unwrap();
 }
 
-#[test_action("ec2", "GetCapacityManagerMetricData", checksum = "46b01e31")]
+#[test_action("ec2", "GetCapacityManagerMetricData", checksum = "b1c1f09d")]
 #[tokio::test]
 async fn ec2_get_capacity_manager_metric_data() {
     let s = TestServer::start().await;
@@ -12148,7 +12148,7 @@ async fn ec2_get_capacity_manager_metric_data() {
         .unwrap();
 }
 
-#[test_action("ec2", "GetCapacityManagerMetricDimensions", checksum = "d9f96edf")]
+#[test_action("ec2", "GetCapacityManagerMetricDimensions", checksum = "c0952eea")]
 #[tokio::test]
 async fn ec2_get_capacity_manager_metric_dimensions() {
     let s = TestServer::start().await;

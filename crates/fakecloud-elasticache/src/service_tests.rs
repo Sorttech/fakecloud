@@ -1321,6 +1321,29 @@ fn create_global_replication_group_registers_metadata_and_updates_primary_group(
 }
 
 #[test]
+fn create_global_replication_group_stores_request_tags() {
+    let service = service_with_replication_group("primary-rg", 1);
+    let req = request(
+        "CreateGlobalReplicationGroup",
+        &[
+            ("GlobalReplicationGroupIdSuffix", "global-t"),
+            ("PrimaryReplicationGroupId", "primary-rg"),
+            ("Tags.Tag.1.Key", "env"),
+            ("Tags.Tag.1.Value", "prod"),
+        ],
+    );
+    service.create_global_replication_group(&req).unwrap();
+
+    let __a = service.state.read();
+    let state = __a.default_ref();
+    let tags = state
+        .tags
+        .get("arn:aws:elasticache:us-east-1:123456789012:globalreplicationgroup:fc-us-east-1-global-t")
+        .expect("global replication group tags stored");
+    assert!(tags.iter().any(|(k, v)| k == "env" && v == "prod"));
+}
+
+#[test]
 fn describe_global_replication_groups_filters_by_id() {
     let service = service_with_global_replication_group("fc-us-east-1-global-a", "primary-rg");
     let req = request(

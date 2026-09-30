@@ -412,9 +412,9 @@ async fn cloudwatch_managed_insight_rules() {
 // Metric streams.
 // ---------------------------------------------------------------------------
 
-#[test_action("monitoring", "PutMetricStream", checksum = "5aa896b0")]
-#[test_action("monitoring", "GetMetricStream", checksum = "7471eba3")]
-#[test_action("monitoring", "ListMetricStreams", checksum = "571129cb")]
+#[test_action("monitoring", "PutMetricStream", checksum = "43812fcc")]
+#[test_action("monitoring", "GetMetricStream", checksum = "9edc43a8")]
+#[test_action("monitoring", "ListMetricStreams", checksum = "13f22263")]
 #[test_action("monitoring", "StopMetricStreams", checksum = "9cac1038")]
 #[test_action("monitoring", "StartMetricStreams", checksum = "1049a044")]
 #[test_action("monitoring", "DeleteMetricStream", checksum = "66b6c627")]

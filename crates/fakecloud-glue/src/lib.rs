@@ -26,5 +26,5 @@ pub use common::resource_arn;
 pub use service::{parse_columns, parse_storage_descriptor, parse_string_map, GlueService};
 pub use state::{
     Column, Database, GlueAccounts, GlueSnapshot, GlueState, Partition, SharedGlueState,
-    StorageDescriptor, Table, GLUE_SNAPSHOT_SCHEMA_VERSION,
+    StorageDescriptor, Table, TableExtensions, GLUE_SNAPSHOT_SCHEMA_VERSION,
 };

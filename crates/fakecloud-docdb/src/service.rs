@@ -533,6 +533,9 @@ impl DocDbService {
             deletion_protection: optional_query_param(req, "DeletionProtection")
                 .map(|v| v == "true")
                 .unwrap_or(false),
+            copy_tags_to_snapshot: optional_query_param(req, "CopyTagsToSnapshot")
+                .map(|v| v == "true")
+                .unwrap_or(false),
             backup_retention_period: optional_query_param(req, "BackupRetentionPeriod")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1),
@@ -653,6 +656,9 @@ impl DocDbService {
         }
         if let Some(v) = optional_query_param(req, "DeletionProtection") {
             cluster.deletion_protection = v == "true";
+        }
+        if let Some(v) = optional_query_param(req, "CopyTagsToSnapshot") {
+            cluster.copy_tags_to_snapshot = v == "true";
         }
         if let Some(v) = optional_query_param(req, "Port").and_then(|v| v.parse().ok()) {
             cluster.port = v;
@@ -1013,7 +1019,14 @@ impl DocDbService {
             .ok_or_else(|| db_cluster_not_found(&cluster_id))?;
         let mut snap =
             snapshot_from_cluster(cluster, &snap_id, &req.region, &req.account_id, "manual");
-        snap.tags = parse_tags(req);
+        // Tags given on the request win; otherwise a cluster with
+        // CopyTagsToSnapshot hands its own tags to the snapshot.
+        let requested = parse_tags(req);
+        snap.tags = if requested.is_empty() && cluster.copy_tags_to_snapshot {
+            cluster.tags.clone()
+        } else {
+            requested
+        };
         st.cluster_snapshots.insert(snap_id, snap.clone());
         Ok(ok_xml(
             "CreateDBClusterSnapshot",
@@ -1234,6 +1247,9 @@ impl DocDbService {
             deletion_protection: optional_query_param(req, "DeletionProtection")
                 .map(|v| v == "true")
                 .unwrap_or(false),
+            copy_tags_to_snapshot: optional_query_param(req, "CopyTagsToSnapshot")
+                .map(|v| v == "true")
+                .unwrap_or(false),
             backup_retention_period: 1,
             preferred_backup_window: "07:00-07:30".to_string(),
             preferred_maintenance_window: "sun:08:00-sun:08:30".to_string(),
@@ -1290,6 +1306,9 @@ impl DocDbService {
         cluster.status = "available".to_string();
         cluster.cluster_create_time = Utc::now();
         cluster.tags = parse_tags(req);
+        cluster.copy_tags_to_snapshot = optional_query_param(req, "CopyTagsToSnapshot")
+            .map(|v| v == "true")
+            .unwrap_or(false);
         st.clusters.insert(new_id, cluster.clone());
         Ok(ok_xml(
             "RestoreDBClusterToPointInTime",

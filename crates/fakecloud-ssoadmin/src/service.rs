@@ -496,10 +496,21 @@ fn build_instance_describe(inst: &StoredInstance) -> Value {
     let mut m = serde_json::Map::new();
     m.insert("InstanceArn".into(), json!(inst.arn));
     m.insert("IdentityStoreId".into(), json!(inst.identity_store_id));
+    m.insert(
+        "IdentityStoreArn".into(),
+        json!(identity_store_arn(
+            &inst.arn,
+            &inst.owner_account_id,
+            &inst.identity_store_id
+        )),
+    );
     m.insert("OwnerAccountId".into(), json!(inst.owner_account_id));
     m.insert("CreatedDate".into(), json!(inst.created_date));
     m.insert("Status".into(), json!(inst.status));
     opt_str(&mut m, "Name", &inst.name);
+    opt_str(&mut m, "PrimaryRegion", &inst.primary_region);
+    let regions: Vec<Value> = inst.regions.iter().map(build_region).collect();
+    m.insert("Regions".into(), json!(regions));
     m.insert(
         "PermissionSetsEnabled".into(),
         json!(inst.permission_sets_enabled),
@@ -522,6 +533,14 @@ fn build_instance_metadata(inst: &StoredInstance) -> Value {
     let mut m = serde_json::Map::new();
     m.insert("InstanceArn".into(), json!(inst.arn));
     m.insert("IdentityStoreId".into(), json!(inst.identity_store_id));
+    m.insert(
+        "IdentityStoreArn".into(),
+        json!(identity_store_arn(
+            &inst.arn,
+            &inst.owner_account_id,
+            &inst.identity_store_id
+        )),
+    );
     m.insert("OwnerAccountId".into(), json!(inst.owner_account_id));
     m.insert("CreatedDate".into(), json!(inst.created_date));
     m.insert("Status".into(), json!(inst.status));

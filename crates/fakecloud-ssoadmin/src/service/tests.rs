@@ -62,9 +62,18 @@ fn instance_lifecycle() {
     assert_eq!(desc["Name"], json!("corp"));
     let list = call(&s, "ListInstances", json!({}));
     assert_eq!(list["Instances"].as_array().unwrap().len(), 1);
-    // InstanceMetadata carries Regions; DescribeInstanceResponse does not.
+    // Both InstanceMetadata and DescribeInstanceResponse carry the Region
+    // list and the connected identity store's ARN.
     assert!(list["Instances"][0].get("Regions").is_some());
-    assert!(desc.get("Regions").is_none());
+    assert_eq!(desc["Regions"], list["Instances"][0]["Regions"]);
+    assert_eq!(desc["PrimaryRegion"], list["Instances"][0]["PrimaryRegion"]);
+    let store_arn = format!(
+        "arn:aws:identitystore::{}:identitystore/{}",
+        desc["OwnerAccountId"].as_str().unwrap(),
+        desc["IdentityStoreId"].as_str().unwrap()
+    );
+    assert_eq!(desc["IdentityStoreArn"], json!(store_arn));
+    assert_eq!(list["Instances"][0]["IdentityStoreArn"], json!(store_arn));
 }
 
 #[test]
@@ -426,6 +435,10 @@ fn china_region_arns_use_the_aws_cn_partition() {
     );
     let desc = in_cn("DescribeInstance", json!({ "InstanceArn": inst }));
     assert_eq!(desc["InstanceArn"], json!(inst));
+    assert!(desc["IdentityStoreArn"]
+        .as_str()
+        .unwrap()
+        .starts_with("arn:aws-cn:identitystore::"));
 
     let ps = in_cn(
         "CreatePermissionSet",

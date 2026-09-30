@@ -2341,3 +2341,109 @@ fn an_attachment_written_by_item_name_reads_back_by_item_id() {
     );
     assert!(got["Items"][0].get("Attachments").is_none());
 }
+
+#[test]
+fn federated_tables_and_view_definitions_round_trip() {
+    let svc = GlueService::default();
+    svc.create_database(&req(
+        "CreateDatabase",
+        json!({"DatabaseInput": {"Name": "db"}}),
+    ))
+    .unwrap();
+    svc.create_table(&req(
+        "CreateTable",
+        json!({"DatabaseName": "db", "TableInput": {"Name": "plain"}}),
+    ))
+    .unwrap();
+    svc.create_table(&req(
+        "CreateTable",
+        json!({
+            "DatabaseName": "db",
+            "TableInput": {
+                "Name": "fed",
+                "FederatedTable": {
+                    "Identifier": "ext_table",
+                    "DatabaseIdentifier": "ext_db",
+                    "ConnectionName": "hive-conn",
+                    "ConnectionType": "HIVE_METASTORE",
+                },
+            }
+        }),
+    ))
+    .unwrap();
+    svc.create_table(&req(
+        "CreateTable",
+        json!({
+            "DatabaseName": "db",
+            "TableInput": {
+                "Name": "mv",
+                "LastAnalyzedTime": 1700000000.0,
+                "ViewDefinition": {
+                    "IsProtected": true,
+                    "Representations": [{
+                        "Dialect": "SPARK",
+                        "DialectVersion": "3.5",
+                        "ViewOriginalText": "SELECT * FROM db.plain",
+                    }],
+                    "SparkPipelineInfo": {"pipelineId": "p-1"},
+                    "SubObjectsStatistics": [{
+                        "SourceType": "ICEBERG",
+                        "FileCount": 3,
+                        "TotalFileBytes": 4096,
+                    }],
+                },
+            }
+        }),
+    ))
+    .unwrap();
+
+    let mv = body_of(
+        svc.get_table(&req(
+            "GetTable",
+            json!({"DatabaseName": "db", "Name": "mv"}),
+        ))
+        .unwrap(),
+    );
+    let vd = &mv["Table"]["ViewDefinition"];
+    assert_eq!(vd["SparkPipelineInfo"]["pipelineId"], "p-1");
+    assert_eq!(vd["SubObjectsStatistics"][0]["FileCount"], 3);
+    assert_eq!(vd["Representations"][0]["IsStale"], false);
+    assert_eq!(mv["Table"]["IsMultiDialectView"], true);
+    assert_eq!(mv["Table"]["LastAnalyzedTime"], 1700000000.0);
+
+    let names = |share: Option<&str>| -> Vec<String> {
+        let mut body = json!({"DatabaseName": "db"});
+        if let Some(s) = share {
+            body["ResourceShareType"] = json!(s);
+        }
+        let got = body_of(svc.get_tables(&req("GetTables", body)).unwrap());
+        got["TableList"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["Name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(names(Some("FEDERATED")), vec!["fed"]);
+    assert_eq!(names(Some("ALL")).len(), 3);
+    assert_eq!(names(None).len(), 3);
+    let fed = body_of(
+        svc.get_table(&req(
+            "GetTable",
+            json!({"DatabaseName": "db", "Name": "fed"}),
+        ))
+        .unwrap(),
+    );
+    assert_eq!(
+        fed["Table"]["FederatedTable"]["ConnectionName"],
+        "hive-conn"
+    );
+
+    match svc.get_tables(&req(
+        "GetTables",
+        json!({"DatabaseName": "db", "ResourceShareType": "FOREIGN"}),
+    )) {
+        Err(e) => assert_eq!(e.code(), "InvalidInputException"),
+        Ok(_) => panic!("unknown ResourceShareType accepted"),
+    }
+}

@@ -70,6 +70,9 @@ pub struct DbCluster {
     pub storage_encrypted: bool,
     pub kms_key_id: Option<String>,
     pub deletion_protection: bool,
+    /// Copy the cluster's tags onto snapshots taken of it.
+    #[serde(default)]
+    pub copy_tags_to_snapshot: bool,
     pub backup_retention_period: i32,
     pub preferred_backup_window: String,
     pub preferred_maintenance_window: String,
