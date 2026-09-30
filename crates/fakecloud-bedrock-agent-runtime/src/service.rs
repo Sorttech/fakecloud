@@ -719,24 +719,23 @@ async fn handle_invoke_flow(
         let mut accts = svc.state.write();
         let s = accts.get_or_create(&req.account_id);
         let key = crate::flows::execution_map_key(&flow.flow_id, &flow.alias_id, &execution_id);
-        // An execution id is scoped to its flow alias: reusing it under the
-        // same flow and alias continues that execution; under another alias
-        // or flow it names a different execution.
-        match s.flow_executions.get_mut(&key) {
-            // Continue: keep its start time and captured snapshot.
-            Some(existing) => {
-                let now = Utc::now();
-                existing.status = "Succeeded".to_string();
-                existing.updated_at = now;
-                existing.ended_at = Some(now);
-            }
-            None => {
-                s.flow_executions.insert(
-                    key,
-                    new_execution(req, flow, execution_id.clone(), "Succeeded"),
-                );
-            }
+        // An execution id is scoped to its flow alias (the same id under
+        // another alias or flow names a different execution). Only an
+        // InvokeFlow execution still waiting for input could be continued;
+        // InvokeFlow here runs the flow to completion (it never pauses for
+        // input), so an existing execution under this id is either finished
+        // (Succeeded / Failed / TimedOut / Aborted) or a StartFlowExecution
+        // run, and neither can be continued. Its state is left untouched.
+        if let Some(existing) = s.flow_executions.get(&key) {
+            return Err(validation(&format!(
+                "Flow execution {execution_id} can't be continued: its status is {}.",
+                existing.status
+            )));
         }
+        s.flow_executions.insert(
+            key,
+            new_execution(req, flow, execution_id.clone(), "Succeeded"),
+        );
         s.invocations.push(InvocationRecord {
             invocation_id: execution_id.clone(),
             op: "invoke_flow".to_string(),
@@ -1902,8 +1901,12 @@ async fn handle_list_flow_executions(
     let scope = match &alias {
         Some(a) => crate::flows::flow_and_alias(&req.account_id, &flow_identifier, a)
             .map(|(f, a)| (f, Some(a))),
-        None => crate::flows::flow_and_alias(&req.account_id, &flow_identifier, "TSTALIASID")
-            .map(|(f, _)| (f, None)),
+        None => crate::flows::flow_and_alias(
+            &req.account_id,
+            &flow_identifier,
+            crate::flows::TEST_ALIAS_ID,
+        )
+        .map(|(f, _)| (f, None)),
     };
 
     let accts = svc.state.read();
@@ -2553,6 +2556,11 @@ mod tests {
                 "arn:aws-cn:bedrock:cn-north-1:999999999999:flow/ABCDEFGHIJ",
                 "TSTALIASID",
             ),
+            // An alias ARN in another account.
+            (
+                FLOW,
+                "arn:aws-cn:bedrock:cn-north-1:999999999999:flow/ABCDEFGHIJ/alias/ALIASV1AAA",
+            ),
         ] {
             let b = json!({"flowIdentifier": flow, "flowAliasIdentifier": alias, "inputs": []});
             let err = handle_start_flow_execution(&svc, &req, &b)
@@ -2881,55 +2889,97 @@ mod tests {
 
     #[tokio::test]
     async fn invoke_flow_execution_ids_are_scoped_to_flow_and_alias() {
-        let (svc, agent_state) = flow_svc();
+        let (svc, _) = flow_svc();
         let req = cn_request();
-        let invoke = |alias: &str, flow: &str| {
+        let invoke = |alias: &str, flow: &str, id: &str| {
             json!({
                 "flowIdentifier": flow,
                 "flowAliasIdentifier": alias,
                 "inputs": [],
-                "executionId": "conversation-1",
+                "executionId": id,
             })
         };
-        handle_invoke_flow(&svc, &req, &invoke(ALIAS_V1, FLOW))
+        handle_invoke_flow(&svc, &req, &invoke(ALIAS_V1, FLOW, "conversation-1"))
             .await
             .unwrap();
-        let key = crate::flows::execution_map_key(FLOW, ALIAS_V1, "conversation-1");
-        let first = svc.state.read().accounts[ACCT].flow_executions[&key].clone();
-        // Editing the flow does not change what the continued execution ran.
-        agent_state
-            .write()
-            .accounts
-            .get_mut(ACCT)
-            .unwrap()
-            .flow_versions
-            .get_mut(FLOW)
-            .unwrap()[0]
-            .definition = Some(json!({"nodes": []}));
-        handle_invoke_flow(&svc, &req, &invoke(ALIAS_V1, FLOW))
-            .await
-            .unwrap();
-        let continued = svc.state.read().accounts[ACCT].flow_executions[&key].clone();
-        assert_eq!(continued.created_at, first.created_at);
-        assert_eq!(continued.definition, first.definition);
-        assert_eq!(continued.execution_arn, first.execution_arn);
-        // The same id under another alias or flow is a separate execution and
-        // leaves this one untouched.
+        // The same id under another alias or flow is a separate execution.
         for (alias, flow) in [("TSTALIASID", FLOW), (OTHER_ALIAS, OTHER_FLOW)] {
-            handle_invoke_flow(&svc, &req, &invoke(alias, flow))
+            handle_invoke_flow(&svc, &req, &invoke(alias, flow, "conversation-1"))
                 .await
                 .unwrap();
             let other = crate::flows::execution_map_key(flow, alias, "conversation-1");
-            let accts = svc.state.read();
-            let e = &accts.accounts[ACCT].flow_executions[&other];
-            assert_eq!(e.flow_id, flow);
-            assert_eq!(e.flow_alias_id, alias);
+            assert!(svc.state.read().accounts[ACCT]
+                .flow_executions
+                .contains_key(&other));
         }
-        let accts = svc.state.read();
-        assert_eq!(accts.accounts[ACCT].flow_executions.len(), 3);
-        let still = &accts.accounts[ACCT].flow_executions[&key];
-        assert_eq!(still.created_at, first.created_at);
-        assert_eq!(still.flow_version, "1");
+        assert_eq!(svc.state.read().accounts[ACCT].flow_executions.len(), 3);
+    }
+
+    /// InvokeFlow cannot continue an execution that already ended (any
+    /// terminal status) or one StartFlowExecution is running; the rejected
+    /// call leaves the execution untouched.
+    #[tokio::test]
+    async fn invoke_flow_does_not_continue_finished_or_started_executions() {
+        let (svc, _) = flow_svc();
+        let req = cn_request();
+        let invoke = |id: &str| {
+            json!({
+                "flowIdentifier": FLOW,
+                "flowAliasIdentifier": ALIAS_V1,
+                "inputs": [],
+                "executionId": id,
+            })
+        };
+        // A finished InvokeFlow execution (Succeeded).
+        handle_invoke_flow(&svc, &req, &invoke("finished"))
+            .await
+            .unwrap();
+        // A StartFlowExecution run, still Running, and one it then aborted.
+        let named = |name: &str| {
+            json!({
+                "flowIdentifier": FLOW,
+                "flowAliasIdentifier": ALIAS_V1,
+                "inputs": [],
+                "flowExecutionName": name,
+            })
+        };
+        handle_start_flow_execution(&svc, &req, &named("running"))
+            .await
+            .unwrap();
+        handle_start_flow_execution(&svc, &req, &named("aborted"))
+            .await
+            .unwrap();
+        handle_stop_flow_execution(&svc, &req, &exec_body(FLOW, ALIAS_V1, "aborted"))
+            .await
+            .unwrap();
+        // A failed and a timed-out execution.
+        for (id, status) in [("failed", "Failed"), ("timed-out", "TimedOut")] {
+            handle_invoke_flow(&svc, &req, &invoke(id)).await.unwrap();
+            let key = crate::flows::execution_map_key(FLOW, ALIAS_V1, id);
+            svc.state
+                .write()
+                .accounts
+                .get_mut(ACCT)
+                .unwrap()
+                .flow_executions
+                .get_mut(&key)
+                .unwrap()
+                .status = status.to_string();
+        }
+
+        for id in ["finished", "running", "aborted", "failed", "timed-out"] {
+            let key = crate::flows::execution_map_key(FLOW, ALIAS_V1, id);
+            let before = svc.state.read().accounts[ACCT].flow_executions[&key].clone();
+            let err = handle_invoke_flow(&svc, &req, &invoke(id))
+                .await
+                .err()
+                .expect("expected an error");
+            assert_eq!(code(err), "ValidationException", "{id}");
+            let after = svc.state.read().accounts[ACCT].flow_executions[&key].clone();
+            assert_eq!(after.status, before.status, "{id}");
+            assert_eq!(after.updated_at, before.updated_at, "{id}");
+            assert_eq!(after.ended_at, before.ended_at, "{id}");
+        }
     }
 
     #[tokio::test]

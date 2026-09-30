@@ -140,11 +140,14 @@ pub(crate) fn resolve_flow(
 ) -> Result<ResolvedFlow, AwsServiceError> {
     let flow_missing = || not_found(format!("Flow {flow_identifier} not found."));
     let alias_missing = || not_found(format!("Flow alias {alias_identifier} not found."));
-    if arn_account(flow_identifier).is_some_and(|a| a != account_id) {
-        return Err(flow_missing());
-    }
-    let (flow_id, alias_id) =
-        flow_and_alias(account_id, flow_identifier, alias_identifier).ok_or_else(alias_missing)?;
+    // A flow or alias ARN in another account (or an alias ARN of another
+    // flow) names nothing here.
+    let (flow_id, alias_id) = flow_and_alias(account_id, flow_identifier, alias_identifier)
+        .ok_or_else(|| {
+            not_found(format!(
+                "Flow {flow_identifier} alias {alias_identifier} not found."
+            ))
+        })?;
 
     let agent_state = agent_state.ok_or_else(flow_missing)?;
     let accounts = agent_state.read();
