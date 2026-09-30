@@ -37,9 +37,9 @@ fn render_hsm_configuration(c: &HsmConfiguration) -> String {
 
 fn render_snapshot_copy_grant(g: &SnapshotCopyGrant) -> String {
     format!(
-        "<SnapshotCopyGrantName>{name}</SnapshotCopyGrantName><KmsKeyId>{kms}</KmsKeyId>{tags}",
+        "<SnapshotCopyGrantName>{name}</SnapshotCopyGrantName>{kms}{tags}",
         name = xml_escape(&g.snapshot_copy_grant_name),
-        kms = xml_escape(&g.kms_key_id),
+        kms = opt_elem("KmsKeyId", g.kms_key_id.as_deref()),
         tags = render_tags(&g.tags),
     )
 }
@@ -300,6 +300,12 @@ impl RedshiftService {
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let name = param(req, "SnapshotCopyGrantName").unwrap_or_default();
+        if self.account_check(req, |a| a.snapshot_copy_grants.contains_key(&name)) {
+            return Err(snapshot_copy_grant_already_exists(&name));
+        }
+        // No key named: the grant is for the account's AWS-managed key,
+        // resolved only for a valid request (the name is re-checked below).
+        let kms_key_id = self.kms_key_or_default(req);
         let mut guard = self.state.write();
         let acct = guard.account(&req.account_id);
         if acct.snapshot_copy_grants.contains_key(&name) {
@@ -307,7 +313,7 @@ impl RedshiftService {
         }
         let g = SnapshotCopyGrant {
             snapshot_copy_grant_name: name.clone(),
-            kms_key_id: param_or(req, "KmsKeyId", "default"),
+            kms_key_id,
             tags: parse_tags(req),
         };
         acct.snapshot_copy_grants.insert(name, g.clone());

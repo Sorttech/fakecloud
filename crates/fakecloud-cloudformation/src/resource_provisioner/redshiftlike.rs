@@ -87,6 +87,17 @@ fn cluster_identifier(props: &Value, key: &str, generated: impl FnOnce() -> Stri
 }
 
 impl ResourceProvisioner {
+    /// The Redshift handlers over the shared state, with the server's KMS hook
+    /// so an encrypted stack cluster reports the same AWS-managed key the
+    /// direct API does.
+    fn redshift_service(&self) -> fakecloud_redshift::RedshiftService {
+        let svc = fakecloud_redshift::RedshiftService::new(self.redshift_state.clone());
+        match &self.kms_hook {
+            Some(hook) => svc.with_kms_hook(hook.clone()),
+            None => svc,
+        }
+    }
+
     // --- AWS::Redshift::Cluster ---
 
     pub(super) fn create_redshift_cluster(
@@ -98,7 +109,7 @@ impl ResourceProvisioner {
         let mut params = props_to_query(props);
         params.insert("ClusterIdentifier".to_string(), id.clone());
 
-        let svc = fakecloud_redshift::RedshiftService::new(self.redshift_state.clone());
+        let svc = self.redshift_service();
         let req = cluster_request(self, "redshift", "CreateCluster", params);
         svc.provision_sync(&req)
             .map_err(|e| format!("Redshift CreateCluster failed: {}", e.message()))?;
@@ -139,7 +150,7 @@ impl ResourceProvisioner {
         // owns. An in-place update keeps the existing physical id.
         params.remove("NewClusterIdentifier");
 
-        let svc = fakecloud_redshift::RedshiftService::new(self.redshift_state.clone());
+        let svc = self.redshift_service();
         let req = cluster_request(self, "redshift", "ModifyCluster", params);
         svc.provision_sync(&req)
             .map_err(|e| format!("Redshift ModifyCluster failed: {}", e.message()))?;
@@ -159,7 +170,7 @@ impl ResourceProvisioner {
     }
 
     pub(super) fn delete_redshift_cluster(&self, physical_id: &str) -> Result<(), String> {
-        let svc = fakecloud_redshift::RedshiftService::new(self.redshift_state.clone());
+        let svc = self.redshift_service();
         let mut params = HashMap::new();
         params.insert("ClusterIdentifier".to_string(), physical_id.to_string());
         params.insert("SkipFinalClusterSnapshot".to_string(), "true".to_string());

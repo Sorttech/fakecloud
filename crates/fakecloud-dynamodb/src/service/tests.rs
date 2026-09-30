@@ -9088,3 +9088,51 @@ async fn transact_put_reports_a_bad_number_before_the_vector_shape() {
     assert_eq!(transact.code(), put.code());
     assert_eq!(err_message(transact), err_message(put));
 }
+
+/// A KMS-encrypted table with no named key reports exactly the key the
+/// account's `alias/aws/dynamodb` alias resolves to, before and after other
+/// services minted per-region AWS-managed keys.
+#[test]
+fn default_sse_key_is_what_the_dynamodb_alias_resolves_to() {
+    let (_kms_state, hook) = fakecloud_kms::test_support::kms_hook("123456789012");
+    let svc = make_service().with_kms_hook(hook.clone());
+    let create = |name: &str, region: &str| {
+        let mut r = make_request(
+            "CreateTable",
+            json!({
+                "TableName": name,
+                "KeySchema": [{ "AttributeName": "pk", "KeyType": "HASH" }],
+                "AttributeDefinitions": [{ "AttributeName": "pk", "AttributeType": "S" }],
+                "BillingMode": "PAY_PER_REQUEST",
+                "SSESpecification": { "Enabled": true, "SSEType": "KMS" },
+            }),
+        );
+        r.region = region.to_string();
+        svc.create_table(&r).unwrap();
+        describe(&svc, name)["SSEDescription"]["KMSMasterKeyArn"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let first = create("table-one", "us-east-1");
+    // Another region's AWS-managed dynamodb key minted through the regional
+    // path does not change what the alias (and so DynamoDB) reports.
+    hook.aws_managed_key_arn(
+        "123456789012",
+        "eu-west-1",
+        "dynamodb",
+        "dynamodb.amazonaws.com",
+    )
+    .unwrap();
+    let second = create("table-two", "eu-west-1");
+    let alias = hook
+        .resolve_key_arn(
+            "123456789012",
+            "us-east-1",
+            "alias/aws/dynamodb",
+            "dynamodb.amazonaws.com",
+        )
+        .unwrap();
+    assert_eq!(first, alias);
+    assert_eq!(second, alias);
+}

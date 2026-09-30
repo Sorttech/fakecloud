@@ -147,6 +147,9 @@ pub struct KafkaService {
     /// broker-reboot transitions, and topic ops + `GetBootstrapBrokers` drive the
     /// REAL Kafka broker.
     runtime: Option<Arc<KafkaRuntime>>,
+    /// KMS access, so a cluster created without a data-volume key reports the
+    /// account's real AWS-managed `aws/kafka` key.
+    kms_hook: Option<Arc<dyn fakecloud_core::delivery::KmsHook>>,
 }
 
 impl KafkaService {
@@ -156,7 +159,13 @@ impl KafkaService {
             snapshot_store: None,
             snapshot_lock: Arc::new(AsyncMutex::new(())),
             runtime: None,
+            kms_hook: None,
         }
+    }
+
+    pub fn with_kms_hook(mut self, hook: Arc<dyn fakecloud_core::delivery::KmsHook>) -> Self {
+        self.kms_hook = Some(hook);
+        self
     }
 
     pub fn with_snapshot_store(mut self, store: Arc<dyn SnapshotStore>) -> Self {
@@ -854,6 +863,27 @@ impl KafkaService {
             .unwrap_or_default()
             .to_string();
         let serverless = v2 && b.get("serverless").is_some();
+        if let Some(msg) = self
+            .state
+            .read()
+            .get(&ctx.account)
+            .and_then(|data| builders::cluster_name_conflict(data, &name, &ctx.region))
+        {
+            return Err(conflict(&msg));
+        }
+        // Resolve (minting on first use) the AWS-managed data-volume key only
+        // for a valid request and before taking the Kafka lock, so KMS work
+        // never runs under it; the name is re-checked under the lock.
+        let default_key = builders::needs_default_data_volume_key(b, v2)
+            .then(|| {
+                fakecloud_core::delivery::aws_managed_kms_key_arn(
+                    self.kms_hook.as_deref(),
+                    &ctx.account,
+                    &ctx.region,
+                    "kafka",
+                )
+            })
+            .flatten();
 
         let mut guard = self.state.write();
         let data = guard.get_or_create(&ctx.account);
@@ -861,7 +891,7 @@ impl KafkaService {
         // Build + insert the record through the SHARED builder (the same path the
         // CloudFormation `AWS::MSK::*` provisioner uses, so the two paths cannot
         // diverge). Returns the ARN, or a name-conflict message.
-        let arn = builders::insert_cluster(data, &ctx.region, &ctx.account, b, v2)
+        let arn = builders::insert_cluster(data, &ctx.region, &ctx.account, b, v2, default_key)
             .map_err(|msg| conflict(&msg))?;
 
         let mut out = json!({
@@ -3516,21 +3546,21 @@ mod tests {
         assert!(bngi["storageInfo"]["ebsStorageInfo"]
             .get("provisionedThroughput")
             .is_none());
-        // Encryption defaults + a synthesized KMS key ARN.
+        // Encryption defaults; with no KMS wired no data-volume key is known, so
+        // none is reported (never a made-up or alias ARN).
         let ei = &d["clusterInfo"]["encryptionInfo"];
         assert_eq!(ei["encryptionInTransit"]["clientBroker"], json!("TLS"));
         assert_eq!(ei["encryptionInTransit"]["inCluster"], json!(true));
-        assert!(ei["encryptionAtRest"]["dataVolumeKMSKeyId"]
-            .as_str()
-            .unwrap()
-            .starts_with("arn:aws:kms:"));
+        assert!(ei.get("encryptionAtRest").is_none(), "{ei}");
         // No client_authentication is echoed for an auth-less cluster.
         assert!(d["clusterInfo"].get("clientAuthentication").is_none());
     }
 
     #[test]
     fn china_cluster_and_node_arns_use_the_china_partition() {
-        let s = svc();
+        use fakecloud_kms::test_support::{assert_aws_managed_key, kms_hook};
+        let (kms_state, hook) = kms_hook("123456789012");
+        let s = svc().with_kms_hook(hook);
         let c = ctx("cn-north-1");
         let arn = json_of(s.create_cluster(&c, &cluster_body("cn"), false).unwrap())["clusterArn"]
             .as_str()
@@ -3543,17 +3573,40 @@ mod tests {
         settle(&s, &c);
         let d = json_of(s.describe_cluster(&c, &arn, false).unwrap());
         assert_eq!(d["clusterInfo"]["clusterArn"], json!(arn));
-        // The synthesized at-rest key is the ARN KMS itself mints for that key
-        // id in the cluster's region.
+        // The default at-rest key is the account's AWS-managed `aws/kafka` key,
+        // a real KMS key minted in the cluster's region and partition.
         let kms = d["clusterInfo"]["encryptionInfo"]["encryptionAtRest"]["dataVolumeKMSKeyId"]
             .as_str()
             .unwrap();
-        let key_id = kms
-            .strip_prefix("arn:aws-cn:kms:cn-north-1:123456789012:key/")
-            .unwrap_or_else(|| panic!("{kms}"));
-        assert_eq!(
+        assert_aws_managed_key(
+            &kms_state,
+            "123456789012",
+            "cn-north-1",
             kms,
-            fakecloud_kms::kms_key_arn("cn-north-1", "123456789012", key_id)
+            "alias/aws/kafka",
+        );
+        // A cluster in another region gets that region's own managed key.
+        let east = ctx("us-east-1");
+        let east_arn = json_of(
+            s.create_cluster(&east, &cluster_body("east"), false)
+                .unwrap(),
+        )["clusterArn"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        settle(&s, &east);
+        let d_east = json_of(s.describe_cluster(&east, &east_arn, false).unwrap());
+        let east_kms = d_east["clusterInfo"]["encryptionInfo"]["encryptionAtRest"]
+            ["dataVolumeKMSKeyId"]
+            .as_str()
+            .unwrap();
+        assert_ne!(east_kms, kms);
+        assert_aws_managed_key(
+            &kms_state,
+            "123456789012",
+            "us-east-1",
+            east_kms,
+            "alias/aws/kafka",
         );
         let nodes = json_of(s.list_nodes(&c, &arn, &[]).unwrap());
         let node_arn = nodes["nodeInfoList"][0]["nodeARN"].as_str().unwrap();

@@ -105,16 +105,11 @@ impl ResourceProvisioner {
         fs.insert("ThroughputMode".into(), json!(throughput_mode));
         fs.insert("Encrypted".into(), json!(encrypted));
         if encrypted {
-            let kms = efs_str(props, "KmsKeyId")
-                .map(str::to_string)
-                .unwrap_or_else(|| {
-                    fakecloud_kms::kms_key_arn(
-                        &self.region,
-                        &self.account_id,
-                        &uuid::Uuid::new_v4().to_string(),
-                    )
-                });
-            fs.insert("KmsKeyId".into(), json!(kms));
+            // No key named: the AWS-managed `aws/elasticfilesystem` key.
+            let kms = self.kms_key_or_aws_managed(efs_str(props, "KmsKeyId"), "elasticfilesystem");
+            if let Some(kms) = kms {
+                fs.insert("KmsKeyId".into(), json!(kms));
+            }
         }
         if throughput_mode == "provisioned" {
             if let Some(p) = props.get("ProvisionedThroughputInMibps") {

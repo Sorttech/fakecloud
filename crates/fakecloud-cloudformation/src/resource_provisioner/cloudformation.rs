@@ -143,6 +143,7 @@ impl ResourceProvisioner {
             pending_custom_invokes: self.pending_custom_invokes.clone(),
             defer_custom_invokes: self.defer_custom_invokes,
             s3_store: self.s3_store.clone(),
+            kms_hook: self.kms_hook.clone(),
             account_id: self.account_id.clone(),
             region: self.region.clone(),
             stack_id: child_stack_id.clone(),

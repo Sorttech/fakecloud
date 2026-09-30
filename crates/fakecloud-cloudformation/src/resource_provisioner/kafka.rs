@@ -69,10 +69,30 @@ impl super::ResourceProvisioner {
     fn insert_and_settle_cluster(&self, body: &Value, v2: bool) -> Result<ProvisionResult, String> {
         let serverless = v2 && body.get("serverless").is_some();
         let runtime_present = self.kafka_runtime.is_some();
+        // Reject a duplicate name before resolving (and possibly minting) the
+        // key, as the direct CreateCluster path does; insert_cluster re-checks
+        // under the write lock.
+        let name = body
+            .get("clusterName")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if let Some(msg) = self
+            .kafka_state
+            .read()
+            .get(&self.account_id)
+            .and_then(|data| builders::cluster_name_conflict(data, name, &self.region))
+        {
+            return Err(msg);
+        }
+        // The AWS-managed data-volume key, resolved before taking the lock.
+        let default_key = builders::needs_default_data_volume_key(body, v2)
+            .then(|| self.aws_managed_kms_key_arn("kafka"))
+            .flatten();
 
         let mut guard = self.kafka_state.write();
         let data = guard.get_or_create(&self.account_id);
-        let arn = builders::insert_cluster(data, &self.region, &self.account_id, body, v2)?;
+        let arn =
+            builders::insert_cluster(data, &self.region, &self.account_id, body, v2, default_key)?;
 
         if runtime_present && !serverless {
             self.pending_container_spawns

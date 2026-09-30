@@ -78,6 +78,9 @@ pub struct TimestreamService {
     state: SharedTimestreamState,
     snapshot_store: Option<Arc<dyn SnapshotStore>>,
     snapshot_lock: Arc<AsyncMutex<()>>,
+    /// KMS access, so a database created without a `KmsKeyId` reports the
+    /// account's real AWS-managed `aws/timestream` key.
+    kms_hook: Option<Arc<dyn fakecloud_core::delivery::KmsHook>>,
 }
 
 impl TimestreamService {
@@ -86,7 +89,13 @@ impl TimestreamService {
             state,
             snapshot_store: None,
             snapshot_lock: Arc::new(AsyncMutex::new(())),
+            kms_hook: None,
         }
+    }
+
+    pub fn with_kms_hook(mut self, hook: Arc<dyn fakecloud_core::delivery::KmsHook>) -> Self {
+        self.kms_hook = Some(hook);
+        self
     }
 
     pub fn with_snapshot_store(mut self, store: Arc<dyn SnapshotStore>) -> Self {
@@ -307,32 +316,39 @@ impl TimestreamService {
         body: &Value,
     ) -> Result<AwsResponse, AwsServiceError> {
         let name = required_str(body, "DatabaseName")?;
-        let kms = str_member(body, "KmsKeyId").map(str::to_string);
         let region = req.region.clone();
         let account = req.account_id.clone();
+        let exists_conflict =
+            || conflict(format!("Database '{name}' already exists in this account."));
+        if self
+            .state
+            .read()
+            .get(&account)
+            .is_some_and(|data| data.databases.contains_key(&name))
+        {
+            return Err(exists_conflict());
+        }
+        // No key named: Timestream uses the account's AWS-managed key for the
+        // region. Resolved (minted on first use) only for a valid request and
+        // with no Timestream lock held; the name is re-checked under the lock.
+        let kms = fakecloud_core::delivery::kms_key_or_aws_managed(
+            self.kms_hook.as_deref(),
+            str_member(body, "KmsKeyId"),
+            &account,
+            &region,
+            "timestream",
+        );
         let tags = body.get("Tags").cloned();
         self.with_account_mut(req, |data| {
             if data.databases.contains_key(&name) {
-                return Err(conflict(format!(
-                    "Database '{name}' already exists in this account."
-                )));
+                return Err(exists_conflict());
             }
             let now = now_epoch();
             let arn = database_arn(&region, &account, &name);
             let db = Database {
                 name: name.clone(),
                 arn: arn.clone(),
-                kms_key_id: kms.or_else(|| {
-                    Some(
-                        fakecloud_aws::arn::Arn::regional(
-                            "kms",
-                            &region,
-                            &account,
-                            "key/timestream-default",
-                        )
-                        .to_string(),
-                    )
-                }),
+                kms_key_id: kms,
                 table_count: 0,
                 creation_time: now,
                 last_updated_time: now,
@@ -1485,30 +1501,67 @@ mod tests {
         assert_eq!(e.code(), "ResourceNotFoundException");
     }
 
-    /// The default database key is the ARN KMS itself mints for that key id
-    /// in the caller's region, partition included.
+    /// A database created without a `KmsKeyId` reports the AWS-managed
+    /// `aws/timestream` key of its account and region: a real KMS key, minted on
+    /// first use in the region's partition, shared within the region and
+    /// distinct across regions.
     #[test]
-    fn default_database_key_uses_the_regions_partition() {
-        let s = svc();
-        let mut r = req("CreateDatabase", json!({ "DatabaseName": "cn" }));
-        r.region = "cn-north-1".to_string();
-        let resp = s.dispatch("CreateDatabase", &r).unwrap();
-        let out: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
-        let kms = out["Database"]["KmsKeyId"].as_str().unwrap();
-        assert_eq!(
-            kms,
-            "arn:aws-cn:kms:cn-north-1:000000000000:key/timestream-default"
+    fn default_database_key_is_the_regions_aws_managed_key() {
+        use fakecloud_kms::test_support::{assert_aws_managed_key, kms_hook};
+        let (kms_state, hook) = kms_hook("000000000000");
+        let s = svc().with_kms_hook(hook);
+        let create = |name: &str, region: &str| {
+            let mut r = req("CreateDatabase", json!({ "DatabaseName": name }));
+            r.region = region.to_string();
+            let resp = s.dispatch("CreateDatabase", &r).unwrap();
+            let out: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+            out["Database"]["KmsKeyId"].as_str().unwrap().to_string()
+        };
+        let cn = create("cn", "cn-north-1");
+        assert_aws_managed_key(
+            &kms_state,
+            "000000000000",
+            "cn-north-1",
+            &cn,
+            "alias/aws/timestream",
         );
-        assert_eq!(
-            kms,
-            fakecloud_kms::kms_key_arn("cn-north-1", "000000000000", "timestream-default")
+        assert_eq!(create("cn2", "cn-north-1"), cn);
+        let west = create("west", "us-west-2");
+        assert_ne!(west, cn);
+        assert_aws_managed_key(
+            &kms_state,
+            "000000000000",
+            "us-west-2",
+            &west,
+            "alias/aws/timestream",
         );
-        // Commercial output is unchanged.
-        let out = call(&s, "CreateDatabase", json!({ "DatabaseName": "us" })).unwrap();
-        assert_eq!(
-            out["Database"]["KmsKeyId"],
-            "arn:aws:kms:us-east-1:000000000000:key/timestream-default"
-        );
+    }
+
+    /// A CreateDatabase that fails (duplicate name) never mints a key.
+    #[test]
+    fn duplicate_database_does_not_mint_a_managed_key() {
+        use fakecloud_kms::test_support::kms_hook;
+        let (kms_state, hook) = kms_hook("000000000000");
+        let s = svc().with_kms_hook(hook);
+        call(
+            &s,
+            "CreateDatabase",
+            json!({ "DatabaseName": "dup", "KmsKeyId": "arn:aws:kms:us-east-1:000000000000:key/mine" }),
+        )
+        .unwrap();
+        let err = call(&s, "CreateDatabase", json!({ "DatabaseName": "dup" })).unwrap_err();
+        assert_eq!(err.code(), "ConflictException");
+        assert!(kms_state
+            .read()
+            .get("000000000000")
+            .is_none_or(|st| st.keys.is_empty()));
+    }
+
+    /// Without KMS wired (no hook), no made-up key is reported.
+    #[test]
+    fn default_database_key_is_omitted_without_kms() {
+        let out = call(&svc(), "CreateDatabase", json!({ "DatabaseName": "nokms" })).unwrap();
+        assert!(out["Database"].get("KmsKeyId").is_none(), "{out}");
     }
 
     #[test]

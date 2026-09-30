@@ -610,6 +610,9 @@ pub struct CloudFormationService {
     /// restart. Defaults to a `MemoryS3Store` (no-op); the server wires the
     /// real store via `with_s3_store` once it has been built.
     s3_store: Arc<dyn S3Store>,
+    /// The server's KMS hook (persisting minted keys), used by provisioners
+    /// that report an AWS-managed key for a default-encrypted resource.
+    kms_hook: Option<Arc<dyn fakecloud_core::delivery::KmsHook>>,
     /// Whole-state snapshot persist hooks keyed by service name (see
     /// `service_key_for_type`). After a stack op the handler invokes the hook
     /// for each touched service so a CFN-provisioned (or CFN-deleted) resource
@@ -1111,6 +1114,7 @@ impl CloudFormationService {
             snapshot_store: None,
             snapshot_lock: Arc::new(AsyncMutex::new(())),
             s3_store: Arc::new(fakecloud_persistence::s3::MemoryS3Store::new()),
+            kms_hook: None,
             snapshot_hooks: BTreeMap::new(),
             auto_deployment_gate: Arc::new(parking_lot::Mutex::new(AutoDeploymentGate::default())),
             auto_deployment_retries: Arc::new(parking_lot::Mutex::new(BTreeSet::new())),
@@ -1126,6 +1130,13 @@ impl CloudFormationService {
     /// written through to disk (see `ResourceProvisioner::s3_store`).
     pub fn with_s3_store(mut self, store: Arc<dyn S3Store>) -> Self {
         self.s3_store = store;
+        self
+    }
+
+    /// Wire the server's KMS hook so stack resources encrypted by default
+    /// report (and persist) the same AWS-managed key as the service APIs.
+    pub fn with_kms_hook(mut self, hook: Arc<dyn fakecloud_core::delivery::KmsHook>) -> Self {
+        self.kms_hook = Some(hook);
         self
     }
 
@@ -1249,6 +1260,7 @@ impl CloudFormationService {
             // drain it off the request path instead.
             defer_custom_invokes: false,
             s3_store: self.s3_store.clone(),
+            kms_hook: self.kms_hook.clone(),
             account_id: account_id.to_string(),
             region: region.to_string(),
             stack_id: stack_id.to_string(),

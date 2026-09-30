@@ -114,14 +114,23 @@ pub struct CodeCommitService {
     state: SharedCodeCommitState,
     snapshot_store: Option<Arc<dyn SnapshotStore>>,
     snapshot_lock: Arc<AsyncMutex<()>>,
+    /// KMS access, so a repository created without a
+    /// `kmsKeyId` reports the account's real AWS-managed `aws/codecommit` key.
+    kms_hook: Option<Arc<dyn fakecloud_core::delivery::KmsHook>>,
 }
 
 impl CodeCommitService {
+    pub fn with_kms_hook(mut self, hook: Arc<dyn fakecloud_core::delivery::KmsHook>) -> Self {
+        self.kms_hook = Some(hook);
+        self
+    }
+
     pub fn new(state: SharedCodeCommitState) -> Self {
         Self {
             state,
             snapshot_store: None,
             snapshot_lock: Arc::new(AsyncMutex::new(())),
+            kms_hook: None,
         }
     }
 
@@ -345,23 +354,35 @@ impl CodeCommitService {
         let account = self.account(req);
         let arn = repo_arn(&req.region, &account, &name);
         let now = Utc::now();
+        let name_taken = || {
+            err(
+                "RepositoryNameExistsException",
+                format!("Repository named {name} already exists."),
+            )
+        };
+        if self
+            .state
+            .read()
+            .get(&account)
+            .is_some_and(|st| st.repositories.contains_key(&name))
+        {
+            return Err(name_taken());
+        }
+        // No key named: CodeCommit uses the account's AWS-managed key for the
+        // region. Resolved (minted on first use) only for a valid request and
+        // with no CodeCommit lock held; the name is re-checked under the lock.
+        let kms = fakecloud_core::delivery::kms_key_or_aws_managed(
+            self.kms_hook.as_deref(),
+            str_field(&b, "kmsKeyId").as_deref(),
+            &account,
+            &req.region,
+            "codecommit",
+        );
         let mut guard = self.state.write();
         let st = guard.get_or_create(&account);
         if st.repositories.contains_key(&name) {
-            return Err(err(
-                "RepositoryNameExistsException",
-                format!("Repository named {name} already exists."),
-            ));
+            return Err(name_taken());
         }
-        let kms = str_field(&b, "kmsKeyId").unwrap_or_else(|| {
-            fakecloud_aws::arn::Arn::regional(
-                "kms",
-                &req.region,
-                &account,
-                &format!("key/{}", new_uuid()),
-            )
-            .to_string()
-        });
         let mut metadata = Map::new();
         metadata.insert("accountId".into(), json!(account));
         metadata.insert("repositoryId".into(), json!(new_uuid()));
@@ -386,7 +407,9 @@ impl CodeCommitService {
             )),
         );
         metadata.insert("Arn".into(), json!(arn));
-        metadata.insert("kmsKeyId".into(), json!(kms));
+        if let Some(kms) = kms {
+            metadata.insert("kmsKeyId".into(), json!(kms));
+        }
         let metadata = Value::Object(metadata);
         let repo = Repo {
             metadata: metadata.clone(),
@@ -4022,9 +4045,54 @@ mod handler_tests {
         base64::engine::general_purpose::STANDARD.encode(s.as_bytes())
     }
 
+    use fakecloud_kms::test_support::{assert_aws_managed_key, kms_hook};
+
+    /// A CreateRepository that fails (name taken) never mints a key.
+    #[test]
+    fn duplicate_repository_does_not_mint_a_managed_key() {
+        let (kms_state, hook) = kms_hook("000000000000");
+        let s = svc().with_kms_hook(hook);
+        let named = json!({
+            "repositoryName": "dup",
+            "kmsKeyId": "arn:aws:kms:us-east-1:000000000000:key/mine"
+        });
+        s.dispatch("CreateRepository", &req_as("CreateRepository", named, None))
+            .unwrap();
+        let again = json!({ "repositoryName": "dup" });
+        assert!(s
+            .dispatch("CreateRepository", &req_as("CreateRepository", again, None))
+            .is_err());
+        assert!(kms_state
+            .read()
+            .get("000000000000")
+            .is_none_or(|st| st.keys.is_empty()));
+    }
+
+    #[test]
+    fn repository_without_kms_key_uses_aws_managed_key() {
+        let (kms_state, hook) = kms_hook("000000000000");
+        let s = svc().with_kms_hook(hook);
+        let resp = s
+            .dispatch(
+                "CreateRepository",
+                &req_as("CreateRepository", json!({ "repositoryName": "r1" }), None),
+            )
+            .unwrap();
+        let out: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        let key = out["repositoryMetadata"]["kmsKeyId"].as_str().unwrap();
+        assert_aws_managed_key(
+            &kms_state,
+            "000000000000",
+            "us-east-1",
+            key,
+            "alias/aws/codecommit",
+        );
+    }
+
     #[test]
     fn repository_arns_carry_china_partition() {
-        let s = svc();
+        let (_kms_state, hook) = kms_hook("000000000000");
+        let s = svc().with_kms_hook(hook);
         let cn = |action: &str, body: Value| {
             let mut r = req_as(action, body, None);
             r.region = "cn-north-1".into();

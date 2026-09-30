@@ -53,6 +53,19 @@ pub struct KmsState {
     /// caller; entries are removed after a successful import.
     #[serde(default)]
     pub import_wrapping_keys: BTreeMap<String, ImportWrapEntry>,
+    /// AWS-managed keys minted for other services, by
+    /// [`aws_managed_key_slot`] (region + `alias/aws/<service>`) -> key id.
+    /// AWS-managed keys exist once per account AND region; this records the
+    /// key for each region independently of the account's single
+    /// `alias/aws/<service>` alias entry.
+    #[serde(default)]
+    pub aws_managed_keys: BTreeMap<String, String>,
+}
+
+/// The [`KmsState::aws_managed_keys`] slot of the AWS-managed key behind
+/// `alias_name` (`alias/aws/<service>`) in `region`.
+pub fn aws_managed_key_slot(region: &str, alias_name: &str) -> String {
+    format!("{region}/{alias_name}")
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -104,6 +117,7 @@ impl KmsState {
             custom_key_stores: BTreeMap::new(),
             master_key_bytes: default_master_key_bytes(),
             import_wrapping_keys: BTreeMap::new(),
+            aws_managed_keys: BTreeMap::new(),
         }
     }
 
@@ -112,6 +126,7 @@ impl KmsState {
         self.aliases.clear();
         self.grants.clear();
         self.custom_key_stores.clear();
+        self.aws_managed_keys.clear();
         // Keep the master key across resets so ciphertexts still decrypt.
     }
 }

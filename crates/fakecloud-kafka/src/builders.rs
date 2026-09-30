@@ -29,29 +29,41 @@ pub(crate) fn default_bngi() -> Value {
     normalize_bngi(None)
 }
 
-/// A synthesized customer-managed KMS key ARN, in the AWS `key/{uuid}` form, for
-/// a cluster's `EncryptionAtRest.DataVolumeKMSKeyId` when the caller omits one
-/// (real MSK always echoes a resolved key ARN, so `encryption_info` round-trips
-/// and `MatchResourceAttrRegionalARN(..., "kms", "key/.+")` matches).
-fn default_kms_key_arn(region: &str, account: &str) -> String {
-    fakecloud_aws::arn::Arn::regional("kms", region, account, &format!("key/{}", Uuid::new_v4()))
-        .to_string()
+/// Whether creating a cluster from `body` needs the default data-volume key:
+/// a provisioned cluster whose `encryptionInfo` names no
+/// `encryptionAtRest.dataVolumeKMSKeyId`. Callers resolve that key (the
+/// account's AWS-managed `aws/kafka` key) BEFORE taking the Kafka state lock
+/// and pass it to [`insert_cluster`].
+pub fn needs_default_data_volume_key(body: &Value, v2: bool) -> bool {
+    if v2 && body.get("serverless").is_some() {
+        return false;
+    }
+    let src = if v2 {
+        body.get("provisioned").unwrap_or(body)
+    } else {
+        body
+    };
+    src.get("encryptionInfo")
+        .and_then(|e| e.get("encryptionAtRest"))
+        .and_then(|r| r.get("dataVolumeKMSKeyId"))
+        .is_none()
 }
 
 /// Fill an `EncryptionInfo` with the sub-objects + AWS defaults `DescribeCluster`
-/// always echoes: an `EncryptionAtRest.DataVolumeKMSKeyId` (synthesized when the
-/// caller omits it) and an `EncryptionInTransit` with `ClientBroker` defaulting
-/// to `TLS` and `InCluster` to `true`. Whatever the caller supplied wins.
+/// always echoes: an `EncryptionAtRest.DataVolumeKMSKeyId` (the account's
+/// AWS-managed `aws/kafka` key ARN, `default_data_volume_key`, when the caller
+/// omits it; the at-rest block is left out when no key is known) and an
+/// `EncryptionInTransit` with `ClientBroker` defaulting to `TLS` and
+/// `InCluster` to `true`. Whatever the caller supplied wins.
 pub(crate) fn normalize_encryption_info(
     user: Option<&Value>,
-    region: &str,
-    account: &str,
+    default_data_volume_key: Option<String>,
 ) -> Value {
     let kms = user
         .and_then(|e| e.get("encryptionAtRest"))
         .and_then(|r| r.get("dataVolumeKMSKeyId"))
         .cloned()
-        .unwrap_or_else(|| json!(default_kms_key_arn(region, account)));
+        .or_else(|| default_data_volume_key.map(Value::String));
     let transit = user.and_then(|e| e.get("encryptionInTransit"));
     let client_broker = transit
         .and_then(|t| t.get("clientBroker"))
@@ -61,10 +73,13 @@ pub(crate) fn normalize_encryption_info(
         .and_then(|t| t.get("inCluster"))
         .cloned()
         .unwrap_or(json!(true));
-    json!({
-        "encryptionAtRest": { "dataVolumeKMSKeyId": kms },
+    let mut info = json!({
         "encryptionInTransit": { "clientBroker": client_broker, "inCluster": in_cluster },
-    })
+    });
+    if let Some(kms) = kms {
+        info["encryptionAtRest"] = json!({ "dataVolumeKMSKeyId": kms });
+    }
+    info
 }
 
 /// Fill a provisioned cluster's `StorageInfo` with the `EbsStorageInfo` +
@@ -242,12 +257,35 @@ fn insert_tags(data: &mut KafkaData, arn: &str, body: &Value) {
 /// provisioned fields. The cluster is inserted `CREATING` -- the caller settles
 /// it to `ACTIVE` (via `reconcile`) or backs it with a real Kafka container.
 /// Returns `Err(message)` when the cluster name already exists in the region.
+/// `default_data_volume_key` is the key a provisioned cluster's data volumes
+/// are encrypted with when the caller names none (the account's AWS-managed
+/// `aws/kafka` key ARN), resolved by the caller before it locked `data` when
+/// [`needs_default_data_volume_key`] says so.
+/// The conflict message when `name` is already a cluster in `region` (cluster
+/// names are unique within an account + region). Callers check this before
+/// resolving a default KMS key, and [`insert_cluster`] re-checks it.
+pub fn cluster_name_conflict(data: &KafkaData, name: &str, region: &str) -> Option<String> {
+    data.clusters
+        .values()
+        .any(|c| {
+            c.get("clusterName").and_then(Value::as_str) == Some(name)
+                && c.get("clusterArn")
+                    .and_then(Value::as_str)
+                    .and_then(shared::arn_region)
+                    == Some(region)
+        })
+        .then(|| {
+            format!("A cluster with the name '{name}' already exists in this account and region.")
+        })
+}
+
 pub fn insert_cluster(
     data: &mut KafkaData,
     region: &str,
     account: &str,
     body: &Value,
     v2: bool,
+    default_data_volume_key: Option<String>,
 ) -> Result<String, String> {
     let name = body
         .get("clusterName")
@@ -268,16 +306,8 @@ pub fn insert_cluster(
     };
 
     // Cluster names are unique within an account + region.
-    if data.clusters.values().any(|c| {
-        c.get("clusterName").and_then(Value::as_str) == Some(name.as_str())
-            && c.get("clusterArn")
-                .and_then(Value::as_str)
-                .and_then(shared::arn_region)
-                == Some(region)
-    }) {
-        return Err(format!(
-            "A cluster with the name '{name}' already exists in this account and region."
-        ));
+    if let Some(msg) = cluster_name_conflict(data, &name, region) {
+        return Err(msg);
     }
 
     let n = data.next_seq();
@@ -355,7 +385,10 @@ pub fn insert_cluster(
         );
         cluster.insert(
             "encryptionInfo".into(),
-            normalize_encryption_info(provisioned_src.get("encryptionInfo"), region, account),
+            normalize_encryption_info(
+                provisioned_src.get("encryptionInfo"),
+                default_data_volume_key,
+            ),
         );
         cluster.insert(
             "storageMode".into(),

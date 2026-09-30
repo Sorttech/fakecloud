@@ -914,3 +914,251 @@ fn china_region_arns_use_the_china_partition_and_resolve_for_tagging() {
     );
     assert!(listed.contains("<Key>team</Key>"));
 }
+
+use fakecloud_kms::test_support::{assert_aws_managed_key, kms_hook};
+
+#[test]
+fn snapshot_copy_grant_without_kms_key_uses_aws_managed_key() {
+    let (kms_state, hook) = kms_hook("123456789012");
+    let svc = service().with_kms_hook(hook);
+    let out = ok(
+        &svc,
+        "CreateSnapshotCopyGrant",
+        &[("SnapshotCopyGrantName", "grant-default")],
+    );
+    let key = out
+        .split("<KmsKeyId>")
+        .nth(1)
+        .and_then(|rest| rest.split("</KmsKeyId>").next())
+        .unwrap_or_else(|| panic!("no KmsKeyId in {out}"));
+    assert!(
+        key.starts_with("arn:aws:kms:us-east-1:123456789012:key/"),
+        "{key}"
+    );
+    assert_aws_managed_key(
+        &kms_state,
+        "123456789012",
+        "us-east-1",
+        key,
+        "alias/aws/redshift",
+    );
+}
+
+fn kms_key_of(xml: &str) -> Option<String> {
+    xml.split("<KmsKeyId>")
+        .nth(1)
+        .and_then(|rest| rest.split("</KmsKeyId>").next())
+        .map(str::to_string)
+}
+
+fn ok_in(svc: &RedshiftService, region: &str, action: &str, params: &[(&str, &str)]) -> String {
+    let mut r = req(action, params);
+    r.region = region.to_string();
+    let resp = svc
+        .dispatch(&r)
+        .unwrap_or_else(|e| panic!("{action}: {e:?}"));
+    body(&resp)
+}
+
+#[test]
+fn encrypted_cluster_without_kms_key_uses_the_regions_aws_managed_key() {
+    let (kms_state, hook) = kms_hook("123456789012");
+    let svc = service().with_kms_hook(hook);
+    let cluster = |region: &str, id: &str, extra: &[(&str, &str)]| {
+        let mut params = vec![
+            ("ClusterIdentifier", id),
+            ("NodeType", "dc2.large"),
+            ("MasterUsername", "admin"),
+            ("MasterUserPassword", "Passw0rd!"),
+        ];
+        params.extend_from_slice(extra);
+        ok_in(&svc, region, "CreateCluster", &params)
+    };
+    let cn = kms_key_of(&cluster("cn-north-1", "enc-cn", &[("Encrypted", "true")]))
+        .expect("encrypted cluster reports a key");
+    assert_aws_managed_key(
+        &kms_state,
+        "123456789012",
+        "cn-north-1",
+        &cn,
+        "alias/aws/redshift",
+    );
+    let east = kms_key_of(&cluster("us-east-1", "enc-east", &[("Encrypted", "true")])).unwrap();
+    assert_ne!(east, cn);
+    assert_aws_managed_key(
+        &kms_state,
+        "123456789012",
+        "us-east-1",
+        &east,
+        "alias/aws/redshift",
+    );
+    // An unencrypted cluster reports no key.
+    assert_eq!(kms_key_of(&cluster("us-east-1", "plain", &[])), None);
+
+    // Turning encryption on later without a key also uses the managed key;
+    // turning it off clears the key.
+    let modified = ok_in(
+        &svc,
+        "us-east-1",
+        "ModifyCluster",
+        &[("ClusterIdentifier", "plain"), ("Encrypted", "true")],
+    );
+    assert_eq!(kms_key_of(&modified).as_deref(), Some(east.as_str()));
+    let decrypted = ok_in(
+        &svc,
+        "us-east-1",
+        "ModifyCluster",
+        &[("ClusterIdentifier", "plain"), ("Encrypted", "false")],
+    );
+    assert_eq!(kms_key_of(&decrypted), None);
+}
+
+#[test]
+fn no_kms_key_is_reported_without_kms() {
+    let svc = service();
+    let grant = ok(
+        &svc,
+        "CreateSnapshotCopyGrant",
+        &[("SnapshotCopyGrantName", "grant-nokms")],
+    );
+    assert_eq!(kms_key_of(&grant), None, "{grant}");
+    let cluster = ok(
+        &svc,
+        "CreateCluster",
+        &[
+            ("ClusterIdentifier", "enc-nokms"),
+            ("NodeType", "dc2.large"),
+            ("MasterUsername", "admin"),
+            ("MasterUserPassword", "Passw0rd!"),
+            ("Encrypted", "true"),
+        ],
+    );
+    assert_eq!(kms_key_of(&cluster), None, "{cluster}");
+}
+
+fn cluster_params<'a>(id: &'a str, extra: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+    let mut params = vec![
+        ("ClusterIdentifier", id),
+        ("NodeType", "dc2.large"),
+        ("MasterUsername", "admin"),
+        ("MasterUserPassword", "Passw0rd!"),
+    ];
+    params.extend_from_slice(extra);
+    params
+}
+
+#[test]
+fn modify_cluster_encryption_flags_and_empty_key() {
+    let (kms_state, hook) = kms_hook("123456789012");
+    let svc = service().with_kms_hook(hook);
+    let mine = "arn:aws:kms:us-east-1:123456789012:key/mine";
+    ok(
+        &svc,
+        "CreateCluster",
+        &cluster_params("mc", &[("Encrypted", "true"), ("KmsKeyId", mine)]),
+    );
+
+    // Encrypted=false clears the key even when a KmsKeyId is also sent.
+    let off = ok(
+        &svc,
+        "ModifyCluster",
+        &[
+            ("ClusterIdentifier", "mc"),
+            ("Encrypted", "false"),
+            ("KmsKeyId", mine),
+        ],
+    );
+    assert_eq!(kms_key_of(&off), None, "{off}");
+    assert!(off.contains("<Encrypted>false</Encrypted>"));
+
+    // Encrypted=true with an empty KmsKeyId uses the aws/redshift default.
+    let on = ok(
+        &svc,
+        "ModifyCluster",
+        &[
+            ("ClusterIdentifier", "mc"),
+            ("Encrypted", "true"),
+            ("KmsKeyId", ""),
+        ],
+    );
+    let key = kms_key_of(&on).expect("default key");
+    assert_aws_managed_key(
+        &kms_state,
+        "123456789012",
+        "us-east-1",
+        &key,
+        "alias/aws/redshift",
+    );
+
+    // CreateCluster with an empty KmsKeyId behaves the same.
+    let created = ok(
+        &svc,
+        "CreateCluster",
+        &cluster_params("empty-key", &[("Encrypted", "true"), ("KmsKeyId", "")]),
+    );
+    assert_eq!(kms_key_of(&created).as_deref(), Some(key.as_str()));
+}
+
+/// Requests that fail (existing cluster/grant, unknown cluster) never mint.
+#[test]
+fn rejected_requests_do_not_mint_a_managed_key() {
+    let (kms_state, hook) = kms_hook("123456789012");
+    let svc = service().with_kms_hook(hook);
+    let mine = "arn:aws:kms:us-east-1:123456789012:key/mine";
+    ok(
+        &svc,
+        "CreateCluster",
+        &cluster_params("dup", &[("Encrypted", "true"), ("KmsKeyId", mine)]),
+    );
+    ok(
+        &svc,
+        "CreateSnapshotCopyGrant",
+        &[("SnapshotCopyGrantName", "g"), ("KmsKeyId", mine)],
+    );
+    assert!(svc
+        .dispatch(&req(
+            "CreateCluster",
+            &cluster_params("dup", &[("Encrypted", "true")])
+        ))
+        .is_err());
+    assert!(svc
+        .dispatch(&req(
+            "CreateSnapshotCopyGrant",
+            &[("SnapshotCopyGrantName", "g")]
+        ))
+        .is_err());
+    assert!(svc
+        .dispatch(&req(
+            "ModifyCluster",
+            &[("ClusterIdentifier", "missing"), ("Encrypted", "true")]
+        ))
+        .is_err());
+    assert!(kms_state
+        .read()
+        .get("123456789012")
+        .is_none_or(|st| st.keys.is_empty()));
+}
+
+/// Re-sending Encrypted=true on a cluster that already has a customer key
+/// keeps that key and mints no AWS-managed key.
+#[test]
+fn reencrypting_a_customer_key_cluster_mints_nothing() {
+    let (kms_state, hook) = kms_hook("123456789012");
+    let svc = service().with_kms_hook(hook);
+    let mine = "arn:aws:kms:us-east-1:123456789012:key/mine";
+    ok(
+        &svc,
+        "CreateCluster",
+        &cluster_params("cust", &[("Encrypted", "true"), ("KmsKeyId", mine)]),
+    );
+    let out = ok(
+        &svc,
+        "ModifyCluster",
+        &[("ClusterIdentifier", "cust"), ("Encrypted", "true")],
+    );
+    assert_eq!(kms_key_of(&out).as_deref(), Some(mine));
+    assert!(kms_state
+        .read()
+        .get("123456789012")
+        .is_none_or(|st| st.keys.is_empty()));
+}

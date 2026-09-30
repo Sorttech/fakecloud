@@ -279,28 +279,44 @@ impl CodeArtifactService {
         let owner = req.account_id.clone();
         let region = req.region.clone();
         let arn = domain_arn(&region, &owner, &name);
-        let encryption_key = body_str(&b, "encryptionKey")
-            .unwrap_or_else(|| {
-                Arn::regional("kms", &region, &owner, &format!("key/{}", uuid::Uuid::new_v4()))
-                    .to_string()
-            });
+        let domain_conflict = || conflict(format!("Domain {name} already exists"));
+        if self
+            .state
+            .read()
+            .get(&req.account_id)
+            .is_some_and(|acct| acct.domains.contains_key(&name))
+        {
+            return Err(domain_conflict());
+        }
+        // No key named: CodeArtifact uses the account's AWS-managed key for the
+        // region. Resolved (minted on first use) only for a valid request and
+        // with no CodeArtifact lock held; the name is re-checked under the lock.
+        let encryption_key = fakecloud_core::delivery::kms_key_or_aws_managed(
+            self.kms_hook.as_deref(),
+            body_str(&b, "encryptionKey").as_deref(),
+            &owner,
+            &region,
+            "codeartifact",
+        );
         let now = Utc::now();
-        let desc = json!({
+        let mut desc = json!({
             "name": name,
             "owner": owner,
             "arn": arn,
             "status": "Active",
             "createdTime": ts(now),
-            "encryptionKey": encryption_key,
             "repositoryCount": 0,
             "assetSizeBytes": 0,
             "s3BucketArn": asset_bucket_arn(&region, &owner),
         });
+        if let Some(key) = encryption_key {
+            desc["encryptionKey"] = json!(key);
+        }
         let tags = parse_tags(b.get("tags"));
         let mut guard = self.state.write();
         let acct = guard.get_or_create(&req.account_id);
         if acct.domains.contains_key(&name) {
-            return Err(conflict(format!("Domain {name} already exists")));
+            return Err(domain_conflict());
         }
         acct.domains.insert(name.clone(), desc.clone());
         acct.domain_order.push(name);
@@ -2165,9 +2181,44 @@ mod handler_tests {
         .unwrap();
     }
 
+
+    use fakecloud_kms::test_support::{assert_aws_managed_key, kms_hook};
+
+    /// A CreateDomain that fails (name taken) never mints a key.
+    #[test]
+    fn duplicate_domain_does_not_mint_a_managed_key() {
+        let (kms_state, hook) = kms_hook("123456789012");
+        let svc = svc().with_kms_hook(hook);
+        let named = jbody(json!({ "encryptionKey": "arn:aws:kms:us-east-1:123456789012:key/mine" }));
+        svc.create_domain(&mkreq("CreateDomain", "domain=dup", named, HeaderMap::new()))
+            .unwrap();
+        let r = mkreq("CreateDomain", "domain=dup", jbody(json!({})), HeaderMap::new());
+        assert!(svc.create_domain(&r).is_err());
+        assert!(kms_state
+            .read()
+            .get("123456789012")
+            .is_none_or(|st| st.keys.is_empty()));
+    }
+
+    #[test]
+    fn domain_without_encryption_key_uses_aws_managed_key() {
+        let (kms_state, hook) = kms_hook("123456789012");
+        let svc = svc().with_kms_hook(hook);
+        let r = mkreq("CreateDomain", "domain=d1", jbody(json!({})), HeaderMap::new());
+        let key = body_json(&svc.create_domain(&r).unwrap())["domain"]["encryptionKey"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_aws_managed_key(&kms_state, "123456789012", "us-east-1", &key, "alias/aws/codeartifact");
+        let r = mkreq("CreateDomain", "domain=d2", jbody(json!({})), HeaderMap::new());
+        let second = body_json(&svc.create_domain(&r).unwrap());
+        assert_eq!(second["domain"]["encryptionKey"], key.as_str());
+    }
+
     #[test]
     fn domain_arns_carry_china_partition() {
-        let svc = svc();
+        let (_kms_state, hook) = kms_hook("123456789012");
+        let svc = svc().with_kms_hook(hook);
         let cn = |action: &str, q: &str| {
             let mut r = mkreq(action, q, jbody(json!({})), HeaderMap::new());
             r.region = "cn-north-1".into();

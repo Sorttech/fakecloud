@@ -426,10 +426,9 @@ async fn main() {
     let kms_usage_state: fakecloud_kms::hook::SharedKmsUsageState = Arc::new(
         parking_lot::RwLock::new(fakecloud_kms::hook::KmsUsageState::default()),
     );
-    // Hook's snapshot store is set below once kms_snapshot_store is
-    // initialized (depends on the persistence config). The OnceLock
-    // wiring lets us hand the same Arc to all services up-front and
-    // populate the store after persistence is read in.
+    // The hook's snapshot store is set below once kms_snapshot_store is
+    // initialized (depends on the persistence config). The OnceLock wiring
+    // lets us hand the same Arc to all services up-front.
     let kms_hook_adapter = Arc::new(KmsHookAdapter::new(
         kms_state.clone(),
         kms_usage_state.clone(),
@@ -2343,18 +2342,16 @@ async fn main() {
             None
         };
     let mut kms_service = KmsService::new(kms_state.clone());
-    if let Some(store) = kms_snapshot_store.clone() {
+    if let Some(store) = kms_snapshot_store {
+        // Hook-driven auto-provisioning (`aws/<service>` first use) saves
+        // KMS state durably before the hook call returns.
+        kms_hook_adapter.set_snapshot_store(store.clone());
         kms_service = kms_service.with_snapshot_store(store);
     }
     if let Some(h) = kms_service.snapshot_hook() {
         cfn_snapshot_hooks.insert("kms", h);
     }
     registry.register(Arc::new(kms_service));
-    // Wire the snapshot store into the hook adapter too, so hook-driven
-    // auto-provisioning (`aws/<service>` first-use) persists immediately.
-    if let Some(store) = kms_snapshot_store {
-        kms_hook_adapter.set_snapshot_store(store);
-    }
     let organizations_snapshot_store: Option<Arc<dyn fakecloud_persistence::SnapshotStore>> =
         if persistence_config.mode == fakecloud_persistence::StorageMode::Persistent {
             let data_path = persistence_config
@@ -4309,7 +4306,8 @@ async fn main() {
             None
         };
     let mut timestream_service =
-        fakecloud_timestream::TimestreamService::new(timestream_state.clone());
+        fakecloud_timestream::TimestreamService::new(timestream_state.clone())
+            .with_kms_hook(kms_hook_for_services.clone());
     if let Some(store) = timestream_snapshot_store {
         timestream_service = timestream_service.with_snapshot_store(store);
     }
@@ -4895,7 +4893,8 @@ async fn main() {
         } else {
             None
         };
-    let mut redshift_service = fakecloud_redshift::RedshiftService::new(redshift_state.clone());
+    let mut redshift_service = fakecloud_redshift::RedshiftService::new(redshift_state.clone())
+        .with_kms_hook(kms_hook_for_services.clone());
     if let Some(store) = redshift_snapshot_store.clone() {
         redshift_service = redshift_service.with_snapshot_store(store);
     }
@@ -5521,7 +5520,8 @@ async fn main() {
         } else {
             None
         };
-    let mut dms_service = fakecloud_dms::DmsService::new(dms_state.clone());
+    let mut dms_service = fakecloud_dms::DmsService::new(dms_state.clone())
+        .with_kms_hook(kms_hook_for_services.clone());
     if let Some(store) = dms_snapshot_store {
         dms_service = dms_service.with_snapshot_store(store);
     }
@@ -6209,7 +6209,8 @@ async fn main() {
             None
         };
     let mut codeartifact_service =
-        fakecloud_codeartifact::CodeArtifactService::new(codeartifact_state.clone());
+        fakecloud_codeartifact::CodeArtifactService::new(codeartifact_state.clone())
+            .with_kms_hook(kms_hook_for_services.clone());
     if let Some(store) = codeartifact_snapshot_store {
         codeartifact_service = codeartifact_service.with_snapshot_store(store);
     }
@@ -6242,8 +6243,9 @@ async fn main() {
         } else {
             None
         };
-    let mut efs_service =
-        fakecloud_efs::EfsService::new(efs_state.clone()).with_ec2_state(ec2_state.clone());
+    let mut efs_service = fakecloud_efs::EfsService::new(efs_state.clone())
+        .with_ec2_state(ec2_state.clone())
+        .with_kms_hook(kms_hook_for_services.clone());
     if let Some(store) = efs_snapshot_store {
         efs_service = efs_service.with_snapshot_store(store);
     }
@@ -6321,7 +6323,8 @@ async fn main() {
         } else {
             None
         };
-    let mut kafka_service = fakecloud_kafka::KafkaService::new(kafka_state.clone());
+    let mut kafka_service = fakecloud_kafka::KafkaService::new(kafka_state.clone())
+        .with_kms_hook(kms_hook_for_services.clone());
     if let Some(store) = kafka_snapshot_store {
         kafka_service = kafka_service.with_snapshot_store(store);
     }
@@ -6368,7 +6371,8 @@ async fn main() {
             None
         };
     let mut codecommit_service =
-        fakecloud_codecommit::CodeCommitService::new(codecommit_state.clone());
+        fakecloud_codecommit::CodeCommitService::new(codecommit_state.clone())
+            .with_kms_hook(kms_hook_for_services.clone());
     if let Some(store) = codecommit_snapshot_store {
         codecommit_service = codecommit_service.with_snapshot_store(store);
     }
@@ -6919,6 +6923,7 @@ async fn main() {
 
     let cloudformation_service = cloudformation_service
         .with_s3_store(s3_store.clone())
+        .with_kms_hook(kms_hook_for_services.clone())
         .with_snapshot_hooks(cfn_snapshot_hooks);
     // Keep a concrete handle: Cloud Control API drives the same resource
     // provisioners one resource at a time via this service.

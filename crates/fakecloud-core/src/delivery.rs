@@ -390,6 +390,68 @@ pub trait KmsHook: Send + Sync {
     ) -> Result<String, String> {
         Err("key resolution is not supported by this hook".to_string())
     }
+
+    /// The ARN of the AWS-managed key for `service` (the key behind
+    /// `alias/aws/<service>`) in `account_id` and `region`, minted on first
+    /// use. AWS-managed keys exist once per account AND region, so each
+    /// region gets its own key in its own partition.
+    fn aws_managed_key_arn(
+        &self,
+        _account_id: &str,
+        _region: &str,
+        _service: &str,
+        _service_principal: &str,
+    ) -> Result<String, String> {
+        Err("AWS-managed key resolution is not supported by this hook".to_string())
+    }
+}
+
+/// The ARN of the AWS-managed KMS key for `service` (the key behind
+/// `alias/aws/<service>`) in `account_id` and `region`, which a service reports
+/// for a resource encrypted at rest when the caller named no key. The key is
+/// resolved through the KMS hook, which mints it on first use in that account
+/// and region (and the region's partition), as real KMS does, so the ARN is a
+/// real key `DescribeKey` / `Decrypt` accept. `None` when no hook is wired (a
+/// service running outside the server) or resolution fails; a failure is
+/// logged, never swallowed.
+pub fn aws_managed_kms_key_arn(
+    hook: Option<&dyn KmsHook>,
+    account_id: &str,
+    region: &str,
+    service: &str,
+) -> Option<String> {
+    let hook = hook?;
+    let alias = format!("alias/aws/{service}");
+    let principal = format!("{service}.amazonaws.com");
+    match hook.aws_managed_key_arn(account_id, region, service, &principal) {
+        Ok(arn) => Some(arn),
+        Err(err) => {
+            tracing::warn!(
+                %err,
+                account_id,
+                region,
+                alias = %alias,
+                "could not resolve the AWS-managed KMS key; reporting no key"
+            );
+            None
+        }
+    }
+}
+
+/// The KMS key a resource is encrypted with: the caller-named key (`named`,
+/// ignored when empty) or, when none is named, the AWS-managed key for
+/// `service` in `account_id` and `region` (see [`aws_managed_kms_key_arn`]).
+pub fn kms_key_or_aws_managed(
+    hook: Option<&dyn KmsHook>,
+    named: Option<&str>,
+    account_id: &str,
+    region: &str,
+    service: &str,
+) -> Option<String> {
+    match named.filter(|k| !k.is_empty()) {
+        Some(key) => Some(key.to_string()),
+        None => aws_managed_kms_key_arn(hook, account_id, region, service),
+    }
 }
 
 /// Cognito-issued JWT verification hook. Implementations are wired by

@@ -18,6 +18,19 @@ use fakecloud_timestream::state::{Database, Table};
 impl ResourceProvisioner {
     // ------------------------------------------------------------- Database
 
+    fn timestream_database_exists(&self, name: &str) -> bool {
+        self.timestream_state
+            .read()
+            .get(&self.account_id)
+            .is_some_and(|data| data.databases.contains_key(name))
+    }
+
+    /// A database's KMS key: the template's `KmsKeyId`, else the AWS-managed
+    /// `aws/timestream` key for the stack's account and region.
+    fn timestream_kms_key(&self, props: &Value) -> Option<String> {
+        self.kms_key_or_aws_managed(props.get("KmsKeyId").and_then(Value::as_str), "timestream")
+    }
+
     pub(super) fn create_timestream_database(
         &self,
         resource: &ResourceDefinition,
@@ -32,17 +45,11 @@ impl ResourceProvisioner {
         let account = &self.account_id;
         let arn = database_arn(region, account, &name);
         let now = now_epoch();
-        let kms = props
-            .get("KmsKeyId")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .or_else(|| {
-                Some(fakecloud_kms::kms_key_arn(
-                    &self.region,
-                    &self.account_id,
-                    "timestream-default",
-                ))
-            });
+        if self.timestream_database_exists(&name) {
+            return Err(format!("Database {name} already exists"));
+        }
+        // Resolved only for a valid request, before taking the lock.
+        let kms = self.timestream_kms_key(props);
 
         let db = Database {
             name: name.clone(),
@@ -85,6 +92,12 @@ impl ResourceProvisioner {
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
         let name = existing.physical_id.clone();
+        if !self.timestream_database_exists(&name) {
+            return Err(format!("Database {name} not yet provisioned"));
+        }
+        // Removing KmsKeyId reverts the database to the AWS-managed default, as
+        // a fresh create would report; resolved before taking the lock.
+        let kms = self.timestream_kms_key(props);
 
         let mut guard = self.timestream_state.write();
         let data = guard.get_or_create(&self.account_id);
@@ -93,9 +106,7 @@ impl ResourceProvisioner {
                 .databases
                 .get_mut(&name)
                 .ok_or_else(|| format!("Database {name} not yet provisioned"))?;
-            if let Some(kms) = props.get("KmsKeyId").and_then(Value::as_str) {
-                db.kms_key_id = Some(kms.to_string());
-            }
+            db.kms_key_id = kms;
             db.last_updated_time = now_epoch();
             // `table_count`, `arn`, `creation_time` are preserved.
             db.arn.clone()

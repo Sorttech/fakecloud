@@ -31,11 +31,19 @@ impl ResourceProvisioner {
         let owner = self.account_id.clone();
         let region = self.region.clone();
         let arn = fakecloud_codeartifact::domain_arn(&region, &owner, &name);
-        // Mirror the direct CreateDomain handler: an omitted EncryptionKey mints a
-        // synthetic KMS key ARN so the stored description round-trips a key.
-        let encryption_key = ca_str(props, "EncryptionKey").unwrap_or_else(|| {
-            fakecloud_kms::kms_key_arn(&region, &owner, &uuid::Uuid::new_v4().to_string())
-        });
+        if self
+            .codeartifact_state
+            .read()
+            .get(&self.account_id)
+            .is_some_and(|acct| acct.domains.contains_key(&name))
+        {
+            return Err(format!("Domain {name} already exists"));
+        }
+        // Mirror the direct CreateDomain handler: an omitted EncryptionKey means
+        // the AWS-managed `aws/codeartifact` key, resolved only for a valid
+        // request and before the lock.
+        let encryption_key =
+            self.kms_key_or_aws_managed(ca_str(props, "EncryptionKey").as_deref(), "codeartifact");
 
         let mut guard = self.codeartifact_state.write();
         let acct = guard.get_or_create(&self.account_id);
@@ -45,17 +53,19 @@ impl ResourceProvisioner {
         if acct.domains.contains_key(&name) {
             return Err(format!("Domain {name} already exists"));
         }
-        let desc = json!({
+        let mut desc = json!({
             "name": name.clone(),
             "owner": owner.clone(),
             "arn": arn.clone(),
             "status": "Active",
             "createdTime": ca_ts(Utc::now()),
-            "encryptionKey": encryption_key.clone(),
             "repositoryCount": 0,
             "assetSizeBytes": 0,
             "s3BucketArn": fakecloud_codeartifact::asset_bucket_arn(&region, &owner),
         });
+        if let Some(key) = &encryption_key {
+            desc["encryptionKey"] = json!(key);
+        }
         acct.domains.insert(name.clone(), desc);
         acct.domain_order.push(name.clone());
 
@@ -74,11 +84,14 @@ impl ResourceProvisioner {
             );
         }
 
-        Ok(ProvisionResult::new(arn.clone())
+        let result = ProvisionResult::new(arn.clone())
             .with("Arn", arn)
             .with("Name", name)
-            .with("Owner", owner)
-            .with("EncryptionKey", encryption_key))
+            .with("Owner", owner);
+        Ok(match encryption_key {
+            Some(key) => result.with("EncryptionKey", key),
+            None => result,
+        })
     }
 
     pub(super) fn update_codeartifact_domain(
