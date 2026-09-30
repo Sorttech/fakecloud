@@ -19,26 +19,18 @@ pub fn session_arn(region: &str, account_id: &str, session_id: &str) -> String {
     bedrock_arn(region, account_id, &format!("session/{session_id}"))
 }
 
+/// A flow execution's ARN, in the model's `FlowExecutionIdentifier` form:
+/// `flow/<flowId>/alias/<aliasId>/execution/<executionId>`.
 pub fn flow_execution_arn(
     region: &str,
     account_id: &str,
     flow_id: &str,
+    alias_id: &str,
     execution_id: &str,
 ) -> String {
     bedrock_arn(
         region,
         account_id,
-        &format!("flow/{flow_id}/execution/{execution_id}"),
+        &format!("flow/{flow_id}/alias/{alias_id}/execution/{execution_id}"),
     )
-}
-
-/// The execution role a flow execution snapshot reports for `flow_id`.
-pub fn flow_execution_role_arn(region: &str, account_id: &str, flow_id: &str) -> String {
-    Arn::global_in(
-        effective_region(region),
-        "iam",
-        account_id,
-        &format!("role/service-role/AmazonBedrockExecutionRoleForFlow_{flow_id}"),
-    )
-    .to_string()
 }
