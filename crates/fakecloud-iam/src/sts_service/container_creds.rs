@@ -185,11 +185,8 @@ pub fn mint_session_credentials(
     let creds = StsCredentials::generate();
     let issued_at = Utc::now();
     let expiration = issued_at + duration;
-    let partition = partition_of(role_arn);
-    let account_id =
-        extract_account_from_arn(role_arn).unwrap_or_else(|| default_account_id.to_string());
-    let role_name = assumed_role_name(role_arn);
-    let assumed_role_arn = format_assumed_role_arn(partition, &account_id, role_name, session_name);
+    let (account_id, assumed_role_arn) =
+        session_principal(default_account_id, role_arn, session_name);
     let user_id = format!("{}:{}", deterministic_role_id(role_arn), session_name);
 
     {
@@ -231,6 +228,53 @@ pub fn mint_session_credentials(
         assumed_role_arn,
         account_id,
     }
+}
+
+/// The account a session for `role_arn` is registered under and its
+/// assumed-role principal ARN.
+fn session_principal(
+    default_account_id: &str,
+    role_arn: &str,
+    session_name: &str,
+) -> (String, String) {
+    let account_id =
+        extract_account_from_arn(role_arn).unwrap_or_else(|| default_account_id.to_string());
+    let assumed_role_arn = format_assumed_role_arn(
+        partition_of(role_arn),
+        &account_id,
+        assumed_role_name(role_arn),
+        session_name,
+    );
+    (account_id, assumed_role_arn)
+}
+
+/// Unregister every registered session of `role_arn` named `session_name`,
+/// whoever holds it. For sessions minted by an earlier server run whose
+/// holder is gone (persisted IAM state outlives the in-memory caches), e.g.
+/// the sessions of ECS tasks a restart stopped. Returns how many were removed.
+pub fn revoke_sessions_named(
+    iam: &SharedIamState,
+    default_account_id: &str,
+    role_arn: &str,
+    session_name: &str,
+) -> usize {
+    let (account_id, assumed_role_arn) =
+        session_principal(default_account_id, role_arn, session_name);
+    let mut accounts = iam.write();
+    let Some(state) = accounts.get_mut(&account_id) else {
+        return 0;
+    };
+    let keys: Vec<String> = state
+        .sts_temp_credentials
+        .iter()
+        .filter(|(_, c)| c.principal_arn == assumed_role_arn)
+        .map(|(k, _)| k.clone())
+        .collect();
+    for key in &keys {
+        state.sts_temp_credentials.remove(key);
+        state.credential_identities.remove(key);
+    }
+    keys.len()
 }
 
 /// True if `creds` is still registered in IAM state (i.e. not cleared by a
@@ -845,5 +889,33 @@ mod tests {
         );
         assert!(resolver.resolve(&first.access_key_id).is_none());
         assert!(resolver.resolve(&second.access_key_id).is_some());
+    }
+
+    #[test]
+    fn sessions_named_after_a_workload_are_revoked_without_the_cache() {
+        let iam = shared();
+        let role = "arn:aws:iam::123456789012:role/app";
+        // Minted by a cache that no longer exists (an earlier server run).
+        let a = WorkloadCredentialCache::new().get_or_mint(
+            &iam,
+            "123456789012",
+            "k",
+            role,
+            "task-1",
+            Duration::hours(1),
+        );
+        let other =
+            mint_session_credentials(&iam, "123456789012", role, "task-2", Duration::hours(1));
+        assert_eq!(
+            revoke_sessions_named(&iam, "123456789012", role, "task-1"),
+            1
+        );
+        let resolver = IamCredentialResolver::new(iam.clone());
+        assert!(resolver.resolve(&a.access_key_id).is_none());
+        assert!(resolver.resolve(&other.access_key_id).is_some());
+        assert_eq!(
+            revoke_sessions_named(&iam, "123456789012", role, "task-1"),
+            0
+        );
     }
 }

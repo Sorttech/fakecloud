@@ -22,7 +22,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use fakecloud_ecs::SharedEcsState;
 use fakecloud_iam::sts_service::container_creds::{
-    ContainerCredentials, WorkloadCredentialCache, DEFAULT_CONTAINER_CREDENTIALS_DURATION,
+    revoke_sessions_named, ContainerCredentials, WorkloadCredentialCache,
+    DEFAULT_CONTAINER_CREDENTIALS_DURATION,
 };
 use fakecloud_iam::SharedIamState;
 
@@ -84,12 +85,33 @@ impl EcsTaskCredentials {
         iam: SharedIamState,
         default_account_id: impl Into<String>,
     ) -> Arc<Self> {
-        Arc::new(Self {
+        let this = Arc::new(Self {
             ecs,
             iam,
             default_account_id: default_account_id.into(),
             cache: WorkloadCredentialCache::new(),
-        })
+        });
+        this.revoke_persisted_sessions();
+        this
+    }
+
+    /// Revoke the sessions of stopped tasks still registered from an earlier
+    /// run. With persistence on, IAM state (and the sessions in it) survives
+    /// a restart while the cache that would revoke them does not, and the
+    /// restart stops every task it restores.
+    fn revoke_persisted_sessions(&self) {
+        let stopped: Vec<(String, String)> = {
+            let accounts = self.ecs.read();
+            accounts
+                .iter()
+                .flat_map(|(_, state)| state.tasks.iter())
+                .filter(|(_, t)| t.last_status == "STOPPED")
+                .filter_map(|(id, t)| Some((t.task_role_arn.clone()?, id.clone())))
+                .collect()
+        };
+        for (role_arn, task_id) in stopped {
+            revoke_sessions_named(&self.iam, &self.default_account_id, &role_arn, &task_id);
+        }
     }
 
     /// The not-yet-stopped task `task_id`, in whichever account runs it.
@@ -360,5 +382,23 @@ mod tests {
             "arn:aws:sts::222222222222:assumed-role/other/x"
         );
         assert!(resolves(&iam, &creds));
+    }
+
+    #[test]
+    fn sessions_of_tasks_stopped_by_a_restart_are_revoked_on_startup() {
+        let (ecs, iam, before_restart) = setup();
+        add_task(&ecs, ACCOUNT, "t", Some(ROLE));
+        add_task(&ecs, ACCOUNT, "still", Some(ROLE));
+        let stale = before_restart.credentials("t").unwrap();
+        let live = before_restart.credentials("still").unwrap();
+        drop(before_restart);
+        // The restart stops the restored task; IAM state kept its session.
+        stop_task(&ecs, ACCOUNT, "t");
+        let _after_restart = EcsTaskCredentials::new(ecs.clone(), iam.clone(), ACCOUNT);
+        assert!(
+            !resolves(&iam, &stale),
+            "persisted session survived restart"
+        );
+        assert!(resolves(&iam, &live));
     }
 }
