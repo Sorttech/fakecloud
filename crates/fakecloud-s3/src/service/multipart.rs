@@ -17,16 +17,29 @@ use super::{
     resolve_object, s3_xml, xml_escape, S3Service,
 };
 
+/// The `Location` of a completed multipart object: its URL on the bucket's
+/// regional virtual-hosted endpoint, under the region's partition DNS suffix
+/// (`https://<bucket>.s3.<region>.amazonaws.com/<key>`, `.amazonaws.com.cn` in
+/// China).
+fn completion_location(bucket: &str, region: &str, key: &str) -> String {
+    format!(
+        "https://{}/{key}",
+        fakecloud_aws::endpoint::s3_regional_domain_name(bucket, region)
+    )
+}
+
 /// Build the `CompleteMultipartUploadResult` XML response for an object that
 /// already exists — used by the idempotent re-completion paths (an upload that
 /// was already completed by a prior or concurrent request). `checksum_xml` is
 /// the optional pre-rendered `<ChecksumX>…</ChecksumX>` element, or `""`.
-fn completion_xml_response(bucket: &str, key: &str, etag: &str, checksum_xml: &str) -> AwsResponse {
-    let location = format!(
-        "https://{bucket_h}.s3.amazonaws.com/{key_h}",
-        bucket_h = xml_escape(bucket),
-        key_h = xml_escape(key),
-    );
+fn completion_xml_response(
+    bucket: &str,
+    region: &str,
+    key: &str,
+    etag: &str,
+    checksum_xml: &str,
+) -> AwsResponse {
+    let location = xml_escape(&completion_location(bucket, region, key));
     let body = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
          <CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
@@ -519,6 +532,7 @@ impl S3Service {
             upload,
             already_has_object,
             region,
+            bucket_region,
             notification_config,
             versioning_enabled,
             versioning_suspended,
@@ -537,7 +551,9 @@ impl S3Service {
                     // Upload already completed - return existing object if it
                     // exists. IfNoneMatch does NOT apply to re-completions.
                     if let Some(obj) = b.objects.get(key) {
-                        return Ok(completion_xml_response(bucket, key, &obj.etag, ""));
+                        return Ok(completion_xml_response(
+                            bucket, &b.region, key, &obj.etag, "",
+                        ));
                     }
                     return Err(no_such_upload(upload_id));
                 }
@@ -546,6 +562,7 @@ impl S3Service {
                 upload,
                 b.objects.contains_key(key),
                 state.region.clone(),
+                b.region.clone(),
                 b.notification_config.clone(),
                 b.versioning.as_deref() == Some("Enabled"),
                 b.versioning.as_deref() == Some("Suspended"),
@@ -760,7 +777,13 @@ impl S3Service {
                     .ok_or_else(|| no_such_bucket(bucket))?;
                 if !b.multipart_uploads.contains_key(upload_id) {
                     if let Some(existing) = b.objects.get(key) {
-                        return Ok(completion_xml_response(bucket, key, &existing.etag, ""));
+                        return Ok(completion_xml_response(
+                            bucket,
+                            &b.region,
+                            key,
+                            &existing.etag,
+                            "",
+                        ));
                     }
                     return Err(no_such_upload(upload_id));
                 }
@@ -865,11 +888,7 @@ impl S3Service {
             );
         }
 
-        let location = format!(
-            "https://{bucket_h}.s3.amazonaws.com/{key_h}",
-            bucket_h = xml_escape(bucket),
-            key_h = xml_escape(key),
-        );
+        let location = xml_escape(&completion_location(bucket, &bucket_region, key));
         // Surface the per-algorithm checksum element AWS emits so
         // SDK clients that round-trip Complete -> Get can verify
         // integrity end-to-end.
@@ -1237,5 +1256,22 @@ impl S3Service {
             xml_escape(upload_id),
         );
         Ok(s3_xml(StatusCode::OK, body))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::completion_location;
+
+    #[test]
+    fn completion_location_uses_the_bucket_region_partition() {
+        assert_eq!(
+            completion_location("b", "eu-central-1", "k/obj"),
+            "https://b.s3.eu-central-1.amazonaws.com/k/obj"
+        );
+        assert_eq!(
+            completion_location("b", "cn-north-1", "k"),
+            "https://b.s3.cn-north-1.amazonaws.com.cn/k"
+        );
     }
 }

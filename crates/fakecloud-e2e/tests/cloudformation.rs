@@ -843,3 +843,82 @@ async fn cloudformation_mappings_find_in_map_missing_no_default_validation_error
         "a rejected template must not leave a stack record behind"
     );
 }
+
+/// `AWS::S3::Bucket` endpoint attributes follow the stack region: its
+/// partition's DNS suffix (`amazonaws.com.cn` in China) and the website
+/// endpoint form AWS publishes for it (dash-separated `s3-website-<region>` in
+/// the legacy regions, dot-separated `s3-website.<region>` everywhere else).
+#[tokio::test]
+async fn s3_bucket_endpoint_attributes_follow_region() {
+    let server = TestServer::start().await;
+    let template = r#"{
+        "Resources": {
+            "Site": {"Type": "AWS::S3::Bucket", "Properties": {"BucketName": {"Fn::Sub": "site-${AWS::Region}"}}}
+        },
+        "Outputs": {
+            "Domain": {"Value": {"Fn::GetAtt": ["Site", "DomainName"]}},
+            "Regional": {"Value": {"Fn::GetAtt": ["Site", "RegionalDomainName"]}},
+            "DualStack": {"Value": {"Fn::GetAtt": ["Site", "DualStackDomainName"]}},
+            "Website": {"Value": {"Fn::GetAtt": ["Site", "WebsiteURL"]}}
+        }
+    }"#;
+    for (region, domain, regional, dualstack, website) in [
+        (
+            "cn-north-1",
+            "site-cn-north-1.s3.amazonaws.com.cn",
+            "site-cn-north-1.s3.cn-north-1.amazonaws.com.cn",
+            "site-cn-north-1.s3.dualstack.cn-north-1.amazonaws.com.cn",
+            "http://site-cn-north-1.s3-website.cn-north-1.amazonaws.com.cn",
+        ),
+        (
+            "eu-central-1",
+            "site-eu-central-1.s3.amazonaws.com",
+            "site-eu-central-1.s3.eu-central-1.amazonaws.com",
+            "site-eu-central-1.s3.dualstack.eu-central-1.amazonaws.com",
+            "http://site-eu-central-1.s3-website.eu-central-1.amazonaws.com",
+        ),
+        (
+            "us-west-2",
+            "site-us-west-2.s3.amazonaws.com",
+            "site-us-west-2.s3.us-west-2.amazonaws.com",
+            "site-us-west-2.s3.dualstack.us-west-2.amazonaws.com",
+            "http://site-us-west-2.s3-website-us-west-2.amazonaws.com",
+        ),
+    ] {
+        let cfg = server.aws_config_in(region).await;
+        let cfn = aws_sdk_cloudformation::Client::new(&cfg);
+        let stack_name = format!("s3-endpoints-{region}");
+        cfn.create_stack()
+            .stack_name(&stack_name)
+            .template_body(template)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("create_stack in {region}: {e:?}"));
+        let described = cfn
+            .describe_stacks()
+            .stack_name(&stack_name)
+            .send()
+            .await
+            .expect("describe_stacks");
+        let stack = described.stacks().first().expect("stack present");
+        assert_eq!(
+            stack.stack_status().unwrap().as_str(),
+            "CREATE_COMPLETE",
+            "{region}: {:?}",
+            stack.stack_status_reason()
+        );
+        let outputs: std::collections::HashMap<&str, &str> = stack
+            .outputs()
+            .iter()
+            .filter_map(|o| Some((o.output_key()?, o.output_value()?)))
+            .collect();
+        assert_eq!(outputs.get("Domain").copied(), Some(domain), "{region}");
+        assert_eq!(outputs.get("Regional").copied(), Some(regional), "{region}");
+        assert_eq!(
+            outputs.get("DualStack").copied(),
+            Some(dualstack),
+            "{region}"
+        );
+        assert_eq!(outputs.get("Website").copied(), Some(website), "{region}");
+    }
+}

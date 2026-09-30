@@ -75,14 +75,7 @@ pub(crate) fn partition_for_region(region: &str) -> &'static str {
 /// Derived from the same partition lookup as `AWS::Partition`, so the two
 /// pseudo-parameters never disagree about which partition a region is in.
 pub(crate) fn url_suffix_for_region(region: &str) -> &'static str {
-    match partition_for_region(region) {
-        "aws-cn" => "amazonaws.com.cn",
-        "aws-iso" => "c2s.ic.gov",
-        "aws-iso-b" => "sc2s.sgov.gov",
-        "aws-iso-e" => "cloud.adc-e.uk",
-        "aws-iso-f" => "csp.hci.ic.gov",
-        _ => "amazonaws.com",
-    }
+    fakecloud_aws::endpoint::dns_suffix(partition_for_region(region))
 }
 
 #[cfg(test)]

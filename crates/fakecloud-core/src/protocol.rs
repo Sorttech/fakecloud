@@ -349,17 +349,6 @@ pub struct RoutingHost {
 }
 
 const LOCALSTACK_SUFFIX: &str = ".localhost.localstack.cloud";
-/// The DNS suffix of every AWS partition: commercial and GovCloud
-/// (`amazonaws.com`), China (`amazonaws.com.cn`) and the isolated partitions.
-/// Endpoint hostnames share one shape across them, only the suffix differs.
-const AWS_SUFFIXES: &[&str] = &[
-    ".amazonaws.com",
-    ".amazonaws.com.cn",
-    ".c2s.ic.gov",
-    ".sc2s.sgov.gov",
-    ".cloud.adc-e.uk",
-    ".csp.hci.ic.gov",
-];
 
 /// Parse a `Host` header value for a LocalStack- or AWS-shaped hostname.
 /// Returns `None` for anything that doesn't match — callers fall through
@@ -373,9 +362,11 @@ pub fn parse_routing_host(host: &str) -> Option<RoutingHost> {
     if let Some(prefix) = hostname.strip_suffix(LOCALSTACK_SUFFIX) {
         return parse_localstack_prefix(prefix);
     }
-    AWS_SUFFIXES
+    // Endpoint hostnames share one shape across partitions; only the DNS
+    // suffix differs, so accept every partition's.
+    fakecloud_aws::endpoint::DNS_SUFFIXES
         .iter()
-        .find_map(|suffix| hostname.strip_suffix(suffix))
+        .find_map(|suffix| hostname.strip_suffix(suffix)?.strip_suffix('.'))
         .and_then(parse_aws_prefix)
 }
 
