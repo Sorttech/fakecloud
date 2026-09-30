@@ -3386,8 +3386,21 @@ impl RdsService {
                 let option_group_name = get_param(req, "OptionGroupName");
                 // Reported as the key's ARN: resolved through KMS before the
                 // RDS lock, or formatted as one when KMS doesn't know it.
+                // Only for a copy that can succeed (the target is free and the
+                // source exists), so a failing copy mints no AWS-managed key.
+                let copy_possible = {
+                    let accounts = self.state_handle().read();
+                    let target_free = accounts
+                        .get(&aid)
+                        .is_none_or(|s| !s.snapshots.contains_key(&target_id));
+                    let owner = source_owner.as_deref().unwrap_or(&aid);
+                    target_free
+                        && accounts
+                            .get(owner)
+                            .is_some_and(|s| s.snapshots.contains_key(&source_key))
+                };
                 let kms_key_id = get_param(req, "KmsKeyId")
-                    .filter(|k| !k.is_empty())
+                    .filter(|k| !k.is_empty() && copy_possible)
                     .map(|k| {
                         let key = self.storage_kms_key(Some(&k), &aid, region).unwrap_or(k);
                         format_kms_arn(&key, region, &aid)

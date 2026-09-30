@@ -475,8 +475,8 @@ pub fn kms_key_arn_or_aws_managed(
 /// The ARN of the key a caller named (key id, key ARN, alias name or alias
 /// ARN) as KMS resolves it: an alias reports its target key's ARN, and an
 /// AWS-managed alias (`alias/aws/<svc>`) that region's AWS-managed key, minted
-/// on first use. A key KMS cannot resolve (one never created in fakecloud, or
-/// no hook wired) is reported as given.
+/// on first use. A key KMS cannot resolve (one never created in fakecloud, one
+/// in another region than `region`, or no hook wired) is reported as given.
 pub fn resolve_named_kms_key_arn(
     hook: Option<&dyn KmsHook>,
     key: &str,
@@ -487,6 +487,14 @@ pub fn resolve_named_kms_key_arn(
     let Some(h) = hook else {
         return key.to_string();
     };
+    // A KMS ARN naming another region is a key the resource's region cannot
+    // use: report it as given rather than resolving (or minting) anything in
+    // that other region.
+    if let Some(rest) = key.strip_prefix("arn:") {
+        if rest.split(':').nth(2).is_some_and(|r| r != region) {
+            return key.to_string();
+        }
+    }
     // KMS resolves an alias name in `region` and an alias ARN in the region
     // it names; `alias/aws/<svc>` resolves to (minting on first use) that
     // region's AWS-managed key for `<svc>`, provisioned for that service.

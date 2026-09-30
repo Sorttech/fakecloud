@@ -6995,3 +6995,40 @@ async fn copying_an_unencrypted_db_snapshot_with_a_key_encrypts_the_copy() {
         .clone();
     assert!(!source.encrypted);
 }
+
+/// A CopyDBSnapshot that fails (missing source, taken target) mints no
+/// AWS-managed key for its KmsKeyId.
+#[tokio::test]
+async fn failing_db_snapshot_copy_mints_no_key() {
+    use fakecloud_core::service::AwsService;
+    let (kms, svc) = svc_with_kms();
+    {
+        let mut accounts = svc.state_handle().write();
+        let st = accounts.get_or_create("000000000000");
+        st.snapshots.insert(
+            "src".to_string(),
+            local_snapshot("src", "my-db", "000000000000"),
+        );
+        st.snapshots.insert(
+            "taken".to_string(),
+            local_snapshot("taken", "my-db", "000000000000"),
+        );
+    }
+    for (source, target) in [("missing", "fresh"), ("src", "taken")] {
+        let result = svc
+            .handle(req(
+                "CopyDBSnapshot",
+                &[
+                    ("SourceDBSnapshotIdentifier", source),
+                    ("TargetDBSnapshotIdentifier", target),
+                    ("KmsKeyId", "alias/aws/rds"),
+                ],
+            ))
+            .await;
+        assert!(result.is_err(), "{source} -> {target} should fail");
+    }
+    assert!(kms
+        .read()
+        .get("000000000000")
+        .is_none_or(|s| s.keys.is_empty()));
+}

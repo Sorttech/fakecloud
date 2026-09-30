@@ -770,13 +770,24 @@ mod tests {
             &rds_west,
             "alias/aws/rds",
         );
-        // An AWS-managed alias ARN names its own region.
-        let rds_east = resolve(
-            &format!("arn:aws:kms:us-east-1:{acct}:alias/aws/rds"),
-            "us-west-2",
+        // An alias ARN naming the resource's own region resolves there; one
+        // naming another region is not usable from this region: it is
+        // reported as given and mints nothing in that region.
+        assert_eq!(
+            resolve(
+                &format!("arn:aws:kms:us-west-2:{acct}:alias/aws/rds"),
+                "us-west-2"
+            ),
+            rds_west
         );
-        assert!(rds_east.starts_with("arn:aws:kms:us-east-1:"), "{rds_east}");
-        assert_ne!(rds_east, rds_west);
+        let foreign = format!("arn:aws:kms:eu-central-1:{acct}:alias/aws/rds");
+        assert_eq!(resolve(&foreign, "us-west-2"), foreign);
+        assert!(state
+            .read()
+            .get(acct)
+            .unwrap()
+            .alias("eu-central-1", "alias/aws/rds")
+            .is_none());
 
         assert_eq!(resolve("alias/unknown", "us-east-1"), "alias/unknown");
         assert_eq!(
