@@ -1879,10 +1879,12 @@ pub struct Ec2State {
     /// applies only to the region its ARN names.
     #[serde(default)]
     pub ebs_default_kms_key_id: Option<String>,
-    /// EBS default KMS key ARN per region, as `ModifyEbsDefaultKmsKeyId` set
-    /// it (absent = the region's AWS-managed `aws/ebs` key).
+    /// EBS default KMS key per region: `Some(arn)` as `ModifyEbsDefaultKmsKeyId`
+    /// set it, `None` once `ResetEbsDefaultKmsKeyId` restored the region's
+    /// AWS-managed `aws/ebs` key. A region with no entry falls back to the
+    /// pre-per-region key, when that applies to it.
     #[serde(default)]
-    pub ebs_default_kms_key_id_by_region: BTreeMap<String, String>,
+    pub ebs_default_kms_key_id_by_region: BTreeMap<String, Option<String>>,
     #[serde(default)]
     pub snapshots: BTreeMap<String, Snapshot>,
     /// Account-level snapshot block-public-access state.
@@ -2211,35 +2213,22 @@ impl Ec2State {
 
     /// The customized EBS default KMS key of `region`, if any.
     pub fn ebs_default_kms_key(&self, region: &str) -> Option<String> {
-        self.ebs_default_kms_key_id_by_region
-            .get(region)
-            .cloned()
-            .or_else(|| {
-                self.ebs_default_kms_key_id
-                    .clone()
-                    .filter(|key| legacy_key_applies(key, region))
-            })
+        match self.ebs_default_kms_key_id_by_region.get(region) {
+            Some(key) => key.clone(),
+            None => self
+                .ebs_default_kms_key_id
+                .clone()
+                .filter(|key| legacy_key_applies(key, region)),
+        }
     }
 
     /// Customize (`Some`) or reset (`None`) the EBS default KMS key of
     /// `region`.
+    /// The region's own entry shadows the pre-per-region key, which keeps
+    /// applying to the other regions it covers.
     pub fn set_ebs_default_kms_key(&mut self, region: &str, key: Option<String>) {
-        if self
-            .ebs_default_kms_key_id
-            .as_deref()
-            .is_some_and(|legacy| legacy_key_applies(legacy, region))
-        {
-            self.ebs_default_kms_key_id = None;
-        }
-        match key {
-            Some(key) => {
-                self.ebs_default_kms_key_id_by_region
-                    .insert(region.to_string(), key);
-            }
-            None => {
-                self.ebs_default_kms_key_id_by_region.remove(region);
-            }
-        }
+        self.ebs_default_kms_key_id_by_region
+            .insert(region.to_string(), key);
     }
 
     pub fn new(account_id: &str, region: &str) -> Self {

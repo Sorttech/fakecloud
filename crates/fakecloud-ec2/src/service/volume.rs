@@ -1804,5 +1804,23 @@ mod tests {
         assert_eq!(st.ebs_default_kms_key("us-west-2"), None);
         st.set_ebs_default_kms_key("us-east-1", None);
         assert_eq!(st.ebs_default_kms_key("us-east-1"), None);
+
+        // A legacy key that names no region covered every region; changing
+        // or resetting one region leaves the others on it.
+        st.ebs_default_kms_key_id = Some("alias/my-key".to_string());
+        st.set_ebs_default_kms_key(
+            "us-west-2",
+            Some("arn:aws:kms:us-west-2:000000000000:key/west".to_string()),
+        );
+        st.set_ebs_default_kms_key("eu-west-1", None);
+        assert_eq!(
+            st.ebs_default_kms_key("us-west-2").as_deref(),
+            Some("arn:aws:kms:us-west-2:000000000000:key/west")
+        );
+        assert_eq!(st.ebs_default_kms_key("eu-west-1"), None);
+        assert_eq!(
+            st.ebs_default_kms_key("ap-south-1").as_deref(),
+            Some("alias/my-key")
+        );
     }
 }
