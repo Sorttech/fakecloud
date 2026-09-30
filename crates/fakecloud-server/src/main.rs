@@ -18,6 +18,7 @@ mod appas_hooks;
 mod cli;
 mod dns;
 mod dynamodb_streams_lambda_poller;
+mod ecs_creds;
 mod imds;
 mod introspection;
 mod kinesis_lambda_poller;
@@ -115,14 +116,6 @@ async fn cloudfront_viewer_middleware(
 const DNS_INTROSPECTION_TYPES: &[&str] = &[
     "A", "AAAA", "CNAME", "MX", "TXT", "NS", "PTR", "SPF", "CAA", "SRV", "SOA",
 ];
-
-/// The role the ECS task-credentials endpoint reports for a task started
-/// without a `taskRoleArn`, in the partition of the task's own ARN.
-fn ecs_default_task_role_arn(task_arn: &str, account_id: &str) -> String {
-    fakecloud_aws::arn::Arn::global("iam", account_id, "role/ecs-task-role")
-        .with_partition(fakecloud_aws::arn::partition_of(task_arn))
-        .to_string()
-}
 
 /// Handler for `GET /_fakecloud/dns/resolve?name=<n>&type=<A|...>`. Returns what
 /// the DNS resolver would answer for the name+type straight from the Route 53
@@ -3516,6 +3509,7 @@ async fn main() {
     ecs_service = ecs_service.with_role_trust_validator(
         fakecloud_iam::pass_role::IamRoleTrustValidator::shared(iam_state.clone()),
     );
+    ecs_service = ecs_service.with_iam_mode(cli.iam_mode());
     if let Some(store) = ecs_snapshot_store {
         ecs_service = ecs_service.with_snapshot_store(store);
     }
@@ -7419,6 +7413,16 @@ async fn main() {
         instance_id: cli.imds_instance_id(),
     });
     let imds_router = imds::routes(imds_ctx.clone());
+    // ECS task-role credentials: each running task's role session (named after
+    // the task), revoked once the task stops.
+    let ecs_task_credentials = ecs_creds::EcsTaskCredentials::new(
+        ecs_introspection_state.clone(),
+        iam_state.clone(),
+        cli.account_id.clone(),
+    );
+    tokio::spawn(ecs_creds::run_revocation_sweep(
+        ecs_task_credentials.clone(),
+    ));
     let app = Router::new()
         .merge(imds_router)
         .route(
@@ -10406,41 +10410,28 @@ async fn main() {
             }),
         )
         .route(
-            // ECS task-role credential endpoint. Containers started by
-            // ECS RunTask with a `taskRoleArn` have
-            // `AWS_CONTAINER_CREDENTIALS_FULL_URI` pointing here; AWS
-            // SDKs following the default credential-provider chain
-            // fetch IMDS-format creds from this path. Returns synthetic
-            // short-lived credentials since fakecloud STS accepts any
-            // access-key/secret.
+            // ECS task-role credential endpoint. Containers of a task whose
+            // task definition has a `taskRoleArn` get
+            // `AWS_CONTAINER_CREDENTIALS_FULL_URI` pointing here; the AWS SDK
+            // default credential chain fetches the task role's session
+            // (named after the task) from it. See `ecs_creds`.
             "/_fakecloud/ecs/creds/{task_id}",
             axum::routing::get({
-                let ec = ecs_introspection_state.clone();
+                let creds = ecs_task_credentials.clone();
                 move |axum::extract::Path(task_id): axum::extract::Path<String>| {
-                    let ec = ec.clone();
-                    async move {
-                        let accounts = ec.read();
-                        for (_, state) in accounts.iter() {
-                            if let Some(t) = state.tasks.get(&task_id) {
-                                let role_arn = t.task_role_arn.clone().unwrap_or_else(|| {
-                                    ecs_default_task_role_arn(&t.task_arn, &state.account_id)
-                                });
-                                let expiry = chrono::Utc::now() + chrono::Duration::minutes(15);
-                                let body = serde_json::json!({
-                                    "AccessKeyId": format!("ASIA{}", "F".repeat(16)),
-                                    "SecretAccessKey": "fakecloud-ecs-task-role-secret",
-                                    "Token": "fakecloud-ecs-task-role-token",
-                                    "Expiration": expiry.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-                                    "RoleArn": role_arn,
-                                });
-                                return (axum::http::StatusCode::OK, axum::Json(body));
-                            }
-                        }
-                        (
-                            axum::http::StatusCode::NOT_FOUND,
-                            axum::Json(serde_json::json!({"error": "task not found"})),
-                        )
-                    }
+                    let creds = creds.clone();
+                    async move { creds.respond(&task_id) }
+                }
+            }),
+        )
+        .route(
+            // No task ID: answered like the agent (`NoIdInRequest`).
+            "/_fakecloud/ecs/creds/",
+            axum::routing::get({
+                let creds = ecs_task_credentials.clone();
+                move || {
+                    let creds = creds.clone();
+                    async move { creds.respond("") }
                 }
             }),
         )
@@ -12204,7 +12195,7 @@ async fn main() {
     if cli.imds_link_local {
         // Detached so a hung alias/bind can never delay the main server; the
         // link-local IMDS IP serves an IMDS-only surface (not the whole app).
-        tokio::spawn(link_local::run(imds_ctx));
+        tokio::spawn(link_local::run(imds_ctx, ecs_task_credentials));
     }
     // Optional DNS resolver answering A/AAAA/CNAME/MX/TXT from the Route 53
     // records created in fakecloud (names in no local zone forward upstream).
@@ -12242,27 +12233,6 @@ async fn main() {
     }
     if let Some(rt) = ec2_runtime {
         rt.stop_all().await;
-    }
-}
-
-#[cfg(test)]
-mod ecs_task_role_tests {
-    #[test]
-    fn default_task_role_follows_the_task_partition() {
-        assert_eq!(
-            super::ecs_default_task_role_arn(
-                "arn:aws-cn:ecs:cn-north-1:123456789012:task/c/abc",
-                "123456789012"
-            ),
-            "arn:aws-cn:iam::123456789012:role/ecs-task-role"
-        );
-        assert_eq!(
-            super::ecs_default_task_role_arn(
-                "arn:aws:ecs:us-east-1:123456789012:task/c/abc",
-                "123456789012"
-            ),
-            "arn:aws:iam::123456789012:role/ecs-task-role"
-        );
     }
 }
 

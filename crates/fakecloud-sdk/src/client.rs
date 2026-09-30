@@ -1737,8 +1737,10 @@ impl EcsClient<'_> {
         FakeCloud::parse(resp).await
     }
 
-    /// Fetch the IAM task-role credentials that fakecloud hands out via
-    /// `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` to the container. Fields
+    /// Fetch the task-role credentials fakecloud hands a running task's
+    /// containers via `AWS_CONTAINER_CREDENTIALS_FULL_URI` (a session for
+    /// the task role named after the task ID). Errors once the task has
+    /// stopped, or for a task without a task role. Fields
     /// use AWS's native PascalCase (`AccessKeyId`, `SecretAccessKey`,
     /// `Token`, `Expiration`, `RoleArn`).
     pub async fn task_credentials(

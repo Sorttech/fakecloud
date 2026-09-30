@@ -138,12 +138,14 @@ async fn ecs_register_task_definition_rejects_role_without_ecs_tasks_trust() {
         .await
         .expect_err("RegisterTaskDefinition should fail when taskRoleArn doesn't trust ecs-tasks.amazonaws.com");
 
-    let msg = format!("{err:?}");
+    // ECS answers a role it cannot assume with ClientException naming it.
+    let err = err.into_service_error();
+    assert!(err.is_client_exception(), "{err:?}");
     assert!(
-        msg.contains("trust policy")
-            || msg.contains("InvalidParameterException")
-            || msg.contains("ecs-tasks.amazonaws.com"),
-        "expected PassRole trust-policy rejection, got: {msg}"
+        err.meta().message().is_some_and(
+            |m| m.starts_with(&format!("ECS was unable to assume the role '{bad_role}'"))
+        ),
+        "{err:?}"
     );
 }
 

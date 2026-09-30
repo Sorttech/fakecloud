@@ -185,11 +185,8 @@ pub fn mint_session_credentials(
     let creds = StsCredentials::generate();
     let issued_at = Utc::now();
     let expiration = issued_at + duration;
-    let partition = partition_of(role_arn);
-    let account_id =
-        extract_account_from_arn(role_arn).unwrap_or_else(|| default_account_id.to_string());
-    let role_name = assumed_role_name(role_arn);
-    let assumed_role_arn = format_assumed_role_arn(partition, &account_id, role_name, session_name);
+    let (account_id, assumed_role_arn) =
+        session_principal(default_account_id, role_arn, session_name);
     let user_id = format!("{}:{}", deterministic_role_id(role_arn), session_name);
 
     {
@@ -231,6 +228,53 @@ pub fn mint_session_credentials(
         assumed_role_arn,
         account_id,
     }
+}
+
+/// The account a session for `role_arn` is registered under and its
+/// assumed-role principal ARN.
+fn session_principal(
+    default_account_id: &str,
+    role_arn: &str,
+    session_name: &str,
+) -> (String, String) {
+    let account_id =
+        extract_account_from_arn(role_arn).unwrap_or_else(|| default_account_id.to_string());
+    let assumed_role_arn = format_assumed_role_arn(
+        partition_of(role_arn),
+        &account_id,
+        assumed_role_name(role_arn),
+        session_name,
+    );
+    (account_id, assumed_role_arn)
+}
+
+/// Unregister every registered session of `role_arn` named `session_name`,
+/// whoever holds it. For sessions minted by an earlier server run whose
+/// holder is gone (persisted IAM state outlives the in-memory caches), e.g.
+/// the sessions of ECS tasks a restart stopped. Returns how many were removed.
+pub fn revoke_sessions_named(
+    iam: &SharedIamState,
+    default_account_id: &str,
+    role_arn: &str,
+    session_name: &str,
+) -> usize {
+    let (account_id, assumed_role_arn) =
+        session_principal(default_account_id, role_arn, session_name);
+    let mut accounts = iam.write();
+    let Some(state) = accounts.get_mut(&account_id) else {
+        return 0;
+    };
+    let keys: Vec<String> = state
+        .sts_temp_credentials
+        .iter()
+        .filter(|(_, c)| c.principal_arn == assumed_role_arn)
+        .map(|(k, _)| k.clone())
+        .collect();
+    for key in &keys {
+        state.sts_temp_credentials.remove(key);
+        state.credential_identities.remove(key);
+    }
+    keys.len()
 }
 
 /// True if `creds` is still registered in IAM state (i.e. not cleared by a
@@ -359,44 +403,161 @@ impl ContainerCredentialCache {
         let mut cache = self.by_role.lock();
 
         if let Some(rc) = cache.get_mut(role_arn) {
-            // Drop any superseded creds that have now actually expired.
-            rc.retired.retain(|c| {
-                if c.expiration <= now {
-                    evict_container_credentials(iam, c);
-                    false
-                } else {
-                    true
-                }
+            return rc.reuse_or_rotate(iam, now, || {
+                mint_container_credentials(iam, default_account_id, role_arn, duration)
             });
-            // Reuse the current credential while it is comfortably valid AND
-            // still registered (a /_reset clears IAM state under the cache).
-            if rc.current.expiration - now > CONTAINER_CREDENTIALS_REFRESH_WINDOW
-                && credential_registered(iam, &rc.current)
-            {
-                return rc.current.clone();
-            }
-            // Rotate. Keep the superseded credential valid until its real
-            // expiration (overlapping validity) unless it is already expired or
-            // already gone from state.
-            let fresh = mint_container_credentials(iam, default_account_id, role_arn, duration);
-            let old = std::mem::replace(&mut rc.current, fresh.clone());
-            if old.expiration > now && credential_registered(iam, &old) {
-                rc.retired.push(old);
-            } else {
-                evict_container_credentials(iam, &old);
-            }
-            return fresh;
         }
 
         let fresh = mint_container_credentials(iam, default_account_id, role_arn, duration);
+        cache.insert(role_arn.to_string(), RoleCreds::new(fresh.clone()));
+        fresh
+    }
+}
+
+impl RoleCreds {
+    fn new(current: ContainerCredentials) -> Self {
+        Self {
+            current,
+            retired: Vec::new(),
+        }
+    }
+
+    /// Hand back the current credential while it is comfortably valid and
+    /// still registered; otherwise rotate to a fresh one from `mint`, keeping
+    /// the superseded set valid until its real expiration.
+    fn reuse_or_rotate(
+        &mut self,
+        iam: &SharedIamState,
+        now: DateTime<Utc>,
+        mint: impl FnOnce() -> ContainerCredentials,
+    ) -> ContainerCredentials {
+        // Drop any superseded creds that have now actually expired.
+        self.retired.retain(|c| {
+            if c.expiration <= now {
+                evict_container_credentials(iam, c);
+                false
+            } else {
+                true
+            }
+        });
+        // Reuse the current credential while it is comfortably valid AND
+        // still registered (a /_reset clears IAM state under the cache).
+        if self.current.expiration - now > CONTAINER_CREDENTIALS_REFRESH_WINDOW
+            && credential_registered(iam, &self.current)
+        {
+            return self.current.clone();
+        }
+        // Rotate. Keep the superseded credential valid until its real
+        // expiration (overlapping validity) unless it is already expired or
+        // already gone from state.
+        let fresh = mint();
+        let old = std::mem::replace(&mut self.current, fresh.clone());
+        if old.expiration > now && credential_registered(iam, &old) {
+            self.retired.push(old);
+        } else {
+            evict_container_credentials(iam, &old);
+        }
+        fresh
+    }
+
+    /// Unregister every credential this entry handed out.
+    fn evict_all(&self, iam: &SharedIamState) {
+        evict_container_credentials(iam, &self.current);
+        for c in &self.retired {
+            evict_container_credentials(iam, c);
+        }
+    }
+}
+
+/// The session a workload runs under: its role and the session name AWS
+/// gives it (an ECS task's role session is named after the task ID).
+struct WorkloadCreds {
+    role_arn: String,
+    session_name: String,
+    creds: RoleCreds,
+}
+
+/// Caches the credentials vended to running workloads (ECS tasks), one live
+/// set per workload, each for that workload's own role and session name.
+///
+/// Refetches within the validity window return the same set; near expiry a
+/// fresh set is minted and the superseded one stays valid until it expires,
+/// as the ECS agent does. [`WorkloadCredentialCache::revoke`] unregisters
+/// every set a workload was handed once it stops.
+///
+/// Lock order matches [`ContainerCredentialCache`]: this `Mutex` before the
+/// IAM `RwLock`, never the reverse.
+#[derive(Default)]
+pub struct WorkloadCredentialCache {
+    by_workload: Mutex<HashMap<String, WorkloadCreds>>,
+}
+
+impl WorkloadCredentialCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Credentials for the workload `key` running as `role_arn` with role
+    /// session `session_name`: the cached set while it is comfortably valid
+    /// and still registered, a freshly minted (and registered) one otherwise.
+    /// A workload whose role changed has its old sessions revoked first.
+    pub fn get_or_mint(
+        &self,
+        iam: &SharedIamState,
+        default_account_id: &str,
+        key: &str,
+        role_arn: &str,
+        session_name: &str,
+        duration: Duration,
+    ) -> ContainerCredentials {
+        let now = Utc::now();
+        let mint =
+            || mint_session_credentials(iam, default_account_id, role_arn, session_name, duration);
+        let mut cache = self.by_workload.lock();
+        if let Some(entry) = cache.get_mut(key) {
+            if entry.role_arn == role_arn && entry.session_name == session_name {
+                return entry.creds.reuse_or_rotate(iam, now, mint);
+            }
+            entry.creds.evict_all(iam);
+            cache.remove(key);
+        }
+        let fresh = mint();
         cache.insert(
-            role_arn.to_string(),
-            RoleCreds {
-                current: fresh.clone(),
-                retired: Vec::new(),
+            key.to_string(),
+            WorkloadCreds {
+                role_arn: role_arn.to_string(),
+                session_name: session_name.to_string(),
+                creds: RoleCreds::new(fresh.clone()),
             },
         );
         fresh
+    }
+
+    /// Unregister every credential set the workload `key` was handed, so
+    /// requests signed with them no longer authenticate. Idempotent; returns
+    /// whether the workload had any.
+    pub fn revoke(&self, iam: &SharedIamState, key: &str) -> bool {
+        let removed = self.by_workload.lock().remove(key);
+        match removed {
+            Some(entry) => {
+                entry.creds.evict_all(iam);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Revoke every workload for which `still_running` returns false.
+    pub fn revoke_unless(&self, iam: &SharedIamState, still_running: impl Fn(&str) -> bool) {
+        let mut cache = self.by_workload.lock();
+        cache.retain(|key, entry| {
+            if still_running(key) {
+                true
+            } else {
+                entry.creds.evict_all(iam);
+                false
+            }
+        });
     }
 }
 
@@ -661,5 +822,100 @@ mod tests {
         assert_eq!(temp_cred_count(&iam, "999999999999"), 0);
         // Revoking twice is a no-op.
         issuer.revoke(&creds);
+    }
+
+    #[test]
+    fn workload_cache_names_the_session_and_revokes_every_rotation() {
+        let iam = shared();
+        let cache = WorkloadCredentialCache::new();
+        let role = "arn:aws:iam::123456789012:role/app";
+        let resolver = IamCredentialResolver::new(iam.clone());
+
+        let long = cache.get_or_mint(&iam, "123456789012", "a/t1", role, "t1", Duration::hours(1));
+        let again = cache.get_or_mint(&iam, "123456789012", "a/t1", role, "t1", Duration::hours(1));
+        assert_eq!(
+            long.access_key_id, again.access_key_id,
+            "reuse within window"
+        );
+        assert_eq!(
+            long.assumed_role_arn,
+            "arn:aws:sts::123456789012:assumed-role/app/t1"
+        );
+
+        // Near expiry a fresh set is minted; the superseded one stays valid.
+        let short = Duration::minutes(2);
+        let a = cache.get_or_mint(&iam, "123456789012", "a/t2", role, "t2", short);
+        let b = cache.get_or_mint(&iam, "123456789012", "a/t2", role, "t2", short);
+        assert_ne!(a.access_key_id, b.access_key_id, "rotates near expiry");
+        assert!(resolver.resolve(&a.access_key_id).is_some());
+
+        // Revoking the workload unregisters the current and superseded sets,
+        // and leaves other workloads alone.
+        assert!(cache.revoke(&iam, "a/t2"));
+        assert!(resolver.resolve(&a.access_key_id).is_none());
+        assert!(resolver.resolve(&b.access_key_id).is_none());
+        assert!(resolver.resolve(&long.access_key_id).is_some());
+        assert!(!cache.revoke(&iam, "a/t2"), "idempotent");
+
+        cache.revoke_unless(&iam, |key| key != "a/t1");
+        assert!(resolver.resolve(&long.access_key_id).is_none());
+        assert_eq!(temp_cred_count(&iam, "123456789012"), 0);
+    }
+
+    #[test]
+    fn workload_cache_role_change_revokes_the_old_session() {
+        let iam = shared();
+        let cache = WorkloadCredentialCache::new();
+        let resolver = IamCredentialResolver::new(iam.clone());
+        let first = cache.get_or_mint(
+            &iam,
+            "123456789012",
+            "k",
+            "arn:aws:iam::123456789012:role/one",
+            "t",
+            Duration::hours(1),
+        );
+        let second = cache.get_or_mint(
+            &iam,
+            "123456789012",
+            "k",
+            "arn:aws:iam::123456789012:role/two",
+            "t",
+            Duration::hours(1),
+        );
+        assert_eq!(
+            second.assumed_role_arn,
+            "arn:aws:sts::123456789012:assumed-role/two/t"
+        );
+        assert!(resolver.resolve(&first.access_key_id).is_none());
+        assert!(resolver.resolve(&second.access_key_id).is_some());
+    }
+
+    #[test]
+    fn sessions_named_after_a_workload_are_revoked_without_the_cache() {
+        let iam = shared();
+        let role = "arn:aws:iam::123456789012:role/app";
+        // Minted by a cache that no longer exists (an earlier server run).
+        let a = WorkloadCredentialCache::new().get_or_mint(
+            &iam,
+            "123456789012",
+            "k",
+            role,
+            "task-1",
+            Duration::hours(1),
+        );
+        let other =
+            mint_session_credentials(&iam, "123456789012", role, "task-2", Duration::hours(1));
+        assert_eq!(
+            revoke_sessions_named(&iam, "123456789012", role, "task-1"),
+            1
+        );
+        let resolver = IamCredentialResolver::new(iam.clone());
+        assert!(resolver.resolve(&a.access_key_id).is_none());
+        assert!(resolver.resolve(&other.access_key_id).is_some());
+        assert_eq!(
+            revoke_sessions_named(&iam, "123456789012", role, "task-1"),
+            0
+        );
     }
 }

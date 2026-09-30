@@ -69,6 +69,21 @@ impl ResourceProvisioner {
         Ok(())
     }
 
+    /// The same role checks `RegisterTaskDefinition` runs: a role whose trust
+    /// policy lets ECS tasks assume it, in the stack's account under IAM
+    /// enforcement.
+    fn validate_ecs_task_role(&self, role_arn: &str) -> Result<(), String> {
+        let validator =
+            fakecloud_iam::pass_role::IamRoleTrustValidator::new(self.iam_state.clone());
+        fakecloud_ecs::validate_task_role(
+            &self.account_id,
+            role_arn,
+            Some(&validator),
+            self.iam_mode,
+        )
+        .map_err(|e| e.to_string())
+    }
+
     pub(super) fn create_ecs_task_definition(
         &self,
         resource: &ResourceDefinition,
@@ -98,6 +113,9 @@ impl ResourceProvisioner {
             .get("ExecutionRoleArn")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        for role_arn in [&task_role_arn, &execution_role_arn].into_iter().flatten() {
+            self.validate_ecs_task_role(role_arn)?;
+        }
         let network_mode = props
             .get("NetworkMode")
             .and_then(|v| v.as_str())

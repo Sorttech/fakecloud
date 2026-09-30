@@ -1703,7 +1703,7 @@ type SnsSmsResponse struct {
 // ── ECS task IAM credentials ───────────────────────────────────────
 
 // EcsTaskCredentials mirrors the JSON the ECS container credentials
-// endpoint serves at AWS_CONTAINER_CREDENTIALS_RELATIVE_URI.
+// endpoint serves at AWS_CONTAINER_CREDENTIALS_FULL_URI.
 type EcsTaskCredentials struct {
 	AccessKeyID     string `json:"AccessKeyId"`
 	SecretAccessKey string `json:"SecretAccessKey"`

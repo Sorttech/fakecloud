@@ -86,7 +86,7 @@ Other metadata paths served: `/latest/meta-data/instance-id`, `/latest/meta-data
 
 ### Advanced: apps that hardcode `169.254.169.254`
 
-Some apps ignore `AWS_EC2_METADATA_SERVICE_ENDPOINT` and talk to the real IMDS IP `http://169.254.169.254` directly (and some ECS SDKs hardcode the `169.254.170.2` container-credentials base). Run fakecloud with `--imds-link-local` (or `FAKECLOUD_IMDS_LINK_LOCAL=1`) and it also binds those addresses on port 80: the full IMDS surface at `169.254.169.254`, and container credentials at `169.254.170.2/creds`. Set `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI=/creds` for apps that use the relative-URI base.
+Some apps ignore `AWS_EC2_METADATA_SERVICE_ENDPOINT` and talk to the real IMDS IP `http://169.254.169.254` directly (and some ECS SDKs hardcode the `169.254.170.2` container-credentials base). Run fakecloud with `--imds-link-local` (or `FAKECLOUD_IMDS_LINK_LOCAL=1`) and it also binds those addresses on port 80: the full IMDS surface at `169.254.169.254`, and container credentials at `169.254.170.2/creds`. Set `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI=/creds` for apps that use the relative-URI base. `169.254.170.2` also serves an ECS task's role credentials at the ECS agent's relative URI, `/v2/credentials/<task-id>`.
 
 This needs privileged host setup that fakecloud does **not** perform for you: binding port 80 needs **root**, and the link-local addresses must already be assigned to the loopback interface. Assign them first, then run fakecloud as root:
 

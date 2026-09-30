@@ -1,8 +1,8 @@
 //! ECS task-role credentials + secrets injection.
 //!
 //! - Tasks with a `taskRoleArn` get `AWS_CONTAINER_CREDENTIALS_FULL_URI`
-//!   injected and a dedicated HTTP endpoint on the main fakecloud
-//!   server vends IMDS-format credentials.
+//!   injected, pointing at the task-credentials endpoint on the main
+//!   fakecloud server.
 //! - Tasks with `containerDefinitions[].secrets[]` entries get the
 //!   referenced SecretsManager secrets / SSM parameters resolved
 //!   synchronously and injected as env vars.
@@ -70,8 +70,8 @@ async fn task_logs(endpoint: &str, task_id: &str) -> String {
 }
 
 /// Creating a task with a `taskRoleArn` causes the runtime to inject
-/// `AWS_CONTAINER_CREDENTIALS_FULL_URI`. Fetching that URL from inside
-/// the container returns IMDS-format credentials.
+/// `AWS_CONTAINER_CREDENTIALS_FULL_URI`; once the task stops the endpoint
+/// no longer has credentials for it.
 #[tokio::test]
 async fn ecs_task_role_credentials_are_served() {
     if !require_docker_or_skip("ecs_task_role_credentials_are_served") {
@@ -125,36 +125,20 @@ async fn ecs_task_role_credentials_are_served() {
         "env var not injected; logs: {logs}"
     );
 
-    // Direct probe of the credential endpoint — same JSON the AWS SDK's
-    // ContainerCredentialsProvider would fetch from inside the container.
-    let creds: serde_json::Value = reqwest::Client::new()
+    // The task has stopped, so -- as with the ECS agent -- its credentials
+    // are gone. The running-task path is covered in
+    // `ecs_task_role_credentials.rs`.
+    let resp = reqwest::Client::new()
         .get(format!(
             "{}/_fakecloud/ecs/creds/{task_id}",
             server.endpoint()
         ))
         .send()
         .await
-        .unwrap()
-        .json()
-        .await
         .unwrap();
-    assert!(
-        creds["AccessKeyId"]
-            .as_str()
-            .unwrap_or("")
-            .starts_with("ASIA"),
-        "AccessKeyId shape unexpected: {creds}"
-    );
-    assert_eq!(
-        creds["RoleArn"].as_str(),
-        Some("arn:aws:iam::123456789012:role/app-task-role"),
-        "RoleArn mismatch: {creds}"
-    );
-    assert!(creds["Token"].as_str().is_some(), "missing Token: {creds}");
-    assert!(
-        creds["Expiration"].as_str().is_some(),
-        "missing Expiration: {creds}"
-    );
+    assert_eq!(resp.status().as_u16(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["code"], "InvalidIdInRequest", "{body}");
 }
 
 /// Container `secrets[]` entries resolve against SecretsManager.
