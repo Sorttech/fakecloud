@@ -11,6 +11,7 @@ pub(crate) mod metric_math;
 pub(crate) mod metric_streams;
 pub(crate) mod mute_rules;
 pub(crate) mod otel;
+pub(crate) mod resource_metrics;
 pub(crate) mod service;
 pub(crate) mod state;
 pub(crate) mod tagging;

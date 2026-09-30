@@ -1,9 +1,16 @@
-//! OTel enrichment toggle, alarm contributors, and metric widget image.
+//! OTel enrichment (start/stop/update with metric filters), alarm contributors, and metric widget image.
 
+use std::collections::BTreeMap;
+
+use chrono::{DateTime, Utc};
 use fakecloud_core::query::optional_query_param;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
-use crate::service::{missing_param, not_found, xml_response, CloudWatchService};
+use crate::service::{
+    collect_indexed, missing_param, not_found, validation_error, xml_escape, xml_response,
+    CloudWatchService,
+};
+use crate::state::{OTelEnrichmentConfig, OTelMetricSelector};
 
 /// A tiny, valid 1x1 transparent PNG (raw bytes). GetMetricWidgetImage
 /// returns a `MetricWidgetImage` blob; this is a deterministic placeholder
@@ -16,18 +23,131 @@ const TINY_PNG: &[u8] = &[
     0x42, 0x60, 0x82,
 ];
 
+/// At most 100 selectors across `IncludeFilters` and `ExcludeFilters`.
+const MAX_OTEL_FILTERS: usize = 100;
+/// At most 100 metric names per selector.
+const MAX_OTEL_METRIC_NAMES: usize = 100;
+
+/// Parse a `<prefix>.member.N` list of `OTelEnrichmentMetricSelector`s,
+/// validating each selector against the model constraints.
+fn parse_selectors(
+    req: &AwsRequest,
+    prefix: &str,
+) -> Result<Vec<OTelMetricSelector>, AwsServiceError> {
+    let mut out = Vec::new();
+    for member in collect_indexed(req, prefix) {
+        let namespace = member
+            .get("Namespace")
+            .cloned()
+            .ok_or_else(|| validation_error(format!("{prefix}.Namespace is required")))?;
+        let ns_len = namespace.chars().count();
+        if !(1..=255).contains(&ns_len) || namespace.starts_with(':') {
+            return Err(validation_error(format!(
+                "{prefix}.Namespace '{namespace}' is invalid: must be 1-255 characters and not start with ':'"
+            )));
+        }
+        let mut indexed: BTreeMap<u32, String> = BTreeMap::new();
+        for (k, v) in &member {
+            if let Some(idx) = k.strip_prefix("MetricNames.member.") {
+                if let Ok(i) = idx.parse::<u32>() {
+                    indexed.insert(i, v.clone());
+                }
+            }
+        }
+        let metric_names: Vec<String> = indexed.into_values().collect();
+        if metric_names.len() > MAX_OTEL_METRIC_NAMES {
+            return Err(validation_error(format!(
+                "A maximum of {MAX_OTEL_METRIC_NAMES} metric names is allowed for each selector"
+            )));
+        }
+        if let Some(bad) = metric_names
+            .iter()
+            .find(|n| !(1..=255).contains(&n.chars().count()))
+        {
+            return Err(validation_error(format!(
+                "Metric name '{bad}' must be 1-255 characters"
+            )));
+        }
+        out.push(OTelMetricSelector {
+            namespace,
+            metric_names,
+        });
+    }
+    Ok(out)
+}
+
+/// Parse and validate the include/exclude filter pair of a Start/Update call.
+fn parse_filter_pair(
+    req: &AwsRequest,
+) -> Result<(Vec<OTelMetricSelector>, Vec<OTelMetricSelector>), AwsServiceError> {
+    let include = parse_selectors(req, "IncludeFilters")?;
+    let exclude = parse_selectors(req, "ExcludeFilters")?;
+    if include.len() + exclude.len() > MAX_OTEL_FILTERS {
+        return Err(validation_error(format!(
+            "A maximum of {MAX_OTEL_FILTERS} filters is allowed across IncludeFilters and ExcludeFilters combined"
+        )));
+    }
+    Ok((include, exclude))
+}
+
+fn render_selectors(out: &mut String, tag: &str, selectors: &[OTelMetricSelector]) {
+    if selectors.is_empty() {
+        return;
+    }
+    out.push_str(&format!("<{tag}>"));
+    for sel in selectors {
+        out.push_str("<member>");
+        out.push_str(&format!(
+            "<Namespace>{}</Namespace>",
+            xml_escape(&sel.namespace)
+        ));
+        if !sel.metric_names.is_empty() {
+            out.push_str("<MetricNames>");
+            for n in &sel.metric_names {
+                out.push_str(&format!("<member>{}</member>", xml_escape(n)));
+            }
+            out.push_str("</MetricNames>");
+        }
+        out.push_str("</member>");
+    }
+    out.push_str(&format!("</{tag}>"));
+}
+
+/// Render the stored filters plus CreatedAt/UpdatedAt, omitting each empty
+/// filter list (an omitted list means "all namespaces" / "nothing excluded").
+fn render_config(cfg: &OTelEnrichmentConfig) -> String {
+    let mut inner = String::new();
+    render_selectors(&mut inner, "IncludeFilters", &cfg.include_filters);
+    render_selectors(&mut inner, "ExcludeFilters", &cfg.exclude_filters);
+    if let Some(t) = cfg.created_at {
+        inner.push_str(&format!("<CreatedAt>{}</CreatedAt>", fmt_ts(t)));
+    }
+    if let Some(t) = cfg.updated_at {
+        inner.push_str(&format!("<UpdatedAt>{}</UpdatedAt>", fmt_ts(t)));
+    }
+    inner
+}
+
+pub(crate) fn fmt_ts(t: DateTime<Utc>) -> String {
+    t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
 impl CloudWatchService {
     pub(crate) fn get_otel_enrichment(
         &self,
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let state = self.state.read();
-        let running = state
-            .get(&req.account_id)
-            .map(|a| a.otel_enrichment_running)
-            .unwrap_or(false);
-        let status = if running { "RUNNING" } else { "STOPPED" };
-        let inner = format!("<Status>{status}</Status>");
+        let acct = state.get(&req.account_id);
+        let running = acct.map(|a| a.otel_enrichment_running).unwrap_or(false);
+        // Filters and CreatedAt are only reported while enrichment runs.
+        let inner = match acct {
+            Some(a) if running => format!(
+                "<Status>Running</Status>{}",
+                render_config(&a.otel_enrichment)
+            ),
+            _ => "<Status>Stopped</Status>".to_string(),
+        };
         Ok(xml_response("GetOTelEnrichment", &inner, &req.request_id))
     }
 
@@ -35,9 +155,47 @@ impl CloudWatchService {
         &self,
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
+        let (include, exclude) = parse_filter_pair(req)?;
         let mut state = self.state.write();
-        state.get_or_create(&req.account_id).otel_enrichment_running = true;
-        Ok(xml_response("StartOTelEnrichment", "", &req.request_id))
+        let acct = state.get_or_create(&req.account_id);
+        // Starting an already-running account is a no-op: the stored filters
+        // are kept and only UpdateOTelEnrichment can change them.
+        if !acct.otel_enrichment_running {
+            let now = Utc::now();
+            acct.otel_enrichment_running = true;
+            acct.otel_enrichment = OTelEnrichmentConfig {
+                include_filters: include,
+                exclude_filters: exclude,
+                created_at: Some(now),
+                updated_at: Some(now),
+            };
+        }
+        let inner = render_config(&acct.otel_enrichment);
+        Ok(xml_response("StartOTelEnrichment", &inner, &req.request_id))
+    }
+
+    pub(crate) fn update_otel_enrichment(
+        &self,
+        req: &AwsRequest,
+    ) -> Result<AwsResponse, AwsServiceError> {
+        let (include, exclude) = parse_filter_pair(req)?;
+        let mut state = self.state.write();
+        let acct = state.get_or_create(&req.account_id);
+        if !acct.otel_enrichment_running {
+            return Err(not_found(
+                "OTel enrichment is not running for this account. Call StartOTelEnrichment first.",
+            ));
+        }
+        // Include and exclude are replaced as a pair: omitting one clears it.
+        acct.otel_enrichment.include_filters = include;
+        acct.otel_enrichment.exclude_filters = exclude;
+        acct.otel_enrichment.updated_at = Some(Utc::now());
+        let inner = render_config(&acct.otel_enrichment);
+        Ok(xml_response(
+            "UpdateOTelEnrichment",
+            &inner,
+            &req.request_id,
+        ))
     }
 
     pub(crate) fn stop_otel_enrichment(
@@ -45,7 +203,9 @@ impl CloudWatchService {
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let mut state = self.state.write();
-        state.get_or_create(&req.account_id).otel_enrichment_running = false;
+        let acct = state.get_or_create(&req.account_id);
+        acct.otel_enrichment_running = false;
+        acct.otel_enrichment = OTelEnrichmentConfig::default();
         Ok(xml_response("StopOTelEnrichment", "", &req.request_id))
     }
 

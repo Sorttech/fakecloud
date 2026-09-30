@@ -98,6 +98,8 @@ const TIMESTAMP_TAGS: &[&str] = &[
     "CreationDate",
     "StartDate",
     "ExpireDate",
+    "CreatedAt",
+    "UpdatedAt",
     "StartTime",
     "EndTime",
 ];
@@ -388,6 +390,22 @@ mod tests {
         let v = json("GetMetricData", inner);
         assert_eq!(v["MetricDataResults"][0]["Timestamps"][0], 1577836800.0);
         assert_eq!(v["MetricDataResults"][0]["Values"][0], 1.5);
+    }
+
+    #[test]
+    fn resource_metrics_configuration_timestamps_typed() {
+        let inner = "<ResourceMetricsConfiguration><ResourceArn>arn:aws:ec2:us-east-1:123456789012:instance/i-1</ResourceArn>\
+            <CreatedAt>2020-01-01T00:00:00.000Z</CreatedAt><UpdatedAt>2020-01-01T00:00:01.000Z</UpdatedAt>\
+            <MetricSelections><member><IncludeMetrics><member>CPUUtilization</member></IncludeMetrics></member></MetricSelections>\
+            </ResourceMetricsConfiguration>";
+        let v = json("GetResourceMetricsConfiguration", inner);
+        let cfg = &v["ResourceMetricsConfiguration"];
+        assert_eq!(cfg["CreatedAt"], 1577836800.0);
+        assert_eq!(cfg["UpdatedAt"], 1577836801.0);
+        assert_eq!(
+            cfg["MetricSelections"][0]["IncludeMetrics"][0],
+            "CPUUtilization"
+        );
     }
 
     #[test]

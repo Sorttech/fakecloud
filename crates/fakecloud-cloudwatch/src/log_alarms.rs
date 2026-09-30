@@ -53,6 +53,7 @@ impl CloudWatchService {
     pub(crate) fn put_log_alarm(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         validate_len(req, "AlarmName", 1, 255)?;
         validate_len(req, "AlarmDescription", 0, 1024)?;
+        validate_len(req, "TreatMissingData", 1, 255)?;
         let alarm_name = required_query_param(req, "AlarmName")?;
 
         // ScheduledQueryConfiguration's required members arrive flattened.

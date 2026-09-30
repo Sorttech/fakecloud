@@ -598,7 +598,7 @@ async fn cloudwatch_tagging() {
 
 // ---------------------------------------------------------------------------
 // Newer surfaces absent from aws-sdk-cloudwatch 1.61.0 (alarm mute rules,
-// OTel enrichment, alarm contributors). The SDK has no operation methods for
+// alarm contributors). The SDK has no operation methods for
 // these yet, so coverage is asserted directly against fakecloud's in-memory
 // implementation via the testkit state handle. The conformance probe runner
 // (`run --services monitoring`) exercises their wire contracts independently;
@@ -609,9 +609,6 @@ async fn cloudwatch_tagging() {
 #[test_action("monitoring", "GetAlarmMuteRule", checksum = "f84159d3")]
 #[test_action("monitoring", "ListAlarmMuteRules", checksum = "60b6192f")]
 #[test_action("monitoring", "DeleteAlarmMuteRule", checksum = "64544862")]
-#[test_action("monitoring", "GetOTelEnrichment", checksum = "fa552521")]
-#[test_action("monitoring", "StartOTelEnrichment", checksum = "ad4b71a4")]
-#[test_action("monitoring", "StopOTelEnrichment", checksum = "004a0bed")]
 #[test_action("monitoring", "DescribeAlarmContributors", checksum = "3c5c78c2")]
 #[tokio::test]
 async fn cloudwatch_sdkless_surfaces() {
@@ -731,4 +728,155 @@ async fn cloudwatch_log_alarm() {
     )
     .await;
     assert!(!described.contains("conf-log-alarm"), "{described}");
+}
+
+/// Raw awsQuery POST returning the status and body, for error assertions.
+async fn cw_raw_status(server: &TestServer, body: &str) -> (u16, String) {
+    let resp = reqwest::Client::new()
+        .post(server.endpoint())
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header("Authorization", CW_RAW_AUTH)
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap();
+    (resp.status().as_u16(), resp.text().await.unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// OTel enrichment with metric filters, absent from the vendored SDK.
+// ---------------------------------------------------------------------------
+
+#[test_action("monitoring", "GetOTelEnrichment", checksum = "fa552521")]
+#[test_action("monitoring", "StartOTelEnrichment", checksum = "ad4b71a4")]
+#[test_action("monitoring", "UpdateOTelEnrichment", checksum = "acf655c7")]
+#[test_action("monitoring", "StopOTelEnrichment", checksum = "004a0bed")]
+#[tokio::test]
+async fn cloudwatch_otel_enrichment() {
+    let server = TestServer::start().await;
+    const V: &str = "Version=2010-08-01";
+
+    let (status, body) = cw_raw_status(&server, &format!("Action=UpdateOTelEnrichment&{V}")).await;
+    assert_eq!(status, 404, "update before start: {body}");
+    assert!(body.contains("ResourceNotFoundException"), "{body}");
+
+    let started = cw_raw(
+        &server,
+        &format!(
+            "Action=StartOTelEnrichment&{V}\
+             &IncludeFilters.member.1.Namespace=AWS%2FEC2\
+             &IncludeFilters.member.1.MetricNames.member.1=CPUUtilization\
+             &ExcludeFilters.member.1.Namespace=AWS%2FRDS"
+        ),
+    )
+    .await;
+    assert!(
+        started.contains("<Namespace>AWS/EC2</Namespace>"),
+        "{started}"
+    );
+    assert!(started.contains("<CreatedAt>"), "{started}");
+
+    let got = cw_raw(&server, &format!("Action=GetOTelEnrichment&{V}")).await;
+    assert!(got.contains("<Status>Running</Status>"), "{got}");
+    assert!(got.contains("<member>CPUUtilization</member>"), "{got}");
+    assert!(got.contains("<Namespace>AWS/RDS</Namespace>"), "{got}");
+
+    // Update replaces both lists as a pair.
+    let updated = cw_raw(
+        &server,
+        &format!("Action=UpdateOTelEnrichment&{V}&IncludeFilters.member.1.Namespace=AWS%2FLambda"),
+    )
+    .await;
+    assert!(updated.contains("AWS/Lambda"), "{updated}");
+    assert!(!updated.contains("ExcludeFilters"), "{updated}");
+
+    cw_raw(&server, &format!("Action=StopOTelEnrichment&{V}")).await;
+    let stopped = cw_raw(&server, &format!("Action=GetOTelEnrichment&{V}")).await;
+    assert!(stopped.contains("<Status>Stopped</Status>"), "{stopped}");
+    assert!(!stopped.contains("IncludeFilters"), "{stopped}");
+}
+
+// ---------------------------------------------------------------------------
+// Resource metrics configurations, absent from the vendored SDK.
+// ---------------------------------------------------------------------------
+
+#[test_action(
+    "monitoring",
+    "CreateResourceMetricsConfiguration",
+    checksum = "f66beaca"
+)]
+#[test_action("monitoring", "GetResourceMetricsConfiguration", checksum = "3e998ea1")]
+#[test_action(
+    "monitoring",
+    "UpdateResourceMetricsConfiguration",
+    checksum = "fdf81d51"
+)]
+#[test_action(
+    "monitoring",
+    "DeleteResourceMetricsConfiguration",
+    checksum = "bd5929a1"
+)]
+#[tokio::test]
+async fn cloudwatch_resource_metrics_configuration() {
+    let server = TestServer::start().await;
+    const V: &str = "Version=2010-08-01";
+    let arn = "arn%3Aaws%3Aec2%3Aus-east-1%3A123456789012%3Ainstance%2Fi-0abc";
+
+    let created = cw_raw(
+        &server,
+        &format!(
+            "Action=CreateResourceMetricsConfiguration&{V}&ResourceArn={arn}\
+             &MetricSelections.member.1.IncludeMetrics.member.1=CPUUtilization"
+        ),
+    )
+    .await;
+    assert!(
+        created.contains(
+            "<ResourceArn>arn:aws:ec2:us-east-1:123456789012:instance/i-0abc</ResourceArn>"
+        ),
+        "{created}"
+    );
+    assert!(
+        created.contains("<member>CPUUtilization</member>"),
+        "{created}"
+    );
+
+    let (status, body) = cw_raw_status(
+        &server,
+        &format!("Action=CreateResourceMetricsConfiguration&{V}&ResourceArn={arn}"),
+    )
+    .await;
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains("ConflictException"), "{body}");
+
+    let updated = cw_raw(
+        &server,
+        &format!(
+            "Action=UpdateResourceMetricsConfiguration&{V}&ResourceArn={arn}\
+             &MetricSelections.member.1.IncludeMetrics.member.1=NetworkIn"
+        ),
+    )
+    .await;
+    assert!(updated.contains("<member>NetworkIn</member>"), "{updated}");
+    assert!(!updated.contains("CPUUtilization"), "{updated}");
+
+    let got = cw_raw(
+        &server,
+        &format!("Action=GetResourceMetricsConfiguration&{V}&ResourceArn={arn}"),
+    )
+    .await;
+    assert!(got.contains("<member>NetworkIn</member>"), "{got}");
+
+    cw_raw(
+        &server,
+        &format!("Action=DeleteResourceMetricsConfiguration&{V}&ResourceArn={arn}"),
+    )
+    .await;
+    let (status, body) = cw_raw_status(
+        &server,
+        &format!("Action=GetResourceMetricsConfiguration&{V}&ResourceArn={arn}"),
+    )
+    .await;
+    assert_eq!(status, 404, "{body}");
+    assert!(body.contains("ResourceNotFoundException"), "{body}");
 }

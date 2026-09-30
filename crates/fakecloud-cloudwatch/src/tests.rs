@@ -634,15 +634,203 @@ async fn mute_rule_lifecycle() {
 async fn otel_enrichment_toggle() {
     let svc = service();
     let initial = call(&svc, "GetOTelEnrichment", &[]).await;
-    assert!(body_of(&initial).contains("<Status>STOPPED</Status>"));
+    assert!(body_of(&initial).contains("<Status>Stopped</Status>"));
 
     call(&svc, "StartOTelEnrichment", &[]).await;
-    let running = call(&svc, "GetOTelEnrichment", &[]).await;
-    assert!(body_of(&running).contains("<Status>RUNNING</Status>"));
+    let running = body_of(&call(&svc, "GetOTelEnrichment", &[]).await);
+    assert!(running.contains("<Status>Running</Status>"));
+    assert!(running.contains("<CreatedAt>"));
+    assert!(!running.contains("IncludeFilters"));
 
     call(&svc, "StopOTelEnrichment", &[]).await;
-    let stopped = call(&svc, "GetOTelEnrichment", &[]).await;
-    assert!(body_of(&stopped).contains("<Status>STOPPED</Status>"));
+    let stopped = body_of(&call(&svc, "GetOTelEnrichment", &[]).await);
+    assert!(stopped.contains("<Status>Stopped</Status>"));
+    assert!(!stopped.contains("CreatedAt"));
+}
+
+#[tokio::test]
+async fn otel_enrichment_filters_stored_and_replaced() {
+    let svc = service();
+    // Update before start is ResourceNotFound.
+    let err = call_err(&svc, "UpdateOTelEnrichment", &[]).await;
+    assert_eq!(err.code(), "ResourceNotFoundException");
+
+    let started = body_of(
+        &call(
+            &svc,
+            "StartOTelEnrichment",
+            &[
+                ("IncludeFilters.member.1.Namespace", "AWS/EC2"),
+                (
+                    "IncludeFilters.member.1.MetricNames.member.1",
+                    "CPUUtilization",
+                ),
+                ("ExcludeFilters.member.1.Namespace", "AWS/RDS"),
+            ],
+        )
+        .await,
+    );
+    assert!(started.contains("<IncludeFilters><member><Namespace>AWS/EC2</Namespace><MetricNames><member>CPUUtilization</member></MetricNames></member></IncludeFilters>"));
+    assert!(started.contains(
+        "<ExcludeFilters><member><Namespace>AWS/RDS</Namespace></member></ExcludeFilters>"
+    ));
+
+    // Starting again is a no-op that keeps the stored filters.
+    let again = body_of(
+        &call(
+            &svc,
+            "StartOTelEnrichment",
+            &[("IncludeFilters.member.1.Namespace", "AWS/Lambda")],
+        )
+        .await,
+    );
+    assert!(again.contains("AWS/EC2"));
+    assert!(!again.contains("AWS/Lambda"));
+
+    // Update replaces the pair: specifying only IncludeFilters clears excludes.
+    let updated = body_of(
+        &call(
+            &svc,
+            "UpdateOTelEnrichment",
+            &[("IncludeFilters.member.1.Namespace", "AWS/Lambda")],
+        )
+        .await,
+    );
+    assert!(updated.contains("AWS/Lambda"));
+    assert!(!updated.contains("ExcludeFilters"));
+    assert!(updated.contains("<UpdatedAt>"));
+    let got = body_of(&call(&svc, "GetOTelEnrichment", &[]).await);
+    assert!(got.contains("AWS/Lambda") && !got.contains("AWS/RDS"));
+}
+
+#[tokio::test]
+async fn otel_enrichment_rejects_too_many_filters() {
+    let svc = service();
+    let keys: Vec<String> = (1..=101)
+        .map(|i| format!("IncludeFilters.member.{i}.Namespace"))
+        .collect();
+    let params: Vec<(&str, &str)> = keys.iter().map(|k| (k.as_str(), "NS")).collect();
+    let err = call_err(&svc, "StartOTelEnrichment", &params).await;
+    assert_eq!(err.code(), "ValidationError");
+
+    let name_keys: Vec<String> = (1..=101)
+        .map(|i| format!("IncludeFilters.member.1.MetricNames.member.{i}"))
+        .collect();
+    let mut params: Vec<(&str, &str)> = name_keys.iter().map(|k| (k.as_str(), "m")).collect();
+    params.push(("IncludeFilters.member.1.Namespace", "NS"));
+    let err = call_err(&svc, "StartOTelEnrichment", &params).await;
+    assert_eq!(err.code(), "ValidationError");
+}
+
+#[tokio::test]
+async fn resource_metrics_configuration_lifecycle() {
+    let svc = service();
+    let arn = "arn:aws:ec2:us-east-1:123456789012:instance/i-0123456789abcdef0";
+    let err = call_err(
+        &svc,
+        "GetResourceMetricsConfiguration",
+        &[("ResourceArn", arn)],
+    )
+    .await;
+    assert_eq!(err.code(), "ResourceNotFoundException");
+
+    let created = body_of(
+        &call(
+            &svc,
+            "CreateResourceMetricsConfiguration",
+            &[
+                ("ResourceArn", arn),
+                (
+                    "MetricSelections.member.1.IncludeMetrics.member.1",
+                    "CPUUtilization",
+                ),
+                (
+                    "MetricSelections.member.1.IncludeMetrics.member.2",
+                    "NetworkIn",
+                ),
+            ],
+        )
+        .await,
+    );
+    assert!(created.contains(&format!("<ResourceArn>{arn}</ResourceArn>")));
+    assert!(created.contains(
+        "<MetricSelections><member><IncludeMetrics><member>CPUUtilization</member><member>NetworkIn</member></IncludeMetrics></member></MetricSelections>"
+    ));
+
+    let err = call_err(
+        &svc,
+        "CreateResourceMetricsConfiguration",
+        &[("ResourceArn", arn)],
+    )
+    .await;
+    assert_eq!(err.code(), "ConflictException");
+
+    // Update without selections clears the filter (collect everything).
+    let updated = body_of(
+        &call(
+            &svc,
+            "UpdateResourceMetricsConfiguration",
+            &[("ResourceArn", arn)],
+        )
+        .await,
+    );
+    assert!(!updated.contains("MetricSelections"));
+    let got = body_of(
+        &call(
+            &svc,
+            "GetResourceMetricsConfiguration",
+            &[("ResourceArn", arn)],
+        )
+        .await,
+    );
+    assert!(!got.contains("MetricSelections") && got.contains("<UpdatedAt>"));
+
+    call(
+        &svc,
+        "DeleteResourceMetricsConfiguration",
+        &[("ResourceArn", arn)],
+    )
+    .await;
+    let err = call_err(
+        &svc,
+        "DeleteResourceMetricsConfiguration",
+        &[("ResourceArn", arn)],
+    )
+    .await;
+    assert_eq!(err.code(), "ResourceNotFoundException");
+    let err = call_err(
+        &svc,
+        "UpdateResourceMetricsConfiguration",
+        &[("ResourceArn", arn)],
+    )
+    .await;
+    assert_eq!(err.code(), "ResourceNotFoundException");
+}
+
+#[tokio::test]
+async fn resource_metrics_configuration_validates_input() {
+    let svc = service();
+    let err = call_err(
+        &svc,
+        "CreateResourceMetricsConfiguration",
+        &[("ResourceArn", "not-an-arn-but-long-enough")],
+    )
+    .await;
+    assert_eq!(err.code(), "ValidationError");
+    let err = call_err(&svc, "CreateResourceMetricsConfiguration", &[]).await;
+    assert_eq!(err.code(), "MissingParameter");
+    let arn = "arn:aws:ec2:us-east-1:123456789012:instance/i-1";
+    let err = call_err(
+        &svc,
+        "CreateResourceMetricsConfiguration",
+        &[
+            ("ResourceArn", arn),
+            ("MetricSelections.member.1.IncludeMetrics.member.1", "a"),
+            ("MetricSelections.member.2.IncludeMetrics.member.1", "b"),
+        ],
+    )
+    .await;
+    assert_eq!(err.code(), "ValidationError");
 }
 
 #[tokio::test]
@@ -1535,4 +1723,17 @@ async fn china_region_alarm_and_dashboard_arns_use_the_aws_cn_partition() {
         .await
         .expect("get dashboard");
     assert!(body_of(&dash).contains("arn:aws-cn:cloudwatch::123456789012:dashboard/cn-dash"));
+}
+
+#[tokio::test]
+async fn associate_dataset_kms_key_rejects_short_arn() {
+    let svc = service();
+    // KmsKeyArn has a 20-character minimum in the model.
+    let err = call_err(
+        &svc,
+        "AssociateDatasetKmsKey",
+        &[("DatasetIdentifier", "ds-1"), ("KmsKeyArn", "arn:short")],
+    )
+    .await;
+    assert_eq!(err.code(), "InvalidParameterValue");
 }

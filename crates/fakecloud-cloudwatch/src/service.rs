@@ -104,6 +104,12 @@ const SUPPORTED_ACTIONS: &[&str] = &[
     "GetOTelEnrichment",
     "StartOTelEnrichment",
     "StopOTelEnrichment",
+    "UpdateOTelEnrichment",
+    // Resource metrics configurations.
+    "CreateResourceMetricsConfiguration",
+    "GetResourceMetricsConfiguration",
+    "UpdateResourceMetricsConfiguration",
+    "DeleteResourceMetricsConfiguration",
     // Dataset KMS key management.
     "AssociateDatasetKmsKey",
     "DisassociateDatasetKmsKey",
@@ -241,6 +247,10 @@ impl AwsService for CloudWatchService {
                 | "DeleteAlarmMuteRule"
                 | "StartOTelEnrichment"
                 | "StopOTelEnrichment"
+                | "UpdateOTelEnrichment"
+                | "CreateResourceMetricsConfiguration"
+                | "UpdateResourceMetricsConfiguration"
+                | "DeleteResourceMetricsConfiguration"
                 | "AssociateDatasetKmsKey"
                 | "DisassociateDatasetKmsKey"
                 | "TagResource"
@@ -295,6 +305,18 @@ impl AwsService for CloudWatchService {
             "GetOTelEnrichment" => self.get_otel_enrichment(&req),
             "StartOTelEnrichment" => self.start_otel_enrichment(&req),
             "StopOTelEnrichment" => self.stop_otel_enrichment(&req),
+            "UpdateOTelEnrichment" => self.update_otel_enrichment(&req),
+            // Resource metrics configurations.
+            "CreateResourceMetricsConfiguration" => {
+                self.create_resource_metrics_configuration(&req)
+            }
+            "GetResourceMetricsConfiguration" => self.get_resource_metrics_configuration(&req),
+            "UpdateResourceMetricsConfiguration" => {
+                self.update_resource_metrics_configuration(&req)
+            }
+            "DeleteResourceMetricsConfiguration" => {
+                self.delete_resource_metrics_configuration(&req)
+            }
             // Dataset KMS key management.
             "AssociateDatasetKmsKey" => self.associate_dataset_kms_key(&req),
             "DisassociateDatasetKmsKey" => self.disassociate_dataset_kms_key(&req),
@@ -361,6 +383,16 @@ pub(crate) fn invalid_param(message: impl Into<String>) -> AwsServiceError {
 /// `ResourceNotFoundException` — wire code matches the awsQueryError trait.
 pub(crate) fn not_found(message: impl Into<String>) -> AwsServiceError {
     AwsServiceError::aws_error(StatusCode::NOT_FOUND, "ResourceNotFoundException", message)
+}
+
+/// `ValidationException` — awsQueryError wire code is `ValidationError`.
+pub(crate) fn validation_error(message: impl Into<String>) -> AwsServiceError {
+    AwsServiceError::aws_error(StatusCode::BAD_REQUEST, "ValidationError", message)
+}
+
+/// `ConflictException` — no awsQueryError trait, so the shape name is the code.
+pub(crate) fn conflict(message: impl Into<String>) -> AwsServiceError {
+    AwsServiceError::aws_error(StatusCode::CONFLICT, "ConflictException", message)
 }
 
 /// `MissingRequiredParameterException` — awsQueryError wire code is

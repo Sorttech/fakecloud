@@ -23,7 +23,7 @@ impl CloudWatchService {
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         validate_len(req, "DatasetIdentifier", 1, 2048)?;
-        validate_len(req, "KmsKeyArn", 1, 2048)?;
+        validate_len(req, "KmsKeyArn", 20, 2048)?;
         let identifier = required_query_param(req, "DatasetIdentifier")?;
         let kms_key_arn = required_query_param(req, "KmsKeyArn")?;
 
