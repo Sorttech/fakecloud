@@ -126,6 +126,10 @@ async fn pull_image_with(
     transport: RegistryTransport,
     base_delay: Duration,
 ) -> Result<PulledImage, String> {
+    // Only a plain-HTTP pull branches on the engine, so only it pays for
+    // (the first, then cached) engine probe.
+    let podman = transport == RegistryTransport::PlainHttp
+        && crate::container_net::is_podman_async(cli).await;
     let mut delay = base_delay;
     let mut attempt = 1;
     loop {
@@ -134,7 +138,7 @@ async fn pull_image_with(
             cmd.env("DOCKER_CONFIG", p);
         }
         let out = cmd
-            .args(pull_args(cli, reference, transport))
+            .args(pull_args(podman, reference, transport))
             .output()
             .await
             .map_err(|e| format!("{cli} pull: {e}"))?;
@@ -168,12 +172,13 @@ async fn pull_image_with(
     }
 }
 
-/// The `pull` arguments for `cli`. Only Podman needs telling that a
-/// plain-HTTP registry is one: Docker accepts it for a loopback registry, and
-/// its `pull` has no `--tls-verify` flag at all.
-fn pull_args(cli: &str, reference: &str, transport: RegistryTransport) -> Vec<String> {
+/// The `pull` arguments, `podman` saying whether the CLI drives Podman (by
+/// engine, not name: the `podman-docker` shim is a `docker` that is Podman).
+/// Only Podman needs telling that a plain-HTTP registry is one: Docker accepts
+/// it for a loopback registry, and its `pull` has no `--tls-verify` flag at all.
+fn pull_args(podman: bool, reference: &str, transport: RegistryTransport) -> Vec<String> {
     let mut args = vec!["pull".to_string()];
-    if transport == RegistryTransport::PlainHttp && crate::container_net::is_podman_binary(cli) {
+    if transport == RegistryTransport::PlainHttp && podman {
         args.push("--tls-verify=false".to_string());
     }
     args.push(reference.to_string());
@@ -335,10 +340,31 @@ mod tests {
         /// A fake installed under `name`, which is what decides whether
         /// fakecloud drives it as Podman.
         fn named(name: &str, pull_failures: u32, pull_stderr: &str, cached: bool) -> Self {
+            let version = if name.contains("podman") {
+                "podman version 5.2.0"
+            } else {
+                "Docker version 27.3.1, build ce12230"
+            };
+            Self::with_version(name, version, pull_failures, pull_stderr, cached)
+        }
+
+        /// A fake whose `--version` prints `version` -- the engine probe's
+        /// answer. That call is not logged, so `calls()` shows only the work.
+        fn with_version(
+            name: &str,
+            version: &str,
+            pull_failures: u32,
+            pull_stderr: &str,
+            cached: bool,
+        ) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let script = format!(
                 r#"#!/bin/sh
 d="{dir}"
+if [ "$1" = --version ]; then
+  echo '{version}'
+  exit 0
+fi
 echo "$*" >> "$d/calls.log"
 case "$1" in
   pull)
@@ -485,6 +511,21 @@ exit 2
         assert_eq!(
             cli.calls(),
             ["pull public.ecr.aws/docker/library/alpine:3.20"]
+        );
+    }
+
+    #[tokio::test]
+    async fn podman_docker_shim_pulls_fakecloud_registry_over_plain_http() {
+        // The podman-docker package installs a `docker` that execs podman
+        // (issue #2599): it is Podman, and needs the flag, whatever its name.
+        let cli = FakeCli::with_version("docker", "podman version 5.2.0", 0, "", false);
+        let got = cli
+            .pull_via("127.0.0.1:4566/test:healthy", RegistryTransport::PlainHttp)
+            .await;
+        assert_eq!(got, Ok(PulledImage::Pulled));
+        assert_eq!(
+            cli.calls(),
+            ["pull --tls-verify=false 127.0.0.1:4566/test:healthy"]
         );
     }
 
