@@ -149,14 +149,23 @@ pub struct DmsService {
     state: SharedDmsState,
     snapshot_store: Option<Arc<dyn SnapshotStore>>,
     snapshot_lock: Arc<AsyncMutex<()>>,
+    /// KMS access, so a replication instance created
+    /// without a `KmsKeyId` reports the account's real AWS-managed `aws/dms` key.
+    kms_hook: Option<Arc<dyn fakecloud_core::delivery::KmsHook>>,
 }
 
 impl DmsService {
+    pub fn with_kms_hook(mut self, hook: Arc<dyn fakecloud_core::delivery::KmsHook>) -> Self {
+        self.kms_hook = Some(hook);
+        self
+    }
+
     pub fn new(state: SharedDmsState) -> Self {
         Self {
             state,
             snapshot_store: None,
             snapshot_lock: Arc::new(AsyncMutex::new(())),
+            kms_hook: None,
         }
     }
 
@@ -639,18 +648,25 @@ impl DmsService {
                 "ReplicationInstanceClass exceeds 30 characters.",
             ));
         }
+        let taken = |data: &DmsData| {
+            !id.is_empty()
+                && data.replication_instances.values().any(|v| {
+                    v.get("ReplicationInstanceIdentifier")
+                        .and_then(Value::as_str)
+                        == Some(&id)
+                })
+        };
+        let exists = || already_exists(&format!("Replication instance {id} already exists."));
+        if self.state.read().get(&ctx.account).is_some_and(taken) {
+            return Err(exists());
+        }
+        // Resolved (minted on first use) only for a valid request, with no DMS
+        // lock held; the identifier is re-checked under the lock.
+        let kms_key = self.kms_key_or_default(ctx, b);
         let mut guard = self.state.write();
         let data = guard.get_or_create(&ctx.account);
-        if !id.is_empty()
-            && data.replication_instances.values().any(|v| {
-                v.get("ReplicationInstanceIdentifier")
-                    .and_then(Value::as_str)
-                    == Some(&id)
-            })
-        {
-            return Err(already_exists(&format!(
-                "Replication instance {id} already exists."
-            )));
+        if taken(data) {
+            return Err(exists());
         }
         let instance_arn = arn(ctx, "rep", &res_id());
         let vpc_sgs = vpc_security_groups(b);
@@ -696,13 +712,9 @@ impl DmsService {
                 .cloned()
                 .unwrap_or(json!(true)),
         );
-        inst.insert(
-            "KmsKeyId".into(),
-            json!(opt_str(b, "KmsKeyId")
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-                .unwrap_or_else(|| arn(ctx, "key", &Uuid::new_v4().to_string()))),
-        );
+        if let Some(kms) = kms_key {
+            inst.insert("KmsKeyId".into(), json!(kms));
+        }
         inst.insert(
             "PubliclyAccessible".into(),
             b.get("PubliclyAccessible").cloned().unwrap_or(json!(true)),
@@ -925,6 +937,20 @@ impl DmsService {
 // ===================== endpoints =====================
 
 impl DmsService {
+    /// The request's `KmsKeyId` or, when it names none, the account's
+    /// AWS-managed `aws/dms` key for the region (what DMS encrypts replication
+    /// instance storage and endpoint connection settings with). Resolved
+    /// (minted on first use) through KMS before callers take the DMS lock.
+    fn kms_key_or_default(&self, ctx: &Ctx, b: &Value) -> Option<String> {
+        fakecloud_core::delivery::kms_key_or_aws_managed(
+            self.kms_hook.as_deref(),
+            opt_str(b, "KmsKeyId"),
+            &ctx.account,
+            &ctx.region,
+            "dms",
+        )
+    }
+
     fn create_endpoint(&self, ctx: &Ctx, b: &Value) -> Result<AwsResponse, AwsServiceError> {
         let id = req_str_allow_empty(b, "EndpointIdentifier")?.to_string();
         let ep_type = req_str_allow_empty(b, "EndpointType")?.to_string();
@@ -932,15 +958,24 @@ impl DmsService {
             return Err(validation("EndpointType must be one of [source, target]."));
         }
         let engine = req_str_allow_empty(b, "EngineName")?.to_string();
+        let taken = |data: &DmsData| {
+            !id.is_empty()
+                && data
+                    .endpoints
+                    .values()
+                    .any(|v| v.get("EndpointIdentifier").and_then(Value::as_str) == Some(&id))
+        };
+        let exists = || already_exists(&format!("Endpoint {id} already exists."));
+        if self.state.read().get(&ctx.account).is_some_and(taken) {
+            return Err(exists());
+        }
+        // Resolved (minted on first use) only for a valid request, with no DMS
+        // lock held; the identifier is re-checked under the lock.
+        let kms_key = self.kms_key_or_default(ctx, b);
         let mut guard = self.state.write();
         let data = guard.get_or_create(&ctx.account);
-        if !id.is_empty()
-            && data
-                .endpoints
-                .values()
-                .any(|v| v.get("EndpointIdentifier").and_then(Value::as_str) == Some(&id))
-        {
-            return Err(already_exists(&format!("Endpoint {id} already exists.")));
+        if taken(data) {
+            return Err(exists());
         }
         let endpoint_arn = arn(ctx, "endpoint", &res_id());
         let mut ep = Map::new();
@@ -959,13 +994,15 @@ impl DmsService {
                 "Port",
                 "DatabaseName",
                 "ExtraConnectionAttributes",
-                "KmsKeyId",
                 "CertificateArn",
                 "SslMode",
                 "ServiceAccessRoleArn",
                 "ExternalTableDefinition",
             ],
         );
+        if let Some(kms) = kms_key {
+            ep.insert("KmsKeyId".into(), json!(kms));
+        }
         copy_fields(b, &mut ep, ENDPOINT_SETTINGS_FIELDS);
         let ep = Value::Object(ep);
         data.endpoints.insert(endpoint_arn.clone(), ep.clone());

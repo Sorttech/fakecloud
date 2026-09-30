@@ -293,7 +293,9 @@ pub struct HsmConfiguration {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotCopyGrant {
     pub snapshot_copy_grant_name: String,
-    pub kms_key_id: String,
+    /// The key the grant is for. `None` only when no key was named and the
+    /// AWS-managed default could not be resolved (no KMS wired).
+    pub kms_key_id: Option<String>,
     pub tags: Vec<Tag>,
 }
 

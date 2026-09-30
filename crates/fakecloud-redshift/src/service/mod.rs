@@ -174,20 +174,58 @@ pub struct RedshiftService {
     state: SharedRedshiftState,
     snapshot_store: Option<Arc<dyn SnapshotStore>>,
     snapshot_lock: Arc<AsyncMutex<()>>,
+    /// KMS access, so a snapshot copy grant created
+    /// without a `KmsKeyId` reports the account's real AWS-managed `aws/redshift`
+    /// key.
+    kms_hook: Option<Arc<dyn fakecloud_core::delivery::KmsHook>>,
 }
 
 impl RedshiftService {
+    pub fn with_kms_hook(mut self, hook: Arc<dyn fakecloud_core::delivery::KmsHook>) -> Self {
+        self.kms_hook = Some(hook);
+        self
+    }
+
     pub fn new(state: SharedRedshiftState) -> Self {
         Self {
             state,
             snapshot_store: None,
             snapshot_lock: Arc::new(AsyncMutex::new(())),
+            kms_hook: None,
         }
     }
 
     pub fn with_snapshot_store(mut self, store: Arc<dyn SnapshotStore>) -> Self {
         self.snapshot_store = Some(store);
         self
+    }
+
+    /// The request's `KmsKeyId` or, when it names none, the account's
+    /// AWS-managed `aws/redshift` key for the request region, resolved (and
+    /// minted on first use) through KMS. Callers resolve it before taking the
+    /// Redshift state lock.
+    pub(crate) fn kms_key_or_default(&self, req: &AwsRequest) -> Option<String> {
+        fakecloud_core::delivery::kms_key_or_aws_managed(
+            self.kms_hook.as_deref(),
+            helpers::param(req, "KmsKeyId").as_deref(),
+            &req.account_id,
+            &req.region,
+            "redshift",
+        )
+    }
+
+    /// Whether `f` holds for the caller's account state, under a read lock;
+    /// used to reject an invalid request before resolving a KMS key.
+    pub(crate) fn account_check(
+        &self,
+        req: &AwsRequest,
+        f: impl FnOnce(&crate::state::RedshiftState) -> bool,
+    ) -> bool {
+        self.state
+            .read()
+            .accounts
+            .get(&req.account_id)
+            .is_some_and(f)
     }
 
     pub fn shared_state(&self) -> SharedRedshiftState {

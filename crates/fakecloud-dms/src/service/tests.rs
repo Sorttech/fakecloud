@@ -827,3 +827,127 @@ fn unknown_filter_name_ignored() {
     );
     assert!(out["Connections"].as_array().unwrap().is_empty());
 }
+
+use fakecloud_kms::test_support::{assert_aws_managed_key, kms_hook};
+
+#[test]
+fn replication_instance_without_kms_key_uses_aws_managed_key() {
+    let (kms_state, hook) = kms_hook("000000000000");
+    let s = svc().with_kms_hook(hook);
+    let out = call(
+        &s,
+        "CreateReplicationInstance",
+        json!({ "ReplicationInstanceIdentifier": "ri-k", "ReplicationInstanceClass": "dms.t3.micro" }),
+    );
+    let key = out["ReplicationInstance"]["KmsKeyId"].as_str().unwrap();
+    assert!(
+        key.starts_with("arn:aws:kms:us-east-1:000000000000:key/"),
+        "{key}"
+    );
+    assert_aws_managed_key(
+        &kms_state,
+        "000000000000",
+        "us-east-1",
+        key,
+        "alias/aws/dms",
+    );
+}
+
+#[test]
+fn endpoint_without_kms_key_uses_the_regions_aws_managed_key() {
+    let (kms_state, hook) = kms_hook("000000000000");
+    let s = svc().with_kms_hook(hook);
+    let out = call_region(
+        &s,
+        "CreateEndpoint",
+        "cn-north-1",
+        json!({ "EndpointIdentifier": "ep-k", "EndpointType": "source", "EngineName": "mysql" }),
+    );
+    let key = out["Endpoint"]["KmsKeyId"].as_str().unwrap();
+    assert_aws_managed_key(
+        &kms_state,
+        "000000000000",
+        "cn-north-1",
+        key,
+        "alias/aws/dms",
+    );
+    // The replication instance in the same region shares that key; one in
+    // another region gets its own.
+    let ri = call_region(
+        &s,
+        "CreateReplicationInstance",
+        "cn-north-1",
+        json!({ "ReplicationInstanceIdentifier": "ri-cn", "ReplicationInstanceClass": "dms.t3.micro" }),
+    );
+    assert_eq!(ri["ReplicationInstance"]["KmsKeyId"], key);
+    let east = call(
+        &s,
+        "CreateEndpoint",
+        json!({ "EndpointIdentifier": "ep-east", "EndpointType": "target", "EngineName": "mysql" }),
+    );
+    assert_ne!(east["Endpoint"]["KmsKeyId"], key);
+    // A caller-named key is kept.
+    let named = call(
+        &s,
+        "CreateEndpoint",
+        json!({
+            "EndpointIdentifier": "ep-named",
+            "EndpointType": "target",
+            "EngineName": "mysql",
+            "KmsKeyId": "arn:aws:kms:us-east-1:000000000000:key/mine"
+        }),
+    );
+    assert_eq!(
+        named["Endpoint"]["KmsKeyId"],
+        "arn:aws:kms:us-east-1:000000000000:key/mine"
+    );
+}
+
+#[test]
+fn no_kms_key_is_reported_without_kms() {
+    let s = svc();
+    let ep = call(
+        &s,
+        "CreateEndpoint",
+        json!({ "EndpointIdentifier": "ep-n", "EndpointType": "source", "EngineName": "mysql" }),
+    );
+    assert!(ep["Endpoint"].get("KmsKeyId").is_none(), "{ep}");
+    let ri = call(
+        &s,
+        "CreateReplicationInstance",
+        json!({ "ReplicationInstanceIdentifier": "ri-n", "ReplicationInstanceClass": "dms.t3.micro" }),
+    );
+    assert!(ri["ReplicationInstance"].get("KmsKeyId").is_none(), "{ri}");
+}
+
+/// A create that fails (identifier taken) never mints a key.
+#[test]
+fn duplicate_identifiers_do_not_mint_a_managed_key() {
+    let (kms_state, hook) = kms_hook("000000000000");
+    let s = svc().with_kms_hook(hook);
+    let mine = "arn:aws:kms:us-east-1:000000000000:key/mine";
+    call(
+        &s,
+        "CreateEndpoint",
+        json!({ "EndpointIdentifier": "ep-d", "EndpointType": "source", "EngineName": "mysql", "KmsKeyId": mine }),
+    );
+    call(
+        &s,
+        "CreateReplicationInstance",
+        json!({ "ReplicationInstanceIdentifier": "ri-d", "ReplicationInstanceClass": "dms.t3.micro", "KmsKeyId": mine }),
+    );
+    err(
+        &s,
+        "CreateEndpoint",
+        json!({ "EndpointIdentifier": "ep-d", "EndpointType": "source", "EngineName": "mysql" }),
+    );
+    err(
+        &s,
+        "CreateReplicationInstance",
+        json!({ "ReplicationInstanceIdentifier": "ri-d", "ReplicationInstanceClass": "dms.t3.micro" }),
+    );
+    assert!(kms_state
+        .read()
+        .get("000000000000")
+        .is_none_or(|st| st.keys.is_empty()));
+}

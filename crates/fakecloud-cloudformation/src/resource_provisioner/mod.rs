@@ -1036,6 +1036,10 @@ pub struct ResourceProvisioner {
     /// matching the real `CreateBucket`/`DeleteBucket` handlers. A
     /// `MemoryS3Store` (memory mode) makes the writes no-ops.
     pub s3_store: Arc<dyn S3Store>,
+    /// The server's KMS hook, which mints (and persists) AWS-managed keys on
+    /// first use. `None` outside the server wiring, where default-encrypted
+    /// resources then report no key.
+    pub kms_hook: Option<Arc<dyn fakecloud_core::delivery::KmsHook>>,
     pub account_id: String,
     pub region: String,
     pub stack_id: String,
@@ -1210,6 +1214,31 @@ impl ResourceProvisioner {
     /// region's partition.
     pub(crate) fn regional_arn(&self, service: &str, resource: &str) -> String {
         Arn::regional(service, &self.region, &self.account_id, resource).to_string()
+    }
+
+    /// The ARN of the AWS-managed KMS key for `service` (the key behind
+    /// `alias/aws/<service>`) in the stack's account and region, resolved
+    /// through the server's KMS hook exactly as the service's own API path
+    /// does (minted and persisted on first use), so a stack resource encrypted
+    /// by default reports the same real key as its direct-API equivalent.
+    pub(crate) fn aws_managed_kms_key_arn(&self, service: &str) -> Option<String> {
+        self.kms_key_or_aws_managed(None, service)
+    }
+
+    /// The template's `named` key (ignored when empty) or, without one, the
+    /// AWS-managed key for `service` (see [`Self::aws_managed_kms_key_arn`]).
+    pub(crate) fn kms_key_or_aws_managed(
+        &self,
+        named: Option<&str>,
+        service: &str,
+    ) -> Option<String> {
+        fakecloud_core::delivery::kms_key_or_aws_managed(
+            self.kms_hook.as_deref(),
+            named,
+            &self.account_id,
+            &self.region,
+            service,
+        )
     }
 
     /// Create a resource and return the StackResource with physical ID.
@@ -4071,7 +4100,7 @@ mod tests {
     use parking_lot::RwLock;
 
     fn make_provisioner() -> ResourceProvisioner {
-        ResourceProvisioner {
+        let mut prov = ResourceProvisioner {
             sqs_state: Arc::new(RwLock::new(
                 fakecloud_core::multi_account::MultiAccountState::new(
                     "123456789012",
@@ -4288,12 +4317,19 @@ mod tests {
             pending_custom_invokes: Arc::new(parking_lot::Mutex::new(Vec::new())),
             defer_custom_invokes: false,
             s3_store: Arc::new(fakecloud_persistence::s3::MemoryS3Store::new()),
+            kms_hook: None,
             account_id: "123456789012".to_string(),
             region: "us-east-1".to_string(),
             stack_id: "arn:aws:cloudformation:us-east-1:123456789012:stack/test/00000000-0000-0000-0000-000000000000".to_string(),
             strict_unknown_types: false,
             reused_names: Default::default(),
-        }
+        };
+        // Wire KMS like the server does, over the provisioner's own KMS state.
+        prov.kms_hook = Some(Arc::new(fakecloud_kms::hook::KmsServiceHook::new(
+            prov.kms_state.clone(),
+            Default::default(),
+        )));
+        prov
     }
 
     fn make_resource(
@@ -7823,13 +7859,8 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        let key_id = kms.rsplit_once(":key/").unwrap().1;
-        assert_eq!(
-            kms,
-            fakecloud_aws::arn::Arn::regional("kms", CN, ACCT, &format!("key/{key_id}"))
-                .to_string()
-        );
         assert!(kms.starts_with("arn:aws-cn:kms:cn-north-1:123456789012:key/"));
+        assert_aws_managed_key(&prov, &kms, "alias/aws/elasticfilesystem");
 
         create(
             "AWS::Timestream::Database",
@@ -7839,10 +7870,233 @@ mod tests {
         let ts_kms = prov.timestream_state.read().get(ACCT).unwrap().databases["cndb"]
             .kms_key_id
             .clone();
-        assert_eq!(
-            ts_kms.as_deref(),
-            Some("arn:aws-cn:kms:cn-north-1:123456789012:key/timestream-default")
+        let ts_kms = ts_kms.expect("default database key");
+        assert!(ts_kms.starts_with("arn:aws-cn:kms:cn-north-1:123456789012:key/"));
+        assert_aws_managed_key(&prov, &ts_kms, "alias/aws/timestream");
+    }
+
+    /// `arn` is the AWS-managed key for `alias` in the provisioner's account
+    /// and region, a real key in its KMS state.
+    fn assert_aws_managed_key(prov: &ResourceProvisioner, arn: &str, alias: &str) {
+        fakecloud_kms::test_support::assert_aws_managed_key(
+            &prov.kms_state,
+            &prov.account_id,
+            &prov.region,
+            arn,
+            alias,
         );
+    }
+
+    /// Stack resources encrypted by default report the account's AWS-managed
+    /// key for their service, the same key the direct API path reports.
+    #[test]
+    fn default_encrypted_stack_resources_use_aws_managed_keys() {
+        let prov = make_provisioner();
+
+        let domain = prov
+            .create_resource(&make_resource(
+                "AWS::CodeArtifact::Domain",
+                "Dom",
+                serde_json::json!({"DomainName": "dom"}),
+            ))
+            .unwrap();
+        let key = prov.get_att(&domain, "EncryptionKey").unwrap();
+        assert_aws_managed_key(&prov, &key, "alias/aws/codeartifact");
+
+        prov.create_resource(&make_resource(
+            "AWS::CodeCommit::Repository",
+            "Repo",
+            serde_json::json!({"RepositoryName": "repo"}),
+        ))
+        .unwrap();
+        let key = prov
+            .codecommit_state
+            .read()
+            .get(&prov.account_id)
+            .unwrap()
+            .repositories["repo"]
+            .metadata["kmsKeyId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_aws_managed_key(&prov, &key, "alias/aws/codecommit");
+
+        let cluster = prov
+            .create_resource(&make_resource(
+                "AWS::MSK::Cluster",
+                "Msk",
+                serde_json::json!({
+                    "ClusterName": "msk",
+                    "KafkaVersion": "3.6.0",
+                    "NumberOfBrokerNodes": 3,
+                    "BrokerNodeGroupInfo": {
+                        "InstanceType": "kafka.m5.large",
+                        "ClientSubnets": ["subnet-1", "subnet-2", "subnet-3"]
+                    }
+                }),
+            ))
+            .unwrap();
+        let accounts = prov.kafka_state.read();
+        let data = accounts.get(&prov.account_id).unwrap();
+        let key = data.clusters[&cluster.physical_id]["encryptionInfo"]["encryptionAtRest"]
+            ["dataVolumeKMSKeyId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        drop(accounts);
+        assert_aws_managed_key(&prov, &key, "alias/aws/kafka");
+    }
+
+    /// Managed keys come only from the injected KMS hook: a provisioner with
+    /// none reports no key rather than minting through raw KMS state.
+    #[test]
+    fn default_keys_come_from_the_injected_kms_hook() {
+        let mut prov = make_provisioner();
+        prov.kms_hook = None;
+        let db = prov
+            .create_resource(&make_resource(
+                "AWS::Timestream::Database",
+                "Db",
+                serde_json::json!({"DatabaseName": "nohook"}),
+            ))
+            .unwrap();
+        let kms = prov
+            .timestream_state
+            .read()
+            .get("123456789012")
+            .unwrap()
+            .databases[&db.physical_id]
+            .kms_key_id
+            .clone();
+        assert_eq!(kms, None);
+        assert!(prov
+            .kms_state
+            .read()
+            .get("123456789012")
+            .is_none_or(|s| s.keys.is_empty()));
+    }
+
+    /// Removing KmsKeyId in an in-place update reverts to the AWS-managed
+    /// default, exactly what a fresh create reports.
+    #[test]
+    fn update_removing_kms_key_reverts_to_the_aws_managed_default() {
+        let prov = make_provisioner();
+        let named = "arn:aws:kms:us-east-1:123456789012:key/11111111-2222-3333-4444-555555555555";
+
+        let db = prov
+            .create_resource(&make_resource(
+                "AWS::Timestream::Database",
+                "Db",
+                serde_json::json!({"DatabaseName": "revert", "KmsKeyId": named}),
+            ))
+            .unwrap();
+        prov.update_resource(
+            &db,
+            &make_resource(
+                "AWS::Timestream::Database",
+                "Db",
+                serde_json::json!({"DatabaseName": "revert"}),
+            ),
+        )
+        .unwrap()
+        .unwrap();
+        let kms = prov
+            .timestream_state
+            .read()
+            .get("123456789012")
+            .unwrap()
+            .databases["revert"]
+            .kms_key_id
+            .clone()
+            .expect("default key");
+        assert_aws_managed_key(&prov, &kms, "alias/aws/timestream");
+
+        let repo = prov
+            .create_resource(&make_resource(
+                "AWS::CodeCommit::Repository",
+                "Repo",
+                serde_json::json!({"RepositoryName": "revert", "KmsKeyId": named}),
+            ))
+            .unwrap();
+        prov.update_resource(
+            &repo,
+            &make_resource(
+                "AWS::CodeCommit::Repository",
+                "Repo",
+                serde_json::json!({"RepositoryName": "revert"}),
+            ),
+        )
+        .unwrap()
+        .unwrap();
+        let kms = prov
+            .codecommit_state
+            .read()
+            .get("123456789012")
+            .unwrap()
+            .repositories["revert"]
+            .metadata["kmsKeyId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_aws_managed_key(&prov, &kms, "alias/aws/codecommit");
+    }
+
+    /// An encrypted stack Redshift cluster with no key reports the AWS-managed
+    /// `aws/redshift` key, like CreateCluster.
+    #[test]
+    fn encrypted_stack_redshift_cluster_uses_the_aws_managed_key() {
+        let prov = make_provisioner();
+        prov.create_resource(&make_resource(
+            "AWS::Redshift::Cluster",
+            "Rs",
+            serde_json::json!({
+                "ClusterIdentifier": "enc-rs",
+                "NodeType": "dc2.large",
+                "MasterUsername": "admin",
+                "MasterUserPassword": "Passw0rd!",
+                "ClusterType": "single-node",
+                "DBName": "dev",
+                "Encrypted": true
+            }),
+        ))
+        .unwrap();
+        let kms = prov.redshift_state.write().account("123456789012").clusters["enc-rs"]
+            .kms_key_id
+            .clone()
+            .expect("default key");
+        assert_aws_managed_key(&prov, &kms, "alias/aws/redshift");
+    }
+
+    /// A stack MSK cluster rejected for a duplicate name mints no key.
+    #[test]
+    fn duplicate_stack_msk_cluster_mints_no_key() {
+        let prov = make_provisioner();
+        let cluster = |key: Option<&str>| {
+            let mut props = serde_json::json!({
+                "ClusterName": "dup-msk",
+                "KafkaVersion": "3.6.0",
+                "NumberOfBrokerNodes": 3,
+                "BrokerNodeGroupInfo": {
+                    "InstanceType": "kafka.m5.large",
+                    "ClientSubnets": ["subnet-1", "subnet-2", "subnet-3"]
+                }
+            });
+            if let Some(key) = key {
+                props["EncryptionInfo"] =
+                    serde_json::json!({"EncryptionAtRest": {"DataVolumeKMSKeyId": key}});
+            }
+            make_resource("AWS::MSK::Cluster", "Msk", props)
+        };
+        prov.create_resource(&cluster(Some(
+            "arn:aws:kms:us-east-1:123456789012:key/11111111-2222-3333-4444-555555555555",
+        )))
+        .unwrap();
+        assert!(prov.create_resource(&cluster(None)).is_err());
+        assert!(prov
+            .kms_state
+            .read()
+            .get("123456789012")
+            .is_none_or(|s| s.keys.is_empty()));
     }
 
     #[test]

@@ -93,6 +93,9 @@ pub struct EfsService {
     /// memory-only contexts (unit tests), where the values are synthesized
     /// deterministically from the subnet id instead.
     ec2_state: Option<fakecloud_ec2::SharedEc2State>,
+    /// KMS access, so an encrypted file system created without a `KmsKeyId`
+    /// reports the account's real AWS-managed `aws/elasticfilesystem` key.
+    kms_hook: Option<Arc<dyn fakecloud_core::delivery::KmsHook>>,
 }
 
 impl EfsService {
@@ -102,7 +105,13 @@ impl EfsService {
             snapshot_store: None,
             snapshot_lock: Arc::new(AsyncMutex::new(())),
             ec2_state: None,
+            kms_hook: None,
         }
+    }
+
+    pub fn with_kms_hook(mut self, hook: Arc<dyn fakecloud_core::delivery::KmsHook>) -> Self {
+        self.kms_hook = Some(hook);
+        self
     }
 
     pub fn with_snapshot_store(mut self, store: Arc<dyn SnapshotStore>) -> Self {
@@ -380,6 +389,18 @@ fn parse_body(req: &AwsRequest) -> Result<Value, AwsServiceError> {
         .map_err(|e| bad_request(&format!("Request body is malformed: {e}")))
 }
 
+/// The model's `RegionName` pattern.
+const REGION_NAME_PATTERN: &str =
+    r"^[a-z]{2}-((iso[a-z]{0,1}-)|(gov-)){0,1}[a-z]+-{0,1}[0-9]{0,1}$";
+
+/// Whether `region` matches the model's `RegionName` (length 1..=64 and
+/// [`REGION_NAME_PATTERN`]).
+fn is_region_name(region: &str) -> bool {
+    static RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(REGION_NAME_PATTERN).unwrap());
+    (1..=64).contains(&region.len()) && RE.is_match(region)
+}
+
 fn bad_request(msg: &str) -> AwsServiceError {
     AwsServiceError::aws_error(StatusCode::BAD_REQUEST, "BadRequest", msg)
 }
@@ -461,7 +482,13 @@ fn fs_arn(ctx: &Ctx, fsid: &str) -> String {
 /// the caller's behalf, so DescribeFileSystems on the destination id resolves.
 /// Destinations are always encrypted and have replication-overwrite protection
 /// DISABLED (which is how a destination file system is distinguished).
-fn destination_file_system(ctx: &Ctx, fsid: &str, region: &str, az: Option<&str>) -> Value {
+fn destination_file_system(
+    ctx: &Ctx,
+    fsid: &str,
+    region: &str,
+    az: Option<&str>,
+    kms_key_id: Option<String>,
+) -> Value {
     let mut fs = Map::new();
     fs.insert("OwnerId".into(), json!(ctx.account));
     fs.insert("FileSystemId".into(), json!(fsid));
@@ -486,6 +513,9 @@ fn destination_file_system(ctx: &Ctx, fsid: &str, region: &str, az: Option<&str>
     fs.insert("PerformanceMode".into(), json!("generalPurpose"));
     fs.insert("ThroughputMode".into(), json!("bursting"));
     fs.insert("Encrypted".into(), json!(true));
+    if let Some(kms) = kms_key_id {
+        fs.insert("KmsKeyId".into(), json!(kms));
+    }
     fs.insert("Tags".into(), json!([]));
     fs.insert(
         "FileSystemProtection".into(),
@@ -588,29 +618,37 @@ impl EfsService {
 // ===================== file systems =====================
 
 impl EfsService {
+    /// The key a file system in `region` is encrypted with: the caller's
+    /// `named` key, else the account's AWS-managed `aws/elasticfilesystem`
+    /// key there (minted on first use). Callers resolve it only once the
+    /// request is known to be valid, and never under the EFS state lock.
+    fn kms_key_or_default(&self, ctx: &Ctx, named: Option<&str>, region: &str) -> Option<String> {
+        fakecloud_core::delivery::kms_key_or_aws_managed(
+            self.kms_hook.as_deref(),
+            named,
+            &ctx.account,
+            region,
+            "elasticfilesystem",
+        )
+    }
+
+    fn file_system_with_token(&self, ctx: &Ctx, creation_token: &str) -> Option<String> {
+        self.state.read().get(&ctx.account).and_then(|data| {
+            data.file_systems
+                .iter()
+                .find(|(_, fs)| {
+                    fs.get("CreationToken").and_then(Value::as_str) == Some(creation_token)
+                })
+                .map(|(id, _)| id.clone())
+        })
+    }
+
     fn create_file_system(&self, ctx: &Ctx, b: &Value) -> Result<AwsResponse, AwsServiceError> {
         let creation_token = b
             .get("CreationToken")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let mut guard = self.state.write();
-        let data = guard.get_or_create(&ctx.account);
-        // CreationToken is EFS's idempotency token: a second create with the
-        // same token collides.
-        if let Some((existing_id, _)) = data.file_systems.iter().find(|(_, fs)| {
-            fs.get("CreationToken").and_then(Value::as_str) == Some(creation_token.as_str())
-        }) {
-            let existing_id = existing_id.clone();
-            return Err(AwsServiceError::aws_error_with_fields(
-                StatusCode::CONFLICT,
-                "FileSystemAlreadyExists",
-                format!("File system already exists with creation token {creation_token}"),
-                vec![("FileSystemId".to_string(), existing_id)],
-            ));
-        }
-
-        let fsid = format!("fs-{}", hex17());
         let performance_mode = b
             .get("PerformanceMode")
             .and_then(Value::as_str)
@@ -644,7 +682,38 @@ impl EfsService {
                 "ProvisionedThroughputInMibps is only applicable when ThroughputMode is set to provisioned.",
             ));
         }
+        // CreationToken is EFS's idempotency token: a second create with the
+        // same token collides.
+        let token_conflict = |existing_id: String| {
+            AwsServiceError::aws_error_with_fields(
+                StatusCode::CONFLICT,
+                "FileSystemAlreadyExists",
+                format!("File system already exists with creation token {creation_token}"),
+                vec![("FileSystemId".to_string(), existing_id)],
+            )
+        };
+        if let Some(existing_id) = self.file_system_with_token(ctx, &creation_token) {
+            return Err(token_conflict(existing_id));
+        }
+        // Only a valid request resolves (and possibly mints) the key, with no
+        // EFS lock held.
         let encrypted = b.get("Encrypted").and_then(Value::as_bool).unwrap_or(false);
+        let kms_key = encrypted
+            .then(|| {
+                self.kms_key_or_default(ctx, b.get("KmsKeyId").and_then(Value::as_str), &ctx.region)
+            })
+            .flatten();
+
+        let mut guard = self.state.write();
+        let data = guard.get_or_create(&ctx.account);
+        // Re-check under the write lock: a concurrent create may have won.
+        if let Some((existing_id, _)) = data.file_systems.iter().find(|(_, fs)| {
+            fs.get("CreationToken").and_then(Value::as_str) == Some(creation_token.as_str())
+        }) {
+            return Err(token_conflict(existing_id.clone()));
+        }
+
+        let fsid = format!("fs-{}", hex17());
 
         let mut fs = Map::new();
         fs.insert("OwnerId".into(), json!(ctx.account));
@@ -669,28 +738,7 @@ impl EfsService {
         fs.insert("PerformanceMode".into(), json!(performance_mode));
         fs.insert("ThroughputMode".into(), json!(throughput_mode));
         fs.insert("Encrypted".into(), json!(encrypted));
-        if encrypted {
-            let kms = b
-                .get("KmsKeyId")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .unwrap_or_else(|| {
-                    let key_id = format!(
-                        "{}-{}-{}-{}-{}",
-                        &hex17()[..8],
-                        &hex17()[..4],
-                        &hex17()[..4],
-                        &hex17()[..4],
-                        &hex17()[..12.min(hex17().len())]
-                    );
-                    fakecloud_aws::arn::Arn::regional(
-                        "kms",
-                        &ctx.region,
-                        &ctx.account,
-                        &format!("key/{key_id}"),
-                    )
-                    .to_string()
-                });
+        if let Some(kms) = kms_key {
             fs.insert("KmsKeyId".into(), json!(kms));
         }
         if throughput_mode == "provisioned" {
@@ -1438,9 +1486,12 @@ impl EfsService {
         b: &Value,
     ) -> Result<AwsResponse, AwsServiceError> {
         let fsid = normalize_fs_id(label);
-        let mut guard = self.state.write();
-        let data = self.account(&mut guard, ctx);
-        if !data.file_systems.contains_key(&fsid) {
+        if !self
+            .state
+            .read()
+            .get(&ctx.account)
+            .is_some_and(|data| data.file_systems.contains_key(&fsid))
+        {
             return Err(fs_not_found(&fsid));
         }
         let requested = b
@@ -1448,12 +1499,65 @@ impl EfsService {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        for d in &requested {
+            if let Some(region) = d.get("Region").and_then(Value::as_str) {
+                if !is_region_name(region) {
+                    return Err(AwsServiceError::aws_error(
+                        StatusCode::BAD_REQUEST,
+                        "ValidationException",
+                        format!(
+                            "1 validation error detected: Value '{region}' at 'destinations.member.region' failed to satisfy constraint: Member must satisfy regular expression pattern: {REGION_NAME_PATTERN}"
+                        ),
+                    ));
+                }
+            }
+        }
+        // A destination file system EFS provisions is encrypted with the
+        // caller's KmsKeyId or, without one, the AWS-managed key of the
+        // DESTINATION region. Resolve keys (with no EFS lock held) only for
+        // the destinations that will be created: no FileSystemId, or one
+        // that does not exist. Creation itself is decided below, under the
+        // single write lock.
+        let will_create: Vec<bool> = {
+            let guard = self.state.read();
+            let data = guard.get(&ctx.account);
+            requested
+                .iter()
+                .map(|d| {
+                    d.get("FileSystemId")
+                        .and_then(Value::as_str)
+                        .map(normalize_fs_id)
+                        .is_none_or(|id| {
+                            !data.is_some_and(|data| data.file_systems.contains_key(&id))
+                        })
+                })
+                .collect()
+        };
+        let dest_keys: Vec<Option<String>> = requested
+            .iter()
+            .zip(&will_create)
+            .map(|(d, create)| {
+                if !create {
+                    return None;
+                }
+                let region = d
+                    .get("Region")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&ctx.region);
+                self.kms_key_or_default(ctx, d.get("KmsKeyId").and_then(Value::as_str), region)
+            })
+            .collect();
+        let mut guard = self.state.write();
+        let data = self.account(&mut guard, ctx);
+        if !data.file_systems.contains_key(&fsid) {
+            return Err(fs_not_found(&fsid));
+        }
         let mut destinations: Vec<Value> = Vec::with_capacity(requested.len());
         // Any destination file system EFS itself provisions (the caller did not
         // point at a pre-existing one) must become a real FileSystem so
         // DescribeFileSystems on it resolves instead of 404ing.
         let mut new_dest_systems: Vec<(String, Value)> = Vec::new();
-        for d in &requested {
+        for (d, dest_key) in requested.iter().zip(dest_keys) {
             let region = d
                 .get("Region")
                 .and_then(Value::as_str)
@@ -1472,7 +1576,7 @@ impl EfsService {
             if !data.file_systems.contains_key(&dest_fs) {
                 new_dest_systems.push((
                     dest_fs.clone(),
-                    destination_file_system(ctx, &dest_fs, &region, az),
+                    destination_file_system(ctx, &dest_fs, &region, az, dest_key),
                 ));
             }
             let mut dest = Map::new();
@@ -1893,36 +1997,198 @@ mod tests {
         );
     }
 
-    /// An encrypted file system's default key is the ARN KMS itself mints for
-    /// that key id in the caller's region, partition included.
+    /// An encrypted file system created without a `KmsKeyId` reports the
+    /// AWS-managed `aws/elasticfilesystem` key of its account and region: a
+    /// real KMS key (minted on first use, in the region's partition), shared by
+    /// every such file system in that region, distinct per region.
     #[test]
-    fn default_kms_key_uses_the_regions_partition() {
-        let s = svc();
-        let c = Ctx {
+    fn default_kms_key_is_the_regions_aws_managed_key() {
+        use fakecloud_kms::test_support::{assert_aws_managed_key, kms_hook};
+        let (kms_state, hook) = kms_hook("000000000000");
+        let s = svc().with_kms_hook(hook);
+        let in_region = |region: &str| Ctx {
             account: "000000000000".to_string(),
-            region: "cn-north-1".to_string(),
+            region: region.to_string(),
         };
+        let create = |c: &Ctx, token: &str| {
+            body_value(
+                &s.create_file_system(c, &json!({ "CreationToken": token, "Encrypted": true }))
+                    .unwrap(),
+            )["KmsKeyId"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let cn = create(&in_region("cn-north-1"), "cn");
+        assert_aws_managed_key(
+            &kms_state,
+            "000000000000",
+            "cn-north-1",
+            &cn,
+            "alias/aws/elasticfilesystem",
+        );
+        assert_eq!(create(&in_region("cn-north-1"), "cn2"), cn);
+        let east = create(&in_region("us-east-1"), "east");
+        assert_ne!(east, cn);
+        assert_aws_managed_key(
+            &kms_state,
+            "000000000000",
+            "us-east-1",
+            &east,
+            "alias/aws/elasticfilesystem",
+        );
+        // A caller-named key is kept; an unencrypted file system reports none.
+        let named = body_value(
+            &s.create_file_system(
+                &in_region("us-east-1"),
+                &json!({ "CreationToken": "named", "Encrypted": true, "KmsKeyId": "alias/mine" }),
+            )
+            .unwrap(),
+        );
+        assert_eq!(named["KmsKeyId"], "alias/mine");
+        let plain = body_value(
+            &s.create_file_system(
+                &in_region("us-east-1"),
+                &json!({ "CreationToken": "plain" }),
+            )
+            .unwrap(),
+        );
+        assert!(plain.get("KmsKeyId").is_none());
+    }
+
+    /// A request that fails validation never mints the AWS-managed key.
+    #[test]
+    fn rejected_requests_do_not_mint_a_managed_key() {
+        use fakecloud_kms::test_support::kms_hook;
+        let (kms_state, hook) = kms_hook("000000000000");
+        let s = svc().with_kms_hook(hook);
+        let key_count = || {
+            kms_state
+                .read()
+                .get("000000000000")
+                .map_or(0, |st| st.keys.len())
+        };
+        // Unencrypted create first so the token exists without minting.
+        s.create_file_system(&ctx(), &json!({ "CreationToken": "taken" }))
+            .unwrap();
+        let dup = s
+            .create_file_system(
+                &ctx(),
+                &json!({ "CreationToken": "taken", "Encrypted": true }),
+            )
+            .err()
+            .expect("duplicate token");
+        assert_eq!(dup.code(), "FileSystemAlreadyExists");
+        let bad = s
+            .create_file_system(
+                &ctx(),
+                &json!({ "CreationToken": "bad", "Encrypted": true, "ThroughputMode": "provisioned" }),
+            )
+            .err()
+            .expect("missing provisioned throughput");
+        assert_eq!(bad.code(), "BadRequest");
+        let missing = s
+            .create_replication_configuration(
+                &ctx(),
+                "fs-missing",
+                &json!({ "Destinations": [{ "Region": "us-west-2" }] }),
+            )
+            .err()
+            .expect("unknown source");
+        assert_eq!(missing.code(), "FileSystemNotFound");
+        assert_eq!(key_count(), 0, "no request above may mint a key");
+    }
+
+    /// Replication resolves a default key only for destinations it creates,
+    /// and rejects a malformed destination Region before minting anything.
+    #[test]
+    fn replication_mints_keys_only_for_created_destinations() {
+        use fakecloud_kms::test_support::kms_hook;
+        let (kms_state, hook) = kms_hook("000000000000");
+        let s = svc().with_kms_hook(hook);
+        seed_fs(&s, "fs-source", "available");
+        seed_fs(&s, "fs-existing", "available");
+        let key_count = || {
+            kms_state
+                .read()
+                .get("000000000000")
+                .map_or(0, |st| st.keys.len())
+        };
+        let err = s
+            .create_replication_configuration(
+                &ctx(),
+                "fs-source",
+                &json!({ "Destinations": [{ "Region": "Not A Region" }] }),
+            )
+            .err()
+            .expect("invalid region");
+        assert_eq!(err.code(), "ValidationException");
+        assert_eq!(key_count(), 0);
+        // Replicating into an existing file system creates nothing, mints nothing.
+        s.create_replication_configuration(
+            &ctx(),
+            "fs-source",
+            &json!({ "Destinations": [{ "Region": "us-west-2", "FileSystemId": "fs-existing" }] }),
+        )
+        .unwrap();
+        assert_eq!(key_count(), 0);
+        assert!(is_region_name("us-gov-west-1"));
+        assert!(is_region_name("cn-north-1"));
+        assert!(!is_region_name("us_east_1"));
+    }
+
+    /// Without KMS wired (no hook), no made-up key is reported.
+    #[test]
+    fn default_kms_key_is_omitted_without_kms() {
         let fs = body_value(
-            &s.create_file_system(&c, &json!({ "CreationToken": "enc", "Encrypted": true }))
+            &svc()
+                .create_file_system(&ctx(), &json!({ "CreationToken": "x", "Encrypted": true }))
                 .unwrap(),
         );
-        let kms = fs["KmsKeyId"].as_str().unwrap();
-        let key_id = kms
-            .strip_prefix("arn:aws-cn:kms:cn-north-1:000000000000:key/")
-            .unwrap_or_else(|| panic!("{kms}"));
-        assert_eq!(
-            kms,
-            fakecloud_kms::kms_key_arn("cn-north-1", "000000000000", key_id)
+        assert_eq!(fs["Encrypted"], true);
+        assert!(fs.get("KmsKeyId").is_none(), "{fs}");
+    }
+
+    /// A replication destination EFS provisions is encrypted with the
+    /// AWS-managed key of the DESTINATION region, or the caller's KmsKeyId.
+    #[test]
+    fn replication_destination_uses_the_destination_regions_managed_key() {
+        use fakecloud_kms::test_support::{assert_aws_managed_key, kms_hook};
+        let (kms_state, hook) = kms_hook("000000000000");
+        let s = svc().with_kms_hook(hook);
+        seed_fs(&s, "fs-source", "available");
+        let resp = s
+            .create_replication_configuration(
+                &ctx(),
+                "fs-source",
+                &json!({ "Destinations": [
+                    { "Region": "us-west-2" },
+                    { "Region": "eu-west-1", "KmsKeyId": "arn:aws:kms:eu-west-1:000000000000:key/mine" }
+                ] }),
+            )
+            .unwrap();
+        let out = body_value(&resp);
+        let dest_key = |i: usize| {
+            let id = out["Destinations"][i]["FileSystemId"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let described = s
+                .describe_file_systems(&ctx(), &[("FileSystemId".to_string(), id)])
+                .unwrap();
+            body_value(&described)["FileSystems"][0]["KmsKeyId"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_aws_managed_key(
+            &kms_state,
+            "000000000000",
+            "us-west-2",
+            &dest_key(0),
+            "alias/aws/elasticfilesystem",
         );
-        // Commercial output keeps the `aws` partition.
-        let fs = body_value(
-            &s.create_file_system(&ctx(), &json!({ "CreationToken": "us", "Encrypted": true }))
-                .unwrap(),
-        );
-        assert!(fs["KmsKeyId"]
-            .as_str()
-            .unwrap()
-            .starts_with("arn:aws:kms:us-east-1:000000000000:key/"));
+        assert_eq!(dest_key(1), "arn:aws:kms:eu-west-1:000000000000:key/mine");
     }
 
     // Defect #1: a nonexistent subnet must be rejected with SubnetNotFound once

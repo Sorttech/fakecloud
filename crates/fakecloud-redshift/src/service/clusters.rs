@@ -143,6 +143,18 @@ impl RedshiftService {
         let cluster_type = param_or(req, "ClusterType", "multi-node");
         let number_of_nodes = int_param(req, "NumberOfNodes")
             .unwrap_or(if cluster_type == "single-node" { 1 } else { 2 });
+        let encrypted = bool_param(req, "Encrypted").unwrap_or(false);
+        if self.account_check(req, |a| a.clusters.contains_key(&id)) {
+            return Err(cluster_already_exists(&id));
+        }
+        // An encrypted cluster with no key named uses the account's
+        // AWS-managed key for the region, resolved only for a valid request
+        // and with no Redshift lock held (the id is re-checked under it).
+        let kms_key_id = if encrypted {
+            self.kms_key_or_default(req)
+        } else {
+            param(req, "KmsKeyId")
+        };
         let mut guard = self.state.write();
         let acct = guard.account(&req.account_id);
         if acct.clusters.contains_key(&id) {
@@ -185,10 +197,10 @@ impl RedshiftService {
             allow_version_upgrade: bool_param(req, "AllowVersionUpgrade").unwrap_or(true),
             number_of_nodes,
             publicly_accessible: bool_param(req, "PubliclyAccessible").unwrap_or(false),
-            encrypted: bool_param(req, "Encrypted").unwrap_or(false),
+            encrypted,
             multi_az: bool_param(req, "MultiAZ").unwrap_or(false),
             cluster_type,
-            kms_key_id: param(req, "KmsKeyId"),
+            kms_key_id,
             enhanced_vpc_routing: bool_param(req, "EnhancedVpcRouting").unwrap_or(false),
             maintenance_track_name: param_or(req, "MaintenanceTrackName", "current"),
             elastic_ip: param(req, "ElasticIp"),
@@ -244,6 +256,23 @@ impl RedshiftService {
 
     pub(super) fn modify_cluster(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let id = param(req, "ClusterIdentifier").unwrap_or_default();
+        if !self.account_check(req, |a| a.clusters.contains_key(&id)) {
+            return Err(cluster_not_found(&id));
+        }
+        let encrypted = bool_param(req, "Encrypted");
+        let named_key = param(req, "KmsKeyId").filter(|k| !k.is_empty());
+        // Turning encryption on for a cluster that has no key, without naming
+        // one, uses the AWS-managed key; resolved only then (a cluster that
+        // already has a key keeps it), for a valid request, and with no
+        // Redshift lock held.
+        let needs_default = encrypted == Some(true)
+            && named_key.is_none()
+            && self.account_check(req, |a| {
+                a.clusters.get(&id).is_some_and(|c| c.kms_key_id.is_none())
+            });
+        let encrypt_default = needs_default
+            .then(|| self.kms_key_or_default(req))
+            .flatten();
         let mut guard = self.state.write();
         let acct = guard.account(&req.account_id);
         let c = acct
@@ -292,11 +321,26 @@ impl RedshiftService {
         if let Some(v) = param(req, "MaintenanceTrackName") {
             c.maintenance_track_name = v;
         }
-        if let Some(v) = bool_param(req, "Encrypted") {
-            c.encrypted = v;
-        }
-        if let Some(v) = param(req, "KmsKeyId") {
-            c.kms_key_id = Some(v);
+        match encrypted {
+            // Decrypting the cluster leaves it with no key, whatever KmsKeyId
+            // says.
+            Some(false) => {
+                c.encrypted = false;
+                c.kms_key_id = None;
+            }
+            Some(true) => {
+                c.encrypted = true;
+                if let Some(key) = named_key {
+                    c.kms_key_id = Some(key);
+                } else if c.kms_key_id.is_none() {
+                    c.kms_key_id = encrypt_default;
+                }
+            }
+            None => {
+                if let Some(key) = named_key {
+                    c.kms_key_id = Some(key);
+                }
+            }
         }
         if let Some(v) = param(req, "ElasticIp") {
             c.elastic_ip = Some(v);

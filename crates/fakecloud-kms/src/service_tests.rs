@@ -4013,3 +4013,68 @@ async fn rsa_key_generation_does_not_hold_the_state_lock() {
     let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
     assert!(!body["PublicKey"].as_str().unwrap().is_empty());
 }
+
+/// ListAliases pagination walks every alias exactly once when customer
+/// aliases and the pre-listed AWS-managed aliases are mixed, including after
+/// services minted AWS-managed keys in other regions (which add no aliases).
+#[test]
+fn list_aliases_pagination_covers_customer_and_managed_aliases() {
+    let svc = make_service();
+    let key_id = create_key(&svc);
+    create_alias(&svc, "alias/aaa-first", &key_id);
+    create_alias(&svc, "alias/zzz-last", &key_id);
+    let hook = crate::hook::KmsServiceHook::new(svc.state.clone(), Default::default());
+    for region in ["us-west-2", "cn-north-1"] {
+        hook.aws_managed_key_arn_tracked(
+            "123456789012",
+            region,
+            "timestream",
+            "timestream.amazonaws.com",
+        );
+    }
+    let list = |body: Value| -> Value {
+        serde_json::from_slice(
+            svc.list_aliases(&make_request("ListAliases", body))
+                .unwrap()
+                .body
+                .expect_bytes(),
+        )
+        .unwrap()
+    };
+    let all: Vec<String> = list(json!({}))["Aliases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["AliasName"].as_str().unwrap().to_string())
+        .collect();
+    assert!(all.iter().any(|n| n == "alias/aaa-first"));
+    assert!(all.iter().any(|n| n == "alias/zzz-last"));
+    assert!(all.iter().any(|n| n == "alias/aws/s3"));
+    assert_eq!(
+        all.iter().filter(|n| *n == "alias/aws/timestream").count(),
+        1,
+        "one managed alias entry per account"
+    );
+
+    let mut paged: Vec<String> = Vec::new();
+    let mut marker: Option<String> = None;
+    loop {
+        let mut body = json!({ "Limit": 3 });
+        if let Some(m) = &marker {
+            body["Marker"] = json!(m);
+        }
+        let page = list(body);
+        paged.extend(
+            page["Aliases"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|a| a["AliasName"].as_str().unwrap().to_string()),
+        );
+        if page["Truncated"] != json!(true) {
+            break;
+        }
+        marker = page["NextMarker"].as_str().map(str::to_string);
+    }
+    assert_eq!(paged, all, "pages cover every alias once, in order");
+}

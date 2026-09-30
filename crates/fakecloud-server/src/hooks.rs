@@ -4,10 +4,9 @@ use std::sync::Arc;
 
 pub(crate) struct KmsHookAdapter {
     pub(crate) inner: fakecloud_kms::hook::KmsServiceHook,
-    /// Shared KMS state — used to snapshot after the hook auto-provisions
-    /// an `aws/<service>` AWS-managed key on first use, so the new key
-    /// survives a server restart and the corresponding ciphertext stays
-    /// decryptable.
+    /// Shared KMS state, snapshotted after the hook mints an `aws/<service>`
+    /// AWS-managed key on first use, so the key survives a restart and the
+    /// corresponding ciphertext stays decryptable.
     pub(crate) state: fakecloud_kms::SharedKmsState,
     pub(crate) snapshot_store: std::sync::OnceLock<Arc<dyn fakecloud_persistence::SnapshotStore>>,
 }
@@ -28,14 +27,7 @@ impl KmsHookAdapter {
         let _ = self.snapshot_store.set(store);
     }
 
-    pub(crate) fn key_count(&self) -> usize {
-        self.state.read().iter().map(|(_, s)| s.keys.len()).sum()
-    }
-
-    pub(crate) fn save_snapshot_blocking(&self) {
-        let Some(store) = self.snapshot_store.get() else {
-            return;
-        };
+    fn save_snapshot_blocking(&self, store: &dyn fakecloud_persistence::SnapshotStore) {
         let snapshot = fakecloud_kms::KmsSnapshot {
             schema_version: fakecloud_kms::KMS_SNAPSHOT_SCHEMA_VERSION,
             accounts: Some(self.state.read().clone()),
@@ -50,6 +42,43 @@ impl KmsHookAdapter {
             Err(err) => tracing::error!(%err, "kms hook snapshot serialize failed"),
         }
     }
+
+    /// Persist KMS state after a key was minted, durably, before the hook
+    /// call returns: a restart right after must still find the key (and so
+    /// decrypt what was encrypted under it). On a multi-thread Tokio runtime
+    /// the blocking serialize + write runs inside `block_in_place`, so the
+    /// worker's other tasks move to another thread instead of stalling;
+    /// elsewhere it runs directly.
+    fn persist_minted_key(&self) {
+        let Some(store) = self.snapshot_store.get() else {
+            return;
+        };
+        let multi_thread = tokio::runtime::Handle::try_current()
+            .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+        if multi_thread {
+            tokio::task::block_in_place(|| self.save_snapshot_blocking(store.as_ref()));
+        } else {
+            self.save_snapshot_blocking(store.as_ref());
+        }
+    }
+
+    /// Resolve `key_id`, persisting KMS state when that minted a key.
+    fn resolve_and_persist(
+        &self,
+        account_id: &str,
+        region: &str,
+        key_id: &str,
+        service_principal: &str,
+    ) -> Result<String, String> {
+        let (arn, minted) = self
+            .inner
+            .resolve_key_arn_tracked(account_id, region, key_id, service_principal)
+            .map_err(|e| e.to_string())?;
+        if minted {
+            self.persist_minted_key();
+        }
+        Ok(arn)
+    }
 }
 
 impl fakecloud_core::delivery::KmsHook for KmsHookAdapter {
@@ -62,24 +91,19 @@ impl fakecloud_core::delivery::KmsHook for KmsHookAdapter {
         service_principal: &str,
         encryption_context: std::collections::HashMap<String, String>,
     ) -> Result<String, String> {
-        let before = self.key_count();
-        let result = self
-            .inner
+        // Resolve first (minting and persisting an AWS-managed key on first
+        // use), then encrypt under the resolved key.
+        let key_arn = self.resolve_and_persist(account_id, region, key_id, service_principal)?;
+        self.inner
             .encrypt(
                 account_id,
                 region,
-                key_id,
+                &key_arn,
                 plaintext,
                 service_principal,
                 encryption_context,
             )
-            .map_err(|e| e.to_string());
-        // Auto-provisioned a new AWS-managed key — persist immediately so
-        // a restart can still decrypt its ciphertext.
-        if result.is_ok() && self.key_count() > before {
-            self.save_snapshot_blocking();
-        }
-        result
+            .map_err(|e| e.to_string())
     }
 
     fn decrypt(
@@ -106,16 +130,23 @@ impl fakecloud_core::delivery::KmsHook for KmsHookAdapter {
         key_id: &str,
         service_principal: &str,
     ) -> Result<String, String> {
-        let before = self.key_count();
-        let result = self
-            .inner
-            .resolve_key_arn(account_id, region, key_id, service_principal)
-            .map_err(|e| e.to_string());
-        // Persist an AWS-managed key minted on first use, as `encrypt` does.
-        if result.is_ok() && self.key_count() > before {
-            self.save_snapshot_blocking();
+        self.resolve_and_persist(account_id, region, key_id, service_principal)
+    }
+
+    fn aws_managed_key_arn(
+        &self,
+        account_id: &str,
+        region: &str,
+        service: &str,
+        service_principal: &str,
+    ) -> Result<String, String> {
+        let (arn, minted) =
+            self.inner
+                .aws_managed_key_arn_tracked(account_id, region, service, service_principal);
+        if minted {
+            self.persist_minted_key();
         }
-        result
+        Ok(arn)
     }
 }
 
@@ -309,5 +340,95 @@ impl fakecloud_core::delivery::SmsDispatcher for SnsSmsDispatcher {
         state
             .sms_messages
             .push((phone_number.to_string(), message.to_string()));
+    }
+}
+
+#[cfg(test)]
+mod kms_hook_adapter_tests {
+    use super::*;
+    use fakecloud_core::delivery::KmsHook;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Counts saves and records the number of keys in the last snapshot.
+    #[derive(Default)]
+    struct CountingStore {
+        saves: AtomicUsize,
+        last_keys: AtomicUsize,
+    }
+
+    impl fakecloud_persistence::SnapshotStore for CountingStore {
+        fn load(&self) -> std::io::Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+
+        fn save(&self, bytes: &[u8]) -> std::io::Result<()> {
+            let snap: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+            let keys = snap["accounts"]["accounts"]["123456789012"]["keys"]
+                .as_object()
+                .map_or(0, |k| k.len());
+            self.last_keys.store(keys, Ordering::SeqCst);
+            self.saves.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn adapter() -> (KmsHookAdapter, Arc<CountingStore>) {
+        let state: fakecloud_kms::SharedKmsState = Arc::new(parking_lot::RwLock::new(
+            fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+        ));
+        let adapter = KmsHookAdapter::new(state, Default::default());
+        let store = Arc::new(CountingStore::default());
+        adapter.set_snapshot_store(store.clone());
+        (adapter, store)
+    }
+
+    /// A minted key is saved before the hook call returns (no yield needed),
+    /// on the multi-thread runtime the server runs; existing keys save nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn minted_keys_are_saved_before_the_call_returns() {
+        let (adapter, store) = adapter();
+        let principal = "timestream.amazonaws.com";
+        adapter
+            .resolve_key_arn(
+                "123456789012",
+                "us-east-1",
+                "alias/aws/timestream",
+                principal,
+            )
+            .unwrap();
+        assert_eq!(store.saves.load(Ordering::SeqCst), 1);
+        assert_eq!(store.last_keys.load(Ordering::SeqCst), 1);
+        adapter
+            .encrypt(
+                "123456789012",
+                "us-east-1",
+                "alias/aws/timestream",
+                b"x",
+                principal,
+                Default::default(),
+            )
+            .unwrap();
+        assert_eq!(store.saves.load(Ordering::SeqCst), 1, "no new key, no save");
+        adapter
+            .aws_managed_key_arn("123456789012", "eu-west-1", "timestream", principal)
+            .unwrap();
+        assert_eq!(store.saves.load(Ordering::SeqCst), 2);
+        assert_eq!(store.last_keys.load(Ordering::SeqCst), 2);
+    }
+
+    /// Outside a multi-thread runtime the save runs directly, still before
+    /// the call returns.
+    #[test]
+    fn minted_keys_are_saved_without_a_runtime() {
+        let (adapter, store) = adapter();
+        adapter
+            .aws_managed_key_arn(
+                "123456789012",
+                "us-east-1",
+                "dynamodb",
+                "dynamodb.amazonaws.com",
+            )
+            .unwrap();
+        assert_eq!(store.saves.load(Ordering::SeqCst), 1);
     }
 }

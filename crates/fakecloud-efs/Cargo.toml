@@ -8,6 +8,7 @@ homepage.workspace = true
 version.workspace = true
 
 [dependencies]
+regex = { workspace = true }
 fakecloud-aws = { workspace = true }
 fakecloud-core = { workspace = true }
 fakecloud-persistence = { workspace = true }
@@ -25,6 +26,6 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-fakecloud-kms = { workspace = true }
+fakecloud-kms = { workspace = true, features = ["test-util"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 bytes = { workspace = true }

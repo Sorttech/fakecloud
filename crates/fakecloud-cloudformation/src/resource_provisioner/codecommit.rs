@@ -31,6 +31,19 @@ impl ResourceProvisioner {
         let region = self.region.clone();
         let arn = fakecloud_codecommit::repo_arn(&self.region, &self.account_id, &name);
         let now = Utc::now();
+        let name_taken = || format!("Repository named {name} already exists");
+        if self
+            .codecommit_state
+            .read()
+            .get(&account)
+            .is_some_and(|st| st.repositories.contains_key(&name))
+        {
+            return Err(name_taken());
+        }
+        // Mirror the direct CreateRepository handler: an omitted KmsKeyId means
+        // the AWS-managed `aws/codecommit` key, resolved only for a valid
+        // request and before taking the lock.
+        let kms = self.kms_key_or_aws_managed(cc_str(props, "KmsKeyId").as_deref(), "codecommit");
 
         let mut guard = self.codecommit_state.write();
         // CloudFormation provisions a stack single-threaded, so a plain
@@ -41,15 +54,6 @@ impl ResourceProvisioner {
             return Err(format!("Repository named {name} already exists"));
         }
 
-        // Mirror the direct CreateRepository handler: an omitted KmsKeyId mints a
-        // synthetic KMS key ARN so the stored metadata round-trips a key.
-        let kms = cc_str(props, "KmsKeyId").unwrap_or_else(|| {
-            fakecloud_kms::kms_key_arn(
-                &self.region,
-                &self.account_id,
-                &uuid::Uuid::new_v4().to_string(),
-            )
-        });
         let clone_http = format!("https://git-codecommit.{region}.amazonaws.com/v1/repos/{name}");
         let clone_ssh = format!("ssh://git-codecommit.{region}.amazonaws.com/v1/repos/{name}");
 
@@ -68,7 +72,9 @@ impl ResourceProvisioner {
         metadata.insert("cloneUrlHttp".into(), json!(clone_http));
         metadata.insert("cloneUrlSsh".into(), json!(clone_ssh));
         metadata.insert("Arn".into(), json!(arn));
-        metadata.insert("kmsKeyId".into(), json!(kms));
+        if let Some(kms) = kms {
+            metadata.insert("kmsKeyId".into(), json!(kms));
+        }
         // The optional `Code` property seeds an initial commit from an S3 object.
         // There is no live git transport here, so the repository is created empty
         // (matching the metadata, which is what Ref/GetAtt and GetRepository read)
@@ -111,6 +117,17 @@ impl ResourceProvisioner {
             return self.create_codecommit_repository(resource);
         }
 
+        if !self
+            .codecommit_state
+            .read()
+            .get(&self.account_id)
+            .is_some_and(|st| st.repositories.contains_key(&old_name))
+        {
+            return Err(format!("Repository {old_name} not yet provisioned"));
+        }
+        // Removing KmsKeyId reverts the repository to the AWS-managed default,
+        // as a fresh create would report; resolved before taking the lock.
+        let kms = self.kms_key_or_aws_managed(cc_str(props, "KmsKeyId").as_deref(), "codecommit");
         let mut guard = self.codecommit_state.write();
         let st = guard.get_or_create(&self.account_id);
         let repo = st
@@ -128,8 +145,13 @@ impl ResourceProvisioner {
                     obj.remove("repositoryDescription");
                 }
             }
-            if let Some(k) = cc_str(props, "KmsKeyId") {
-                obj.insert("kmsKeyId".into(), json!(k));
+            match kms {
+                Some(k) => {
+                    obj.insert("kmsKeyId".into(), json!(k));
+                }
+                None => {
+                    obj.remove("kmsKeyId");
+                }
             }
             obj.insert("lastModifiedDate".into(), cc_ts(Utc::now()));
         }
