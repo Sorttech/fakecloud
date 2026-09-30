@@ -132,6 +132,16 @@ pub struct FlowExecution {
     pub updated_at: DateTime<Utc>,
     #[serde(default)]
     pub ended_at: Option<DateTime<Utc>>,
+    /// The flow definition the execution runs, captured at start from the
+    /// version its alias routed to. `GetExecutionFlowSnapshot` returns it.
+    #[serde(default)]
+    pub definition: Option<serde_json::Value>,
+    /// The executed version's service role, captured at start.
+    #[serde(default)]
+    pub execution_role_arn: Option<String>,
+    /// The executed version's customer-managed KMS key, captured at start.
+    #[serde(default)]
+    pub customer_encryption_key_arn: Option<String>,
 }
 
 #[cfg(test)]

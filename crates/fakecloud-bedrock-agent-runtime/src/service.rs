@@ -8,7 +8,8 @@ use serde_json::{json, Value};
 
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 
-use crate::arns::{flow_execution_arn, flow_execution_role_arn, session_arn};
+use crate::arns::{flow_execution_arn, session_arn};
+use crate::flows::bare_flow_id;
 use crate::state::{
     FlowExecution, InvocationRecord, InvocationStep, Session, SessionInvocation,
     SharedBedrockAgentRuntimeState,
@@ -487,8 +488,13 @@ fn merge_path_params(body: Value, path_params: &[(String, String)]) -> Value {
         Value::Object(m) => m,
         _ => serde_json::Map::new(),
     };
+    // Path labels arrive percent-encoded (an ARN label carries `%3A` / `%2F`);
+    // handlers see the decoded value, as the model's labels define it.
     for (k, v) in path_params {
-        out.insert(k.clone(), Value::String(v.clone()));
+        let decoded = percent_encoding::percent_decode_str(v)
+            .decode_utf8_lossy()
+            .into_owned();
+        out.insert(k.clone(), Value::String(decoded));
     }
     Value::Object(out)
 }
@@ -678,24 +684,7 @@ async fn handle_invoke_flow(
     req: &AwsRequest,
     body: &Value,
 ) -> Result<AwsResponse, AwsServiceError> {
-    let flow_id = req_str(body, "flowIdentifier");
-    let flow_alias_id = req_str(body, "flowAliasIdentifier");
-    validate_str(
-        flow_id.as_deref(),
-        "flowIdentifier",
-        Some(re_flow_identifier()),
-        Some(1),
-        Some(2048),
-        true,
-    )?;
-    validate_str(
-        flow_alias_id.as_deref(),
-        "flowAliasIdentifier",
-        Some(re_flow_alias_identifier()),
-        Some(1),
-        Some(2048),
-        true,
-    )?;
+    let (flow_identifier, alias_identifier) = validate_flow_labels(body)?;
     if body.get("inputs").is_none() {
         return Err(validation("inputs is required"));
     }
@@ -712,8 +701,16 @@ async fn handle_invoke_flow(
         )?;
     }
 
-    let flow_id = bare_flow_id(&flow_id.unwrap()).to_string();
-    let execution_id = uuid::Uuid::new_v4().to_string();
+    let flow = crate::flows::resolve_flow(
+        svc.agent_state.as_ref(),
+        &req.account_id,
+        &flow_identifier,
+        &alias_identifier,
+    )?;
+    let flow_id = flow.flow_id.clone();
+    // A caller-supplied executionId continues that execution; otherwise the
+    // service mints one.
+    let execution_id = execution_id_opt.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let input = req_str(body, "input").unwrap_or_default();
 
     let start = std::time::Instant::now();
@@ -724,22 +721,7 @@ async fn handle_invoke_flow(
         let s = accts.get_or_create(&req.account_id);
         s.flow_executions.insert(
             execution_id.clone(),
-            FlowExecution {
-                execution_id: execution_id.clone(),
-                execution_arn: flow_execution_arn(
-                    &req.region,
-                    &req.account_id,
-                    &flow_id,
-                    &execution_id,
-                ),
-                flow_id: flow_id.clone(),
-                flow_alias_id: flow_alias_id.unwrap_or_default(),
-                flow_version: "DRAFT".to_string(),
-                status: "SUCCEEDED".to_string(),
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-                ended_at: Some(Utc::now()),
-            },
+            new_execution(req, flow, execution_id.clone(), "Succeeded"),
         );
         s.invocations.push(InvocationRecord {
             invocation_id: execution_id.clone(),
@@ -1714,14 +1696,11 @@ async fn handle_put_invocation_step(
 
 // ── Flow execution handlers ─────────────────────────────────────────
 
-async fn handle_get_flow_execution(
-    svc: &BedrockAgentRuntimeService,
-    req: &AwsRequest,
-    body: &Value,
-) -> Result<AwsResponse, AwsServiceError> {
+/// Validate the `flowIdentifier` / `flowAliasIdentifier` path labels every
+/// flow-execution operation carries, returning them.
+fn validate_flow_labels(body: &Value) -> Result<(String, String), AwsServiceError> {
     let flow_id = req_str(body, "flowIdentifier");
     let flow_alias_id = req_str(body, "flowAliasIdentifier");
-    let exec_id = req_str(body, "executionIdentifier");
     validate_str(
         flow_id.as_deref(),
         "flowIdentifier",
@@ -1738,6 +1717,17 @@ async fn handle_get_flow_execution(
         Some(2048),
         true,
     )?;
+    Ok((
+        flow_id.unwrap_or_default(),
+        flow_alias_id.unwrap_or_default(),
+    ))
+}
+
+/// Validate the flow labels plus the `executionIdentifier` label of an
+/// operation on one execution, returning all three.
+fn validate_execution_labels(body: &Value) -> Result<(String, String, String), AwsServiceError> {
+    let (flow_id, alias_id) = validate_flow_labels(body)?;
+    let exec_id = req_str(body, "executionIdentifier");
     validate_str(
         exec_id.as_deref(),
         "executionIdentifier",
@@ -1746,72 +1736,97 @@ async fn handle_get_flow_execution(
         Some(2048),
         true,
     )?;
+    Ok((flow_id, alias_id, exec_id.unwrap_or_default()))
+}
 
-    let exec_id = exec_id.unwrap();
-    let accts = svc.state.read();
-    let s = accts.accounts.get(&req.account_id).ok_or_else(|| {
-        make_error(
-            StatusCode::NOT_FOUND,
-            "ResourceNotFoundException",
-            "Flow execution not found",
-        )
-    })?;
-    // Match by execution_id or ARN
-    let exec = s
+fn execution_not_found(exec_id: &str) -> AwsServiceError {
+    crate::flows::not_found(format!("Flow execution {exec_id} not found."))
+}
+
+/// The key of the execution `exec_id` (an id or execution ARN) names, when it
+/// is an execution of the flow `flow_identifier` names in this account.
+fn execution_key(
+    state: &crate::state::BedrockAgentRuntimeState,
+    flow_identifier: &str,
+    exec_id: &str,
+) -> Option<String> {
+    let flow_id = bare_flow_id(flow_identifier);
+    state
         .flow_executions
-        .values()
-        .find(|e| e.execution_id == exec_id || e.execution_arn == exec_id)
-        .ok_or_else(|| {
-            make_error(
-                StatusCode::NOT_FOUND,
-                "ResourceNotFoundException",
-                "Flow execution not found",
-            )
-        })?;
+        .iter()
+        .find(|(_, e)| {
+            e.flow_id == flow_id
+                && crate::flows::names_execution(exec_id, &e.execution_id, &e.execution_arn)
+        })
+        .map(|(k, _)| k.clone())
+}
 
-    Ok(AwsResponse::ok_json(json!({
+/// Record a new execution of `flow`, capturing what it runs.
+fn new_execution(
+    req: &AwsRequest,
+    flow: crate::flows::ResolvedFlow,
+    execution_id: String,
+    status: &str,
+) -> FlowExecution {
+    let now = Utc::now();
+    FlowExecution {
+        execution_arn: flow_execution_arn(
+            &req.region,
+            &req.account_id,
+            &flow.flow_id,
+            &flow.alias_id,
+            &execution_id,
+        ),
+        execution_id,
+        flow_id: flow.flow_id,
+        flow_alias_id: flow.alias_id,
+        flow_version: flow.version,
+        status: status.to_string(),
+        created_at: now,
+        updated_at: now,
+        ended_at: (status != "Running").then_some(now),
+        definition: flow.definition,
+        execution_role_arn: flow.execution_role_arn,
+        customer_encryption_key_arn: flow.customer_encryption_key_arn,
+    }
+}
+
+async fn handle_get_flow_execution(
+    svc: &BedrockAgentRuntimeService,
+    req: &AwsRequest,
+    body: &Value,
+) -> Result<AwsResponse, AwsServiceError> {
+    let (flow_id, _, exec_id) = validate_execution_labels(body)?;
+
+    let accts = svc.state.read();
+    let s = accts
+        .accounts
+        .get(&req.account_id)
+        .ok_or_else(|| execution_not_found(&exec_id))?;
+    let exec = execution_key(s, &flow_id, &exec_id)
+        .and_then(|k| s.flow_executions.get(&k))
+        .ok_or_else(|| execution_not_found(&exec_id))?;
+
+    let mut out = json!({
         "executionArn": exec.execution_arn,
         "flowIdentifier": exec.flow_id,
         "flowAliasIdentifier": exec.flow_alias_id,
         "flowVersion": exec.flow_version,
         "status": exec.status,
         "startedAt": exec.created_at.to_rfc3339(),
-        "endedAt": exec.ended_at.map(|d| d.to_rfc3339()),
-    })))
+    });
+    if let Some(ended) = exec.ended_at {
+        out["endedAt"] = json!(ended.to_rfc3339());
+    }
+    Ok(AwsResponse::ok_json(out))
 }
 
 async fn handle_list_flow_execution_events(
-    _svc: &BedrockAgentRuntimeService,
+    svc: &BedrockAgentRuntimeService,
     req: &AwsRequest,
     body: &Value,
 ) -> Result<AwsResponse, AwsServiceError> {
-    let flow_id = req_str(body, "flowIdentifier");
-    let flow_alias_id = req_str(body, "flowAliasIdentifier");
-    let exec_id = req_str(body, "executionIdentifier");
-    validate_str(
-        flow_id.as_deref(),
-        "flowIdentifier",
-        Some(re_flow_identifier()),
-        Some(1),
-        Some(2048),
-        true,
-    )?;
-    validate_str(
-        flow_alias_id.as_deref(),
-        "flowAliasIdentifier",
-        Some(re_flow_alias_identifier()),
-        Some(1),
-        Some(2048),
-        true,
-    )?;
-    validate_str(
-        exec_id.as_deref(),
-        "executionIdentifier",
-        Some(re_flow_execution_id()),
-        None,
-        Some(2048),
-        true,
-    )?;
+    let (flow_id, _, exec_id) = validate_execution_labels(body)?;
     // eventType is required (httpQuery)
     let event_type = req
         .query_params
@@ -1825,6 +1840,14 @@ async fn handle_list_flow_execution_events(
     validate_int_range(extract_int(req, body, "maxResults"), "maxResults", 1, 1000)?;
     validate_next_token(req, body)?;
 
+    let accts = svc.state.read();
+    accts
+        .accounts
+        .get(&req.account_id)
+        .and_then(|s| execution_key(s, &flow_id, &exec_id))
+        .ok_or_else(|| execution_not_found(&exec_id))?;
+
+    // No node ran any work, so the execution has recorded no events.
     Ok(AwsResponse::ok_json(json!({
         "flowExecutionEvents": []
     })))
@@ -1858,6 +1881,8 @@ async fn handle_list_flow_executions(
     validate_int_range(extract_int(req, body, "maxResults"), "maxResults", 1, 1000)?;
     validate_next_token(req, body)?;
     let flow_id = bare_flow_id(&flow_id.unwrap()).to_string();
+    // An alias filter names the alias by id or by ARN.
+    let alias_id = alias.map(|a| a.rsplit('/').next().unwrap_or(&a).to_string());
 
     let accts = svc.state.read();
     let summaries: Vec<Value> = accts
@@ -1868,16 +1893,20 @@ async fn handle_list_flow_executions(
                 .flow_executions
                 .values()
                 .filter(|e| e.flow_id == flow_id)
+                .filter(|e| alias_id.as_deref().is_none_or(|a| e.flow_alias_id == a))
                 .map(|e| {
-                    json!({
+                    let mut o = json!({
                         "executionArn": e.execution_arn,
                         "flowIdentifier": e.flow_id,
                         "flowAliasIdentifier": e.flow_alias_id,
                         "flowVersion": e.flow_version,
                         "status": e.status,
                         "createdAt": e.created_at.to_rfc3339(),
-                        "endedAt": e.ended_at.map(|d| d.to_rfc3339()),
-                    })
+                    });
+                    if let Some(ended) = e.ended_at {
+                        o["endedAt"] = json!(ended.to_rfc3339());
+                    }
+                    o
                 })
                 .collect()
         })
@@ -1893,24 +1922,7 @@ async fn handle_start_flow_execution(
     req: &AwsRequest,
     body: &Value,
 ) -> Result<AwsResponse, AwsServiceError> {
-    let flow_id = req_str(body, "flowIdentifier");
-    let flow_alias_id = req_str(body, "flowAliasIdentifier");
-    validate_str(
-        flow_id.as_deref(),
-        "flowIdentifier",
-        Some(re_flow_identifier()),
-        Some(1),
-        Some(2048),
-        true,
-    )?;
-    validate_str(
-        flow_alias_id.as_deref(),
-        "flowAliasIdentifier",
-        Some(re_flow_alias_identifier()),
-        Some(1),
-        Some(2048),
-        true,
-    )?;
+    let (flow_identifier, alias_identifier) = validate_flow_labels(body)?;
     if body.get("inputs").is_none() {
         return Err(validation("inputs is required"));
     }
@@ -1926,29 +1938,19 @@ async fn handle_start_flow_execution(
         )?;
     }
 
-    let flow_id = bare_flow_id(&flow_id.unwrap()).to_string();
-    let flow_alias_id = flow_alias_id.unwrap();
-    let execution_id = uuid::Uuid::new_v4().to_string();
-    let arn = flow_execution_arn(&req.region, &req.account_id, &flow_id, &execution_id);
-    let now = Utc::now();
-
+    let flow = crate::flows::resolve_flow(
+        svc.agent_state.as_ref(),
+        &req.account_id,
+        &flow_identifier,
+        &alias_identifier,
+    )?;
+    let execution = new_execution(req, flow, uuid::Uuid::new_v4().to_string(), "Running");
+    let arn = execution.execution_arn.clone();
     {
         let mut accts = svc.state.write();
         let s = accts.get_or_create(&req.account_id);
-        s.flow_executions.insert(
-            execution_id.clone(),
-            FlowExecution {
-                execution_id: execution_id.clone(),
-                execution_arn: arn.clone(),
-                flow_id: flow_id.clone(),
-                flow_alias_id,
-                flow_version: "DRAFT".to_string(),
-                status: "InProgress".to_string(),
-                created_at: now,
-                updated_at: now,
-                ended_at: None,
-            },
-        );
+        s.flow_executions
+            .insert(execution.execution_id.clone(), execution);
     }
 
     Ok(AwsResponse::ok_json(json!({ "executionArn": arn })))
@@ -1959,128 +1961,64 @@ async fn handle_stop_flow_execution(
     req: &AwsRequest,
     body: &Value,
 ) -> Result<AwsResponse, AwsServiceError> {
-    let flow_id = req_str(body, "flowIdentifier");
-    let flow_alias_id = req_str(body, "flowAliasIdentifier");
-    let exec_id = req_str(body, "executionIdentifier");
-    validate_str(
-        flow_id.as_deref(),
-        "flowIdentifier",
-        Some(re_flow_identifier()),
-        Some(1),
-        Some(2048),
-        true,
-    )?;
-    validate_str(
-        flow_alias_id.as_deref(),
-        "flowAliasIdentifier",
-        Some(re_flow_alias_identifier()),
-        Some(1),
-        Some(2048),
-        true,
-    )?;
-    validate_str(
-        exec_id.as_deref(),
-        "executionIdentifier",
-        Some(re_flow_execution_id()),
-        None,
-        Some(2048),
-        true,
-    )?;
-    let exec_id = exec_id.unwrap();
+    let (flow_id, _, exec_id) = validate_execution_labels(body)?;
 
-    let now = Utc::now();
     let mut accts = svc.state.write();
     let s = accts.get_or_create(&req.account_id);
-    let key = s
+    let key = execution_key(s, &flow_id, &exec_id).ok_or_else(|| execution_not_found(&exec_id))?;
+    let e = s
         .flow_executions
-        .iter()
-        .find(|(_, e)| e.execution_id == exec_id || e.execution_arn == exec_id)
-        .map(|(k, _)| k.clone());
-    let (arn, status) = if let Some(k) = key {
-        let e = s.flow_executions.get_mut(&k).unwrap();
+        .get_mut(&key)
+        .ok_or_else(|| execution_not_found(&exec_id))?;
+    // Only a running execution is aborted; one that already ended keeps (and
+    // reports) the status it ended with.
+    if e.status == "Running" {
+        let now = Utc::now();
         e.status = "Aborted".to_string();
         e.updated_at = now;
         e.ended_at = Some(now);
-        (e.execution_arn.clone(), e.status.clone())
-    } else {
-        // Allow stop on unknown execution: still return Aborted with synthetic ARN
-        (
-            flow_execution_arn(&req.region, &req.account_id, "unknown", &exec_id),
-            "Aborted".to_string(),
-        )
-    };
+    }
 
     Ok(AwsResponse::ok_json(json!({
-        "executionArn": arn,
-        "status": status,
+        "executionArn": e.execution_arn,
+        "status": e.status,
     })))
 }
 
 async fn handle_get_execution_flow_snapshot(
-    _svc: &BedrockAgentRuntimeService,
+    svc: &BedrockAgentRuntimeService,
     req: &AwsRequest,
     body: &Value,
 ) -> Result<AwsResponse, AwsServiceError> {
-    let flow_id = req_str(body, "flowIdentifier");
-    let flow_alias_id = req_str(body, "flowAliasIdentifier");
-    let exec_id = req_str(body, "executionIdentifier");
-    validate_str(
-        flow_id.as_deref(),
-        "flowIdentifier",
-        Some(re_flow_identifier()),
-        Some(1),
-        Some(2048),
-        true,
-    )?;
-    validate_str(
-        flow_alias_id.as_deref(),
-        "flowAliasIdentifier",
-        Some(re_flow_alias_identifier()),
-        Some(1),
-        Some(2048),
-        true,
-    )?;
-    validate_str(
-        exec_id.as_deref(),
-        "executionIdentifier",
-        Some(re_flow_execution_id()),
-        None,
-        Some(2048),
-        true,
-    )?;
+    let (flow_id, _, exec_id) = validate_execution_labels(body)?;
 
-    let flow_id = bare_flow_id(&flow_id.unwrap()).to_string();
-    let flow_alias_id = flow_alias_id.unwrap();
+    let accts = svc.state.read();
+    let s = accts
+        .accounts
+        .get(&req.account_id)
+        .ok_or_else(|| execution_not_found(&exec_id))?;
+    let exec = execution_key(s, &flow_id, &exec_id)
+        .and_then(|k| s.flow_executions.get(&k))
+        .ok_or_else(|| execution_not_found(&exec_id))?;
 
-    let role_arn = flow_execution_role_arn(&req.region, &req.account_id, &flow_id);
-
-    let definition = serde_json::to_string(&json!({
-        "nodes": [
-            {
-                "name": "Start",
-                "type": "Input",
-                "configuration": { "input": {} }
-            }
-        ],
-        "connections": []
-    }))
-    .unwrap();
-
-    Ok(AwsResponse::ok_json(json!({
-        "flowIdentifier": flow_id,
-        "flowAliasIdentifier": flow_alias_id,
-        "flowVersion": "DRAFT",
-        "executionRoleArn": role_arn,
+    // The definition the execution ran, captured at start, as the JSON
+    // document string the model's `definition` member carries.
+    let definition = exec
+        .definition
+        .as_ref()
+        .map(Value::to_string)
+        .unwrap_or_else(|| "{}".to_string());
+    let mut out = json!({
+        "flowIdentifier": exec.flow_id,
+        "flowAliasIdentifier": exec.flow_alias_id,
+        "flowVersion": exec.flow_version,
+        "executionRoleArn": exec.execution_role_arn.clone().unwrap_or_default(),
         "definition": definition,
-    })))
-}
-
-/// The bare flow id a `flowIdentifier` names: the identifier itself, or the id
-/// inside a flow ARN (`arn:<partition>:bedrock:<region>:<account>:flow/<id>`).
-fn bare_flow_id(identifier: &str) -> &str {
-    fakecloud_aws::arn::arn_resource(identifier, "bedrock")
-        .and_then(|rest| rest.split_once(":flow/"))
-        .map_or(identifier, |(_, id)| id.split('/').next().unwrap_or(id))
+    });
+    if let Some(key) = &exec.customer_encryption_key_arn {
+        out["customerEncryptionKeyArn"] = json!(key);
+    }
+    Ok(AwsResponse::ok_json(out))
 }
 
 // ── Other handlers ──────────────────────────────────────────────────
@@ -2441,84 +2379,377 @@ mod tests {
         assert_eq!(got["sessionId"], created["sessionId"]);
     }
 
-    #[tokio::test]
-    async fn flow_snapshot_role_uses_the_region_partition_and_bare_flow_id() {
+    const ACCT: &str = "123456789012";
+    const FLOW: &str = "ABCDEFGHIJ";
+    const OTHER_FLOW: &str = "ZYXWVUTSRQ";
+    const ALIAS_V1: &str = "ALIASV1AAA";
+    const OTHER_ALIAS: &str = "ALIASZZZZZ";
+    const DRAFT_ROLE: &str = "arn:aws-cn:iam::123456789012:role/service-role/draft-role";
+    const V1_ROLE: &str = "arn:aws-cn:iam::123456789012:role/service-role/v1-role";
+    const V1_KEY: &str =
+        "arn:aws-cn:kms:cn-north-1:123456789012:key/11111111-2222-3333-4444-555555555555";
+
+    fn flow(id: &str, definition: Value, role: &str) -> fakecloud_bedrock_agent::Flow {
+        let now = Utc::now();
+        fakecloud_bedrock_agent::Flow {
+            flow_id: id.to_string(),
+            name: format!("flow-{id}"),
+            description: None,
+            execution_role_arn: Some(role.to_string()),
+            status: "Prepared".to_string(),
+            created_at: now,
+            updated_at: now,
+            version: "DRAFT".to_string(),
+            definition: Some(definition),
+            arn: format!("arn:aws-cn:bedrock:cn-north-1:{ACCT}:flow/{id}"),
+            customer_encryption_key_arn: None,
+            latest_version: 1,
+        }
+    }
+
+    fn alias(id: &str, flow_id: &str, version: &str) -> fakecloud_bedrock_agent::FlowAlias {
+        let now = Utc::now();
+        fakecloud_bedrock_agent::FlowAlias {
+            alias_id: id.to_string(),
+            alias_name: id.to_lowercase(),
+            flow_id: flow_id.to_string(),
+            routing_configuration: vec![json!({ "flowVersion": version })],
+            description: None,
+            created_at: now,
+            updated_at: now,
+            concurrency_configuration: None,
+        }
+    }
+
+    fn draft_definition() -> Value {
+        json!({"nodes": [{"name": "Draft", "type": "Input"}], "connections": []})
+    }
+
+    fn v1_definition() -> Value {
+        json!({"nodes": [{"name": "V1", "type": "Input"}], "connections": []})
+    }
+
+    /// A runtime wired to Bedrock Agents state holding FLOW (draft + version 1,
+    /// routed by ALIAS_V1) and OTHER_FLOW (whose alias is OTHER_ALIAS).
+    fn flow_svc() -> (
+        BedrockAgentRuntimeService,
+        fakecloud_bedrock_agent::SharedBedrockAgentState,
+    ) {
+        let mut accounts = fakecloud_bedrock_agent::BedrockAgentAccounts::new();
+        let st = accounts.get_or_create(ACCT, "cn-north-1");
+        st.flows
+            .insert(FLOW.into(), flow(FLOW, draft_definition(), DRAFT_ROLE));
+        st.flows
+            .insert(OTHER_FLOW.into(), flow(OTHER_FLOW, json!({}), DRAFT_ROLE));
+        let now = Utc::now();
+        st.flow_versions.insert(
+            FLOW.into(),
+            vec![fakecloud_bedrock_agent::FlowVersion {
+                flow_version: "1".into(),
+                flow_id: FLOW.into(),
+                description: None,
+                created_at: now,
+                updated_at: now,
+                definition: Some(v1_definition()),
+                name: Some(format!("flow-{FLOW}")),
+                execution_role_arn: Some(V1_ROLE.into()),
+                customer_encryption_key_arn: Some(V1_KEY.into()),
+                status: Some("Prepared".into()),
+            }],
+        );
+        st.flow_aliases
+            .insert(ALIAS_V1.into(), alias(ALIAS_V1, FLOW, "1"));
+        st.flow_aliases
+            .insert(OTHER_ALIAS.into(), alias(OTHER_ALIAS, OTHER_FLOW, "DRAFT"));
+        let agent_state = Arc::new(RwLock::new(accounts));
         let svc = BedrockAgentRuntimeService::new(Arc::new(RwLock::new(
             BedrockAgentRuntimeAccounts::new(),
-        )));
-        let snapshot = body(
-            handle_get_execution_flow_snapshot(
-                &svc,
+        )))
+        .with_agent_state(agent_state.clone());
+        (svc, agent_state)
+    }
+
+    async fn start(svc: &BedrockAgentRuntimeService, flow: &str, alias: &str) -> String {
+        body(
+            handle_start_flow_execution(
+                svc,
                 &cn_request(),
-                &json!({
-                    "flowIdentifier": "arn:aws-cn:bedrock:cn-north-1:123456789012:flow/ABCDEFGHIJ",
-                    "flowAliasIdentifier": "TSTALIASID",
-                    "executionIdentifier": "exec-1",
-                }),
+                &json!({"flowIdentifier": flow, "flowAliasIdentifier": alias, "inputs": []}),
             )
             .await
             .unwrap(),
+        )["executionArn"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn code(err: AwsServiceError) -> String {
+        err.code().to_string()
+    }
+
+    fn exec_body(flow: &str, alias: &str, exec: &str) -> Value {
+        json!({"flowIdentifier": flow, "flowAliasIdentifier": alias, "executionIdentifier": exec})
+    }
+
+    #[test]
+    fn path_labels_are_percent_decoded() {
+        let merged = merge_path_params(
+            json!({}),
+            &[(
+                "executionIdentifier".to_string(),
+                "arn%3Aaws%3Abedrock%3Aus-east-1%3A123456789012%3Aflow%2FF".to_string(),
+            )],
         );
-        assert_eq!(snapshot["flowIdentifier"], "ABCDEFGHIJ");
         assert_eq!(
-            snapshot["executionRoleArn"],
-            "arn:aws-cn:iam::123456789012:role/service-role/AmazonBedrockExecutionRoleForFlow_ABCDEFGHIJ"
+            merged["executionIdentifier"],
+            "arn:aws:bedrock:us-east-1:123456789012:flow/F"
         );
     }
 
     #[tokio::test]
-    async fn flow_arn_identifier_yields_a_flat_execution_arn() {
-        let svc = BedrockAgentRuntimeService::new(Arc::new(RwLock::new(
+    async fn executions_require_an_existing_flow_and_alias() {
+        let (svc, _) = flow_svc();
+        let req = cn_request();
+        for (flow, alias) in [
+            ("QQQQQQQQQQ", "TSTALIASID"),
+            (FLOW, "NOSUCHALIA"),
+            // An alias of another flow is not an alias of this one.
+            (FLOW, OTHER_ALIAS),
+            // A flow ARN in another account.
+            (
+                "arn:aws-cn:bedrock:cn-north-1:999999999999:flow/ABCDEFGHIJ",
+                "TSTALIASID",
+            ),
+        ] {
+            let b = json!({"flowIdentifier": flow, "flowAliasIdentifier": alias, "inputs": []});
+            let err = handle_start_flow_execution(&svc, &req, &b)
+                .await
+                .err()
+                .expect("expected an error");
+            assert_eq!(code(err), "ResourceNotFoundException", "{flow} {alias}");
+            let err = handle_invoke_flow(&svc, &req, &b)
+                .await
+                .err()
+                .expect("expected an error");
+            assert_eq!(code(err), "ResourceNotFoundException", "{flow} {alias}");
+        }
+        // Without Bedrock Agents state there is no flow to run.
+        let bare = BedrockAgentRuntimeService::new(Arc::new(RwLock::new(
             BedrockAgentRuntimeAccounts::new(),
         )));
-        let flow_arn = "arn:aws-cn:bedrock:cn-north-1:123456789012:flow/ABCDEFGHIJ";
-        let expected_prefix =
-            "arn:aws-cn:bedrock:cn-north-1:123456789012:flow/ABCDEFGHIJ/execution/";
+        let b = json!({"flowIdentifier": FLOW, "flowAliasIdentifier": "TSTALIASID", "inputs": []});
+        let err = handle_start_flow_execution(&bare, &req, &b)
+            .await
+            .err()
+            .expect("expected an error");
+        assert_eq!(code(err), "ResourceNotFoundException");
+        assert!(svc
+            .state
+            .read()
+            .accounts
+            .get(ACCT)
+            .is_none_or(|s| s.flow_executions.is_empty()));
+    }
 
-        let started = body(
-            handle_start_flow_execution(
+    #[tokio::test]
+    async fn test_alias_runs_the_draft_and_snapshot_is_captured_at_start() {
+        let (svc, agent_state) = flow_svc();
+        let flow_arn = format!("arn:aws-cn:bedrock:cn-north-1:{ACCT}:flow/{FLOW}");
+        let arn = start(&svc, &flow_arn, "TSTALIASID").await;
+        assert!(
+            arn.starts_with(&format!(
+                "arn:aws-cn:bedrock:cn-north-1:{ACCT}:flow/{FLOW}/alias/TSTALIASID/execution/"
+            )),
+            "{arn}"
+        );
+        // Editing the draft after start does not change what the execution ran.
+        agent_state
+            .write()
+            .accounts
+            .get_mut(ACCT)
+            .unwrap()
+            .flows
+            .get_mut(FLOW)
+            .unwrap()
+            .definition = Some(json!({"nodes": [], "connections": []}));
+
+        let snap = body(
+            handle_get_execution_flow_snapshot(
                 &svc,
                 &cn_request(),
-                &json!({
-                    "flowIdentifier": flow_arn,
-                    "flowAliasIdentifier": "TSTALIASID",
-                    "inputs": [],
-                }),
+                &exec_body(&flow_arn, "TSTALIASID", &arn),
             )
             .await
             .unwrap(),
         );
-        let arn = started["executionArn"].as_str().unwrap();
-        assert!(arn.starts_with(expected_prefix), "{arn}");
+        assert_eq!(snap["flowIdentifier"], FLOW);
+        assert_eq!(snap["flowAliasIdentifier"], "TSTALIASID");
+        assert_eq!(snap["flowVersion"], "DRAFT");
+        assert_eq!(snap["executionRoleArn"], DRAFT_ROLE);
+        let def: Value = serde_json::from_str(snap["definition"].as_str().unwrap()).unwrap();
+        assert_eq!(def, draft_definition());
+        assert!(snap.get("customerEncryptionKeyArn").is_none());
+
+        let got = body(
+            handle_get_flow_execution(&svc, &cn_request(), &exec_body(FLOW, "TSTALIASID", &arn))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(got["status"], "Running");
+        assert_eq!(got["flowVersion"], "DRAFT");
+        assert!(got.get("endedAt").is_none());
+    }
+
+    #[tokio::test]
+    async fn alias_routes_to_its_version() {
+        let (svc, _) = flow_svc();
+        let alias_arn =
+            format!("arn:aws-cn:bedrock:cn-north-1:{ACCT}:flow/{FLOW}/alias/{ALIAS_V1}");
+        let arn = start(&svc, FLOW, &alias_arn).await;
+        let exec_id = arn.rsplit('/').next().unwrap();
+        let snap = body(
+            handle_get_execution_flow_snapshot(
+                &svc,
+                &cn_request(),
+                &exec_body(FLOW, ALIAS_V1, exec_id),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(snap["flowVersion"], "1");
+        assert_eq!(snap["flowAliasIdentifier"], ALIAS_V1);
+        assert_eq!(snap["executionRoleArn"], V1_ROLE);
+        assert_eq!(snap["customerEncryptionKeyArn"], V1_KEY);
+        let def: Value = serde_json::from_str(snap["definition"].as_str().unwrap()).unwrap();
+        assert_eq!(def, v1_definition());
 
         let listed = body(
-            handle_list_flow_executions(&svc, &cn_request(), &json!({"flowIdentifier": flow_arn}))
+            handle_list_flow_executions(&svc, &cn_request(), &json!({"flowIdentifier": FLOW}))
                 .await
                 .unwrap(),
         );
         let summaries = listed["flowExecutionSummaries"].as_array().unwrap();
-        assert_eq!(summaries.len(), 1, "{listed}");
-        assert_eq!(summaries[0]["flowIdentifier"], "ABCDEFGHIJ");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0]["flowVersion"], "1");
+        assert_eq!(summaries[0]["status"], "Running");
+    }
 
-        handle_invoke_flow(
+    #[tokio::test]
+    async fn unknown_or_foreign_executions_are_not_found() {
+        let (svc, _) = flow_svc();
+        let arn = start(&svc, FLOW, "TSTALIASID").await;
+        let other = start(&svc, OTHER_FLOW, OTHER_ALIAS).await;
+        let req = cn_request();
+        // Unknown execution id.
+        let err =
+            handle_get_execution_flow_snapshot(&svc, &req, &exec_body(FLOW, "TSTALIASID", "nope"))
+                .await
+                .err()
+                .expect("expected an error");
+        assert_eq!(code(err), "ResourceNotFoundException");
+        // An execution of another flow, asked for under FLOW.
+        for handler_result in [
+            handle_get_execution_flow_snapshot(&svc, &req, &exec_body(FLOW, "TSTALIASID", &other))
+                .await,
+            handle_get_flow_execution(&svc, &req, &exec_body(FLOW, "TSTALIASID", &other)).await,
+            handle_stop_flow_execution(&svc, &req, &exec_body(FLOW, "TSTALIASID", &other)).await,
+            handle_stop_flow_execution(&svc, &req, &exec_body(FLOW, "TSTALIASID", "nope")).await,
+        ] {
+            assert_eq!(
+                code(handler_result.err().expect("expected an error")),
+                "ResourceNotFoundException"
+            );
+        }
+        // The foreign stop left the other execution running.
+        let got = body(
+            handle_get_flow_execution(&svc, &req, &exec_body(OTHER_FLOW, OTHER_ALIAS, &other))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(got["status"], "Running");
+        // ListFlowExecutionEvents is scoped the same way.
+        let mut events_req = cn_request();
+        events_req
+            .query_params
+            .insert("eventType".into(), "Flow".into());
+        let err = handle_list_flow_execution_events(
+            &svc,
+            &events_req,
+            &exec_body(FLOW, "TSTALIASID", &other),
+        )
+        .await
+        .err()
+        .expect("expected an error");
+        assert_eq!(code(err), "ResourceNotFoundException");
+        handle_list_flow_execution_events(&svc, &events_req, &exec_body(FLOW, "TSTALIASID", &arn))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_aborts_a_running_execution_once() {
+        let (svc, _) = flow_svc();
+        let arn = start(&svc, FLOW, "TSTALIASID").await;
+        let req = cn_request();
+        let stopped = body(
+            handle_stop_flow_execution(&svc, &req, &exec_body(FLOW, "TSTALIASID", &arn))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(stopped["executionArn"], arn.as_str());
+        assert_eq!(stopped["status"], "Aborted");
+        let got = body(
+            handle_get_flow_execution(&svc, &req, &exec_body(FLOW, "TSTALIASID", &arn))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(got["status"], "Aborted");
+        let ended = got["endedAt"].clone();
+        assert!(ended.is_string());
+        // Stopping again reports the terminal status without re-ending it.
+        let again = body(
+            handle_stop_flow_execution(&svc, &req, &exec_body(FLOW, "TSTALIASID", &arn))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(again["status"], "Aborted");
+        let got = body(
+            handle_get_flow_execution(&svc, &req, &exec_body(FLOW, "TSTALIASID", &arn))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(got["endedAt"], ended);
+    }
+
+    #[tokio::test]
+    async fn invoke_flow_records_the_routed_version_and_caller_execution_id() {
+        let (svc, _) = flow_svc();
+        let resp = handle_invoke_flow(
             &svc,
             &cn_request(),
             &json!({
-                "flowIdentifier": flow_arn,
-                "flowAliasIdentifier": "TSTALIASID",
+                "flowIdentifier": FLOW,
+                "flowAliasIdentifier": ALIAS_V1,
                 "inputs": [],
+                "executionId": "my-execution-1",
             }),
         )
         .await
         .unwrap();
+        assert_eq!(
+            resp.headers["x-amz-bedrock-flow-execution-id"],
+            "my-execution-1"
+        );
         let accts = svc.state.read();
-        for exec in accts.accounts["123456789012"].flow_executions.values() {
-            assert_eq!(exec.flow_id, "ABCDEFGHIJ");
-            assert!(
-                exec.execution_arn.starts_with(expected_prefix),
-                "{}",
-                exec.execution_arn
-            );
-        }
+        let exec = &accts.accounts[ACCT].flow_executions["my-execution-1"];
+        assert_eq!(exec.flow_version, "1");
+        assert_eq!(exec.status, "Succeeded");
+        assert!(exec.ended_at.is_some());
+        assert_eq!(
+            exec.execution_arn,
+            format!("arn:aws-cn:bedrock:cn-north-1:{ACCT}:flow/{FLOW}/alias/{ALIAS_V1}/execution/my-execution-1")
+        );
+        assert_eq!(exec.execution_role_arn.as_deref(), Some(V1_ROLE));
     }
 }
