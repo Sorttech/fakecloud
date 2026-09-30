@@ -723,6 +723,80 @@ mod tests {
         );
     }
 
+    /// A caller-named key is reported as the key ARN it names: an alias name
+    /// or ARN and a bare key id resolve to the target key's ARN, an
+    /// AWS-managed alias to that region's AWS-managed key, and a key KMS does
+    /// not know (or no hook) is reported as given.
+    #[test]
+    fn named_keys_resolve_to_their_key_arn() {
+        use fakecloud_core::delivery::{kms_key_arn_or_aws_managed, resolve_named_kms_key_arn};
+        let acct = "123456789012";
+        let (state, hook) = crate::test_support::kms_hook(acct);
+        let h = Some(hook.as_ref());
+        let target =
+            fakecloud_core::delivery::aws_managed_kms_key_arn(h, acct, "us-east-1", "backup")
+                .unwrap();
+        let target_id = key_id_from_arn(&target).to_string();
+        {
+            let mut accounts = state.write();
+            accounts.get_or_create(acct).insert_alias(
+                "us-east-1",
+                crate::state::KmsAlias {
+                    alias_name: "alias/mine".to_string(),
+                    alias_arn: format!("arn:aws:kms:us-east-1:{acct}:alias/mine"),
+                    target_key_id: target_id.clone(),
+                    creation_date: 0.0,
+                },
+            );
+        }
+        let resolve =
+            |key: &str, region: &str| resolve_named_kms_key_arn(h, key, acct, region, "rds");
+        assert_eq!(resolve("alias/mine", "us-east-1"), target);
+        assert_eq!(
+            resolve(
+                &format!("arn:aws:kms:us-east-1:{acct}:alias/mine"),
+                "us-east-1"
+            ),
+            target
+        );
+        assert_eq!(resolve(&target_id, "us-east-1"), target);
+        assert_eq!(resolve(&target, "us-east-1"), target);
+
+        let rds_west = resolve("alias/aws/rds", "us-west-2");
+        crate::test_support::assert_aws_managed_key(
+            &state,
+            acct,
+            "us-west-2",
+            &rds_west,
+            "alias/aws/rds",
+        );
+        // An AWS-managed alias ARN names its own region.
+        let rds_east = resolve(
+            &format!("arn:aws:kms:us-east-1:{acct}:alias/aws/rds"),
+            "us-west-2",
+        );
+        assert!(rds_east.starts_with("arn:aws:kms:us-east-1:"), "{rds_east}");
+        assert_ne!(rds_east, rds_west);
+
+        assert_eq!(resolve("alias/unknown", "us-east-1"), "alias/unknown");
+        assert_eq!(
+            resolve_named_kms_key_arn(None, "alias/mine", acct, "us-east-1", "rds"),
+            "alias/mine"
+        );
+        // No key named: the AWS-managed key; an empty name counts as none.
+        assert_eq!(
+            kms_key_arn_or_aws_managed(h, Some(""), acct, "us-west-2", "rds").as_deref(),
+            Some(rds_west.as_str())
+        );
+        assert_eq!(
+            kms_key_arn_or_aws_managed(h, Some("alias/mine"), acct, "us-east-1", "rds").as_deref(),
+            Some(target.as_str())
+        );
+        // A customer alias names a key only in its own region: elsewhere it
+        // is unresolvable and reported as given.
+        assert_eq!(resolve("alias/mine", "us-west-2"), "alias/mine");
+    }
+
     /// A managed alias pre-listed by ListAliases (in the listing region) is
     /// the key that region's services report; other regions mint their own.
     #[test]

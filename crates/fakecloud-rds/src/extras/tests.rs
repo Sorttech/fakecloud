@@ -6589,3 +6589,232 @@ fn kms_key_id_is_expanded_in_the_regions_partition() {
         "arn:aws:kms:us-east-1:000000000000:key/1234abcd"
     );
 }
+
+/// The `<KmsKeyId>` a response reports, if any.
+fn reported_kms_key(resp: &fakecloud_core::service::AwsResponse) -> Option<String> {
+    let xml = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
+    let start = xml.find("<KmsKeyId>")? + "<KmsKeyId>".len();
+    let end = xml[start..].find("</KmsKeyId>")? + start;
+    Some(xml[start..end].to_string())
+}
+
+/// An RDS service over fresh state with a KMS hook, plus the KMS state.
+fn svc_with_kms() -> (fakecloud_kms::SharedKmsState, RdsService) {
+    let (kms, hook) = fakecloud_kms::test_support::kms_hook("000000000000");
+    (kms, svc().with_kms_hook(hook))
+}
+
+async fn handle_ok(
+    svc: &RdsService,
+    action: &str,
+    params: &[(&str, &str)],
+) -> fakecloud_core::service::AwsResponse {
+    use fakecloud_core::service::AwsService;
+    match svc.handle(req(action, params)).await {
+        Ok(r) => r,
+        Err(e) => panic!("{action} failed: {e:?}"),
+    }
+}
+
+/// A cluster encrypted without a named key reports the account's AWS-managed
+/// `aws/rds` key for the region (a real KMS key); the key follows the cluster
+/// into its snapshots, copies and restores, and a restore that names a key is
+/// encrypted with that key's ARN.
+#[tokio::test]
+async fn encrypted_cluster_reports_the_aws_managed_rds_key() {
+    let (kms, svc) = svc_with_kms();
+    let created = handle_ok(
+        &svc,
+        "CreateDBCluster",
+        &[
+            ("DBClusterIdentifier", "enc"),
+            ("Engine", "aurora-postgresql"),
+            ("StorageEncrypted", "true"),
+        ],
+    )
+    .await;
+    let key = reported_kms_key(&created).expect("encrypted cluster reports a key");
+    fakecloud_kms::test_support::assert_aws_managed_key(
+        &kms,
+        "000000000000",
+        "us-east-1",
+        &key,
+        "alias/aws/rds",
+    );
+    let described = handle_ok(
+        &svc,
+        "DescribeDBClusters",
+        &[("DBClusterIdentifier", "enc")],
+    )
+    .await;
+    assert_eq!(reported_kms_key(&described).as_deref(), Some(key.as_str()));
+
+    let plain = handle_ok(
+        &svc,
+        "CreateDBCluster",
+        &[
+            ("DBClusterIdentifier", "plain"),
+            ("Engine", "aurora-postgresql"),
+        ],
+    )
+    .await;
+    assert_eq!(reported_kms_key(&plain), None);
+
+    let snap = handle_ok(
+        &svc,
+        "CreateDBClusterSnapshot",
+        &[
+            ("DBClusterSnapshotIdentifier", "s1"),
+            ("DBClusterIdentifier", "enc"),
+        ],
+    )
+    .await;
+    assert_eq!(reported_kms_key(&snap).as_deref(), Some(key.as_str()));
+    let described = handle_ok(
+        &svc,
+        "DescribeDBClusterSnapshots",
+        &[("DBClusterSnapshotIdentifier", "s1")],
+    )
+    .await;
+    assert_eq!(reported_kms_key(&described).as_deref(), Some(key.as_str()));
+    handle_ok(
+        &svc,
+        "CopyDBClusterSnapshot",
+        &[
+            ("SourceDBClusterSnapshotIdentifier", "s1"),
+            ("TargetDBClusterSnapshotIdentifier", "s1-copy"),
+        ],
+    )
+    .await;
+    let copy = handle_ok(
+        &svc,
+        "DescribeDBClusterSnapshots",
+        &[("DBClusterSnapshotIdentifier", "s1-copy")],
+    )
+    .await;
+    assert_eq!(reported_kms_key(&copy).as_deref(), Some(key.as_str()));
+
+    handle_ok(
+        &svc,
+        "RestoreDBClusterFromSnapshot",
+        &[
+            ("DBClusterIdentifier", "restored"),
+            ("SnapshotIdentifier", "s1"),
+            ("Engine", "aurora-postgresql"),
+        ],
+    )
+    .await;
+    let restored = handle_ok(
+        &svc,
+        "DescribeDBClusters",
+        &[("DBClusterIdentifier", "restored")],
+    )
+    .await;
+    assert_eq!(reported_kms_key(&restored).as_deref(), Some(key.as_str()));
+    handle_ok(
+        &svc,
+        "RestoreDBClusterToPointInTime",
+        &[
+            ("DBClusterIdentifier", "pitr"),
+            ("SourceDBClusterIdentifier", "enc"),
+        ],
+    )
+    .await;
+    let pitr = handle_ok(
+        &svc,
+        "DescribeDBClusters",
+        &[("DBClusterIdentifier", "pitr")],
+    )
+    .await;
+    assert_eq!(reported_kms_key(&pitr).as_deref(), Some(key.as_str()));
+
+    // Restoring an unencrypted snapshot with a named key encrypts the new
+    // cluster with it, reported as the key's ARN rather than the alias given.
+    handle_ok(
+        &svc,
+        "CreateDBClusterSnapshot",
+        &[
+            ("DBClusterSnapshotIdentifier", "plain-snap"),
+            ("DBClusterIdentifier", "plain"),
+        ],
+    )
+    .await;
+    handle_ok(
+        &svc,
+        "RestoreDBClusterFromSnapshot",
+        &[
+            ("DBClusterIdentifier", "named"),
+            ("SnapshotIdentifier", "plain-snap"),
+            ("Engine", "aurora-postgresql"),
+            ("KmsKeyId", "alias/aws/rds"),
+        ],
+    )
+    .await;
+    let named = handle_ok(
+        &svc,
+        "DescribeDBClusters",
+        &[("DBClusterIdentifier", "named")],
+    )
+    .await;
+    let xml = String::from_utf8(named.body.expect_bytes().to_vec()).unwrap();
+    assert!(
+        xml.contains("<StorageEncrypted>true</StorageEncrypted>"),
+        "{xml}"
+    );
+    assert_eq!(reported_kms_key(&named).as_deref(), Some(key.as_str()));
+
+    // RestoreDBClusterFromS3 honors StorageEncrypted too.
+    let from_s3 = handle_ok(
+        &svc,
+        "RestoreDBClusterFromS3",
+        &[
+            ("DBClusterIdentifier", "from-s3"),
+            ("Engine", "aurora-mysql"),
+            ("MasterUsername", "admin"),
+            ("SourceEngine", "mysql"),
+            ("SourceEngineVersion", "8.0.36"),
+            ("S3BucketName", "bucket"),
+            ("S3IngestionRoleArn", "arn:aws:iam::000000000000:role/r"),
+            ("StorageEncrypted", "true"),
+        ],
+    )
+    .await;
+    assert_eq!(reported_kms_key(&from_s3).as_deref(), Some(key.as_str()));
+}
+
+/// A DB instance's requested storage encryption: encrypted storage with no
+/// key named uses the region's AWS-managed `aws/rds` key, a named alias
+/// reports its key's ARN, and unencrypted storage keeps a named key as given.
+#[test]
+fn instance_storage_encryption_resolves_its_key() {
+    let (kms, svc) = svc_with_kms();
+    let (encrypted, key) = svc
+        .requested_storage_encryption(&req("CreateDBInstance", &[("StorageEncrypted", "true")]))
+        .unwrap();
+    assert!(encrypted);
+    let key = key.expect("encrypted storage reports a key");
+    fakecloud_kms::test_support::assert_aws_managed_key(
+        &kms,
+        "000000000000",
+        "us-east-1",
+        &key,
+        "alias/aws/rds",
+    );
+    let (_, named) = svc
+        .requested_storage_encryption(&req(
+            "CreateDBInstance",
+            &[("StorageEncrypted", "true"), ("KmsKeyId", "alias/aws/rds")],
+        ))
+        .unwrap();
+    assert_eq!(named.as_deref(), Some(key.as_str()));
+    assert_eq!(
+        svc.requested_storage_encryption(&req("CreateDBInstance", &[("KmsKeyId", "k")]))
+            .unwrap(),
+        (false, Some("k".to_string()))
+    );
+    assert_eq!(
+        svc.requested_storage_encryption(&req("CreateDBInstance", &[]))
+            .unwrap(),
+        (false, None)
+    );
+}

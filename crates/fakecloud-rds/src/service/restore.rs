@@ -359,6 +359,8 @@ impl RdsService {
         if let Some(ref name) = db_subnet_group_name {
             instance.db_subnet_group_name = Some(name.clone());
         }
+        (instance.storage_encrypted, instance.kms_key_id) =
+            self.requested_storage_encryption(request)?;
 
         self.state
             .write()

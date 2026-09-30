@@ -23,6 +23,7 @@ fakecloud implements **53 of 53** KMS operations at 100% Smithy conformance.
 - **Custom key stores** — CRUD (records only)
 - **Key replica** — ReplicateKey
 - **Cross-service KMS hook** — S3 (SSE-KMS), SQS, SNS, DynamoDB, Secrets Manager, and SSM SecureString call into KMS for real encrypt/decrypt under the hood. Every call is recorded at `/_fakecloud/kms/usage` so test code can assert which service principal triggered which operation on which key with which encryption context. AWS-managed aliases (`aws/s3`, `aws/sqs`, `aws/sns`, `aws/dynamodb`, `aws/secretsmanager`, `aws/ssm`, ...) auto-provision on first use, one AWS-managed key per account and region, which that region's `alias/aws/<service>` names.
+- **Default keys on encrypted resources** - a resource encrypted at rest without a named key reports the ARN of its service's AWS-managed key, a real key minted once per account and region that `DescribeKey alias/aws/<service>` resolves to: `aws/rds` for RDS instances and clusters, DocumentDB and Neptune clusters, `aws/ebs` for EBS volumes and snapshots (or the account's EBS default key when `ModifyEbsDefaultKmsKeyId` customized it), and `aws/elasticfilesystem`, `aws/redshift`, `aws/dms`, `aws/kafka`, `aws/timestream`, `aws/codeartifact`, `aws/codecommit` for their services. A key named by alias (resolved in the resource's region) or key id is reported as the ARN of the key it names. CloudFormation-provisioned resources report the same keys.
 
 ## Introspection
 

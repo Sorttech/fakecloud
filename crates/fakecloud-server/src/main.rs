@@ -2506,8 +2506,9 @@ async fn main() {
         } else {
             None
         };
-    let mut ec2_service =
-        Ec2Service::with_state(ec2_state.clone()).with_runtime(ec2_runtime.clone());
+    let mut ec2_service = Ec2Service::with_state(ec2_state.clone())
+        .with_runtime(ec2_runtime.clone())
+        .with_kms_hook(Some(kms_hook_for_services.clone()));
     if let Some(store) = ec2_snapshot_store.clone() {
         ec2_service = ec2_service.with_snapshot_store(store);
     }
@@ -3155,7 +3156,8 @@ async fn main() {
         } else {
             None
         };
-    let mut rds_service = RdsService::new(rds_state.clone());
+    let mut rds_service =
+        RdsService::new(rds_state.clone()).with_kms_hook(kms_hook_for_services.clone());
     if let Some(ref rt) = rds_runtime {
         rds_service = rds_service.with_runtime(rt.clone());
     }
@@ -3249,7 +3251,8 @@ async fn main() {
         } else {
             None
         };
-    let mut docdb_service = fakecloud_docdb::DocDbService::new(docdb_state.clone());
+    let mut docdb_service = fakecloud_docdb::DocDbService::new(docdb_state.clone())
+        .with_kms_hook(kms_hook_for_services.clone());
     if let Some(store) = docdb_snapshot_store {
         docdb_service = docdb_service.with_snapshot_store(store);
     }
@@ -3307,7 +3310,8 @@ async fn main() {
         } else {
             None
         };
-    let mut neptune_service = fakecloud_neptune::NeptuneService::new(neptune_state.clone());
+    let mut neptune_service = fakecloud_neptune::NeptuneService::new(neptune_state.clone())
+        .with_kms_hook(kms_hook_for_services.clone());
     if let Some(store) = neptune_snapshot_store {
         neptune_service = neptune_service.with_snapshot_store(store);
     }

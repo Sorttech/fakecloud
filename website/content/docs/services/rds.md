@@ -12,6 +12,7 @@ fakecloud implements **163 of 163** RDS operations at 100% Smithy conformance. D
 - **Real engines via Docker** — PostgreSQL, MySQL, MariaDB, Oracle (gvenzl/oracle-free), SQL Server (mssql/server Express), Db2 (db2_community)
 - **Snapshots** — automated and manual, CreateDBSnapshot, RestoreDBInstanceFromDBSnapshot, CopyDBSnapshot, DeleteDBSnapshot
 - **Read replicas** — CreateDBInstanceReadReplica, PromoteReadReplica
+- **Storage encryption** - `StorageEncrypted` without a `KmsKeyId` encrypts with the account's AWS-managed `aws/rds` key for the region and reports its key ARN; a key named by alias or key id is reported as its key ARN. Aurora cluster members report their cluster's encryption and key, and snapshots, copies, read replicas and restores carry the source's key (a restore or copy that names a `KmsKeyId` uses it).
 - **Parameter groups** — DBParameterGroup and DBClusterParameterGroup CRUD, parameter management
 - **Option groups** — CRUD
 - **Subnet groups** — CRUD

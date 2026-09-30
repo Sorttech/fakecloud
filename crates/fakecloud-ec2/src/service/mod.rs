@@ -922,6 +922,10 @@ pub struct Ec2Service {
     pub(crate) runtime: Option<Arc<Ec2Runtime>>,
     pub(crate) snapshot_store: Option<Arc<dyn SnapshotStore>>,
     pub(crate) snapshot_lock: Arc<AsyncMutex<()>>,
+    /// KMS access, so encrypted EBS volumes and snapshots report a real key
+    /// ARN (the account's EBS default key, the AWS-managed `aws/ebs` key
+    /// unless customized) and a named key reports its ARN.
+    pub(crate) kms_hook: Option<Arc<dyn fakecloud_core::delivery::KmsHook>>,
 }
 
 impl Ec2Service {
@@ -936,6 +940,7 @@ impl Ec2Service {
             runtime: None,
             snapshot_store: None,
             snapshot_lock: Arc::new(AsyncMutex::new(())),
+            kms_hook: None,
         }
     }
 
@@ -947,6 +952,7 @@ impl Ec2Service {
             runtime: None,
             snapshot_store: None,
             snapshot_lock: Arc::new(AsyncMutex::new(())),
+            kms_hook: None,
         }
     }
 
@@ -968,6 +974,8 @@ impl Ec2Service {
             "DeleteRouteTable" => routing::delete_route_table(self, request),
             "CreateInternetGateway" => routing::create_internet_gateway(self, request),
             "DeleteInternetGateway" => routing::delete_internet_gateway(self, request),
+            "CreateVolume" => volume::create_volume(self, request),
+            "DeleteVolume" => volume::delete_volume(self, request),
             // Attribute / rule application the CloudFormation provisioner issues
             // after a Create so VPC DNS attributes, subnet MapPublicIpOnLaunch,
             // and inline SecurityGroup ingress/egress rules from a template are
@@ -994,6 +1002,15 @@ impl Ec2Service {
             }
             other => Err(AwsServiceError::action_not_implemented("ec2", other)),
         }
+    }
+
+    /// Attach the KMS hook EBS encryption resolves keys through.
+    pub fn with_kms_hook(
+        mut self,
+        hook: Option<Arc<dyn fakecloud_core::delivery::KmsHook>>,
+    ) -> Self {
+        self.kms_hook = hook;
+        self
     }
 
     /// Attach a container runtime so `RunInstances` boots real containers.

@@ -132,6 +132,17 @@ impl RdsService {
             replica.domain_dns_ips = parse_string_member_list(request, "DomainDnsIps");
         }
 
+        // A replica of an encrypted source that names its own key is
+        // encrypted with that key (a cross-region replica must name one);
+        // otherwise it keeps the source's key, copied by the builder.
+        if replica.storage_encrypted {
+            if let Some(named) = optional_query_param(request, "KmsKeyId").filter(|k| !k.is_empty())
+            {
+                replica.kms_key_id =
+                    self.storage_kms_key(Some(&named), &request.account_id, &request.region);
+            }
+        }
+
         replica.db_instance_status = "creating".to_string();
         replica.endpoint_address = String::new();
         replica.port = 0;

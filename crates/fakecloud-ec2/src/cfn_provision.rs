@@ -17,13 +17,15 @@ pub use crate::service::instance::{CfnInstanceAttrs, CfnInstanceSpec};
 
 /// Synchronously create a control-plane `AWS::EC2::Instance` record and return
 /// its Ref/GetAtt attributes (instance id, private/public IP, AZ).
+/// `kms_hook` resolves the keys of encrypted block-device volumes.
 pub fn cfn_create(
     state: SharedEc2State,
+    kms_hook: Option<Arc<dyn fakecloud_core::delivery::KmsHook>>,
     account_id: &str,
     region: &str,
     spec: &CfnInstanceSpec,
 ) -> CfnInstanceAttrs {
-    let svc = Ec2Service::with_state(state);
+    let svc = Ec2Service::with_state(state).with_kms_hook(kms_hook);
     cfn_create_instance(&svc, account_id, region, spec)
 }
 

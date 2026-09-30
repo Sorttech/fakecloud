@@ -34,6 +34,11 @@ persists across restarts in persistent mode:
   `ModifyDBClusterSnapshotAttribute`, `DescribeDBClusterSnapshotAttributes`.
   `RestoreDBClusterFromSnapshot` and `RestoreDBClusterToPointInTime`
   recreate a cluster.
+- **Storage encryption** - `StorageEncrypted` without a `KmsKeyId`
+  encrypts with the account's AWS-managed `aws/rds` key for the region and
+  reports its key ARN (a named alias or key id is reported as its key ARN).
+  Member instances, snapshots, copies and restores carry the cluster's key;
+  a restore or copy that names a `KmsKeyId` uses it.
 - **Parameter groups** — create / copy / delete / describe / modify /
   reset cluster parameter groups; set values round-trip through
   `DescribeDBClusterParameters`. `DescribeEngineDefaultClusterParameters`

@@ -97,6 +97,46 @@ fn sg_rule_params(group_id: &str, rules: &[Value]) -> HashMap<String, String> {
     p
 }
 
+/// A CFN scalar (string, number or bool) as its query-string form.
+fn cfn_scalar(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// CFN `BlockDeviceMappings` (on `AWS::EC2::Instance`) in RunInstances query
+/// form: `BlockDeviceMapping.N.DeviceName`, `.VirtualName`, `.NoDevice` and
+/// `.Ebs.<field>`, so the instance gets the EBS volumes a direct launch with
+/// the same mappings creates.
+fn cfn_block_device_params(props: &Value) -> HashMap<String, String> {
+    let mut params = HashMap::new();
+    let Some(mappings) = props.get("BlockDeviceMappings").and_then(|v| v.as_array()) else {
+        return params;
+    };
+    for (i, m) in mappings.iter().enumerate() {
+        let prefix = format!("BlockDeviceMapping.{}", i + 1);
+        for field in ["DeviceName", "VirtualName"] {
+            if let Some(v) = m.get(field).and_then(cfn_scalar) {
+                params.insert(format!("{prefix}.{field}"), v);
+            }
+        }
+        if m.get("NoDevice").is_some_and(|v| !v.is_null()) {
+            params.insert(format!("{prefix}.NoDevice"), String::new());
+        }
+        if let Some(ebs) = m.get("Ebs").and_then(|v| v.as_object()) {
+            for (field, v) in ebs {
+                if let Some(v) = cfn_scalar(v) {
+                    params.insert(format!("{prefix}.Ebs.{field}"), v);
+                }
+            }
+        }
+    }
+    params
+}
+
 impl ResourceProvisioner {
     fn ec2_request(&self, action: &str, params: HashMap<String, String>) -> AwsRequest {
         AwsRequest {
@@ -126,7 +166,8 @@ impl ResourceProvisioner {
         action: &str,
         params: HashMap<String, String>,
     ) -> Result<String, String> {
-        let svc = Ec2Service::with_state(self.ec2_state.clone());
+        let svc =
+            Ec2Service::with_state(self.ec2_state.clone()).with_kms_hook(self.kms_hook.clone());
         let req = self.ec2_request(action, params);
         let resp = svc
             .provision_sync(&req)
@@ -554,10 +595,12 @@ impl ResourceProvisioner {
             monitoring: prop_bool(props, "Monitoring").unwrap_or(false),
             iam_instance_profile_arn,
             iam_instance_profile_name,
+            block_device_params: cfn_block_device_params(props),
         };
 
         let attrs = fakecloud_ec2::cfn_provision::cfn_create(
             self.ec2_state.clone(),
+            self.kms_hook.clone(),
             &self.account_id,
             &self.region,
             &spec,
@@ -758,6 +801,38 @@ impl ResourceProvisioner {
 
     /// Delete an EC2 resource by its physical id, routing through the real
     /// handler so dependent default resources are cleaned up correctly.
+    /// `AWS::EC2::Volume` through the real CreateVolume handler, so a stack
+    /// volume is sized, typed and encrypted exactly as a direct CreateVolume
+    /// (encryption by default, the account's EBS default key, a named key
+    /// reported as its ARN, a source snapshot's size and key).
+    pub(super) fn create_ec2_volume(
+        &self,
+        resource: &ResourceDefinition,
+    ) -> Result<ProvisionResult, String> {
+        let props = &resource.properties;
+        let mut params = HashMap::new();
+        for field in [
+            "AvailabilityZone",
+            "Size",
+            "VolumeType",
+            "Iops",
+            "Throughput",
+            "Encrypted",
+            "KmsKeyId",
+            "SnapshotId",
+            "MultiAttachEnabled",
+            "OutpostArn",
+        ] {
+            if let Some(v) = props.get(field).and_then(cfn_scalar) {
+                params.insert(field.to_string(), v);
+            }
+        }
+        self.ec2_tag_params(props, "volume", &mut params);
+        let body = self.ec2_dispatch("CreateVolume", params)?;
+        let id = xml_elem(&body, "volumeId").ok_or("CreateVolume returned no volumeId")?;
+        Ok(ProvisionResult::new(id.clone()).with("VolumeId", id))
+    }
+
     pub(super) fn delete_ec2_resource(
         &self,
         resource_type: &str,
@@ -769,6 +844,7 @@ impl ResourceProvisioner {
             "AWS::EC2::SecurityGroup" => ("DeleteSecurityGroup", "GroupId"),
             "AWS::EC2::InternetGateway" => ("DeleteInternetGateway", "InternetGatewayId"),
             "AWS::EC2::RouteTable" => ("DeleteRouteTable", "RouteTableId"),
+            "AWS::EC2::Volume" => ("DeleteVolume", "VolumeId"),
             _ => return Ok(()),
         };
         let mut params = HashMap::new();
@@ -787,7 +863,8 @@ impl ResourceProvisioner {
             | ("AWS::EC2::SecurityGroup", "GroupId")
             | ("AWS::EC2::SecurityGroup", "Id")
             | ("AWS::EC2::InternetGateway", "InternetGatewayId")
-            | ("AWS::EC2::RouteTable", "RouteTableId") => Some(resource.physical_id.clone()),
+            | ("AWS::EC2::RouteTable", "RouteTableId")
+            | ("AWS::EC2::Volume", "VolumeId") => Some(resource.physical_id.clone()),
             _ => resource.attributes.get(attribute).cloned(),
         }
     }

@@ -403,14 +403,7 @@ impl ResourceProvisioner {
             .get("StorageType")
             .and_then(|v| v.as_str())
             .map(String::from);
-        let storage_encrypted = props
-            .get("StorageEncrypted")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let kms_key_id = props
-            .get("KmsKeyId")
-            .and_then(|v| v.as_str())
-            .map(String::from);
+        let (storage_encrypted, kms_key_id) = self.rds_instance_storage_encryption(props);
         let iam_database_authentication_enabled = props
             .get("EnableIAMDatabaseAuthentication")
             .and_then(|v| v.as_bool())
@@ -781,6 +774,50 @@ impl ResourceProvisioner {
         Ok(())
     }
 
+    /// An `AWS::RDS::DBInstance`'s storage encryption and key, as the
+    /// `CreateDBInstance` API path reports them: an Aurora cluster member
+    /// takes its cluster's; otherwise encrypted storage uses the named key's
+    /// ARN or the AWS-managed `aws/rds` key, and unencrypted storage keeps any
+    /// named key as given. Resolved before the RDS state lock is taken.
+    fn rds_instance_storage_encryption(&self, props: &serde_json::Value) -> (bool, Option<String>) {
+        let cluster = props
+            .get("DBClusterIdentifier")
+            .and_then(|v| v.as_str())
+            .and_then(|cluster_id| {
+                let accounts = self.rds_state.read();
+                let cluster = accounts
+                    .get(&self.account_id)?
+                    .extras
+                    .get("clusters")?
+                    .get(cluster_id)?;
+                Some((
+                    cluster["StorageEncrypted"].as_bool().unwrap_or(false),
+                    cluster["KmsKeyId"].as_str().map(String::from),
+                ))
+            });
+        if let Some(inherited) = cluster {
+            return inherited;
+        }
+        let named = props.get("KmsKeyId").and_then(|v| v.as_str());
+        if props.get("StorageEncrypted").and_then(|v| v.as_bool()) == Some(true) {
+            (true, self.kms_key_arn_or_aws_managed(named, "rds"))
+        } else {
+            (false, named.map(String::from))
+        }
+    }
+
+    /// An `AWS::RDS::DBCluster`'s storage key: the named key's ARN or the
+    /// AWS-managed `aws/rds` key when storage is encrypted, else any named
+    /// key as given.
+    fn rds_cluster_storage_key(&self, props: &serde_json::Value) -> Option<String> {
+        let named = props.get("KmsKeyId").and_then(|v| v.as_str());
+        if props.get("StorageEncrypted").and_then(|v| v.as_bool()) == Some(true) {
+            self.kms_key_arn_or_aws_managed(named, "rds")
+        } else {
+            named.map(String::from)
+        }
+    }
+
     pub(super) fn create_rds_db_cluster(
         &self,
         resource: &ResourceDefinition,
@@ -805,6 +842,7 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .map(String::from);
         let port = props.get("Port").and_then(|v| v.as_i64()).unwrap_or(5432);
+        let kms_key_id = self.rds_cluster_storage_key(props);
         let mut accounts = self.rds_state.write();
         let state = accounts.get_or_create(&self.account_id);
         let arn = fakecloud_rds::rds_arn(&self.region, &self.account_id, "cluster", &identifier);
@@ -834,7 +872,7 @@ impl ResourceProvisioner {
             "DBSubnetGroup": props.get("DBSubnetGroupName").and_then(|v| v.as_str()),
             "VpcSecurityGroupIds": props.get("VpcSecurityGroupIds").cloned().unwrap_or(serde_json::json!([])),
             "StorageEncrypted": props.get("StorageEncrypted").and_then(|v| v.as_bool()).unwrap_or(false),
-            "KmsKeyId": props.get("KmsKeyId").and_then(|v| v.as_str()),
+            "KmsKeyId": kms_key_id,
             "DeletionProtection": props.get("DeletionProtection").and_then(|v| v.as_bool()).unwrap_or(false),
             "ClusterCreateTime": Utc::now().to_rfc3339(),
             "EnabledCloudwatchLogsExports": props.get("EnableCloudwatchLogsExports").cloned().unwrap_or(serde_json::json!([])),
@@ -869,6 +907,11 @@ impl ResourceProvisioner {
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
         let identifier = existing.physical_id.clone();
+        // Resolved before the RDS state lock; applied below only when the
+        // update turns encryption on for a cluster without a key.
+        let encrypt_key = (props.get("StorageEncrypted").and_then(|v| v.as_bool()) == Some(true))
+            .then(|| self.rds_cluster_storage_key(props))
+            .flatten();
 
         let mut accounts = self.rds_state.write();
         let state = accounts.get_or_create(&self.account_id);
@@ -904,6 +947,13 @@ impl ResourceProvisioner {
         }
         if let Some(v) = props.get("StorageEncrypted").and_then(|v| v.as_bool()) {
             obj.insert("StorageEncrypted".to_string(), serde_json::json!(v));
+            if !v {
+                obj.remove("KmsKeyId");
+            } else if obj.get("KmsKeyId").is_none_or(|k| k.is_null()) {
+                if let Some(key) = encrypt_key {
+                    obj.insert("KmsKeyId".to_string(), serde_json::json!(key));
+                }
+            }
         }
         if let Some(v) = props.get("AllocatedStorage").and_then(|v| v.as_i64()) {
             obj.insert("AllocatedStorage".to_string(), serde_json::json!(v));

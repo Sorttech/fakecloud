@@ -98,6 +98,27 @@ impl ResourceProvisioner {
         }
     }
 
+    /// The DocumentDB handlers over the shared state, with the server's KMS
+    /// hook so an encrypted stack cluster reports the same key the direct API
+    /// does.
+    fn docdb_service(&self) -> fakecloud_docdb::DocDbService {
+        let svc = fakecloud_docdb::DocDbService::new(self.docdb_state.clone());
+        match &self.kms_hook {
+            Some(hook) => svc.with_kms_hook(hook.clone()),
+            None => svc,
+        }
+    }
+
+    /// The Neptune handlers over the shared state, with the server's KMS hook
+    /// (see [`Self::docdb_service`]).
+    fn neptune_service(&self) -> fakecloud_neptune::NeptuneService {
+        let svc = fakecloud_neptune::NeptuneService::new(self.neptune_state.clone());
+        match &self.kms_hook {
+            Some(hook) => svc.with_kms_hook(hook.clone()),
+            None => svc,
+        }
+    }
+
     // --- AWS::Redshift::Cluster ---
 
     pub(super) fn create_redshift_cluster(
@@ -214,7 +235,7 @@ impl ResourceProvisioner {
             .entry("Engine".to_string())
             .or_insert_with(|| "docdb".to_string());
 
-        let svc = fakecloud_docdb::DocDbService::new(self.docdb_state.clone());
+        let svc = self.docdb_service();
         let req = cluster_request(self, "docdb", "CreateDBCluster", params);
         svc.provision_sync(&req)
             .map_err(|e| format!("DocDB CreateDBCluster failed: {}", e.message()))?;
@@ -251,7 +272,7 @@ impl ResourceProvisioner {
         params.insert("DBClusterIdentifier".to_string(), id.clone());
         params.remove("NewDBClusterIdentifier");
 
-        let svc = fakecloud_docdb::DocDbService::new(self.docdb_state.clone());
+        let svc = self.docdb_service();
         let req = cluster_request(self, "docdb", "ModifyDBCluster", params);
         svc.provision_sync(&req)
             .map_err(|e| format!("DocDB ModifyDBCluster failed: {}", e.message()))?;
@@ -273,7 +294,7 @@ impl ResourceProvisioner {
     }
 
     pub(super) fn delete_docdb_cluster(&self, physical_id: &str) -> Result<(), String> {
-        let svc = fakecloud_docdb::DocDbService::new(self.docdb_state.clone());
+        let svc = self.docdb_service();
         let mut params = HashMap::new();
         params.insert("DBClusterIdentifier".to_string(), physical_id.to_string());
         params.insert("SkipFinalSnapshot".to_string(), "true".to_string());
@@ -317,7 +338,7 @@ impl ResourceProvisioner {
             .entry("Engine".to_string())
             .or_insert_with(|| "neptune".to_string());
 
-        let svc = fakecloud_neptune::NeptuneService::new(self.neptune_state.clone());
+        let svc = self.neptune_service();
         let req = cluster_request(self, "neptune", "CreateDBCluster", params);
         svc.provision_sync(&req)
             .map_err(|e| format!("Neptune CreateDBCluster failed: {}", e.message()))?;
@@ -352,7 +373,7 @@ impl ResourceProvisioner {
         params.insert("DBClusterIdentifier".to_string(), id.clone());
         params.remove("NewDBClusterIdentifier");
 
-        let svc = fakecloud_neptune::NeptuneService::new(self.neptune_state.clone());
+        let svc = self.neptune_service();
         let req = cluster_request(self, "neptune", "ModifyDBCluster", params);
         svc.provision_sync(&req)
             .map_err(|e| format!("Neptune ModifyDBCluster failed: {}", e.message()))?;
@@ -374,7 +395,7 @@ impl ResourceProvisioner {
     }
 
     pub(super) fn delete_neptune_cluster(&self, physical_id: &str) -> Result<(), String> {
-        let svc = fakecloud_neptune::NeptuneService::new(self.neptune_state.clone());
+        let svc = self.neptune_service();
         let mut params = HashMap::new();
         params.insert("DBClusterIdentifier".to_string(), physical_id.to_string());
         params.insert("SkipFinalSnapshot".to_string(), "true".to_string());

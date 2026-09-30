@@ -555,6 +555,9 @@ pub struct Snapshot {
     pub volume_size: i64,
     pub description: String,
     pub encrypted: bool,
+    /// The KMS key (ARN) an encrypted snapshot is encrypted with.
+    #[serde(default)]
+    pub kms_key_id: Option<String>,
     /// `standard` | `archive`.
     pub storage_tier: String,
     #[serde(default)]
@@ -1868,7 +1871,8 @@ pub struct Ec2State {
     /// Account-level EBS default encryption toggle.
     #[serde(default)]
     pub ebs_encryption_default: bool,
-    /// Account-level EBS default KMS key (None = `alias/aws/ebs`).
+    /// Account-level EBS default KMS key ARN, as `ModifyEbsDefaultKmsKeyId`
+    /// set it (None = the region's AWS-managed `aws/ebs` key).
     #[serde(default)]
     pub ebs_default_kms_key_id: Option<String>,
     #[serde(default)]

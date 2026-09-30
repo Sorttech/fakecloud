@@ -93,6 +93,9 @@ pub struct DocDbService {
     state: SharedDocDbState,
     snapshot_store: Option<Arc<dyn SnapshotStore>>,
     snapshot_lock: Arc<AsyncMutex<()>>,
+    /// KMS access, so encrypted storage reports a real key ARN (the
+    /// AWS-managed `aws/rds` key when none is named).
+    kms_hook: Option<Arc<dyn fakecloud_core::delivery::KmsHook>>,
 }
 
 impl DocDbService {
@@ -101,7 +104,41 @@ impl DocDbService {
             state,
             snapshot_store: None,
             snapshot_lock: Arc::new(AsyncMutex::new(())),
+            kms_hook: None,
         }
+    }
+
+    pub fn with_kms_hook(mut self, hook: Arc<dyn fakecloud_core::delivery::KmsHook>) -> Self {
+        self.kms_hook = Some(hook);
+        self
+    }
+
+    /// The key storage encrypted in the request's account and region
+    /// reports: `named` as the ARN of the key it names or, with none named,
+    /// the account's AWS-managed `aws/rds` key, which DocumentDB encrypts with
+    /// by default as RDS does. Resolved before the state lock is taken (KMS
+    /// may mint and persist the key).
+    fn storage_kms_key(&self, named: Option<&str>, req: &AwsRequest) -> Option<String> {
+        fakecloud_core::delivery::kms_key_arn_or_aws_managed(
+            self.kms_hook.as_deref(),
+            named,
+            &req.account_id,
+            &req.region,
+            "rds",
+        )
+    }
+
+    /// The request's `KmsKeyId` as its key ARN; `None` when it names none.
+    fn requested_kms_key(&self, req: &AwsRequest) -> Option<String> {
+        optional_query_param(req, "KmsKeyId")
+            .filter(|k| !k.is_empty())
+            .and_then(|k| self.storage_kms_key(Some(&k), req))
+    }
+
+    /// Whether `f` holds for the caller's account state, under a read lock;
+    /// used to reject an invalid request before resolving a KMS key.
+    fn account_check(&self, req: &AwsRequest, f: impl FnOnce(&DocDbState) -> bool) -> bool {
+        self.state.read().get(&req.account_id).is_some_and(f)
     }
 
     pub fn with_snapshot_store(mut self, store: Arc<dyn SnapshotStore>) -> Self {
@@ -497,6 +534,21 @@ impl DocDbService {
     fn create_db_cluster(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let id = required_query_param(req, "DBClusterIdentifier")?;
         let engine = required_query_param(req, "Engine")?;
+        if self.account_check(req, |st| st.clusters.contains_key(&id)) {
+            return Err(db_cluster_already_exists(&id));
+        }
+        let storage_encrypted = optional_query_param(req, "StorageEncrypted")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        // Encrypted storage with no key named uses the AWS-managed key; a
+        // named key reports its ARN. Unencrypted storage keeps any named key
+        // as given.
+        let named_key = optional_query_param(req, "KmsKeyId");
+        let kms_key_id = if storage_encrypted {
+            self.storage_kms_key(named_key.as_deref(), req)
+        } else {
+            named_key
+        };
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id);
         if st.clusters.contains_key(&id) {
@@ -526,10 +578,8 @@ impl DocDbService {
                 .unwrap_or_else(|| "default".to_string()),
             db_cluster_parameter_group: optional_query_param(req, "DBClusterParameterGroupName")
                 .unwrap_or_else(|| format!("default.{DEFAULT_FAMILY}")),
-            storage_encrypted: optional_query_param(req, "StorageEncrypted")
-                .map(|v| v == "true")
-                .unwrap_or(false),
-            kms_key_id: optional_query_param(req, "KmsKeyId"),
+            storage_encrypted,
+            kms_key_id,
             deletion_protection: optional_query_param(req, "DeletionProtection")
                 .map(|v| v == "true")
                 .unwrap_or(false),
@@ -855,6 +905,10 @@ impl DocDbService {
         let cluster_pmw = cluster.preferred_maintenance_window.clone();
         let cluster_subnet = cluster.db_subnet_group.clone();
         let cluster_engine_version = cluster.engine_version.clone();
+        // A member instance's storage is the cluster's: it reports the
+        // cluster's encryption and key.
+        let cluster_storage_encrypted = cluster.storage_encrypted;
+        let cluster_kms_key_id = cluster.kms_key_id.clone();
         let az = cluster
             .availability_zones
             .first()
@@ -887,8 +941,8 @@ impl DocDbService {
             preferred_maintenance_window: optional_query_param(req, "PreferredMaintenanceWindow")
                 .unwrap_or(cluster_pmw),
             backup_retention_period: 1,
-            storage_encrypted: false,
-            kms_key_id: None,
+            storage_encrypted: cluster_storage_encrypted,
+            kms_key_id: cluster_kms_key_id,
             db_subnet_group: cluster_subnet,
             enabled_cloudwatch_logs_exports: Vec::new(),
             instance_create_time: Utc::now(),
@@ -1044,6 +1098,9 @@ impl DocDbService {
     fn copy_db_cluster_snapshot(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let source = required_query_param(req, "SourceDBClusterSnapshotIdentifier")?;
         let target = required_query_param(req, "TargetDBClusterSnapshotIdentifier")?;
+        // A copy of an encrypted snapshot that names a key is re-encrypted
+        // with it.
+        let copy_key = self.requested_kms_key(req);
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id);
         if st.cluster_snapshots.contains_key(&target) {
@@ -1055,6 +1112,11 @@ impl DocDbService {
             .cloned()
             .ok_or_else(|| snapshot_not_found(&source))?;
         snap.source_db_cluster_snapshot_arn = Some(snap.db_cluster_snapshot_arn.clone());
+        if snap.storage_encrypted {
+            if let Some(key) = copy_key {
+                snap.kms_key_id = Some(key);
+            }
+        }
         snap.db_cluster_snapshot_identifier = target.clone();
         snap.db_cluster_snapshot_arn =
             rds_arn(&req.region, &req.account_id, "cluster-snapshot", &target);
@@ -1211,6 +1273,9 @@ impl DocDbService {
         let new_id = required_query_param(req, "DBClusterIdentifier")?;
         let snap_id = required_query_param(req, "SnapshotIdentifier")?;
         let engine = required_query_param(req, "Engine")?;
+        // A named key encrypts the restored cluster with it; without one it
+        // keeps the snapshot's encryption and key.
+        let restore_key = self.requested_kms_key(req);
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id);
         if st.clusters.contains_key(&new_id) {
@@ -1245,8 +1310,8 @@ impl DocDbService {
             db_subnet_group: optional_query_param(req, "DBSubnetGroupName")
                 .unwrap_or_else(|| "default".to_string()),
             db_cluster_parameter_group: format!("default.{DEFAULT_FAMILY}"),
-            storage_encrypted: snap.storage_encrypted,
-            kms_key_id: snap.kms_key_id.clone(),
+            storage_encrypted: restore_key.is_some() || snap.storage_encrypted,
+            kms_key_id: restore_key.or_else(|| snap.kms_key_id.clone()),
             deletion_protection: optional_query_param(req, "DeletionProtection")
                 .map(|v| v == "true")
                 .unwrap_or(false),
@@ -1282,6 +1347,9 @@ impl DocDbService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let new_id = required_query_param(req, "DBClusterIdentifier")?;
         let source_id = required_query_param(req, "SourceDBClusterIdentifier")?;
+        // A named key encrypts the restored cluster with it; without one it
+        // keeps the source's encryption and key.
+        let restore_key = self.requested_kms_key(req);
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id);
         if st.clusters.contains_key(&new_id) {
@@ -1294,6 +1362,10 @@ impl DocDbService {
             .ok_or_else(|| db_cluster_not_found(&source_id))?;
         let suffix = endpoint_suffix();
         let mut cluster = source.clone();
+        if let Some(key) = restore_key {
+            cluster.storage_encrypted = true;
+            cluster.kms_key_id = Some(key);
+        }
         cluster.db_cluster_identifier = new_id.clone();
         cluster.db_cluster_arn = cluster_arn(&req.region, &req.account_id, &new_id);
         cluster.db_cluster_resource_id = format!("cluster-{}", resource_token());
