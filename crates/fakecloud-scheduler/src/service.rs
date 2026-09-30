@@ -123,18 +123,15 @@ impl SchedulerService {
             (&Method::GET, 1, Some("schedule-groups")) => {
                 Some(("ListScheduleGroups", PathArgs::None))
             }
-            (&Method::POST, 2, Some("tags")) => Some((
-                "TagResource",
-                PathArgs::Arn(percent_decode(&effective_name)),
-            )),
-            (&Method::DELETE, 2, Some("tags")) => Some((
-                "UntagResource",
-                PathArgs::Arn(percent_decode(&effective_name)),
-            )),
-            (&Method::GET, 2, Some("tags")) => Some((
-                "ListTagsForResource",
-                PathArgs::Arn(percent_decode(&effective_name)),
-            )),
+            (&Method::POST, 2, Some("tags")) => {
+                Some(("TagResource", PathArgs::Arn(effective_name)))
+            }
+            (&Method::DELETE, 2, Some("tags")) => {
+                Some(("UntagResource", PathArgs::Arn(effective_name)))
+            }
+            (&Method::GET, 2, Some("tags")) => {
+                Some(("ListTagsForResource", PathArgs::Arn(effective_name)))
+            }
             _ => None,
         }
     }
@@ -1199,12 +1196,6 @@ fn target_json(t: &Target) -> Value {
     out
 }
 
-fn percent_decode(s: &str) -> String {
-    percent_encoding::percent_decode_str(s)
-        .decode_utf8_lossy()
-        .into_owned()
-}
-
 /// Parse a repeated query-string key into a Vec of decoded values.
 /// Scheduler uses `?TagKeys=k1&TagKeys=k2` which HashMap<String,String>
 /// can't represent faithfully; we parse raw_query instead.
@@ -1214,7 +1205,7 @@ fn parse_multi_query(raw_query: &str, key: &str) -> Vec<String> {
     raw_query
         .split('&')
         .filter(|pair| pair.starts_with(key_eq))
-        .map(|pair| percent_decode(&pair[key_eq.len()..]))
+        .map(|pair| fakecloud_core::path::percent_decode_segment(&pair[key_eq.len()..]))
         .collect()
 }
 
@@ -1261,11 +1252,7 @@ mod tests {
             Some(i) => (&path[..i], &path[i + 1..]),
             None => (path, ""),
         };
-        let path_segments: Vec<String> = p
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .collect();
+        let path_segments = fakecloud_core::path::split_path_segments(p);
         let query_params: HashMap<String, String> = q
             .split('&')
             .filter(|s| !s.is_empty())

@@ -2659,7 +2659,8 @@ mod tests {
         let locked = stub.last_request.lock();
         let dispatched = locked.as_ref().expect("stub must have received a request");
         assert_eq!(dispatched.raw_path, "/");
-        assert_eq!(dispatched.path_segments, vec![""]); // path/ splits to [""]
+        // Dispatch-shaped: empty segments dropped, as core dispatch does.
+        assert!(dispatched.path_segments.is_empty());
     }
 
     // ── H1: non-proxy HTTP uses integrationHttpMethod ──

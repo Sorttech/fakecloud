@@ -58,13 +58,6 @@ pub(crate) fn tenant_arn(region: &str, account_id: &str, name: &str) -> String {
     Arn::regional("ses", region, account_id, &format!("tenant/{name}")).to_string()
 }
 
-/// URL-decode a path segment (e.g. `test%40example.com` -> `test@example.com`).
-pub(crate) fn decode_segment(s: &str) -> String {
-    percent_encoding::percent_decode_str(s)
-        .decode_utf8_lossy()
-        .into_owned()
-}
-
 pub(crate) fn resolve_account_action(method: &Method, segs: &[String]) -> ResolvedAction {
     match (method, segs.len()) {
         (&Method::GET, 3) => Some(("GetAccount", None, None)),
@@ -114,21 +107,15 @@ pub(crate) fn resolve_identities_action(
         (&Method::PUT, 6) if segs[4] == "dkim" && segs[5] == "signing" => {
             Some(("PutEmailIdentityDkimSigningAttributes", resource, None))
         }
-        (&Method::POST, 6) if segs[4] == "policies" => Some((
-            "CreateEmailIdentityPolicy",
-            resource,
-            Some(decode_segment(&segs[5])),
-        )),
-        (&Method::PUT, 6) if segs[4] == "policies" => Some((
-            "UpdateEmailIdentityPolicy",
-            resource,
-            Some(decode_segment(&segs[5])),
-        )),
-        (&Method::DELETE, 6) if segs[4] == "policies" => Some((
-            "DeleteEmailIdentityPolicy",
-            resource,
-            Some(decode_segment(&segs[5])),
-        )),
+        (&Method::POST, 6) if segs[4] == "policies" => {
+            Some(("CreateEmailIdentityPolicy", resource, Some(segs[5].clone())))
+        }
+        (&Method::PUT, 6) if segs[4] == "policies" => {
+            Some(("UpdateEmailIdentityPolicy", resource, Some(segs[5].clone())))
+        }
+        (&Method::DELETE, 6) if segs[4] == "policies" => {
+            Some(("DeleteEmailIdentityPolicy", resource, Some(segs[5].clone())))
+        }
         _ => None,
     }
 }
@@ -232,12 +219,12 @@ pub(crate) fn resolve_configuration_sets_action(
         (&Method::PUT, 6) if segs[4] == "event-destinations" => Some((
             "UpdateConfigurationSetEventDestination",
             resource,
-            Some(decode_segment(&segs[5])),
+            Some(segs[5].clone()),
         )),
         (&Method::DELETE, 6) if segs[4] == "event-destinations" => Some((
             "DeleteConfigurationSetEventDestination",
             resource,
-            Some(decode_segment(&segs[5])),
+            Some(segs[5].clone()),
         )),
         _ => None,
     }
@@ -279,13 +266,13 @@ pub(crate) fn resolve_contact_lists_action(
             Some(("ListContacts", resource, None))
         }
         (&Method::GET, 6) if segs[4] == "contacts" => {
-            Some(("GetContact", resource, Some(decode_segment(&segs[5]))))
+            Some(("GetContact", resource, Some(segs[5].clone())))
         }
         (&Method::PUT, 6) if segs[4] == "contacts" => {
-            Some(("UpdateContact", resource, Some(decode_segment(&segs[5]))))
+            Some(("UpdateContact", resource, Some(segs[5].clone())))
         }
         (&Method::DELETE, 6) if segs[4] == "contacts" => {
-            Some(("DeleteContact", resource, Some(decode_segment(&segs[5]))))
+            Some(("DeleteContact", resource, Some(segs[5].clone())))
         }
         _ => None,
     }
@@ -298,16 +285,8 @@ pub(crate) fn resolve_suppression_action(method: &Method, segs: &[String]) -> Re
     match (method, segs.len()) {
         (&Method::PUT, 4) => Some(("PutSuppressedDestination", None, None)),
         (&Method::GET, 4) => Some(("ListSuppressedDestinations", None, None)),
-        (&Method::GET, 5) => Some((
-            "GetSuppressedDestination",
-            Some(decode_segment(&segs[4])),
-            None,
-        )),
-        (&Method::DELETE, 5) => Some((
-            "DeleteSuppressedDestination",
-            Some(decode_segment(&segs[4])),
-            None,
-        )),
+        (&Method::GET, 5) => Some(("GetSuppressedDestination", Some(segs[4].clone()), None)),
+        (&Method::DELETE, 5) => Some(("DeleteSuppressedDestination", Some(segs[4].clone()), None)),
         _ => None,
     }
 }
@@ -343,24 +322,20 @@ pub(crate) fn resolve_deliverability_dashboard_action(
         (&Method::GET, 4) if segs[3] == "test-reports" => {
             Some(("ListDeliverabilityTestReports", None, None))
         }
-        (&Method::GET, 5) if segs[3] == "test-reports" => Some((
-            "GetDeliverabilityTestReport",
-            Some(decode_segment(&segs[4])),
-            None,
-        )),
+        (&Method::GET, 5) if segs[3] == "test-reports" => {
+            Some(("GetDeliverabilityTestReport", Some(segs[4].clone()), None))
+        }
         (&Method::GET, 5) if segs[3] == "campaigns" => Some((
             "GetDomainDeliverabilityCampaign",
-            Some(decode_segment(&segs[4])),
+            Some(segs[4].clone()),
             None,
         )),
-        (&Method::GET, 5) if segs[3] == "statistics-report" => Some((
-            "GetDomainStatisticsReport",
-            Some(decode_segment(&segs[4])),
-            None,
-        )),
+        (&Method::GET, 5) if segs[3] == "statistics-report" => {
+            Some(("GetDomainStatisticsReport", Some(segs[4].clone()), None))
+        }
         (&Method::GET, 6) if segs[3] == "domains" && segs[5] == "campaigns" => Some((
             "ListDomainDeliverabilityCampaigns",
-            Some(decode_segment(&segs[4])),
+            Some(segs[4].clone()),
             None,
         )),
         _ => None,
@@ -476,18 +451,18 @@ pub(crate) fn resolve_reputation_action(method: &Method, segs: &[String]) -> Res
         (&Method::POST, 4) => Some(("ListReputationEntities", None, None)),
         (&Method::GET, 6) => Some((
             "GetReputationEntity",
-            Some(decode_segment(&segs[4])),
-            Some(decode_segment(&segs[5])),
+            Some(segs[4].clone()),
+            Some(segs[5].clone()),
         )),
         (&Method::PUT, 7) if segs[6] == "customer-managed-status" => Some((
             "UpdateReputationEntityCustomerManagedStatus",
-            Some(decode_segment(&segs[4])),
-            Some(decode_segment(&segs[5])),
+            Some(segs[4].clone()),
+            Some(segs[5].clone()),
         )),
         (&Method::PUT, 7) if segs[6] == "policy" => Some((
             "UpdateReputationEntityPolicy",
-            Some(decode_segment(&segs[4])),
-            Some(decode_segment(&segs[5])),
+            Some(segs[4].clone()),
+            Some(segs[5].clone()),
         )),
         _ => None,
     }

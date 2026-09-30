@@ -828,7 +828,7 @@ mod extras_create_tests {
             query_params: std::collections::HashMap::new(),
             body_stream: parking_lot::Mutex::new(None),
             body: bytes::Bytes::from(body.to_string()),
-            path_segments: vec![],
+            path_segments: fakecloud_core::path::split_path_segments(path),
             raw_path: path.into(),
             raw_query: raw_query.into(),
             method,

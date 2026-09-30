@@ -516,11 +516,10 @@ pub async fn dispatch(
         wire_path.to_string()
     };
     let raw_query = parts.uri.query().unwrap_or("").to_string();
-    let path_segments: Vec<String> = path
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect();
+    // Split on `/` first, then percent-decode each segment once, so handlers
+    // see decoded `@httpLabel` values and an encoded `/` (`%2F`) stays inside
+    // its label. `raw_path` keeps the undecoded wire form.
+    let path_segments = crate::path::split_path_segments(&path);
 
     // For JSON protocol, validate that non-empty bodies are valid JSON
     if detected.protocol == AwsProtocol::Json

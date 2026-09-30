@@ -785,7 +785,7 @@ impl PipesService {
             .raw_query
             .split('&')
             .filter_map(|kv| kv.strip_prefix("tagKeys="))
-            .map(url_decode)
+            .map(fakecloud_core::protocol::url_decode)
             .collect();
         {
             let mut accounts = self.state.write();
@@ -1075,16 +1075,16 @@ fn sync_tags_into_pipe(st: &mut crate::state::PipesState, arn: &str) {
 fn pipe_name_from_path(req: &AwsRequest) -> Result<String, AwsServiceError> {
     req.path_segments
         .get(2)
-        .map(|s| url_decode(s))
+        .cloned()
         .filter(|s| !s.is_empty())
         .ok_or_else(|| validation_error("Pipe name is required"))
 }
 
 fn resource_arn_from_path(req: &AwsRequest) -> Result<String, AwsServiceError> {
-    // /tags/{resourceArn} — the ARN's own slashes are URL-encoded by the SDK,
-    // but tolerate the decoded form by re-joining any trailing segments.
-    let joined = req.path_segments[1..].join("/");
-    let arn = url_decode(&joined);
+    // /tags/{resourceArn} — the ARN's own slashes are URL-encoded by the SDK
+    // (and decoded by dispatch), but tolerate the unencoded form by re-joining
+    // any trailing segments.
+    let arn = req.path_segments[1..].join("/");
     if arn.is_empty() {
         return Err(validation_error("resourceArn is required"));
     }
@@ -1247,47 +1247,6 @@ fn conflict_error(msg: impl Into<String>, resource_id: &str) -> AwsServiceError 
             ("resourceType".to_string(), "pipe".to_string()),
         ],
     )
-}
-
-/// Minimal percent-decoder for path/query segments (the SDK encodes ARNs and
-/// names). Mirrors the decode used elsewhere in the gateway.
-fn url_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' if i + 2 < bytes.len() => {
-                let hi = from_hex(bytes[i + 1]);
-                let lo = from_hex(bytes[i + 2]);
-                if let (Some(hi), Some(lo)) = (hi, lo) {
-                    out.push(hi << 4 | lo);
-                    i += 3;
-                    continue;
-                }
-                out.push(b'%');
-                i += 1;
-            }
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b => {
-                out.push(b);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-fn from_hex(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
 }
 
 async fn save_snapshot_static(
@@ -1780,11 +1739,7 @@ mod tests {
             Some(i) => (&path[..i], &path[i + 1..]),
             None => (path, ""),
         };
-        let path_segments: Vec<String> = p
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .collect();
+        let path_segments = fakecloud_core::path::split_path_segments(p);
         let query_params: std::collections::HashMap<String, String> = q
             .split('&')
             .filter(|s| !s.is_empty())

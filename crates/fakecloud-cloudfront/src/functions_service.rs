@@ -1370,11 +1370,7 @@ mod tests {
             query_params: std::collections::HashMap::new(),
             body_stream: parking_lot::Mutex::new(None),
             body: Bytes::from(body.to_string()),
-            path_segments: path
-                .split('/')
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-                .collect(),
+            path_segments: fakecloud_core::path::split_path_segments(path),
             raw_path: path.into(),
             raw_query: String::new(),
             method,

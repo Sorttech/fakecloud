@@ -533,13 +533,10 @@ fn merge_path_params(body: Value, path_params: &[(String, String)]) -> Value {
         Value::Object(m) => m,
         _ => serde_json::Map::new(),
     };
-    // Path labels arrive percent-encoded (an ARN label carries `%3A` / `%2F`);
-    // handlers see the decoded value, as the model's labels define it.
+    // Labels come from `path_segments`, which dispatch already decoded (an
+    // ARN label's `%3A` / `%2F` are real `:` / `/` here); never decode twice.
     for (k, v) in path_params {
-        let decoded = percent_encoding::percent_decode_str(v)
-            .decode_utf8_lossy()
-            .into_owned();
-        out.insert(k.clone(), Value::String(decoded));
+        out.insert(k.clone(), Value::String(v.clone()));
     }
     Value::Object(out)
 }
@@ -2844,17 +2841,20 @@ mod tests {
     }
 
     #[test]
-    fn path_labels_are_percent_decoded() {
+    fn path_labels_are_not_decoded_twice() {
+        // Dispatch already decoded `path_segments`; a label whose decoded
+        // value still holds `%3A` (sent as `%253A`) must reach the handler
+        // verbatim, not be decoded a second time.
         let merged = merge_path_params(
             json!({}),
             &[(
                 "executionIdentifier".to_string(),
-                "arn%3Aaws%3Abedrock%3Aus-east-1%3A123456789012%3Aflow%2FF".to_string(),
+                "arn:aws:bedrock:us-east-1:123456789012:flow/F%3A".to_string(),
             )],
         );
         assert_eq!(
             merged["executionIdentifier"],
-            "arn:aws:bedrock:us-east-1:123456789012:flow/F"
+            "arn:aws:bedrock:us-east-1:123456789012:flow/F%3A"
         );
     }
 

@@ -26,7 +26,7 @@ use crate::model::{
     UpdateTrafficPolicyCommentRequest, UpdateTrafficPolicyInstanceRequest, VpcAuthorizationRequest,
     VPC,
 };
-use crate::router::{route, Route};
+use crate::router::{route_segments, Route};
 use crate::state::{
     AccountState, HealthCheckStatus, Route53Accounts, Route53Snapshot, SharedRoute53State,
     StoredChange, StoredCidrCollection, StoredHealthCheck, StoredHostedZone, StoredKeySigningKey,
@@ -346,7 +346,7 @@ impl AwsService for Route53Service {
     }
 
     async fn handle(&self, req: AwsRequest) -> Result<AwsResponse, AwsServiceError> {
-        let resolved = match route(&req.method, &req.raw_path, &req.raw_query) {
+        let resolved = match route_segments(&req.method, &req.path_segments, &req.raw_query) {
             Some(r) => r,
             None => {
                 return Err(aws_error(

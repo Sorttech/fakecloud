@@ -81,15 +81,10 @@ pub(crate) fn prevalidate(
     // Path-label checks first so a missing identifier surfaces as a
     // validation error before any per-handler logic runs.
     for name in spec.required_path {
-        let raw = params.get(*name).map(String::as_str).unwrap_or("");
-        // The path segment in `params` is still URL-encoded as it came
-        // off the wire (the dispatcher doesn't decode). URL-decode here
-        // so the placeholder check sees `{Name}` regardless of whether
-        // the probe sent `%7BNameNAME%7D` or the literal braces.
-        let decoded = percent_encoding::percent_decode_str(raw)
-            .decode_utf8_lossy()
-            .into_owned();
-        if decoded.is_empty() || is_placeholder(&decoded) {
+        // Dispatch already percent-decoded the label, so a probe's
+        // `%7BName%7D` arrives here as the literal `{Name}`.
+        let value = params.get(*name).map(String::as_str).unwrap_or("");
+        if value.is_empty() || is_placeholder(value) {
             return Err(bad_request(&format!("{name} is required")));
         }
     }
@@ -134,18 +129,12 @@ pub(crate) fn prevalidate(
         }
     }
 
-    // Enum-valued path parameters. URL-decoded for matching.
+    // Enum-valued path parameters (already decoded by dispatch).
     for (name, allowed) in spec.path_enums {
-        if let Some(raw) = params.get(*name) {
-            let decoded = percent_encoding::percent_decode_str(raw)
-                .decode_utf8_lossy()
-                .into_owned();
-            if !decoded.is_empty()
-                && !is_placeholder(&decoded)
-                && !allowed.contains(&decoded.as_str())
-            {
+        if let Some(value) = params.get(*name) {
+            if !value.is_empty() && !is_placeholder(value) && !allowed.contains(&value.as_str()) {
                 return Err(bad_request(&format!(
-                    "{name} value '{decoded}' is not one of the supported enum values",
+                    "{name} value '{value}' is not one of the supported enum values",
                 )));
             }
         }

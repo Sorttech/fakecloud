@@ -209,7 +209,9 @@ impl SesV2Service {
         }
 
         let method = &req.method;
-        let resource = segs.get(3).map(|s| decode_segment(s));
+        // Dispatch already decoded the labels (`test%40example.com` arrives as
+        // `test@example.com`).
+        let resource = segs.get(3).cloned();
         let collection = segs[2].as_str();
 
         match collection {

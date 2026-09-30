@@ -923,7 +923,11 @@ fn decode_form_urlencoded(input: &[u8]) -> HashMap<String, String> {
     result
 }
 
-fn url_decode(input: &str) -> String {
+/// Decode one `application/x-www-form-urlencoded` component (a query-string
+/// key or value, or a form-body field): `+` is a space and `%XX` escapes are
+/// decoded on the raw bytes, then read as UTF-8 (lossily). For URI path
+/// segments, where `+` is literal, use [`crate::path::percent_decode_segment`].
+pub fn url_decode(input: &str) -> String {
     // Accumulate the decoded RAW BYTES first, then interpret the whole buffer
     // as UTF-8. Decoding each `%XX` byte straight into a `char` would treat it
     // as a Unicode codepoint (Latin-1), which corrupts multi-byte UTF-8

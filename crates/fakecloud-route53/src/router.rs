@@ -35,20 +35,30 @@ impl Route {
     }
 }
 
-pub fn route(method: &Method, path: &str, _raw_query: &str) -> Option<Route> {
+/// Route a raw (undecoded) URI path. Splits and percent-decodes it the same
+/// way dispatch builds `AwsRequest::path_segments`.
+pub fn route(method: &Method, path: &str, raw_query: &str) -> Option<Route> {
+    route_segments(
+        method,
+        &fakecloud_core::path::split_path_segments(path),
+        raw_query,
+    )
+}
+
+/// Route already-decoded path segments (dispatch's `path_segments`).
+pub fn route_segments(method: &Method, segments: &[String], _raw_query: &str) -> Option<Route> {
     // Real Route 53 only serves operations beneath `/2013-04-01/`. Refuse
     // anything else outright instead of permissively trimming a missing
     // prefix and possibly matching a malformed path against a route.
-    let path = path.strip_prefix(crate::API_PREFIX)?;
-    if !path.is_empty() && !path.starts_with('/') {
+    let (first, rest) = segments.split_first()?;
+    if crate::API_PREFIX.strip_prefix('/') != Some(first.as_str()) {
         return None;
     }
-    let path = path.trim_start_matches('/');
-    // Filter out empty segments so a trailing slash (`/hostedzone/`, which
-    // botocore/AWS CLI < 1.40 and curl emit for a collection root) routes to the
-    // List op, not GetHostedZone(id="") -> NoSuchHostedZone (the #1645 shape;
-    // bug-audit 2026-06-20, 1.1).
-    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    // Empty segments are already dropped, so a trailing slash (`/hostedzone/`,
+    // which botocore/AWS CLI < 1.40 and curl emit for a collection root)
+    // routes to the List op, not GetHostedZone(id="") -> NoSuchHostedZone (the
+    // #1645 shape; bug-audit 2026-06-20, 1.1).
+    let segs: Vec<&str> = rest.iter().map(String::as_str).collect();
 
     match (method, segs.as_slice()) {
         // ─── Hosted Zones ────────────────────────────────────────────

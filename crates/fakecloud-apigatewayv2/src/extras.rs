@@ -966,16 +966,15 @@ impl ApiGatewayV2Service {
 
             // ── Tags ──
             "TagResource" => {
-                // `ResourceArn` is a non-greedy @httpLabel, so the SDK
-                // percent-encodes its `/` and `:` on the wire; decode back to
-                // the plain ARN so `state.tags` is keyed by the same value that
-                // CreateApi/CreateStage compute (`arn:aws:apigateway:...`),
-                // unifying create-time tags with the tag verbs.
-                let arn = percent_encoding::percent_decode_str(
-                    resource_id.ok_or_else(|| missing("ResourceArn"))?,
-                )
-                .decode_utf8_lossy()
-                .into_owned();
+                // `ResourceArn` is a non-greedy @httpLabel: the SDK
+                // percent-encodes its `/` and `:` on the wire and dispatch
+                // decodes it back, so `state.tags` is keyed by the same plain
+                // ARN that CreateApi/CreateStage compute
+                // (`arn:aws:apigateway:...`), unifying create-time tags with
+                // the tag verbs.
+                let arn = resource_id
+                    .ok_or_else(|| missing("ResourceArn"))?
+                    .to_string();
                 let body = body(req);
                 let tags_in = req_object(&body, "Tags")?.clone();
                 let mut accounts = self.state.write();
@@ -989,12 +988,10 @@ impl ApiGatewayV2Service {
                 no_content()
             }
             "UntagResource" => {
-                // Decode the percent-encoded @httpLabel ARN (see TagResource).
-                let arn = percent_encoding::percent_decode_str(
-                    resource_id.ok_or_else(|| missing("ResourceArn"))?,
-                )
-                .decode_utf8_lossy()
-                .into_owned();
+                // Dispatch-decoded @httpLabel ARN (see TagResource).
+                let arn = resource_id
+                    .ok_or_else(|| missing("ResourceArn"))?
+                    .to_string();
                 // TagKeys is a required @httpQuery list per Smithy — the SDK
                 // renders each entry as repeated `tagKeys={key}` pairs.
                 // `query_params` collapses repeats to the last value, so parse
@@ -1027,12 +1024,10 @@ impl ApiGatewayV2Service {
                 no_content()
             }
             "GetTags" => {
-                // Decode the percent-encoded @httpLabel ARN (see TagResource).
-                let arn = percent_encoding::percent_decode_str(
-                    resource_id.ok_or_else(|| missing("ResourceArn"))?,
-                )
-                .decode_utf8_lossy()
-                .into_owned();
+                // Dispatch-decoded @httpLabel ARN (see TagResource).
+                let arn = resource_id
+                    .ok_or_else(|| missing("ResourceArn"))?
+                    .to_string();
                 self.read_state(aid, &region, |state| {
                     let tags = state.tags.get(&arn).cloned().unwrap_or_default();
                     ok(json!({"Tags": tags}))
@@ -1359,13 +1354,11 @@ impl ApiGatewayV2Service {
                 if !valid_path_id(raw_key) {
                     return Err(missing("RequestParameterKey"));
                 }
-                // The key may be percent-encoded in the URL; match the stored
-                // (decoded) key. Previously this validated then returned 204
-                // WITHOUT removing anything, so GetRoute kept returning the
-                // parameter (bug-hunt 2026-07-16, 1.22).
-                let key = percent_encoding::percent_decode_str(raw_key)
-                    .decode_utf8_lossy()
-                    .into_owned();
+                // Dispatch decoded the key, so it matches the stored key.
+                // Previously this validated then returned 204 WITHOUT
+                // removing anything, so GetRoute kept returning the parameter
+                // (bug-hunt 2026-07-16, 1.22).
+                let key = raw_key.to_string();
                 let mut accounts = self.state.write();
                 let state = accounts.get_or_create(aid);
                 let route_obj = state
@@ -1389,11 +1382,10 @@ impl ApiGatewayV2Service {
                     return Err(missing("RouteKey"));
                 }
                 // Actually remove the per-route entry from the stage's
-                // route_settings. Previously this no-op'd and left the override
-                // in place (bug-hunt 2026-07-16, 1.22).
-                let key = percent_encoding::percent_decode_str(raw_key)
-                    .decode_utf8_lossy()
-                    .into_owned();
+                // route_settings (the key is already decoded by dispatch).
+                // Previously this no-op'd and left the override in place
+                // (bug-hunt 2026-07-16, 1.22).
+                let key = raw_key.to_string();
                 let mut accounts = self.state.write();
                 let state = accounts.get_or_create(aid);
                 let stage = state
@@ -2240,7 +2232,11 @@ mod tests {
             method: Method::POST,
             raw_path: format!("/{}", segs.join("/")),
             raw_query,
-            path_segments: segs.iter().map(|s| s.to_string()).collect(),
+            // Mirror dispatch: labels arrive percent-decoded.
+            path_segments: segs
+                .iter()
+                .map(|s| fakecloud_core::path::percent_decode_segment(s))
+                .collect(),
             query_params: qp,
             headers: http::HeaderMap::new(),
             body: bytes::Bytes::from(body.to_string()),
