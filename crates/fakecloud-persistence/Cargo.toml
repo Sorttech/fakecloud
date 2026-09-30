@@ -8,6 +8,8 @@ homepage.workspace = true
 version.workspace = true
 
 [dependencies]
+fakecloud-aws = { workspace = true }
+serde_json = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
 thiserror = { workspace = true }

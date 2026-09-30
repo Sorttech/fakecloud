@@ -55,10 +55,10 @@ CRATES=(
   # Layer 1: no internal deps
   fakecloud-aws
   fakecloud-sdk
-  fakecloud-persistence
   fakecloud-k8s   # only external deps (kube/k8s-openapi); dependents: lambda/elasticache/rds/ecs/server
 
   # Layer 2: depends on fakecloud-aws
+  fakecloud-persistence
   fakecloud-core
 
   # Layer 3a: depend on aws + core + persistence only

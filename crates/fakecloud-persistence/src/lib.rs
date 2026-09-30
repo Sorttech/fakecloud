@@ -1,3 +1,4 @@
+pub mod arn_partition;
 pub mod atomic;
 pub mod cache;
 pub mod config;

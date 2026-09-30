@@ -73,7 +73,20 @@ These data volumes default **on** under `--storage-mode=persistent` and **off** 
 
 On startup fakecloud reads `<data-path>/fakecloud.version.toml`. The file records the on-disk format version and the fakecloud version that created the directory. If the format version doesn't match the running binary, startup fails with an actionable error that points at the file.
 
-Except for the legacy CloudWatch Logs migration described below, there is no automatic migration. The intent is that you either keep using the binary that wrote the directory or start from an empty data path.
+Except for the ARN partition migration and the legacy CloudWatch Logs migration described below, there is no automatic migration. The intent is that you either keep using the binary that wrote the directory or start from an empty data path.
+
+### ARN partition migration
+
+fakecloud mints ARNs in the partition of their region: `arn:aws-cn:` for `cn-*` regions, `arn:aws-us-gov:` for GovCloud, and the `aws-iso*` partitions for the isolated regions. Older releases used `arn:aws:` everywhere, so a data directory written by a China, GovCloud or ISO-region server before that change holds `arn:aws:` ARNs.
+
+The first time a newer binary opens such a directory it rewrites those ARNs once, before any service loads its state, and records `arn_partitions_migrated = true` in `fakecloud.version.toml` so it never runs again. Directories created by a current binary start with the marker set.
+
+- A regional ARN whose region belongs to another partition (`arn:aws:kms:cn-north-1:...`) is rewritten to that partition (`arn:aws-cn:kms:cn-north-1:...`), whatever `--region` the server runs with.
+- A region-less ARN (`arn:aws:iam::123456789012:role/app`, `arn:aws:s3:::bucket`) is rewritten to the partition of the server's `--region`, and only when that partition is not `aws`. AWS-managed policy ARNs (`arn:aws:iam::aws:policy/...`) keep the `aws` spelling, matching what fakecloud serves for them in every partition.
+- The rewrite covers every service's state: resource fields, maps keyed by ARN (SNS topics, tag maps, ...), and ARNs inside stored documents such as IAM, bucket, queue and key policies, which are otherwise left byte-for-byte unchanged. S3 bucket configuration and object metadata are covered too.
+- Payloads are not rewritten: SQS message bodies and attributes (their MD5 digests would stop matching), ECR image manifests (addressed by digest), CloudWatch Logs events, S3 object bodies, and container data volumes.
+
+After the migration, responses return the partition-correct ARN for these resources, the same as for resources created afterwards, and ARN-keyed lookups (for example SNS `GetTopicAttributes`) take the new ARN.
 
 ## S3 object body handling
 
