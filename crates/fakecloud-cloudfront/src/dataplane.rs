@@ -860,7 +860,7 @@ mod tests {
             (
                 "b.s3.us-east-1.amazonaws.com",
                 None,
-                "http://b.s3.us-east-1.amazonaws.com",
+                "http://127.0.0.1:4566",
             ),
             (
                 "api.example.com",
@@ -883,7 +883,7 @@ mod tests {
         let cfg = cfg_with_origin_path(Some("/prod"), "b.s3.us-east-1.amazonaws.com");
         let route = resolve_route(&cfg, "/", "127.0.0.1:4566").unwrap();
         let url = format!("{}{}", route.upstream.url_base, route.root_object.unwrap());
-        assert_eq!(url, "http://b.s3.us-east-1.amazonaws.com/prod/index.html");
+        assert_eq!(url, "http://127.0.0.1:4566/prod/index.html");
     }
 
     #[test]
@@ -891,10 +891,7 @@ mod tests {
         for p in [None, Some(""), Some("/")] {
             let cfg = cfg_with_origin_path(p, "b.s3.us-east-1.amazonaws.com");
             let route = resolve_route(&cfg, "/x", "127.0.0.1:4566").unwrap();
-            assert_eq!(
-                route.upstream.url_base, "http://b.s3.us-east-1.amazonaws.com",
-                "{p:?}"
-            );
+            assert_eq!(route.upstream.url_base, "http://127.0.0.1:4566", "{p:?}");
         }
     }
 
@@ -910,7 +907,7 @@ mod tests {
             let route = resolve_route(&cfg, "/x", "127.0.0.1:4566").unwrap();
             assert_eq!(
                 route.upstream.url_base,
-                format!("http://b.s3.us-east-1.amazonaws.com{want}"),
+                format!("http://127.0.0.1:4566{want}"),
                 "{p}"
             );
         }
