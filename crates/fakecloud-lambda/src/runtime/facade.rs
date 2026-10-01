@@ -1728,6 +1728,13 @@ mod tests {
             super::session_role_arn("arn:aws:iam::000000000000:role/path/r", f),
             "arn:aws:iam::123456789012:role/path/r"
         );
+        // Regression: an account-less role ARN is validated as the
+        // function account's role, so its session is minted there too rather
+        // than in the server's default account.
+        assert_eq!(
+            super::session_role_arn("arn:aws:iam:::role/r", f),
+            "arn:aws:iam::123456789012:role/r"
+        );
         assert_eq!(super::session_role_arn("not-an-arn", f), "not-an-arn");
     }
 

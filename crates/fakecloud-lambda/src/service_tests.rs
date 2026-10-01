@@ -4433,7 +4433,7 @@ fn trust_check_runs_in_the_roles_account() {
 }
 
 #[test]
-fn role_in_account_rehomes_only_arns_naming_an_account() {
+fn role_in_account_rehomes_role_arns() {
     assert_eq!(
         role_in_account("arn:aws:iam::000000000000:role/path/r", "123456789012"),
         "arn:aws:iam::123456789012:role/path/r"
@@ -4442,11 +4442,26 @@ fn role_in_account_rehomes_only_arns_naming_an_account() {
         role_in_account("arn:aws-cn:iam::000000000000:role/r", "123456789012"),
         "arn:aws-cn:iam::123456789012:role/r"
     );
+    // An account-less role ARN is the caller's role: re-homed so the session
+    // is minted where its trust policy was checked, partition and path kept.
     assert_eq!(
-        role_in_account("arn:aws:iam:::role/r", "1"),
-        "arn:aws:iam:::role/r"
+        role_in_account("arn:aws:iam:::role/r", "123456789012"),
+        "arn:aws:iam::123456789012:role/r"
     );
+    assert_eq!(
+        role_in_account("arn:aws-cn:iam:::role/path/r", "123456789012"),
+        "arn:aws-cn:iam::123456789012:role/path/r"
+    );
+    // Not an IAM role ARN and naming no account: left alone.
     assert_eq!(role_in_account("not-an-arn", "1"), "not-an-arn");
+    assert_eq!(
+        role_in_account("arn:aws:iam:::user/u", "1"),
+        "arn:aws:iam:::user/u"
+    );
+    assert_eq!(
+        role_in_account("arn:aws:iam:::role", "1"),
+        "arn:aws:iam:::role"
+    );
 }
 
 /// Two accounts each hold a role named `app`; only those in the listed

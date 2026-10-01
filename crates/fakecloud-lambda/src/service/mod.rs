@@ -632,12 +632,18 @@ pub fn validate_execution_role(
 /// (IAM off or soft). Minting in the role's own account would send the
 /// function's SDK calls (commonly from templates carrying another emulator's
 /// default `000000000000`) to an account that holds none of its resources.
-/// An ARN naming no account is returned unchanged.
+/// An IAM role ARN naming no account (`arn:aws:iam:::role/r`) is the
+/// caller's role, which is where its trust policy is checked, so it is
+/// re-homed too; otherwise the session would be minted in the server's
+/// default account. Anything else naming no account (not an ARN) is
+/// returned unchanged.
 pub(crate) fn role_in_account(role_arn: &str, account: &str) -> String {
-    if fakecloud_aws::arn::account_of(role_arn).is_none() {
+    let mut parts: Vec<&str> = role_arn.split(':').collect();
+    let accountless_role =
+        parts.len() >= 6 && parts[0] == "arn" && parts[2] == "iam" && parts[5].starts_with("role/");
+    if fakecloud_aws::arn::account_of(role_arn).is_none() && !accountless_role {
         return role_arn.to_string();
     }
-    let mut parts: Vec<&str> = role_arn.split(':').collect();
     parts[4] = account;
     parts.join(":")
 }
