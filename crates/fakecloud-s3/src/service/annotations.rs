@@ -436,7 +436,7 @@ fn resolve_object_mut<'a>(
                     o.version_id.as_deref() == Some(vid.as_str())
                 }
             };
-            if b.objects.get(key).is_some_and(&matches) {
+            if b.objects.get(key).is_some_and(matches) {
                 return b.objects.get_mut(key).ok_or_else(|| no_such_key(key));
             }
             b.object_versions

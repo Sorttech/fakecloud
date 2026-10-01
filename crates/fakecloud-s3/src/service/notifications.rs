@@ -398,12 +398,16 @@ static SEQUENCER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 pub(crate) fn next_sequencer() -> String {
     use std::sync::atomic::Ordering;
     let now = Utc::now().timestamp_micros().max(0) as u64;
-    let prev = SEQUENCER
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |prev| {
-            Some(now.max(prev.saturating_add(1)))
-        })
-        .unwrap_or(0);
-    format!("{:016X}", now.max(prev.saturating_add(1)))
+    // Compare-and-swap loop (rather than `fetch_update`, deprecated in favor
+    // of `try_update`, which is newer than the crate's MSRV).
+    let mut prev = SEQUENCER.load(Ordering::SeqCst);
+    loop {
+        let next = now.max(prev.saturating_add(1));
+        match SEQUENCER.compare_exchange_weak(prev, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return format!("{next:016X}"),
+            Err(actual) => prev = actual,
+        }
+    }
 }
 
 /// URL-encode an object key the way S3 encodes it in event notifications:
