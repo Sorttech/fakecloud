@@ -274,8 +274,8 @@ pub fn render_template(template: &EmailTemplate, template_data_str: &str) -> Ren
         result
     };
     RenderedTemplate {
-        subject: template.subject.as_deref().map(&substitute),
-        html: template.html_body.as_deref().map(&substitute),
-        text: template.text_body.as_deref().map(&substitute),
+        subject: template.subject.as_deref().map(substitute),
+        html: template.html_body.as_deref().map(substitute),
+        text: template.text_body.as_deref().map(substitute),
     }
 }
