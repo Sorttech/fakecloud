@@ -663,7 +663,11 @@ async fn cross_account_vpc_association_follows_ec2_vpc_ownership() {
         .await
         .expect("B associates its own VPC");
 
-    for (client, expected) in [(&r53_b, vec![zone.clone()]), (&r53_c, vec![])] {
+    for (client, expected) in [
+        (&r53_a, vec![zone.clone()]),
+        (&r53_b, vec![zone.clone()]),
+        (&r53_c, vec![]),
+    ] {
         let ids: Vec<String> = client
             .list_hosted_zones_by_vpc()
             .vpc_id(&vpc_b)
@@ -696,4 +700,20 @@ async fn cross_account_vpc_association_follows_ec2_vpc_ownership() {
         .send()
         .await
         .expect("B disassociates its VPC");
+
+    // The zone owner may disassociate another account's VPC too.
+    r53_b
+        .associate_vpc_with_hosted_zone()
+        .hosted_zone_id(&zone)
+        .vpc(vpc(&vpc_b))
+        .send()
+        .await
+        .expect("B re-associates its VPC");
+    r53_a
+        .disassociate_vpc_from_hosted_zone()
+        .hosted_zone_id(&zone)
+        .vpc(vpc(&vpc_b))
+        .send()
+        .await
+        .expect("A disassociates B's VPC from its zone");
 }

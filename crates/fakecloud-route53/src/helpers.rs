@@ -1000,13 +1000,15 @@ impl Route53Service {
         // Another account may only remove a VPC it owns: the owner EC2
         // reports, or (VPC unknown to EC2) the account that associated it.
         if cross_account {
-            let caller_owns_vpc = match &vpc_owner {
-                Some(o) => *o == route.account,
-                None => zone_account.cross_account_vpcs.get(&id).is_some_and(|vs| {
-                    vs.iter()
-                        .any(|(v, acct)| same_vpc(v, &vpc) && *acct == route.account)
-                }),
-            };
+            // The recorded associator also counts: an account a v1 snapshot's
+            // migration kept as associator retains access once EC2 knows the
+            // VPC (new associations already required EC2 ownership).
+            let recorded = zone_account.cross_account_vpcs.get(&id).is_some_and(|vs| {
+                vs.iter()
+                    .any(|(v, acct)| same_vpc(v, &vpc) && *acct == route.account)
+            });
+            let caller_owns_vpc =
+                recorded || vpc_owner.as_deref().is_some_and(|o| o == route.account);
             if !caller_owns_vpc {
                 return Err(not_authorized_vpc_association(&vpc, &id));
             }
@@ -1256,13 +1258,14 @@ impl Route53Service {
                 let visible = if *owner == req.account_id {
                     z.vpcs.iter().any(matches)
                 } else {
-                    let caller_owns_vpc = match &vpc_owner {
-                        Some(o) => *o == req.account_id,
-                        None => account.cross_account_vpcs.get(&z.id).is_some_and(|vs| {
-                            vs.iter()
-                                .any(|(v, acct)| matches(v) && *acct == req.account_id)
-                        }),
-                    };
+                    // EC2's owner, or the recorded associator (which keeps a
+                    // v1-migrated associator's access once EC2 knows the VPC).
+                    let recorded = account.cross_account_vpcs.get(&z.id).is_some_and(|vs| {
+                        vs.iter()
+                            .any(|(v, acct)| matches(v) && *acct == req.account_id)
+                    });
+                    let caller_owns_vpc =
+                        recorded || vpc_owner.as_deref().is_some_and(|o| o == req.account_id);
                     caller_owns_vpc && z.vpcs.iter().any(matches)
                 };
                 if visible {
