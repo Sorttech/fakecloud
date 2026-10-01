@@ -398,6 +398,10 @@ static SEQUENCER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 pub(crate) fn next_sequencer() -> String {
     use std::sync::atomic::Ordering;
     let now = Utc::now().timestamp_micros().max(0) as u64;
+    // `fetch_update` is deprecated in favour of `try_update` from Rust 1.99,
+    // which is newer than the workspace's `rust-version`. Switch once the
+    // MSRV reaches 1.99.
+    #[allow(deprecated)]
     let prev = SEQUENCER
         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |prev| {
             Some(now.max(prev.saturating_add(1)))
