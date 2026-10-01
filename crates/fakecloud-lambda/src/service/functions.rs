@@ -26,8 +26,11 @@ impl LambdaService {
             ));
         }
 
-        // PassRole: a role whose trust policy (read in the role's own account)
-        // lets Lambda assume it, and (under strict IAM) in the caller's account.
+        // PassRole: under strict IAM a role in another account is refused
+        // outright. Otherwise the role's trust policy (read in the account its
+        // ARN names) must let Lambda assume it, and for a cross-account role so
+        // must the same-named role in the caller's account, which is the one
+        // the function's session is minted for.
         super::validate_execution_role(
             &req.account_id,
             &input.role,
