@@ -96,6 +96,7 @@ pub fn parse_route53_snapshot(
         if let Some(accounts) = snapshot.accounts.as_mut() {
             accounts.migrate_legacy_bucket(default_account, &stack_owned());
         }
+        snapshot.schema_version = ROUTE53_SNAPSHOT_SCHEMA_VERSION;
     }
     Ok(snapshot)
 }
@@ -677,6 +678,7 @@ mod snapshot_migration_tests {
     fn a_v1_snapshot_moves_stack_created_resources_to_the_stacks_account() {
         let parsed = parse_route53_snapshot(&v1_snapshot_bytes(), DEFAULT, stack_owned)
             .expect("v1 snapshot loads");
+        assert_eq!(parsed.schema_version, ROUTE53_SNAPSHOT_SCHEMA_VERSION);
         let accounts = parsed.accounts.unwrap();
         assert!(
             accounts.get(LEGACY_ACCOUNT).is_none(),
