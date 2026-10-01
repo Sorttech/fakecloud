@@ -81,11 +81,7 @@ fn make_request_with_query(
     raw_query: &str,
     query_params: HashMap<String, String>,
 ) -> AwsRequest {
-    let path_segments: Vec<String> = path
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect();
+    let path_segments = fakecloud_core::path::split_path_segments(path);
     AwsRequest {
         service: "ses".to_string(),
         action: String::new(),

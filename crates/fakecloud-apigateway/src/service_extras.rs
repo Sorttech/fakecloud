@@ -456,7 +456,7 @@ impl ApiGatewayService {
         req: &AwsRequest,
         params: &BTreeMap<String, String>,
     ) -> Result<AwsResponse, AwsServiceError> {
-        let arn = decode_resource_arn(&params.get("resourceArn").cloned().unwrap_or_default());
+        let arn = params.get("resourceArn").cloned().unwrap_or_default();
         let body = req.json_body();
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&request_account(req));
@@ -507,7 +507,6 @@ impl ApiGatewayService {
                     .collect();
             }
         }
-        let arn = decode_resource_arn(&arn);
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&request_account(req));
         let entry = match rest_api_id_from_arn(&arn).and_then(|id| state.apis.get_mut(&id)) {
@@ -527,7 +526,7 @@ impl ApiGatewayService {
         req: &AwsRequest,
         params: &BTreeMap<String, String>,
     ) -> Result<AwsResponse, AwsServiceError> {
-        let arn = decode_resource_arn(&params.get("resourceArn").cloned().unwrap_or_default());
+        let arn = params.get("resourceArn").cloned().unwrap_or_default();
         let accounts = self.state.read();
         let map = accounts
             .get(&request_account(req))
@@ -540,16 +539,6 @@ impl ApiGatewayService {
             .unwrap_or_default();
         ok(json!({"tags": map}))
     }
-}
-
-/// Percent-decode the greedy `resourceArn` path suffix. The core dispatcher
-/// captures `/tags/{arn+}` as raw path segments and re-joins them without
-/// decoding, so the SDK's percent-encoded `:` (`%3A`) and `/` (`%2F`) arrive
-/// literal; decode them back to a real ARN before matching.
-fn decode_resource_arn(raw: &str) -> String {
-    percent_encoding::percent_decode_str(raw)
-        .decode_utf8_lossy()
-        .into_owned()
 }
 
 /// When `arn` names a REST API itself (`arn:aws:apigateway:{region}::/restapis/{id}`
@@ -694,8 +683,8 @@ mod tag_store_tests {
                 .unwrap(),
         );
         let id = created["id"].as_str().unwrap().to_string();
-        // resourceArn arrives percent-encoded (as the dispatcher hands it over).
-        let arn_enc = format!("arn%3Aaws%3Aapigateway%3Aus-east-1%3A%3A%2Frestapis%2F{id}");
+        // resourceArn arrives decoded (dispatch percent-decodes path labels).
+        let arn_enc = format!("arn:aws:apigateway:us-east-1::/restapis/{id}");
 
         // Add a tag via the generic TagResource path.
         s.tag_resource(

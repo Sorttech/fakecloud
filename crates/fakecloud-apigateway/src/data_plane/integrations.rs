@@ -434,7 +434,8 @@ pub(super) async fn aws_direct_integration(
         query_params: req.query_params.clone(),
         body: req.body.clone(),
         body_stream: parking_lot::Mutex::new(None),
-        path_segments: req.path_segments.clone(),
+        // The target service expects dispatch-shaped (decoded) segments.
+        path_segments: fakecloud_core::path::split_path_segments(&req.raw_path),
         raw_path: req.raw_path.clone(),
         raw_query: req.raw_query.clone(),
         method: dispatch_method,
@@ -447,7 +448,7 @@ pub(super) async fn aws_direct_integration(
         dispatch_req.action = action.to_string();
     } else if let Some(path) = action_or_path.strip_prefix("path/") {
         dispatch_req.raw_path = format!("/{path}");
-        dispatch_req.path_segments = path.split('/').map(|s| s.to_string()).collect();
+        dispatch_req.path_segments = fakecloud_core::path::split_path_segments(path);
     } else {
         return Err(bad_gateway(format!(
             "AWS integration uri must contain action/ or path/ segment: {uri}"

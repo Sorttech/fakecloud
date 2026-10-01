@@ -12,11 +12,7 @@ fn make_state() -> SharedLambdaState {
 }
 
 fn make_request(method: Method, path: &str, body: &str) -> AwsRequest {
-    let path_segments: Vec<String> = path
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect();
+    let path_segments = fakecloud_core::path::split_path_segments(path);
     AwsRequest {
         service: "lambda".to_string(),
         action: String::new(),
@@ -117,12 +113,34 @@ fn normalize_function_name_empty() {
     assert_eq!(normalize_function_name(""), "");
 }
 
-#[test]
-fn normalize_function_name_decodes_percent_encoded_arn() {
-    // SDKs URL-encode `:` in path segments. The toolkit / aws-sdk-lambda
-    // wire form for `arn:aws:lambda:...` is `arn%3Aaws%3Alambda%3A...`.
-    let encoded = "arn%3Aaws%3Alambda%3Aus-east-1%3A123456789012%3Afunction%3AMyFunc";
-    assert_eq!(normalize_function_name(encoded), "MyFunc");
+#[tokio::test]
+async fn get_function_accepts_percent_encoded_arn_label() {
+    // SDKs URL-encode `:` in path segments (`arn%3Aaws%3Alambda%3A...`);
+    // dispatch decodes the label once, so the handler resolves the ARN.
+    let svc = LambdaService::new(make_state());
+    let create_body = json!({
+        "FunctionName": "MyFunc",
+        "Runtime": "nodejs20.x",
+        "Role": "arn:aws:iam::123456789012:role/lambda-role",
+        "Handler": "index.handler",
+        "Code": {"ZipFile": ""},
+    });
+    svc.handle(make_request(
+        Method::POST,
+        "/2015-03-31/functions",
+        &create_body.to_string(),
+    ))
+    .await
+    .unwrap();
+    let resp = svc
+        .handle(make_request(
+            Method::GET,
+            "/2015-03-31/functions/arn%3Aaws%3Alambda%3Aus-east-1%3A123456789012%3Afunction%3AMyFunc",
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status, StatusCode::OK);
 }
 
 #[tokio::test]

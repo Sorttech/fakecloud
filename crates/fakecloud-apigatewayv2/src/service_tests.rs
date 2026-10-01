@@ -14,12 +14,7 @@ fn make_state() -> SharedApiGatewayV2State {
 
 fn make_request(method: Method, path: &str, body: &str) -> AwsRequest {
     let raw_path = path.to_string();
-    let segs: Vec<String> = raw_path
-        .trim_start_matches('/')
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect();
+    let segs = fakecloud_core::path::split_path_segments(&raw_path);
     AwsRequest {
         service: "apigateway".to_string(),
         action: String::new(),

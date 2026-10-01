@@ -18,7 +18,7 @@ use fakecloud_persistence::SnapshotStore;
 use crate::model::{
     DistributionConfig, DistributionConfigWithTags, InvalidationBatch, TagKeys, Tags as ModelTags,
 };
-use crate::router::{route, Route};
+use crate::router::{route_segments, Route};
 use crate::state::{
     CloudFrontAccounts, CloudFrontSnapshot, DomainOwner, SharedCloudFrontState, StoredDistribution,
     StoredInvalidation, Tag, CLOUDFRONT_SNAPSHOT_SCHEMA_VERSION,
@@ -439,7 +439,7 @@ impl AwsService for CloudFrontService {
     }
 
     async fn handle(&self, req: AwsRequest) -> Result<AwsResponse, AwsServiceError> {
-        let mut resolved = match route(&req.method, &req.raw_path, &req.raw_query) {
+        let mut resolved = match route_segments(&req.method, &req.path_segments, &req.raw_query) {
             Some(r) => r,
             None => {
                 return Err(aws_error(
@@ -1436,7 +1436,7 @@ impl CloudFrontService {
     fn parse_arn_query(query: &str) -> Option<String> {
         for pair in query.split('&').filter(|p| !p.is_empty()) {
             if let Some(rest) = pair.strip_prefix("Resource=") {
-                return Some(percent_decode(rest));
+                return Some(fakecloud_core::protocol::url_decode(rest));
             }
         }
         None
@@ -2274,40 +2274,8 @@ fn empty_response(status: StatusCode) -> AwsResponse {
     }
 }
 
-fn percent_decode(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let bytes = input.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b == b'%' && i + 2 < bytes.len() {
-            if let (Some(a), Some(c)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2])) {
-                out.push(((a << 4) | c) as char);
-                i += 3;
-                continue;
-            }
-        }
-        if b == b'+' {
-            out.push(' ');
-        } else {
-            out.push(b as char);
-        }
-        i += 1;
-    }
-    out
-}
-
-fn hex_digit(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
-/// True when a URL-decoded label segment looks like an unsubstituted Smithy
-/// URI placeholder (e.g. `{Identifier}` or its percent-encoded form
+/// True when a (dispatch-decoded) label segment looks like an unsubstituted
+/// Smithy URI placeholder (e.g. `{Identifier}`, sent on the wire as
 /// `%7BIdentifier%7D`). Conformance probes that omit a required `@httpLabel`
 /// input leave the literal placeholder in the URL; handlers that can
 /// short-circuit on it return the declared validation error instead of a
@@ -2316,8 +2284,7 @@ pub(crate) fn is_placeholder_label(value: &str) -> bool {
     if value.is_empty() {
         return true;
     }
-    let lower = value.to_ascii_lowercase();
-    value.starts_with('{') || lower.starts_with("%7b")
+    value.starts_with('{')
 }
 
 /// Best-effort field extractor for request bodies the probe sends as JSON
@@ -2360,7 +2327,7 @@ fn parse_query_value(query: &str, key: &str) -> Option<String> {
     let prefix = format!("{key}=");
     for pair in query.split('&').filter(|p| !p.is_empty()) {
         if let Some(rest) = pair.strip_prefix(&prefix) {
-            return Some(percent_decode(rest));
+            return Some(fakecloud_core::protocol::url_decode(rest));
         }
     }
     None
@@ -2390,8 +2357,9 @@ mod tests {
     fn placeholder_label_detects_braces_and_percent_encoding() {
         assert!(is_placeholder_label(""));
         assert!(is_placeholder_label("{Identifier}"));
-        assert!(is_placeholder_label("%7BIdentifier%7D"));
-        assert!(is_placeholder_label("%7bidentifier%7d"));
+        // Dispatch hands labels over decoded, so the probe's
+        // `%7BIdentifier%7D` arrives as braces; a literal `%7B` is a value.
+        assert!(!is_placeholder_label("%7BIdentifier%7D"));
         assert!(!is_placeholder_label("E1234567890ABC"));
         assert!(!is_placeholder_label(
             "arn:aws:cloudfront::000:distribution/E1"
@@ -2489,11 +2457,7 @@ mod tests {
             query_params: std::collections::HashMap::new(),
             body_stream: parking_lot::Mutex::new(None),
             body: Bytes::from(body.to_string()),
-            path_segments: path
-                .split('/')
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-                .collect(),
+            path_segments: fakecloud_core::path::split_path_segments(path),
             raw_path: path.into(),
             raw_query: query.into(),
             method,

@@ -9,6 +9,7 @@ pub mod ecr_uri;
 pub mod ids;
 pub mod multi_account;
 pub mod pagination;
+pub mod path;
 pub mod protocol;
 pub mod query;
 pub mod query_filters;

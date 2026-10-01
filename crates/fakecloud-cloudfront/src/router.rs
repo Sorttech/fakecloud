@@ -56,16 +56,29 @@ impl Route {
     }
 }
 
+/// Route a raw (undecoded) URI path. Splits and percent-decodes it the same
+/// way dispatch builds `AwsRequest::path_segments`.
 pub fn route(method: &Method, path: &str, raw_query: &str) -> Option<Route> {
-    let path = path.strip_prefix("/2020-05-31").unwrap_or(path);
-    let path = path.trim_start_matches('/');
-    // Filter out empty segments so a trailing slash (`/distribution/`, which
-    // botocore/AWS CLI < 1.40 and curl emit for a collection root) routes to the
-    // List op, not GetDistribution(id="") -> NoSuchDistribution (the #1645
-    // shape; bug-audit 2026-06-20, 1.1).
-    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    route_segments(
+        method,
+        &fakecloud_core::path::split_path_segments(path),
+        raw_query,
+    )
+}
+
+/// Route already-decoded path segments (dispatch's `path_segments`). Empty
+/// segments are already gone, so a trailing slash (`/distribution/`, which
+/// botocore/AWS CLI < 1.40 and curl emit for a collection root) routes to the
+/// List op, not GetDistribution(id="") -> NoSuchDistribution (the #1645
+/// shape; bug-audit 2026-06-20, 1.1).
+pub fn route_segments(method: &Method, segments: &[String], raw_query: &str) -> Option<Route> {
+    let all: Vec<&str> = segments.iter().map(String::as_str).collect();
+    let segs: &[&str] = match all.split_first() {
+        Some((&"2020-05-31", rest)) => rest,
+        _ => &all,
+    };
     let q = QueryFlags::parse(raw_query);
-    match (method, segs.as_slice()) {
+    match (method, segs) {
         // ─── Distributions ──────────────────────────────────────────
         (&Method::POST, ["distribution"]) if q.with_tags => {
             Some(Route::just("CreateDistributionWithTags").flag_with_tags())

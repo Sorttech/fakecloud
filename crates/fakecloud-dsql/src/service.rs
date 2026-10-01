@@ -126,9 +126,9 @@ impl DsqlService {
             (&Method::GET, ["clusters", id, "vpc-endpoint-service-name"]) => {
                 Some(Route::GetVpcEndpointServiceName((*id).to_string()))
             }
-            (&Method::POST, ["tags", arn]) => Some(Route::TagResource(percent_decode(arn))),
-            (&Method::DELETE, ["tags", arn]) => Some(Route::UntagResource(percent_decode(arn))),
-            (&Method::GET, ["tags", arn]) => Some(Route::ListTagsForResource(percent_decode(arn))),
+            (&Method::POST, ["tags", arn]) => Some(Route::TagResource((*arn).to_string())),
+            (&Method::DELETE, ["tags", arn]) => Some(Route::UntagResource((*arn).to_string())),
+            (&Method::GET, ["tags", arn]) => Some(Route::ListTagsForResource((*arn).to_string())),
             // An empty `resourceArn` label collapses `/tags/` to a single
             // segment; route it through so the handler returns a modeled
             // ValidationException rather than "unknown operation".
@@ -615,7 +615,7 @@ impl DsqlService {
             .raw_query
             .split('&')
             .filter_map(|pair| pair.strip_prefix("tagKeys="))
-            .map(percent_decode)
+            .map(fakecloud_core::path::percent_decode_segment)
             .collect();
         let mut accounts = self.state.write();
         let st = accounts
@@ -1010,12 +1010,6 @@ fn hex6(id: &str) -> String {
         h = h.wrapping_mul(16777619);
     }
     format!("{:06x}", h & 0x00ff_ffff)
-}
-
-fn percent_decode(s: &str) -> String {
-    percent_encoding::percent_decode_str(s)
-        .decode_utf8_lossy()
-        .to_string()
 }
 
 // ---------------------------------------------------------------------------

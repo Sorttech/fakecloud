@@ -620,11 +620,13 @@ impl AwsService for BedrockAgentService {
             if body.is_null() {
                 body = serde_json::Value::Object(serde_json::Map::new());
             }
-            // Path labels arrive percent-encoded (an ARN identifier is
-            // `arn%3Aaws%3A...`); decode each once here so every handler sees
-            // the identifier the caller sent.
+            // The labels were cut from the raw wire path (to keep empty
+            // segments), so they are still percent-encoded (an ARN identifier
+            // is `arn%3Aaws%3A...`); decode each exactly once, the same way
+            // dispatch decodes `path_segments`.
             for (k, v) in path_params {
-                body[k] = serde_json::Value::String(decode_label(&v));
+                body[k] =
+                    serde_json::Value::String(fakecloud_core::path::percent_decode_segment(&v));
             }
             req.body = serde_json::to_vec(&body).unwrap_or_default().into();
         }
@@ -1012,14 +1014,6 @@ fn opt_array(val: &Value, key: &str) -> Vec<Value> {
 
 fn now() -> DateTime<Utc> {
     Utc::now()
-}
-
-/// Percent-decode an `@httpLabel` path segment. An ARN identifier arrives
-/// URL-encoded (`arn%3Aaws%3A...%2F...`); a bare ID is unchanged.
-fn decode_label(segment: &str) -> String {
-    percent_encoding::percent_decode_str(segment)
-        .decode_utf8_lossy()
-        .into_owned()
 }
 
 /// A resource identifier as a request names it.

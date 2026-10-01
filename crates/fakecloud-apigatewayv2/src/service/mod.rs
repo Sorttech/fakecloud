@@ -294,7 +294,12 @@ impl AwsService for ApiGatewayV2Service {
             return self.handle_management_api(req).await;
         }
 
-        // Execute API
+        // Execute API. Route matching, `rawPath` and the proxy event's path
+        // parameters work on the path exactly as the client sent it, so hand
+        // the data plane the undecoded segments rather than dispatch's
+        // decoded `@httpLabel` view.
+        let mut req = req;
+        req.path_segments = fakecloud_core::path::split_raw_path_segments(&req.raw_path);
         self.handle_execute_api(req).await
     }
 

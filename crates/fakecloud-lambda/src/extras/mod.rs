@@ -824,14 +824,11 @@ impl LambdaService {
                     .collect()
             })
             .unwrap_or_default();
-        // SDKs URL-encode `:` in the path so the ARN arrives as
-        // `arn%3Aaws%3Alambda%3A...`; decode before parsing.
-        let resource_arn_decoded = decode_query_segment(resource_arn);
-        let name = function_name_from_arn(&resource_arn_decoded).ok_or_else(|| {
+        let name = function_name_from_arn(resource_arn).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
                 "InvalidParameterValueException",
-                format!("Resource ARN is not a Lambda function: {resource_arn_decoded}"),
+                format!("Resource ARN is not a Lambda function: {resource_arn}"),
             )
         })?;
         let mut accounts = self.state.write();
@@ -889,12 +886,11 @@ impl LambdaService {
                 }
             }
         }
-        let resource_arn_decoded = decode_query_segment(resource_arn);
-        let name = function_name_from_arn(&resource_arn_decoded).ok_or_else(|| {
+        let name = function_name_from_arn(resource_arn).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
                 "InvalidParameterValueException",
-                format!("Resource ARN is not a Lambda function: {resource_arn_decoded}"),
+                format!("Resource ARN is not a Lambda function: {resource_arn}"),
             )
         })?;
         let mut accounts = self.state.write();
@@ -917,12 +913,11 @@ impl LambdaService {
         resource_arn: &str,
         account_id: &str,
     ) -> Result<AwsResponse, AwsServiceError> {
-        let resource_arn_decoded = decode_query_segment(resource_arn);
-        let name = function_name_from_arn(&resource_arn_decoded).ok_or_else(|| {
+        let name = function_name_from_arn(resource_arn).ok_or_else(|| {
             AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
                 "InvalidParameterValueException",
-                format!("Resource ARN is not a Lambda function: {resource_arn_decoded}"),
+                format!("Resource ARN is not a Lambda function: {resource_arn}"),
             )
         })?;
         let region = self.region_for(account_id);
@@ -1050,36 +1045,9 @@ impl LambdaService {
 }
 
 fn extract_csc_id(input: &str) -> String {
-    // Decode percent encoding then take the segment after the last colon
-    // (csc id), or treat as id if no colon present.
-    let decoded = percent_decode(input);
-    decoded.rsplit(':').next().unwrap_or(&decoded).to_string()
-}
-
-/// Re-export of `percent_decode` for the service-mod length check.
-/// Wraps the private helper without changing its signature.
-pub(crate) fn percent_decode_for_length(input: &str) -> String {
-    percent_decode(input)
-}
-
-fn percent_decode(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let bytes = input.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hi = (bytes[i + 1] as char).to_digit(16);
-            let lo = (bytes[i + 2] as char).to_digit(16);
-            if let (Some(h), Some(l)) = (hi, lo) {
-                out.push(((h * 16 + l) as u8) as char);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i] as char);
-        i += 1;
-    }
-    out
+    // Take the segment after the last colon (csc id), or treat as id if no
+    // colon present. A path label is already decoded by dispatch.
+    input.rsplit(':').next().unwrap_or(input).to_string()
 }
 
 fn code_signing_json(c: &CodeSigningConfig) -> Value {

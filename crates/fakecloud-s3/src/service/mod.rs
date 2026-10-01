@@ -596,30 +596,20 @@ impl AwsService for S3Service {
             ));
         }
         let bucket = req.path_segments.first().map(|s| s.as_str());
-        // Extract key from the raw path to preserve leading slashes and empty segments.
-        // The raw path is like "/bucket/key/parts" — we strip the bucket prefix.
-        let key = if let Some(b) = bucket {
-            let prefix = format!("/{b}/");
-            if req.raw_path.starts_with(&prefix) && req.raw_path.len() > prefix.len() {
-                let raw_key = &req.raw_path[prefix.len()..];
-                Some(
-                    percent_encoding::percent_decode_str(raw_key)
-                        .decode_utf8_lossy()
-                        .into_owned(),
-                )
-            } else if req.path_segments.len() > 1 {
-                let raw = req.path_segments[1..].join("/");
-                Some(
-                    percent_encoding::percent_decode_str(&raw)
-                        .decode_utf8_lossy()
-                        .into_owned(),
-                )
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        // Extract the key from the RAW path (everything after the first
+        // segment), decoded exactly once. This preserves leading slashes and
+        // empty segments inside the key that `path_segments` drops, and it
+        // stays correct when an access-point alias in the first segment was
+        // rewritten to its bucket in `path_segments` but not in `raw_path`.
+        let key = bucket.and_then(|_| {
+            let rest = req.raw_path.strip_prefix('/').unwrap_or(&req.raw_path);
+            let (_, raw_key) = rest.split_once('/')?;
+            (!raw_key.is_empty()).then(|| {
+                percent_encoding::percent_decode_str(raw_key)
+                    .decode_utf8_lossy()
+                    .into_owned()
+            })
+        });
 
         // Multipart upload operations (checked before main match). Held in an
         // Option rather than returned directly so these responses still reach

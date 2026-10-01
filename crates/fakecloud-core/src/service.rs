@@ -33,8 +33,11 @@ pub struct AwsRequest {
     /// behind the shared `&AwsRequest` reference threaded through the
     /// call chain.
     pub body_stream: Mutex<Option<RequestBodyStream>>,
+    /// The URI path split on `/` (empty segments dropped), each segment
+    /// percent-decoded exactly once per the Smithy `@httpLabel` rules -- see
+    /// [`crate::path`]. Handlers must not decode these again.
     pub path_segments: Vec<String>,
-    /// The raw URI path, before splitting into segments.
+    /// The raw (undecoded) URI path, before splitting into segments.
     pub raw_path: String,
     /// The raw URI query string (everything after `?`), preserving repeated keys.
     pub raw_query: String,

@@ -1212,7 +1212,7 @@ impl BatchService {
         let arn = req
             .path_segments
             .get(2)
-            .map(|s| percent_decode(s))
+            .cloned()
             .ok_or_else(|| client_error("ClientException", "resourceArn is required"))?;
         let body = req.json_body();
         let tags = body
@@ -1238,7 +1238,7 @@ impl BatchService {
         let arn = req
             .path_segments
             .get(2)
-            .map(|s| percent_decode(s))
+            .cloned()
             .ok_or_else(|| client_error("ClientException", "resourceArn is required"))?;
         // `tagKeys` is an `@httpQuery` list sent as repeated `tagKeys=a&tagKeys=b`
         // pairs; `query_params` collapses repeats to the last value, so parse the
@@ -1247,7 +1247,7 @@ impl BatchService {
             .raw_query
             .split('&')
             .filter_map(|pair| pair.strip_prefix("tagKeys="))
-            .map(percent_decode)
+            .map(fakecloud_core::path::percent_decode_segment)
             .collect();
         let mut accounts = self.state.write();
         if let Some(entry) = accounts.get_or_create(&req.account_id).tags.get_mut(&arn) {
@@ -1262,7 +1262,7 @@ impl BatchService {
         let arn = req
             .path_segments
             .get(2)
-            .map(|s| percent_decode(s))
+            .cloned()
             .ok_or_else(|| client_error("ClientException", "resourceArn is required"))?;
         let accounts = self.state.read();
         let tags = accounts
@@ -1950,37 +1950,6 @@ fn arn_or_name(body: &Value, key: &str) -> Result<String, AwsServiceError> {
     Ok(raw.rsplit('/').next().unwrap_or(raw).to_string())
 }
 
-fn hex_val(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn percent_decode(s: &str) -> String {
-    // ARNs in the path are percent-encoded by SDKs; decode %XX escapes on the
-    // raw BYTES and reassemble as UTF-8. Slicing the &str directly
-    // (`&s[i+1..i+3]`) panics when a `%` sits within a multi-byte char boundary
-    // (e.g. `%€`), which would kill the request task and drop the connection.
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
-                out.push(hi * 16 + lo);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 #[async_trait]
 impl AwsService for BatchService {
     fn service_name(&self) -> &str {
@@ -2028,11 +1997,7 @@ mod tests {
 
     fn req(path: &str, body: Value) -> AwsRequest {
         let p = path.split('?').next().unwrap_or(path);
-        let path_segments: Vec<String> = p
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .map(String::from)
-            .collect();
+        let path_segments = fakecloud_core::path::split_path_segments(p);
         AwsRequest {
             service: "batch".into(),
             action: String::new(),
@@ -2590,22 +2555,6 @@ mod tests {
         );
         r.method = Method::DELETE;
         assert_eq!(BatchService::resolve_action(&r), Some("UntagResource"));
-    }
-
-    #[test]
-    fn percent_decode_handles_multibyte_without_panicking() {
-        // A `%` adjacent to a multi-byte UTF-8 char used to slice on a non-char
-        // boundary and panic, killing the request task. The bytes after `%` are
-        // not ASCII hex, so the `%` and the char pass through unchanged.
-        assert_eq!(percent_decode("%€"), "%€");
-        // Trailing/partial escapes pass through untouched, no panic.
-        assert_eq!(percent_decode("%"), "%");
-        assert_eq!(percent_decode("%2"), "%2");
-        assert_eq!(percent_decode("%zz"), "%zz");
-        // Valid escapes still decode, and multi-byte content round-trips.
-        assert_eq!(percent_decode("arn%3Aaws%3Abatch"), "arn:aws:batch");
-        assert_eq!(percent_decode("caf%C3%A9"), "café");
-        assert_eq!(percent_decode("plain"), "plain");
     }
 
     #[tokio::test]
