@@ -1803,6 +1803,11 @@ fn finalize_stopped_multi(
         let Some(task) = s.tasks.get_mut(task_id) else {
             return;
         };
+        // A task stopped before it ever ran (StopTask during launch) leaves
+        // the pending count, not the running one -- the counterpart of what
+        // `mark_running_multi` moves. An already-STOPPED row was counted out
+        // by whoever stopped it.
+        let previous_status = task.last_status.clone();
         task.last_status = "STOPPED".into();
         task.desired_status = "STOPPED".into();
         task.stopping_at = task.stopping_at.or(Some(Utc::now()));
@@ -1820,10 +1825,20 @@ fn finalize_stopped_multi(
                 c.exit_code = mapped.or(Some(primary_exit_code));
             }
         }
-        if let Some(cluster) = s.clusters.get_mut(&task.cluster_name) {
-            if cluster.running_tasks_count > 0 {
-                cluster.running_tasks_count -= 1;
+        let was_running = previous_status == "RUNNING";
+        let was_pending = !was_running && previous_status != "STOPPED";
+        let release = |running: &mut i32, pending: &mut i32| {
+            if was_running && *running > 0 {
+                *running -= 1;
+            } else if was_pending && *pending > 0 {
+                *pending -= 1;
             }
+        };
+        if let Some(cluster) = s.clusters.get_mut(&task.cluster_name) {
+            release(
+                &mut cluster.running_tasks_count,
+                &mut cluster.pending_tasks_count,
+            );
         }
         if let Some(ref ci_arn) = task.container_instance_arn {
             if let Some(ci) = s
@@ -1831,9 +1846,7 @@ fn finalize_stopped_multi(
                 .values_mut()
                 .find(|ci| ci.container_instance_arn == *ci_arn)
             {
-                if ci.running_tasks_count > 0 {
-                    ci.running_tasks_count -= 1;
-                }
+                release(&mut ci.running_tasks_count, &mut ci.pending_tasks_count);
             }
         }
         (task.task_arn.clone(), task.cluster_arn.clone())
@@ -2354,6 +2367,53 @@ mod tests {
         assert_eq!(sc.exit_code, Some(137));
         assert_eq!(app.last_status, "STOPPED");
         assert_eq!(sc.last_status, "STOPPED");
+    }
+
+    /// Stopping a task releases the count it held: RUNNING tasks leave
+    /// `runningTasksCount`, tasks stopped before they ran (StopTask during
+    /// launch) leave `pendingTasksCount`, and neither touches another task's.
+    #[test]
+    fn finalize_stopped_multi_releases_the_count_the_task_held() {
+        for (status, want_running, want_pending) in
+            [("RUNNING", 1, 1), ("PENDING", 1, 1), ("STOPPED", 1, 1)]
+        {
+            let mut accounts: MultiAccountState<EcsState> =
+                MultiAccountState::new("000000000000", "us-east-1", "http://localhost:4566");
+            let acct = accounts.get_or_create("000000000000");
+            let mut cluster = crate::state::Cluster::new(
+                "default",
+                "arn:aws:ecs:us-east-1:000000000000:cluster/default".into(),
+            );
+            // One other task running and one pending, plus this one's own
+            // count: afterwards only the other tasks' counts remain.
+            cluster.running_tasks_count = 1 + i32::from(status == "RUNNING");
+            cluster.pending_tasks_count = 1 + i32::from(status == "PENDING");
+            acct.clusters.insert("default".into(), cluster);
+            let mut t = make_task("t1");
+            t.last_status = status.into();
+            t.containers = vec![make_container("app", true)];
+            acct.tasks.insert("t1".into(), t);
+            let state: SharedEcsState = Arc::new(RwLock::new(accounts));
+
+            finalize_stopped_multi(
+                &state,
+                "000000000000",
+                "t1",
+                &[],
+                137,
+                "",
+                "UserInitiated",
+                None,
+            );
+
+            let accounts = state.read();
+            let cluster = &accounts.get("000000000000").unwrap().clusters["default"];
+            assert_eq!(
+                (cluster.running_tasks_count, cluster.pending_tasks_count),
+                (want_running, want_pending),
+                "stopping a {status} task"
+            );
+        }
     }
 
     fn plan(name: &str, deps: &[&str]) -> ContainerPlan {
