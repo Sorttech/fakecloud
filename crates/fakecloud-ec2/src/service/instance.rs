@@ -657,11 +657,15 @@ pub(crate) fn launch_instances(
     // The non-primary network interfaces: each is created (or an existing
     // one attached) at its device index, as RunInstances does.
     let secondary_nis = secondary_network_interfaces(params, primary_ni);
-    if count > 1 && secondary_nis.iter().any(|n| n.eni_id.is_some()) {
+    if count > 1
+        && secondary_nis
+            .iter()
+            .any(|n| n.eni_id.is_some() || n.private_ip.is_some())
+    {
         return Err(AwsServiceError::aws_error(
             http::StatusCode::BAD_REQUEST,
             "InvalidParameterCombination",
-            "Cannot attach an existing network interface when launching more than one instance."
+            "Cannot attach an existing network interface or a fixed private IP address to more than one instance."
                 .to_string(),
         ));
     }
@@ -690,17 +694,56 @@ pub(crate) fn launch_instances(
                 ));
             }
         }
-        for ni in secondary_nis.iter().filter_map(|n| n.eni_id.as_ref()) {
-            match state.network_interfaces.get(ni) {
-                None => return Err(super::eni::eni_not_found(ni)),
-                Some(e) if e.attachment.is_some() => {
+        for ni in &secondary_nis {
+            if let Some(eni_id) = &ni.eni_id {
+                match state.network_interfaces.get(eni_id) {
+                    None => return Err(super::eni::eni_not_found(eni_id)),
+                    Some(e) if e.attachment.is_some() => {
+                        return Err(AwsServiceError::aws_error(
+                            http::StatusCode::BAD_REQUEST,
+                            "InvalidNetworkInterface.InUse",
+                            format!("Interface: [{eni_id}] in use."),
+                        ))
+                    }
+                    // An interface lives in one AZ; it can only attach there.
+                    Some(e) if e.availability_zone != az => {
+                        return Err(AwsServiceError::aws_error(
+                            http::StatusCode::BAD_REQUEST,
+                            "InvalidParameterCombination",
+                            format!(
+                                "The network interface {eni_id} and the instance must be in the same availability zone."
+                            ),
+                        ))
+                    }
+                    Some(_) => {}
+                }
+                continue;
+            }
+            if let Some(sn) = &ni.subnet_id {
+                if !state.subnets.contains_key(sn) {
                     return Err(AwsServiceError::aws_error(
                         http::StatusCode::BAD_REQUEST,
-                        "InvalidNetworkInterface.InUse",
-                        format!("Interface: [{ni}] in use."),
-                    ))
+                        "InvalidSubnetID.NotFound",
+                        format!("The subnet ID '{sn}' does not exist"),
+                    ));
                 }
-                Some(_) => {}
+            }
+            if let Some(ip) = &ni.private_ip {
+                let in_use = state
+                    .instances
+                    .values()
+                    .any(|i| i.state_code != 48 && &i.private_ip == ip)
+                    || state
+                        .network_interfaces
+                        .values()
+                        .any(|e| &e.private_ip_address == ip);
+                if in_use {
+                    return Err(AwsServiceError::aws_error(
+                        http::StatusCode::BAD_REQUEST,
+                        "InvalidIPAddress.InUse",
+                        format!("Address {ip} is in use."),
+                    ));
+                }
             }
         }
         let sg_names = sg_name_map(state);
@@ -762,7 +805,7 @@ pub(crate) fn launch_instances(
                 enable_resource_name_dns_aaaa_record: launch_opts.enable_aaaa_record,
                 instance_lifecycle: instance_lifecycle.clone(),
             };
-            attach_secondary_network_interfaces(state, id, &inst, &secondary_nis, params);
+            attach_secondary_network_interfaces(state, id, idx, &inst, &secondary_nis, params);
             crate::service::tags::apply_tag_specifications(state, params, id, "instance");
             if let Some(credits) = &credit_spec {
                 state
@@ -872,6 +915,7 @@ fn secondary_network_interfaces(
 fn attach_secondary_network_interfaces(
     state: &mut Ec2State,
     id: &str,
+    launch_index: usize,
     inst: &Instance,
     secondary: &[SecondaryNi],
     params: &HashMap<String, String>,
@@ -891,7 +935,8 @@ fn attach_secondary_network_interfaces(
                     let prefix = subnet
                         .map(|s| subnet_ip_prefix(&s.cidr_block))
                         .unwrap_or_else(|| "10.0.0".to_string());
-                    format!("{prefix}.{}", 100 + k)
+                    // Distinct per instance and interface of the launch.
+                    format!("{prefix}.{}", 100 + launch_index * 8 + k)
                 });
                 let eni = crate::state::NetworkInterface {
                     network_interface_id: eni_id.clone(),
@@ -904,7 +949,17 @@ fn attach_secondary_network_interfaces(
                         .unwrap_or_else(|| inst.az.clone()),
                     subnet_id,
                     description: ni.description.clone(),
-                    mac_address: format!("0a:1b:2c:3d:4e:{:02x}", 0x60 + k),
+                    mac_address: {
+                        let h = uuid::Uuid::new_v4().simple().to_string();
+                        format!(
+                            "0a:{}:{}:{}:{}:{}",
+                            &h[0..2],
+                            &h[2..4],
+                            &h[4..6],
+                            &h[6..8],
+                            &h[8..10]
+                        )
+                    },
                     private_ip_address: private_ip,
                     status: "in-use".to_string(),
                     interface_type: "interface".to_string(),
@@ -1454,11 +1509,20 @@ async fn change_state(
             super::volume::release_terminated_volumes(state, &affected);
             // Network interfaces too: the ones launched with it are deleted,
             // other attached ones detached.
-            state.network_interfaces.retain(|_, eni| {
-                !eni.attachment
-                    .as_ref()
-                    .is_some_and(|a| affected.contains(&a.instance_id) && a.delete_on_termination)
-            });
+            let deleted: Vec<String> = state
+                .network_interfaces
+                .iter()
+                .filter(|(_, eni)| {
+                    eni.attachment.as_ref().is_some_and(|a| {
+                        affected.contains(&a.instance_id) && a.delete_on_termination
+                    })
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            for eni_id in &deleted {
+                state.network_interfaces.remove(eni_id);
+                state.tags.remove(eni_id);
+            }
             for eni in state.network_interfaces.values_mut() {
                 if eni
                     .attachment
@@ -4021,7 +4085,6 @@ mod modify_tests {
                         ("NetworkInterface.1.DeviceIndex", "0"),
                         ("NetworkInterface.1.SubnetId", "subnet-a"),
                         ("NetworkInterface.2.DeviceIndex", "1"),
-                        ("NetworkInterface.2.SubnetId", "subnet-b"),
                         ("NetworkInterface.2.SecurityGroupId.1", "sg-2"),
                     ],
                 ),
@@ -4045,7 +4108,10 @@ mod modify_tests {
             let a = eni.attachment.as_ref().unwrap();
             assert_eq!(a.device_index, 1);
             assert!(a.delete_on_termination);
-            assert_eq!(eni.subnet_id, "subnet-b");
+            assert_eq!(
+                eni.subnet_id, "subnet-a",
+                "the instance's subnet by default"
+            );
             assert_eq!(eni.group_ids, vec!["sg-2".to_string()]);
             eni_id.clone()
         };
@@ -4059,6 +4125,57 @@ mod modify_tests {
             .unwrap()
             .network_interfaces
             .contains_key(&eni_id));
+    }
+
+    #[tokio::test]
+    async fn secondary_interfaces_are_distinct_per_instance_and_validated() {
+        let svc = Ec2Service::new();
+        let out = body(
+            run_instances(
+                &svc,
+                &req(
+                    "RunInstances",
+                    &[
+                        ("ImageId", "ami-1"),
+                        ("MinCount", "2"),
+                        ("MaxCount", "2"),
+                        ("NetworkInterface.1.DeviceIndex", "0"),
+                        ("NetworkInterface.2.DeviceIndex", "1"),
+                    ],
+                ),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(out.matches("<instanceId>").count(), 2);
+        {
+            let accounts = svc.state.read();
+            let st = accounts.get("000000000000").unwrap();
+            let ips: std::collections::BTreeSet<&String> = st
+                .network_interfaces
+                .values()
+                .map(|e| &e.private_ip_address)
+                .collect();
+            assert_eq!(ips.len(), 2, "one distinct address per instance");
+        }
+        let err = crate::test_support::err_of(
+            run_instances(
+                &svc,
+                &req(
+                    "RunInstances",
+                    &[
+                        ("ImageId", "ami-1"),
+                        ("MinCount", "1"),
+                        ("MaxCount", "1"),
+                        ("NetworkInterface.1.DeviceIndex", "0"),
+                        ("NetworkInterface.2.DeviceIndex", "1"),
+                        ("NetworkInterface.2.SubnetId", "subnet-doesnotexist"),
+                    ],
+                ),
+            )
+            .await,
+        );
+        assert_eq!(err.code(), "InvalidSubnetID.NotFound");
     }
 
     #[tokio::test]

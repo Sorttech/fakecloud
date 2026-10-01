@@ -266,12 +266,15 @@ pub fn launch_configuration_from_instance(
         security_groups: inst.security_group_ids.clone(),
         user_data: inst.user_data.clone(),
         iam_instance_profile,
-        // Replacements get a public IP exactly when the instance has one.
-        associate_public_ip_address: Some(inst.public_ip.is_some()),
+        // Replacements get a public IP exactly when the running instance has
+        // one; a stopped instance has released its public IP, so it says
+        // nothing and the subnet's default applies.
+        associate_public_ip_address: (inst.state_code != 80).then_some(inst.public_ip.is_some()),
         instance_monitoring: inst.monitoring,
         ebs_optimized: inst.ebs_optimized,
         spot_price: None,
         placement_tenancy: inst.placement_tenancy.clone(),
+        source_instance_id: Some(instance_id.to_string()),
         block_device_mappings,
         metadata_options: Some(InstanceMetadataOptions {
             http_tokens: Some(m.http_tokens.clone()),
@@ -641,6 +644,7 @@ mod tests {
             ebs_optimized: true,
             spot_price: Some("0.05".into()),
             placement_tenancy: Some("dedicated".into()),
+            source_instance_id: None,
             block_device_mappings: vec![BlockDeviceMapping {
                 device_name: "/dev/xvda".into(),
                 ebs: Some(Ebs {

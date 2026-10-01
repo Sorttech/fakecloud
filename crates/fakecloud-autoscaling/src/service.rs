@@ -458,6 +458,7 @@ impl AutoScalingService {
                 .unwrap_or(false),
             spot_price: optional_query_param(req, "SpotPrice"),
             placement_tenancy: optional_query_param(req, "PlacementTenancy"),
+            source_instance_id: None,
             block_device_mappings: crate::launch::parse_block_device_mappings(req),
             metadata_options: crate::launch::parse_metadata_options(req),
             created_time: Utc::now(),

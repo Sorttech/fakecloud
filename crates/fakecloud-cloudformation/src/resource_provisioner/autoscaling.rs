@@ -290,6 +290,7 @@ impl ResourceProvisioner {
             ebs_optimized: prop_bool(props, "EbsOptimized").unwrap_or(false),
             spot_price: prop_str(props, "SpotPrice").map(String::from),
             placement_tenancy: prop_str(props, "PlacementTenancy").map(String::from),
+            source_instance_id: None,
             block_device_mappings: parse_cfn_block_device_mappings(props),
             metadata_options: parse_cfn_metadata_options(props),
             created_time: Utc::now(),
@@ -443,16 +444,30 @@ impl ResourceProvisioner {
         // An `InstanceId` source re-derives the group's launch configuration
         // from the (possibly new) instance.
         if let Some(iid) = prop_str(props, "InstanceId") {
-            let owned = self
-                .autoscaling_state
-                .read()
-                .accounts
-                .get(&self.account_id)
-                .and_then(|a| a.groups.get(&name))
-                .and_then(|g| g.launch_configuration_name.clone());
-            let (lc, _, _) =
-                self.install_instance_launch_configuration(iid, &name, owned.as_deref())?;
-            new_lc = Some(lc);
+            // The configuration the group owns, and the instance it came from.
+            let (owned, source) = {
+                let st = self.autoscaling_state.read();
+                let acct = st.accounts.get(&self.account_id);
+                let owned = acct
+                    .and_then(|a| a.groups.get(&name))
+                    .and_then(|g| g.launch_configuration_name.clone());
+                let source = owned
+                    .as_ref()
+                    .and_then(|lc| acct.and_then(|a| a.launch_configurations.get(lc)))
+                    .and_then(|lc| lc.source_instance_id.clone());
+                (owned, source)
+            };
+            // Re-derive only for a different instance: the original may since
+            // have stopped or terminated, which must not fail an unrelated
+            // update (or change what the group launches).
+            new_lc = if source.as_deref() == Some(iid) {
+                owned
+            } else {
+                Some(
+                    self.install_instance_launch_configuration(iid, &name, owned.as_deref())?
+                        .0,
+                )
+            };
         }
 
         let arn = {

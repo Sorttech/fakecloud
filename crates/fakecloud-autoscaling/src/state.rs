@@ -76,6 +76,10 @@ pub struct LaunchConfiguration {
     /// `MetadataOptions` (instance metadata service settings).
     #[serde(default)]
     pub metadata_options: Option<InstanceMetadataOptions>,
+    /// The instance an `InstanceId`-sourced group derived this configuration
+    /// from (`None` for one created directly).
+    #[serde(default)]
+    pub source_instance_id: Option<String>,
     pub created_time: DateTime<Utc>,
 }
 

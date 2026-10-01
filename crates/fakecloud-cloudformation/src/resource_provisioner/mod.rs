@@ -8491,6 +8491,26 @@ mod tests {
         let lc =
             &acct_state.launch_configurations[group.launch_configuration_name.as_ref().unwrap()];
         assert_eq!(lc.image_id, "ami-0v2", "derived from the new instance");
+        drop(st);
+        // The same InstanceId is not re-derived: an unrelated update still
+        // works after the source instance is gone.
+        prov.ec2_state
+            .write()
+            .get_or_create(acct)
+            .instances
+            .remove(&replaced.physical_id);
+        prov.update_resource(
+            &from_instance,
+            &make_resource(
+                "AWS::AutoScaling::AutoScalingGroup",
+                "FromInstance",
+                serde_json::json!({
+                    "MinSize": "0", "MaxSize": "2", "DesiredCapacity": "0",
+                    "InstanceId": replaced.physical_id
+                }),
+            ),
+        )
+        .expect("unchanged InstanceId needs no live instance");
     }
 
     /// A stack launch template's tags follow `TagSpecifications` on update,
