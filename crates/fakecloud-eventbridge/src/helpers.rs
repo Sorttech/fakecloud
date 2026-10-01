@@ -1009,6 +1009,11 @@ pub(crate) fn function_name_from_arn(arn: &str) -> &str {
     }
 }
 
+/// The account ID a Lambda function ARN names, or `None` for a bare name.
+pub(crate) fn lambda_arn_account(arn: &str) -> Option<&str> {
+    arn.split(':').nth(4).filter(|a| !a.is_empty())
+}
+
 /// Spawn a background task to invoke a Lambda function via ContainerRuntime.
 /// This is fire-and-forget: EventBridge delivery is asynchronous.
 pub(crate) fn invoke_lambda_async(
@@ -1041,23 +1046,20 @@ pub(crate) fn invoke_lambda_async(
     };
     let func_name = function_name_from_arn(function_arn).to_string();
     // Resolve the function in the account its ARN names (an event from another
-    // account's bus targets that account's function), falling back to the
-    // default account for a bare name.
-    let func_account = function_arn
-        .split(':')
-        .nth(4)
-        .filter(|a| !a.is_empty())
-        .map(str::to_string);
+    // account's bus targets that account's function); only a bare name falls
+    // back to the default account.
+    let func_account = lambda_arn_account(function_arn).map(str::to_string);
     let payload = payload.as_bytes().to_vec();
 
     tokio::spawn(async move {
         let resolved = {
             let accounts = lambda_state.read();
-            let state = func_account
-                .as_deref()
-                .and_then(|a| accounts.get(a))
-                .unwrap_or_else(|| accounts.default_ref());
-            state.functions.get(&func_name).cloned().map(|func| {
+            let state = match func_account.as_deref() {
+                Some(account) => accounts.get(account),
+                None => Some(accounts.default_ref()),
+            };
+            let func = state.and_then(|s| s.functions.get(&func_name).cloned());
+            func.map(|func| {
                 let mut layer_zips: Vec<Vec<u8>> = Vec::with_capacity(func.layers.len());
                 for attached in &func.layers {
                     if let Some(bytes) = fakecloud_lambda::extras::parse_layer_version_arn(
@@ -1367,15 +1369,18 @@ pub(crate) fn dispatch_event_target(
             });
         }
         if let Some(ls) = ctx.lambda_state {
-            ls.write()
-                .default_mut()
-                .invocations
-                .push(fakecloud_lambda::LambdaInvocation {
-                    function_arn: arn.clone(),
-                    payload: body_str.clone(),
-                    timestamp: now,
-                    source: "aws:events".to_string(),
-                });
+            let mut accounts = ls.write();
+            match lambda_arn_account(arn) {
+                Some(account) => accounts.get_or_create(account),
+                None => accounts.default_mut(),
+            }
+            .invocations
+            .push(fakecloud_lambda::LambdaInvocation {
+                function_arn: arn.clone(),
+                payload: body_str.clone(),
+                timestamp: now,
+                source: "aws:events".to_string(),
+            });
         }
         invoke_lambda_async(
             ctx.container_runtime,

@@ -565,6 +565,41 @@ mod tests {
         assert_eq!(state.read().default_ref().lambda_invocations.len(), 1);
     }
 
+    /// A Lambda target ARN naming another account is recorded against that
+    /// account, never the default one (which may own a same-named function).
+    #[test]
+    fn put_event_records_lambda_invocation_in_arn_account() {
+        let state = make_shared();
+        let fn_arn = "arn:aws:lambda:us-east-1:999988887777:function:foo";
+        insert_rule(&state, make_rule("xacct", None, fn_arn));
+        let lambda_state: SharedLambdaState = Arc::new(RwLock::new(
+            fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+        ));
+        let delivery = EventBridgeDeliveryImpl::new(state, Arc::new(DeliveryBus::new()))
+            .with_target_wiring(EventTargetWiring {
+                lambda_state: Some(lambda_state.clone()),
+                ..Default::default()
+            });
+
+        delivery.put_event("app", "T", "{}", "default");
+
+        let accounts = lambda_state.read();
+        assert!(accounts.default_ref().invocations.is_empty());
+        let target = accounts.get("999988887777").expect("target account");
+        assert_eq!(target.invocations.len(), 1);
+        assert_eq!(target.invocations[0].function_arn, fn_arn);
+    }
+
+    #[test]
+    fn lambda_arn_account_only_for_full_arns() {
+        use crate::service::helpers::lambda_arn_account;
+        assert_eq!(
+            lambda_arn_account("arn:aws:lambda:us-east-1:999988887777:function:foo:live"),
+            Some("999988887777")
+        );
+        assert_eq!(lambda_arn_account("foo"), None);
+    }
+
     /// A cross-service event matched by a rule with a CloudWatch Logs target
     /// lands in the log group, as with PutEvents.
     #[test]
