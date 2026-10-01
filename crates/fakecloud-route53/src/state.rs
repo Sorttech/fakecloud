@@ -184,10 +184,21 @@ impl Route53Accounts {
         self.entry(default_account);
 
         for (id, zone) in hosted_zones {
-            self.entry(&zone_owner(&id))
-                .hosted_zones
-                .entry(id)
-                .or_insert(zone);
+            let account = zone_owner(&id);
+            let bucket = self.entry(&account);
+            if account != default_account && !zone.vpcs.is_empty() {
+                // v1 kept no record of who associated a VPC, and every
+                // account shared the zone, so the default account may have
+                // associated any of them through the API. Keep its access to
+                // disassociate and list them rather than lose it on load.
+                let vpcs = zone
+                    .vpcs
+                    .iter()
+                    .map(|v| (v.clone(), default_account.to_string()))
+                    .collect();
+                bucket.cross_account_vpcs.entry(id.clone()).or_insert(vpcs);
+            }
+            bucket.hosted_zones.entry(id).or_insert(zone);
         }
         for (id, hc) in health_checks {
             self.entry(&hc_owner(&id))
@@ -547,6 +558,10 @@ mod snapshot_migration_tests {
         let legacy = accounts.entry(LEGACY_ACCOUNT);
         legacy.hosted_zones.insert("ZAPI".into(), zone("ZAPI"));
         let mut stack_zone = zone("ZSTACK");
+        stack_zone.vpcs.push(VPC {
+            vpc_id: Some("vpc-1".into()),
+            vpc_region: Some("us-east-1".into()),
+        });
         stack_zone
             .resource_record_sets
             .push(crate::model::ResourceRecordSet {
@@ -660,6 +675,8 @@ mod snapshot_migration_tests {
         assert_eq!(stack.dnssec_status["ZSTACK"], "SIGNING");
         assert!(stack.query_logging_configs.contains_key("qlc-1"));
         assert!(stack.vpc_authorizations.contains_key("ZSTACK"));
+        // The default account keeps access to the VPCs it may have associated.
+        assert_eq!(stack.cross_account_vpcs["ZSTACK"][0].1, DEFAULT);
         assert_eq!(
             stack.tags[&("hostedzone".to_string(), "ZSTACK".to_string())]["team"],
             "dns"
