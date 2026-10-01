@@ -256,6 +256,16 @@ impl K8sTaskBackend {
     }
 }
 
+/// Whether a task whose Pod disappeared should still pass through RUNNING
+/// before it is finalized. A StopTask that deleted the Pod before any of its
+/// containers was seen running (for instance while the credentials
+/// initContainer was still routing `169.254.170.2`) takes the task straight
+/// from PENDING to STOPPED, as on ECS and the Docker backend; a Pod deleted
+/// out from under a task nobody stopped still reports the RUNNING it reached.
+fn mark_running_when_pod_gone(marked_running: bool, desired_stopped: bool) -> bool {
+    !marked_running && !desired_stopped
+}
+
 /// Why a task Pod's credentials initContainer did not get it running.
 #[derive(Debug, PartialEq, Eq)]
 enum CredsInitError {
@@ -534,7 +544,10 @@ impl EcsRuntime {
                 // intentional StopTask (which deletes the Pod). Finalize
                 // as a clean stop instead of surfacing TaskFailedToStart.
                 Err(e) if is_not_found(&e) => {
-                    if !marked_running {
+                    if mark_running_when_pod_gone(
+                        marked_running,
+                        task_desired_stopped(state, account_id, task_id),
+                    ) {
                         mark_running_multi(state, account_id, task_id, &started);
                         self.emit_state_change(state, account_id, task_id, "RUNNING", None);
                         self.persist_snapshot().await;
@@ -1411,6 +1424,17 @@ mod tests {
             }),
             ..Pod::default()
         }
+    }
+
+    #[test]
+    fn a_task_stopped_before_it_ran_never_reports_running() {
+        // StopTask deleted the Pod before anything ran: straight to STOPPED.
+        assert!(!mark_running_when_pod_gone(false, true));
+        // Already RUNNING: nothing more to mark.
+        assert!(!mark_running_when_pod_gone(true, true));
+        assert!(!mark_running_when_pod_gone(true, false));
+        // The Pod vanished without a StopTask: keep the RUNNING transition.
+        assert!(mark_running_when_pod_gone(false, false));
     }
 
     #[test]
