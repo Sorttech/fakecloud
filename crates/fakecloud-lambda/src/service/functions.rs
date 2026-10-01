@@ -26,8 +26,8 @@ impl LambdaService {
             ));
         }
 
-        // PassRole: a role whose trust policy lets Lambda assume it, and (under
-        // IAM enforcement) in the caller's account.
+        // PassRole: a role whose trust policy (read in the role's own account)
+        // lets Lambda assume it, and (under strict IAM) in the caller's account.
         super::validate_execution_role(
             &req.account_id,
             &input.role,

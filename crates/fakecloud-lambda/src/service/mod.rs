@@ -573,11 +573,12 @@ pub(crate) fn validate_environment(
 ///   whatever its trust policy says; `--iam soft` logs the would-be denial to
 ///   the IAM audit target and allows it; with IAM off (the default) it is
 ///   accepted, so templates carrying another emulator's default account
-///   (`000000000000`) keep working. The execution session is then minted in
-///   the function's account.
-/// - The role's trust policy must let `lambda.amazonaws.com` assume it,
-///   looked up in the caller's (function's) account, where the session is
-///   minted. Always applied, as it always was on `CreateFunction`.
+///   (`000000000000`) keep working.
+/// - The role's trust policy must let `lambda.amazonaws.com` assume it. The
+///   role checked is the one the ARN names, in the account that owns it, or
+///   the caller's when the ARN names none: a same-named role in the caller's
+///   account is a different role. Always applied, as it always was on
+///   `CreateFunction`.
 pub fn validate_execution_role(
     caller_account: &str,
     role_arn: &str,
@@ -604,8 +605,9 @@ pub fn validate_execution_role(
         }
     }
     if let Some(validator) = validator {
+        let role_account = fakecloud_aws::arn::account_of(role_arn).unwrap_or(caller_account);
         validator
-            .validate(caller_account, role_arn, "lambda.amazonaws.com")
+            .validate(role_account, role_arn, "lambda.amazonaws.com")
             .map_err(|err| {
                 AwsServiceError::aws_error(
                     StatusCode::BAD_REQUEST,

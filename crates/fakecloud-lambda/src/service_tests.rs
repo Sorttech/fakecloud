@@ -4403,7 +4403,7 @@ fn cross_account_execution_role_is_refused_only_under_strict_iam() {
 }
 
 #[test]
-fn trust_check_runs_in_the_function_account() {
+fn trust_check_runs_in_the_roles_account() {
     let validator = RecordingTrustValidator::default();
     validate_execution_role(
         "123456789012",
@@ -4412,7 +4412,123 @@ fn trust_check_runs_in_the_function_account() {
         fakecloud_core::auth::IamMode::Off,
     )
     .unwrap();
-    // The session is minted in the function's account, so that is where
-    // the role's trust policy is looked up.
-    assert_eq!(*validator.accounts.lock(), vec!["123456789012".to_string()]);
+    // A role ARN naming no account falls back to the caller's.
+    validate_execution_role(
+        "123456789012",
+        "arn:aws:iam:::role/r",
+        Some(&validator),
+        fakecloud_core::auth::IamMode::Off,
+    )
+    .unwrap();
+    assert_eq!(
+        *validator.accounts.lock(),
+        vec!["000000000000".to_string(), "123456789012".to_string()]
+    );
+}
+
+/// Two accounts each hold a role named `app`; only the one in `trusting`
+/// has a trust policy that lets Lambda assume it.
+struct TrustsOnlyIn(&'static str);
+
+impl fakecloud_core::auth::RoleTrustValidator for TrustsOnlyIn {
+    fn validate(
+        &self,
+        account_id: &str,
+        role_arn: &str,
+        service_principal: &str,
+    ) -> Result<(), fakecloud_core::auth::PassRoleError> {
+        assert_eq!(service_principal, "lambda.amazonaws.com");
+        if account_id == self.0 {
+            Ok(())
+        } else {
+            Err(fakecloud_core::auth::PassRoleError::TrustPolicyDenies {
+                role_arn: role_arn.to_string(),
+                service_principal: service_principal.to_string(),
+            })
+        }
+    }
+}
+
+#[test]
+fn another_accounts_role_is_checked_against_its_own_trust_policy() {
+    use fakecloud_core::auth::IamMode;
+    let foreign = "arn:aws:iam::999999999999:role/app";
+    let own = "arn:aws:iam::123456789012:role/app";
+    // The role's own account trusts Lambda; the caller's untrusting
+    // same-named role must not decide the outcome.
+    let foreign_trusts = TrustsOnlyIn("999999999999");
+    for mode in [IamMode::Off, IamMode::Soft] {
+        validate_execution_role("123456789012", foreign, Some(&foreign_trusts), mode)
+            .unwrap_or_else(|e| panic!("{mode}: checked in the role's account: {e}"));
+    }
+    let err = validate_execution_role("123456789012", own, Some(&foreign_trusts), IamMode::Off)
+        .expect_err("caller's own untrusting role refused");
+    assert_eq!(err.code(), "InvalidParameterValueException");
+
+    // And the other way round: the caller's role trusting Lambda does not
+    // vouch for the foreign one.
+    let own_trusts = TrustsOnlyIn("123456789012");
+    let err = validate_execution_role("123456789012", foreign, Some(&own_trusts), IamMode::Off)
+        .expect_err("foreign untrusting role refused");
+    assert_eq!(err.code(), "InvalidParameterValueException");
+    assert!(err.message().contains(foreign), "{}", err.message());
+    validate_execution_role("123456789012", own, Some(&own_trusts), IamMode::Strict).unwrap();
+
+    // Strict refuses another account's role before its trust policy is read.
+    let err = validate_execution_role(
+        "123456789012",
+        foreign,
+        Some(&foreign_trusts),
+        IamMode::Strict,
+    )
+    .expect_err("strict refuses cross-account");
+    assert_eq!(err.code(), "AccessDeniedException");
+}
+
+#[tokio::test]
+async fn create_and_update_function_check_the_roles_own_account() {
+    let svc = LambdaService::new(make_state())
+        .with_role_trust_validator(Arc::new(TrustsOnlyIn("999999999999")));
+    let create = |name: &str, role: &str| {
+        make_request(
+            Method::POST,
+            "/2015-03-31/functions",
+            &json!({
+                "FunctionName": name,
+                "Runtime": "python3.12",
+                "Role": role,
+                "Handler": "index.handler",
+                "Code": {}
+            })
+            .to_string(),
+        )
+    };
+    let foreign = "arn:aws:iam::999999999999:role/app";
+    let own = "arn:aws:iam::123456789012:role/app";
+    svc.handle(create("foreign-role", foreign))
+        .await
+        .expect("foreign role trusting Lambda accepted");
+    let err = svc
+        .handle(create("own-role", own))
+        .await
+        .err()
+        .expect("caller's untrusting role refused");
+    assert_eq!(err.code(), "InvalidParameterValueException");
+
+    let update = |role: &str| {
+        make_request(
+            Method::PUT,
+            "/2015-03-31/functions/foreign-role/configuration",
+            &json!({ "Role": role }).to_string(),
+        )
+    };
+    let err = svc
+        .handle(update(own))
+        .await
+        .err()
+        .expect("update to the caller's untrusting role refused");
+    assert_eq!(err.code(), "InvalidParameterValueException");
+    svc.handle(update(foreign))
+        .await
+        .expect("update to the foreign trusting role accepted");
 }

@@ -8634,6 +8634,73 @@ mod tests {
     }
 
     #[test]
+    fn lambda_function_role_trust_is_read_in_the_roles_account() {
+        // Two accounts each hold a role named `app`; only one trusts Lambda.
+        let mut prov = make_provisioner();
+        let role = |trusts_lambda: bool| {
+            let statement = if trusts_lambda {
+                serde_json::json!([{
+                    "Effect": "Allow",
+                    "Principal": {"Service": "lambda.amazonaws.com"},
+                    "Action": "sts:AssumeRole"
+                }])
+            } else {
+                serde_json::json!([])
+            };
+            make_resource(
+                "AWS::IAM::Role",
+                "App",
+                serde_json::json!({
+                    "RoleName": "app",
+                    "AssumeRolePolicyDocument": {"Version": "2012-10-17", "Statement": statement}
+                }),
+            )
+        };
+        prov.account_id = "999999999999".to_string();
+        let foreign = prov.create_resource(&role(true)).unwrap().physical_id;
+        prov.account_id = "123456789012".to_string();
+        let own = prov.create_resource(&role(false)).unwrap().physical_id;
+        assert_eq!(foreign, "arn:aws:iam::999999999999:role/app");
+        assert_eq!(own, "arn:aws:iam::123456789012:role/app");
+
+        let func = |name: &str, role: &str| {
+            make_resource(
+                "AWS::Lambda::Function",
+                "Fn",
+                serde_json::json!({
+                    "FunctionName": name,
+                    "Runtime": "python3.12",
+                    "Handler": "index.handler",
+                    "Role": role,
+                    "Code": {"ZipFile": "def handler(e,c): return e"}
+                }),
+            )
+        };
+        // The foreign role trusts Lambda: its untrusting namesake in the
+        // stack's account does not decide the outcome.
+        prov.create_resource(&func("foreign-fn", &foreign))
+            .expect("foreign role trusting Lambda accepted");
+        let err = prov.create_resource(&func("own-fn", &own)).unwrap_err();
+        assert!(err.contains("InvalidParameterValueException"), "{err}");
+
+        // Swap the trust: now the stack's role trusts Lambda, the foreign
+        // one does not, and the foreign one is refused.
+        prov.account_id = "999999999999".to_string();
+        prov.create_resource(&role(false)).unwrap();
+        prov.account_id = "123456789012".to_string();
+        prov.create_resource(&role(true)).unwrap();
+        let err = prov
+            .create_resource(&func("foreign-fn-2", &foreign))
+            .unwrap_err();
+        assert!(
+            err.contains("InvalidParameterValueException") && err.contains(&foreign),
+            "{err}"
+        );
+        prov.create_resource(&func("own-fn-2", &own))
+            .expect("stack's role trusting Lambda accepted");
+    }
+
+    #[test]
     fn getatt_iam_role_arn_returns_role_arn() {
         let prov = make_provisioner();
         let role = make_resource(
