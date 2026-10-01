@@ -2150,10 +2150,26 @@ mod tests {
         }
     }
 
+    /// Run a request and return its status and body, rendering a handler
+    /// error the way core dispatch does (Route 53's `<ErrorResponse>`).
     async fn call(svc: &Route53Service, req: AwsRequest) -> (StatusCode, String) {
-        let resp = svc.handle(req).await.unwrap();
-        let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
-        (resp.status, body)
+        let request_id = req.request_id.clone();
+        match svc.handle(req).await {
+            Ok(resp) => {
+                let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
+                (resp.status, body)
+            }
+            Err(err) => {
+                let (status, _, body) = fakecloud_aws::error::rest_xml_error_response(
+                    err.status(),
+                    err.code(),
+                    &err.message(),
+                    &request_id,
+                    fakecloud_aws::error::ROUTE53_XMLNS,
+                );
+                (status, String::from_utf8(body.to_vec()).unwrap())
+            }
+        }
     }
 
     fn xml_value<'a>(body: &'a str, tag: &str) -> &'a str {
