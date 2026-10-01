@@ -8444,15 +8444,16 @@ mod tests {
         ));
         assert!(missing.is_err(), "missing launch template fails the create");
         // `InstanceId` is a launch source of its own.
-        prov.create_resource(&make_resource(
-            "AWS::AutoScaling::AutoScalingGroup",
-            "FromInstance",
-            serde_json::json!({
-                "MinSize": "0", "MaxSize": "1", "DesiredCapacity": "0",
-                "InstanceId": inst.physical_id
-            }),
-        ))
-        .expect("InstanceId-sourced group");
+        let from_instance = prov
+            .create_resource(&make_resource(
+                "AWS::AutoScaling::AutoScalingGroup",
+                "FromInstance",
+                serde_json::json!({
+                    "MinSize": "0", "MaxSize": "1", "DesiredCapacity": "0",
+                    "InstanceId": inst.physical_id
+                }),
+            ))
+            .expect("InstanceId-sourced group");
         {
             // AWS derives a launch configuration named after the group from
             // the instance.
@@ -8471,6 +8472,85 @@ mod tests {
             assert_eq!(lc.instance_type, "m5.large");
             assert_eq!(lc.block_device_mappings.len(), 1);
         }
+        // Updating to another instance re-derives the configuration.
+        prov.update_resource(
+            &from_instance,
+            &make_resource(
+                "AWS::AutoScaling::AutoScalingGroup",
+                "FromInstance",
+                serde_json::json!({
+                    "MinSize": "0", "MaxSize": "1", "DesiredCapacity": "0",
+                    "InstanceId": replaced.physical_id
+                }),
+            ),
+        )
+        .unwrap();
+        let st = prov.autoscaling_state.read();
+        let acct_state = &st.accounts[acct];
+        let group = &acct_state.groups[&from_instance.physical_id];
+        let lc =
+            &acct_state.launch_configurations[group.launch_configuration_name.as_ref().unwrap()];
+        assert_eq!(lc.image_id, "ami-0v2", "derived from the new instance");
+    }
+
+    /// A stack launch template's tags follow `TagSpecifications` on update,
+    /// and dropping an explicit `LaunchTemplateName` replaces the template.
+    #[test]
+    fn stack_launch_template_tags_and_name_on_update() {
+        let prov = make_provisioner();
+        let acct = "123456789012";
+        let def = |name: Option<&str>, tags: serde_json::Value| {
+            let mut props = serde_json::json!({
+                "LaunchTemplateData": {"ImageId": "ami-1"},
+                "TagSpecifications": [{"ResourceType": "launch-template", "Tags": tags}]
+            });
+            if let Some(n) = name {
+                props["LaunchTemplateName"] = serde_json::json!(n);
+            }
+            make_resource("AWS::EC2::LaunchTemplate", "Tmpl", props)
+        };
+        let lt = prov
+            .create_resource(&def(
+                Some("named"),
+                serde_json::json!([{"Key": "a", "Value": "1"}]),
+            ))
+            .unwrap();
+        let updated = prov
+            .update_resource(
+                &lt,
+                &def(
+                    Some("named"),
+                    serde_json::json!([{"Key": "b", "Value": "2"}]),
+                ),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.physical_id, lt.physical_id);
+        {
+            let ec2 = prov.ec2_state.read();
+            let tags: Vec<(String, String)> = ec2
+                .get(acct)
+                .unwrap()
+                .tags_for(&lt.physical_id)
+                .iter()
+                .map(|t| (t.key.clone(), t.value.clone()))
+                .collect();
+            assert_eq!(tags, vec![("b".to_string(), "2".to_string())]);
+        }
+        let replaced = prov
+            .update_resource(&updated, &def(None, serde_json::json!([])))
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            replaced.physical_id, lt.physical_id,
+            "dropping the name replaces"
+        );
+        // A generated name is kept on the next update.
+        let again = prov
+            .update_resource(&replaced, &def(None, serde_json::json!([])))
+            .unwrap()
+            .unwrap();
+        assert_eq!(again.physical_id, replaced.physical_id);
     }
 
     /// A stack MSK cluster rejected for a duplicate name mints no key.

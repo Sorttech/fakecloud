@@ -240,7 +240,33 @@ async fn run_instances_launches_from_launch_template_versions() {
     let vols = volumes_of(&ec2, out.instances()[0].instance_id().unwrap()).await;
     assert_eq!(vols.len(), 1);
     assert_eq!(vols[0].size(), Some(50));
+    assert_eq!(
+        vols[0].attachments()[0].device(),
+        Some("/dev/sdf"),
+        "the request's mapping replaced the template's /dev/xvda"
+    );
     assert_eq!(vols[0].encrypted(), Some(false));
+
+    // GetLaunchTemplateData round-trips through the SDK, including the
+    // primary interface's security groups (`groupSet` of `groupId`s).
+    let data = ec2
+        .get_launch_template_data()
+        .instance_id(&id)
+        .send()
+        .await
+        .unwrap();
+    let data = data.launch_template_data().unwrap();
+    assert_eq!(data.image_id(), Some("ami-0a1b2c3d4e5f60001"));
+    let groups = data.network_interfaces()[0].groups();
+    assert_eq!(
+        groups,
+        i.security_groups()
+            .iter()
+            .filter_map(|g| g.group_id().map(String::from))
+            .collect::<Vec<_>>()
+            .as_slice()
+    );
+    assert!(!groups.is_empty());
 }
 
 /// The error code RunInstances answers a launch-template launch with.

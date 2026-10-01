@@ -723,7 +723,19 @@ impl AutoScalingService {
         let new_lc = optional_query_param(req, "LaunchConfigurationName");
         let mut new_lt = parse_launch_template(req);
         let mut new_mixed = crate::launch::parse_mixed_instances_policy(req);
-        if new_lc.is_some() || new_lt.is_some() || new_mixed.is_some() {
+        let sources = [new_lc.is_some(), new_lt.is_some(), new_mixed.is_some()]
+            .iter()
+            .filter(|s| **s)
+            .count();
+        if sources > 1 {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "ValidationError",
+                "Valid requests must contain either LaunchTemplate, LaunchConfigurationName \
+                 or MixedInstancesPolicy parameter.",
+            ));
+        }
+        if sources == 1 {
             self.validate_launch_source(
                 req,
                 new_lc.as_deref(),
@@ -1064,6 +1076,16 @@ fn group_not_found(name: &str) -> AwsServiceError {
     )
 }
 
+/// What one reconcile launches from: one plan, or a mixed-instances
+/// policy's plan per override.
+enum LaunchPlans {
+    Single(LaunchPlan),
+    Mixed {
+        policy: Box<crate::state::MixedInstancesPolicy>,
+        plans: Vec<LaunchPlan>,
+    },
+}
+
 /// How one reconcile launches each new instance of a group.
 struct LaunchPlan {
     /// The `RunInstances` parameters (before placement and tags).
@@ -1081,6 +1103,27 @@ fn weight_of(w: &Option<String>) -> i64 {
         .and_then(|v| v.parse::<i64>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(1)
+}
+
+/// The instances (oldest first in `instances`) a scale-in to `target`
+/// terminates: repeatedly the heaviest one (newest first among equals) whose
+/// removal still leaves the target covered, so a weighted group gets as close
+/// to its desired capacity as it can.
+fn scale_in_choice(mut instances: Vec<(String, i64)>, target: i64) -> Vec<String> {
+    let mut cap: i64 = instances.iter().map(|(_, w)| w).sum();
+    let mut out = Vec::new();
+    while let Some(pos) = instances
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, w))| cap - w >= target)
+        .max_by_key(|(i, (_, w))| (*w, *i))
+        .map(|(i, _)| i)
+    {
+        let (id, w) = instances.remove(pos);
+        cap -= w;
+        out.push(id);
+    }
+    out
 }
 
 fn parse_launch_template(req: &AwsRequest) -> Option<LaunchTemplateSpec> {
@@ -1203,6 +1246,48 @@ impl AutoScalingService {
     /// each new instance launches with. A launch template is resolved once
     /// here, so every instance of this reconcile launches from (and records)
     /// the same concrete version; `Err` is the reason the launch fails.
+    fn launch_plans(
+        &self,
+        source: &crate::launch::LaunchSource,
+        account: &str,
+        region: &str,
+    ) -> Result<LaunchPlans, String> {
+        use crate::launch::LaunchSource;
+        let LaunchSource::Mixed(policy) = source else {
+            return self
+                .launch_plan(source, account, region)
+                .map(LaunchPlans::Single);
+        };
+        // One plan per override (the base template when there are none),
+        // each resolved once for the whole reconcile.
+        let overrides: Vec<crate::state::LaunchTemplateOverride> = if policy.overrides.is_empty() {
+            vec![crate::state::LaunchTemplateOverride::default()]
+        } else {
+            policy.overrides.clone()
+        };
+        let plans = overrides
+            .iter()
+            .map(|o| {
+                self.launch_plan(
+                    &LaunchSource::Template {
+                        spec: o
+                            .launch_template_specification
+                            .clone()
+                            .unwrap_or_else(|| policy.launch_template.clone()),
+                        instance_type: o.instance_type.clone(),
+                        weighted_capacity: o.weighted_capacity.clone(),
+                    },
+                    account,
+                    region,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(LaunchPlans::Mixed {
+            policy: policy.clone(),
+            plans,
+        })
+    }
+
     fn launch_plan(
         &self,
         source: &crate::launch::LaunchSource,
@@ -1211,6 +1296,9 @@ impl AutoScalingService {
     ) -> Result<LaunchPlan, String> {
         use crate::launch::LaunchSource;
         match source {
+            LaunchSource::Mixed(_) => {
+                Err("a mixed-instances policy has one plan per override".into())
+            }
             LaunchSource::Configuration(lc) => Ok(LaunchPlan {
                 params: crate::launch::launch_configuration_params(lc),
                 instance_type: Some(lc.instance_type.clone()),
@@ -1306,7 +1394,14 @@ impl AutoScalingService {
                 g.desired_capacity.max(0),
                 g.instances
                     .iter()
-                    .map(|i| (i.instance_id.clone(), i.weighted_capacity.clone()))
+                    .map(|i| {
+                        (
+                            i.instance_id.clone(),
+                            i.weighted_capacity.clone(),
+                            i.instance_type.clone(),
+                            i.lifecycle.is_some(),
+                        )
+                    })
                     .collect::<Vec<_>>(),
                 g.availability_zones.clone(),
                 g.vpc_zone_identifier
@@ -1322,7 +1417,7 @@ impl AutoScalingService {
                 instance_tags,
             )
         };
-        let capacity: i64 = current.iter().map(|(_, w)| weight_of(w)).sum();
+        let capacity: i64 = current.iter().map(|(_, w, _, _)| weight_of(w)).sum();
 
         let mut launched: Vec<AsgInstance> = Vec::new();
         let mut failures: Vec<String> = Vec::new();
@@ -1334,14 +1429,58 @@ impl AutoScalingService {
         let mut ec2_touched = false;
 
         if capacity < target {
-            match self.launch_plan(&source, account, &req.region) {
+            match self.launch_plans(&source, account, &req.region) {
                 Err(reason) => failures.push(reason),
-                Ok(plan) => {
+                Ok(plans) => {
                     let ec2 = self.ec2_service();
-                    let weight = weight_of(&plan.weighted_capacity);
+                    // What the group already runs, for a mixed-instances
+                    // policy's on-demand / Spot split and Spot spreading.
+                    let mut tally: Vec<crate::launch::MixedTally> = match &plans {
+                        LaunchPlans::Single(_) => Vec::new(),
+                        LaunchPlans::Mixed { plans, .. } => current
+                            .iter()
+                            .map(|(_, w, itype, spot)| crate::launch::MixedTally {
+                                override_index: plans.iter().position(|p| {
+                                    p.instance_type.is_some() && &p.instance_type == itype
+                                }),
+                                spot: *spot,
+                                weight: weight_of(w),
+                            })
+                            .collect(),
+                    };
                     let mut cap = capacity;
                     let mut slot = current.len();
                     while cap < target {
+                        let (plan, spot) = match &plans {
+                            LaunchPlans::Single(plan) => (plan, false),
+                            LaunchPlans::Mixed { policy, plans } => {
+                                let weights: Vec<i64> = plans
+                                    .iter()
+                                    .map(|p| weight_of(&p.weighted_capacity))
+                                    .collect();
+                                let (i, spot) =
+                                    crate::launch::choose_mixed_launch(policy, &tally, &weights);
+                                tally.push(crate::launch::MixedTally {
+                                    override_index: Some(i),
+                                    spot,
+                                    weight: weights[i],
+                                });
+                                (&plans[i], spot)
+                            }
+                        };
+                        let weight = weight_of(&plan.weighted_capacity);
+                        let spot_max_price = match &plans {
+                            LaunchPlans::Mixed { policy, .. } => policy
+                                .instances_distribution
+                                .as_ref()
+                                .and_then(|d| d.spot_max_price.clone()),
+                            LaunchPlans::Single(_) => None,
+                        };
+                        let is_spot = spot
+                            || plan
+                                .params
+                                .get("InstanceMarketOptions.MarketType")
+                                .is_some_and(|m| m == "spot");
                         // Spread across the group's subnets (or, without a
                         // VPC zone identifier, its availability zones).
                         let az_hint = azs
@@ -1354,6 +1493,19 @@ impl AutoScalingService {
                             None => Ok((gen_instance_id(), az_hint.clone())),
                             Some(svc) => {
                                 let mut params = plan.params.clone();
+                                if spot {
+                                    params.insert(
+                                        "InstanceMarketOptions.MarketType".to_string(),
+                                        "spot".to_string(),
+                                    );
+                                    if let Some(price) = &spot_max_price {
+                                        params.insert(
+                                            "InstanceMarketOptions.SpotOptions.MaxPrice"
+                                                .to_string(),
+                                            price.clone(),
+                                        );
+                                    }
+                                }
                                 match subnets.get(slot % subnets.len().max(1)) {
                                     Some(subnet) => {
                                         params.insert("SubnetId".to_string(), subnet.clone());
@@ -1395,6 +1547,7 @@ impl AutoScalingService {
                                 instance_type: plan.instance_type.clone(),
                                 launch_template: plan.launch_template.clone(),
                                 weighted_capacity: plan.weighted_capacity.clone(),
+                                lifecycle: is_spot.then(|| "spot".to_string()),
                             }),
                             Err(reason) => {
                                 failures.push(reason);
@@ -1410,15 +1563,13 @@ impl AutoScalingService {
             // Scale in newest-first, keeping the group at or above its
             // desired capacity (a weighted instance is only removed while the
             // rest still covers the target).
-            let mut cap = capacity;
-            for (id, w) in current.iter().rev() {
-                let w = weight_of(w);
-                if cap - w < target {
-                    continue;
-                }
-                cap -= w;
-                terminate_ids.push(id.clone());
-            }
+            terminate_ids = scale_in_choice(
+                current
+                    .iter()
+                    .map(|(id, w, _, _)| (id.clone(), weight_of(w)))
+                    .collect(),
+                target,
+            );
             self.terminate_ec2_instances(&terminate_ids, req).await;
             ec2_touched = self.ec2_state.is_some() && !terminate_ids.is_empty();
         }
@@ -2515,6 +2666,133 @@ mod tests {
         assert!(
             lcs.contains("<LaunchConfigurationName>g</LaunchConfigurationName>"),
             "{lcs}"
+        );
+    }
+
+    #[test]
+    fn weighted_scale_in_reaches_the_target() {
+        let pick = |v: &[(&str, i64)], t| {
+            scale_in_choice(v.iter().map(|(i, w)| (i.to_string(), *w)).collect(), t)
+        };
+        // Weights 2 then 1, target 1: drop the weight-2 instance, not the newest.
+        assert_eq!(pick(&[("a", 2), ("b", 1)], 1), vec!["a"]);
+        // Unweighted: newest first.
+        assert_eq!(pick(&[("a", 1), ("b", 1), ("c", 1)], 1), vec!["c", "b"]);
+    }
+
+    #[tokio::test]
+    async fn update_rejects_two_launch_sources() {
+        let (s, ec2) = ec2_wired();
+        ec2_call(
+            &ec2,
+            "CreateLaunchTemplate",
+            &[
+                ("LaunchTemplateName", "web"),
+                ("LaunchTemplateData.ImageId", "ami-1"),
+            ],
+        )
+        .await;
+        s.handle(req(
+            "CreateLaunchConfiguration",
+            &[
+                ("LaunchConfigurationName", "lc"),
+                ("ImageId", "ami-1"),
+                ("InstanceType", "t3.micro"),
+            ],
+        ))
+        .await
+        .unwrap();
+        s.handle(req(
+            "CreateAutoScalingGroup",
+            &[
+                ("AutoScalingGroupName", "g"),
+                ("LaunchConfigurationName", "lc"),
+                ("MinSize", "0"),
+                ("MaxSize", "1"),
+            ],
+        ))
+        .await
+        .unwrap();
+        let err = s
+            .handle(req(
+                "UpdateAutoScalingGroup",
+                &[
+                    ("AutoScalingGroupName", "g"),
+                    ("LaunchConfigurationName", "lc"),
+                    ("LaunchTemplate.LaunchTemplateName", "web"),
+                ],
+            ))
+            .await
+            .err()
+            .expect("two sources rejected");
+        assert_eq!(err.code(), "ValidationError");
+    }
+
+    #[tokio::test]
+    async fn mixed_spot_share_launches_spot_instances() {
+        let (s, ec2) = ec2_wired();
+        ec2_call(
+            &ec2,
+            "CreateLaunchTemplate",
+            &[
+                ("LaunchTemplateName", "base"),
+                ("LaunchTemplateData.ImageId", "ami-1"),
+            ],
+        )
+        .await;
+        let p = "MixedInstancesPolicy";
+        s.handle(req(
+            "CreateAutoScalingGroup",
+            &[
+                ("AutoScalingGroupName", "g"),
+                (
+                    &format!("{p}.LaunchTemplate.LaunchTemplateSpecification.LaunchTemplateName"),
+                    "base",
+                ),
+                (
+                    &format!("{p}.LaunchTemplate.Overrides.member.1.InstanceType"),
+                    "c5.large",
+                ),
+                (
+                    &format!("{p}.LaunchTemplate.Overrides.member.2.InstanceType"),
+                    "m5.large",
+                ),
+                (
+                    &format!("{p}.InstancesDistribution.OnDemandBaseCapacity"),
+                    "1",
+                ),
+                (
+                    &format!("{p}.InstancesDistribution.OnDemandPercentageAboveBaseCapacity"),
+                    "0",
+                ),
+                (
+                    &format!("{p}.InstancesDistribution.SpotAllocationStrategy"),
+                    "capacity-optimized",
+                ),
+                ("MinSize", "3"),
+                ("MaxSize", "3"),
+            ],
+        ))
+        .await
+        .unwrap();
+        let ids = group_instance_ids(&s, "g");
+        let accounts = ec2.read();
+        let st = accounts.get("123456789012").unwrap();
+        let mut got: Vec<(String, Option<String>)> = ids
+            .iter()
+            .map(|id| {
+                let i = &st.instances[id];
+                (i.instance_type.clone(), i.instance_lifecycle.clone())
+            })
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("c5.large".to_string(), None),
+                ("c5.large".to_string(), Some("spot".to_string())),
+                ("m5.large".to_string(), Some("spot".to_string())),
+            ]
         );
     }
 }

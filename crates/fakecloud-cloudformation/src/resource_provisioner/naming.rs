@@ -261,6 +261,21 @@ fn generate_with_suffix(stack_id: &str, logical_id: &str, rule: NameRule, suffix
     }
 }
 
+/// Whether `name` is the name [`generate`] gives `logical_id` in this stack
+/// (with whatever random suffix it drew).
+pub(crate) fn is_generated_name(
+    stack_id: &str,
+    logical_id: &str,
+    resource_type: &str,
+    name: &str,
+) -> bool {
+    let rule = name_rule(resource_type);
+    let Some(suffix) = name.rsplit(rule.separator).next() else {
+        return false;
+    };
+    generate_with_suffix(stack_id, logical_id, rule, suffix) == name
+}
+
 /// Whether `name` is one an older build gave an unnamed resource: the bare
 /// logical id, `{LogicalId}-{8 hex}`, `cfn-{kind}-{LogicalId}`, or
 /// `cfn-[{kind}-]{logicalid}-{8 alphanumerics}`.

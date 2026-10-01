@@ -243,6 +243,10 @@ pub struct AsgInstance {
     /// toward the group's desired capacity; `None` counts as 1.
     #[serde(default)]
     pub weighted_capacity: Option<String>,
+    /// `spot` for a Spot instance (a mixed-instances policy's Spot share or a
+    /// launch configuration's `SpotPrice`), `None` for on-demand.
+    #[serde(default)]
+    pub lifecycle: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -952,14 +952,25 @@ impl ResourceProvisioner {
         existing: &StackResource,
         resource: &ResourceDefinition,
     ) -> bool {
-        let Some(wanted) = prop_str(&resource.properties, "LaunchTemplateName") else {
-            return true;
-        };
         let accounts = self.ec2_state.read();
-        accounts
+        let Some(current) = accounts
             .get(&self.account_id)
             .and_then(|s| s.launch_templates.get(&existing.physical_id))
-            .is_some_and(|t| t.name == wanted)
+            .map(|t| t.name.clone())
+        else {
+            return false;
+        };
+        match prop_str(&resource.properties, "LaunchTemplateName") {
+            Some(wanted) => current == wanted,
+            // Dropping an explicit name replaces the template with a
+            // generated-name one; a generated name is kept.
+            None => super::naming::is_generated_name(
+                &self.stack_id,
+                &resource.logical_id,
+                &resource.resource_type,
+                &current,
+            ),
+        }
     }
 
     /// In-place update of an `AWS::EC2::LaunchTemplate`: new
@@ -981,6 +992,28 @@ impl ResourceProvisioner {
         modify.insert("LaunchTemplateId".to_string(), id.clone());
         modify.insert("SetDefaultVersion".to_string(), version.clone());
         self.ec2_dispatch("ModifyLaunchTemplate", modify)?;
+        // The template's own tags follow `TagSpecifications` (resource type
+        // `launch-template`): added, changed and removed in place.
+        let desired: Vec<fakecloud_ec2::state::Tag> = props
+            .get("TagSpecifications")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter(|spec| {
+                spec.get("ResourceType").and_then(|v| v.as_str()) == Some("launch-template")
+            })
+            .flat_map(cfn_tag_pairs)
+            .map(|(key, value)| fakecloud_ec2::state::Tag { key, value })
+            .collect();
+        {
+            let mut accounts = self.ec2_state.write();
+            let state = accounts.get_or_create(&self.account_id);
+            if desired.is_empty() {
+                state.tags.remove(&id);
+            } else {
+                state.tags.insert(id.clone(), desired);
+            }
+        }
         Ok(ProvisionResult::new(id.clone())
             .with("LaunchTemplateId", id)
             .with("LatestVersionNumber", version.clone())

@@ -260,6 +260,9 @@ pub(super) fn service_common_errors(service_name: &str) -> &'static [&'static st
             // A RunInstances variant re-using the probe's fixed
             // `PrivateIpAddress` in the same subnet.
             "InvalidIPAddress.InUse",
+            // A RunInstances secondary interface naming an interface that is
+            // already attached.
+            "InvalidNetworkInterface.InUse",
         ],
         // EKS under-declares two client errors that the real API returns for
         // sub-resource operations:

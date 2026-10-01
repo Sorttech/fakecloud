@@ -1288,6 +1288,7 @@ mod tests {
                 private_dns_hostname_type: None,
                 enable_resource_name_dns_a_record: false,
                 enable_resource_name_dns_aaaa_record: false,
+                instance_lifecycle: None,
             },
         );
         if !tags.is_empty() {

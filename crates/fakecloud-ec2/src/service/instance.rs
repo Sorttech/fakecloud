@@ -160,6 +160,13 @@ fn instance_xml(
             )
         })
         .unwrap_or_default();
+    let cpu_options = format!(
+        "{cpu_options}{}",
+        i.instance_lifecycle
+            .as_deref()
+            .map(|l| ec2_elem("instanceLifecycle", l))
+            .unwrap_or_default()
+    );
     let private_dns_name_options = format!(
         "<privateDnsNameOptions><hostnameType>{}</hostnameType>\
          <enableResourceNameDnsARecord>{}</enableResourceNameDnsARecord>\
@@ -633,24 +640,32 @@ pub(crate) fn launch_instances(
         (vpc, auto_public, instance_network, ip_prefix, az)
     };
     let assign_public = assoc_public.unwrap_or(subnet_auto_public);
-
-    // A fixed private IP must be free in its subnet (one launched from a
-    // template that pins it, e.g. by a second Auto Scaling launch, is not).
-    if let Some(ip) = &fixed_private_ip {
-        let accounts = svc.state.read();
-        let in_use = accounts.get(account_id).is_some_and(|st| {
-            st.instances
-                .values()
-                .any(|i| i.state_code != 48 && &i.private_ip == ip && i.subnet_id == subnet_id)
-        });
-        if in_use {
-            return Err(AwsServiceError::aws_error(
-                http::StatusCode::BAD_REQUEST,
-                "InvalidIPAddress.InUse",
-                format!("Address {ip} is in use."),
-            ));
-        }
+    // One fixed private IP can only go to one instance.
+    if fixed_private_ip.is_some() && max > 1 {
+        return Err(AwsServiceError::aws_error(
+            http::StatusCode::BAD_REQUEST,
+            "InvalidParameterCombination",
+            "Cannot specify a private IP address when launching more than one instance."
+                .to_string(),
+        ));
     }
+    // `InstanceMarketOptions.MarketType=spot` launches a Spot instance.
+    let instance_lifecycle = params
+        .get("InstanceMarketOptions.MarketType")
+        .filter(|v| v.as_str() == "spot")
+        .cloned();
+    // The non-primary network interfaces: each is created (or an existing
+    // one attached) at its device index, as RunInstances does.
+    let secondary_nis = secondary_network_interfaces(params, primary_ni);
+    if count > 1 && secondary_nis.iter().any(|n| n.eni_id.is_some()) {
+        return Err(AwsServiceError::aws_error(
+            http::StatusCode::BAD_REQUEST,
+            "InvalidParameterCombination",
+            "Cannot attach an existing network interface when launching more than one instance."
+                .to_string(),
+        ));
+    }
+
     let ids: Vec<String> = (0..count).map(|_| gen_id("i")).collect();
     // EBS volumes the block-device mappings create for each instance, with
     // their encryption resolved (KMS) before the EC2 lock is taken.
@@ -660,6 +675,34 @@ pub(crate) fn launch_instances(
     {
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(account_id);
+        // Checked under the write lock the instances are inserted under, so
+        // two concurrent launches cannot both claim one address.
+        if let Some(ip) = &fixed_private_ip {
+            let in_use = state
+                .instances
+                .values()
+                .any(|i| i.state_code != 48 && &i.private_ip == ip && i.subnet_id == subnet_id);
+            if in_use {
+                return Err(AwsServiceError::aws_error(
+                    http::StatusCode::BAD_REQUEST,
+                    "InvalidIPAddress.InUse",
+                    format!("Address {ip} is in use."),
+                ));
+            }
+        }
+        for ni in secondary_nis.iter().filter_map(|n| n.eni_id.as_ref()) {
+            match state.network_interfaces.get(ni) {
+                None => return Err(super::eni::eni_not_found(ni)),
+                Some(e) if e.attachment.is_some() => {
+                    return Err(AwsServiceError::aws_error(
+                        http::StatusCode::BAD_REQUEST,
+                        "InvalidNetworkInterface.InUse",
+                        format!("Interface: [{ni}] in use."),
+                    ))
+                }
+                Some(_) => {}
+            }
+        }
         let sg_names = sg_name_map(state);
         let launch_opts = parse_launch_opts(params);
         for (idx, id) in ids.iter().enumerate() {
@@ -717,7 +760,9 @@ pub(crate) fn launch_instances(
                 private_dns_hostname_type: launch_opts.private_dns_hostname_type.clone(),
                 enable_resource_name_dns_a_record: launch_opts.enable_a_record,
                 enable_resource_name_dns_aaaa_record: launch_opts.enable_aaaa_record,
+                instance_lifecycle: instance_lifecycle.clone(),
             };
+            attach_secondary_network_interfaces(state, id, &inst, &secondary_nis, params);
             crate::service::tags::apply_tag_specifications(state, params, id, "instance");
             if let Some(credits) = &credit_spec {
                 state
@@ -770,6 +815,131 @@ pub(crate) fn launch_instances(
         instance_tags,
         instance_network,
     })
+}
+
+/// A non-primary `NetworkInterface.N` of a launch.
+struct SecondaryNi {
+    device_index: i64,
+    /// An existing interface to attach; otherwise one is created.
+    eni_id: Option<String>,
+    subnet_id: Option<String>,
+    groups: Vec<String>,
+    private_ip: Option<String>,
+    description: String,
+    delete_on_termination: Option<bool>,
+}
+
+/// The launch's network interfaces other than the primary one, by index.
+fn secondary_network_interfaces(
+    params: &HashMap<String, String>,
+    primary: Option<usize>,
+) -> Vec<SecondaryNi> {
+    let indexes: std::collections::BTreeSet<usize> = params
+        .keys()
+        .filter_map(|k| k.strip_prefix("NetworkInterface."))
+        .filter_map(|rest| rest.split('.').next()?.parse().ok())
+        .collect();
+    indexes
+        .into_iter()
+        .filter(|n| Some(*n) != primary)
+        .map(|n| {
+            let get = |f: &str| {
+                params
+                    .get(&format!("NetworkInterface.{n}.{f}"))
+                    .filter(|v| !v.is_empty())
+                    .cloned()
+            };
+            SecondaryNi {
+                device_index: get("DeviceIndex")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(n as i64 - 1),
+                eni_id: get("NetworkInterfaceId"),
+                subnet_id: get("SubnetId"),
+                groups: indexed_list(params, &format!("NetworkInterface.{n}.SecurityGroupId")),
+                private_ip: get("PrivateIpAddress"),
+                description: get("Description").unwrap_or_default(),
+                delete_on_termination: get("DeleteOnTermination").map(|v| v == "true"),
+            }
+        })
+        .collect()
+}
+
+/// Attach a launch's secondary network interfaces to `id`: an existing one
+/// named by `NetworkInterfaceId` is attached (kept on termination unless
+/// asked otherwise), any other is created in its subnet (the instance's when
+/// it names none) with its groups (the instance's when it names none) and
+/// deleted with the instance by default.
+fn attach_secondary_network_interfaces(
+    state: &mut Ec2State,
+    id: &str,
+    inst: &Instance,
+    secondary: &[SecondaryNi],
+    params: &HashMap<String, String>,
+) {
+    for (k, ni) in secondary.iter().enumerate() {
+        let (eni_id, default_dot) = match &ni.eni_id {
+            Some(existing) => (existing.clone(), false),
+            None => {
+                let eni_id = gen_id("eni");
+                let subnet_id = ni
+                    .subnet_id
+                    .clone()
+                    .or_else(|| inst.subnet_id.clone())
+                    .unwrap_or_default();
+                let subnet = state.subnets.get(&subnet_id);
+                let private_ip = ni.private_ip.clone().unwrap_or_else(|| {
+                    let prefix = subnet
+                        .map(|s| subnet_ip_prefix(&s.cidr_block))
+                        .unwrap_or_else(|| "10.0.0".to_string());
+                    format!("{prefix}.{}", 100 + k)
+                });
+                let eni = crate::state::NetworkInterface {
+                    network_interface_id: eni_id.clone(),
+                    vpc_id: subnet
+                        .map(|s| s.vpc_id.clone())
+                        .or_else(|| inst.vpc_id.clone())
+                        .unwrap_or_default(),
+                    availability_zone: subnet
+                        .map(|s| s.availability_zone.clone())
+                        .unwrap_or_else(|| inst.az.clone()),
+                    subnet_id,
+                    description: ni.description.clone(),
+                    mac_address: format!("0a:1b:2c:3d:4e:{:02x}", 0x60 + k),
+                    private_ip_address: private_ip,
+                    status: "in-use".to_string(),
+                    interface_type: "interface".to_string(),
+                    source_dest_check: true,
+                    group_ids: if ni.groups.is_empty() {
+                        inst.security_group_ids.clone()
+                    } else {
+                        ni.groups.clone()
+                    },
+                    private_ips: Vec::new(),
+                    ipv6_addresses: Vec::new(),
+                    attachment: None,
+                    public_ip_dns_hostname_type: None,
+                };
+                crate::service::tags::apply_tag_specifications(
+                    state,
+                    params,
+                    &eni_id,
+                    "network-interface",
+                );
+                state.network_interfaces.insert(eni_id.clone(), eni);
+                (eni_id, true)
+            }
+        };
+        if let Some(eni) = state.network_interfaces.get_mut(&eni_id) {
+            eni.status = "in-use".to_string();
+            eni.attachment = Some(crate::state::EniAttachment {
+                attachment_id: gen_id("eni-attach"),
+                instance_id: id.to_string(),
+                device_index: ni.device_index,
+                status: "attached".to_string(),
+                delete_on_termination: ni.delete_on_termination.unwrap_or(default_dot),
+            });
+        }
+    }
 }
 
 /// Flip a `pending`/`stopped` instance to `running` after its backing
@@ -1282,6 +1452,23 @@ async fn change_state(
             // Its EBS volumes go with it: DeleteOnTermination ones are
             // deleted, the rest detached.
             super::volume::release_terminated_volumes(state, &affected);
+            // Network interfaces too: the ones launched with it are deleted,
+            // other attached ones detached.
+            state.network_interfaces.retain(|_, eni| {
+                !eni.attachment
+                    .as_ref()
+                    .is_some_and(|a| affected.contains(&a.instance_id) && a.delete_on_termination)
+            });
+            for eni in state.network_interfaces.values_mut() {
+                if eni
+                    .attachment
+                    .as_ref()
+                    .is_some_and(|a| affected.contains(&a.instance_id))
+                {
+                    eni.attachment = None;
+                    eni.status = "available".to_string();
+                }
+            }
         }
     }
 
@@ -2757,6 +2944,7 @@ mod modify_tests {
                 private_dns_hostname_type: None,
                 enable_resource_name_dns_a_record: false,
                 enable_resource_name_dns_aaaa_record: false,
+                instance_lifecycle: None,
             };
             state.instances.insert("i-1".into(), inst);
             state.upsert_tags(
@@ -3794,6 +3982,83 @@ mod modify_tests {
         );
         assert!(!inst.ebs_optimized, "explicit false wins");
         assert!(inst.monitoring, "unset comes from the template");
+    }
+
+    #[tokio::test]
+    async fn fixed_private_ip_with_several_instances_is_rejected() {
+        let svc = Ec2Service::new();
+        let err = crate::test_support::err_of(
+            run_instances(
+                &svc,
+                &req(
+                    "RunInstances",
+                    &[
+                        ("ImageId", "ami-1"),
+                        ("MinCount", "1"),
+                        ("MaxCount", "2"),
+                        ("PrivateIpAddress", "10.1.2.3"),
+                    ],
+                ),
+            )
+            .await,
+        );
+        assert_eq!(err.code(), "InvalidParameterCombination");
+    }
+
+    #[tokio::test]
+    async fn spot_market_and_secondary_interfaces_are_launched() {
+        let svc = Ec2Service::new();
+        let out = body(
+            run_instances(
+                &svc,
+                &req(
+                    "RunInstances",
+                    &[
+                        ("ImageId", "ami-1"),
+                        ("MinCount", "1"),
+                        ("MaxCount", "1"),
+                        ("InstanceMarketOptions.MarketType", "spot"),
+                        ("NetworkInterface.1.DeviceIndex", "0"),
+                        ("NetworkInterface.1.SubnetId", "subnet-a"),
+                        ("NetworkInterface.2.DeviceIndex", "1"),
+                        ("NetworkInterface.2.SubnetId", "subnet-b"),
+                        ("NetworkInterface.2.SecurityGroupId.1", "sg-2"),
+                    ],
+                ),
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(
+            out.contains("<instanceLifecycle>spot</instanceLifecycle>"),
+            "{out}"
+        );
+        let id = launched_id(&out);
+        let eni_id = {
+            let accounts = svc.state.read();
+            let st = accounts.get("000000000000").unwrap();
+            let (eni_id, eni) = st
+                .network_interfaces
+                .iter()
+                .find(|(_, e)| e.attachment.as_ref().is_some_and(|a| a.instance_id == id))
+                .expect("secondary interface attached");
+            let a = eni.attachment.as_ref().unwrap();
+            assert_eq!(a.device_index, 1);
+            assert!(a.delete_on_termination);
+            assert_eq!(eni.subnet_id, "subnet-b");
+            assert_eq!(eni.group_ids, vec!["sg-2".to_string()]);
+            eni_id.clone()
+        };
+        terminate_instances(&svc, &req("TerminateInstances", &[("InstanceId.1", &id)]))
+            .await
+            .unwrap();
+        assert!(!svc
+            .state
+            .read()
+            .get("000000000000")
+            .unwrap()
+            .network_interfaces
+            .contains_key(&eni_id));
     }
 
     #[tokio::test]

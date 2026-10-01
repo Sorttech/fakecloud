@@ -187,6 +187,38 @@ impl ResourceProvisioner {
         )
     }
 
+    /// Derive the launch configuration an `InstanceId`-sourced group launches
+    /// from (named after the group) and store it, returning its name and the
+    /// instance's subnet / AZ. `replacing` names the configuration the group
+    /// already owns under that name (an update), which may be overwritten;
+    /// any other configuration of that name is never replaced.
+    fn install_instance_launch_configuration(
+        &self,
+        instance_id: &str,
+        group: &str,
+        replacing: Option<&str>,
+    ) -> Result<(String, Option<String>, String), String> {
+        let (lc, subnet, az) = fakecloud_autoscaling::launch::launch_configuration_from_instance(
+            &self.ec2_state,
+            &self.account_id,
+            &self.region,
+            instance_id,
+            group,
+        )?;
+        let mut st = self.autoscaling_state.write();
+        let acct = st.get_or_create(&self.account_id);
+        if acct.launch_configurations.contains_key(&lc.name) && replacing != Some(lc.name.as_str())
+        {
+            return Err(format!(
+                "Launch Configuration by this name already exists - A launch configuration already exists with the name {}",
+                lc.name
+            ));
+        }
+        let name = lc.name.clone();
+        acct.launch_configurations.insert(name.clone(), lc);
+        Ok((name, subnet, az))
+    }
+
     /// Validate an `AWS::AutoScaling::AutoScalingGroup`'s launch source as
     /// CreateAutoScalingGroup does: exactly one of an instance id, launch
     /// configuration, launch template or mixed-instances policy; a named launch configuration
@@ -310,31 +342,14 @@ impl ResourceProvisioner {
         // `InstanceId`: a launch configuration named after the group, derived
         // from the instance (as CreateAutoScalingGroup does).
         if let Some(iid) = prop_str(props, "InstanceId") {
-            let (lc, subnet, az) =
-                fakecloud_autoscaling::launch::launch_configuration_from_instance(
-                    &self.ec2_state,
-                    &self.account_id,
-                    &self.region,
-                    iid,
-                    &name,
-                )?;
+            let (lc, subnet, az) = self.install_instance_launch_configuration(iid, &name, None)?;
             if vpc_zone_identifier.is_none() && props.get("AvailabilityZones").is_none() {
                 match subnet {
                     Some(s) => vpc_zone_identifier = Some(s),
                     None => azs = vec![az],
                 }
             }
-            lcn = Some(lc.name.clone());
-            let mut st = self.autoscaling_state.write();
-            let acct = st.get_or_create(&self.account_id);
-            // Never replace a configuration another group launches from.
-            if acct.launch_configurations.contains_key(&lc.name) {
-                return Err(format!(
-                    "Launch Configuration by this name already exists - A launch configuration already exists with the name {}",
-                    lc.name
-                ));
-            }
-            acct.launch_configurations.insert(lc.name.clone(), lc);
+            lcn = Some(lc);
         }
 
         // Insert the group as control-plane only (no instances). After
@@ -416,7 +431,7 @@ impl ResourceProvisioner {
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
         let name = existing.physical_id.clone();
-        let new_lc = prop_str(props, "LaunchConfigurationName").map(String::from);
+        let mut new_lc = prop_str(props, "LaunchConfigurationName").map(String::from);
         let mut new_lt = parse_cfn_launch_template(props.get("LaunchTemplate"));
         let mut new_mixed = parse_cfn_mixed_instances_policy(props);
         self.validate_asg_launch_source(
@@ -425,6 +440,20 @@ impl ResourceProvisioner {
             new_lt.as_mut(),
             new_mixed.as_mut(),
         )?;
+        // An `InstanceId` source re-derives the group's launch configuration
+        // from the (possibly new) instance.
+        if let Some(iid) = prop_str(props, "InstanceId") {
+            let owned = self
+                .autoscaling_state
+                .read()
+                .accounts
+                .get(&self.account_id)
+                .and_then(|a| a.groups.get(&name))
+                .and_then(|g| g.launch_configuration_name.clone());
+            let (lc, _, _) =
+                self.install_instance_launch_configuration(iid, &name, owned.as_deref())?;
+            new_lc = Some(lc);
+        }
 
         let arn = {
             let mut st = self.autoscaling_state.write();

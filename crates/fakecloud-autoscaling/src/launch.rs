@@ -266,7 +266,8 @@ pub fn launch_configuration_from_instance(
         security_groups: inst.security_group_ids.clone(),
         user_data: inst.user_data.clone(),
         iam_instance_profile,
-        associate_public_ip_address: None,
+        // Replacements get a public IP exactly when the instance has one.
+        associate_public_ip_address: Some(inst.public_ip.is_some()),
         instance_monitoring: inst.monitoring,
         ebs_optimized: inst.ebs_optimized,
         spot_price: None,
@@ -323,6 +324,17 @@ pub(crate) fn launch_configuration_params(lc: &LaunchConfiguration) -> HashMap<S
     p.insert("EbsOptimized".to_string(), lc.ebs_optimized.to_string());
     if let Some(t) = lc.placement_tenancy.as_ref().filter(|t| !t.is_empty()) {
         p.insert("Placement.Tenancy".to_string(), t.clone());
+    }
+    // A `SpotPrice` launches Spot instances at that maximum price.
+    if let Some(price) = lc.spot_price.as_ref().filter(|v| !v.is_empty()) {
+        p.insert(
+            "InstanceMarketOptions.MarketType".to_string(),
+            "spot".to_string(),
+        );
+        p.insert(
+            "InstanceMarketOptions.SpotOptions.MaxPrice".to_string(),
+            price.clone(),
+        );
     }
     for (i, m) in lc.block_device_mappings.iter().enumerate() {
         let b = format!("BlockDeviceMapping.{}", i + 1);
@@ -385,30 +397,22 @@ pub(crate) enum LaunchSource {
         instance_type: Option<String>,
         weighted_capacity: Option<String>,
     },
+    /// A mixed-instances policy: each launch picks an override and a market
+    /// per the policy's distribution (see [`choose_mixed_launch`]).
+    Mixed(Box<MixedInstancesPolicy>),
     /// No launch source recorded (a group record inserted without one):
     /// launches a seeded public AMI.
     Default,
 }
 
 impl LaunchSource {
-    /// The launch source of a group. A mixed-instances policy launches its
-    /// highest-priority override (the `prioritized` on-demand strategy, which
-    /// is the AWS default and the only one that can tell overrides apart when
-    /// capacity is never short): that override's instance type and weight,
-    /// and its own launch template when it names one.
+    /// The launch source of a group.
     pub(crate) fn for_group(
         g: &crate::state::AutoScalingGroup,
         lcs: &std::collections::BTreeMap<String, LaunchConfiguration>,
     ) -> Self {
         if let Some(policy) = &g.mixed_instances_policy {
-            let first = policy.overrides.first();
-            return LaunchSource::Template {
-                spec: first
-                    .and_then(|o| o.launch_template_specification.clone())
-                    .unwrap_or_else(|| policy.launch_template.clone()),
-                instance_type: first.and_then(|o| o.instance_type.clone()),
-                weighted_capacity: first.and_then(|o| o.weighted_capacity.clone()),
-            };
+            return LaunchSource::Mixed(Box::new(policy.clone()));
         }
         if let Some(lt) = &g.launch_template {
             return LaunchSource::Template {
@@ -425,6 +429,76 @@ impl LaunchSource {
             None => LaunchSource::Default,
         }
     }
+}
+
+/// One instance a mixed-instances group already runs (or just launched):
+/// which override it came from (`None` when it matches none), whether it is
+/// Spot, and its capacity weight.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MixedTally {
+    pub(crate) override_index: Option<usize>,
+    pub(crate) spot: bool,
+    pub(crate) weight: i64,
+}
+
+/// Pick the override and market of a mixed-instances group's next launch,
+/// per its `InstancesDistribution`:
+/// - On-demand until `OnDemandBaseCapacity` is met, then on-demand for
+///   `OnDemandPercentageAboveBaseCapacity` percent of the capacity above it
+///   (rounded up, as AWS rounds in favor of on-demand), Spot for the rest.
+/// - On-demand launches take the highest-priority override (`prioritized`).
+///   `lowest-price` orders by price, and with no instance pricing data here
+///   the override order stands in for it, so both pick the first override.
+/// - Spot launches diversify: `lowest-price` spreads across the first
+///   `SpotInstancePools` (default 2) overrides, the capacity strategies
+///   (`capacity-optimized`, `price-capacity-optimized`,
+///   `capacity-optimized-prioritized`) across all of them; each launch goes
+///   to the pool with the least Spot capacity, ties to the higher priority.
+///
+/// `weights` is each override's capacity weight; the result is
+/// `(override index, spot)`.
+pub(crate) fn choose_mixed_launch(
+    policy: &MixedInstancesPolicy,
+    existing: &[MixedTally],
+    weights: &[i64],
+) -> (usize, bool) {
+    let d = policy.instances_distribution.clone().unwrap_or_default();
+    let base = d.on_demand_base_capacity.unwrap_or(0).max(0);
+    let pct = d
+        .on_demand_percentage_above_base_capacity
+        .unwrap_or(100)
+        .clamp(0, 100);
+    let on_demand: i64 = existing.iter().filter(|t| !t.spot).map(|t| t.weight).sum();
+    let total: i64 = existing.iter().map(|t| t.weight).sum();
+    let pools = weights.len().max(1);
+    let first_weight = weights.first().copied().unwrap_or(1);
+    let spot = if on_demand < base {
+        false
+    } else {
+        let above_after = (total - base).max(0) + first_weight;
+        let want_on_demand = (pct * above_after + 99) / 100;
+        (on_demand - base) >= want_on_demand
+    };
+    if !spot {
+        return (0, false);
+    }
+    let candidates = match d.spot_allocation_strategy.as_deref() {
+        None | Some("lowest-price") => {
+            (d.spot_instance_pools.unwrap_or(2).max(1) as usize).min(pools)
+        }
+        _ => pools,
+    };
+    let spot_capacity = |i: usize| -> i64 {
+        existing
+            .iter()
+            .filter(|t| t.spot && t.override_index == Some(i))
+            .map(|t| t.weight)
+            .sum()
+    };
+    let pick = (0..candidates)
+        .min_by_key(|i| (spot_capacity(*i), *i))
+        .unwrap_or(0);
+    (pick, true)
 }
 
 /// A `LaunchTemplateSpecification` rendered as its XML members.
@@ -565,7 +639,7 @@ mod tests {
             associate_public_ip_address: Some(false),
             instance_monitoring: false,
             ebs_optimized: true,
-            spot_price: None,
+            spot_price: Some("0.05".into()),
             placement_tenancy: Some("dedicated".into()),
             block_device_mappings: vec![BlockDeviceMapping {
                 device_name: "/dev/xvda".into(),
@@ -599,6 +673,8 @@ mod tests {
             ("Monitoring.Enabled", "false"),
             ("EbsOptimized", "true"),
             ("Placement.Tenancy", "dedicated"),
+            ("InstanceMarketOptions.MarketType", "spot"),
+            ("InstanceMarketOptions.SpotOptions.MaxPrice", "0.05"),
             ("BlockDeviceMapping.1.DeviceName", "/dev/xvda"),
             ("BlockDeviceMapping.1.Ebs.VolumeSize", "25"),
             ("BlockDeviceMapping.1.Ebs.Encrypted", "true"),
@@ -614,7 +690,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_policy_launches_first_override() {
+    fn mixed_policy_is_its_own_launch_source() {
         let mut g = crate::state::AutoScalingGroup {
             name: "g".into(),
             arn: "a".into(),
@@ -658,23 +734,99 @@ mod tests {
                 instances_distribution: None,
             }),
         };
-        match LaunchSource::for_group(&g, &Default::default()) {
-            LaunchSource::Template {
-                spec,
-                instance_type,
-                weighted_capacity,
-            } => {
-                assert_eq!(spec.launch_template_name.as_deref(), Some("other"));
-                assert_eq!(instance_type.as_deref(), Some("c5.large"));
-                assert_eq!(weighted_capacity.as_deref(), Some("2"));
-            }
-            other => panic!("{other:?}"),
-        }
+        assert!(matches!(
+            LaunchSource::for_group(&g, &Default::default()),
+            LaunchSource::Mixed(_)
+        ));
+        let policy = g.mixed_instances_policy.clone().unwrap();
+        // Default distribution: all on-demand, highest priority.
+        assert_eq!(choose_mixed_launch(&policy, &[], &[2, 1]), (0, false));
         g.mixed_instances_policy = None;
         g.launch_configuration_name = Some("gone".into());
         assert!(matches!(
             LaunchSource::for_group(&g, &Default::default()),
             LaunchSource::MissingConfiguration(n) if n == "gone"
         ));
+    }
+
+    fn policy(dist: InstancesDistribution, overrides: usize) -> MixedInstancesPolicy {
+        MixedInstancesPolicy {
+            launch_template: LaunchTemplateSpec::default(),
+            overrides: (0..overrides)
+                .map(|i| LaunchTemplateOverride {
+                    instance_type: Some(format!("t{i}.large")),
+                    ..Default::default()
+                })
+                .collect(),
+            instances_distribution: Some(dist),
+        }
+    }
+
+    /// Launch `n` instances one at a time, as a reconcile does.
+    fn launch_n(policy: &MixedInstancesPolicy, n: usize, weights: &[i64]) -> Vec<MixedTally> {
+        let mut out: Vec<MixedTally> = Vec::new();
+        for _ in 0..n {
+            let (i, spot) = choose_mixed_launch(policy, &out, weights);
+            out.push(MixedTally {
+                override_index: Some(i),
+                spot,
+                weight: weights[i],
+            });
+        }
+        out
+    }
+
+    #[test]
+    fn mixed_distribution_honors_base_and_percentage() {
+        let p = policy(
+            InstancesDistribution {
+                on_demand_base_capacity: Some(2),
+                on_demand_percentage_above_base_capacity: Some(50),
+                ..Default::default()
+            },
+            3,
+        );
+        let got = launch_n(&p, 6, &[1, 1, 1]);
+        let on_demand = got.iter().filter(|t| !t.spot).count();
+        // 2 base + half of the 4 above it.
+        assert_eq!(on_demand, 4, "{got:?}");
+        assert!(got[..2].iter().all(|t| !t.spot), "base is on-demand first");
+        assert!(got
+            .iter()
+            .filter(|t| !t.spot)
+            .all(|t| t.override_index == Some(0)));
+    }
+
+    #[test]
+    fn spot_lowest_price_spreads_over_its_pools() {
+        let p = policy(
+            InstancesDistribution {
+                on_demand_percentage_above_base_capacity: Some(0),
+                spot_allocation_strategy: Some("lowest-price".into()),
+                spot_instance_pools: Some(2),
+                ..Default::default()
+            },
+            3,
+        );
+        let got = launch_n(&p, 4, &[1, 1, 1]);
+        assert!(got.iter().all(|t| t.spot));
+        let per = |i| got.iter().filter(|t| t.override_index == Some(i)).count();
+        assert_eq!((per(0), per(1), per(2)), (2, 2, 0));
+    }
+
+    #[test]
+    fn spot_capacity_optimized_spreads_over_every_override() {
+        let p = policy(
+            InstancesDistribution {
+                on_demand_percentage_above_base_capacity: Some(0),
+                spot_allocation_strategy: Some("capacity-optimized".into()),
+                ..Default::default()
+            },
+            3,
+        );
+        let got = launch_n(&p, 3, &[1, 1, 1]);
+        let mut idx: Vec<_> = got.iter().map(|t| t.override_index.unwrap()).collect();
+        idx.sort();
+        assert_eq!(idx, vec![0, 1, 2]);
     }
 }
