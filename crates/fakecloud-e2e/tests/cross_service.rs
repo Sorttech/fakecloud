@@ -998,6 +998,136 @@ async fn s3_eventbridge_notification_invokes_lambda_target() {
     assert_eq!(payload["detail"]["object"]["key"], "anything");
 }
 
+/// S3 -> EventBridge -> Lambda (#2628), proving the function really *runs* in
+/// its container rather than only being recorded: the handler writes the
+/// object key it received into DynamoDB, which the test then reads back.
+#[tokio::test]
+async fn s3_eventbridge_notification_executes_lambda_target() {
+    if !require_docker_or_skip("s3_eventbridge_notification_executes_lambda_target") {
+        return;
+    }
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+    let eb = server.eventbridge_client().await;
+    let lambda = server.lambda_client().await;
+    let ddb = server.dynamodb_client().await;
+
+    ddb.create_table()
+        .table_name("s3-eb-seen")
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("pk")
+                .key_type(KeyType::Hash)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("pk")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .billing_mode(BillingMode::PayPerRequest)
+        .send()
+        .await
+        .unwrap();
+
+    let handler = br#"import boto3
+
+def handler(event, context):
+    detail = event["detail"]
+    boto3.client("dynamodb").put_item(
+        TableName="s3-eb-seen",
+        Item={
+            "pk": {"S": detail["object"]["key"]},
+            "bucket": {"S": detail["bucket"]["name"]},
+            "source": {"S": event["source"]},
+        },
+    )
+    return {"ok": True}
+"#;
+    lambda
+        .create_function()
+        .function_name("s3-eb-exec-fn")
+        .runtime(aws_sdk_lambda::types::Runtime::Python312)
+        .role("arn:aws:iam::123456789012:role/lambda-role")
+        .handler("index.handler")
+        .timeout(30)
+        .code(
+            aws_sdk_lambda::types::FunctionCode::builder()
+                .zip_file(aws_sdk_lambda::primitives::Blob::new(make_zip(&[(
+                    "index.py", handler,
+                )])))
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    eb.put_rule()
+        .name("s3-to-exec-fn")
+        .event_pattern(r#"{"source":["aws.s3"],"detail-type":["Object Created"]}"#)
+        .send()
+        .await
+        .unwrap();
+    eb.put_targets()
+        .rule("s3-to-exec-fn")
+        .targets(
+            Target::builder()
+                .id("fn")
+                .arn("arn:aws:lambda:us-east-1:123456789012:function:s3-eb-exec-fn")
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    s3.create_bucket()
+        .bucket("eb-exec-bucket")
+        .send()
+        .await
+        .unwrap();
+    enable_s3_eventbridge_notifications(&s3, "eb-exec-bucket").await;
+    s3.put_object()
+        .bucket("eb-exec-bucket")
+        .key("ran.txt")
+        .body(ByteStream::from_static(b"payload"))
+        .send()
+        .await
+        .unwrap();
+
+    // Delivery is asynchronous and the first invoke pays the container cold
+    // start (image pull on a fresh runner), so poll generously.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    let item = loop {
+        let got = ddb
+            .get_item()
+            .table_name("s3-eb-seen")
+            .key("pk", AttributeValue::S("ran.txt".to_string()))
+            .send()
+            .await
+            .unwrap();
+        if let Some(item) = got.item().cloned() {
+            break item;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "S3->EventBridge->Lambda target never executed (no DynamoDB write from the handler)"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    };
+    assert_eq!(
+        item.get("bucket"),
+        Some(&AttributeValue::S("eb-exec-bucket".to_string()))
+    );
+    assert_eq!(
+        item.get("source"),
+        Some(&AttributeValue::S("aws.s3".to_string()))
+    );
+}
+
 /// S3 -> EventBridge -> CloudWatch Logs: the cross-service delivery writes a
 /// Logs target's log group, matching PutEvents.
 #[tokio::test]

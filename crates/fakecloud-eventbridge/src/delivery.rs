@@ -19,13 +19,24 @@ use crate::state::{PutEvent, SharedEventBridgeState};
 /// PutEvents (`EventBridgeService`), the rule `Scheduler` and every
 /// cross-service [`EventBridgeDeliveryImpl`] take the same value, so an event
 /// another service publishes (S3, SES, ECS, RDS, Step Functions, ...) reaches
-/// the same target types as one sent with PutEvents. A field left `None`
-/// means that target type is only recorded, never delivered, and dispatch
-/// logs a warning when it hits one.
+/// the same target types as one sent with PutEvents.
+///
+/// The delivery dependencies and the persistence hook behave differently
+/// when absent:
+/// - `lambda_state` / `logs_state` missing: that target type cannot be
+///   delivered; dispatch records the attempt in EventBridge's own log and
+///   emits a `warn!` naming the skipped target.
+/// - `container_runtime` missing (no Docker/Podman/Kubernetes): Lambda
+///   targets are still recorded in Lambda's invocation log but not executed,
+///   with a `warn!`.
+/// - `logs_persist` missing (memory mode): Logs targets are still delivered
+///   to the log group as normal; there is just no snapshot to write through,
+///   so nothing is skipped and nothing is warned.
 #[derive(Clone, Default)]
 pub struct EventTargetWiring {
     pub lambda_state: Option<SharedLambdaState>,
     pub logs_state: Option<SharedLogsState>,
+    /// Optional persistence hook, not a delivery dependency (see above).
     pub logs_persist: Option<fakecloud_persistence::SnapshotHook>,
     pub container_runtime: Option<Arc<ContainerRuntime>>,
 }
@@ -613,6 +624,174 @@ mod tests {
         let accounts = lambda_state.read();
         assert!(accounts.get("555555555555").is_none());
         assert_eq!(accounts.default_ref().invocations.len(), 1);
+    }
+
+    /// Lambda backend double: records which function each launch was for and
+    /// points the instance at an in-process RIE stand-in.
+    struct RecordingBackend {
+        endpoint: String,
+        launched: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl fakecloud_lambda::runtime::LambdaBackend for RecordingBackend {
+        fn name(&self) -> &str {
+            "recording"
+        }
+        async fn launch(
+            &self,
+            func: &fakecloud_lambda::LambdaFunction,
+            _code_zip: Option<&[u8]>,
+            _layers: &[Vec<u8>],
+            _deploy_id: &str,
+            _credentials: Option<&fakecloud_core::auth::SessionCredentials>,
+        ) -> Result<fakecloud_lambda::runtime::WarmInstance, fakecloud_lambda::runtime::RuntimeError>
+        {
+            self.launched
+                .lock()
+                .unwrap()
+                .push(func.function_arn.clone());
+            Ok(fakecloud_lambda::runtime::WarmInstance {
+                endpoint: self.endpoint.clone(),
+                handle: fakecloud_lambda::runtime::BackendHandle::Container {
+                    id: "c0".to_string(),
+                },
+            })
+        }
+        async fn terminate(&self, _handle: &fakecloud_lambda::runtime::BackendHandle) {}
+    }
+
+    /// Minimal RIE stand-in: records each invocation request body and answers
+    /// 200 `{}`. Bare reachability probes (connect, no bytes) are ignored.
+    async fn spawn_recording_rie(bodies: Arc<Mutex<Vec<String>>>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let bodies = bodies.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        let text = String::from_utf8_lossy(&buf).to_string();
+                        let Some(header_end) = text.find("\r\n\r\n") else {
+                            continue;
+                        };
+                        let content_length = text[..header_end]
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                k.eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        if buf.len() < header_end + 4 + content_length {
+                            continue;
+                        }
+                        let body = String::from_utf8_lossy(
+                            &buf[header_end + 4..header_end + 4 + content_length],
+                        )
+                        .to_string();
+                        bodies.lock().unwrap().push(body);
+                        let _ = sock
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                            )
+                            .await;
+                        return;
+                    }
+                });
+            }
+        });
+        addr.to_string()
+    }
+
+    fn lambda_function(arn: &str) -> fakecloud_lambda::LambdaFunction {
+        fakecloud_lambda::LambdaFunction {
+            function_name: crate::service::helpers::function_name_from_arn(arn).to_string(),
+            function_arn: arn.to_string(),
+            runtime: "python3.12".to_string(),
+            handler: "index.handler".to_string(),
+            timeout: 5,
+            package_type: "Zip".to_string(),
+            code_zip: Some(vec![1, 2, 3]),
+            ..Default::default()
+        }
+    }
+
+    /// #2628's real symptom was that the function never *ran* (no container,
+    /// no Pod), not just a missing record. A cross-service event matched to a
+    /// Lambda target must reach the container runtime: the function the ARN
+    /// names (in the ARN's account, not a same-named default-account one) is
+    /// launched and receives the EventBridge envelope as its payload.
+    #[tokio::test]
+    async fn put_event_executes_lambda_target_in_container_runtime() {
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let endpoint = spawn_recording_rie(bodies.clone()).await;
+        let backend = Arc::new(RecordingBackend {
+            endpoint,
+            launched: std::sync::Mutex::new(Vec::new()),
+        });
+        let runtime = Arc::new(ContainerRuntime::from_backend(backend.clone()));
+
+        let fn_arn = "arn:aws:lambda:us-east-1:999988887777:function:my-fn";
+        let default_fn_arn = "arn:aws:lambda:us-east-1:123456789012:function:my-fn";
+        let lambda_state: SharedLambdaState = Arc::new(RwLock::new(
+            fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+        ));
+        {
+            let mut accounts = lambda_state.write();
+            accounts
+                .default_mut()
+                .functions
+                .insert("my-fn".to_string(), lambda_function(default_fn_arn));
+            accounts
+                .get_or_create("999988887777")
+                .functions
+                .insert("my-fn".to_string(), lambda_function(fn_arn));
+        }
+
+        let state = make_shared();
+        insert_rule(
+            &state,
+            make_rule("s3-to-fn", Some(r#"{"source":["aws.s3"]}"#), fn_arn),
+        );
+        let delivery = EventBridgeDeliveryImpl::new(state, Arc::new(DeliveryBus::new()))
+            .with_target_wiring(EventTargetWiring {
+                lambda_state: Some(lambda_state),
+                container_runtime: Some(runtime),
+                ..Default::default()
+            });
+
+        delivery.put_event(
+            "aws.s3",
+            "Object Created",
+            r#"{"bucket":{"name":"eb-bucket"},"object":{"key":"anything"}}"#,
+            "default",
+        );
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while bodies.lock().unwrap().is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Lambda target was never executed by the container runtime"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        assert_eq!(*backend.launched.lock().unwrap(), vec![fn_arn.to_string()]);
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 1);
+        let payload: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+        assert_eq!(payload["source"], "aws.s3");
+        assert_eq!(payload["detail-type"], "Object Created");
+        assert_eq!(payload["detail"]["object"]["key"], "anything");
     }
 
     #[test]
