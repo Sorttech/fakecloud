@@ -18,11 +18,6 @@ impl ResourceProvisioner {
             .and_then(|v| v.as_str())
             .ok_or("Name is required")?
             .to_string();
-        let normalized_name = if name.ends_with('.') {
-            name.clone()
-        } else {
-            format!("{name}.")
-        };
         let comment = props
             .get("HostedZoneConfig")
             .and_then(|v| v.get("Comment"))
@@ -49,30 +44,25 @@ impl ResourceProvisioner {
             })
             .unwrap_or_default();
 
-        let id = format!("Z{}", fakecloud_core::ids::short_id(14).to_uppercase());
-        let name_servers = (1..=4)
-            .map(|i| format!("ns-{}.awsdns-{:02}.com", 100 + i, i))
-            .collect::<Vec<_>>();
-
-        let zone = StoredHostedZone {
-            id: id.clone(),
-            name: normalized_name,
-            caller_reference: self.physical_name(resource),
+        // Same zone `CreateHostedZone` stores (name servers, default SOA + NS
+        // record sets), under the stack's account, with a globally unique id.
+        let mut accounts = self.route53_state.write();
+        let id = accounts.unused_zone_id();
+        let zone = fakecloud_route53::build_hosted_zone(
+            &id,
+            &name,
+            self.physical_name(resource),
             comment,
             private_zone,
-            features: Some(HostedZoneFeatures::default()),
             vpcs,
-            delegation_set_id: None,
-            name_servers: name_servers.clone(),
-            created_time: Utc::now(),
-            resource_record_sets: Vec::new(),
-        };
-
-        let mut accounts = self.route53_state.write();
-        // Route53 is a global service in fakecloud; all entries share the
-        // default account bucket so SDK reads land on the same data.
-        let state = accounts.entry("000000000000");
-        state.hosted_zones.insert(id.clone(), zone);
+            None,
+        );
+        let name_servers = zone.name_servers.clone();
+        accounts
+            .entry(&self.account_id)
+            .hosted_zones
+            .insert(id.clone(), zone);
+        drop(accounts);
 
         let mut result = ProvisionResult::new(id.clone()).with("Id", id);
         for (i, ns) in name_servers.iter().enumerate() {
@@ -84,9 +74,7 @@ impl ResourceProvisioner {
 
     pub(super) fn delete_route53_hosted_zone(&self, physical_id: &str) -> Result<(), String> {
         let mut accounts = self.route53_state.write();
-        // Route53 is a global service in fakecloud; all entries share the
-        // default account bucket so SDK reads land on the same data.
-        let state = accounts.entry("000000000000");
+        let state = accounts.entry(&self.account_id);
         state.hosted_zones.remove(physical_id);
         Ok(())
     }
@@ -123,7 +111,7 @@ impl ResourceProvisioner {
 
         let in_place = {
             let mut accounts = self.route53_state.write();
-            let state = accounts.entry("000000000000");
+            let state = accounts.entry(&self.account_id);
             match state.hosted_zones.get_mut(&existing.physical_id) {
                 Some(z) if z.name == normalized_name => {
                     z.comment = comment; // record sets / id / name servers preserved
@@ -257,9 +245,7 @@ impl ResourceProvisioner {
         };
 
         let mut accounts = self.route53_state.write();
-        // Route53 is a global service in fakecloud; all entries share the
-        // default account bucket so SDK reads land on the same data.
-        let state = accounts.entry("000000000000");
+        let state = accounts.entry(&self.account_id);
         let zone = state.hosted_zones.get_mut(&zone_id).ok_or_else(|| {
             format!(
                 "HostedZone {zone_id} not yet provisioned; will retry once it has been provisioned"
@@ -295,9 +281,7 @@ impl ResourceProvisioner {
         let set_identifier = parts.get(3).map(|s| s.to_string());
 
         let mut accounts = self.route53_state.write();
-        // Route53 is a global service in fakecloud; all entries share the
-        // default account bucket so SDK reads land on the same data.
-        let state = accounts.entry("000000000000");
+        let state = accounts.entry(&self.account_id);
         if let Some(zone) = state.hosted_zones.get_mut(zone_id) {
             zone.resource_record_sets.retain(|r| {
                 !(r.name == name
@@ -330,9 +314,7 @@ impl ResourceProvisioner {
         };
 
         let mut accounts = self.route53_state.write();
-        // Route53 is a global service in fakecloud; all entries share the
-        // default account bucket so SDK reads land on the same data.
-        let state = accounts.entry("000000000000");
+        let state = accounts.entry(&self.account_id);
         state.health_checks.insert(id.clone(), hc);
 
         Ok(ProvisionResult::new(id.clone()).with("HealthCheckId", id))
@@ -356,7 +338,7 @@ impl ResourceProvisioner {
         let id = existing.physical_id.clone();
 
         let mut accounts = self.route53_state.write();
-        let state = accounts.entry("000000000000");
+        let state = accounts.entry(&self.account_id);
         let hc = state
             .health_checks
             .get_mut(&id)
@@ -474,9 +456,7 @@ impl ResourceProvisioner {
 
     pub(super) fn delete_route53_health_check(&self, physical_id: &str) -> Result<(), String> {
         let mut accounts = self.route53_state.write();
-        // Route53 is a global service in fakecloud; all entries share the
-        // default account bucket so SDK reads land on the same data.
-        let state = accounts.entry("000000000000");
+        let state = accounts.entry(&self.account_id);
         state.health_checks.remove(physical_id);
         Ok(())
     }
@@ -496,7 +476,7 @@ impl ResourceProvisioner {
             .trim_start_matches("/hostedzone/")
             .to_string();
         let mut accounts = self.route53_state.write();
-        let state = accounts.entry("000000000000");
+        let state = accounts.entry(&self.account_id);
         if !state.hosted_zones.contains_key(&zone_id) {
             return Err(format!("HostedZone {zone_id} does not exist"));
         }
@@ -508,7 +488,7 @@ impl ResourceProvisioner {
 
     pub(super) fn delete_route53_dnssec(&self, physical_id: &str) -> Result<(), String> {
         let mut accounts = self.route53_state.write();
-        let state = accounts.entry("000000000000");
+        let state = accounts.entry(&self.account_id);
         state.dnssec_status.remove(physical_id);
         Ok(())
     }
@@ -551,7 +531,7 @@ impl ResourceProvisioner {
         let key_material = fakecloud_route53::dnssec::derive_keypair(&zone_id, &name);
         let key_tag = fakecloud_route53::dnssec::key_tag_for(&key_material.dnskey_public_key);
         let mut accounts = self.route53_state.write();
-        let state = accounts.entry("000000000000");
+        let state = accounts.entry(&self.account_id);
         if !state.hosted_zones.contains_key(&zone_id) {
             return Err(format!("HostedZone {zone_id} does not exist"));
         }
@@ -590,7 +570,7 @@ impl ResourceProvisioner {
             None => return Ok(()),
         };
         let mut accounts = self.route53_state.write();
-        let state = accounts.entry("000000000000");
+        let state = accounts.entry(&self.account_id);
         state
             .key_signing_keys
             .remove(&(zone_id.to_string(), name.to_string()));

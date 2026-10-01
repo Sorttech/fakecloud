@@ -59,11 +59,11 @@ impl Route53Service {
         zone_id: &str,
     ) -> Option<(StoredKeySigningKey, Vec<u8>, u16, String)> {
         let state = self.state.read();
-        let account = state.accounts.get(DEFAULT_ACCOUNT)?;
         let zone_id_clean = strip_zone_prefix(zone_id);
-        // Existence check — return None when the zone is unknown
+        // The admin endpoint carries no account: look in the zone's owning
+        // account. Existence check — return None when the zone is unknown
         // rather than synthesising bogus material.
-        account.hosted_zones.get(&zone_id_clean)?;
+        let account = state.zone_account(&zone_id_clean)?;
         let ksk = account
             .key_signing_keys
             .values()
@@ -92,7 +92,9 @@ impl Route53Service {
     ) -> Option<DnssecSignature> {
         let zone_id_clean = strip_zone_prefix(zone_id);
         let state = self.state.read();
-        let account = state.accounts.get(DEFAULT_ACCOUNT)?;
+        // The admin endpoint carries no account: sign with the KSK of the
+        // zone's owning account.
+        let account = state.zone_account(&zone_id_clean)?;
         let zone = account.hosted_zones.get(&zone_id_clean)?;
         let zone_name = zone.name.clone();
         let ksk = account
@@ -155,7 +157,7 @@ impl Route53Service {
         let state = self.state.read();
         let account = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .ok_or_else(|| no_such_hosted_zone(&zone_id))?;
         if !account.hosted_zones.contains_key(&zone_id) {
             return Err(no_such_hosted_zone(&zone_id));
@@ -202,7 +204,7 @@ impl Route53Service {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&route.account)
             .ok_or_else(|| no_such_hosted_zone(&zone_id))?;
         if !account.hosted_zones.contains_key(&zone_id) {
             return Err(no_such_hosted_zone(&zone_id));
@@ -248,7 +250,7 @@ impl Route53Service {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&route.account)
             .ok_or_else(|| no_such_hosted_zone(&zone_id))?;
         if !account.hosted_zones.contains_key(&zone_id) {
             return Err(no_such_hosted_zone(&zone_id));
@@ -292,10 +294,7 @@ impl Route53Service {
         }
         let zone_id = strip_zone_prefix(&cfg.hosted_zone_id);
         let mut state = self.state.write();
-        let account = state
-            .accounts
-            .entry(DEFAULT_ACCOUNT.to_string())
-            .or_default();
+        let account = state.accounts.entry(req.account_id.clone()).or_default();
         if !account.hosted_zones.contains_key(&zone_id) {
             return Err(no_such_hosted_zone(&zone_id));
         }
@@ -377,7 +376,7 @@ impl Route53Service {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&route.account)
             .ok_or_else(|| no_such_key_signing_key(&zone_id, &name))?;
         let ksk = account
             .key_signing_keys
@@ -440,7 +439,7 @@ impl Route53Service {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&route.account)
             .ok_or_else(|| no_such_key_signing_key(&zone_id, &name))?;
         let ksk = account
             .key_signing_keys

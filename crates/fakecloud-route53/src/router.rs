@@ -7,6 +7,10 @@ pub struct Route {
     pub action: &'static str,
     pub id: Option<String>,
     pub second_id: Option<String>,
+    /// Caller's account id. The router leaves it empty; the service fills it
+    /// in from the request before dispatching, so handlers that only receive
+    /// the route still act on the caller's account.
+    pub account: String,
 }
 
 impl Route {
@@ -15,6 +19,7 @@ impl Route {
             action,
             id: None,
             second_id: None,
+            account: String::new(),
         }
     }
 
@@ -23,6 +28,7 @@ impl Route {
             action,
             id: Some(id.to_string()),
             second_id: None,
+            account: String::new(),
         }
     }
 
@@ -31,6 +37,7 @@ impl Route {
             action,
             id: Some(id.to_string()),
             second_id: Some(second.to_string()),
+            account: String::new(),
         }
     }
 }

@@ -2,6 +2,46 @@
 
 use super::*;
 
+/// Build a new hosted zone the way `CreateHostedZone` stores it: the
+/// `name` normalized to its trailing-dot form, the synthesized delegation-set
+/// name servers, and the default SOA + NS record sets. Shared with the
+/// CloudFormation provisioner so API- and stack-created zones are identical.
+/// `id` should come from [`crate::Route53Accounts::unused_zone_id`].
+pub fn build_hosted_zone(
+    id: &str,
+    name: &str,
+    caller_reference: String,
+    comment: Option<String>,
+    private_zone: bool,
+    vpcs: Vec<VPC>,
+    delegation_set_id: Option<String>,
+) -> StoredHostedZone {
+    let name = if name.ends_with('.') {
+        name.to_string()
+    } else {
+        format!("{name}.")
+    };
+    let name_servers = synth_name_servers(id);
+    // Both public and private hosted zones carry default NS + SOA records.
+    // The Terraform provider reads a private zone's name servers from its
+    // NS record set (findNameServersByZone), so omitting them made the
+    // resource read crash on an empty name-server list.
+    let resource_record_sets = default_zone_records(&name, &name_servers);
+    StoredHostedZone {
+        id: id.to_string(),
+        name,
+        caller_reference,
+        comment,
+        private_zone,
+        features: None,
+        vpcs,
+        delegation_set_id,
+        name_servers,
+        created_time: Utc::now(),
+        resource_record_sets,
+    }
+}
+
 impl Route53Service {
     pub(super) fn create_hosted_zone(
         &self,
@@ -35,10 +75,8 @@ impl Route53Service {
             .and_then(|c| c.comment.clone());
 
         let mut state = self.state.write();
-        let account = state
-            .accounts
-            .entry(DEFAULT_ACCOUNT.to_string())
-            .or_default();
+        let id = state.unused_zone_id();
+        let account = state.accounts.entry(req.account_id.clone()).or_default();
         if account
             .hosted_zones
             .values()
@@ -53,28 +91,16 @@ impl Route53Service {
                 ),
             ));
         }
-        let id = generate_zone_id();
-        let now = Utc::now();
-        let name_servers = synth_name_servers(&id);
-        let vpcs = cfg.vpc.into_iter().collect();
-        // Both public and private hosted zones carry default NS + SOA records.
-        // The Terraform provider reads a private zone's name servers from its
-        // NS record set (findNameServersByZone), so omitting them made the
-        // resource read crash on an empty name-server list.
-        let default_records = default_zone_records(&name, &name_servers);
-        let zone = StoredHostedZone {
-            id: id.clone(),
-            name: name.clone(),
-            caller_reference: cfg.caller_reference,
+        let zone = build_hosted_zone(
+            &id,
+            &name,
+            cfg.caller_reference,
             comment,
             private_zone,
-            features: None,
-            vpcs,
-            delegation_set_id: cfg.delegation_set_id,
-            name_servers: name_servers.clone(),
-            created_time: now,
-            resource_record_sets: default_records,
-        };
+            cfg.vpc.into_iter().collect(),
+            cfg.delegation_set_id,
+        );
+        let now = zone.created_time;
         account.hosted_zones.insert(id.clone(), zone.clone());
 
         let change_id = generate_change_id();
@@ -120,7 +146,7 @@ impl Route53Service {
         let id = require_id(route)?;
         let id = strip_zone_prefix(&id);
         let state = self.state.read();
-        let account = state.accounts.get(DEFAULT_ACCOUNT);
+        let account = state.accounts.get(&route.account);
         let zone = account
             .and_then(|a| a.hosted_zones.get(&id).cloned())
             .ok_or_else(|| no_such_hosted_zone(&id))?;
@@ -156,7 +182,7 @@ impl Route53Service {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&route.account)
             .ok_or_else(|| no_such_hosted_zone(&id))?;
         let zone = account
             .hosted_zones
@@ -220,7 +246,7 @@ impl Route53Service {
         let state = self.state.read();
         let mut zones: Vec<StoredHostedZone> = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&req.account_id)
             .map(|a| a.hosted_zones.values().cloned().collect())
             .unwrap_or_default();
         drop(state);
@@ -312,7 +338,7 @@ impl Route53Service {
         let state = self.state.read();
         let mut zones: Vec<StoredHostedZone> = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&req.account_id)
             .map(|a| a.hosted_zones.values().cloned().collect())
             .unwrap_or_default();
         drop(state);
@@ -375,11 +401,14 @@ impl Route53Service {
         Ok(xml_response(StatusCode::OK, body, HeaderMap::new()))
     }
 
-    pub(super) fn get_hosted_zone_count(&self) -> Result<AwsResponse, AwsServiceError> {
+    pub(super) fn get_hosted_zone_count(
+        &self,
+        route: &Route,
+    ) -> Result<AwsResponse, AwsServiceError> {
         let state = self.state.read();
         let count = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .map(|a| a.hosted_zones.len())
             .unwrap_or(0);
         drop(state);
@@ -405,7 +434,7 @@ impl Route53Service {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&route.account)
             .ok_or_else(|| no_such_hosted_zone(&id))?;
         let zone = account
             .hosted_zones
@@ -436,7 +465,7 @@ impl Route53Service {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&route.account)
             .ok_or_else(|| no_such_hosted_zone(&id))?;
         let zone = account
             .hosted_zones
@@ -470,7 +499,7 @@ impl Route53Service {
         let state = self.state.read();
         let zone = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.hosted_zones.get(&id).cloned())
             .ok_or_else(|| no_such_hosted_zone(&id))?;
         drop(state);

@@ -424,6 +424,8 @@ impl ResetState {
                 state.accounts.remove(account_id);
             }
             "route53" => {
+                // Route 53 is global (no region) but its resources are owned
+                // by the creating account; drop only that account's.
                 let mut state = self.route53.write();
                 state.accounts.remove(account_id);
             }

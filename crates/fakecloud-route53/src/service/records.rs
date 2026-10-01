@@ -23,7 +23,7 @@ impl Route53Service {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&route.account)
             .ok_or_else(|| no_such_hosted_zone(&id))?;
         let zone = account
             .hosted_zones
@@ -118,7 +118,7 @@ impl Route53Service {
         let state = self.state.read();
         let zone = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.hosted_zones.get(&id).cloned())
             .ok_or_else(|| no_such_hosted_zone(&id))?;
         drop(state);
@@ -238,7 +238,7 @@ impl Route53Service {
             .unwrap_or(1);
         let change = {
             let mut state = self.state.write();
-            let account = state.accounts.get_mut(DEFAULT_ACCOUNT).ok_or_else(|| {
+            let account = state.accounts.get_mut(&route.account).ok_or_else(|| {
                 aws_error(
                     StatusCode::NOT_FOUND,
                     "NoSuchChange",
@@ -298,7 +298,7 @@ impl Route53Service {
             .unwrap_or(false);
         let zone_id = strip_zone_prefix(&zone_id);
         let state = self.state.read();
-        let account = state.accounts.get(DEFAULT_ACCOUNT);
+        let account = state.accounts.get(&req.account_id);
         let zone = account
             .and_then(|a| a.hosted_zones.get(&zone_id).cloned())
             .ok_or_else(|| no_such_hosted_zone(&zone_id))?;

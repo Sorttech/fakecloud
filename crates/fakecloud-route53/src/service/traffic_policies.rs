@@ -18,10 +18,7 @@ impl Route53Service {
         }
         let policy_type = infer_policy_type(&cfg.document);
         let mut state = self.state.write();
-        let account = state
-            .accounts
-            .entry(DEFAULT_ACCOUNT.to_string())
-            .or_default();
+        let account = state.accounts.entry(req.account_id.clone()).or_default();
         // Match real Route 53: name uniqueness applies across all versions
         // of every existing policy. Checking only version == 1 would let a
         // duplicate name slip through whenever the v1 row had been deleted
@@ -85,7 +82,7 @@ impl Route53Service {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&route.account)
             .ok_or_else(|| no_such_traffic_policy(&id))?;
         let existing_versions: Vec<i64> = account
             .traffic_policies
@@ -142,7 +139,7 @@ impl Route53Service {
         let state = self.state.read();
         let p = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.traffic_policies.get(&(id.clone(), version)).cloned())
             .ok_or_else(|| no_such_traffic_policy(&id))?;
         drop(state);
@@ -170,7 +167,7 @@ impl Route53Service {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&route.account)
             .ok_or_else(|| no_such_traffic_policy(&id))?;
         let p = account
             .traffic_policies
@@ -198,7 +195,7 @@ impl Route53Service {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&route.account)
             .ok_or_else(|| no_such_traffic_policy(&id))?;
         if !account
             .traffic_policies
@@ -251,7 +248,7 @@ impl Route53Service {
         // Group by policy id; emit only the latest version of each.
         let mut latest: BTreeMap<String, StoredTrafficPolicy> = BTreeMap::new();
         let mut counts: BTreeMap<String, i64> = BTreeMap::new();
-        if let Some(account) = state.accounts.get(DEFAULT_ACCOUNT) {
+        if let Some(account) = state.accounts.get(&req.account_id) {
             for p in account.traffic_policies.values() {
                 let entry = latest.entry(p.id.clone()).or_insert_with(|| p.clone());
                 if p.version > entry.version {
@@ -318,7 +315,7 @@ impl Route53Service {
         let state = self.state.read();
         let mut versions: Vec<StoredTrafficPolicy> = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .map(|a| {
                 a.traffic_policies
                     .values()
@@ -391,10 +388,7 @@ impl Route53Service {
         }
         let zone_id = strip_zone_prefix(&cfg.hosted_zone_id);
         let mut state = self.state.write();
-        let account = state
-            .accounts
-            .entry(DEFAULT_ACCOUNT.to_string())
-            .or_default();
+        let account = state.accounts.entry(req.account_id.clone()).or_default();
         if !account.hosted_zones.contains_key(&zone_id) {
             return Err(no_such_hosted_zone(&zone_id));
         }
@@ -478,7 +472,7 @@ impl Route53Service {
         let state = self.state.read();
         let i = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.traffic_policy_instances.get(&id).cloned())
             .ok_or_else(|| no_such_traffic_policy_instance(&id))?;
         drop(state);
@@ -507,7 +501,7 @@ impl Route53Service {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&route.account)
             .ok_or_else(|| no_such_traffic_policy_instance(&id))?;
         let policy = account
             .traffic_policies
@@ -556,7 +550,7 @@ impl Route53Service {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&route.account)
             .ok_or_else(|| no_such_traffic_policy_instance(&id))?;
         let Some(removed) = account.traffic_policy_instances.remove(&id) else {
             return Err(no_such_traffic_policy_instance(&id));
@@ -607,7 +601,7 @@ impl Route53Service {
         let state = self.state.read();
         let mut instances: Vec<StoredTrafficPolicyInstance> = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&req.account_id)
             .map(|a| a.traffic_policy_instances.values().cloned().collect())
             .unwrap_or_default();
         drop(state);
@@ -716,7 +710,7 @@ impl Route53Service {
         let state = self.state.read();
         let account = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&req.account_id)
             .ok_or_else(|| no_such_hosted_zone(&zone_id))?;
         if !account.hosted_zones.contains_key(&zone_id) {
             return Err(no_such_hosted_zone(&zone_id));
@@ -832,7 +826,7 @@ impl Route53Service {
         let state = self.state.read();
         let mut instances: Vec<StoredTrafficPolicyInstance> = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&req.account_id)
             .map(|a| {
                 a.traffic_policy_instances
                     .values()
@@ -885,11 +879,14 @@ impl Route53Service {
         Ok(xml_response(StatusCode::OK, body, HeaderMap::new()))
     }
 
-    pub(super) fn get_traffic_policy_instance_count(&self) -> Result<AwsResponse, AwsServiceError> {
+    pub(super) fn get_traffic_policy_instance_count(
+        &self,
+        route: &Route,
+    ) -> Result<AwsResponse, AwsServiceError> {
         let state = self.state.read();
         let count = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .map(|a| a.traffic_policy_instances.len())
             .unwrap_or(0);
         drop(state);

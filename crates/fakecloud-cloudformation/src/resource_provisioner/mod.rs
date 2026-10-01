@@ -93,8 +93,8 @@ use fakecloud_organizations::{OrganizationState, SharedOrganizationsState, POLIC
 use fakecloud_persistence::{BucketSubresource, S3Store};
 use fakecloud_rds::{DbInstance, DbParameterGroup, DbSubnetGroup, RdsTag, SharedRdsState};
 use fakecloud_route53::{
-    model::{HealthCheckConfig, HostedZoneFeatures, ResourceRecordSet},
-    SharedRoute53State, StoredHealthCheck, StoredHostedZone,
+    model::{HealthCheckConfig, ResourceRecordSet},
+    SharedRoute53State, StoredHealthCheck,
 };
 use fakecloud_s3::persistence::bucket_meta_snapshot;
 use fakecloud_s3::{S3Bucket, SharedS3State};
@@ -4548,7 +4548,7 @@ mod tests {
         );
         {
             let accounts = prov.route53_state.read();
-            let state = accounts.get("000000000000").unwrap();
+            let state = accounts.get(&prov.account_id).unwrap();
             let z = state.hosted_zones.get(&zid).expect("zone preserved");
             assert_eq!(z.comment.as_deref(), Some("v2"));
         }
@@ -5320,7 +5320,7 @@ mod tests {
         .expect("update ok")
         .expect("updatable");
         let accounts = prov.route53_state.read();
-        let state = accounts.get("000000000000").unwrap();
+        let state = accounts.get(&prov.account_id).unwrap();
         let rec = state
             .health_checks
             .get(&id)
@@ -6972,6 +6972,173 @@ mod tests {
         );
         let sr = prov.create_resource(&res).unwrap();
         assert!(!sr.physical_id.is_empty());
+    }
+
+    /// A provisioner acting for a stack in a non-default account.
+    fn make_second_account_provisioner() -> ResourceProvisioner {
+        let mut prov = make_provisioner();
+        prov.account_id = "222222222222".to_string();
+        prov
+    }
+
+    #[test]
+    fn route53_resources_land_in_the_stacks_account() {
+        let prov = make_second_account_provisioner();
+        let zone = prov
+            .create_resource(&make_resource(
+                "AWS::Route53::HostedZone",
+                "Zone",
+                serde_json::json!({"Name": "example.com"}),
+            ))
+            .unwrap();
+        let zid = zone.physical_id.clone();
+        let rec = prov
+            .create_resource(&make_resource(
+                "AWS::Route53::RecordSet",
+                "Www",
+                serde_json::json!({
+                    "HostedZoneId": zid, "Name": "www.example.com", "Type": "A",
+                    "TTL": "60", "ResourceRecords": ["192.0.2.10"]
+                }),
+            ))
+            .unwrap();
+        let hc = prov
+            .create_resource(&make_resource(
+                "AWS::Route53::HealthCheck",
+                "HC",
+                serde_json::json!({"HealthCheckConfig": {
+                    "Type": "HTTP", "FullyQualifiedDomainName": "example.com", "Port": 80
+                }}),
+            ))
+            .unwrap();
+        {
+            let accounts = prov.route53_state.read();
+            assert_eq!(accounts.zone_owner(&zid), Some("222222222222"));
+            assert!(
+                accounts.get("000000000000").is_none(),
+                "nothing in the legacy bucket"
+            );
+            let state = accounts.get("222222222222").unwrap();
+            let stored = &state.hosted_zones[&zid];
+            // Same shape CreateHostedZone stores: default SOA + NS records
+            // and the synthesized name servers, plus the stack's record.
+            let api_shape = fakecloud_route53::build_hosted_zone(
+                &zid,
+                "example.com",
+                stored.caller_reference.clone(),
+                None,
+                false,
+                vec![],
+                None,
+            );
+            assert_eq!(stored.name, api_shape.name);
+            assert_eq!(stored.name_servers, api_shape.name_servers);
+            assert_eq!(stored.features.is_none(), api_shape.features.is_none());
+            let types: Vec<&str> = stored
+                .resource_record_sets
+                .iter()
+                .map(|r| r.record_type.as_str())
+                .collect();
+            assert_eq!(types, ["SOA", "NS", "A"]);
+            assert!(state.health_checks.contains_key(&hc.physical_id));
+        }
+
+        // Update + delete act on the stack's account too.
+        let updated = prov
+            .update_resource(
+                &zone,
+                &make_resource(
+                    "AWS::Route53::HostedZone",
+                    "Zone",
+                    serde_json::json!({"Name": "example.com", "HostedZoneConfig": {"Comment": "c"}}),
+                ),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.physical_id, zid, "comment update is in place");
+        prov.delete_resource(&rec).unwrap();
+        prov.delete_resource(&hc).unwrap();
+        {
+            let accounts = prov.route53_state.read();
+            let state = accounts.get("222222222222").unwrap();
+            let stored = &state.hosted_zones[&zid];
+            assert_eq!(stored.comment.as_deref(), Some("c"));
+            assert!(stored
+                .resource_record_sets
+                .iter()
+                .all(|r| r.record_type != "A"));
+            assert!(state.health_checks.is_empty());
+        }
+        prov.delete_resource(&zone).unwrap();
+        assert!(prov.route53_state.read().zone_owner(&zid).is_none());
+    }
+
+    #[test]
+    fn deleting_a_stack_resource_acts_on_the_stacks_account() {
+        let prov = make_second_account_provisioner();
+        let group = prov
+            .create_resource(&make_resource(
+                "AWS::Logs::LogGroup",
+                "Logs",
+                serde_json::json!({"LogGroupName": "/app/logs"}),
+            ))
+            .unwrap();
+        let rule = prov
+            .create_resource(&make_resource(
+                "AWS::Events::Rule",
+                "Rule",
+                serde_json::json!({"Name": "r", "ScheduleExpression": "rate(1 hour)"}),
+            ))
+            .unwrap();
+        let func = prov
+            .create_resource(&make_resource(
+                "AWS::Lambda::Function",
+                "Fn",
+                serde_json::json!({
+                    "FunctionName": "fn-b",
+                    "Runtime": "nodejs20.x",
+                    "Role": "arn:aws:iam::222222222222:role/lambda-role",
+                    "Handler": "index.handler"
+                }),
+            ))
+            .unwrap();
+        assert!(prov
+            .logs_state
+            .read()
+            .get("222222222222")
+            .is_some_and(|s| s.log_groups.contains_key("/app/logs")));
+        assert!(prov
+            .lambda_state
+            .read()
+            .get("222222222222")
+            .is_some_and(|s| s.functions.contains_key("fn-b")));
+
+        prov.delete_resource(&group).unwrap();
+        prov.delete_resource(&rule).unwrap();
+        prov.delete_resource(&func).unwrap();
+
+        assert!(!prov
+            .logs_state
+            .read()
+            .get("222222222222")
+            .unwrap()
+            .log_groups
+            .contains_key("/app/logs"));
+        assert!(prov
+            .eventbridge_state
+            .read()
+            .get("222222222222")
+            .unwrap()
+            .rules
+            .values()
+            .all(|r| r.arn != rule.physical_id));
+        assert!(!prov
+            .lambda_state
+            .read()
+            .get("222222222222")
+            .unwrap()
+            .functions
+            .contains_key("fn-b"));
     }
 
     #[test]

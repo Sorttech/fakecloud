@@ -25,7 +25,77 @@ pub struct Route53Snapshot {
     pub accounts: Option<Route53Accounts>,
 }
 
-pub const ROUTE53_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+///
+/// v2: resources live under the account that created them. v1 kept every
+/// resource in one [`LEGACY_ACCOUNT`] bucket whatever the caller's account.
+pub const ROUTE53_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
+
+/// The single account bucket v1 snapshots stored every resource under.
+const LEGACY_ACCOUNT: &str = "000000000000";
+
+/// Route 53 resources CloudFormation stacks provisioned, by physical id,
+/// mapped to the stack's account. A v1 snapshot stored them in the shared
+/// legacy bucket, and Route 53 resources carry no account of their own (their
+/// ARNs have none), so the owning stack's ARN is the only record of who owns
+/// them. Built from the CloudFormation state when a v1 snapshot is loaded.
+#[derive(Debug, Default, Clone)]
+pub struct StackOwnedResources {
+    hosted_zones: BTreeMap<String, String>,
+    health_checks: BTreeMap<String, String>,
+}
+
+impl StackOwnedResources {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a stack resource. Only `AWS::Route53::HostedZone` and
+    /// `AWS::Route53::HealthCheck` own top-level Route 53 state: record sets,
+    /// DNSSEC and key-signing keys live inside (or are keyed by) their zone
+    /// and follow it. The owner is the account in `stack_id`, the stack ARN.
+    pub fn record(&mut self, stack_id: &str, resource_type: &str, physical_id: &str) {
+        let Some(account) = arn_account(stack_id) else {
+            return;
+        };
+        let map = match resource_type {
+            "AWS::Route53::HostedZone" => &mut self.hosted_zones,
+            "AWS::Route53::HealthCheck" => &mut self.health_checks,
+            _ => return,
+        };
+        let id = physical_id.trim_start_matches("/hostedzone/");
+        if !id.is_empty() {
+            map.insert(id.to_string(), account.to_string());
+        }
+    }
+}
+
+/// The 12-digit account an ARN names, if any.
+fn arn_account(arn: &str) -> Option<&str> {
+    let account = arn.strip_prefix("arn:")?.split(':').nth(3)?;
+    (account.len() == 12 && account.bytes().all(|b| b.is_ascii_digit())).then_some(account)
+}
+
+/// Parse a Route 53 snapshot, migrating older schema versions.
+///
+/// A v1 snapshot kept every resource in one shared [`LEGACY_ACCOUNT`] bucket.
+/// Its stack-provisioned zones and health checks move to the stack's account
+/// (`stack_owned`), with everything keyed by or scoped to such a zone following
+/// it; every other entry was created through the API, which stored under the
+/// legacy bucket whatever the caller, and moves to `default_account` (the
+/// server's configured account).
+pub fn parse_route53_snapshot(
+    bytes: &[u8],
+    default_account: &str,
+    stack_owned: &StackOwnedResources,
+) -> Result<Route53Snapshot, serde_json::Error> {
+    let mut snapshot: Route53Snapshot = serde_json::from_slice(bytes)?;
+    if snapshot.schema_version < 2 {
+        if let Some(accounts) = snapshot.accounts.as_mut() {
+            accounts.migrate_legacy_bucket(default_account, stack_owned);
+        }
+    }
+    Ok(snapshot)
+}
 
 /// (De)serialize a `(A, B) -> V` map as a sequence of `(A, B, V)` triples. JSON
 /// object keys must be strings, so tuple-keyed maps (traffic policies keyed by
@@ -77,6 +147,137 @@ impl Route53Accounts {
 
     pub fn get(&self, account_id: &str) -> Option<&AccountState> {
         self.accounts.get(account_id)
+    }
+
+    /// Split the v1 shared bucket by owner (see [`parse_route53_snapshot`]).
+    /// Entries already stored under the owning account win over legacy ones
+    /// with the same key.
+    fn migrate_legacy_bucket(&mut self, default_account: &str, stack_owned: &StackOwnedResources) {
+        let Some(legacy) = self.accounts.remove(LEGACY_ACCOUNT) else {
+            return;
+        };
+        // Destructured exhaustively so a new field has to pick an owner here.
+        let AccountState {
+            hosted_zones,
+            changes,
+            health_checks,
+            traffic_policies,
+            traffic_policy_instances,
+            dnssec_status,
+            key_signing_keys,
+            query_logging_configs,
+            cidr_collections,
+            reusable_delegation_sets,
+            vpc_authorizations,
+            tags,
+        } = legacy;
+        let owner = |map: &BTreeMap<String, String>, id: &str| -> String {
+            map.get(id)
+                .cloned()
+                .unwrap_or_else(|| default_account.to_string())
+        };
+        let zone_owner = |id: &str| owner(&stack_owned.hosted_zones, id);
+        let hc_owner = |id: &str| owner(&stack_owned.health_checks, id);
+        // Make sure the default bucket exists even when the legacy one was
+        // entirely stack-owned or empty.
+        self.entry(default_account);
+
+        for (id, zone) in hosted_zones {
+            self.entry(&zone_owner(&id))
+                .hosted_zones
+                .entry(id)
+                .or_insert(zone);
+        }
+        for (id, hc) in health_checks {
+            self.entry(&hc_owner(&id))
+                .health_checks
+                .entry(id)
+                .or_insert(hc);
+        }
+        for (id, instance) in traffic_policy_instances {
+            self.entry(&zone_owner(&instance.hosted_zone_id))
+                .traffic_policy_instances
+                .entry(id)
+                .or_insert(instance);
+        }
+        for (id, status) in dnssec_status {
+            self.entry(&zone_owner(&id))
+                .dnssec_status
+                .entry(id)
+                .or_insert(status);
+        }
+        for (key, ksk) in key_signing_keys {
+            self.entry(&zone_owner(&key.0))
+                .key_signing_keys
+                .entry(key)
+                .or_insert(ksk);
+        }
+        for (id, cfg) in query_logging_configs {
+            self.entry(&zone_owner(&cfg.hosted_zone_id))
+                .query_logging_configs
+                .entry(id)
+                .or_insert(cfg);
+        }
+        for (id, vpcs) in vpc_authorizations {
+            self.entry(&zone_owner(&id))
+                .vpc_authorizations
+                .entry(id)
+                .or_insert(vpcs);
+        }
+        for (key, value) in tags {
+            let account = match key.0.as_str() {
+                "hostedzone" => zone_owner(&key.1),
+                "healthcheck" => hc_owner(&key.1),
+                _ => default_account.to_string(),
+            };
+            self.entry(&account).tags.entry(key).or_insert(value);
+        }
+        // Account-level resources with no zone: always API-created.
+        let default = self.entry(default_account);
+        for (id, change) in changes {
+            default.changes.entry(id).or_insert(change);
+        }
+        for (key, policy) in traffic_policies {
+            default.traffic_policies.entry(key).or_insert(policy);
+        }
+        for (id, collection) in cidr_collections {
+            default.cidr_collections.entry(id).or_insert(collection);
+        }
+        for (id, set) in reusable_delegation_sets {
+            default.reusable_delegation_sets.entry(id).or_insert(set);
+        }
+    }
+
+    /// The account that owns hosted zone `zone_id`, if any. Hosted zone ids
+    /// are unique across all accounts (see [`Self::unused_zone_id`]).
+    pub fn zone_owner(&self, zone_id: &str) -> Option<&str> {
+        self.accounts
+            .iter()
+            .find(|(_, a)| a.hosted_zones.contains_key(zone_id))
+            .map(|(id, _)| id.as_str())
+    }
+
+    /// The state of the account that owns hosted zone `zone_id`, if any.
+    pub fn zone_account(&self, zone_id: &str) -> Option<&AccountState> {
+        self.accounts
+            .values()
+            .find(|a| a.hosted_zones.contains_key(zone_id))
+    }
+
+    /// Draw a hosted zone id no account holds.
+    ///
+    /// Route 53 zone ids are global: a VPC owner associates another account's
+    /// private zone by id, and the DNS resolver and admin endpoints find zones
+    /// by id without knowing the owner. Ids therefore stay unique across every
+    /// account even though the zones themselves are per-account.
+    pub fn unused_zone_id(&self) -> String {
+        loop {
+            let raw = uuid::Uuid::new_v4().simple().to_string().to_uppercase();
+            let id = format!("Z{}", &raw[..14]);
+            if self.zone_owner(&id).is_none() {
+                return id;
+            }
+        }
     }
 }
 
@@ -269,4 +470,239 @@ pub struct StoredReusableDelegationSet {
     pub id: String,
     pub caller_reference: String,
     pub name_servers: Vec<String>,
+}
+
+#[cfg(test)]
+mod snapshot_migration_tests {
+    use super::*;
+
+    const STACK_ACCOUNT: &str = "222222222222";
+    const DEFAULT: &str = "123456789012";
+
+    fn zone(id: &str) -> StoredHostedZone {
+        crate::build_hosted_zone(
+            id,
+            "example.com",
+            format!("ref-{id}"),
+            None,
+            false,
+            vec![],
+            None,
+        )
+    }
+
+    fn health_check(id: &str) -> StoredHealthCheck {
+        StoredHealthCheck {
+            id: id.to_string(),
+            caller_reference: format!("ref-{id}"),
+            version: 1,
+            config: HealthCheckConfig {
+                health_check_type: "HTTP".to_string(),
+                ..Default::default()
+            },
+            created_time: Utc::now(),
+            status: HealthCheckStatus::Success,
+            last_failure_reason: None,
+        }
+    }
+
+    /// A v1 snapshot: an API-created zone (`ZAPI`) and health check, plus a
+    /// stack-created zone (`ZSTACK`, with a record set, DNSSEC, a query
+    /// logging config, a VPC authorization and tags) and health check, all in
+    /// the shared legacy bucket.
+    fn v1_snapshot_bytes() -> Vec<u8> {
+        let mut accounts = Route53Accounts::new();
+        let legacy = accounts.entry(LEGACY_ACCOUNT);
+        legacy.hosted_zones.insert("ZAPI".into(), zone("ZAPI"));
+        let mut stack_zone = zone("ZSTACK");
+        stack_zone
+            .resource_record_sets
+            .push(crate::model::ResourceRecordSet {
+                name: "www.example.com.".to_string(),
+                record_type: "A".to_string(),
+                ttl: Some(60),
+                ..Default::default()
+            });
+        legacy.hosted_zones.insert("ZSTACK".into(), stack_zone);
+        legacy
+            .health_checks
+            .insert("hc-api".into(), health_check("hc-api"));
+        legacy
+            .health_checks
+            .insert("hc-stack".into(), health_check("hc-stack"));
+        legacy
+            .dnssec_status
+            .insert("ZSTACK".into(), "SIGNING".into());
+        legacy.query_logging_configs.insert(
+            "qlc-1".into(),
+            StoredQueryLoggingConfig {
+                id: "qlc-1".into(),
+                hosted_zone_id: "ZSTACK".into(),
+                cloud_watch_logs_log_group_arn: format!(
+                    "arn:aws:logs:us-east-1:{STACK_ACCOUNT}:log-group:/aws/route53/example.com"
+                ),
+            },
+        );
+        legacy.vpc_authorizations.insert("ZSTACK".into(), vec![]);
+        legacy.tags.insert(
+            ("hostedzone".into(), "ZSTACK".into()),
+            BTreeMap::from([("team".into(), "dns".into())]),
+        );
+        legacy
+            .tags
+            .insert(("healthcheck".into(), "hc-stack".into()), BTreeMap::new());
+        legacy
+            .tags
+            .insert(("hostedzone".into(), "ZAPI".into()), BTreeMap::new());
+        legacy.changes.insert(
+            "C1".into(),
+            StoredChange::pending("C1".into(), Utc::now(), None),
+        );
+        serde_json::to_vec(&Route53Snapshot {
+            schema_version: 1,
+            accounts: Some(accounts),
+        })
+        .unwrap()
+    }
+
+    fn stack_owned() -> StackOwnedResources {
+        let stack = format!("arn:aws:cloudformation:us-east-1:{STACK_ACCOUNT}:stack/dns/abc");
+        let mut owned = StackOwnedResources::new();
+        owned.record(&stack, "AWS::Route53::HostedZone", "ZSTACK");
+        owned.record(&stack, "AWS::Route53::HealthCheck", "hc-stack");
+        owned.record(
+            &stack,
+            "AWS::Route53::RecordSet",
+            "ZSTACK|www.example.com.|A",
+        );
+        owned.record(&stack, "AWS::SQS::Queue", "ZAPI");
+        owned
+    }
+
+    #[test]
+    fn a_v1_snapshot_moves_stack_created_resources_to_the_stacks_account() {
+        let parsed = parse_route53_snapshot(&v1_snapshot_bytes(), DEFAULT, &stack_owned())
+            .expect("v1 snapshot loads");
+        let accounts = parsed.accounts.unwrap();
+        assert!(
+            accounts.get(LEGACY_ACCOUNT).is_none(),
+            "legacy bucket split"
+        );
+
+        let stack = accounts.get(STACK_ACCOUNT).expect("stack account bucket");
+        let zone = &stack.hosted_zones["ZSTACK"];
+        assert!(
+            zone.resource_record_sets
+                .iter()
+                .any(|r| r.name == "www.example.com." && r.record_type == "A"),
+            "record sets travel inside their zone"
+        );
+        assert!(stack.health_checks.contains_key("hc-stack"));
+        assert_eq!(stack.dnssec_status["ZSTACK"], "SIGNING");
+        assert!(stack.query_logging_configs.contains_key("qlc-1"));
+        assert!(stack.vpc_authorizations.contains_key("ZSTACK"));
+        assert_eq!(
+            stack.tags[&("hostedzone".to_string(), "ZSTACK".to_string())]["team"],
+            "dns"
+        );
+        assert!(stack
+            .tags
+            .contains_key(&("healthcheck".to_string(), "hc-stack".to_string())));
+        assert!(!stack.hosted_zones.contains_key("ZAPI"));
+
+        // Everything else was API-created and belongs to the default account.
+        let default = accounts.get(DEFAULT).expect("default account bucket");
+        assert!(default.hosted_zones.contains_key("ZAPI"));
+        assert!(default.health_checks.contains_key("hc-api"));
+        assert!(default.changes.contains_key("C1"));
+        assert!(default
+            .tags
+            .contains_key(&("hostedzone".to_string(), "ZAPI".to_string())));
+        assert!(!default.hosted_zones.contains_key("ZSTACK"));
+        assert!(!default.health_checks.contains_key("hc-stack"));
+        assert_eq!(accounts.account_count(), 2);
+    }
+
+    #[test]
+    fn a_v1_snapshot_keeps_api_resources_put_when_the_default_account_is_the_legacy_one() {
+        let parsed =
+            parse_route53_snapshot(&v1_snapshot_bytes(), LEGACY_ACCOUNT, &stack_owned()).unwrap();
+        let accounts = parsed.accounts.unwrap();
+        let legacy = accounts.get(LEGACY_ACCOUNT).unwrap();
+        assert!(legacy.hosted_zones.contains_key("ZAPI"));
+        assert!(!legacy.hosted_zones.contains_key("ZSTACK"));
+        assert!(accounts
+            .get(STACK_ACCOUNT)
+            .unwrap()
+            .hosted_zones
+            .contains_key("ZSTACK"));
+    }
+
+    #[test]
+    fn a_v1_snapshot_merges_into_an_existing_owner_bucket() {
+        let mut value: serde_json::Value = serde_json::from_slice(&v1_snapshot_bytes()).unwrap();
+        let existing = serde_json::to_value(AccountState {
+            hosted_zones: BTreeMap::from([("ZOWN".to_string(), zone("ZOWN"))]),
+            ..Default::default()
+        })
+        .unwrap();
+        value["accounts"]["accounts"][STACK_ACCOUNT] = existing;
+        let parsed = parse_route53_snapshot(
+            &serde_json::to_vec(&value).unwrap(),
+            DEFAULT,
+            &stack_owned(),
+        )
+        .unwrap();
+        let accounts = parsed.accounts.unwrap();
+        let stack = accounts.get(STACK_ACCOUNT).unwrap();
+        let ids: Vec<&String> = stack.hosted_zones.keys().collect();
+        assert_eq!(ids, ["ZOWN", "ZSTACK"]);
+    }
+
+    #[test]
+    fn a_current_snapshot_is_not_migrated() {
+        let mut accounts = Route53Accounts::new();
+        accounts
+            .entry(LEGACY_ACCOUNT)
+            .hosted_zones
+            .insert("ZSTACK".into(), zone("ZSTACK"));
+        let bytes = serde_json::to_vec(&Route53Snapshot {
+            schema_version: ROUTE53_SNAPSHOT_SCHEMA_VERSION,
+            accounts: Some(accounts),
+        })
+        .unwrap();
+        let parsed = parse_route53_snapshot(&bytes, DEFAULT, &stack_owned()).unwrap();
+        let accounts = parsed.accounts.unwrap();
+        assert!(accounts
+            .get(LEGACY_ACCOUNT)
+            .unwrap()
+            .hosted_zones
+            .contains_key("ZSTACK"));
+        assert!(accounts.get(STACK_ACCOUNT).is_none());
+    }
+
+    #[test]
+    fn stack_owned_resources_ignore_malformed_stack_arns() {
+        let mut owned = StackOwnedResources::new();
+        owned.record("not-an-arn", "AWS::Route53::HostedZone", "Z1");
+        owned.record(
+            "arn:aws:cloudformation:us-east-1:12:stack/x/y",
+            "AWS::Route53::HostedZone",
+            "Z2",
+        );
+        assert!(owned.hosted_zones.is_empty());
+    }
+
+    #[test]
+    fn unused_zone_id_is_unique_across_accounts() {
+        let mut accounts = Route53Accounts::new();
+        accounts
+            .entry("111111111111")
+            .hosted_zones
+            .insert("ZTAKEN".into(), zone("ZTAKEN"));
+        let id = accounts.unused_zone_id();
+        assert!(id.starts_with('Z') && id.len() == 15, "{id}");
+        assert_eq!(accounts.zone_owner("ZTAKEN"), Some("111111111111"));
+        assert!(accounts.zone_owner(&id).is_none());
+    }
 }

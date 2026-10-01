@@ -3712,7 +3712,30 @@ async fn main() {
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
-                    match serde_json::from_slice::<fakecloud_route53::Route53Snapshot>(&bytes) {
+                    // A v1 snapshot kept stack-provisioned zones in the shared
+                    // legacy bucket; the (already loaded) CloudFormation state
+                    // says which stack, and so which account, owns them.
+                    let stack_owned = {
+                        let mut owned = fakecloud_route53::StackOwnedResources::new();
+                        let cfn = cloudformation_state.read();
+                        for (_, account) in cfn.iter() {
+                            for stack in account.stacks.values() {
+                                for resource in &stack.resources {
+                                    owned.record(
+                                        &stack.stack_id,
+                                        &resource.resource_type,
+                                        &resource.physical_id,
+                                    );
+                                }
+                            }
+                        }
+                        owned
+                    };
+                    match fakecloud_route53::parse_route53_snapshot(
+                        &bytes,
+                        &cli.account_id,
+                        &stack_owned,
+                    ) {
                         Ok(snapshot) => {
                             if snapshot.schema_version
                                 > fakecloud_route53::ROUTE53_SNAPSHOT_SCHEMA_VERSION
