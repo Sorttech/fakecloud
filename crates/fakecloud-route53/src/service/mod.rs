@@ -2677,4 +2677,37 @@ mod tests {
         let (status, out) = call(&svc, disassociate_req(ACCOUNT_B, &zid, "vpc-1")).await;
         assert_eq!(status, StatusCode::OK, "{out}");
     }
+
+    #[tokio::test]
+    async fn a_migrated_associator_record_does_not_cover_the_zone_owners_own_vpc() {
+        // Migration recorded B as associator of vpc-own, which EC2 says the
+        // zone owner A owns.
+        let svc = Route53Service::new(Arc::new(RwLock::new(Route53Accounts::default())))
+            .with_vpc_owner_lookup(Arc::new(|vpc_id: &str, _: &str| {
+                (vpc_id == "vpc-own").then(|| ACCOUNT_A.to_string())
+            }));
+        let zid = create_zone(
+            &svc,
+            ACCOUNT_A,
+            &private_zone_body("internal.example.", "ref-o", "vpc-a-local"),
+        )
+        .await;
+        {
+            let mut st = svc.state.write();
+            let a = st.entry(ACCOUNT_A);
+            let vpc = VPC {
+                vpc_id: Some("vpc-own".into()),
+                vpc_region: Some("us-east-1".into()),
+            };
+            a.hosted_zones.get_mut(&zid).unwrap().vpcs.push(vpc.clone());
+            a.cross_account_vpcs
+                .insert(zid.clone(), vec![(vpc, ACCOUNT_B.to_string())]);
+        }
+        assert!(!call(&svc, list_by_vpc_req(ACCOUNT_B, "vpc-own"))
+            .await
+            .1
+            .contains(&zid));
+        let (status, out) = call(&svc, disassociate_req(ACCOUNT_B, &zid, "vpc-own")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{out}");
+    }
 }

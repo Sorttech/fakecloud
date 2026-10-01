@@ -1000,13 +1000,13 @@ impl Route53Service {
         // Another account may only remove a VPC it owns: the owner EC2
         // reports, or (VPC unknown to EC2) the account that associated it.
         if cross_account {
-            // The recorded associator also counts: an account a v1 snapshot's
-            // migration kept as associator retains access once EC2 knows the
-            // VPC (new associations already required EC2 ownership).
+            // The recorded associator also counts (a v1 snapshot's migration
+            // keeps the default account as associator), except for a VPC EC2
+            // says the zone owner owns: the zone owner associated that itself.
             let recorded = zone_account.cross_account_vpcs.get(&id).is_some_and(|vs| {
                 vs.iter()
                     .any(|(v, acct)| same_vpc(v, &vpc) && *acct == route.account)
-            });
+            }) && vpc_owner.as_deref() != Some(owner.as_str());
             let caller_owns_vpc =
                 recorded || vpc_owner.as_deref().is_some_and(|o| o == route.account);
             if !caller_owns_vpc {
@@ -1246,8 +1246,9 @@ impl Route53Service {
             v.vpc_id.as_deref() == Some(vpc_id.as_str())
                 && v.vpc_region.as_deref() == Some(vpc_region.as_str())
         };
-        // The VPC's owner per EC2, when EC2 knows the VPC: then only that
-        // owner sees other accounts' zones the VPC is associated with.
+        // The VPC's owner per EC2, when EC2 knows the VPC: that owner, and an
+        // account recorded as the VPC's associator on a zone, see other
+        // accounts' zones the VPC is associated with.
         let vpc_owner = self.known_vpc_owner(&VPC {
             vpc_id: Some(vpc_id.clone()),
             vpc_region: Some(vpc_region.clone()),
@@ -1259,11 +1260,12 @@ impl Route53Service {
                     z.vpcs.iter().any(matches)
                 } else {
                     // EC2's owner, or the recorded associator (which keeps a
-                    // v1-migrated associator's access once EC2 knows the VPC).
+                    // v1-migrated associator's access once EC2 knows the VPC),
+                    // unless EC2 says the zone owner owns the VPC.
                     let recorded = account.cross_account_vpcs.get(&z.id).is_some_and(|vs| {
                         vs.iter()
                             .any(|(v, acct)| matches(v) && *acct == req.account_id)
-                    });
+                    }) && vpc_owner.as_deref() != Some(owner.as_str());
                     let caller_owns_vpc =
                         recorded || vpc_owner.as_deref().is_some_and(|o| o == req.account_id);
                     caller_owns_vpc && z.vpcs.iter().any(matches)
