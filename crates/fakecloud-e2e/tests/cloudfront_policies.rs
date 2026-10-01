@@ -188,9 +188,12 @@ async fn managed_cache_policy_cannot_be_deleted() {
         .if_match(&etag)
         .send()
         .await;
+    let err = res
+        .expect_err("managed policy must not be deletable")
+        .into_service_error();
     assert!(
-        res.unwrap_err().into_service_error().is_illegal_delete(),
-        "managed policy must not be deletable"
+        err.is_illegal_delete(),
+        "expected IllegalDelete, got {err:?}"
     );
 }
 
