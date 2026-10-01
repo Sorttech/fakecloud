@@ -996,8 +996,8 @@ fn address_used_in_subnet(state: &Ec2State, subnet: Option<&str>, ip: &str) -> b
 
 /// The first address from `.100` up in `subnet` no instance or interface
 /// uses (interfaces created earlier in the same launch included, as they are
-/// already in `state`).
-fn next_free_address(state: &Ec2State, subnet: &str) -> String {
+/// already in `state`) and the launch has not `reserved`.
+fn next_free_address(state: &Ec2State, subnet: &str, reserved: &[&str]) -> String {
     let prefix = state
         .subnets
         .get(subnet)
@@ -1005,7 +1005,9 @@ fn next_free_address(state: &Ec2State, subnet: &str) -> String {
         .unwrap_or_else(|| "10.0.0".to_string());
     (100..255)
         .map(|n| format!("{prefix}.{n}"))
-        .find(|ip| !address_used_in_subnet(state, Some(subnet), ip))
+        .find(|ip| {
+            !reserved.contains(&ip.as_str()) && !address_used_in_subnet(state, Some(subnet), ip)
+        })
         .unwrap_or_else(|| format!("{prefix}.254"))
 }
 
@@ -1068,6 +1070,11 @@ fn attach_secondary_network_interfaces(
     secondary: &[SecondaryNi],
     params: &HashMap<String, String>,
 ) {
+    // Addresses this launch claims that are not in `state` yet: the
+    // instance's own and every fixed secondary address.
+    let reserved: Vec<&str> = std::iter::once(inst.private_ip.as_str())
+        .chain(secondary.iter().filter_map(|n| n.private_ip.as_deref()))
+        .collect();
     for ni in secondary {
         let (eni_id, default_dot) = match &ni.eni_id {
             Some(existing) => (existing.clone(), false),
@@ -1081,7 +1088,7 @@ fn attach_secondary_network_interfaces(
                 let private_ip = ni
                     .private_ip
                     .clone()
-                    .unwrap_or_else(|| next_free_address(state, &subnet_id));
+                    .unwrap_or_else(|| next_free_address(state, &subnet_id, &reserved));
                 let subnet = state.subnets.get(&subnet_id);
                 let eni = crate::state::NetworkInterface {
                     network_interface_id: eni_id.clone(),
@@ -4409,12 +4416,41 @@ mod modify_tests {
             .unwrap(),
         );
         let id = launched_id(&out);
+        {
+            let accounts = svc.state.read();
+            let st = accounts.get("000000000000").unwrap();
+            assert_eq!(st.instances[&id].private_ip, "10.7.7.7");
+            assert_eq!(st.instances[&id].subnet_id.as_deref(), Some("subnet-x"));
+            let a = st.network_interfaces[&eni_id].attachment.as_ref().unwrap();
+            assert_eq!((a.instance_id.as_str(), a.device_index), (id.as_str(), 0));
+        }
+        // A generated secondary address skips the launch's own fixed ones.
+        let out = body(
+            run(vec![
+                ("NetworkInterface.1.DeviceIndex", "0".into()),
+                ("NetworkInterface.1.SubnetId", "subnet-y".into()),
+                ("NetworkInterface.1.PrivateIpAddress", "10.0.0.100".into()),
+                ("NetworkInterface.2.DeviceIndex", "1".into()),
+                ("NetworkInterface.3.DeviceIndex", "2".into()),
+                ("NetworkInterface.3.PrivateIpAddress", "10.0.0.101".into()),
+            ])
+            .await
+            .unwrap(),
+        );
+        let id = launched_id(&out);
         let accounts = svc.state.read();
         let st = accounts.get("000000000000").unwrap();
-        assert_eq!(st.instances[&id].private_ip, "10.7.7.7");
-        assert_eq!(st.instances[&id].subnet_id.as_deref(), Some("subnet-x"));
-        let a = st.network_interfaces[&eni_id].attachment.as_ref().unwrap();
-        assert_eq!((a.instance_id.as_str(), a.device_index), (id.as_str(), 0));
+        let mut ips: Vec<String> = st
+            .network_interfaces
+            .values()
+            .filter(|e| e.attachment.as_ref().is_some_and(|a| a.instance_id == id))
+            .map(|e| e.private_ip_address.clone())
+            .collect();
+        ips.sort();
+        assert_eq!(
+            ips,
+            vec!["10.0.0.101".to_string(), "10.0.0.102".to_string()]
+        );
         assert!(!ipv4_in_cidr("10.1.0.5", "10.0.0.0/24"));
         assert!(ipv4_in_cidr("10.0.0.5", "10.0.0.0/24"));
     }
