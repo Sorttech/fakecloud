@@ -352,6 +352,26 @@ impl Drop for HelperImageOverride {
 
 const IT_ACCOUNT: &str = "123456789012";
 
+/// Delete Pods an interrupted earlier run of a test left for `task_id` (the
+/// task Pods have fixed names) and wait until they are gone.
+async fn clean_task_pods(task_id: &str) {
+    let c = client().await;
+    let lp = kube::api::ListParams::default().labels(&format!("fakecloud-ecs-task={task_id}"));
+    for _ in 0..120 {
+        let pods = c.pods().list(&lp).await.unwrap().items;
+        if pods.is_empty() {
+            return;
+        }
+        for pod in pods {
+            if let Some(name) = pod.metadata.name.as_deref() {
+                c.delete_pod(name).await;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    panic!("stale pods of task {task_id} were not deleted");
+}
+
 async fn k8s_runtime() -> EcsRuntime {
     std::env::set_var(
         "FAKECLOUD_K8S_SELF_URL",
@@ -479,6 +499,7 @@ async fn task_stopped_during_failed_creds_init_never_runs() {
     let _override = HelperImageOverride::unpullable();
     let rt = k8s_runtime().await;
     let task_id = "0123456789abcdef0123456789abcd01";
+    clean_task_pods(task_id).await;
     let state = task_state(task_id, true, true, "sleep 300");
     rt.run_task_inner(&state, task_id, IT_ACCOUNT)
         .await
@@ -494,6 +515,7 @@ async fn task_stopped_while_its_pod_is_created_never_runs() {
     ensure_namespace().await;
     let rt = k8s_runtime().await;
     let task_id = "0123456789abcdef0123456789abcd02";
+    clean_task_pods(task_id).await;
     let state = task_state(task_id, true, false, "sleep 300");
     rt.run_task_inner(&state, task_id, IT_ACCOUNT)
         .await
@@ -510,6 +532,7 @@ async fn failed_creds_init_relaunches_the_task_once_with_the_full_uri() {
     let _override = HelperImageOverride::unpullable();
     let rt = k8s_runtime().await;
     let task_id = "0123456789abcdef0123456789abcd03";
+    clean_task_pods(task_id).await;
     let state = task_state(
         task_id,
         false,

@@ -64,6 +64,9 @@ const CREDS_INIT_TIMEOUT: Duration = Duration::from_secs(180);
 /// How long a relaunch waits for the first task Pod to be deleted.
 const POD_GONE_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// How long deletion of a Pod the relaunch gave up on keeps being retried.
+const POD_GONE_RETRY_LIMIT: Duration = Duration::from_secs(30 * 60);
+
 /// How long a task-role Pod may go without its credentials initContainer
 /// reaching a node before the task fails to start (the same budget the
 /// task's own start deadline gives a Pod).
@@ -205,6 +208,28 @@ impl K8sTaskBackend {
             self.client.delete_pod(&name).await;
         }
         self.pods.write().clear();
+    }
+
+    /// Keep deleting `name` in the background until it is gone (or
+    /// [`POD_GONE_RETRY_LIMIT`] passes), for a Pod the runtime gave up
+    /// waiting on but must not leave running.
+    fn keep_deleting(&self, name: &str) {
+        let client = self.client.clone();
+        let name = name.to_string();
+        tokio::spawn(async move {
+            let deadline = std::time::Instant::now() + POD_GONE_RETRY_LIMIT;
+            loop {
+                client.delete_pod(&name).await;
+                match client.pods().get_opt(&name).await {
+                    Ok(None) => return,
+                    _ if std::time::Instant::now() >= deadline => {
+                        tracing::warn!(pod = %name, "task pod still present after repeated deletes");
+                        return;
+                    }
+                    _ => tokio::time::sleep(Duration::from_secs(5)).await,
+                }
+            }
+        });
     }
 
     /// Delete `name` and wait until the API server no longer has it. `false`
@@ -536,7 +561,11 @@ impl EcsRuntime {
                 // twice once its initContainer got through.
                 if !backend.delete_pod_and_wait(&pod_name).await {
                     mark_pull_stopped(state, account_id, task_id);
-                    backend.pods.write().remove(task_id);
+                    // Keep owning the Pod: the task_id -> Pod mapping stays
+                    // so StopTask / shutdown still reach it, and deletion is
+                    // retried in the background until the API server
+                    // confirms it (the Pod also keeps its reaper labels).
+                    backend.keep_deleting(&pod_name);
                     return Err(RuntimeError::ContainerStart(format!(
                         "task pod {pod_name} could not be removed for the relaunch without \
                          the credentials initContainer ({reason})"
