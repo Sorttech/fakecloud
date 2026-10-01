@@ -1009,6 +1009,53 @@ pub(crate) fn function_name_from_arn(arn: &str) -> &str {
     }
 }
 
+/// The account ID a Lambda function ARN names, or `None` for a bare name.
+pub(crate) fn lambda_arn_account(arn: &str) -> Option<&str> {
+    // arn:PARTITION:lambda:REGION:ACCOUNT:function:NAME[:QUALIFIER]
+    let mut parts = arn.split(':');
+    let mut next = || parts.next().unwrap_or_default();
+    let (prefix, partition, service, region, account, resource, name) =
+        (next(), next(), next(), next(), next(), next(), next());
+    if prefix != "arn"
+        || partition.is_empty()
+        || service != "lambda"
+        || region.is_empty()
+        || account.is_empty()
+        || resource != "function"
+        || name.is_empty()
+    {
+        return None;
+    }
+    Some(account)
+}
+
+/// Record an EventBridge-driven invocation in Lambda's invocation log (what
+/// `/_fakecloud/lambda/invocations` serves). It lands in the account the
+/// function ARN names when fakecloud knows that account, else in the bus's
+/// account -- never creating a Lambda account just to hold the record.
+pub(crate) fn record_lambda_invocation(
+    lambda_state: &SharedLambdaState,
+    function_arn: &str,
+    bus_account: &str,
+    payload: &str,
+    timestamp: chrono::DateTime<chrono::Utc>,
+) {
+    let mut accounts = lambda_state.write();
+    let account = lambda_arn_account(function_arn)
+        .filter(|a| accounts.get(a).is_some())
+        .unwrap_or(bus_account)
+        .to_string();
+    accounts
+        .get_or_create(&account)
+        .invocations
+        .push(fakecloud_lambda::LambdaInvocation {
+            function_arn: function_arn.to_string(),
+            payload: payload.to_string(),
+            timestamp,
+            source: "aws:events".to_string(),
+        });
+}
+
 /// Spawn a background task to invoke a Lambda function via ContainerRuntime.
 /// This is fire-and-forget: EventBridge delivery is asynchronous.
 pub(crate) fn invoke_lambda_async(
@@ -1017,22 +1064,44 @@ pub(crate) fn invoke_lambda_async(
     function_arn: &str,
     payload: &str,
 ) {
-    let runtime = match container_runtime {
-        Some(rt) => rt.clone(),
-        None => return,
-    };
     let lambda_state = match lambda_state {
         Some(ls) => ls.clone(),
-        None => return,
+        None => {
+            tracing::warn!(
+                function_arn = %function_arn,
+                "EventBridge Lambda target skipped: Lambda state is not wired into this \
+                 EventBridge delivery path, so the function cannot be resolved or invoked"
+            );
+            return;
+        }
+    };
+    let runtime = match container_runtime {
+        Some(rt) => rt.clone(),
+        None => {
+            tracing::warn!(
+                function_arn = %function_arn,
+                "EventBridge Lambda target recorded but not executed: no container runtime \
+                 is available (Docker/Podman/Kubernetes backend)"
+            );
+            return;
+        }
     };
     let func_name = function_name_from_arn(function_arn).to_string();
+    // Resolve the function in the account its ARN names (an event from another
+    // account's bus targets that account's function); only a bare name falls
+    // back to the default account.
+    let func_account = lambda_arn_account(function_arn).map(str::to_string);
     let payload = payload.as_bytes().to_vec();
 
     tokio::spawn(async move {
         let resolved = {
             let accounts = lambda_state.read();
-            let state = accounts.default_ref();
-            state.functions.get(&func_name).cloned().map(|func| {
+            let state = match func_account.as_deref() {
+                Some(account) => accounts.get(account),
+                None => Some(accounts.default_ref()),
+            };
+            let func = state.and_then(|s| s.functions.get(&func_name).cloned());
+            func.map(|func| {
                 let mut layer_zips: Vec<Vec<u8>> = Vec::with_capacity(func.layers.len());
                 for attached in &func.layers {
                     if let Some(bytes) = fakecloud_lambda::extras::parse_layer_version_arn(
@@ -1342,15 +1411,7 @@ pub(crate) fn dispatch_event_target(
             });
         }
         if let Some(ls) = ctx.lambda_state {
-            ls.write()
-                .default_mut()
-                .invocations
-                .push(fakecloud_lambda::LambdaInvocation {
-                    function_arn: arn.clone(),
-                    payload: body_str.clone(),
-                    timestamp: now,
-                    source: "aws:events".to_string(),
-                });
+            record_lambda_invocation(ls, arn, ctx.account_id, &body_str, now);
         }
         invoke_lambda_async(
             ctx.container_runtime,
@@ -1376,6 +1437,12 @@ pub(crate) fn dispatch_event_target(
         }
         if let Some(log_state) = ctx.logs_state {
             deliver_to_logs_and_persist(log_state, ctx.logs_persist, arn, &body_str, now);
+        } else {
+            tracing::warn!(
+                log_group_arn = %arn,
+                "EventBridge CloudWatch Logs target skipped: Logs state is not wired into \
+                 this EventBridge delivery path"
+            );
         }
     } else if arn.contains(":kinesis:") {
         tracing::info!(

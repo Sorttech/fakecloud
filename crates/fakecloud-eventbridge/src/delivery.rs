@@ -10,15 +10,45 @@ use fakecloud_logs::SharedLogsState;
 use crate::service::{dispatch_event_target, matches_pattern, EventDispatchContext};
 use crate::state::{PutEvent, SharedEventBridgeState};
 
-/// Implements EventBridgeDelivery so other services (SES) can put events
-/// on an EventBridge bus with full rule matching and target delivery.
+/// The non-bus plumbing a rule target dispatch needs beyond the
+/// [`DeliveryBus`]: Lambda state + container runtime (Lambda targets are
+/// recorded in Lambda's invocation log and executed directly, not via the
+/// bus), and CloudWatch Logs state + its persist hook (Logs targets write the
+/// log group directly).
+///
+/// PutEvents (`EventBridgeService`), the rule `Scheduler` and every
+/// cross-service [`EventBridgeDeliveryImpl`] take the same value, so an event
+/// another service publishes (S3, SES, ECS, RDS, Step Functions, ...) reaches
+/// the same target types as one sent with PutEvents.
+///
+/// The delivery dependencies and the persistence hook behave differently
+/// when absent:
+/// - `lambda_state` / `logs_state` missing: that target type cannot be
+///   delivered; dispatch records the attempt in EventBridge's own log and
+///   emits a `warn!` naming the skipped target.
+/// - `container_runtime` missing (no Docker/Podman/Kubernetes) while
+///   `lambda_state` is wired: Lambda targets are still recorded in Lambda's
+///   invocation log but not executed, with a `warn!`. Without `lambda_state`
+///   the previous case applies and nothing is recorded in Lambda's log.
+/// - `logs_persist` missing (memory mode): Logs targets are still delivered
+///   to the log group as normal; there is just no snapshot to write through,
+///   so nothing is skipped and nothing is warned.
+#[derive(Clone, Default)]
+pub struct EventTargetWiring {
+    pub lambda_state: Option<SharedLambdaState>,
+    pub logs_state: Option<SharedLogsState>,
+    /// Optional persistence hook, not a delivery dependency (see above).
+    pub logs_persist: Option<fakecloud_persistence::SnapshotHook>,
+    pub container_runtime: Option<Arc<ContainerRuntime>>,
+}
+
+/// Implements EventBridgeDelivery so other services (S3, SES, ECS, ...) can
+/// put events on an EventBridge bus with full rule matching and target
+/// delivery.
 pub struct EventBridgeDeliveryImpl {
     state: SharedEventBridgeState,
     delivery: Arc<DeliveryBus>,
-    lambda_state: Option<SharedLambdaState>,
-    logs_state: Option<SharedLogsState>,
-    logs_persist: Option<fakecloud_persistence::SnapshotHook>,
-    container_runtime: Option<Arc<ContainerRuntime>>,
+    wiring: EventTargetWiring,
 }
 
 impl EventBridgeDeliveryImpl {
@@ -26,20 +56,23 @@ impl EventBridgeDeliveryImpl {
         Self {
             state,
             delivery,
-            lambda_state: None,
-            logs_state: None,
-            logs_persist: None,
-            container_runtime: None,
+            wiring: EventTargetWiring::default(),
         }
     }
 
+    /// Wire every non-bus target dependency at once (see [`EventTargetWiring`]).
+    pub fn with_target_wiring(mut self, wiring: EventTargetWiring) -> Self {
+        self.wiring = wiring;
+        self
+    }
+
     pub fn with_lambda(mut self, lambda_state: SharedLambdaState) -> Self {
-        self.lambda_state = Some(lambda_state);
+        self.wiring.lambda_state = Some(lambda_state);
         self
     }
 
     pub fn with_logs(mut self, logs_state: SharedLogsState) -> Self {
-        self.logs_state = Some(logs_state);
+        self.wiring.logs_state = Some(logs_state);
         self
     }
 
@@ -47,13 +80,76 @@ impl EventBridgeDeliveryImpl {
     /// Logs target are written through to the Logs snapshot (see
     /// `EventDispatchContext::logs_persist`).
     pub fn with_logs_persist(mut self, hook: fakecloud_persistence::SnapshotHook) -> Self {
-        self.logs_persist = Some(hook);
+        self.wiring.logs_persist = Some(hook);
         self
     }
 
     pub fn with_runtime(mut self, runtime: Arc<ContainerRuntime>) -> Self {
-        self.container_runtime = Some(runtime);
+        self.wiring.container_runtime = Some(runtime);
         self
+    }
+}
+
+/// An [`EventBridgeDelivery`] whose real implementation is supplied after
+/// construction. Breaks the construction cycle where the bus EventBridge
+/// targets deliver through (which starts Step Functions executions) must
+/// itself hold an EventBridge sender (for the interpreter's
+/// `events:putEvents` task). Events put before [`Self::set`] is called are
+/// dropped with a warning.
+#[derive(Clone, Default)]
+pub struct DeferredEventBridgeDelivery {
+    inner: Arc<std::sync::OnceLock<Arc<dyn EventBridgeDelivery>>>,
+}
+
+impl DeferredEventBridgeDelivery {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Install the real sender. Only the first call takes effect.
+    pub fn set(&self, delivery: Arc<dyn EventBridgeDelivery>) {
+        if self.inner.set(delivery).is_err() {
+            tracing::warn!("deferred EventBridge delivery already set; ignoring");
+        }
+    }
+
+    fn get(&self, source: &str, detail_type: &str) -> Option<&Arc<dyn EventBridgeDelivery>> {
+        let inner = self.inner.get();
+        if inner.is_none() {
+            tracing::warn!(
+                source,
+                detail_type,
+                "EventBridge delivery not wired yet; dropping event"
+            );
+        }
+        inner
+    }
+}
+
+impl EventBridgeDelivery for DeferredEventBridgeDelivery {
+    fn put_event(&self, source: &str, detail_type: &str, detail: &str, event_bus_name: &str) {
+        if let Some(inner) = self.get(source, detail_type) {
+            inner.put_event(source, detail_type, detail, event_bus_name);
+        }
+    }
+
+    fn put_event_to_account(
+        &self,
+        source: &str,
+        detail_type: &str,
+        detail: &str,
+        event_bus_name: &str,
+        target_account_id: &str,
+    ) {
+        if let Some(inner) = self.get(source, detail_type) {
+            inner.put_event_to_account(
+                source,
+                detail_type,
+                detail,
+                event_bus_name,
+                target_account_id,
+            );
+        }
     }
 }
 
@@ -131,9 +227,6 @@ impl EventBridgeDeliveryImpl {
             "region": region,
             "resources": [],
         });
-        let event_str = event_json.to_string();
-
-        let _ = event_str;
         let resolved_account = if let Some(acct) = target_account_id {
             acct.to_string()
         } else {
@@ -142,10 +235,10 @@ impl EventBridgeDeliveryImpl {
         let ctx = EventDispatchContext {
             state: &self.state,
             delivery: &self.delivery,
-            lambda_state: self.lambda_state.as_ref(),
-            logs_state: self.logs_state.as_ref(),
-            logs_persist: self.logs_persist.as_ref(),
-            container_runtime: &self.container_runtime,
+            lambda_state: self.wiring.lambda_state.as_ref(),
+            logs_state: self.wiring.logs_state.as_ref(),
+            logs_persist: self.wiring.logs_persist.as_ref(),
+            container_runtime: &self.wiring.container_runtime,
             account_id: &resolved_account,
             region: &region,
         };
@@ -428,5 +521,386 @@ mod tests {
         let calls = recorder.sqs.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, q_arn);
+    }
+
+    fn insert_rule(state: &SharedEventBridgeState, rule: EventRule) {
+        let mut accounts = state.write();
+        accounts
+            .default_mut()
+            .rules
+            .insert(("default".to_string(), rule.name.clone()), rule);
+    }
+
+    /// Regression for #2628: an event another service (S3) publishes through
+    /// the cross-service delivery must reach a Lambda target exactly like
+    /// PutEvents -- recorded in Lambda's invocation log (what
+    /// `/_fakecloud/lambda/invocations` serves) rather than dropped because
+    /// the delivery impl had no Lambda wiring.
+    #[test]
+    fn put_event_with_target_wiring_records_lambda_invocation() {
+        let state = make_shared();
+        let fn_arn = "arn:aws:lambda:us-east-1:123456789012:function:my-fn";
+        insert_rule(
+            &state,
+            make_rule(
+                "s3-to-fn",
+                Some(r#"{"source":["aws.s3"],"detail-type":["Object Created"]}"#),
+                fn_arn,
+            ),
+        );
+        let lambda_state: SharedLambdaState = Arc::new(RwLock::new(
+            fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+        ));
+        let delivery = EventBridgeDeliveryImpl::new(state.clone(), Arc::new(DeliveryBus::new()))
+            .with_target_wiring(EventTargetWiring {
+                lambda_state: Some(lambda_state.clone()),
+                ..Default::default()
+            });
+
+        delivery.put_event(
+            "aws.s3",
+            "Object Created",
+            r#"{"bucket":{"name":"eb-bucket"},"object":{"key":"anything"}}"#,
+            "default",
+        );
+
+        let accounts = lambda_state.read();
+        let invocations = &accounts.default_ref().invocations;
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].function_arn, fn_arn);
+        assert_eq!(invocations[0].source, "aws:events");
+        let payload: serde_json::Value = serde_json::from_str(&invocations[0].payload).unwrap();
+        assert_eq!(payload["source"], "aws.s3");
+        assert_eq!(payload["detail-type"], "Object Created");
+        assert_eq!(payload["detail"]["bucket"]["name"], "eb-bucket");
+        // EventBridge's own delivery record is kept too.
+        assert_eq!(state.read().default_ref().lambda_invocations.len(), 1);
+    }
+
+    /// A Lambda target ARN naming another known account is recorded against
+    /// that account, never the default one (which may own a same-named
+    /// function).
+    #[test]
+    fn put_event_records_lambda_invocation_in_arn_account() {
+        let state = make_shared();
+        let fn_arn = "arn:aws:lambda:us-east-1:999988887777:function:foo";
+        insert_rule(&state, make_rule("xacct", None, fn_arn));
+        let lambda_state: SharedLambdaState = Arc::new(RwLock::new(
+            fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+        ));
+        lambda_state.write().get_or_create("999988887777");
+        let delivery = EventBridgeDeliveryImpl::new(state, Arc::new(DeliveryBus::new()))
+            .with_target_wiring(EventTargetWiring {
+                lambda_state: Some(lambda_state.clone()),
+                ..Default::default()
+            });
+
+        delivery.put_event("app", "T", "{}", "default");
+
+        let accounts = lambda_state.read();
+        assert!(accounts.default_ref().invocations.is_empty());
+        let target = accounts.get("999988887777").expect("target account");
+        assert_eq!(target.invocations.len(), 1);
+        assert_eq!(target.invocations[0].function_arn, fn_arn);
+    }
+
+    /// An ARN naming an account fakecloud has never seen does not conjure a
+    /// Lambda account for it; the record stays with the bus's account.
+    #[test]
+    fn put_event_does_not_create_lambda_account_for_unknown_arn_account() {
+        let state = make_shared();
+        let fn_arn = "arn:aws:lambda:us-east-1:555555555555:function:foo";
+        insert_rule(&state, make_rule("unknown", None, fn_arn));
+        let lambda_state: SharedLambdaState = Arc::new(RwLock::new(
+            fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+        ));
+        let delivery = EventBridgeDeliveryImpl::new(state, Arc::new(DeliveryBus::new()))
+            .with_target_wiring(EventTargetWiring {
+                lambda_state: Some(lambda_state.clone()),
+                ..Default::default()
+            });
+
+        delivery.put_event("app", "T", "{}", "default");
+
+        let accounts = lambda_state.read();
+        assert!(accounts.get("555555555555").is_none());
+        assert_eq!(accounts.default_ref().invocations.len(), 1);
+    }
+
+    /// Lambda backend double: records which function each launch was for and
+    /// points the instance at an in-process RIE stand-in.
+    struct RecordingBackend {
+        endpoint: String,
+        launched: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl fakecloud_lambda::runtime::LambdaBackend for RecordingBackend {
+        fn name(&self) -> &str {
+            "recording"
+        }
+        async fn launch(
+            &self,
+            func: &fakecloud_lambda::LambdaFunction,
+            _code_zip: Option<&[u8]>,
+            _layers: &[Vec<u8>],
+            _deploy_id: &str,
+            _credentials: Option<&fakecloud_core::auth::SessionCredentials>,
+        ) -> Result<fakecloud_lambda::runtime::WarmInstance, fakecloud_lambda::runtime::RuntimeError>
+        {
+            self.launched
+                .lock()
+                .unwrap()
+                .push(func.function_arn.clone());
+            Ok(fakecloud_lambda::runtime::WarmInstance {
+                endpoint: self.endpoint.clone(),
+                handle: fakecloud_lambda::runtime::BackendHandle::Container {
+                    id: "c0".to_string(),
+                },
+            })
+        }
+        async fn terminate(&self, _handle: &fakecloud_lambda::runtime::BackendHandle) {}
+    }
+
+    /// Minimal RIE stand-in: records each invocation request body and answers
+    /// 200 `{}`. Bare reachability probes (connect, no bytes) are ignored.
+    async fn spawn_recording_rie(bodies: Arc<Mutex<Vec<String>>>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let bodies = bodies.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        let text = String::from_utf8_lossy(&buf).to_string();
+                        let Some(header_end) = text.find("\r\n\r\n") else {
+                            continue;
+                        };
+                        let content_length = text[..header_end]
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                k.eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        if buf.len() < header_end + 4 + content_length {
+                            continue;
+                        }
+                        let body = String::from_utf8_lossy(
+                            &buf[header_end + 4..header_end + 4 + content_length],
+                        )
+                        .to_string();
+                        bodies.lock().unwrap().push(body);
+                        let _ = sock
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                            )
+                            .await;
+                        return;
+                    }
+                });
+            }
+        });
+        addr.to_string()
+    }
+
+    fn lambda_function(arn: &str) -> fakecloud_lambda::LambdaFunction {
+        fakecloud_lambda::LambdaFunction {
+            function_name: crate::service::helpers::function_name_from_arn(arn).to_string(),
+            function_arn: arn.to_string(),
+            runtime: "python3.12".to_string(),
+            handler: "index.handler".to_string(),
+            timeout: 5,
+            package_type: "Zip".to_string(),
+            code_zip: Some(vec![1, 2, 3]),
+            ..Default::default()
+        }
+    }
+
+    /// #2628's real symptom was that the function never *ran* (no container,
+    /// no Pod), not just a missing record. A cross-service event matched to a
+    /// Lambda target must reach the container runtime: the function the ARN
+    /// names (in the ARN's account, not a same-named default-account one) is
+    /// launched and receives the EventBridge envelope as its payload.
+    #[tokio::test]
+    async fn put_event_executes_lambda_target_in_container_runtime() {
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let endpoint = spawn_recording_rie(bodies.clone()).await;
+        let backend = Arc::new(RecordingBackend {
+            endpoint,
+            launched: std::sync::Mutex::new(Vec::new()),
+        });
+        let runtime = Arc::new(ContainerRuntime::from_backend(backend.clone()));
+
+        let fn_arn = "arn:aws:lambda:us-east-1:999988887777:function:my-fn";
+        let default_fn_arn = "arn:aws:lambda:us-east-1:123456789012:function:my-fn";
+        let lambda_state: SharedLambdaState = Arc::new(RwLock::new(
+            fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+        ));
+        {
+            let mut accounts = lambda_state.write();
+            accounts
+                .default_mut()
+                .functions
+                .insert("my-fn".to_string(), lambda_function(default_fn_arn));
+            accounts
+                .get_or_create("999988887777")
+                .functions
+                .insert("my-fn".to_string(), lambda_function(fn_arn));
+        }
+
+        let state = make_shared();
+        insert_rule(
+            &state,
+            make_rule("s3-to-fn", Some(r#"{"source":["aws.s3"]}"#), fn_arn),
+        );
+        let delivery = EventBridgeDeliveryImpl::new(state, Arc::new(DeliveryBus::new()))
+            .with_target_wiring(EventTargetWiring {
+                lambda_state: Some(lambda_state),
+                container_runtime: Some(runtime),
+                ..Default::default()
+            });
+
+        delivery.put_event(
+            "aws.s3",
+            "Object Created",
+            r#"{"bucket":{"name":"eb-bucket"},"object":{"key":"anything"}}"#,
+            "default",
+        );
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while bodies.lock().unwrap().is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Lambda target was never executed by the container runtime"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        assert_eq!(*backend.launched.lock().unwrap(), vec![fn_arn.to_string()]);
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 1);
+        let payload: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+        assert_eq!(payload["source"], "aws.s3");
+        assert_eq!(payload["detail-type"], "Object Created");
+        assert_eq!(payload["detail"]["object"]["key"], "anything");
+    }
+
+    #[test]
+    fn lambda_arn_account_only_for_full_arns() {
+        use crate::service::helpers::lambda_arn_account;
+        assert_eq!(
+            lambda_arn_account("arn:aws:lambda:us-east-1:999988887777:function:foo:live"),
+            Some("999988887777")
+        );
+        assert_eq!(
+            lambda_arn_account("arn:aws:lambda:us-east-1:999988887777:function:foo"),
+            Some("999988887777")
+        );
+        assert_eq!(
+            lambda_arn_account("arn:aws-cn:lambda:cn-north-1:999988887777:function:foo"),
+            Some("999988887777")
+        );
+        // Bare names and anything that isn't a Lambda *function* ARN.
+        assert_eq!(lambda_arn_account("foo"), None);
+        assert_eq!(lambda_arn_account(""), None);
+        assert_eq!(
+            lambda_arn_account("arn:aws:sqs:us-east-1:999988887777:function:foo"),
+            None,
+            "wrong service"
+        );
+        assert_eq!(
+            lambda_arn_account("arn:aws:lambda:us-east-1:999988887777:layer:foo:1"),
+            None,
+            "layer, not function"
+        );
+        assert_eq!(
+            lambda_arn_account("arn:aws:lambda:us-east-1:999988887777:function"),
+            None,
+            "missing function name"
+        );
+        assert_eq!(
+            lambda_arn_account("arn:aws:lambda:us-east-1::function:foo"),
+            None,
+            "empty account"
+        );
+        assert_eq!(
+            lambda_arn_account("xrn:aws:lambda:us-east-1:999988887777:function:foo"),
+            None,
+            "not an arn"
+        );
+        assert_eq!(
+            lambda_arn_account("arn::lambda:us-east-1:999988887777:function:foo"),
+            None,
+            "empty partition"
+        );
+        assert_eq!(
+            lambda_arn_account("arn:aws:lambda::999988887777:function:foo"),
+            None,
+            "empty region"
+        );
+    }
+
+    /// A cross-service event matched by a rule with a CloudWatch Logs target
+    /// lands in the log group, as with PutEvents.
+    #[test]
+    fn put_event_with_target_wiring_writes_logs_target() {
+        let state = make_shared();
+        let group_arn = "arn:aws:logs:us-east-1:123456789012:log-group:/aws/events/s3";
+        insert_rule(
+            &state,
+            make_rule("s3-to-logs", Some(r#"{"source":["aws.s3"]}"#), group_arn),
+        );
+        let logs_state: SharedLogsState = Arc::new(RwLock::new(
+            fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+        ));
+        let delivery = EventBridgeDeliveryImpl::new(state, Arc::new(DeliveryBus::new()))
+            .with_target_wiring(EventTargetWiring {
+                logs_state: Some(logs_state.clone()),
+                ..Default::default()
+            });
+
+        delivery.put_event("aws.s3", "Object Created", r#"{"k":1}"#, "default");
+
+        let accounts = logs_state.read();
+        let group = accounts
+            .default_ref()
+            .log_groups
+            .get("/aws/events/s3")
+            .expect("log group auto-created by the Logs target");
+        let events = &group.log_streams["events"].events;
+        assert_eq!(events.len(), 1);
+        let payload: serde_json::Value = serde_json::from_str(&events[0].message).unwrap();
+        assert_eq!(payload["source"], "aws.s3");
+    }
+
+    #[test]
+    fn deferred_delivery_forwards_once_set() {
+        let state = make_shared();
+        let deferred = DeferredEventBridgeDelivery::new();
+        // Before the real sender is bound the event is dropped, not panicked on.
+        deferred.put_event("early", "T", "{}", "default");
+        assert!(state.read().default_ref().events.is_empty());
+
+        deferred.set(Arc::new(EventBridgeDeliveryImpl::new(
+            state.clone(),
+            Arc::new(DeliveryBus::new()),
+        )));
+        deferred.put_event("app", "T", "{}", "default");
+        deferred.put_event_to_account("app", "T", "{}", "default", "999988887777");
+
+        let accounts = state.read();
+        assert_eq!(accounts.default_ref().events.len(), 1);
+        assert_eq!(accounts.default_ref().events[0].source, "app");
+        assert_eq!(accounts.get("999988887777").unwrap().events.len(), 1);
     }
 }

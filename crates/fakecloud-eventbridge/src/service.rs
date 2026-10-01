@@ -16,7 +16,7 @@ use fakecloud_core::validation::*;
 use fakecloud_persistence::SnapshotStore;
 
 use fakecloud_lambda::runtime::ContainerRuntime;
-use fakecloud_lambda::{LambdaInvocation, SharedLambdaState};
+use fakecloud_lambda::SharedLambdaState;
 use fakecloud_logs::SharedLogsState;
 
 use crate::state::{
@@ -48,6 +48,16 @@ impl EventBridgeService {
             snapshot_store: None,
             snapshot_lock: Arc::new(AsyncMutex::new(())),
         }
+    }
+
+    /// Wire every non-bus target dependency at once (see
+    /// [`crate::delivery::EventTargetWiring`]).
+    pub fn with_target_wiring(mut self, wiring: crate::delivery::EventTargetWiring) -> Self {
+        self.lambda_state = wiring.lambda_state;
+        self.logs_state = wiring.logs_state;
+        self.logs_persist = wiring.logs_persist;
+        self.container_runtime = wiring.container_runtime;
+        self
     }
 
     pub fn with_lambda(mut self, lambda_state: SharedLambdaState) -> Self {
