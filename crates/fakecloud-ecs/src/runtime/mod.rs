@@ -1825,8 +1825,17 @@ fn finalize_stopped_multi(
                 c.exit_code = mapped.or(Some(primary_exit_code));
             }
         }
-        let was_running = previous_status == "RUNNING";
-        let was_pending = !was_running && previous_status != "STOPPED";
+        // ECS lifecycle: PROVISIONING/PENDING/ACTIVATING precede RUNNING;
+        // DEACTIVATING/STOPPING/DEPROVISIONING follow it (and still hold the
+        // running count).
+        let was_pending = matches!(
+            previous_status.as_str(),
+            "PROVISIONING" | "PENDING" | "ACTIVATING"
+        );
+        let was_running = matches!(
+            previous_status.as_str(),
+            "RUNNING" | "DEACTIVATING" | "STOPPING" | "DEPROVISIONING"
+        );
         let release = |running: &mut i32, pending: &mut i32| {
             if was_running && *running > 0 {
                 *running -= 1;
@@ -2374,9 +2383,13 @@ mod tests {
     /// launch) leave `pendingTasksCount`, and neither touches another task's.
     #[test]
     fn finalize_stopped_multi_releases_the_count_the_task_held() {
-        for (status, want_running, want_pending) in
-            [("RUNNING", 1, 1), ("PENDING", 1, 1), ("STOPPED", 1, 1)]
-        {
+        for (status, want_running, want_pending) in [
+            ("RUNNING", 1, 1),
+            ("STOPPING", 1, 1),
+            ("PENDING", 1, 1),
+            ("PROVISIONING", 1, 1),
+            ("STOPPED", 1, 1),
+        ] {
             let mut accounts: MultiAccountState<EcsState> =
                 MultiAccountState::new("000000000000", "us-east-1", "http://localhost:4566");
             let acct = accounts.get_or_create("000000000000");
@@ -2386,8 +2399,10 @@ mod tests {
             );
             // One other task running and one pending, plus this one's own
             // count: afterwards only the other tasks' counts remain.
-            cluster.running_tasks_count = 1 + i32::from(status == "RUNNING");
-            cluster.pending_tasks_count = 1 + i32::from(status == "PENDING");
+            let holds_running = matches!(status, "RUNNING" | "STOPPING");
+            let holds_pending = matches!(status, "PENDING" | "PROVISIONING");
+            cluster.running_tasks_count = 1 + i32::from(holds_running);
+            cluster.pending_tasks_count = 1 + i32::from(holds_pending);
             acct.clusters.insert("default".into(), cluster);
             let mut t = make_task("t1");
             t.last_status = status.into();
