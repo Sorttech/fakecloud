@@ -4439,7 +4439,7 @@ fn role_in_account_rehomes_only_arns_naming_an_account() {
         "arn:aws:iam::123456789012:role/path/r"
     );
     assert_eq!(
-        role_in_account("arn:aws-cn:iam::123456789012:role/r", "123456789012"),
+        role_in_account("arn:aws-cn:iam::000000000000:role/r", "123456789012"),
         "arn:aws-cn:iam::123456789012:role/r"
     );
     assert_eq!(
@@ -4461,11 +4461,14 @@ impl fakecloud_core::auth::RoleTrustValidator for TrustsOnlyIn {
         service_principal: &str,
     ) -> Result<(), fakecloud_core::auth::PassRoleError> {
         assert_eq!(service_principal, "lambda.amazonaws.com");
-        assert_eq!(
-            fakecloud_aws::arn::account_of(role_arn),
-            Some(account_id),
-            "a role is looked up in the account its ARN names"
-        );
+        // A role is looked up in the account its ARN names; an ARN naming
+        // none is looked up in the caller's.
+        if let Some(arn_account) = fakecloud_aws::arn::account_of(role_arn) {
+            assert_eq!(
+                arn_account, account_id,
+                "a role is looked up in the account its ARN names"
+            );
+        }
         if self.0.contains(&account_id) {
             Ok(())
         } else {
@@ -4493,6 +4496,22 @@ fn another_accounts_role_is_checked_against_its_own_trust_policy() {
         assert!(err.message().contains(foreign), "{}", err.message());
     }
     validate_execution_role("123456789012", own, Some(&own_trusts), IamMode::Strict).unwrap();
+    // An ARN naming no account is the caller's role.
+    validate_execution_role(
+        "123456789012",
+        "arn:aws:iam:::role/app",
+        Some(&own_trusts),
+        IamMode::Strict,
+    )
+    .unwrap();
+    let err = validate_execution_role(
+        "123456789012",
+        "arn:aws:iam:::role/app",
+        Some(&TrustsOnlyIn(&["999999999999"])),
+        IamMode::Off,
+    )
+    .expect_err("caller's untrusting role refused");
+    assert_eq!(err.code(), "InvalidParameterValueException");
 
     // The foreign role trusts Lambda, but the session is minted for the
     // caller's untrusting `app`, so that one refuses it.
