@@ -75,9 +75,11 @@ if [ -z "$ip" ]; then
   exit 1
 fi
 # nft first; iptables when nft is missing or the kernel refuses its rule.
-if have nft && printf 'table ip fakecloud_ecs_creds {\n chain output {\n  type nat hook output priority -100; policy accept;\n  ip daddr 169.254.170.2 tcp dport 80 dnat to %s:%s\n }\n}\n' "$ip" "$port" | nft -f -; then
+# Both are idempotent: a re-run in the same namespace replaces the rule.
+if have nft && printf 'table ip fakecloud_ecs_creds\ndelete table ip fakecloud_ecs_creds\ntable ip fakecloud_ecs_creds {\n chain output {\n  type nat hook output priority -100; policy accept;\n  ip daddr 169.254.170.2 tcp dport 80 dnat to %s:%s\n }\n}\n' "$ip" "$port" | nft -f -; then
   :
-elif have iptables && iptables -t nat -A OUTPUT -d 169.254.170.2/32 -p tcp --dport 80 -j DNAT --to-destination "$ip:$port"; then
+elif have iptables && rule="-d 169.254.170.2/32 -p tcp --dport 80 -j DNAT --to-destination $ip:$port" \
+  && { iptables -t nat -C OUTPUT $rule 2>/dev/null || iptables -t nat -A OUTPUT $rule; }; then
   :
 else
   echo "fakecloud-ecs-creds: could not install the NAT rule with nft or iptables" >&2
@@ -444,7 +446,7 @@ impl EcsRuntime {
                 .unwrap_or(false);
             if !running {
                 return Err(format!(
-                    "holder exited before installing the NAT rule: {}{}",
+                    "holder exited before installing the NAT rule; stdout: {:?}; stderr: {:?}",
                     stdout.trim(),
                     stderr.trim()
                 ));
@@ -622,7 +624,11 @@ mod tests {
                 std::os::unix::fs::symlink(real, dir.path().join(util)).unwrap();
             }
             tool("getent", "echo '10.1.2.3 STREAM host'");
-            tool("iptables", &format!("echo \"iptables $*\" >> {log_s}"));
+            // `-C` (check) finds no rule, so the script appends one.
+            tool(
+                "iptables",
+                &format!("case \"$3\" in -C) exit 1;; esac; echo \"iptables $*\" >> {log_s}"),
+            );
             match nft_ok {
                 Some(true) => tool("nft", &format!("cat >/dev/null; echo nft >> {log_s}")),
                 Some(false) => tool("nft", "cat >/dev/null; exit 1"),
@@ -644,6 +650,9 @@ mod tests {
         let (ok, stdout, calls) = run(Some(true));
         assert!(ok && stdout.contains(READY_MARKER), "{stdout}");
         assert_eq!(calls.trim(), "nft");
+        // nft gets a ruleset that replaces any earlier copy of the table, so
+        // a re-run in the same namespace doesn't fail on "already exists".
+        assert!(SETUP_SCRIPT.contains("delete table ip fakecloud_ecs_creds"));
         let (ok, stdout, calls) = run(Some(false));
         assert!(ok && stdout.contains("-> 10.1.2.3:4566"), "{stdout}");
         assert!(

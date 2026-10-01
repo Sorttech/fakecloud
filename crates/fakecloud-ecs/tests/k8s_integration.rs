@@ -328,43 +328,52 @@ async fn creds_init_container_routes_the_agent_address_to_its_target() {
     let _ = services.delete(server, &DeleteParams::default()).await;
 }
 
-/// A task stopped while its credentials initContainer is failing is not
-/// relaunched (there is nothing to run) and goes straight to STOPPED with
-/// the user's stop reason, never RUNNING.
-#[tokio::test]
-async fn task_stopped_during_failed_creds_init_never_runs() {
-    use fakecloud_core::multi_account::MultiAccountState;
-    use fakecloud_ecs::{EcsState, SharedEcsState, Task, TaskDefinition};
+/// Unsets the helper-image override on drop, so a failed assertion can't
+/// leak it into later tests in this binary.
+struct HelperImageOverride;
 
-    require_test_env();
-    ensure_namespace().await;
+impl HelperImageOverride {
+    /// A helper image that can never be pulled: the credentials
+    /// initContainer fails, which relaunches the task without it.
+    fn unpullable() -> Self {
+        std::env::set_var(
+            "FAKECLOUD_ECS_CREDS_HELPER_IMAGE",
+            "registry.invalid/fakecloud/no-such-helper:1",
+        );
+        Self
+    }
+}
+
+impl Drop for HelperImageOverride {
+    fn drop(&mut self) {
+        std::env::remove_var("FAKECLOUD_ECS_CREDS_HELPER_IMAGE");
+    }
+}
+
+const IT_ACCOUNT: &str = "123456789012";
+
+async fn k8s_runtime() -> EcsRuntime {
     std::env::set_var(
         "FAKECLOUD_K8S_SELF_URL",
         "http://fakecloud.fakecloud-ecs-test.svc.cluster.local:4566",
     );
     std::env::set_var("FAKECLOUD_K8S_NAMESPACE", TEST_NS);
-    // A helper image that can never be pulled: the initContainer fails, which
-    // would normally relaunch the task without it. Unset on drop, so a failed
-    // assertion can't leak it into later tests in this binary.
-    struct HelperImageOverride;
-    impl Drop for HelperImageOverride {
-        fn drop(&mut self) {
-            std::env::remove_var("FAKECLOUD_ECS_CREDS_HELPER_IMAGE");
-        }
-    }
-    std::env::set_var(
-        "FAKECLOUD_ECS_CREDS_HELPER_IMAGE",
-        "registry.invalid/fakecloud/no-such-helper:1",
-    );
-    let _override = HelperImageOverride;
-    let rt = EcsRuntime::new_k8s(4566).await.expect("new_k8s");
+    EcsRuntime::new_k8s(4566).await.expect("new_k8s")
+}
 
-    let account = "123456789012";
-    let task_id = "0123456789abcdef0123456789abcd01";
-    let state: SharedEcsState =
-        std::sync::Arc::new(parking_lot::RwLock::new(
-            MultiAccountState::<EcsState>::new(account, "us-east-1", "http://localhost:4566"),
-        ));
+/// ECS state holding one PENDING single-container task, already stopped by
+/// StopTask when `stopped`, with a task role when `with_role`.
+fn task_state(
+    task_id: &str,
+    stopped: bool,
+    with_role: bool,
+    script: &str,
+) -> fakecloud_ecs::SharedEcsState {
+    use fakecloud_core::multi_account::MultiAccountState;
+    use fakecloud_ecs::{EcsState, Task, TaskDefinition};
+
+    let account = IT_ACCOUNT;
+    let role = with_role.then(|| format!("arn:aws:iam::{account}:role/app"));
     let td: TaskDefinition = serde_json::from_value(serde_json::json!({
         "family": "it-creds",
         "revision": 1,
@@ -373,10 +382,10 @@ async fn task_stopped_during_failed_creds_init_never_runs() {
             "name": "app",
             "image": "busybox:1.36",
             "essential": true,
-            "command": ["sh", "-c", "sleep 300"],
+            "command": ["sh", "-c", script],
         }],
         "status": "ACTIVE",
-        "task_role_arn": format!("arn:aws:iam::{account}:role/app"),
+        "task_role_arn": role,
         "network_mode": "awsvpc",
         "registered_at": chrono::Utc::now(),
     }))
@@ -390,10 +399,9 @@ async fn task_stopped_during_failed_creds_init_never_runs() {
         "family": "it-creds",
         "revision": 1,
         "last_status": "PENDING",
-        // StopTask already landed.
-        "desired_status": "STOPPED",
-        "stop_code": "UserInitiated",
-        "stopped_reason": "stopped by test",
+        "desired_status": if stopped { "STOPPED" } else { "RUNNING" },
+        "stop_code": stopped.then_some("UserInitiated"),
+        "stopped_reason": stopped.then_some("stopped by test"),
         "launch_type": "FARGATE",
         "containers": [{
             "container_arn": format!("arn:aws:ecs:us-east-1:{account}:container/c/{task_id}/app"),
@@ -406,10 +414,13 @@ async fn task_stopped_during_failed_creds_init_never_runs() {
         "overrides": {},
         "connectivity": "CONNECTING",
         "created_at": chrono::Utc::now(),
-        "task_role_arn": format!("arn:aws:iam::{account}:role/app"),
+        "task_role_arn": role,
         "tags": [],
     }))
     .expect("task");
+    let state: fakecloud_ecs::SharedEcsState = std::sync::Arc::new(parking_lot::RwLock::new(
+        MultiAccountState::<EcsState>::new(account, "us-east-1", "http://localhost:4566"),
+    ));
     {
         let mut accounts = state.write();
         let s = accounts.get_or_create(account);
@@ -419,21 +430,25 @@ async fn task_stopped_during_failed_creds_init_never_runs() {
             .insert(1, td);
         s.tasks.insert(task_id.into(), task);
     }
+    state
+}
 
-    rt.run_task_inner(&state, task_id, account)
-        .await
-        .expect("run_task_inner");
-
+/// The task went straight from PENDING to STOPPED with the user's reason,
+/// and none of its Pods is left running.
+async fn assert_stopped_without_running(state: &fakecloud_ecs::SharedEcsState, task_id: &str) {
     {
         let accounts = state.read();
-        let task = accounts.get(account).unwrap().tasks.get(task_id).unwrap();
+        let task = accounts
+            .get(IT_ACCOUNT)
+            .unwrap()
+            .tasks
+            .get(task_id)
+            .unwrap();
         assert_eq!(task.last_status, "STOPPED");
         assert!(task.started_at.is_none(), "task was marked RUNNING");
         assert_eq!(task.stop_code.as_deref(), Some("UserInitiated"));
         assert_eq!(task.stopped_reason.as_deref(), Some("stopped by test"));
     }
-    // No relaunched (full-URI) Pod: the only Pod the task had is on its way
-    // out.
     let pods = client().await.pods();
     let lp = kube::api::ListParams::default().labels(&format!("fakecloud-ecs-task={task_id}"));
     for pod in pods.list(&lp).await.unwrap().items {
@@ -452,4 +467,84 @@ async fn task_stopped_during_failed_creds_init_never_runs() {
             pod.metadata.name
         );
     }
+}
+
+/// A task stopped while its credentials initContainer is failing is not
+/// relaunched (there is nothing to run) and goes straight to STOPPED with
+/// the user's stop reason, never RUNNING.
+#[tokio::test]
+async fn task_stopped_during_failed_creds_init_never_runs() {
+    require_test_env();
+    ensure_namespace().await;
+    let _override = HelperImageOverride::unpullable();
+    let rt = k8s_runtime().await;
+    let task_id = "0123456789abcdef0123456789abcd01";
+    let state = task_state(task_id, true, true, "sleep 300");
+    rt.run_task_inner(&state, task_id, IT_ACCOUNT)
+        .await
+        .expect("run_task_inner");
+    assert_stopped_without_running(&state, task_id).await;
+}
+
+/// A StopTask that lands while the task Pod is being created (here: before
+/// it) is honored once the Pod exists, instead of the task running.
+#[tokio::test]
+async fn task_stopped_while_its_pod_is_created_never_runs() {
+    require_test_env();
+    ensure_namespace().await;
+    let rt = k8s_runtime().await;
+    let task_id = "0123456789abcdef0123456789abcd02";
+    let state = task_state(task_id, true, false, "sleep 300");
+    rt.run_task_inner(&state, task_id, IT_ACCOUNT)
+        .await
+        .expect("run_task_inner");
+    assert_stopped_without_running(&state, task_id).await;
+}
+
+/// A failed credentials initContainer relaunches the task exactly once,
+/// without it and with the full URI, after the first Pod is gone.
+#[tokio::test]
+async fn failed_creds_init_relaunches_the_task_once_with_the_full_uri() {
+    require_test_env();
+    ensure_namespace().await;
+    let _override = HelperImageOverride::unpullable();
+    let rt = k8s_runtime().await;
+    let task_id = "0123456789abcdef0123456789abcd03";
+    let state = task_state(
+        task_id,
+        false,
+        true,
+        "echo FULL=[$AWS_CONTAINER_CREDENTIALS_FULL_URI] REL=[$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI]",
+    );
+    rt.run_task_inner(&state, task_id, IT_ACCOUNT)
+        .await
+        .expect("run_task_inner");
+    let accounts = state.read();
+    let task = accounts
+        .get(IT_ACCOUNT)
+        .unwrap()
+        .tasks
+        .get(task_id)
+        .unwrap();
+    assert_eq!(task.last_status, "STOPPED");
+    assert_eq!(
+        task.containers[0].exit_code,
+        Some(0),
+        "{}",
+        task.captured_logs
+    );
+    // One run, of the relaunched Pod.
+    assert_eq!(
+        task.captured_logs.matches("FULL=[").count(),
+        1,
+        "{}",
+        task.captured_logs
+    );
+    assert!(
+        task.captured_logs.contains(&format!(
+            "FULL=[http://fakecloud.fakecloud-ecs-test.svc.cluster.local:4566/_fakecloud/ecs/creds/{task_id}] REL=[]"
+        )),
+        "{}",
+        task.captured_logs
+    );
 }

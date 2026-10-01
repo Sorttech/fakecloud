@@ -568,6 +568,18 @@ mod tests {
         // HEAD: GET's status, no body.
         let (status, body) = call(&app, "HEAD", "169.254.170.2", "/v2/credentials/task1").await;
         assert_eq!((status, body.as_str()), (StatusCode::OK, ""));
+        // GET's headers carry no Content-Length to go stale (hyper computes
+        // it from the body it actually sends).
+        let creds = {
+            let (ecs, _iam, endpoint) = setup();
+            add_task(&ecs, ACCOUNT, "t", Some(ROLE));
+            endpoint
+        };
+        let head = respond_link_local(&creds, &axum::http::Method::HEAD, "/v2/credentials/t");
+        assert!(head
+            .headers()
+            .get(axum::http::header::CONTENT_LENGTH)
+            .is_none());
         let (status, body) = call(&app, "HEAD", "169.254.170.2", "/v2/credentials/nope").await;
         assert_eq!((status, body.as_str()), (StatusCode::BAD_REQUEST, ""));
     }

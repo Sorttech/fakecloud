@@ -61,6 +61,9 @@ const POD_PREFIX: &str = "fakecloud-ecs";
 /// relaunched without it (covers its image pull).
 const CREDS_INIT_TIMEOUT: Duration = Duration::from_secs(180);
 
+/// How long a relaunch waits for the first task Pod to be deleted.
+const POD_GONE_TIMEOUT: Duration = Duration::from_secs(90);
+
 /// How long a task-role Pod may go without its credentials initContainer
 /// reaching a node before the task fails to start (the same budget the
 /// task's own start deadline gives a Pod).
@@ -202,6 +205,21 @@ impl K8sTaskBackend {
             self.client.delete_pod(&name).await;
         }
         self.pods.write().clear();
+    }
+
+    /// Delete `name` and wait until the API server no longer has it. `false`
+    /// when it is still there after [`POD_GONE_TIMEOUT`].
+    async fn delete_pod_and_wait(&self, name: &str) -> bool {
+        let api = self.client.pods();
+        let deadline = std::time::Instant::now() + POD_GONE_TIMEOUT;
+        loop {
+            self.client.delete_pod(name).await;
+            match api.get_opt(name).await {
+                Ok(None) => return true,
+                Ok(Some(_)) | Err(_) if std::time::Instant::now() >= deadline => return false,
+                _ => tokio::time::sleep(Duration::from_millis(500)).await,
+            }
+        }
     }
 
     /// Wait for the task Pod's credentials initContainer to install its NAT
@@ -512,6 +530,18 @@ impl EcsRuntime {
                     )
                     .await;
             } else {
+                // The first Pod must be gone before its replacement exists:
+                // a delete that didn't land (or a create that the API server
+                // accepted despite the error) would otherwise run the task
+                // twice once its initContainer got through.
+                if !backend.delete_pod_and_wait(&pod_name).await {
+                    mark_pull_stopped(state, account_id, task_id);
+                    backend.pods.write().remove(task_id);
+                    return Err(RuntimeError::ContainerStart(format!(
+                        "task pod {pod_name} could not be removed for the relaunch without \
+                         the credentials initContainer ({reason})"
+                    )));
+                }
                 pod_name = names::pod_name(POD_PREFIX, task_id, &format!("{task_id}-full-uri"));
                 let (pod, map) = build(&pod_name, None);
                 container_map = map;
@@ -528,6 +558,24 @@ impl EcsRuntime {
             return Err(RuntimeError::ContainerStart(format!(
                 "create task pod: {e}"
             )));
+        }
+        // A StopTask that landed while the Pod was being (re)created may
+        // have deleted the previous name and missed this Pod: honor it now,
+        // before any task container is reported RUNNING.
+        if task_desired_stopped(state, account_id, task_id) {
+            backend.client.delete_pod(&pod_name).await;
+            let never_started = build_running_list(&container_map);
+            return self
+                .k8s_finalize(
+                    state,
+                    account_id,
+                    task_id,
+                    &pod_name,
+                    &container_map,
+                    never_started,
+                    true,
+                )
+                .await;
         }
 
         // Wait until the app containers have started (or the Pod already
