@@ -10362,11 +10362,12 @@ async fn main() {
             }),
         )
         .route(
-            // ECS task-role credential endpoint. Containers of a task whose
-            // task definition has a `taskRoleArn` get
-            // `AWS_CONTAINER_CREDENTIALS_FULL_URI` pointing here; the AWS SDK
-            // default credential chain fetches the task role's session
-            // (named after the task) from it. See `ecs_creds`.
+            // ECS task-role credential endpoint: the task role's session
+            // (named after the task). Task containers normally fetch it via
+            // the agent's link-local `169.254.170.2/v2/credentials/<task-id>`
+            // (see `ecs_creds::link_local_host_middleware`); this is the
+            // `AWS_CONTAINER_CREDENTIALS_FULL_URI` fallback when the task's
+            // network namespace could not be set up. See `ecs_creds`.
             "/_fakecloud/ecs/creds/{task_id}",
             axum::routing::get({
                 let creds = ecs_task_credentials.clone();
@@ -12136,12 +12137,22 @@ async fn main() {
         })
         .layer(Extension(dispatch_config))
         .layer(TraceLayer::new_for_http())
-        // Outermost: CloudFront viewer routing. Requests whose `Host` matches an
-        // enabled distribution are served by the data plane; everything else
-        // (the AWS API, `/_fakecloud/*`, health) falls straight through.
+        // CloudFront viewer routing (inside the ECS link-local layer below,
+        // which is outermost). Requests whose `Host` matches an enabled
+        // distribution are served by the data plane; everything else (the AWS
+        // API, `/_fakecloud/*`, health) falls straight through.
         .layer(axum::middleware::from_fn_with_state(
             cloudfront_dataplane,
             cloudfront_viewer_middleware,
+        ))
+        // Outermost: ECS task containers reach the agent's link-local
+        // credentials address (`169.254.170.2:80`), which their network
+        // namespace NATs to this listener; those requests
+        // (`Host: 169.254.170.2`) get the agent's `/v2/credentials/<task-id>`
+        // surface, nothing else, and never reach CloudFront or the AWS API.
+        .layer(axum::middleware::from_fn_with_state(
+            ecs_task_credentials.clone(),
+            ecs_creds::link_local_host_middleware,
         ));
     // Optionally bind the AWS link-local metadata addresses (169.254.169.254 for
     // IMDS, 169.254.170.2 for ECS container credentials) so apps that hardcode

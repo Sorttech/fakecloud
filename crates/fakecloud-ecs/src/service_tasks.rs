@@ -1225,9 +1225,11 @@ mod port_mapping_tests {
             &[],
             "task-1",
             "host.docker.internal",
-            None,
+            crate::runtime::ContainerNetwork::Own {
+                add_host_arg: None,
+                awsvpc_network_ready: true,
+            },
             "alpine:latest",
-            true,
         )
     }
 
@@ -1248,9 +1250,11 @@ mod port_mapping_tests {
             None,
         );
         let argv = argv_string(&plan);
+        // `--publish` takes `hostPort:containerPort`: host 8080 reaches the
+        // container's port 80, which is what `networkBindings` reports.
         assert!(
-            argv_has_publish(&argv, "80:8080/tcp"),
-            "expected --publish 80:8080/tcp in argv: {argv:?}"
+            argv_has_publish(&argv, "8080:80/tcp"),
+            "expected --publish 8080:80/tcp in argv: {argv:?}"
         );
     }
 

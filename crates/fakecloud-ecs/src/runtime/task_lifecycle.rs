@@ -15,6 +15,9 @@ impl EcsRuntime {
                 // Also surface on stderr so nextest's captured-output for a
                 // failed E2E shows the reason instead of just "empty logs".
                 eprintln!("[ecs] task {task_id} failed: {err}");
+                // A failure past the launch loop leaves the namespace
+                // holders of the task's containers behind.
+                rt.remove_netns_holders(&task_id).await;
                 finalize_failure(&state, &account_id, &task_id, &err.to_string());
                 rt.emit_state_change(
                     &state,
@@ -62,16 +65,10 @@ impl EcsRuntime {
             // the container reaches them via the platform host alias —
             // `host.docker.internal` for docker, `host.containers.internal`
             // for podman (issue #1539).
+            // The task-role credentials variable is added at launch, once we
+            // know whether the container's namespace reaches the agent's
+            // link-local address (see `task_creds`).
             let host_alias = &self.net.host_alias;
-            if plan.has_task_role {
-                env.push((
-                    "AWS_CONTAINER_CREDENTIALS_FULL_URI".into(),
-                    format!(
-                        "http://{host_alias}:{}/_fakecloud/ecs/creds/{}",
-                        self.server_port, task_id
-                    ),
-                ));
-            }
             env.push((
                 "ECS_CONTAINER_METADATA_URI".into(),
                 format!(
@@ -141,6 +138,29 @@ impl EcsRuntime {
             run_images.push(run_image);
             image_digests.push(digest);
         }
+        // Task-role containers reach credentials at the agent's link-local
+        // address through a namespace holder built from this image. Without
+        // it they fall back to the full URI (see `task_creds`).
+        let creds_helper_image = if resolved_plans
+            .iter()
+            .any(|rp| super::task_creds::wants_netns_holder(&rp.plan))
+        {
+            match self.ensure_creds_helper_image().await {
+                Ok(image) => Some(image),
+                Err(err) => {
+                    tracing::warn!(
+                        task = %task_id,
+                        error = %err,
+                        "ECS task-credentials helper image unavailable; task-role containers \
+                         get AWS_CONTAINER_CREDENTIALS_FULL_URI instead of the link-local \
+                         169.254.170.2 endpoint"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         mark_pull_stopped(state, account_id, task_id);
 
         // For awsvpc network mode, create a per-task docker network so
@@ -299,14 +319,47 @@ impl EcsRuntime {
                     return Err(err);
                 }
             }
+            let mut env = rp.env.clone();
+            let mut holder: Option<String> = None;
+            if rp.plan.has_task_role {
+                let wants_holder = super::task_creds::wants_netns_holder(&rp.plan);
+                if let Some(image) = creds_helper_image.as_deref().filter(|_| wants_holder) {
+                    match self
+                        .start_netns_holder(&rp.plan, task_id, network_created, image)
+                        .await
+                    {
+                        Ok(id) => holder = Some(id),
+                        Err(err) => tracing::warn!(
+                            task = %task_id,
+                            container = %rp.plan.container_name,
+                            error = %err,
+                            "could not route 169.254.170.2 into the container's network; \
+                             it gets AWS_CONTAINER_CREDENTIALS_FULL_URI instead"
+                        ),
+                    }
+                }
+                // A `none`-mode container gets the agent's relative URI with
+                // nothing behind it, as on ECS (it has no network).
+                env.push(super::task_creds::credentials_env(
+                    task_id,
+                    holder.is_some() || !wants_holder,
+                    &format!("http://{}:{}", self.net.host_alias, self.server_port),
+                ));
+            }
+            let network = match holder.as_deref() {
+                Some(holder) => ContainerNetwork::Joined { holder },
+                None => ContainerNetwork::Own {
+                    add_host_arg: self.net.add_host_arg.as_deref(),
+                    awsvpc_network_ready: network_created,
+                },
+            };
             let argv = build_run_argv(
                 &rp.plan,
-                &rp.env,
+                &env,
                 task_id,
                 &self.net.host_alias,
-                self.net.add_host_arg.as_deref(),
+                network,
                 run_image,
-                network_created,
             );
             let mut cmd = Command::new(&self.cli);
             cmd.args(&argv);
@@ -358,6 +411,7 @@ impl EcsRuntime {
                     .output()
                     .await;
             }
+            self.remove_netns_holders(task_id).await;
             if network_created {
                 let _ = Command::new(&self.cli)
                     .args(["network", "rm", &network_name])
@@ -507,6 +561,9 @@ impl EcsRuntime {
                 .output()
                 .await;
         }
+        // The namespace holders outlive their containers; remove them before
+        // the per-task network they are attached to.
+        self.remove_netns_holders(task_id).await;
         // Clean up the per-task docker network for awsvpc.
         if network_created {
             let _ = Command::new(&self.cli)
@@ -699,13 +756,20 @@ impl EcsRuntime {
     pub(super) fn cleanup_partial_start(&self, started: &[RunningContainer], task_id: &str) {
         let cli = self.cli.clone();
         let ids: Vec<String> = started.iter().map(|c| c.container_id.clone()).collect();
+        // Namespace holders go after the containers sharing them and before
+        // the network they are attached to.
+        let holders = self
+            .netns_holders
+            .write()
+            .remove(task_id)
+            .unwrap_or_default();
         let network = format!("fakecloud-ecs-{task_id}");
         // Drop the runtime map entry we pre-registered before the launch loop
         // so a failed launch doesn't leave a stale (now-empty) key that
         // future StopTask calls would treat as a live task.
         self.containers.write().remove(task_id);
         tokio::spawn(async move {
-            for id in ids {
+            for id in ids.into_iter().chain(holders) {
                 let _ = Command::new(&cli).args(["rm", "-f", &id]).output().await;
             }
             let _ = Command::new(&cli)
@@ -761,5 +825,17 @@ impl EcsRuntime {
             let _ = Command::new(&self.cli).args(["rm", &id]).output().await;
         }
         self.containers.write().clear();
+        let holders: Vec<String> = self
+            .netns_holders
+            .write()
+            .drain()
+            .flat_map(|(_, ids)| ids)
+            .collect();
+        for id in holders {
+            let _ = Command::new(&self.cli)
+                .args(["rm", "-f", &id])
+                .output()
+                .await;
+        }
     }
 }

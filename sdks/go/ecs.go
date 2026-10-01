@@ -104,8 +104,10 @@ func (c *ECSClient) GetTaskMetadata(ctx context.Context, taskArn string) (*EcsTa
 }
 
 // GetTaskCredentials returns the task-role credentials fakecloud hands a
-// running task's containers via AWS_CONTAINER_CREDENTIALS_FULL_URI (a
-// session for the task role named after the task ID). It errors once the
+// running task's containers at http://169.254.170.2 plus the path in
+// AWS_CONTAINER_CREDENTIALS_RELATIVE_URI, or at
+// AWS_CONTAINER_CREDENTIALS_FULL_URI when the task's network could not be
+// routed (a session for the task role named after the task ID). It errors once the
 // task has stopped, or for a task without a task role.
 func (c *ECSClient) GetTaskCredentials(ctx context.Context, taskID string) (*EcsTaskCredentials, error) {
 	var out EcsTaskCredentials

@@ -17,8 +17,14 @@
 //!   `healthCheck` still becomes a readinessProbe.
 //! - `healthCheck` -> container `readinessProbe` (exec).
 //! - Secrets resolve exactly as on the Docker backend and are injected as
-//!   env; the task-role/metadata endpoints are reached at the in-cluster
+//!   env; the metadata endpoints are reached at the in-cluster
 //!   `FAKECLOUD_K8S_SELF_URL`.
+//! - Task-role credentials: a first initContainer with `NET_ADMIN` NATs the
+//!   agent's `169.254.170.2:80` to fakecloud in the Pod's network namespace
+//!   and the containers get `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`, as on
+//!   ECS (see `task_creds`). If the Pod is refused (e.g. a Pod Security
+//!   level that forbids `NET_ADMIN`) or that initContainer fails, the task
+//!   is relaunched without it, with `AWS_CONTAINER_CREDENTIALS_FULL_URI`.
 //! - Low-level Docker-runtime knobs (ulimits, devices, sysctls, tmpfs,
 //!   capabilities) aren't translated to the Pod; `privileged`,
 //!   `readonlyRootFilesystem`, and a numeric `user` are.
@@ -31,23 +37,91 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use k8s_openapi::api::core::v1::{
-    Container, ContainerPort, EmptyDirVolumeSource, EnvVar, ExecAction, LocalObjectReference, Pod,
-    PodSpec, Probe, SecurityContext, Volume, VolumeMount as K8sVolumeMount,
+    Capabilities, Container, ContainerPort, EmptyDirVolumeSource, EnvVar, ExecAction,
+    LocalObjectReference, Pod, PodSpec, Probe, SecurityContext, Volume,
+    VolumeMount as K8sVolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use parking_lot::RwLock;
 
 use fakecloud_k8s::{labels, names, K8sClient, K8sEnv, K8sPodConfig};
 
+use super::task_creds;
 use super::{
     build_container_plans, finalize_stopped_multi, mark_pull_started, mark_pull_stopped,
-    mark_running_multi, task_should_stop, ContainerPlan, DependsOnCondition, EcsRuntime,
-    HealthCheckSpec, RunningContainer, RuntimeError,
+    mark_running_multi, task_desired_stopped, task_should_stop, ContainerPlan, DependsOnCondition,
+    EcsRuntime, HealthCheckSpec, RunningContainer, RuntimeError,
 };
 use crate::state::SharedEcsState;
 
 const SERVICE: &str = "ecs";
 const POD_PREFIX: &str = "fakecloud-ecs";
+
+/// How long the credentials initContainer may take before the task is
+/// relaunched without it (covers its image pull).
+const CREDS_INIT_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// How long a relaunch waits for the first task Pod to be deleted.
+const POD_GONE_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// How long deletion of a Pod the relaunch gave up on keeps being retried.
+const POD_GONE_RETRY_LIMIT: Duration = Duration::from_secs(30 * 60);
+
+/// How long a task-role Pod may go without its credentials initContainer
+/// reaching a node before the task fails to start (the same budget the
+/// task's own start deadline gives a Pod).
+const UNSCHEDULED_LIMIT: Duration = Duration::from_secs(300);
+
+/// Waiting reasons that mean a container will never start on its own.
+const STUCK_WAITING_REASONS: &[&str] = &[
+    "ErrImagePull",
+    "ImagePullBackOff",
+    "InvalidImageName",
+    "ErrImageNeverPull",
+    "CreateContainerConfigError",
+    "CreateContainerError",
+    "RunContainerError",
+];
+
+/// The initContainer that routes the agent's link-local credentials address
+/// to fakecloud inside the task Pod.
+#[derive(Clone, Debug)]
+pub(super) struct CredsInit {
+    pub(super) image: String,
+    /// fakecloud's in-cluster host and port (`FAKECLOUD_K8S_SELF_URL`).
+    pub(super) host: String,
+    pub(super) port: u16,
+}
+
+impl CredsInit {
+    pub(super) fn container(&self) -> Container {
+        Container {
+            name: task_creds::K8S_INIT_CONTAINER.to_string(),
+            image: Some(self.image.clone()),
+            command: Some(vec![
+                "sh".into(),
+                "-c".into(),
+                task_creds::SETUP_SCRIPT.into(),
+                "fakecloud-ecs-creds".into(),
+                self.host.clone(),
+                self.port.to_string(),
+                "once".into(),
+            ]),
+            security_context: Some(SecurityContext {
+                capabilities: Some(Capabilities {
+                    add: Some(vec!["NET_ADMIN".into()]),
+                    drop: None,
+                }),
+                // Installing the rule (and, on the default Alpine image,
+                // `nftables`) needs root inside the container.
+                run_as_user: Some(0),
+                run_as_non_root: Some(false),
+                ..SecurityContext::default()
+            }),
+            ..Container::default()
+        }
+    }
+}
 
 /// Error initializing the Kubernetes backend at startup.
 #[derive(Debug, thiserror::Error)]
@@ -64,6 +138,10 @@ pub(super) struct K8sTaskBackend {
     client: K8sClient,
     /// In-cluster fakecloud base URL — task-role / metadata endpoints.
     self_url: String,
+    /// Host and port of [`self_url`](Self::self_url): where the task Pod's
+    /// link-local credentials address is NATed to.
+    self_host: String,
+    self_port: u16,
     ecr_host: String,
     ecr_port: u16,
     pull_secret: Option<String>,
@@ -72,7 +150,7 @@ pub(super) struct K8sTaskBackend {
     /// this when the Pod is built.
     pod_config: K8sPodConfig,
     /// task_id -> Pod name, so StopTask/stop_all can find the Pod.
-    pods: RwLock<HashMap<String, String>>,
+    pods: std::sync::Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl std::fmt::Debug for K8sTaskBackend {
@@ -99,11 +177,13 @@ impl K8sTaskBackend {
         Ok(Self {
             client,
             self_url: env.self_url,
+            self_host: env.self_host,
+            self_port: env.self_port,
             ecr_host: env.ecr_host,
             ecr_port: env.ecr_port,
             pull_secret: env.pull_secret,
             pod_config,
-            pods: RwLock::new(HashMap::new()),
+            pods: std::sync::Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -129,6 +209,209 @@ impl K8sTaskBackend {
         }
         self.pods.write().clear();
     }
+
+    /// Keep deleting `name` in the background until it is gone (or
+    /// [`POD_GONE_RETRY_LIMIT`] passes), for a Pod the runtime gave up
+    /// waiting on but must not leave running.
+    /// Once it is gone, `task_id`'s mapping is dropped if it still names it.
+    fn keep_deleting(&self, task_id: &str, name: &str) {
+        let client = self.client.clone();
+        let pods = self.pods.clone();
+        let task_id = task_id.to_string();
+        let name = name.to_string();
+        tokio::spawn(async move {
+            let deadline = std::time::Instant::now() + POD_GONE_RETRY_LIMIT;
+            loop {
+                client.delete_pod(&name).await;
+                match client.pods().get_opt(&name).await {
+                    Ok(None) => {
+                        forget_pod(&mut pods.write(), &task_id, &name);
+                        return;
+                    }
+                    _ if std::time::Instant::now() >= deadline => {
+                        tracing::warn!(pod = %name, "task pod still present after repeated deletes");
+                        return;
+                    }
+                    _ => tokio::time::sleep(Duration::from_secs(5)).await,
+                }
+            }
+        });
+    }
+
+    /// Delete `name` and wait until the API server no longer has it. `false`
+    /// when it is still there after [`POD_GONE_TIMEOUT`].
+    async fn delete_pod_and_wait(&self, name: &str) -> bool {
+        let api = self.client.pods();
+        let deadline = std::time::Instant::now() + POD_GONE_TIMEOUT;
+        loop {
+            self.client.delete_pod(name).await;
+            match api.get_opt(name).await {
+                Ok(None) => return true,
+                Ok(Some(_)) | Err(_) if std::time::Instant::now() >= deadline => return false,
+                _ => tokio::time::sleep(Duration::from_millis(500)).await,
+            }
+        }
+    }
+
+    /// Wait for the task Pod's credentials initContainer to install its NAT
+    /// rule. `Err` says why it won't; a Pod that is gone (StopTask) is left to
+    /// the caller's wait loop.
+    async fn wait_for_creds_init(&self, pod_name: &str) -> Result<(), CredsInitError> {
+        let api = self.client.pods();
+        // The initContainer's own budget starts once the kubelet has it: a
+        // Pod waiting to be scheduled (autoscaling, quota, volumes) is not a
+        // credentials-routing failure.
+        let created = std::time::Instant::now();
+        let mut deadline: Option<std::time::Instant> = None;
+        loop {
+            let pod = match api.get(pod_name).await {
+                Ok(p) => p,
+                Err(e) if is_not_found(&e) => return Ok(()),
+                Err(e) => return Err(CredsInitError::Fallback(format!("get pod {pod_name}: {e}"))),
+            };
+            match creds_init_outcome(&pod) {
+                CredsInitOutcome::Ready => return Ok(()),
+                CredsInitOutcome::Failed(reason) => {
+                    let logs = self
+                        .client
+                        .pod_logs(pod_name, Some(task_creds::K8S_INIT_CONTAINER))
+                        .await
+                        .unwrap_or_default();
+                    return Err(CredsInitError::Fallback(format!(
+                        "{reason}: {}",
+                        logs.trim()
+                    )));
+                }
+                CredsInitOutcome::Pending => {}
+            }
+            let now = std::time::Instant::now();
+            if deadline.is_none() && creds_init_started(&pod) {
+                deadline = Some(now + CREDS_INIT_TIMEOUT);
+            }
+            if deadline.is_none() && now >= created + UNSCHEDULED_LIMIT {
+                // Never reached a node: the task can't start at all, with or
+                // without the credentials route.
+                return Err(CredsInitError::NotScheduled);
+            }
+            if deadline.is_some_and(|d| now >= d) {
+                return Err(CredsInitError::Fallback(format!(
+                    "{} did not finish within {}s",
+                    task_creds::K8S_INIT_CONTAINER,
+                    CREDS_INIT_TIMEOUT.as_secs()
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+}
+
+/// Drop `task_id`'s Pod mapping if it still names `pod` (a later Pod for the
+/// task must keep its own).
+fn forget_pod(pods: &mut HashMap<String, String>, task_id: &str, pod: &str) {
+    if pods.get(task_id).is_some_and(|p| p == pod) {
+        pods.remove(task_id);
+    }
+}
+
+/// Whether a task whose Pod disappeared should still pass through RUNNING
+/// before it is finalized. A StopTask that deleted the Pod before any of its
+/// containers was seen running (for instance while the credentials
+/// initContainer was still routing `169.254.170.2`) takes the task straight
+/// from PENDING to STOPPED, as on ECS and the Docker backend; a Pod deleted
+/// out from under a task nobody stopped still reports the RUNNING it reached.
+fn mark_running_when_pod_gone(marked_running: bool, desired_stopped: bool) -> bool {
+    !marked_running && !desired_stopped
+}
+
+/// Why a task Pod's credentials initContainer did not get it running.
+#[derive(Debug, PartialEq, Eq)]
+enum CredsInitError {
+    /// The initContainer failed: relaunch the task without it.
+    Fallback(String),
+    /// The Pod never reached a node within the start deadline.
+    NotScheduled,
+}
+
+/// Where a task Pod's credentials initContainer stands.
+#[derive(Debug, PartialEq, Eq)]
+enum CredsInitOutcome {
+    /// It installed the rule and exited 0.
+    Ready,
+    /// It failed, or can never start.
+    Failed(String),
+    /// Not done yet.
+    Pending,
+}
+
+fn creds_init_outcome(pod: &Pod) -> CredsInitOutcome {
+    let status = pod.status.as_ref();
+    let init = status
+        .and_then(|s| s.init_container_statuses.as_ref())
+        .and_then(|all| {
+            all.iter()
+                .find(|c| c.name == task_creds::K8S_INIT_CONTAINER)
+        });
+    if let Some(state) = init.and_then(|c| c.state.as_ref()) {
+        if let Some(t) = state.terminated.as_ref() {
+            return if t.exit_code == 0 {
+                CredsInitOutcome::Ready
+            } else {
+                CredsInitOutcome::Failed(format!(
+                    "{} exited with code {}",
+                    task_creds::K8S_INIT_CONTAINER,
+                    t.exit_code
+                ))
+            };
+        }
+        if let Some(reason) = state
+            .waiting
+            .as_ref()
+            .and_then(|w| w.reason.as_deref())
+            .filter(|r| STUCK_WAITING_REASONS.contains(r))
+        {
+            return CredsInitOutcome::Failed(format!(
+                "{} cannot start: {reason}",
+                task_creds::K8S_INIT_CONTAINER
+            ));
+        }
+    }
+    if status.and_then(|s| s.phase.as_deref()) == Some("Failed") {
+        return CredsInitOutcome::Failed("task pod failed".to_string());
+    }
+    CredsInitOutcome::Pending
+}
+
+/// Whether the kubelet has picked up the credentials initContainer (it has
+/// a status), as opposed to the Pod still waiting to be scheduled.
+fn creds_init_started(pod: &Pod) -> bool {
+    pod.status
+        .as_ref()
+        .and_then(|s| s.init_container_statuses.as_ref())
+        .is_some_and(|all| {
+            all.iter()
+                .any(|c| c.name == task_creds::K8S_INIT_CONTAINER && c.state.is_some())
+        })
+}
+
+/// `resolved` with the task-role credentials variable added to each
+/// task-role container: the agent's relative URI when the Pod routes
+/// `169.254.170.2`, else fakecloud's full URI under `base`.
+fn with_credentials_env(
+    resolved: &[(ContainerPlan, Vec<(String, String)>)],
+    task_id: &str,
+    link_local: bool,
+    base: &str,
+) -> Vec<(ContainerPlan, Vec<(String, String)>)> {
+    resolved
+        .iter()
+        .map(|(plan, env)| {
+            let mut env = env.clone();
+            if plan.has_task_role {
+                env.push(task_creds::credentials_env(task_id, link_local, base));
+            }
+            (plan.clone(), env)
+        })
+        .collect()
 }
 
 impl EcsRuntime {
@@ -163,12 +446,6 @@ impl EcsRuntime {
                 env.push((name.clone(), self.resolve_secret(account_id, value_from)?));
             }
             let base = backend.self_url.trim_end_matches('/');
-            if plan.has_task_role {
-                env.push((
-                    "AWS_CONTAINER_CREDENTIALS_FULL_URI".into(),
-                    format!("{base}/_fakecloud/ecs/creds/{task_id}"),
-                ));
-            }
             env.push((
                 "ECS_CONTAINER_METADATA_URI".into(),
                 format!("{base}/_fakecloud/ecs/v3/{task_id}"),
@@ -196,22 +473,42 @@ impl EcsRuntime {
                 .unwrap_or_default()
         };
 
-        let pod_name = names::pod_name(POD_PREFIX, task_id, task_id);
-        let (mut pod, container_map) = build_task_pod(
-            &pod_name,
-            backend.client.namespace(),
-            backend.client.instance_id(),
-            backend.pull_secret.as_deref(),
-            &backend.ecr_host,
-            backend.ecr_port,
-            task_id,
-            &resolved,
-        );
-        backend
+        // Task-role containers reach credentials at the agent's link-local
+        // address via the credentials initContainer; the fallback launch
+        // drops it and hands out the full URI instead.
+        let creds_init = resolved
+            .iter()
+            .any(|(plan, _)| plan.has_task_role)
+            .then(|| CredsInit {
+                image: task_creds::helper_image_override()
+                    .unwrap_or_else(|| task_creds::HELPER_BASE_IMAGE.to_string()),
+                host: backend.self_host.clone(),
+                port: backend.self_port,
+            });
+        let base = backend.self_url.trim_end_matches('/').to_string();
+        let pod_config = backend
             .pod_config
             .clone()
-            .merge(K8sPodConfig::from_tags(&task_tags))
-            .apply(&mut pod);
+            .merge(K8sPodConfig::from_tags(&task_tags));
+        let build = |pod_name: &str, creds_init: Option<&CredsInit>| {
+            let with_creds = with_credentials_env(&resolved, task_id, creds_init.is_some(), &base);
+            let (mut pod, map) = build_task_pod(
+                pod_name,
+                backend.client.namespace(),
+                backend.client.instance_id(),
+                backend.pull_secret.as_deref(),
+                &backend.ecr_host,
+                backend.ecr_port,
+                task_id,
+                &with_creds,
+                creds_init,
+            );
+            pod_config.apply(&mut pod);
+            (pod, map)
+        };
+
+        let mut pod_name = names::pod_name(POD_PREFIX, task_id, task_id);
+        let (pod, mut container_map) = build(&pod_name, creds_init.as_ref());
 
         backend
             .pods
@@ -219,13 +516,109 @@ impl EcsRuntime {
             .insert(task_id.to_string(), pod_name.clone());
 
         mark_pull_started(state, account_id, task_id);
-        let create = backend.client.create_pod(&pod).await;
+        let mut create = backend.client.create_pod(&pod).await;
+        let mut fallback_reason: Option<String> = None;
+        if creds_init.is_some() {
+            match &create {
+                // Admission refused the Pod (typically NET_ADMIN under a
+                // restrictive Pod Security level).
+                Err(e) => fallback_reason = Some(format!("task pod refused: {e}")),
+                Ok(()) => match backend.wait_for_creds_init(&pod_name).await {
+                    Ok(()) => {}
+                    Err(CredsInitError::Fallback(reason)) => {
+                        backend.client.delete_pod(&pod_name).await;
+                        fallback_reason = Some(reason);
+                    }
+                    // Same outcome as the start deadline below: a relaunch
+                    // without the initContainer would not schedule either.
+                    Err(CredsInitError::NotScheduled) => {
+                        mark_pull_stopped(state, account_id, task_id);
+                        backend.client.delete_pod(&pod_name).await;
+                        backend.pods.write().remove(task_id);
+                        return Err(RuntimeError::ContainerStart(format!(
+                            "task pod {pod_name} did not start within {}s",
+                            UNSCHEDULED_LIMIT.as_secs()
+                        )));
+                    }
+                },
+            }
+        }
+        if let Some(reason) = fallback_reason {
+            tracing::warn!(
+                task = %task_id,
+                reason = %reason,
+                "could not route 169.254.170.2 into the task pod; relaunching it with \
+                 AWS_CONTAINER_CREDENTIALS_FULL_URI instead"
+            );
+            if task_desired_stopped(state, account_id, task_id) {
+                // Stopped while the credentials initContainer ran: nothing
+                // to relaunch, and no task container ever started, so the
+                // task goes straight to STOPPED (never RUNNING), like a
+                // Docker task stopped during launch.
+                mark_pull_stopped(state, account_id, task_id);
+                let never_started = build_running_list(&container_map);
+                return self
+                    .k8s_finalize(
+                        state,
+                        account_id,
+                        task_id,
+                        &pod_name,
+                        &container_map,
+                        never_started,
+                        true,
+                    )
+                    .await;
+            } else {
+                // The first Pod must be gone before its replacement exists:
+                // a delete that didn't land (or a create that the API server
+                // accepted despite the error) would otherwise run the task
+                // twice once its initContainer got through.
+                if !backend.delete_pod_and_wait(&pod_name).await {
+                    mark_pull_stopped(state, account_id, task_id);
+                    // Keep owning the Pod: the task_id -> Pod mapping stays
+                    // so StopTask / shutdown still reach it, and deletion is
+                    // retried in the background until the API server
+                    // confirms it (the Pod also keeps its reaper labels).
+                    backend.keep_deleting(task_id, &pod_name);
+                    return Err(RuntimeError::ContainerStart(format!(
+                        "task pod {pod_name} could not be removed for the relaunch without \
+                         the credentials initContainer ({reason})"
+                    )));
+                }
+                pod_name = names::pod_name(POD_PREFIX, task_id, &format!("{task_id}-full-uri"));
+                let (pod, map) = build(&pod_name, None);
+                container_map = map;
+                backend
+                    .pods
+                    .write()
+                    .insert(task_id.to_string(), pod_name.clone());
+                create = backend.client.create_pod(&pod).await;
+            }
+        }
         mark_pull_stopped(state, account_id, task_id);
         if let Err(e) = create {
             backend.pods.write().remove(task_id);
             return Err(RuntimeError::ContainerStart(format!(
                 "create task pod: {e}"
             )));
+        }
+        // A StopTask that landed while the Pod was being (re)created may
+        // have deleted the previous name and missed this Pod: honor it now,
+        // before any task container is reported RUNNING.
+        if task_desired_stopped(state, account_id, task_id) {
+            backend.client.delete_pod(&pod_name).await;
+            let never_started = build_running_list(&container_map);
+            return self
+                .k8s_finalize(
+                    state,
+                    account_id,
+                    task_id,
+                    &pod_name,
+                    &container_map,
+                    never_started,
+                    true,
+                )
+                .await;
         }
 
         // Wait until the app containers have started (or the Pod already
@@ -242,7 +635,10 @@ impl EcsRuntime {
                 // intentional StopTask (which deletes the Pod). Finalize
                 // as a clean stop instead of surfacing TaskFailedToStart.
                 Err(e) if is_not_found(&e) => {
-                    if !marked_running {
+                    if mark_running_when_pod_gone(
+                        marked_running,
+                        task_desired_stopped(state, account_id, task_id),
+                    ) {
                         mark_running_multi(state, account_id, task_id, &started);
                         self.emit_state_change(state, account_id, task_id, "RUNNING", None);
                         self.persist_snapshot().await;
@@ -494,6 +890,7 @@ fn build_task_pod(
     ecr_port: u16,
     task_id: &str,
     resolved: &[(ContainerPlan, Vec<(String, String)>)],
+    creds_init: Option<&CredsInit>,
 ) -> (Pod, Vec<ContainerMapEntry>) {
     // A container depended on with COMPLETE/SUCCESS runs to completion
     // first -> initContainer.
@@ -514,6 +911,12 @@ fn build_task_pod(
     let mut volumes: HashMap<String, ()> = HashMap::new();
     let mut init_containers: Vec<Container> = Vec::new();
     let mut app_containers: Vec<Container> = Vec::new();
+    // The credentials rule goes in first, so every task container (init or
+    // not) starts with `169.254.170.2` routed.
+    if let Some(creds) = creds_init {
+        used_names.insert(task_creds::K8S_INIT_CONTAINER.to_string());
+        init_containers.push(creds.container());
+    }
 
     for (idx, (plan, env)) in resolved.iter().enumerate() {
         let k8s_name = unique_dns_name(&plan.container_name, idx, &mut used_names);
@@ -777,6 +1180,7 @@ mod tests {
             4566,
             "task-1",
             resolved,
+            None,
         )
     }
 
@@ -959,5 +1363,232 @@ mod tests {
         let (pod, _) = build(&[(a, vec![]), (b, vec![])]);
         let vols = pod.spec.unwrap().volumes.unwrap();
         assert_eq!(vols.len(), 1, "same source should share one volume");
+    }
+
+    fn creds_init() -> CredsInit {
+        CredsInit {
+            image: "helper:1".to_string(),
+            host: "fakecloud.fc.svc".to_string(),
+            port: 4566,
+        }
+    }
+
+    fn env_of<'a>(c: &'a Container, name: &str) -> Option<&'a str> {
+        c.env
+            .as_ref()?
+            .iter()
+            .find(|e| e.name == name)
+            .and_then(|e| e.value.as_deref())
+    }
+
+    #[test]
+    fn task_role_pod_routes_link_local_creds_before_any_task_container() {
+        let mut web = plan("web", true);
+        web.has_task_role = true;
+        web.depends_on = vec![DependsOn {
+            container_name: "migrate".to_string(),
+            condition: DependsOnCondition::Success,
+        }];
+        let mut migrate = plan("migrate", false);
+        migrate.has_task_role = true;
+        let resolved = with_credentials_env(
+            &[(web, vec![]), (migrate, vec![])],
+            "task-1",
+            true,
+            "http://fakecloud.fc.svc:4566",
+        );
+        let creds = creds_init();
+        let (pod, map) = build_task_pod(
+            "p",
+            "fc",
+            "fakecloud-1",
+            None,
+            "fakecloud.fc.svc",
+            4566,
+            "task-1",
+            &resolved,
+            Some(&creds),
+        );
+        let spec = pod.spec.unwrap();
+        let inits = spec.init_containers.unwrap();
+        // The NAT rule runs first, then the ECS dependency.
+        assert_eq!(inits[0].name, task_creds::K8S_INIT_CONTAINER);
+        assert_eq!(inits[1].name, "migrate");
+        let helper = &inits[0];
+        assert_eq!(helper.image.as_deref(), Some("helper:1"));
+        let cmd = helper.command.as_ref().unwrap();
+        assert_eq!(cmd[..3], ["sh", "-c", task_creds::SETUP_SCRIPT]);
+        assert_eq!(
+            cmd[3..],
+            ["fakecloud-ecs-creds", "fakecloud.fc.svc", "4566", "once"]
+        );
+        let caps = helper
+            .security_context
+            .as_ref()
+            .and_then(|s| s.capabilities.as_ref())
+            .and_then(|c| c.add.as_ref())
+            .unwrap();
+        assert_eq!(caps, &vec!["NET_ADMIN".to_string()]);
+        // The helper is not a task container.
+        assert!(map
+            .iter()
+            .all(|e| e.k8s_name != task_creds::K8S_INIT_CONTAINER));
+
+        for c in [&inits[1], &spec.containers[0]] {
+            assert_eq!(
+                env_of(c, "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"),
+                Some("/v2/credentials/task-1"),
+                "{}",
+                c.name
+            );
+            assert_eq!(env_of(c, "AWS_CONTAINER_CREDENTIALS_FULL_URI"), None);
+        }
+    }
+
+    #[test]
+    fn fallback_pod_has_no_helper_and_gets_the_full_uri() {
+        let mut web = plan("web", true);
+        web.has_task_role = true;
+        let resolved = with_credentials_env(
+            &[(web, vec![])],
+            "task-1",
+            false,
+            "http://fakecloud.fc.svc:4566",
+        );
+        let (pod, _) = build(&resolved);
+        let spec = pod.spec.unwrap();
+        assert!(spec.init_containers.is_none());
+        let c = &spec.containers[0];
+        assert_eq!(
+            env_of(c, "AWS_CONTAINER_CREDENTIALS_FULL_URI"),
+            Some("http://fakecloud.fc.svc:4566/_fakecloud/ecs/creds/task-1")
+        );
+        assert_eq!(env_of(c, "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"), None);
+    }
+
+    #[test]
+    fn roleless_containers_get_no_credentials_env() {
+        let resolved = with_credentials_env(
+            &[(plan("web", true), vec![])],
+            "task-1",
+            true,
+            "http://fakecloud.fc.svc:4566",
+        );
+        assert!(resolved[0].1.is_empty());
+    }
+
+    #[test]
+    fn task_container_named_like_the_helper_is_renamed() {
+        let creds = creds_init();
+        let (pod, map) = build_task_pod(
+            "p",
+            "fc",
+            "fakecloud-1",
+            None,
+            "fakecloud.fc.svc",
+            4566,
+            "task-1",
+            &[(plan(task_creds::K8S_INIT_CONTAINER, true), vec![])],
+            Some(&creds),
+        );
+        assert_eq!(
+            map[0].k8s_name,
+            format!("{}-1", task_creds::K8S_INIT_CONTAINER)
+        );
+        assert_eq!(pod.spec.unwrap().containers[0].name, map[0].k8s_name);
+    }
+
+    fn pod_with_helper_state(
+        state: k8s_openapi::api::core::v1::ContainerState,
+        phase: &str,
+    ) -> Pod {
+        use k8s_openapi::api::core::v1::{ContainerStatus, PodStatus};
+        Pod {
+            status: Some(PodStatus {
+                phase: Some(phase.to_string()),
+                init_container_statuses: Some(vec![ContainerStatus {
+                    name: task_creds::K8S_INIT_CONTAINER.to_string(),
+                    state: Some(state),
+                    ..ContainerStatus::default()
+                }]),
+                ..PodStatus::default()
+            }),
+            ..Pod::default()
+        }
+    }
+
+    #[test]
+    fn forget_pod_only_drops_the_mapping_it_still_owns() {
+        let mut pods = HashMap::from([("t".to_string(), "pod-a".to_string())]);
+        forget_pod(&mut pods, "t", "pod-b");
+        assert_eq!(pods.get("t").map(String::as_str), Some("pod-a"));
+        forget_pod(&mut pods, "t", "pod-a");
+        assert!(pods.is_empty());
+    }
+
+    #[test]
+    fn a_task_stopped_before_it_ran_never_reports_running() {
+        // StopTask deleted the Pod before anything ran: straight to STOPPED.
+        assert!(!mark_running_when_pod_gone(false, true));
+        // Already RUNNING: nothing more to mark.
+        assert!(!mark_running_when_pod_gone(true, true));
+        assert!(!mark_running_when_pod_gone(true, false));
+        // The Pod vanished without a StopTask: keep the RUNNING transition.
+        assert!(mark_running_when_pod_gone(false, false));
+    }
+
+    #[test]
+    fn creds_init_outcome_tracks_the_helper() {
+        use k8s_openapi::api::core::v1::{
+            ContainerState, ContainerStateTerminated, ContainerStateWaiting,
+        };
+        let terminated = |code| ContainerState {
+            terminated: Some(ContainerStateTerminated {
+                exit_code: code,
+                ..ContainerStateTerminated::default()
+            }),
+            ..ContainerState::default()
+        };
+        let waiting = |reason: &str| ContainerState {
+            waiting: Some(ContainerStateWaiting {
+                reason: Some(reason.to_string()),
+                ..ContainerStateWaiting::default()
+            }),
+            ..ContainerState::default()
+        };
+        assert_eq!(
+            creds_init_outcome(&pod_with_helper_state(terminated(0), "Pending")),
+            CredsInitOutcome::Ready
+        );
+        assert!(matches!(
+            creds_init_outcome(&pod_with_helper_state(terminated(1), "Failed")),
+            CredsInitOutcome::Failed(_)
+        ));
+        assert!(matches!(
+            creds_init_outcome(&pod_with_helper_state(
+                waiting("ImagePullBackOff"),
+                "Pending"
+            )),
+            CredsInitOutcome::Failed(_)
+        ));
+        assert_eq!(
+            creds_init_outcome(&pod_with_helper_state(
+                waiting("PodInitializing"),
+                "Pending"
+            )),
+            CredsInitOutcome::Pending
+        );
+        assert_eq!(
+            creds_init_outcome(&Pod::default()),
+            CredsInitOutcome::Pending
+        );
+
+        // The initContainer's budget only starts once it has a status, not
+        // while the Pod waits to be scheduled.
+        assert!(!creds_init_started(&Pod::default()));
+        assert!(creds_init_started(&pod_with_helper_state(
+            waiting("PodInitializing"),
+            "Pending"
+        )));
     }
 }

@@ -103,7 +103,7 @@ sudo fakecloud --imds-link-local
 
 fakecloud never creates or deletes these aliases itself, so it leaves no host-networking state behind: the alias is yours to add and to remove (`sudo ip addr del 169.254.169.254/32 dev lo` when you're done). If the address is not aliased, the bind simply fails: fakecloud logs the exact command above and keeps running, and the main listener (plus the `AWS_EC2_METADATA_SERVICE_ENDPOINT` / `AWS_CONTAINER_CREDENTIALS_FULL_URI` paths) is unaffected.
 
-**Reaching it from a container.** A container hitting `169.254.169.254` reaches its own network namespace, not the host's loopback alias, so an app *inside* a container needs the address routed to fakecloud explicitly, e.g. a docker-compose `extra_hosts` entry or a route to the host. Prefer the `AWS_EC2_METADATA_SERVICE_ENDPOINT` / `AWS_CONTAINER_CREDENTIALS_FULL_URI` env-var approach for containerized apps; the link-local listener is aimed at apps running directly on the host.
+**Reaching it from a container.** A container hitting `169.254.169.254` reaches its own network namespace, not the host's loopback alias, so an app *inside* a container needs the address routed to fakecloud explicitly, e.g. a docker-compose `extra_hosts` entry or a route to the host. Prefer the `AWS_EC2_METADATA_SERVICE_ENDPOINT` / `AWS_CONTAINER_CREDENTIALS_FULL_URI` env-var approach for containerized apps; the link-local listener is aimed at apps running directly on the host. (ECS tasks that fakecloud runs itself need none of this: each task-role container already reaches `169.254.170.2` inside its own network, with `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` set. See [ECS task role credentials](/docs/services/ecs/#task-role-credentials).)
 
 ## Choosing the role
 

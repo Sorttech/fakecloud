@@ -95,6 +95,13 @@ pub struct EcsRuntime {
     /// [`EcsRuntime::persist_snapshot`]. A `OnceLock` so the `Arc<EcsRuntime>`
     /// can receive the hook through a shared reference after construction.
     snapshot_hook: std::sync::OnceLock<fakecloud_persistence::SnapshotHook>,
+    /// The task-credentials helper image (see [`task_creds`]), resolved
+    /// (built or pulled) on the first task with a task role, or its last
+    /// failure. The lock also serializes concurrent first builds.
+    creds_helper_image: tokio::sync::Mutex<Option<task_creds::HelperImage>>,
+    /// Per-task IDs of the containers holding each task container's network
+    /// namespace (see [`task_creds`]); removed when the task stops.
+    netns_holders: RwLock<std::collections::HashMap<String, Vec<String>>>,
 }
 
 mod config;
@@ -102,7 +109,24 @@ mod k8s;
 mod lb;
 mod monitoring;
 mod secrets;
+mod task_creds;
 mod task_lifecycle;
+
+/// The initContainer the Kubernetes backend puts first in a task-role Pod:
+/// it NATs the ECS agent's `169.254.170.2:80` to `host:port` in the Pod's
+/// network namespace. Exposed for the opt-in cluster integration tests.
+pub fn k8s_creds_init_container(
+    image: &str,
+    host: &str,
+    port: u16,
+) -> k8s_openapi::api::core::v1::Container {
+    k8s::CredsInit {
+        image: image.to_string(),
+        host: host.to_string(),
+        port,
+    }
+    .container()
+}
 
 impl EcsRuntime {
     /// Auto-detect Docker or Podman. Returns `None` if neither is
@@ -126,6 +150,8 @@ impl EcsRuntime {
             kms_hook: None,
             k8s: None,
             snapshot_hook: std::sync::OnceLock::new(),
+            creds_helper_image: tokio::sync::Mutex::new(None),
+            netns_holders: RwLock::new(std::collections::HashMap::new()),
         })
     }
 
@@ -154,6 +180,8 @@ impl EcsRuntime {
             kms_hook: None,
             k8s: Some(backend),
             snapshot_hook: std::sync::OnceLock::new(),
+            creds_helper_image: tokio::sync::Mutex::new(None),
+            netns_holders: RwLock::new(std::collections::HashMap::new()),
         })
     }
 
@@ -220,7 +248,7 @@ pub(crate) struct ContainerPlan {
     pub(crate) essential: bool,
     pub(crate) has_task_role: bool,
     /// Port mappings parsed from the task definition. Each entry becomes
-    /// a `--publish containerPort:hostPort/protocol` flag on the docker
+    /// a `--publish hostPort:containerPort/protocol` flag on the docker
     /// run command (except for `awsvpc`, where ports are exposed via the
     /// per-task ENI rather than the docker host's port table).
     pub(crate) port_mappings: Vec<PortMapping>,
@@ -1322,6 +1350,19 @@ pub(crate) fn fakecloud_instance_label() -> String {
     format!("fakecloud-instance=fakecloud-{}", std::process::id())
 }
 
+/// Whose network namespace a task container runs in.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ContainerNetwork<'a> {
+    /// The container owns its namespace and carries its own network flags.
+    Own {
+        add_host_arg: Option<&'a str>,
+        awsvpc_network_ready: bool,
+    },
+    /// The container joins the namespace of `holder` (see [`task_creds`]),
+    /// which carries the network flags.
+    Joined { holder: &'a str },
+}
+
 /// Build the docker `run` argv for a single container plan. Pure so unit
 /// tests can assert on flag ordering / `--publish` translation without
 /// shelling out. The returned vector is everything *after* the binary
@@ -1332,9 +1373,8 @@ pub(crate) fn build_run_argv(
     env: &[(String, String)],
     task_id: &str,
     host_alias: &str,
-    add_host_arg: Option<&str>,
+    network: ContainerNetwork<'_>,
     run_image: &str,
-    awsvpc_network_ready: bool,
 ) -> Vec<String> {
     let mut argv: Vec<String> = Vec::new();
     argv.push("run".into());
@@ -1353,33 +1393,29 @@ pub(crate) fn build_run_argv(
     // ungraceful restart. See fakecloud_instance_label().
     argv.push("--label".into());
     argv.push(fakecloud_instance_label());
-    // Inject `--add-host host.docker.internal:<ip>` only for docker;
-    // podman provides `host.containers.internal` natively and rejects
-    // the host-gateway mapping (issue #1539).
-    if let Some(arg) = add_host_arg {
-        argv.push("--add-host".into());
-        argv.push(arg.to_string());
-    }
-    let use_awsvpc_network = plan.network_mode.as_deref() == Some("awsvpc") && awsvpc_network_ready;
-    if use_awsvpc_network {
-        argv.push("--network".into());
-        argv.push(format!("fakecloud-ecs-{}", task_id));
-    }
-    // `awsvpc` puts the container on a per-task ENI; emulating that on a
-    // local docker host means *not* publishing to the host port table.
-    // Bridge / host / default network modes still get `--publish`. If
-    // the awsvpc per-task network creation failed and we fell back to
-    // bridge, we DO want to publish so the container is reachable.
-    let publish_ports = !use_awsvpc_network;
-    if publish_ports {
-        for pm in &plan.port_mappings {
-            argv.push("--publish".into());
-            argv.push(format!(
-                "{}:{}/{}",
-                pm.container_port, pm.host_port, pm.protocol
+    let joined_namespace = match network {
+        ContainerNetwork::Own {
+            add_host_arg,
+            awsvpc_network_ready,
+        } => {
+            argv.extend(task_creds::namespace_network_argv(
+                plan,
+                task_id,
+                add_host_arg,
+                awsvpc_network_ready,
+                None,
             ));
+            false
         }
-    }
+        // The holder carries the network, published ports and host alias;
+        // the runtimes refuse those flags on a container that joins another
+        // container's namespace.
+        ContainerNetwork::Joined { holder } => {
+            argv.push("--network".into());
+            argv.push(format!("container:{holder}"));
+            true
+        }
+    };
     if let Some(ref hc) = plan.health_check {
         argv.extend(render_health_flags(hc));
     }
@@ -1430,7 +1466,13 @@ pub(crate) fn build_run_argv(
             argv.push("--shm-size".into());
             argv.push(format!("{}m", size));
         }
-        for sys in &lp.sysctls {
+        // `net.*` sysctls belong to the namespace's owner (the holder when
+        // this container joins one).
+        for sys in lp
+            .sysctls
+            .iter()
+            .filter(|s| !(joined_namespace && task_creds::is_net_sysctl(&s.name)))
+        {
             argv.push("--sysctl".into());
             argv.push(format!("{}={}", sys.name, sys.value));
         }
@@ -1482,10 +1524,10 @@ pub(crate) fn build_run_argv(
 }
 
 /// Render `networkBindings` JSON for a launched container. Empty under
-/// `awsvpc` (the equivalent info goes on the task's ENI attachments) and
-/// for containers without `portMappings`.
+/// `awsvpc` (the equivalent info goes on the task's ENI attachments), under
+/// `none` (nothing is published), and for containers without `portMappings`.
 pub(crate) fn network_bindings_for(plan: &ContainerPlan) -> Vec<serde_json::Value> {
-    if plan.network_mode.as_deref() == Some("awsvpc") {
+    if matches!(plan.network_mode.as_deref(), Some("awsvpc") | Some("none")) {
         return Vec::new();
     }
     plan.port_mappings
@@ -1761,6 +1803,9 @@ fn finalize_stopped_multi(
         let Some(task) = s.tasks.get_mut(task_id) else {
             return;
         };
+        // A task stopped before it ever ran (StopTask during launch) leaves
+        // the pending count, not the running one -- the counterpart of what
+        // `mark_running_multi` moves.
         task.last_status = "STOPPED".into();
         task.desired_status = "STOPPED".into();
         task.stopping_at = task.stopping_at.or(Some(Utc::now()));
@@ -1778,10 +1823,23 @@ fn finalize_stopped_multi(
                 c.exit_code = mapped.or(Some(primary_exit_code));
             }
         }
-        if let Some(cluster) = s.clusters.get_mut(&task.cluster_name) {
-            if cluster.running_tasks_count > 0 {
-                cluster.running_tasks_count -= 1;
+        // Which count the task holds follows from whether the runtime ever
+        // moved it to RUNNING (`mark_running_multi` stamps `started_at`), not
+        // from the status string an agent may have overwritten since.
+        let was_running = task.started_at.is_some();
+        let was_pending = !was_running;
+        let release = |running: &mut i32, pending: &mut i32| {
+            if was_running && *running > 0 {
+                *running -= 1;
+            } else if was_pending && *pending > 0 {
+                *pending -= 1;
             }
+        };
+        if let Some(cluster) = s.clusters.get_mut(&task.cluster_name) {
+            release(
+                &mut cluster.running_tasks_count,
+                &mut cluster.pending_tasks_count,
+            );
         }
         if let Some(ref ci_arn) = task.container_instance_arn {
             if let Some(ci) = s
@@ -1789,9 +1847,7 @@ fn finalize_stopped_multi(
                 .values_mut()
                 .find(|ci| ci.container_instance_arn == *ci_arn)
             {
-                if ci.running_tasks_count > 0 {
-                    ci.running_tasks_count -= 1;
-                }
+                release(&mut ci.running_tasks_count, &mut ci.pending_tasks_count);
             }
         }
         (task.task_arn.clone(), task.cluster_arn.clone())
@@ -1818,12 +1874,13 @@ fn finalize_failure(state: &SharedEcsState, account_id: &str, task_id: &str, rea
         let Some(task) = s.tasks.get_mut(task_id) else {
             return;
         };
-        // Capture the prior status before we clobber it: if the task had
-        // already reached RUNNING when execution failed (e.g. `docker wait`
-        // blew up after the container started), we owe the cluster a
-        // running-tasks decrement. Tasks that died before RUNNING only
-        // ever incremented pendingTasksCount.
-        let was_running = task.last_status == "RUNNING";
+        // If the task had already reached RUNNING when execution failed
+        // (e.g. `docker wait` blew up after the container started), we owe
+        // the cluster a running-tasks decrement; tasks that died before
+        // RUNNING only ever held pendingTasksCount. Whether it ran is
+        // `mark_running_multi`'s `started_at` stamp, not the status string
+        // an agent may have overwritten since.
+        let was_running = task.started_at.is_some();
         task.last_status = "STOPPED".into();
         task.desired_status = "STOPPED".into();
         task.stopped_at = Some(Utc::now());
@@ -1901,13 +1958,53 @@ impl EcsRuntime {
             kms_hook: None,
             k8s: None,
             snapshot_hook: std::sync::OnceLock::new(),
+            creds_helper_image: tokio::sync::Mutex::new(None),
+            netns_holders: RwLock::new(std::collections::HashMap::new()),
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use super::ContainerPlan;
+
+    pub(crate) fn minimal_plan() -> ContainerPlan {
+        ContainerPlan {
+            container_name: "app".into(),
+            image: "alpine".into(),
+            env: Vec::new(),
+            entry_point: Vec::new(),
+            command: Vec::new(),
+            secrets_refs: Vec::new(),
+            essential: true,
+            has_task_role: false,
+            port_mappings: Vec::new(),
+            network_mode: None,
+            depends_on: Vec::new(),
+            health_check: None,
+            volume_mounts: Vec::new(),
+            ulimits: Vec::new(),
+            linux_parameters: None,
+            stop_timeout: None,
+            user: None,
+            working_directory: None,
+            tty: false,
+            interactive: false,
+            readonly_rootfs: false,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::tests_support::minimal_plan;
     use super::*;
+
+    /// The container owns its namespace on a ready per-task network.
+    const OWN_NET: ContainerNetwork<'static> = ContainerNetwork::Own {
+        add_host_arg: None,
+        awsvpc_network_ready: true,
+    };
     use crate::state::{EcsState, Task};
     use fakecloud_aws::arn::Arn;
     use fakecloud_core::multi_account::MultiAccountState;
@@ -2274,6 +2371,98 @@ mod tests {
         assert_eq!(sc.last_status, "STOPPED");
     }
 
+    /// Stopping a task releases the count it held: RUNNING tasks leave
+    /// `runningTasksCount`, tasks stopped before they ran (StopTask during
+    /// launch) leave `pendingTasksCount`, and neither touches another task's.
+    #[test]
+    fn finalize_stopped_multi_releases_the_count_the_task_held() {
+        // (status, ran): an agent (SubmitTaskStateChange) may have rewritten
+        // the status of a task that ran or not, even to STOPPED, without
+        // touching the counts.
+        for ((status, ran), want_running, want_pending) in [
+            (("RUNNING", true), 1, 1),
+            (("STOPPING", true), 1, 1),
+            (("STOPPING", false), 1, 1),
+            (("PENDING", false), 1, 1),
+            (("PROVISIONING", false), 1, 1),
+            (("STOPPED", true), 1, 1),
+            (("STOPPED", false), 1, 1),
+        ] {
+            let mut accounts: MultiAccountState<EcsState> =
+                MultiAccountState::new("000000000000", "us-east-1", "http://localhost:4566");
+            let acct = accounts.get_or_create("000000000000");
+            let mut cluster = crate::state::Cluster::new(
+                "default",
+                "arn:aws:ecs:us-east-1:000000000000:cluster/default".into(),
+            );
+            // One other task running and one pending, plus this one's own
+            // count: afterwards only the other tasks' counts remain.
+            let holds_running = ran;
+            let holds_pending = !ran;
+            cluster.running_tasks_count = 1 + i32::from(holds_running);
+            cluster.pending_tasks_count = 1 + i32::from(holds_pending);
+            acct.clusters.insert("default".into(), cluster);
+            let mut t = make_task("t1");
+            t.last_status = status.into();
+            t.started_at = ran.then(Utc::now);
+            t.containers = vec![make_container("app", true)];
+            acct.tasks.insert("t1".into(), t);
+            let state: SharedEcsState = Arc::new(RwLock::new(accounts));
+
+            finalize_stopped_multi(
+                &state,
+                "000000000000",
+                "t1",
+                &[],
+                137,
+                "",
+                "UserInitiated",
+                None,
+            );
+
+            let accounts = state.read();
+            let cluster = &accounts.get("000000000000").unwrap().clusters["default"];
+            assert_eq!(
+                (cluster.running_tasks_count, cluster.pending_tasks_count),
+                (want_running, want_pending),
+                "stopping a {status} task (ran: {ran})"
+            );
+        }
+    }
+
+    /// A launch failure after the task ran releases its running count even if
+    /// an agent rewrote its status; before it ran, the pending one.
+    #[test]
+    fn finalize_failure_releases_the_count_the_task_held() {
+        for ran in [true, false] {
+            let mut accounts: MultiAccountState<EcsState> =
+                MultiAccountState::new("000000000000", "us-east-1", "http://localhost:4566");
+            let acct = accounts.get_or_create("000000000000");
+            let mut cluster = crate::state::Cluster::new(
+                "default",
+                "arn:aws:ecs:us-east-1:000000000000:cluster/default".into(),
+            );
+            cluster.running_tasks_count = 1 + i32::from(ran);
+            cluster.pending_tasks_count = 1 + i32::from(!ran);
+            acct.clusters.insert("default".into(), cluster);
+            let mut t = make_task("t1");
+            t.last_status = "STOPPING".into();
+            t.started_at = ran.then(Utc::now);
+            acct.tasks.insert("t1".into(), t);
+            let state: SharedEcsState = Arc::new(RwLock::new(accounts));
+
+            finalize_failure(&state, "000000000000", "t1", "docker wait failed");
+
+            let accounts = state.read();
+            let cluster = &accounts.get("000000000000").unwrap().clusters["default"];
+            assert_eq!(
+                (cluster.running_tasks_count, cluster.pending_tasks_count),
+                (1, 1),
+                "ran: {ran}"
+            );
+        }
+    }
+
     fn plan(name: &str, deps: &[&str]) -> ContainerPlan {
         ContainerPlan {
             container_name: name.into(),
@@ -2471,9 +2660,8 @@ mod tests {
             &[],
             "task-1",
             "host.docker.internal",
-            None,
+            OWN_NET,
             "alpine",
-            true,
         );
         let joined = argv.join(" ");
         assert!(joined.contains("--health-cmd true"), "argv: {joined}");
@@ -2516,9 +2704,8 @@ mod tests {
             &[],
             "task-1",
             "host.docker.internal",
-            None,
+            OWN_NET,
             "alpine",
-            true,
         );
         assert!(!argv.iter().any(|s| s.starts_with("--health")));
     }
@@ -2591,9 +2778,8 @@ mod tests {
             &[],
             "task-1",
             "host.docker.internal",
-            None,
+            OWN_NET,
             "alpine",
-            true,
         );
         let pair = argv
             .windows(2)
@@ -2914,7 +3100,7 @@ mod tests {
             interactive: false,
             readonly_rootfs: false,
         };
-        let argv = build_run_argv(&plan, &[], "t", "host.docker.internal", None, "img", true);
+        let argv = build_run_argv(&plan, &[], "t", "host.docker.internal", OWN_NET, "img");
         assert!(argv.contains(&"--ulimit".to_string()));
         assert!(argv.contains(&"nofile=1024:2048".to_string()));
     }
@@ -2964,7 +3150,7 @@ mod tests {
             interactive: true,
             readonly_rootfs: true,
         };
-        let argv = build_run_argv(&plan, &[], "t", "host.docker.internal", None, "img", true);
+        let argv = build_run_argv(&plan, &[], "t", "host.docker.internal", OWN_NET, "img");
         assert!(argv.contains(&"--cap-add".to_string()));
         assert!(argv.contains(&"NET_ADMIN".to_string()));
         assert!(argv.contains(&"--cap-drop".to_string()));
@@ -3265,30 +3451,58 @@ mod tests {
         assert_eq!(tg_targets[0].1, Some(80));
     }
 
-    fn minimal_plan() -> ContainerPlan {
-        ContainerPlan {
-            container_name: "app".into(),
-            image: "alpine".into(),
-            env: Vec::new(),
-            entry_point: Vec::new(),
-            command: Vec::new(),
-            secrets_refs: Vec::new(),
-            essential: true,
-            has_task_role: false,
-            port_mappings: Vec::new(),
-            network_mode: None,
-            depends_on: Vec::new(),
-            health_check: None,
-            volume_mounts: Vec::new(),
-            ulimits: Vec::new(),
-            linux_parameters: None,
-            stop_timeout: None,
-            user: None,
-            working_directory: None,
-            tty: false,
-            interactive: false,
-            readonly_rootfs: false,
-        }
+    /// A container joining its namespace holder leaves every network flag
+    /// (and the `net.*` sysctls) to the holder: the runtimes refuse
+    /// `--add-host` / `--publish` / a second `--network` on it.
+    #[test]
+    fn build_run_argv_joined_namespace_defers_network_flags_to_the_holder() {
+        let mut plan = minimal_plan();
+        plan.network_mode = Some("awsvpc".into());
+        plan.port_mappings = vec![PortMapping {
+            container_port: 80,
+            host_port: 80,
+            protocol: "tcp".into(),
+        }];
+        plan.linux_parameters = Some(LinuxParameters {
+            sysctls: vec![
+                Sysctl {
+                    name: "net.core.somaxconn".into(),
+                    value: "1024".into(),
+                },
+                Sysctl {
+                    name: "kernel.shm_rmid_forced".into(),
+                    value: "1".into(),
+                },
+            ],
+            ..LinuxParameters::default()
+        });
+        let argv = build_run_argv(
+            &plan,
+            &[(
+                "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI".into(),
+                "/v2/credentials/task-1".into(),
+            )],
+            "task-1",
+            "host.docker.internal",
+            ContainerNetwork::Joined {
+                holder: "holder-id",
+            },
+            "alpine",
+        );
+        let joined = argv.join(" ");
+        assert!(joined.contains("--network container:holder-id"), "{joined}");
+        assert_eq!(argv.iter().filter(|a| *a == "--network").count(), 1);
+        assert!(!joined.contains("--publish"), "{joined}");
+        assert!(!joined.contains("--add-host"), "{joined}");
+        assert!(!joined.contains("net.core.somaxconn"), "{joined}");
+        assert!(
+            joined.contains("--sysctl kernel.shm_rmid_forced=1"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("-e AWS_CONTAINER_CREDENTIALS_RELATIVE_URI=/v2/credentials/task-1"),
+            "{joined}"
+        );
     }
 
     /// 4.1 — every ECS task container must carry the shared
@@ -3302,9 +3516,8 @@ mod tests {
             &[],
             "task-1",
             "host.docker.internal",
-            None,
+            OWN_NET,
             "alpine",
-            true,
         );
         let expected = fakecloud_instance_label();
         assert!(

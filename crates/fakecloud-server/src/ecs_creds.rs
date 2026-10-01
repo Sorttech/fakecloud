@@ -1,7 +1,12 @@
 //! The ECS task-role credentials endpoint (`GET /_fakecloud/ecs/creds/{task_id}`).
 //!
 //! A task whose task definition names a `taskRoleArn` gets
-//! `AWS_CONTAINER_CREDENTIALS_FULL_URI` pointed here. Like the ECS agent, the
+//! `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI=/v2/credentials/<task-id>`, which
+//! its SDK resolves against the agent's link-local `http://169.254.170.2`; the
+//! task's network namespace NATs that address to fakecloud, and
+//! [`link_local_host_middleware`] answers it from this endpoint. (When that
+//! namespace can't be set up the task falls back to
+//! `AWS_CONTAINER_CREDENTIALS_FULL_URI` pointed here.) Like the ECS agent, the
 //! endpoint hands out credentials for that role's session named after the
 //! task ID (`assumed-role/<role>/<task-id>`), minted and registered like an
 //! `AssumeRole` session so they verify under `--verify-sigv4` and are
@@ -188,6 +193,76 @@ impl EcsTaskCredentials {
             Err(e) => e.into_response(),
         }
     }
+}
+
+/// The ECS agent's link-local credentials address. Task containers reach it
+/// as `http://169.254.170.2` + `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`.
+pub const LINK_LOCAL_HOST: &str = "169.254.170.2";
+
+/// The agent's task-credentials path prefix (`/v2/credentials/<task-id>`).
+const V2_CREDENTIALS_PATH: &str = "/v2/credentials";
+
+/// Whether a request's `Host` names the agent's link-local address (port 80,
+/// explicit or implied).
+fn is_link_local_host(headers: &axum::http::HeaderMap) -> bool {
+    let Some(host) = headers
+        .get(axum::http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+    else {
+        return false;
+    };
+    let host = host.trim();
+    host == LINK_LOCAL_HOST
+        || host
+            .strip_prefix(LINK_LOCAL_HOST)
+            .is_some_and(|rest| rest == ":80")
+}
+
+/// Answer a request addressed to the agent's link-local address the way the
+/// agent does: task-role credentials at `/v2/credentials/<task-id>` (a missing
+/// ID is `NoIdInRequest`), and nothing else.
+fn respond_link_local(
+    creds: &EcsTaskCredentials,
+    method: &axum::http::Method,
+    path: &str,
+) -> Response {
+    let Some(rest) = path.strip_prefix(V2_CREDENTIALS_PATH) else {
+        return (StatusCode::NOT_FOUND, "404 page not found\n").into_response();
+    };
+    let task_id = match rest {
+        "" | "/" => "",
+        _ => match rest.strip_prefix('/') {
+            Some(id) => id,
+            // `/v2/credentialsXYZ` is a different path.
+            None => return (StatusCode::NOT_FOUND, "404 page not found\n").into_response(),
+        },
+    };
+    if method == axum::http::Method::HEAD {
+        // Same status and headers as GET, no body.
+        let (parts, _) = creds.respond(task_id).into_parts();
+        return Response::from_parts(parts, axum::body::Body::empty());
+    }
+    if method != axum::http::Method::GET {
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    }
+    creds.respond(task_id)
+}
+
+/// Serve the ECS agent's link-local credentials surface on the main listener.
+///
+/// Task containers reach fakecloud at `169.254.170.2:80`: the task's network
+/// namespace NATs that address to fakecloud's port (see the ECS runtime), so
+/// the request arrives here with `Host: 169.254.170.2`. Such requests are
+/// answered from the agent's surface; everything else falls through.
+pub async fn link_local_host_middleware(
+    axum::extract::State(creds): axum::extract::State<Arc<EcsTaskCredentials>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if is_link_local_host(req.headers()) {
+        return respond_link_local(&creds, req.method(), req.uri().path());
+    }
+    next.run(req).await
 }
 
 /// Revoke stopped tasks' credentials for as long as the server runs.
@@ -429,5 +504,103 @@ mod tests {
         stop_task(&ecs, "222222222222", "x");
         let _after_restart = EcsTaskCredentials::new(ecs.clone(), iam.clone(), ACCOUNT);
         assert!(!resolves(&iam, &creds));
+    }
+
+    /// A router whose own routes answer `fallthrough`, behind the link-local
+    /// middleware, so tests see which requests the middleware claims.
+    fn app(endpoint: Arc<EcsTaskCredentials>) -> axum::Router {
+        axum::Router::new()
+            .fallback(|| async { "fallthrough" })
+            .layer(axum::middleware::from_fn_with_state(
+                endpoint,
+                link_local_host_middleware,
+            ))
+    }
+
+    async fn call(
+        app: &axum::Router,
+        method: &str,
+        host: &str,
+        path: &str,
+    ) -> (StatusCode, String) {
+        use tower::ServiceExt;
+        let req = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header(axum::http::header::HOST, host)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    #[tokio::test]
+    async fn link_local_host_serves_the_agents_v2_credentials_path() {
+        let (ecs, _iam, endpoint) = setup();
+        add_task(&ecs, ACCOUNT, "task1", Some(ROLE));
+        let app = app(endpoint);
+
+        for host in ["169.254.170.2", "169.254.170.2:80"] {
+            let (status, body) = call(&app, "GET", host, "/v2/credentials/task1").await;
+            assert_eq!(status, StatusCode::OK, "{host}: {body}");
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(json["RoleArn"], ROLE);
+            assert!(json["AccessKeyId"].is_string(), "{json}");
+        }
+
+        let (status, body) = call(&app, "GET", "169.254.170.2", "/v2/credentials/nope").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("InvalidIdInRequest"), "{body}");
+        let (status, body) = call(&app, "GET", "169.254.170.2", "/v2/credentials/").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("NoIdInRequest"), "{body}");
+        let (status, _) = call(&app, "GET", "169.254.170.2", "/v2/credentialsX").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        // Only the agent surface lives on the link-local address.
+        let (status, _) = call(&app, "GET", "169.254.170.2", "/").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = call(&app, "POST", "169.254.170.2", "/v2/credentials/task1").await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+        // HEAD: GET's status, no body.
+        let (status, body) = call(&app, "HEAD", "169.254.170.2", "/v2/credentials/task1").await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, ""));
+        // GET's headers carry no Content-Length to go stale (hyper computes
+        // it from the body it actually sends).
+        let creds = {
+            let (ecs, _iam, endpoint) = setup();
+            add_task(&ecs, ACCOUNT, "t", Some(ROLE));
+            endpoint
+        };
+        let head = respond_link_local(&creds, &axum::http::Method::HEAD, "/v2/credentials/t");
+        assert!(head
+            .headers()
+            .get(axum::http::header::CONTENT_LENGTH)
+            .is_none());
+        let (status, body) = call(&app, "HEAD", "169.254.170.2", "/v2/credentials/nope").await;
+        assert_eq!((status, body.as_str()), (StatusCode::BAD_REQUEST, ""));
+    }
+
+    #[tokio::test]
+    async fn other_hosts_fall_through_to_the_app() {
+        let (ecs, _iam, endpoint) = setup();
+        add_task(&ecs, ACCOUNT, "task1", Some(ROLE));
+        let app = app(endpoint);
+        for host in [
+            "localhost:4566",
+            "169.254.170.2:4566",
+            "169.254.170.20",
+            "v2.s3.localhost",
+        ] {
+            let (status, body) = call(&app, "GET", host, "/v2/credentials/task1").await;
+            assert_eq!(
+                (status, body.as_str()),
+                (StatusCode::OK, "fallthrough"),
+                "{host}"
+            );
+        }
     }
 }
