@@ -1010,7 +1010,7 @@ impl Route53Service {
             let caller_owns_vpc =
                 recorded || vpc_owner.as_deref().is_some_and(|o| o == route.account);
             if !caller_owns_vpc {
-                return Err(not_authorized_vpc_association(&vpc, &id));
+                return Err(vpc_not_owned_by_caller(&vpc, &route.account));
             }
         }
         let zone = zone_account
