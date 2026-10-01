@@ -25,7 +25,9 @@
 //! server is unaffected. Setup runs as a detached task so it never delays the
 //! main server's startup. A container reaching these host addresses is a separate,
 //! platform-specific networking step (documented in the guide), not something
-//! fakecloud can arrange from inside the process.
+//! fakecloud can arrange from inside the process. (ECS tasks fakecloud runs
+//! itself are routed to `169.254.170.2` inside their own network namespace
+//! instead; see `ecs_creds::link_local_host_middleware`.)
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -38,7 +40,7 @@ use crate::imds::ImdsContext;
 /// IMDS link-local address.
 const IMDS_IP: &str = "169.254.169.254";
 /// ECS container-credentials relative-URI base address.
-const ECS_CREDS_IP: &str = "169.254.170.2";
+const ECS_CREDS_IP: &str = crate::ecs_creds::LINK_LOCAL_HOST;
 /// The fixed path the ECS-credentials listener serves (set
 /// `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` to this).
 const ECS_CREDS_PATH: &str = "/creds";

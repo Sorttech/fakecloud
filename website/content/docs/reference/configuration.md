@@ -28,6 +28,7 @@ fakecloud is configured via CLI flags or environment variables. Flags take prece
 |                      | `FAKECLOUD_CONTAINER_BACKEND` | unset (docker)   | Global execution backend for all container-backed services (Lambda, ECS, RDS, ElastiCache, EC2). `k8s` runs them as native Kubernetes Pods. See [Kubernetes backend](/docs/guides/kubernetes-backend/). |
 |                      | `FAKECLOUD_LAMBDA_BACKEND`  | inherits global    | Per-service override for Lambda (`k8s` or `docker`). Wins over `FAKECLOUD_CONTAINER_BACKEND`. |
 |                      | `FAKECLOUD_ECS_BACKEND`     | inherits global    | Per-service override for ECS task execution (`k8s` or `docker`). |
+|                      | `FAKECLOUD_ECS_CREDS_HELPER_IMAGE` | built locally (Docker/Podman), `public.ecr.aws/docker/library/alpine:3.20` (Kubernetes) | Image that routes the ECS agent's `169.254.170.2` credentials address to fakecloud inside a task-role task's network. Needs `sh`, `getent`, `awk`, and `nft` or `iptables`. See [ECS task role credentials](/docs/services/ecs/#task-role-credentials). |
 |                      | `FAKECLOUD_RDS_BACKEND`     | inherits global    | Per-service override for RDS DB instances (`k8s` or `docker`). |
 |                      | `FAKECLOUD_ELASTICACHE_BACKEND` | inherits global| Per-service override for ElastiCache (`k8s` or `docker`). |
 |                      | `FAKECLOUD_EC2_BACKEND`     | inherits global    | Per-service override for EC2 instances (`k8s` or `docker`). |

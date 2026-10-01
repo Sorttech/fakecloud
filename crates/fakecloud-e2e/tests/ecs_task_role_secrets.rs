@@ -69,9 +69,10 @@ async fn task_logs(endpoint: &str, task_id: &str) -> String {
         .to_string()
 }
 
-/// Creating a task with a `taskRoleArn` causes the runtime to inject
-/// `AWS_CONTAINER_CREDENTIALS_FULL_URI`; once the task stops the endpoint
-/// no longer has credentials for it.
+/// Creating a task with a `taskRoleArn` causes the runtime to inject the ECS
+/// agent's `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` (served at
+/// `169.254.170.2` inside the task); once the task stops the endpoint no
+/// longer has credentials for it.
 #[tokio::test]
 async fn ecs_task_role_credentials_are_served() {
     if !require_docker_or_skip("ecs_task_role_credentials_are_served") {
@@ -95,12 +96,13 @@ async fn ecs_task_role_credentials_are_served() {
                 .essential(true)
                 .command("sh")
                 .command("-c")
-                // Print the creds env + fetch them via apk + wget. No
-                // wget on alpine:3.20 default — use nc/getent? Simpler:
-                // just print the env var so we can see injection worked.
-                // A curl/wget pull is the integration check; we assert
-                // via direct HTTP from the host instead.
-                .command("echo FULL_URI=$AWS_CONTAINER_CREDENTIALS_FULL_URI")
+                // Print the creds env so we can see injection worked. The
+                // in-container fetch is covered in
+                // `ecs_task_role_credentials.rs`.
+                .command(
+                    "echo RELATIVE_URI=$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI \
+                     FULL_URI=[$AWS_CONTAINER_CREDENTIALS_FULL_URI]",
+                )
                 .build(),
         )
         .send()
@@ -120,8 +122,9 @@ async fn ecs_task_role_credentials_are_served() {
     let task_id = arn.rsplit('/').next().unwrap();
     let logs = task_logs(server.endpoint(), task_id).await;
     assert!(
-        logs.contains("FULL_URI=http://host.docker.internal:")
-            && logs.contains(&format!("/_fakecloud/ecs/creds/{task_id}")),
+        logs.contains(&format!(
+            "RELATIVE_URI=/v2/credentials/{task_id} FULL_URI=[]"
+        )),
         "env var not injected; logs: {logs}"
     );
 

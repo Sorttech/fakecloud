@@ -95,6 +95,13 @@ pub struct EcsRuntime {
     /// [`EcsRuntime::persist_snapshot`]. A `OnceLock` so the `Arc<EcsRuntime>`
     /// can receive the hook through a shared reference after construction.
     snapshot_hook: std::sync::OnceLock<fakecloud_persistence::SnapshotHook>,
+    /// The resolved task-credentials helper image (see [`task_creds`]),
+    /// resolved (built or pulled) on the first task with a task role. The
+    /// lock also serializes concurrent first builds.
+    creds_helper_image: tokio::sync::Mutex<Option<String>>,
+    /// Per-task IDs of the containers holding each task container's network
+    /// namespace (see [`task_creds`]); removed when the task stops.
+    netns_holders: RwLock<std::collections::HashMap<String, Vec<String>>>,
 }
 
 mod config;
@@ -102,7 +109,24 @@ mod k8s;
 mod lb;
 mod monitoring;
 mod secrets;
+mod task_creds;
 mod task_lifecycle;
+
+/// The initContainer the Kubernetes backend puts first in a task-role Pod:
+/// it NATs the ECS agent's `169.254.170.2:80` to `host:port` in the Pod's
+/// network namespace. Exposed for the opt-in cluster integration tests.
+pub fn k8s_creds_init_container(
+    image: &str,
+    host: &str,
+    port: u16,
+) -> k8s_openapi::api::core::v1::Container {
+    k8s::CredsInit {
+        image: image.to_string(),
+        host: host.to_string(),
+        port,
+    }
+    .container()
+}
 
 impl EcsRuntime {
     /// Auto-detect Docker or Podman. Returns `None` if neither is
@@ -126,6 +150,8 @@ impl EcsRuntime {
             kms_hook: None,
             k8s: None,
             snapshot_hook: std::sync::OnceLock::new(),
+            creds_helper_image: tokio::sync::Mutex::new(None),
+            netns_holders: RwLock::new(std::collections::HashMap::new()),
         })
     }
 
@@ -154,6 +180,8 @@ impl EcsRuntime {
             kms_hook: None,
             k8s: Some(backend),
             snapshot_hook: std::sync::OnceLock::new(),
+            creds_helper_image: tokio::sync::Mutex::new(None),
+            netns_holders: RwLock::new(std::collections::HashMap::new()),
         })
     }
 
@@ -220,7 +248,7 @@ pub(crate) struct ContainerPlan {
     pub(crate) essential: bool,
     pub(crate) has_task_role: bool,
     /// Port mappings parsed from the task definition. Each entry becomes
-    /// a `--publish containerPort:hostPort/protocol` flag on the docker
+    /// a `--publish hostPort:containerPort/protocol` flag on the docker
     /// run command (except for `awsvpc`, where ports are exposed via the
     /// per-task ENI rather than the docker host's port table).
     pub(crate) port_mappings: Vec<PortMapping>,
@@ -1322,6 +1350,19 @@ pub(crate) fn fakecloud_instance_label() -> String {
     format!("fakecloud-instance=fakecloud-{}", std::process::id())
 }
 
+/// Whose network namespace a task container runs in.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ContainerNetwork<'a> {
+    /// The container owns its namespace and carries its own network flags.
+    Own {
+        add_host_arg: Option<&'a str>,
+        awsvpc_network_ready: bool,
+    },
+    /// The container joins the namespace of `holder` (see [`task_creds`]),
+    /// which carries the network flags.
+    Joined { holder: &'a str },
+}
+
 /// Build the docker `run` argv for a single container plan. Pure so unit
 /// tests can assert on flag ordering / `--publish` translation without
 /// shelling out. The returned vector is everything *after* the binary
@@ -1332,9 +1373,8 @@ pub(crate) fn build_run_argv(
     env: &[(String, String)],
     task_id: &str,
     host_alias: &str,
-    add_host_arg: Option<&str>,
+    network: ContainerNetwork<'_>,
     run_image: &str,
-    awsvpc_network_ready: bool,
 ) -> Vec<String> {
     let mut argv: Vec<String> = Vec::new();
     argv.push("run".into());
@@ -1353,33 +1393,29 @@ pub(crate) fn build_run_argv(
     // ungraceful restart. See fakecloud_instance_label().
     argv.push("--label".into());
     argv.push(fakecloud_instance_label());
-    // Inject `--add-host host.docker.internal:<ip>` only for docker;
-    // podman provides `host.containers.internal` natively and rejects
-    // the host-gateway mapping (issue #1539).
-    if let Some(arg) = add_host_arg {
-        argv.push("--add-host".into());
-        argv.push(arg.to_string());
-    }
-    let use_awsvpc_network = plan.network_mode.as_deref() == Some("awsvpc") && awsvpc_network_ready;
-    if use_awsvpc_network {
-        argv.push("--network".into());
-        argv.push(format!("fakecloud-ecs-{}", task_id));
-    }
-    // `awsvpc` puts the container on a per-task ENI; emulating that on a
-    // local docker host means *not* publishing to the host port table.
-    // Bridge / host / default network modes still get `--publish`. If
-    // the awsvpc per-task network creation failed and we fell back to
-    // bridge, we DO want to publish so the container is reachable.
-    let publish_ports = !use_awsvpc_network;
-    if publish_ports {
-        for pm in &plan.port_mappings {
-            argv.push("--publish".into());
-            argv.push(format!(
-                "{}:{}/{}",
-                pm.container_port, pm.host_port, pm.protocol
+    let joined_namespace = match network {
+        ContainerNetwork::Own {
+            add_host_arg,
+            awsvpc_network_ready,
+        } => {
+            argv.extend(task_creds::namespace_network_argv(
+                plan,
+                task_id,
+                add_host_arg,
+                awsvpc_network_ready,
+                None,
             ));
+            false
         }
-    }
+        // The holder carries the network, published ports and host alias;
+        // the runtimes refuse those flags on a container that joins another
+        // container's namespace.
+        ContainerNetwork::Joined { holder } => {
+            argv.push("--network".into());
+            argv.push(format!("container:{holder}"));
+            true
+        }
+    };
     if let Some(ref hc) = plan.health_check {
         argv.extend(render_health_flags(hc));
     }
@@ -1430,7 +1466,13 @@ pub(crate) fn build_run_argv(
             argv.push("--shm-size".into());
             argv.push(format!("{}m", size));
         }
-        for sys in &lp.sysctls {
+        // `net.*` sysctls belong to the namespace's owner (the holder when
+        // this container joins one).
+        for sys in lp
+            .sysctls
+            .iter()
+            .filter(|s| !(joined_namespace && task_creds::is_net_sysctl(&s.name)))
+        {
             argv.push("--sysctl".into());
             argv.push(format!("{}={}", sys.name, sys.value));
         }
@@ -1901,13 +1943,53 @@ impl EcsRuntime {
             kms_hook: None,
             k8s: None,
             snapshot_hook: std::sync::OnceLock::new(),
+            creds_helper_image: tokio::sync::Mutex::new(None),
+            netns_holders: RwLock::new(std::collections::HashMap::new()),
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use super::ContainerPlan;
+
+    pub(crate) fn minimal_plan() -> ContainerPlan {
+        ContainerPlan {
+            container_name: "app".into(),
+            image: "alpine".into(),
+            env: Vec::new(),
+            entry_point: Vec::new(),
+            command: Vec::new(),
+            secrets_refs: Vec::new(),
+            essential: true,
+            has_task_role: false,
+            port_mappings: Vec::new(),
+            network_mode: None,
+            depends_on: Vec::new(),
+            health_check: None,
+            volume_mounts: Vec::new(),
+            ulimits: Vec::new(),
+            linux_parameters: None,
+            stop_timeout: None,
+            user: None,
+            working_directory: None,
+            tty: false,
+            interactive: false,
+            readonly_rootfs: false,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::tests_support::minimal_plan;
     use super::*;
+
+    /// The container owns its namespace on a ready per-task network.
+    const OWN_NET: ContainerNetwork<'static> = ContainerNetwork::Own {
+        add_host_arg: None,
+        awsvpc_network_ready: true,
+    };
     use crate::state::{EcsState, Task};
     use fakecloud_aws::arn::Arn;
     use fakecloud_core::multi_account::MultiAccountState;
@@ -2471,9 +2553,8 @@ mod tests {
             &[],
             "task-1",
             "host.docker.internal",
-            None,
+            OWN_NET,
             "alpine",
-            true,
         );
         let joined = argv.join(" ");
         assert!(joined.contains("--health-cmd true"), "argv: {joined}");
@@ -2516,9 +2597,8 @@ mod tests {
             &[],
             "task-1",
             "host.docker.internal",
-            None,
+            OWN_NET,
             "alpine",
-            true,
         );
         assert!(!argv.iter().any(|s| s.starts_with("--health")));
     }
@@ -2591,9 +2671,8 @@ mod tests {
             &[],
             "task-1",
             "host.docker.internal",
-            None,
+            OWN_NET,
             "alpine",
-            true,
         );
         let pair = argv
             .windows(2)
@@ -2914,7 +2993,7 @@ mod tests {
             interactive: false,
             readonly_rootfs: false,
         };
-        let argv = build_run_argv(&plan, &[], "t", "host.docker.internal", None, "img", true);
+        let argv = build_run_argv(&plan, &[], "t", "host.docker.internal", OWN_NET, "img");
         assert!(argv.contains(&"--ulimit".to_string()));
         assert!(argv.contains(&"nofile=1024:2048".to_string()));
     }
@@ -2964,7 +3043,7 @@ mod tests {
             interactive: true,
             readonly_rootfs: true,
         };
-        let argv = build_run_argv(&plan, &[], "t", "host.docker.internal", None, "img", true);
+        let argv = build_run_argv(&plan, &[], "t", "host.docker.internal", OWN_NET, "img");
         assert!(argv.contains(&"--cap-add".to_string()));
         assert!(argv.contains(&"NET_ADMIN".to_string()));
         assert!(argv.contains(&"--cap-drop".to_string()));
@@ -3265,30 +3344,58 @@ mod tests {
         assert_eq!(tg_targets[0].1, Some(80));
     }
 
-    fn minimal_plan() -> ContainerPlan {
-        ContainerPlan {
-            container_name: "app".into(),
-            image: "alpine".into(),
-            env: Vec::new(),
-            entry_point: Vec::new(),
-            command: Vec::new(),
-            secrets_refs: Vec::new(),
-            essential: true,
-            has_task_role: false,
-            port_mappings: Vec::new(),
-            network_mode: None,
-            depends_on: Vec::new(),
-            health_check: None,
-            volume_mounts: Vec::new(),
-            ulimits: Vec::new(),
-            linux_parameters: None,
-            stop_timeout: None,
-            user: None,
-            working_directory: None,
-            tty: false,
-            interactive: false,
-            readonly_rootfs: false,
-        }
+    /// A container joining its namespace holder leaves every network flag
+    /// (and the `net.*` sysctls) to the holder: the runtimes refuse
+    /// `--add-host` / `--publish` / a second `--network` on it.
+    #[test]
+    fn build_run_argv_joined_namespace_defers_network_flags_to_the_holder() {
+        let mut plan = minimal_plan();
+        plan.network_mode = Some("awsvpc".into());
+        plan.port_mappings = vec![PortMapping {
+            container_port: 80,
+            host_port: 80,
+            protocol: "tcp".into(),
+        }];
+        plan.linux_parameters = Some(LinuxParameters {
+            sysctls: vec![
+                Sysctl {
+                    name: "net.core.somaxconn".into(),
+                    value: "1024".into(),
+                },
+                Sysctl {
+                    name: "kernel.shm_rmid_forced".into(),
+                    value: "1".into(),
+                },
+            ],
+            ..LinuxParameters::default()
+        });
+        let argv = build_run_argv(
+            &plan,
+            &[(
+                "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI".into(),
+                "/v2/credentials/task-1".into(),
+            )],
+            "task-1",
+            "host.docker.internal",
+            ContainerNetwork::Joined {
+                holder: "holder-id",
+            },
+            "alpine",
+        );
+        let joined = argv.join(" ");
+        assert!(joined.contains("--network container:holder-id"), "{joined}");
+        assert_eq!(argv.iter().filter(|a| *a == "--network").count(), 1);
+        assert!(!joined.contains("--publish"), "{joined}");
+        assert!(!joined.contains("--add-host"), "{joined}");
+        assert!(!joined.contains("net.core.somaxconn"), "{joined}");
+        assert!(
+            joined.contains("--sysctl kernel.shm_rmid_forced=1"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("-e AWS_CONTAINER_CREDENTIALS_RELATIVE_URI=/v2/credentials/task-1"),
+            "{joined}"
+        );
     }
 
     /// 4.1 — every ECS task container must carry the shared
@@ -3302,9 +3409,8 @@ mod tests {
             &[],
             "task-1",
             "host.docker.internal",
-            None,
+            OWN_NET,
             "alpine",
-            true,
         );
         let expected = fakecloud_instance_label();
         assert!(

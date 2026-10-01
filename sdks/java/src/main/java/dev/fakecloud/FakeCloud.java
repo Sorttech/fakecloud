@@ -1151,7 +1151,8 @@ public final class FakeCloud {
 
         /**
          * Return the task-role credentials a running task's containers get
-         * from {@code AWS_CONTAINER_CREDENTIALS_FULL_URI}: a session for the
+         * from {@code http://169.254.170.2} +
+         * {@code AWS_CONTAINER_CREDENTIALS_RELATIVE_URI}: a session for the
          * task role named after the task ID, in the ECS credentials wire
          * shape (PascalCase keys). Throws once the task has stopped, or for
          * an unknown task or one without a task role (HTTP 400

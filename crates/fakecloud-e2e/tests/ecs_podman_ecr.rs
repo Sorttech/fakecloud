@@ -4,6 +4,9 @@
 //! task's pull failed with "server gave HTTP response to HTTPS client" until
 //! the runtime passed `--tls-verify=false` for fakecloud's registry.
 //!
+//! Also: task-role credentials at the ECS agent's link-local address under
+//! podman (issue #2629).
+//!
 //! Runs in the podman E2E partition, which installs podman. Per the project's
 //! no-silent-skip rule it hard-fails when podman is unavailable.
 
@@ -211,4 +214,119 @@ async fn ecs_task_pulls_ecr_image_with_podman() {
         "task logs: {logs}"
     );
     assert_eq!(logs["exitCode"].as_i64(), Some(0), "task logs: {logs}");
+}
+
+/// Under podman too, a task-role container reaches its credentials at
+/// `http://169.254.170.2` + the injected `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`
+/// (the namespace holder routes the address to fakecloud), and the holder is
+/// gone once the task stops.
+#[tokio::test]
+async fn ecs_task_role_credentials_at_link_local_address_with_podman() {
+    require_podman();
+    let (_, env) = registry_host_and_env();
+    let server = TestServer::start_with_env(&env).await;
+    let iam = server.iam_client().await;
+    let role_arn = iam
+        .create_role()
+        .role_name("podman-task-role")
+        .assume_role_policy_document(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]}"#,
+        )
+        .send()
+        .await
+        .expect("create_role")
+        .role()
+        .unwrap()
+        .arn()
+        .to_string();
+
+    let ecs = server.ecs_client().await;
+    ecs.create_cluster()
+        .cluster_name("podman-creds")
+        .send()
+        .await
+        .expect("create_cluster");
+    ecs.register_task_definition()
+        .family("podman-creds-task")
+        .task_role_arn(&role_arn)
+        .container_definitions(
+            ContainerDefinition::builder()
+                .name("app")
+                .image(SEED_IMAGE)
+                .essential(true)
+                .entry_point("/bin/sh")
+                .command("-c")
+                .command(
+                    "echo RELATIVE_URI=[$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI]; \
+                     wget -qO- \"http://169.254.170.2$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI\" \
+                     | grep -o '\"RoleArn\":\"[^\"]*\"'",
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .expect("register_task_definition");
+
+    let run = ecs
+        .run_task()
+        .cluster("podman-creds")
+        .task_definition("podman-creds-task")
+        .send()
+        .await
+        .expect("run_task");
+    let arn = run.tasks()[0].task_arn().unwrap().to_string();
+    let task_id = arn.rsplit('/').next().unwrap().to_string();
+
+    let mut stopped = false;
+    for _ in 0..240 {
+        let desc = ecs
+            .describe_tasks()
+            .cluster("podman-creds")
+            .tasks(&arn)
+            .send()
+            .await
+            .expect("describe_tasks");
+        if desc.tasks()[0].last_status() == Some("STOPPED") {
+            stopped = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(stopped, "task did not reach STOPPED");
+
+    let logs: serde_json::Value = reqwest::Client::new()
+        .get(format!(
+            "{}/_fakecloud/ecs/tasks/{task_id}/logs",
+            server.endpoint()
+        ))
+        .send()
+        .await
+        .expect("fetch task logs")
+        .json()
+        .await
+        .expect("task logs json");
+    let text = logs["logs"].as_str().unwrap_or_default();
+    assert!(
+        text.contains(&format!("RELATIVE_URI=[/v2/credentials/{task_id}]")),
+        "task logs: {logs}"
+    );
+    assert!(
+        text.contains(&format!("\"RoleArn\":\"{role_arn}\"")),
+        "task logs: {logs}"
+    );
+
+    let holders = podman(&[
+        "ps",
+        "-a",
+        "--filter",
+        &format!("label=fakecloud-ecs-task={task_id}"),
+        "--format",
+        "{{.Names}}",
+    ])
+    .await;
+    assert_eq!(
+        String::from_utf8_lossy(&holders.stdout).trim(),
+        "",
+        "task containers left behind"
+    );
 }

@@ -1,8 +1,9 @@
 //! Opt-in Kubernetes integration tests for the ECS k8s backend.
 //!
 //! Needs a real cluster (a local `kind` cluster works) with `busybox:1.36`
-//! loaded, plus a valid kubeconfig. Gated behind the `k8s-integration`
-//! feature.
+//! loaded (and `public.ecr.aws/docker/library/alpine:3.20` pullable, plus
+//! egress to the Alpine package mirror, for the credentials initContainer),
+//! plus a valid kubeconfig. Gated behind the `k8s-integration` feature.
 //!
 //! Per `feedback_tests_never_silently_skip`: with the feature on, a
 //! missing `FAKECLOUD_K8S_TEST=1` / unreachable cluster **panics** rather
@@ -18,6 +19,8 @@
 //! ```sh
 //! kind create cluster --name fakecloud-test
 //! docker pull busybox:1.36 && kind load docker-image busybox:1.36 --name fakecloud-test
+//! docker pull public.ecr.aws/docker/library/alpine:3.20 \
+//!     && kind load docker-image public.ecr.aws/docker/library/alpine:3.20 --name fakecloud-test
 //! FAKECLOUD_K8S_TEST=1 cargo test -p fakecloud-ecs \
 //!     --features k8s-integration --test k8s_integration -- --test-threads=1
 //! ```
@@ -191,4 +194,112 @@ async fn reap_stale_deletes_foreign_instance_pods() {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     panic!("foreign pod still present after reap");
+}
+
+/// The task-role credentials initContainer really routes the ECS agent's
+/// `169.254.170.2:80` to its target inside the Pod: a later container
+/// fetching `http://169.254.170.2/v2/credentials/<id>` reaches a stand-in
+/// server behind a Service, on another port, while port 80 in the Pod stays
+/// free for the app.
+#[tokio::test]
+async fn creds_init_container_routes_the_agent_address_to_its_target() {
+    use k8s_openapi::api::core::v1::{Service, ServicePort, ServiceSpec};
+    use kube::api::{Api, DeleteParams, PostParams};
+
+    require_test_env();
+    ensure_namespace().await;
+    let c = client().await;
+    let services: Api<Service> = Api::namespaced(c.client().clone(), TEST_NS);
+    let server = "fakecloud-ecs-it-creds-srv";
+    let task = "fakecloud-ecs-it-creds-task";
+    c.delete_pod(server).await;
+    c.delete_pod(task).await;
+    let _ = services.delete(server, &DeleteParams::default()).await;
+
+    // Stand-in for fakecloud: serves the agent path on 8080.
+    let mut srv = task_pod(server);
+    let spec = srv.spec.as_mut().unwrap();
+    spec.init_containers = None;
+    spec.containers = vec![busybox(
+        "srv",
+        "mkdir -p /www/v2/credentials && echo CREDS_OK > /www/v2/credentials/t1 \
+         && exec httpd -f -p 8080 -h /www",
+    )];
+    srv.metadata
+        .labels
+        .as_mut()
+        .unwrap()
+        .insert("app".into(), server.into());
+    c.create_pod(&srv).await.expect("create server pod");
+    services
+        .create(
+            &PostParams::default(),
+            &Service {
+                metadata: ObjectMeta {
+                    name: Some(server.into()),
+                    namespace: Some(TEST_NS.into()),
+                    ..Default::default()
+                },
+                spec: Some(ServiceSpec {
+                    selector: Some(BTreeMap::from([("app".to_string(), server.to_string())])),
+                    ports: Some(vec![ServicePort {
+                        port: 8080,
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create server service");
+
+    let mut pod = task_pod(task);
+    let spec = pod.spec.as_mut().unwrap();
+    spec.init_containers = Some(vec![fakecloud_ecs::runtime::k8s_creds_init_container(
+        "public.ecr.aws/docker/library/alpine:3.20",
+        &format!("{server}.{TEST_NS}.svc.cluster.local"),
+        8080,
+    )]);
+    spec.containers = vec![busybox(
+        "app",
+        "nc -l -p 80 -e true & sleep 1; \
+         for i in $(seq 60); do \
+           wget -qO- http://169.254.170.2/v2/credentials/t1 && exit 0; sleep 1; \
+         done; exit 1",
+    )];
+    c.create_pod(&pod).await.expect("create task pod");
+
+    let mut phase = String::new();
+    for _ in 0..240 {
+        if let Ok(p) = c.pods().get(task).await {
+            phase = p
+                .status
+                .as_ref()
+                .and_then(|s| s.phase.clone())
+                .unwrap_or_default();
+            if phase == "Succeeded" || phase == "Failed" {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let init_logs = c
+        .pod_logs(task, Some("fakecloud-ecs-creds"))
+        .await
+        .unwrap_or_default();
+    let app_logs = c.pod_logs(task, Some("app")).await.unwrap_or_default();
+    assert_eq!(
+        phase, "Succeeded",
+        "init logs: {init_logs:?}, app logs: {app_logs:?}"
+    );
+    assert!(
+        init_logs.contains("FAKECLOUD_ECS_CREDS_READY"),
+        "init logs: {init_logs:?}"
+    );
+    assert!(app_logs.contains("CREDS_OK"), "app logs: {app_logs:?}");
+
+    c.delete_pod(task).await;
+    c.delete_pod(server).await;
+    let _ = services.delete(server, &DeleteParams::default()).await;
 }
