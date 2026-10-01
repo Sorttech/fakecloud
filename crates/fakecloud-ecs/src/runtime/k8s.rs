@@ -61,6 +61,11 @@ const POD_PREFIX: &str = "fakecloud-ecs";
 /// relaunched without it (covers its image pull).
 const CREDS_INIT_TIMEOUT: Duration = Duration::from_secs(180);
 
+/// How long the credentials wait lets a task Pod go without its
+/// initContainer reaching a node before deferring to the task's own start
+/// deadline.
+const UNSCHEDULED_LIMIT: Duration = Duration::from_secs(300);
+
 /// Waiting reasons that mean a container will never start on its own.
 const STUCK_WAITING_REASONS: &[&str] = &[
     "ErrImagePull",
@@ -204,7 +209,11 @@ impl K8sTaskBackend {
     /// the caller's wait loop.
     async fn wait_for_creds_init(&self, pod_name: &str) -> Result<(), String> {
         let api = self.client.pods();
-        let deadline = std::time::Instant::now() + CREDS_INIT_TIMEOUT;
+        // The initContainer's own budget starts once the kubelet has it: a
+        // Pod waiting to be scheduled (autoscaling, quota, volumes) is not a
+        // credentials-routing failure.
+        let created = std::time::Instant::now();
+        let mut deadline: Option<std::time::Instant> = None;
         loop {
             let pod = match api.get(pod_name).await {
                 Ok(p) => p,
@@ -223,7 +232,16 @@ impl K8sTaskBackend {
                 }
                 CredsInitOutcome::Pending => {}
             }
-            if std::time::Instant::now() >= deadline {
+            let now = std::time::Instant::now();
+            if deadline.is_none() && creds_init_started(&pod) {
+                deadline = Some(now + CREDS_INIT_TIMEOUT);
+            }
+            if deadline.is_none() && now >= created + UNSCHEDULED_LIMIT {
+                // Never reached a node: leave the Pod to the task's own start
+                // deadline rather than relaunching it without credentials.
+                return Ok(());
+            }
+            if deadline.is_some_and(|d| now >= d) {
                 return Err(format!(
                     "{} did not finish within {}s",
                     task_creds::K8S_INIT_CONTAINER,
@@ -282,6 +300,18 @@ fn creds_init_outcome(pod: &Pod) -> CredsInitOutcome {
         return CredsInitOutcome::Failed("task pod failed".to_string());
     }
     CredsInitOutcome::Pending
+}
+
+/// Whether the kubelet has picked up the credentials initContainer (it has
+/// a status), as opposed to the Pod still waiting to be scheduled.
+fn creds_init_started(pod: &Pod) -> bool {
+    pod.status
+        .as_ref()
+        .and_then(|s| s.init_container_statuses.as_ref())
+        .is_some_and(|all| {
+            all.iter()
+                .any(|c| c.name == task_creds::K8S_INIT_CONTAINER && c.state.is_some())
+        })
 }
 
 /// `resolved` with the task-role credentials variable added to each
@@ -1391,5 +1421,13 @@ mod tests {
             creds_init_outcome(&Pod::default()),
             CredsInitOutcome::Pending
         );
+
+        // The initContainer's budget only starts once it has a status, not
+        // while the Pod waits to be scheduled.
+        assert!(!creds_init_started(&Pod::default()));
+        assert!(creds_init_started(&pod_with_helper_state(
+            waiting("PodInitializing"),
+            "Pending"
+        )));
     }
 }

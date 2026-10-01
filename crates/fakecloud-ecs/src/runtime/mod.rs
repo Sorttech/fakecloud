@@ -95,10 +95,10 @@ pub struct EcsRuntime {
     /// [`EcsRuntime::persist_snapshot`]. A `OnceLock` so the `Arc<EcsRuntime>`
     /// can receive the hook through a shared reference after construction.
     snapshot_hook: std::sync::OnceLock<fakecloud_persistence::SnapshotHook>,
-    /// The resolved task-credentials helper image (see [`task_creds`]),
-    /// resolved (built or pulled) on the first task with a task role. The
-    /// lock also serializes concurrent first builds.
-    creds_helper_image: tokio::sync::Mutex<Option<String>>,
+    /// The task-credentials helper image (see [`task_creds`]), resolved
+    /// (built or pulled) on the first task with a task role, or its last
+    /// failure. The lock also serializes concurrent first builds.
+    creds_helper_image: tokio::sync::Mutex<Option<task_creds::HelperImage>>,
     /// Per-task IDs of the containers holding each task container's network
     /// namespace (see [`task_creds`]); removed when the task stops.
     netns_holders: RwLock<std::collections::HashMap<String, Vec<String>>>,

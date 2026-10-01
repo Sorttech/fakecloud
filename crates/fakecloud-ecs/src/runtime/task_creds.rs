@@ -87,6 +87,20 @@ trap 'exit 0' TERM INT
 while :; do sleep 3600 & wait $!; done
 "#;
 
+/// How long a failed helper-image resolution is remembered before a task
+/// tries again.
+pub(crate) const HELPER_RETRY_AFTER: Duration = Duration::from_secs(300);
+
+/// The resolved helper image, or the last failure to resolve it.
+#[derive(Debug, Clone)]
+pub(crate) enum HelperImage {
+    Ready(String),
+    Failed {
+        error: String,
+        at: std::time::Instant,
+    },
+}
+
 /// How long a holder may take to install its rule.
 const HOLDER_READY_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -253,29 +267,40 @@ impl EcsRuntime {
     /// locally built Alpine + nftables image (built once per host and reused).
     pub(crate) async fn ensure_creds_helper_image(&self) -> Result<String, String> {
         let mut cached = self.creds_helper_image.lock().await;
-        if let Some(image) = cached.as_ref() {
-            return Ok(image.clone());
-        }
-        let image = match helper_image_override() {
-            Some(image) => {
-                fakecloud_core::container_image::ensure_image(
-                    &self.cli,
-                    self.docker_config_path().as_deref(),
-                    &image,
-                )
-                .await?;
-                image
+        match cached.as_ref() {
+            Some(HelperImage::Ready(image)) => return Ok(image.clone()),
+            // Don't make every task-role launch repeat a build/pull that just
+            // failed (with its retries and backoff) before falling back.
+            Some(HelperImage::Failed { error, at }) if at.elapsed() < HELPER_RETRY_AFTER => {
+                return Err(error.clone());
             }
+            _ => {}
+        }
+        let resolved = match helper_image_override() {
+            Some(image) => fakecloud_core::container_image::ensure_image(
+                &self.cli,
+                self.docker_config_path().as_deref(),
+                &image,
+            )
+            .await
+            .map(|_| image),
             None => {
                 let tag = local_helper_tag();
-                if !self.image_present(&tag).await {
-                    self.build_local_helper(&tag).await?;
+                if self.image_present(&tag).await {
+                    Ok(tag)
+                } else {
+                    self.build_local_helper(&tag).await.map(|()| tag)
                 }
-                tag
             }
         };
-        *cached = Some(image.clone());
-        Ok(image)
+        *cached = Some(match &resolved {
+            Ok(image) => HelperImage::Ready(image.clone()),
+            Err(error) => HelperImage::Failed {
+                error: error.clone(),
+                at: std::time::Instant::now(),
+            },
+        });
+        resolved
     }
 
     async fn image_present(&self, tag: &str) -> bool {
@@ -554,6 +579,23 @@ mod tests {
         assert_eq!(repo, HELPER_LOCAL_REPO);
         assert_eq!(digest.len(), 12);
         assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[tokio::test]
+    async fn a_failed_helper_image_is_not_retried_by_every_task() {
+        let rt = EcsRuntime::bare_for_tests();
+        *rt.creds_helper_image.lock().await = Some(HelperImage::Failed {
+            error: "pull failed".into(),
+            at: std::time::Instant::now(),
+        });
+        // Within the retry window the failure is returned without touching
+        // the (absent) container CLI.
+        assert_eq!(
+            rt.ensure_creds_helper_image().await,
+            Err("pull failed".to_string())
+        );
+        *rt.creds_helper_image.lock().await = Some(HelperImage::Ready("helper:1".into()));
+        assert_eq!(rt.ensure_creds_helper_image().await, Ok("helper:1".into()));
     }
 
     #[test]
