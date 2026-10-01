@@ -942,12 +942,15 @@ async fn s3_eventbridge_notification_invokes_lambda_target() {
     lambda
         .create_function()
         .function_name("s3-eb-fn")
-        .runtime(aws_sdk_lambda::types::Runtime::Nodejs18x)
+        .runtime(aws_sdk_lambda::types::Runtime::Python312)
         .role("arn:aws:iam::123456789012:role/lambda-role")
         .handler("index.handler")
         .code(
             aws_sdk_lambda::types::FunctionCode::builder()
-                .zip_file(aws_sdk_lambda::primitives::Blob::new(b"fake-code"))
+                .zip_file(aws_sdk_lambda::primitives::Blob::new(make_zip(&[(
+                    "index.py",
+                    b"def handler(event, context):\n    return {}\n",
+                )])))
                 .build(),
         )
         .send()
@@ -978,18 +981,28 @@ async fn s3_eventbridge_notification_invokes_lambda_target() {
         .await
         .unwrap();
 
-    let invocations = get_lambda_invocations(server.endpoint()).await;
-    let matched: Vec<_> = invocations["invocations"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|i| i["source"] == "aws:events" && i["functionArn"] == fn_arn)
-        .collect();
-    assert_eq!(
-        matched.len(),
-        1,
-        "expected one S3->EventBridge->Lambda invocation, got {invocations}"
-    );
+    // Poll until the invocation is recorded, so the test doesn't depend on the
+    // delivery being synchronous with the PutObject response.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let matched = loop {
+        let invocations = get_lambda_invocations(server.endpoint()).await;
+        let matched: Vec<serde_json::Value> = invocations["invocations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|i| i["source"] == "aws:events" && i["functionArn"] == fn_arn)
+            .cloned()
+            .collect();
+        if !matched.is_empty() {
+            break matched;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "expected an S3->EventBridge->Lambda invocation, got {invocations}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    };
+    assert_eq!(matched.len(), 1, "expected exactly one invocation");
     let payload: serde_json::Value =
         serde_json::from_str(matched[0]["payload"].as_str().unwrap()).unwrap();
     assert_eq!(payload["source"], "aws.s3");
@@ -1175,14 +1188,28 @@ async fn s3_eventbridge_notification_delivers_to_logs_target() {
         .await
         .unwrap();
 
-    let events = logs
-        .get_log_events()
-        .log_group_name("/aws/events/s3")
-        .log_stream_name("events")
-        .send()
-        .await
-        .unwrap();
-    let log_events = events.events();
+    // Poll until the event lands (the "events" stream only exists once the
+    // first delivery creates it), so the test doesn't depend on delivery being
+    // synchronous with the PutObject response.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let log_events = loop {
+        let got = logs
+            .get_log_events()
+            .log_group_name("/aws/events/s3")
+            .log_stream_name("events")
+            .send()
+            .await;
+        if let Ok(out) = got {
+            if !out.events().is_empty() {
+                break out.events().to_vec();
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "S3 event never reached the CloudWatch Logs target"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    };
     assert_eq!(
         log_events.len(),
         1,

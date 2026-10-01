@@ -802,7 +802,47 @@ mod tests {
             lambda_arn_account("arn:aws:lambda:us-east-1:999988887777:function:foo:live"),
             Some("999988887777")
         );
+        assert_eq!(
+            lambda_arn_account("arn:aws:lambda:us-east-1:999988887777:function:foo"),
+            Some("999988887777")
+        );
+        assert_eq!(
+            lambda_arn_account("arn:aws-cn:lambda:cn-north-1:999988887777:function:foo"),
+            Some("999988887777")
+        );
+        // Bare names and anything that isn't a Lambda *function* ARN.
         assert_eq!(lambda_arn_account("foo"), None);
+        assert_eq!(lambda_arn_account(""), None);
+        assert_eq!(
+            lambda_arn_account("arn:aws:sqs:us-east-1:999988887777:function:foo"),
+            None,
+            "wrong service"
+        );
+        assert_eq!(
+            lambda_arn_account("arn:aws:lambda:us-east-1:999988887777:layer:foo:1"),
+            None,
+            "layer, not function"
+        );
+        assert_eq!(
+            lambda_arn_account("arn:aws:lambda:us-east-1:999988887777:function"),
+            None,
+            "missing function name"
+        );
+        assert_eq!(
+            lambda_arn_account("arn:aws:lambda:us-east-1::function:foo"),
+            None,
+            "empty account"
+        );
+        assert_eq!(
+            lambda_arn_account("xrn:aws:lambda:us-east-1:999988887777:function:foo"),
+            None,
+            "not an arn"
+        );
+        assert_eq!(
+            lambda_arn_account("arn::lambda:us-east-1:999988887777:function:foo"),
+            None,
+            "empty partition"
+        );
     }
 
     /// A cross-service event matched by a rule with a CloudWatch Logs target

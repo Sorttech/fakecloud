@@ -1011,7 +1011,18 @@ pub(crate) fn function_name_from_arn(arn: &str) -> &str {
 
 /// The account ID a Lambda function ARN names, or `None` for a bare name.
 pub(crate) fn lambda_arn_account(arn: &str) -> Option<&str> {
-    arn.split(':').nth(4).filter(|a| !a.is_empty())
+    // arn:PARTITION:lambda:REGION:ACCOUNT:function:NAME[:QUALIFIER]
+    let parts: Vec<&str> = arn.split(':').collect();
+    if parts.len() < 7
+        || parts[0] != "arn"
+        || parts[1].is_empty()
+        || parts[2] != "lambda"
+        || parts[5] != "function"
+        || parts[6].is_empty()
+    {
+        return None;
+    }
+    Some(parts[4]).filter(|a| !a.is_empty())
 }
 
 /// Record an EventBridge-driven invocation in Lambda's invocation log (what
