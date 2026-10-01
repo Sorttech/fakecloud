@@ -1128,6 +1128,98 @@ async fn main() {
         }
         Arc::new(bus)
     };
+    // CloudWatch Logs persistence store + a shared save-lock, created ahead of
+    // the EventBridge delivery (PutEvents, the rule scheduler and every
+    // cross-service EventBridge sender) so their Logs-target delivery can write
+    // through to the same snapshot LogsService persists to. Loading here (before
+    // the scheduler is spawned) also means the background rule scheduler fires
+    // against the restored Logs state rather than an empty one. The lock is
+    // shared with LogsService (below) so the two Logs writers can't
+    // interleave event appends and manifest commits.
+    let logs_snapshot_store: Option<Arc<fakecloud_logs::persistence::SegmentedLogsStore>> =
+        if persistence_config.mode == fakecloud_persistence::StorageMode::Persistent {
+            let directory = persistence_config
+                .data_path
+                .as_ref()
+                .expect("validated above")
+                .join("logs");
+            let store = fakecloud_logs::persistence::SegmentedLogsStore::new(directory);
+            match store.load() {
+                Ok(Some(snapshot)) => {
+                    if snapshot.schema_version > fakecloud_logs::LOGS_SNAPSHOT_SCHEMA_VERSION {
+                        fatal_exit(format_args!(
+                            "logs persistence schema too new: on-disk={}, max supported={}",
+                            snapshot.schema_version,
+                            fakecloud_logs::LOGS_SNAPSHOT_SCHEMA_VERSION,
+                        ));
+                    }
+                    if let Some(accounts) = snapshot.accounts {
+                        *logs_state.write() = accounts;
+                    } else if let Some(single) = snapshot.state {
+                        let account_id = single.account_id.clone();
+                        *logs_state.write().get_or_create(&account_id) = single;
+                    } else {
+                        tracing::warn!(
+                            "logs persistence snapshot has neither accounts nor state; starting empty"
+                        );
+                    }
+                    // Finish legacy migration and persist offline expiration before
+                    // accepting policy changes or starting background deliveries.
+                    if let Err(error) = store.save(&mut logs_state.write()) {
+                        fatal_exit(format_args!(
+                            "failed to initialize Logs persistence: {error}"
+                        ));
+                    }
+                    tracing::info!("loaded Logs persistence state");
+                }
+                Ok(None) => tracing::info!("no Logs persistence state found; starting empty"),
+                Err(error) => fatal_exit(format_args!("failed to load Logs persistence: {error}")),
+            }
+            Some(Arc::new(store))
+        } else {
+            None
+        };
+    let logs_snapshot_lock = Arc::new(tokio::sync::Mutex::new(()));
+    // Enforce retention on idle groups too, not only on Logs mutations. An idle
+    // sweep that changes nothing skips the manifest write.
+    {
+        let state = logs_state.clone();
+        let store = logs_snapshot_store.clone();
+        let lock = logs_snapshot_lock.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                if let Err(error) =
+                    fakecloud_logs::save_logs_state(&state, store.clone(), &lock).await
+                {
+                    tracing::error!(%error, "Logs retention sweep failed");
+                }
+            }
+        });
+    }
+    // Persist hook routing EventBridge -> CloudWatch Logs deliveries through the
+    // Logs snapshot store, so an event delivered to a Logs target (including
+    // from the background rule scheduler) survives a restart, matching every
+    // other target type (which persists via the DeliveryBus).
+    let logs_persist_hook: Option<fakecloud_persistence::SnapshotHook> =
+        logs_snapshot_store.clone().map(|store| {
+            let state = logs_state.clone();
+            let lock = logs_snapshot_lock.clone();
+            Arc::new(move || {
+                let state = state.clone();
+                let store = store.clone();
+                let lock = lock.clone();
+                Box::pin(async move {
+                    if let Err(error) =
+                        fakecloud_logs::save_logs_state(&state, Some(store), &lock).await
+                    {
+                        tracing::error!(%error, "failed to persist delivered Logs events");
+                    }
+                })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+            }) as fakecloud_persistence::SnapshotHook
+        });
     // Step 2: SNS delivery (EventBridge can publish to SNS topics, which then fan out to SQS)
     let sns_delivery = Arc::new(fakecloud_sns::delivery::SnsDeliveryImpl::new(
         sns_state.clone(),
@@ -1137,6 +1229,8 @@ async fn main() {
         kinesis_state.clone(),
         kinesis_delivery_dirty.clone(),
     );
+    let eb_delivery_for_sfn_deferred =
+        fakecloud_eventbridge::delivery::DeferredEventBridgeDelivery::new();
     // Step Functions delivery (EventBridge/Scheduler can start executions)
     let sfn_delivery_for_eb: Arc<dyn fakecloud_core::delivery::StepFunctionsDelivery> = {
         // Build a full delivery bus for the SFN interpreter so task states
@@ -1149,16 +1243,13 @@ async fn main() {
             sns_state.clone(),
             Arc::new(sns_fanout_for_sfn),
         ));
-        let eb_for_sfn_delivery = Arc::new(
-            fakecloud_eventbridge::delivery::EventBridgeDeliveryImpl::new(
-                eb_state.clone(),
-                Arc::new(DeliveryBus::new().with_sqs(sqs_delivery.clone())),
-            ),
-        );
+        // The interpreter's `events:putEvents` task sends through the shared
+        // EventBridge delivery, which is built from `delivery_for_eb` (holding
+        // this very SFN delivery) -- so it is bound once that exists below.
         let mut sfn_interpreter_bus = DeliveryBus::new()
             .with_sqs(sqs_delivery.clone())
             .with_sns(sns_for_sfn_delivery)
-            .with_eventbridge(eb_for_sfn_delivery);
+            .with_eventbridge(Arc::new(eb_delivery_for_sfn_deferred.clone()));
         if let Some(ref ld) = lambda_delivery {
             sfn_interpreter_bus = sfn_interpreter_bus.with_lambda(ld.clone());
         }
@@ -1178,24 +1269,37 @@ async fn main() {
             .with_kinesis(kinesis_delivery_for_eb.clone())
             .with_stepfunctions(sfn_delivery_for_eb),
     );
+    // Everything a rule target needs beyond the bus (Lambda state + container
+    // runtime, Logs state + persist hook). PutEvents, the rule scheduler and
+    // the single shared cross-service EventBridge delivery all take this one
+    // value, so an event S3/SES/ECS/RDS/Step Functions/Scheduler/Pipes/Lambda
+    // destinations publish reaches exactly the targets PutEvents would.
+    let eb_target_wiring = fakecloud_eventbridge::delivery::EventTargetWiring {
+        lambda_state: Some(lambda_state.clone()),
+        logs_state: Some(logs_state.clone()),
+        logs_persist: logs_persist_hook.clone(),
+        container_runtime: container_runtime.clone(),
+    };
+    // The one EventBridge sender every other service publishes through. Same
+    // bus + wiring as `EventBridgeService` (PutEvents), so SQS/SNS/Lambda/Logs/
+    // Kinesis/Step Functions/API destination/HTTP targets all deliver.
+    let eb_delivery: Arc<fakecloud_eventbridge::delivery::EventBridgeDeliveryImpl> = Arc::new(
+        fakecloud_eventbridge::delivery::EventBridgeDeliveryImpl::new(
+            eb_state.clone(),
+            delivery_for_eb.clone(),
+        )
+        .with_target_wiring(eb_target_wiring.clone()),
+    );
+    eb_delivery_for_sfn_deferred.set(eb_delivery.clone());
     // Step 3: S3 delivery (S3 notifications can push to SQS, SNS, Lambda, and EventBridge)
     let sns_delivery_for_ses = sns_delivery.clone();
     let sns_delivery_for_cf = sns_delivery.clone();
     let sns_delivery_for_scheduler = sns_delivery.clone();
-    let sns_delivery_for_scheduler_eb = sns_delivery.clone();
-    let sns_delivery_for_scheduler_sfn_eb = sns_delivery.clone();
-    let sns_delivery_for_rds = sns_delivery.clone();
-    let eb_delivery_for_s3 = Arc::new(
-        fakecloud_eventbridge::delivery::EventBridgeDeliveryImpl::new(
-            eb_state.clone(),
-            Arc::new(DeliveryBus::new().with_sqs(sqs_delivery.clone())),
-        ),
-    );
     let delivery_for_s3 = {
         let mut bus = DeliveryBus::new()
             .with_sqs(sqs_delivery.clone())
             .with_sns(sns_delivery.clone())
-            .with_eventbridge(eb_delivery_for_s3);
+            .with_eventbridge(eb_delivery.clone());
         if let Some(ref ld) = lambda_delivery {
             bus = bus.with_lambda(ld.clone());
         }
@@ -1208,7 +1312,6 @@ async fn main() {
     );
     // Step 4: Logs delivery (subscription filters can push to SQS, Lambda, and Kinesis;
     // metric filters publish CloudWatch metric data points)
-    let sqs_delivery_for_ses = sqs_delivery.clone();
     let kinesis_delivery = fakecloud_kinesis::delivery::KinesisDeliveryImpl::with_dirty_flag(
         kinesis_state.clone(),
         kinesis_delivery_dirty.clone(),
@@ -1254,18 +1357,12 @@ async fn main() {
     // task state transitions emit `aws.ecs` events and `awslogs`-driver
     // output forwards to CloudWatch Logs. Built here so `sqs_delivery`
     // (the EventBridge SQS target) is available for rule fan-out.
-    let eb_delivery_for_ecs = Arc::new(
-        fakecloud_eventbridge::delivery::EventBridgeDeliveryImpl::new(
-            eb_state.clone(),
-            Arc::new(DeliveryBus::new().with_sqs(sqs_delivery.clone())),
-        ),
-    );
     let elbv2_state: fakecloud_elbv2::SharedElbv2State = Arc::new(parking_lot::RwLock::new(
         fakecloud_elbv2::Elbv2Accounts::new(),
     ));
     let ecs_delivery_bus = Arc::new(
         DeliveryBus::new()
-            .with_eventbridge(eb_delivery_for_ecs)
+            .with_eventbridge(eb_delivery.clone())
             .with_elbv2_target_registration(Arc::new(Elbv2TargetRegistrationImpl {
                 state: elbv2_state.clone(),
             })),
@@ -1372,9 +1469,7 @@ async fn main() {
     let sqs_sim_force_dlq_state = sqs_state.clone();
     let eb_sim_state = eb_state.clone();
     let eb_sim_delivery = delivery_for_eb.clone();
-    let eb_sim_lambda_state = Some(lambda_state.clone());
-    let eb_sim_logs_state = Some(logs_state.clone());
-    let eb_sim_container_runtime = container_runtime.clone();
+    let eb_sim_wiring = eb_target_wiring.clone();
     let s3_sim_lifecycle_state = s3_state.clone();
     let lambda_sim_warm_state = lambda_state.clone();
     let lambda_sim_warm_runtime = container_runtime.clone();
@@ -1811,107 +1906,8 @@ async fn main() {
         } else {
             None
         };
-    // CloudWatch Logs persistence store + a shared save-lock, created ahead of
-    // the EventBridge service/scheduler so their Logs-target delivery can write
-    // through to the same snapshot LogsService persists to. Loading here (before
-    // the scheduler is spawned) also means the background rule scheduler fires
-    // against the restored Logs state rather than an empty one. The lock is
-    // shared with LogsService (below) so the two Logs writers can't
-    // interleave event appends and manifest commits.
-    let logs_snapshot_store: Option<Arc<fakecloud_logs::persistence::SegmentedLogsStore>> =
-        if persistence_config.mode == fakecloud_persistence::StorageMode::Persistent {
-            let directory = persistence_config
-                .data_path
-                .as_ref()
-                .expect("validated above")
-                .join("logs");
-            let store = fakecloud_logs::persistence::SegmentedLogsStore::new(directory);
-            match store.load() {
-                Ok(Some(snapshot)) => {
-                    if snapshot.schema_version > fakecloud_logs::LOGS_SNAPSHOT_SCHEMA_VERSION {
-                        fatal_exit(format_args!(
-                            "logs persistence schema too new: on-disk={}, max supported={}",
-                            snapshot.schema_version,
-                            fakecloud_logs::LOGS_SNAPSHOT_SCHEMA_VERSION,
-                        ));
-                    }
-                    if let Some(accounts) = snapshot.accounts {
-                        *logs_state.write() = accounts;
-                    } else if let Some(single) = snapshot.state {
-                        let account_id = single.account_id.clone();
-                        *logs_state.write().get_or_create(&account_id) = single;
-                    } else {
-                        tracing::warn!(
-                            "logs persistence snapshot has neither accounts nor state; starting empty"
-                        );
-                    }
-                    // Finish legacy migration and persist offline expiration before
-                    // accepting policy changes or starting background deliveries.
-                    if let Err(error) = store.save(&mut logs_state.write()) {
-                        fatal_exit(format_args!(
-                            "failed to initialize Logs persistence: {error}"
-                        ));
-                    }
-                    tracing::info!("loaded Logs persistence state");
-                }
-                Ok(None) => tracing::info!("no Logs persistence state found; starting empty"),
-                Err(error) => fatal_exit(format_args!("failed to load Logs persistence: {error}")),
-            }
-            Some(Arc::new(store))
-        } else {
-            None
-        };
-    let logs_snapshot_lock = Arc::new(tokio::sync::Mutex::new(()));
-    // Enforce retention on idle groups too, not only on Logs mutations. An idle
-    // sweep that changes nothing skips the manifest write.
-    {
-        let state = logs_state.clone();
-        let store = logs_snapshot_store.clone();
-        let lock = logs_snapshot_lock.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-            loop {
-                interval.tick().await;
-                if let Err(error) =
-                    fakecloud_logs::save_logs_state(&state, store.clone(), &lock).await
-                {
-                    tracing::error!(%error, "Logs retention sweep failed");
-                }
-            }
-        });
-    }
-    // Persist hook routing EventBridge -> CloudWatch Logs deliveries through the
-    // Logs snapshot store, so an event delivered to a Logs target (including
-    // from the background rule scheduler) survives a restart, matching every
-    // other target type (which persists via the DeliveryBus).
-    let logs_persist_hook: Option<fakecloud_persistence::SnapshotHook> =
-        logs_snapshot_store.clone().map(|store| {
-            let state = logs_state.clone();
-            let lock = logs_snapshot_lock.clone();
-            Arc::new(move || {
-                let state = state.clone();
-                let store = store.clone();
-                let lock = lock.clone();
-                Box::pin(async move {
-                    if let Err(error) =
-                        fakecloud_logs::save_logs_state(&state, Some(store), &lock).await
-                    {
-                        tracing::error!(%error, "failed to persist delivered Logs events");
-                    }
-                })
-                    as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
-            }) as fakecloud_persistence::SnapshotHook
-        });
-    let eb_sim_logs_persist = logs_persist_hook.clone();
     let mut eb_service = EventBridgeService::new(eb_state.clone(), delivery_for_eb.clone())
-        .with_lambda(lambda_state.clone())
-        .with_logs(logs_state.clone());
-    if let Some(ref hook) = logs_persist_hook {
-        eb_service = eb_service.with_logs_persist(hook.clone());
-    }
-    if let Some(ref rt) = container_runtime {
-        eb_service = eb_service.with_runtime(rt.clone());
-    }
+        .with_target_wiring(eb_target_wiring.clone());
     if let Some(store) = eb_snapshot_store.clone() {
         eb_service = eb_service.with_snapshot_store(store);
     }
@@ -1920,21 +1916,9 @@ async fn main() {
     }
     registry.register(Arc::new(eb_service));
     // Spawn the EventBridge scheduler as a background task
-    let eb_state_for_ses = eb_state.clone();
-    let eb_state_for_sfn = eb_state.clone();
-    let eb_state_for_scheduler = eb_state.clone();
-    let eb_state_for_rds = eb_state.clone();
-    let eb_state_for_lambda = eb_state.clone();
     let mut scheduler =
         fakecloud_eventbridge::scheduler::Scheduler::new(eb_state.clone(), delivery_for_eb)
-            .with_lambda(lambda_state.clone())
-            .with_logs(logs_state.clone());
-    if let Some(ref hook) = logs_persist_hook {
-        scheduler = scheduler.with_logs_persist(hook.clone());
-    }
-    if let Some(ref rt) = container_runtime {
-        scheduler = scheduler.with_runtime(rt.clone());
-    }
+            .with_target_wiring(eb_target_wiring.clone());
     // Persist last_fired advances so a rate(...) rule doesn't double-fire after
     // a restart (on-disk last_fired would otherwise stay at its creation value).
     if let Some(store) = eb_snapshot_store {
@@ -2121,18 +2105,8 @@ async fn main() {
     if let Some(ref ld) = lambda_delivery {
         lambda_destinations_inner = lambda_destinations_inner.with_lambda(ld.clone());
     }
-    let lambda_destinations_bus = Arc::new(
-        lambda_destinations_inner.with_eventbridge(Arc::new(
-            fakecloud_eventbridge::delivery::EventBridgeDeliveryImpl::new(
-                eb_state_for_lambda,
-                Arc::new(
-                    DeliveryBus::new()
-                        .with_sqs(sqs_delivery.clone())
-                        .with_sns(sns_delivery.clone()),
-                ),
-            ),
-        )),
-    );
+    let lambda_destinations_bus =
+        Arc::new(lambda_destinations_inner.with_eventbridge(eb_delivery.clone()));
     lambda_service = lambda_service.with_delivery_bus(lambda_destinations_bus);
     let lambda_snapshot_store: Option<Arc<dyn fakecloud_persistence::SnapshotStore>> =
         if persistence_config.mode == fakecloud_persistence::StorageMode::Persistent {
@@ -2811,16 +2785,10 @@ async fn main() {
         dynamodb_state.clone(),
     )));
     // SES delivery bus (event fanout to SNS topics and EventBridge buses)
-    let eb_delivery_for_ses = Arc::new(
-        fakecloud_eventbridge::delivery::EventBridgeDeliveryImpl::new(
-            eb_state_for_ses,
-            Arc::new(DeliveryBus::new().with_sqs(sqs_delivery_for_ses)),
-        ),
-    );
     let delivery_for_ses = Arc::new(
         DeliveryBus::new()
             .with_sns(sns_delivery_for_ses)
-            .with_eventbridge(eb_delivery_for_ses)
+            .with_eventbridge(eb_delivery.clone())
             .with_kinesis(kinesis_delivery_for_eb.clone())
             .with_firehose(firehose_delivery_for_logs.clone())
             .with_cloudwatch_metrics(cloudwatch_delivery_for_logs.clone()),
@@ -3171,20 +3139,10 @@ async fn main() {
     if let Some(store) = rds_snapshot_store {
         rds_service = rds_service.with_snapshot_store(store);
     }
-    // aws.rds events on lifecycle ops: rule targets see SQS/SNS via the
-    // inner bus; more targets mirror what ECS wires.
-    let eb_delivery_for_rds = Arc::new(
-        fakecloud_eventbridge::delivery::EventBridgeDeliveryImpl::new(
-            eb_state_for_rds,
-            Arc::new(
-                DeliveryBus::new()
-                    .with_sqs(sqs_delivery.clone())
-                    .with_sns(sns_delivery_for_rds),
-            ),
-        ),
-    );
+    // aws.rds events on lifecycle ops go through the shared EventBridge
+    // delivery, so rule targets match PutEvents.
     let mut rds_bus = DeliveryBus::new()
-        .with_eventbridge(eb_delivery_for_rds)
+        .with_eventbridge(eb_delivery.clone())
         .with_s3(s3_delivery_for_rds);
     if let Some(ref ld) = lambda_delivery {
         rds_bus = rds_bus.with_lambda(ld.clone());
@@ -4918,26 +4876,6 @@ async fn main() {
     registry.register(Arc::new(redshift_service));
     let mut sfn_service = StepFunctionsService::new(stepfunctions_state.clone());
     let sfn_delivery_bus = {
-        let mut sns_eb_bus = DeliveryBus::new().with_sqs(sqs_delivery.clone());
-        if let Some(ref ld) = lambda_delivery {
-            sns_eb_bus = sns_eb_bus.with_lambda(ld.clone());
-        }
-        let sns_delivery_for_sfn_eb = Arc::new(fakecloud_sns::delivery::SnsDeliveryImpl::new(
-            sns_state_for_sfn.clone(),
-            Arc::new(sns_eb_bus),
-        ));
-        let mut eb_target_bus = DeliveryBus::new()
-            .with_sqs(sqs_delivery.clone())
-            .with_sns(sns_delivery_for_sfn_eb);
-        if let Some(ref ld) = lambda_delivery {
-            eb_target_bus = eb_target_bus.with_lambda(ld.clone());
-        }
-        let eb_delivery_for_sfn = Arc::new(
-            fakecloud_eventbridge::delivery::EventBridgeDeliveryImpl::new(
-                eb_state_for_sfn,
-                Arc::new(eb_target_bus),
-            ),
-        );
         let sns_delivery_for_sfn = Arc::new(fakecloud_sns::delivery::SnsDeliveryImpl::new(
             sns_state_for_sfn,
             delivery_for_sns_sfn,
@@ -4945,7 +4883,7 @@ async fn main() {
         let mut bus = DeliveryBus::new()
             .with_sqs(sqs_delivery.clone())
             .with_sns(sns_delivery_for_sfn)
-            .with_eventbridge(eb_delivery_for_sfn);
+            .with_eventbridge(eb_delivery.clone());
         if let Some(ref ld) = lambda_delivery {
             bus = bus.with_lambda(ld.clone());
         }
@@ -7061,26 +6999,10 @@ async fn main() {
             sns_state.clone(),
             Arc::new(sns_fanout_for_sfn),
         ));
-        // Inner bus for EB rule delivery: matches other call-sites'
-        // surface (SQS + SNS + Lambda) so Scheduler-triggered SFN
-        // executions that hit EB rules fanning to SNS don't get
-        // silently dropped.
-        let mut inner_eb_bus = DeliveryBus::new()
-            .with_sqs(sqs_delivery.clone())
-            .with_sns(sns_delivery_for_scheduler_sfn_eb);
-        if let Some(ref ld) = lambda_delivery {
-            inner_eb_bus = inner_eb_bus.with_lambda(ld.clone());
-        }
-        let eb_for_sfn = Arc::new(
-            fakecloud_eventbridge::delivery::EventBridgeDeliveryImpl::new(
-                eb_state_for_scheduler.clone(),
-                Arc::new(inner_eb_bus),
-            ),
-        );
         let mut sfn_interpreter_bus = DeliveryBus::new()
             .with_sqs(sqs_delivery.clone())
             .with_sns(sns_for_sfn)
-            .with_eventbridge(eb_for_sfn);
+            .with_eventbridge(eb_delivery.clone());
         if let Some(ref ld) = lambda_delivery {
             sfn_interpreter_bus = sfn_interpreter_bus.with_lambda(ld.clone());
         }
@@ -7091,20 +7013,6 @@ async fn main() {
                 Some(dynamodb_state.clone()),
             )
             .with_registry(sfn_registry_handle.clone()),
-        )
-    };
-    let eb_delivery_for_scheduler = {
-        let mut inner = DeliveryBus::new()
-            .with_sqs(sqs_delivery.clone())
-            .with_sns(sns_delivery_for_scheduler_eb);
-        if let Some(ref ld) = lambda_delivery {
-            inner = inner.with_lambda(ld.clone());
-        }
-        Arc::new(
-            fakecloud_eventbridge::delivery::EventBridgeDeliveryImpl::new(
-                eb_state_for_scheduler,
-                Arc::new(inner),
-            ),
         )
     };
     let delivery_for_scheduler = {
@@ -7134,7 +7042,7 @@ async fn main() {
         let mut bus = DeliveryBus::new()
             .with_sqs(sqs_delivery.clone())
             .with_sns(sns_delivery_for_scheduler)
-            .with_eventbridge(eb_delivery_for_scheduler)
+            .with_eventbridge(eb_delivery.clone())
             .with_stepfunctions(sfn_delivery_for_scheduler)
             .with_kinesis(kinesis_delivery_for_scheduler)
             .with_ses_dispatcher(ses_dispatcher_for_scheduler)
@@ -7197,24 +7105,17 @@ async fn main() {
     // matches to Lambda/SQS/SNS/Step Functions/EventBridge-bus/Kinesis targets
     // via the shared delivery paths.
     {
-        // EventBridge-bus + Step Functions target senders need their own
-        // delivery impls (mirroring the scheduler/EB wiring); a minimal inner
-        // bus suffices because a pipe delivers *to* these targets rather than
-        // driving their downstream fan-out.
-        let pipes_eb_delivery = {
-            let mut inner = DeliveryBus::new().with_sqs(sqs_delivery.clone());
-            if let Some(ref ld) = lambda_delivery {
-                inner = inner.with_lambda(ld.clone());
-            }
-            Arc::new(
-                fakecloud_eventbridge::delivery::EventBridgeDeliveryImpl::new(
-                    eb_state.clone(),
-                    Arc::new(inner),
-                ),
-            )
-        };
+        // An EventBridge-bus pipe target publishes through the shared
+        // EventBridge delivery, so the bus's rules fan out to every target
+        // type PutEvents supports.
+        let pipes_eb_delivery = eb_delivery.clone();
         let pipes_sfn_delivery = {
-            let mut sfn_bus = DeliveryBus::new().with_sqs(sqs_delivery.clone());
+            // Same interpreter surface as the other SFN deliveries, so a
+            // pipe-started execution's SNS / `events:putEvents` tasks deliver.
+            let mut sfn_bus = DeliveryBus::new()
+                .with_sqs(sqs_delivery.clone())
+                .with_sns(sns_delivery.clone())
+                .with_eventbridge(eb_delivery.clone());
             if let Some(ref ld) = lambda_delivery {
                 sfn_bus = sfn_bus.with_lambda(ld.clone());
             }
@@ -8677,19 +8578,16 @@ async fn main() {
             axum::routing::post({
                 let es = eb_sim_state;
                 let delivery = eb_sim_delivery;
-                let lambda_state = eb_sim_lambda_state;
-                let logs_state = eb_sim_logs_state;
-                let logs_persist = eb_sim_logs_persist;
-                let container_runtime = eb_sim_container_runtime;
+                let wiring = eb_sim_wiring;
                 move |axum::Json(body): axum::Json<types::FireRuleRequest>| async move {
                     let bus_name = body.bus_name.as_deref().unwrap_or("default");
                     let ctx = fakecloud_eventbridge::simulation::FireRuleContext {
                         state: &es,
                         delivery: &delivery,
-                        lambda_state: &lambda_state,
-                        logs_state: &logs_state,
-                        logs_persist: &logs_persist,
-                        container_runtime: &container_runtime,
+                        lambda_state: &wiring.lambda_state,
+                        logs_state: &wiring.logs_state,
+                        logs_persist: &wiring.logs_persist,
+                        container_runtime: &wiring.container_runtime,
                     };
                     match fakecloud_eventbridge::simulation::fire_rule(
                         &ctx,

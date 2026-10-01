@@ -1017,21 +1017,46 @@ pub(crate) fn invoke_lambda_async(
     function_arn: &str,
     payload: &str,
 ) {
-    let runtime = match container_runtime {
-        Some(rt) => rt.clone(),
-        None => return,
-    };
     let lambda_state = match lambda_state {
         Some(ls) => ls.clone(),
-        None => return,
+        None => {
+            tracing::warn!(
+                function_arn = %function_arn,
+                "EventBridge Lambda target skipped: Lambda state is not wired into this \
+                 EventBridge delivery path, so the function cannot be resolved or invoked"
+            );
+            return;
+        }
+    };
+    let runtime = match container_runtime {
+        Some(rt) => rt.clone(),
+        None => {
+            tracing::warn!(
+                function_arn = %function_arn,
+                "EventBridge Lambda target recorded but not executed: no container runtime \
+                 is available (Docker/Podman/Kubernetes backend)"
+            );
+            return;
+        }
     };
     let func_name = function_name_from_arn(function_arn).to_string();
+    // Resolve the function in the account its ARN names (an event from another
+    // account's bus targets that account's function), falling back to the
+    // default account for a bare name.
+    let func_account = function_arn
+        .split(':')
+        .nth(4)
+        .filter(|a| !a.is_empty())
+        .map(str::to_string);
     let payload = payload.as_bytes().to_vec();
 
     tokio::spawn(async move {
         let resolved = {
             let accounts = lambda_state.read();
-            let state = accounts.default_ref();
+            let state = func_account
+                .as_deref()
+                .and_then(|a| accounts.get(a))
+                .unwrap_or_else(|| accounts.default_ref());
             state.functions.get(&func_name).cloned().map(|func| {
                 let mut layer_zips: Vec<Vec<u8>> = Vec::with_capacity(func.layers.len());
                 for attached in &func.layers {
@@ -1376,6 +1401,12 @@ pub(crate) fn dispatch_event_target(
         }
         if let Some(log_state) = ctx.logs_state {
             deliver_to_logs_and_persist(log_state, ctx.logs_persist, arn, &body_str, now);
+        } else {
+            tracing::warn!(
+                log_group_arn = %arn,
+                "EventBridge CloudWatch Logs target skipped: Logs state is not wired into \
+                 this EventBridge delivery path"
+            );
         }
     } else if arn.contains(":kinesis:") {
         tracing::info!(

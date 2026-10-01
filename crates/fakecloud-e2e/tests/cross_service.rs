@@ -912,6 +912,158 @@ async fn eventbridge_logs_delivery() {
     assert_eq!(parsed["detail-type"], "UserLogin");
 }
 
+/// Turn on EventBridge notifications for `bucket`.
+async fn enable_s3_eventbridge_notifications(s3: &aws_sdk_s3::Client, bucket: &str) {
+    s3.put_bucket_notification_configuration()
+        .bucket(bucket)
+        .notification_configuration(
+            aws_sdk_s3::types::NotificationConfiguration::builder()
+                .event_bridge_configuration(
+                    aws_sdk_s3::types::EventBridgeConfiguration::builder().build(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+}
+
+/// S3 -> EventBridge -> Lambda (#2628): an `Object Created` event S3 publishes
+/// to the default bus reaches a rule's Lambda target exactly like PutEvents,
+/// so the invocation is recorded (and executed when a container runtime is
+/// available) instead of being logged and dropped.
+#[tokio::test]
+async fn s3_eventbridge_notification_invokes_lambda_target() {
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+    let eb = server.eventbridge_client().await;
+    let lambda = server.lambda_client().await;
+
+    lambda
+        .create_function()
+        .function_name("s3-eb-fn")
+        .runtime(aws_sdk_lambda::types::Runtime::Nodejs18x)
+        .role("arn:aws:iam::123456789012:role/lambda-role")
+        .handler("index.handler")
+        .code(
+            aws_sdk_lambda::types::FunctionCode::builder()
+                .zip_file(aws_sdk_lambda::primitives::Blob::new(b"fake-code"))
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    eb.put_rule()
+        .name("s3-to-fn")
+        .event_pattern(r#"{"source":["aws.s3"],"detail-type":["Object Created"]}"#)
+        .send()
+        .await
+        .unwrap();
+    let fn_arn = "arn:aws:lambda:us-east-1:123456789012:function:s3-eb-fn";
+    eb.put_targets()
+        .rule("s3-to-fn")
+        .targets(Target::builder().id("fn").arn(fn_arn).build().unwrap())
+        .send()
+        .await
+        .unwrap();
+
+    s3.create_bucket().bucket("eb-bucket").send().await.unwrap();
+    enable_s3_eventbridge_notifications(&s3, "eb-bucket").await;
+    s3.put_object()
+        .bucket("eb-bucket")
+        .key("anything")
+        .body(ByteStream::from_static(b"payload"))
+        .send()
+        .await
+        .unwrap();
+
+    let invocations = get_lambda_invocations(server.endpoint()).await;
+    let matched: Vec<_> = invocations["invocations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["source"] == "aws:events" && i["functionArn"] == fn_arn)
+        .collect();
+    assert_eq!(
+        matched.len(),
+        1,
+        "expected one S3->EventBridge->Lambda invocation, got {invocations}"
+    );
+    let payload: serde_json::Value =
+        serde_json::from_str(matched[0]["payload"].as_str().unwrap()).unwrap();
+    assert_eq!(payload["source"], "aws.s3");
+    assert_eq!(payload["detail-type"], "Object Created");
+    assert_eq!(payload["detail"]["bucket"]["name"], "eb-bucket");
+    assert_eq!(payload["detail"]["object"]["key"], "anything");
+}
+
+/// S3 -> EventBridge -> CloudWatch Logs: the cross-service delivery writes a
+/// Logs target's log group, matching PutEvents.
+#[tokio::test]
+async fn s3_eventbridge_notification_delivers_to_logs_target() {
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+    let eb = server.eventbridge_client().await;
+    let logs = server.logs_client().await;
+
+    logs.create_log_group()
+        .log_group_name("/aws/events/s3")
+        .send()
+        .await
+        .unwrap();
+    eb.put_rule()
+        .name("s3-to-logs")
+        .event_pattern(r#"{"source":["aws.s3"]}"#)
+        .send()
+        .await
+        .unwrap();
+    eb.put_targets()
+        .rule("s3-to-logs")
+        .targets(
+            Target::builder()
+                .id("logs")
+                .arn("arn:aws:logs:us-east-1:123456789012:log-group:/aws/events/s3")
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    s3.create_bucket()
+        .bucket("eb-logs-bucket")
+        .send()
+        .await
+        .unwrap();
+    enable_s3_eventbridge_notifications(&s3, "eb-logs-bucket").await;
+    s3.put_object()
+        .bucket("eb-logs-bucket")
+        .key("k.txt")
+        .body(ByteStream::from_static(b"payload"))
+        .send()
+        .await
+        .unwrap();
+
+    let events = logs
+        .get_log_events()
+        .log_group_name("/aws/events/s3")
+        .log_stream_name("events")
+        .send()
+        .await
+        .unwrap();
+    let log_events = events.events();
+    assert_eq!(
+        log_events.len(),
+        1,
+        "expected one S3 event in the log group"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(log_events[0].message().unwrap()).unwrap();
+    assert_eq!(parsed["source"], "aws.s3");
+    assert_eq!(parsed["detail"]["bucket"]["name"], "eb-logs-bucket");
+    assert_eq!(parsed["detail"]["object"]["key"], "k.txt");
+}
+
 /// S3 -> KMS: PutObject with aws:kms encryption stores KMS key ID,
 /// bucket default encryption applies KMS to all objects.
 #[tokio::test]

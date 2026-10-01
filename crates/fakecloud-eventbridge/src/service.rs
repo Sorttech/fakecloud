@@ -50,6 +50,16 @@ impl EventBridgeService {
         }
     }
 
+    /// Wire every non-bus target dependency at once (see
+    /// [`crate::delivery::EventTargetWiring`]).
+    pub fn with_target_wiring(mut self, wiring: crate::delivery::EventTargetWiring) -> Self {
+        self.lambda_state = wiring.lambda_state;
+        self.logs_state = wiring.logs_state;
+        self.logs_persist = wiring.logs_persist;
+        self.container_runtime = wiring.container_runtime;
+        self
+    }
+
     pub fn with_lambda(mut self, lambda_state: SharedLambdaState) -> Self {
         self.lambda_state = Some(lambda_state);
         self
