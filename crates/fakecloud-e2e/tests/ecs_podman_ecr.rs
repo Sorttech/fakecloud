@@ -259,7 +259,8 @@ async fn ecs_task_role_credentials_at_link_local_address_with_podman() {
                 .command(
                     "echo RELATIVE_URI=[$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI]; \
                      wget -qO- \"http://169.254.170.2$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI\" \
-                     | grep -o '\"RoleArn\":\"[^\"]*\"'",
+                     | grep -o '\"RoleArn\":\"[^\"]*\"'; \
+                     wget -qO- \"$ECS_CONTAINER_METADATA_URI_V4\" >/dev/null && echo META=ok",
                 )
                 .build(),
         )
@@ -314,6 +315,8 @@ async fn ecs_task_role_credentials_at_link_local_address_with_podman() {
         text.contains(&format!("\"RoleArn\":\"{role_arn}\"")),
         "task logs: {logs}"
     );
+    // The host alias still resolves inside the holder's namespace.
+    assert!(text.contains("META=ok"), "task logs: {logs}");
 
     let holders = podman(&[
         "ps",

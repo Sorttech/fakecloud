@@ -484,10 +484,23 @@ impl EcsRuntime {
                  AWS_CONTAINER_CREDENTIALS_FULL_URI instead"
             );
             if task_desired_stopped(state, account_id, task_id) {
-                // Stopped while the credentials initContainer ran: there is
-                // nothing to relaunch. The wait loop below observes the Pod
-                // as gone and finalizes the stop.
-                create = Ok(());
+                // Stopped while the credentials initContainer ran: nothing
+                // to relaunch, and no task container ever started, so the
+                // task goes straight to STOPPED (never RUNNING), like a
+                // Docker task stopped during launch.
+                mark_pull_stopped(state, account_id, task_id);
+                let never_started = build_running_list(&container_map);
+                return self
+                    .k8s_finalize(
+                        state,
+                        account_id,
+                        task_id,
+                        &pod_name,
+                        &container_map,
+                        never_started,
+                        true,
+                    )
+                    .await;
             } else {
                 pod_name = names::pod_name(POD_PREFIX, task_id, &format!("{task_id}-full-uri"));
                 let (pod, map) = build(&pod_name, None);

@@ -212,9 +212,32 @@ async fn creds_init_container_routes_the_agent_address_to_its_target() {
     let services: Api<Service> = Api::namespaced(c.client().clone(), TEST_NS);
     let server = "fakecloud-ecs-it-creds-srv";
     let task = "fakecloud-ecs-it-creds-task";
-    c.delete_pod(server).await;
-    c.delete_pod(task).await;
+    // Pods and a Service left by an interrupted run must be gone before we
+    // recreate them, or the create is a 409 while they terminate.
+    for pod in [server, task] {
+        c.delete_pod(pod).await;
+        let mut gone = false;
+        for _ in 0..120 {
+            if c.pods().get_opt(pod).await.unwrap().is_none() {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        assert!(gone, "stale pod {pod} was not deleted");
+    }
+    // A Service left by an interrupted run must be gone before we recreate
+    // it, or the create is a 409 while it terminates.
     let _ = services.delete(server, &DeleteParams::default()).await;
+    let mut gone = false;
+    for _ in 0..60 {
+        if services.get_opt(server).await.unwrap().is_none() {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(gone, "stale service {server} was not deleted");
 
     // Stand-in for fakecloud: serves the agent path on 8080.
     let mut srv = task_pod(server);
@@ -223,7 +246,7 @@ async fn creds_init_container_routes_the_agent_address_to_its_target() {
     spec.containers = vec![busybox(
         "srv",
         "mkdir -p /www/v2/credentials && echo CREDS_OK > /www/v2/credentials/t1 \
-         && exec httpd -f -p 8080 -h /www",
+         && trap 'exit 0' TERM; httpd -f -p 8080 -h /www & wait",
     )];
     srv.metadata
         .labels
@@ -263,7 +286,8 @@ async fn creds_init_container_routes_the_agent_address_to_its_target() {
     )]);
     spec.containers = vec![busybox(
         "app",
-        "nc -l -p 80 -e true & sleep 1; \
+        "nc -l -p 80 -e true & nc_pid=$!; sleep 1; \
+         kill -0 \"$nc_pid\" || { echo PORT80_BIND_FAILED; exit 1; }; \
          for i in $(seq 60); do \
            wget -qO- http://169.254.170.2/v2/credentials/t1 && exit 0; sleep 1; \
          done; exit 1",
@@ -302,4 +326,123 @@ async fn creds_init_container_routes_the_agent_address_to_its_target() {
     c.delete_pod(task).await;
     c.delete_pod(server).await;
     let _ = services.delete(server, &DeleteParams::default()).await;
+}
+
+/// A task stopped while its credentials initContainer is failing is not
+/// relaunched (there is nothing to run) and goes straight to STOPPED with
+/// the user's stop reason, never RUNNING.
+#[tokio::test]
+async fn task_stopped_during_failed_creds_init_never_runs() {
+    use fakecloud_core::multi_account::MultiAccountState;
+    use fakecloud_ecs::{EcsState, SharedEcsState, Task, TaskDefinition};
+
+    require_test_env();
+    ensure_namespace().await;
+    std::env::set_var(
+        "FAKECLOUD_K8S_SELF_URL",
+        "http://fakecloud.fakecloud-ecs-test.svc.cluster.local:4566",
+    );
+    std::env::set_var("FAKECLOUD_K8S_NAMESPACE", TEST_NS);
+    // A helper image that can never be pulled: the initContainer fails, which
+    // would normally relaunch the task without it.
+    std::env::set_var(
+        "FAKECLOUD_ECS_CREDS_HELPER_IMAGE",
+        "registry.invalid/fakecloud/no-such-helper:1",
+    );
+    let rt = EcsRuntime::new_k8s(4566).await.expect("new_k8s");
+
+    let account = "123456789012";
+    let task_id = "0123456789abcdef0123456789abcd01";
+    let state: SharedEcsState =
+        std::sync::Arc::new(parking_lot::RwLock::new(
+            MultiAccountState::<EcsState>::new(account, "us-east-1", "http://localhost:4566"),
+        ));
+    let td: TaskDefinition = serde_json::from_value(serde_json::json!({
+        "family": "it-creds",
+        "revision": 1,
+        "task_definition_arn": format!("arn:aws:ecs:us-east-1:{account}:task-definition/it-creds:1"),
+        "container_definitions": [{
+            "name": "app",
+            "image": "busybox:1.36",
+            "essential": true,
+            "command": ["sh", "-c", "sleep 300"],
+        }],
+        "status": "ACTIVE",
+        "task_role_arn": format!("arn:aws:iam::{account}:role/app"),
+        "network_mode": "awsvpc",
+        "registered_at": chrono::Utc::now(),
+    }))
+    .expect("task definition");
+    let task: Task = serde_json::from_value(serde_json::json!({
+        "task_arn": format!("arn:aws:ecs:us-east-1:{account}:task/c/{task_id}"),
+        "task_id": task_id,
+        "cluster_arn": format!("arn:aws:ecs:us-east-1:{account}:cluster/c"),
+        "cluster_name": "c",
+        "task_definition_arn": format!("arn:aws:ecs:us-east-1:{account}:task-definition/it-creds:1"),
+        "family": "it-creds",
+        "revision": 1,
+        "last_status": "PENDING",
+        // StopTask already landed.
+        "desired_status": "STOPPED",
+        "stop_code": "UserInitiated",
+        "stopped_reason": "stopped by test",
+        "launch_type": "FARGATE",
+        "containers": [{
+            "container_arn": format!("arn:aws:ecs:us-east-1:{account}:container/c/{task_id}/app"),
+            "name": "app",
+            "image": "busybox:1.36",
+            "task_arn": format!("arn:aws:ecs:us-east-1:{account}:task/c/{task_id}"),
+            "last_status": "PENDING",
+            "essential": true,
+        }],
+        "overrides": {},
+        "connectivity": "CONNECTING",
+        "created_at": chrono::Utc::now(),
+        "task_role_arn": format!("arn:aws:iam::{account}:role/app"),
+        "tags": [],
+    }))
+    .expect("task");
+    {
+        let mut accounts = state.write();
+        let s = accounts.get_or_create(account);
+        s.task_definitions
+            .entry("it-creds".into())
+            .or_default()
+            .insert(1, td);
+        s.tasks.insert(task_id.into(), task);
+    }
+
+    rt.run_task_inner(&state, task_id, account)
+        .await
+        .expect("run_task_inner");
+    std::env::remove_var("FAKECLOUD_ECS_CREDS_HELPER_IMAGE");
+
+    {
+        let accounts = state.read();
+        let task = accounts.get(account).unwrap().tasks.get(task_id).unwrap();
+        assert_eq!(task.last_status, "STOPPED");
+        assert!(task.started_at.is_none(), "task was marked RUNNING");
+        assert_eq!(task.stop_code.as_deref(), Some("UserInitiated"));
+        assert_eq!(task.stopped_reason.as_deref(), Some("stopped by test"));
+    }
+    // No relaunched (full-URI) Pod: the only Pod the task had is on its way
+    // out.
+    let pods = client().await.pods();
+    let lp = kube::api::ListParams::default().labels(&format!("fakecloud-ecs-task={task_id}"));
+    for pod in pods.list(&lp).await.unwrap().items {
+        assert!(
+            pod.metadata.deletion_timestamp.is_some(),
+            "live pod left behind: {:?}",
+            pod.metadata.name
+        );
+        assert!(
+            !pod.metadata
+                .name
+                .as_deref()
+                .unwrap_or_default()
+                .contains("full-uri"),
+            "task was relaunched: {:?}",
+            pod.metadata.name
+        );
+    }
 }

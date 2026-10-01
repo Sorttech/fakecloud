@@ -1,8 +1,9 @@
 //! ECS task-role credentials + secrets injection.
 //!
-//! - Tasks with a `taskRoleArn` get `AWS_CONTAINER_CREDENTIALS_FULL_URI`
-//!   injected, pointing at the task-credentials endpoint on the main
-//!   fakecloud server.
+//! - Tasks with a `taskRoleArn` get the ECS agent's
+//!   `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` path injected, served at
+//!   `http://169.254.170.2` inside the task by the task-credentials
+//!   endpoint on the main fakecloud server.
 //! - Tasks with `containerDefinitions[].secrets[]` entries get the
 //!   referenced SecretsManager secrets / SSM parameters resolved
 //!   synchronously and injected as env vars.

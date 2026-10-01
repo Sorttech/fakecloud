@@ -12204,17 +12204,19 @@ async fn main() {
         })
         .layer(Extension(dispatch_config))
         .layer(TraceLayer::new_for_http())
-        // Outermost: CloudFront viewer routing. Requests whose `Host` matches an
-        // enabled distribution are served by the data plane; everything else
-        // (the AWS API, `/_fakecloud/*`, health) falls straight through.
+        // CloudFront viewer routing (inside the ECS link-local layer below,
+        // which is outermost). Requests whose `Host` matches an enabled
+        // distribution are served by the data plane; everything else (the AWS
+        // API, `/_fakecloud/*`, health) falls straight through.
         .layer(axum::middleware::from_fn_with_state(
             cloudfront_dataplane,
             cloudfront_viewer_middleware,
         ))
-        // ECS task containers reach the agent's link-local credentials
-        // address (`169.254.170.2:80`), which their network namespace NATs to
-        // this listener; those requests (`Host: 169.254.170.2`) get the
-        // agent's `/v2/credentials/<task-id>` surface, nothing else.
+        // Outermost: ECS task containers reach the agent's link-local
+        // credentials address (`169.254.170.2:80`), which their network
+        // namespace NATs to this listener; those requests
+        // (`Host: 169.254.170.2`) get the agent's `/v2/credentials/<task-id>`
+        // surface, nothing else, and never reach CloudFront or the AWS API.
         .layer(axum::middleware::from_fn_with_state(
             ecs_task_credentials.clone(),
             ecs_creds::link_local_host_middleware,

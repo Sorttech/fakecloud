@@ -1738,8 +1738,10 @@ impl EcsClient<'_> {
     }
 
     /// Fetch the task-role credentials fakecloud hands a running task's
-    /// containers at `http://169.254.170.2` +
-    /// `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` (a session for
+    /// containers at `http://169.254.170.2` plus the path in
+    /// `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`, or at
+    /// `AWS_CONTAINER_CREDENTIALS_FULL_URI` when the task's network could not
+    /// be routed (a session for
     /// the task role named after the task ID). Errors once the task has
     /// stopped, or for a task without a task role. Fields
     /// use AWS's native PascalCase (`AccessKeyId`, `SecretAccessKey`,

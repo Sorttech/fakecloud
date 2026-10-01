@@ -141,7 +141,10 @@ impl EcsRuntime {
         // Task-role containers reach credentials at the agent's link-local
         // address through a namespace holder built from this image. Without
         // it they fall back to the full URI (see `task_creds`).
-        let creds_helper_image = if resolved_plans.iter().any(|rp| rp.plan.has_task_role) {
+        let creds_helper_image = if resolved_plans
+            .iter()
+            .any(|rp| super::task_creds::wants_netns_holder(&rp.plan))
+        {
             match self.ensure_creds_helper_image().await {
                 Ok(image) => Some(image),
                 Err(err) => {
@@ -319,7 +322,8 @@ impl EcsRuntime {
             let mut env = rp.env.clone();
             let mut holder: Option<String> = None;
             if rp.plan.has_task_role {
-                if let Some(image) = creds_helper_image.as_deref() {
+                let wants_holder = super::task_creds::wants_netns_holder(&rp.plan);
+                if let Some(image) = creds_helper_image.as_deref().filter(|_| wants_holder) {
                     match self
                         .start_netns_holder(&rp.plan, task_id, network_created, image)
                         .await
@@ -334,9 +338,11 @@ impl EcsRuntime {
                         ),
                     }
                 }
+                // A `none`-mode container gets the agent's relative URI with
+                // nothing behind it, as on ECS (it has no network).
                 env.push(super::task_creds::credentials_env(
                     task_id,
-                    holder.is_some(),
+                    holder.is_some() || !wants_holder,
                     &format!("http://{}:{}", self.net.host_alias, self.server_port),
                 ));
             }

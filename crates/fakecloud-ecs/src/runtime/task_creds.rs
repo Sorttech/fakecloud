@@ -163,6 +163,20 @@ pub(crate) fn is_net_sysctl(name: &str) -> bool {
     name.starts_with("net.")
 }
 
+/// Whether the task uses the `none` network mode: no network at all, only a
+/// loopback interface.
+pub(crate) fn is_none_network(plan: &ContainerPlan) -> bool {
+    plan.network_mode.as_deref() == Some("none")
+}
+
+/// Whether a container gets a namespace holder routing `169.254.170.2`.
+/// Only task-role containers need one, and a `none`-mode container has no
+/// network to route over: as on ECS, it gets the relative URI with nothing
+/// answering it.
+pub(crate) fn wants_netns_holder(plan: &ContainerPlan) -> bool {
+    plan.has_task_role && !is_none_network(plan)
+}
+
 /// The network flags of the container that owns a task container's network
 /// namespace: the container itself, or its holder. `alias` is the task
 /// container's own name, kept resolvable on the per-task network when a holder
@@ -175,6 +189,12 @@ pub(crate) fn namespace_network_argv(
     alias: Option<&str>,
 ) -> Vec<String> {
     let mut argv = Vec::new();
+    // `none`: loopback only. No host alias, no published ports.
+    if is_none_network(plan) {
+        argv.push("--network".into());
+        argv.push("none".into());
+        return argv;
+    }
     // Inject `--add-host host.docker.internal:<ip>` only for docker;
     // podman provides `host.containers.internal` natively and rejects
     // the host-gateway mapping (issue #1539).
@@ -193,7 +213,10 @@ pub(crate) fn namespace_network_argv(
     }
     // `awsvpc` puts the container on a per-task ENI; emulating that on a
     // local docker host means *not* publishing to the host port table.
-    // Bridge / host / default network modes still get `--publish`. If
+    // Bridge / host / default network modes still get `--publish`: `host`
+    // is emulated on a bridge whose published ports are the host ports the
+    // task binds (never the host's own namespace, which a task-role holder
+    // would otherwise have to NAT in). If
     // the awsvpc per-task network creation failed and we fell back to
     // bridge, we DO want to publish so the container is reachable.
     if !use_awsvpc_network {
@@ -612,6 +635,32 @@ mod tests {
             *rt.creds_helper_image.lock().await,
             Some(HelperImage::Failed { .. })
         ));
+    }
+
+    #[test]
+    fn none_network_mode_has_no_network_and_no_holder() {
+        let p = plan(Some("none"));
+        // Loopback only: no host alias, no published ports, whatever the
+        // runtime and the task definition say.
+        assert_eq!(
+            namespace_network_argv(
+                &p,
+                "t1",
+                Some("host.docker.internal:host-gateway"),
+                true,
+                None
+            ),
+            ["--network", "none"]
+        );
+        assert!(!wants_netns_holder(&p));
+        // Every other mode with a task role gets a holder; without a role
+        // none does.
+        for mode in [None, Some("bridge"), Some("host"), Some("awsvpc")] {
+            assert!(wants_netns_holder(&plan(mode)), "{mode:?}");
+            let mut roleless = plan(mode);
+            roleless.has_task_role = false;
+            assert!(!wants_netns_holder(&roleless), "{mode:?}");
+        }
     }
 
     #[test]

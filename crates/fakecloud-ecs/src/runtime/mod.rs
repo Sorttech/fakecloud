@@ -1524,10 +1524,10 @@ pub(crate) fn build_run_argv(
 }
 
 /// Render `networkBindings` JSON for a launched container. Empty under
-/// `awsvpc` (the equivalent info goes on the task's ENI attachments) and
-/// for containers without `portMappings`.
+/// `awsvpc` (the equivalent info goes on the task's ENI attachments), under
+/// `none` (nothing is published), and for containers without `portMappings`.
 pub(crate) fn network_bindings_for(plan: &ContainerPlan) -> Vec<serde_json::Value> {
-    if plan.network_mode.as_deref() == Some("awsvpc") {
+    if matches!(plan.network_mode.as_deref(), Some("awsvpc") | Some("none")) {
         return Vec::new();
     }
     plan.port_mappings

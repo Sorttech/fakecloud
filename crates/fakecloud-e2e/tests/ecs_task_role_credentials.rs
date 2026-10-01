@@ -359,7 +359,7 @@ async fn sdk_in_task_resolves_the_task_role_from_the_link_local_endpoint() {
         .container_definitions(
             ContainerDefinition::builder()
                 .name("cli")
-                .image("public.ecr.aws/aws-cli/aws-cli:latest")
+                .image("public.ecr.aws/aws-cli/aws-cli:2.37.6")
                 .essential(true)
                 // fakecloud rewrites loopback URLs in the environment to the
                 // host alias the container reaches it at.
@@ -444,7 +444,7 @@ async fn sdk_in_task_resolves_the_task_role_from_the_link_local_endpoint() {
 async fn run_role_task_to_completion(
     server: &TestServer,
     name: &str,
-    awsvpc: bool,
+    network_mode: Option<aws_sdk_ecs::types::NetworkMode>,
     script: &str,
 ) -> (String, String) {
     let root = root_config(server).await;
@@ -480,8 +480,8 @@ async fn run_role_task_to_completion(
                 .command(script)
                 .build(),
         );
-    if awsvpc {
-        register = register.network_mode(aws_sdk_ecs::types::NetworkMode::Awsvpc);
+    if let Some(mode) = network_mode {
+        register = register.network_mode(mode);
     }
     register.send().await.unwrap();
     let run = ecs
@@ -511,6 +511,83 @@ async fn run_role_task_to_completion(
     )
 }
 
+/// Fetches the credentials at the agent address + relative URI and the task
+/// metadata at `ECS_CONTAINER_METADATA_URI_V4`, which names fakecloud by the
+/// runtime's host alias: a container joining its holder's namespace shares
+/// the holder's `/etc/hosts`, `--add-host` entry included.
+const LINK_LOCAL_PROBE: &str =
+    "wget -qO- \"http://169.254.170.2$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI\" \
+     | grep -o '\"RoleArn\":\"[^\"]*\"'; \
+     echo RELATIVE_URI=[$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI]; \
+     wget -qO- \"$ECS_CONTAINER_METADATA_URI_V4\" >/dev/null && echo META=ok";
+
+/// A bridge-mode task-role container keeps reaching fakecloud by the host
+/// alias (task metadata) while its credentials come from 169.254.170.2.
+#[tokio::test]
+async fn bridge_task_reaches_the_link_local_endpoint_and_the_host_alias() {
+    if !require_docker_or_skip("bridge_task_reaches_the_link_local_endpoint_and_the_host_alias") {
+        return;
+    }
+    let server = TestServer::start().await;
+    let (task_id, logs) = run_role_task_to_completion(
+        &server,
+        "bridge-creds",
+        Some(aws_sdk_ecs::types::NetworkMode::Bridge),
+        LINK_LOCAL_PROBE,
+    )
+    .await;
+    assert!(
+        logs.contains("\"RoleArn\":\"arn:aws:iam::123456789012:role/bridge-creds-role\""),
+        "{logs}"
+    );
+    assert!(
+        logs.contains(&format!("RELATIVE_URI=[/v2/credentials/{task_id}]")),
+        "{logs}"
+    );
+    assert!(logs.contains("META=ok"), "{logs}");
+}
+
+/// A `none`-mode task has no network: as on ECS it gets the relative URI but
+/// nothing answers it, and fakecloud starts no holder for it.
+#[tokio::test]
+async fn none_mode_task_gets_the_relative_uri_and_no_network() {
+    if !require_docker_or_skip("none_mode_task_gets_the_relative_uri_and_no_network") {
+        return;
+    }
+    let server = TestServer::start().await;
+    let (task_id, logs) = run_role_task_to_completion(
+        &server,
+        "none-creds",
+        Some(aws_sdk_ecs::types::NetworkMode::None),
+        "echo RELATIVE_URI=[$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI] \
+         FULL_URI=[$AWS_CONTAINER_CREDENTIALS_FULL_URI]; \
+         if [ -e /sys/class/net/eth0 ]; then echo ETH0=yes; else echo ETH0=no; fi; \
+         wget -T 2 -qO- \"http://169.254.170.2$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI\" \
+         && echo CREDS=reachable || echo CREDS=unreachable",
+    )
+    .await;
+    assert!(
+        logs.contains(&format!(
+            "RELATIVE_URI=[/v2/credentials/{task_id}] FULL_URI=[]"
+        )),
+        "{logs}"
+    );
+    assert!(logs.contains("ETH0=no"), "{logs}");
+    assert!(logs.contains("CREDS=unreachable"), "{logs}");
+    let holders = std::process::Command::new("docker")
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            &format!("name=fakecloud-ecs-netns-{task_id}"),
+            "--format",
+            "{{.Names}}",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&holders.stdout).trim(), "");
+}
+
 /// An `awsvpc` task reaches the link-local endpoint too: the namespace
 /// holder joins the per-task network in the container's place.
 #[tokio::test]
@@ -522,12 +599,11 @@ async fn awsvpc_task_reaches_the_link_local_endpoint() {
     let (task_id, logs) = run_role_task_to_completion(
         &server,
         "awsvpc-creds",
-        true,
-        "wget -qO- \"http://169.254.170.2$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI\" \
-         | grep -o '\"RoleArn\":\"[^\"]*\"'; \
-         echo RELATIVE_URI=[$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI]",
+        Some(aws_sdk_ecs::types::NetworkMode::Awsvpc),
+        LINK_LOCAL_PROBE,
     )
     .await;
+    assert!(logs.contains("META=ok"), "{logs}");
     assert!(
         logs.contains("\"RoleArn\":\"arn:aws:iam::123456789012:role/awsvpc-creds-role\""),
         "{logs}"
@@ -557,7 +633,7 @@ async fn task_falls_back_to_the_full_uri_when_the_namespace_cannot_be_set_up() {
     let (task_id, logs) = run_role_task_to_completion(
         &server,
         "fallback-creds",
-        false,
+        None,
         "echo RELATIVE_URI=[$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI]; \
          wget -qO- \"$AWS_CONTAINER_CREDENTIALS_FULL_URI\" | grep -o '\"RoleArn\":\"[^\"]*\"'",
     )
