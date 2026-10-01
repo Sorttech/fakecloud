@@ -8634,7 +8634,7 @@ mod tests {
     }
 
     #[test]
-    fn lambda_function_role_trust_is_read_in_the_roles_account() {
+    fn lambda_function_role_trust_is_read_in_both_accounts() {
         // Two accounts each hold a role named `app`; only one trusts Lambda.
         let mut prov = make_provisioner();
         let role = |trusts_lambda: bool| {
@@ -8676,15 +8676,20 @@ mod tests {
                 }),
             )
         };
-        // The foreign role trusts Lambda: its untrusting namesake in the
-        // stack's account does not decide the outcome.
-        prov.create_resource(&func("foreign-fn", &foreign))
-            .expect("foreign role trusting Lambda accepted");
+        // The foreign role trusts Lambda, but the session is minted for its
+        // untrusting namesake in the stack's account, which refuses it.
+        let err = prov
+            .create_resource(&func("foreign-fn", &foreign))
+            .unwrap_err();
+        assert!(
+            err.contains("InvalidParameterValueException") && err.contains(&own),
+            "{err}"
+        );
         let err = prov.create_resource(&func("own-fn", &own)).unwrap_err();
         assert!(err.contains("InvalidParameterValueException"), "{err}");
 
         // Swap the trust: now the stack's role trusts Lambda, the foreign
-        // one does not, and the foreign one is refused.
+        // one does not, and the foreign one is refused on its own policy.
         prov.account_id = "999999999999".to_string();
         prov.create_resource(&role(false)).unwrap();
         prov.account_id = "123456789012".to_string();
@@ -8698,6 +8703,13 @@ mod tests {
         );
         prov.create_resource(&func("own-fn-2", &own))
             .expect("stack's role trusting Lambda accepted");
+
+        // Both trust Lambda: the foreign role is accepted (IAM off).
+        prov.account_id = "999999999999".to_string();
+        prov.create_resource(&role(true)).unwrap();
+        prov.account_id = "123456789012".to_string();
+        prov.create_resource(&func("foreign-fn-3", &foreign))
+            .expect("both roles trusting Lambda accepted");
     }
 
     #[test]
