@@ -757,3 +757,95 @@ fn an_unreadable_s3_file_does_not_stop_other_buckets() {
         assert_eq!(report.skipped, vec![locked]);
     }
 }
+
+#[test]
+fn sent_emails_and_published_messages_are_kept_verbatim() {
+    // Regression: SES bodies were rewritten under an unchanged DKIM
+    // signature, and SNS messages diverged from the SQS copies of the same
+    // publish (which are kept verbatim).
+    let tmp = legacy_dir();
+    let dir = tmp.path();
+    let text = "alarm on arn:aws:sns:cn-north-1:1:t";
+    let ses = dir.join("ses/snapshot.json");
+    write(
+        &ses,
+        &json!({
+            "identity_arn": "arn:aws:ses:cn-north-1:1:identity/example.com",
+            "sent_emails": [{
+                "subject": text, "text_body": text, "html_body": text, "raw_data": text,
+                "template_data": text, "headers": [["X-Topic", text]], "dkim_signature": "bh=x"
+            }]
+        })
+        .to_string(),
+    );
+    let sns = dir.join("sns/snapshot.json");
+    write(
+        &sns,
+        &json!({
+            "published": [{
+                "topic_arn": "arn:aws:sns:cn-north-1:1:t", "message": text, "subject": text,
+                "message_attributes": {"src": {"string_value": text}}
+            }],
+            "sms_messages": [["+15555550100", text]]
+        })
+        .to_string(),
+    );
+
+    migrate_data_dir(dir, "cn-north-1").unwrap();
+
+    let ses: Value = serde_json::from_str(&read(&ses)).unwrap();
+    assert_eq!(
+        ses["identity_arn"],
+        "arn:aws-cn:ses:cn-north-1:1:identity/example.com"
+    );
+    let email = &ses["sent_emails"][0];
+    for field in [
+        "subject",
+        "text_body",
+        "html_body",
+        "raw_data",
+        "template_data",
+    ] {
+        assert_eq!(email[field], text, "{field}");
+    }
+    assert_eq!(email["headers"][0][1], text);
+    let sns: Value = serde_json::from_str(&read(&sns)).unwrap();
+    let published = &sns["published"][0];
+    assert_eq!(published["topic_arn"], "arn:aws-cn:sns:cn-north-1:1:t");
+    assert_eq!(published["message"], text);
+    assert_eq!(published["subject"], text);
+    assert_eq!(published["message_attributes"]["src"]["string_value"], text);
+    assert_eq!(sns["sms_messages"][0][1], text);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_rewrite_fails_the_migration_instead_of_being_skipped() {
+    // Regression: a write failure (a readable but read-only service
+    // directory) was skipped as "unreadable" and the directory still marked
+    // migrated, so the loader served the stale ARNs for good.
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = legacy_dir();
+    let dir = tmp.path();
+    let sqs_dir = dir.join("sqs");
+    let snapshot = sqs_dir.join("snapshot.json");
+    write(&snapshot, r#"{"arn":"arn:aws:sqs:cn-north-1:1:q"}"#);
+    std::fs::set_permissions(&sqs_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let probe = sqs_dir.join("probe");
+    let enforced = std::fs::write(&probe, b"x").is_err();
+    let _ = std::fs::remove_file(&probe);
+
+    let result = migrate_data_dir(dir, "cn-north-1");
+    std::fs::set_permissions(&sqs_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if !enforced {
+        return; // root ignores the mode
+    }
+    assert!(result.is_err(), "{result:?}");
+    assert!(!crate::version::arn_partitions_migrated(dir).unwrap());
+    // Once writable, the next start migrates it.
+    migrate_data_dir(dir, "cn-north-1").unwrap();
+    assert_eq!(
+        read(&snapshot),
+        r#"{"arn":"arn:aws-cn:sqs:cn-north-1:1:q"}"#
+    );
+}

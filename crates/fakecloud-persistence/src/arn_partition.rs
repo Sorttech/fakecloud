@@ -33,8 +33,8 @@
 //! and an ECR manifest is addressed by its digest. Others are customer data
 //! the service stores rather than describes, where a rewrite would change
 //! what the application wrote or break a lookup by it: DynamoDB items, SSM
-//! parameter values, Secrets Manager secrets, EventBridge events, CloudWatch
-//! dashboard bodies, S3 object keys, user metadata and object tags, log
+//! parameter values, Secrets Manager secrets, SES sent emails, SNS published
+//! messages, EventBridge events, CloudWatch dashboard bodies, S3 object keys, user metadata and object tags, log
 //! events. Bulk payloads streamed outside the snapshots
 //! (S3 object bodies, CloudWatch Logs event segments, container data volumes)
 //! are not read at all.
@@ -278,6 +278,17 @@ fn opaque_keys_for(service_dir: &str) -> &'static [&'static str] {
         // Parameter values (current and every version).
         "ssm" => &["value"],
         "secretsmanager" => &["secret_string"],
+        // Sent emails: the stored DKIM signature covers the body and headers.
+        "ses" => &[
+            "subject",
+            "text_body",
+            "html_body",
+            "raw_data",
+            "template_data",
+            "headers",
+        ],
+        // Published messages, kept as the SQS copies of the same publish are.
+        "sns" => &["message", "subject", "message_attributes", "sms_messages"],
         // Published events (the bus log and archives): customer payloads,
         // and an archive's `size_bytes` measures them.
         "eventbridge" => &["events"],
@@ -377,6 +388,15 @@ fn migrate_service_dir(
     Ok(())
 }
 
+/// Replace `path` with its migrated contents. A failure here is never a
+/// skippable "unreadable" file: the loader would read the stale file fine and
+/// the marker would stop the migration from ever running again, so it fails
+/// the migration (and startup) instead, whatever its kind.
+fn write_migrated(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    crate::atomic::write_atomic_bytes(path, bytes)
+        .map_err(|err| io::Error::other(format!("writing {}: {err}", path.display())))
+}
+
 /// Turn a permission error on `path` into a skipped entry. A file or
 /// directory the server cannot read is one its own loader cannot read either
 /// (the S3 loader isolates such failures per bucket); that loader reports it,
@@ -433,7 +453,7 @@ fn migrate_json_file(
     }
     let out = serde_json::to_vec(&value)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-    crate::atomic::write_atomic_bytes(path, &out)?;
+    write_migrated(path, &out)?;
     report.rewritten.push(path.to_path_buf());
     Ok(())
 }
@@ -508,7 +528,7 @@ fn migrate_s3_sidecar(
             Cow::Borrowed(_) => return Ok(()),
         }
     };
-    crate::atomic::write_atomic_bytes(path, rewritten.as_bytes())?;
+    write_migrated(path, rewritten.as_bytes())?;
     report.rewritten.push(path.to_path_buf());
     Ok(())
 }
