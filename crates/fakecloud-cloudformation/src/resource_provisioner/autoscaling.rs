@@ -207,8 +207,14 @@ impl ResourceProvisioner {
         )?;
         let mut st = self.autoscaling_state.write();
         let acct = st.get_or_create(&self.account_id);
-        if acct.launch_configurations.contains_key(&lc.name) && replacing != Some(lc.name.as_str())
-        {
+        // Only a configuration this group itself derived from an instance may
+        // be replaced; an independently defined one of that name never is.
+        let replaceable = replacing == Some(lc.name.as_str())
+            && acct
+                .launch_configurations
+                .get(&lc.name)
+                .is_some_and(|existing| existing.source_instance_id.is_some());
+        if acct.launch_configurations.contains_key(&lc.name) && !replaceable {
             return Err(format!(
                 "Launch Configuration by this name already exists - A launch configuration already exists with the name {}",
                 lc.name

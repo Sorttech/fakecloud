@@ -1095,6 +1095,9 @@ struct LaunchPlan {
     instance_type: Option<String>,
     launch_template: Option<LaunchTemplateSpec>,
     weighted_capacity: Option<String>,
+    /// Whether the source itself launches Spot (a launch configuration's
+    /// `SpotPrice`, or a launch template's `InstanceMarketOptions`).
+    spot: bool,
 }
 
 /// The capacity units an instance counts for (its mixed-instances weight,
@@ -1305,6 +1308,7 @@ impl AutoScalingService {
                 instance_type: Some(lc.instance_type.clone()),
                 launch_template: None,
                 weighted_capacity: None,
+                spot: lc.spot_price.as_ref().is_some_and(|p| !p.is_empty()),
             }),
             LaunchSource::MissingConfiguration(name) => {
                 Err(format!("Launch configuration {name} not found."))
@@ -1324,6 +1328,7 @@ impl AutoScalingService {
                         instance_type: instance_type.clone(),
                         launch_template: Some(spec.clone()),
                         weighted_capacity: weighted_capacity.clone(),
+                        spot: false,
                     });
                 };
                 let resolved = fakecloud_ec2::service::launch_template::resolve_launch_template_in(
@@ -1346,7 +1351,12 @@ impl AutoScalingService {
                     "LaunchTemplate.Version".to_string(),
                     resolved.version.to_string(),
                 );
+                let spot = resolved
+                    .data
+                    .get("InstanceMarketOptions.MarketType")
+                    .is_some_and(|m| m == "spot");
                 Ok(LaunchPlan {
+                    spot,
                     instance_type: instance_type
                         .clone()
                         .or_else(|| resolved.data.get("InstanceType").cloned()),
@@ -1370,6 +1380,7 @@ impl AutoScalingService {
                     instance_type: Some("t3.micro".to_string()),
                     launch_template: None,
                     weighted_capacity: None,
+                    spot: false,
                 })
             }
         }
@@ -1477,11 +1488,7 @@ impl AutoScalingService {
                                 .and_then(|d| d.spot_max_price.clone()),
                             LaunchPlans::Single(_) => None,
                         };
-                        let is_spot = spot
-                            || plan
-                                .params
-                                .get("InstanceMarketOptions.MarketType")
-                                .is_some_and(|m| m == "spot");
+                        let is_spot = spot || plan.spot;
                         // Spread across the group's subnets (or, without a
                         // VPC zone identifier, its availability zones).
                         let az_hint = azs
@@ -2795,5 +2802,37 @@ mod tests {
                 ("m5.large".to_string(), Some("spot".to_string())),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn spot_launch_template_records_spot_instances() {
+        let (s, ec2) = ec2_wired();
+        ec2_call(
+            &ec2,
+            "CreateLaunchTemplate",
+            &[
+                ("LaunchTemplateName", "spot"),
+                ("LaunchTemplateData.ImageId", "ami-1"),
+                (
+                    "LaunchTemplateData.InstanceMarketOptions.MarketType",
+                    "spot",
+                ),
+            ],
+        )
+        .await;
+        s.handle(req(
+            "CreateAutoScalingGroup",
+            &[
+                ("AutoScalingGroupName", "g"),
+                ("LaunchTemplate.LaunchTemplateName", "spot"),
+                ("MinSize", "1"),
+                ("MaxSize", "1"),
+            ],
+        ))
+        .await
+        .unwrap();
+        let st = s.state.read();
+        let inst = &st.accounts["123456789012"].groups["g"].instances[0];
+        assert_eq!(inst.lifecycle.as_deref(), Some("spot"));
     }
 }

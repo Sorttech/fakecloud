@@ -8511,6 +8511,49 @@ mod tests {
             ),
         )
         .expect("unchanged InstanceId needs no live instance");
+
+        // A group switching to `InstanceId` never replaces an independently
+        // defined launch configuration that happens to carry its name.
+        let lc = prov
+            .create_resource(&make_resource(
+                "AWS::AutoScaling::LaunchConfiguration",
+                "SharedLc",
+                serde_json::json!({
+                    "LaunchConfigurationName": "shared-name",
+                    "ImageId": "ami-shared",
+                    "InstanceType": "t3.micro"
+                }),
+            ))
+            .unwrap();
+        let named = prov
+            .create_resource(&make_resource(
+                "AWS::AutoScaling::AutoScalingGroup",
+                "Named",
+                serde_json::json!({
+                    "AutoScalingGroupName": "shared-name",
+                    "MinSize": "0", "MaxSize": "1", "DesiredCapacity": "0",
+                    "LaunchConfigurationName": lc.physical_id
+                }),
+            ))
+            .unwrap();
+        let clash = prov.update_resource(
+            &named,
+            &make_resource(
+                "AWS::AutoScaling::AutoScalingGroup",
+                "Named",
+                serde_json::json!({
+                    "AutoScalingGroupName": "shared-name",
+                    "MinSize": "0", "MaxSize": "1", "DesiredCapacity": "0",
+                    "InstanceId": inst.physical_id
+                }),
+            ),
+        );
+        assert!(clash.is_err(), "independent configuration is not replaced");
+        assert_eq!(
+            prov.autoscaling_state.read().accounts[acct].launch_configurations["shared-name"]
+                .image_id,
+            "ami-shared"
+        );
     }
 
     /// A stack launch template's tags follow `TagSpecifications` on update,
