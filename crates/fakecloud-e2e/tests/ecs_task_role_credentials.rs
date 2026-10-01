@@ -439,8 +439,9 @@ async fn sdk_in_task_resolves_the_task_role_from_the_link_local_endpoint() {
     );
 }
 
-/// Run a one-container task with a task role whose container prints its
-/// output and exits, and return `(task_id, captured logs)` once it stopped.
+/// Run a one-container task with a task role whose container (`<name>-app`)
+/// prints its output and exits, and return `(task_id, captured logs)` once
+/// it stopped.
 async fn run_role_task_to_completion(
     server: &TestServer,
     name: &str,
@@ -472,7 +473,7 @@ async fn run_role_task_to_completion(
         .task_role_arn(&role_arn)
         .container_definitions(
             ContainerDefinition::builder()
-                .name("app")
+                .name(format!("{name}-app"))
                 .image("public.ecr.aws/docker/library/alpine:3.20")
                 .essential(true)
                 .command("sh")
@@ -555,17 +556,65 @@ async fn none_mode_task_gets_the_relative_uri_and_no_network() {
         return;
     }
     let server = TestServer::start().await;
-    let (task_id, logs) = run_role_task_to_completion(
-        &server,
-        "none-creds",
-        Some(aws_sdk_ecs::types::NetworkMode::None),
-        "echo RELATIVE_URI=[$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI] \
-         FULL_URI=[$AWS_CONTAINER_CREDENTIALS_FULL_URI]; \
-         if [ -e /sys/class/net/eth0 ]; then echo ETH0=yes; else echo ETH0=no; fi; \
-         wget -T 2 -qO- \"http://169.254.170.2$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI\" \
-         && echo CREDS=reachable || echo CREDS=unreachable",
-    )
-    .await;
+    // Watch the task while it runs (holders are removed when it stops): its
+    // container must run with `--network none` and no holder may exist.
+    let watch = async {
+        let docker = |args: Vec<String>| async move {
+            let out = tokio::process::Command::new("docker")
+                .args(&args)
+                .output()
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        for _ in 0..300 {
+            let holders = docker(vec![
+                "ps".into(),
+                "-a".into(),
+                "--filter".into(),
+                "label=fakecloud-ecs-netns-for=none-creds-app".into(),
+                "-q".into(),
+            ])
+            .await;
+            assert_eq!(holders, "", "a holder was started for a none-mode task");
+            let app = docker(vec![
+                "ps".into(),
+                "--filter".into(),
+                "label=fakecloud-ecs-container=none-creds-app".into(),
+                "-q".into(),
+            ])
+            .await;
+            if let Some(id) = app.lines().next() {
+                let mode = docker(vec![
+                    "inspect".into(),
+                    "-f".into(),
+                    "{{.HostConfig.NetworkMode}}".into(),
+                    id.to_string(),
+                ])
+                .await;
+                if !mode.is_empty() {
+                    return mode;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        panic!("the none-mode task container was never seen running");
+    };
+    let ((task_id, logs), network_mode) = tokio::join!(
+        run_role_task_to_completion(
+            &server,
+            "none-creds",
+            Some(aws_sdk_ecs::types::NetworkMode::None),
+            "echo RELATIVE_URI=[$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI] \
+             FULL_URI=[$AWS_CONTAINER_CREDENTIALS_FULL_URI]; \
+             if [ -e /sys/class/net/eth0 ]; then echo ETH0=yes; else echo ETH0=no; fi; \
+             wget -T 2 -qO- \"http://169.254.170.2$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI\" \
+             && echo CREDS=reachable || echo CREDS=unreachable; \
+             sleep 5",
+        ),
+        watch
+    );
+    assert_eq!(network_mode, "none");
     assert!(
         logs.contains(&format!(
             "RELATIVE_URI=[/v2/credentials/{task_id}] FULL_URI=[]"
@@ -574,18 +623,6 @@ async fn none_mode_task_gets_the_relative_uri_and_no_network() {
     );
     assert!(logs.contains("ETH0=no"), "{logs}");
     assert!(logs.contains("CREDS=unreachable"), "{logs}");
-    let holders = std::process::Command::new("docker")
-        .args([
-            "ps",
-            "-a",
-            "--filter",
-            &format!("name=fakecloud-ecs-netns-{task_id}"),
-            "--format",
-            "{{.Names}}",
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(String::from_utf8_lossy(&holders.stdout).trim(), "");
 }
 
 /// An `awsvpc` task reaches the link-local endpoint too: the namespace

@@ -344,11 +344,19 @@ async fn task_stopped_during_failed_creds_init_never_runs() {
     );
     std::env::set_var("FAKECLOUD_K8S_NAMESPACE", TEST_NS);
     // A helper image that can never be pulled: the initContainer fails, which
-    // would normally relaunch the task without it.
+    // would normally relaunch the task without it. Unset on drop, so a failed
+    // assertion can't leak it into later tests in this binary.
+    struct HelperImageOverride;
+    impl Drop for HelperImageOverride {
+        fn drop(&mut self) {
+            std::env::remove_var("FAKECLOUD_ECS_CREDS_HELPER_IMAGE");
+        }
+    }
     std::env::set_var(
         "FAKECLOUD_ECS_CREDS_HELPER_IMAGE",
         "registry.invalid/fakecloud/no-such-helper:1",
     );
+    let _override = HelperImageOverride;
     let rt = EcsRuntime::new_k8s(4566).await.expect("new_k8s");
 
     let account = "123456789012";
@@ -415,7 +423,6 @@ async fn task_stopped_during_failed_creds_init_never_runs() {
     rt.run_task_inner(&state, task_id, account)
         .await
         .expect("run_task_inner");
-    std::env::remove_var("FAKECLOUD_ECS_CREDS_HELPER_IMAGE");
 
     {
         let accounts = state.read();
