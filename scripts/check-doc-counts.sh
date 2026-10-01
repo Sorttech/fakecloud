@@ -605,7 +605,9 @@ fi
             problems+=("$CONF_DOC: E2E suite claims '$claim', actual $e2e_tests tests")
             fail=1
         fi
-    done < <(grep -oE '[0-9][0-9,]*\+? tests' "$CONF_DOC" || true)
+    # Scoped to the E2E sentence: other suites (parity, tfacc) may state their
+    # own, smaller test counts on this page and must not be held to this rule.
+    done < <(grep -E 'E2E suite' "$CONF_DOC" | grep -oE '[0-9][0-9,]*\+? tests' || true)
 }
 
 if [ "$fail" -eq 0 ]; then
