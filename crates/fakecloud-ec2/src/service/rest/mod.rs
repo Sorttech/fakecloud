@@ -113,12 +113,21 @@ pub(crate) fn associate_enclave_certificate_iam_role(
 /// round-trips. `None` when the request carries neither (optional on
 /// RunInstances, required on Associate/Replace).
 pub(crate) fn iam_profile_arn(req: &AwsRequest) -> Result<Option<String>, AwsServiceError> {
+    iam_profile_arn_from(&req.query_params, &req.region, &req.account_id)
+}
+
+/// [`iam_profile_arn`] over a bare parameter map (the effective launch
+/// parameters of a launch-template launch).
+pub(crate) fn iam_profile_arn_from(
+    params: &std::collections::HashMap<String, String>,
+    region: &str,
+    account_id: &str,
+) -> Result<Option<String>, AwsServiceError> {
     // An empty `Arn=` / `Name=` is the same as the member being absent: the
     // SDKs serialize `IamInstanceProfileSpecification::builder().name("")` as
     // a present-but-empty parameter, and storing that would leave an
     // association whose ARN renders as `<arn></arn>` on every instance.
-    if let Some(arn) = req
-        .query_params
+    if let Some(arn) = params
         .get("IamInstanceProfile.Arn")
         .filter(|v| !v.is_empty())
     {
@@ -127,8 +136,7 @@ pub(crate) fn iam_profile_arn(req: &AwsRequest) -> Result<Option<String>, AwsSer
         }
         return Ok(Some(arn.clone()));
     }
-    if let Some(name) = req
-        .query_params
+    if let Some(name) = params
         .get("IamInstanceProfile.Name")
         .filter(|v| !v.is_empty())
     {
@@ -145,8 +153,8 @@ pub(crate) fn iam_profile_arn(req: &AwsRequest) -> Result<Option<String>, AwsSer
         // crate does not depend on fakecloud-iam). Pass the ARN for those.
         return Ok(Some(format!(
             "arn:{}:iam::{}:instance-profile/{name}",
-            fakecloud_aws::arn::partition_for(&req.region),
-            req.account_id
+            fakecloud_aws::arn::partition_for(region),
+            account_id
         )));
     }
     Ok(None)

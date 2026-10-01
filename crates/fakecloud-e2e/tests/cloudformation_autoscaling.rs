@@ -96,13 +96,25 @@ async fn cfn_provisions_autoscaling_group() {
 
 // bug-audit 2026-06-27, T1.8: a CFN ASG declared with a LaunchTemplate (not the
 // legacy LaunchConfigurationName) must carry the launch template, not drop it.
+// The template must exist (as CreateAutoScalingGroup requires), so the stack
+// declares it too.
 const TEMPLATE_LT: &str = r#"{
   "Resources": {
+    "Tmpl": {
+      "Type": "AWS::EC2::LaunchTemplate",
+      "Properties": {
+        "LaunchTemplateName": "asg-lt",
+        "LaunchTemplateData": { "ImageId": "ami-0a1b2c3d4e5f60001", "InstanceType": "t3.micro" }
+      }
+    },
     "ASG": {
       "Type": "AWS::AutoScaling::AutoScalingGroup",
       "Properties": {
         "MinSize": "1", "MaxSize": "2", "DesiredCapacity": "1",
-        "LaunchTemplate": { "LaunchTemplateId": "lt-0abc123", "Version": "3" },
+        "LaunchTemplate": {
+          "LaunchTemplateId": { "Ref": "Tmpl" },
+          "Version": { "Fn::GetAtt": ["Tmpl", "LatestVersionNumber"] }
+        },
         "AvailabilityZones": ["us-east-1a"]
       }
     }
@@ -135,8 +147,13 @@ async fn cfn_asg_honors_launch_template() {
     let lt = g
         .launch_template()
         .expect("launch template carried from CFN");
-    assert_eq!(lt.launch_template_id(), Some("lt-0abc123"));
-    assert_eq!(lt.version(), Some("3"));
+    assert!(
+        lt.launch_template_id()
+            .is_some_and(|id| id.starts_with("lt-")),
+        "{lt:?}"
+    );
+    assert_eq!(lt.launch_template_name(), Some("asg-lt"));
+    assert_eq!(lt.version(), Some("1"));
 }
 
 // batch 2: a CFN-provisioned ASG must reconcile to REAL container-backed EC2

@@ -54,6 +54,9 @@ pub struct AutoScalingService {
     /// mutation writes the EC2 state through, the same way a direct
     /// `RunInstances` API call persists (bug-hunt restart-dataloss).
     ec2_snapshot_hook: Option<SnapshotHook>,
+    /// KMS hook the EC2 launches resolve encrypted volumes' keys through
+    /// (`aws/ebs` for an encrypted mapping without a key).
+    kms_hook: Option<Arc<dyn fakecloud_core::delivery::KmsHook>>,
 }
 
 impl AutoScalingService {
@@ -65,7 +68,30 @@ impl AutoScalingService {
             ec2_state: None,
             ec2_runtime: None,
             ec2_snapshot_hook: None,
+            kms_hook: None,
         }
+    }
+
+    /// Attach the KMS hook so encrypted block-device volumes on launched
+    /// instances get the key EC2 would use (the region's `aws/ebs` key when
+    /// the mapping names none).
+    pub fn with_kms_hook(
+        mut self,
+        hook: Option<Arc<dyn fakecloud_core::delivery::KmsHook>>,
+    ) -> Self {
+        self.kms_hook = hook;
+        self
+    }
+
+    /// A bare EC2 service over the wired EC2 state, for the launches and
+    /// terminations this group drives.
+    fn ec2_service(&self) -> Option<fakecloud_ec2::Ec2Service> {
+        let state = self.ec2_state.clone()?;
+        Some(
+            fakecloud_ec2::Ec2Service::with_state(state)
+                .with_runtime(self.ec2_runtime.clone())
+                .with_kms_hook(self.kms_hook.clone()),
+        )
     }
 
     pub fn with_snapshot_store(mut self, store: Arc<dyn SnapshotStore>) -> Self {
@@ -95,39 +121,33 @@ impl AutoScalingService {
         self
     }
 
-    /// Launch `count` real EC2 instances for a group, returning their ids.
-    /// Falls back to empty (caller synthesizes ids) when no EC2 backend is
-    /// wired. Real instances reconcile to `running` via the EC2 runtime (or
-    /// metadata-only when there's no container runtime, e.g. CI).
-    async fn run_ec2_instances(
+    /// Launch one EC2 instance for a group through `RunInstances` with the
+    /// given parameters, returning its id and availability zone, or the
+    /// launch error's message.
+    async fn run_ec2_instance(
         &self,
-        image_id: &str,
-        instance_type: &str,
-        subnet: Option<&str>,
-        count: usize,
+        svc: &fakecloud_ec2::Ec2Service,
+        mut params: std::collections::HashMap<String, String>,
         req: &AwsRequest,
-    ) -> Vec<String> {
-        let Some(ec2_state) = self.ec2_state.clone() else {
-            return Vec::new();
-        };
-        let svc =
-            fakecloud_ec2::Ec2Service::with_state(ec2_state).with_runtime(self.ec2_runtime.clone());
-        let mut params = std::collections::HashMap::new();
-        params.insert("ImageId".to_string(), image_id.to_string());
-        params.insert("InstanceType".to_string(), instance_type.to_string());
-        params.insert("MinCount".to_string(), count.to_string());
-        params.insert("MaxCount".to_string(), count.to_string());
-        if let Some(s) = subnet {
-            params.insert("SubnetId".to_string(), s.to_string());
-        }
-        let run_req = ec2_request("RunInstances", params, req);
-        match svc.handle(run_req).await {
-            Ok(resp) => {
-                let body = String::from_utf8_lossy(resp.body.expect_bytes()).to_string();
-                parse_instance_ids(&body)
-            }
-            Err(_) => Vec::new(),
-        }
+    ) -> Result<(String, String), String> {
+        params.insert("MinCount".to_string(), "1".to_string());
+        params.insert("MaxCount".to_string(), "1".to_string());
+        let resp = svc
+            .handle(ec2_request("RunInstances", params, req))
+            .await
+            .map_err(|e| e.message())?;
+        let body = String::from_utf8_lossy(resp.body.expect_bytes()).to_string();
+        let id = parse_instance_ids(&body)
+            .into_iter()
+            .next()
+            .ok_or_else(|| "RunInstances returned no instance".to_string())?;
+        let az = body
+            .split("<availabilityZone>")
+            .nth(1)
+            .and_then(|r| r.split("</availabilityZone>").next())
+            .unwrap_or_default()
+            .to_string();
+        Ok((id, az))
     }
 
     /// Terminate the REAL EC2 instances that backed a CFN-provisioned Auto
@@ -168,8 +188,9 @@ impl AutoScalingService {
         if ids.is_empty() {
             return;
         }
-        let svc =
-            fakecloud_ec2::Ec2Service::with_state(ec2_state).with_runtime(self.ec2_runtime.clone());
+        let svc = fakecloud_ec2::Ec2Service::with_state(ec2_state)
+            .with_runtime(self.ec2_runtime.clone())
+            .with_kms_hook(self.kms_hook.clone());
         let mut params = std::collections::HashMap::new();
         for (n, id) in ids.iter().enumerate() {
             params.insert(format!("InstanceId.{}", n + 1), id.clone());
@@ -236,7 +257,7 @@ fn xesc(s: &str) -> String {
     out
 }
 
-fn el(name: &str, value: &str) -> String {
+pub(crate) fn el(name: &str, value: &str) -> String {
     format!("<{name}>{}</{name}>", xesc(value))
 }
 
@@ -437,6 +458,8 @@ impl AutoScalingService {
                 .unwrap_or(false),
             spot_price: optional_query_param(req, "SpotPrice"),
             placement_tenancy: optional_query_param(req, "PlacementTenancy"),
+            block_device_mappings: crate::launch::parse_block_device_mappings(req),
+            metadata_options: crate::launch::parse_metadata_options(req),
             created_time: Utc::now(),
         };
         {
@@ -471,6 +494,27 @@ impl AutoScalingService {
                     "<InstanceMonitoring><Enabled>{}</Enabled></InstanceMonitoring>",
                     lc.instance_monitoring
                 );
+                let block_devices = format!(
+                        "{}{}",
+                        crate::launch::block_device_mappings_xml(&lc.block_device_mappings),
+                        lc.metadata_options
+                            .as_ref()
+                            .map(|m| format!(
+                                "<MetadataOptions>{}{}{}</MetadataOptions>",
+                                m.http_tokens
+                                    .as_deref()
+                                    .map(|v| el("HttpTokens", v))
+                                    .unwrap_or_default(),
+                                m.http_put_response_hop_limit
+                                    .map(|v| el("HttpPutResponseHopLimit", &v.to_string()))
+                                    .unwrap_or_default(),
+                                m.http_endpoint
+                                    .as_deref()
+                                    .map(|v| el("HttpEndpoint", v))
+                                    .unwrap_or_default(),
+                            ))
+                            .unwrap_or_default(),
+                    );
                 format!(
                     "<member>{}{}{}{}{}{}{monitoring}{}{}{}<SecurityGroups>{sgs}</SecurityGroups>{}{}{}{}</member>",
                     el("LaunchConfigurationName", &lc.name),
@@ -490,7 +534,7 @@ impl AutoScalingService {
                         .as_deref()
                         .map(|u| el("UserData", u))
                         .unwrap_or_default(),
-                    "<BlockDeviceMappings/>",
+                    block_devices,
                     el("CreatedTime", &iso(lc.created_time)),
                 )
             })
@@ -531,9 +575,19 @@ impl AutoScalingService {
             .and_then(|v| v.parse::<i64>().ok())
             .unwrap_or(min_size);
 
-        let launch_template = parse_launch_template(req);
+        let mut launch_template = parse_launch_template(req);
+        let mut mixed_instances_policy = crate::launch::parse_mixed_instances_policy(req);
         let launch_configuration_name = optional_query_param(req, "LaunchConfigurationName");
-        if launch_configuration_name.is_none() && launch_template.is_none() {
+        let sources = [
+            launch_configuration_name.is_some(),
+            launch_template.is_some(),
+            mixed_instances_policy.is_some(),
+        ]
+        .iter()
+        .filter(|s| **s)
+        .count();
+        // Exactly one launch source.
+        if sources != 1 {
             return Err(AwsServiceError::aws_error(
                 StatusCode::BAD_REQUEST,
                 "ValidationError",
@@ -541,6 +595,12 @@ impl AutoScalingService {
                  InstanceId or MixedInstancesPolicy parameter.",
             ));
         }
+        self.validate_launch_source(
+            req,
+            launch_configuration_name.as_deref(),
+            launch_template.as_mut(),
+            mixed_instances_policy.as_mut(),
+        )?;
 
         let mut azs = member_list(req, "AvailabilityZones");
         let vpc_zone_identifier = optional_query_param(req, "VPCZoneIdentifier");
@@ -581,6 +641,7 @@ impl AutoScalingService {
             status: None,
             service_linked_role_arn: optional_query_param(req, "ServiceLinkedRoleARN")
                 .unwrap_or_else(|| service_linked_role_arn(&req.region, &req.account_id)),
+            mixed_instances_policy,
         };
 
         let _ = azs;
@@ -611,6 +672,17 @@ impl AutoScalingService {
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
         let name = required_query_param(req, "AutoScalingGroupName")?;
+        let new_lc = optional_query_param(req, "LaunchConfigurationName");
+        let mut new_lt = parse_launch_template(req);
+        let mut new_mixed = crate::launch::parse_mixed_instances_policy(req);
+        if new_lc.is_some() || new_lt.is_some() || new_mixed.is_some() {
+            self.validate_launch_source(
+                req,
+                new_lc.as_deref(),
+                new_lt.as_mut(),
+                new_mixed.as_mut(),
+            )?;
+        }
         {
             let mut accounts = self.state.write();
             let st = accounts.get_or_create(&req.account_id);
@@ -628,13 +700,21 @@ impl AutoScalingService {
             {
                 group.desired_capacity = v;
             }
-            if let Some(v) = optional_query_param(req, "LaunchConfigurationName") {
+            // Switching the launch source replaces the previous one.
+            if let Some(v) = new_lc {
                 group.launch_configuration_name = Some(v);
                 group.launch_template = None;
+                group.mixed_instances_policy = None;
             }
-            if let Some(lt) = parse_launch_template(req) {
+            if let Some(lt) = new_lt {
                 group.launch_template = Some(lt);
                 group.launch_configuration_name = None;
+                group.mixed_instances_policy = None;
+            }
+            if let Some(policy) = new_mixed {
+                group.mixed_instances_policy = Some(policy);
+                group.launch_configuration_name = None;
+                group.launch_template = None;
             }
             if let Some(v) = optional_query_param(req, "HealthCheckType") {
                 group.health_check_type = v;
@@ -936,6 +1016,25 @@ fn group_not_found(name: &str) -> AwsServiceError {
     )
 }
 
+/// How one reconcile launches each new instance of a group.
+struct LaunchPlan {
+    /// The `RunInstances` parameters (before placement and tags).
+    params: std::collections::HashMap<String, String>,
+    /// What the group records about each launched instance.
+    instance_type: Option<String>,
+    launch_template: Option<LaunchTemplateSpec>,
+    weighted_capacity: Option<String>,
+}
+
+/// The capacity units an instance counts for (its mixed-instances weight,
+/// else 1).
+fn weight_of(w: &Option<String>) -> i64 {
+    w.as_deref()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(1)
+}
+
 fn parse_launch_template(req: &AwsRequest) -> Option<LaunchTemplateSpec> {
     let id = optional_query_param(req, "LaunchTemplate.LaunchTemplateId");
     let name = optional_query_param(req, "LaunchTemplate.LaunchTemplateName");
@@ -1012,8 +1111,135 @@ impl AutoScalingService {
         self.apply_capacity(account, name, &req).await;
     }
 
+    /// Check a group's launch source the way CreateAutoScalingGroup /
+    /// UpdateAutoScalingGroup do: a named launch configuration must exist, and
+    /// a launch template (direct, mixed-instances base, or an override's) must
+    /// resolve to an existing version. Resolved templates are recorded with
+    /// both their id and name, and `$Default` when no version was given, as
+    /// DescribeAutoScalingGroups reports them.
+    fn validate_launch_source(
+        &self,
+        req: &AwsRequest,
+        launch_configuration: Option<&str>,
+        launch_template: Option<&mut LaunchTemplateSpec>,
+        mixed: Option<&mut crate::state::MixedInstancesPolicy>,
+    ) -> Result<(), AwsServiceError> {
+        if let Some(lc) = launch_configuration {
+            let exists = self
+                .state
+                .read()
+                .accounts
+                .get(&req.account_id)
+                .is_some_and(|st| st.launch_configurations.contains_key(lc));
+            if !exists {
+                return Err(AwsServiceError::aws_error(
+                    StatusCode::BAD_REQUEST,
+                    "ValidationError",
+                    format!(
+                        "Launch configuration name not found - Launch configuration {lc} not found"
+                    ),
+                ));
+            }
+        }
+        crate::launch::resolve_launch_template_specs(
+            self.ec2_state.as_ref(),
+            &req.account_id,
+            &req.region,
+            launch_template,
+            mixed,
+        )
+        .map_err(|msg| AwsServiceError::aws_error(StatusCode::BAD_REQUEST, "ValidationError", msg))
+    }
+
+    /// Resolve a group's launch source into the `RunInstances` parameters
+    /// each new instance launches with. A launch template is resolved once
+    /// here, so every instance of this reconcile launches from (and records)
+    /// the same concrete version; `Err` is the reason the launch fails.
+    fn launch_plan(
+        &self,
+        source: &crate::launch::LaunchSource,
+        account: &str,
+        region: &str,
+    ) -> Result<LaunchPlan, String> {
+        use crate::launch::LaunchSource;
+        match source {
+            LaunchSource::Configuration(lc) => Ok(LaunchPlan {
+                params: crate::launch::launch_configuration_params(lc),
+                instance_type: Some(lc.instance_type.clone()),
+                launch_template: None,
+                weighted_capacity: None,
+            }),
+            LaunchSource::MissingConfiguration(name) => {
+                Err(format!("Launch configuration {name} not found."))
+            }
+            LaunchSource::Template {
+                spec,
+                instance_type,
+                weighted_capacity,
+            } => {
+                let mut params = std::collections::HashMap::new();
+                if let Some(t) = instance_type {
+                    params.insert("InstanceType".to_string(), t.clone());
+                }
+                let Some(ec2_state) = &self.ec2_state else {
+                    return Ok(LaunchPlan {
+                        params,
+                        instance_type: instance_type.clone(),
+                        launch_template: Some(spec.clone()),
+                        weighted_capacity: weighted_capacity.clone(),
+                    });
+                };
+                let resolved = fakecloud_ec2::service::launch_template::resolve_launch_template_in(
+                    ec2_state,
+                    account,
+                    region,
+                    spec.launch_template_id.as_deref(),
+                    // Once resolved, a spec carries both; the id is authoritative.
+                    spec.launch_template_name
+                        .as_deref()
+                        .filter(|_| spec.launch_template_id.is_none()),
+                    spec.version.as_deref(),
+                )
+                .map_err(|e| e.message())?;
+                params.insert(
+                    "LaunchTemplate.LaunchTemplateId".to_string(),
+                    resolved.id.clone(),
+                );
+                params.insert(
+                    "LaunchTemplate.Version".to_string(),
+                    resolved.version.to_string(),
+                );
+                Ok(LaunchPlan {
+                    instance_type: instance_type
+                        .clone()
+                        .or_else(|| resolved.data.get("InstanceType").cloned()),
+                    params,
+                    launch_template: Some(LaunchTemplateSpec {
+                        launch_template_id: Some(resolved.id),
+                        launch_template_name: Some(resolved.name),
+                        version: Some(resolved.version.to_string()),
+                    }),
+                    weighted_capacity: weighted_capacity.clone(),
+                })
+            }
+            LaunchSource::Default => {
+                // No launch source recorded: a seeded public AMI + a common
+                // type still boots a real instance.
+                let mut params = std::collections::HashMap::new();
+                params.insert("ImageId".to_string(), "ami-0a1b2c3d4e5f60001".to_string());
+                params.insert("InstanceType".to_string(), "t3.micro".to_string());
+                Ok(LaunchPlan {
+                    params,
+                    instance_type: Some("t3.micro".to_string()),
+                    launch_template: None,
+                    weighted_capacity: None,
+                })
+            }
+        }
+    }
+
     async fn apply_capacity(&self, account: &str, name: &str, req: &AwsRequest) {
-        let (target, current_ids, azs, image_id, instance_type, subnet) = {
+        let (target, current, azs, subnets, source, instance_tags) = {
             let accounts = self.state.read();
             let Some(st) = accounts.accounts.get(account) else {
                 return;
@@ -1021,33 +1247,37 @@ impl AutoScalingService {
             let Some(g) = st.groups.get(name) else {
                 return;
             };
-            let (image_id, instance_type) = g
-                .launch_configuration_name
-                .as_ref()
-                .and_then(|lc| st.launch_configurations.get(lc))
-                .map(|lc| (lc.image_id.clone(), lc.instance_type.clone()))
-                .unwrap_or_else(|| {
-                    // Launch-template-backed (the LT data isn't stored on the
-                    // EC2 side) or unresolved: a seeded public AMI + a common
-                    // type still boots a real instance.
-                    ("ami-0a1b2c3d4e5f60001".to_string(), "t3.micro".to_string())
-                });
+            // Every instance carries the group-name system tag plus the
+            // group's propagate-at-launch tags; these win over same-key tags
+            // from a launch template (AWS gives the group's value precedence).
+            let mut instance_tags = vec![("aws:autoscaling:groupName".to_string(), g.name.clone())];
+            for t in g.tags.iter().filter(|t| t.propagate_at_launch) {
+                instance_tags.push((t.key.clone(), t.value.clone()));
+            }
             (
-                g.desired_capacity.max(0) as usize,
+                g.desired_capacity.max(0),
                 g.instances
                     .iter()
-                    .map(|i| i.instance_id.clone())
+                    .map(|i| (i.instance_id.clone(), i.weighted_capacity.clone()))
                     .collect::<Vec<_>>(),
                 g.availability_zones.clone(),
-                image_id,
-                instance_type,
                 g.vpc_zone_identifier
-                    .as_ref()
-                    .and_then(|v| v.split(',').next().map(|s| s.trim().to_string())),
+                    .as_deref()
+                    .map(|v| {
+                        v.split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default(),
+                crate::launch::LaunchSource::for_group(g, &st.launch_configurations),
+                instance_tags,
             )
         };
+        let capacity: i64 = current.iter().map(|(_, w)| weight_of(w)).sum();
 
         let mut launched: Vec<AsgInstance> = Vec::new();
+        let mut failures: Vec<String> = Vec::new();
         let mut terminate_ids: Vec<String> = Vec::new();
         // Whether this reconcile mutated REAL EC2 state (launched or terminated
         // container-backed instances), so it must be persisted through the EC2
@@ -1055,36 +1285,94 @@ impl AutoScalingService {
         // synthesized metadata) or no hook wired.
         let mut ec2_touched = false;
 
-        if current_ids.len() < target {
-            let need = target - current_ids.len();
-            let mut ids = self
-                .run_ec2_instances(&image_id, &instance_type, subnet.as_deref(), need, req)
-                .await;
-            ec2_touched = self.ec2_state.is_some();
-            // No EC2 backend wired (unit tests) or a partial launch: synthesize
-            // the remainder so the group still reports its desired capacity.
-            while ids.len() < need {
-                ids.push(gen_instance_id());
+        if capacity < target {
+            match self.launch_plan(&source, account, &req.region) {
+                Err(reason) => failures.push(reason),
+                Ok(plan) => {
+                    let ec2 = self.ec2_service();
+                    let weight = weight_of(&plan.weighted_capacity);
+                    let mut cap = capacity;
+                    let mut slot = current.len();
+                    while cap < target {
+                        // Spread across the group's subnets (or, without a
+                        // VPC zone identifier, its availability zones).
+                        let az_hint = azs
+                            .get(slot % azs.len().max(1))
+                            .cloned()
+                            .unwrap_or_else(|| format!("{}a", req.region));
+                        let placed = match &ec2 {
+                            // No EC2 backend wired (unit tests): synthesize the
+                            // instance so the group still reports its capacity.
+                            None => Ok((gen_instance_id(), az_hint.clone())),
+                            Some(svc) => {
+                                let mut params = plan.params.clone();
+                                match subnets.get(slot % subnets.len().max(1)) {
+                                    Some(subnet) => {
+                                        params.insert("SubnetId".to_string(), subnet.clone());
+                                    }
+                                    None => {
+                                        params.insert(
+                                            "Placement.AvailabilityZone".to_string(),
+                                            az_hint.clone(),
+                                        );
+                                    }
+                                }
+                                params.insert(
+                                    "TagSpecification.1.ResourceType".to_string(),
+                                    "instance".to_string(),
+                                );
+                                for (i, (k, v)) in instance_tags.iter().enumerate() {
+                                    let n = i + 1;
+                                    params.insert(
+                                        format!("TagSpecification.1.Tag.{n}.Key"),
+                                        k.clone(),
+                                    );
+                                    params.insert(
+                                        format!("TagSpecification.1.Tag.{n}.Value"),
+                                        v.clone(),
+                                    );
+                                }
+                                ec2_touched = true;
+                                self.run_ec2_instance(svc, params, req).await
+                            }
+                        };
+                        match placed {
+                            Ok((id, az)) => launched.push(AsgInstance {
+                                instance_id: id,
+                                availability_zone: if az.is_empty() { az_hint } else { az },
+                                lifecycle_state: "InService".to_string(),
+                                health_status: "Healthy".to_string(),
+                                launch_configuration_name: None,
+                                protected_from_scale_in: false,
+                                instance_type: plan.instance_type.clone(),
+                                launch_template: plan.launch_template.clone(),
+                                weighted_capacity: plan.weighted_capacity.clone(),
+                            }),
+                            Err(reason) => {
+                                failures.push(reason);
+                                break;
+                            }
+                        }
+                        cap += weight;
+                        slot += 1;
+                    }
+                }
             }
-            for (k, id) in ids.into_iter().enumerate() {
-                let az = azs
-                    .get(k % azs.len().max(1))
-                    .cloned()
-                    .unwrap_or_else(|| format!("{}a", req.region));
-                launched.push(AsgInstance {
-                    instance_id: id,
-                    availability_zone: az,
-                    lifecycle_state: "InService".to_string(),
-                    health_status: "Healthy".to_string(),
-                    launch_configuration_name: None,
-                    protected_from_scale_in: false,
-                });
+        } else if capacity > target {
+            // Scale in newest-first, keeping the group at or above its
+            // desired capacity (a weighted instance is only removed while the
+            // rest still covers the target).
+            let mut cap = capacity;
+            for (id, w) in current.iter().rev() {
+                let w = weight_of(w);
+                if cap - w < target {
+                    continue;
+                }
+                cap -= w;
+                terminate_ids.push(id.clone());
             }
-        } else if current_ids.len() > target {
-            let remove = current_ids.len() - target;
-            terminate_ids = current_ids.iter().rev().take(remove).cloned().collect();
             self.terminate_ec2_instances(&terminate_ids, req).await;
-            ec2_touched = self.ec2_state.is_some();
+            ec2_touched = self.ec2_state.is_some() && !terminate_ids.is_empty();
         }
 
         // Persist the REAL EC2 records this reconcile launched/terminated BEFORE
@@ -1104,30 +1392,35 @@ impl AutoScalingService {
         {
             let mut accounts = self.state.write();
             let st = accounts.get_or_create(account);
-            let descs: Vec<String> = {
+            let mut activities: Vec<ScalingActivity> = Vec::new();
+            {
                 let Some(g) = st.groups.get_mut(name) else {
                     return;
                 };
                 let lcn = g.launch_configuration_name.clone();
                 let prot = g.new_instances_protected_from_scale_in;
-                let mut descs = Vec::new();
                 for mut ni in launched {
                     ni.launch_configuration_name = lcn.clone();
                     ni.protected_from_scale_in = prot;
-                    descs.push(format!("Launching a new EC2 instance: {}", ni.instance_id));
+                    activities.push(activity(
+                        name,
+                        &format!("Launching a new EC2 instance: {}", ni.instance_id),
+                    ));
                     g.instances.push(ni);
                 }
                 if !terminate_ids.is_empty() {
                     g.instances
                         .retain(|i| !terminate_ids.contains(&i.instance_id));
                     for id in &terminate_ids {
-                        descs.push(format!("Terminating EC2 instance: {id}"));
+                        activities.push(activity(name, &format!("Terminating EC2 instance: {id}")));
                     }
                 }
-                descs
-            };
-            for d in descs {
-                st.activities.insert(0, activity(name, &d));
+                for reason in &failures {
+                    activities.push(failed_launch_activity(name, reason));
+                }
+            }
+            for a in activities {
+                st.activities.insert(0, a);
             }
         }
     }
@@ -1145,7 +1438,20 @@ fn activity(group: &str, description: &str) -> ScalingActivity {
         status_code: "Successful".to_string(),
         progress: 100,
         details: String::new(),
+        status_message: None,
     }
+}
+
+/// A launch that failed, as AWS records it.
+fn failed_launch_activity(group: &str, reason: &str) -> ScalingActivity {
+    let message = format!("{reason} Launching EC2 instance failed.");
+    let mut a = activity(
+        group,
+        &format!("Launching a new EC2 instance.  Status Reason: {message}"),
+    );
+    a.status_code = "Failed".to_string();
+    a.status_message = Some(message);
+    a
 }
 
 fn group_xml(g: &AutoScalingGroup) -> String {
@@ -1176,19 +1482,8 @@ fn group_xml(g: &AutoScalingGroup) -> String {
         .as_ref()
         .map(|lt| {
             format!(
-                "<LaunchTemplate>{}{}{}</LaunchTemplate>",
-                lt.launch_template_id
-                    .as_deref()
-                    .map(|v| el("LaunchTemplateId", v))
-                    .unwrap_or_default(),
-                lt.launch_template_name
-                    .as_deref()
-                    .map(|v| el("LaunchTemplateName", v))
-                    .unwrap_or_default(),
-                lt.version
-                    .as_deref()
-                    .map(|v| el("Version", v))
-                    .unwrap_or_default(),
+                "<LaunchTemplate>{}</LaunchTemplate>",
+                crate::launch::launch_template_spec_xml(lt)
             )
         })
         .unwrap_or_default();
@@ -1206,11 +1501,16 @@ fn group_xml(g: &AutoScalingGroup) -> String {
             )
         })
         .collect();
+    let mixed = g
+        .mixed_instances_policy
+        .as_ref()
+        .map(crate::launch::mixed_instances_policy_xml)
+        .unwrap_or_default();
     format!(
         "<member>{}{}{}{lt}{}{}{}{}{}{}{}{}<AvailabilityZones>{azs}</AvailabilityZones>\
          <Instances>{instances}</Instances><TargetGroupARNs>{tgs}</TargetGroupARNs>\
          <LoadBalancerNames>{lbs}</LoadBalancerNames>\
-         <Tags>{tags}</Tags>{}{}{}</member>",
+         <Tags>{tags}</Tags>{}{}{}<AvailabilityZoneDistribution><CapacityDistributionStrategy>balanced-best-effort</CapacityDistributionStrategy></AvailabilityZoneDistribution></member>",
         el("AutoScalingGroupName", &g.name),
         el("AutoScalingGroupARN", &g.arn),
         g.launch_configuration_name
@@ -1236,14 +1536,29 @@ fn group_xml(g: &AutoScalingGroup) -> String {
             &g.new_instances_protected_from_scale_in.to_string()
         ),
         el("ServiceLinkedRoleARN", &g.service_linked_role_arn),
-        "<AvailabilityZoneDistribution><CapacityDistributionStrategy>balanced-best-effort</CapacityDistributionStrategy></AvailabilityZoneDistribution>",
+        mixed,
     )
 }
 
 fn asg_instance_member(g: &AutoScalingGroup, i: &AsgInstance, with_group: bool) -> String {
     format!(
-        "<member>{}{}{}{}{}{}{}</member>",
+        "<member>{}{}{}{}{}{}{}{}{}{}</member>",
         el("InstanceId", &i.instance_id),
+        i.instance_type
+            .as_deref()
+            .map(|t| el("InstanceType", t))
+            .unwrap_or_default(),
+        i.launch_template
+            .as_ref()
+            .map(|lt| format!(
+                "<LaunchTemplate>{}</LaunchTemplate>",
+                crate::launch::launch_template_spec_xml(lt)
+            ))
+            .unwrap_or_default(),
+        i.weighted_capacity
+            .as_deref()
+            .map(|w| el("WeightedCapacity", w))
+            .unwrap_or_default(),
         el("AvailabilityZone", &i.availability_zone),
         el("LifecycleState", &i.lifecycle_state),
         el("HealthStatus", &i.health_status),
@@ -1265,7 +1580,7 @@ fn asg_instance_member(g: &AutoScalingGroup, i: &AsgInstance, with_group: bool) 
 
 fn activity_member(a: &ScalingActivity) -> String {
     format!(
-        "<member>{}{}{}{}{}{}{}{}</member>",
+        "<member>{}{}{}{}{}{}{}{}{}</member>",
         el("ActivityId", &a.activity_id),
         el("AutoScalingGroupName", &a.auto_scaling_group_name),
         el("Description", &a.description),
@@ -1276,6 +1591,10 @@ fn activity_member(a: &ScalingActivity) -> String {
             .unwrap_or_default(),
         el("StatusCode", &a.status_code),
         el("Progress", &a.progress.to_string()),
+        a.status_message
+            .as_deref()
+            .map(|m| el("StatusMessage", m))
+            .unwrap_or_default(),
     )
 }
 
@@ -1775,5 +2094,331 @@ mod tests {
             groups.contains("<ServiceLinkedRoleARN>arn:aws-cn:iam::123456789012:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling</ServiceLinkedRoleARN>"),
             "{groups}"
         );
+    }
+
+    fn ec2_wired() -> (AutoScalingService, fakecloud_ec2::SharedEc2State) {
+        let ec2_state: fakecloud_ec2::SharedEc2State = Arc::new(parking_lot::RwLock::new(
+            fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+        ));
+        let s = AutoScalingService::new(Arc::new(parking_lot::RwLock::new(
+            AutoScalingAccounts::new(),
+        )))
+        .with_ec2(ec2_state.clone(), None);
+        (s, ec2_state)
+    }
+
+    async fn ec2_call(
+        state: &fakecloud_ec2::SharedEc2State,
+        action: &str,
+        params: &[(&str, &str)],
+    ) {
+        let mut r = req(action, params);
+        r.service = "ec2".into();
+        fakecloud_ec2::Ec2Service::with_state(state.clone())
+            .handle(r)
+            .await
+            .unwrap_or_else(|e| panic!("{action}: {}", e.message()));
+    }
+
+    /// The EC2 view of the group's instances: (instance type, image, tags,
+    /// attached volumes as (size, encrypted)).
+    type Ec2View = Vec<(String, String, Vec<(String, String)>, Vec<(i64, bool)>)>;
+
+    fn ec2_view(state: &fakecloud_ec2::SharedEc2State, ids: &[String]) -> Ec2View {
+        let accounts = state.read();
+        let st = accounts.get("123456789012").unwrap();
+        ids.iter()
+            .map(|id| {
+                let i = &st.instances[id];
+                let tags = st
+                    .tags_for(id)
+                    .iter()
+                    .map(|t| (t.key.clone(), t.value.clone()))
+                    .collect();
+                let vols = st
+                    .volumes
+                    .values()
+                    .filter(|v| v.attachments.iter().any(|a| &a.instance_id == id))
+                    .map(|v| (v.size, v.encrypted))
+                    .collect();
+                (i.instance_type.clone(), i.image_id.clone(), tags, vols)
+            })
+            .collect()
+    }
+
+    fn group_instance_ids(s: &AutoScalingService, name: &str) -> Vec<String> {
+        s.state.read().accounts["123456789012"].groups[name]
+            .instances
+            .iter()
+            .map(|i| i.instance_id.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn launch_template_group_launches_template_volumes_and_tags() {
+        let (s, ec2) = ec2_wired();
+        ec2_call(
+            &ec2,
+            "CreateLaunchTemplate",
+            &[
+                ("LaunchTemplateName", "web"),
+                ("LaunchTemplateData.ImageId", "ami-tmpl"),
+                ("LaunchTemplateData.InstanceType", "t3.small"),
+                (
+                    "LaunchTemplateData.BlockDeviceMapping.1.DeviceName",
+                    "/dev/xvda",
+                ),
+                (
+                    "LaunchTemplateData.BlockDeviceMapping.1.Ebs.VolumeSize",
+                    "40",
+                ),
+                (
+                    "LaunchTemplateData.BlockDeviceMapping.1.Ebs.Encrypted",
+                    "true",
+                ),
+                (
+                    "LaunchTemplateData.TagSpecification.1.ResourceType",
+                    "instance",
+                ),
+                ("LaunchTemplateData.TagSpecification.1.Tag.1.Key", "team"),
+                ("LaunchTemplateData.TagSpecification.1.Tag.1.Value", "tmpl"),
+            ],
+        )
+        .await;
+        s.handle(req(
+            "CreateAutoScalingGroup",
+            &[
+                ("AutoScalingGroupName", "g"),
+                ("LaunchTemplate.LaunchTemplateName", "web"),
+                ("MinSize", "2"),
+                ("MaxSize", "2"),
+                ("Tags.member.1.Key", "team"),
+                ("Tags.member.1.Value", "asg"),
+                ("Tags.member.1.PropagateAtLaunch", "true"),
+                ("Tags.member.2.Key", "private"),
+                ("Tags.member.2.Value", "x"),
+                ("Tags.member.2.PropagateAtLaunch", "false"),
+            ],
+        ))
+        .await
+        .unwrap();
+        let ids = group_instance_ids(&s, "g");
+        assert_eq!(ids.len(), 2);
+        for (itype, image, tags, vols) in ec2_view(&ec2, &ids) {
+            assert_eq!(itype, "t3.small");
+            assert_eq!(image, "ami-tmpl");
+            assert_eq!(vols, vec![(40, true)], "template BDM volume");
+            assert!(
+                tags.contains(&("team".into(), "asg".into())),
+                "group tag wins: {tags:?}"
+            );
+            assert!(tags.contains(&("aws:autoscaling:groupName".into(), "g".into())));
+            assert!(tags.contains(&("aws:ec2launchtemplate:version".into(), "1".into())));
+            assert!(!tags.iter().any(|(k, _)| k == "private"), "not propagated");
+        }
+        // The group reports the template by id + name with the default
+        // version, and each instance the concrete version it came from.
+        let desc = body_async(&s, "DescribeAutoScalingGroups", &[]).await;
+        assert!(
+            desc.contains("<LaunchTemplateName>web</LaunchTemplateName>"),
+            "{desc}"
+        );
+        assert!(desc.contains("<Version>$Default</Version>"), "{desc}");
+        assert!(desc.contains("<Version>1</Version>"), "{desc}");
+        assert!(
+            desc.contains("<InstanceType>t3.small</InstanceType>"),
+            "{desc}"
+        );
+    }
+
+    async fn body_async(s: &AutoScalingService, action: &str, params: &[(&str, &str)]) -> String {
+        let r = s.handle(req(action, params)).await.unwrap();
+        String::from_utf8_lossy(r.body.expect_bytes()).to_string()
+    }
+
+    #[tokio::test]
+    async fn launch_configuration_group_gets_block_device_volumes_and_profile() {
+        let (s, ec2) = ec2_wired();
+        s.handle(req(
+            "CreateLaunchConfiguration",
+            &[
+                ("LaunchConfigurationName", "lc"),
+                ("ImageId", "ami-lc"),
+                ("InstanceType", "m5.large"),
+                ("IamInstanceProfile", "lc-profile"),
+                ("BlockDeviceMappings.member.1.DeviceName", "/dev/xvda"),
+                ("BlockDeviceMappings.member.1.Ebs.VolumeSize", "16"),
+                ("BlockDeviceMappings.member.1.Ebs.Encrypted", "true"),
+                ("BlockDeviceMappings.member.2.DeviceName", "/dev/xvdb"),
+                ("BlockDeviceMappings.member.2.Ebs.VolumeSize", "100"),
+            ],
+        ))
+        .await
+        .unwrap();
+        let lcs = body_async(&s, "DescribeLaunchConfigurations", &[]).await;
+        assert!(
+            lcs.contains("<DeviceName>/dev/xvdb</DeviceName><Ebs><VolumeSize>100</VolumeSize>"),
+            "{lcs}"
+        );
+        s.handle(req(
+            "CreateAutoScalingGroup",
+            &[
+                ("AutoScalingGroupName", "g"),
+                ("LaunchConfigurationName", "lc"),
+                ("MinSize", "1"),
+                ("MaxSize", "1"),
+            ],
+        ))
+        .await
+        .unwrap();
+        let ids = group_instance_ids(&s, "g");
+        let view = ec2_view(&ec2, &ids);
+        assert_eq!(view.len(), 1);
+        let (itype, image, _, mut vols) = view[0].clone();
+        vols.sort();
+        assert_eq!((itype.as_str(), image.as_str()), ("m5.large", "ami-lc"));
+        assert_eq!(vols, vec![(16, true), (100, false)]);
+        let accounts = ec2.read();
+        assert!(accounts
+            .get("123456789012")
+            .unwrap()
+            .iam_instance_profile_associations
+            .values()
+            .any(|a| a.instance_id == ids[0]
+                && a.iam_instance_profile_arn
+                    .ends_with("instance-profile/lc-profile")));
+    }
+
+    #[tokio::test]
+    async fn mixed_instances_policy_launches_override_type_and_weight() {
+        let (s, ec2) = ec2_wired();
+        ec2_call(
+            &ec2,
+            "CreateLaunchTemplate",
+            &[
+                ("LaunchTemplateName", "base"),
+                ("LaunchTemplateData.ImageId", "ami-base"),
+                ("LaunchTemplateData.InstanceType", "t3.micro"),
+            ],
+        )
+        .await;
+        s.handle(req(
+            "CreateAutoScalingGroup",
+            &[
+                ("AutoScalingGroupName", "g"),
+                (
+                    "MixedInstancesPolicy.LaunchTemplate.LaunchTemplateSpecification.LaunchTemplateName",
+                    "base",
+                ),
+                ("MixedInstancesPolicy.LaunchTemplate.LaunchTemplateSpecification.Version", "$Latest"),
+                ("MixedInstancesPolicy.LaunchTemplate.Overrides.member.1.InstanceType", "c5.xlarge"),
+                ("MixedInstancesPolicy.LaunchTemplate.Overrides.member.1.WeightedCapacity", "2"),
+                ("MixedInstancesPolicy.LaunchTemplate.Overrides.member.2.InstanceType", "m5.large"),
+                ("MinSize", "4"),
+                ("MaxSize", "4"),
+            ],
+        ))
+        .await
+        .unwrap();
+        // Desired 4 capacity units at weight 2 -> two c5.xlarge instances.
+        let ids = group_instance_ids(&s, "g");
+        assert_eq!(ids.len(), 2);
+        for (itype, image, _, _) in ec2_view(&ec2, &ids) {
+            assert_eq!((itype.as_str(), image.as_str()), ("c5.xlarge", "ami-base"));
+        }
+        let desc = body_async(&s, "DescribeAutoScalingGroups", &[]).await;
+        assert!(desc.contains("<MixedInstancesPolicy>"), "{desc}");
+        assert!(
+            desc.contains("<WeightedCapacity>2</WeightedCapacity>"),
+            "{desc}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_launch_template_or_configuration_is_rejected() {
+        let (s, _) = ec2_wired();
+        let err = s
+            .handle(req(
+                "CreateAutoScalingGroup",
+                &[
+                    ("AutoScalingGroupName", "g"),
+                    ("LaunchTemplate.LaunchTemplateName", "missing"),
+                    ("MinSize", "1"),
+                    ("MaxSize", "1"),
+                ],
+            ))
+            .await
+            .err()
+            .expect("unknown launch template rejected");
+        assert_eq!(err.code(), "ValidationError");
+        assert!(
+            err.message().contains("valid fully-formed launch template"),
+            "{}",
+            err.message()
+        );
+        let err = s
+            .handle(req(
+                "CreateAutoScalingGroup",
+                &[
+                    ("AutoScalingGroupName", "g"),
+                    ("LaunchConfigurationName", "missing"),
+                    ("MinSize", "1"),
+                    ("MaxSize", "1"),
+                ],
+            ))
+            .await
+            .err()
+            .expect("unknown launch configuration rejected");
+        assert_eq!(err.code(), "ValidationError");
+    }
+
+    #[tokio::test]
+    async fn deleted_template_version_records_a_failed_launch() {
+        let (s, ec2) = ec2_wired();
+        ec2_call(
+            &ec2,
+            "CreateLaunchTemplate",
+            &[
+                ("LaunchTemplateName", "web"),
+                ("LaunchTemplateData.ImageId", "ami-1"),
+            ],
+        )
+        .await;
+        s.handle(req(
+            "CreateAutoScalingGroup",
+            &[
+                ("AutoScalingGroupName", "g"),
+                ("LaunchTemplate.LaunchTemplateName", "web"),
+                ("MinSize", "0"),
+                ("MaxSize", "2"),
+                ("DesiredCapacity", "0"),
+            ],
+        ))
+        .await
+        .unwrap();
+        ec2_call(
+            &ec2,
+            "DeleteLaunchTemplate",
+            &[("LaunchTemplateName", "web")],
+        )
+        .await;
+        s.handle(req(
+            "SetDesiredCapacity",
+            &[("AutoScalingGroupName", "g"), ("DesiredCapacity", "1")],
+        ))
+        .await
+        .unwrap();
+        assert!(
+            group_instance_ids(&s, "g").is_empty(),
+            "no phantom instance"
+        );
+        let acts = body_async(
+            &s,
+            "DescribeScalingActivities",
+            &[("AutoScalingGroupName", "g")],
+        )
+        .await;
+        assert!(acts.contains("<StatusCode>Failed</StatusCode>"), "{acts}");
+        assert!(acts.contains("does not exist"), "{acts}");
     }
 }

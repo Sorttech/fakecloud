@@ -10,12 +10,31 @@ use helpers::TestServer;
 async fn describe_asg_round_trips_launch_template_and_load_balancers() {
     let s = TestServer::start().await;
     let asg = aws_sdk_autoscaling::Client::new(&s.aws_config().await);
+    // CreateAutoScalingGroup requires the template to exist.
+    let lt_id = s
+        .ec2_client()
+        .await
+        .create_launch_template()
+        .launch_template_name("lt-asg-template")
+        .launch_template_data(
+            aws_sdk_ec2::types::RequestLaunchTemplateData::builder()
+                .image_id("ami-0a1b2c3d4e5f60001")
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap()
+        .launch_template()
+        .unwrap()
+        .launch_template_id()
+        .unwrap()
+        .to_string();
 
     asg.create_auto_scaling_group()
         .auto_scaling_group_name("lt-asg")
         .launch_template(
             aws_sdk_autoscaling::types::LaunchTemplateSpecification::builder()
-                .launch_template_id("lt-0abc1230000000000")
+                .launch_template_id(&lt_id)
                 .version("$Latest")
                 .build(),
         )
@@ -43,7 +62,8 @@ async fn describe_asg_round_trips_launch_template_and_load_balancers() {
     let lt = g
         .launch_template()
         .expect("DescribeAutoScalingGroups must report the LaunchTemplate");
-    assert_eq!(lt.launch_template_id(), Some("lt-0abc1230000000000"));
+    assert_eq!(lt.launch_template_id(), Some(lt_id.as_str()));
+    assert_eq!(lt.launch_template_name(), Some("lt-asg-template"));
     assert_eq!(lt.version(), Some("$Latest"));
 
     assert_eq!(

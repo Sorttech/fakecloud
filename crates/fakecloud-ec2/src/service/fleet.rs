@@ -116,7 +116,7 @@ fn render_lt_data(d: &BTreeMap<String, String>) -> String {
     ));
     out.push_str(&ec2_list(
         "securityGroupSet",
-        &lt_indexed(d, "SecurityGroupName"),
+        &lt_indexed(d, "SecurityGroup"),
     ));
 
     // Monitoring.
@@ -179,6 +179,80 @@ fn render_lt_data(d: &BTreeMap<String, String>) -> String {
     // Credit specification.
     if let Some(v) = d.get("CreditSpecification.CpuCredits") {
         out.push_str(&lt_struct("creditSpecification", ec2_elem("cpuCredits", v)));
+    }
+
+    // Network interfaces (indexed list of structs).
+    let mut nis: Vec<String> = Vec::new();
+    let mut i = 1;
+    while d
+        .keys()
+        .any(|k| k.starts_with(&format!("NetworkInterface.{i}.")))
+    {
+        let p = format!("NetworkInterface.{i}");
+        let scalars = [
+            ("AssociateCarrierIpAddress", "associateCarrierIpAddress"),
+            ("AssociatePublicIpAddress", "associatePublicIpAddress"),
+            ("DeleteOnTermination", "deleteOnTermination"),
+            ("Description", "description"),
+            ("DeviceIndex", "deviceIndex"),
+            ("InterfaceType", "interfaceType"),
+            ("Ipv6AddressCount", "ipv6AddressCount"),
+            ("NetworkInterfaceId", "networkInterfaceId"),
+            ("PrivateIpAddress", "privateIpAddress"),
+            (
+                "SecondaryPrivateIpAddressCount",
+                "secondaryPrivateIpAddressCount",
+            ),
+            ("SubnetId", "subnetId"),
+            ("NetworkCardIndex", "networkCardIndex"),
+            ("Ipv4PrefixCount", "ipv4PrefixCount"),
+            ("Ipv6PrefixCount", "ipv6PrefixCount"),
+            ("PrimaryIpv6", "primaryIpv6"),
+            ("EnaQueueCount", "enaQueueCount"),
+        ]
+        .iter()
+        .filter_map(|(k, e)| d.get(&format!("{p}.{k}")).map(|v| ec2_elem(e, v)))
+        .collect::<String>();
+        let groups: Vec<String> = lt_indexed(d, &format!("{p}.SecurityGroupId"))
+            .iter()
+            .map(|g| g.to_string())
+            .collect();
+        let groups = if groups.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "<groupSet>{}</groupSet>",
+                groups
+                    .iter()
+                    .map(|g| ec2_elem("groupId", g))
+                    .collect::<String>()
+            )
+        };
+        nis.push(format!("{scalars}{groups}"));
+        i += 1;
+    }
+    out.push_str(&ec2_list("networkInterfaceSet", &nis));
+    // Private DNS name options.
+    let dns = [
+        ("PrivateDnsNameOptions.HostnameType", "hostnameType"),
+        (
+            "PrivateDnsNameOptions.EnableResourceNameDnsARecord",
+            "enableResourceNameDnsARecord",
+        ),
+        (
+            "PrivateDnsNameOptions.EnableResourceNameDnsAAAARecord",
+            "enableResourceNameDnsAAAARecord",
+        ),
+    ]
+    .iter()
+    .filter_map(|(k, e)| d.get(*k).map(|v| ec2_elem(e, v)))
+    .collect::<String>();
+    out.push_str(&lt_struct("privateDnsNameOptions", dns));
+    if let Some(v) = d.get("MaintenanceOptions.AutoRecovery") {
+        out.push_str(&lt_struct(
+            "maintenanceOptions",
+            ec2_elem("autoRecovery", v),
+        ));
     }
 
     // Block device mappings (indexed list of structs).
@@ -286,6 +360,19 @@ pub(crate) fn create_launch_template(
     // empty one is wire-invisible and can't be enforced (see require_struct).
     validate_length(&req.query_params, "VersionDescription", 0, 255)?;
     let name = require(&req.query_params, "LaunchTemplateName")?;
+    {
+        let accounts = svc.state.read();
+        if accounts
+            .get(&req.account_id)
+            .is_some_and(|st| st.launch_templates.values().any(|t| t.name == name))
+        {
+            return Err(AwsServiceError::aws_error(
+                http::StatusCode::BAD_REQUEST,
+                "InvalidLaunchTemplateName.AlreadyExistsException",
+                format!("Launch template name already in use: {name}"),
+            ));
+        }
+    }
     let id = gen_id("lt");
     let t = LaunchTemplate {
         id: id.clone(),
@@ -330,7 +417,7 @@ pub(crate) fn create_launch_template_version(
     let id = req.query_params.get("LaunchTemplateId").cloned();
     let name = req.query_params.get("LaunchTemplateName").cloned();
     let data = collect_lt_data(&req.query_params);
-    let (t, version) = {
+    let (t, version, data) = {
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(&req.account_id);
         let key = id
@@ -346,10 +433,25 @@ pub(crate) fn create_launch_template_version(
             })
             .unwrap_or_default();
         if let Some(t) = state.launch_templates.get_mut(&key) {
+            // `SourceVersion`: the new version inherits the source version's
+            // data, with the request's LaunchTemplateData winning (the same
+            // precedence a launch applies to the request over the template).
+            let data: BTreeMap<String, String> = match req.query_params.get("SourceVersion") {
+                Some(src) => {
+                    let n = super::launch_template::resolve_version(t, Some(src))?;
+                    let source = t.versions.get(&n).cloned().unwrap_or_default();
+                    let own: std::collections::HashMap<String, String> =
+                        data.clone().into_iter().collect();
+                    super::launch_template::merge_launch_template_data(&source, &own)
+                        .into_iter()
+                        .collect()
+                }
+                None => data.clone(),
+            };
             t.latest_version += 1;
             let v = t.latest_version;
             t.versions.insert(v, data.clone());
-            (t.clone(), v)
+            (t.clone(), v, data)
         } else {
             // Unknown template: synthesize a response-only record (do NOT
             // persist — fabricating a template for a version request on a
@@ -361,7 +463,7 @@ pub(crate) fn create_launch_template_version(
                 latest_version: 2,
                 versions: BTreeMap::from([(2, data.clone())]),
             };
-            (synthetic, 2)
+            (synthetic, 2, data.clone())
         }
     };
     Ok(Ec2Service::respond(
@@ -419,30 +521,94 @@ pub(crate) fn delete_launch_template(
 }
 
 pub(crate) fn delete_launch_template_versions(
-    _svc: &Ec2Service,
+    svc: &Ec2Service,
     req: &AwsRequest,
 ) -> Result<AwsResponse, AwsServiceError> {
     validate_lt_strings(req)?;
-    let id = req
-        .query_params
-        .get("LaunchTemplateId")
-        .cloned()
-        .unwrap_or_default();
     let versions = indexed_list(&req.query_params, "LaunchTemplateVersion");
-    let items: Vec<String> = versions
-        .iter()
-        .map(|v| {
-            format!(
-                "{}<versionNumber>{}</versionNumber>",
-                ec2_elem("launchTemplateId", &id),
-                v
-            )
-        })
-        .collect();
+    let req_id = req.query_params.get("LaunchTemplateId").cloned();
+    let req_name = req.query_params.get("LaunchTemplateName").cloned();
+    let mut ok_items: Vec<String> = Vec::new();
+    let mut err_items: Vec<String> = Vec::new();
+    let err_item = |id: &str, name: &str, v: &str, code: &str, msg: String| {
+        format!(
+            "{}{}{}<responseError>{}{}</responseError>",
+            ec2_elem("launchTemplateId", id),
+            ec2_elem("launchTemplateName", name),
+            ec2_elem("versionNumber", v),
+            ec2_elem("code", code),
+            ec2_elem("message", &msg),
+        )
+    };
+    {
+        let mut accounts = svc.state.write();
+        let state = accounts.get_or_create(&req.account_id);
+        let key = resolve_lt(state, req).map(|t| t.id);
+        match key.and_then(|k| state.launch_templates.get_mut(&k)) {
+            None => {
+                let (code, what) = match (&req_id, &req_name) {
+                    (Some(id), _) => ("launchTemplateIdDoesNotExist", format!("ID {id}")),
+                    (None, Some(n)) => ("launchTemplateNameDoesNotExist", format!("name {n}")),
+                    (None, None) => ("launchTemplateIdDoesNotExist", "ID".to_string()),
+                };
+                for v in &versions {
+                    err_items.push(err_item(
+                        req_id.as_deref().unwrap_or(""),
+                        req_name.as_deref().unwrap_or(""),
+                        v,
+                        code,
+                        format!(
+                            "The specified launch template, with template {what}, does not exist"
+                        ),
+                    ));
+                }
+            }
+            Some(t) => {
+                for v in &versions {
+                    let n = v
+                        .parse::<i64>()
+                        .ok()
+                        .filter(|n| super::launch_template::version_exists(t, *n));
+                    match n {
+                        None => err_items.push(err_item(
+                            &t.id,
+                            &t.name,
+                            v,
+                            "launchTemplateVersionDoesNotExist",
+                            format!("The specified launch template version, {v}, does not exist"),
+                        )),
+                        Some(n) if n == t.default_version => err_items.push(err_item(
+                            &t.id,
+                            &t.name,
+                            v,
+                            "unexpectedError",
+                            "Cannot delete the default version of a launch template".to_string(),
+                        )),
+                        Some(n) => {
+                            // A template persisted before per-version data was
+                            // recorded materializes its implicit versions first,
+                            // so deleting one keeps the others resolvable.
+                            if t.versions.is_empty() {
+                                t.versions = (1..=t.latest_version)
+                                    .map(|v| (v, BTreeMap::new()))
+                                    .collect();
+                            }
+                            t.versions.remove(&n);
+                            ok_items.push(format!(
+                                "{}{}<versionNumber>{n}</versionNumber>",
+                                ec2_elem("launchTemplateId", &t.id),
+                                ec2_elem("launchTemplateName", &t.name),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
     let body = format!(
         "{}{}",
-        ec2_list("successfullyDeletedLaunchTemplateVersionSet", &items),
-        ec2_list("unsuccessfullyDeletedLaunchTemplateVersionSet", &[])
+        ec2_list("successfullyDeletedLaunchTemplateVersionSet", &ok_items),
+        ec2_list("unsuccessfullyDeletedLaunchTemplateVersionSet", &err_items)
     );
     Ok(Ec2Service::respond(
         "DeleteLaunchTemplateVersions",
@@ -475,6 +641,16 @@ pub(crate) fn describe_launch_templates(
     ))
 }
 
+/// The existing version numbers of a template, ascending (templates persisted
+/// before per-version data was recorded had every number up to the latest).
+fn existing_versions(t: &LaunchTemplate) -> Vec<i64> {
+    if t.versions.is_empty() {
+        (1..=t.latest_version).collect()
+    } else {
+        t.versions.keys().copied().collect()
+    }
+}
+
 pub(crate) fn describe_launch_template_versions(
     svc: &Ec2Service,
     req: &AwsRequest,
@@ -485,16 +661,58 @@ pub(crate) fn describe_launch_template_versions(
     let empty = Ec2State::new(&req.account_id, &req.region);
     let state = accounts.get(&req.account_id).unwrap_or(&empty);
     let empty_data = BTreeMap::new();
-    let items: Vec<String> = resolve_lt(state, req)
-        .map(|t| {
-            (1..=t.latest_version)
-                .map(|v| {
-                    let data = t.versions.get(&v).unwrap_or(&empty_data);
-                    lt_version_xml(&t, v, &owner, data, &req.region)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let selectors = indexed_list(&req.query_params, "LaunchTemplateVersion");
+    let bound = |key: &str| {
+        req.query_params
+            .get(key)
+            .and_then(|v| v.parse::<i64>().ok())
+    };
+    let (min, max) = (bound("MinVersion"), bound("MaxVersion"));
+    let render = |t: &LaunchTemplate, v: i64| {
+        let data = t.versions.get(&v).unwrap_or(&empty_data);
+        lt_version_xml(t, v, &owner, data, &req.region)
+    };
+    let named = req.query_params.contains_key("LaunchTemplateId")
+        || req.query_params.contains_key("LaunchTemplateName");
+    let items: Vec<String> = if named {
+        match resolve_lt(state, req) {
+            None => Vec::new(),
+            Some(t) => {
+                let mut wanted: Vec<i64> = if selectors.is_empty() {
+                    existing_versions(&t)
+                } else {
+                    let mut out = Vec::new();
+                    for sel in &selectors {
+                        out.push(super::launch_template::resolve_version(&t, Some(sel))?);
+                    }
+                    out.sort_unstable();
+                    out.dedup();
+                    out
+                };
+                wanted.retain(|v| min.is_none_or(|m| *v > m) && max.is_none_or(|m| *v <= m));
+                wanted.into_iter().map(|v| render(&t, v)).collect()
+            }
+        }
+    } else {
+        // Account-wide: the latest and/or default version of every template.
+        let latest = selectors.iter().any(|s| s == "$Latest");
+        let default = selectors.iter().any(|s| s == "$Default");
+        state
+            .launch_templates
+            .values()
+            .flat_map(|t| {
+                let mut vs = Vec::new();
+                if latest {
+                    vs.push(t.latest_version);
+                }
+                if default && !vs.contains(&t.default_version) {
+                    vs.push(t.default_version);
+                }
+                vs.into_iter().map(move |v| (t, v))
+            })
+            .map(|(t, v)| render(t, v))
+            .collect()
+    };
     Ok(Ec2Service::respond(
         "DescribeLaunchTemplateVersions",
         &req.request_id,
@@ -502,15 +720,190 @@ pub(crate) fn describe_launch_template_versions(
     ))
 }
 
+/// The `LaunchTemplateData` (flattened, as stored for a template version) that
+/// relaunches an existing instance the way it was launched: AMI, type, key,
+/// placement, monitoring, the primary network interface with its security
+/// groups, IAM instance profile, metadata / CPU / credit / DNS options, its
+/// EBS volumes and tags.
+fn instance_launch_template_data(state: &Ec2State, id: &str) -> Option<BTreeMap<String, String>> {
+    let inst = state.instances.get(id)?;
+    let mut d = BTreeMap::new();
+    let mut put = |k: &str, v: String| {
+        d.insert(k.to_string(), v);
+    };
+    put("ImageId", inst.image_id.clone());
+    put("InstanceType", inst.instance_type.clone());
+    if let Some(k) = &inst.key_name {
+        put("KeyName", k.clone());
+    }
+    put("Monitoring.Enabled", inst.monitoring.to_string());
+    put("EbsOptimized", inst.ebs_optimized.to_string());
+    put(
+        "DisableApiTermination",
+        inst.disable_api_termination.to_string(),
+    );
+    put("DisableApiStop", inst.disable_api_stop.to_string());
+    put(
+        "InstanceInitiatedShutdownBehavior",
+        inst.instance_initiated_shutdown_behavior.clone(),
+    );
+    if let Some(u) = &inst.user_data {
+        put("UserData", u.clone());
+    }
+    put("Placement.AvailabilityZone", inst.az.clone());
+    put(
+        "Placement.Tenancy",
+        inst.placement_tenancy
+            .clone()
+            .unwrap_or_else(|| "default".to_string()),
+    );
+    if let Some(g) = &inst.placement_group_name {
+        put("Placement.GroupName", g.clone());
+    }
+    if let Some(a) = &inst.placement_affinity {
+        put("Placement.Affinity", a.clone());
+    }
+    let m = &inst.metadata_options;
+    put("MetadataOptions.HttpTokens", m.http_tokens.clone());
+    put(
+        "MetadataOptions.HttpPutResponseHopLimit",
+        m.http_put_response_hop_limit.to_string(),
+    );
+    put("MetadataOptions.HttpEndpoint", m.http_endpoint.clone());
+    put(
+        "MetadataOptions.HttpProtocolIpv6",
+        m.http_protocol_ipv6.clone(),
+    );
+    put(
+        "MetadataOptions.InstanceMetadataTags",
+        m.instance_metadata_tags.clone(),
+    );
+    if let Some(c) = &inst.cpu_options {
+        put("CpuOptions.CoreCount", c.core_count.to_string());
+        put("CpuOptions.ThreadsPerCore", c.threads_per_core.to_string());
+    }
+    if let Some(c) = state.instance_credit_specs.get(id) {
+        put("CreditSpecification.CpuCredits", c.clone());
+    }
+    put(
+        "PrivateDnsNameOptions.HostnameType",
+        inst.private_dns_hostname_type
+            .clone()
+            .unwrap_or_else(|| "ip-name".to_string()),
+    );
+    put(
+        "PrivateDnsNameOptions.EnableResourceNameDnsARecord",
+        inst.enable_resource_name_dns_a_record.to_string(),
+    );
+    put(
+        "PrivateDnsNameOptions.EnableResourceNameDnsAAAARecord",
+        inst.enable_resource_name_dns_aaaa_record.to_string(),
+    );
+    put(
+        "MaintenanceOptions.AutoRecovery",
+        inst.maintenance_options.auto_recovery.clone(),
+    );
+    if let Some(assoc) = state
+        .iam_instance_profile_associations
+        .values()
+        .find(|a| a.instance_id == id && a.state != "disassociated")
+    {
+        put(
+            "IamInstanceProfile.Arn",
+            assoc.iam_instance_profile_arn.clone(),
+        );
+    }
+    // The primary network interface carries the subnet, private IP and
+    // security groups.
+    put("NetworkInterface.1.DeviceIndex", "0".to_string());
+    put("NetworkInterface.1.DeleteOnTermination", "true".to_string());
+    put(
+        "NetworkInterface.1.AssociatePublicIpAddress",
+        inst.public_ip.is_some().to_string(),
+    );
+    if let Some(sn) = &inst.subnet_id {
+        put("NetworkInterface.1.SubnetId", sn.clone());
+    }
+    put(
+        "NetworkInterface.1.PrivateIpAddress",
+        inst.private_ip.clone(),
+    );
+    for (i, g) in inst.security_group_ids.iter().enumerate() {
+        put(
+            &format!("NetworkInterface.1.SecurityGroupId.{}", i + 1),
+            g.clone(),
+        );
+    }
+    let mut volumes: Vec<(&crate::state::Volume, &crate::state::VolumeAttachment)> = state
+        .volumes
+        .values()
+        .filter_map(|v| {
+            v.attachments
+                .iter()
+                .find(|a| a.instance_id == id)
+                .map(|a| (v, a))
+        })
+        .collect();
+    volumes.sort_by(|a, b| a.1.device.cmp(&b.1.device));
+    for (n, (v, a)) in volumes.iter().enumerate() {
+        let p = format!("BlockDeviceMapping.{}", n + 1);
+        put(&format!("{p}.DeviceName"), a.device.clone());
+        put(&format!("{p}.Ebs.VolumeSize"), v.size.to_string());
+        put(&format!("{p}.Ebs.VolumeType"), v.volume_type.clone());
+        put(
+            &format!("{p}.Ebs.DeleteOnTermination"),
+            a.delete_on_termination.to_string(),
+        );
+        put(&format!("{p}.Ebs.Encrypted"), v.encrypted.to_string());
+        if let Some(k) = &v.kms_key_id {
+            put(&format!("{p}.Ebs.KmsKeyId"), k.clone());
+        }
+        if let Some(i) = v.iops {
+            put(&format!("{p}.Ebs.Iops"), i.to_string());
+        }
+        if let Some(t) = v.throughput {
+            put(&format!("{p}.Ebs.Throughput"), t.to_string());
+        }
+        if let Some(sn) = &v.snapshot_id {
+            put(&format!("{p}.Ebs.SnapshotId"), sn.clone());
+        }
+    }
+    // User tags (not `aws:` system tags, which a template cannot carry).
+    let tags: Vec<&Tag> = state
+        .tags_for(id)
+        .iter()
+        .filter(|t| !t.key.starts_with("aws:"))
+        .collect();
+    if !tags.is_empty() {
+        put("TagSpecification.1.ResourceType", "instance".to_string());
+        for (j, t) in tags.iter().enumerate() {
+            put(
+                &format!("TagSpecification.1.Tag.{}.Key", j + 1),
+                t.key.clone(),
+            );
+            put(
+                &format!("TagSpecification.1.Tag.{}.Value", j + 1),
+                t.value.clone(),
+            );
+        }
+    }
+    Some(d)
+}
+
 pub(crate) fn get_launch_template_data(
-    _svc: &Ec2Service,
+    svc: &Ec2Service,
     req: &AwsRequest,
 ) -> Result<AwsResponse, AwsServiceError> {
-    require(&req.query_params, "InstanceId")?;
+    let id = require(&req.query_params, "InstanceId")?;
+    let accounts = svc.state.read();
+    let empty = Ec2State::new(&req.account_id, &req.region);
+    let state = accounts.get(&req.account_id).unwrap_or(&empty);
+    let data = instance_launch_template_data(state, &id)
+        .ok_or_else(|| crate::service_helpers::instance_not_found(&id))?;
     Ok(Ec2Service::respond(
         "GetLaunchTemplateData",
         &req.request_id,
-        "<launchTemplateData><instanceType>t3.micro</instanceType></launchTemplateData>",
+        &render_lt_data(&data),
     ))
 }
 
@@ -522,14 +915,16 @@ pub(crate) fn modify_launch_template(
     let owner = req.account_id.clone();
     let mut accounts = svc.state.write();
     let state = accounts.get_or_create(&req.account_id);
-    if let (Some(t), Some(v)) = (
-        resolve_lt(state, req),
-        req.query_params
-            .get("DefaultVersion")
-            .and_then(|v| v.parse::<i64>().ok()),
-    ) {
+    // `DefaultVersion` is serialized as `SetDefaultVersion` on the wire.
+    let new_default = req
+        .query_params
+        .get("SetDefaultVersion")
+        .or_else(|| req.query_params.get("DefaultVersion"));
+    if let (Some(t), Some(v)) = (resolve_lt(state, req), new_default) {
+        // Only an existing version can become the default.
+        let n = super::launch_template::resolve_version(&t, Some(v))?;
         if let Some(t) = state.launch_templates.get_mut(&t.id) {
-            t.default_version = v;
+            t.default_version = n;
         }
     }
     let t = resolve_lt(state, req);
@@ -1480,5 +1875,290 @@ mod spot_placement_score_tests {
             ),
         ));
         assert_eq!(err.code(), "InvalidParameterValue");
+    }
+}
+
+#[cfg(test)]
+mod launch_template_version_tests {
+    use super::*;
+    use crate::test_support::{ec2_request as req, err_of};
+
+    fn body(resp: AwsResponse) -> String {
+        String::from_utf8_lossy(resp.body.expect_bytes()).to_string()
+    }
+
+    fn template_with_versions(svc: &Ec2Service, versions: &[&str]) {
+        create_launch_template(
+            svc,
+            &req(
+                "CreateLaunchTemplate",
+                &[
+                    ("LaunchTemplateName", "web"),
+                    ("LaunchTemplateData.InstanceType", versions[0]),
+                    ("LaunchTemplateData.KeyName", "kp"),
+                ],
+            ),
+        )
+        .unwrap();
+        for v in &versions[1..] {
+            create_launch_template_version(
+                svc,
+                &req(
+                    "CreateLaunchTemplateVersion",
+                    &[
+                        ("LaunchTemplateName", "web"),
+                        ("LaunchTemplateData.InstanceType", v),
+                    ],
+                ),
+            )
+            .unwrap();
+        }
+    }
+
+    fn version_numbers(xml: &str) -> Vec<String> {
+        xml.split("<versionNumber>")
+            .skip(1)
+            .filter_map(|s| s.split("</versionNumber>").next())
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn duplicate_template_name_is_rejected() {
+        let svc = Ec2Service::new();
+        template_with_versions(&svc, &["t3.micro"]);
+        let err = err_of(create_launch_template(
+            &svc,
+            &req("CreateLaunchTemplate", &[("LaunchTemplateName", "web")]),
+        ));
+        assert_eq!(
+            err.code(),
+            "InvalidLaunchTemplateName.AlreadyExistsException"
+        );
+    }
+
+    #[test]
+    fn deleted_versions_are_gone_and_the_default_cannot_be_deleted() {
+        let svc = Ec2Service::new();
+        template_with_versions(&svc, &["t3.micro", "t3.small", "t3.large"]);
+        let out = body(
+            delete_launch_template_versions(
+                &svc,
+                &req(
+                    "DeleteLaunchTemplateVersions",
+                    &[
+                        ("LaunchTemplateName", "web"),
+                        ("LaunchTemplateVersion.1", "2"),
+                        ("LaunchTemplateVersion.2", "1"),
+                        ("LaunchTemplateVersion.3", "9"),
+                    ],
+                ),
+            )
+            .unwrap(),
+        );
+        let (ok, failed) = out
+            .split_once("<unsuccessfullyDeletedLaunchTemplateVersionSet>")
+            .unwrap();
+        assert_eq!(version_numbers(ok), vec!["2"]);
+        assert_eq!(version_numbers(failed), vec!["1", "9"]);
+        assert!(failed.contains("<code>launchTemplateVersionDoesNotExist</code>"));
+
+        let desc = body(
+            describe_launch_template_versions(
+                &svc,
+                &req(
+                    "DescribeLaunchTemplateVersions",
+                    &[("LaunchTemplateName", "web")],
+                ),
+            )
+            .unwrap(),
+        );
+        assert_eq!(version_numbers(&desc), vec!["1", "3"]);
+    }
+
+    #[test]
+    fn describe_versions_honors_selectors_and_bounds() {
+        let svc = Ec2Service::new();
+        template_with_versions(&svc, &["t3.micro", "t3.small", "t3.large", "m5.large"]);
+        let describe = |q: &[(&str, &str)]| {
+            let mut q = q.to_vec();
+            q.push(("LaunchTemplateName", "web"));
+            version_numbers(&body(
+                describe_launch_template_versions(&svc, &req("DescribeLaunchTemplateVersions", &q))
+                    .unwrap(),
+            ))
+        };
+        assert_eq!(
+            describe(&[("LaunchTemplateVersion.1", "$Latest")]),
+            vec!["4"]
+        );
+        assert_eq!(
+            describe(&[
+                ("LaunchTemplateVersion.1", "$Default"),
+                ("LaunchTemplateVersion.2", "3")
+            ]),
+            vec!["1", "3"]
+        );
+        assert_eq!(
+            describe(&[("MinVersion", "1"), ("MaxVersion", "3")]),
+            vec!["2", "3"]
+        );
+        let err = err_of(describe_launch_template_versions(
+            &svc,
+            &req(
+                "DescribeLaunchTemplateVersions",
+                &[
+                    ("LaunchTemplateName", "web"),
+                    ("LaunchTemplateVersion.1", "7"),
+                ],
+            ),
+        ));
+        assert_eq!(err.code(), "InvalidLaunchTemplateId.VersionNotFound");
+    }
+
+    #[test]
+    fn set_default_version_and_source_version() {
+        let svc = Ec2Service::new();
+        template_with_versions(&svc, &["t3.micro", "t3.small"]);
+        let out = body(
+            modify_launch_template(
+                &svc,
+                &req(
+                    "ModifyLaunchTemplate",
+                    &[("LaunchTemplateName", "web"), ("SetDefaultVersion", "2")],
+                ),
+            )
+            .unwrap(),
+        );
+        assert!(
+            out.contains("<defaultVersionNumber>2</defaultVersionNumber>"),
+            "{out}"
+        );
+        let err = err_of(modify_launch_template(
+            &svc,
+            &req(
+                "ModifyLaunchTemplate",
+                &[("LaunchTemplateName", "web"), ("SetDefaultVersion", "8")],
+            ),
+        ));
+        assert_eq!(err.code(), "InvalidLaunchTemplateId.VersionNotFound");
+
+        // Version 3 from source version 1: inherits KeyName, overrides type.
+        let out = body(
+            create_launch_template_version(
+                &svc,
+                &req(
+                    "CreateLaunchTemplateVersion",
+                    &[
+                        ("LaunchTemplateName", "web"),
+                        ("SourceVersion", "1"),
+                        ("LaunchTemplateData.InstanceType", "c5.large"),
+                    ],
+                ),
+            )
+            .unwrap(),
+        );
+        assert!(out.contains("<versionNumber>3</versionNumber>"), "{out}");
+        assert!(out.contains("<keyName>kp</keyName>"), "{out}");
+        assert!(
+            out.contains("<instanceType>c5.large</instanceType>"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn security_group_names_and_network_interfaces_round_trip() {
+        let svc = Ec2Service::new();
+        create_launch_template(
+            &svc,
+            &req(
+                "CreateLaunchTemplate",
+                &[
+                    ("LaunchTemplateName", "net"),
+                    ("LaunchTemplateData.SecurityGroup.1", "web"),
+                    ("LaunchTemplateData.NetworkInterface.1.DeviceIndex", "0"),
+                    ("LaunchTemplateData.NetworkInterface.1.SubnetId", "subnet-1"),
+                    (
+                        "LaunchTemplateData.NetworkInterface.1.SecurityGroupId.1",
+                        "sg-1",
+                    ),
+                ],
+            ),
+        )
+        .unwrap();
+        let desc = body(
+            describe_launch_template_versions(
+                &svc,
+                &req(
+                    "DescribeLaunchTemplateVersions",
+                    &[("LaunchTemplateName", "net")],
+                ),
+            )
+            .unwrap(),
+        );
+        assert!(
+            desc.contains("<securityGroupSet><item>web</item></securityGroupSet>"),
+            "{desc}"
+        );
+        assert!(
+            desc.contains("<networkInterfaceSet><item><deviceIndex>0</deviceIndex><subnetId>subnet-1</subnetId><groupSet><groupId>sg-1</groupId></groupSet></item></networkInterfaceSet>"),
+            "{desc}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_launch_template_data_reflects_the_instance() {
+        let svc = Ec2Service::new();
+        let out = body(
+            super::super::instance::run_instances(
+                &svc,
+                &req(
+                    "RunInstances",
+                    &[
+                        ("ImageId", "ami-9"),
+                        ("InstanceType", "m5.large"),
+                        ("MinCount", "1"),
+                        ("MaxCount", "1"),
+                        ("KeyName", "kp"),
+                        ("BlockDeviceMapping.1.DeviceName", "/dev/xvda"),
+                        ("BlockDeviceMapping.1.Ebs.VolumeSize", "11"),
+                        ("TagSpecification.1.ResourceType", "instance"),
+                        ("TagSpecification.1.Tag.1.Key", "Name"),
+                        ("TagSpecification.1.Tag.1.Value", "box"),
+                    ],
+                ),
+            )
+            .await
+            .unwrap(),
+        );
+        let id = out
+            .split("<instanceId>")
+            .nth(1)
+            .and_then(|s| s.split("</instanceId>").next())
+            .unwrap()
+            .to_string();
+        let data = body(
+            get_launch_template_data(&svc, &req("GetLaunchTemplateData", &[("InstanceId", &id)]))
+                .unwrap(),
+        );
+        for needle in [
+            "<imageId>ami-9</imageId>",
+            "<instanceType>m5.large</instanceType>",
+            "<keyName>kp</keyName>",
+            "<deviceName>/dev/xvda</deviceName>",
+            "<volumeSize>11</volumeSize>",
+            "<key>Name</key><value>box</value>",
+            "<deviceIndex>0</deviceIndex>",
+        ] {
+            assert!(data.contains(needle), "missing {needle}: {data}");
+        }
+        let err = err_of(get_launch_template_data(
+            &svc,
+            &req(
+                "GetLaunchTemplateData",
+                &[("InstanceId", "i-0000000000000000f")],
+            ),
+        ));
+        assert_eq!(err.code(), "InvalidInstanceID.NotFound");
     }
 }

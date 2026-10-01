@@ -81,6 +81,11 @@ fn well_known_attributes_for(resource_type: &str) -> &'static [&'static str] {
         "AWS::EC2::InternetGateway" => &["InternetGatewayId"],
         "AWS::EC2::RouteTable" => &["RouteTableId"],
         "AWS::EC2::Volume" => &["VolumeId"],
+        "AWS::EC2::LaunchTemplate" => &[
+            "LaunchTemplateId",
+            "LatestVersionNumber",
+            "DefaultVersionNumber",
+        ],
         "AWS::Pipes::Pipe" => &["Arn"],
         "AWS::CodeArtifact::Domain" => &["Arn", "EncryptionKey", "Name", "Owner"],
         "AWS::CodeArtifact::Repository" => &["Arn", "DomainName", "DomainOwner", "Name"],
@@ -765,6 +770,9 @@ pub(crate) struct ContainerBackingHandles {
     /// hooks itself once it has finished mutating (bug-hunt restart-dataloss).
     autoscaling_snapshot_hook: Option<SnapshotHook>,
     ec2_snapshot_hook: Option<SnapshotHook>,
+    /// KMS hook an Auto Scaling reconcile's EC2 launches resolve encrypted
+    /// block-device volumes' keys through.
+    kms_hook: Option<Arc<dyn fakecloud_core::delivery::KmsHook>>,
 }
 
 impl ContainerBackingHandles {
@@ -787,6 +795,7 @@ impl ContainerBackingHandles {
             kafka_runtime: p.kafka_runtime.clone(),
             autoscaling_snapshot_hook: None,
             ec2_snapshot_hook: None,
+            kms_hook: p.kms_hook.clone(),
         }
     }
 
@@ -838,6 +847,7 @@ impl ContainerBackingHandles {
                         autoscaling: self.autoscaling_snapshot_hook.clone(),
                         ec2: self.ec2_snapshot_hook.clone(),
                     };
+                    let kms_hook = self.kms_hook.clone();
                     tokio::spawn(async move {
                         fakecloud_autoscaling::cfn_provision::cfn_reconcile_capacity(
                             asg_state,
@@ -847,6 +857,7 @@ impl ContainerBackingHandles {
                             account,
                             region,
                             persist,
+                            kms_hook,
                         )
                         .await;
                     });

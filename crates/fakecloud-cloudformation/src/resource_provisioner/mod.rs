@@ -1417,6 +1417,7 @@ impl ResourceProvisioner {
             "AWS::EC2::InternetGateway" => self.create_ec2_internet_gateway(resource),
             "AWS::EC2::RouteTable" => self.create_ec2_route_table(resource),
             "AWS::EC2::Volume" => self.create_ec2_volume(resource),
+            "AWS::EC2::LaunchTemplate" => self.create_ec2_launch_template(resource),
             "AWS::ECS::Cluster" => self.create_ecs_cluster(resource),
             "AWS::ECS::TaskDefinition" => self.create_ecs_task_definition(resource),
             "AWS::ECS::Service" => self.create_ecs_service(resource),
@@ -1910,6 +1911,11 @@ impl ResourceProvisioner {
             "AWS::DocDB::DBCluster" => Some(self.update_docdb_cluster(existing, new_def)?),
             "AWS::Neptune::DBCluster" => Some(self.update_neptune_cluster(existing, new_def)?),
             "AWS::EC2::Instance" => Some(self.update_ec2_instance(existing, new_def)?),
+            // A new template version, made the default, keeps the template id
+            // every launch references; a rename replaces it.
+            "AWS::EC2::LaunchTemplate" if self.launch_template_name_kept(existing, new_def) => {
+                Some(self.update_ec2_launch_template(existing, new_def)?)
+            }
             // Stateful catalog/timeseries types: an in-place update preserves
             // the contained data (Glue tables/partitions, Timestream records)
             // that a reprovision (delete+create) would silently wipe.
@@ -2227,7 +2233,8 @@ impl ResourceProvisioner {
             | "AWS::EC2::InternetGateway"
             | "AWS::EC2::Instance"
             | "AWS::EC2::RouteTable"
-            | "AWS::EC2::Volume" => self.get_att_ec2(resource, attribute),
+            | "AWS::EC2::Volume"
+            | "AWS::EC2::LaunchTemplate" => self.get_att_ec2(resource, attribute),
             "AWS::ECS::CapacityProvider" => {
                 self.get_att_ecs_capacity_provider(&resource.physical_id, attribute)
             }
@@ -2621,7 +2628,8 @@ impl ResourceProvisioner {
             | "AWS::EC2::SecurityGroup"
             | "AWS::EC2::InternetGateway"
             | "AWS::EC2::RouteTable"
-            | "AWS::EC2::Volume" => {
+            | "AWS::EC2::Volume"
+            | "AWS::EC2::LaunchTemplate" => {
                 self.delete_ec2_resource(&resource.resource_type, &resource.physical_id)
             }
             "AWS::AutoScaling::LaunchConfiguration" | "AWS::AutoScaling::AutoScalingGroup" => {
@@ -8241,6 +8249,156 @@ mod tests {
             .unwrap()
             .volumes
             .contains_key(&vol.physical_id));
+    }
+
+    /// A stack launch template is a real EC2 launch template: an instance
+    /// that references it launches from its data (image, type, encrypted
+    /// volume, tags) under the instance's own properties, an update adds a
+    /// new default version, and an Auto Scaling group referencing it records
+    /// the resolved template while one naming a missing template fails.
+    #[test]
+    fn stack_launch_template_drives_instances_and_groups() {
+        let prov = make_provisioner();
+        let acct = "123456789012";
+        let lt = prov
+            .create_resource(&make_resource(
+                "AWS::EC2::LaunchTemplate",
+                "Tmpl",
+                serde_json::json!({
+                    "LaunchTemplateName": "stack-web",
+                    "LaunchTemplateData": {
+                        "ImageId": "ami-0tmpl",
+                        "InstanceType": "t3.small",
+                        "IamInstanceProfile": {"Name": "web-profile"},
+                        "MetadataOptions": {"HttpTokens": "required"},
+                        "BlockDeviceMappings": [{
+                            "DeviceName": "/dev/xvda",
+                            "Ebs": {"VolumeSize": 24, "Encrypted": true}
+                        }],
+                        "TagSpecifications": [{
+                            "ResourceType": "instance",
+                            "Tags": [{"Key": "tier", "Value": "web"}]
+                        }]
+                    }
+                }),
+            ))
+            .unwrap();
+        assert!(lt.physical_id.starts_with("lt-"), "{}", lt.physical_id);
+        assert_eq!(
+            prov.get_att(&lt, "LatestVersionNumber").as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            prov.get_att(&lt, "LaunchTemplateId").as_deref(),
+            Some(lt.physical_id.as_str())
+        );
+
+        let inst = prov
+            .create_resource(&make_resource(
+                "AWS::EC2::Instance",
+                "Box",
+                serde_json::json!({
+                    "InstanceType": "m5.large",
+                    "LaunchTemplate": {"LaunchTemplateId": lt.physical_id, "Version": "1"},
+                    "Tags": [{"Key": "Name", "Value": "box"}]
+                }),
+            ))
+            .unwrap();
+        {
+            let ec2 = prov.ec2_state.read();
+            let st = ec2.get(acct).unwrap();
+            let i = &st.instances[&inst.physical_id];
+            assert_eq!(i.image_id, "ami-0tmpl");
+            assert_eq!(i.instance_type, "m5.large", "instance property wins");
+            assert_eq!(i.metadata_options.http_tokens, "required");
+            let tags: Vec<(String, String)> = st
+                .tags_for(&inst.physical_id)
+                .iter()
+                .map(|t| (t.key.clone(), t.value.clone()))
+                .collect();
+            for want in [
+                ("tier", "web"),
+                ("Name", "box"),
+                ("aws:ec2launchtemplate:version", "1"),
+            ] {
+                assert!(
+                    tags.contains(&(want.0.to_string(), want.1.to_string())),
+                    "{want:?} in {tags:?}"
+                );
+            }
+            let vol = st
+                .volumes
+                .values()
+                .find(|v| {
+                    v.attachments
+                        .iter()
+                        .any(|a| a.instance_id == inst.physical_id)
+                })
+                .expect("template volume");
+            assert_eq!(vol.size, 24);
+            assert!(vol.encrypted);
+            let key = vol.kms_key_id.clone().expect("aws/ebs key");
+            drop(ec2);
+            assert_aws_managed_key(&prov, &key, "alias/aws/ebs");
+        }
+
+        // Updating the data adds version 2 and makes it the default.
+        let updated = prov
+            .update_resource(
+                &lt,
+                &make_resource(
+                    "AWS::EC2::LaunchTemplate",
+                    "Tmpl",
+                    serde_json::json!({
+                        "LaunchTemplateName": "stack-web",
+                        "LaunchTemplateData": {"ImageId": "ami-0v2", "InstanceType": "t3.large"}
+                    }),
+                ),
+            )
+            .unwrap()
+            .expect("in-place update");
+        assert_eq!(updated.physical_id, lt.physical_id, "id kept");
+        assert_eq!(
+            prov.get_att(&updated, "DefaultVersionNumber").as_deref(),
+            Some("2")
+        );
+        {
+            let ec2 = prov.ec2_state.read();
+            let t = &ec2.get(acct).unwrap().launch_templates[&lt.physical_id];
+            assert_eq!((t.default_version, t.latest_version), (2, 2));
+        }
+
+        let asg = prov
+            .create_resource(&make_resource(
+                "AWS::AutoScaling::AutoScalingGroup",
+                "Group",
+                serde_json::json!({
+                    "MinSize": "0", "MaxSize": "1", "DesiredCapacity": "0",
+                    "LaunchTemplate": {"LaunchTemplateName": "stack-web"},
+                    "Tags": [{"Key": "team", "Value": "a", "PropagateAtLaunch": "true"}]
+                }),
+            ))
+            .unwrap();
+        {
+            let st = prov.autoscaling_state.read();
+            let g = &st.accounts[acct].groups[&asg.physical_id];
+            let spec = g.launch_template.as_ref().unwrap();
+            assert_eq!(
+                spec.launch_template_id.as_deref(),
+                Some(lt.physical_id.as_str())
+            );
+            assert_eq!(spec.version.as_deref(), Some("$Default"));
+            assert!(g.tags[0].propagate_at_launch);
+        }
+        let missing = prov.create_resource(&make_resource(
+            "AWS::AutoScaling::AutoScalingGroup",
+            "Bad",
+            serde_json::json!({
+                "MinSize": "0", "MaxSize": "1",
+                "LaunchTemplate": {"LaunchTemplateName": "nope"}
+            }),
+        ));
+        assert!(missing.is_err(), "missing launch template fails the create");
     }
 
     /// A stack MSK cluster rejected for a duplicate name mints no key.

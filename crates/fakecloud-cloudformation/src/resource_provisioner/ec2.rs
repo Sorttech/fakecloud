@@ -137,6 +137,93 @@ fn cfn_block_device_params(props: &Value) -> HashMap<String, String> {
     params
 }
 
+/// The EC2 query member name of a CloudFormation list property. CFN names
+/// lists in the plural (`BlockDeviceMappings`, `SecurityGroupIds`, `Tags`),
+/// the EC2 query protocol by their singular member name (`BlockDeviceMapping.N`,
+/// `SecurityGroupId.N`, `Tag.N`).
+fn cfn_list_member(name: &str) -> &str {
+    match name {
+        "BlockDeviceMappings" => "BlockDeviceMapping",
+        "NetworkInterfaces" => "NetworkInterface",
+        "Groups" => "SecurityGroupId",
+        "SecurityGroupIds" => "SecurityGroupId",
+        "SecurityGroups" => "SecurityGroup",
+        "TagSpecifications" => "TagSpecification",
+        "Tags" => "Tag",
+        "ElasticGpuSpecifications" => "ElasticGpuSpecification",
+        "ElasticInferenceAccelerators" => "ElasticInferenceAccelerator",
+        "LicenseSpecifications" => "LicenseSpecification",
+        "Ipv4Prefixes" => "Ipv4Prefix",
+        "Ipv6Prefixes" => "Ipv6Prefix",
+        other => other,
+    }
+}
+
+/// Flatten a CloudFormation property value into EC2 query parameters under
+/// `prefix`: objects become `prefix.Member`, lists `prefix.Member.N`
+/// (1-based, with the singular member name), scalars the value.
+fn flatten_cfn_query(prefix: &str, value: &Value, out: &mut HashMap<String, String>) {
+    match value {
+        Value::Object(map) => {
+            for (k, v) in map {
+                let name = if v.is_array() {
+                    cfn_list_member(k)
+                } else {
+                    k.as_str()
+                };
+                let key = if prefix.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{prefix}.{name}")
+                };
+                flatten_cfn_query(&key, v, out);
+            }
+        }
+        Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                flatten_cfn_query(&format!("{prefix}.{}", i + 1), item, out);
+            }
+        }
+        Value::Null => {}
+        scalar => {
+            if let Some(v) = cfn_scalar(scalar) {
+                out.insert(prefix.to_string(), v);
+            }
+        }
+    }
+}
+
+/// A CFN `LaunchTemplate` (`LaunchTemplateSpecification`) property.
+fn cfn_launch_template_ref(
+    props: &Value,
+) -> Option<fakecloud_ec2::cfn_provision::LaunchTemplateRef> {
+    let lt = props.get("LaunchTemplate")?;
+    let field = |k: &str| lt.get(k).and_then(cfn_scalar).filter(|v| !v.is_empty());
+    Some(fakecloud_ec2::cfn_provision::LaunchTemplateRef {
+        id: field("LaunchTemplateId"),
+        name: field("LaunchTemplateName"),
+        version: field("Version"),
+    })
+}
+
+/// CFN `Tags` as `(key, value)` pairs.
+fn cfn_tag_pairs(props: &Value) -> Vec<(String, String)> {
+    props
+        .get("Tags")
+        .and_then(|v| v.as_array())
+        .map(|tags| {
+            tags.iter()
+                .filter_map(|t| {
+                    Some((
+                        t.get("Key")?.as_str()?.to_string(),
+                        t.get("Value").and_then(cfn_scalar).unwrap_or_default(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 impl ResourceProvisioner {
     fn ec2_request(&self, action: &str, params: HashMap<String, String>) -> AwsRequest {
         AwsRequest {
@@ -596,6 +683,13 @@ impl ResourceProvisioner {
             iam_instance_profile_arn,
             iam_instance_profile_name,
             block_device_params: cfn_block_device_params(props),
+            // `LaunchTemplate`: the template version fills every property the
+            // resource leaves out, through the same resolution RunInstances
+            // applies.
+            launch_template: cfn_launch_template_ref(props),
+            tags: cfn_tag_pairs(props),
+            propagate_tags_to_volumes: prop_bool(props, "PropagateTagsToVolumeOnCreation")
+                .unwrap_or(false),
         };
 
         let attrs = fakecloud_ec2::cfn_provision::cfn_create(
@@ -604,27 +698,7 @@ impl ResourceProvisioner {
             &self.account_id,
             &self.region,
             &spec,
-        );
-
-        // Apply the template's Tags to the created instance (mirrors a direct
-        // CreateTags) so DescribeInstances / cost reports reflect them.
-        if let Some(tags) = props.get("Tags").and_then(|v| v.as_array()) {
-            if !tags.is_empty() {
-                let mut params = HashMap::new();
-                params.insert("ResourceId.1".to_string(), attrs.instance_id.clone());
-                for (i, t) in tags.iter().enumerate() {
-                    if let (Some(k), Some(v)) = (
-                        t.get("Key").and_then(|v| v.as_str()),
-                        t.get("Value").and_then(|v| v.as_str()),
-                    ) {
-                        let n = i + 1;
-                        params.insert(format!("Tag.{n}.Key"), k.to_string());
-                        params.insert(format!("Tag.{n}.Value"), v.to_string());
-                    }
-                }
-                let _ = self.ec2_dispatch("CreateTags", params);
-            }
-        }
+        )?;
 
         // Background the container boot via the spawn-intent drain so stack
         // creation never blocks on a cold image pull / Pod readiness.
@@ -799,6 +873,90 @@ impl ResourceProvisioner {
         }
     }
 
+    /// The `CreateLaunchTemplate` / `CreateLaunchTemplateVersion` parameters
+    /// for an `AWS::EC2::LaunchTemplate`'s `LaunchTemplateData` and
+    /// `VersionDescription`.
+    fn launch_template_data_params(props: &Value) -> HashMap<String, String> {
+        let mut params = HashMap::new();
+        if let Some(data) = props.get("LaunchTemplateData") {
+            flatten_cfn_query("LaunchTemplateData", data, &mut params);
+        }
+        if let Some(v) = props.get("VersionDescription").and_then(cfn_scalar) {
+            params.insert("VersionDescription".to_string(), v);
+        }
+        params
+    }
+
+    /// `AWS::EC2::LaunchTemplate` through the real CreateLaunchTemplate
+    /// handler, so the stack template's `LaunchTemplateData` is stored as
+    /// version 1 and resolvable by every launch (RunInstances, an
+    /// `AWS::EC2::Instance` or an Auto Scaling group that references it).
+    pub(super) fn create_ec2_launch_template(
+        &self,
+        resource: &ResourceDefinition,
+    ) -> Result<ProvisionResult, String> {
+        let props = &resource.properties;
+        let name = prop_str(props, "LaunchTemplateName")
+            .map(String::from)
+            .unwrap_or_else(|| self.physical_name(resource));
+        let mut params = Self::launch_template_data_params(props);
+        params.insert("LaunchTemplateName".to_string(), name);
+        if let Some(specs) = props.get("TagSpecifications").and_then(|v| v.as_array()) {
+            for (i, spec) in specs.iter().enumerate() {
+                flatten_cfn_query(&format!("TagSpecification.{}", i + 1), spec, &mut params);
+            }
+        }
+        let body = self.ec2_dispatch("CreateLaunchTemplate", params)?;
+        let id = xml_elem(&body, "launchTemplateId")
+            .ok_or("CreateLaunchTemplate returned no launchTemplateId")?;
+        Ok(ProvisionResult::new(id.clone())
+            .with("LaunchTemplateId", id)
+            .with("LatestVersionNumber", "1".to_string())
+            .with("DefaultVersionNumber", "1".to_string()))
+    }
+
+    /// Whether an `AWS::EC2::LaunchTemplate` update keeps the template's name
+    /// (an explicit `LaunchTemplateName` change replaces the template).
+    pub(super) fn launch_template_name_kept(
+        &self,
+        existing: &StackResource,
+        resource: &ResourceDefinition,
+    ) -> bool {
+        let Some(wanted) = prop_str(&resource.properties, "LaunchTemplateName") else {
+            return true;
+        };
+        let accounts = self.ec2_state.read();
+        accounts
+            .get(&self.account_id)
+            .and_then(|s| s.launch_templates.get(&existing.physical_id))
+            .is_some_and(|t| t.name == wanted)
+    }
+
+    /// In-place update of an `AWS::EC2::LaunchTemplate`: new
+    /// `LaunchTemplateData` becomes a new version that is made the default,
+    /// keeping the template id (a rename replaces the template).
+    pub(super) fn update_ec2_launch_template(
+        &self,
+        existing: &StackResource,
+        resource: &ResourceDefinition,
+    ) -> Result<ProvisionResult, String> {
+        let props = &resource.properties;
+        let id = existing.physical_id.clone();
+        let mut params = Self::launch_template_data_params(props);
+        params.insert("LaunchTemplateId".to_string(), id.clone());
+        let body = self.ec2_dispatch("CreateLaunchTemplateVersion", params)?;
+        let version = xml_elem(&body, "versionNumber")
+            .ok_or("CreateLaunchTemplateVersion returned no versionNumber")?;
+        let mut modify = HashMap::new();
+        modify.insert("LaunchTemplateId".to_string(), id.clone());
+        modify.insert("SetDefaultVersion".to_string(), version.clone());
+        self.ec2_dispatch("ModifyLaunchTemplate", modify)?;
+        Ok(ProvisionResult::new(id.clone())
+            .with("LaunchTemplateId", id)
+            .with("LatestVersionNumber", version.clone())
+            .with("DefaultVersionNumber", version))
+    }
+
     /// Delete an EC2 resource by its physical id, routing through the real
     /// handler so dependent default resources are cleaned up correctly.
     /// `AWS::EC2::Volume` through the real CreateVolume handler, so a stack
@@ -845,6 +1003,7 @@ impl ResourceProvisioner {
             "AWS::EC2::InternetGateway" => ("DeleteInternetGateway", "InternetGatewayId"),
             "AWS::EC2::RouteTable" => ("DeleteRouteTable", "RouteTableId"),
             "AWS::EC2::Volume" => ("DeleteVolume", "VolumeId"),
+            "AWS::EC2::LaunchTemplate" => ("DeleteLaunchTemplate", "LaunchTemplateId"),
             _ => return Ok(()),
         };
         let mut params = HashMap::new();
@@ -864,7 +1023,10 @@ impl ResourceProvisioner {
             | ("AWS::EC2::SecurityGroup", "Id")
             | ("AWS::EC2::InternetGateway", "InternetGatewayId")
             | ("AWS::EC2::RouteTable", "RouteTableId")
-            | ("AWS::EC2::Volume", "VolumeId") => Some(resource.physical_id.clone()),
+            | ("AWS::EC2::Volume", "VolumeId")
+            | ("AWS::EC2::LaunchTemplate", "LaunchTemplateId") => {
+                Some(resource.physical_id.clone())
+            }
             _ => resource.attributes.get(attribute).cloned(),
         }
     }

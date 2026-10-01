@@ -4855,9 +4855,10 @@ async fn ec2_delete_launch_template_versions() {
 async fn ec2_get_launch_template_data() {
     let s = TestServer::start().await;
     let c = s.ec2_client().await;
+    let id = run_one(&c).await;
     let r = c
         .get_launch_template_data()
-        .instance_id("i-1")
+        .instance_id(&id)
         .send()
         .await
         .unwrap();

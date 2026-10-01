@@ -34,6 +34,7 @@ pub struct CfnReconcilePersistHooks {
 /// container boot/pull (the #1539/#1730 timeout lesson). With no EC2 backend
 /// wired (CI / metadata-only) the group still reaches desired capacity via
 /// synthesized instance ids, matching the direct API path.
+#[allow(clippy::too_many_arguments)]
 pub async fn cfn_reconcile_capacity(
     asg_state: SharedAutoScalingState,
     ec2_state: fakecloud_ec2::SharedEc2State,
@@ -42,6 +43,7 @@ pub async fn cfn_reconcile_capacity(
     account_id: String,
     region: String,
     persist: CfnReconcilePersistHooks,
+    kms_hook: Option<Arc<dyn fakecloud_core::delivery::KmsHook>>,
 ) {
     // The EC2 hook is set on the service so `apply_capacity` persists the REAL
     // EC2 instances it launches; the autoscaling hook is fired below to persist
@@ -51,6 +53,7 @@ pub async fn cfn_reconcile_capacity(
     // EC2 records) vanish on restart (bug-hunt restart-dataloss).
     let svc = AutoScalingService::new(asg_state)
         .with_ec2(ec2_state, ec2_runtime)
+        .with_kms_hook(kms_hook)
         .with_ec2_snapshot_hook(persist.ec2);
     svc.reconcile_group(&account_id, &group_name, &region).await;
     if let Some(hook) = persist.autoscaling {
@@ -132,6 +135,7 @@ mod tests {
             tags: Vec::new(),
             status: None,
             service_linked_role_arn: String::new(),
+            mixed_instances_policy: None,
         }
     }
 
@@ -181,6 +185,7 @@ mod tests {
                 autoscaling: asg_hook,
                 ec2: ec2_hook,
             },
+            None,
         )
         .await;
 

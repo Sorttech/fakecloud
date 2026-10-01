@@ -16,6 +16,7 @@ mod ipam;
 mod ipam_discovery;
 mod ipam_policy;
 mod ipam_registry;
+pub mod launch_template;
 mod lgw;
 mod meta;
 mod nacl;
@@ -1000,6 +1001,12 @@ impl Ec2Service {
             "DescribeIamInstanceProfileAssociations" => {
                 rest::describe_iam_instance_profile_associations(self, request)
             }
+            // AWS::EC2::LaunchTemplate: create, new version on update, default
+            // version, delete.
+            "CreateLaunchTemplate" => fleet::create_launch_template(self, request),
+            "CreateLaunchTemplateVersion" => fleet::create_launch_template_version(self, request),
+            "ModifyLaunchTemplate" => fleet::modify_launch_template(self, request),
+            "DeleteLaunchTemplate" => fleet::delete_launch_template(self, request),
             other => Err(AwsServiceError::action_not_implemented("ec2", other)),
         }
     }
