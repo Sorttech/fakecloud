@@ -135,9 +135,18 @@ pub struct Route53Service {
     /// or virtual-hosted bucket endpoint resolve only when the bucket
     /// exists.
     pub(crate) s3_state: Option<fakecloud_s3::SharedS3State>,
+    /// Optional VPC-owner lookup (wired from EC2 state by the server). When
+    /// it knows a VPC, the VPC association operations require the caller to
+    /// own it, as Route 53 does.
+    pub(crate) vpc_owner: Option<VpcOwnerLookup>,
     pub(crate) snapshot_store: Option<Arc<dyn SnapshotStore>>,
     pub(crate) snapshot_lock: Arc<AsyncMutex<()>>,
 }
+
+/// Resolve the account that owns a VPC from its `(vpc_id, vpc_region)`;
+/// `None` when no EC2 VPC with that id exists (e.g. a test that only invents
+/// VPC ids for private zones).
+pub type VpcOwnerLookup = Arc<dyn Fn(&str, &str) -> Option<String> + Send + Sync>;
 
 mod cidr;
 mod dnssec;
@@ -157,9 +166,25 @@ impl Route53Service {
             elbv2_state: None,
             cloudfront_state: None,
             s3_state: None,
+            vpc_owner: None,
             snapshot_store: None,
             snapshot_lock: Arc::new(AsyncMutex::new(())),
         }
+    }
+
+    /// Wire the VPC-owner lookup used by the VPC association operations.
+    pub fn with_vpc_owner_lookup(mut self, lookup: VpcOwnerLookup) -> Self {
+        self.vpc_owner = Some(lookup);
+        self
+    }
+
+    /// The account that owns `vpc`, when the lookup knows it.
+    pub(crate) fn known_vpc_owner(&self, vpc: &VPC) -> Option<String> {
+        let lookup = self.vpc_owner.as_ref()?;
+        lookup(
+            vpc.vpc_id.as_deref().unwrap_or_default(),
+            vpc.vpc_region.as_deref().unwrap_or_default(),
+        )
     }
 
     pub fn with_snapshot_store(mut self, store: Arc<dyn SnapshotStore>) -> Self {
@@ -2455,5 +2480,154 @@ mod tests {
             svc.state.read().get(ACCOUNT_B).unwrap().health_checks["hc-x"].status,
             HealthCheckStatus::Failure
         );
+    }
+
+    const ACCOUNT_C: &str = "333333333333";
+
+    fn associate_req(account: &str, zid: &str, vpc: &str) -> AwsRequest {
+        account_req(
+            account,
+            http::Method::POST,
+            &format!("/2013-04-01/hostedzone/{zid}/associatevpc"),
+            &[],
+            &vpc_body("AssociateVPCWithHostedZoneRequest", vpc),
+        )
+    }
+
+    fn disassociate_req(account: &str, zid: &str, vpc: &str) -> AwsRequest {
+        account_req(
+            account,
+            http::Method::POST,
+            &format!("/2013-04-01/hostedzone/{zid}/disassociatevpc"),
+            &[],
+            &vpc_body("DisassociateVPCFromHostedZoneRequest", vpc),
+        )
+    }
+
+    fn authorize_req(account: &str, zid: &str, vpc: &str) -> AwsRequest {
+        account_req(
+            account,
+            http::Method::POST,
+            &format!("/2013-04-01/hostedzone/{zid}/authorizevpcassociation"),
+            &[],
+            &vpc_body("CreateVPCAssociationAuthorizationRequest", vpc),
+        )
+    }
+
+    fn list_by_vpc_req(account: &str, vpc: &str) -> AwsRequest {
+        account_req(
+            account,
+            http::Method::GET,
+            "/2013-04-01/hostedzonesbyvpc",
+            &[("vpcid", vpc), ("vpcregion", "us-east-1")],
+            "",
+        )
+    }
+
+    #[tokio::test]
+    async fn vpc_association_requires_the_caller_to_own_a_known_vpc() {
+        // EC2 knows vpc-bbb belongs to B.
+        let svc = Route53Service::new(Arc::new(RwLock::new(Route53Accounts::default())))
+            .with_vpc_owner_lookup(Arc::new(|vpc_id: &str, _: &str| {
+                (vpc_id == "vpc-bbb").then(|| ACCOUNT_B.to_string())
+            }));
+        let zid = create_zone(
+            &svc,
+            ACCOUNT_A,
+            &private_zone_body("internal.example.", "ref-k", "vpc-aaa"),
+        )
+        .await;
+        assert_eq!(
+            call(&svc, authorize_req(ACCOUNT_A, &zid, "vpc-bbb"))
+                .await
+                .0,
+            StatusCode::OK
+        );
+
+        // C names B's VPC: refused although the VPC is authorized.
+        let (status, out) = call(&svc, associate_req(ACCOUNT_C, &zid, "vpc-bbb")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{out}");
+        assert!(out.contains("not owned by account"), "{out}");
+        // B, the owner, may.
+        assert_eq!(
+            call(&svc, associate_req(ACCOUNT_B, &zid, "vpc-bbb"))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        // Only B sees A's zone through vpc-bbb, and only B may disassociate it.
+        assert!(call(&svc, list_by_vpc_req(ACCOUNT_B, "vpc-bbb"))
+            .await
+            .1
+            .contains(&zid));
+        assert!(!call(&svc, list_by_vpc_req(ACCOUNT_C, "vpc-bbb"))
+            .await
+            .1
+            .contains(&zid));
+        assert_eq!(
+            call(&svc, disassociate_req(ACCOUNT_C, &zid, "vpc-bbb"))
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            call(&svc, disassociate_req(ACCOUNT_B, &zid, "vpc-bbb"))
+                .await
+                .0,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn an_authorization_for_an_unknown_vpc_binds_to_its_first_user() {
+        let svc = Route53Service::new(Arc::new(RwLock::new(Route53Accounts::default())));
+        let zid = create_zone(
+            &svc,
+            ACCOUNT_A,
+            &private_zone_body("internal.example.", "ref-u", "vpc-aaa"),
+        )
+        .await;
+        call(&svc, authorize_req(ACCOUNT_A, &zid, "vpc-bbb")).await;
+        assert_eq!(
+            call(&svc, associate_req(ACCOUNT_B, &zid, "vpc-bbb"))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            call(&svc, disassociate_req(ACCOUNT_B, &zid, "vpc-bbb"))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        // The authorization stays, but it is B's now: C cannot use it.
+        let (status, out) = call(&svc, associate_req(ACCOUNT_C, &zid, "vpc-bbb")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{out}");
+        assert_eq!(
+            call(&svc, associate_req(ACCOUNT_B, &zid, "vpc-bbb"))
+                .await
+                .0,
+            StatusCode::OK
+        );
+
+        // Deleting the zone drops its authorization bookkeeping.
+        call(&svc, disassociate_req(ACCOUNT_B, &zid, "vpc-bbb")).await;
+        let (status, out) = call(
+            &svc,
+            account_req(
+                ACCOUNT_A,
+                http::Method::DELETE,
+                &format!("/2013-04-01/hostedzone/{zid}"),
+                &[],
+                "",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        let st = svc.state.read();
+        let a = st.get(ACCOUNT_A).unwrap();
+        assert!(a.vpc_authorizations.is_empty());
+        assert!(a.vpc_authorization_consumers.is_empty());
+        assert!(a.cross_account_vpcs.is_empty());
     }
 }

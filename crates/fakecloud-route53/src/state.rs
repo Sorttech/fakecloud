@@ -1,6 +1,6 @@
 //! In-memory state for Route 53 resources.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -83,15 +83,18 @@ fn arn_account(arn: &str) -> Option<&str> {
 /// it; every other entry was created through the API, which stored under the
 /// legacy bucket whatever the caller, and moves to `default_account` (the
 /// server's configured account).
+///
+/// `stack_owned` is only called for a v1 snapshot, so loading a current one
+/// never walks the CloudFormation state.
 pub fn parse_route53_snapshot(
     bytes: &[u8],
     default_account: &str,
-    stack_owned: &StackOwnedResources,
+    stack_owned: impl FnOnce() -> StackOwnedResources,
 ) -> Result<Route53Snapshot, serde_json::Error> {
     let mut snapshot: Route53Snapshot = serde_json::from_slice(bytes)?;
     if snapshot.schema_version < 2 {
         if let Some(accounts) = snapshot.accounts.as_mut() {
-            accounts.migrate_legacy_bucket(default_account, stack_owned);
+            accounts.migrate_legacy_bucket(default_account, &stack_owned());
         }
     }
     Ok(snapshot)
@@ -170,6 +173,7 @@ impl Route53Accounts {
             reusable_delegation_sets,
             vpc_authorizations,
             cross_account_vpcs,
+            vpc_authorization_consumers,
             tags,
         } = legacy;
         let owner = |map: &BTreeMap<String, String>, id: &str| -> String {
@@ -206,27 +210,33 @@ impl Route53Accounts {
                 .entry(id)
                 .or_insert(hc);
         }
+        // A traffic policy instance writes its records into its zone, so it
+        // follows the zone. Its policy keeps a single authoritative home: it
+        // moves with its instances when every one of them lands in the same
+        // account, and otherwise (no instances, or instances split across
+        // accounts) stays in the default account.
+        let mut policy_homes: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for (id, instance) in traffic_policy_instances {
             let account = zone_owner(&instance.hosted_zone_id);
-            if account != default_account {
-                // The instance's policy was created through the API (stacks
-                // provision no traffic policies), so it stays in the default
-                // account; the instance's new account gets a copy of every
-                // version so the instance still resolves its policy there.
-                let bucket = self.entry(&account);
-                for (key, policy) in &traffic_policies {
-                    if key.0 == instance.traffic_policy_id {
-                        bucket
-                            .traffic_policies
-                            .entry(key.clone())
-                            .or_insert_with(|| policy.clone());
-                    }
-                }
-            }
+            policy_homes
+                .entry(instance.traffic_policy_id.clone())
+                .or_default()
+                .insert(account.clone());
             self.entry(&account)
                 .traffic_policy_instances
                 .entry(id)
                 .or_insert(instance);
+        }
+        for (key, policy) in traffic_policies {
+            let account = match policy_homes.get(&key.0) {
+                Some(homes) if homes.len() == 1 => homes.iter().next().cloned(),
+                _ => None,
+            }
+            .unwrap_or_else(|| default_account.to_string());
+            self.entry(&account)
+                .traffic_policies
+                .entry(key)
+                .or_insert(policy);
         }
         for (id, status) in dnssec_status {
             self.entry(&zone_owner(&id))
@@ -252,6 +262,12 @@ impl Route53Accounts {
                 .entry(id)
                 .or_insert(vpcs);
         }
+        for (id, consumers) in vpc_authorization_consumers {
+            self.entry(&zone_owner(&id))
+                .vpc_authorization_consumers
+                .entry(id)
+                .or_insert(consumers);
+        }
         for (id, vpcs) in cross_account_vpcs {
             self.entry(&zone_owner(&id))
                 .cross_account_vpcs
@@ -272,9 +288,6 @@ impl Route53Accounts {
         let default = self.entry(default_account);
         for (id, change) in changes {
             default.changes.entry(id).or_insert(change);
-        }
-        for (key, policy) in traffic_policies {
-            default.traffic_policies.entry(key).or_insert(policy);
         }
         for (id, collection) in cidr_collections {
             default.cidr_collections.entry(id).or_insert(collection);
@@ -345,6 +358,13 @@ pub struct AccountState {
     /// account may.
     #[serde(default)]
     pub cross_account_vpcs: BTreeMap<String, Vec<(VPC, String)>>,
+    /// Per-zone VPC authorizations already consumed by a cross-account
+    /// association, each with the account that used it. When the VPC's owner
+    /// is unknown (no EC2 VPC with that id), the first account to use an
+    /// authorization is taken as the VPC's owner, and no other account may use
+    /// it. Dropped with the authorization.
+    #[serde(default)]
+    pub vpc_authorization_consumers: BTreeMap<String, Vec<(VPC, String)>>,
     /// Tag bag keyed by `(resource_type, resource_id)`. Both supported
     /// resource types ("healthcheck", "hostedzone") share the bag; the
     /// resource-type discriminator is in the key tuple.
@@ -655,7 +675,7 @@ mod snapshot_migration_tests {
 
     #[test]
     fn a_v1_snapshot_moves_stack_created_resources_to_the_stacks_account() {
-        let parsed = parse_route53_snapshot(&v1_snapshot_bytes(), DEFAULT, &stack_owned())
+        let parsed = parse_route53_snapshot(&v1_snapshot_bytes(), DEFAULT, stack_owned)
             .expect("v1 snapshot loads");
         let accounts = parsed.accounts.unwrap();
         assert!(
@@ -685,8 +705,8 @@ mod snapshot_migration_tests {
             .tags
             .contains_key(&("healthcheck".to_string(), "hc-stack".to_string())));
         assert!(!stack.hosted_zones.contains_key("ZAPI"));
-        // A traffic policy instance follows its zone and keeps resolving its
-        // policy there.
+        // A traffic policy instance follows its zone, and its policy (all of
+        // whose instances moved) follows it.
         assert!(stack.traffic_policy_instances.contains_key("tpi-1"));
         assert!(stack
             .traffic_policies
@@ -697,9 +717,12 @@ mod snapshot_migration_tests {
         assert!(default.hosted_zones.contains_key("ZAPI"));
         assert!(default.health_checks.contains_key("hc-api"));
         assert!(default.changes.contains_key("C1"));
-        assert!(default
-            .traffic_policies
-            .contains_key(&("tp-1".to_string(), 1)));
+        assert!(
+            !default
+                .traffic_policies
+                .contains_key(&("tp-1".to_string(), 1)),
+            "the policy moved with its only instance, not copied"
+        );
         assert!(default
             .tags
             .contains_key(&("hostedzone".to_string(), "ZAPI".to_string())));
@@ -711,7 +734,7 @@ mod snapshot_migration_tests {
     #[test]
     fn a_v1_snapshot_keeps_api_resources_put_when_the_default_account_is_the_legacy_one() {
         let parsed =
-            parse_route53_snapshot(&v1_snapshot_bytes(), LEGACY_ACCOUNT, &stack_owned()).unwrap();
+            parse_route53_snapshot(&v1_snapshot_bytes(), LEGACY_ACCOUNT, stack_owned).unwrap();
         let accounts = parsed.accounts.unwrap();
         let legacy = accounts.get(LEGACY_ACCOUNT).unwrap();
         assert!(legacy.hosted_zones.contains_key("ZAPI"));
@@ -732,16 +755,39 @@ mod snapshot_migration_tests {
         })
         .unwrap();
         value["accounts"]["accounts"][STACK_ACCOUNT] = existing;
-        let parsed = parse_route53_snapshot(
-            &serde_json::to_vec(&value).unwrap(),
-            DEFAULT,
-            &stack_owned(),
-        )
-        .unwrap();
+        let parsed =
+            parse_route53_snapshot(&serde_json::to_vec(&value).unwrap(), DEFAULT, stack_owned)
+                .unwrap();
         let accounts = parsed.accounts.unwrap();
         let stack = accounts.get(STACK_ACCOUNT).unwrap();
         let ids: Vec<&String> = stack.hosted_zones.keys().collect();
         assert_eq!(ids, ["ZOWN", "ZSTACK"]);
+    }
+
+    #[test]
+    fn a_traffic_policy_whose_instances_split_across_accounts_stays_in_the_default_account() {
+        let mut value: serde_json::Value = serde_json::from_slice(&v1_snapshot_bytes()).unwrap();
+        // A second instance of tp-1, on the API-created zone.
+        let mut second = value["accounts"]["accounts"][LEGACY_ACCOUNT]["traffic_policy_instances"]
+            ["tpi-1"]
+            .clone();
+        second["id"] = "tpi-2".into();
+        second["hosted_zone_id"] = "ZAPI".into();
+        value["accounts"]["accounts"][LEGACY_ACCOUNT]["traffic_policy_instances"]["tpi-2"] = second;
+        let parsed =
+            parse_route53_snapshot(&serde_json::to_vec(&value).unwrap(), DEFAULT, stack_owned)
+                .unwrap();
+        let accounts = parsed.accounts.unwrap();
+        let key = ("tp-1".to_string(), 1);
+        let default = accounts.get(DEFAULT).unwrap();
+        assert!(default.traffic_policies.contains_key(&key));
+        assert!(default.traffic_policy_instances.contains_key("tpi-2"));
+        let stack = accounts.get(STACK_ACCOUNT).unwrap();
+        assert!(stack.traffic_policy_instances.contains_key("tpi-1"));
+        assert!(
+            !stack.traffic_policies.contains_key(&key),
+            "one authoritative copy"
+        );
     }
 
     #[test]
@@ -756,7 +802,10 @@ mod snapshot_migration_tests {
             accounts: Some(accounts),
         })
         .unwrap();
-        let parsed = parse_route53_snapshot(&bytes, DEFAULT, &stack_owned()).unwrap();
+        let parsed = parse_route53_snapshot(&bytes, DEFAULT, || {
+            panic!("a current snapshot must not build the stack-owned map")
+        })
+        .unwrap();
         let accounts = parsed.accounts.unwrap();
         assert!(accounts
             .get(LEGACY_ACCOUNT)

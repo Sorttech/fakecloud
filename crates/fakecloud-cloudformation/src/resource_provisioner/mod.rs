@@ -7074,6 +7074,76 @@ mod tests {
     }
 
     #[test]
+    fn route53_resources_refuse_a_zone_in_another_account() {
+        // Account A's zone; a stack in account B references it.
+        let owner = make_provisioner();
+        let zone = owner
+            .create_resource(&make_resource(
+                "AWS::Route53::HostedZone",
+                "Zone",
+                serde_json::json!({"Name": "example.com"}),
+            ))
+            .unwrap();
+        let zid = zone.physical_id.clone();
+        let mut other = make_second_account_provisioner();
+        other.route53_state = owner.route53_state.clone();
+
+        let err = other
+            .create_resource(&make_resource(
+                "AWS::Route53::RecordSet",
+                "Www",
+                serde_json::json!({
+                    "HostedZoneId": zid, "Name": "www.example.com", "Type": "A",
+                    "TTL": "60", "ResourceRecords": ["192.0.2.10"]
+                }),
+            ))
+            .unwrap_err();
+        assert!(
+            err.contains("No hosted zone found") && !err.contains("will retry"),
+            "{err}"
+        );
+        for (rtype, props) in [
+            (
+                "AWS::Route53::DNSSEC",
+                serde_json::json!({"HostedZoneId": zid}),
+            ),
+            (
+                "AWS::Route53::KeySigningKey",
+                serde_json::json!({
+                    "HostedZoneId": zid, "Name": "k",
+                    "KeyManagementServiceArn": "arn:aws:kms:us-east-1:222222222222:key/x",
+                    "Status": "ACTIVE"
+                }),
+            ),
+        ] {
+            let err = other
+                .create_resource(&make_resource(rtype, "R", props))
+                .unwrap_err();
+            assert!(err.contains("No hosted zone found"), "{rtype}: {err}");
+        }
+
+        // A record the owner's stack put in the zone: deleting it from the
+        // other account's stack fails instead of silently leaving it behind.
+        let rec = owner
+            .create_resource(&make_resource(
+                "AWS::Route53::RecordSet",
+                "Www",
+                serde_json::json!({
+                    "HostedZoneId": zid, "Name": "www.example.com", "Type": "A",
+                    "TTL": "60", "ResourceRecords": ["192.0.2.10"]
+                }),
+            ))
+            .unwrap();
+        let err = other.delete_resource(&rec).unwrap_err();
+        assert!(err.contains("No hosted zone found"), "{err}");
+        let accounts = owner.route53_state.read();
+        assert!(accounts.get(&owner.account_id).unwrap().hosted_zones[&zid]
+            .resource_record_sets
+            .iter()
+            .any(|r| r.record_type == "A"));
+    }
+
+    #[test]
     fn deleting_a_stack_resource_acts_on_the_stacks_account() {
         let prov = make_second_account_provisioner();
         let group = prov
@@ -7112,6 +7182,11 @@ mod tests {
             .read()
             .get("222222222222")
             .is_some_and(|s| s.functions.contains_key("fn-b")));
+        assert!(prov
+            .eventbridge_state
+            .read()
+            .get("222222222222")
+            .is_some_and(|s| s.rules.values().any(|r| r.arn == rule.physical_id)));
 
         prov.delete_resource(&group).unwrap();
         prov.delete_resource(&rule).unwrap();

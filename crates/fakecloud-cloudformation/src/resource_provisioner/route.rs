@@ -8,6 +8,26 @@ use super::*;
 impl ResourceProvisioner {
     // --- Route53 ---
 
+    /// Refuse a reference to a hosted zone another account owns: a stack's
+    /// record sets, DNSSEC and key-signing keys can only use zones in the
+    /// stack's own account. Unlike a zone that is not provisioned yet, this
+    /// never resolves on a later pass, and deleting must not silently skip a
+    /// record that lives in the other account's zone.
+    fn require_own_zone(
+        &self,
+        accounts: &fakecloud_route53::Route53Accounts,
+        zone_id: &str,
+    ) -> Result<(), String> {
+        match accounts.zone_owner(zone_id) {
+            Some(owner) if owner != self.account_id => Err(format!(
+                "No hosted zone found with ID: {zone_id} in account {}; a stack can only use \
+                 hosted zones in its own account",
+                self.account_id
+            )),
+            _ => Ok(()),
+        }
+    }
+
     pub(super) fn create_route53_hosted_zone(
         &self,
         resource: &ResourceDefinition,
@@ -77,6 +97,8 @@ impl ResourceProvisioner {
         let state = accounts.entry(&self.account_id);
         state.hosted_zones.remove(physical_id);
         state.cross_account_vpcs.remove(physical_id);
+        state.vpc_authorizations.remove(physical_id);
+        state.vpc_authorization_consumers.remove(physical_id);
         Ok(())
     }
 
@@ -246,6 +268,7 @@ impl ResourceProvisioner {
         };
 
         let mut accounts = self.route53_state.write();
+        self.require_own_zone(&accounts, &zone_id)?;
         let state = accounts.entry(&self.account_id);
         let zone = state.hosted_zones.get_mut(&zone_id).ok_or_else(|| {
             format!(
@@ -282,6 +305,7 @@ impl ResourceProvisioner {
         let set_identifier = parts.get(3).map(|s| s.to_string());
 
         let mut accounts = self.route53_state.write();
+        self.require_own_zone(&accounts, zone_id)?;
         let state = accounts.entry(&self.account_id);
         if let Some(zone) = state.hosted_zones.get_mut(zone_id) {
             zone.resource_record_sets.retain(|r| {
@@ -477,6 +501,7 @@ impl ResourceProvisioner {
             .trim_start_matches("/hostedzone/")
             .to_string();
         let mut accounts = self.route53_state.write();
+        self.require_own_zone(&accounts, &zone_id)?;
         let state = accounts.entry(&self.account_id);
         if !state.hosted_zones.contains_key(&zone_id) {
             return Err(format!("HostedZone {zone_id} does not exist"));
@@ -489,6 +514,7 @@ impl ResourceProvisioner {
 
     pub(super) fn delete_route53_dnssec(&self, physical_id: &str) -> Result<(), String> {
         let mut accounts = self.route53_state.write();
+        self.require_own_zone(&accounts, physical_id)?;
         let state = accounts.entry(&self.account_id);
         state.dnssec_status.remove(physical_id);
         Ok(())
@@ -532,6 +558,7 @@ impl ResourceProvisioner {
         let key_material = fakecloud_route53::dnssec::derive_keypair(&zone_id, &name);
         let key_tag = fakecloud_route53::dnssec::key_tag_for(&key_material.dnskey_public_key);
         let mut accounts = self.route53_state.write();
+        self.require_own_zone(&accounts, &zone_id)?;
         let state = accounts.entry(&self.account_id);
         if !state.hosted_zones.contains_key(&zone_id) {
             return Err(format!("HostedZone {zone_id} does not exist"));
@@ -571,6 +598,7 @@ impl ResourceProvisioner {
             None => return Ok(()),
         };
         let mut accounts = self.route53_state.write();
+        self.require_own_zone(&accounts, zone_id)?;
         let state = accounts.entry(&self.account_id);
         state
             .key_signing_keys

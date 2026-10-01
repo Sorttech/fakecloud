@@ -841,6 +841,18 @@ pub(crate) fn push_cidr_collection_full(out: &mut String, c: &StoredCidrCollecti
 
 // ─── VPC Association handlers ────────────────────────────────────────
 
+/// Route 53's refusal when the caller does not own the VPC it names.
+fn vpc_not_owned_by_caller(vpc: &VPC, account: &str) -> AwsServiceError {
+    aws_error(
+        StatusCode::UNAUTHORIZED,
+        "NotAuthorizedException",
+        format!(
+            "The VPC {} is not owned by account {account}.",
+            vpc.vpc_id.as_deref().unwrap_or_default()
+        ),
+    )
+}
+
 /// Route 53's refusal when a VPC owner associates (or disassociates) a VPC
 /// with another account's hosted zone that has not authorized it.
 fn not_authorized_vpc_association(vpc: &VPC, zone_id: &str) -> AwsServiceError {
@@ -865,6 +877,12 @@ impl Route53Service {
             .map_err(|e| invalid_argument(format!("invalid AssociateVPCRequest XML: {e}")))?;
         let vpc = cfg.vpc;
         require_vpc(&vpc)?;
+        // Only the VPC's owner may associate it. When EC2 knows the VPC, its
+        // owning account is authoritative.
+        let vpc_owner = self.known_vpc_owner(&vpc);
+        if vpc_owner.as_deref().is_some_and(|o| o != route.account) {
+            return Err(vpc_not_owned_by_caller(&vpc, &route.account));
+        }
         let mut state = self.state.write();
         // The VPC owner associates the VPC, so the zone may belong to another
         // account; that account must have authorized this VPC first
@@ -875,13 +893,25 @@ impl Route53Service {
             .ok_or_else(|| no_such_hosted_zone(&id))?;
         let cross_account = owner != route.account;
         let zone_account = state.entry(&owner);
-        if cross_account
-            && !zone_account
+        if cross_account {
+            let authorized = zone_account
                 .vpc_authorizations
                 .get(&id)
-                .is_some_and(|vs| vs.iter().any(|v| same_vpc(v, &vpc)))
-        {
-            return Err(not_authorized_vpc_association(&vpc, &id));
+                .is_some_and(|vs| vs.iter().any(|v| same_vpc(v, &vpc)));
+            // An authorization names a VPC, not an account. With the VPC's
+            // owner unknown to EC2, the first account to use the
+            // authorization is taken as that owner; nobody else may use it.
+            let consumed_by_other = vpc_owner.is_none()
+                && zone_account
+                    .vpc_authorization_consumers
+                    .get(&id)
+                    .is_some_and(|cs| {
+                        cs.iter()
+                            .any(|(v, acct)| same_vpc(v, &vpc) && *acct != route.account)
+                    });
+            if !authorized || consumed_by_other {
+                return Err(not_authorized_vpc_association(&vpc, &id));
+            }
         }
         let zone = zone_account
             .hosted_zones
@@ -906,6 +936,15 @@ impl Route53Service {
         }
         zone.vpcs.push(vpc.clone());
         if cross_account {
+            if vpc_owner.is_none() {
+                let consumers = zone_account
+                    .vpc_authorization_consumers
+                    .entry(id.clone())
+                    .or_default();
+                if !consumers.iter().any(|(v, _)| same_vpc(v, &vpc)) {
+                    consumers.push((vpc.clone(), route.account.clone()));
+                }
+            }
             zone_account
                 .cross_account_vpcs
                 .entry(id.clone())
@@ -947,6 +986,7 @@ impl Route53Service {
             .map_err(|e| invalid_argument(format!("invalid DisassociateVPCRequest XML: {e}")))?;
         let vpc = cfg.vpc;
         require_vpc(&vpc)?;
+        let vpc_owner = self.known_vpc_owner(&vpc);
         let mut state = self.state.write();
         // Either the zone owner or the owner of an associated VPC may
         // disassociate it, so the zone may belong to another account. Another
@@ -957,15 +997,19 @@ impl Route53Service {
             .ok_or_else(|| no_such_hosted_zone(&id))?;
         let cross_account = owner != route.account;
         let zone_account = state.entry(&owner);
-        // Another account may only remove a VPC it associated itself (the
-        // VPC it owns), never the zone owner's or a third account's.
-        if cross_account
-            && !zone_account.cross_account_vpcs.get(&id).is_some_and(|vs| {
-                vs.iter()
-                    .any(|(v, acct)| same_vpc(v, &vpc) && *acct == route.account)
-            })
-        {
-            return Err(not_authorized_vpc_association(&vpc, &id));
+        // Another account may only remove a VPC it owns: the owner EC2
+        // reports, or (VPC unknown to EC2) the account that associated it.
+        if cross_account {
+            let caller_owns_vpc = match &vpc_owner {
+                Some(o) => *o == route.account,
+                None => zone_account.cross_account_vpcs.get(&id).is_some_and(|vs| {
+                    vs.iter()
+                        .any(|(v, acct)| same_vpc(v, &vpc) && *acct == route.account)
+                }),
+            };
+            if !caller_owns_vpc {
+                return Err(not_authorized_vpc_association(&vpc, &id));
+            }
         }
         let zone = zone_account
             .hosted_zones
@@ -1101,6 +1145,12 @@ impl Route53Service {
         if entry.is_empty() {
             account.vpc_authorizations.remove(&id);
         }
+        if let Some(consumers) = account.vpc_authorization_consumers.get_mut(&id) {
+            consumers.retain(|(v, _)| !same_vpc(v, &vpc));
+            if consumers.is_empty() {
+                account.vpc_authorization_consumers.remove(&id);
+            }
+        }
         drop(state);
         let mut body = String::with_capacity(128);
         body.push_str(XML_DECL);
@@ -1194,16 +1244,26 @@ impl Route53Service {
             v.vpc_id.as_deref() == Some(vpc_id.as_str())
                 && v.vpc_region.as_deref() == Some(vpc_region.as_str())
         };
+        // The VPC's owner per EC2, when EC2 knows the VPC: then only that
+        // owner sees other accounts' zones the VPC is associated with.
+        let vpc_owner = self.known_vpc_owner(&VPC {
+            vpc_id: Some(vpc_id.clone()),
+            vpc_region: Some(vpc_region.clone()),
+        });
         let mut summaries: Vec<(String, String, String)> = Vec::new();
         for (owner, account) in &state.accounts {
             for z in account.hosted_zones.values() {
                 let visible = if *owner == req.account_id {
                     z.vpcs.iter().any(matches)
                 } else {
-                    account.cross_account_vpcs.get(&z.id).is_some_and(|vs| {
-                        vs.iter()
-                            .any(|(v, acct)| matches(v) && *acct == req.account_id)
-                    }) && z.vpcs.iter().any(matches)
+                    let caller_owns_vpc = match &vpc_owner {
+                        Some(o) => *o == req.account_id,
+                        None => account.cross_account_vpcs.get(&z.id).is_some_and(|vs| {
+                            vs.iter()
+                                .any(|(v, acct)| matches(v) && *acct == req.account_id)
+                        }),
+                    };
+                    caller_owns_vpc && z.vpcs.iter().any(matches)
                 };
                 if visible {
                     summaries.push((z.id.clone(), z.name.clone(), owner.clone()));

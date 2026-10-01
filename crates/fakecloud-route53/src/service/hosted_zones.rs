@@ -201,6 +201,8 @@ impl Route53Service {
         }
         account.hosted_zones.remove(&id);
         account.cross_account_vpcs.remove(&id);
+        account.vpc_authorizations.remove(&id);
+        account.vpc_authorization_consumers.remove(&id);
         let change_id = generate_change_id();
         let change = StoredChange {
             id: change_id.clone(),
