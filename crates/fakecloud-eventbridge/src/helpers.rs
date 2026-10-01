@@ -1014,6 +1014,33 @@ pub(crate) fn lambda_arn_account(arn: &str) -> Option<&str> {
     arn.split(':').nth(4).filter(|a| !a.is_empty())
 }
 
+/// Record an EventBridge-driven invocation in Lambda's invocation log (what
+/// `/_fakecloud/lambda/invocations` serves). It lands in the account the
+/// function ARN names when fakecloud knows that account, else in the bus's
+/// account -- never creating a Lambda account just to hold the record.
+pub(crate) fn record_lambda_invocation(
+    lambda_state: &SharedLambdaState,
+    function_arn: &str,
+    bus_account: &str,
+    payload: &str,
+    timestamp: chrono::DateTime<chrono::Utc>,
+) {
+    let mut accounts = lambda_state.write();
+    let account = lambda_arn_account(function_arn)
+        .filter(|a| accounts.get(a).is_some())
+        .unwrap_or(bus_account)
+        .to_string();
+    accounts
+        .get_or_create(&account)
+        .invocations
+        .push(fakecloud_lambda::LambdaInvocation {
+            function_arn: function_arn.to_string(),
+            payload: payload.to_string(),
+            timestamp,
+            source: "aws:events".to_string(),
+        });
+}
+
 /// Spawn a background task to invoke a Lambda function via ContainerRuntime.
 /// This is fire-and-forget: EventBridge delivery is asynchronous.
 pub(crate) fn invoke_lambda_async(
@@ -1369,18 +1396,7 @@ pub(crate) fn dispatch_event_target(
             });
         }
         if let Some(ls) = ctx.lambda_state {
-            let mut accounts = ls.write();
-            match lambda_arn_account(arn) {
-                Some(account) => accounts.get_or_create(account),
-                None => accounts.default_mut(),
-            }
-            .invocations
-            .push(fakecloud_lambda::LambdaInvocation {
-                function_arn: arn.clone(),
-                payload: body_str.clone(),
-                timestamp: now,
-                source: "aws:events".to_string(),
-            });
+            record_lambda_invocation(ls, arn, ctx.account_id, &body_str, now);
         }
         invoke_lambda_async(
             ctx.container_runtime,

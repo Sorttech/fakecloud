@@ -526,15 +526,13 @@ impl EventBridgeService {
                 });
             drop(accounts);
             if let Some(ref ls) = self.lambda_state {
-                ls.write()
-                    .get_or_create(account_id)
-                    .invocations
-                    .push(LambdaInvocation {
-                        function_arn: target_arn.clone(),
-                        payload: body_str.clone(),
-                        timestamp: Utc::now(),
-                        source: "aws:events".to_string(),
-                    });
+                crate::service::helpers::record_lambda_invocation(
+                    ls,
+                    target_arn,
+                    account_id,
+                    &body_str,
+                    Utc::now(),
+                );
             }
             invoke_lambda_async(
                 &self.container_runtime,

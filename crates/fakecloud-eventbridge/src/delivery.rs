@@ -565,8 +565,9 @@ mod tests {
         assert_eq!(state.read().default_ref().lambda_invocations.len(), 1);
     }
 
-    /// A Lambda target ARN naming another account is recorded against that
-    /// account, never the default one (which may own a same-named function).
+    /// A Lambda target ARN naming another known account is recorded against
+    /// that account, never the default one (which may own a same-named
+    /// function).
     #[test]
     fn put_event_records_lambda_invocation_in_arn_account() {
         let state = make_shared();
@@ -575,6 +576,7 @@ mod tests {
         let lambda_state: SharedLambdaState = Arc::new(RwLock::new(
             fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
         ));
+        lambda_state.write().get_or_create("999988887777");
         let delivery = EventBridgeDeliveryImpl::new(state, Arc::new(DeliveryBus::new()))
             .with_target_wiring(EventTargetWiring {
                 lambda_state: Some(lambda_state.clone()),
@@ -588,6 +590,29 @@ mod tests {
         let target = accounts.get("999988887777").expect("target account");
         assert_eq!(target.invocations.len(), 1);
         assert_eq!(target.invocations[0].function_arn, fn_arn);
+    }
+
+    /// An ARN naming an account fakecloud has never seen does not conjure a
+    /// Lambda account for it; the record stays with the bus's account.
+    #[test]
+    fn put_event_does_not_create_lambda_account_for_unknown_arn_account() {
+        let state = make_shared();
+        let fn_arn = "arn:aws:lambda:us-east-1:555555555555:function:foo";
+        insert_rule(&state, make_rule("unknown", None, fn_arn));
+        let lambda_state: SharedLambdaState = Arc::new(RwLock::new(
+            fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+        ));
+        let delivery = EventBridgeDeliveryImpl::new(state, Arc::new(DeliveryBus::new()))
+            .with_target_wiring(EventTargetWiring {
+                lambda_state: Some(lambda_state.clone()),
+                ..Default::default()
+            });
+
+        delivery.put_event("app", "T", "{}", "default");
+
+        let accounts = lambda_state.read();
+        assert!(accounts.get("555555555555").is_none());
+        assert_eq!(accounts.default_ref().invocations.len(), 1);
     }
 
     #[test]
