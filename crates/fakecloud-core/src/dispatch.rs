@@ -280,7 +280,7 @@ pub async fn dispatch(
                 "UnknownService",
                 &format!("Service '{}' is not available", detected.service),
                 &request_id,
-                detected.protocol,
+                ErrorEnvelope::for_request(&detected),
             );
         }
     };
@@ -379,7 +379,7 @@ pub async fn dispatch(
                     "IncompleteSignature",
                     "Request is missing or has a malformed AWS Signature",
                     &request_id,
-                    detected.protocol,
+                    ErrorEnvelope::for_request(&detected),
                 );
             }
         };
@@ -391,7 +391,7 @@ pub async fn dispatch(
                     "InvalidClientTokenId",
                     "The security token included in the request is invalid",
                     &request_id,
-                    detected.protocol,
+                    ErrorEnvelope::for_request(&detected),
                 );
             }
         };
@@ -439,7 +439,7 @@ pub async fn dispatch(
                                 "SignatureDoesNotMatch",
                                 "The request signature we calculated does not match the signature you provided",
                                 &request_id,
-                                detected.protocol,
+                                ErrorEnvelope::for_request(&detected),
                             );
                         }
                     }
@@ -451,7 +451,7 @@ pub async fn dispatch(
                     "RequestTimeTooSkewed",
                     "The difference between the request time and the current time is too large",
                     &request_id,
-                    detected.protocol,
+                    ErrorEnvelope::for_request(&detected),
                 );
             }
             Err(fakecloud_aws::sigv4::SigV4Error::InvalidDate(msg)) => {
@@ -460,7 +460,7 @@ pub async fn dispatch(
                     "IncompleteSignature",
                     &format!("Invalid x-amz-date: {msg}"),
                     &request_id,
-                    detected.protocol,
+                    ErrorEnvelope::for_request(&detected),
                 );
             }
             Err(fakecloud_aws::sigv4::SigV4Error::Malformed(msg)) => {
@@ -469,7 +469,7 @@ pub async fn dispatch(
                     "IncompleteSignature",
                     &format!("Malformed SigV4 signature: {msg}"),
                     &request_id,
-                    detected.protocol,
+                    ErrorEnvelope::for_request(&detected),
                 );
             }
             Err(fakecloud_aws::sigv4::SigV4Error::SignatureMismatch) => {
@@ -478,7 +478,7 @@ pub async fn dispatch(
                     "SignatureDoesNotMatch",
                     "The request signature we calculated does not match the signature you provided",
                     &request_id,
-                    detected.protocol,
+                    ErrorEnvelope::for_request(&detected),
                 );
             }
             Err(fakecloud_aws::sigv4::SigV4Error::PresignedUrlExpired { .. }) => {
@@ -487,7 +487,7 @@ pub async fn dispatch(
                     "AccessDenied",
                     "Request has expired",
                     &request_id,
-                    detected.protocol,
+                    ErrorEnvelope::for_request(&detected),
                 );
             }
             Err(fakecloud_aws::sigv4::SigV4Error::InvalidPresignExpires(_)) => {
@@ -496,7 +496,7 @@ pub async fn dispatch(
                     "AuthorizationQueryParametersError",
                     "X-Amz-Expires must be a number between 1 and 604800 seconds",
                     &request_id,
-                    detected.protocol,
+                    ErrorEnvelope::for_request(&detected),
                 );
             }
         }
@@ -814,7 +814,7 @@ pub async fn dispatch(
                                         encoded,
                                     ),
                                     &request_id,
-                                    detected.protocol,
+                                    ErrorEnvelope::for_request(&detected),
                                 );
                                 }
                                 // Soft mode: audit log already emitted; fall
@@ -850,7 +850,7 @@ pub async fn dispatch(
                                     principal.arn, aws_request.action,
                                 ),
                                 &request_id,
-                                detected.protocol,
+                                ErrorEnvelope::for_request(&detected),
                             );
                         }
                         // Soft mode: audit log emitted; fall through to the
@@ -928,7 +928,7 @@ pub async fn dispatch(
                                     "AccessDenied",
                                     "Access Denied",
                                     &request_id,
-                                    detected.protocol,
+                                    ErrorEnvelope::for_request(&detected),
                                 );
                             }
                             // Soft mode: audit log emitted; fall through to the handler.
@@ -955,7 +955,7 @@ pub async fn dispatch(
                             "AccessDenied",
                             "Access Denied",
                             &request_id,
-                            detected.protocol,
+                            ErrorEnvelope::for_request(&detected),
                         );
                     }
                 }
@@ -1008,7 +1008,7 @@ pub async fn dispatch(
                 err.code(),
                 &err.message(),
                 &request_id,
-                detected.protocol,
+                ErrorEnvelope::for_request(&detected),
                 err.extra_fields(),
             );
             for (k, v) in &error_headers {
@@ -1339,14 +1339,49 @@ fn extract_region_from_user_agent(headers: &http::HeaderMap) -> Option<String> {
     None
 }
 
+/// The wire shape of an error body. It follows the protocol, except within
+/// REST-XML: S3 answers with a bare `<Error>` document, while CloudFront and
+/// Route 53 wrap theirs in a namespaced `<ErrorResponse>`. The AWS SDKs parse
+/// each service's errors strictly against its own shape.
+#[derive(Clone, Copy, Debug)]
+struct ErrorEnvelope {
+    protocol: AwsProtocol,
+    /// `Some(xmlns)` selects the `<ErrorResponse>` REST-XML shape.
+    rest_xml_namespace: Option<&'static str>,
+}
+
+impl ErrorEnvelope {
+    /// The envelope for an error answering a request routed to `detected`.
+    fn for_request(detected: &protocol::DetectedRequest) -> Self {
+        let rest_xml_namespace = if detected.protocol == AwsProtocol::Rest {
+            fakecloud_aws::error::rest_xml_error_namespace(&detected.service)
+        } else {
+            None
+        };
+        Self {
+            protocol: detected.protocol,
+            rest_xml_namespace,
+        }
+    }
+}
+
+impl From<AwsProtocol> for ErrorEnvelope {
+    fn from(protocol: AwsProtocol) -> Self {
+        Self {
+            protocol,
+            rest_xml_namespace: None,
+        }
+    }
+}
+
 fn build_error_response(
     status: StatusCode,
     code: &str,
     message: &str,
     request_id: &str,
-    protocol: AwsProtocol,
+    envelope: impl Into<ErrorEnvelope>,
 ) -> Response<Body> {
-    build_error_response_with_fields(status, code, message, request_id, protocol, &[])
+    build_error_response_with_fields(status, code, message, request_id, envelope, &[])
 }
 
 fn build_error_response_with_fields(
@@ -1354,30 +1389,36 @@ fn build_error_response_with_fields(
     code: &str,
     message: &str,
     request_id: &str,
-    protocol: AwsProtocol,
+    envelope: impl Into<ErrorEnvelope>,
     extra_fields: &[(String, String)],
 ) -> Response<Body> {
-    let (status, content_type, body) = match protocol {
+    let envelope = envelope.into();
+    let (status, content_type, body) = match (envelope.protocol, envelope.rest_xml_namespace) {
         // awsQuery services (SQS, SNS, IAM, STS, RDS, ELBv2, CloudWatch,
         // AutoScaling, ...) share the `<ErrorResponse>` envelope.
-        AwsProtocol::Query => {
+        (AwsProtocol::Query, _) => {
             fakecloud_aws::error::xml_error_response(status, code, message, request_id)
         }
         // EC2 uses the distinct ec2Query error envelope
         // (`<Response><Errors><Error>...</Errors><RequestID>`). Only EC2 is
         // classified `Ec2Query`, so the other Query-protocol services above are
         // untouched.
-        AwsProtocol::Ec2Query => {
+        (AwsProtocol::Ec2Query, _) => {
             fakecloud_aws::ec2query::ec2_error_response(status, code, message, request_id)
         }
-        AwsProtocol::Rest => fakecloud_aws::error::s3_xml_error_response_with_fields(
+        // CloudFront and Route 53 wrap the error in a namespaced
+        // `<ErrorResponse>`; S3 (and the REST-XML fallbacks) use a bare `<Error>`.
+        (AwsProtocol::Rest, Some(namespace)) => fakecloud_aws::error::rest_xml_error_response(
+            status, code, message, request_id, namespace,
+        ),
+        (AwsProtocol::Rest, None) => fakecloud_aws::error::s3_xml_error_response_with_fields(
             status,
             code,
             message,
             request_id,
             extra_fields,
         ),
-        AwsProtocol::Json | AwsProtocol::RestJson => {
+        (AwsProtocol::Json | AwsProtocol::RestJson, _) => {
             fakecloud_aws::error::json_error_response_with_fields(
                 status,
                 code,
@@ -1549,7 +1590,7 @@ fn authorize_internal_caller(
                 "AccessDenied",
                 "Access Denied",
                 request_id,
-                detected.protocol,
+                ErrorEnvelope::for_request(detected),
             )
         })
     };
@@ -2198,6 +2239,69 @@ mod tests {
             .to_str()
             .unwrap();
         assert!(ct.contains("xml"));
+    }
+
+    fn rest_detected(service: &str) -> protocol::DetectedRequest {
+        protocol::DetectedRequest {
+            service: service.to_string(),
+            action: String::new(),
+            protocol: AwsProtocol::Rest,
+        }
+    }
+
+    async fn body_string(resp: Response<Body>) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn cloudfront_and_route53_errors_use_error_response_wrapper() {
+        for (service, ns) in [
+            (
+                "cloudfront",
+                "http://cloudfront.amazonaws.com/doc/2020-05-31/",
+            ),
+            ("route53", "https://route53.amazonaws.com/doc/2013-04-01/"),
+        ] {
+            let resp = build_error_response(
+                StatusCode::NOT_FOUND,
+                "NoSuchThing",
+                "missing",
+                "req-w",
+                ErrorEnvelope::for_request(&rest_detected(service)),
+            );
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+            assert_eq!(
+                resp.headers().get("x-amz-error-code").unwrap(),
+                "NoSuchThing"
+            );
+            let body = body_string(resp).await;
+            assert!(
+                body.contains(&format!(
+                    "<ErrorResponse xmlns=\"{ns}\"><Error><Type>Sender</Type>\
+                     <Code>NoSuchThing</Code><Message>missing</Message></Error>\
+                     <RequestId>req-w</RequestId></ErrorResponse>"
+                )),
+                "{service}: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn s3_errors_keep_bare_error_document() {
+        let resp = build_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "missing",
+            "req-s3",
+            ErrorEnvelope::for_request(&rest_detected("s3")),
+        );
+        let body = body_string(resp).await;
+        assert!(!body.contains("<ErrorResponse"), "{body}");
+        assert!(body.contains("<Error>"), "{body}");
+        assert!(body.contains("<Code>NoSuchBucket</Code>"), "{body}");
     }
 
     #[test]

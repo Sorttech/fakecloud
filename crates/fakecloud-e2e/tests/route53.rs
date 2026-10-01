@@ -59,6 +59,25 @@ async fn create_get_delete_hosted_zone_lifecycle() {
         .expect("delete");
 }
 
+/// Route 53 errors use the REST-XML `<ErrorResponse>` wrapper, so the SDK
+/// parses them into the typed modeled error.
+#[tokio::test]
+async fn missing_hosted_zone_is_typed_sdk_error() {
+    use aws_sdk_route53::error::ProvideErrorMetadata;
+
+    let server = TestServer::start().await;
+    let r53 = server.route53_client().await;
+    let err = r53
+        .get_hosted_zone()
+        .id("Z0DOESNOTEXIST")
+        .send()
+        .await
+        .unwrap_err()
+        .into_service_error();
+    assert!(err.is_no_such_hosted_zone(), "{err:?}");
+    assert_eq!(err.code(), Some("NoSuchHostedZone"));
+}
+
 #[tokio::test]
 async fn change_and_list_resource_record_sets() {
     let server = TestServer::start().await;

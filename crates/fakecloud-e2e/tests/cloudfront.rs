@@ -151,6 +151,48 @@ async fn cloudfront_update_distribution_requires_if_match() {
     );
 }
 
+/// CloudFront errors use the REST-XML `<ErrorResponse>` wrapper, so the SDK
+/// parses them into the typed modeled error (#2632).
+#[tokio::test]
+async fn cloudfront_errors_are_typed_sdk_errors() {
+    use aws_sdk_cloudfront::error::ProvideErrorMetadata;
+
+    let server = TestServer::start().await;
+    let cf = server.cloudfront_client().await;
+
+    let err = cf
+        .get_distribution()
+        .id("EDOESNOTEXIST")
+        .send()
+        .await
+        .unwrap_err()
+        .into_service_error();
+    assert!(err.is_no_such_distribution(), "{err:?}");
+    assert_eq!(err.code(), Some("NoSuchDistribution"));
+    assert!(
+        err.message().is_some_and(|m| !m.is_empty()),
+        "message must be parsed: {err:?}"
+    );
+
+    let create = cf
+        .create_distribution()
+        .distribution_config(minimal_config("e2e-typed-err"))
+        .send()
+        .await
+        .expect("create_distribution");
+    let id = create.distribution().unwrap().id().to_string();
+    let err = cf
+        .update_distribution()
+        .id(&id)
+        .if_match("ESTALEETAG")
+        .distribution_config(minimal_config("e2e-typed-err"))
+        .send()
+        .await
+        .unwrap_err()
+        .into_service_error();
+    assert!(err.is_precondition_failed(), "{err:?}");
+}
+
 #[tokio::test]
 async fn cloudfront_create_invalidation() {
     let server = TestServer::start().await;

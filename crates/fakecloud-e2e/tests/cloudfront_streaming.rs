@@ -100,7 +100,12 @@ async fn delete_enabled_streaming_distribution_is_rejected() {
         .if_match(&etag)
         .send()
         .await;
-    assert!(res.is_err(), "deleting enabled streaming dist must fail");
+    assert!(
+        res.unwrap_err()
+            .into_service_error()
+            .is_streaming_distribution_not_disabled(),
+        "deleting enabled streaming dist must fail"
+    );
 }
 
 #[tokio::test]
@@ -117,7 +122,12 @@ async fn duplicate_streaming_caller_reference_is_rejected() {
         .streaming_distribution_config(streaming_cfg("e2e-sd-dup", true))
         .send()
         .await;
-    assert!(res.is_err(), "duplicate CallerReference must be rejected");
+    assert!(
+        res.unwrap_err()
+            .into_service_error()
+            .is_streaming_distribution_already_exists(),
+        "duplicate CallerReference must be rejected"
+    );
 }
 
 #[tokio::test]

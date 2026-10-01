@@ -32,7 +32,7 @@ pub mod xml_io;
 
 pub const API_VERSION: &str = "2020-05-31";
 pub const API_PREFIX: &str = "/2020-05-31";
-pub const NAMESPACE: &str = "http://cloudfront.amazonaws.com/doc/2020-05-31/";
+pub const NAMESPACE: &str = fakecloud_aws::error::CLOUDFRONT_XMLNS;
 
 pub use service::{cloudfront_arn, distribution_arn, CloudFrontService};
 pub use state::{

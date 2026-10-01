@@ -100,17 +100,6 @@ fn distribution_config(caller_reference: &str, origin: &str, enabled: bool) -> D
         .unwrap()
 }
 
-/// The CloudFront error code of a failed call, read from the
-/// `x-amz-error-code` header fakecloud sets on every REST-XML error.
-fn error_code<E>(
-    err: &aws_sdk_cloudfront::error::SdkError<E, aws_smithy_runtime_api::http::Response>,
-) -> String {
-    err.raw_response()
-        .and_then(|r| r.headers().get("x-amz-error-code"))
-        .unwrap_or_default()
-        .to_string()
-}
-
 #[tokio::test]
 async fn another_account_cannot_see_or_change_a_distribution() {
     let server = TestServer::start_with_env(&[("FAKECLOUD_IAM", "soft")]).await;
@@ -134,7 +123,7 @@ async fn another_account_cannot_see_or_change_a_distribution() {
 
     // B: no read, no listing, no update, no delete, no invalidation.
     let err = cf_b.get_distribution().id(&id).send().await.unwrap_err();
-    assert_eq!(error_code(&err), "NoSuchDistribution");
+    assert!(err.into_service_error().is_no_such_distribution());
     let listed = cf_b.list_distributions().send().await.unwrap();
     let b_ids: Vec<&str> = listed
         .distribution_list()
@@ -149,7 +138,7 @@ async fn another_account_cannot_see_or_change_a_distribution() {
         .send()
         .await
         .unwrap_err();
-    assert_eq!(error_code(&err), "NoSuchDistribution");
+    assert!(err.into_service_error().is_no_such_distribution());
     let err = cf_b
         .delete_distribution()
         .id(&id)
@@ -157,7 +146,7 @@ async fn another_account_cannot_see_or_change_a_distribution() {
         .send()
         .await
         .unwrap_err();
-    assert_eq!(error_code(&err), "NoSuchDistribution");
+    assert!(err.into_service_error().is_no_such_distribution());
     let err = cf_b
         .create_invalidation()
         .distribution_id(&id)
@@ -171,7 +160,7 @@ async fn another_account_cannot_see_or_change_a_distribution() {
         .send()
         .await
         .unwrap_err();
-    assert_eq!(error_code(&err), "NoSuchDistribution");
+    assert!(err.into_service_error().is_no_such_distribution());
 
     // B reusing A's CallerReference is its own, independent distribution.
     let b_dist = cf_b
@@ -232,7 +221,7 @@ async fn another_account_cannot_see_or_change_a_distribution() {
         .send()
         .await
         .unwrap_err();
-    assert_eq!(error_code(&err), "NoSuchDistribution");
+    assert!(err.into_service_error().is_no_such_distribution());
 }
 
 #[tokio::test]
@@ -288,7 +277,9 @@ async fn another_account_cannot_see_or_change_policies_or_functions() {
         .id(&oac_id)
         .send()
         .await
-        .is_err());
+        .unwrap_err()
+        .into_service_error()
+        .is_no_such_origin_access_control());
     let b_oacs = cf_b.list_origin_access_controls().send().await.unwrap();
     assert_eq!(
         b_oacs
@@ -303,7 +294,9 @@ async fn another_account_cannot_see_or_change_policies_or_functions() {
         .if_match(&oac_etag)
         .send()
         .await
-        .is_err());
+        .unwrap_err()
+        .into_service_error()
+        .is_no_such_origin_access_control());
 
     // B cannot describe, list, or delete A's function; the name is free in B.
     let err = cf_b
@@ -312,7 +305,7 @@ async fn another_account_cannot_see_or_change_policies_or_functions() {
         .send()
         .await
         .unwrap_err();
-    assert_eq!(error_code(&err), "NoSuchFunctionExists");
+    assert!(err.into_service_error().is_no_such_function_exists());
     let b_fns = cf_b.list_functions().send().await.unwrap();
     assert_eq!(
         b_fns
@@ -327,7 +320,9 @@ async fn another_account_cannot_see_or_change_policies_or_functions() {
         .if_match(&fn_etag)
         .send()
         .await
-        .is_err());
+        .unwrap_err()
+        .into_service_error()
+        .is_no_such_function_exists());
     cf_b.create_function()
         .name("fn-a")
         .function_config(
