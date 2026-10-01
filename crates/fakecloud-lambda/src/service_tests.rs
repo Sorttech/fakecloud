@@ -4474,15 +4474,16 @@ fn another_accounts_role_is_checked_against_its_own_trust_policy() {
     assert!(err.message().contains(foreign), "{}", err.message());
     validate_execution_role("123456789012", own, Some(&own_trusts), IamMode::Strict).unwrap();
 
-    // Strict refuses another account's role before its trust policy is read.
-    let err = validate_execution_role(
-        "123456789012",
-        foreign,
-        Some(&foreign_trusts),
-        IamMode::Strict,
-    )
-    .expect_err("strict refuses cross-account");
+    // Strict refuses another account's role before its trust policy is read:
+    // the validator is never consulted.
+    let recording = RecordingTrustValidator::default();
+    let err = validate_execution_role("123456789012", foreign, Some(&recording), IamMode::Strict)
+        .expect_err("strict refuses cross-account");
     assert_eq!(err.code(), "AccessDeniedException");
+    assert!(
+        recording.accounts.lock().is_empty(),
+        "trust policy looked up before the strict refusal"
+    );
 }
 
 #[tokio::test]
