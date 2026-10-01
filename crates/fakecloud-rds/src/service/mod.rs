@@ -195,6 +195,9 @@ pub struct RdsService {
     snapshot_store: Option<Arc<dyn SnapshotStore>>,
     snapshot_lock: Arc<AsyncMutex<()>>,
     pub(crate) delivery_bus: Option<Arc<DeliveryBus>>,
+    /// KMS access, so storage encrypted without a named key reports the
+    /// account's AWS-managed `aws/rds` key and a named key reports its ARN.
+    kms_hook: Option<Arc<dyn fakecloud_core::delivery::KmsHook>>,
 }
 
 /// Source type for RDS EventBridge events. Maps `aws.rds` detail-type.
@@ -271,6 +274,76 @@ impl RdsService {
             snapshot_store: None,
             snapshot_lock: Arc::new(AsyncMutex::new(())),
             delivery_bus: None,
+            kms_hook: None,
+        }
+    }
+
+    pub fn with_kms_hook(mut self, hook: Arc<dyn fakecloud_core::delivery::KmsHook>) -> Self {
+        self.kms_hook = Some(hook);
+        self
+    }
+
+    /// The key storage encrypted in `region` is reported under: the ARN of
+    /// `named` (resolved through KMS, ignored when empty) or, with no key
+    /// named, the account's AWS-managed `aws/rds` key for the region. `None`
+    /// without a KMS hook and no key named. Resolve before taking the RDS
+    /// state lock (KMS may mint and persist the key).
+    pub(crate) fn storage_kms_key(
+        &self,
+        named: Option<&str>,
+        account_id: &str,
+        region: &str,
+    ) -> Option<String> {
+        fakecloud_core::delivery::kms_key_arn_or_aws_managed(
+            self.kms_hook.as_deref(),
+            named,
+            account_id,
+            region,
+            "rds",
+        )
+    }
+
+    /// A create/restore request's `StorageEncrypted` and the key it reports:
+    /// encrypted storage uses [`Self::storage_kms_key`] (the named key's ARN
+    /// or the AWS-managed `aws/rds` key); unencrypted storage keeps any named
+    /// key as given.
+    pub(crate) fn requested_storage_encryption(
+        &self,
+        request: &AwsRequest,
+    ) -> Result<(bool, Option<String>), AwsServiceError> {
+        let encrypted = service_helpers::parse_optional_bool(
+            optional_query_param(request, "StorageEncrypted").as_deref(),
+        )?
+        .unwrap_or(false);
+        let named = optional_query_param(request, "KmsKeyId");
+        if !encrypted {
+            return Ok((false, named));
+        }
+        Ok((
+            true,
+            self.storage_kms_key(named.as_deref(), &request.account_id, &request.region),
+        ))
+    }
+
+    /// For a cluster row (or cluster-shaped row) with `StorageEncrypted`
+    /// set, report its storage key as AWS does: the named `KmsKeyId` as its
+    /// key ARN, or the AWS-managed `aws/rds` key when none is named. An
+    /// unencrypted row is left as is.
+    pub(crate) fn resolve_cluster_storage_key(
+        &self,
+        obj: &mut serde_json::Map<String, serde_json::Value>,
+        account_id: &str,
+        region: &str,
+    ) {
+        if obj.get("StorageEncrypted").and_then(|v| v.as_bool()) != Some(true) {
+            return;
+        }
+        let named = obj
+            .get("KmsKeyId")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        if let Some(key) = self.storage_kms_key(named.as_deref(), account_id, region) {
+            obj.insert("KmsKeyId".to_string(), serde_json::Value::String(key));
         }
     }
 

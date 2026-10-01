@@ -12,7 +12,7 @@ use crate::service_helpers::{
     gen_id, indexed_list, instance_limit_exceeded, invalid_parameter_value, missing_parameter,
     parse_filters, require, require_struct, validate_enum, Filter,
 };
-use crate::state::{Ec2State, IamInstanceProfileAssociation, Instance, Tag};
+use crate::state::{Ec2State, IamInstanceProfileAssociation, Instance, Tag, VolumeAttachment};
 
 const LAUNCH_TIME: &str = "2024-01-01T00:00:00.000Z";
 
@@ -82,7 +82,9 @@ fn platform_for(state: &Ec2State, image_id: &str) -> String {
 /// IAM instance-profile association, looked up by the caller from
 /// `state.iam_instance_profile_associations` (the instance record itself does
 /// not carry the profile, mirroring how `sg_names` and block-device mappings
-/// are resolved at describe time).
+/// are resolved at describe time). `block_devices` are the instance's EBS
+/// volume attachments, rendered as `blockDeviceMapping`.
+#[allow(clippy::too_many_arguments)]
 fn instance_xml(
     i: &Instance,
     tags: &[Tag],
@@ -91,7 +93,24 @@ fn instance_xml(
     architecture: &str,
     platform_details: &str,
     iam_assoc: Option<&IamInstanceProfileAssociation>,
+    block_devices: &[&VolumeAttachment],
 ) -> String {
+    // The EBS volumes attached to the instance, by device name.
+    let mut devices: Vec<&&VolumeAttachment> = block_devices.iter().collect();
+    devices.sort_by(|a, b| a.device.cmp(&b.device));
+    let block_device_items: Vec<String> = devices
+        .iter()
+        .map(|a| {
+            format!(
+                "{}<ebs>{}{}{}<deleteOnTermination>{}</deleteOnTermination></ebs>",
+                ec2_elem("deviceName", &a.device),
+                ec2_elem("volumeId", &a.volume_id),
+                ec2_elem("status", &a.status),
+                ec2_elem("attachTime", &i.launch_time),
+                a.delete_on_termination,
+            )
+        })
+        .collect();
     // Rendered whenever an association exists, regardless of its `state`, so
     // records persisted by older versions (which never left `associating`)
     // still reflect on the instance.
@@ -180,7 +199,7 @@ fn instance_xml(
         .map(|a| ec2_elem("affinity", a))
         .unwrap_or_default();
     format!(
-        "{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}",
+        "{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}",
         ec2_elem("instanceId", &i.instance_id),
         ec2_elem("imageId", &i.image_id),
         state_xml("instanceState", i.state_code, &i.state_name),
@@ -197,6 +216,7 @@ fn instance_xml(
         platform_xml,
         ec2_elem("rootDeviceType", "ebs"),
         ec2_elem("rootDeviceName", "/dev/xvda"),
+        ec2_list("blockDeviceMapping", &block_device_items),
         ec2_elem("virtualizationType", "hvm"),
         ec2_elem("hypervisor", "xen"),
         format_args!(
@@ -491,6 +511,15 @@ pub(crate) async fn run_instances(
     // RDS CreateDBInstance). With no runtime configured the instance is
     // flipped to `running` immediately in a spawned task.
     let ids: Vec<String> = (0..count).map(|_| gen_id("i")).collect();
+    // EBS volumes the block-device mappings create for each instance, with
+    // their encryption resolved (KMS) before the EC2 lock is taken.
+    let launch_volumes = super::volume::launch_volumes(
+        svc,
+        &req.account_id,
+        &req.region,
+        &req.query_params,
+        "BlockDeviceMapping",
+    );
     let mut rendered = Vec::new();
     {
         let mut accounts = svc.state.write();
@@ -563,6 +592,20 @@ pub(crate) async fn run_instances(
             let iam_assoc = iam_profile_arn.clone().map(|profile_arn| {
                 super::rest::new_iam_profile_association(id.clone(), profile_arn)
             });
+            super::volume::create_launch_volumes(
+                state,
+                id,
+                &inst.az,
+                &launch_volumes,
+                &req.query_params,
+            );
+            let attachments: Vec<VolumeAttachment> = state
+                .volumes
+                .values()
+                .flat_map(|v| v.attachments.iter().filter(|a| &a.instance_id == id))
+                .cloned()
+                .collect();
+            let block_devices: Vec<&VolumeAttachment> = attachments.iter().collect();
             rendered.push(instance_xml(
                 &inst,
                 &tags,
@@ -571,6 +614,7 @@ pub(crate) async fn run_instances(
                 &architecture,
                 &platform_details,
                 iam_assoc.as_ref(),
+                &block_devices,
             ));
             state.instances.insert(id.clone(), inst);
             if let Some(assoc) = iam_assoc {
@@ -766,6 +810,10 @@ pub struct CfnInstanceSpec {
     /// AssociateIamInstanceProfile after launch.
     pub iam_instance_profile_arn: Option<String>,
     pub iam_instance_profile_name: Option<String>,
+    /// `BlockDeviceMappings` in RunInstances query form
+    /// (`BlockDeviceMapping.N.DeviceName`, `BlockDeviceMapping.N.Ebs.*`):
+    /// each EBS mapping creates an attached volume, as a direct launch does.
+    pub block_device_params: HashMap<String, String>,
 }
 
 /// The Ref / GetAtt-resolvable attributes of a CFN-launched instance.
@@ -867,6 +915,13 @@ pub(crate) fn cfn_create_instance(
     };
 
     let assign_public = subnet_auto_public;
+    let launch_volumes = super::volume::launch_volumes(
+        svc,
+        account_id,
+        region,
+        &spec.block_device_params,
+        "BlockDeviceMapping",
+    );
     let id = gen_id("i");
     let private_ip = spec
         .private_ip
@@ -917,6 +972,7 @@ pub(crate) fn cfn_create_instance(
             enable_resource_name_dns_aaaa_record: false,
         };
         state.instances.insert(id.clone(), inst);
+        super::volume::create_launch_volumes(state, &id, &az, &launch_volumes, &HashMap::new());
 
         // Record an IAM instance-profile association when the template supplies
         // `IamInstanceProfile`, mirroring a direct AssociateIamInstanceProfile
@@ -1184,6 +1240,9 @@ async fn change_state(
             state
                 .iam_instance_profile_associations
                 .retain(|_, a| !affected.contains(&a.instance_id));
+            // Its EBS volumes go with it: DeleteOnTermination ones are
+            // deleted, the rest detached.
+            super::volume::release_terminated_volumes(state, &affected);
         }
     }
 
@@ -1500,6 +1559,7 @@ pub(crate) fn describe_instances(
                 &arch_for(state, &i.image_id),
                 &platform_for(state, &i.image_id),
                 profile_by_instance.get(i.instance_id.as_str()).copied(),
+                bdm_by_instance.get(&i.instance_id).unwrap_or(&no_bdm),
             ));
     }
     let reservations: Vec<String> = order

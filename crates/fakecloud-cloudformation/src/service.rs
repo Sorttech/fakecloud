@@ -80,6 +80,7 @@ fn well_known_attributes_for(resource_type: &str) -> &'static [&'static str] {
         "AWS::EC2::SecurityGroup" => &["GroupId", "VpcId"],
         "AWS::EC2::InternetGateway" => &["InternetGatewayId"],
         "AWS::EC2::RouteTable" => &["RouteTableId"],
+        "AWS::EC2::Volume" => &["VolumeId"],
         "AWS::Pipes::Pipe" => &["Arn"],
         "AWS::CodeArtifact::Domain" => &["Arn", "EncryptionKey", "Name", "Owner"],
         "AWS::CodeArtifact::Repository" => &["Arn", "DomainName", "DomainOwner", "Name"],

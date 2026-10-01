@@ -536,6 +536,7 @@ impl RdsService {
                 // dropped until a follow-up ModifyDBCluster.
                 if let Some(obj) = entry.as_object_mut() {
                     apply_create_cluster_params(obj, req);
+                    self.resolve_cluster_storage_key(obj, &aid, region);
                 }
                 {
                     let mut accounts = write_state!();
@@ -719,6 +720,28 @@ impl RdsService {
                 let source_id = get_param(req, "SourceDBClusterSnapshotIdentifier")
                     .ok_or_else(|| missing("SourceDBClusterSnapshotIdentifier"))?;
                 let arn = cluster_snapshot_arn(region, &aid, &id);
+                // A copy of an encrypted snapshot that names a key is
+                // re-encrypted with it (reported as the key's ARN). Resolved
+                // before the RDS lock, and only for an encrypted source: an
+                // unencrypted one with a key is rejected below, and must not
+                // mint an AWS-managed key on the way.
+                let named_key = get_param(req, "KmsKeyId").filter(|k| !k.is_empty());
+                let source_encrypted = named_key.is_some() && {
+                    let accounts = self.state_handle().read();
+                    let key = normalized_identifier(Some(source_id.clone()), "cluster-snapshot")
+                        .unwrap_or_else(|| source_id.clone());
+                    find_cluster_snapshot(
+                        &accounts,
+                        &aid,
+                        identifier_account(&source_id).as_deref(),
+                        &key,
+                    )
+                    .is_some_and(|e| e["StorageEncrypted"].as_bool() == Some(true))
+                };
+                let copy_key = named_key
+                    .as_deref()
+                    .filter(|_| source_encrypted)
+                    .and_then(|k| self.storage_kms_key(Some(k), &aid, region));
                 let mut accounts = write_state!();
                 // Guarded ARN reduction: AWS automated-snapshot ids carry
                 // a colon (`rds:mydb-...`), so only an `arn:` value is
@@ -754,6 +777,13 @@ impl RdsService {
                                 format!("DBClusterSnapshot {source_id} not found."),
                             )
                         })?;
+                // An unencrypted cluster snapshot cannot be encrypted by
+                // copying it: naming a key for one is an error.
+                if named_key.is_some() && entry["StorageEncrypted"].as_bool() != Some(true) {
+                    return Err(crate::service::service_helpers::copy_unencrypted_cluster_snapshot_with_key(
+                        &source_id,
+                    ));
+                }
                 let state = accounts.get_or_create(&aid);
                 let cluster = entry
                     .get("DBClusterIdentifier")
@@ -778,6 +808,9 @@ impl RdsService {
                     obj.insert("Status".to_string(), json!("available"));
                     obj.insert("SnapshotType".to_string(), json!("manual"));
                     obj.insert("SourceDBClusterSnapshotArn".to_string(), json!(source_arn));
+                    if let Some(key) = copy_key {
+                        obj.insert("KmsKeyId".to_string(), json!(key));
+                    }
                     // The copy is created now; CopyDBSnapshot does the
                     // same, and a stale time sorts it wrongly in a
                     // time-ordered listing.
@@ -3351,7 +3384,35 @@ impl RdsService {
                     .unwrap_or_else(|| source_id.clone());
                 let source_owner = identifier_account(&source_id);
                 let option_group_name = get_param(req, "OptionGroupName");
-                let kms_key_id = get_param(req, "KmsKeyId");
+                // Reported as the key's ARN: resolved through KMS before the
+                // RDS lock, or formatted as one when KMS doesn't know it.
+                // Only for a copy that can succeed (the target is free and the
+                // source exists), so a failing copy mints no AWS-managed key.
+                let copy_possible = {
+                    let accounts = self.state_handle().read();
+                    let target_free = accounts
+                        .get(&aid)
+                        .is_none_or(|s| !s.snapshots.contains_key(&target_id));
+                    let owner = source_owner.as_deref().unwrap_or(&aid);
+                    // Another account's snapshot is copyable only when it was
+                    // shared with this caller, as the copy below requires.
+                    let source_usable = accounts
+                        .get(owner)
+                        .and_then(|s| s.snapshots.get(&source_key))
+                        .is_some_and(|snapshot| {
+                            owner == aid
+                                || snapshot.snapshot_attributes.get("restore").is_some_and(
+                                    |targets| targets.iter().any(|t| *t == aid || t == "all"),
+                                )
+                        });
+                    target_free && source_usable
+                };
+                let kms_key_id = get_param(req, "KmsKeyId")
+                    .filter(|k| !k.is_empty() && copy_possible)
+                    .map(|k| {
+                        let key = self.storage_kms_key(Some(&k), &aid, region).unwrap_or(k);
+                        format_kms_arn(&key, region, &aid)
+                    });
                 let (snapshot, arn) = {
                     let mut accounts = write_state!();
                     let state = accounts.get_or_create(&aid);
@@ -3417,7 +3478,7 @@ impl RdsService {
                     }
                     if let Some(kms) = kms_key_id {
                         snapshot.encrypted = true;
-                        snapshot.kms_key_id = Some(format_kms_arn(&kms, region, &aid));
+                        snapshot.kms_key_id = Some(kms);
                     }
                     // A copy is a fresh sharing surface; it does not inherit
                     // the source snapshot's restore attributes.
@@ -3690,7 +3751,7 @@ impl RdsService {
                 let port = get_param(req, "Port")
                     .and_then(|p| p.parse::<i64>().ok())
                     .unwrap_or(if engine.contains("postgresql") { 5432 } else { 3306 });
-                let entry = json!({
+                let mut entry = json!({
                     "DBClusterIdentifier": id, "DBClusterArn": arn,
                     "DbClusterResourceId": new_cluster_resource_id(),
                     "Status": "available", "Engine": engine,
@@ -3699,7 +3760,14 @@ impl RdsService {
                     "ReaderEndpoint": format!("{id}.cluster-ro-xxx.{region}.rds.amazonaws.com"),
                     "Port": port,
                     "MasterUsername": get_param(req, "MasterUsername").unwrap_or_else(|| "admin".to_string()),
+                    "StorageEncrypted": get_param(req, "StorageEncrypted").is_some_and(|v| v.eq_ignore_ascii_case("true")),
                 });
+                if let Some(obj) = entry.as_object_mut() {
+                    if let Some(key) = get_param(req, "KmsKeyId").filter(|k| !k.is_empty()) {
+                        obj.insert("KmsKeyId".to_string(), json!(key));
+                    }
+                    self.resolve_cluster_storage_key(obj, &aid, region);
+                }
                 {
                     let mut accounts = write_state!();
                     let state = accounts.get_or_create(&aid);
@@ -4184,6 +4252,15 @@ pub(crate) fn cluster_snapshot_detail_xml(entry: Option<&Value>) -> String {
             "\n      <EngineVersion>{}</EngineVersion>",
             xml_escape(version)
         ));
+    }
+    // The snapshot's encryption, as the Describe rendering reports it: the
+    // create/copy response is the same DBClusterSnapshot.
+    out.push_str(&format!(
+        "\n      <StorageEncrypted>{}</StorageEncrypted>",
+        entry["StorageEncrypted"].as_bool().unwrap_or(false)
+    ));
+    if let Some(key) = entry_str(entry, "KmsKeyId") {
+        out.push_str(&format!("\n      <KmsKeyId>{}</KmsKeyId>", xml_escape(key)));
     }
     out
 }

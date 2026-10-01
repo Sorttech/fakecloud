@@ -27,6 +27,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+fakecloud-kms = { workspace = true, features = ["test-util"] }
 # The opt-in k8s-integration test drives a real cluster directly.
 kube = { workspace = true }
 

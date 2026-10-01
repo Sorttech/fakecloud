@@ -6589,3 +6589,458 @@ fn kms_key_id_is_expanded_in_the_regions_partition() {
         "arn:aws:kms:us-east-1:000000000000:key/1234abcd"
     );
 }
+
+/// The `<KmsKeyId>` a response reports, if any.
+fn reported_kms_key(resp: &fakecloud_core::service::AwsResponse) -> Option<String> {
+    let xml = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
+    let start = xml.find("<KmsKeyId>")? + "<KmsKeyId>".len();
+    let end = xml[start..].find("</KmsKeyId>")? + start;
+    Some(xml[start..end].to_string())
+}
+
+/// An RDS service over fresh state with a KMS hook, plus the KMS state.
+fn svc_with_kms() -> (fakecloud_kms::SharedKmsState, RdsService) {
+    let (kms, hook) = fakecloud_kms::test_support::kms_hook("000000000000");
+    (kms, svc().with_kms_hook(hook))
+}
+
+async fn handle_ok(
+    svc: &RdsService,
+    action: &str,
+    params: &[(&str, &str)],
+) -> fakecloud_core::service::AwsResponse {
+    use fakecloud_core::service::AwsService;
+    match svc.handle(req(action, params)).await {
+        Ok(r) => r,
+        Err(e) => panic!("{action} failed: {e:?}"),
+    }
+}
+
+/// A cluster encrypted without a named key reports the account's AWS-managed
+/// `aws/rds` key for the region (a real KMS key); the key follows the cluster
+/// into its snapshots, copies and restores, and a restore that names a key is
+/// encrypted with that key's ARN.
+#[tokio::test]
+async fn encrypted_cluster_reports_the_aws_managed_rds_key() {
+    let (kms, svc) = svc_with_kms();
+    let created = handle_ok(
+        &svc,
+        "CreateDBCluster",
+        &[
+            ("DBClusterIdentifier", "enc"),
+            ("Engine", "aurora-postgresql"),
+            ("StorageEncrypted", "true"),
+        ],
+    )
+    .await;
+    let key = reported_kms_key(&created).expect("encrypted cluster reports a key");
+    fakecloud_kms::test_support::assert_aws_managed_key(
+        &kms,
+        "000000000000",
+        "us-east-1",
+        &key,
+        "alias/aws/rds",
+    );
+    let described = handle_ok(
+        &svc,
+        "DescribeDBClusters",
+        &[("DBClusterIdentifier", "enc")],
+    )
+    .await;
+    assert_eq!(reported_kms_key(&described).as_deref(), Some(key.as_str()));
+
+    let plain = handle_ok(
+        &svc,
+        "CreateDBCluster",
+        &[
+            ("DBClusterIdentifier", "plain"),
+            ("Engine", "aurora-postgresql"),
+        ],
+    )
+    .await;
+    assert_eq!(reported_kms_key(&plain), None);
+
+    let snap = handle_ok(
+        &svc,
+        "CreateDBClusterSnapshot",
+        &[
+            ("DBClusterSnapshotIdentifier", "s1"),
+            ("DBClusterIdentifier", "enc"),
+        ],
+    )
+    .await;
+    assert_eq!(reported_kms_key(&snap).as_deref(), Some(key.as_str()));
+    let described = handle_ok(
+        &svc,
+        "DescribeDBClusterSnapshots",
+        &[("DBClusterSnapshotIdentifier", "s1")],
+    )
+    .await;
+    assert_eq!(reported_kms_key(&described).as_deref(), Some(key.as_str()));
+    handle_ok(
+        &svc,
+        "CopyDBClusterSnapshot",
+        &[
+            ("SourceDBClusterSnapshotIdentifier", "s1"),
+            ("TargetDBClusterSnapshotIdentifier", "s1-copy"),
+        ],
+    )
+    .await;
+    let copy = handle_ok(
+        &svc,
+        "DescribeDBClusterSnapshots",
+        &[("DBClusterSnapshotIdentifier", "s1-copy")],
+    )
+    .await;
+    assert_eq!(reported_kms_key(&copy).as_deref(), Some(key.as_str()));
+
+    handle_ok(
+        &svc,
+        "RestoreDBClusterFromSnapshot",
+        &[
+            ("DBClusterIdentifier", "restored"),
+            ("SnapshotIdentifier", "s1"),
+            ("Engine", "aurora-postgresql"),
+        ],
+    )
+    .await;
+    let restored = handle_ok(
+        &svc,
+        "DescribeDBClusters",
+        &[("DBClusterIdentifier", "restored")],
+    )
+    .await;
+    assert_eq!(reported_kms_key(&restored).as_deref(), Some(key.as_str()));
+    handle_ok(
+        &svc,
+        "RestoreDBClusterToPointInTime",
+        &[
+            ("DBClusterIdentifier", "pitr"),
+            ("SourceDBClusterIdentifier", "enc"),
+        ],
+    )
+    .await;
+    let pitr = handle_ok(
+        &svc,
+        "DescribeDBClusters",
+        &[("DBClusterIdentifier", "pitr")],
+    )
+    .await;
+    assert_eq!(reported_kms_key(&pitr).as_deref(), Some(key.as_str()));
+
+    // Restoring an unencrypted snapshot with a named key encrypts the new
+    // cluster with it, reported as the key's ARN rather than the alias given.
+    handle_ok(
+        &svc,
+        "CreateDBClusterSnapshot",
+        &[
+            ("DBClusterSnapshotIdentifier", "plain-snap"),
+            ("DBClusterIdentifier", "plain"),
+        ],
+    )
+    .await;
+    handle_ok(
+        &svc,
+        "RestoreDBClusterFromSnapshot",
+        &[
+            ("DBClusterIdentifier", "named"),
+            ("SnapshotIdentifier", "plain-snap"),
+            ("Engine", "aurora-postgresql"),
+            ("KmsKeyId", "alias/aws/rds"),
+        ],
+    )
+    .await;
+    let named = handle_ok(
+        &svc,
+        "DescribeDBClusters",
+        &[("DBClusterIdentifier", "named")],
+    )
+    .await;
+    let xml = String::from_utf8(named.body.expect_bytes().to_vec()).unwrap();
+    assert!(
+        xml.contains("<StorageEncrypted>true</StorageEncrypted>"),
+        "{xml}"
+    );
+    assert_eq!(reported_kms_key(&named).as_deref(), Some(key.as_str()));
+
+    // RestoreDBClusterFromS3 honors StorageEncrypted too.
+    let from_s3 = handle_ok(
+        &svc,
+        "RestoreDBClusterFromS3",
+        &[
+            ("DBClusterIdentifier", "from-s3"),
+            ("Engine", "aurora-mysql"),
+            ("MasterUsername", "admin"),
+            ("SourceEngine", "mysql"),
+            ("SourceEngineVersion", "8.0.36"),
+            ("S3BucketName", "bucket"),
+            ("S3IngestionRoleArn", "arn:aws:iam::000000000000:role/r"),
+            ("StorageEncrypted", "true"),
+        ],
+    )
+    .await;
+    assert_eq!(reported_kms_key(&from_s3).as_deref(), Some(key.as_str()));
+}
+
+/// A DB instance's requested storage encryption: encrypted storage with no
+/// key named uses the region's AWS-managed `aws/rds` key, a named alias
+/// reports its key's ARN, and unencrypted storage keeps a named key as given.
+#[test]
+fn instance_storage_encryption_resolves_its_key() {
+    let (kms, svc) = svc_with_kms();
+    let (encrypted, key) = svc
+        .requested_storage_encryption(&req("CreateDBInstance", &[("StorageEncrypted", "true")]))
+        .unwrap();
+    assert!(encrypted);
+    let key = key.expect("encrypted storage reports a key");
+    fakecloud_kms::test_support::assert_aws_managed_key(
+        &kms,
+        "000000000000",
+        "us-east-1",
+        &key,
+        "alias/aws/rds",
+    );
+    let (_, named) = svc
+        .requested_storage_encryption(&req(
+            "CreateDBInstance",
+            &[("StorageEncrypted", "true"), ("KmsKeyId", "alias/aws/rds")],
+        ))
+        .unwrap();
+    assert_eq!(named.as_deref(), Some(key.as_str()));
+    assert_eq!(
+        svc.requested_storage_encryption(&req("CreateDBInstance", &[("KmsKeyId", "k")]))
+            .unwrap(),
+        (false, Some("k".to_string()))
+    );
+    assert_eq!(
+        svc.requested_storage_encryption(&req("CreateDBInstance", &[]))
+            .unwrap(),
+        (false, None)
+    );
+}
+
+/// A malformed `StorageEncrypted` on RestoreDBInstanceFromS3 is rejected
+/// before anything else runs, so it can never leave the identifier reserved
+/// (which made every later create/restore of that name fail with
+/// DBInstanceAlreadyExists).
+#[tokio::test]
+async fn restore_from_s3_rejects_bad_storage_encrypted_without_reserving() {
+    use fakecloud_core::service::AwsService;
+    let (_kms, svc) = svc_with_kms();
+    let params = [
+        ("DBInstanceIdentifier", "s3-restored"),
+        ("S3BucketName", "bucket"),
+        ("Engine", "mysql"),
+        ("SourceEngine", "mysql"),
+        ("SourceEngineVersion", "8.0.36"),
+        ("S3IngestionRoleArn", "arn:aws:iam::000000000000:role/r"),
+        ("StorageEncrypted", "yes"),
+    ];
+    for _ in 0..2 {
+        let err = match svc.handle(req("RestoreDBInstanceFromS3", &params)).await {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => e,
+        };
+        assert_eq!(err.code(), "InvalidParameterValue");
+    }
+    let accounts = svc.state_handle().read();
+    assert!(accounts
+        .get("000000000000")
+        .is_none_or(|s| !s.instances.contains_key("s3-restored")));
+}
+
+/// An unencrypted DB cluster snapshot cannot be encrypted by copying it: a
+/// copy naming a KmsKeyId fails and records nothing; an encrypted source's
+/// copy takes the named key (as its ARN).
+#[tokio::test]
+async fn copying_an_unencrypted_cluster_snapshot_with_a_key_fails() {
+    use fakecloud_core::service::AwsService;
+    let (kms, svc) = svc_with_kms();
+    handle_ok(
+        &svc,
+        "CreateDBCluster",
+        &[
+            ("DBClusterIdentifier", "plain"),
+            ("Engine", "aurora-postgresql"),
+        ],
+    )
+    .await;
+    handle_ok(
+        &svc,
+        "CreateDBClusterSnapshot",
+        &[
+            ("DBClusterSnapshotIdentifier", "plain-snap"),
+            ("DBClusterIdentifier", "plain"),
+        ],
+    )
+    .await;
+    let err = match svc
+        .handle(req(
+            "CopyDBClusterSnapshot",
+            &[
+                ("SourceDBClusterSnapshotIdentifier", "plain-snap"),
+                ("TargetDBClusterSnapshotIdentifier", "keyed-copy"),
+                ("KmsKeyId", "alias/aws/rds"),
+            ],
+        ))
+        .await
+    {
+        Ok(_) => panic!("expected an error"),
+        Err(e) => e,
+    };
+    assert_eq!(err.code(), "InvalidParameterCombination");
+    // The rejected copy minted no AWS-managed key.
+    assert!(kms
+        .read()
+        .get("000000000000")
+        .is_none_or(|s| s.keys.is_empty()));
+    assert!(svc
+        .state_handle()
+        .read()
+        .get("000000000000")
+        .and_then(|s| s.extras.get("cluster_snapshots"))
+        .is_none_or(|m| !m.contains_key("keyed-copy")));
+
+    // A plain copy of it is fine, and stays unencrypted.
+    let plain = handle_ok(
+        &svc,
+        "CopyDBClusterSnapshot",
+        &[
+            ("SourceDBClusterSnapshotIdentifier", "plain-snap"),
+            ("TargetDBClusterSnapshotIdentifier", "plain-copy"),
+        ],
+    )
+    .await;
+    assert_eq!(reported_kms_key(&plain), None);
+
+    // An encrypted source re-encrypts under the named key.
+    let enc = handle_ok(
+        &svc,
+        "CreateDBCluster",
+        &[
+            ("DBClusterIdentifier", "enc"),
+            ("Engine", "aurora-postgresql"),
+            ("StorageEncrypted", "true"),
+        ],
+    )
+    .await;
+    let key = reported_kms_key(&enc).unwrap();
+    handle_ok(
+        &svc,
+        "CreateDBClusterSnapshot",
+        &[
+            ("DBClusterSnapshotIdentifier", "enc-snap"),
+            ("DBClusterIdentifier", "enc"),
+        ],
+    )
+    .await;
+    let copy = handle_ok(
+        &svc,
+        "CopyDBClusterSnapshot",
+        &[
+            ("SourceDBClusterSnapshotIdentifier", "enc-snap"),
+            ("TargetDBClusterSnapshotIdentifier", "enc-copy"),
+            ("KmsKeyId", "alias/aws/rds"),
+        ],
+    )
+    .await;
+    assert_eq!(reported_kms_key(&copy).as_deref(), Some(key.as_str()));
+}
+
+/// Unlike a cluster snapshot, an unencrypted DB snapshot copied with a
+/// KmsKeyId becomes an ENCRYPTED copy under that key (reported as its ARN).
+#[tokio::test]
+async fn copying_an_unencrypted_db_snapshot_with_a_key_encrypts_the_copy() {
+    let (kms, svc) = svc_with_kms();
+    {
+        let mut accounts = svc.state_handle().write();
+        accounts.get_or_create("000000000000").snapshots.insert(
+            "plain-snap".to_string(),
+            local_snapshot("plain-snap", "my-db", "000000000000"),
+        );
+    }
+    let copy = handle_ok(
+        &svc,
+        "CopyDBSnapshot",
+        &[
+            ("SourceDBSnapshotIdentifier", "plain-snap"),
+            ("TargetDBSnapshotIdentifier", "enc-copy"),
+            ("KmsKeyId", "alias/aws/rds"),
+        ],
+    )
+    .await;
+    let key = reported_kms_key(&copy).expect("encrypted copy reports its key");
+    fakecloud_kms::test_support::assert_aws_managed_key(
+        &kms,
+        "000000000000",
+        "us-east-1",
+        &key,
+        "alias/aws/rds",
+    );
+    let stored = svc
+        .state_handle()
+        .read()
+        .get("000000000000")
+        .unwrap()
+        .snapshots["enc-copy"]
+        .clone();
+    assert!(stored.encrypted);
+    assert_eq!(stored.kms_key_id.as_deref(), Some(key.as_str()));
+    let source = svc
+        .state_handle()
+        .read()
+        .get("000000000000")
+        .unwrap()
+        .snapshots["plain-snap"]
+        .clone();
+    assert!(!source.encrypted);
+}
+
+/// A CopyDBSnapshot that fails (missing source, taken target) mints no
+/// AWS-managed key for its KmsKeyId.
+#[tokio::test]
+async fn failing_db_snapshot_copy_mints_no_key() {
+    use fakecloud_core::service::AwsService;
+    let (kms, svc) = svc_with_kms();
+    {
+        let mut accounts = svc.state_handle().write();
+        let st = accounts.get_or_create("000000000000");
+        st.snapshots.insert(
+            "src".to_string(),
+            local_snapshot("src", "my-db", "000000000000"),
+        );
+        st.snapshots.insert(
+            "taken".to_string(),
+            local_snapshot("taken", "my-db", "000000000000"),
+        );
+        // Another account's snapshot, never shared with this one.
+        accounts.get_or_create("999999999999").snapshots.insert(
+            "theirs".to_string(),
+            local_snapshot("theirs", "their-db", "999999999999"),
+        );
+    }
+    for (source, target) in [
+        ("missing", "fresh"),
+        ("src", "taken"),
+        (
+            "arn:aws:rds:us-east-1:999999999999:snapshot:theirs",
+            "fresh",
+        ),
+    ] {
+        let result = svc
+            .handle(req(
+                "CopyDBSnapshot",
+                &[
+                    ("SourceDBSnapshotIdentifier", source),
+                    ("TargetDBSnapshotIdentifier", target),
+                    ("KmsKeyId", "alias/aws/rds"),
+                ],
+            ))
+            .await;
+        assert!(result.is_err(), "{source} -> {target} should fail");
+    }
+    assert!(kms
+        .read()
+        .get("000000000000")
+        .is_none_or(|s| s.keys.is_empty()));
+}

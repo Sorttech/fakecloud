@@ -454,6 +454,65 @@ pub fn kms_key_or_aws_managed(
     }
 }
 
+/// [`kms_key_or_aws_managed`] for services that report the key as a key ARN
+/// whatever form the caller named it in (RDS, DocumentDB, Neptune, EBS): a
+/// named key is resolved with [`resolve_named_kms_key_arn`].
+pub fn kms_key_arn_or_aws_managed(
+    hook: Option<&dyn KmsHook>,
+    named: Option<&str>,
+    account_id: &str,
+    region: &str,
+    service: &str,
+) -> Option<String> {
+    match named.filter(|k| !k.is_empty()) {
+        Some(key) => Some(resolve_named_kms_key_arn(
+            hook, key, account_id, region, service,
+        )),
+        None => aws_managed_kms_key_arn(hook, account_id, region, service),
+    }
+}
+
+/// The ARN of the key a caller named (key id, key ARN, alias name or alias
+/// ARN) as KMS resolves it: an alias reports its target key's ARN, and an
+/// AWS-managed alias (`alias/aws/<svc>`) that region's AWS-managed key, minted
+/// on first use. A key KMS cannot resolve (one never created in fakecloud, one
+/// in another region than `region`, or no hook wired) is reported as given.
+pub fn resolve_named_kms_key_arn(
+    hook: Option<&dyn KmsHook>,
+    key: &str,
+    account_id: &str,
+    region: &str,
+    service: &str,
+) -> String {
+    let Some(h) = hook else {
+        return key.to_string();
+    };
+    // A KMS ARN naming another region is a key the resource's region cannot
+    // use: report it as given rather than resolving (or minting) anything in
+    // that other region.
+    if let Some(rest) = key.strip_prefix("arn:") {
+        if rest.split(':').nth(2).is_some_and(|r| r != region) {
+            return key.to_string();
+        }
+    }
+    // KMS resolves an alias name in `region` and an alias ARN in the region
+    // it names; `alias/aws/<svc>` resolves to (minting on first use) that
+    // region's AWS-managed key for `<svc>`, provisioned for that service.
+    let resource = key.rsplit(':').next().unwrap_or(key);
+    let owner = resource
+        .strip_prefix("alias/aws/")
+        .filter(|s| !s.is_empty())
+        .unwrap_or(service);
+    let principal = format!("{owner}.amazonaws.com");
+    match h.resolve_key_arn(account_id, region, key, &principal) {
+        Ok(arn) => arn,
+        Err(err) => {
+            tracing::debug!(%err, key, "KMS key not resolvable; reporting it as given");
+            key.to_string()
+        }
+    }
+}
+
 /// Cognito-issued JWT verification hook. Implementations are wired by
 /// fakecloud-server and back the `COGNITO_USER_POOLS` authorizer in
 /// API Gateway v1. The verifier validates RS256 signature, exp/nbf,

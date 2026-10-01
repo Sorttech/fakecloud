@@ -4,7 +4,31 @@ use super::*;
 
 use crate::filters::{identifier_account, normalized_identifier};
 
+/// A restore that names a `KmsKeyId` encrypts the restored cluster with that
+/// key; one that names none keeps the source's encryption and key, as AWS
+/// restores do.
+fn apply_restore_kms_key(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    key: Option<String>,
+) {
+    if let Some(key) = key {
+        obj.insert(
+            "StorageEncrypted".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        obj.insert("KmsKeyId".to_string(), serde_json::Value::String(key));
+    }
+}
+
 impl RdsService {
+    /// The restore request's `KmsKeyId` as its key ARN, resolved before the
+    /// RDS state lock is taken; `None` when the request names no key.
+    fn restore_kms_key(&self, request: &AwsRequest) -> Option<String> {
+        optional_query_param(request, "KmsKeyId")
+            .filter(|k| !k.is_empty())
+            .and_then(|k| self.storage_kms_key(Some(&k), &request.account_id, &request.region))
+    }
+
     /// Real CreateDBClusterSnapshot: locates the cluster's writer
     /// member, dumps its database synchronously via the runtime, and
     /// stores the dump alongside the snapshot's metadata so a later
@@ -258,6 +282,7 @@ impl RdsService {
                 )
             })?;
         let arn = rds_arn(&request.region, &request.account_id, "cluster", &target);
+        let restore_key = self.restore_kms_key(request);
 
         let mut accounts = self.state.write();
         // Resolved before the mutable borrow the cluster insert needs.
@@ -398,6 +423,7 @@ impl RdsService {
             if let Some(b64) = pending_dump_b64 {
                 obj.insert("PendingRestoreDumpB64".to_string(), json!(b64));
             }
+            apply_restore_kms_key(obj, restore_key);
         }
         state
             .extras
@@ -494,6 +520,7 @@ impl RdsService {
         // cluster, which the first attached CreateDBInstance replays. Mirrors
         // the instance-restore path's `spawn_finalize_restored_instance`.
         let restore_type = optional_query_param(request, "RestoreType");
+        let restore_key = self.restore_kms_key(request);
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&request.account_id);
         // Restoring onto an existing cluster would replace a live
@@ -612,6 +639,7 @@ impl RdsService {
             if let Some(latest) = optional_query_param(request, "UseLatestRestorableTime") {
                 obj.insert("UseLatestRestorableTime".to_string(), json!(latest));
             }
+            apply_restore_kms_key(obj, restore_key);
         }
         state
             .extras

@@ -91,10 +91,6 @@ impl RdsService {
             .unwrap_or(false);
         let availability_zone = optional_query_param(request, "AvailabilityZone");
         let storage_type = optional_query_param(request, "StorageType");
-        let storage_encrypted =
-            parse_optional_bool(optional_query_param(request, "StorageEncrypted").as_deref())?
-                .unwrap_or(false);
-        let kms_key_id = optional_query_param(request, "KmsKeyId");
         let iam_database_authentication_enabled = parse_optional_bool(
             optional_query_param(request, "EnableIAMDatabaseAuthentication").as_deref(),
         )?
@@ -136,6 +132,24 @@ impl RdsService {
             &engine_version,
             port,
         )?;
+        // An Aurora cluster member's storage is the cluster's, so it reports
+        // the cluster's encryption and key; any other instance's encrypted
+        // storage uses the named key or the AWS-managed `aws/rds` key.
+        let cluster_encryption = db_cluster_identifier.as_deref().and_then(|cluster_id| {
+            let accounts = self.state.read();
+            let cluster = accounts
+                .get(&request.account_id)?
+                .extras
+                .get("clusters")?
+                .get(cluster_id)?;
+            let encrypted = cluster["StorageEncrypted"].as_bool().unwrap_or(false);
+            let key = cluster["KmsKeyId"].as_str().map(str::to_string);
+            Some((encrypted, key))
+        });
+        let (storage_encrypted, kms_key_id) = match cluster_encryption {
+            Some(inherited) => inherited,
+            None => self.requested_storage_encryption(request)?,
+        };
 
         // Resolve the container runtime BEFORE reserving the identifier.
         // If it is unavailable this returns early, and reserving first

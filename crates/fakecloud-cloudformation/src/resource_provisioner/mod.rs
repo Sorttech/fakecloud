@@ -1241,6 +1241,23 @@ impl ResourceProvisioner {
         )
     }
 
+    /// [`Self::kms_key_or_aws_managed`] for services that report a named key
+    /// as the ARN of the key it names (RDS, DocumentDB, Neptune, EBS), as
+    /// their own API paths do.
+    pub(crate) fn kms_key_arn_or_aws_managed(
+        &self,
+        named: Option<&str>,
+        service: &str,
+    ) -> Option<String> {
+        fakecloud_core::delivery::kms_key_arn_or_aws_managed(
+            self.kms_hook.as_deref(),
+            named,
+            &self.account_id,
+            &self.region,
+            service,
+        )
+    }
+
     /// Create a resource and return the StackResource with physical ID.
     pub fn create_resource(&self, resource: &ResourceDefinition) -> Result<StackResource, String> {
         let result = match resource.resource_type.as_str() {
@@ -1399,6 +1416,7 @@ impl ResourceProvisioner {
             "AWS::EC2::SecurityGroup" => self.create_ec2_security_group(resource),
             "AWS::EC2::InternetGateway" => self.create_ec2_internet_gateway(resource),
             "AWS::EC2::RouteTable" => self.create_ec2_route_table(resource),
+            "AWS::EC2::Volume" => self.create_ec2_volume(resource),
             "AWS::ECS::Cluster" => self.create_ecs_cluster(resource),
             "AWS::ECS::TaskDefinition" => self.create_ecs_task_definition(resource),
             "AWS::ECS::Service" => self.create_ecs_service(resource),
@@ -2208,7 +2226,8 @@ impl ResourceProvisioner {
             | "AWS::EC2::SecurityGroup"
             | "AWS::EC2::InternetGateway"
             | "AWS::EC2::Instance"
-            | "AWS::EC2::RouteTable" => self.get_att_ec2(resource, attribute),
+            | "AWS::EC2::RouteTable"
+            | "AWS::EC2::Volume" => self.get_att_ec2(resource, attribute),
             "AWS::ECS::CapacityProvider" => {
                 self.get_att_ecs_capacity_provider(&resource.physical_id, attribute)
             }
@@ -2601,7 +2620,8 @@ impl ResourceProvisioner {
             | "AWS::EC2::Subnet"
             | "AWS::EC2::SecurityGroup"
             | "AWS::EC2::InternetGateway"
-            | "AWS::EC2::RouteTable" => {
+            | "AWS::EC2::RouteTable"
+            | "AWS::EC2::Volume" => {
                 self.delete_ec2_resource(&resource.resource_type, &resource.physical_id)
             }
             "AWS::AutoScaling::LaunchConfiguration" | "AWS::AutoScaling::AutoScalingGroup" => {
@@ -8063,6 +8083,164 @@ mod tests {
             .clone()
             .expect("default key");
         assert_aws_managed_key(&prov, &kms, "alias/aws/redshift");
+    }
+
+    /// Encrypted stack RDS, DocumentDB and Neptune clusters and RDS instances
+    /// with no key report the AWS-managed `aws/rds` key, like the API paths;
+    /// an RDS instance in a cluster reports the cluster's key.
+    #[test]
+    fn encrypted_stack_rds_family_uses_the_aws_managed_rds_key() {
+        let prov = make_provisioner();
+        let acct = "123456789012";
+        prov.create_resource(&make_resource(
+            "AWS::RDS::DBCluster",
+            "Aurora",
+            serde_json::json!({
+                "DBClusterIdentifier": "enc-aurora",
+                "Engine": "aurora-postgresql",
+                "StorageEncrypted": true
+            }),
+        ))
+        .unwrap();
+        let cluster_key = prov.rds_state.read().get(acct).unwrap().extras["clusters"]["enc-aurora"]
+            ["KmsKeyId"]
+            .as_str()
+            .expect("default key")
+            .to_string();
+        assert_aws_managed_key(&prov, &cluster_key, "alias/aws/rds");
+
+        prov.create_resource(&make_resource(
+            "AWS::RDS::DBInstance",
+            "Member",
+            serde_json::json!({
+                "DBInstanceIdentifier": "enc-member",
+                "DBInstanceClass": "db.r6g.large",
+                "Engine": "aurora-postgresql",
+                "DBClusterIdentifier": "enc-aurora"
+            }),
+        ))
+        .unwrap();
+        prov.create_resource(&make_resource(
+            "AWS::RDS::DBInstance",
+            "Standalone",
+            serde_json::json!({
+                "DBInstanceIdentifier": "enc-standalone",
+                "DBInstanceClass": "db.t4g.micro",
+                "Engine": "postgres",
+                "StorageEncrypted": true
+            }),
+        ))
+        .unwrap();
+        {
+            let rds = prov.rds_state.read();
+            let instances = &rds.get(acct).unwrap().instances;
+            let member = &instances["enc-member"];
+            assert!(member.storage_encrypted);
+            assert_eq!(member.kms_key_id.as_deref(), Some(cluster_key.as_str()));
+            let standalone = &instances["enc-standalone"];
+            assert!(standalone.storage_encrypted);
+            assert_eq!(standalone.kms_key_id.as_deref(), Some(cluster_key.as_str()));
+        }
+
+        prov.create_resource(&make_resource(
+            "AWS::DocDB::DBCluster",
+            "Doc",
+            serde_json::json!({"DBClusterIdentifier": "enc-doc", "StorageEncrypted": true}),
+        ))
+        .unwrap();
+        let doc_key = prov.docdb_state.write().get_or_create(acct).clusters["enc-doc"]
+            .kms_key_id
+            .clone()
+            .expect("default key");
+        assert_eq!(doc_key, cluster_key);
+
+        prov.create_resource(&make_resource(
+            "AWS::Neptune::DBCluster",
+            "Graph",
+            serde_json::json!({"DBClusterIdentifier": "enc-graph", "StorageEncrypted": true}),
+        ))
+        .unwrap();
+        let graph_key = prov.neptune_state.write().get_or_create(acct).clusters["enc-graph"]
+            .kms_key_id
+            .clone()
+            .expect("default key");
+        assert_eq!(graph_key, cluster_key);
+    }
+
+    /// An encrypted stack EBS volume with no key, and an encrypted
+    /// block-device mapping on a stack instance, report the AWS-managed
+    /// `aws/ebs` key, like CreateVolume / RunInstances.
+    #[test]
+    fn encrypted_stack_ebs_volumes_use_the_aws_managed_ebs_key() {
+        let prov = make_provisioner();
+        let acct = "123456789012";
+        let vol = prov
+            .create_resource(&make_resource(
+                "AWS::EC2::Volume",
+                "Vol",
+                serde_json::json!({
+                    "AvailabilityZone": "us-east-1a",
+                    "Size": 10,
+                    "Encrypted": true
+                }),
+            ))
+            .unwrap();
+        assert!(vol.physical_id.starts_with("vol-"), "{}", vol.physical_id);
+        assert_eq!(
+            prov.get_att(&vol, "VolumeId").as_deref(),
+            Some(vol.physical_id.as_str())
+        );
+        let (encrypted, key, size) = {
+            let ec2 = prov.ec2_state.read();
+            let v = &ec2.get(acct).unwrap().volumes[&vol.physical_id];
+            (v.encrypted, v.kms_key_id.clone(), v.size)
+        };
+        assert!(encrypted);
+        assert_eq!(size, 10);
+        let key = key.expect("default key");
+        assert_aws_managed_key(&prov, &key, "alias/aws/ebs");
+
+        let inst = prov
+            .create_resource(&make_resource(
+                "AWS::EC2::Instance",
+                "Box",
+                serde_json::json!({
+                    "ImageId": "ami-12345678",
+                    "InstanceType": "t3.micro",
+                    "BlockDeviceMappings": [{
+                        "DeviceName": "/dev/xvda",
+                        "Ebs": {"VolumeSize": 16, "Encrypted": true}
+                    }]
+                }),
+            ))
+            .unwrap();
+        {
+            let ec2 = prov.ec2_state.read();
+            let root = ec2
+                .get(acct)
+                .unwrap()
+                .volumes
+                .values()
+                .find(|v| {
+                    v.attachments
+                        .iter()
+                        .any(|a| a.instance_id == inst.physical_id)
+                })
+                .expect("block-device volume")
+                .clone();
+            assert_eq!(root.size, 16);
+            assert!(root.encrypted);
+            assert_eq!(root.kms_key_id.as_deref(), Some(key.as_str()));
+        }
+
+        prov.delete_resource(&vol).unwrap();
+        assert!(!prov
+            .ec2_state
+            .read()
+            .get(acct)
+            .unwrap()
+            .volumes
+            .contains_key(&vol.physical_id));
     }
 
     /// A stack MSK cluster rejected for a duplicate name mints no key.

@@ -16,7 +16,7 @@ const FIXED_TIME: &str = "2024-01-01T00:00:00.000Z";
 
 fn snapshot_xml(s: &Snapshot, tags: &[Tag], owner: &str) -> String {
     format!(
-        "{}{}{}<volumeSize>{}</volumeSize>{}{}<encrypted>{}</encrypted>{}{}{}{}",
+        "{}{}{}<volumeSize>{}</volumeSize>{}{}<encrypted>{}</encrypted>{}{}{}{}{}",
         ec2_elem("snapshotId", &s.snapshot_id),
         ec2_elem("volumeId", &s.volume_id),
         ec2_elem("status", &s.state),
@@ -24,6 +24,10 @@ fn snapshot_xml(s: &Snapshot, tags: &[Tag], owner: &str) -> String {
         ec2_elem("startTime", FIXED_TIME),
         ec2_elem("progress", "100%"),
         s.encrypted,
+        s.kms_key_id
+            .as_deref()
+            .map(|k| ec2_elem("kmsKeyId", k))
+            .unwrap_or_default(),
         ec2_elem("ownerId", owner),
         ec2_elem("description", &s.description),
         ec2_elem("storageTier", &s.storage_tier),
@@ -39,6 +43,7 @@ fn build_snapshot(volume_id: String, description: String) -> Snapshot {
         volume_size: 8,
         description,
         encrypted: false,
+        kms_key_id: None,
         storage_tier: "standard".to_string(),
         in_recycle_bin: false,
         locked: false,
@@ -71,7 +76,9 @@ pub(crate) fn create_snapshot(
             .get(&volume_id)
             .ok_or_else(|| not_found("InvalidVolume.NotFound", &volume_id))?;
         snap.volume_size = vol.size;
+        // A snapshot of an encrypted volume is encrypted with its key.
         snap.encrypted = vol.encrypted;
+        snap.kms_key_id = vol.kms_key_id.clone().filter(|_| vol.encrypted);
         crate::service::tags::apply_tag_specifications(state, &req.query_params, &id, "snapshot");
         let t = state.tags_for(&id).to_vec();
         state.snapshots.insert(id.clone(), snap.clone());
@@ -106,17 +113,21 @@ pub(crate) fn create_snapshots(
         }
         // One snapshot per volume attached to the instance, each carrying the
         // real source volume id and size (not a fabricated placeholder).
-        let sources: Vec<(String, i64, bool)> = state
+        let sources: Vec<(String, i64, bool, Option<String>)> = state
             .volumes
             .values()
             .filter(|v| v.attachments.iter().any(|a| a.instance_id == instance_id))
-            .map(|v| (v.volume_id.clone(), v.size, v.encrypted))
+            .map(|v| {
+                let key = v.kms_key_id.clone().filter(|_| v.encrypted);
+                (v.volume_id.clone(), v.size, v.encrypted, key)
+            })
             .collect();
         let mut rendered = Vec::new();
-        for (vol_id, size, encrypted) in sources {
+        for (vol_id, size, encrypted, kms_key_id) in sources {
             let mut snap = build_snapshot(vol_id, description.clone());
             snap.volume_size = size;
             snap.encrypted = encrypted;
+            snap.kms_key_id = kms_key_id;
             let id = snap.snapshot_id.clone();
             rendered.push(snapshot_xml(&snap, &[], &owner));
             state.snapshots.insert(id, snap);
@@ -238,16 +249,54 @@ pub(crate) fn copy_snapshot(
     svc: &Ec2Service,
     req: &AwsRequest,
 ) -> Result<AwsResponse, AwsServiceError> {
-    require(&req.query_params, "SourceRegion")?;
+    let source_region = require(&req.query_params, "SourceRegion")?;
     let src = require(&req.query_params, "SourceSnapshotId")?;
     validate_int_range(&req.query_params, "CompletionDurationMinutes", 1, 2880)?;
-    let snap = build_snapshot(
+    let mut snap = build_snapshot(
         format!("vol-copy-{src}"),
         req.query_params
             .get("Description")
             .cloned()
             .unwrap_or_default(),
     );
+    let source = {
+        let accounts = svc.state.read();
+        accounts
+            .get(&req.account_id)
+            .and_then(|s| s.snapshots.get(&src))
+            .map(|s| (s.volume_size, s.encrypted, s.kms_key_id.clone()))
+    };
+    let (source_encrypted, source_key) = match source {
+        Some((size, encrypted, key)) => {
+            snap.volume_size = size;
+            (encrypted, key)
+        }
+        None => (false, None),
+    };
+    // A copy is encrypted when asked or when its source is. It uses the named
+    // key (as its ARN); otherwise a same-region copy of an encrypted snapshot
+    // keeps the source's key, and any other encrypted copy (a newly encrypted
+    // one, or a cross-region one, whose source key lives in another region)
+    // uses the account's EBS default key.
+    let requested = req
+        .query_params
+        .get("Encrypted")
+        .is_some_and(|v| v == "true");
+    if requested || source_encrypted {
+        snap.encrypted = true;
+        let named = req.query_params.get("KmsKeyId").filter(|k| !k.is_empty());
+        snap.kms_key_id = match named {
+            Some(key) => Some(super::volume::named_ebs_key(
+                svc,
+                &req.account_id,
+                &req.region,
+                key,
+            )),
+            None if source_encrypted && source_region == req.region => source_key
+                .or_else(|| super::volume::ebs_default_key(svc, &req.account_id, &req.region)),
+            None => super::volume::ebs_default_key(svc, &req.account_id, &req.region),
+        };
+    }
     let id = snap.snapshot_id.clone();
     {
         let mut accounts = svc.state.write();
