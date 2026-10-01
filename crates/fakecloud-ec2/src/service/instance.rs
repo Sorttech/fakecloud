@@ -739,18 +739,11 @@ pub(crate) fn launch_instances(
         let state = accounts.get_or_create(account_id);
         // Checked under the write lock the instances are inserted under, so
         // two concurrent launches cannot both claim one address.
+        // Re-validated under the write lock the attachment happens under, so
+        // an interface deleted or attached since the lookup above fails the
+        // launch before anything is inserted.
         if let Some(eni_id) = &primary_eni_id {
-            if state
-                .network_interfaces
-                .get(eni_id)
-                .is_some_and(|e| e.attachment.is_some())
-            {
-                return Err(AwsServiceError::aws_error(
-                    http::StatusCode::BAD_REQUEST,
-                    "InvalidNetworkInterface.InUse",
-                    format!("Interface: [{eni_id}] in use."),
-                ));
-            }
+            check_eni_attachable(state, eni_id)?;
         }
         if let Some(ip) = &fixed_private_ip {
             let in_use = state
@@ -900,6 +893,8 @@ pub(crate) fn launch_instances(
                 instance_lifecycle: instance_lifecycle.clone(),
             };
             if let Some(eni_id) = &primary_eni_id {
+                // Present and unattached: `check_eni_attachable` ran under
+                // this same write lock before any insert.
                 if let Some(eni) = state.network_interfaces.get_mut(eni_id) {
                     eni.status = "in-use".to_string();
                     eni.attachment = Some(crate::state::EniAttachment {
@@ -964,6 +959,19 @@ pub(crate) fn launch_instances(
         instance_tags,
         instance_network,
     })
+}
+
+/// An existing network interface a launch attaches must exist and be free.
+fn check_eni_attachable(state: &Ec2State, eni_id: &str) -> Result<(), AwsServiceError> {
+    match state.network_interfaces.get(eni_id) {
+        None => Err(super::eni::eni_not_found(eni_id)),
+        Some(e) if e.attachment.is_some() => Err(AwsServiceError::aws_error(
+            http::StatusCode::BAD_REQUEST,
+            "InvalidNetworkInterface.InUse",
+            format!("Interface: [{eni_id}] in use."),
+        )),
+        Some(_) => Ok(()),
+    }
 }
 
 /// Whether `ip` is an IPv4 address inside `cidr`.
@@ -4450,6 +4458,16 @@ mod modify_tests {
         assert_eq!(
             ips,
             vec!["10.0.0.101".to_string(), "10.0.0.102".to_string()]
+        );
+        // The write-lock re-check: a vanished interface is NotFound, an
+        // attached one InUse.
+        assert_eq!(
+            check_eni_attachable(st, "eni-gone").unwrap_err().code(),
+            "InvalidNetworkInterfaceID.NotFound"
+        );
+        assert_eq!(
+            check_eni_attachable(st, &eni_id).unwrap_err().code(),
+            "InvalidNetworkInterface.InUse"
         );
         assert!(!ipv4_in_cidr("10.1.0.5", "10.0.0.0/24"));
         assert!(ipv4_in_cidr("10.0.0.5", "10.0.0.0/24"));
