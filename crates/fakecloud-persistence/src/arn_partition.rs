@@ -33,8 +33,9 @@
 //! and an ECR manifest is addressed by its digest. Others are customer data
 //! the service stores rather than describes, where a rewrite would change
 //! what the application wrote or break a lookup by it: DynamoDB items, SSM
-//! parameter values, Secrets Manager secrets, S3 object keys, user metadata
-//! and object tags, log events. Bulk payloads streamed outside the snapshots
+//! parameter values, Secrets Manager secrets, EventBridge events, CloudWatch
+//! dashboard bodies, S3 object keys, user metadata and object tags, log
+//! events. Bulk payloads streamed outside the snapshots
 //! (S3 object bodies, CloudWatch Logs event segments, container data volumes)
 //! are not read at all.
 
@@ -66,10 +67,11 @@ impl ArnPartitionMigration {
     /// The partition the ARN starting at `arn:aws:` + `rest` moves to, or
     /// `None` when it stays in `aws` (or is not an ARN at all).
     ///
-    /// Policy wildcards (`*`, `?`) are accepted in the service, region and
-    /// account fields, so a stored policy's patterns move with the resources
-    /// they match: a region pattern that pins a partition (`cn-*`) takes it,
-    /// one that does not (`*`) is treated like a region-less ARN.
+    /// Policy wildcards (`*`, `?`) and `${...}` variables are accepted in the
+    /// service, region and account fields, so a stored policy's patterns move
+    /// with the resources they match: a region pattern that pins a partition
+    /// (`cn-*`) takes it, one that does not (`*`, `${aws:RequestedRegion}`) is
+    /// treated like a region-less ARN.
     fn target_partition(&self, rest: &[u8]) -> Option<&'static str> {
         let (service, rest) = split_field(rest, |b| {
             b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'*'
@@ -85,7 +87,7 @@ impl ArnPartitionMigration {
         })?;
         // The field was checked to be ASCII.
         let region = std::str::from_utf8(region).ok()?;
-        let wildcard = region.contains(['*', '?']);
+        let wildcard = region.contains(['*', '?']) || region.contains("${");
         match partition_for(region) {
             "aws" if region.is_empty() || wildcard => (self.global_partition != "aws"
                 && account != b"aws")
@@ -221,10 +223,37 @@ impl ArnPartitionMigration {
 }
 
 /// Split `bytes` at the first `:`, requiring every byte before it to satisfy
-/// `allowed`. `None` when a disallowed byte comes first or there is no `:`.
+/// `allowed` or belong to a `${...}` variable (an IAM policy variable such as
+/// `${aws:PrincipalAccount}`, or a CloudFormation `Fn::Sub` reference such as
+/// `${AWS::AccountId}`, whose own `:`s do not end the field). `None` when a
+/// disallowed byte comes first or there is no `:`.
 fn split_field(bytes: &[u8], allowed: impl Fn(u8) -> bool) -> Option<(&[u8], &[u8])> {
-    let end = bytes.iter().position(|&b| !allowed(b))?;
-    (bytes[end] == b':').then(|| (&bytes[..end], &bytes[end + 1..]))
+    /// Longest variable accepted; anything longer is not a policy variable.
+    const MAX_VARIABLE: usize = 128;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b':' => return Some((&bytes[..i], &bytes[i + 1..])),
+            b'$' if bytes.get(i + 1) == Some(&b'{') => {
+                let close = bytes[i + 2..]
+                    .iter()
+                    .take(MAX_VARIABLE)
+                    .position(|&b| b == b'}')?;
+                let name = &bytes[i + 2..i + 2 + close];
+                if name.is_empty()
+                    || !name.iter().all(|&b| {
+                        b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'-' | b'.' | b'/')
+                    })
+                {
+                    return None;
+                }
+                i += close + 3;
+            }
+            b if allowed(b) => i += 1,
+            _ => return None,
+        }
+    }
+    None
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -249,6 +278,11 @@ fn opaque_keys_for(service_dir: &str) -> &'static [&'static str] {
         // Parameter values (current and every version).
         "ssm" => &["value"],
         "secretsmanager" => &["secret_string"],
+        // Published events (the bus log and archives): customer payloads,
+        // and an archive's `size_bytes` measures them.
+        "eventbridge" => &["events"],
+        // Dashboard bodies: customer documents measured by `size_bytes`.
+        "cloudwatch" => &["body"],
         _ => &[],
     }
 }
@@ -312,7 +346,7 @@ pub fn migrate_data_dir(
             continue;
         };
         let result = if service_dir == "s3" {
-            migrate_s3_sidecars(&migration, &entry, false, &mut report)
+            migrate_s3_sidecars(&migration, &entry, 0, false, &mut report)
         } else {
             migrate_service_dir(
                 &migration,
@@ -321,19 +355,7 @@ pub fn migrate_data_dir(
                 &mut report,
             )
         };
-        if let Err(err) = result {
-            // A directory the server cannot read is one its own loader
-            // cannot read either; it reports that, not the migration.
-            if err.kind() == io::ErrorKind::PermissionDenied {
-                tracing::warn!(
-                    path = %entry.display(),
-                    "skipping ARN partition migration of an unreadable directory: {err}"
-                );
-                report.skipped.push(entry);
-                continue;
-            }
-            return Err(io_err(&entry)(err));
-        }
+        skip_unreadable(result, &entry, &mut report).map_err(io_err(&entry))?;
     }
 
     crate::version::mark_arn_partitions_migrated(dir)?;
@@ -348,10 +370,33 @@ fn migrate_service_dir(
 ) -> io::Result<()> {
     for file in read_dir_sorted(dir)? {
         if file.is_file() && file.extension().is_some_and(|e| e == "json") {
-            migrate_json_file(migration, &file, opaque_keys, report)?;
+            let result = migrate_json_file(migration, &file, opaque_keys, report);
+            skip_unreadable(result, &file, report)?;
         }
     }
     Ok(())
+}
+
+/// Turn a permission error on `path` into a skipped entry. A file or
+/// directory the server cannot read is one its own loader cannot read either
+/// (the S3 loader isolates such failures per bucket); that loader reports it,
+/// and everything else is still migrated.
+fn skip_unreadable(
+    result: io::Result<()>,
+    path: &Path,
+    report: &mut MigrationReport,
+) -> io::Result<()> {
+    match result {
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+            tracing::warn!(
+                path = %path.display(),
+                "skipping ARN partition migration of an unreadable path: {err}"
+            );
+            report.skipped.push(path.to_path_buf());
+            Ok(())
+        }
+        other => other,
+    }
 }
 
 fn read_dir_sorted(dir: &Path) -> io::Result<Vec<PathBuf>> {
@@ -405,52 +450,66 @@ fn migrate_json_file(
 fn migrate_s3_sidecars(
     migration: &ArnPartitionMigration,
     dir: &Path,
+    depth: usize,
     in_objects: bool,
     report: &mut MigrationReport,
 ) -> io::Result<()> {
     for path in read_dir_sorted(dir)? {
-        if path.is_dir() {
+        let result = if path.is_dir() {
+            // `s3/buckets/<bucket>/{objects,mpu}`: only that level names the
+            // object trees (a bucket may itself be called `objects`).
             let objects = in_objects
-                || path
-                    .file_name()
-                    .is_some_and(|n| n == "objects" || n == "mpu");
-            migrate_s3_sidecars(migration, &path, objects, report)?;
-            continue;
-        }
-        if !path.extension().is_some_and(|e| e == "toml") {
-            continue;
-        }
-        let bytes = std::fs::read(&path)?;
-        if !migration.needs_rewrite(&bytes) {
-            continue;
-        }
-        let Ok(text) = std::str::from_utf8(&bytes) else {
-            report.skipped.push(path);
-            continue;
-        };
-        let rewritten = if in_objects {
-            let Ok(mut table) = text.parse::<toml::Table>() else {
-                tracing::warn!(
-                    path = %path.display(),
-                    "skipping ARN partition migration of an unparseable file"
-                );
-                report.skipped.push(path);
-                continue;
-            };
-            if !migration.rewrite_toml_table(&mut table, S3_OBJECT_OPAQUE_KEYS) {
-                continue;
-            }
-            toml::to_string_pretty(&table)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
+                || (depth + 1 == 3
+                    && path
+                        .file_name()
+                        .is_some_and(|n| n == "objects" || n == "mpu"));
+            migrate_s3_sidecars(migration, &path, depth + 1, objects, report)
+        } else if path.extension().is_some_and(|e| e == "toml") {
+            migrate_s3_sidecar(migration, &path, in_objects, report)
         } else {
-            match migration.rewrite_str(text) {
-                Cow::Owned(new) => new,
-                Cow::Borrowed(_) => continue,
-            }
+            Ok(())
         };
-        crate::atomic::write_atomic_bytes(&path, rewritten.as_bytes())?;
-        report.rewritten.push(path);
+        skip_unreadable(result, &path, report)?;
     }
+    Ok(())
+}
+
+fn migrate_s3_sidecar(
+    migration: &ArnPartitionMigration,
+    path: &Path,
+    in_objects: bool,
+    report: &mut MigrationReport,
+) -> io::Result<()> {
+    let bytes = std::fs::read(path)?;
+    if !migration.needs_rewrite(&bytes) {
+        return Ok(());
+    }
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        report.skipped.push(path.to_path_buf());
+        return Ok(());
+    };
+    let rewritten = if in_objects {
+        let Ok(mut table) = text.parse::<toml::Table>() else {
+            tracing::warn!(
+                path = %path.display(),
+                "skipping ARN partition migration of an unparseable file"
+            );
+            report.skipped.push(path.to_path_buf());
+            return Ok(());
+        };
+        if !migration.rewrite_toml_table(&mut table, S3_OBJECT_OPAQUE_KEYS) {
+            return Ok(());
+        }
+        toml::to_string_pretty(&table)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
+    } else {
+        match migration.rewrite_str(text) {
+            Cow::Owned(new) => new,
+            Cow::Borrowed(_) => return Ok(()),
+        }
+    };
+    crate::atomic::write_atomic_bytes(path, rewritten.as_bytes())?;
+    report.rewritten.push(path.to_path_buf());
     Ok(())
 }
 

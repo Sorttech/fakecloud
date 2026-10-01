@@ -627,3 +627,133 @@ fn unreadable_and_filesystem_artifact_directories_do_not_stop_startup() {
     }
     assert!(crate::version::arn_partitions_migrated(dir).unwrap());
 }
+
+#[test]
+fn policy_and_template_variables_move_with_the_resources_they_match() {
+    // Regression: `${...}` in the account or region field made the token
+    // unparseable, so a stored `Resource` stopped matching the migrated role.
+    let m = cn();
+    for (legacy, migrated) in [
+        (
+            "arn:aws:iam::${aws:PrincipalAccount}:role/app",
+            "arn:aws-cn:iam::${aws:PrincipalAccount}:role/app",
+        ),
+        (
+            "arn:aws:sqs:${aws:RequestedRegion}:1:q",
+            "arn:aws-cn:sqs:${aws:RequestedRegion}:1:q",
+        ),
+        (
+            "arn:aws:iam::${AWS::AccountId}:role/x",
+            "arn:aws-cn:iam::${AWS::AccountId}:role/x",
+        ),
+        (
+            "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:t",
+            "arn:aws-cn:sns:${AWS::Region}:${AWS::AccountId}:t",
+        ),
+        (
+            "arn:aws:sqs:cn-north-1:${AWS::AccountId}:q",
+            "arn:aws-cn:sqs:cn-north-1:${AWS::AccountId}:q",
+        ),
+    ] {
+        assert_eq!(rewrite(&m, legacy), migrated, "{legacy}");
+        assert!(m.needs_rewrite(legacy.as_bytes()), "{legacy}");
+    }
+    // A variable region on a commercial server stays aws.
+    assert_eq!(
+        rewrite(&commercial(), "arn:aws:sqs:${aws:RequestedRegion}:1:q"),
+        "arn:aws:sqs:${aws:RequestedRegion}:1:q"
+    );
+    // Not variables: unterminated, empty, or carrying other characters.
+    for s in [
+        "arn:aws:iam::${aws:PrincipalAccount:role/app",
+        "arn:aws:iam::${}:role/app",
+        "arn:aws:iam::${a b}:role/app",
+    ] {
+        assert_eq!(rewrite(&m, s), s, "{s}");
+    }
+}
+
+#[test]
+fn a_bucket_named_like_an_object_tree_keeps_text_rewrites() {
+    // Regression: any directory called `objects`/`mpu` switched to the
+    // field-by-field path, so a bucket with that name had its raw JSON/XML
+    // configuration skipped as unparseable TOML, then marked migrated.
+    let tmp = legacy_dir();
+    let dir = tmp.path();
+    let mut paths = Vec::new();
+    for bucket in ["objects", "mpu"] {
+        let policy = dir.join(format!("s3/buckets/{bucket}/policy.toml"));
+        write(&policy, r#"{"Resource":"arn:aws:s3:::b/*"}"#);
+        paths.push(policy);
+    }
+    let report = migrate_data_dir(dir, "cn-north-1").unwrap();
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    for policy in paths {
+        assert_eq!(read(&policy), r#"{"Resource":"arn:aws-cn:s3:::b/*"}"#);
+    }
+}
+
+#[test]
+fn size_measured_payloads_are_kept_verbatim() {
+    // Regression: dashboard bodies and archived events were rewritten while
+    // the `size_bytes` stored next to them was not.
+    let tmp = legacy_dir();
+    let dir = tmp.path();
+    let body = r#"{"widgets":[{"properties":{"title":"arn:aws:sqs:cn-north-1:1:q"}}]}"#;
+    let cw = dir.join("cloudwatch/snapshot.json");
+    write(
+        &cw,
+        &json!({"d": {"arn": "arn:aws:cloudwatch::1:dashboard/d", "body": body, "size_bytes": body.len()}})
+            .to_string(),
+    );
+    let event = json!({"resources": ["arn:aws:sqs:cn-north-1:1:q"]});
+    let eb = dir.join("eventbridge/snapshot.json");
+    write(
+        &eb,
+        &json!({
+            "events": [event],
+            "archives": {"a": {"arn": "arn:aws:events:cn-north-1:1:archive/a", "size_bytes": 10, "events": [event]}}
+        })
+        .to_string(),
+    );
+
+    migrate_data_dir(dir, "cn-north-1").unwrap();
+
+    let cw: Value = serde_json::from_str(&read(&cw)).unwrap();
+    assert_eq!(cw["d"]["arn"], "arn:aws-cn:cloudwatch::1:dashboard/d");
+    assert_eq!(cw["d"]["body"], body);
+    let eb: Value = serde_json::from_str(&read(&eb)).unwrap();
+    assert_eq!(
+        eb["archives"]["a"]["arn"],
+        "arn:aws-cn:events:cn-north-1:1:archive/a"
+    );
+    assert_eq!(eb["archives"]["a"]["events"][0], event);
+    assert_eq!(eb["events"][0], event);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unreadable_s3_file_does_not_stop_other_buckets() {
+    // Regression: the first permission error in `s3/` abandoned every later
+    // bucket, and the directory was still marked migrated.
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = legacy_dir();
+    let dir = tmp.path();
+    let locked = dir.join("s3/buckets/a/objects/k/null.toml");
+    write(
+        &locked,
+        "sse_kms_key_id = \"arn:aws:kms:cn-north-1:1:key/k\"\n",
+    );
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let enforced = std::fs::read(&locked).is_err();
+    let later = dir.join("s3/buckets/b/policy.toml");
+    write(&later, r#"{"Resource":"arn:aws:s3:::b/*"}"#);
+
+    let report = migrate_data_dir(dir, "cn-north-1");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let report = report.unwrap();
+    assert_eq!(read(&later), r#"{"Resource":"arn:aws-cn:s3:::b/*"}"#);
+    if enforced {
+        assert_eq!(report.skipped, vec![locked]);
+    }
+}
