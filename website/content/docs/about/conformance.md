@@ -94,7 +94,7 @@ The real-AWS job is locked down hard:
 
 ### Why E2E isn't parity
 
-The E2E suite is much bigger (280+ tests, 105 services) but it doesn't run against real AWS — ever. Two reasons:
+The E2E suite is much bigger (2,300+ tests, 105 services) but it doesn't run against real AWS — ever. Two reasons:
 
 1. **A lot of E2E is testing fakecloud itself.** Introspection endpoints, persistence mode, `/_fakecloud/*/tick` processors, warm Lambda container introspection, forced SQS DLQ moves, auth event logs in Cognito — none of that exists on real AWS. Running those tests against AWS would be meaningless; they'd just fail at the first `/_fakecloud/*` request.
 
@@ -116,7 +116,7 @@ Running both is how fakecloud can claim 100% behavioral parity with a straight f
 
 ### Current coverage
 
-27 services today: `apigatewayv2`, `bedrock`, `cloudformation`, `cloudfront`, `cognito-identity`, `cognitoidp`, `dynamodb`, `ec2`, `ecr`, `ecs`, `elasticache`, `events` (EventBridge), `glue`, `iam`, `kinesis`, `kms`, `lambda`, `logs`, `organizations`, `route53`, `s3`, `secretsmanager`, `sfn` (Step Functions), `sns`, `sqs`, `ssm`, `sts`.
+75 services today: `account`, `acmpca`, `apigateway`, `apigatewayv2`, `appautoscaling`, `appconfig`, `autoscaling`, `backup`, `batch`, `bedrock`, `bedrockagent`, `ce`, `cloudformation`, `cloudfront`, `cloudtrail`, `cloudwatch`, `codeartifact`, `codebuild`, `codecommit`, `codeconnections`, `codepipeline`, `cognitoidentity`, `cognitoidp`, `config`, `deploy`, `dms`, `dynamodb`, `ec2`, `ecr`, `ecs`, `efs`, `eks`, `elasticache`, `elasticbeanstalk`, `elasticsearch`, `elbv2`, `events` (EventBridge), `firehose`, `glacier`, `glue`, `iam`, `identitystore`, `kafka`, `kinesis`, `kinesisanalyticsv2`, `kms`, `lakeformation`, `lambda`, `logs`, `memorydb`, `mq`, `opensearch`, `organizations`, `pipes`, `ram`, `rds`, `redshift`, `route53`, `route53resolver`, `s3`, `s3tables`, `scheduler`, `secretsmanager`, `servicediscovery`, `ses`, `sesv2`, `sfn` (Step Functions), `sns`, `sqs`, `ssm`, `ssoadmin`, `sts`, `transfer`, `verifiedpermissions`, `wafv2`. The source of truth is the `SERVICES` allow-list in [`crates/fakecloud-tfacc/src/allowlist.rs`](https://github.com/faiscadev/fakecloud/blob/main/crates/fakecloud-tfacc/src/allowlist.rs).
 
 ### Allow-list, not deny-list
 
