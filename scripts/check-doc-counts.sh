@@ -594,29 +594,26 @@ fi
             print NR "\t" section "\t" n "\t" split(list, _, ", ")
         }' "$CONF_DOC")
 
-    # "The E2E suite is much bigger (N+ tests, ...)". A "+" claim is a floor,
-    # "true" at any N <= actual, which is exactly how "280+" survived against
-    # 2,377 real tests: require it within 80% of the real count. An exact
-    # "N tests" claim must be exact. Scoped to the E2E sentence, because other
-    # suites (parity, tfacc) may state their own smaller test counts here.
+    # "The E2E suite is much bigger (N+ tests, ...)". A floor claim is "true"
+    # at any N <= actual, which is exactly how "280+" survived against 2,377
+    # real tests: require it within 80% of the real count. Deliberately narrow:
+    # only the "E2E suite ... (N+ tests" clause is read, so another suite's
+    # count elsewhere on the page or the line is never mistaken for it, and any
+    # rewording falls through to the loud "no claim found" failure below.
     e2e_claims=0
     while IFS= read -r claim; do
         [ -z "$claim" ] && continue
         claimed=$(last_num "$claim" | tr -d ',')
         [ -z "$claimed" ] && continue
         e2e_claims=$(( e2e_claims + 1 ))
-        case "$claim" in
-            *+*) bad=$(( claimed > e2e_tests || claimed * 100 < e2e_tests * 80 )) ;;
-            *)   bad=$(( claimed != e2e_tests )) ;;
-        esac
-        if [ "$bad" -eq 1 ]; then
-            problems+=("$CONF_DOC: E2E suite claims '$claim', actual $e2e_tests tests")
+        if [ "$claimed" -gt "$e2e_tests" ] || [ $(( claimed * 100 )) -lt $(( e2e_tests * 80 )) ]; then
+            problems+=("$CONF_DOC: E2E suite claims '$claimed+ tests', actual $e2e_tests tests")
             fail=1
         fi
-    done < <(grep -E 'E2E suite' "$CONF_DOC" | grep -oE '[0-9][0-9,]*\+? tests' || true)
+    done < <(grep -oE 'E2E suite[^(]*\([0-9][0-9,]*\+ tests' "$CONF_DOC" || true)
     # The claim vanishing (sentence reworded) must not turn this pass into a no-op.
     if [ "$e2e_claims" -eq 0 ]; then
-        problems+=("$CONF_DOC: no 'E2E suite ... N tests' claim found; update this pass if the sentence was reworded")
+        problems+=("$CONF_DOC: no 'E2E suite ... (N+ tests' claim found; update this pass if the sentence was reworded")
         fail=1
     fi
 }
