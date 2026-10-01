@@ -1874,13 +1874,12 @@ fn finalize_failure(state: &SharedEcsState, account_id: &str, task_id: &str, rea
         let Some(task) = s.tasks.get_mut(task_id) else {
             return;
         };
-        // Capture the prior status before we clobber it: if the task had
-        // already reached RUNNING when execution failed (e.g. `docker wait`
-        // blew up after the container started), we owe the cluster a
-        // running-tasks decrement. Tasks that died before RUNNING only
-        // ever incremented pendingTasksCount.
-        // Whether it ran is `mark_running_multi`'s `started_at` stamp, not
-        // the status string an agent may have overwritten since.
+        // If the task had already reached RUNNING when execution failed
+        // (e.g. `docker wait` blew up after the container started), we owe
+        // the cluster a running-tasks decrement; tasks that died before
+        // RUNNING only ever held pendingTasksCount. Whether it ran is
+        // `mark_running_multi`'s `started_at` stamp, not the status string
+        // an agent may have overwritten since.
         let was_running = task.started_at.is_some();
         task.last_status = "STOPPED".into();
         task.desired_status = "STOPPED".into();
