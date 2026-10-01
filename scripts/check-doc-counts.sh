@@ -594,20 +594,31 @@ fi
             print NR "\t" section "\t" n "\t" split(list, _, ", ")
         }' "$CONF_DOC")
 
-    # "The E2E suite is much bigger (N+ tests, ...)" — a floor claim. It is
+    # "The E2E suite is much bigger (N+ tests, ...)". A "+" claim is a floor,
     # "true" at any N <= actual, which is exactly how "280+" survived against
-    # 2,377 real tests. Require the floor to be within 80% of the real count.
+    # 2,377 real tests: require it within 80% of the real count. An exact
+    # "N tests" claim must be exact. Scoped to the E2E sentence, because other
+    # suites (parity, tfacc) may state their own smaller test counts here.
+    e2e_claims=0
     while IFS= read -r claim; do
         [ -z "$claim" ] && continue
         claimed=$(last_num "$claim" | tr -d ',')
         [ -z "$claimed" ] && continue
-        if [ "$claimed" -gt "$e2e_tests" ] || [ $(( claimed * 100 )) -lt $(( e2e_tests * 80 )) ]; then
+        e2e_claims=$(( e2e_claims + 1 ))
+        case "$claim" in
+            *+*) bad=$(( claimed > e2e_tests || claimed * 100 < e2e_tests * 80 )) ;;
+            *)   bad=$(( claimed != e2e_tests )) ;;
+        esac
+        if [ "$bad" -eq 1 ]; then
             problems+=("$CONF_DOC: E2E suite claims '$claim', actual $e2e_tests tests")
             fail=1
         fi
-    # Scoped to the E2E sentence: other suites (parity, tfacc) may state their
-    # own, smaller test counts on this page and must not be held to this rule.
     done < <(grep -E 'E2E suite' "$CONF_DOC" | grep -oE '[0-9][0-9,]*\+? tests' || true)
+    # The claim vanishing (sentence reworded) must not turn this pass into a no-op.
+    if [ "$e2e_claims" -eq 0 ]; then
+        problems+=("$CONF_DOC: no 'E2E suite ... N tests' claim found; update this pass if the sentence was reworded")
+        fail=1
+    fi
 }
 
 if [ "$fail" -eq 0 ]; then
