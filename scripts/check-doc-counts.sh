@@ -173,7 +173,7 @@ tfacc_services=$(awk '/^pub const SERVICES: &\[Service\] = &\[/ {f=1; next}
 # One test file per service in the real-AWS parity suite.
 parity_sandbox=$(find "$PARITY_TESTS" -maxdepth 1 -name '*.rs' -type f | wc -l | tr -d ' ')
 # Every #[test] / #[tokio::test(...)] in the E2E suite.
-e2e_tests=$(cat "$E2E_TESTS"/*.rs | awk '/#\[(tokio::)?test([](]|$)/ {n++} END {print n+0}')
+e2e_tests=$(cat "$E2E_TESTS"/*.rs | awk '/#\[(tokio::)?test(\]|\(|$)/ {n++} END {print n+0}')
 
 echo "Canonical truth:"
 echo "  services           = $parity_services (parity.md row count)"
@@ -561,7 +561,13 @@ done < <(
 # satisfy the parity line), and check the enumerated list has exactly N items so
 # the list and the number cannot drift apart either.
 CONF_DOC="website/content/docs/about/conformance.md"
-if [ -f "$CONF_DOC" ]; then
+# Fail loud if the page moves: a silently skipped pass is a green gate over
+# stale counts, the exact failure this pass exists to prevent.
+if [ ! -f "$CONF_DOC" ]; then
+    echo "missing $CONF_DOC (subset-count claims moved? update CONF_DOC)" >&2
+    exit 2
+fi
+{
     while IFS=$'\t' read -r lineno section n items; do
         [ -z "$lineno" ] && continue
         case "$section" in
@@ -600,7 +606,7 @@ if [ -f "$CONF_DOC" ]; then
             fail=1
         fi
     done < <(grep -oE '[0-9][0-9,]*\+? tests' "$CONF_DOC" || true)
-fi
+}
 
 if [ "$fail" -eq 0 ]; then
     echo "OK — every evergreen surface agrees with the canonical sources."
