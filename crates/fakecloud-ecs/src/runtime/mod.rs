@@ -1805,9 +1805,7 @@ fn finalize_stopped_multi(
         };
         // A task stopped before it ever ran (StopTask during launch) leaves
         // the pending count, not the running one -- the counterpart of what
-        // `mark_running_multi` moves. An already-STOPPED row was counted out
-        // by whoever stopped it.
-        let previous_status = task.last_status.clone();
+        // `mark_running_multi` moves.
         task.last_status = "STOPPED".into();
         task.desired_status = "STOPPED".into();
         task.stopping_at = task.stopping_at.or(Some(Utc::now()));
@@ -1828,8 +1826,8 @@ fn finalize_stopped_multi(
         // Which count the task holds follows from whether the runtime ever
         // moved it to RUNNING (`mark_running_multi` stamps `started_at`), not
         // from the status string an agent may have overwritten since.
-        let was_running = previous_status != "STOPPED" && task.started_at.is_some();
-        let was_pending = previous_status != "STOPPED" && task.started_at.is_none();
+        let was_running = task.started_at.is_some();
+        let was_pending = !was_running;
         let release = |running: &mut i32, pending: &mut i32| {
             if was_running && *running > 0 {
                 *running -= 1;
@@ -1881,7 +1879,9 @@ fn finalize_failure(state: &SharedEcsState, account_id: &str, task_id: &str, rea
         // blew up after the container started), we owe the cluster a
         // running-tasks decrement. Tasks that died before RUNNING only
         // ever incremented pendingTasksCount.
-        let was_running = task.last_status == "RUNNING";
+        // Whether it ran is `mark_running_multi`'s `started_at` stamp, not
+        // the status string an agent may have overwritten since.
+        let was_running = task.started_at.is_some();
         task.last_status = "STOPPED".into();
         task.desired_status = "STOPPED".into();
         task.stopped_at = Some(Utc::now());
@@ -2377,8 +2377,9 @@ mod tests {
     /// launch) leave `pendingTasksCount`, and neither touches another task's.
     #[test]
     fn finalize_stopped_multi_releases_the_count_the_task_held() {
-        // (status, ran): an agent may have rewritten the status of a task
-        // that ran (STOPPING) or not (STOPPING before it started).
+        // (status, ran): an agent (SubmitTaskStateChange) may have rewritten
+        // the status of a task that ran or not, even to STOPPED, without
+        // touching the counts.
         for ((status, ran), want_running, want_pending) in [
             (("RUNNING", true), 1, 1),
             (("STOPPING", true), 1, 1),
@@ -2386,6 +2387,7 @@ mod tests {
             (("PENDING", false), 1, 1),
             (("PROVISIONING", false), 1, 1),
             (("STOPPED", true), 1, 1),
+            (("STOPPED", false), 1, 1),
         ] {
             let mut accounts: MultiAccountState<EcsState> =
                 MultiAccountState::new("000000000000", "us-east-1", "http://localhost:4566");
@@ -2396,8 +2398,8 @@ mod tests {
             );
             // One other task running and one pending, plus this one's own
             // count: afterwards only the other tasks' counts remain.
-            let holds_running = ran && status != "STOPPED";
-            let holds_pending = !ran && status != "STOPPED";
+            let holds_running = ran;
+            let holds_pending = !ran;
             cluster.running_tasks_count = 1 + i32::from(holds_running);
             cluster.pending_tasks_count = 1 + i32::from(holds_pending);
             acct.clusters.insert("default".into(), cluster);
@@ -2425,6 +2427,39 @@ mod tests {
                 (cluster.running_tasks_count, cluster.pending_tasks_count),
                 (want_running, want_pending),
                 "stopping a {status} task (ran: {ran})"
+            );
+        }
+    }
+
+    /// A launch failure after the task ran releases its running count even if
+    /// an agent rewrote its status; before it ran, the pending one.
+    #[test]
+    fn finalize_failure_releases_the_count_the_task_held() {
+        for ran in [true, false] {
+            let mut accounts: MultiAccountState<EcsState> =
+                MultiAccountState::new("000000000000", "us-east-1", "http://localhost:4566");
+            let acct = accounts.get_or_create("000000000000");
+            let mut cluster = crate::state::Cluster::new(
+                "default",
+                "arn:aws:ecs:us-east-1:000000000000:cluster/default".into(),
+            );
+            cluster.running_tasks_count = 1 + i32::from(ran);
+            cluster.pending_tasks_count = 1 + i32::from(!ran);
+            acct.clusters.insert("default".into(), cluster);
+            let mut t = make_task("t1");
+            t.last_status = "STOPPING".into();
+            t.started_at = ran.then(Utc::now);
+            acct.tasks.insert("t1".into(), t);
+            let state: SharedEcsState = Arc::new(RwLock::new(accounts));
+
+            finalize_failure(&state, "000000000000", "t1", "docker wait failed");
+
+            let accounts = state.read();
+            let cluster = &accounts.get("000000000000").unwrap().clusters["default"];
+            assert_eq!(
+                (cluster.running_tasks_count, cluster.pending_tasks_count),
+                (1, 1),
+                "ran: {ran}"
             );
         }
     }
