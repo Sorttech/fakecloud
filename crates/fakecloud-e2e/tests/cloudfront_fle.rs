@@ -228,7 +228,9 @@ async fn duplicate_fle_caller_reference_is_rejected() {
         .send()
         .await;
     assert!(
-        res.is_err(),
+        res.unwrap_err()
+            .into_service_error()
+            .is_field_level_encryption_config_already_exists(),
         "duplicate FLE CallerReference must be rejected"
     );
 }
@@ -318,5 +320,10 @@ async fn duplicate_realtime_log_config_is_rejected() {
         .fields("timestamp")
         .send()
         .await;
-    assert!(res.is_err(), "duplicate name must be rejected");
+    assert!(
+        res.unwrap_err()
+            .into_service_error()
+            .is_realtime_log_config_already_exists(),
+        "duplicate name must be rejected"
+    );
 }

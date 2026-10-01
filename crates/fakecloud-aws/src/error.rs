@@ -88,6 +88,60 @@ pub fn json_error_response_with_fields(
     )
 }
 
+/// XML namespace of the CloudFront API (`2020-05-31`).
+pub const CLOUDFRONT_XMLNS: &str = "http://cloudfront.amazonaws.com/doc/2020-05-31/";
+
+/// XML namespace of the Route 53 API (`2013-04-01`).
+pub const ROUTE53_XMLNS: &str = "https://route53.amazonaws.com/doc/2013-04-01/";
+
+/// The namespace of a REST-XML service whose errors use the `<ErrorResponse>`
+/// wrapper (see [`rest_xml_error_response`]), or `None` for one that answers
+/// with S3's bare `<Error>` document.
+pub fn rest_xml_error_namespace(service: &str) -> Option<&'static str> {
+    match service {
+        "cloudfront" => Some(CLOUDFRONT_XMLNS),
+        "route53" => Some(ROUTE53_XMLNS),
+        _ => None,
+    }
+}
+
+/// Build a REST-XML error response in the `<ErrorResponse>` shape CloudFront
+/// and Route 53 use:
+///
+/// ```xml
+/// <ErrorResponse xmlns="{namespace}">
+///   <Error><Type>Sender</Type><Code>..</Code><Message>..</Message></Error>
+///   <RequestId>..</RequestId>
+/// </ErrorResponse>
+/// ```
+///
+/// `Type` is `Receiver` for a 5xx and `Sender` otherwise. Unlike S3's bare
+/// `<Error>`, the AWS SDKs for these services only find the code inside this
+/// wrapper.
+pub fn rest_xml_error_response(
+    status: StatusCode,
+    code: &str,
+    message: &str,
+    request_id: &str,
+    namespace: &str,
+) -> (StatusCode, String, Bytes) {
+    let error_type = if status.is_server_error() {
+        "Receiver"
+    } else {
+        "Sender"
+    };
+    let body = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <ErrorResponse xmlns=\"{}\"><Error><Type>{error_type}</Type><Code>{}</Code>\
+         <Message>{}</Message></Error><RequestId>{}</RequestId></ErrorResponse>",
+        xml_escape(namespace),
+        xml_escape(code),
+        xml_escape(message),
+        xml_escape(request_id),
+    );
+    (status, "text/xml".to_string(), Bytes::from(body))
+}
+
 /// Build an S3-style XML error response.
 /// S3 uses `<Error>` (not `<ErrorResponse>`) with different field ordering.
 pub fn s3_xml_error_response(
@@ -178,6 +232,62 @@ mod tests {
         );
         let body_str = String::from_utf8(body.to_vec()).unwrap();
         assert!(body_str.contains("<BucketName>my-bucket</BucketName>"));
+    }
+
+    #[test]
+    fn rest_xml_error_wraps_in_namespaced_error_response() {
+        let (status, content_type, body) = rest_xml_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchDistribution",
+            "The specified distribution does not exist.",
+            "req-cf",
+            CLOUDFRONT_XMLNS,
+        );
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(content_type, "text/xml");
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"));
+        assert!(body.contains(
+            "<ErrorResponse xmlns=\"http://cloudfront.amazonaws.com/doc/2020-05-31/\">\
+             <Error><Type>Sender</Type><Code>NoSuchDistribution</Code>\
+             <Message>The specified distribution does not exist.</Message></Error>\
+             <RequestId>req-cf</RequestId></ErrorResponse>"
+        ));
+    }
+
+    #[test]
+    fn rest_xml_error_type_is_receiver_for_5xx() {
+        let (_, _, body) = rest_xml_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalError",
+            "boom",
+            "r",
+            ROUTE53_XMLNS,
+        );
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("<Type>Receiver</Type>"), "{body}");
+        assert!(body.contains("xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\""));
+    }
+
+    #[test]
+    fn rest_xml_error_escapes_code_message_and_request_id() {
+        let (_, _, body) =
+            rest_xml_error_response(StatusCode::BAD_REQUEST, "A&B", "x<y>", "r\"1", "urn:ns");
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("<Code>A&amp;B</Code>"), "{body}");
+        assert!(body.contains("<Message>x&lt;y&gt;</Message>"), "{body}");
+        assert!(body.contains("<RequestId>r&quot;1</RequestId>"), "{body}");
+    }
+
+    #[test]
+    fn rest_xml_error_namespace_only_for_wrapped_services() {
+        assert_eq!(
+            rest_xml_error_namespace("cloudfront"),
+            Some(CLOUDFRONT_XMLNS)
+        );
+        assert_eq!(rest_xml_error_namespace("route53"), Some(ROUTE53_XMLNS));
+        assert_eq!(rest_xml_error_namespace("s3"), None);
+        assert_eq!(rest_xml_error_namespace("ecr"), None);
     }
 
     #[test]

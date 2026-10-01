@@ -453,35 +453,11 @@ impl AwsService for Route53Service {
         if mutates && matches!(result.as_ref(), Ok(resp) if resp.status.is_success()) {
             self.save_snapshot().await;
         }
-        // Route 53 is a REST-XML service whose error wire format wraps the
-        // error in `<ErrorResponse>` (unlike S3's bare `<Error>`). The shared
-        // dispatcher renders Rest-protocol errors in the S3 shape, so the AWS
-        // SDK can't parse the code and reports `UnknownError` — which broke the
-        // provider's post-destroy `GetHostedZone` check (it expects
-        // `NoSuchHostedZone`). Render the route53-shaped error body here.
-        match result {
-            Ok(resp) => Ok(resp),
-            Err(err) => Ok(route53_error_response(&err, &req.request_id)),
-        }
+        // Errors propagate to the dispatcher, which renders Route 53's
+        // REST-XML `<ErrorResponse>` wrapper (see
+        // `fakecloud_aws::error::rest_xml_error_response`).
+        result
     }
-}
-
-/// Render an [`AwsServiceError`] as a Route 53 REST-XML `<ErrorResponse>`
-/// document so the AWS SDK can extract the error code.
-fn route53_error_response(err: &AwsServiceError, request_id: &str) -> AwsResponse {
-    let body = format!(
-        "{XML_DECL}<ErrorResponse xmlns=\"{NS}\">\
-         <Error><Type>Sender</Type><Code>{}</Code><Message>{}</Message></Error>\
-         <RequestId>{}</RequestId></ErrorResponse>",
-        esc(err.code()),
-        esc(&err.message()),
-        esc(request_id),
-    );
-    let mut headers = HeaderMap::new();
-    if let Ok(v) = http::HeaderValue::from_str(err.code()) {
-        headers.insert("x-amz-error-code", v);
-    }
-    xml_response(err.status(), body, headers)
 }
 
 // ─── Hosted Zone handlers ────────────────────────────────────────────
@@ -1708,10 +1684,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_missing_hosted_zone_returns_errorresponse_wrapper() {
-        // Route 53's REST-XML errors must be wrapped in <ErrorResponse> (not
-        // S3's bare <Error>) so the AWS SDK can read the code; otherwise the
-        // provider's post-destroy GetHostedZone check sees "UnknownError".
+    async fn get_missing_hosted_zone_returns_no_such_hosted_zone() {
+        // The handler surfaces the typed error; the dispatcher renders it in
+        // Route 53's `<ErrorResponse>` wrapper (covered in fakecloud-core and
+        // the route53 e2e), which the provider's post-destroy GetHostedZone
+        // check needs to see `NoSuchHostedZone`.
         let (svc, _) = svc_with_zone(vec![]);
         let req = AwsRequest {
             service: "route53".to_string(),
@@ -1731,14 +1708,12 @@ mod tests {
             access_key_id: None,
             principal: None,
         };
-        let resp = svc.handle(req).await.unwrap();
-        assert_eq!(resp.status, StatusCode::NOT_FOUND);
-        let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
-        assert!(body.contains("<ErrorResponse"), "missing wrapper: {body}");
-        assert!(
-            body.contains("<Code>NoSuchHostedZone</Code>"),
-            "missing code: {body}"
-        );
+        let err = match svc.handle(req).await {
+            Err(e) => e,
+            Ok(resp) => panic!("expected an error, got HTTP {}", resp.status),
+        };
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
+        assert_eq!(err.code(), "NoSuchHostedZone");
     }
 
     fn extract_record_data(body: &str) -> Vec<String> {
@@ -2056,13 +2031,16 @@ mod tests {
                     xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\">\
                     <ChangeBatch><Changes></Changes></ChangeBatch>\
                     </ChangeResourceRecordSetsRequest>";
-        let resp = svc.handle(change_rrset_req(&zid, body)).await.unwrap();
-        assert_eq!(resp.status, StatusCode::BAD_REQUEST);
-        let out = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
-        assert!(
-            out.contains("<Code>InvalidChangeBatch</Code>"),
-            "expected InvalidChangeBatch, got {out}"
-        );
+        let err = expect_err(svc.handle(change_rrset_req(&zid, body)).await);
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(err.code(), "InvalidChangeBatch");
+    }
+
+    fn expect_err(result: Result<AwsResponse, AwsServiceError>) -> AwsServiceError {
+        match result {
+            Err(e) => e,
+            Ok(resp) => panic!("expected an error, got HTTP {}", resp.status),
+        }
     }
 
     #[tokio::test]
@@ -2070,16 +2048,12 @@ mod tests {
         // Seed an alias record with EvaluateTargetHealth=false; a DELETE that
         // submits true does not match the current values and must be rejected.
         let (svc, zid) = svc_with_zone(vec![alias_rrset(false)]);
-        let resp = svc
-            .handle(change_rrset_req(&zid, &alias_delete_body(true)))
-            .await
-            .unwrap();
-        assert_eq!(resp.status, StatusCode::BAD_REQUEST);
-        let out = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
-        assert!(
-            out.contains("<Code>InvalidChangeBatch</Code>"),
-            "expected InvalidChangeBatch, got {out}"
+        let err = expect_err(
+            svc.handle(change_rrset_req(&zid, &alias_delete_body(true)))
+                .await,
         );
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(err.code(), "InvalidChangeBatch");
         // The record is still present (DELETE did not apply).
         let st = svc.state.read();
         let zone = &st.accounts.get(DEFAULT_ACCOUNT).unwrap().hosted_zones[&zid];

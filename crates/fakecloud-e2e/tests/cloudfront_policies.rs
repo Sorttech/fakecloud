@@ -89,8 +89,13 @@ async fn origin_access_control_lifecycle() {
         .await
         .expect("delete_oac");
 
-    let err = cf.get_origin_access_control().id(&id).send().await;
-    assert!(err.is_err());
+    let err = cf
+        .get_origin_access_control()
+        .id(&id)
+        .send()
+        .await
+        .unwrap_err();
+    assert!(err.into_service_error().is_no_such_origin_access_control());
 }
 
 #[tokio::test]
@@ -183,7 +188,10 @@ async fn managed_cache_policy_cannot_be_deleted() {
         .if_match(&etag)
         .send()
         .await;
-    assert!(res.is_err(), "managed policy must not be deletable");
+    assert!(
+        res.unwrap_err().into_service_error().is_illegal_delete(),
+        "managed policy must not be deletable"
+    );
 }
 
 #[tokio::test]
