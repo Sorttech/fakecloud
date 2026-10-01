@@ -8409,6 +8409,24 @@ mod tests {
             }),
         ))
         .expect("InstanceId-sourced group");
+        {
+            // AWS derives a launch configuration named after the group from
+            // the instance.
+            let st = prov.autoscaling_state.read();
+            let acct_state = &st.accounts[acct];
+            let group = acct_state
+                .groups
+                .values()
+                .find(|g| g.name.contains("FromInstance"))
+                .expect("group");
+            let lc = &acct_state.launch_configurations[group
+                .launch_configuration_name
+                .as_ref()
+                .expect("derived LC")];
+            assert_eq!(lc.image_id, "ami-0tmpl");
+            assert_eq!(lc.instance_type, "m5.large");
+            assert_eq!(lc.block_device_mappings.len(), 1);
+        }
     }
 
     /// A stack MSK cluster rejected for a duplicate name mints no key.

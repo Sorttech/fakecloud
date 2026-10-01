@@ -577,11 +577,13 @@ impl AutoScalingService {
 
         let mut launch_template = parse_launch_template(req);
         let mut mixed_instances_policy = crate::launch::parse_mixed_instances_policy(req);
-        let launch_configuration_name = optional_query_param(req, "LaunchConfigurationName");
+        let mut launch_configuration_name = optional_query_param(req, "LaunchConfigurationName");
+        let instance_id = optional_query_param(req, "InstanceId");
         let sources = [
             launch_configuration_name.is_some(),
             launch_template.is_some(),
             mixed_instances_policy.is_some(),
+            instance_id.is_some(),
         ]
         .iter()
         .filter(|s| **s)
@@ -603,7 +605,38 @@ impl AutoScalingService {
         )?;
 
         let mut azs = member_list(req, "AvailabilityZones");
-        let vpc_zone_identifier = optional_query_param(req, "VPCZoneIdentifier");
+        let mut vpc_zone_identifier = optional_query_param(req, "VPCZoneIdentifier");
+        // `InstanceId`: AWS derives a launch configuration named after the
+        // group from the instance, and launches into its subnet / AZ unless
+        // the request names others.
+        let mut derived_lc = None;
+        if let Some(iid) = &instance_id {
+            let Some(ec2_state) = &self.ec2_state else {
+                return Err(AwsServiceError::aws_error(
+                    StatusCode::BAD_REQUEST,
+                    "ValidationError",
+                    format!("Invalid instance id {iid}"),
+                ));
+            };
+            let (lc, subnet, az) = crate::launch::launch_configuration_from_instance(
+                ec2_state,
+                &req.account_id,
+                &req.region,
+                iid,
+                &name,
+            )
+            .map_err(|m| {
+                AwsServiceError::aws_error(StatusCode::BAD_REQUEST, "ValidationError", m)
+            })?;
+            if vpc_zone_identifier.is_none() && azs.is_empty() {
+                match subnet {
+                    Some(s) => vpc_zone_identifier = Some(s),
+                    None => azs.push(az),
+                }
+            }
+            launch_configuration_name = Some(lc.name.clone());
+            derived_lc = Some(lc);
+        }
         if azs.is_empty() {
             azs.push(format!("{}a", req.region));
         }
@@ -657,6 +690,9 @@ impl AutoScalingService {
                     "AlreadyExists",
                     format!("AutoScalingGroup by this name already exists - A group with the name {name} already exists"),
                 ));
+            }
+            if let Some(lc) = derived_lc {
+                st.launch_configurations.insert(lc.name.clone(), lc);
             }
             st.groups.insert(name.clone(), group);
         }
@@ -2420,5 +2456,53 @@ mod tests {
         .await;
         assert!(acts.contains("<StatusCode>Failed</StatusCode>"), "{acts}");
         assert!(acts.contains("does not exist"), "{acts}");
+    }
+
+    #[tokio::test]
+    async fn instance_id_group_launches_like_the_instance() {
+        let (s, ec2) = ec2_wired();
+        let mut r = req(
+            "RunInstances",
+            &[
+                ("ImageId", "ami-src"),
+                ("InstanceType", "c5.large"),
+                ("MinCount", "1"),
+                ("MaxCount", "1"),
+                ("BlockDeviceMapping.1.DeviceName", "/dev/xvda"),
+                ("BlockDeviceMapping.1.Ebs.VolumeSize", "9"),
+            ],
+        );
+        r.service = "ec2".into();
+        let out = fakecloud_ec2::Ec2Service::with_state(ec2.clone())
+            .handle(r)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(out.body.expect_bytes()).to_string();
+        let src = parse_instance_ids(&body)[0].clone();
+        s.handle(req(
+            "CreateAutoScalingGroup",
+            &[
+                ("AutoScalingGroupName", "g"),
+                ("InstanceId", &src),
+                ("MinSize", "1"),
+                ("MaxSize", "1"),
+            ],
+        ))
+        .await
+        .unwrap();
+        let ids = group_instance_ids(&s, "g");
+        assert_eq!(ids.len(), 1);
+        let view = ec2_view(&ec2, &ids);
+        assert_eq!(
+            (view[0].0.as_str(), view[0].1.as_str()),
+            ("c5.large", "ami-src")
+        );
+        assert_eq!(view[0].3, vec![(9, false)]);
+        // The derived launch configuration is named after the group.
+        let lcs = body_async(&s, "DescribeLaunchConfigurations", &[]).await;
+        assert!(
+            lcs.contains("<LaunchConfigurationName>g</LaunchConfigurationName>"),
+            "{lcs}"
+        );
     }
 }

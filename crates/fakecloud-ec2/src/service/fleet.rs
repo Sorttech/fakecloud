@@ -824,10 +824,8 @@ fn instance_launch_template_data(state: &Ec2State, id: &str) -> Option<BTreeMap<
     if let Some(sn) = &inst.subnet_id {
         put("NetworkInterface.1.SubnetId", sn.clone());
     }
-    put(
-        "NetworkInterface.1.PrivateIpAddress",
-        inst.private_ip.clone(),
-    );
+    // The private IP is the instance's own: a template that pinned it would
+    // hand every launch from it the same address.
     for (i, g) in inst.security_group_ids.iter().enumerate() {
         put(
             &format!("NetworkInterface.1.SecurityGroupId.{}", i + 1),

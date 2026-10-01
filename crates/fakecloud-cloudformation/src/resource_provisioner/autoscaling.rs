@@ -285,7 +285,7 @@ impl ResourceProvisioner {
         if azs.is_empty() {
             azs.push(format!("{}a", self.region));
         }
-        let lcn = prop_str(props, "LaunchConfigurationName").map(String::from);
+        let mut lcn = prop_str(props, "LaunchConfigurationName").map(String::from);
         // Modern templates use LaunchTemplate (or MixedInstancesPolicy) instead
         // of the legacy LaunchConfigurationName; honor every form so the
         // launch spec isn't silently dropped.
@@ -297,7 +297,7 @@ impl ResourceProvisioner {
             launch_template.as_mut(),
             mixed_instances_policy.as_mut(),
         )?;
-        let vpc_zone_identifier = props
+        let mut vpc_zone_identifier = props
             .get("VPCZoneIdentifier")
             .and_then(|v| v.as_array())
             .map(|a| {
@@ -307,6 +307,30 @@ impl ResourceProvisioner {
                     .join(",")
             })
             .or_else(|| prop_str(props, "VPCZoneIdentifier").map(String::from));
+        // `InstanceId`: a launch configuration named after the group, derived
+        // from the instance (as CreateAutoScalingGroup does).
+        if let Some(iid) = prop_str(props, "InstanceId") {
+            let (lc, subnet, az) =
+                fakecloud_autoscaling::launch::launch_configuration_from_instance(
+                    &self.ec2_state,
+                    &self.account_id,
+                    &self.region,
+                    iid,
+                    &name,
+                )?;
+            if vpc_zone_identifier.is_none() && props.get("AvailabilityZones").is_none() {
+                match subnet {
+                    Some(s) => vpc_zone_identifier = Some(s),
+                    None => azs = vec![az],
+                }
+            }
+            lcn = Some(lc.name.clone());
+            self.autoscaling_state
+                .write()
+                .get_or_create(&self.account_id)
+                .launch_configurations
+                .insert(lc.name.clone(), lc);
+        }
 
         // Insert the group as control-plane only (no instances). After
         // provisioning, `CreateStack` drains an `AsgInstances` spawn intent that

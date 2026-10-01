@@ -193,6 +193,95 @@ pub fn resolve_launch_template_specs(
     Ok(())
 }
 
+/// The launch configuration AWS creates for a group given an `InstanceId`:
+/// named after the group, with the instance's AMI, type, key pair, security
+/// groups, user data, IAM instance profile, monitoring, EBS optimization,
+/// tenancy and EBS volumes. Also returns the instance's subnet (the group's
+/// `VPCZoneIdentifier` when none is given) and availability zone.
+pub fn launch_configuration_from_instance(
+    ec2_state: &fakecloud_ec2::SharedEc2State,
+    account_id: &str,
+    region: &str,
+    instance_id: &str,
+    name: &str,
+) -> Result<(LaunchConfiguration, Option<String>, String), String> {
+    let accounts = ec2_state.read();
+    let st = accounts
+        .get(account_id)
+        .ok_or_else(|| format!("Invalid instance id {instance_id}"))?;
+    let inst = st
+        .instances
+        .get(instance_id)
+        .filter(|i| i.state_name != "terminated")
+        .ok_or_else(|| format!("Invalid instance id {instance_id}"))?;
+    let mut volumes: Vec<(
+        &fakecloud_ec2::state::Volume,
+        &fakecloud_ec2::state::VolumeAttachment,
+    )> = st
+        .volumes
+        .values()
+        .filter_map(|v| {
+            v.attachments
+                .iter()
+                .find(|a| a.instance_id == instance_id)
+                .map(|a| (v, a))
+        })
+        .collect();
+    volumes.sort_by(|a, b| a.1.device.cmp(&b.1.device));
+    let block_device_mappings = volumes
+        .into_iter()
+        .map(|(v, a)| BlockDeviceMapping {
+            device_name: a.device.clone(),
+            virtual_name: None,
+            no_device: false,
+            ebs: Some(Ebs {
+                snapshot_id: v.snapshot_id.clone(),
+                volume_size: Some(v.size),
+                volume_type: Some(v.volume_type.clone()),
+                delete_on_termination: Some(a.delete_on_termination),
+                iops: v.iops,
+                encrypted: Some(v.encrypted),
+                throughput: v.throughput,
+            }),
+        })
+        .collect();
+    let iam_instance_profile = st
+        .iam_instance_profile_associations
+        .values()
+        .find(|a| a.instance_id == instance_id && a.state != "disassociated")
+        .map(|a| a.iam_instance_profile_arn.clone());
+    let m = &inst.metadata_options;
+    let lc = LaunchConfiguration {
+        name: name.to_string(),
+        arn: crate::service::autoscaling_arn(
+            region,
+            account_id,
+            "launchConfiguration",
+            &uuid::Uuid::new_v4().to_string(),
+            name,
+        ),
+        image_id: inst.image_id.clone(),
+        instance_type: inst.instance_type.clone(),
+        key_name: inst.key_name.clone(),
+        security_groups: inst.security_group_ids.clone(),
+        user_data: inst.user_data.clone(),
+        iam_instance_profile,
+        associate_public_ip_address: None,
+        instance_monitoring: inst.monitoring,
+        ebs_optimized: inst.ebs_optimized,
+        spot_price: None,
+        placement_tenancy: inst.placement_tenancy.clone(),
+        block_device_mappings,
+        metadata_options: Some(InstanceMetadataOptions {
+            http_tokens: Some(m.http_tokens.clone()),
+            http_put_response_hop_limit: Some(m.http_put_response_hop_limit),
+            http_endpoint: Some(m.http_endpoint.clone()),
+        }),
+        created_time: chrono::Utc::now(),
+    };
+    Ok((lc, inst.subnet_id.clone(), inst.az.clone()))
+}
+
 /// The `RunInstances` parameters equivalent to a launch configuration.
 pub(crate) fn launch_configuration_params(lc: &LaunchConfiguration) -> HashMap<String, String> {
     let mut p = HashMap::new();
