@@ -62,6 +62,7 @@ pub(crate) const K8S_INIT_CONTAINER: &str = "fakecloud-ecs-creds";
 /// namespace. `$3` is `hold` to keep running afterwards (the Docker holder
 /// owns the namespace) or `once` to exit (the Kubernetes initContainer).
 /// Without `nft`/`iptables` on an Alpine image it installs `nftables` first.
+/// It tries `nft`, then `iptables` if `nft` is missing or its rule is refused.
 pub(crate) const SETUP_SCRIPT: &str = r#"set -eu
 host="$1"; port="$2"; mode="$3"
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -73,12 +74,13 @@ if [ -z "$ip" ]; then
   echo "fakecloud-ecs-creds: cannot resolve $host" >&2
   exit 1
 fi
-if have nft; then
-  printf 'table ip fakecloud_ecs_creds {\n chain output {\n  type nat hook output priority -100; policy accept;\n  ip daddr 169.254.170.2 tcp dport 80 dnat to %s:%s\n }\n}\n' "$ip" "$port" | nft -f -
-elif have iptables; then
-  iptables -t nat -A OUTPUT -d 169.254.170.2/32 -p tcp --dport 80 -j DNAT --to-destination "$ip:$port"
+# nft first; iptables when nft is missing or the kernel refuses its rule.
+if have nft && printf 'table ip fakecloud_ecs_creds {\n chain output {\n  type nat hook output priority -100; policy accept;\n  ip daddr 169.254.170.2 tcp dport 80 dnat to %s:%s\n }\n}\n' "$ip" "$port" | nft -f -; then
+  :
+elif have iptables && iptables -t nat -A OUTPUT -d 169.254.170.2/32 -p tcp --dport 80 -j DNAT --to-destination "$ip:$port"; then
+  :
 else
-  echo "fakecloud-ecs-creds: neither nft nor iptables is available" >&2
+  echo "fakecloud-ecs-creds: could not install the NAT rule with nft or iptables" >&2
   exit 1
 fi
 echo "FAKECLOUD_ECS_CREDS_READY 169.254.170.2:80 -> $ip:$port"
@@ -422,6 +424,7 @@ impl EcsRuntime {
 
     async fn wait_for_holder_ready(&self, id: &str) -> Result<(), String> {
         let deadline = std::time::Instant::now() + HOLDER_READY_TIMEOUT;
+        let mut poll = Duration::from_millis(100);
         loop {
             let logs = Command::new(&self.cli)
                 .args(["logs", id])
@@ -452,7 +455,10 @@ impl EcsRuntime {
                     HOLDER_READY_TIMEOUT.as_secs()
                 ));
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(poll).await;
+            // The rule normally lands within a few polls; back off for a
+            // slow first start instead of shelling out every 100ms.
+            poll = (poll * 2).min(Duration::from_secs(1));
         }
     }
 
@@ -587,6 +593,55 @@ mod tests {
         // awsvpc doesn't publish to the host, and podman needs no --add-host.
         assert!(!joined.contains("--publish"), "{joined}");
         assert!(!joined.contains("--add-host"), "{joined}");
+    }
+
+    /// The setup script really installs the rule: run it under `sh` with
+    /// fake `nft` / `iptables` / `getent` on `PATH` and check which tool got
+    /// the rule, including the iptables fallback when nft refuses it.
+    #[test]
+    fn setup_script_falls_back_to_iptables_when_nft_refuses_the_rule() {
+        use std::os::unix::fs::PermissionsExt;
+        let run = |nft_ok: Option<bool>| {
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("calls");
+            let tool = |name: &str, body: &str| {
+                let path = dir.path().join(name);
+                std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            };
+            let log_s = log.display().to_string();
+            tool("getent", "echo '10.1.2.3 STREAM host'");
+            tool("iptables", &format!("echo \"iptables $*\" >> {log_s}"));
+            match nft_ok {
+                Some(true) => tool("nft", &format!("cat >/dev/null; echo nft >> {log_s}")),
+                Some(false) => tool("nft", "cat >/dev/null; exit 1"),
+                None => {}
+            }
+            // Only the fakes plus the shell's own utilities.
+            let path = format!("{}:/usr/bin:/bin", dir.path().display());
+            let out = std::process::Command::new("/bin/sh")
+                .args(["-c", SETUP_SCRIPT, "t", "host", "4566", "once"])
+                .env("PATH", path)
+                .output()
+                .unwrap();
+            let calls = std::fs::read_to_string(&log).unwrap_or_default();
+            (
+                out.status.success(),
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                calls,
+            )
+        };
+        let (ok, stdout, calls) = run(Some(true));
+        assert!(ok && stdout.contains(READY_MARKER), "{stdout}");
+        assert_eq!(calls.trim(), "nft");
+        let (ok, stdout, calls) = run(Some(false));
+        assert!(ok && stdout.contains("-> 10.1.2.3:4566"), "{stdout}");
+        assert!(
+            calls.contains("iptables -t nat -A OUTPUT -d 169.254.170.2/32 -p tcp --dport 80 -j DNAT --to-destination 10.1.2.3:4566"),
+            "{calls}"
+        );
+        let (ok, _, calls) = run(None);
+        assert!(ok && calls.starts_with("iptables"), "{calls}");
     }
 
     #[test]

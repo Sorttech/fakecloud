@@ -237,7 +237,12 @@ fn respond_link_local(
             None => return (StatusCode::NOT_FOUND, "404 page not found\n").into_response(),
         },
     };
-    if method != axum::http::Method::GET && method != axum::http::Method::HEAD {
+    if method == axum::http::Method::HEAD {
+        // Same status and headers as GET, no body.
+        let (parts, _) = creds.respond(task_id).into_parts();
+        return Response::from_parts(parts, axum::body::Body::empty());
+    }
+    if method != axum::http::Method::GET {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
     creds.respond(task_id)
@@ -560,6 +565,11 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         let (status, _) = call(&app, "POST", "169.254.170.2", "/v2/credentials/task1").await;
         assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+        // HEAD: GET's status, no body.
+        let (status, body) = call(&app, "HEAD", "169.254.170.2", "/v2/credentials/task1").await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, ""));
+        let (status, body) = call(&app, "HEAD", "169.254.170.2", "/v2/credentials/nope").await;
+        assert_eq!((status, body.as_str()), (StatusCode::BAD_REQUEST, ""));
     }
 
     #[tokio::test]
