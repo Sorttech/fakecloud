@@ -420,18 +420,11 @@ pub(crate) fn create_launch_template_version(
     let (t, version, data) = {
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(&req.account_id);
-        let key = id
-            .clone()
-            .or_else(|| {
-                name.as_ref().and_then(|n| {
-                    state
-                        .launch_templates
-                        .values()
-                        .find(|t| &t.name == n)
-                        .map(|t| t.id.clone())
-                })
-            })
-            .unwrap_or_default();
+        // AWS answers an unknown template (by id or name) with its not-found
+        // error rather than inventing a version.
+        let key = super::launch_template::find_template(state, id.as_deref(), name.as_deref())?
+            .id
+            .clone();
         if let Some(t) = state.launch_templates.get_mut(&key) {
             super::launch_template::materialize_versions(t);
             // `SourceVersion`: the new version inherits the source version's
@@ -454,17 +447,11 @@ pub(crate) fn create_launch_template_version(
             t.versions.insert(v, data.clone());
             (t.clone(), v, data)
         } else {
-            // Unknown template: synthesize a response-only record (do NOT
-            // persist — fabricating a template for a version request on a
-            // non-existent template would leave bogus state behind).
-            let synthetic = LaunchTemplate {
-                id: id.unwrap_or_else(|| gen_id("lt")),
-                name: name.unwrap_or_default(),
-                default_version: 1,
-                latest_version: 2,
-                versions: BTreeMap::from([(2, data.clone())]),
-            };
-            (synthetic, 2, data.clone())
+            // find_template found it under this same lock.
+            return Err(crate::service_helpers::not_found(
+                "InvalidLaunchTemplateId.NotFound",
+                &key,
+            ));
         }
     };
     Ok(Ec2Service::respond(
@@ -2152,5 +2139,21 @@ mod launch_template_version_tests {
             ),
         ));
         assert_eq!(err.code(), "InvalidInstanceID.NotFound");
+    }
+
+    #[test]
+    fn version_of_unknown_template_is_not_found() {
+        let svc = Ec2Service::new();
+        let err = err_of(create_launch_template_version(
+            &svc,
+            &req(
+                "CreateLaunchTemplateVersion",
+                &[
+                    ("LaunchTemplateName", "nope"),
+                    ("LaunchTemplateData.ImageId", "ami-1"),
+                ],
+            ),
+        ));
+        assert_eq!(err.code(), "InvalidLaunchTemplateName.NotFoundException");
     }
 }

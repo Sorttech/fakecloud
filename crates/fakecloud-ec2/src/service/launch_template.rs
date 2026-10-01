@@ -41,7 +41,7 @@ fn ec2_error(code: &str, message: String) -> AwsServiceError {
 }
 
 /// Find the template a launch names, by id or by name (exactly one of them).
-fn find_template<'a>(
+pub(crate) fn find_template<'a>(
     state: &'a Ec2State,
     id: Option<&str>,
     name: Option<&str>,
