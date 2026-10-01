@@ -705,6 +705,48 @@ impl ResourceProvisioner {
         Ok(result)
     }
 
+    /// Whether an `AWS::EC2::Instance` update points at a different launch
+    /// template version than the instance was launched from (compared via the
+    /// `aws:ec2launchtemplate:*` tags the launch recorded), which AWS handles
+    /// by replacing the instance.
+    pub(super) fn instance_launch_template_changed(
+        &self,
+        existing: &StackResource,
+        resource: &ResourceDefinition,
+    ) -> bool {
+        let launched = {
+            let accounts = self.ec2_state.read();
+            let Some(st) = accounts.get(&self.account_id) else {
+                return false;
+            };
+            let tag = |k: &str| {
+                st.tags_for(&existing.physical_id)
+                    .iter()
+                    .find(|t| t.key == k)
+                    .map(|t| t.value.clone())
+            };
+            tag("aws:ec2launchtemplate:id").zip(tag("aws:ec2launchtemplate:version"))
+        };
+        let wanted = cfn_launch_template_ref(&resource.properties).map(|lt| {
+            fakecloud_ec2::service::launch_template::resolve_launch_template_in(
+                &self.ec2_state,
+                &self.account_id,
+                &self.region,
+                lt.id.as_deref(),
+                lt.name.as_deref(),
+                lt.version.as_deref(),
+            )
+            .map(|r| (r.id, r.version.to_string()))
+        });
+        match (launched, wanted) {
+            (None, None) => false,
+            // An unresolvable template: let the replacement surface the error.
+            (_, Some(Err(_))) => true,
+            (Some(l), Some(Ok(w))) => l != w,
+            _ => true,
+        }
+    }
+
     /// In-place stack update for `AWS::EC2::Instance`. An instance is stateful
     /// (a real backing container / attached EBS with data), so a benign
     /// property or tag change must NOT terminate + relaunch it the way the

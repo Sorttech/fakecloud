@@ -433,6 +433,7 @@ pub(crate) fn create_launch_template_version(
             })
             .unwrap_or_default();
         if let Some(t) = state.launch_templates.get_mut(&key) {
+            super::launch_template::materialize_versions(t);
             // `SourceVersion`: the new version inherits the source version's
             // data, with the request's LaunchTemplateData winning (the same
             // precedence a launch applies to the request over the template).
@@ -585,14 +586,7 @@ pub(crate) fn delete_launch_template_versions(
                             "Cannot delete the default version of a launch template".to_string(),
                         )),
                         Some(n) => {
-                            // A template persisted before per-version data was
-                            // recorded materializes its implicit versions first,
-                            // so deleting one keeps the others resolvable.
-                            if t.versions.is_empty() {
-                                t.versions = (1..=t.latest_version)
-                                    .map(|v| (v, BTreeMap::new()))
-                                    .collect();
-                            }
+                            super::launch_template::materialize_versions(t);
                             t.versions.remove(&n);
                             ok_items.push(format!(
                                 "{}{}<versionNumber>{n}</versionNumber>",

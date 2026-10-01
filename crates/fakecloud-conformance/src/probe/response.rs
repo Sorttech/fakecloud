@@ -257,6 +257,9 @@ pub(super) fn service_common_errors(service_name: &str) -> &'static [&'static st
             "InvalidLaunchTemplateId.VersionNotFound",
             "InvalidLaunchTemplateName.NotFoundException",
             "InvalidLaunchTemplateName.AlreadyExistsException",
+            // A RunInstances variant re-using the probe's fixed
+            // `PrivateIpAddress` in the same subnet.
+            "InvalidIPAddress.InUse",
         ],
         // EKS under-declares two client errors that the real API returns for
         // sub-resource operations:

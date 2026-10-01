@@ -325,11 +325,16 @@ impl ResourceProvisioner {
                 }
             }
             lcn = Some(lc.name.clone());
-            self.autoscaling_state
-                .write()
-                .get_or_create(&self.account_id)
-                .launch_configurations
-                .insert(lc.name.clone(), lc);
+            let mut st = self.autoscaling_state.write();
+            let acct = st.get_or_create(&self.account_id);
+            // Never replace a configuration another group launches from.
+            if acct.launch_configurations.contains_key(&lc.name) {
+                return Err(format!(
+                    "Launch Configuration by this name already exists - A launch configuration already exists with the name {}",
+                    lc.name
+                ));
+            }
+            acct.launch_configurations.insert(lc.name.clone(), lc);
         }
 
         // Insert the group as control-plane only (no instances). After

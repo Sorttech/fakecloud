@@ -1910,6 +1910,11 @@ impl ResourceProvisioner {
             }
             "AWS::DocDB::DBCluster" => Some(self.update_docdb_cluster(existing, new_def)?),
             "AWS::Neptune::DBCluster" => Some(self.update_neptune_cluster(existing, new_def)?),
+            // A different launch template (or version) replaces the instance,
+            // as in AWS; anything else updates it in place.
+            "AWS::EC2::Instance" if self.instance_launch_template_changed(existing, new_def) => {
+                self.reprovision_resource(existing, new_def)?
+            }
             "AWS::EC2::Instance" => Some(self.update_ec2_instance(existing, new_def)?),
             // A new template version, made the default, keeps the template id
             // every launch references; a rename replaces it.
@@ -8367,6 +8372,45 @@ mod tests {
             let t = &ec2.get(acct).unwrap().launch_templates[&lt.physical_id];
             assert_eq!((t.default_version, t.latest_version), (2, 2));
         }
+        // Same template version: in-place update keeps the instance; a new
+        // version replaces it.
+        let same = prov
+            .update_resource(
+                &inst,
+                &make_resource(
+                    "AWS::EC2::Instance",
+                    "Box",
+                    serde_json::json!({
+                        "InstanceType": "m5.large",
+                        "LaunchTemplate": {"LaunchTemplateId": lt.physical_id, "Version": "1"},
+                        "Tags": [{"Key": "Name", "Value": "box2"}]
+                    }),
+                ),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(same.physical_id, inst.physical_id);
+        let replaced = prov
+            .update_resource(
+                &inst,
+                &make_resource(
+                    "AWS::EC2::Instance",
+                    "Box",
+                    serde_json::json!({
+                        "LaunchTemplate": {"LaunchTemplateId": lt.physical_id, "Version": "2"}
+                    }),
+                ),
+            )
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            replaced.physical_id, inst.physical_id,
+            "new version replaces"
+        );
+        assert_eq!(
+            prov.ec2_state.read().get(acct).unwrap().instances[&replaced.physical_id].image_id,
+            "ami-0v2"
+        );
 
         let asg = prov
             .create_resource(&make_resource(

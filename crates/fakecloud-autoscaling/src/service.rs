@@ -692,6 +692,18 @@ impl AutoScalingService {
                 ));
             }
             if let Some(lc) = derived_lc {
+                // The derived configuration takes the group's name; never
+                // replace one another group may launch from.
+                if st.launch_configurations.contains_key(&lc.name) {
+                    return Err(AwsServiceError::aws_error(
+                        StatusCode::BAD_REQUEST,
+                        "AlreadyExists",
+                        format!(
+                            "Launch Configuration by this name already exists - A launch configuration already exists with the name {}",
+                            lc.name
+                        ),
+                    ));
+                }
                 st.launch_configurations.insert(lc.name.clone(), lc);
             }
             st.groups.insert(name.clone(), group);

@@ -634,6 +634,23 @@ pub(crate) fn launch_instances(
     };
     let assign_public = assoc_public.unwrap_or(subnet_auto_public);
 
+    // A fixed private IP must be free in its subnet (one launched from a
+    // template that pins it, e.g. by a second Auto Scaling launch, is not).
+    if let Some(ip) = &fixed_private_ip {
+        let accounts = svc.state.read();
+        let in_use = accounts.get(account_id).is_some_and(|st| {
+            st.instances
+                .values()
+                .any(|i| i.state_code != 48 && &i.private_ip == ip && i.subnet_id == subnet_id)
+        });
+        if in_use {
+            return Err(AwsServiceError::aws_error(
+                http::StatusCode::BAD_REQUEST,
+                "InvalidIPAddress.InUse",
+                format!("Address {ip} is in use."),
+            ));
+        }
+    }
     let ids: Vec<String> = (0..count).map(|_| gen_id("i")).collect();
     // EBS volumes the block-device mappings create for each instance, with
     // their encryption resolved (KMS) before the EC2 lock is taken.
@@ -3777,6 +3794,26 @@ mod modify_tests {
         );
         assert!(!inst.ebs_optimized, "explicit false wins");
         assert!(inst.monitoring, "unset comes from the template");
+    }
+
+    #[tokio::test]
+    async fn pinned_private_ip_in_use_is_rejected() {
+        let svc = Ec2Service::new();
+        let launch = || {
+            req(
+                "RunInstances",
+                &[
+                    ("ImageId", "ami-1"),
+                    ("MinCount", "1"),
+                    ("MaxCount", "1"),
+                    ("SubnetId", "subnet-x"),
+                    ("PrivateIpAddress", "10.1.2.3"),
+                ],
+            )
+        };
+        run_instances(&svc, &launch()).await.unwrap();
+        let err = crate::test_support::err_of(run_instances(&svc, &launch()).await);
+        assert_eq!(err.code(), "InvalidIPAddress.InUse");
     }
 
     #[test]

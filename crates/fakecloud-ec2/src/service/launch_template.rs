@@ -113,6 +113,17 @@ pub(crate) fn latest_existing_version(t: &LaunchTemplate) -> i64 {
         .unwrap_or(t.latest_version)
 }
 
+/// Give a template persisted before per-version data was recorded (empty
+/// `versions`, every number up to `latest_version` implicitly existing) an
+/// explicit entry per version, so adding or deleting one keeps the others.
+pub(crate) fn materialize_versions(t: &mut LaunchTemplate) {
+    if t.versions.is_empty() {
+        t.versions = (1..=t.latest_version)
+            .map(|v| (v, BTreeMap::new()))
+            .collect();
+    }
+}
+
 /// Resolve a version selector (`$Default` / absent, `$Latest`, or a number)
 /// against a template, to a concrete existing version number.
 pub(crate) fn resolve_version(
@@ -517,6 +528,16 @@ mod tests {
             ),
             "InvalidParameterCombination"
         );
+    }
+
+    #[test]
+    fn materialized_legacy_versions_survive_a_new_version() {
+        let mut t = template(&[], 1);
+        t.latest_version = 3;
+        t.versions.clear();
+        materialize_versions(&mut t);
+        t.versions.insert(4, BTreeMap::new());
+        assert!((1..=4).all(|v| version_exists(&t, v)));
     }
 
     #[test]
