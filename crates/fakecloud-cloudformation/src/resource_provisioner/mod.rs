@@ -8399,6 +8399,16 @@ mod tests {
             }),
         ));
         assert!(missing.is_err(), "missing launch template fails the create");
+        // `InstanceId` is a launch source of its own.
+        prov.create_resource(&make_resource(
+            "AWS::AutoScaling::AutoScalingGroup",
+            "FromInstance",
+            serde_json::json!({
+                "MinSize": "0", "MaxSize": "1", "DesiredCapacity": "0",
+                "InstanceId": inst.physical_id
+            }),
+        ))
+        .expect("InstanceId-sourced group");
     }
 
     /// A stack MSK cluster rejected for a duplicate name mints no key.

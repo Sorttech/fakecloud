@@ -613,34 +613,22 @@ impl ResourceProvisioner {
                     .collect()
             })
             .unwrap_or_default();
-        // MetadataOptions: only build one when the template supplies the block,
-        // so an instance without it keeps the AWS defaults. Each field falls
-        // back to the DescribeInstances-default when omitted.
+        // MetadataOptions: only the fields the resource sets, so the rest come
+        // from a launch template (or the AWS defaults).
         let metadata_options = props
             .get("MetadataOptions")
-            .and_then(|v| v.as_object())
             .map(|m| {
-                let default = fakecloud_ec2::state::MetadataOptions::default();
-                let get_str = |key: &str, dflt: &str| {
-                    m.get(key)
-                        .and_then(|v| v.as_str())
-                        .map(String::from)
-                        .unwrap_or_else(|| dflt.to_string())
-                };
-                fakecloud_ec2::state::MetadataOptions {
-                    http_tokens: get_str("HttpTokens", &default.http_tokens),
-                    http_endpoint: get_str("HttpEndpoint", &default.http_endpoint),
-                    http_put_response_hop_limit: m
-                        .get("HttpPutResponseHopLimit")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(default.http_put_response_hop_limit),
-                    http_protocol_ipv6: get_str("HttpProtocolIpv6", &default.http_protocol_ipv6),
-                    instance_metadata_tags: get_str(
-                        "InstanceMetadataTags",
-                        &default.instance_metadata_tags,
-                    ),
+                let s = |key: &str| m.get(key).and_then(cfn_scalar);
+                fakecloud_ec2::cfn_provision::CfnMetadataOptions {
+                    http_tokens: s("HttpTokens"),
+                    http_endpoint: s("HttpEndpoint"),
+                    http_put_response_hop_limit: s("HttpPutResponseHopLimit")
+                        .and_then(|v| v.parse().ok()),
+                    http_protocol_ipv6: s("HttpProtocolIpv6"),
+                    instance_metadata_tags: s("InstanceMetadataTags"),
                 }
-            });
+            })
+            .unwrap_or_default();
 
         let (iam_instance_profile_arn, iam_instance_profile_name) = cfn_iam_instance_profile(props);
         // Validate here, the way Associate/Replace do, so a template that
@@ -678,8 +666,8 @@ impl ResourceProvisioner {
             metadata_options,
             // CFN `EbsOptimized` / `Monitoring` are booleans; templates may pass
             // them as JSON bool or the stringified form after Ref resolution.
-            ebs_optimized: prop_bool(props, "EbsOptimized").unwrap_or(false),
-            monitoring: prop_bool(props, "Monitoring").unwrap_or(false),
+            ebs_optimized: prop_bool(props, "EbsOptimized"),
+            monitoring: prop_bool(props, "Monitoring"),
             iam_instance_profile_arn,
             iam_instance_profile_name,
             block_device_params: cfn_block_device_params(props),

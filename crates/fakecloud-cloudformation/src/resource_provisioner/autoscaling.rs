@@ -188,19 +188,21 @@ impl ResourceProvisioner {
     }
 
     /// Validate an `AWS::AutoScaling::AutoScalingGroup`'s launch source as
-    /// CreateAutoScalingGroup does: exactly one of a launch configuration,
-    /// launch template or mixed-instances policy; a named launch configuration
+    /// CreateAutoScalingGroup does: exactly one of an instance id, launch
+    /// configuration, launch template or mixed-instances policy; a named launch configuration
     /// exists; every launch template resolves (recorded with id + name and
     /// `$Default` when no version is given).
     fn validate_asg_launch_source(
         &self,
+        instance_id: Option<&str>,
         launch_configuration: Option<&str>,
         launch_template: Option<&mut LaunchTemplateSpec>,
         mixed: Option<&mut MixedInstancesPolicy>,
     ) -> Result<(), String> {
         let sources = usize::from(launch_configuration.is_some())
             + usize::from(launch_template.is_some())
-            + usize::from(mixed.is_some());
+            + usize::from(mixed.is_some())
+            + usize::from(instance_id.is_some());
         if sources != 1 {
             return Err("Valid requests must contain either LaunchTemplate, \
                         LaunchConfigurationName, InstanceId or MixedInstancesPolicy parameter."
@@ -290,6 +292,7 @@ impl ResourceProvisioner {
         let mut launch_template = parse_cfn_launch_template(props.get("LaunchTemplate"));
         let mut mixed_instances_policy = parse_cfn_mixed_instances_policy(props);
         self.validate_asg_launch_source(
+            prop_str(props, "InstanceId"),
             lcn.as_deref(),
             launch_template.as_mut(),
             mixed_instances_policy.as_mut(),
@@ -387,7 +390,12 @@ impl ResourceProvisioner {
         let new_lc = prop_str(props, "LaunchConfigurationName").map(String::from);
         let mut new_lt = parse_cfn_launch_template(props.get("LaunchTemplate"));
         let mut new_mixed = parse_cfn_mixed_instances_policy(props);
-        self.validate_asg_launch_source(new_lc.as_deref(), new_lt.as_mut(), new_mixed.as_mut())?;
+        self.validate_asg_launch_source(
+            prop_str(props, "InstanceId"),
+            new_lc.as_deref(),
+            new_lt.as_mut(),
+            new_mixed.as_mut(),
+        )?;
 
         let arn = {
             let mut st = self.autoscaling_state.write();

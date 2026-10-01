@@ -101,6 +101,18 @@ pub(crate) fn version_exists(t: &LaunchTemplate, version: i64) -> bool {
     t.versions.contains_key(&version)
 }
 
+/// The newest version that still exists: what `$Latest` resolves to and
+/// `latestVersionNumber` reports. Version numbers keep counting up from
+/// `latest_version` (a deleted newest version is not reused), but `$Latest`
+/// names the highest one left.
+pub(crate) fn latest_existing_version(t: &LaunchTemplate) -> i64 {
+    t.versions
+        .keys()
+        .next_back()
+        .copied()
+        .unwrap_or(t.latest_version)
+}
+
 /// Resolve a version selector (`$Default` / absent, `$Latest`, or a number)
 /// against a template, to a concrete existing version number.
 pub(crate) fn resolve_version(
@@ -110,7 +122,7 @@ pub(crate) fn resolve_version(
     let selector = version.map(str::trim).filter(|v| !v.is_empty());
     let n = match selector {
         None | Some("$Default") => t.default_version,
-        Some("$Latest") => t.latest_version,
+        Some("$Latest") => latest_existing_version(t),
         Some(v) => v.parse::<i64>().map_err(|_| {
             ec2_error(
                 "InvalidLaunchTemplateId.VersionNotFound",
@@ -505,6 +517,15 @@ mod tests {
             ),
             "InvalidParameterCombination"
         );
+    }
+
+    #[test]
+    fn latest_skips_a_deleted_newest_version() {
+        let mut t = template(&[(1, &[]), (2, &[]), (3, &[])], 1);
+        t.versions.remove(&3);
+        let s = state_with(t);
+        let r = resolve_launch_template(&s, None, Some("web"), Some("$Latest")).unwrap();
+        assert_eq!(r.version, 2);
     }
 
     #[test]

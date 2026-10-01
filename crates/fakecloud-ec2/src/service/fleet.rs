@@ -35,7 +35,7 @@ fn lt_xml(t: &LaunchTemplate, tags: &[Tag], owner: &str, region: &str) -> String
             &fakecloud_aws::arn::Arn::global_in(region, "iam", owner, "root").to_string(),
         ),
         t.default_version,
-        t.latest_version,
+        super::launch_template::latest_existing_version(t),
         super::tags::tag_set_xml(tags),
     )
 }
@@ -360,19 +360,6 @@ pub(crate) fn create_launch_template(
     // empty one is wire-invisible and can't be enforced (see require_struct).
     validate_length(&req.query_params, "VersionDescription", 0, 255)?;
     let name = require(&req.query_params, "LaunchTemplateName")?;
-    {
-        let accounts = svc.state.read();
-        if accounts
-            .get(&req.account_id)
-            .is_some_and(|st| st.launch_templates.values().any(|t| t.name == name))
-        {
-            return Err(AwsServiceError::aws_error(
-                http::StatusCode::BAD_REQUEST,
-                "InvalidLaunchTemplateName.AlreadyExistsException",
-                format!("Launch template name already in use: {name}"),
-            ));
-        }
-    }
     let id = gen_id("lt");
     let t = LaunchTemplate {
         id: id.clone(),
@@ -385,6 +372,19 @@ pub(crate) fn create_launch_template(
     let tags = {
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(&req.account_id);
+        // Checked under the same write lock as the insert, so two concurrent
+        // creates of one name cannot both succeed.
+        if state
+            .launch_templates
+            .values()
+            .any(|existing| existing.name == t.name)
+        {
+            return Err(AwsServiceError::aws_error(
+                http::StatusCode::BAD_REQUEST,
+                "InvalidLaunchTemplateName.AlreadyExistsException",
+                format!("Launch template name already in use: {}", t.name),
+            ));
+        }
         crate::service::tags::apply_tag_specifications(
             state,
             &req.query_params,
@@ -703,7 +703,7 @@ pub(crate) fn describe_launch_template_versions(
             .flat_map(|t| {
                 let mut vs = Vec::new();
                 if latest {
-                    vs.push(t.latest_version);
+                    vs.push(super::launch_template::latest_existing_version(t));
                 }
                 if default && !vs.contains(&t.default_version) {
                     vs.push(t.default_version);

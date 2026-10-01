@@ -870,6 +870,16 @@ pub struct LaunchTemplateRef {
     pub version: Option<String>,
 }
 
+/// The `MetadataOptions` fields an `AWS::EC2::Instance` sets.
+#[derive(Debug, Clone, Default)]
+pub struct CfnMetadataOptions {
+    pub http_tokens: Option<String>,
+    pub http_endpoint: Option<String>,
+    pub http_put_response_hop_limit: Option<i64>,
+    pub http_protocol_ipv6: Option<String>,
+    pub instance_metadata_tags: Option<String>,
+}
+
 /// Inputs for a CloudFormation-driven `AWS::EC2::Instance` launch.
 #[derive(Debug, Clone, Default)]
 pub struct CfnInstanceSpec {
@@ -881,14 +891,15 @@ pub struct CfnInstanceSpec {
     pub key_name: Option<String>,
     pub user_data: Option<String>,
     pub private_ip: Option<String>,
-    /// Instance metadata service options (`MetadataOptions`). When present the
-    /// created instance reports these in DescribeInstances, matching a direct
-    /// RunInstances launch with the same options.
-    pub metadata_options: Option<crate::state::MetadataOptions>,
-    /// `EbsOptimized` — reflected in DescribeInstances `<ebsOptimized>`.
-    pub ebs_optimized: bool,
-    /// `Monitoring` — reflected in DescribeInstances `<monitoring><state>`.
-    pub monitoring: bool,
+    /// Instance metadata service options (`MetadataOptions`): only the fields
+    /// the resource sets, so the rest come from the launch template (or the
+    /// AWS defaults), as with a direct RunInstances launch.
+    pub metadata_options: CfnMetadataOptions,
+    /// `EbsOptimized` when the resource sets it (an explicit `false`
+    /// overrides a launch template's `true`).
+    pub ebs_optimized: Option<bool>,
+    /// `Monitoring` when the resource sets it.
+    pub monitoring: Option<bool>,
     /// `IamInstanceProfile` (arn, name). When present, an
     /// `IamInstanceProfileAssociation` is recorded so
     /// DescribeIamInstanceProfileAssociations reflects it, mirroring a direct
@@ -950,30 +961,26 @@ impl CfnInstanceSpec {
         }
         // Only the properties the resource sets: anything left out falls back
         // to the launch template (or the EC2 default).
-        if self.ebs_optimized {
-            p.insert("EbsOptimized".into(), "true".into());
+        if let Some(v) = self.ebs_optimized {
+            p.insert("EbsOptimized".into(), v.to_string());
         }
-        if self.monitoring {
-            p.insert("Monitoring.Enabled".into(), "true".into());
+        if let Some(v) = self.monitoring {
+            p.insert("Monitoring.Enabled".into(), v.to_string());
         }
-        if let Some(m) = &self.metadata_options {
-            p.insert("MetadataOptions.HttpTokens".into(), m.http_tokens.clone());
-            p.insert(
-                "MetadataOptions.HttpEndpoint".into(),
-                m.http_endpoint.clone(),
-            );
-            p.insert(
-                "MetadataOptions.HttpPutResponseHopLimit".into(),
-                m.http_put_response_hop_limit.to_string(),
-            );
-            p.insert(
-                "MetadataOptions.HttpProtocolIpv6".into(),
-                m.http_protocol_ipv6.clone(),
-            );
-            p.insert(
-                "MetadataOptions.InstanceMetadataTags".into(),
-                m.instance_metadata_tags.clone(),
-            );
+        let m = &self.metadata_options;
+        for (key, value) in [
+            ("HttpTokens", m.http_tokens.clone()),
+            ("HttpEndpoint", m.http_endpoint.clone()),
+            (
+                "HttpPutResponseHopLimit",
+                m.http_put_response_hop_limit.map(|v| v.to_string()),
+            ),
+            ("HttpProtocolIpv6", m.http_protocol_ipv6.clone()),
+            ("InstanceMetadataTags", m.instance_metadata_tags.clone()),
+        ] {
+            if let Some(v) = value {
+                p.insert(format!("MetadataOptions.{key}"), v);
+            }
         }
         for (k, v) in &self.tags {
             super::launch_template::add_tag(&mut p, "instance", k, v);
@@ -2769,13 +2776,13 @@ mod modify_tests {
         let spec = CfnInstanceSpec {
             image_id: Some("ami-123".into()),
             instance_type: Some("t3.small".into()),
-            metadata_options: Some(crate::state::MetadataOptions {
-                http_tokens: "required".into(),
-                http_put_response_hop_limit: 3,
+            metadata_options: CfnMetadataOptions {
+                http_tokens: Some("required".into()),
+                http_put_response_hop_limit: Some(3),
                 ..Default::default()
-            }),
-            ebs_optimized: true,
-            monitoring: true,
+            },
+            ebs_optimized: Some(true),
+            monitoring: Some(true),
             iam_instance_profile_name: Some("my-profile".into()),
             ..Default::default()
         };
@@ -3732,6 +3739,44 @@ mod modify_tests {
         assert_eq!(inst.security_group_ids, vec!["sg-tmpl".to_string()]);
         assert_eq!(inst.placement_tenancy.as_deref(), Some("dedicated"));
         assert!(inst.disable_api_termination);
+    }
+
+    #[test]
+    fn cfn_instance_overrides_only_the_fields_it_sets() {
+        let svc = Ec2Service::new();
+        create_lt(
+            &svc,
+            "meta",
+            &[
+                ("ImageId", "ami-1"),
+                ("MetadataOptions.HttpPutResponseHopLimit", "2"),
+                ("MetadataOptions.HttpEndpoint", "enabled"),
+                ("EbsOptimized", "true"),
+                ("Monitoring.Enabled", "true"),
+            ],
+        );
+        let spec = CfnInstanceSpec {
+            launch_template: Some(LaunchTemplateRef {
+                name: Some("meta".into()),
+                ..Default::default()
+            }),
+            metadata_options: CfnMetadataOptions {
+                http_tokens: Some("required".into()),
+                ..Default::default()
+            },
+            ebs_optimized: Some(false),
+            ..Default::default()
+        };
+        let attrs = cfn_create_instance(&svc, "000000000000", "us-east-1", &spec).unwrap();
+        let accounts = svc.state.read();
+        let inst = &accounts.get("000000000000").unwrap().instances[&attrs.instance_id];
+        assert_eq!(inst.metadata_options.http_tokens, "required");
+        assert_eq!(
+            inst.metadata_options.http_put_response_hop_limit, 2,
+            "template kept"
+        );
+        assert!(!inst.ebs_optimized, "explicit false wins");
+        assert!(inst.monitoring, "unset comes from the template");
     }
 
     #[test]

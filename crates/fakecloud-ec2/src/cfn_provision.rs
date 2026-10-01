@@ -13,7 +13,9 @@ use std::sync::Arc;
 use crate::service::instance::{cfn_boot_instance, cfn_create_instance, cfn_terminate_instance};
 use crate::{Ec2Runtime, Ec2Service, SharedEc2State};
 
-pub use crate::service::instance::{CfnInstanceAttrs, CfnInstanceSpec, LaunchTemplateRef};
+pub use crate::service::instance::{
+    CfnInstanceAttrs, CfnInstanceSpec, CfnMetadataOptions, LaunchTemplateRef,
+};
 
 /// Synchronously create a control-plane `AWS::EC2::Instance` record and return
 /// its Ref/GetAtt attributes (instance id, private/public IP, AZ). Launches
