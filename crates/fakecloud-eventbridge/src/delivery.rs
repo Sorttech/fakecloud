@@ -26,9 +26,10 @@ use crate::state::{PutEvent, SharedEventBridgeState};
 /// - `lambda_state` / `logs_state` missing: that target type cannot be
 ///   delivered; dispatch records the attempt in EventBridge's own log and
 ///   emits a `warn!` naming the skipped target.
-/// - `container_runtime` missing (no Docker/Podman/Kubernetes): Lambda
-///   targets are still recorded in Lambda's invocation log but not executed,
-///   with a `warn!`.
+/// - `container_runtime` missing (no Docker/Podman/Kubernetes) while
+///   `lambda_state` is wired: Lambda targets are still recorded in Lambda's
+///   invocation log but not executed, with a `warn!`. Without `lambda_state`
+///   the previous case applies and nothing is recorded in Lambda's log.
 /// - `logs_persist` missing (memory mode): Logs targets are still delivered
 ///   to the log group as normal; there is just no snapshot to write through,
 ///   so nothing is skipped and nothing is warned.
