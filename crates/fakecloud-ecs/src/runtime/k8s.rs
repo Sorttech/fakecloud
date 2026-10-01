@@ -150,7 +150,7 @@ pub(super) struct K8sTaskBackend {
     /// this when the Pod is built.
     pod_config: K8sPodConfig,
     /// task_id -> Pod name, so StopTask/stop_all can find the Pod.
-    pods: RwLock<HashMap<String, String>>,
+    pods: std::sync::Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl std::fmt::Debug for K8sTaskBackend {
@@ -183,7 +183,7 @@ impl K8sTaskBackend {
             ecr_port: env.ecr_port,
             pull_secret: env.pull_secret,
             pod_config,
-            pods: RwLock::new(HashMap::new()),
+            pods: std::sync::Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -213,15 +213,21 @@ impl K8sTaskBackend {
     /// Keep deleting `name` in the background until it is gone (or
     /// [`POD_GONE_RETRY_LIMIT`] passes), for a Pod the runtime gave up
     /// waiting on but must not leave running.
-    fn keep_deleting(&self, name: &str) {
+    /// Once it is gone, `task_id`'s mapping is dropped if it still names it.
+    fn keep_deleting(&self, task_id: &str, name: &str) {
         let client = self.client.clone();
+        let pods = self.pods.clone();
+        let task_id = task_id.to_string();
         let name = name.to_string();
         tokio::spawn(async move {
             let deadline = std::time::Instant::now() + POD_GONE_RETRY_LIMIT;
             loop {
                 client.delete_pod(&name).await;
                 match client.pods().get_opt(&name).await {
-                    Ok(None) => return,
+                    Ok(None) => {
+                        forget_pod(&mut pods.write(), &task_id, &name);
+                        return;
+                    }
                     _ if std::time::Instant::now() >= deadline => {
                         tracing::warn!(pod = %name, "task pod still present after repeated deletes");
                         return;
@@ -296,6 +302,14 @@ impl K8sTaskBackend {
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
+    }
+}
+
+/// Drop `task_id`'s Pod mapping if it still names `pod` (a later Pod for the
+/// task must keep its own).
+fn forget_pod(pods: &mut HashMap<String, String>, task_id: &str, pod: &str) {
+    if pods.get(task_id).is_some_and(|p| p == pod) {
+        pods.remove(task_id);
     }
 }
 
@@ -565,7 +579,7 @@ impl EcsRuntime {
                     // so StopTask / shutdown still reach it, and deletion is
                     // retried in the background until the API server
                     // confirms it (the Pod also keeps its reaper labels).
-                    backend.keep_deleting(&pod_name);
+                    backend.keep_deleting(task_id, &pod_name);
                     return Err(RuntimeError::ContainerStart(format!(
                         "task pod {pod_name} could not be removed for the relaunch without \
                          the credentials initContainer ({reason})"
@@ -1501,6 +1515,15 @@ mod tests {
             }),
             ..Pod::default()
         }
+    }
+
+    #[test]
+    fn forget_pod_only_drops_the_mapping_it_still_owns() {
+        let mut pods = HashMap::from([("t".to_string(), "pod-a".to_string())]);
+        forget_pod(&mut pods, "t", "pod-b");
+        assert_eq!(pods.get("t").map(String::as_str), Some("pod-a"));
+        forget_pod(&mut pods, "t", "pod-a");
+        assert!(pods.is_empty());
     }
 
     #[test]
