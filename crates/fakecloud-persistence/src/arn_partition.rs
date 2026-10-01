@@ -74,7 +74,7 @@ impl ArnPartitionMigration {
     /// treated like a region-less ARN.
     fn target_partition(&self, rest: &[u8]) -> Option<&'static str> {
         let (service, rest) = split_field(rest, |b| {
-            b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'*'
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'*' | b'?')
         })?;
         if service.is_empty() {
             return None;
@@ -99,8 +99,9 @@ impl ArnPartitionMigration {
 
     /// `text` with every ARN token that belongs to another partition
     /// rewritten, borrowed when nothing changes. A token must start the string
-    /// or follow a non-alphanumeric byte (`"`, `/`, `:`, whitespace, ...) and
-    /// look like `arn:aws:<service>:<region>:<account>:` -- free text that
+    /// or follow a non-alphanumeric byte (`"`, `/`, `:`, whitespace, ...) or
+    /// the tail of a backslash escape (`\narn:aws:...` in raw JSON/XML text),
+    /// and look like `arn:aws:<service>:<region>:<account>:` -- free text that
     /// merely contains `arn:aws` is left alone.
     pub fn rewrite_str<'a>(&self, text: &'a str) -> Cow<'a, str> {
         let bytes = text.as_bytes();
@@ -110,7 +111,7 @@ impl ArnPartitionMigration {
         while let Some(found) = text[from..].find(ARN_PREFIX) {
             let start = from + found;
             from = start + ARN_PREFIX.len();
-            if start > 0 && bytes[start - 1].is_ascii_alphanumeric() {
+            if !at_token_start(bytes, start) {
                 continue;
             }
             let Some(partition) = self.target_partition(&bytes[from..]) else {
@@ -222,6 +223,18 @@ impl ArnPartitionMigration {
     }
 }
 
+/// Whether an ARN token starting at `start` begins a token: at the start of
+/// the text, after a non-alphanumeric byte, or after a backslash escape such
+/// as `\n` / `\t`, which raw (still-escaped) JSON or XML text puts right
+/// before a value's first character.
+fn at_token_start(bytes: &[u8], start: usize) -> bool {
+    match start {
+        0 => true,
+        1 => !bytes[0].is_ascii_alphanumeric(),
+        _ => !bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 2] == b'\\',
+    }
+}
+
 /// Split `bytes` at the first `:`, requiring every byte before it to satisfy
 /// `allowed` or belong to a `${...}` variable (an IAM policy variable such as
 /// `${aws:PrincipalAccount}`, or a CloudFormation `Fn::Sub` reference such as
@@ -302,8 +315,23 @@ fn opaque_keys_for(service_dir: &str) -> &'static [&'static str] {
 
 /// Object and multipart-upload sidecar fields that are customer data: the
 /// object key (its directory on disk is derived from it, so rewriting the
-/// field would strand the object), user metadata and object tags.
-const S3_OBJECT_OPAQUE_KEYS: &[&str] = &["key", "metadata", "tags"];
+/// field would strand the object), user metadata, object tags and the
+/// client-supplied object headers.
+const S3_OBJECT_OPAQUE_KEYS: &[&str] = &[
+    "key",
+    "metadata",
+    "tags",
+    // A multipart upload's tags, as the `x-amz-tagging` query string.
+    "tagging",
+    // Headers the client supplied with the object, returned verbatim.
+    "content_type",
+    "content_encoding",
+    "cache_control",
+    "content_disposition",
+    "content_language",
+    "expires",
+    "website_redirect_location",
+];
 
 /// What [`migrate_data_dir`] did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

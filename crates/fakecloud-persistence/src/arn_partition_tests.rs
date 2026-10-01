@@ -849,3 +849,85 @@ fn a_failed_rewrite_fails_the_migration_instead_of_being_skipped() {
         r#"{"arn":"arn:aws-cn:sqs:cn-north-1:1:q"}"#
     );
 }
+
+#[test]
+fn service_field_question_mark_wildcard_is_a_pattern() {
+    // Regression: `?` was accepted in the region and account fields but not
+    // the service field, so such a pattern kept matching only `arn:aws:`.
+    let m = cn();
+    assert_eq!(
+        rewrite(&m, "arn:aws:sq?:cn-north-1:1:q"),
+        "arn:aws-cn:sq?:cn-north-1:1:q"
+    );
+    assert_eq!(rewrite(&m, "arn:aws:s?:::b"), "arn:aws-cn:s?:::b");
+}
+
+#[test]
+fn text_rewrite_accepts_an_arn_behind_an_escape() {
+    // Regression: bucket subresource payloads are rewritten as raw text, where
+    // `\narn:aws:...` puts `n` before the token. The pre-check accepted the
+    // file but the rewrite skipped the token, and the directory was marked
+    // migrated with the stale ARN.
+    let m = cn();
+    let raw = r#"{"Resource":["a\narn:aws:s3:::b/*","\tarn:aws:sns:cn-north-1:1:t"]}"#;
+    assert_eq!(
+        rewrite(&m, raw),
+        r#"{"Resource":["a\narn:aws-cn:s3:::b/*","\tarn:aws-cn:sns:cn-north-1:1:t"]}"#
+    );
+
+    let tmp = legacy_dir();
+    let dir = tmp.path();
+    let policy = dir.join("s3/buckets/b/policy.toml");
+    write(&policy, raw);
+    migrate_data_dir(dir, "cn-north-1").unwrap();
+    assert!(!read(&policy).contains("arn:aws:"), "{}", read(&policy));
+    assert!(crate::version::arn_partitions_migrated(dir).unwrap());
+}
+
+#[test]
+fn multipart_upload_tagging_and_object_headers_are_kept_verbatim() {
+    // Regression: a multipart upload stores its tags as `tagging`, which was
+    // rewritten although object `tags` were kept.
+    let tmp = legacy_dir();
+    let dir = tmp.path();
+    let init = dir.join("s3/buckets/b/mpu/u1/init.toml");
+    write(
+        &init,
+        "key = \"k\"\n\
+         tagging = \"owner=arn%3Aaws%3Aiam%3A%3A1%3Arole%2Fx&src=arn:aws:sns:cn-north-1:1:t\"\n\
+         content_disposition = \"attachment; filename=arn:aws:iam::1:role/x\"\n\
+         sse_kms_key_id = \"arn:aws:kms:cn-north-1:1:key/k\"\n",
+    );
+    let object = dir.join("s3/buckets/b/objects/k/null.toml");
+    write(
+        &object,
+        "key = \"k\"\n\
+         website_redirect_location = \"/arn:aws:iam::1:role/x\"\n\
+         sse_kms_key_id = \"arn:aws:kms:cn-north-1:1:key/k\"\n",
+    );
+
+    migrate_data_dir(dir, "cn-north-1").unwrap();
+
+    let init: toml::Table = read(&init).parse().unwrap();
+    assert_eq!(
+        init["tagging"].as_str(),
+        Some("owner=arn%3Aaws%3Aiam%3A%3A1%3Arole%2Fx&src=arn:aws:sns:cn-north-1:1:t")
+    );
+    assert_eq!(
+        init["content_disposition"].as_str(),
+        Some("attachment; filename=arn:aws:iam::1:role/x")
+    );
+    assert_eq!(
+        init["sse_kms_key_id"].as_str(),
+        Some("arn:aws-cn:kms:cn-north-1:1:key/k")
+    );
+    let object: toml::Table = read(&object).parse().unwrap();
+    assert_eq!(
+        object["website_redirect_location"].as_str(),
+        Some("/arn:aws:iam::1:role/x")
+    );
+    assert_eq!(
+        object["sse_kms_key_id"].as_str(),
+        Some("arn:aws-cn:kms:cn-north-1:1:key/k")
+    );
+}
