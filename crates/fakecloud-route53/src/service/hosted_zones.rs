@@ -74,6 +74,24 @@ impl Route53Service {
             .as_ref()
             .and_then(|c| c.comment.clone());
 
+        // A private zone's VPC must belong to the caller. When EC2 knows the
+        // VPC, its owning account is authoritative.
+        if let Some(vpc) = &cfg.vpc {
+            if let Some(owner) = self.known_vpc_owner(vpc) {
+                if owner != req.account_id {
+                    return Err(aws_error(
+                        StatusCode::BAD_REQUEST,
+                        "InvalidVPCId",
+                        format!(
+                            "The VPC {} does not belong to account {}.",
+                            vpc.vpc_id.as_deref().unwrap_or_default(),
+                            req.account_id
+                        ),
+                    ));
+                }
+            }
+        }
+
         let mut state = self.state.write();
         let id = state.unused_zone_id();
         let account = state.accounts.entry(req.account_id.clone()).or_default();

@@ -2543,6 +2543,20 @@ mod tests {
                 .0,
             StatusCode::OK
         );
+        // A cannot create a private zone on B's VPC either.
+        let (status, out) = call(
+            &svc,
+            account_req(
+                ACCOUNT_A,
+                http::Method::POST,
+                "/2013-04-01/hostedzone",
+                &[],
+                &private_zone_body("other.example.", "ref-k2", "vpc-bbb"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{out}");
+        assert!(out.contains("<Code>InvalidVPCId</Code>"), "{out}");
 
         // C names B's VPC: refused although the VPC is authorized.
         let (status, out) = call(&svc, associate_req(ACCOUNT_C, &zid, "vpc-bbb")).await;

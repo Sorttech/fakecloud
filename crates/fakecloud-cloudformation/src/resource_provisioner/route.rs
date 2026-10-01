@@ -11,8 +11,7 @@ impl ResourceProvisioner {
     /// Refuse a reference to a hosted zone another account owns: a stack's
     /// record sets, DNSSEC and key-signing keys can only use zones in the
     /// stack's own account. Unlike a zone that is not provisioned yet, this
-    /// never resolves on a later pass, and deleting must not silently skip a
-    /// record that lives in the other account's zone.
+    /// never resolves on a later pass, so it is reported as such.
     fn require_own_zone(
         &self,
         accounts: &fakecloud_route53::Route53Accounts,
@@ -26,6 +25,19 @@ impl ResourceProvisioner {
             )),
             _ => Ok(()),
         }
+    }
+
+    /// The account whose bucket holds `zone_id` for a delete: its owner when
+    /// it exists anywhere, else the stack's account. New stacks can only put
+    /// records, DNSSEC and KSKs in their own zones, but a snapshot from before
+    /// Route 53 was account-scoped may have a stack's record in a zone that
+    /// migration gave to another account; deleting the stack removes what it
+    /// created there rather than skipping it or failing forever.
+    fn zone_home(&self, accounts: &fakecloud_route53::Route53Accounts, zone_id: &str) -> String {
+        accounts
+            .zone_owner(zone_id)
+            .unwrap_or(&self.account_id)
+            .to_string()
     }
 
     pub(super) fn create_route53_hosted_zone(
@@ -64,6 +76,24 @@ impl ResourceProvisioner {
             })
             .unwrap_or_default();
 
+        // A private zone's VPCs must belong to the stack's account, as
+        // `CreateHostedZone` requires (VPCs EC2 does not know are accepted).
+        {
+            let ec2 = self.ec2_state.read();
+            for vpc in &vpcs {
+                let id = vpc.vpc_id.as_deref().unwrap_or_default();
+                if let Some((owner, _)) = ec2
+                    .iter()
+                    .find(|(_, st)| st.vpcs.contains_key(id))
+                    .filter(|(owner, _)| *owner != self.account_id)
+                {
+                    return Err(format!(
+                        "InvalidVPCId: The VPC {id} belongs to account {owner}, not {}",
+                        self.account_id
+                    ));
+                }
+            }
+        }
         // Same zone `CreateHostedZone` stores (name servers, default SOA + NS
         // record sets), under the stack's account, with a globally unique id.
         let mut accounts = self.route53_state.write();
@@ -305,8 +335,8 @@ impl ResourceProvisioner {
         let set_identifier = parts.get(3).map(|s| s.to_string());
 
         let mut accounts = self.route53_state.write();
-        self.require_own_zone(&accounts, zone_id)?;
-        let state = accounts.entry(&self.account_id);
+        let home = self.zone_home(&accounts, zone_id);
+        let state = accounts.entry(&home);
         if let Some(zone) = state.hosted_zones.get_mut(zone_id) {
             zone.resource_record_sets.retain(|r| {
                 !(r.name == name
@@ -514,8 +544,8 @@ impl ResourceProvisioner {
 
     pub(super) fn delete_route53_dnssec(&self, physical_id: &str) -> Result<(), String> {
         let mut accounts = self.route53_state.write();
-        self.require_own_zone(&accounts, physical_id)?;
-        let state = accounts.entry(&self.account_id);
+        let home = self.zone_home(&accounts, physical_id);
+        let state = accounts.entry(&home);
         state.dnssec_status.remove(physical_id);
         Ok(())
     }
@@ -598,8 +628,8 @@ impl ResourceProvisioner {
             None => return Ok(()),
         };
         let mut accounts = self.route53_state.write();
-        self.require_own_zone(&accounts, zone_id)?;
-        let state = accounts.entry(&self.account_id);
+        let home = self.zone_home(&accounts, zone_id);
+        let state = accounts.entry(&home);
         state
             .key_signing_keys
             .remove(&(zone_id.to_string(), name.to_string()));

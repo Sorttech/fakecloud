@@ -7122,8 +7122,9 @@ mod tests {
             assert!(err.contains("No hosted zone found"), "{rtype}: {err}");
         }
 
-        // A record the owner's stack put in the zone: deleting it from the
-        // other account's stack fails instead of silently leaving it behind.
+        // A record a pre-scoping stack in the other account put in the zone
+        // (legacy shared bucket): deleting that stack removes it from the
+        // zone's owner instead of skipping it or failing forever.
         let rec = owner
             .create_resource(&make_resource(
                 "AWS::Route53::RecordSet",
@@ -7134,13 +7135,42 @@ mod tests {
                 }),
             ))
             .unwrap();
-        let err = other.delete_resource(&rec).unwrap_err();
-        assert!(err.contains("No hosted zone found"), "{err}");
+        other.delete_resource(&rec).unwrap();
         let accounts = owner.route53_state.read();
         assert!(accounts.get(&owner.account_id).unwrap().hosted_zones[&zid]
             .resource_record_sets
             .iter()
-            .any(|r| r.record_type == "A"));
+            .all(|r| r.record_type != "A"));
+    }
+
+    #[test]
+    fn route53_private_zone_refuses_another_accounts_vpc() {
+        let owner = make_provisioner();
+        let vpc = owner
+            .create_resource(&make_resource(
+                "AWS::EC2::VPC",
+                "Vpc",
+                serde_json::json!({"CidrBlock": "10.9.0.0/16"}),
+            ))
+            .unwrap();
+        let mut other = make_second_account_provisioner();
+        other.ec2_state = owner.ec2_state.clone();
+        let props = serde_json::json!({
+            "Name": "internal.example.com",
+            "VPCs": [{"VPCId": vpc.physical_id, "VPCRegion": "us-east-1"}]
+        });
+        let err = other
+            .create_resource(&make_resource(
+                "AWS::Route53::HostedZone",
+                "Z",
+                props.clone(),
+            ))
+            .unwrap_err();
+        assert!(err.contains("InvalidVPCId"), "{err}");
+        // The VPC's owner may.
+        owner
+            .create_resource(&make_resource("AWS::Route53::HostedZone", "Z", props))
+            .unwrap();
     }
 
     #[test]
