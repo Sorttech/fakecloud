@@ -268,7 +268,11 @@ impl EcsRuntime {
     pub(crate) async fn ensure_creds_helper_image(&self) -> Result<String, String> {
         let mut cached = self.creds_helper_image.lock().await;
         match cached.as_ref() {
-            Some(HelperImage::Ready(image)) => return Ok(image.clone()),
+            // Re-check: the image can be pruned while fakecloud runs, and a
+            // holder `run` would then try to pull the local-only tag.
+            Some(HelperImage::Ready(image)) if self.image_present(image).await => {
+                return Ok(image.clone());
+            }
             // Don't make every task-role launch repeat a build/pull that just
             // failed (with its retries and backoff) before falling back.
             Some(HelperImage::Failed { error, at }) if at.elapsed() < HELPER_RETRY_AFTER => {
@@ -594,8 +598,20 @@ mod tests {
             rt.ensure_creds_helper_image().await,
             Err("pull failed".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn a_cached_helper_image_that_is_gone_is_resolved_again() {
+        // No container CLI: the cached image can't be found, so the runtime
+        // tries to resolve it again (and remembers that failure) instead of
+        // handing out a tag the holder `run` would fail to pull.
+        let rt = EcsRuntime::bare_for_tests();
         *rt.creds_helper_image.lock().await = Some(HelperImage::Ready("helper:1".into()));
-        assert_eq!(rt.ensure_creds_helper_image().await, Ok("helper:1".into()));
+        assert!(rt.ensure_creds_helper_image().await.is_err());
+        assert!(matches!(
+            *rt.creds_helper_image.lock().await,
+            Some(HelperImage::Failed { .. })
+        ));
     }
 
     #[test]

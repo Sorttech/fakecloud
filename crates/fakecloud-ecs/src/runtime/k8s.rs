@@ -61,9 +61,9 @@ const POD_PREFIX: &str = "fakecloud-ecs";
 /// relaunched without it (covers its image pull).
 const CREDS_INIT_TIMEOUT: Duration = Duration::from_secs(180);
 
-/// How long the credentials wait lets a task Pod go without its
-/// initContainer reaching a node before deferring to the task's own start
-/// deadline.
+/// How long a task-role Pod may go without its credentials initContainer
+/// reaching a node before the task fails to start (the same budget the
+/// task's own start deadline gives a Pod).
 const UNSCHEDULED_LIMIT: Duration = Duration::from_secs(300);
 
 /// Waiting reasons that mean a container will never start on its own.
@@ -207,7 +207,7 @@ impl K8sTaskBackend {
     /// Wait for the task Pod's credentials initContainer to install its NAT
     /// rule. `Err` says why it won't; a Pod that is gone (StopTask) is left to
     /// the caller's wait loop.
-    async fn wait_for_creds_init(&self, pod_name: &str) -> Result<(), String> {
+    async fn wait_for_creds_init(&self, pod_name: &str) -> Result<(), CredsInitError> {
         let api = self.client.pods();
         // The initContainer's own budget starts once the kubelet has it: a
         // Pod waiting to be scheduled (autoscaling, quota, volumes) is not a
@@ -218,7 +218,7 @@ impl K8sTaskBackend {
             let pod = match api.get(pod_name).await {
                 Ok(p) => p,
                 Err(e) if is_not_found(&e) => return Ok(()),
-                Err(e) => return Err(format!("get pod {pod_name}: {e}")),
+                Err(e) => return Err(CredsInitError::Fallback(format!("get pod {pod_name}: {e}"))),
             };
             match creds_init_outcome(&pod) {
                 CredsInitOutcome::Ready => return Ok(()),
@@ -228,7 +228,10 @@ impl K8sTaskBackend {
                         .pod_logs(pod_name, Some(task_creds::K8S_INIT_CONTAINER))
                         .await
                         .unwrap_or_default();
-                    return Err(format!("{reason}: {}", logs.trim()));
+                    return Err(CredsInitError::Fallback(format!(
+                        "{reason}: {}",
+                        logs.trim()
+                    )));
                 }
                 CredsInitOutcome::Pending => {}
             }
@@ -237,20 +240,29 @@ impl K8sTaskBackend {
                 deadline = Some(now + CREDS_INIT_TIMEOUT);
             }
             if deadline.is_none() && now >= created + UNSCHEDULED_LIMIT {
-                // Never reached a node: leave the Pod to the task's own start
-                // deadline rather than relaunching it without credentials.
-                return Ok(());
+                // Never reached a node: the task can't start at all, with or
+                // without the credentials route.
+                return Err(CredsInitError::NotScheduled);
             }
             if deadline.is_some_and(|d| now >= d) {
-                return Err(format!(
+                return Err(CredsInitError::Fallback(format!(
                     "{} did not finish within {}s",
                     task_creds::K8S_INIT_CONTAINER,
                     CREDS_INIT_TIMEOUT.as_secs()
-                ));
+                )));
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
+}
+
+/// Why a task Pod's credentials initContainer did not get it running.
+#[derive(Debug, PartialEq, Eq)]
+enum CredsInitError {
+    /// The initContainer failed: relaunch the task without it.
+    Fallback(String),
+    /// The Pod never reached a node within the start deadline.
+    NotScheduled,
 }
 
 /// Where a task Pod's credentials initContainer stands.
@@ -444,12 +456,24 @@ impl EcsRuntime {
                 // Admission refused the Pod (typically NET_ADMIN under a
                 // restrictive Pod Security level).
                 Err(e) => fallback_reason = Some(format!("task pod refused: {e}")),
-                Ok(()) => {
-                    if let Err(reason) = backend.wait_for_creds_init(&pod_name).await {
+                Ok(()) => match backend.wait_for_creds_init(&pod_name).await {
+                    Ok(()) => {}
+                    Err(CredsInitError::Fallback(reason)) => {
                         backend.client.delete_pod(&pod_name).await;
                         fallback_reason = Some(reason);
                     }
-                }
+                    // Same outcome as the start deadline below: a relaunch
+                    // without the initContainer would not schedule either.
+                    Err(CredsInitError::NotScheduled) => {
+                        mark_pull_stopped(state, account_id, task_id);
+                        backend.client.delete_pod(&pod_name).await;
+                        backend.pods.write().remove(task_id);
+                        return Err(RuntimeError::ContainerStart(format!(
+                            "task pod {pod_name} did not start within {}s",
+                            UNSCHEDULED_LIMIT.as_secs()
+                        )));
+                    }
+                },
             }
         }
         if let Some(reason) = fallback_reason {
