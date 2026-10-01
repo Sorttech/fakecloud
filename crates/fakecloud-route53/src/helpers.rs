@@ -904,7 +904,14 @@ impl Route53Service {
                 ),
             ));
         }
-        zone.vpcs.push(vpc);
+        zone.vpcs.push(vpc.clone());
+        if cross_account {
+            zone_account
+                .cross_account_vpcs
+                .entry(id.clone())
+                .or_default()
+                .push((vpc, route.account.clone()));
+        }
         let now = Utc::now();
         let change_id = generate_change_id();
         let change = StoredChange {
@@ -949,14 +956,21 @@ impl Route53Service {
             .map(str::to_string)
             .ok_or_else(|| no_such_hosted_zone(&id))?;
         let cross_account = owner != route.account;
-        let zone = state
-            .entry(&owner)
+        let zone_account = state.entry(&owner);
+        // Another account may only remove a VPC it associated itself (the
+        // VPC it owns), never the zone owner's or a third account's.
+        if cross_account
+            && !zone_account.cross_account_vpcs.get(&id).is_some_and(|vs| {
+                vs.iter()
+                    .any(|(v, acct)| same_vpc(v, &vpc) && *acct == route.account)
+            })
+        {
+            return Err(not_authorized_vpc_association(&vpc, &id));
+        }
+        let zone = zone_account
             .hosted_zones
             .get_mut(&id)
             .ok_or_else(|| no_such_hosted_zone(&id))?;
-        if cross_account && !zone.vpcs.iter().any(|v| same_vpc(v, &vpc)) {
-            return Err(not_authorized_vpc_association(&vpc, &id));
-        }
         let Some(pos) = zone.vpcs.iter().position(|v| same_vpc(v, &vpc)) else {
             return Err(aws_error(
                 StatusCode::NOT_FOUND,
@@ -975,6 +989,12 @@ impl Route53Service {
             ));
         }
         zone.vpcs.remove(pos);
+        if let Some(assoc) = zone_account.cross_account_vpcs.get_mut(&id) {
+            assoc.retain(|(v, _)| !same_vpc(v, &vpc));
+            if assoc.is_empty() {
+                zone_account.cross_account_vpcs.remove(&id);
+            }
+        }
         let now = Utc::now();
         let change_id = generate_change_id();
         let change = StoredChange {
@@ -1165,15 +1185,27 @@ impl Route53Service {
             .cloned()
             .ok_or_else(|| invalid_argument("vpcregion query parameter is required"))?;
         let state = self.state.read();
-        // Every private zone the VPC is associated with, whichever account
-        // owns it (cross-account associations included), with its owner.
+        // Every private zone the caller's VPC is associated with, whichever
+        // account owns it, with its owner: the caller's own zones, plus other
+        // accounts' zones the caller associated the VPC with. Another
+        // account's zones associated with some other account's VPC of the
+        // same id stay hidden.
+        let matches = |v: &VPC| {
+            v.vpc_id.as_deref() == Some(vpc_id.as_str())
+                && v.vpc_region.as_deref() == Some(vpc_region.as_str())
+        };
         let mut summaries: Vec<(String, String, String)> = Vec::new();
         for (owner, account) in &state.accounts {
             for z in account.hosted_zones.values() {
-                if z.vpcs.iter().any(|v| {
-                    v.vpc_id.as_deref() == Some(vpc_id.as_str())
-                        && v.vpc_region.as_deref() == Some(vpc_region.as_str())
-                }) {
+                let visible = if *owner == req.account_id {
+                    z.vpcs.iter().any(matches)
+                } else {
+                    account.cross_account_vpcs.get(&z.id).is_some_and(|vs| {
+                        vs.iter()
+                            .any(|(v, acct)| matches(v) && *acct == req.account_id)
+                    }) && z.vpcs.iter().any(matches)
+                };
+                if visible {
                     summaries.push((z.id.clone(), z.name.clone(), owner.clone()));
                 }
             }

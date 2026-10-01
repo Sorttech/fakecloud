@@ -76,6 +76,7 @@ impl ResourceProvisioner {
         let mut accounts = self.route53_state.write();
         let state = accounts.entry(&self.account_id);
         state.hosted_zones.remove(physical_id);
+        state.cross_account_vpcs.remove(physical_id);
         Ok(())
     }
 

@@ -169,6 +169,7 @@ impl Route53Accounts {
             cidr_collections,
             reusable_delegation_sets,
             vpc_authorizations,
+            cross_account_vpcs,
             tags,
         } = legacy;
         let owner = |map: &BTreeMap<String, String>, id: &str| -> String {
@@ -195,7 +196,23 @@ impl Route53Accounts {
                 .or_insert(hc);
         }
         for (id, instance) in traffic_policy_instances {
-            self.entry(&zone_owner(&instance.hosted_zone_id))
+            let account = zone_owner(&instance.hosted_zone_id);
+            if account != default_account {
+                // The instance's policy was created through the API (stacks
+                // provision no traffic policies), so it stays in the default
+                // account; the instance's new account gets a copy of every
+                // version so the instance still resolves its policy there.
+                let bucket = self.entry(&account);
+                for (key, policy) in &traffic_policies {
+                    if key.0 == instance.traffic_policy_id {
+                        bucket
+                            .traffic_policies
+                            .entry(key.clone())
+                            .or_insert_with(|| policy.clone());
+                    }
+                }
+            }
+            self.entry(&account)
                 .traffic_policy_instances
                 .entry(id)
                 .or_insert(instance);
@@ -224,6 +241,12 @@ impl Route53Accounts {
                 .entry(id)
                 .or_insert(vpcs);
         }
+        for (id, vpcs) in cross_account_vpcs {
+            self.entry(&zone_owner(&id))
+                .cross_account_vpcs
+                .entry(id)
+                .or_insert(vpcs);
+        }
         for (key, value) in tags {
             let account = match key.0.as_str() {
                 "hostedzone" => zone_owner(&key.1),
@@ -232,7 +255,9 @@ impl Route53Accounts {
             };
             self.entry(&account).tags.entry(key).or_insert(value);
         }
-        // Account-level resources with no zone: always API-created.
+        // Account-level resources with no zone: always API-created. (A stack's
+        // zone never references a reusable delegation set: the provisioner
+        // creates zones without one.)
         let default = self.entry(default_account);
         for (id, change) in changes {
             default.changes.entry(id).or_insert(change);
@@ -302,6 +327,13 @@ pub struct AccountState {
     pub reusable_delegation_sets: BTreeMap<String, StoredReusableDelegationSet>,
     /// Per-zone authorized cross-account VPCs that may be associated next.
     pub vpc_authorizations: BTreeMap<String, Vec<VPC>>,
+    /// Per-zone VPCs another account associated with this account's zone
+    /// (cross-account `AssociateVPCWithHostedZone`), each paired with the
+    /// associating (VPC-owning) account. That account may disassociate the
+    /// VPC again and sees the zone in `ListHostedZonesByVPC`; no other
+    /// account may.
+    #[serde(default)]
+    pub cross_account_vpcs: BTreeMap<String, Vec<(VPC, String)>>,
     /// Tag bag keyed by `(resource_type, resource_id)`. Both supported
     /// resource types ("healthcheck", "hostedzone") share the bag; the
     /// resource-type discriminator is in the key tuple.
@@ -554,6 +586,33 @@ mod snapshot_migration_tests {
         legacy
             .tags
             .insert(("hostedzone".into(), "ZAPI".into()), BTreeMap::new());
+        legacy.traffic_policies.insert(
+            ("tp-1".into(), 1),
+            StoredTrafficPolicy {
+                id: "tp-1".into(),
+                version: 1,
+                name: "p".into(),
+                policy_type: "A".into(),
+                document: "{}".into(),
+                comment: None,
+                created_time: Utc::now(),
+            },
+        );
+        legacy.traffic_policy_instances.insert(
+            "tpi-1".into(),
+            StoredTrafficPolicyInstance {
+                id: "tpi-1".into(),
+                hosted_zone_id: "ZSTACK".into(),
+                name: "www.example.com.".into(),
+                ttl: 60,
+                state: "Applied".into(),
+                message: String::new(),
+                traffic_policy_id: "tp-1".into(),
+                traffic_policy_version: 1,
+                traffic_policy_type: "A".into(),
+                created_time: Utc::now(),
+            },
+        );
         legacy.changes.insert(
             "C1".into(),
             StoredChange::pending("C1".into(), Utc::now(), None),
@@ -609,12 +668,21 @@ mod snapshot_migration_tests {
             .tags
             .contains_key(&("healthcheck".to_string(), "hc-stack".to_string())));
         assert!(!stack.hosted_zones.contains_key("ZAPI"));
+        // A traffic policy instance follows its zone and keeps resolving its
+        // policy there.
+        assert!(stack.traffic_policy_instances.contains_key("tpi-1"));
+        assert!(stack
+            .traffic_policies
+            .contains_key(&("tp-1".to_string(), 1)));
 
         // Everything else was API-created and belongs to the default account.
         let default = accounts.get(DEFAULT).expect("default account bucket");
         assert!(default.hosted_zones.contains_key("ZAPI"));
         assert!(default.health_checks.contains_key("hc-api"));
         assert!(default.changes.contains_key("C1"));
+        assert!(default
+            .traffic_policies
+            .contains_key(&("tp-1".to_string(), 1)));
         assert!(default
             .tags
             .contains_key(&("hostedzone".to_string(), "ZAPI".to_string())));

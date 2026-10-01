@@ -2378,19 +2378,62 @@ mod tests {
             .len();
         assert_eq!(vpcs, 2);
 
-        // The VPC owner may disassociate its VPC again.
-        let (status, out) = call(
+        // Another account sees none of this through the same VPC id.
+        let (_, out) = call(
             &svc,
             account_req(
-                ACCOUNT_B,
-                http::Method::POST,
-                &format!("/2013-04-01/hostedzone/{zid}/disassociatevpc"),
-                &[],
-                &vpc_body("DisassociateVPCFromHostedZoneRequest", "vpc-bbb"),
+                "333333333333",
+                http::Method::GET,
+                "/2013-04-01/hostedzonesbyvpc",
+                &[("vpcid", "vpc-bbb"), ("vpcregion", "us-east-1")],
+                "",
             ),
         )
         .await;
+        assert!(!out.contains(&zid), "{out}");
+        // B does not see A's zone through A's own VPC either.
+        let (_, out) = call(
+            &svc,
+            account_req(
+                ACCOUNT_B,
+                http::Method::GET,
+                "/2013-04-01/hostedzonesbyvpc",
+                &[("vpcid", "vpc-aaa"), ("vpcregion", "us-east-1")],
+                "",
+            ),
+        )
+        .await;
+        assert!(!out.contains(&zid), "{out}");
+
+        // B cannot remove A's own VPC from A's zone.
+        let disassociate = |account: &str, vpc: &str| {
+            account_req(
+                account,
+                http::Method::POST,
+                &format!("/2013-04-01/hostedzone/{zid}/disassociatevpc"),
+                &[],
+                &vpc_body("DisassociateVPCFromHostedZoneRequest", vpc),
+            )
+        };
+        let (status, out) = call(&svc, disassociate(ACCOUNT_B, "vpc-aaa")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{out}");
+        // Nor can a third account remove B's.
+        let (status, _) = call(&svc, disassociate("333333333333", "vpc-bbb")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // The VPC owner may disassociate its VPC again.
+        let (status, out) = call(&svc, disassociate(ACCOUNT_B, "vpc-bbb")).await;
         assert_eq!(status, StatusCode::OK, "{out}");
+        assert!(svc
+            .state
+            .read()
+            .get(ACCOUNT_A)
+            .unwrap()
+            .cross_account_vpcs
+            .is_empty());
+        // Once disassociated, B can no longer touch the zone.
+        let (status, _) = call(&svc, disassociate(ACCOUNT_B, "vpc-bbb")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     #[test]
