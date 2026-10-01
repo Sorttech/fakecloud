@@ -297,6 +297,10 @@ pub struct EniAttachment {
     pub device_index: i64,
     /// `attaching` | `attached` | `detaching` | `detached`.
     pub status: String,
+    /// Whether terminating the instance deletes the interface (true for one
+    /// RunInstances created) rather than detaching it.
+    #[serde(default)]
+    pub delete_on_termination: bool,
 }
 
 /// An elastic network interface.
@@ -414,6 +418,10 @@ pub struct Instance {
     /// `privateDnsNameOptions.enableResourceNameDnsAAAARecord`.
     #[serde(default)]
     pub enable_resource_name_dns_aaaa_record: bool,
+    /// `instanceLifecycle`: `spot` for an instance launched with
+    /// `InstanceMarketOptions.MarketType=spot`, `None` for on-demand.
+    #[serde(default)]
+    pub instance_lifecycle: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -2397,6 +2405,7 @@ mod tests {
             private_dns_hostname_type: Some("resource-name".to_string()),
             enable_resource_name_dns_a_record: true,
             enable_resource_name_dns_aaaa_record: false,
+            instance_lifecycle: None,
         }
     }
 

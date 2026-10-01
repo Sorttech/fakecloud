@@ -13,20 +13,25 @@ use std::sync::Arc;
 use crate::service::instance::{cfn_boot_instance, cfn_create_instance, cfn_terminate_instance};
 use crate::{Ec2Runtime, Ec2Service, SharedEc2State};
 
-pub use crate::service::instance::{CfnInstanceAttrs, CfnInstanceSpec};
+pub use crate::service::instance::{
+    CfnInstanceAttrs, CfnInstanceSpec, CfnMetadataOptions, LaunchTemplateRef,
+};
 
 /// Synchronously create a control-plane `AWS::EC2::Instance` record and return
-/// its Ref/GetAtt attributes (instance id, private/public IP, AZ).
-/// `kms_hook` resolves the keys of encrypted block-device volumes.
+/// its Ref/GetAtt attributes (instance id, private/public IP, AZ). Launches
+/// through the RunInstances path, so a `LaunchTemplate` is resolved and merged
+/// exactly as a direct launch does; an unknown template or version is the
+/// returned error. `kms_hook` resolves the keys of encrypted block-device
+/// volumes.
 pub fn cfn_create(
     state: SharedEc2State,
     kms_hook: Option<Arc<dyn fakecloud_core::delivery::KmsHook>>,
     account_id: &str,
     region: &str,
     spec: &CfnInstanceSpec,
-) -> CfnInstanceAttrs {
+) -> Result<CfnInstanceAttrs, String> {
     let svc = Ec2Service::with_state(state).with_kms_hook(kms_hook);
-    cfn_create_instance(&svc, account_id, region, spec)
+    cfn_create_instance(&svc, account_id, region, spec).map_err(|e| e.message())
 }
 
 /// Boot the REAL backing container for a CFN-created instance and reconcile it

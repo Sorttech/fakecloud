@@ -69,7 +69,60 @@ pub struct LaunchConfiguration {
     pub spot_price: Option<String>,
     #[serde(default)]
     pub placement_tenancy: Option<String>,
+    /// `BlockDeviceMappings`: the EBS volumes every instance launched from
+    /// this configuration gets.
+    #[serde(default)]
+    pub block_device_mappings: Vec<BlockDeviceMapping>,
+    /// `MetadataOptions` (instance metadata service settings).
+    #[serde(default)]
+    pub metadata_options: Option<InstanceMetadataOptions>,
+    /// The instance an `InstanceId`-sourced group derived this configuration
+    /// from (`None` for one created directly).
+    #[serde(default)]
+    pub source_instance_id: Option<String>,
     pub created_time: DateTime<Utc>,
+}
+
+/// A launch configuration block-device mapping.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockDeviceMapping {
+    pub device_name: String,
+    #[serde(default)]
+    pub virtual_name: Option<String>,
+    #[serde(default)]
+    pub no_device: bool,
+    #[serde(default)]
+    pub ebs: Option<Ebs>,
+}
+
+/// The EBS volume of a launch configuration block-device mapping.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ebs {
+    #[serde(default)]
+    pub snapshot_id: Option<String>,
+    #[serde(default)]
+    pub volume_size: Option<i64>,
+    #[serde(default)]
+    pub volume_type: Option<String>,
+    #[serde(default)]
+    pub delete_on_termination: Option<bool>,
+    #[serde(default)]
+    pub iops: Option<i64>,
+    #[serde(default)]
+    pub encrypted: Option<bool>,
+    #[serde(default)]
+    pub throughput: Option<i64>,
+}
+
+/// A launch configuration's `MetadataOptions`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstanceMetadataOptions {
+    #[serde(default)]
+    pub http_tokens: Option<String>,
+    #[serde(default)]
+    pub http_put_response_hop_limit: Option<i64>,
+    #[serde(default)]
+    pub http_endpoint: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -115,9 +168,54 @@ pub struct AutoScalingGroup {
     /// `ServiceLinkedRoleARN` — defaults to the AWSServiceRoleForAutoScaling SLR.
     #[serde(default)]
     pub service_linked_role_arn: String,
+    /// `MixedInstancesPolicy`: a launch template plus instance-type /
+    /// template overrides, launched instead of `launch_template`.
+    #[serde(default)]
+    pub mixed_instances_policy: Option<MixedInstancesPolicy>,
 }
 
+/// An Auto Scaling group's `MixedInstancesPolicy`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MixedInstancesPolicy {
+    /// `LaunchTemplate.LaunchTemplateSpecification`.
+    pub launch_template: LaunchTemplateSpec,
+    /// `LaunchTemplate.Overrides`, in priority order.
+    #[serde(default)]
+    pub overrides: Vec<LaunchTemplateOverride>,
+    #[serde(default)]
+    pub instances_distribution: Option<InstancesDistribution>,
+}
+
+/// One `LaunchTemplateOverrides` entry.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LaunchTemplateOverride {
+    #[serde(default)]
+    pub instance_type: Option<String>,
+    #[serde(default)]
+    pub weighted_capacity: Option<String>,
+    /// A different launch template for this instance type.
+    #[serde(default)]
+    pub launch_template_specification: Option<LaunchTemplateSpec>,
+}
+
+/// A `MixedInstancesPolicy`'s `InstancesDistribution`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InstancesDistribution {
+    #[serde(default)]
+    pub on_demand_allocation_strategy: Option<String>,
+    #[serde(default)]
+    pub on_demand_base_capacity: Option<i64>,
+    #[serde(default)]
+    pub on_demand_percentage_above_base_capacity: Option<i64>,
+    #[serde(default)]
+    pub spot_allocation_strategy: Option<String>,
+    #[serde(default)]
+    pub spot_instance_pools: Option<i64>,
+    #[serde(default)]
+    pub spot_max_price: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaunchTemplateSpec {
     #[serde(default)]
     pub launch_template_id: Option<String>,
@@ -139,6 +237,20 @@ pub struct AsgInstance {
     pub launch_configuration_name: Option<String>,
     #[serde(default)]
     pub protected_from_scale_in: bool,
+    /// The instance type it was launched with.
+    #[serde(default)]
+    pub instance_type: Option<String>,
+    /// The launch template (id, name, resolved version) it was launched from.
+    #[serde(default)]
+    pub launch_template: Option<LaunchTemplateSpec>,
+    /// Its `WeightedCapacity` (mixed-instances override weight), counted
+    /// toward the group's desired capacity; `None` counts as 1.
+    #[serde(default)]
+    pub weighted_capacity: Option<String>,
+    /// `spot` for a Spot instance (a mixed-instances policy's Spot share or a
+    /// launch configuration's `SpotPrice`), `None` for on-demand.
+    #[serde(default)]
+    pub lifecycle: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,4 +275,7 @@ pub struct ScalingActivity {
     pub progress: i64,
     #[serde(default)]
     pub details: String,
+    /// Why a `Failed` activity failed.
+    #[serde(default)]
+    pub status_message: Option<String>,
 }

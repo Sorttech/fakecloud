@@ -8,6 +8,7 @@
 //! every rival has where an ASG scales to a *mock* instance.
 
 pub mod cfn_provision;
+pub mod launch;
 pub mod service;
 pub mod state;
 

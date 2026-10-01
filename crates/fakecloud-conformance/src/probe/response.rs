@@ -247,6 +247,22 @@ pub(super) fn service_common_errors(service_name: &str) -> &'static [&'static st
             // instance-profile ARN, which AWS rejects with this code.
             "InvalidIamInstanceProfileArn.Malformed",
             "InvalidID",
+            // Launch templates: RunInstances / the launch-template ops address
+            // a template by the probe's synthetic id, name or version, which
+            // AWS answers with these codes (EC2 "Error codes" reference); a
+            // second CreateLaunchTemplate with the probe's fixed name is a
+            // duplicate.
+            "InvalidLaunchTemplateId.NotFound",
+            "InvalidLaunchTemplateId.Malformed",
+            "InvalidLaunchTemplateId.VersionNotFound",
+            "InvalidLaunchTemplateName.NotFoundException",
+            "InvalidLaunchTemplateName.AlreadyExistsException",
+            // A RunInstances variant re-using the probe's fixed
+            // `PrivateIpAddress` in the same subnet.
+            "InvalidIPAddress.InUse",
+            // A RunInstances secondary interface naming an interface that is
+            // already attached.
+            "InvalidNetworkInterface.InUse",
         ],
         // EKS under-declares two client errors that the real API returns for
         // sub-resource operations:

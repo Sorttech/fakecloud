@@ -6,7 +6,9 @@
 
 use chrono::Utc;
 use fakecloud_autoscaling::state::{
-    AsgInstance, AutoScalingGroup, LaunchConfiguration, LaunchTemplateSpec,
+    AsgInstance, AsgTag, AutoScalingGroup, BlockDeviceMapping, Ebs, InstanceMetadataOptions,
+    InstancesDistribution, LaunchConfiguration, LaunchTemplateOverride, LaunchTemplateSpec,
+    MixedInstancesPolicy,
 };
 use serde_json::Value;
 use uuid::Uuid;
@@ -25,11 +27,131 @@ fn parse_cfn_launch_template(v: Option<&Value>) -> Option<LaunchTemplateSpec> {
     Some(LaunchTemplateSpec {
         launch_template_id: id.map(String::from),
         launch_template_name: name.map(String::from),
-        version: obj
-            .get("Version")
-            .and_then(|x| x.as_str())
-            .map(String::from),
+        version: obj.get("Version").and_then(scalar),
     })
+}
+
+/// A CFN scalar (string, number or bool) as a string.
+fn scalar(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// A CFN boolean, given as a JSON bool or (after `Ref` resolution) a string.
+fn prop_bool(p: &Value, k: &str) -> Option<bool> {
+    p.get(k).and_then(|v| {
+        v.as_bool()
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+    })
+}
+
+/// CFN `MixedInstancesPolicy`.
+fn parse_cfn_mixed_instances_policy(props: &Value) -> Option<MixedInstancesPolicy> {
+    let policy = props.get("MixedInstancesPolicy")?;
+    let lt = policy.get("LaunchTemplate")?;
+    let launch_template = parse_cfn_launch_template(lt.get("LaunchTemplateSpecification"))?;
+    let overrides = lt
+        .get("Overrides")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .map(|o| LaunchTemplateOverride {
+                    instance_type: o.get("InstanceType").and_then(scalar),
+                    weighted_capacity: o.get("WeightedCapacity").and_then(scalar),
+                    launch_template_specification: parse_cfn_launch_template(
+                        o.get("LaunchTemplateSpecification"),
+                    ),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let instances_distribution = policy.get("InstancesDistribution").map(|d| {
+        let s = |k: &str| d.get(k).and_then(scalar);
+        let n = |k: &str| s(k).and_then(|v| v.parse().ok());
+        InstancesDistribution {
+            on_demand_allocation_strategy: s("OnDemandAllocationStrategy"),
+            on_demand_base_capacity: n("OnDemandBaseCapacity"),
+            on_demand_percentage_above_base_capacity: n("OnDemandPercentageAboveBaseCapacity"),
+            spot_allocation_strategy: s("SpotAllocationStrategy"),
+            spot_instance_pools: n("SpotInstancePools"),
+            spot_max_price: s("SpotMaxPrice"),
+        }
+    });
+    Some(MixedInstancesPolicy {
+        launch_template,
+        overrides,
+        instances_distribution,
+    })
+}
+
+/// CFN `BlockDeviceMappings` of an `AWS::AutoScaling::LaunchConfiguration`.
+fn parse_cfn_block_device_mappings(props: &Value) -> Vec<BlockDeviceMapping> {
+    props
+        .get("BlockDeviceMappings")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|m| {
+                    let ebs = m.get("Ebs").map(|e| {
+                        let s = |k: &str| e.get(k).and_then(scalar);
+                        Ebs {
+                            snapshot_id: s("SnapshotId"),
+                            volume_size: s("VolumeSize").and_then(|v| v.parse().ok()),
+                            volume_type: s("VolumeType"),
+                            delete_on_termination: prop_bool(e, "DeleteOnTermination"),
+                            iops: s("Iops").and_then(|v| v.parse().ok()),
+                            encrypted: prop_bool(e, "Encrypted"),
+                            throughput: s("Throughput").and_then(|v| v.parse().ok()),
+                        }
+                    });
+                    Some(BlockDeviceMapping {
+                        device_name: m.get("DeviceName").and_then(scalar)?,
+                        virtual_name: m.get("VirtualName").and_then(scalar),
+                        no_device: prop_bool(m, "NoDevice").unwrap_or(false),
+                        ebs,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// CFN `MetadataOptions` of an `AWS::AutoScaling::LaunchConfiguration`.
+fn parse_cfn_metadata_options(props: &Value) -> Option<InstanceMetadataOptions> {
+    let m = props.get("MetadataOptions")?;
+    Some(InstanceMetadataOptions {
+        http_tokens: m.get("HttpTokens").and_then(scalar),
+        http_put_response_hop_limit: m
+            .get("HttpPutResponseHopLimit")
+            .and_then(scalar)
+            .and_then(|v| v.parse().ok()),
+        http_endpoint: m.get("HttpEndpoint").and_then(scalar),
+    })
+}
+
+/// CFN `Tags` of an `AWS::AutoScaling::AutoScalingGroup`.
+fn parse_cfn_asg_tags(props: &Value) -> Vec<AsgTag> {
+    props
+        .get("Tags")
+        .and_then(|v| v.as_array())
+        .map(|tags| {
+            tags.iter()
+                .filter_map(|t| {
+                    Some(AsgTag {
+                        key: t.get("Key").and_then(scalar)?,
+                        value: t.get("Value").and_then(scalar).unwrap_or_default(),
+                        propagate_at_launch: prop_bool(t, "PropagateAtLaunch").unwrap_or(false),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn prop_str<'a>(p: &'a Value, k: &str) -> Option<&'a str> {
@@ -65,6 +187,87 @@ impl ResourceProvisioner {
         )
     }
 
+    /// Derive the launch configuration an `InstanceId`-sourced group launches
+    /// from (named after the group) and store it, returning its name and the
+    /// instance's subnet / AZ. `replacing` names the configuration the group
+    /// already owns under that name (an update), which may be overwritten;
+    /// any other configuration of that name is never replaced.
+    fn install_instance_launch_configuration(
+        &self,
+        instance_id: &str,
+        group: &str,
+        replacing: Option<&str>,
+    ) -> Result<(String, Option<String>, String), String> {
+        let (lc, subnet, az) = fakecloud_autoscaling::launch::launch_configuration_from_instance(
+            &self.ec2_state,
+            &self.account_id,
+            &self.region,
+            instance_id,
+            group,
+        )?;
+        let mut st = self.autoscaling_state.write();
+        let acct = st.get_or_create(&self.account_id);
+        // Only a configuration this group itself derived from an instance may
+        // be replaced; an independently defined one of that name never is.
+        let replaceable = replacing == Some(lc.name.as_str())
+            && acct
+                .launch_configurations
+                .get(&lc.name)
+                .is_some_and(|existing| existing.source_instance_id.is_some());
+        if acct.launch_configurations.contains_key(&lc.name) && !replaceable {
+            return Err(format!(
+                "Launch Configuration by this name already exists - A launch configuration already exists with the name {}",
+                lc.name
+            ));
+        }
+        let name = lc.name.clone();
+        acct.launch_configurations.insert(name.clone(), lc);
+        Ok((name, subnet, az))
+    }
+
+    /// Validate an `AWS::AutoScaling::AutoScalingGroup`'s launch source as
+    /// CreateAutoScalingGroup does: exactly one of an instance id, launch
+    /// configuration, launch template or mixed-instances policy; a named launch configuration
+    /// exists; every launch template resolves (recorded with id + name and
+    /// `$Default` when no version is given).
+    fn validate_asg_launch_source(
+        &self,
+        instance_id: Option<&str>,
+        launch_configuration: Option<&str>,
+        launch_template: Option<&mut LaunchTemplateSpec>,
+        mixed: Option<&mut MixedInstancesPolicy>,
+    ) -> Result<(), String> {
+        let sources = usize::from(launch_configuration.is_some())
+            + usize::from(launch_template.is_some())
+            + usize::from(mixed.is_some())
+            + usize::from(instance_id.is_some());
+        if sources != 1 {
+            return Err("Valid requests must contain either LaunchTemplate, \
+                        LaunchConfigurationName, InstanceId or MixedInstancesPolicy parameter."
+                .to_string());
+        }
+        if let Some(lc) = launch_configuration {
+            let exists = self
+                .autoscaling_state
+                .read()
+                .accounts
+                .get(&self.account_id)
+                .is_some_and(|st| st.launch_configurations.contains_key(lc));
+            if !exists {
+                return Err(format!(
+                    "Launch configuration name not found - Launch configuration {lc} not found"
+                ));
+            }
+        }
+        fakecloud_autoscaling::launch::resolve_launch_template_specs(
+            Some(&self.ec2_state),
+            &self.account_id,
+            &self.region,
+            launch_template,
+            mixed,
+        )
+    }
+
     pub(super) fn create_autoscaling_launch_configuration(
         &self,
         resource: &ResourceDefinition,
@@ -88,19 +291,14 @@ impl ResourceProvisioner {
             security_groups: str_list(props, "SecurityGroups"),
             user_data: prop_str(props, "UserData").map(String::from),
             iam_instance_profile: prop_str(props, "IamInstanceProfile").map(String::from),
-            associate_public_ip_address: props
-                .get("AssociatePublicIpAddress")
-                .and_then(|v| v.as_bool()),
-            instance_monitoring: props
-                .get("InstanceMonitoring")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true),
-            ebs_optimized: props
-                .get("EbsOptimized")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
+            associate_public_ip_address: prop_bool(props, "AssociatePublicIpAddress"),
+            instance_monitoring: prop_bool(props, "InstanceMonitoring").unwrap_or(true),
+            ebs_optimized: prop_bool(props, "EbsOptimized").unwrap_or(false),
             spot_price: prop_str(props, "SpotPrice").map(String::from),
             placement_tenancy: prop_str(props, "PlacementTenancy").map(String::from),
+            source_instance_id: None,
+            block_device_mappings: parse_cfn_block_device_mappings(props),
+            metadata_options: parse_cfn_metadata_options(props),
             created_time: Utc::now(),
         };
         self.autoscaling_state
@@ -126,19 +324,19 @@ impl ResourceProvisioner {
         if azs.is_empty() {
             azs.push(format!("{}a", self.region));
         }
-        let lcn = prop_str(props, "LaunchConfigurationName").map(String::from);
+        let mut lcn = prop_str(props, "LaunchConfigurationName").map(String::from);
         // Modern templates use LaunchTemplate (or MixedInstancesPolicy) instead
-        // of the legacy LaunchConfigurationName; honor both so the launch spec
-        // isn't silently dropped.
-        let launch_template =
-            parse_cfn_launch_template(props.get("LaunchTemplate")).or_else(|| {
-                props
-                    .get("MixedInstancesPolicy")
-                    .and_then(|m| m.get("LaunchTemplate"))
-                    .and_then(|lt| lt.get("LaunchTemplateSpecification"))
-                    .and_then(|spec| parse_cfn_launch_template(Some(spec)))
-            });
-        let vpc_zone_identifier = props
+        // of the legacy LaunchConfigurationName; honor every form so the
+        // launch spec isn't silently dropped.
+        let mut launch_template = parse_cfn_launch_template(props.get("LaunchTemplate"));
+        let mut mixed_instances_policy = parse_cfn_mixed_instances_policy(props);
+        self.validate_asg_launch_source(
+            prop_str(props, "InstanceId"),
+            lcn.as_deref(),
+            launch_template.as_mut(),
+            mixed_instances_policy.as_mut(),
+        )?;
+        let mut vpc_zone_identifier = props
             .get("VPCZoneIdentifier")
             .and_then(|v| v.as_array())
             .map(|a| {
@@ -148,6 +346,18 @@ impl ResourceProvisioner {
                     .join(",")
             })
             .or_else(|| prop_str(props, "VPCZoneIdentifier").map(String::from));
+        // `InstanceId`: a launch configuration named after the group, derived
+        // from the instance (as CreateAutoScalingGroup does).
+        if let Some(iid) = prop_str(props, "InstanceId") {
+            let (lc, subnet, az) = self.install_instance_launch_configuration(iid, &name, None)?;
+            if vpc_zone_identifier.is_none() && props.get("AvailabilityZones").is_none() {
+                match subnet {
+                    Some(s) => vpc_zone_identifier = Some(s),
+                    None => azs = vec![az],
+                }
+            }
+            lcn = Some(lc);
+        }
 
         // Insert the group as control-plane only (no instances). After
         // provisioning, `CreateStack` drains an `AsgInstances` spawn intent that
@@ -181,12 +391,13 @@ impl ResourceProvisioner {
                 .unwrap_or(false),
             created_time: Utc::now(),
             instances,
-            tags: Vec::new(),
+            tags: parse_cfn_asg_tags(props),
             status: None,
             service_linked_role_arn: fakecloud_autoscaling::service_linked_role_arn(
                 &self.region,
                 &self.account_id,
             ),
+            mixed_instances_policy,
         };
         self.autoscaling_state
             .write()
@@ -227,6 +438,43 @@ impl ResourceProvisioner {
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
         let name = existing.physical_id.clone();
+        let mut new_lc = prop_str(props, "LaunchConfigurationName").map(String::from);
+        let mut new_lt = parse_cfn_launch_template(props.get("LaunchTemplate"));
+        let mut new_mixed = parse_cfn_mixed_instances_policy(props);
+        self.validate_asg_launch_source(
+            prop_str(props, "InstanceId"),
+            new_lc.as_deref(),
+            new_lt.as_mut(),
+            new_mixed.as_mut(),
+        )?;
+        // An `InstanceId` source re-derives the group's launch configuration
+        // from the (possibly new) instance.
+        if let Some(iid) = prop_str(props, "InstanceId") {
+            // The configuration the group owns, and the instance it came from.
+            let (owned, source) = {
+                let st = self.autoscaling_state.read();
+                let acct = st.accounts.get(&self.account_id);
+                let owned = acct
+                    .and_then(|a| a.groups.get(&name))
+                    .and_then(|g| g.launch_configuration_name.clone());
+                let source = owned
+                    .as_ref()
+                    .and_then(|lc| acct.and_then(|a| a.launch_configurations.get(lc)))
+                    .and_then(|lc| lc.source_instance_id.clone());
+                (owned, source)
+            };
+            // Re-derive only for a different instance: the original may since
+            // have stopped or terminated, which must not fail an unrelated
+            // update (or change what the group launches).
+            new_lc = if source.as_deref() == Some(iid) {
+                owned
+            } else {
+                Some(
+                    self.install_instance_launch_configuration(iid, &name, owned.as_deref())?
+                        .0,
+                )
+            };
+        }
 
         let arn = {
             let mut st = self.autoscaling_state.write();
@@ -289,18 +537,15 @@ impl ResourceProvisioner {
             {
                 group.vpc_zone_identifier = Some(vzi);
             }
-            if props.get("LaunchConfigurationName").is_some() {
-                group.launch_configuration_name =
-                    prop_str(props, "LaunchConfigurationName").map(String::from);
+            // The template's launch source replaces the group's (a group has
+            // exactly one).
+            if new_lc.is_some() || new_lt.is_some() || new_mixed.is_some() {
+                group.launch_configuration_name = new_lc;
+                group.launch_template = new_lt;
+                group.mixed_instances_policy = new_mixed;
             }
-            if let Some(lt) = parse_cfn_launch_template(props.get("LaunchTemplate")).or_else(|| {
-                props
-                    .get("MixedInstancesPolicy")
-                    .and_then(|m| m.get("LaunchTemplate"))
-                    .and_then(|lt| lt.get("LaunchTemplateSpecification"))
-                    .and_then(|spec| parse_cfn_launch_template(Some(spec)))
-            }) {
-                group.launch_template = Some(lt);
+            if props.get("Tags").is_some() {
+                group.tags = parse_cfn_asg_tags(props);
             }
             group.arn.clone()
         };

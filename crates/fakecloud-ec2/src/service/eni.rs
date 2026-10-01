@@ -65,11 +65,12 @@ fn eni_xml(n: &NetworkInterface, tags: &[Tag], owner: &str) -> String {
 
 fn attachment_inner(a: &EniAttachment) -> String {
     format!(
-        "{}{}<deviceIndex>{}</deviceIndex>{}<deleteOnTermination>false</deleteOnTermination>",
+        "{}{}<deviceIndex>{}</deviceIndex>{}<deleteOnTermination>{}</deleteOnTermination>",
         ec2_elem("attachmentId", &a.attachment_id),
         ec2_elem("instanceId", &a.instance_id),
         a.device_index,
         ec2_elem("status", &a.status),
+        a.delete_on_termination,
     )
 }
 
@@ -324,6 +325,7 @@ pub(crate) fn attach_network_interface(
             instance_id,
             device_index,
             status: "attached".to_string(),
+            delete_on_termination: false,
         });
     }
     let body = format!(
@@ -578,7 +580,7 @@ pub(crate) fn describe_network_interface_permissions(
 // ---- IP assignment ----
 
 /// `InvalidNetworkInterfaceID.NotFound` — the referenced ENI does not exist.
-fn eni_not_found(id: &str) -> AwsServiceError {
+pub(crate) fn eni_not_found(id: &str) -> AwsServiceError {
     AwsServiceError::aws_error(
         http::StatusCode::BAD_REQUEST,
         "InvalidNetworkInterfaceID.NotFound",
@@ -1038,6 +1040,7 @@ mod tests {
                         instance_id: "i-123".into(),
                         device_index: 0,
                         status: "attached".into(),
+                        delete_on_termination: false,
                     }),
                     public_ip_dns_hostname_type: None,
                 },

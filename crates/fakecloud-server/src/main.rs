@@ -4605,6 +4605,9 @@ async fn main() {
     let mut autoscaling_service =
         fakecloud_autoscaling::AutoScalingService::new(autoscaling_state.clone())
             .with_ec2(ec2_state.clone(), ec2_runtime.clone())
+            // Encrypted block-device volumes on ASG-launched instances get the
+            // key EC2 resolves (the region's `aws/ebs` key by default).
+            .with_kms_hook(Some(kms_hook_for_services.clone()))
             // ASG capacity reconciliation launches REAL EC2 instances through a
             // bare Ec2Service; without the EC2 snapshot hook those records live
             // only in memory and leak their containers on restart (the EC2

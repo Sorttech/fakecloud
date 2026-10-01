@@ -160,6 +160,13 @@ fn instance_xml(
             )
         })
         .unwrap_or_default();
+    let cpu_options = format!(
+        "{cpu_options}{}",
+        i.instance_lifecycle
+            .as_deref()
+            .map(|l| ec2_elem("instanceLifecycle", l))
+            .unwrap_or_default()
+    );
     let private_dns_name_options = format!(
         "<privateDnsNameOptions><hostnameType>{}</hostnameType>\
          <enableResourceNameDnsARecord>{}</enableResourceNameDnsARecord>\
@@ -309,14 +316,110 @@ fn parse_launch_opts(params: &HashMap<String, String>) -> LaunchOpts {
     }
 }
 
+/// The result of the control-plane half of an instance launch: the reservation,
+/// the new instance ids, their rendered `instancesSet` items, and the inputs the
+/// background boot needs to bring up each backing container.
+pub(crate) struct Launched {
+    pub(crate) reservation_id: String,
+    pub(crate) ids: Vec<String>,
+    pub(crate) rendered: Vec<String>,
+    user_data: Option<String>,
+    instance_tags: std::collections::BTreeMap<String, String>,
+    instance_network: Option<crate::runtime::InstanceNetwork>,
+}
+
 pub(crate) async fn run_instances(
     svc: &Ec2Service,
     req: &AwsRequest,
 ) -> Result<AwsResponse, AwsServiceError> {
-    let min: usize = require(&req.query_params, "MinCount")?
+    let launched = launch_instances(svc, &req.account_id, &req.region, &req.query_params)?;
+    boot_launched(svc, &req.account_id, &launched);
+    let body = reservation_xml(
+        &launched.reservation_id,
+        &req.account_id,
+        &launched.rendered,
+    );
+    Ok(Ec2Service::respond("RunInstances", &req.request_id, &body))
+}
+
+/// Background boot: bring up each backing container and reconcile state.
+/// Each instance is inserted synchronously in `pending` state (code 0) by
+/// [`launch_instances`]; this boots the backing container in a background task
+/// that reconciles the instance to `running` (code 16) when it's up, or serves
+/// it metadata-only on failure. RunInstances returns immediately so a cold
+/// image pull / k8s Pod readiness never blocks the client (mirrors RDS
+/// CreateDBInstance). With no runtime configured the instance is flipped to
+/// `running` in the spawned task.
+fn boot_launched(svc: &Ec2Service, account_id: &str, launched: &Launched) {
+    let svc_state = svc.state.clone();
+    let runtime = svc.runtime.clone();
+    let account_id = account_id.to_string();
+    let ids = launched.ids.clone();
+    let user_data = launched.user_data.clone();
+    let instance_tags = launched.instance_tags.clone();
+    let instance_network = launched.instance_network.clone();
+    // Capture the persistence hook so the pending->running flip is written
+    // through to disk; RunInstances' own dispatch-path snapshot ran while
+    // the instance was still `pending` (M12).
+    let snapshot_hook = svc.snapshot_hook();
+    tokio::spawn(async move {
+        for id in &ids {
+            let running = if let Some(rt) = &runtime {
+                match rt
+                    .run_instance(
+                        &account_id,
+                        id,
+                        user_data.as_deref(),
+                        &instance_tags,
+                        instance_network.as_ref(),
+                    )
+                    .await
+                {
+                    Ok(r) => Some(r),
+                    Err(e) => {
+                        tracing::warn!(instance_id = %id, error = %e, "EC2 instance container failed to start; serving metadata-only");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            reconcile_started(&svc_state, &account_id, id, running);
+        }
+        // Persist the reconciled (`running`) state so a restart restores
+        // running instances rather than resurrecting them as pending.
+        if let Some(hook) = &snapshot_hook {
+            hook().await;
+        }
+        // All instances are up with their real IPs: (re)apply the
+        // security-group firewall so the new instances are filtered
+        // (#1745 phase 3). No-op when enforcement is disabled.
+        if let Some(rt) = &runtime {
+            if rt.network_isolation_enforced() {
+                super::firewall_model::reconcile(&svc_state, rt).await;
+            }
+        }
+    });
+}
+
+/// The control-plane half of an instance launch, shared by `RunInstances`
+/// (and so Auto Scaling, which launches through it) and the CloudFormation
+/// `AWS::EC2::Instance` provisioner. `request` is the flattened RunInstances
+/// parameter map. A referenced launch template is resolved and its data merged
+/// underneath the request (see [`super::launch_template`]); every value below
+/// is then read from that one effective parameter map. Inserts each instance
+/// in `pending` state together with its EBS volumes, tags, credit
+/// specification and IAM instance-profile association.
+pub(crate) fn launch_instances(
+    svc: &Ec2Service,
+    account_id: &str,
+    region: &str,
+    request: &HashMap<String, String>,
+) -> Result<Launched, AwsServiceError> {
+    let min: usize = require(request, "MinCount")?
         .parse()
         .map_err(|_| invalid_parameter_value("MinCount must be an integer"))?;
-    let max: usize = require(&req.query_params, "MaxCount")?
+    let max: usize = require(request, "MaxCount")?
         .parse()
         .map_err(|_| invalid_parameter_value("MaxCount must be an integer"))?;
     if min == 0 {
@@ -337,9 +440,23 @@ pub(crate) async fn run_instances(
             "You have requested more instances ({min}) than your current instance limit of {MAX_INSTANCES_PER_REQUEST} allows for this launch."
         )));
     }
-    validate_enum_instance_type(req)?;
+    let region = if region.is_empty() {
+        "us-east-1"
+    } else {
+        region
+    };
+    // Resolve the launch template (if any) and merge its data under the
+    // request: from here on `params` is the effective launch configuration.
+    let (params, _template) = {
+        let accounts = svc.state.read();
+        let empty = Ec2State::new(account_id, region);
+        let state = accounts.get(account_id).unwrap_or(&empty);
+        super::launch_template::effective_launch_params(state, request)?
+    };
+    let params = &params;
+    validate_enum_instance_type(params)?;
     validate_enum(
-        &req.query_params,
+        params,
         "InstanceInitiatedShutdownBehavior",
         &["stop", "terminate"],
     )?;
@@ -349,55 +466,111 @@ pub(crate) async fn run_instances(
     // and never with `lo > hi`, which would panic).
     let count = max.min(MAX_INSTANCES_PER_REQUEST).max(min);
     let reservation_id = gen_id("r");
-    // ImageId is required unless a launch template (which can carry the image)
-    // is referenced. AWS returns MissingParameter rather than silently
-    // launching from a placeholder AMI.
-    let uses_launch_template = req.query_params.keys().any(|k| {
-        k.starts_with("LaunchTemplate.LaunchTemplateId")
-            || k.starts_with("LaunchTemplate.LaunchTemplateName")
-    });
-    let image_id = match req.query_params.get("ImageId").filter(|v| !v.is_empty()) {
-        Some(v) => v.clone(),
-        None if uses_launch_template => "ami-00000000000000000".to_string(),
-        None => return Err(missing_parameter("ImageId")),
-    };
-    let instance_type = req
-        .query_params
+    // ImageId is required unless the launch template supplies it. AWS returns
+    // MissingParameter rather than launching from a placeholder AMI.
+    let image_id = params
+        .get("ImageId")
+        .filter(|v| !v.is_empty())
+        .cloned()
+        .ok_or_else(|| missing_parameter("ImageId"))?;
+    let instance_type = params
         .get("InstanceType")
+        .filter(|v| !v.is_empty())
         .cloned()
         .unwrap_or_else(|| "t3.micro".to_string());
-    let key_name = req.query_params.get("KeyName").cloned();
-    let mut subnet_id = req.query_params.get("SubnetId").cloned();
-    let mut sg_ids = indexed_list(&req.query_params, "SecurityGroupId");
-    let user_data = req.query_params.get("UserData").cloned();
-    let owner = req.account_id.clone();
-    // Honor launch-time `Monitoring.Enabled`, `EbsOptimized`, and
-    // `MetadataOptions.*` so DescribeInstances reflects them, matching CFN's
-    // `AWS::EC2::Instance` provisioner (which shares the same instance model).
-    let monitoring = req
-        .query_params
-        .get("Monitoring.Enabled")
-        .map(|v| v == "true")
-        .unwrap_or(false);
-    let ebs_optimized = req
-        .query_params
-        .get("EbsOptimized")
-        .map(|v| v == "true")
-        .unwrap_or(false);
-    let metadata_options = parse_metadata_options(&req.query_params);
-    let iam_profile_arn = super::rest::iam_profile_arn(req)?;
-    let az = format!(
-        "{}a",
-        if req.region.is_empty() {
-            "us-east-1"
-        } else {
-            &req.region
+    let key_name = params.get("KeyName").filter(|v| !v.is_empty()).cloned();
+    // The primary network interface (DeviceIndex 0) carries the subnet,
+    // security groups, private IP and public-IP choice when the launch is
+    // described through `NetworkInterface.N` (typical of launch templates).
+    let primary_ni = super::launch_template::primary_network_interface(params);
+    let ni = |field: &str| {
+        primary_ni.and_then(|n| {
+            params
+                .get(&format!("NetworkInterface.{n}.{field}"))
+                .filter(|v| !v.is_empty())
+        })
+    };
+    let mut subnet_id = params
+        .get("SubnetId")
+        .filter(|v| !v.is_empty())
+        .or_else(|| ni("SubnetId"))
+        .cloned();
+    let mut sg_ids = indexed_list(params, "SecurityGroupId");
+    if let Some(n) = primary_ni {
+        for id in indexed_list(params, &format!("NetworkInterface.{n}.SecurityGroupId")) {
+            if !sg_ids.contains(&id) {
+                sg_ids.push(id);
+            }
         }
-    );
+    }
+    let mut fixed_private_ip = params
+        .get("PrivateIpAddress")
+        .filter(|v| !v.is_empty())
+        .or_else(|| ni("PrivateIpAddress"))
+        .cloned();
+    // Network interfaces and instance-level security groups are exclusive.
+    if primary_ni.is_some()
+        && (!indexed_list(params, "SecurityGroup").is_empty()
+            || !indexed_list(params, "SecurityGroupId").is_empty())
+    {
+        return Err(AwsServiceError::aws_error(
+            http::StatusCode::BAD_REQUEST,
+            "InvalidParameterCombination",
+            "Network interfaces and an instance-level security groups may not be specified on the same request"
+                .to_string(),
+        ));
+    }
+    // A primary interface given by `NetworkInterfaceId` is that existing
+    // interface: the instance takes its subnet, address and groups.
+    let primary_eni_id = ni("NetworkInterfaceId").cloned();
+    let primary_eni_dot = ni("DeleteOnTermination").map(|v| v == "true");
+    if let Some(eni_id) = &primary_eni_id {
+        if max > 1 {
+            return Err(AwsServiceError::aws_error(
+                http::StatusCode::BAD_REQUEST,
+                "InvalidParameterCombination",
+                "Cannot attach an existing network interface to more than one instance."
+                    .to_string(),
+            ));
+        }
+        let accounts = svc.state.read();
+        let eni = accounts
+            .get(account_id)
+            .and_then(|st| st.network_interfaces.get(eni_id))
+            .ok_or_else(|| super::eni::eni_not_found(eni_id))?;
+        subnet_id = Some(eni.subnet_id.clone());
+        sg_ids = eni.group_ids.clone();
+        fixed_private_ip = Some(eni.private_ip_address.clone());
+    }
+    let user_data = params.get("UserData").cloned();
+    // Honor launch-time `Monitoring.Enabled`, `EbsOptimized`, and
+    // `MetadataOptions.*` so DescribeInstances reflects them.
+    let flag = |key: &str| params.get(key).is_some_and(|v| v == "true");
+    let monitoring = flag("Monitoring.Enabled");
+    let ebs_optimized = flag("EbsOptimized");
+    let disable_api_termination = flag("DisableApiTermination");
+    let disable_api_stop = flag("DisableApiStop");
+    let metadata_options = parse_metadata_options(params);
+    let mut maintenance_options = crate::state::MaintenanceOptions::default();
+    if let Some(v) = params
+        .get("MaintenanceOptions.AutoRecovery")
+        .filter(|v| !v.is_empty())
+    {
+        maintenance_options.auto_recovery = v.clone();
+    }
+    let credit_spec = params
+        .get("CreditSpecification.CpuCredits")
+        .filter(|v| !v.is_empty())
+        .cloned();
+    let iam_profile_arn = super::rest::iam_profile_arn_from(params, region, account_id)?;
+    let placement_az = params
+        .get("Placement.AvailabilityZone")
+        .filter(|v| !v.is_empty())
+        .cloned();
 
-    // Reserved `fakecloud-k8s/*` scheduling tags are read from the request's
+    // Reserved `fakecloud-k8s/*` scheduling tags are read from the effective
     // TagSpecification here, before the backing Pod is built.
-    let instance_tags = crate::service::tags::tag_specifications_for(&req.query_params, "instance");
+    let instance_tags = crate::service::tags::tag_specifications_for(params, "instance");
 
     // Resolve the VPC from the requested subnet (so the `vpc-id` filter and
     // describe output reflect reality), and decide whether a public IP is
@@ -405,15 +578,16 @@ pub(crate) async fn run_instances(
     // the subnet's `map_public_ip_on_launch` / default-subnet behavior. With
     // no subnet, an instance launched into the (implicit) default VPC gets a
     // public IP, matching the EC2-default-VPC contract.
-    let assoc_public = req
-        .query_params
-        .get("NetworkInterface.1.AssociatePublicIpAddress")
-        .or_else(|| req.query_params.get("AssociatePublicIpAddress"))
+    let assoc_public = ni("AssociatePublicIpAddress")
+        .or_else(|| params.get("AssociatePublicIpAddress"))
         .map(|v| v == "true");
-    let (vpc_id, subnet_auto_public, instance_network, ip_prefix) = {
+    let (vpc_id, subnet_auto_public, instance_network, ip_prefix, az) = {
         let accounts = svc.state.read();
-        let empty = Ec2State::new(&req.account_id, &req.region);
-        let state = accounts.get(&req.account_id).unwrap_or(&empty);
+        let empty = Ec2State::new(account_id, region);
+        let state = accounts.get(account_id).unwrap_or(&empty);
+        // The instance lands in its subnet's AZ; without a subnet, in the
+        // requested `Placement.AvailabilityZone` (else the region's first AZ).
+        let wanted_az = placement_az.clone().unwrap_or_else(|| format!("{region}a"));
         // No explicit subnet: land in the default VPC's default subnet for the
         // target AZ (falling back to any default subnet), exactly as AWS does.
         // This fills `subnet_id`/`vpc_id` so DescribeInstances reports a real
@@ -423,25 +597,27 @@ pub(crate) async fn run_instances(
                 .subnets
                 .values()
                 .filter(|s| s.default_for_az)
-                .find(|s| s.availability_zone == az)
+                .find(|s| s.availability_zone == wanted_az)
                 .or_else(|| state.subnets.values().find(|s| s.default_for_az))
             {
                 subnet_id = Some(s.subnet_id.clone());
             }
         }
+        let subnet = subnet_id.as_ref().and_then(|sid| state.subnets.get(sid));
+        let az = subnet
+            .map(|s| s.availability_zone.clone())
+            .filter(|a| !a.is_empty())
+            .unwrap_or(wanted_az);
         // When the caller named no security group, AWS attaches the VPC's
         // `default` group. Resolve it from the subnet's VPC (or the default VPC).
-        let resolved_vpc = subnet_id
-            .as_ref()
-            .and_then(|sid| state.subnets.get(sid))
-            .map(|s| s.vpc_id.clone());
+        let resolved_vpc = subnet.map(|s| s.vpc_id.clone());
         // Honor `SecurityGroup.N` (group *names*, EC2-Classic/default-VPC form)
         // by resolving each to its id, alongside the modern `SecurityGroupId.N`.
-        let sg_names = indexed_list(&req.query_params, "SecurityGroup");
+        let sg_names = indexed_list(params, "SecurityGroup");
         if !sg_names.is_empty() {
             let target_vpc = resolved_vpc
                 .clone()
-                .unwrap_or_else(|| crate::defaults::default_vpc_id(&req.account_id));
+                .unwrap_or_else(|| crate::defaults::default_vpc_id(account_id));
             for name in &sg_names {
                 if let Some(sg) = state
                     .security_groups
@@ -457,7 +633,7 @@ pub(crate) async fn run_instances(
         if sg_ids.is_empty() {
             let vpc = resolved_vpc
                 .clone()
-                .unwrap_or_else(|| crate::defaults::default_vpc_id(&req.account_id));
+                .unwrap_or_else(|| crate::defaults::default_vpc_id(account_id));
             if let Some(sg) = state
                 .security_groups
                 .values()
@@ -475,9 +651,7 @@ pub(crate) async fn run_instances(
                 internal: !crate::defaults::subnet_is_public(state, sid),
             });
         let (vpc, auto_public) = match subnet_id.as_ref() {
-            Some(sid) => state
-                .subnets
-                .get(sid)
+            Some(_) => subnet
                 .map(|s| {
                     (
                         Some(s.vpc_id.clone()),
@@ -487,53 +661,192 @@ pub(crate) async fn run_instances(
                 .unwrap_or((None, false)),
             // No subnet (and no default subnet found): still a default-VPC
             // launch, which assigns public IPs by default.
-            None => (Some(crate::defaults::default_vpc_id(&req.account_id)), true),
+            None => (Some(crate::defaults::default_vpc_id(account_id)), true),
         };
         // Metadata-only private IP base, derived from the resolved subnet's
         // CIDR so DescribeInstances reports an IP inside the subnet (was a
         // hard-coded 10.0.0.x outside the subnet — bug-hunt finding 1.7). A
         // real container-backed instance overwrites this with its true bridge
         // IP once running.
-        let ip_prefix = subnet_id
-            .as_ref()
-            .and_then(|sid| state.subnets.get(sid))
+        let ip_prefix = subnet
             .map(|s| subnet_ip_prefix(&s.cidr_block))
             .unwrap_or_else(|| "10.0.0".to_string());
-        (vpc, auto_public, instance_network, ip_prefix)
+        (vpc, auto_public, instance_network, ip_prefix, az)
     };
     let assign_public = assoc_public.unwrap_or(subnet_auto_public);
+    // One fixed private IP can only go to one instance.
+    if fixed_private_ip.is_some() && max > 1 {
+        return Err(AwsServiceError::aws_error(
+            http::StatusCode::BAD_REQUEST,
+            "InvalidParameterCombination",
+            "Cannot specify a private IP address when launching more than one instance."
+                .to_string(),
+        ));
+    }
+    // `InstanceMarketOptions.MarketType=spot` launches a Spot instance.
+    let instance_lifecycle = params
+        .get("InstanceMarketOptions.MarketType")
+        .filter(|v| v.as_str() == "spot")
+        .cloned();
+    // The non-primary network interfaces: each is created (or an existing
+    // one attached) at its device index, as RunInstances does.
+    let secondary_nis = secondary_network_interfaces(params, primary_ni);
+    // Each interface needs its own device index (the primary is 0), and an
+    // existing interface can be attached only once.
+    {
+        let mut indexes = std::collections::BTreeSet::new();
+        if primary_ni.is_some() {
+            indexes.insert(0i64);
+        }
+        let mut enis: std::collections::BTreeSet<&String> = primary_eni_id.iter().collect();
+        for n in &secondary_nis {
+            if !indexes.insert(n.device_index) {
+                return Err(invalid_parameter_value(format!(
+                    "Each network interface requires a unique device index; {} is repeated.",
+                    n.device_index
+                )));
+            }
+            if let Some(e) = &n.eni_id {
+                if !enis.insert(e) {
+                    return Err(invalid_parameter_value(format!(
+                        "Network interface {e} is specified more than once."
+                    )));
+                }
+            }
+        }
+    }
+    if count > 1
+        && secondary_nis
+            .iter()
+            .any(|n| n.eni_id.is_some() || n.private_ip.is_some())
+    {
+        return Err(AwsServiceError::aws_error(
+            http::StatusCode::BAD_REQUEST,
+            "InvalidParameterCombination",
+            "Cannot attach an existing network interface or a fixed private IP address to more than one instance."
+                .to_string(),
+        ));
+    }
 
-    // Generate instance ids; insert each instance synchronously in `pending`
-    // state (code 0), then boot the backing container in a background task
-    // that reconciles the instance to `running` (code 16) when it's up, or to
-    // `stopped` (code 80) on failure. RunInstances returns immediately so a
-    // cold image pull / k8s Pod readiness never blocks the client (mirrors
-    // RDS CreateDBInstance). With no runtime configured the instance is
-    // flipped to `running` immediately in a spawned task.
     let ids: Vec<String> = (0..count).map(|_| gen_id("i")).collect();
     // EBS volumes the block-device mappings create for each instance, with
     // their encryption resolved (KMS) before the EC2 lock is taken.
-    let launch_volumes = super::volume::launch_volumes(
-        svc,
-        &req.account_id,
-        &req.region,
-        &req.query_params,
-        "BlockDeviceMapping",
-    );
+    let launch_volumes =
+        super::volume::launch_volumes(svc, account_id, region, params, "BlockDeviceMapping");
     let mut rendered = Vec::new();
     {
         let mut accounts = svc.state.write();
-        let state = accounts.get_or_create(&req.account_id);
+        let state = accounts.get_or_create(account_id);
+        // Checked under the write lock the instances are inserted under, so
+        // two concurrent launches cannot both claim one address.
+        // Re-validated under the write lock the attachment happens under, so
+        // an interface deleted or attached since the lookup above fails the
+        // launch before anything is inserted.
+        if let Some(eni_id) = &primary_eni_id {
+            check_eni_attachable(state, eni_id)?;
+        }
+        if let Some(ip) = &fixed_private_ip {
+            let in_use = state
+                .instances
+                .values()
+                .any(|i| i.state_code != 48 && &i.private_ip == ip && i.subnet_id == subnet_id);
+            if in_use {
+                return Err(AwsServiceError::aws_error(
+                    http::StatusCode::BAD_REQUEST,
+                    "InvalidIPAddress.InUse",
+                    format!("Address {ip} is in use."),
+                ));
+            }
+        }
+        for ni in &secondary_nis {
+            if let Some(eni_id) = &ni.eni_id {
+                match state.network_interfaces.get(eni_id) {
+                    None => return Err(super::eni::eni_not_found(eni_id)),
+                    Some(e) if e.attachment.is_some() => {
+                        return Err(AwsServiceError::aws_error(
+                            http::StatusCode::BAD_REQUEST,
+                            "InvalidNetworkInterface.InUse",
+                            format!("Interface: [{eni_id}] in use."),
+                        ))
+                    }
+                    // An interface lives in one AZ; it can only attach there.
+                    Some(e) if e.availability_zone != az => {
+                        return Err(AwsServiceError::aws_error(
+                            http::StatusCode::BAD_REQUEST,
+                            "InvalidParameterCombination",
+                            format!(
+                                "The network interface {eni_id} and the instance must be in the same availability zone."
+                            ),
+                        ))
+                    }
+                    Some(_) => {}
+                }
+                continue;
+            }
+            if let Some(sn) = &ni.subnet_id {
+                match state.subnets.get(sn) {
+                    None => {
+                        return Err(AwsServiceError::aws_error(
+                            http::StatusCode::BAD_REQUEST,
+                            "InvalidSubnetID.NotFound",
+                            format!("The subnet ID '{sn}' does not exist"),
+                        ))
+                    }
+                    // Every interface of an instance is in its AZ and VPC.
+                    Some(sub)
+                        if sub.availability_zone != az
+                            || vpc_id.as_ref().is_some_and(|v| v != &sub.vpc_id) =>
+                    {
+                        return Err(AwsServiceError::aws_error(
+                            http::StatusCode::BAD_REQUEST,
+                            "InvalidParameterCombination",
+                            format!(
+                                "Subnet {sn} is not in the instance's availability zone and VPC."
+                            ),
+                        ))
+                    }
+                    Some(_) => {}
+                }
+            }
+            if let Some(ip) = &ni.private_ip {
+                let sn = ni.subnet_id.clone().or_else(|| subnet_id.clone());
+                if let Some(sub) = sn.as_ref().and_then(|s| state.subnets.get(s)) {
+                    if !ipv4_in_cidr(ip, &sub.cidr_block) {
+                        return Err(invalid_parameter_value(format!(
+                            "Address {ip} does not fall within the subnet's address range"
+                        )));
+                    }
+                }
+                let repeated = secondary_nis
+                    .iter()
+                    .filter(|o| o.private_ip.as_ref() == Some(ip))
+                    .count()
+                    > 1
+                    || fixed_private_ip.as_ref() == Some(ip);
+                let in_use = repeated || address_used_in_subnet(state, sn.as_deref(), ip);
+                if in_use {
+                    return Err(AwsServiceError::aws_error(
+                        http::StatusCode::BAD_REQUEST,
+                        "InvalidIPAddress.InUse",
+                        format!("Address {ip} is in use."),
+                    ));
+                }
+            }
+        }
         let sg_names = sg_name_map(state);
-        let launch_opts = parse_launch_opts(&req.query_params);
+        let launch_opts = parse_launch_opts(params);
         for (idx, id) in ids.iter().enumerate() {
+            let private_ip = match (&fixed_private_ip, idx) {
+                (Some(ip), 0) => ip.clone(),
+                _ => format!("{ip_prefix}.{}", 10 + idx),
+            };
             let inst = Instance {
                 instance_id: id.clone(),
                 image_id: image_id.clone(),
                 instance_type: instance_type.clone(),
                 state_code: 0,
                 state_name: "pending".to_string(),
-                private_ip: format!("{ip_prefix}.{}", 10 + idx),
+                private_ip,
                 public_ip: if assign_public {
                     Some(format!("52.0.0.{}", 10 + idx))
                 } else {
@@ -549,13 +862,13 @@ pub(crate) async fn run_instances(
                 az: az.clone(),
                 launch_time: LAUNCH_TIME.to_string(),
                 container_id: None,
-                disable_api_termination: false,
-                disable_api_stop: false,
+                disable_api_termination,
+                disable_api_stop,
                 source_dest_check: true,
                 ebs_optimized,
-                instance_initiated_shutdown_behavior: req
-                    .query_params
+                instance_initiated_shutdown_behavior: params
                     .get("InstanceInitiatedShutdownBehavior")
+                    .filter(|v| !v.is_empty())
                     .cloned()
                     .unwrap_or_else(|| "stop".to_string()),
                 user_data: user_data.clone().filter(|s| !s.is_empty()),
@@ -567,24 +880,43 @@ pub(crate) async fn run_instances(
                 // -- and they are ForceNew, so the drift never self-healed.
                 cpu_options: launch_opts.cpu_options.clone(),
                 bandwidth_weighting: None,
-                maintenance_options: crate::state::MaintenanceOptions::default(),
+                maintenance_options: maintenance_options.clone(),
                 placement_tenancy: launch_opts.placement_tenancy.clone(),
                 placement_affinity: launch_opts.placement_affinity.clone(),
-                placement_group_name: req.query_params.get("Placement.GroupName").cloned(),
+                placement_group_name: params
+                    .get("Placement.GroupName")
+                    .filter(|v| !v.is_empty())
+                    .cloned(),
                 private_dns_hostname_type: launch_opts.private_dns_hostname_type.clone(),
                 enable_resource_name_dns_a_record: launch_opts.enable_a_record,
                 enable_resource_name_dns_aaaa_record: launch_opts.enable_aaaa_record,
+                instance_lifecycle: instance_lifecycle.clone(),
             };
-            crate::service::tags::apply_tag_specifications(
-                state,
-                &req.query_params,
-                id,
-                "instance",
-            );
+            if let Some(eni_id) = &primary_eni_id {
+                // Present and unattached: `check_eni_attachable` ran under
+                // this same write lock before any insert.
+                if let Some(eni) = state.network_interfaces.get_mut(eni_id) {
+                    eni.status = "in-use".to_string();
+                    eni.attachment = Some(crate::state::EniAttachment {
+                        attachment_id: gen_id("eni-attach"),
+                        instance_id: id.clone(),
+                        device_index: 0,
+                        status: "attached".to_string(),
+                        delete_on_termination: primary_eni_dot.unwrap_or(false),
+                    });
+                }
+            }
+            attach_secondary_network_interfaces(state, id, &inst, &secondary_nis, params);
+            crate::service::tags::apply_tag_specifications(state, params, id, "instance");
+            if let Some(credits) = &credit_spec {
+                state
+                    .instance_credit_specs
+                    .insert(id.clone(), credits.clone());
+            }
             let tags = state.tags_for(id).to_vec();
             let architecture = arch_for(state, &inst.image_id);
             let platform_details = platform_for(state, &inst.image_id);
-            // Build the IAM instance-profile association (when the request
+            // Build the IAM instance-profile association (when the launch
             // supplies `IamInstanceProfile`) before rendering, so the launch
             // response carries <iamInstanceProfile> as on AWS. The record
             // matches a direct AssociateIamInstanceProfile so
@@ -592,13 +924,7 @@ pub(crate) async fn run_instances(
             let iam_assoc = iam_profile_arn.clone().map(|profile_arn| {
                 super::rest::new_iam_profile_association(id.clone(), profile_arn)
             });
-            super::volume::create_launch_volumes(
-                state,
-                id,
-                &inst.az,
-                &launch_volumes,
-                &req.query_params,
-            );
+            super::volume::create_launch_volumes(state, id, &inst.az, &launch_volumes, params);
             let attachments: Vec<VolumeAttachment> = state
                 .volumes
                 .values()
@@ -609,7 +935,7 @@ pub(crate) async fn run_instances(
             rendered.push(instance_xml(
                 &inst,
                 &tags,
-                &owner,
+                account_id,
                 &sg_names,
                 &architecture,
                 &platform_details,
@@ -625,59 +951,210 @@ pub(crate) async fn run_instances(
         }
     }
 
-    // Background boot: bring up each backing container and reconcile state.
-    {
-        let svc_state = svc.state.clone();
-        let runtime = svc.runtime.clone();
-        let account_id = req.account_id.clone();
-        let ids = ids.clone();
-        let instance_network = instance_network.clone();
-        // Capture the persistence hook so the pending->running flip is written
-        // through to disk; RunInstances' own dispatch-path snapshot ran while
-        // the instance was still `pending` (M12).
-        let snapshot_hook = svc.snapshot_hook();
-        tokio::spawn(async move {
-            for id in &ids {
-                let running = if let Some(rt) = &runtime {
-                    match rt
-                        .run_instance(
-                            &account_id,
-                            id,
-                            user_data.as_deref(),
-                            &instance_tags,
-                            instance_network.as_ref(),
-                        )
-                        .await
-                    {
-                        Ok(r) => Some(r),
-                        Err(e) => {
-                            tracing::warn!(instance_id = %id, error = %e, "EC2 instance container failed to start; serving metadata-only");
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-                reconcile_started(&svc_state, &account_id, id, running);
-            }
-            // Persist the reconciled (`running`) state so a restart restores
-            // running instances rather than resurrecting them as pending.
-            if let Some(hook) = &snapshot_hook {
-                hook().await;
-            }
-            // All instances are up with their real IPs: (re)apply the
-            // security-group firewall so the new instances are filtered
-            // (#1745 phase 3). No-op when enforcement is disabled.
-            if let Some(rt) = &runtime {
-                if rt.network_isolation_enforced() {
-                    super::firewall_model::reconcile(&svc_state, rt).await;
-                }
-            }
-        });
-    }
+    Ok(Launched {
+        reservation_id,
+        ids,
+        rendered,
+        user_data,
+        instance_tags,
+        instance_network,
+    })
+}
 
-    let body = reservation_xml(&reservation_id, &owner, &rendered);
-    Ok(Ec2Service::respond("RunInstances", &req.request_id, &body))
+/// An existing network interface a launch attaches must exist and be free.
+fn check_eni_attachable(state: &Ec2State, eni_id: &str) -> Result<(), AwsServiceError> {
+    match state.network_interfaces.get(eni_id) {
+        None => Err(super::eni::eni_not_found(eni_id)),
+        Some(e) if e.attachment.is_some() => Err(AwsServiceError::aws_error(
+            http::StatusCode::BAD_REQUEST,
+            "InvalidNetworkInterface.InUse",
+            format!("Interface: [{eni_id}] in use."),
+        )),
+        Some(_) => Ok(()),
+    }
+}
+
+/// Whether `ip` is an IPv4 address inside `cidr`.
+fn ipv4_in_cidr(ip: &str, cidr: &str) -> bool {
+    let parse = |a: &str| a.parse::<std::net::Ipv4Addr>().ok().map(u32::from);
+    let Some((net, len)) = cidr.split_once('/') else {
+        return false;
+    };
+    match (parse(ip), parse(net), len.parse::<u32>()) {
+        (Some(ip), Some(net), Ok(len)) if len <= 32 => {
+            let mask = if len == 0 { 0 } else { u32::MAX << (32 - len) };
+            ip & mask == net & mask
+        }
+        _ => false,
+    }
+}
+
+/// Whether `ip` is taken in `subnet` by a live instance or a network
+/// interface.
+fn address_used_in_subnet(state: &Ec2State, subnet: Option<&str>, ip: &str) -> bool {
+    state
+        .instances
+        .values()
+        .any(|i| i.state_code != 48 && i.private_ip == ip && i.subnet_id.as_deref() == subnet)
+        || state
+            .network_interfaces
+            .values()
+            .any(|e| e.private_ip_address == ip && Some(e.subnet_id.as_str()) == subnet)
+}
+
+/// The first address from `.100` up in `subnet` no instance or interface
+/// uses (interfaces created earlier in the same launch included, as they are
+/// already in `state`) and the launch has not `reserved`.
+fn next_free_address(state: &Ec2State, subnet: &str, reserved: &[&str]) -> String {
+    let prefix = state
+        .subnets
+        .get(subnet)
+        .map(|s| subnet_ip_prefix(&s.cidr_block))
+        .unwrap_or_else(|| "10.0.0".to_string());
+    (100..255)
+        .map(|n| format!("{prefix}.{n}"))
+        .find(|ip| {
+            !reserved.contains(&ip.as_str()) && !address_used_in_subnet(state, Some(subnet), ip)
+        })
+        .unwrap_or_else(|| format!("{prefix}.254"))
+}
+
+/// A non-primary `NetworkInterface.N` of a launch.
+struct SecondaryNi {
+    device_index: i64,
+    /// An existing interface to attach; otherwise one is created.
+    eni_id: Option<String>,
+    subnet_id: Option<String>,
+    groups: Vec<String>,
+    private_ip: Option<String>,
+    description: String,
+    delete_on_termination: Option<bool>,
+}
+
+/// The launch's network interfaces other than the primary one, by index.
+fn secondary_network_interfaces(
+    params: &HashMap<String, String>,
+    primary: Option<usize>,
+) -> Vec<SecondaryNi> {
+    let indexes: std::collections::BTreeSet<usize> = params
+        .keys()
+        .filter_map(|k| k.strip_prefix("NetworkInterface."))
+        .filter_map(|rest| rest.split('.').next()?.parse().ok())
+        .collect();
+    indexes
+        .into_iter()
+        .filter(|n| Some(*n) != primary)
+        .map(|n| {
+            let get = |f: &str| {
+                params
+                    .get(&format!("NetworkInterface.{n}.{f}"))
+                    .filter(|v| !v.is_empty())
+                    .cloned()
+            };
+            SecondaryNi {
+                device_index: get("DeviceIndex")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(n as i64 - 1),
+                eni_id: get("NetworkInterfaceId"),
+                subnet_id: get("SubnetId"),
+                groups: indexed_list(params, &format!("NetworkInterface.{n}.SecurityGroupId")),
+                private_ip: get("PrivateIpAddress"),
+                description: get("Description").unwrap_or_default(),
+                delete_on_termination: get("DeleteOnTermination").map(|v| v == "true"),
+            }
+        })
+        .collect()
+}
+
+/// Attach a launch's secondary network interfaces to `id`: an existing one
+/// named by `NetworkInterfaceId` is attached (kept on termination unless
+/// asked otherwise), any other is created in its subnet (the instance's when
+/// it names none) with its groups (the instance's when it names none) and
+/// deleted with the instance by default.
+fn attach_secondary_network_interfaces(
+    state: &mut Ec2State,
+    id: &str,
+    inst: &Instance,
+    secondary: &[SecondaryNi],
+    params: &HashMap<String, String>,
+) {
+    // Addresses this launch claims that are not in `state` yet: the
+    // instance's own and every fixed secondary address.
+    let reserved: Vec<&str> = std::iter::once(inst.private_ip.as_str())
+        .chain(secondary.iter().filter_map(|n| n.private_ip.as_deref()))
+        .collect();
+    for ni in secondary {
+        let (eni_id, default_dot) = match &ni.eni_id {
+            Some(existing) => (existing.clone(), false),
+            None => {
+                let eni_id = gen_id("eni");
+                let subnet_id = ni
+                    .subnet_id
+                    .clone()
+                    .or_else(|| inst.subnet_id.clone())
+                    .unwrap_or_default();
+                let private_ip = ni
+                    .private_ip
+                    .clone()
+                    .unwrap_or_else(|| next_free_address(state, &subnet_id, &reserved));
+                let subnet = state.subnets.get(&subnet_id);
+                let eni = crate::state::NetworkInterface {
+                    network_interface_id: eni_id.clone(),
+                    vpc_id: subnet
+                        .map(|s| s.vpc_id.clone())
+                        .or_else(|| inst.vpc_id.clone())
+                        .unwrap_or_default(),
+                    availability_zone: subnet
+                        .map(|s| s.availability_zone.clone())
+                        .unwrap_or_else(|| inst.az.clone()),
+                    subnet_id,
+                    description: ni.description.clone(),
+                    mac_address: {
+                        let h = uuid::Uuid::new_v4().simple().to_string();
+                        format!(
+                            "0a:{}:{}:{}:{}:{}",
+                            &h[0..2],
+                            &h[2..4],
+                            &h[4..6],
+                            &h[6..8],
+                            &h[8..10]
+                        )
+                    },
+                    private_ip_address: private_ip,
+                    status: "in-use".to_string(),
+                    interface_type: "interface".to_string(),
+                    source_dest_check: true,
+                    group_ids: if ni.groups.is_empty() {
+                        inst.security_group_ids.clone()
+                    } else {
+                        ni.groups.clone()
+                    },
+                    private_ips: Vec::new(),
+                    ipv6_addresses: Vec::new(),
+                    attachment: None,
+                    public_ip_dns_hostname_type: None,
+                };
+                crate::service::tags::apply_tag_specifications(
+                    state,
+                    params,
+                    &eni_id,
+                    "network-interface",
+                );
+                state.network_interfaces.insert(eni_id.clone(), eni);
+                (eni_id, true)
+            }
+        };
+        if let Some(eni) = state.network_interfaces.get_mut(&eni_id) {
+            eni.status = "in-use".to_string();
+            eni.attachment = Some(crate::state::EniAttachment {
+                attachment_id: gen_id("eni-attach"),
+                instance_id: id.to_string(),
+                device_index: ni.device_index,
+                status: "attached".to_string(),
+                delete_on_termination: ni.delete_on_termination.unwrap_or(default_dot),
+            });
+        }
+    }
 }
 
 /// Flip a `pending`/`stopped` instance to `running` after its backing
@@ -785,6 +1262,26 @@ fn parse_metadata_options(
     }
 }
 
+/// A launch template reference (`LaunchTemplateSpecification`): exactly one
+/// of id / name, plus an optional version selector (`$Default` when absent,
+/// `$Latest`, or a number).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LaunchTemplateRef {
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub version: Option<String>,
+}
+
+/// The `MetadataOptions` fields an `AWS::EC2::Instance` sets.
+#[derive(Debug, Clone, Default)]
+pub struct CfnMetadataOptions {
+    pub http_tokens: Option<String>,
+    pub http_endpoint: Option<String>,
+    pub http_put_response_hop_limit: Option<i64>,
+    pub http_protocol_ipv6: Option<String>,
+    pub instance_metadata_tags: Option<String>,
+}
+
 /// Inputs for a CloudFormation-driven `AWS::EC2::Instance` launch.
 #[derive(Debug, Clone, Default)]
 pub struct CfnInstanceSpec {
@@ -796,14 +1293,15 @@ pub struct CfnInstanceSpec {
     pub key_name: Option<String>,
     pub user_data: Option<String>,
     pub private_ip: Option<String>,
-    /// Instance metadata service options (`MetadataOptions`). When present the
-    /// created instance reports these in DescribeInstances, matching a direct
-    /// RunInstances launch with the same options.
-    pub metadata_options: Option<crate::state::MetadataOptions>,
-    /// `EbsOptimized` — reflected in DescribeInstances `<ebsOptimized>`.
-    pub ebs_optimized: bool,
-    /// `Monitoring` — reflected in DescribeInstances `<monitoring><state>`.
-    pub monitoring: bool,
+    /// Instance metadata service options (`MetadataOptions`): only the fields
+    /// the resource sets, so the rest come from the launch template (or the
+    /// AWS defaults), as with a direct RunInstances launch.
+    pub metadata_options: CfnMetadataOptions,
+    /// `EbsOptimized` when the resource sets it (an explicit `false`
+    /// overrides a launch template's `true`).
+    pub ebs_optimized: Option<bool>,
+    /// `Monitoring` when the resource sets it.
+    pub monitoring: Option<bool>,
     /// `IamInstanceProfile` (arn, name). When present, an
     /// `IamInstanceProfileAssociation` is recorded so
     /// DescribeIamInstanceProfileAssociations reflects it, mirroring a direct
@@ -814,6 +1312,86 @@ pub struct CfnInstanceSpec {
     /// (`BlockDeviceMapping.N.DeviceName`, `BlockDeviceMapping.N.Ebs.*`):
     /// each EBS mapping creates an attached volume, as a direct launch does.
     pub block_device_params: HashMap<String, String>,
+    /// `LaunchTemplate`: the template version whose data fills every property
+    /// the resource itself does not set, as RunInstances does.
+    pub launch_template: Option<LaunchTemplateRef>,
+    /// `Tags` for the instance.
+    pub tags: Vec<(String, String)>,
+    /// `PropagateTagsToVolumeOnCreation`: the instance `Tags` also go on the
+    /// volumes created at launch.
+    pub propagate_tags_to_volumes: bool,
+}
+
+impl CfnInstanceSpec {
+    /// The RunInstances parameters this resource launches with.
+    fn run_instances_params(&self) -> HashMap<String, String> {
+        let mut p: HashMap<String, String> = self.block_device_params.clone();
+        p.insert("MinCount".into(), "1".into());
+        p.insert("MaxCount".into(), "1".into());
+        let mut set = |k: &str, v: Option<&String>| {
+            if let Some(v) = v.filter(|v| !v.is_empty()) {
+                p.insert(k.to_string(), v.clone());
+            }
+        };
+        set("ImageId", self.image_id.as_ref());
+        set("InstanceType", self.instance_type.as_ref());
+        set("SubnetId", self.subnet_id.as_ref());
+        set(
+            "Placement.AvailabilityZone",
+            self.availability_zone.as_ref(),
+        );
+        set("KeyName", self.key_name.as_ref());
+        set("UserData", self.user_data.as_ref());
+        set("PrivateIpAddress", self.private_ip.as_ref());
+        // An ARN wins over a name, as CloudFormation resolves a profile `Ref`
+        // to its ARN where IAM knows it.
+        match (
+            &self.iam_instance_profile_arn,
+            &self.iam_instance_profile_name,
+        ) {
+            (Some(arn), _) => set("IamInstanceProfile.Arn", Some(arn)),
+            (None, Some(name)) => set("IamInstanceProfile.Name", Some(name)),
+            (None, None) => {}
+        }
+        if let Some(lt) = &self.launch_template {
+            set("LaunchTemplate.LaunchTemplateId", lt.id.as_ref());
+            set("LaunchTemplate.LaunchTemplateName", lt.name.as_ref());
+            set("LaunchTemplate.Version", lt.version.as_ref());
+        }
+        for (i, sg) in self.security_group_ids.iter().enumerate() {
+            p.insert(format!("SecurityGroupId.{}", i + 1), sg.clone());
+        }
+        // Only the properties the resource sets: anything left out falls back
+        // to the launch template (or the EC2 default).
+        if let Some(v) = self.ebs_optimized {
+            p.insert("EbsOptimized".into(), v.to_string());
+        }
+        if let Some(v) = self.monitoring {
+            p.insert("Monitoring.Enabled".into(), v.to_string());
+        }
+        let m = &self.metadata_options;
+        for (key, value) in [
+            ("HttpTokens", m.http_tokens.clone()),
+            ("HttpEndpoint", m.http_endpoint.clone()),
+            (
+                "HttpPutResponseHopLimit",
+                m.http_put_response_hop_limit.map(|v| v.to_string()),
+            ),
+            ("HttpProtocolIpv6", m.http_protocol_ipv6.clone()),
+            ("InstanceMetadataTags", m.instance_metadata_tags.clone()),
+        ] {
+            if let Some(v) = value {
+                p.insert(format!("MetadataOptions.{key}"), v);
+            }
+        }
+        for (k, v) in &self.tags {
+            super::launch_template::add_tag(&mut p, "instance", k, v);
+            if self.propagate_tags_to_volumes {
+                super::launch_template::add_tag(&mut p, "volume", k, v);
+            }
+        }
+        p
+    }
 }
 
 /// The Ref / GetAtt-resolvable attributes of a CFN-launched instance.
@@ -826,179 +1404,41 @@ pub struct CfnInstanceAttrs {
 }
 
 /// Synchronously insert a control-plane `AWS::EC2::Instance` record (status
-/// `pending`) and return its Ref/GetAtt attributes. Mirrors the control-plane
-/// half of [`run_instances`] for a single instance so a CFN-provisioned
-/// instance resolves `Ref` to a real `i-...` id and `GetAtt`
-/// PrivateIp/PublicIp/AvailabilityZone immediately. The backing container is
-/// booted afterwards by [`cfn_boot_instance`] (drained off the request path).
+/// `pending`) through the same launch path as [`run_instances`] (launch
+/// template resolution, volumes, tags, IAM instance profile) and return its
+/// Ref/GetAtt attributes, so a CFN-provisioned instance resolves `Ref` to a
+/// real `i-...` id and `GetAtt` PrivateIp/PublicIp/AvailabilityZone
+/// immediately. The backing container is booted afterwards by
+/// [`cfn_boot_instance`] (drained off the request path).
 pub(crate) fn cfn_create_instance(
     svc: &Ec2Service,
     account_id: &str,
     region: &str,
     spec: &CfnInstanceSpec,
-) -> CfnInstanceAttrs {
-    let image_id = spec
-        .image_id
-        .clone()
-        .unwrap_or_else(|| "ami-00000000000000000".to_string());
-    let instance_type = spec
-        .instance_type
-        .clone()
-        .unwrap_or_else(|| "t3.micro".to_string());
-    let region = if region.is_empty() {
-        "us-east-1"
-    } else {
-        region
-    };
-    let mut subnet_id = spec.subnet_id.clone();
-    let mut sg_ids = spec.security_group_ids.clone();
-
-    let (vpc_id, subnet_auto_public, ip_prefix, az) = {
-        let accounts = svc.state.read();
-        let empty = Ec2State::new(account_id, region);
-        let state = accounts.get(account_id).unwrap_or(&empty);
-        // Resolve a default subnet when none is given, preferring the requested
-        // AZ, exactly like `run_instances`.
-        if subnet_id.is_none() {
-            let want_az = spec.availability_zone.clone();
-            if let Some(s) = state
-                .subnets
-                .values()
-                .filter(|s| s.default_for_az)
-                .find(|s| want_az.as_deref().is_none_or(|a| s.availability_zone == a))
-                .or_else(|| state.subnets.values().find(|s| s.default_for_az))
-            {
-                subnet_id = Some(s.subnet_id.clone());
-            }
-        }
-        let resolved_vpc = subnet_id
-            .as_ref()
-            .and_then(|sid| state.subnets.get(sid))
-            .map(|s| s.vpc_id.clone());
-        if sg_ids.is_empty() {
-            let vpc = resolved_vpc
-                .clone()
-                .unwrap_or_else(|| crate::defaults::default_vpc_id(account_id));
-            if let Some(sg) = state
-                .security_groups
-                .values()
-                .find(|g| g.vpc_id == vpc && g.group_name == "default")
-            {
-                sg_ids = vec![sg.group_id.clone()];
-            }
-        }
-        let (vpc, auto_public, az) = match subnet_id.as_ref() {
-            Some(sid) => state
-                .subnets
-                .get(sid)
-                .map(|s| {
-                    (
-                        Some(s.vpc_id.clone()),
-                        s.map_public_ip_on_launch || s.default_for_az,
-                        s.availability_zone.clone(),
-                    )
-                })
-                .unwrap_or((None, false, format!("{region}a"))),
-            None => (
-                Some(crate::defaults::default_vpc_id(account_id)),
-                true,
-                format!("{region}a"),
-            ),
-        };
-        let az = spec.availability_zone.clone().unwrap_or(az);
-        let ip_prefix = subnet_id
-            .as_ref()
-            .and_then(|sid| state.subnets.get(sid))
-            .map(|s| subnet_ip_prefix(&s.cidr_block))
-            .unwrap_or_else(|| "10.0.0".to_string());
-        (vpc, auto_public, ip_prefix, az)
-    };
-
-    let assign_public = subnet_auto_public;
-    let launch_volumes = super::volume::launch_volumes(
-        svc,
-        account_id,
-        region,
-        &spec.block_device_params,
-        "BlockDeviceMapping",
-    );
-    let id = gen_id("i");
-    let private_ip = spec
-        .private_ip
-        .clone()
-        .unwrap_or_else(|| format!("{ip_prefix}.10"));
-    let public_ip = if assign_public {
-        Some("52.0.0.10".to_string())
-    } else {
-        None
-    };
-
-    {
-        let mut accounts = svc.state.write();
-        let state = accounts.get_or_create(account_id);
-        let inst = Instance {
-            instance_id: id.clone(),
-            image_id,
-            instance_type,
-            state_code: 0,
-            state_name: "pending".to_string(),
-            private_ip: private_ip.clone(),
-            public_ip: public_ip.clone(),
-            subnet_id: subnet_id.clone(),
-            vpc_id: vpc_id.clone(),
-            key_name: spec.key_name.clone(),
-            security_group_ids: sg_ids,
-            reservation_id: gen_id("r"),
-            ami_launch_index: 0,
-            monitoring: spec.monitoring,
-            az: az.clone(),
-            launch_time: LAUNCH_TIME.to_string(),
-            container_id: None,
-            disable_api_termination: false,
-            disable_api_stop: false,
-            source_dest_check: true,
-            ebs_optimized: spec.ebs_optimized,
-            instance_initiated_shutdown_behavior: "stop".to_string(),
-            user_data: spec.user_data.clone().filter(|s| !s.is_empty()),
-            metadata_options: spec.metadata_options.clone().unwrap_or_default(),
-            cpu_options: None,
-            bandwidth_weighting: None,
-            maintenance_options: crate::state::MaintenanceOptions::default(),
-            placement_tenancy: None,
-            placement_affinity: None,
-            placement_group_name: None,
-            private_dns_hostname_type: None,
-            enable_resource_name_dns_a_record: false,
-            enable_resource_name_dns_aaaa_record: false,
-        };
-        state.instances.insert(id.clone(), inst);
-        super::volume::create_launch_volumes(state, &id, &az, &launch_volumes, &HashMap::new());
-
-        // Record an IAM instance-profile association when the template supplies
-        // `IamInstanceProfile`, mirroring a direct AssociateIamInstanceProfile
-        // so DescribeIamInstanceProfileAssociations reflects it. AWS accepts
-        // either Arn or Name; synthesize the missing half so it round-trips.
-        if spec.iam_instance_profile_arn.is_some() || spec.iam_instance_profile_name.is_some() {
-            let arn = spec.iam_instance_profile_arn.clone().unwrap_or_else(|| {
-                let name = spec.iam_instance_profile_name.clone().unwrap_or_default();
-                format!(
-                    "arn:{}:iam::{account_id}:instance-profile/{name}",
-                    fakecloud_aws::arn::partition_for(region)
-                )
-            });
-            let assoc = super::rest::new_iam_profile_association(id.clone(), arn);
-            state
-                .iam_instance_profile_associations
-                .insert(assoc.association_id.clone(), assoc);
-        }
+) -> Result<CfnInstanceAttrs, AwsServiceError> {
+    let mut params = spec.run_instances_params();
+    // CloudFormation instances without an image (and no template to supply
+    // one) launch from the placeholder AMI, as before.
+    if spec.launch_template.is_none() && !params.contains_key("ImageId") {
+        params.insert("ImageId".into(), "ami-00000000000000000".into());
     }
-
-    CfnInstanceAttrs {
-        instance_id: id,
-        private_ip,
-        public_ip,
-        availability_zone: az,
-    }
+    let launched = launch_instances(svc, account_id, region, &params)?;
+    let id = launched
+        .ids
+        .into_iter()
+        .next()
+        .ok_or_else(|| invalid_parameter_value("no instance launched"))?;
+    let accounts = svc.state.read();
+    let inst = accounts
+        .get(account_id)
+        .and_then(|s| s.instances.get(&id))
+        .ok_or_else(|| invalid_parameter_value("no instance launched"))?;
+    Ok(CfnInstanceAttrs {
+        instance_id: id.clone(),
+        private_ip: inst.private_ip.clone(),
+        public_ip: inst.public_ip.clone(),
+        availability_zone: inst.az.clone(),
+    })
 }
 
 /// Boot the backing container for a CFN-created instance and reconcile it to
@@ -1007,32 +1447,20 @@ pub(crate) fn cfn_create_instance(
 /// the CloudFormation create drain so stack creation never blocks on a cold
 /// image pull / Pod readiness.
 pub(crate) async fn cfn_boot_instance(svc: &Ec2Service, account_id: &str, id: &str) {
-    let (user_data, instance_network) = {
-        let accounts = svc.state.read();
-        let Some(state) = accounts.get(account_id) else {
-            return;
-        };
-        let Some(inst) = state.instances.get(id) else {
-            return;
-        };
-        let network = inst
-            .subnet_id
-            .as_ref()
-            .map(|sid| crate::runtime::InstanceNetwork {
-                subnet_id: sid.clone(),
-                internal: !crate::defaults::subnet_is_public(state, sid),
-            });
-        (inst.user_data.clone(), network)
+    // The same boot inputs a direct launch passes (user data, the tag map that
+    // carries `fakecloud-k8s/*` scheduling tags, the subnet network).
+    let Some((user_data, tags, instance_network)) = run_instance_inputs(&svc.state, account_id, id)
+    else {
+        return;
     };
 
-    let empty_tags = std::collections::BTreeMap::new();
     let running = if let Some(rt) = &svc.runtime {
         match rt
             .run_instance(
                 account_id,
                 id,
                 user_data.as_deref(),
-                &empty_tags,
+                &tags,
                 instance_network.as_ref(),
             )
             .await
@@ -1088,14 +1516,10 @@ pub(crate) async fn cfn_terminate_instance(
     let _ = terminate_instances(svc, &req).await;
 }
 
-fn validate_enum_instance_type(req: &AwsRequest) -> Result<(), AwsServiceError> {
+fn validate_enum_instance_type(params: &HashMap<String, String>) -> Result<(), AwsServiceError> {
     // InstanceType has ~850 enum members; accept any non-empty value that looks
     // like a `family.size` token rather than enumerating them all.
-    if let Some(v) = req
-        .query_params
-        .get("InstanceType")
-        .filter(|v| !v.is_empty())
-    {
+    if let Some(v) = params.get("InstanceType").filter(|v| !v.is_empty()) {
         if !v.contains('.') {
             return Err(invalid_parameter_value(format!(
                 "Invalid instance type '{v}'"
@@ -1243,6 +1667,32 @@ async fn change_state(
             // Its EBS volumes go with it: DeleteOnTermination ones are
             // deleted, the rest detached.
             super::volume::release_terminated_volumes(state, &affected);
+            // Network interfaces too: the ones launched with it are deleted,
+            // other attached ones detached.
+            let deleted: Vec<String> = state
+                .network_interfaces
+                .iter()
+                .filter(|(_, eni)| {
+                    eni.attachment.as_ref().is_some_and(|a| {
+                        affected.contains(&a.instance_id) && a.delete_on_termination
+                    })
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            for eni_id in &deleted {
+                state.network_interfaces.remove(eni_id);
+                state.tags.remove(eni_id);
+            }
+            for eni in state.network_interfaces.values_mut() {
+                if eni
+                    .attachment
+                    .as_ref()
+                    .is_some_and(|a| affected.contains(&a.instance_id))
+                {
+                    eni.attachment = None;
+                    eni.status = "available".to_string();
+                }
+            }
         }
     }
 
@@ -2718,6 +3168,7 @@ mod modify_tests {
                 private_dns_hostname_type: None,
                 enable_resource_name_dns_a_record: false,
                 enable_resource_name_dns_aaaa_record: false,
+                instance_lifecycle: None,
             };
             state.instances.insert("i-1".into(), inst);
             state.upsert_tags(
@@ -2754,17 +3205,17 @@ mod modify_tests {
         let spec = CfnInstanceSpec {
             image_id: Some("ami-123".into()),
             instance_type: Some("t3.small".into()),
-            metadata_options: Some(crate::state::MetadataOptions {
-                http_tokens: "required".into(),
-                http_put_response_hop_limit: 3,
+            metadata_options: CfnMetadataOptions {
+                http_tokens: Some("required".into()),
+                http_put_response_hop_limit: Some(3),
                 ..Default::default()
-            }),
-            ebs_optimized: true,
-            monitoring: true,
+            },
+            ebs_optimized: Some(true),
+            monitoring: Some(true),
             iam_instance_profile_name: Some("my-profile".into()),
             ..Default::default()
         };
-        let attrs = cfn_create_instance(&svc, "000000000000", "us-east-1", &spec);
+        let attrs = cfn_create_instance(&svc, "000000000000", "us-east-1", &spec).unwrap();
 
         // ...and DescribeInstances renders the profile on the instance.
         let desc = body(describe_instances(&svc, &req("DescribeInstances", &[])).unwrap());
@@ -3479,5 +3930,623 @@ mod modify_tests {
             code, 16,
             "healthy instance must be untouched on atomic fail"
         );
+    }
+
+    fn create_lt(svc: &Ec2Service, name: &str, data: &[(&str, &str)]) -> String {
+        let mut q: Vec<(String, String)> =
+            vec![("LaunchTemplateName".to_string(), name.to_string())];
+        for (k, v) in data {
+            q.push((format!("LaunchTemplateData.{k}"), v.to_string()));
+        }
+        let q: Vec<(&str, &str)> = q.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let out = body(
+            super::super::fleet::create_launch_template(svc, &req("CreateLaunchTemplate", &q))
+                .unwrap(),
+        );
+        out.split("<launchTemplateId>")
+            .nth(1)
+            .and_then(|s| s.split("</launchTemplateId>").next())
+            .unwrap()
+            .to_string()
+    }
+
+    fn add_lt_version(svc: &Ec2Service, name: &str, data: &[(&str, &str)]) {
+        let mut q: Vec<(String, String)> =
+            vec![("LaunchTemplateName".to_string(), name.to_string())];
+        for (k, v) in data {
+            q.push((format!("LaunchTemplateData.{k}"), v.to_string()));
+        }
+        let q: Vec<(&str, &str)> = q.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        super::super::fleet::create_launch_template_version(
+            svc,
+            &req("CreateLaunchTemplateVersion", &q),
+        )
+        .unwrap();
+    }
+
+    fn launched_id(xml: &str) -> String {
+        xml.split("<instanceId>")
+            .nth(1)
+            .and_then(|s| s.split("</instanceId>").next())
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn run_instances_applies_launch_template_version_with_request_override() {
+        let svc = Ec2Service::new();
+        let lt_id = create_lt(
+            &svc,
+            "web",
+            &[
+                ("ImageId", "ami-v1"),
+                ("InstanceType", "t3.small"),
+                ("KeyName", "kp"),
+                ("IamInstanceProfile.Name", "web-profile"),
+                ("MetadataOptions.HttpTokens", "required"),
+                ("Monitoring.Enabled", "true"),
+                ("EbsOptimized", "true"),
+                ("CreditSpecification.CpuCredits", "unlimited"),
+                ("BlockDeviceMapping.1.DeviceName", "/dev/xvda"),
+                ("BlockDeviceMapping.1.Ebs.VolumeSize", "30"),
+                ("BlockDeviceMapping.1.Ebs.Encrypted", "true"),
+                ("TagSpecification.1.ResourceType", "instance"),
+                ("TagSpecification.1.Tag.1.Key", "env"),
+                ("TagSpecification.1.Tag.1.Value", "tmpl"),
+                ("TagSpecification.2.ResourceType", "volume"),
+                ("TagSpecification.2.Tag.1.Key", "backup"),
+                ("TagSpecification.2.Tag.1.Value", "daily"),
+            ],
+        );
+        add_lt_version(
+            &svc,
+            "web",
+            &[("ImageId", "ami-v2"), ("InstanceType", "m5.large")],
+        );
+
+        // Default ($Default = version 1) with an InstanceType + tag override.
+        let out = body(
+            run_instances(
+                &svc,
+                &req(
+                    "RunInstances",
+                    &[
+                        ("MinCount", "1"),
+                        ("MaxCount", "1"),
+                        ("LaunchTemplate.LaunchTemplateName", "web"),
+                        ("InstanceType", "c5.large"),
+                        ("TagSpecification.1.ResourceType", "instance"),
+                        ("TagSpecification.1.Tag.1.Key", "env"),
+                        ("TagSpecification.1.Tag.1.Value", "prod"),
+                    ],
+                ),
+            )
+            .await
+            .unwrap(),
+        );
+        let id = launched_id(&out);
+        {
+            let accounts = svc.state.read();
+            let state = accounts.get("000000000000").unwrap();
+            let inst = &state.instances[&id];
+            assert_eq!(inst.image_id, "ami-v1");
+            assert_eq!(inst.instance_type, "c5.large", "request wins");
+            assert_eq!(inst.key_name.as_deref(), Some("kp"));
+            assert_eq!(inst.metadata_options.http_tokens, "required");
+            assert!(inst.monitoring && inst.ebs_optimized);
+            assert_eq!(state.instance_credit_specs[&id], "unlimited");
+            let tags: Vec<(String, String)> = state
+                .tags_for(&id)
+                .iter()
+                .map(|t| (t.key.clone(), t.value.clone()))
+                .collect();
+            assert!(tags.contains(&("env".into(), "prod".into())), "{tags:?}");
+            assert!(tags.contains(&("aws:ec2launchtemplate:id".into(), lt_id.clone())));
+            assert!(tags.contains(&("aws:ec2launchtemplate:version".into(), "1".into())));
+            // The template's BDM created an encrypted 30 GiB volume, tagged
+            // with the template's volume tags.
+            let vol = state
+                .volumes
+                .values()
+                .find(|v| v.attachments.iter().any(|a| a.instance_id == id))
+                .expect("template BDM creates a volume");
+            assert_eq!(vol.size, 30);
+            assert!(vol.encrypted);
+            assert_eq!(state.tags_for(&vol.volume_id)[0].key, "backup");
+            assert!(state.iam_instance_profile_associations.values().any(
+                |a| a.instance_id == id && a.iam_instance_profile_arn.ends_with("/web-profile")
+            ));
+        }
+
+        // $Latest and an explicit version number by id.
+        for (version, image) in [("$Latest", "ami-v2"), ("1", "ami-v1"), ("2", "ami-v2")] {
+            let out = body(
+                run_instances(
+                    &svc,
+                    &req(
+                        "RunInstances",
+                        &[
+                            ("MinCount", "1"),
+                            ("MaxCount", "1"),
+                            ("LaunchTemplate.LaunchTemplateId", &lt_id),
+                            ("LaunchTemplate.Version", version),
+                        ],
+                    ),
+                )
+                .await
+                .unwrap(),
+            );
+            let id = launched_id(&out);
+            let accounts = svc.state.read();
+            assert_eq!(
+                accounts.get("000000000000").unwrap().instances[&id].image_id,
+                image,
+                "version {version}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn run_instances_rejects_unknown_launch_template_and_version() {
+        let svc = Ec2Service::new();
+        create_lt(&svc, "web", &[("ImageId", "ami-1")]);
+        let run = |q: Vec<(&'static str, &'static str)>| {
+            let svc = &svc;
+            async move {
+                let mut q = q;
+                q.push(("MinCount", "1"));
+                q.push(("MaxCount", "1"));
+                crate::test_support::err_of(run_instances(svc, &req("RunInstances", &q)).await)
+                    .code()
+                    .to_string()
+            }
+        };
+        assert_eq!(
+            run(vec![("LaunchTemplate.LaunchTemplateName", "nope")]).await,
+            "InvalidLaunchTemplateName.NotFoundException"
+        );
+        assert_eq!(
+            run(vec![(
+                "LaunchTemplate.LaunchTemplateId",
+                "lt-00000000000000000"
+            )])
+            .await,
+            "InvalidLaunchTemplateId.NotFound"
+        );
+        assert_eq!(
+            run(vec![
+                ("LaunchTemplate.LaunchTemplateName", "web"),
+                ("LaunchTemplate.Version", "9")
+            ])
+            .await,
+            "InvalidLaunchTemplateId.VersionNotFound"
+        );
+        // A template with no image and no ImageId in the request.
+        create_lt(&svc, "noimage", &[("InstanceType", "t3.micro")]);
+        assert_eq!(
+            run(vec![("LaunchTemplate.LaunchTemplateName", "noimage")]).await,
+            "MissingParameter"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_instances_honors_template_network_interface_and_placement() {
+        let svc = Ec2Service::new();
+        create_lt(
+            &svc,
+            "net",
+            &[
+                ("ImageId", "ami-1"),
+                ("NetworkInterface.1.DeviceIndex", "0"),
+                ("NetworkInterface.1.SubnetId", "subnet-tmpl"),
+                ("NetworkInterface.1.PrivateIpAddress", "10.9.9.9"),
+                ("NetworkInterface.1.SecurityGroupId.1", "sg-tmpl"),
+                ("Placement.Tenancy", "dedicated"),
+                ("DisableApiTermination", "true"),
+            ],
+        );
+        let out = body(
+            run_instances(
+                &svc,
+                &req(
+                    "RunInstances",
+                    &[
+                        ("MinCount", "1"),
+                        ("MaxCount", "1"),
+                        ("LaunchTemplate.LaunchTemplateName", "net"),
+                    ],
+                ),
+            )
+            .await
+            .unwrap(),
+        );
+        let id = launched_id(&out);
+        let accounts = svc.state.read();
+        let inst = &accounts.get("000000000000").unwrap().instances[&id];
+        assert_eq!(inst.subnet_id.as_deref(), Some("subnet-tmpl"));
+        assert_eq!(inst.private_ip, "10.9.9.9");
+        assert_eq!(inst.security_group_ids, vec!["sg-tmpl".to_string()]);
+        assert_eq!(inst.placement_tenancy.as_deref(), Some("dedicated"));
+        assert!(inst.disable_api_termination);
+    }
+
+    #[test]
+    fn cfn_instance_overrides_only_the_fields_it_sets() {
+        let svc = Ec2Service::new();
+        create_lt(
+            &svc,
+            "meta",
+            &[
+                ("ImageId", "ami-1"),
+                ("MetadataOptions.HttpPutResponseHopLimit", "2"),
+                ("MetadataOptions.HttpEndpoint", "enabled"),
+                ("EbsOptimized", "true"),
+                ("Monitoring.Enabled", "true"),
+            ],
+        );
+        let spec = CfnInstanceSpec {
+            launch_template: Some(LaunchTemplateRef {
+                name: Some("meta".into()),
+                ..Default::default()
+            }),
+            metadata_options: CfnMetadataOptions {
+                http_tokens: Some("required".into()),
+                ..Default::default()
+            },
+            ebs_optimized: Some(false),
+            ..Default::default()
+        };
+        let attrs = cfn_create_instance(&svc, "000000000000", "us-east-1", &spec).unwrap();
+        let accounts = svc.state.read();
+        let inst = &accounts.get("000000000000").unwrap().instances[&attrs.instance_id];
+        assert_eq!(inst.metadata_options.http_tokens, "required");
+        assert_eq!(
+            inst.metadata_options.http_put_response_hop_limit, 2,
+            "template kept"
+        );
+        assert!(!inst.ebs_optimized, "explicit false wins");
+        assert!(inst.monitoring, "unset comes from the template");
+    }
+
+    #[tokio::test]
+    async fn fixed_private_ip_with_several_instances_is_rejected() {
+        let svc = Ec2Service::new();
+        let err = crate::test_support::err_of(
+            run_instances(
+                &svc,
+                &req(
+                    "RunInstances",
+                    &[
+                        ("ImageId", "ami-1"),
+                        ("MinCount", "1"),
+                        ("MaxCount", "2"),
+                        ("PrivateIpAddress", "10.1.2.3"),
+                    ],
+                ),
+            )
+            .await,
+        );
+        assert_eq!(err.code(), "InvalidParameterCombination");
+    }
+
+    #[tokio::test]
+    async fn spot_market_and_secondary_interfaces_are_launched() {
+        let svc = Ec2Service::new();
+        let out = body(
+            run_instances(
+                &svc,
+                &req(
+                    "RunInstances",
+                    &[
+                        ("ImageId", "ami-1"),
+                        ("MinCount", "1"),
+                        ("MaxCount", "1"),
+                        ("InstanceMarketOptions.MarketType", "spot"),
+                        ("NetworkInterface.1.DeviceIndex", "0"),
+                        ("NetworkInterface.1.SubnetId", "subnet-a"),
+                        ("NetworkInterface.2.DeviceIndex", "1"),
+                        ("NetworkInterface.2.SecurityGroupId.1", "sg-2"),
+                    ],
+                ),
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(
+            out.contains("<instanceLifecycle>spot</instanceLifecycle>"),
+            "{out}"
+        );
+        let id = launched_id(&out);
+        let eni_id = {
+            let accounts = svc.state.read();
+            let st = accounts.get("000000000000").unwrap();
+            let (eni_id, eni) = st
+                .network_interfaces
+                .iter()
+                .find(|(_, e)| e.attachment.as_ref().is_some_and(|a| a.instance_id == id))
+                .expect("secondary interface attached");
+            let a = eni.attachment.as_ref().unwrap();
+            assert_eq!(a.device_index, 1);
+            assert!(a.delete_on_termination);
+            assert_eq!(
+                eni.subnet_id, "subnet-a",
+                "the instance's subnet by default"
+            );
+            assert_eq!(eni.group_ids, vec!["sg-2".to_string()]);
+            eni_id.clone()
+        };
+        terminate_instances(&svc, &req("TerminateInstances", &[("InstanceId.1", &id)]))
+            .await
+            .unwrap();
+        assert!(!svc
+            .state
+            .read()
+            .get("000000000000")
+            .unwrap()
+            .network_interfaces
+            .contains_key(&eni_id));
+    }
+
+    #[tokio::test]
+    async fn secondary_interfaces_are_distinct_per_instance_and_validated() {
+        let svc = Ec2Service::new();
+        let out = body(
+            run_instances(
+                &svc,
+                &req(
+                    "RunInstances",
+                    &[
+                        ("ImageId", "ami-1"),
+                        ("MinCount", "2"),
+                        ("MaxCount", "2"),
+                        ("NetworkInterface.1.DeviceIndex", "0"),
+                        ("NetworkInterface.2.DeviceIndex", "1"),
+                    ],
+                ),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(out.matches("<instanceId>").count(), 2);
+        {
+            let accounts = svc.state.read();
+            let st = accounts.get("000000000000").unwrap();
+            let ips: std::collections::BTreeSet<&String> = st
+                .network_interfaces
+                .values()
+                .map(|e| &e.private_ip_address)
+                .collect();
+            assert_eq!(ips.len(), 2, "one distinct address per instance");
+        }
+        let err = crate::test_support::err_of(
+            run_instances(
+                &svc,
+                &req(
+                    "RunInstances",
+                    &[
+                        ("ImageId", "ami-1"),
+                        ("MinCount", "1"),
+                        ("MaxCount", "1"),
+                        ("NetworkInterface.1.DeviceIndex", "0"),
+                        ("NetworkInterface.2.DeviceIndex", "1"),
+                        ("NetworkInterface.2.SubnetId", "subnet-doesnotexist"),
+                    ],
+                ),
+            )
+            .await,
+        );
+        assert_eq!(err.code(), "InvalidSubnetID.NotFound");
+    }
+
+    #[tokio::test]
+    async fn network_interface_rules() {
+        let svc = Ec2Service::new();
+        let run = |q: Vec<(&'static str, String)>| {
+            let svc = &svc;
+            async move {
+                let mut q: Vec<(&str, String)> = q;
+                q.push(("ImageId", "ami-1".into()));
+                q.push(("MinCount", "1".into()));
+                q.push(("MaxCount", "1".into()));
+                let q: Vec<(&str, &str)> = q.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                run_instances(svc, &req("RunInstances", &q)).await
+            }
+        };
+        let code = |r: Result<AwsResponse, AwsServiceError>| {
+            crate::test_support::err_of(r).code().to_string()
+        };
+        // Duplicate device index.
+        assert_eq!(
+            code(
+                run(vec![
+                    ("NetworkInterface.1.DeviceIndex", "0".into()),
+                    ("NetworkInterface.2.DeviceIndex", "1".into()),
+                    ("NetworkInterface.3.DeviceIndex", "1".into()),
+                ])
+                .await
+            ),
+            "InvalidParameterValue"
+        );
+        // Instance-level groups with interfaces.
+        assert_eq!(
+            code(
+                run(vec![
+                    ("NetworkInterface.1.DeviceIndex", "0".into()),
+                    ("SecurityGroup.1", "web".into()),
+                ])
+                .await
+            ),
+            "InvalidParameterCombination"
+        );
+        // Separate launches never reuse a generated secondary address.
+        for _ in 0..2 {
+            run(vec![
+                ("NetworkInterface.1.DeviceIndex", "0".into()),
+                ("NetworkInterface.2.DeviceIndex", "1".into()),
+            ])
+            .await
+            .unwrap();
+        }
+        {
+            let accounts = svc.state.read();
+            let ips: std::collections::BTreeSet<String> = accounts
+                .get("000000000000")
+                .unwrap()
+                .network_interfaces
+                .values()
+                .map(|e| e.private_ip_address.clone())
+                .collect();
+            assert_eq!(ips.len(), 2, "{ips:?}");
+        }
+        // A primary interface by id: the instance takes it over.
+        let eni = body(
+            super::super::eni::create_network_interface(
+                &svc,
+                &req(
+                    "CreateNetworkInterface",
+                    &[("SubnetId", "subnet-x"), ("PrivateIpAddress", "10.7.7.7")],
+                ),
+            )
+            .unwrap(),
+        );
+        let eni_id = eni
+            .split("<networkInterfaceId>")
+            .nth(1)
+            .and_then(|s| s.split("</networkInterfaceId>").next())
+            .unwrap()
+            .to_string();
+        let out = body(
+            run(vec![
+                ("NetworkInterface.1.DeviceIndex", "0".into()),
+                ("NetworkInterface.1.NetworkInterfaceId", eni_id.clone()),
+            ])
+            .await
+            .unwrap(),
+        );
+        let id = launched_id(&out);
+        {
+            let accounts = svc.state.read();
+            let st = accounts.get("000000000000").unwrap();
+            assert_eq!(st.instances[&id].private_ip, "10.7.7.7");
+            assert_eq!(st.instances[&id].subnet_id.as_deref(), Some("subnet-x"));
+            let a = st.network_interfaces[&eni_id].attachment.as_ref().unwrap();
+            assert_eq!((a.instance_id.as_str(), a.device_index), (id.as_str(), 0));
+        }
+        // A generated secondary address skips the launch's own fixed ones.
+        let out = body(
+            run(vec![
+                ("NetworkInterface.1.DeviceIndex", "0".into()),
+                ("NetworkInterface.1.SubnetId", "subnet-y".into()),
+                ("NetworkInterface.1.PrivateIpAddress", "10.0.0.100".into()),
+                ("NetworkInterface.2.DeviceIndex", "1".into()),
+                ("NetworkInterface.3.DeviceIndex", "2".into()),
+                ("NetworkInterface.3.PrivateIpAddress", "10.0.0.101".into()),
+            ])
+            .await
+            .unwrap(),
+        );
+        let id = launched_id(&out);
+        let accounts = svc.state.read();
+        let st = accounts.get("000000000000").unwrap();
+        let mut ips: Vec<String> = st
+            .network_interfaces
+            .values()
+            .filter(|e| e.attachment.as_ref().is_some_and(|a| a.instance_id == id))
+            .map(|e| e.private_ip_address.clone())
+            .collect();
+        ips.sort();
+        assert_eq!(
+            ips,
+            vec!["10.0.0.101".to_string(), "10.0.0.102".to_string()]
+        );
+        // The write-lock re-check: a vanished interface is NotFound, an
+        // attached one InUse.
+        assert_eq!(
+            check_eni_attachable(st, "eni-gone").unwrap_err().code(),
+            "InvalidNetworkInterfaceID.NotFound"
+        );
+        assert_eq!(
+            check_eni_attachable(st, &eni_id).unwrap_err().code(),
+            "InvalidNetworkInterface.InUse"
+        );
+        assert!(!ipv4_in_cidr("10.1.0.5", "10.0.0.0/24"));
+        assert!(ipv4_in_cidr("10.0.0.5", "10.0.0.0/24"));
+    }
+
+    #[tokio::test]
+    async fn pinned_private_ip_in_use_is_rejected() {
+        let svc = Ec2Service::new();
+        let launch = || {
+            req(
+                "RunInstances",
+                &[
+                    ("ImageId", "ami-1"),
+                    ("MinCount", "1"),
+                    ("MaxCount", "1"),
+                    ("SubnetId", "subnet-x"),
+                    ("PrivateIpAddress", "10.1.2.3"),
+                ],
+            )
+        };
+        run_instances(&svc, &launch()).await.unwrap();
+        let err = crate::test_support::err_of(run_instances(&svc, &launch()).await);
+        assert_eq!(err.code(), "InvalidIPAddress.InUse");
+    }
+
+    #[test]
+    fn cfn_instance_launches_from_launch_template() {
+        let svc = Ec2Service::new();
+        create_lt(
+            &svc,
+            "cfn",
+            &[
+                ("ImageId", "ami-tmpl"),
+                ("InstanceType", "t3.large"),
+                ("BlockDeviceMapping.1.DeviceName", "/dev/xvda"),
+                ("BlockDeviceMapping.1.Ebs.VolumeSize", "12"),
+            ],
+        );
+        let spec = CfnInstanceSpec {
+            instance_type: Some("m5.xlarge".into()),
+            launch_template: Some(LaunchTemplateRef {
+                name: Some("cfn".into()),
+                version: Some("$Latest".into()),
+                ..Default::default()
+            }),
+            tags: vec![("Name".into(), "from-cfn".into())],
+            propagate_tags_to_volumes: true,
+            ..Default::default()
+        };
+        let attrs = cfn_create_instance(&svc, "000000000000", "us-east-1", &spec).unwrap();
+        let accounts = svc.state.read();
+        let state = accounts.get("000000000000").unwrap();
+        let inst = &state.instances[&attrs.instance_id];
+        assert_eq!(inst.image_id, "ami-tmpl");
+        assert_eq!(inst.instance_type, "m5.xlarge");
+        let vol = state
+            .volumes
+            .values()
+            .find(|v| {
+                v.attachments
+                    .iter()
+                    .any(|a| a.instance_id == attrs.instance_id)
+            })
+            .expect("volume from template BDM");
+        assert_eq!(vol.size, 12);
+        assert!(state
+            .tags_for(&vol.volume_id)
+            .iter()
+            .any(|t| t.key == "Name" && t.value == "from-cfn"));
+
+        // An unknown template fails the create.
+        let bad = CfnInstanceSpec {
+            launch_template: Some(LaunchTemplateRef {
+                name: Some("missing".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        drop(accounts);
+        assert!(cfn_create_instance(&svc, "000000000000", "us-east-1", &bad).is_err());
     }
 }
