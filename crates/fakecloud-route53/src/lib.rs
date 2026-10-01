@@ -17,8 +17,9 @@ pub const API_VERSION: &str = "2013-04-01";
 pub const API_PREFIX: &str = "/2013-04-01";
 pub const NAMESPACE: &str = "https://route53.amazonaws.com/doc/2013-04-01/";
 
-pub use service::{DnssecSignature, Route53Service};
+pub use service::{build_hosted_zone, DnssecSignature, Route53Service, VpcOwnerLookup};
 pub use state::{
-    AccountState, HealthCheckStatus, Route53Accounts, Route53Snapshot, SharedRoute53State,
-    StoredHealthCheck, StoredHostedZone, StoredKeySigningKey, ROUTE53_SNAPSHOT_SCHEMA_VERSION,
+    parse_route53_snapshot, AccountState, HealthCheckStatus, Route53Accounts, Route53Snapshot,
+    SharedRoute53State, StackOwnedResources, StoredHealthCheck, StoredHostedZone,
+    StoredKeySigningKey, ROUTE53_SNAPSHOT_SCHEMA_VERSION,
 };

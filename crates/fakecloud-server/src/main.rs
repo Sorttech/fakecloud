@@ -3670,7 +3670,31 @@ async fn main() {
             let store = fakecloud_persistence::DiskSnapshotStore::new(path);
             match fakecloud_persistence::SnapshotStore::load(&store) {
                 Ok(Some(bytes)) => {
-                    match serde_json::from_slice::<fakecloud_route53::Route53Snapshot>(&bytes) {
+                    // A v1 snapshot kept stack-provisioned zones in the shared
+                    // legacy bucket; the (already loaded) CloudFormation state
+                    // says which stack, and so which account, owns them. Only
+                    // walked when the snapshot is v1.
+                    let stack_owned = || {
+                        let mut owned = fakecloud_route53::StackOwnedResources::new();
+                        let cfn = cloudformation_state.read();
+                        for (_, account) in cfn.iter() {
+                            for stack in account.stacks.values() {
+                                for resource in &stack.resources {
+                                    owned.record(
+                                        &stack.stack_id,
+                                        &resource.resource_type,
+                                        &resource.physical_id,
+                                    );
+                                }
+                            }
+                        }
+                        owned
+                    };
+                    match fakecloud_route53::parse_route53_snapshot(
+                        &bytes,
+                        &cli.account_id,
+                        stack_owned,
+                    ) {
                         Ok(snapshot) => {
                             if snapshot.schema_version
                                 > fakecloud_route53::ROUTE53_SNAPSHOT_SCHEMA_VERSION
@@ -3710,7 +3734,18 @@ async fn main() {
         .with_logs(logs_state.clone())
         .with_elbv2(elbv2_state.clone())
         .with_cloudfront(cloudfront_state.clone())
-        .with_s3(s3_state.clone());
+        .with_s3(s3_state.clone())
+        .with_vpc_owner_lookup({
+            // The account whose EC2 state holds the VPC. VPC ids are unique,
+            // so the id alone identifies it.
+            let ec2 = ec2_state.clone();
+            Arc::new(move |vpc_id: &str, _region: &str| {
+                ec2.read()
+                    .iter()
+                    .find(|(_, st)| st.vpcs.contains_key(vpc_id))
+                    .map(|(account, _)| account.to_string())
+            })
+        });
     if let Some(store) = route53_snapshot_store.clone() {
         route53_inner = route53_inner.with_snapshot_store(store);
     }

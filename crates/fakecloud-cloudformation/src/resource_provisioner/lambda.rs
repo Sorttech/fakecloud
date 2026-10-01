@@ -270,7 +270,7 @@ impl ResourceProvisioner {
 
     pub(super) fn delete_lambda_function(&self, physical_id: &str) -> Result<(), String> {
         let mut accounts = self.lambda_state.write();
-        let state = accounts.default_mut();
+        let state = accounts.get_or_create(&self.account_id);
         state.functions.remove(physical_id);
         Ok(())
     }

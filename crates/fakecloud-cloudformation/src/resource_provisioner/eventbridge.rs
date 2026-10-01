@@ -155,7 +155,7 @@ impl ResourceProvisioner {
 
     pub(super) fn delete_eventbridge_rule(&self, physical_id: &str) -> Result<(), String> {
         let mut eb_accounts = self.eventbridge_state.write();
-        let state = eb_accounts.default_mut();
+        let state = eb_accounts.get_or_create(&self.account_id);
         // physical_id is the ARN; find the rule key
         let key = state
             .rules

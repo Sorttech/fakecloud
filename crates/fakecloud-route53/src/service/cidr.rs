@@ -14,10 +14,7 @@ impl Route53Service {
             return Err(invalid_argument("Name and CallerReference are required"));
         }
         let mut state = self.state.write();
-        let account = state
-            .accounts
-            .entry(DEFAULT_ACCOUNT.to_string())
-            .or_default();
+        let account = state.accounts.entry(req.account_id.clone()).or_default();
         if account
             .cidr_collections
             .values()
@@ -75,7 +72,7 @@ impl Route53Service {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&route.account)
             .ok_or_else(|| no_such_cidr_collection(&id))?;
         let coll = account
             .cidr_collections
@@ -141,7 +138,7 @@ impl Route53Service {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&route.account)
             .ok_or_else(|| no_such_cidr_collection(&id))?;
         let coll = account
             .cidr_collections
@@ -189,7 +186,7 @@ impl Route53Service {
         let state = self.state.read();
         let mut colls: Vec<StoredCidrCollection> = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&req.account_id)
             .map(|a| a.cidr_collections.values().cloned().collect())
             .unwrap_or_default();
         drop(state);
@@ -253,7 +250,7 @@ impl Route53Service {
         let state = self.state.read();
         let coll = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.cidr_collections.get(&id).cloned())
             .ok_or_else(|| no_such_cidr_collection(&id))?;
         drop(state);
@@ -314,7 +311,7 @@ impl Route53Service {
         let state = self.state.read();
         let coll = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.cidr_collections.get(&id).cloned())
             .ok_or_else(|| no_such_cidr_collection(&id))?;
         drop(state);

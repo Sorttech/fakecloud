@@ -115,7 +115,7 @@ impl ResourceProvisioner {
     /// surfaces back to the caller.
     pub(crate) fn delete_log_group(&self, physical_id: &str) -> Result<(), String> {
         let mut logs_accounts = self.logs_state.write();
-        let state = logs_accounts.default_mut();
+        let state = logs_accounts.get_or_create(&self.account_id);
         // physical_id is the ARN; find the log group name
         let name = state
             .log_groups

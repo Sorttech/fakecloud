@@ -407,11 +407,6 @@ pub(crate) fn esc(s: &str) -> String {
     out
 }
 
-pub(crate) fn generate_zone_id() -> String {
-    let raw = Uuid::new_v4().simple().to_string().to_uppercase();
-    format!("Z{}", &raw[..14])
-}
-
 pub(crate) fn generate_change_id() -> String {
     let raw = Uuid::new_v4().simple().to_string().to_uppercase();
     format!("C{}", &raw[..14])
@@ -846,6 +841,31 @@ pub(crate) fn push_cidr_collection_full(out: &mut String, c: &StoredCidrCollecti
 
 // ─── VPC Association handlers ────────────────────────────────────────
 
+/// Route 53's refusal when the caller does not own the VPC it names.
+fn vpc_not_owned_by_caller(vpc: &VPC, account: &str) -> AwsServiceError {
+    aws_error(
+        StatusCode::UNAUTHORIZED,
+        "NotAuthorizedException",
+        format!(
+            "The VPC {} is not owned by account {account}.",
+            vpc.vpc_id.as_deref().unwrap_or_default()
+        ),
+    )
+}
+
+/// Route 53's refusal when a VPC owner associates (or disassociates) a VPC
+/// with another account's hosted zone that has not authorized it.
+fn not_authorized_vpc_association(vpc: &VPC, zone_id: &str) -> AwsServiceError {
+    aws_error(
+        StatusCode::UNAUTHORIZED,
+        "NotAuthorizedException",
+        format!(
+            "The VPC: {} has not authorized to associate with your hosted zone {zone_id}.",
+            vpc.vpc_id.as_deref().unwrap_or_default()
+        ),
+    )
+}
+
 impl Route53Service {
     pub(crate) fn associate_vpc_with_hosted_zone(
         &self,
@@ -857,12 +877,43 @@ impl Route53Service {
             .map_err(|e| invalid_argument(format!("invalid AssociateVPCRequest XML: {e}")))?;
         let vpc = cfg.vpc;
         require_vpc(&vpc)?;
+        // Only the VPC's owner may associate it. When EC2 knows the VPC, its
+        // owning account is authoritative.
+        let vpc_owner = self.known_vpc_owner(&vpc);
+        if vpc_owner.as_deref().is_some_and(|o| o != route.account) {
+            return Err(vpc_not_owned_by_caller(&vpc, &route.account));
+        }
         let mut state = self.state.write();
-        let account = state
-            .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+        // The VPC owner associates the VPC, so the zone may belong to another
+        // account; that account must have authorized this VPC first
+        // (CreateVPCAssociationAuthorization).
+        let owner = state
+            .zone_owner(&id)
+            .map(str::to_string)
             .ok_or_else(|| no_such_hosted_zone(&id))?;
-        let zone = account
+        let cross_account = owner != route.account;
+        let zone_account = state.entry(&owner);
+        if cross_account {
+            let authorized = zone_account
+                .vpc_authorizations
+                .get(&id)
+                .is_some_and(|vs| vs.iter().any(|v| same_vpc(v, &vpc)));
+            // An authorization names a VPC, not an account. With the VPC's
+            // owner unknown to EC2, the first account to use the
+            // authorization is taken as that owner; nobody else may use it.
+            let consumed_by_other = vpc_owner.is_none()
+                && zone_account
+                    .vpc_authorization_consumers
+                    .get(&id)
+                    .is_some_and(|cs| {
+                        cs.iter()
+                            .any(|(v, acct)| same_vpc(v, &vpc) && *acct != route.account)
+                    });
+            if !authorized || consumed_by_other {
+                return Err(not_authorized_vpc_association(&vpc, &id));
+            }
+        }
+        let zone = zone_account
             .hosted_zones
             .get_mut(&id)
             .ok_or_else(|| no_such_hosted_zone(&id))?;
@@ -883,13 +934,23 @@ impl Route53Service {
                 ),
             ));
         }
-        // For cross-account associations Route 53 requires a prior
-        // CreateVPCAssociationAuthorization. For same-account associations
-        // (the only kind fakecloud has — single DEFAULT_ACCOUNT) the
-        // authorization is implicit, so we don't gate on it. Once we model
-        // multi-account ownership of zones we can wire the authorization
-        // check in.
-        zone.vpcs.push(vpc);
+        zone.vpcs.push(vpc.clone());
+        if cross_account {
+            if vpc_owner.is_none() {
+                let consumers = zone_account
+                    .vpc_authorization_consumers
+                    .entry(id.clone())
+                    .or_default();
+                if !consumers.iter().any(|(v, _)| same_vpc(v, &vpc)) {
+                    consumers.push((vpc.clone(), route.account.clone()));
+                }
+            }
+            zone_account
+                .cross_account_vpcs
+                .entry(id.clone())
+                .or_default()
+                .push((vpc, route.account.clone()));
+        }
         let now = Utc::now();
         let change_id = generate_change_id();
         let change = StoredChange {
@@ -899,7 +960,11 @@ impl Route53Service {
             comment: cfg.comment,
             read_count: 0,
         };
-        account.changes.insert(change_id.clone(), change.clone());
+        // The change belongs to the caller, who polls it with GetChange.
+        state
+            .entry(&route.account)
+            .changes
+            .insert(change_id.clone(), change.clone());
         drop(state);
         let mut body = String::with_capacity(256);
         body.push_str(XML_DECL);
@@ -921,12 +986,34 @@ impl Route53Service {
             .map_err(|e| invalid_argument(format!("invalid DisassociateVPCRequest XML: {e}")))?;
         let vpc = cfg.vpc;
         require_vpc(&vpc)?;
+        let vpc_owner = self.known_vpc_owner(&vpc);
         let mut state = self.state.write();
-        let account = state
-            .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+        // Either the zone owner or the owner of an associated VPC may
+        // disassociate it, so the zone may belong to another account. Another
+        // account only sees the zone through one of its associated VPCs.
+        let owner = state
+            .zone_owner(&id)
+            .map(str::to_string)
             .ok_or_else(|| no_such_hosted_zone(&id))?;
-        let zone = account
+        let cross_account = owner != route.account;
+        let zone_account = state.entry(&owner);
+        // Another account may only remove a VPC it owns: the owner EC2
+        // reports, or (VPC unknown to EC2) the account that associated it.
+        if cross_account {
+            // The recorded associator also counts (a v1 snapshot's migration
+            // keeps the default account as associator), except for a VPC EC2
+            // says the zone owner owns: the zone owner associated that itself.
+            let recorded = zone_account.cross_account_vpcs.get(&id).is_some_and(|vs| {
+                vs.iter()
+                    .any(|(v, acct)| same_vpc(v, &vpc) && *acct == route.account)
+            }) && vpc_owner.as_deref() != Some(owner.as_str());
+            let caller_owns_vpc =
+                recorded || vpc_owner.as_deref().is_some_and(|o| o == route.account);
+            if !caller_owns_vpc {
+                return Err(vpc_not_owned_by_caller(&vpc, &route.account));
+            }
+        }
+        let zone = zone_account
             .hosted_zones
             .get_mut(&id)
             .ok_or_else(|| no_such_hosted_zone(&id))?;
@@ -948,6 +1035,12 @@ impl Route53Service {
             ));
         }
         zone.vpcs.remove(pos);
+        if let Some(assoc) = zone_account.cross_account_vpcs.get_mut(&id) {
+            assoc.retain(|(v, _)| !same_vpc(v, &vpc));
+            if assoc.is_empty() {
+                zone_account.cross_account_vpcs.remove(&id);
+            }
+        }
         let now = Utc::now();
         let change_id = generate_change_id();
         let change = StoredChange {
@@ -957,7 +1050,10 @@ impl Route53Service {
             comment: cfg.comment,
             read_count: 0,
         };
-        account.changes.insert(change_id.clone(), change.clone());
+        state
+            .entry(&route.account)
+            .changes
+            .insert(change_id.clone(), change.clone());
         drop(state);
         let mut body = String::with_capacity(256);
         body.push_str(XML_DECL);
@@ -985,7 +1081,7 @@ impl Route53Service {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&route.account)
             .ok_or_else(|| no_such_hosted_zone(&id))?;
         let zone = account
             .hosted_zones
@@ -1030,7 +1126,7 @@ impl Route53Service {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&route.account)
             .ok_or_else(|| no_such_hosted_zone(&id))?;
         if !account.hosted_zones.contains_key(&id) {
             return Err(no_such_hosted_zone(&id));
@@ -1051,6 +1147,12 @@ impl Route53Service {
         if entry.is_empty() {
             account.vpc_authorizations.remove(&id);
         }
+        if let Some(consumers) = account.vpc_authorization_consumers.get_mut(&id) {
+            consumers.retain(|(v, _)| !same_vpc(v, &vpc));
+            if consumers.is_empty() {
+                account.vpc_authorization_consumers.remove(&id);
+            }
+        }
         drop(state);
         let mut body = String::with_capacity(128);
         body.push_str(XML_DECL);
@@ -1069,7 +1171,7 @@ impl Route53Service {
         let state = self.state.read();
         let account = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .ok_or_else(|| no_such_hosted_zone(&id))?;
         if !account.hosted_zones.contains_key(&id) {
             return Err(no_such_hosted_zone(&id));
@@ -1135,14 +1237,41 @@ impl Route53Service {
             .cloned()
             .ok_or_else(|| invalid_argument("vpcregion query parameter is required"))?;
         let state = self.state.read();
-        let mut summaries: Vec<(String, String)> = Vec::new();
-        if let Some(account) = state.accounts.get(DEFAULT_ACCOUNT) {
+        // Every private zone the caller's VPC is associated with, whichever
+        // account owns it, with its owner: the caller's own zones, plus other
+        // accounts' zones the caller associated the VPC with. Another
+        // account's zones associated with some other account's VPC of the
+        // same id stay hidden.
+        let matches = |v: &VPC| {
+            v.vpc_id.as_deref() == Some(vpc_id.as_str())
+                && v.vpc_region.as_deref() == Some(vpc_region.as_str())
+        };
+        // The VPC's owner per EC2, when EC2 knows the VPC: that owner, and an
+        // account recorded as the VPC's associator on a zone, see other
+        // accounts' zones the VPC is associated with.
+        let vpc_owner = self.known_vpc_owner(&VPC {
+            vpc_id: Some(vpc_id.clone()),
+            vpc_region: Some(vpc_region.clone()),
+        });
+        let mut summaries: Vec<(String, String, String)> = Vec::new();
+        for (owner, account) in &state.accounts {
             for z in account.hosted_zones.values() {
-                if z.vpcs.iter().any(|v| {
-                    v.vpc_id.as_deref() == Some(vpc_id.as_str())
-                        && v.vpc_region.as_deref() == Some(vpc_region.as_str())
-                }) {
-                    summaries.push((z.id.clone(), z.name.clone()));
+                let visible = if *owner == req.account_id {
+                    z.vpcs.iter().any(matches)
+                } else {
+                    // EC2's owner, or the recorded associator (which keeps a
+                    // v1-migrated associator's access once EC2 knows the VPC),
+                    // unless EC2 says the zone owner owns the VPC.
+                    let recorded = account.cross_account_vpcs.get(&z.id).is_some_and(|vs| {
+                        vs.iter()
+                            .any(|(v, acct)| matches(v) && *acct == req.account_id)
+                    }) && vpc_owner.as_deref() != Some(owner.as_str());
+                    let caller_owns_vpc =
+                        recorded || vpc_owner.as_deref().is_some_and(|o| o == req.account_id);
+                    caller_owns_vpc && z.vpcs.iter().any(matches)
+                };
+                if visible {
+                    summaries.push((z.id.clone(), z.name.clone(), owner.clone()));
                 }
             }
         }
@@ -1158,17 +1287,17 @@ impl Route53Service {
         let start = match req.query_params.get("nexttoken") {
             Some(t) => summaries
                 .iter()
-                .position(|(id, _)| id.as_str() > t.as_str())
+                .position(|(id, _, _)| id.as_str() > t.as_str())
                 .unwrap_or(summaries.len()),
             None => 0,
         };
         let rest = &summaries[start..];
-        let page: Vec<&(String, String)> = rest.iter().take(max_items).collect();
+        let page: Vec<&(String, String, String)> = rest.iter().take(max_items).collect();
         // Token is the LAST id emitted on this page; the next request resumes
         // strictly after it (`id > token`). Emitting the first *excluded* id
         // here would skip it, since resume is strict-greater.
         let next_token = if page.len() < rest.len() {
-            page.last().map(|(id, _)| id.clone())
+            page.last().map(|(id, _, _)| id.clone())
         } else {
             None
         };
@@ -1176,14 +1305,14 @@ impl Route53Service {
         body.push_str(XML_DECL);
         body.push_str(&format!("<ListHostedZonesByVPCResponse xmlns=\"{NS}\">"));
         body.push_str("<HostedZoneSummaries>");
-        for (id, name) in &page {
+        for (id, name, owner) in &page {
             body.push_str("<HostedZoneSummary>");
             // HostedZoneId in a summary is the bare id (no `/hostedzone/`
             // prefix); the SDK validates the id pattern and rejects the prefix.
             body.push_str(&format!("<HostedZoneId>{}</HostedZoneId>", esc(id)));
             body.push_str(&format!("<Name>{}</Name>", esc(name)));
             body.push_str("<Owner>");
-            body.push_str(&format!("<OwningAccount>{DEFAULT_ACCOUNT}</OwningAccount>",));
+            body.push_str(&format!("<OwningAccount>{}</OwningAccount>", esc(owner)));
             body.push_str("</Owner>");
             body.push_str("</HostedZoneSummary>");
         }
@@ -1214,10 +1343,7 @@ impl Route53Service {
             return Err(invalid_argument("CallerReference is required"));
         }
         let mut state = self.state.write();
-        let account = state
-            .accounts
-            .entry(DEFAULT_ACCOUNT.to_string())
-            .or_default();
+        let account = state.accounts.entry(req.account_id.clone()).or_default();
         if account
             .reusable_delegation_sets
             .values()
@@ -1282,7 +1408,7 @@ impl Route53Service {
         let state = self.state.read();
         let ds = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.reusable_delegation_sets.get(&id).cloned())
             .ok_or_else(|| no_such_delegation_set(&id))?;
         drop(state);
@@ -1304,7 +1430,7 @@ impl Route53Service {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&route.account)
             .ok_or_else(|| no_such_delegation_set(&id))?;
         if !account.reusable_delegation_sets.contains_key(&id) {
             return Err(no_such_delegation_set(&id));
@@ -1356,7 +1482,7 @@ impl Route53Service {
         let state = self.state.read();
         let mut sets: Vec<StoredReusableDelegationSet> = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&req.account_id)
             .map(|a| a.reusable_delegation_sets.values().cloned().collect())
             .unwrap_or_default();
         drop(state);
@@ -1421,7 +1547,7 @@ impl Route53Service {
             .clone()
             .ok_or_else(|| invalid_argument("limit Type is required"))?;
         let state = self.state.read();
-        let account = state.accounts.get(DEFAULT_ACCOUNT);
+        let account = state.accounts.get(&route.account);
         if !account
             .map(|a| a.reusable_delegation_sets.contains_key(&id))
             .unwrap_or(false)
@@ -1600,7 +1726,7 @@ impl Route53Service {
     pub(crate) fn get_account_limit(&self, route: &Route) -> Result<AwsResponse, AwsServiceError> {
         let lim_type = require_id(route)?;
         let state = self.state.read();
-        let account = state.accounts.get(DEFAULT_ACCOUNT);
+        let account = state.accounts.get(&route.account);
         let (value, count) = match lim_type.as_str() {
             "MAX_HEALTH_CHECKS_BY_OWNER" => (
                 200_u64,
@@ -1665,10 +1791,7 @@ impl Route53Service {
             invalid_argument(format!("invalid ChangeTagsForResourceRequest XML: {e}"))
         })?;
         let mut state = self.state.write();
-        let account = state
-            .accounts
-            .entry(DEFAULT_ACCOUNT.to_string())
-            .or_default();
+        let account = state.accounts.entry(req.account_id.clone()).or_default();
         if !tag_target_exists(account, &res_type, &res_id) {
             return Err(no_such_tag_target(&res_type, &res_id));
         }
@@ -1708,7 +1831,7 @@ impl Route53Service {
         let state = self.state.read();
         let account = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .ok_or_else(|| no_such_tag_target(&res_type, &res_id))?;
         if !tag_target_exists(account, &res_type, &res_id) {
             return Err(no_such_tag_target(&res_type, &res_id));
@@ -1745,7 +1868,7 @@ impl Route53Service {
             return Err(invalid_argument("ResourceIds must contain at least one ID"));
         }
         let state = self.state.read();
-        let account = state.accounts.get(DEFAULT_ACCOUNT);
+        let account = state.accounts.get(&route.account);
         let mut sets: Vec<(String, BTreeMap<String, String>)> = Vec::new();
         for id in &cfg.resource_ids.resource_id {
             if let Some(a) = account {

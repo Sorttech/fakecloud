@@ -17,10 +17,7 @@ impl Route53Service {
         }
         validate_health_check_config(&cfg.health_check_config)?;
         let mut state = self.state.write();
-        let account = state
-            .accounts
-            .entry(DEFAULT_ACCOUNT.to_string())
-            .or_default();
+        let account = state.accounts.entry(req.account_id.clone()).or_default();
         if let Some(existing) = account
             .health_checks
             .values()
@@ -66,7 +63,7 @@ impl Route53Service {
         let state = self.state.read();
         let hc = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.health_checks.get(&id).cloned())
             .ok_or_else(|| no_such_health_check(&id))?;
         drop(state);
@@ -89,7 +86,7 @@ impl Route53Service {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&route.account)
             .ok_or_else(|| no_such_health_check(&id))?;
         let hc = account
             .health_checks
@@ -179,7 +176,7 @@ impl Route53Service {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&route.account)
             .ok_or_else(|| no_such_health_check(&id))?;
         if !account.health_checks.contains_key(&id) {
             return Err(no_such_health_check(&id));
@@ -232,7 +229,7 @@ impl Route53Service {
         let state = self.state.read();
         let mut hcs: Vec<StoredHealthCheck> = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&req.account_id)
             .map(|a| a.health_checks.values().cloned().collect())
             .unwrap_or_default();
         drop(state);
@@ -276,11 +273,14 @@ impl Route53Service {
         Ok(xml_response(StatusCode::OK, body, HeaderMap::new()))
     }
 
-    pub(super) fn get_health_check_count(&self) -> Result<AwsResponse, AwsServiceError> {
+    pub(super) fn get_health_check_count(
+        &self,
+        route: &Route,
+    ) -> Result<AwsResponse, AwsServiceError> {
         let state = self.state.read();
         let count = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .map(|a| a.health_checks.len())
             .unwrap_or(0);
         drop(state);
@@ -300,7 +300,7 @@ impl Route53Service {
         let state = self.state.read();
         let hc = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.health_checks.get(&id).cloned())
             .ok_or_else(|| no_such_health_check(&id))?;
         drop(state);
@@ -346,10 +346,13 @@ impl Route53Service {
         last_failure_reason: Option<String>,
     ) -> bool {
         let mut state = self.state.write();
-        let Some(account) = state.accounts.get_mut(DEFAULT_ACCOUNT) else {
-            return false;
-        };
-        let Some(hc) = account.health_checks.get_mut(id) else {
+        // The admin endpoint carries no account; health check ids are unique
+        // across accounts, so find the one that owns `id`.
+        let Some(hc) = state
+            .accounts
+            .values_mut()
+            .find_map(|a| a.health_checks.get_mut(id))
+        else {
             return false;
         };
         hc.status = status;
@@ -371,7 +374,7 @@ impl Route53Service {
         let state = self.state.read();
         let hc = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.health_checks.get(&id).cloned())
             .ok_or_else(|| no_such_health_check(&id))?;
         drop(state);

@@ -581,3 +581,139 @@ async fn create_zone_with_vpc_is_implicitly_private_with_name_servers() {
         .expect("get zone");
     assert!(!got.delegation_set().unwrap().name_servers().is_empty());
 }
+
+/// Cross-account VPC association is gated on who owns the VPC in EC2: an
+/// authorization for a VPC lets its owner associate it, and nobody else.
+#[tokio::test]
+async fn cross_account_vpc_association_follows_ec2_vpc_ownership() {
+    use aws_credential_types::Credentials;
+
+    let server = TestServer::start_with_env(&[("FAKECLOUD_IAM", "soft")]).await;
+    let mut configs = Vec::new();
+    for (account, name) in [
+        ("111111111111", "admin-a"),
+        ("222222222222", "admin-b"),
+        ("333333333333", "admin-c"),
+    ] {
+        let (akid, secret) = server.create_admin(account, name).await;
+        configs.push(
+            aws_config::defaults(aws_config::BehaviorVersion::latest())
+                .endpoint_url(server.endpoint())
+                .region(aws_config::Region::new("us-east-1"))
+                .credentials_provider(Credentials::new(akid, secret, None, None, "r53-vpc"))
+                .load()
+                .await,
+        );
+    }
+    let r53_a = aws_sdk_route53::Client::new(&configs[0]);
+    let r53_b = aws_sdk_route53::Client::new(&configs[1]);
+    let r53_c = aws_sdk_route53::Client::new(&configs[2]);
+
+    // B owns a real EC2 VPC.
+    let vpc_b = aws_sdk_ec2::Client::new(&configs[1])
+        .create_vpc()
+        .cidr_block("10.42.0.0/16")
+        .send()
+        .await
+        .expect("create_vpc")
+        .vpc()
+        .and_then(|v| v.vpc_id())
+        .expect("vpc id")
+        .to_string();
+
+    let zone = r53_a
+        .create_hosted_zone()
+        .name("internal.example.")
+        .caller_reference("xacct-vpc")
+        .hosted_zone_config(HostedZoneConfig::builder().private_zone(true).build())
+        .vpc(vpc("vpc-a-local"))
+        .send()
+        .await
+        .expect("zone")
+        .hosted_zone()
+        .unwrap()
+        .id()
+        .trim_start_matches("/hostedzone/")
+        .to_string();
+    r53_a
+        .create_vpc_association_authorization()
+        .hosted_zone_id(&zone)
+        .vpc(vpc(&vpc_b))
+        .send()
+        .await
+        .expect("authorize B's VPC");
+
+    let err = r53_c
+        .associate_vpc_with_hosted_zone()
+        .hosted_zone_id(&zone)
+        .vpc(vpc(&vpc_b))
+        .send()
+        .await
+        .expect_err("C does not own B's VPC");
+    assert_eq!(
+        err.as_service_error().and_then(|e| e.meta().code()),
+        Some("NotAuthorizedException")
+    );
+
+    r53_b
+        .associate_vpc_with_hosted_zone()
+        .hosted_zone_id(&zone)
+        .vpc(vpc(&vpc_b))
+        .send()
+        .await
+        .expect("B associates its own VPC");
+
+    for (client, expected) in [
+        (&r53_a, vec![zone.clone()]),
+        (&r53_b, vec![zone.clone()]),
+        (&r53_c, vec![]),
+    ] {
+        let ids: Vec<String> = client
+            .list_hosted_zones_by_vpc()
+            .vpc_id(&vpc_b)
+            .vpc_region(VpcRegion::UsEast1)
+            .send()
+            .await
+            .expect("list by vpc")
+            .hosted_zone_summaries()
+            .iter()
+            .map(|s| s.hosted_zone_id().to_string())
+            .collect();
+        assert_eq!(ids, expected);
+    }
+
+    let err = r53_c
+        .disassociate_vpc_from_hosted_zone()
+        .hosted_zone_id(&zone)
+        .vpc(vpc(&vpc_b))
+        .send()
+        .await
+        .expect_err("C cannot disassociate B's VPC");
+    assert_eq!(
+        err.as_service_error().and_then(|e| e.meta().code()),
+        Some("NotAuthorizedException")
+    );
+    r53_b
+        .disassociate_vpc_from_hosted_zone()
+        .hosted_zone_id(&zone)
+        .vpc(vpc(&vpc_b))
+        .send()
+        .await
+        .expect("B disassociates its VPC");
+
+    // The zone owner may disassociate another account's VPC too.
+    r53_b
+        .associate_vpc_with_hosted_zone()
+        .hosted_zone_id(&zone)
+        .vpc(vpc(&vpc_b))
+        .send()
+        .await
+        .expect("B re-associates its VPC");
+    r53_a
+        .disassociate_vpc_from_hosted_zone()
+        .hosted_zone_id(&zone)
+        .vpc(vpc(&vpc_b))
+        .send()
+        .await
+        .expect("A disassociates B's VPC from its zone");
+}

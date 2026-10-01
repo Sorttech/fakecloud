@@ -18,10 +18,7 @@ impl Route53Service {
         }
         let zone_id = strip_zone_prefix(&cfg.hosted_zone_id);
         let mut state = self.state.write();
-        let account = state
-            .accounts
-            .entry(DEFAULT_ACCOUNT.to_string())
-            .or_default();
+        let account = state.accounts.entry(req.account_id.clone()).or_default();
         if let Some(zone) = account.hosted_zones.get(&zone_id) {
             if zone.private_zone {
                 return Err(invalid_argument(
@@ -77,7 +74,7 @@ impl Route53Service {
         let state = self.state.read();
         let cfg = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&route.account)
             .and_then(|a| a.query_logging_configs.get(&id).cloned())
             .ok_or_else(|| no_such_query_logging_config(&id))?;
         drop(state);
@@ -97,7 +94,7 @@ impl Route53Service {
         let mut state = self.state.write();
         let account = state
             .accounts
-            .get_mut(DEFAULT_ACCOUNT)
+            .get_mut(&route.account)
             .ok_or_else(|| no_such_query_logging_config(&id))?;
         if account.query_logging_configs.remove(&id).is_none() {
             return Err(no_such_query_logging_config(&id));
@@ -140,7 +137,7 @@ impl Route53Service {
         let state = self.state.read();
         let mut configs: Vec<StoredQueryLoggingConfig> = state
             .accounts
-            .get(DEFAULT_ACCOUNT)
+            .get(&req.account_id)
             .map(|a| a.query_logging_configs.values().cloned().collect())
             .unwrap_or_default();
         drop(state);

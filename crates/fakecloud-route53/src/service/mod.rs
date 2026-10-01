@@ -35,6 +35,7 @@ use crate::state::{
 };
 use crate::xml_io;
 
+#[cfg(test)]
 pub(crate) const DEFAULT_ACCOUNT: &str = "000000000000";
 pub(crate) const NS: &str = crate::NAMESPACE;
 const XML_DECL: &str = r#"<?xml version="1.0" encoding="UTF-8"?>"#;
@@ -134,9 +135,18 @@ pub struct Route53Service {
     /// or virtual-hosted bucket endpoint resolve only when the bucket
     /// exists.
     pub(crate) s3_state: Option<fakecloud_s3::SharedS3State>,
+    /// Optional VPC-owner lookup (wired from EC2 state by the server). When
+    /// it knows a VPC, the VPC association operations require the caller to
+    /// own it, as Route 53 does.
+    pub(crate) vpc_owner: Option<VpcOwnerLookup>,
     pub(crate) snapshot_store: Option<Arc<dyn SnapshotStore>>,
     pub(crate) snapshot_lock: Arc<AsyncMutex<()>>,
 }
+
+/// Resolve the account that owns a VPC from its `(vpc_id, vpc_region)`;
+/// `None` when no EC2 VPC with that id exists (e.g. a test that only invents
+/// VPC ids for private zones).
+pub type VpcOwnerLookup = Arc<dyn Fn(&str, &str) -> Option<String> + Send + Sync>;
 
 mod cidr;
 mod dnssec;
@@ -146,6 +156,8 @@ mod query_logging;
 mod records;
 mod traffic_policies;
 
+pub use hosted_zones::build_hosted_zone;
+
 impl Route53Service {
     pub fn new(state: SharedRoute53State) -> Self {
         Self {
@@ -154,9 +166,25 @@ impl Route53Service {
             elbv2_state: None,
             cloudfront_state: None,
             s3_state: None,
+            vpc_owner: None,
             snapshot_store: None,
             snapshot_lock: Arc::new(AsyncMutex::new(())),
         }
+    }
+
+    /// Wire the VPC-owner lookup used by the VPC association operations.
+    pub fn with_vpc_owner_lookup(mut self, lookup: VpcOwnerLookup) -> Self {
+        self.vpc_owner = Some(lookup);
+        self
+    }
+
+    /// The account that owns `vpc`, when the lookup knows it.
+    pub(crate) fn known_vpc_owner(&self, vpc: &VPC) -> Option<String> {
+        let lookup = self.vpc_owner.as_ref()?;
+        lookup(
+            vpc.vpc_id.as_deref().unwrap_or_default(),
+            vpc.vpc_region.as_deref().unwrap_or_default(),
+        )
     }
 
     pub fn with_snapshot_store(mut self, store: Arc<dyn SnapshotStore>) -> Self {
@@ -346,7 +374,7 @@ impl AwsService for Route53Service {
     }
 
     async fn handle(&self, req: AwsRequest) -> Result<AwsResponse, AwsServiceError> {
-        let resolved = match route_segments(&req.method, &req.path_segments, &req.raw_query) {
+        let mut resolved = match route_segments(&req.method, &req.path_segments, &req.raw_query) {
             Some(r) => r,
             None => {
                 return Err(aws_error(
@@ -357,6 +385,9 @@ impl AwsService for Route53Service {
             }
         };
 
+        // Route 53 is global (no region) but every resource is owned by the
+        // caller's account; handlers that only see the route read it from here.
+        resolved.account = req.account_id.clone();
         let mutates = MUTATING_ACTIONS.contains(&resolved.action);
         let result = match resolved.action {
             "CreateHostedZone" => self.create_hosted_zone(&req),
@@ -364,7 +395,7 @@ impl AwsService for Route53Service {
             "DeleteHostedZone" => self.delete_hosted_zone(&resolved),
             "ListHostedZones" => self.list_hosted_zones(&req),
             "ListHostedZonesByName" => self.list_hosted_zones_by_name(&req),
-            "GetHostedZoneCount" => self.get_hosted_zone_count(),
+            "GetHostedZoneCount" => self.get_hosted_zone_count(&resolved),
             "UpdateHostedZoneComment" => self.update_hosted_zone_comment(&req, &resolved),
             "UpdateHostedZoneFeatures" => self.update_hosted_zone_features(&req, &resolved),
             "GetHostedZoneLimit" => self.get_hosted_zone_limit(&resolved),
@@ -377,7 +408,7 @@ impl AwsService for Route53Service {
             "UpdateHealthCheck" => self.update_health_check(&req, &resolved),
             "DeleteHealthCheck" => self.delete_health_check(&resolved),
             "ListHealthChecks" => self.list_health_checks(&req),
-            "GetHealthCheckCount" => self.get_health_check_count(),
+            "GetHealthCheckCount" => self.get_health_check_count(&resolved),
             "GetHealthCheckStatus" => self.get_health_check_status(&resolved),
             "GetHealthCheckLastFailureReason" => {
                 self.get_health_check_last_failure_reason(&resolved)
@@ -401,7 +432,7 @@ impl AwsService for Route53Service {
             "ListTrafficPolicyInstancesByPolicy" => {
                 self.list_traffic_policy_instances_by_policy(&req)
             }
-            "GetTrafficPolicyInstanceCount" => self.get_traffic_policy_instance_count(),
+            "GetTrafficPolicyInstanceCount" => self.get_traffic_policy_instance_count(&resolved),
             "GetDNSSEC" => self.get_dnssec(&resolved),
             "EnableHostedZoneDNSSEC" => self.enable_hosted_zone_dnssec(&resolved),
             "DisableHostedZoneDNSSEC" => self.disable_hosted_zone_dnssec(&resolved),
@@ -964,8 +995,18 @@ fn infer_geo_from_subnet(subnet: Option<&str>) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::model::HealthCheckConfig;
     use crate::state::{HealthCheckStatus, Route53Accounts, StoredHealthCheck};
+
+    /// Route a request the way `handle` does for a caller in the default
+    /// account.
+    fn default_account_route(method: &http::Method, path: &str, query: &str) -> Option<Route> {
+        crate::router::route(method, path, query).map(|mut r| {
+            r.account = DEFAULT_ACCOUNT.to_string();
+            r
+        })
+    }
 
     fn svc_with_health_check(id: &str) -> Route53Service {
         let state = Arc::new(RwLock::new(Route53Accounts::default()));
@@ -1089,6 +1130,7 @@ mod tests {
             action: "ListResourceRecordSets",
             id: Some(zid.clone()),
             second_id: None,
+            account: DEFAULT_ACCOUNT.to_string(),
         };
         let req = AwsRequest {
             service: "route53".to_string(),
@@ -1144,6 +1186,7 @@ mod tests {
             action: "ListResourceRecordSets",
             id: Some(zid.clone()),
             second_id: None,
+            account: DEFAULT_ACCOUNT.to_string(),
         };
         let mut query_params = std::collections::HashMap::new();
         // StartRecordType without StartRecordName is invalid.
@@ -1415,7 +1458,7 @@ mod tests {
         }
         let svc = Route53Service::new(state);
         let route =
-            crate::router::route(&http::Method::GET, "/2013-04-01/change/C123", "").unwrap();
+            default_account_route(&http::Method::GET, "/2013-04-01/change/C123", "").unwrap();
 
         for i in 1..=5 {
             svc.get_change(&route).unwrap();
@@ -1433,7 +1476,7 @@ mod tests {
     fn get_change_unknown_id_returns_404() {
         let svc = Route53Service::new(Arc::new(RwLock::new(Route53Accounts::default())));
         let route =
-            crate::router::route(&http::Method::GET, "/2013-04-01/change/CGHOST", "").unwrap();
+            default_account_route(&http::Method::GET, "/2013-04-01/change/CGHOST", "").unwrap();
         let err = match svc.get_change(&route) {
             Err(e) => e,
             Ok(_) => panic!("expected NoSuchChange"),
@@ -1465,7 +1508,7 @@ mod tests {
     #[test]
     fn get_health_check_status_returns_success_by_default() {
         let svc = svc_with_health_check("hc-default");
-        let route = crate::router::route(
+        let route = default_account_route(
             &http::Method::GET,
             "/2013-04-01/healthcheck/hc-default/status",
             "",
@@ -1496,7 +1539,7 @@ mod tests {
             hc.status = HealthCheckStatus::Failure;
             hc.last_failure_reason = Some("test".to_string());
         }
-        let route = crate::router::route(
+        let route = default_account_route(
             &http::Method::GET,
             "/2013-04-01/healthcheck/hc-down/status",
             "",
@@ -1527,7 +1570,7 @@ mod tests {
             hc.status = HealthCheckStatus::Failure;
             hc.last_failure_reason = None;
         }
-        let route = crate::router::route(
+        let route = default_account_route(
             &http::Method::GET,
             "/2013-04-01/healthcheck/hc-bare/status",
             "",
@@ -1582,7 +1625,7 @@ mod tests {
                 hc.status = status;
                 hc.last_failure_reason = reason.clone();
             }
-            let route = crate::router::route(
+            let route = default_account_route(
                 &http::Method::GET,
                 "/2013-04-01/healthcheck/hc-flavours/status",
                 "",
@@ -2101,5 +2144,570 @@ mod tests {
             zone.resource_record_sets.is_empty(),
             "alias record should have been deleted"
         );
+    }
+
+    fn account_req(
+        account: &str,
+        method: http::Method,
+        path: &str,
+        query: &[(&str, &str)],
+        body: &str,
+    ) -> AwsRequest {
+        AwsRequest {
+            service: "route53".to_string(),
+            action: String::new(),
+            region: "us-east-1".to_string(),
+            account_id: account.to_string(),
+            request_id: "rid".to_string(),
+            headers: HeaderMap::new(),
+            query_params: query
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            body: Bytes::from(body.to_string()),
+            body_stream: parking_lot::Mutex::new(None),
+            path_segments: fakecloud_core::path::split_path_segments(path),
+            raw_path: path.to_string(),
+            raw_query: String::new(),
+            method,
+            is_query_protocol: false,
+            access_key_id: None,
+            principal: None,
+        }
+    }
+
+    async fn call(svc: &Route53Service, req: AwsRequest) -> (StatusCode, String) {
+        let resp = svc.handle(req).await.unwrap();
+        let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
+        (resp.status, body)
+    }
+
+    fn xml_value<'a>(body: &'a str, tag: &str) -> &'a str {
+        let open = format!("<{tag}>");
+        let start = body.find(&open).expect(tag) + open.len();
+        let end = body[start..].find(&format!("</{tag}>")).expect(tag) + start;
+        &body[start..end]
+    }
+
+    const ACCOUNT_A: &str = "111111111111";
+    const ACCOUNT_B: &str = "222222222222";
+
+    async fn create_zone(svc: &Route53Service, account: &str, body: &str) -> String {
+        let (status, out) = call(
+            svc,
+            account_req(
+                account,
+                http::Method::POST,
+                "/2013-04-01/hostedzone",
+                &[],
+                body,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{out}");
+        xml_value(&out, "Id")
+            .trim_start_matches("/hostedzone/")
+            .to_string()
+    }
+
+    fn public_zone_body(name: &str, caller_ref: &str) -> String {
+        format!(
+            "<CreateHostedZoneRequest xmlns=\"{NS}\"><Name>{name}</Name>\
+             <CallerReference>{caller_ref}</CallerReference></CreateHostedZoneRequest>"
+        )
+    }
+
+    fn private_zone_body(name: &str, caller_ref: &str, vpc: &str) -> String {
+        format!(
+            "<CreateHostedZoneRequest xmlns=\"{NS}\"><Name>{name}</Name>\
+             <CallerReference>{caller_ref}</CallerReference>\
+             <VPC><VPCRegion>us-east-1</VPCRegion><VPCId>{vpc}</VPCId></VPC>\
+             </CreateHostedZoneRequest>"
+        )
+    }
+
+    fn vpc_body(root: &str, vpc: &str) -> String {
+        format!(
+            "<{root} xmlns=\"{NS}\"><VPC><VPCRegion>us-east-1</VPCRegion>\
+             <VPCId>{vpc}</VPCId></VPC></{root}>"
+        )
+    }
+
+    #[tokio::test]
+    async fn hosted_zones_are_scoped_to_the_callers_account() {
+        let svc = Route53Service::new(Arc::new(RwLock::new(Route53Accounts::default())));
+        let zid = create_zone(&svc, ACCOUNT_A, &public_zone_body("a.example.", "ref-1")).await;
+        assert_eq!(
+            svc.state.read().zone_owner(&zid),
+            Some(ACCOUNT_A),
+            "stored under the caller's account"
+        );
+
+        let get = |account: &str| {
+            account_req(
+                account,
+                http::Method::GET,
+                &format!("/2013-04-01/hostedzone/{zid}"),
+                &[],
+                "",
+            )
+        };
+        assert_eq!(call(&svc, get(ACCOUNT_A)).await.0, StatusCode::OK);
+        let (status, out) = call(&svc, get(ACCOUNT_B)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(out.contains("<Code>NoSuchHostedZone</Code>"), "{out}");
+
+        let list = |account: &str| {
+            account_req(
+                account,
+                http::Method::GET,
+                "/2013-04-01/hostedzone",
+                &[],
+                "",
+            )
+        };
+        assert!(call(&svc, list(ACCOUNT_A)).await.1.contains(&zid));
+        assert!(!call(&svc, list(ACCOUNT_B)).await.1.contains(&zid));
+
+        // CallerReference is unique per account, not globally.
+        create_zone(&svc, ACCOUNT_B, &public_zone_body("a.example.", "ref-1")).await;
+        let (_, out) = call(
+            &svc,
+            account_req(
+                ACCOUNT_B,
+                http::Method::GET,
+                "/2013-04-01/hostedzonecount",
+                &[],
+                "",
+            ),
+        )
+        .await;
+        assert_eq!(xml_value(&out, "HostedZoneCount"), "1");
+
+        // Another account can neither change nor delete the zone.
+        let rrset = format!(
+            "<ChangeResourceRecordSetsRequest xmlns=\"{NS}\">\
+             <ChangeBatch><Changes><Change><Action>CREATE</Action><ResourceRecordSet>\
+             <Name>www.a.example.</Name><Type>A</Type><TTL>60</TTL><ResourceRecords>\
+             <ResourceRecord><Value>192.0.2.1</Value></ResourceRecord></ResourceRecords>\
+             </ResourceRecordSet></Change></Changes></ChangeBatch>\
+             </ChangeResourceRecordSetsRequest>"
+        );
+        let path = format!("/2013-04-01/hostedzone/{zid}/rrset");
+        let (status, _) = call(
+            &svc,
+            account_req(ACCOUNT_B, http::Method::POST, &path, &[], &rrset),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = call(
+            &svc,
+            account_req(
+                ACCOUNT_B,
+                http::Method::DELETE,
+                &format!("/2013-04-01/hostedzone/{zid}"),
+                &[],
+                "",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(svc.state.read().zone_owner(&zid), Some(ACCOUNT_A));
+    }
+
+    #[tokio::test]
+    async fn cross_account_vpc_association_requires_the_zone_owners_authorization() {
+        let svc = Route53Service::new(Arc::new(RwLock::new(Route53Accounts::default())));
+        let zid = create_zone(
+            &svc,
+            ACCOUNT_A,
+            &private_zone_body("internal.example.", "ref-p", "vpc-aaa"),
+        )
+        .await;
+        let associate = |account: &str| {
+            account_req(
+                account,
+                http::Method::POST,
+                &format!("/2013-04-01/hostedzone/{zid}/associatevpc"),
+                &[],
+                &vpc_body("AssociateVPCWithHostedZoneRequest", "vpc-bbb"),
+            )
+        };
+
+        // B owns vpc-bbb but A has not authorized it.
+        let (status, out) = call(&svc, associate(ACCOUNT_B)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{out}");
+        assert!(out.contains("<Code>NotAuthorizedException</Code>"), "{out}");
+
+        // B cannot authorize on A's behalf.
+        let authorize = |account: &str| {
+            account_req(
+                account,
+                http::Method::POST,
+                &format!("/2013-04-01/hostedzone/{zid}/authorizevpcassociation"),
+                &[],
+                &vpc_body("CreateVPCAssociationAuthorizationRequest", "vpc-bbb"),
+            )
+        };
+        assert_eq!(
+            call(&svc, authorize(ACCOUNT_B)).await.0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(call(&svc, authorize(ACCOUNT_A)).await.0, StatusCode::OK);
+
+        let (status, out) = call(&svc, associate(ACCOUNT_B)).await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        // The change belongs to the caller.
+        let change = xml_value(&out, "Id")
+            .trim_start_matches("/change/")
+            .to_string();
+        let (status, _) = call(
+            &svc,
+            account_req(
+                ACCOUNT_B,
+                http::Method::GET,
+                &format!("/2013-04-01/change/{change}"),
+                &[],
+                "",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // ListHostedZonesByVPC spans owners and names the owning account.
+        let (status, out) = call(
+            &svc,
+            account_req(
+                ACCOUNT_B,
+                http::Method::GET,
+                "/2013-04-01/hostedzonesbyvpc",
+                &[("vpcid", "vpc-bbb"), ("vpcregion", "us-east-1")],
+                "",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        assert!(
+            out.contains(&format!("<HostedZoneId>{zid}</HostedZoneId>")),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!("<OwningAccount>{ACCOUNT_A}</OwningAccount>")),
+            "{out}"
+        );
+
+        // The zone itself stays A's, now with both VPCs.
+        assert_eq!(svc.state.read().zone_owner(&zid), Some(ACCOUNT_A));
+        let vpcs = svc.state.read().zone_account(&zid).unwrap().hosted_zones[&zid]
+            .vpcs
+            .len();
+        assert_eq!(vpcs, 2);
+
+        // Another account sees none of this through the same VPC id.
+        let (_, out) = call(
+            &svc,
+            account_req(
+                "333333333333",
+                http::Method::GET,
+                "/2013-04-01/hostedzonesbyvpc",
+                &[("vpcid", "vpc-bbb"), ("vpcregion", "us-east-1")],
+                "",
+            ),
+        )
+        .await;
+        assert!(!out.contains(&zid), "{out}");
+        // B does not see A's zone through A's own VPC either.
+        let (_, out) = call(
+            &svc,
+            account_req(
+                ACCOUNT_B,
+                http::Method::GET,
+                "/2013-04-01/hostedzonesbyvpc",
+                &[("vpcid", "vpc-aaa"), ("vpcregion", "us-east-1")],
+                "",
+            ),
+        )
+        .await;
+        assert!(!out.contains(&zid), "{out}");
+
+        // B cannot remove A's own VPC from A's zone.
+        let disassociate = |account: &str, vpc: &str| {
+            account_req(
+                account,
+                http::Method::POST,
+                &format!("/2013-04-01/hostedzone/{zid}/disassociatevpc"),
+                &[],
+                &vpc_body("DisassociateVPCFromHostedZoneRequest", vpc),
+            )
+        };
+        let (status, out) = call(&svc, disassociate(ACCOUNT_B, "vpc-aaa")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{out}");
+        // Nor can a third account remove B's.
+        let (status, _) = call(&svc, disassociate("333333333333", "vpc-bbb")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // The VPC owner may disassociate its VPC again.
+        let (status, out) = call(&svc, disassociate(ACCOUNT_B, "vpc-bbb")).await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        assert!(svc
+            .state
+            .read()
+            .get(ACCOUNT_A)
+            .unwrap()
+            .cross_account_vpcs
+            .is_empty());
+        // Once disassociated, B can no longer touch the zone.
+        let (status, _) = call(&svc, disassociate(ACCOUNT_B, "vpc-bbb")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn admin_health_check_status_finds_the_check_in_any_account() {
+        let svc = svc_with_health_check("hc-x");
+        {
+            let mut st = svc.state.write();
+            let hc = st
+                .accounts
+                .get_mut(DEFAULT_ACCOUNT)
+                .unwrap()
+                .health_checks
+                .remove("hc-x")
+                .unwrap();
+            st.entry(ACCOUNT_B).health_checks.insert("hc-x".into(), hc);
+        }
+        assert!(svc.set_health_check_status("hc-x", HealthCheckStatus::Failure, None));
+        assert_eq!(
+            svc.state.read().get(ACCOUNT_B).unwrap().health_checks["hc-x"].status,
+            HealthCheckStatus::Failure
+        );
+    }
+
+    const ACCOUNT_C: &str = "333333333333";
+
+    fn associate_req(account: &str, zid: &str, vpc: &str) -> AwsRequest {
+        account_req(
+            account,
+            http::Method::POST,
+            &format!("/2013-04-01/hostedzone/{zid}/associatevpc"),
+            &[],
+            &vpc_body("AssociateVPCWithHostedZoneRequest", vpc),
+        )
+    }
+
+    fn disassociate_req(account: &str, zid: &str, vpc: &str) -> AwsRequest {
+        account_req(
+            account,
+            http::Method::POST,
+            &format!("/2013-04-01/hostedzone/{zid}/disassociatevpc"),
+            &[],
+            &vpc_body("DisassociateVPCFromHostedZoneRequest", vpc),
+        )
+    }
+
+    fn authorize_req(account: &str, zid: &str, vpc: &str) -> AwsRequest {
+        account_req(
+            account,
+            http::Method::POST,
+            &format!("/2013-04-01/hostedzone/{zid}/authorizevpcassociation"),
+            &[],
+            &vpc_body("CreateVPCAssociationAuthorizationRequest", vpc),
+        )
+    }
+
+    fn list_by_vpc_req(account: &str, vpc: &str) -> AwsRequest {
+        account_req(
+            account,
+            http::Method::GET,
+            "/2013-04-01/hostedzonesbyvpc",
+            &[("vpcid", vpc), ("vpcregion", "us-east-1")],
+            "",
+        )
+    }
+
+    #[tokio::test]
+    async fn vpc_association_requires_the_caller_to_own_a_known_vpc() {
+        // EC2 knows vpc-bbb belongs to B.
+        let svc = Route53Service::new(Arc::new(RwLock::new(Route53Accounts::default())))
+            .with_vpc_owner_lookup(Arc::new(|vpc_id: &str, _: &str| {
+                (vpc_id == "vpc-bbb").then(|| ACCOUNT_B.to_string())
+            }));
+        let zid = create_zone(
+            &svc,
+            ACCOUNT_A,
+            &private_zone_body("internal.example.", "ref-k", "vpc-aaa"),
+        )
+        .await;
+        assert_eq!(
+            call(&svc, authorize_req(ACCOUNT_A, &zid, "vpc-bbb"))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        // A cannot create a private zone on B's VPC either.
+        let (status, out) = call(
+            &svc,
+            account_req(
+                ACCOUNT_A,
+                http::Method::POST,
+                "/2013-04-01/hostedzone",
+                &[],
+                &private_zone_body("other.example.", "ref-k2", "vpc-bbb"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{out}");
+        assert!(out.contains("<Code>InvalidVPCId</Code>"), "{out}");
+
+        // C names B's VPC: refused although the VPC is authorized.
+        let (status, out) = call(&svc, associate_req(ACCOUNT_C, &zid, "vpc-bbb")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{out}");
+        assert!(out.contains("not owned by account"), "{out}");
+        // B, the owner, may.
+        assert_eq!(
+            call(&svc, associate_req(ACCOUNT_B, &zid, "vpc-bbb"))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        // Only B sees A's zone through vpc-bbb, and only B may disassociate it.
+        assert!(call(&svc, list_by_vpc_req(ACCOUNT_B, "vpc-bbb"))
+            .await
+            .1
+            .contains(&zid));
+        assert!(!call(&svc, list_by_vpc_req(ACCOUNT_C, "vpc-bbb"))
+            .await
+            .1
+            .contains(&zid));
+        assert_eq!(
+            call(&svc, disassociate_req(ACCOUNT_C, &zid, "vpc-bbb"))
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            call(&svc, disassociate_req(ACCOUNT_B, &zid, "vpc-bbb"))
+                .await
+                .0,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn an_authorization_for_an_unknown_vpc_binds_to_its_first_user() {
+        let svc = Route53Service::new(Arc::new(RwLock::new(Route53Accounts::default())));
+        let zid = create_zone(
+            &svc,
+            ACCOUNT_A,
+            &private_zone_body("internal.example.", "ref-u", "vpc-aaa"),
+        )
+        .await;
+        call(&svc, authorize_req(ACCOUNT_A, &zid, "vpc-bbb")).await;
+        assert_eq!(
+            call(&svc, associate_req(ACCOUNT_B, &zid, "vpc-bbb"))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            call(&svc, disassociate_req(ACCOUNT_B, &zid, "vpc-bbb"))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        // The authorization stays, but it is B's now: C cannot use it.
+        let (status, out) = call(&svc, associate_req(ACCOUNT_C, &zid, "vpc-bbb")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{out}");
+        assert_eq!(
+            call(&svc, associate_req(ACCOUNT_B, &zid, "vpc-bbb"))
+                .await
+                .0,
+            StatusCode::OK
+        );
+
+        // Deleting the zone drops its authorization bookkeeping.
+        call(&svc, disassociate_req(ACCOUNT_B, &zid, "vpc-bbb")).await;
+        let (status, out) = call(
+            &svc,
+            account_req(
+                ACCOUNT_A,
+                http::Method::DELETE,
+                &format!("/2013-04-01/hostedzone/{zid}"),
+                &[],
+                "",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        let st = svc.state.read();
+        let a = st.get(ACCOUNT_A).unwrap();
+        assert!(a.vpc_authorizations.is_empty());
+        assert!(a.vpc_authorization_consumers.is_empty());
+        assert!(a.cross_account_vpcs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_migrated_associator_keeps_access_once_ec2_knows_the_vpc() {
+        // A v1 migration recorded B as the associator of vpc-1 on A's zone;
+        // EC2 now reports another account (C) as vpc-1's owner.
+        let svc = Route53Service::new(Arc::new(RwLock::new(Route53Accounts::default())))
+            .with_vpc_owner_lookup(Arc::new(|vpc_id: &str, _: &str| {
+                (vpc_id == "vpc-1").then(|| ACCOUNT_C.to_string())
+            }));
+        let zid = create_zone(
+            &svc,
+            ACCOUNT_A,
+            &private_zone_body("internal.example.", "ref-m", "vpc-a-local"),
+        )
+        .await;
+        {
+            let mut st = svc.state.write();
+            let a = st.entry(ACCOUNT_A);
+            let vpc = VPC {
+                vpc_id: Some("vpc-1".into()),
+                vpc_region: Some("us-east-1".into()),
+            };
+            a.hosted_zones.get_mut(&zid).unwrap().vpcs.push(vpc.clone());
+            a.cross_account_vpcs
+                .insert(zid.clone(), vec![(vpc, ACCOUNT_B.to_string())]);
+        }
+        assert!(call(&svc, list_by_vpc_req(ACCOUNT_B, "vpc-1"))
+            .await
+            .1
+            .contains(&zid));
+        let (status, out) = call(&svc, disassociate_req(ACCOUNT_B, &zid, "vpc-1")).await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+    }
+
+    #[tokio::test]
+    async fn a_migrated_associator_record_does_not_cover_the_zone_owners_own_vpc() {
+        // Migration recorded B as associator of vpc-own, which EC2 says the
+        // zone owner A owns.
+        let svc = Route53Service::new(Arc::new(RwLock::new(Route53Accounts::default())))
+            .with_vpc_owner_lookup(Arc::new(|vpc_id: &str, _: &str| {
+                (vpc_id == "vpc-own").then(|| ACCOUNT_A.to_string())
+            }));
+        let zid = create_zone(
+            &svc,
+            ACCOUNT_A,
+            &private_zone_body("internal.example.", "ref-o", "vpc-a-local"),
+        )
+        .await;
+        {
+            let mut st = svc.state.write();
+            let a = st.entry(ACCOUNT_A);
+            let vpc = VPC {
+                vpc_id: Some("vpc-own".into()),
+                vpc_region: Some("us-east-1".into()),
+            };
+            a.hosted_zones.get_mut(&zid).unwrap().vpcs.push(vpc.clone());
+            a.cross_account_vpcs
+                .insert(zid.clone(), vec![(vpc, ACCOUNT_B.to_string())]);
+        }
+        assert!(!call(&svc, list_by_vpc_req(ACCOUNT_B, "vpc-own"))
+            .await
+            .1
+            .contains(&zid));
+        let (status, out) = call(&svc, disassociate_req(ACCOUNT_B, &zid, "vpc-own")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{out}");
     }
 }

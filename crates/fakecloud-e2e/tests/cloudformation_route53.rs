@@ -239,3 +239,142 @@ async fn cfn_provisions_route53_dnssec_and_ksk() {
         "DNSSEC config should be gone after stack deletion"
     );
 }
+
+/// A stack owns its Route 53 resources in the stack's account (#2633): a
+/// second account's stack creates a zone + records visible through that
+/// account's Route 53 API and not through the default account's.
+#[tokio::test]
+async fn cfn_route53_resources_belong_to_the_stacks_account() {
+    use aws_credential_types::Credentials;
+
+    const ACCOUNT_B: &str = "222222222222";
+    let server = TestServer::start_with_env(&[("FAKECLOUD_IAM", "soft")]).await;
+    let (akid, secret) = server.create_admin(ACCOUNT_B, "admin-b").await;
+    let cfg_b = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .endpoint_url(server.endpoint())
+        .region(aws_config::Region::new("us-east-1"))
+        .credentials_provider(Credentials::new(akid, secret, None, None, "r53-acct-b"))
+        .load()
+        .await;
+    let cfn_b = aws_sdk_cloudformation::Client::new(&cfg_b);
+    let r53_b = aws_sdk_route53::Client::new(&cfg_b);
+    let r53_default = aws_sdk_route53::Client::new(&server.aws_config().await);
+
+    cfn_b
+        .create_stack()
+        .stack_name("r53-acct-b")
+        .template_body(TEMPLATE)
+        .on_failure(OnFailure::Rollback)
+        .send()
+        .await
+        .expect("create_stack in account B");
+    let described = cfn_b
+        .describe_stacks()
+        .stack_name("r53-acct-b")
+        .send()
+        .await
+        .expect("describe_stacks");
+    let stack = described.stacks().first().expect("stack present");
+    assert_eq!(stack.stack_status().unwrap().as_str(), "CREATE_COMPLETE");
+    assert!(
+        stack
+            .stack_id()
+            .unwrap()
+            .contains(&format!(":{ACCOUNT_B}:")),
+        "stack lives in account B: {:?}",
+        stack.stack_id()
+    );
+    let outputs: std::collections::HashMap<&str, &str> = stack
+        .outputs()
+        .iter()
+        .filter_map(|o| Some((o.output_key()?, o.output_value()?)))
+        .collect();
+    let zone_id = outputs["ZoneId"];
+    let health_id = outputs["HealthCheckId"];
+
+    // Account B sees the zone, its records and the health check...
+    let zone = r53_b
+        .get_hosted_zone()
+        .id(zone_id)
+        .send()
+        .await
+        .expect("account B reads its zone");
+    assert_eq!(zone.hosted_zone().unwrap().name(), "example.com.");
+    let listed = r53_b.list_hosted_zones().send().await.unwrap();
+    assert!(listed
+        .hosted_zones()
+        .iter()
+        .any(|z| z.id().ends_with(zone_id)));
+    let records = r53_b
+        .list_resource_record_sets()
+        .hosted_zone_id(zone_id)
+        .send()
+        .await
+        .expect("account B lists its records");
+    let mut types: Vec<&str> = records
+        .resource_record_sets()
+        .iter()
+        .map(|r| r.r#type().as_str())
+        .collect();
+    types.sort();
+    // The stack's A record plus the default SOA + NS records every zone
+    // carries, exactly as CreateHostedZone stores them.
+    assert_eq!(types, ["A", "NS", "SOA"]);
+    r53_b
+        .get_health_check()
+        .health_check_id(health_id)
+        .send()
+        .await
+        .expect("account B reads its health check");
+
+    // ...the default account does not.
+    let err = r53_default
+        .get_hosted_zone()
+        .id(zone_id)
+        .send()
+        .await
+        .expect_err("default account must not see account B's zone");
+    assert_eq!(
+        err.as_service_error().and_then(|e| e.meta().code()),
+        Some("NoSuchHostedZone")
+    );
+    let err = r53_default
+        .list_resource_record_sets()
+        .hosted_zone_id(zone_id)
+        .send()
+        .await
+        .expect_err("default account must not list account B's records");
+    assert_eq!(
+        err.as_service_error().and_then(|e| e.meta().code()),
+        Some("NoSuchHostedZone")
+    );
+    let listed = r53_default.list_hosted_zones().send().await.unwrap();
+    assert!(listed.hosted_zones().is_empty(), "{listed:?}");
+    assert!(r53_default
+        .get_health_check()
+        .health_check_id(health_id)
+        .send()
+        .await
+        .is_err());
+
+    // DNS resolution spans accounts, so the stack's record still resolves.
+    let resolved: serde_json::Value = reqwest::get(format!(
+        "{}/_fakecloud/dns/resolve?name=api.example.com&type=A",
+        server.endpoint()
+    ))
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(resolved["status"], "ANSWERED", "{resolved}");
+
+    // Deleting the stack removes the zone from account B.
+    cfn_b
+        .delete_stack()
+        .stack_name("r53-acct-b")
+        .send()
+        .await
+        .expect("delete_stack");
+    assert!(r53_b.get_hosted_zone().id(zone_id).send().await.is_err());
+}
