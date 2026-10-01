@@ -946,15 +946,7 @@ impl SsmService {
         param_arn: &str,
         ciphertext: &str,
     ) -> String {
-        let Some(hook) = &self.kms_hook else {
-            return ciphertext.to_string();
-        };
-        let mut ctx = std::collections::HashMap::new();
-        ctx.insert("PARAMETER_ARN".to_string(), param_arn.to_string());
-        match hook.decrypt(account_id, ciphertext, "ssm.amazonaws.com", ctx) {
-            Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-            Err(_) => ciphertext.to_string(),
-        }
+        decrypt_parameter_value(self.kms_hook.as_deref(), account_id, param_arn, ciphertext)
     }
 
     /// Wrapper around [`param_to_json`] that decrypts SecureString values
@@ -2696,4 +2688,178 @@ fn history_entry_json(
     }
     entry["Labels"] = json!(labels.cloned().unwrap_or_default());
     entry
+}
+
+/// One parameter version's value, as `GetParameters` with
+/// `WithDecryption=true` returns it: a `SecureString` stored KMS-encrypted
+/// is decrypted.
+#[derive(Debug, Clone)]
+pub struct ParameterValue {
+    pub name: String,
+    pub param_type: String,
+    pub version: i64,
+    pub value: String,
+}
+
+/// Read a parameter's value the way `GetParameters` (`WithDecryption=true`)
+/// does, as `caller_account`.
+///
+/// `name` is a parameter name or ARN, optionally followed by a `:version`
+/// or `:label` selector. A name is looked up in `caller_account`; an ARN in
+/// the ARN's account, where a parameter owned by another account is readable
+/// only when a resource policy on it (the sharing `PutResourcePolicy`
+/// creates) allows the caller `ssm:GetParameters`. A missing parameter,
+/// version or label is `ParameterNotFound`.
+pub fn read_parameter_value(
+    state: &crate::state::SharedSsmState,
+    kms_hook: Option<&dyn fakecloud_core::delivery::KmsHook>,
+    caller_account: &str,
+    name: &str,
+) -> Result<ParameterValue, AwsServiceError> {
+    let (owner_account, reference) = if arn_resource(name, "ssm").is_some() {
+        // arn:<partition>:ssm:<region>:<account>:parameter/<name>[:<selector>]
+        let reference = name
+            .splitn(6, ':')
+            .nth(5)
+            .and_then(|resource| resource.strip_prefix("parameter"))
+            .filter(|r| r.starts_with('/'))
+            .ok_or_else(|| param_not_found(name))?;
+        let account = fakecloud_aws::arn::account_of(name).unwrap_or(caller_account);
+        (account.to_string(), reference)
+    } else {
+        (caller_account.to_string(), name)
+    };
+    let (base_name, selector) = parse_param_selector(reference);
+
+    let (value, param_arn) = {
+        let mut accounts = state.write();
+        let state = accounts
+            .get_mut(&owner_account)
+            .ok_or_else(|| param_not_found(name))?;
+        purge_expired_params(state);
+        let param =
+            lookup_param(&state.parameters, base_name).ok_or_else(|| param_not_found(name))?;
+        if owner_account != caller_account && !parameter_shared_with(state, param, caller_account) {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "AccessDeniedException",
+                format!(
+                    "User: {} is not authorized to perform: ssm:GetParameters on resource: {} \
+                     because no resource-based policy allows the ssm:GetParameters action",
+                    Arn::global("iam", caller_account, "root")
+                        .with_partition(fakecloud_aws::arn::partition_of(&param.arn)),
+                    param.arn
+                ),
+            ));
+        }
+        let current = || ParameterValue {
+            name: param.name.clone(),
+            param_type: param.param_type.clone(),
+            version: param.version,
+            value: param.value.clone(),
+        };
+        let historical = |hist: &SsmParameterVersion| ParameterValue {
+            name: param.name.clone(),
+            param_type: hist.param_type.clone(),
+            version: hist.version,
+            value: hist.value.clone(),
+        };
+        let value = match selector {
+            ParamSelector::None => current(),
+            ParamSelector::Version(ver) if ver == param.version => current(),
+            ParamSelector::Version(ver) => param
+                .history
+                .iter()
+                .find(|h| h.version == ver)
+                .map(historical)
+                .ok_or_else(|| param_not_found(name))?,
+            ParamSelector::Label(label) => {
+                let ver = param
+                    .labels
+                    .iter()
+                    .find(|(_, labels)| labels.contains(&label))
+                    .map(|(ver, _)| *ver)
+                    .ok_or_else(|| param_not_found(name))?;
+                if ver == param.version {
+                    current()
+                } else {
+                    param
+                        .history
+                        .iter()
+                        .find(|h| h.version == ver)
+                        .map(historical)
+                        .ok_or_else(|| param_not_found(name))?
+                }
+            }
+            ParamSelector::Invalid(_) => return Err(param_not_found(name)),
+        };
+        (value, param.arn.clone())
+    };
+
+    if value.param_type != "SecureString" {
+        return Ok(value);
+    }
+    let value_text = decrypt_parameter_value(kms_hook, &owner_account, &param_arn, &value.value);
+    Ok(ParameterValue {
+        value: value_text,
+        ..value
+    })
+}
+
+/// Decrypt a stored `SecureString` value. Values written while a KMS hook
+/// was wired are stored as ciphertext; anything else (no hook, or a value
+/// that does not decrypt) is returned as stored.
+pub(crate) fn decrypt_parameter_value(
+    kms_hook: Option<&dyn fakecloud_core::delivery::KmsHook>,
+    account_id: &str,
+    param_arn: &str,
+    stored: &str,
+) -> String {
+    let Some(hook) = kms_hook else {
+        return stored.to_string();
+    };
+    let mut ctx = std::collections::HashMap::new();
+    ctx.insert("PARAMETER_ARN".to_string(), param_arn.to_string());
+    match hook.decrypt(account_id, stored, "ssm.amazonaws.com", ctx) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+        Err(_) => stored.to_string(),
+    }
+}
+
+/// Whether a resource policy attached to `param` (in its owner's state)
+/// allows `caller_account` to read it: how a parameter is shared across
+/// accounts.
+fn parameter_shared_with(state: &SsmState, param: &SsmParameter, caller_account: &str) -> bool {
+    use fakecloud_core::auth::{Principal, PrincipalType};
+    use fakecloud_iam::evaluator::{evaluate, Decision, EvalRequest, PolicyDocument};
+    let docs: Vec<PolicyDocument> = state
+        .resource_policies
+        .iter()
+        .filter(|p| {
+            resolve_param_by_name_or_arn(state, &p.resource_arn)
+                .is_ok_and(|shared| shared.name == param.name)
+        })
+        .map(|p| PolicyDocument::parse(&p.policy))
+        .collect();
+    if docs.is_empty() {
+        return false;
+    }
+    let principal_arn = Arn::global("iam", caller_account, "root")
+        .with_partition(fakecloud_aws::arn::partition_of(&param.arn))
+        .to_string();
+    let principal = Principal {
+        arn: principal_arn.clone(),
+        user_id: principal_arn,
+        account_id: caller_account.to_string(),
+        principal_type: PrincipalType::User,
+        source_identity: None,
+        tags: None,
+    };
+    let req = EvalRequest {
+        principal: &principal,
+        action: "ssm:GetParameters".to_string(),
+        resource: param.arn.clone(),
+        context: Default::default(),
+    };
+    matches!(evaluate(&docs, &req), Decision::Allow)
 }

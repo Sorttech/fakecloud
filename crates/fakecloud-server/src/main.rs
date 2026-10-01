@@ -1278,6 +1278,7 @@ async fn main() {
                 .with_logs(logs_state.clone())
                 .with_secretsmanager(secretsmanager_state.clone())
                 .with_ssm(ssm_state.clone())
+                .with_kms_hook(kms_hook_for_services.clone())
         })
         .map(Arc::new);
     if let Some(ref rt) = ecs_runtime {

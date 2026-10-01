@@ -160,14 +160,7 @@ impl EcsRuntime {
         for plan in plans {
             let mut env = plan.env.clone();
             for (name, value_from) in &plan.secrets_refs {
-                match self.resolve_secret(account_id, value_from) {
-                    Some(v) => env.push((name.clone(), v)),
-                    None => {
-                        return Err(RuntimeError::ContainerStart(format!(
-                            "failed to resolve secret {name} from {value_from}"
-                        )));
-                    }
-                }
+                env.push((name.clone(), self.resolve_secret(account_id, value_from)?));
             }
             let base = backend.self_url.trim_end_matches('/');
             if plan.has_task_role {

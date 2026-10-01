@@ -179,19 +179,15 @@ impl SecretsManagerService {
         kms_key_id: Option<&str>,
         stored: Option<&str>,
     ) -> Option<String> {
-        let stored = stored?;
-        let (Some(hook), Some(_)) = (&self.kms_hook, kms_key_id) else {
-            return Some(stored.to_string());
-        };
-        let mut ctx = HashMap::new();
-        ctx.insert(
-            "aws:secretsmanager:secretArn".to_string(),
-            secret_arn.to_string(),
-        );
-        match hook.decrypt(account_id, stored, "secretsmanager.amazonaws.com", ctx) {
-            Ok(bytes) => Some(String::from_utf8_lossy(&bytes).to_string()),
-            Err(_) => Some(stored.to_string()),
-        }
+        stored.map(|stored| {
+            crate::value::decrypt_secret_string(
+                self.kms_hook.as_deref(),
+                account_id,
+                secret_arn,
+                kms_key_id,
+                stored.to_string(),
+            )
+        })
     }
 
     /// Persist current state as a snapshot. Held across the
@@ -368,109 +364,26 @@ impl SecretsManagerService {
         validate_optional_string_length("versionId", body["VersionId"].as_str(), 32, 64)?;
         validate_optional_string_length("versionStage", body["VersionStage"].as_str(), 1, 256)?;
 
-        // Resolve owning account from an ARN form. Cross-account
-        // GetSecretValue then evaluates `secret.resource_policy` via
-        // the IAM evaluator before returning the value.
-        let owner_account = secret_owner_account(&secret_id, &req.account_id);
-        let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&owner_account);
-        let secret = self.find_secret_mut(state, &secret_id)?;
-        if owner_account != req.account_id {
-            let policy_doc = secret.resource_policy.as_deref().unwrap_or("");
-            let secret_arn = secret.arn.clone();
-            if !resource_policy_allows(policy_doc, &req.account_id, &secret_arn) {
-                return Err(AwsServiceError::aws_error(
-                    StatusCode::FORBIDDEN,
-                    "AccessDeniedException",
-                    "User is not authorized to perform: secretsmanager:GetSecretValue on the requested resource",
-                ));
-            }
-        }
-
-        if secret.deleted {
-            return Err(AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "InvalidRequestException",
-                "You can't perform this operation on the secret because it was marked for deletion.",
-            ));
-        }
-
-        let requested_stage = body["VersionStage"].as_str().unwrap_or("AWSCURRENT");
-
-        // Determine which version to return
-        let version_id = body["VersionId"]
-            .as_str()
-            .map(|s| s.to_string())
-            .or_else(|| {
-                secret
-                    .versions
-                    .iter()
-                    .find(|(_, v)| v.stages.contains(&requested_stage.to_string()))
-                    .map(|(id, _)| id.clone())
-            });
-
-        let version_id = match version_id {
-            Some(vid) => vid,
-            None => {
-                // No versions exist
-                return Err(AwsServiceError::aws_error(
-                    StatusCode::BAD_REQUEST,
-                    "ResourceNotFoundException",
-                    format!(
-                        "Secrets Manager can't find the specified secret value for staging label: {requested_stage}"
-                    ),
-                ));
-            }
-        };
-
-        let version = secret.versions.get(&version_id).ok_or_else(|| {
-            AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "ResourceNotFoundException",
-                format!(
-                    "Secrets Manager can't find the specified secret value for VersionId: {version_id}"
-                ),
-            )
-        })?;
-
-        // If VersionStage is specified with VersionId, verify they match
-        if body["VersionId"].as_str().is_some() {
-            if let Some(stage) = body["VersionStage"].as_str() {
-                if !version.stages.contains(&stage.to_string()) {
-                    return Err(AwsServiceError::aws_error(
-                        StatusCode::BAD_REQUEST,
-                        "ResourceNotFoundException",
-                        "You provided a VersionStage that is not associated to the provided VersionId.",
-                    ));
-                }
-            }
-        }
-
-        // Only set last_accessed_at on successful retrieval
-        secret.last_accessed_at = Some(Utc::now());
+        let value = crate::value::read_secret_value(
+            &self.state,
+            self.kms_hook.as_deref(),
+            &req.account_id,
+            &secret_id,
+            body["VersionId"].as_str(),
+            body["VersionStage"].as_str(),
+        )?;
 
         let mut response = json!({
-            "ARN": secret.arn,
-            "Name": secret.name,
-            "VersionId": version.version_id,
-            "VersionStages": version.stages,
-            "CreatedDate": version.created_at.timestamp_millis() as f64 / 1000.0,
+            "ARN": value.arn,
+            "Name": value.name,
+            "VersionId": value.version_id,
+            "VersionStages": value.version_stages,
+            "CreatedDate": value.created_at.timestamp_millis() as f64 / 1000.0,
         });
-
-        let kms_for_decrypt = secret.kms_key_id.clone();
-        let arn_for_decrypt = secret.arn.clone();
-        if let Some(ref s) = version.secret_string {
-            let plaintext = self
-                .maybe_decrypt_secret_string(
-                    &req.account_id,
-                    &arn_for_decrypt,
-                    kms_for_decrypt.as_deref(),
-                    Some(s.as_str()),
-                )
-                .unwrap_or_else(|| s.clone());
-            response["SecretString"] = json!(plaintext);
+        if let Some(s) = value.secret_string {
+            response["SecretString"] = json!(s);
         }
-        if let Some(ref b) = version.secret_binary {
+        if let Some(ref b) = value.secret_binary {
             response["SecretBinary"] = json!(base64_encode(b));
         }
 
@@ -2145,7 +2058,7 @@ impl SecretsManagerService {
 }
 
 /// The standard "secret can't be found" error, shared by the resolution helpers.
-fn secret_not_found() -> AwsServiceError {
+pub(crate) fn secret_not_found() -> AwsServiceError {
     AwsServiceError::aws_error(
         StatusCode::BAD_REQUEST,
         "ResourceNotFoundException",
@@ -2412,7 +2325,7 @@ pub fn secret_arn(region: &str, account_id: &str, name: &str) -> String {
 /// Extract the owning account-id from an `arn:aws:secretsmanager:...:ACCOUNT:secret:...`
 /// secret id. Returns `caller_account` when the input is a bare name
 /// or a same-account ARN.
-fn secret_owner_account(secret_id: &str, caller_account: &str) -> String {
+pub(crate) fn secret_owner_account(secret_id: &str, caller_account: &str) -> String {
     if arn_resource(secret_id, "secretsmanager").is_none() {
         return caller_account.to_string();
     }
@@ -2432,7 +2345,11 @@ fn secret_owner_account(secret_id: &str, caller_account: &str) -> String {
 /// caller. Empty policy implicitly denies (real AWS behaviour). Uses
 /// the shared IAM evaluator so the same policy semantics apply
 /// service-wide.
-fn resource_policy_allows(policy_doc: &str, caller_account: &str, secret_arn: &str) -> bool {
+pub(crate) fn resource_policy_allows(
+    policy_doc: &str,
+    caller_account: &str,
+    secret_arn: &str,
+) -> bool {
     if policy_doc.is_empty() {
         return false;
     }

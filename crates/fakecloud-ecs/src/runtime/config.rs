@@ -33,4 +33,11 @@ impl EcsRuntime {
         self.ssm_state = Some(state);
         self
     }
+
+    /// Wire the KMS hook so `secrets[]` values stored KMS-encrypted (SSM
+    /// `SecureString`s, secrets with a KMS key) are decrypted at task launch.
+    pub fn with_kms_hook(mut self, hook: Arc<dyn fakecloud_core::delivery::KmsHook>) -> Self {
+        self.kms_hook = Some(hook);
+        self
+    }
 }
