@@ -8,12 +8,62 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::auth::{
-    is_root_bypass, ConditionContext, CredentialResolver, IamMode, IamPolicyEvaluator, Principal,
-    PrincipalType, ResourcePolicyProvider,
+    is_root_bypass, ConditionContext, CredentialResolver, IamMode, IamPolicyEvaluator,
+    InternalCaller, Principal, PrincipalType, ResourcePolicyProvider,
 };
 use crate::protocol::{self, AwsProtocol};
 use crate::registry::ServiceRegistry;
 use crate::service::{AwsRequest, ResponseBody};
+
+/// Pins an in-process request to one REST service; see [`dispatch_to_service`].
+/// Private, so only this module can attach it.
+#[derive(Clone, Copy, Debug)]
+struct PinnedService(&'static str);
+
+/// Dispatch an in-process request straight to one REST-protocol service
+/// (`"s3"`), bypassing the HTTP router and service detection.
+///
+/// The CloudFront data plane fetches an S3 origin this way: the request is by
+/// construction an S3 request addressed to the origin bucket (via its `Host`),
+/// so no viewer path (`/_fakecloud/*`, `/latest/*`, ...) can reach one of
+/// fakecloud's own routes, and no viewer header (`X-Amz-Target`, an
+/// `Authorization` scoped to another service, `?Action=`) can steer it to
+/// another service. Authentication and IAM enforcement run exactly as for any
+/// request, including an [`InternalCaller`] extension. The source address is
+/// the request's `ConnectInfo<SocketAddr>` extension, or loopback.
+pub async fn dispatch_to_service(
+    service: &'static str,
+    registry: Arc<ServiceRegistry>,
+    config: Arc<DispatchConfig>,
+    mut request: Request<Body>,
+) -> Response<Body> {
+    let remote_addr = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0)
+        .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0)));
+    let query = match Query::<HashMap<String, String>>::try_from_uri(request.uri()) {
+        Ok(q) => q,
+        Err(e) => {
+            return build_error_response(
+                StatusCode::BAD_REQUEST,
+                "InvalidArgument",
+                &format!("Invalid query string: {e}"),
+                &uuid::Uuid::new_v4().to_string(),
+                AwsProtocol::Rest,
+            )
+        }
+    };
+    request.extensions_mut().insert(PinnedService(service));
+    dispatch(
+        ConnectInfo(remote_addr),
+        Extension(registry),
+        Extension(config),
+        query,
+        request,
+    )
+    .await
+}
 
 /// The main dispatch handler. All HTTP requests come through here.
 pub async fn dispatch(
@@ -27,6 +77,9 @@ pub async fn dispatch(
     let request_id = uuid::Uuid::new_v4().to_string();
 
     let (parts, body) = request.into_parts();
+    // Set only by [`dispatch_to_service`]: the request is for this service,
+    // whatever its headers or query say.
+    let pinned = parts.extensions.get::<PinnedService>().map(|p| p.0);
 
     // Streaming opt-in: if the route is a known large-body S3 / ECR
     // upload, we skip the buffered `to_bytes` step entirely and hand
@@ -41,6 +94,9 @@ pub async fn dispatch(
     );
     let header_only = protocol::detect_service_headers_only(&parts.headers, &query_params);
     let stream_dispatch = match (&stream_route, &header_only) {
+        // A pinned request is always buffered: its caller already holds the
+        // whole body, and header detection must not pick its service.
+        _ if pinned.is_some() => None,
         // Header-only detection agrees with the URL match — covers S3
         // PUT object (SigV4 service=s3 in Authorization).
         (Some(sr), Some(detected)) if sr.0 == detected.service => Some(detected.clone()),
@@ -80,7 +136,13 @@ pub async fn dispatch(
     };
 
     // Detect service and action
-    let detected = if let Some(d) = stream_dispatch {
+    let detected = if let Some(service) = pinned {
+        protocol::DetectedRequest {
+            service: service.to_string(),
+            action: String::new(),
+            protocol: AwsProtocol::Rest,
+        }
+    } else if let Some(d) = stream_dispatch {
         d
     } else {
         match protocol::detect_service(&parts.headers, &query_params, &body_bytes) {
@@ -498,14 +560,35 @@ pub async fn dispatch(
         }
     }
 
+    // An in-process request fakecloud issues as an AWS-owned principal (e.g.
+    // CloudFront fetching an S3 origin through an origin access control). The
+    // identity rides a request extension that only in-process code can set,
+    // and is honored only when the request presents no credentials of its
+    // own: a request that does is authorized as that caller instead.
+    let internal_caller = if is_fully_anonymous && access_key_id.is_none() {
+        parts.extensions.get::<InternalCaller>().cloned()
+    } else {
+        None
+    };
+    let caller_principal =
+        caller_principal.or_else(|| internal_caller.as_ref().map(|c| c.principal()));
+
     let aws_request = AwsRequest {
         service: detected.service.clone(),
         action: detected.action.clone(),
         region,
-        account_id: caller_principal
-            .as_ref()
-            .map(|p| p.account_id.clone())
-            .unwrap_or_else(|| config.account_id.clone()),
+        // A service acting for a customer works on the target resource in its
+        // owner's account: an S3 origin bucket may belong to another account
+        // than the distribution fetching it.
+        account_id: match internal_caller.as_ref() {
+            Some(caller) => {
+                internal_caller_account(caller, &detected.service, &path_segments, &config)
+            }
+            None => caller_principal
+                .as_ref()
+                .map(|p| p.account_id.clone())
+                .unwrap_or_else(|| config.account_id.clone()),
+        },
         request_id: request_id.clone(),
         headers: parts.headers,
         query_params: all_params,
@@ -541,7 +624,19 @@ pub async fn dispatch(
         && !is_root_bypass(aws_request.access_key_id.as_deref().unwrap_or(""))
     {
         if let Some(evaluator) = config.policy_evaluator.as_ref() {
-            if let Some(principal) = aws_request.principal.as_ref() {
+            if let Some(caller) = internal_caller.as_ref() {
+                if let Some(denied) = authorize_internal_caller(
+                    caller,
+                    service.as_ref(),
+                    &aws_request,
+                    evaluator.as_ref(),
+                    &config,
+                    &detected,
+                    &request_id,
+                ) {
+                    return denied;
+                }
+            } else if let Some(principal) = aws_request.principal.as_ref() {
                 if !principal.is_root() {
                     // A request can need several authorizations -- one per
                     // table in a batch, say -- and every one must allow it.
@@ -1404,6 +1499,122 @@ fn anonymous_s3_bucket(uri: &http::Uri, config: &DispatchConfig) -> Option<Strin
     provider.resource_owner_account("s3", &arn).map(|_| segment)
 }
 
+/// The account an [`InternalCaller`] request works in: for S3, the owner of
+/// the addressed bucket (bucket names are global, and a bucket policy can
+/// grant a service acting for another account's resource); otherwise, or
+/// when the bucket does not exist, the account the caller acts for.
+fn internal_caller_account(
+    caller: &InternalCaller,
+    service: &str,
+    path_segments: &[String],
+    config: &DispatchConfig,
+) -> String {
+    let bucket_owner = (service == "s3")
+        .then(|| path_segments.first())
+        .flatten()
+        .and_then(|bucket| {
+            let arn = fakecloud_aws::arn::Arn::s3(bucket).to_string();
+            config
+                .resource_policy_provider
+                .as_ref()?
+                .resource_owner_account("s3", &arn)
+        });
+    bucket_owner.unwrap_or_else(|| caller.acting_account().to_string())
+}
+
+/// Authorize a request fakecloud makes in-process as an AWS-owned principal
+/// (see [`InternalCaller`]). Such a principal has no identity policies and no
+/// account, so -- as in AWS -- only the resource policy (S3 bucket policy) can
+/// grant it the action, with a public-read ACL honored the way it is for any
+/// caller. The request context carries the caller's keys (`aws:SourceArn`,
+/// `aws:SourceAccount`, ...) so a confused-deputy condition scoped to the
+/// acting resource matches. `aws:SourceIp` is absent, as AWS omits it for a
+/// request a service makes.
+///
+/// Returns the error response to send when the request is denied under
+/// strict mode; soft mode only logs.
+fn authorize_internal_caller(
+    caller: &InternalCaller,
+    service: &dyn crate::service::AwsService,
+    aws_request: &AwsRequest,
+    evaluator: &dyn IamPolicyEvaluator,
+    config: &DispatchConfig,
+    detected: &protocol::DetectedRequest,
+    request_id: &str,
+) -> Option<Response<Body>> {
+    let principal = caller.principal();
+    let denied = || {
+        config.iam_mode.is_strict().then(|| {
+            build_error_response(
+                StatusCode::FORBIDDEN,
+                "AccessDenied",
+                "Access Denied",
+                request_id,
+                detected.protocol,
+            )
+        })
+    };
+    let iam_actions = service.iam_actions_for(aws_request);
+    if iam_actions.is_empty() {
+        tracing::warn!(
+            target: "fakecloud::iam::audit",
+            service = %detected.service,
+            action = %aws_request.action,
+            principal = %principal.arn,
+            mode = %config.iam_mode,
+            request_id = %request_id,
+            "service-principal request has no IamAction mapping; denying under strict, allowing under soft"
+        );
+        return denied();
+    }
+    for iam_action in &iam_actions {
+        let now = chrono::Utc::now();
+        let mut context = ConditionContext {
+            aws_principal_arn: Some(principal.arn.clone()),
+            aws_current_time: Some(now),
+            aws_epoch_time: Some(now.timestamp()),
+            aws_secure_transport: Some(is_secure_transport(&aws_request.headers)),
+            aws_requested_region: Some(aws_request.region.clone()),
+            ..Default::default()
+        };
+        context.service_keys = service.iam_condition_keys_for(aws_request, iam_action);
+        context.service_keys.extend(caller.condition_keys());
+        let resource_policy_json = config
+            .resource_policy_provider
+            .as_ref()
+            .and_then(|p| p.resource_policy(&detected.service, &iam_action.resource));
+        let decision = evaluator.evaluate_resource_policy_only(
+            &principal,
+            iam_action,
+            &context,
+            resource_policy_json.as_deref(),
+        );
+        let explicit_deny = matches!(decision, crate::auth::IamDecision::ExplicitDeny);
+        let acl_allows = !explicit_deny
+            && config.resource_policy_provider.as_ref().is_some_and(|p| {
+                p.public_acl_allows(&detected.service, &iam_action.resource, iam_action.action)
+            });
+        if !decision.is_allow() && !acl_allows {
+            tracing::warn!(
+                target: "fakecloud::iam::audit",
+                service = %detected.service,
+                action = %iam_action.action_string(),
+                resource = %iam_action.resource,
+                principal = %principal.arn,
+                resource_policy_present = resource_policy_json.is_some(),
+                decision = ?decision,
+                mode = %config.iam_mode,
+                request_id = %request_id,
+                "service-principal request denied: the resource policy does not grant the action"
+            );
+            if let Some(resp) = denied() {
+                return Some(resp);
+            }
+        }
+    }
+    None
+}
+
 fn build_condition_context(
     principal: &Principal,
     remote_addr: Option<SocketAddr>,
@@ -1463,6 +1674,7 @@ fn principal_type_label(t: PrincipalType) -> &'static str {
         PrincipalType::FederatedUser => "FederatedUser",
         PrincipalType::Root => "Account",
         PrincipalType::Unknown => "Unknown",
+        PrincipalType::Service => "Service",
     }
 }
 

@@ -48,8 +48,11 @@ impl S3Service {
         // PublicAccessBlock.IgnorePublicAcls: anonymous callers cannot
         // ride a public-read ACL when the bucket has IgnorePublicAcls
         // set. Authenticated callers always pass this gate; the ACL
-        // check itself is unchanged for authed paths.
-        if req.access_key_id.is_none() {
+        // check itself is unchanged for authed paths. A request fakecloud
+        // makes as an AWS-owned principal (CloudFront through an origin
+        // access control) carries no access key but is not anonymous: it
+        // has a principal, and the bucket policy authorized it.
+        if req.access_key_id.is_none() && req.principal.is_none() {
             if let Some(xml) = b.public_access_block.as_ref() {
                 let flags = crate::service::config::PublicAccessBlockFlags::parse(xml);
                 let acl_is_public = obj.acl_grants.iter().chain(b.acl_grants.iter()).any(|g| {

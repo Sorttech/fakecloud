@@ -124,6 +124,26 @@ impl IamPolicyEvaluator for IamPolicyEvaluatorImpl {
         let policy = evaluator::PolicyDocument::parse(json);
         decision_to_core(evaluator::evaluate_resource_policy_only(&policy, &request))
     }
+
+    fn evaluate_resource_policy_only(
+        &self,
+        principal: &Principal,
+        action: &IamAction,
+        context: &ConditionContext,
+        resource_policy_json: Option<&str>,
+    ) -> IamDecision {
+        let Some(json) = resource_policy_json else {
+            return IamDecision::ImplicitDeny;
+        };
+        let request = EvalRequest {
+            principal,
+            action: action.action_string(),
+            resource: action.resource.clone(),
+            context: context.clone(),
+        };
+        let policy = evaluator::PolicyDocument::parse(json);
+        decision_to_core(evaluator::evaluate_resource_policy_only(&policy, &request))
+    }
 }
 
 /// A synthetic principal standing in for an unsigned (anonymous) caller.
@@ -570,6 +590,172 @@ mod tests {
             Some(policy),
         );
         assert!(!decision.is_allow());
+    }
+
+    const DIST_A: &str = "arn:aws:cloudfront::123456789012:distribution/EDFDVBD6EXAMPLE";
+    const DIST_B: &str = "arn:aws:cloudfront::123456789012:distribution/EOTHERDIST0001";
+
+    fn cloudfront_caller(source_arn: &str) -> fakecloud_core::auth::InternalCaller {
+        fakecloud_core::auth::InternalCaller::Service {
+            service: "cloudfront.amazonaws.com".into(),
+            source_arn: source_arn.into(),
+            source_account: "123456789012".into(),
+        }
+    }
+
+    fn oai_caller(canonical: &str) -> fakecloud_core::auth::InternalCaller {
+        fakecloud_core::auth::InternalCaller::ServiceOwned {
+            arn: "arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity E2QWRUHAPOMQZL"
+                .into(),
+            canonical_user_id: Some(canonical.into()),
+            acting_account: "123456789012".into(),
+        }
+    }
+
+    fn eval_caller(caller: &fakecloud_core::auth::InternalCaller, policy: &str) -> IamDecision {
+        let context = ConditionContext {
+            service_keys: caller.condition_keys(),
+            ..Default::default()
+        };
+        IamPolicyEvaluatorImpl::new(setup()).evaluate_resource_policy_only(
+            &caller.principal(),
+            &s3_get_object_action(),
+            &context,
+            Some(policy),
+        )
+    }
+
+    /// The bucket policy CDK's `S3BucketOrigin.withOriginAccessControl`
+    /// writes: the CloudFront service principal, scoped to one distribution.
+    fn oac_policy(source_arn: &str) -> String {
+        format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"Service":"cloudfront.amazonaws.com"}},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{{"StringEquals":{{"AWS:SourceArn":"{source_arn}"}}}}}}]}}"#
+        )
+    }
+
+    #[test]
+    fn cloudfront_service_principal_allowed_for_its_own_distribution() {
+        assert_eq!(
+            eval_caller(&cloudfront_caller(DIST_A), &oac_policy(DIST_A)),
+            IamDecision::Allow
+        );
+    }
+
+    #[test]
+    fn cloudfront_service_principal_denied_for_another_distribution() {
+        assert_eq!(
+            eval_caller(&cloudfront_caller(DIST_B), &oac_policy(DIST_A)),
+            IamDecision::ImplicitDeny
+        );
+    }
+
+    #[test]
+    fn cloudfront_service_principal_matches_source_account_condition() {
+        let policy = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"cloudfront.amazonaws.com"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"aws:SourceAccount":"123456789012"},"Bool":{"aws:PrincipalIsAWSService":"true"}}}]}"#;
+        assert_eq!(
+            eval_caller(&cloudfront_caller(DIST_A), policy),
+            IamDecision::Allow
+        );
+        let other_account = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"cloudfront.amazonaws.com"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"aws:SourceAccount":"999999999999"}}}]}"#;
+        assert_eq!(
+            eval_caller(&cloudfront_caller(DIST_A), other_account),
+            IamDecision::ImplicitDeny
+        );
+    }
+
+    #[test]
+    fn service_principal_is_not_matched_by_another_service_or_account_root() {
+        let other_service = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"s3:GetObject","Resource":"*"}]}"#;
+        assert_eq!(
+            eval_caller(&cloudfront_caller(DIST_A), other_service),
+            IamDecision::ImplicitDeny
+        );
+        // The source account's root grants that account's identities, not a
+        // service acting for one of its resources.
+        let account_root = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::123456789012:root"},"Action":"s3:GetObject","Resource":"*"}]}"#;
+        assert_eq!(
+            eval_caller(&cloudfront_caller(DIST_A), account_root),
+            IamDecision::ImplicitDeny
+        );
+    }
+
+    #[test]
+    fn service_principal_explicit_deny_wins() {
+        let policy = format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"Service":"cloudfront.amazonaws.com"}},"Action":"s3:GetObject","Resource":"*","Condition":{{"StringEquals":{{"AWS:SourceArn":"{DIST_A}"}}}}}},{{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"*"}}]}}"#
+        );
+        assert_eq!(
+            eval_caller(&cloudfront_caller(DIST_A), &policy),
+            IamDecision::ExplicitDeny
+        );
+    }
+
+    #[test]
+    fn origin_access_identity_matches_by_arn_or_canonical_user() {
+        let canonical = "5f0b6c1a2e3d4c5b6a7f8e9d0c1b2a3f";
+        let by_arn = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity E2QWRUHAPOMQZL"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"}]}"#;
+        assert_eq!(
+            eval_caller(&oai_caller(canonical), by_arn),
+            IamDecision::Allow
+        );
+        let by_canonical = format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"CanonicalUser":"{canonical}"}},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"}}]}}"#
+        );
+        assert_eq!(
+            eval_caller(&oai_caller(canonical), &by_canonical),
+            IamDecision::Allow
+        );
+        // A different OAI's canonical id does not match.
+        assert_eq!(
+            eval_caller(
+                &oai_caller("0123456789abcdef0123456789abcdef"),
+                &by_canonical
+            ),
+            IamDecision::ImplicitDeny
+        );
+        // Nor does the CloudFront service principal grant reach an OAI.
+        assert_eq!(
+            eval_caller(&oai_caller(canonical), &oac_policy(DIST_A)),
+            IamDecision::ImplicitDeny
+        );
+    }
+
+    #[test]
+    fn canonical_user_never_matches_an_iam_user_id() {
+        // IAM ids are not canonical ids, even when a policy names one.
+        let eval = IamPolicyEvaluatorImpl::new(setup());
+        let principal = Principal {
+            arn: "arn:aws:iam::123456789012:user/alice".into(),
+            user_id: "AIDAALICE".into(),
+            account_id: "123456789012".into(),
+            principal_type: PrincipalType::User,
+            source_identity: None,
+            tags: None,
+        };
+        let policy = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"CanonicalUser":"AIDAALICE"},"Action":"s3:GetObject","Resource":"*"}]}"#;
+        assert_eq!(
+            eval.evaluate_resource_policy_only(
+                &principal,
+                &s3_get_object_action(),
+                &ConditionContext::default(),
+                Some(policy)
+            ),
+            IamDecision::ImplicitDeny
+        );
+    }
+
+    #[test]
+    fn service_principal_denied_without_resource_policy() {
+        let caller = cloudfront_caller(DIST_A);
+        assert_eq!(
+            IamPolicyEvaluatorImpl::new(setup()).evaluate_resource_policy_only(
+                &caller.principal(),
+                &s3_get_object_action(),
+                &ConditionContext::default(),
+                None
+            ),
+            IamDecision::ImplicitDeny
+        );
     }
 
     #[test]

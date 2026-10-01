@@ -41,6 +41,11 @@ pub enum PrincipalType {
     /// non-bypassable principal so a malformed or unexpected ARN can never
     /// silently grant elevated permissions during IAM evaluation.
     Unknown,
+    /// An AWS service principal (`cloudfront.amazonaws.com`) acting on its
+    /// own behalf. Its `arn` is the service name. Never produced from a
+    /// credential: only an [`InternalCaller::Service`] yields one, so no
+    /// client can present it.
+    Service,
 }
 
 impl PrincipalType {
@@ -51,6 +56,7 @@ impl PrincipalType {
             PrincipalType::FederatedUser => "federated-user",
             PrincipalType::Root => "root",
             PrincipalType::Unknown => "unknown",
+            PrincipalType::Service => "service",
         }
     }
 
@@ -471,6 +477,138 @@ pub trait IamPolicyEvaluator: Send + Sync {
     ) -> IamDecision {
         IamDecision::ImplicitDeny
     }
+
+    /// Evaluate `action` for `principal` against a resource-based policy in
+    /// isolation, with no identity-policy, boundary, session or SCP layer.
+    ///
+    /// This is how AWS authorizes a principal that lives outside every
+    /// customer account -- an AWS service principal or a service-owned
+    /// identity such as a CloudFront origin access identity (see
+    /// [`InternalCaller`]): only the resource policy can grant it access.
+    ///
+    /// The default implementation returns [`IamDecision::ImplicitDeny`] so
+    /// evaluators that don't support it never silently grant.
+    fn evaluate_resource_policy_only(
+        &self,
+        _principal: &Principal,
+        _action: &IamAction,
+        _context: &ConditionContext,
+        _resource_policy_json: Option<&str>,
+    ) -> IamDecision {
+        IamDecision::ImplicitDeny
+    }
+}
+
+/// The AWS-owned principal a request is made as when fakecloud itself issues
+/// it on a customer's behalf through its own front door -- CloudFront
+/// fetching from an S3 origin through an origin access control, for example.
+///
+/// It travels as an `http::Request` **extension** set by in-process code and
+/// is never parsed from the wire, so a client cannot claim it. Dispatch
+/// honors it only on a request that carries no credentials of its own, and
+/// authorizes it against the resource policy alone (see
+/// [`IamPolicyEvaluator::evaluate_resource_policy_only`]): neither kind of
+/// principal belongs to an account with identity policies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InternalCaller {
+    /// An AWS service principal (`cloudfront.amazonaws.com`) acting for one
+    /// of its resources. `source_arn` / `source_account` are that resource
+    /// and its owner -- the `aws:SourceArn` / `aws:SourceAccount` values a
+    /// confused-deputy condition compares against.
+    Service {
+        service: String,
+        source_arn: String,
+        source_account: String,
+    },
+    /// An IAM identity an AWS service owns outside every customer account,
+    /// such as a CloudFront origin access identity
+    /// (`arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity <id>`).
+    /// A resource policy names it by `arn` or, in S3, by its
+    /// `canonical_user_id`. `acting_account` is the customer account whose
+    /// resource made the request.
+    ServiceOwned {
+        arn: String,
+        canonical_user_id: Option<String>,
+        acting_account: String,
+    },
+}
+
+impl InternalCaller {
+    /// The principal the request is evaluated as. Neither kind carries an
+    /// account id: a service principal belongs to no account and a
+    /// service-owned identity to AWS's, so an account-root grant
+    /// (`arn:aws:iam::<acct>:root`) never matches either, as in AWS. A
+    /// service-owned identity's canonical user id is its `user_id`.
+    pub fn principal(&self) -> Principal {
+        match self {
+            InternalCaller::Service { service, .. } => Principal {
+                arn: service.clone(),
+                user_id: service.clone(),
+                account_id: String::new(),
+                principal_type: PrincipalType::Service,
+                source_identity: None,
+                tags: None,
+            },
+            InternalCaller::ServiceOwned {
+                arn,
+                canonical_user_id,
+                ..
+            } => Principal {
+                arn: arn.clone(),
+                user_id: canonical_user_id.clone().unwrap_or_default(),
+                account_id: String::new(),
+                principal_type: PrincipalType::from_arn(arn),
+                source_identity: None,
+                tags: None,
+            },
+        }
+    }
+
+    /// The customer account the request is made for: the owner of the
+    /// resource on whose behalf the service acts.
+    pub fn acting_account(&self) -> &str {
+        match self {
+            InternalCaller::Service { source_account, .. } => source_account,
+            InternalCaller::ServiceOwned { acting_account, .. } => acting_account,
+        }
+    }
+
+    /// The request-context keys this caller contributes: for a service
+    /// principal `aws:SourceArn`, `aws:SourceAccount`,
+    /// `aws:PrincipalServiceName` and `aws:PrincipalIsAWSService`; for a
+    /// service-owned identity nothing beyond its principal ARN (set on the
+    /// typed context by dispatch).
+    pub fn condition_keys(&self) -> BTreeMap<String, Vec<String>> {
+        let mut keys = BTreeMap::new();
+        match self {
+            InternalCaller::Service {
+                service,
+                source_arn,
+                source_account,
+            } => {
+                keys.insert("aws:SourceArn".to_string(), vec![source_arn.clone()]);
+                keys.insert(
+                    "aws:SourceAccount".to_string(),
+                    vec![source_account.clone()],
+                );
+                keys.insert(
+                    "aws:PrincipalServiceName".to_string(),
+                    vec![service.clone()],
+                );
+                keys.insert(
+                    "aws:PrincipalIsAWSService".to_string(),
+                    vec!["true".to_string()],
+                );
+            }
+            InternalCaller::ServiceOwned { .. } => {
+                keys.insert(
+                    "aws:PrincipalIsAWSService".to_string(),
+                    vec!["false".to_string()],
+                );
+            }
+        }
+        keys
+    }
 }
 
 /// Abstraction over "given a principal, return the inherited SCP
@@ -811,6 +949,61 @@ pub fn is_root_bypass(access_key_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_internal_caller_is_an_accountless_service_principal() {
+        let caller = InternalCaller::Service {
+            service: "cloudfront.amazonaws.com".into(),
+            source_arn: "arn:aws:cloudfront::123456789012:distribution/E1".into(),
+            source_account: "123456789012".into(),
+        };
+        let p = caller.principal();
+        assert_eq!(p.arn, "cloudfront.amazonaws.com");
+        assert_eq!(p.principal_type, PrincipalType::Service);
+        assert!(p.account_id.is_empty());
+        assert!(!p.is_root());
+        assert_eq!(caller.acting_account(), "123456789012");
+        let ctx = ConditionContext {
+            service_keys: caller.condition_keys(),
+            ..Default::default()
+        };
+        assert_eq!(
+            ctx.lookup("aws:SourceArn"),
+            Some(vec![
+                "arn:aws:cloudfront::123456789012:distribution/E1".to_string()
+            ])
+        );
+        // Condition keys are case-insensitive, as CDK writes `AWS:SourceArn`.
+        assert!(ctx.lookup("AWS:SourceArn").is_some());
+        assert_eq!(
+            ctx.lookup("aws:SourceAccount"),
+            Some(vec!["123456789012".to_string()])
+        );
+        assert_eq!(
+            ctx.lookup("aws:PrincipalServiceName"),
+            Some(vec!["cloudfront.amazonaws.com".to_string()])
+        );
+        assert_eq!(
+            ctx.lookup("aws:PrincipalIsAWSService"),
+            Some(vec!["true".to_string()])
+        );
+    }
+
+    #[test]
+    fn service_owned_internal_caller_carries_its_canonical_user_id() {
+        let caller = InternalCaller::ServiceOwned {
+            arn: "arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity E2Q".into(),
+            canonical_user_id: Some("0123456789abcdef".into()),
+            acting_account: "123456789012".into(),
+        };
+        let p = caller.principal();
+        assert_eq!(p.principal_type, PrincipalType::User);
+        assert_eq!(p.user_id, "0123456789abcdef");
+        assert!(p.account_id.is_empty());
+        assert!(!p.is_root());
+        assert_eq!(caller.acting_account(), "123456789012");
+        assert!(!caller.condition_keys().contains_key("aws:SourceArn"));
+    }
 
     #[test]
     fn iam_mode_default_is_off() {

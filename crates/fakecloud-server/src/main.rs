@@ -91,8 +91,9 @@ use hooks::*;
 
 /// Outer middleware that serves CloudFront viewer traffic on the main listener.
 /// If the request's `Host` matches an enabled distribution, the data plane
-/// proxies it to the resolved origin; otherwise the request is handed back for
-/// normal AWS dispatch (the common case for all API / introspection traffic).
+/// proxies it to the resolved origin (an S3 origin is dispatched straight into
+/// the S3 service); otherwise it hands the request to `next` for normal AWS dispatch
+/// (the common case for all API / introspection traffic).
 async fn cloudfront_viewer_middleware(
     axum::extract::State(dp): axum::extract::State<
         std::sync::Arc<fakecloud_cloudfront::dataplane::CloudFrontDataPlane>,
@@ -100,10 +101,7 @@ async fn cloudfront_viewer_middleware(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    match dp.serve(req).await {
-        Ok(resp) => resp,
-        Err(req) => next.run(req).await,
-    }
+    dp.serve(req, next).await
 }
 
 /// Record types the `--dns` resolver (and this introspection endpoint) answer:
@@ -7428,6 +7426,7 @@ async fn main() {
     tokio::spawn(ecs_creds::run_revocation_sweep(
         ecs_task_credentials.clone(),
     ));
+    let dispatch_config = Arc::new(config);
     let app = Router::new()
         .merge(imds_router)
         .route(
@@ -12182,9 +12181,12 @@ async fn main() {
             // which we silently ignore.
             let _ = sfn_registry_handle.set(registry_arc.clone());
             let _ = apigw_v1_registry_handle.set(registry_arc.clone());
+            // CloudFront S3 origin fetches dispatch straight into the S3
+            // service with this registry + config, never through the router.
+            cloudfront_dataplane.set_s3_dispatch(registry_arc.clone(), dispatch_config.clone());
             Extension(registry_arc)
         })
-        .layer(Extension(Arc::new(config)))
+        .layer(Extension(dispatch_config))
         .layer(TraceLayer::new_for_http())
         // Outermost: CloudFront viewer routing. Requests whose `Host` matches an
         // enabled distribution are served by the data plane; everything else

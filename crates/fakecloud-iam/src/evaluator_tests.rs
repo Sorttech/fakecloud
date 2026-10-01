@@ -1300,15 +1300,14 @@ fn not_principal_with_account_root() {
 
 #[test]
 fn not_principal_with_unrecognized_type_safe_skips() {
-    // NotPrincipal with only CanonicalUser (still unrecognized) ->
-    // empty refs list -> statement skipped safely. Federated is now
-    // recognized (F1) so we use CanonicalUser to keep covering the
-    // safe-skip path.
+    // NotPrincipal with only an unrecognized principal type -> empty refs
+    // list -> statement skipped safely. Federated and CanonicalUser are
+    // recognized, so an invented key covers the safe-skip path.
     let alice = principal_in(ACCT_A, "alice");
     let resource = json!({
         "Statement": [{
             "Effect": "Allow",
-            "NotPrincipal": {"CanonicalUser": "abc123"},
+            "NotPrincipal": {"Bogus": "abc123"},
             "Action": "s3:GetObject",
             "Resource": "*"
         }]
