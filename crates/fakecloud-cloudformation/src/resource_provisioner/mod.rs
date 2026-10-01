@@ -3059,21 +3059,34 @@ impl ResourceProvisioner {
                 .ok_or_else(|| format!("S3 object s3://{bucket}/{key} does not exist"))?;
             (object.body.clone(), object.sse_algorithm.clone())
         };
-        let (body_ref, sse_algorithm) = body_ref;
         // `read_body` consults the body cache (which is owned by the state),
         // so re-borrow `state` after dropping the bucket borrow above.
+        self.read_object_body(state, bucket, &body_ref.0, body_ref.1.as_deref())
+    }
+
+    /// Read a stored object body and unwrap it when it is an SSE-KMS envelope.
+    ///
+    /// Every provisioner read of an S3 object goes through here. An SSE-KMS
+    /// bucket stores an envelope, not the object, and `cdk bootstrap` makes its
+    /// assets bucket `aws:kms`: a reader that skips this hands Lambda a base64
+    /// KMS blob in place of its ZIP, or parses a nested-stack "template" with no
+    /// resources.
+    fn read_object_body(
+        &self,
+        state: &fakecloud_s3::S3State,
+        bucket: &str,
+        body_ref: &fakecloud_persistence::s3::BodyRef,
+        sse_algorithm: Option<&str>,
+    ) -> Result<Vec<u8>, String> {
         let stored = state
-            .read_body(&body_ref)
+            .read_body(body_ref)
             .map(|b| b.to_vec())
             .map_err(|e| format!("S3 read failed: {e}"))?;
-        // An SSE-KMS bucket stores an envelope, not the object. `cdk bootstrap`
-        // makes its assets bucket `aws:kms`, so skipping this hands Lambda a
-        // base64 KMS blob in place of its ZIP.
         fakecloud_s3::sse::decrypt_body(
             self.kms_hook.as_ref(),
             &self.account_id,
             bucket,
-            sse_algorithm.as_deref(),
+            sse_algorithm,
             stored,
         )
     }
@@ -3100,24 +3113,21 @@ impl ResourceProvisioner {
                 .objects
                 .get(key)
                 .filter(|o| o.version_id.as_deref() == Some(version_id))
-                .map(|o| o.body.clone());
+                .map(|o| (o.body.clone(), o.sse_algorithm.clone()));
             from_current
                 .or_else(|| {
                     b.object_versions.get(key).and_then(|versions| {
                         versions
                             .iter()
                             .find(|o| o.version_id.as_deref() == Some(version_id))
-                            .map(|o| o.body.clone())
+                            .map(|o| (o.body.clone(), o.sse_algorithm.clone()))
                     })
                 })
                 .ok_or_else(|| {
                     format!("S3 object s3://{bucket}/{key} version {version_id} does not exist")
                 })?
         };
-        state
-            .read_body(&body_ref)
-            .map(|b| b.to_vec())
-            .map_err(|e| format!("S3 read failed: {e}"))
+        self.read_object_body(state, bucket, &body_ref.0, body_ref.1.as_deref())
     }
 
     /// Build a canonical Lambda resource-policy statement from a CFN
@@ -3523,10 +3533,9 @@ impl ResourceProvisioner {
             .objects
             .get(key)
             .ok_or_else(|| format!("S3 object not found: {bucket}/{key}"))?;
-        let bytes = s3_state
-            .read_body(&obj.body)
-            .map_err(|e| format!("Failed to read S3 object body: {e}"))?;
-        String::from_utf8(bytes.to_vec()).map_err(|e| format!("S3 object is not valid UTF-8: {e}"))
+        let bytes =
+            self.read_object_body(s3_state, bucket, &obj.body, obj.sse_algorithm.as_deref())?;
+        String::from_utf8(bytes).map_err(|e| format!("S3 object is not valid UTF-8: {e}"))
     }
 }
 
@@ -7544,6 +7553,90 @@ mod tests {
         assert_eq!(sr.physical_id, "service/my-cluster/my-service");
         assert!(sr.attributes.contains_key("ScalableTargetARN"));
         assert!(prov.delete_resource(&sr).is_ok());
+    }
+
+    /// Store `plaintext` the way S3 does in an SSE-KMS bucket: as the KMS
+    /// envelope, with `sse_algorithm = aws:kms`. `version` lands on the
+    /// current object.
+    fn put_sse_kms_object(
+        prov: &ResourceProvisioner,
+        bucket: &str,
+        key: &str,
+        version: &str,
+        plaintext: &[u8],
+    ) {
+        let mut ctx = std::collections::HashMap::new();
+        ctx.insert(
+            "aws:s3:arn".to_string(),
+            fakecloud_aws::arn::Arn::s3(bucket).to_string(),
+        );
+        let envelope = prov
+            .kms_hook
+            .as_ref()
+            .expect("make_provisioner wires KMS")
+            .encrypt(
+                &prov.account_id,
+                &prov.region,
+                "aws/s3",
+                plaintext,
+                "s3.amazonaws.com",
+                ctx,
+            )
+            .expect("encrypt");
+        assert_ne!(
+            envelope.as_bytes(),
+            plaintext,
+            "the stored body must be the envelope"
+        );
+        let mut accounts = prov.s3_state.write();
+        let state = accounts.get_or_create(&prov.account_id);
+        let mut b = fakecloud_s3::S3Bucket::new(bucket, &prov.region, &prov.account_id);
+        b.objects.insert(
+            key.to_string(),
+            fakecloud_s3::S3Object {
+                key: key.to_string(),
+                size: envelope.len() as u64,
+                body: fakecloud_s3::memory_body(bytes::Bytes::from(envelope.into_bytes())),
+                sse_algorithm: Some("aws:kms".to_string()),
+                version_id: Some(version.to_string()),
+                ..Default::default()
+            },
+        );
+        state.buckets.insert(bucket.to_string(), b);
+    }
+
+    #[test]
+    fn current_object_read_decrypts_an_sse_kms_body() {
+        let prov = make_provisioner();
+        put_sse_kms_object(&prov, "assets", "code.zip", "v1", b"plaintext body");
+        assert_eq!(
+            prov.read_s3_object_bytes("assets", "code.zip").unwrap(),
+            b"plaintext body"
+        );
+    }
+
+    #[test]
+    fn pinned_version_read_decrypts_an_sse_kms_body() {
+        // A Step Functions `DefinitionS3Location.Version` takes this path.
+        let prov = make_provisioner();
+        put_sse_kms_object(&prov, "assets", "sm.json", "v1", br#"{"StartAt":"A"}"#);
+        assert_eq!(
+            prov.read_s3_object_version_bytes("assets", "sm.json", "v1")
+                .unwrap(),
+            br#"{"StartAt":"A"}"#
+        );
+    }
+
+    #[test]
+    fn nested_stack_template_read_decrypts_an_sse_kms_body() {
+        // CDK uploads nested-stack templates to its `aws:kms` assets bucket.
+        let prov = make_provisioner();
+        let template = r#"{"Resources":{"Q":{"Type":"AWS::SQS::Queue"}}}"#;
+        put_sse_kms_object(&prov, "assets", "nested.json", "v1", template.as_bytes());
+        assert_eq!(
+            prov.fetch_s3_template("assets", "nested.json").unwrap(),
+            template
+        );
     }
 
     fn cn_provisioner() -> ResourceProvisioner {
