@@ -150,6 +150,31 @@ ops_fmt=$(fmt "$parity_ops")
 vp_fmt=$(fmt "$variants_pass")
 vt_fmt=$(fmt "$variants_total")
 
+# --- Subset counts (tfacc / real-AWS parity sandbox / E2E suite) ---
+# NOTE (2026-10-01): these used to be hardcoded EXCEPTIONS entries
+# ("conformance.md:services:27"). A whitelisted constant is a stale count
+# waiting to happen: tfacc grew from 27 to 75 services and the page kept saying
+# 27 under a green gate, because the exception matched the stale value forever.
+# Derive every subset count from the code it describes instead.
+TFACC_ALLOWLIST="crates/fakecloud-tfacc/src/allowlist.rs"
+PARITY_TESTS="crates/fakecloud-parity/tests"
+E2E_TESTS="crates/fakecloud-e2e/tests"
+for _p in "$TFACC_ALLOWLIST" "$PARITY_TESTS" "$E2E_TESTS"; do
+    if [ ! -e "$_p" ]; then
+        echo "missing $_p (canonical source for a subset count moved?)" >&2
+        exit 2
+    fi
+done
+# One `Service {` entry per tfacc service in the SERVICES allow-list.
+tfacc_services=$(awk '/^pub const SERVICES: &\[Service\] = &\[/ {f=1; next}
+                      f && /^\];/ {f=0}
+                      f && /^    Service \{/ {n++}
+                      END {print n+0}' "$TFACC_ALLOWLIST")
+# One test file per service in the real-AWS parity suite.
+parity_sandbox=$(find "$PARITY_TESTS" -maxdepth 1 -name '*.rs' -type f | wc -l | tr -d ' ')
+# Every #[test] / #[tokio::test(...)] in the E2E suite.
+e2e_tests=$(cat "$E2E_TESTS"/*.rs | awk '/#\[(tokio::)?test(\]|\(|$)/ {n++} END {print n+0}')
+
 echo "Canonical truth:"
 echo "  services           = $parity_services (parity.md row count)"
 echo "  operations         = $parity_ops ($ops_fmt) (sum of parity.md Ops column)"
@@ -159,7 +184,10 @@ echo "  startup_ms         = $STARTUP_MS (script constant)"
 echo "  idle_mem_mib       = $IDLE_MEM_MIB (script constant)"
 echo "  binary_mb          = $BINARY_MB (script constant)"
 echo "  bedrock surface    = $bedrock_ctrl + $bedrock_runtime + $bedrock_agent + $bedrock_agent_rt = $bedrock_family (parity.md rows)"
-echo "  lambda_runtimes    = $LAMBDA_RUNTIMES (script constant; canonical: docs/services/lambda.md)"
+echo "  lambda_runtimes    = $LAMBDA_RUNTIMES (script constant; canonical: runtime_to_image() in crates/fakecloud-lambda/src/runtime/docker.rs)"
+echo "  tfacc_services     = $tfacc_services ($TFACC_ALLOWLIST SERVICES entries)"
+echo "  parity_sandbox     = $parity_sandbox ($PARITY_TESTS/*.rs)"
+echo "  e2e_tests          = $e2e_tests (#[test] in $E2E_TESTS)"
 echo
 
 # Files to check. Evergreen-only, derived by EXCLUSION, not by an allowlist.
@@ -198,10 +226,10 @@ done < <(
 # These are intentional non-headline mentions where the number is correct in
 # its local context (subset counts, rhetorical comparisons, etc.).
 EXCEPTIONS=(
-    # tfacc covers a subset of services
-    "website/content/docs/about/conformance.md:services:27"
-    # real-AWS parity sandbox covers a subset
-    "website/content/docs/about/conformance.md:services:7"
+    # tfacc and the real-AWS parity sandbox cover subsets. DERIVED, never
+    # hardcoded — the subset pass below checks each against its own source.
+    "website/content/docs/about/conformance.md:services:$tfacc_services"
+    "website/content/docs/about/conformance.md:services:$parity_sandbox"
     # rhetorical comparison: "depth-first vs N services at 50%"
     "website/content/docs/about/what-it-is.md:services:100"
     # vs/localstack.md aliases redirect legacy blog slugs that have "500ms" in
@@ -526,6 +554,69 @@ done < <(
         grep -nHE '<td>[^<]*AWS services[^<]*</td><td[^>]*>[0-9]' "$_f" 2>/dev/null || true
     done | sort -u
 )
+
+# --- Subset-count claims -------------------------------------------------------
+# conformance.md states "N services today: a, b, c" once per suite. Check N
+# against the suite's own source (by section heading, so a tfacc number can't
+# satisfy the parity line), and check the enumerated list has exactly N items so
+# the list and the number cannot drift apart either.
+CONF_DOC="website/content/docs/about/conformance.md"
+# Fail loud if the page moves: a silently skipped pass is a green gate over
+# stale counts, the exact failure this pass exists to prevent.
+if [ ! -f "$CONF_DOC" ]; then
+    echo "missing $CONF_DOC (subset-count claims moved? update CONF_DOC)" >&2
+    exit 2
+fi
+{
+    while IFS=$'\t' read -r lineno section n items; do
+        [ -z "$lineno" ] && continue
+        case "$section" in
+            *[Tt]erraform*) expected_sub="$tfacc_services" ;;
+            *[Pp]arity*)    expected_sub="$parity_sandbox" ;;
+            *) problems+=("$CONF_DOC:$lineno: '$n services today' under unrecognised section '$section'"); fail=1; continue ;;
+        esac
+        if [ "$n" != "$expected_sub" ]; then
+            problems+=("$CONF_DOC:$lineno: '$section' claims $n services, expected $expected_sub")
+            fail=1
+        fi
+        if [ "$items" != "$n" ]; then
+            problems+=("$CONF_DOC:$lineno: '$section' says $n services but lists $items")
+            fail=1
+        fi
+    done < <(awk '
+        /^## / { section = substr($0, 4) }
+        /^[0-9]+ services today: / {
+            n = $1
+            list = $0
+            sub(/^[0-9]+ services today: /, "", list)
+            sub(/\. The source of truth.*$/, "", list)
+            sub(/\.$/, "", list)
+            print NR "\t" section "\t" n "\t" split(list, _, ", ")
+        }' "$CONF_DOC")
+
+    # "The E2E suite is much bigger (N+ tests, ...)". A floor claim is "true"
+    # at any N <= actual, which is exactly how "280+" survived against 2,377
+    # real tests: require it within 80% of the real count. Deliberately narrow:
+    # only the "E2E suite ... (N+ tests" clause is read, so another suite's
+    # count elsewhere on the page or the line is never mistaken for it, and any
+    # rewording falls through to the loud "no claim found" failure below.
+    e2e_claims=0
+    while IFS= read -r claim; do
+        [ -z "$claim" ] && continue
+        claimed=$(last_num "$claim" | tr -d ',')
+        [ -z "$claimed" ] && continue
+        e2e_claims=$(( e2e_claims + 1 ))
+        if [ "$claimed" -gt "$e2e_tests" ] || [ $(( claimed * 100 )) -lt $(( e2e_tests * 80 )) ]; then
+            problems+=("$CONF_DOC: E2E suite claims '$claimed+ tests', actual $e2e_tests tests")
+            fail=1
+        fi
+    done < <(grep -oE 'E2E suite[^(]*\([0-9][0-9,]*\+ tests' "$CONF_DOC" || true)
+    # The claim vanishing (sentence reworded) must not turn this pass into a no-op.
+    if [ "$e2e_claims" -eq 0 ]; then
+        problems+=("$CONF_DOC: no 'E2E suite ... (N+ tests' claim found; update this pass if the sentence was reworded")
+        fail=1
+    fi
+}
 
 if [ "$fail" -eq 0 ]; then
     echo "OK — every evergreen surface agrees with the canonical sources."
