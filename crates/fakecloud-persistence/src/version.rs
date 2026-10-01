@@ -16,7 +16,7 @@ const IGNORED_DIR_ENTRIES: &[&str] = &["lost+found", ".snapshot"];
 
 /// Whether a directory entry is a benign filesystem artifact that should not make
 /// the data directory count as "non-empty".
-fn is_benign_entry(name: &OsStr) -> bool {
+pub(crate) fn is_benign_entry(name: &OsStr) -> bool {
     match name.to_str() {
         Some(s) => s.starts_with('.') || IGNORED_DIR_ENTRIES.contains(&s),
         None => false, // non-UTF8 name => treat as a real entry, be conservative
@@ -28,6 +28,13 @@ pub struct FormatVersion {
     pub format_version: u32,
     pub fakecloud_version: String,
     pub created_at: String,
+    /// Whether the directory's state spells ARNs in their region's partition.
+    /// Absent (false) in directories written before fakecloud minted
+    /// partition-aware ARNs; [`crate::arn_partition::migrate_data_dir`]
+    /// rewrites those once and sets it. A directory created by a binary that
+    /// already mints partition-aware ARNs starts with it set.
+    #[serde(default)]
+    pub arn_partitions_migrated: bool,
 }
 
 #[derive(Debug, Error)]
@@ -72,6 +79,7 @@ pub fn write_version_file(dir: &Path, fakecloud_version: &str) -> Result<(), Ver
         format_version: FORMAT_VERSION,
         fakecloud_version: fakecloud_version.to_string(),
         created_at: chrono::Utc::now().to_rfc3339(),
+        arn_partitions_migrated: true,
     };
     crate::atomic::write_atomic_toml(&path, &value).map_err(|source| VersionError::Io {
         path: path.clone(),
@@ -80,19 +88,49 @@ pub fn write_version_file(dir: &Path, fakecloud_version: &str) -> Result<(), Ver
     Ok(())
 }
 
+fn read_version_file(path: &Path) -> Result<FormatVersion, VersionError> {
+    let text = std::fs::read_to_string(path).map_err(|source| VersionError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    toml::from_str(&text).map_err(|source| VersionError::Parse {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Whether `dir`'s version file records the ARN partition migration as done.
+/// A directory with no version file holds no state yet, so it counts as
+/// migrated.
+pub fn arn_partitions_migrated(dir: &Path) -> Result<bool, VersionError> {
+    let path = version_file_path(dir);
+    if !path.exists() {
+        return Ok(true);
+    }
+    Ok(read_version_file(&path)?.arn_partitions_migrated)
+}
+
+/// Record in `dir`'s version file that the ARN partition migration ran,
+/// keeping its other fields.
+pub fn mark_arn_partitions_migrated(dir: &Path) -> Result<(), VersionError> {
+    let path = version_file_path(dir);
+    let mut value = read_version_file(&path)?;
+    if value.arn_partitions_migrated {
+        return Ok(());
+    }
+    value.arn_partitions_migrated = true;
+    crate::atomic::write_atomic_toml(&path, &value).map_err(|source| VersionError::Io {
+        path: path.clone(),
+        source,
+    })
+}
+
 pub fn check_version_file(dir: &Path) -> Result<(), VersionError> {
     let path = version_file_path(dir);
     if !path.exists() {
         return Ok(());
     }
-    let text = std::fs::read_to_string(&path).map_err(|source| VersionError::Io {
-        path: path.clone(),
-        source,
-    })?;
-    let parsed: FormatVersion = toml::from_str(&text).map_err(|source| VersionError::Parse {
-        path: path.clone(),
-        source,
-    })?;
+    let parsed = read_version_file(&path)?;
     if parsed.format_version != FORMAT_VERSION {
         return Err(VersionError::FormatMismatch {
             path,

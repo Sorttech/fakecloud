@@ -260,6 +260,21 @@ async fn main() {
                     data_path.display()
                 ));
             }
+            // State persisted before ARNs were minted in the region's
+            // partition still spells them `arn:aws:`; rewrite it once, before
+            // any service loads its snapshot.
+            match fakecloud_persistence::arn_partition::migrate_data_dir(data_path, &cli.region) {
+                Ok(report) if report.already_migrated => {}
+                Ok(report) => tracing::info!(
+                    rewritten = report.rewritten.len(),
+                    skipped = report.skipped.len(),
+                    "migrated persisted ARNs to their region's partition"
+                ),
+                Err(err) => fatal_exit(format_args!(
+                    "ARN partition migration failed at {}: {err}",
+                    data_path.display()
+                )),
+            }
         }
     }
     // Bind early so we know the actual port before initialising service state.
