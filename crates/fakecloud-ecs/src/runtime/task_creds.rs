@@ -610,6 +610,17 @@ mod tests {
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             };
             let log_s = log.display().to_string();
+            // PATH is only this directory: the fakes plus the two real
+            // utilities the script needs, so a real nft/iptables on the
+            // machine is never reached (the "no nft" case really has none).
+            for util in ["awk", "cat"] {
+                let real = ["/usr/bin", "/bin"]
+                    .iter()
+                    .map(|d| std::path::Path::new(d).join(util))
+                    .find(|p| p.exists())
+                    .unwrap_or_else(|| panic!("{util} not found"));
+                std::os::unix::fs::symlink(real, dir.path().join(util)).unwrap();
+            }
             tool("getent", "echo '10.1.2.3 STREAM host'");
             tool("iptables", &format!("echo \"iptables $*\" >> {log_s}"));
             match nft_ok {
@@ -617,8 +628,7 @@ mod tests {
                 Some(false) => tool("nft", "cat >/dev/null; exit 1"),
                 None => {}
             }
-            // Only the fakes plus the shell's own utilities.
-            let path = format!("{}:/usr/bin:/bin", dir.path().display());
+            let path = dir.path().display().to_string();
             let out = std::process::Command::new("/bin/sh")
                 .args(["-c", SETUP_SCRIPT, "t", "host", "4566", "once"])
                 .env("PATH", path)

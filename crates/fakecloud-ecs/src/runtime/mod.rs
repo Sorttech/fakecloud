@@ -1825,17 +1825,11 @@ fn finalize_stopped_multi(
                 c.exit_code = mapped.or(Some(primary_exit_code));
             }
         }
-        // ECS lifecycle: PROVISIONING/PENDING/ACTIVATING precede RUNNING;
-        // DEACTIVATING/STOPPING/DEPROVISIONING follow it (and still hold the
-        // running count).
-        let was_pending = matches!(
-            previous_status.as_str(),
-            "PROVISIONING" | "PENDING" | "ACTIVATING"
-        );
-        let was_running = matches!(
-            previous_status.as_str(),
-            "RUNNING" | "DEACTIVATING" | "STOPPING" | "DEPROVISIONING"
-        );
+        // Which count the task holds follows from whether the runtime ever
+        // moved it to RUNNING (`mark_running_multi` stamps `started_at`), not
+        // from the status string an agent may have overwritten since.
+        let was_running = previous_status != "STOPPED" && task.started_at.is_some();
+        let was_pending = previous_status != "STOPPED" && task.started_at.is_none();
         let release = |running: &mut i32, pending: &mut i32| {
             if was_running && *running > 0 {
                 *running -= 1;
@@ -2383,12 +2377,15 @@ mod tests {
     /// launch) leave `pendingTasksCount`, and neither touches another task's.
     #[test]
     fn finalize_stopped_multi_releases_the_count_the_task_held() {
-        for (status, want_running, want_pending) in [
-            ("RUNNING", 1, 1),
-            ("STOPPING", 1, 1),
-            ("PENDING", 1, 1),
-            ("PROVISIONING", 1, 1),
-            ("STOPPED", 1, 1),
+        // (status, ran): an agent may have rewritten the status of a task
+        // that ran (STOPPING) or not (STOPPING before it started).
+        for ((status, ran), want_running, want_pending) in [
+            (("RUNNING", true), 1, 1),
+            (("STOPPING", true), 1, 1),
+            (("STOPPING", false), 1, 1),
+            (("PENDING", false), 1, 1),
+            (("PROVISIONING", false), 1, 1),
+            (("STOPPED", true), 1, 1),
         ] {
             let mut accounts: MultiAccountState<EcsState> =
                 MultiAccountState::new("000000000000", "us-east-1", "http://localhost:4566");
@@ -2399,13 +2396,14 @@ mod tests {
             );
             // One other task running and one pending, plus this one's own
             // count: afterwards only the other tasks' counts remain.
-            let holds_running = matches!(status, "RUNNING" | "STOPPING");
-            let holds_pending = matches!(status, "PENDING" | "PROVISIONING");
+            let holds_running = ran && status != "STOPPED";
+            let holds_pending = !ran && status != "STOPPED";
             cluster.running_tasks_count = 1 + i32::from(holds_running);
             cluster.pending_tasks_count = 1 + i32::from(holds_pending);
             acct.clusters.insert("default".into(), cluster);
             let mut t = make_task("t1");
             t.last_status = status.into();
+            t.started_at = ran.then(Utc::now);
             t.containers = vec![make_container("app", true)];
             acct.tasks.insert("t1".into(), t);
             let state: SharedEcsState = Arc::new(RwLock::new(accounts));
@@ -2426,7 +2424,7 @@ mod tests {
             assert_eq!(
                 (cluster.running_tasks_count, cluster.pending_tasks_count),
                 (want_running, want_pending),
-                "stopping a {status} task"
+                "stopping a {status} task (ran: {ran})"
             );
         }
     }
