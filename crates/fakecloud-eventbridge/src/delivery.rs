@@ -843,6 +843,11 @@ mod tests {
             None,
             "empty partition"
         );
+        assert_eq!(
+            lambda_arn_account("arn:aws:lambda::999988887777:function:foo"),
+            None,
+            "empty region"
+        );
     }
 
     /// A cross-service event matched by a rule with a CloudWatch Logs target

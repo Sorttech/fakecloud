@@ -1199,14 +1199,23 @@ async fn s3_eventbridge_notification_delivers_to_logs_target() {
             .log_stream_name("events")
             .send()
             .await;
-        if let Ok(out) = got {
-            if !out.events().is_empty() {
-                break out.events().to_vec();
+        let last_error = match got {
+            Ok(out) if !out.events().is_empty() => break out.events().to_vec(),
+            Ok(_) => None,
+            // The stream doesn't exist until the first delivery creates it;
+            // any other error is permanent and fails immediately.
+            Err(err) => {
+                let svc = err.into_service_error();
+                assert!(
+                    svc.is_resource_not_found_exception(),
+                    "GetLogEvents failed: {svc:?}"
+                );
+                Some(svc)
             }
-        }
+        };
         assert!(
             std::time::Instant::now() < deadline,
-            "S3 event never reached the CloudWatch Logs target"
+            "S3 event never reached the CloudWatch Logs target (last error: {last_error:?})"
         );
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     };

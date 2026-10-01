@@ -1017,6 +1017,7 @@ pub(crate) fn lambda_arn_account(arn: &str) -> Option<&str> {
         || parts[0] != "arn"
         || parts[1].is_empty()
         || parts[2] != "lambda"
+        || parts[3].is_empty()
         || parts[5] != "function"
         || parts[6].is_empty()
     {
