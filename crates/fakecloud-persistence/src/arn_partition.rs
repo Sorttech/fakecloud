@@ -33,8 +33,8 @@
 //! and an ECR manifest is addressed by its digest. Others are customer data
 //! the service stores rather than describes, where a rewrite would change
 //! what the application wrote or break a lookup by it: DynamoDB items, SSM
-//! parameter values, Secrets Manager secrets, SES sent emails, SNS published
-//! messages, EventBridge events, CloudWatch dashboard bodies, S3 object keys, user metadata and object tags, log
+//! parameter values, Secrets Manager secrets, SES email template content, SNS
+//! published messages, EventBridge events, CloudWatch dashboard bodies, S3 object keys, user metadata and object tags, log
 //! events. Bulk payloads streamed outside the snapshots
 //! (S3 object bodies, CloudWatch Logs event segments, container data volumes)
 //! are not read at all.
@@ -278,7 +278,9 @@ fn opaque_keys_for(service_dir: &str) -> &'static [&'static str] {
         // Parameter values (current and every version).
         "ssm" => &["value"],
         "secretsmanager" => &["secret_string"],
-        // Sent emails: the stored DKIM signature covers the body and headers.
+        // Customer-written email content: templates (persisted), and sent
+        // emails, whose DKIM signature covers body and headers, should they
+        // ever be persisted.
         "ses" => &[
             "subject",
             "text_body",
