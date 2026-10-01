@@ -101,22 +101,12 @@ fn pool_key_belongs_to(key: &str, function_arn: &str) -> bool {
 }
 
 /// The role the execution session is minted for: the function's role, in the
-/// function's account. The two only differ when IAM is not strict and a
-/// template names another account's role (commonly another emulator's
-/// default `000000000000`); minting there would send the function's SDK calls
-/// to an empty account instead of the one holding its resources.
+/// function's account (see [`crate::service::role_in_account`]).
 fn session_role_arn(role_arn: &str, function_arn: &str) -> String {
-    let (Some(function_account), Some(role_account)) = (
-        fakecloud_aws::arn::account_of(function_arn),
-        fakecloud_aws::arn::account_of(role_arn),
-    ) else {
-        return role_arn.to_string();
-    };
-    let mut parts: Vec<&str> = role_arn.split(':').collect();
-    if role_account != function_account {
-        parts[4] = function_account;
+    match fakecloud_aws::arn::account_of(function_arn) {
+        Some(function_account) => crate::service::role_in_account(role_arn, function_account),
+        None => role_arn.to_string(),
     }
-    parts.join(":")
 }
 
 /// Whether `entry` can take a new invocation of `deploy_id`: same code +
@@ -1737,6 +1727,13 @@ mod tests {
         assert_eq!(
             super::session_role_arn("arn:aws:iam::000000000000:role/path/r", f),
             "arn:aws:iam::123456789012:role/path/r"
+        );
+        // Regression: an account-less role ARN is validated as the
+        // function account's role, so its session is minted there too rather
+        // than in the server's default account.
+        assert_eq!(
+            super::session_role_arn("arn:aws:iam:::role/r", f),
+            "arn:aws:iam::123456789012:role/r"
         );
         assert_eq!(super::session_role_arn("not-an-arn", f), "not-an-arn");
     }

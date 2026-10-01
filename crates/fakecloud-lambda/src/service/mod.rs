@@ -573,11 +573,13 @@ pub(crate) fn validate_environment(
 ///   whatever its trust policy says; `--iam soft` logs the would-be denial to
 ///   the IAM audit target and allows it; with IAM off (the default) it is
 ///   accepted, so templates carrying another emulator's default account
-///   (`000000000000`) keep working. The execution session is then minted in
-///   the function's account.
-/// - The role's trust policy must let `lambda.amazonaws.com` assume it,
-///   looked up in the caller's (function's) account, where the session is
-///   minted. Always applied, as it always was on `CreateFunction`.
+///   (`000000000000`) keep working.
+/// - The role's trust policy must let `lambda.amazonaws.com` assume it. The
+///   role checked is the one the ARN names, in the account that owns it, or
+///   the caller's when the ARN names none. For another account's role the
+///   execution session is minted for the same-named role in the caller's
+///   account (see [`role_in_account`]), so that role's trust policy must
+///   allow Lambda too. Always applied, as it always was on `CreateFunction`.
 pub fn validate_execution_role(
     caller_account: &str,
     role_arn: &str,
@@ -604,17 +606,46 @@ pub fn validate_execution_role(
         }
     }
     if let Some(validator) = validator {
-        validator
-            .validate(caller_account, role_arn, "lambda.amazonaws.com")
-            .map_err(|err| {
-                AwsServiceError::aws_error(
-                    StatusCode::BAD_REQUEST,
-                    "InvalidParameterValueException",
-                    err.to_string(),
-                )
-            })?;
+        let check = |account: &str, arn: &str| {
+            validator
+                .validate(account, arn, "lambda.amazonaws.com")
+                .map_err(|err| {
+                    AwsServiceError::aws_error(
+                        StatusCode::BAD_REQUEST,
+                        "InvalidParameterValueException",
+                        err.to_string(),
+                    )
+                })
+        };
+        let role_account = fakecloud_aws::arn::account_of(role_arn).unwrap_or(caller_account);
+        check(role_account, role_arn)?;
+        if cross_account {
+            // The role the function's session is actually minted for.
+            check(caller_account, &role_in_account(role_arn, caller_account))?;
+        }
     }
     Ok(())
+}
+
+/// `role_arn` re-homed into `account`: the role a function's execution
+/// session is minted for when its configured role belongs to another account
+/// (IAM off or soft). Minting in the role's own account would send the
+/// function's SDK calls (commonly from templates carrying another emulator's
+/// default `000000000000`) to an account that holds none of its resources.
+/// An IAM role ARN naming no account (`arn:aws:iam:::role/r`) is the
+/// caller's role, which is where its trust policy is checked, so it is
+/// re-homed too; otherwise the session would be minted in the server's
+/// default account. Anything else naming no account (not an ARN) is
+/// returned unchanged.
+pub(crate) fn role_in_account(role_arn: &str, account: &str) -> String {
+    let mut parts: Vec<&str> = role_arn.split(':').collect();
+    let accountless_role =
+        parts.len() >= 6 && parts[0] == "arn" && parts[2] == "iam" && parts[5].starts_with("role/");
+    if fakecloud_aws::arn::account_of(role_arn).is_none() && !accountless_role {
+        return role_arn.to_string();
+    }
+    parts[4] = account;
+    parts.join(":")
 }
 
 /// All fields of a `CreateFunction` request, already parsed and
