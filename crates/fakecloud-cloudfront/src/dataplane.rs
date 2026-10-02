@@ -327,11 +327,35 @@ impl CloudFrontDataPlane {
     }
 }
 
+/// Whether the alternate domain name `alias` covers `host` (both without a port,
+/// matched case-insensitively). An alias beginning `*.` is a wildcard standing
+/// for one or more whole leading labels: `*.example.com` covers
+/// `www.example.com` and `a.b.example.com` but NOT the apex `example.com`. The
+/// `*` is only special as that leading `*.`; CloudFront rejects it anywhere else
+/// (`*example.com`, `a.*.example.com`), so elsewhere it compares literally.
+/// Source: <https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/alternate-domain-names-wildcard.html>
+/// (checked 2026-10-01).
+fn alias_matches_host(alias: &str, host: &str) -> bool {
+    match alias.strip_prefix('*') {
+        // `suffix` keeps the dot, so the host must have a non-empty label
+        // before it -- which is what excludes the apex.
+        Some(suffix) if suffix.starts_with('.') => host
+            .len()
+            .checked_sub(suffix.len())
+            .filter(|split| *split > 0)
+            .and_then(|split| host.get(split..))
+            .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix)),
+        _ => alias.eq_ignore_ascii_case(host),
+    }
+}
+
 /// Find the enabled distribution whose `DomainName` (`<id>.cloudfront.net`) or one
 /// of its alternate domain names (`Aliases`/CNAMEs) matches `host`, paired with
 /// its owning account. The port is stripped and matching is case-insensitive.
-/// Alternate domain names are exact in CloudFront (not wildcards), so this is an
-/// exact host compare, mirroring the route53 CloudFront resolver.
+/// The `DomainName` compares exactly; an alternate domain name may be a wildcard
+/// (see `alias_matches_host`). Overlapping names are legal -- `*.example.com` on
+/// one distribution and `www.example.com` on another -- and CloudFront routes to
+/// the more specific match, so an exact name wins over any wildcard.
 pub(crate) fn find_distribution_by_host<'a>(
     accs: &'a CloudFrontAccounts,
     host: &str,
@@ -340,16 +364,26 @@ pub(crate) fn find_distribution_by_host<'a>(
     if host.is_empty() {
         return None;
     }
-    accs.all_distributions()
-        .map(|(account_id, d)| (account_id.as_str(), d))
-        .filter(|(_, d)| d.config.enabled)
+    let aliases = |d: &'a StoredDistribution| {
+        d.config
+            .aliases
+            .as_ref()
+            .and_then(|a| a.items.as_ref())
+            .map(|it| it.cname.as_slice())
+            .unwrap_or_default()
+    };
+    let candidates = || {
+        accs.all_distributions()
+            .map(|(account_id, d)| (account_id.as_str(), d))
+            .filter(|(_, d)| d.config.enabled)
+    };
+    candidates()
         .find(|(_, d)| {
             d.domain_name.eq_ignore_ascii_case(host)
-                || d.config
-                    .aliases
-                    .as_ref()
-                    .and_then(|a| a.items.as_ref())
-                    .is_some_and(|it| it.cname.iter().any(|c| c.eq_ignore_ascii_case(host)))
+                || aliases(d).iter().any(|c| c.eq_ignore_ascii_case(host))
+        })
+        .or_else(|| {
+            candidates().find(|(_, d)| aliases(d).iter().any(|c| alias_matches_host(c, host)))
         })
 }
 
@@ -1053,6 +1087,70 @@ mod tests {
         let accs = accounts_with(vec![dist("E1ABC", true, &["cdn.example.com"])]);
         let (_, found) = find_distribution_by_host(&accs, "cdn.example.com").unwrap();
         assert_eq!(found.id, "E1ABC");
+    }
+
+    #[test]
+    fn wildcard_alias_matches_subdomains_at_any_depth() {
+        let accs = accounts_with(vec![dist("E1ABC", true, &["*.example.com"])]);
+        // "you can use any domain name that ends with example.com in your URLs,
+        // such as www.example.com, product-name.example.com,
+        // marketing.product-name.example.com" -- so deeper labels match too.
+        for host in [
+            "app.example.com",
+            "APP.Example.COM",
+            "a.b.example.com",
+            "app.example.com:4566",
+        ] {
+            let (_, found) = find_distribution_by_host(&accs, host)
+                .unwrap_or_else(|| panic!("{host} should match *.example.com"));
+            assert_eq!(found.id, "E1ABC");
+        }
+    }
+
+    #[test]
+    fn wildcard_alias_does_not_match_the_apex_or_a_sibling_domain() {
+        let accs = accounts_with(vec![dist("E1ABC", true, &["*.example.com"])]);
+        // The wildcard stands for at least one whole label, so the apex is not
+        // covered; nor is a domain that merely ends with the same text.
+        assert!(find_distribution_by_host(&accs, "example.com").is_none());
+        assert!(find_distribution_by_host(&accs, "notexample.com").is_none());
+        assert!(find_distribution_by_host(&accs, ".example.com").is_none());
+        assert!(find_distribution_by_host(&accs, "app.example.com.evil.test").is_none());
+    }
+
+    #[test]
+    fn an_exact_alias_beats_a_wildcard_on_another_distribution() {
+        let accs = accounts_with(vec![
+            dist("E1WILD", true, &["*.example.com"]),
+            dist("E2EXACT", true, &["www.example.com"]),
+        ]);
+        let (_, found) = find_distribution_by_host(&accs, "www.example.com").unwrap();
+        assert_eq!(found.id, "E2EXACT");
+        let (_, found) = find_distribution_by_host(&accs, "other.example.com").unwrap();
+        assert_eq!(found.id, "E1WILD");
+    }
+
+    #[test]
+    fn literal_alias_matches_exactly_only() {
+        let accs = accounts_with(vec![dist("E1ABC", true, &["cdn.example.com"])]);
+        assert!(find_distribution_by_host(&accs, "cdn.example.com").is_some());
+        assert!(find_distribution_by_host(&accs, "a.cdn.example.com").is_none());
+        assert!(find_distribution_by_host(&accs, "example.com").is_none());
+    }
+
+    #[test]
+    fn asterisk_outside_the_leftmost_label_is_not_a_wildcard() {
+        // CloudFront accepts "*." only at the start; anything else is literal,
+        // so no glob semantics leak in.
+        let accs = accounts_with(vec![dist(
+            "E1ABC",
+            true,
+            &["*cdn.example.com", "a.*.example.com", "cdn.*"],
+        )]);
+        assert!(find_distribution_by_host(&accs, "mycdn.example.com").is_none());
+        assert!(find_distribution_by_host(&accs, "cdn.example.com").is_none());
+        assert!(find_distribution_by_host(&accs, "a.b.example.com").is_none());
+        assert!(find_distribution_by_host(&accs, "cdn.example.test").is_none());
     }
 
     #[test]
