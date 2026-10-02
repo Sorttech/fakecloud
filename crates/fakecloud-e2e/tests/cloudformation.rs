@@ -922,3 +922,165 @@ async fn s3_bucket_endpoint_attributes_follow_region() {
         assert_eq!(outputs.get("Website").copied(), Some(website), "{region}");
     }
 }
+
+/// Regression: `CreateStack` with a `TemplateURL` pointing into an SSE-KMS
+/// bucket read the stored envelope instead of the template. The envelope is
+/// base64 ASCII, so it parsed as a template with no resources and the stack
+/// reported CREATE_COMPLETE having provisioned nothing — which is what the CDK
+/// CLI hits, since `cdk bootstrap` makes its assets bucket `aws:kms` and the
+/// CLI always uploads the template.
+/// Create `bucket` with default SSE-KMS under a fresh customer key, the shape
+/// `cdk bootstrap` gives its assets bucket.
+async fn create_sse_kms_bucket(server: &TestServer, bucket: &str) {
+    let s3 = server.s3_client().await;
+    let kms = server.kms_client().await;
+
+    let key_id = kms
+        .create_key()
+        .send()
+        .await
+        .expect("create_key")
+        .key_metadata()
+        .expect("key metadata")
+        .key_id()
+        .to_string();
+
+    s3.create_bucket()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("create_bucket");
+    s3.put_bucket_encryption()
+        .bucket(bucket)
+        .server_side_encryption_configuration(
+            aws_sdk_s3::types::ServerSideEncryptionConfiguration::builder()
+                .rules(
+                    aws_sdk_s3::types::ServerSideEncryptionRule::builder()
+                        .apply_server_side_encryption_by_default(
+                            aws_sdk_s3::types::ServerSideEncryptionByDefault::builder()
+                                .sse_algorithm(aws_sdk_s3::types::ServerSideEncryption::AwsKms)
+                                .kms_master_key_id(&key_id)
+                                .build()
+                                .unwrap(),
+                        )
+                        .build(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .expect("put_bucket_encryption");
+}
+
+#[tokio::test]
+async fn cfn_reads_a_template_url_from_an_sse_kms_bucket() {
+    let server = TestServer::start().await;
+    let cf = server.cloudformation_client().await;
+    let s3 = server.s3_client().await;
+
+    let bucket = "cfn-template-kms-bucket";
+    create_sse_kms_bucket(&server, bucket).await;
+
+    let template = r#"{"Resources":{"P":{"Type":"AWS::SSM::Parameter",
+        "Properties":{"Name":"/from-kms-template","Type":"String","Value":"hi"}}}}"#;
+    s3.put_object()
+        .bucket(bucket)
+        .key("t.json")
+        .body(aws_sdk_s3::primitives::ByteStream::from(
+            template.as_bytes().to_vec(),
+        ))
+        .send()
+        .await
+        .expect("put_object");
+
+    cf.create_stack()
+        .stack_name("cfn-template-kms")
+        .template_url(format!(
+            "https://{bucket}.s3.us-east-1.amazonaws.com/t.json"
+        ))
+        .send()
+        .await
+        .expect("create_stack");
+
+    let described = cf
+        .describe_stacks()
+        .stack_name("cfn-template-kms")
+        .send()
+        .await
+        .expect("describe_stacks");
+    let stack = described.stacks().first().expect("stack");
+    assert_eq!(stack.stack_status().unwrap().as_str(), "CREATE_COMPLETE");
+
+    // The point: CREATE_COMPLETE with zero resources is the failure mode.
+    let resources = cf
+        .describe_stack_resources()
+        .stack_name("cfn-template-kms")
+        .send()
+        .await
+        .expect("describe_stack_resources");
+    assert_eq!(
+        resources.stack_resources().len(),
+        1,
+        "template from the SSE-KMS bucket must actually provision"
+    );
+}
+#[tokio::test]
+async fn cfn_reads_a_nested_stack_template_from_an_sse_kms_bucket() {
+    // CDK uploads nested-stack templates to its `aws:kms` assets bucket, and
+    // the provisioner fetches them through a different reader than the
+    // top-level TemplateURL.
+    let server = TestServer::start().await;
+    let cf = server.cloudformation_client().await;
+    let s3 = server.s3_client().await;
+    let ssm = server.ssm_client().await;
+
+    let bucket = "cfn-nested-kms-bucket";
+    create_sse_kms_bucket(&server, bucket).await;
+
+    let child = r#"{"Resources":{"P":{"Type":"AWS::SSM::Parameter",
+        "Properties":{"Name":"/from-kms-nested","Type":"String","Value":"nested"}}}}"#;
+    s3.put_object()
+        .bucket(bucket)
+        .key("child.json")
+        .body(aws_sdk_s3::primitives::ByteStream::from(
+            child.as_bytes().to_vec(),
+        ))
+        .send()
+        .await
+        .expect("put_object");
+
+    let parent = format!(
+        r#"{{"Resources":{{"Child":{{"Type":"AWS::CloudFormation::Stack",
+        "Properties":{{"TemplateURL":"https://{bucket}.s3.us-east-1.amazonaws.com/child.json"}}}}}}}}"#
+    );
+    cf.create_stack()
+        .stack_name("cfn-nested-kms")
+        .template_body(parent)
+        .send()
+        .await
+        .expect("create_stack");
+
+    let described = cf
+        .describe_stacks()
+        .stack_name("cfn-nested-kms")
+        .send()
+        .await
+        .expect("describe_stacks");
+    let stack = described.stacks().first().expect("stack");
+    assert_eq!(
+        stack.stack_status().unwrap().as_str(),
+        "CREATE_COMPLETE",
+        "{:?}",
+        stack.stack_status_reason()
+    );
+
+    // The child's resource exists only if its template was decrypted.
+    let param = ssm
+        .get_parameter()
+        .name("/from-kms-nested")
+        .send()
+        .await
+        .expect("nested stack must provision its parameter");
+    assert_eq!(param.parameter().unwrap().value(), Some("nested"));
+}
