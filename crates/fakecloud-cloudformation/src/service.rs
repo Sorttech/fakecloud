@@ -617,8 +617,9 @@ pub struct CloudFormationService {
     /// real store via `with_s3_store` once it has been built.
     s3_store: Arc<dyn S3Store>,
     /// The server's KMS hook (persisting minted keys), used by provisioners
-    /// that report an AWS-managed key for a default-encrypted resource.
-    kms_hook: Option<Arc<dyn fakecloud_core::delivery::KmsHook>>,
+    /// that report an AWS-managed key for a default-encrypted resource, and to
+    /// unwrap SSE-KMS bodies read from S3 (a `TemplateURL`, Lambda code).
+    pub(crate) kms_hook: Option<Arc<dyn fakecloud_core::delivery::KmsHook>>,
     /// Whole-state snapshot persist hooks keyed by service name (see
     /// `service_key_for_type`). After a stack op the handler invokes the hook
     /// for each touched service so a CFN-provisioned (or CFN-deleted) resource
