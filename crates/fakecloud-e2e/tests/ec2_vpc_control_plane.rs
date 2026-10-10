@@ -589,3 +589,185 @@ async fn describe_regions_and_zone_ids_follow_aws_naming() {
         );
     }
 }
+
+/// A permission authorized with several CIDRs lists every one of them, with its
+/// description, under the permission's single `IpRanges` list -- through both
+/// the AWS CLI (botocore) and the Rust SDK.
+#[tokio::test]
+async fn describe_security_groups_lists_every_cidr_of_a_permission() {
+    let server = TestServer::start().await;
+    let out = server
+        .aws_cli(&[
+            "ec2",
+            "create-security-group",
+            "--group-name",
+            "demo",
+            "--description",
+            "Testing SG CIDRs",
+        ])
+        .await;
+    assert!(out.success(), "create failed: {}", out.stderr_text());
+    let sg_id = out.stdout_json()["GroupId"].as_str().unwrap().to_string();
+    let out = server
+        .aws_cli(&[
+            "ec2",
+            "authorize-security-group-ingress",
+            "--group-id",
+            &sg_id,
+            "--ip-permissions",
+            r#"[{"IpProtocol":"tcp","FromPort":22,"ToPort":22,"IpRanges":[{"Description":"Allow SSH","CidrIp":"172.0.0.0/12"},{"Description":"Allow SSH","CidrIp":"192.168.0.0/16"},{"CidrIp":"10.0.0.0/8"}]}]"#,
+        ])
+        .await;
+    assert!(out.success(), "authorize failed: {}", out.stderr_text());
+
+    let out = server
+        .aws_cli(&["ec2", "describe-security-groups", "--group-ids", &sg_id])
+        .await;
+    assert!(out.success(), "describe failed: {}", out.stderr_text());
+    let json = out.stdout_json();
+    let sg = &json["SecurityGroups"][0];
+    assert_eq!(
+        sg["IpPermissions"],
+        serde_json::json!([{
+            "IpProtocol": "tcp",
+            "FromPort": 22,
+            "ToPort": 22,
+            "IpRanges": [
+                {"CidrIp": "172.0.0.0/12", "Description": "Allow SSH"},
+                {"CidrIp": "192.168.0.0/16", "Description": "Allow SSH"},
+                {"CidrIp": "10.0.0.0/8"}
+            ]
+        }])
+    );
+    // The default egress rule has no description, so none is reported.
+    assert_eq!(
+        sg["IpPermissionsEgress"][0]["IpRanges"],
+        serde_json::json!([{"CidrIp": "0.0.0.0/0"}])
+    );
+
+    let c = server.ec2_client().await;
+    let resp = c
+        .describe_security_groups()
+        .group_ids(&sg_id)
+        .send()
+        .await
+        .unwrap();
+    let perms = resp.security_groups()[0].ip_permissions();
+    assert_eq!(perms.len(), 1);
+    let cidrs: Vec<(&str, Option<&str>)> = perms[0]
+        .ip_ranges()
+        .iter()
+        .map(|r| (r.cidr_ip().unwrap(), r.description()))
+        .collect();
+    assert_eq!(
+        cidrs,
+        vec![
+            ("172.0.0.0/12", Some("Allow SSH")),
+            ("192.168.0.0/16", Some("Allow SSH")),
+            ("10.0.0.0/8", None),
+        ]
+    );
+}
+
+/// DescribeSecurityGroupRules honors its `group-id`, `security-group-rule-id`
+/// and `tag:<key>` filters instead of returning every rule in the account.
+#[tokio::test]
+async fn describe_security_group_rules_honors_filters() {
+    use aws_sdk_ec2::types::{Filter, IpPermission, IpRange, ResourceType, Tag, TagSpecification};
+
+    let server = TestServer::start().await;
+    let c = server.ec2_client().await;
+    let a = c
+        .create_security_group()
+        .group_name("rules-a")
+        .description("a")
+        .send()
+        .await
+        .unwrap()
+        .group_id()
+        .unwrap()
+        .to_string();
+    let b = c
+        .create_security_group()
+        .group_name("rules-b")
+        .description("b")
+        .send()
+        .await
+        .unwrap()
+        .group_id()
+        .unwrap()
+        .to_string();
+    let ssh = IpPermission::builder()
+        .ip_protocol("tcp")
+        .from_port(22)
+        .to_port(22)
+        .ip_ranges(IpRange::builder().cidr_ip("10.0.0.0/8").build())
+        .build();
+    let authorized = c
+        .authorize_security_group_ingress()
+        .group_id(&a)
+        .ip_permissions(ssh.clone())
+        .tag_specifications(
+            TagSpecification::builder()
+                .resource_type(ResourceType::SecurityGroupRule)
+                .tags(Tag::builder().key("team").value("net").build())
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let a_rule = authorized.security_group_rules()[0].clone();
+    assert_eq!(a_rule.tags().len(), 1);
+    assert_eq!(a_rule.description(), None);
+    c.authorize_security_group_ingress()
+        .group_id(&b)
+        .ip_permissions(ssh)
+        .send()
+        .await
+        .unwrap();
+
+    // group-id: sg-a's ingress rule + its default egress rule, nothing else.
+    let out = server
+        .aws_cli(&[
+            "ec2",
+            "describe-security-group-rules",
+            "--filters",
+            &format!("Name=group-id,Values={a}"),
+        ])
+        .await;
+    assert!(out.success(), "describe failed: {}", out.stderr_text());
+    let rules = out.stdout_json()["SecurityGroupRules"].clone();
+    let rules = rules.as_array().unwrap();
+    assert_eq!(rules.len(), 2, "{rules:?}");
+    assert!(
+        rules.iter().all(|r| r["GroupId"] == a.as_str()),
+        "{rules:?}"
+    );
+
+    let by_id = c
+        .describe_security_group_rules()
+        .filters(
+            Filter::builder()
+                .name("security-group-rule-id")
+                .values(a_rule.security_group_rule_id().unwrap())
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(by_id.security_group_rules().len(), 1);
+
+    let by_tag = c
+        .describe_security_group_rules()
+        .filters(Filter::builder().name("tag:team").values("net").build())
+        .send()
+        .await
+        .unwrap();
+    let tagged = by_tag.security_group_rules();
+    assert_eq!(tagged.len(), 1);
+    assert_eq!(
+        tagged[0].security_group_rule_id(),
+        a_rule.security_group_rule_id()
+    );
+    assert_eq!(tagged[0].tags()[0].key(), Some("team"));
+}
