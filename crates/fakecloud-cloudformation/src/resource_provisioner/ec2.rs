@@ -632,6 +632,12 @@ impl ResourceProvisioner {
                 return Err(err);
             }
         }
+        // The replaced rules are gone for good: their tags go with them.
+        let mut accounts = self.ec2_state.write();
+        let state = accounts.get_or_create(&self.account_id);
+        for r in &removed {
+            state.tags.remove(&r.rule_id);
+        }
         Ok(())
     }
 

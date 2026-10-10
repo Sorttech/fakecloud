@@ -15,9 +15,9 @@ use crate::service_helpers::{
 };
 use crate::state::{Ec2State, SecurityGroup, SecurityGroupRule, SecurityGroupVpcAssociation, Tag};
 
-fn rule_xml(r: &SecurityGroupRule, owner: &str, region: &str) -> String {
+fn rule_xml(r: &SecurityGroupRule, tags: &[Tag], owner: &str, region: &str) -> String {
     let mut out = format!(
-        "{}{}{}<isEgress>{}</isEgress>{}<fromPort>{}</fromPort><toPort>{}</toPort>{}{}",
+        "{}{}{}<isEgress>{}</isEgress>{}<fromPort>{}</fromPort><toPort>{}</toPort>{}{}{}",
         ec2_elem("securityGroupRuleId", &r.rule_id),
         ec2_elem("groupId", &r.group_id),
         ec2_elem("groupOwnerId", owner),
@@ -25,11 +25,12 @@ fn rule_xml(r: &SecurityGroupRule, owner: &str, region: &str) -> String {
         ec2_elem("ipProtocol", &r.ip_protocol),
         r.from_port,
         r.to_port,
-        ec2_elem("description", &r.description),
+        description_elem(&r.description),
         ec2_elem(
             "securityGroupRuleArn",
             &ec2_arn(region, owner, &format!("security-group-rule/{}", r.rule_id)),
         ),
+        super::tags::tag_set_xml(tags),
     );
     if let Some(c) = &r.cidr_ipv4 {
         out.push_str(&ec2_elem("cidrIpv4", c));
@@ -45,9 +46,11 @@ fn rule_xml(r: &SecurityGroupRule, owner: &str, region: &str) -> String {
         if let Some(g) = &r.referenced_group_id {
             info.push_str(&ec2_elem("groupId", g));
         }
-        if let Some(u) = &r.referenced_user_id {
-            info.push_str(&ec2_elem("userId", u));
-        }
+        // A same-account reference still names its owning account.
+        info.push_str(&ec2_elem(
+            "userId",
+            r.referenced_user_id.as_deref().unwrap_or(owner),
+        ));
         out.push_str(&format!(
             "<referencedGroupInfo>{info}</referencedGroupInfo>"
         ));
@@ -74,81 +77,123 @@ fn ip_permission_header(r: &SecurityGroupRule) -> String {
     }
 }
 
-/// Emit the range children (`ipRanges`/`ipv6Ranges`/`prefixListIds`/`groups`)
-/// for a single stored rule record. Storage keeps one range source per record,
-/// so each record contributes at most one range child; the aggregator
-/// concatenates the children of every record that shares a permission group.
-fn ip_permission_ranges(r: &SecurityGroupRule) -> String {
-    let mut ranges = String::new();
-    if let Some(c) = &r.cidr_ipv4 {
-        ranges.push_str(&format!(
-            "<ipRanges><item>{}{}</item></ipRanges>",
-            ec2_elem("cidrIp", c),
-            ec2_elem("description", &r.description)
-        ));
+/// Optional `<description>` leaf: EC2 omits the member when no description was
+/// set rather than emitting an empty string.
+fn description_elem(description: &str) -> String {
+    if description.is_empty() {
+        String::new()
+    } else {
+        ec2_elem("description", description)
     }
-    if let Some(c) = &r.cidr_ipv6 {
-        ranges.push_str(&format!(
-            "<ipv6Ranges><item>{}{}</item></ipv6Ranges>",
-            ec2_elem("cidrIpv6", c),
-            ec2_elem("description", &r.description)
-        ));
+}
+
+/// The range children of one IpPermission, one `<item>` per stored rule record,
+/// bucketed by list so each list renders under a SINGLE wrapper element.
+#[derive(Default)]
+struct PermissionRanges {
+    ipv4: Vec<String>,
+    ipv6: Vec<String>,
+    prefix_lists: Vec<String>,
+    groups: Vec<String>,
+}
+
+impl PermissionRanges {
+    /// Add the range item of a single stored rule record. Storage keeps one
+    /// range source per record, so each record contributes one item.
+    fn push(&mut self, r: &SecurityGroupRule, owner: &str) {
+        if let Some(c) = &r.cidr_ipv4 {
+            self.ipv4.push(format!(
+                "{}{}",
+                ec2_elem("cidrIp", c),
+                description_elem(&r.description)
+            ));
+        }
+        if let Some(c) = &r.cidr_ipv6 {
+            self.ipv6.push(format!(
+                "{}{}",
+                ec2_elem("cidrIpv6", c),
+                description_elem(&r.description)
+            ));
+        }
+        if let Some(p) = &r.prefix_list_id {
+            self.prefix_lists.push(format!(
+                "{}{}",
+                ec2_elem("prefixListId", p),
+                description_elem(&r.description)
+            ));
+        }
+        if r.referenced_group_id.is_some() || r.referenced_group_name.is_some() {
+            // A same-account pair still names its owning account.
+            let mut item = ec2_elem("userId", r.referenced_user_id.as_deref().unwrap_or(owner));
+            if let Some(g) = &r.referenced_group_id {
+                item.push_str(&ec2_elem("groupId", g));
+            }
+            if let Some(n) = &r.referenced_group_name {
+                item.push_str(&ec2_elem("groupName", n));
+            }
+            item.push_str(&description_elem(&r.description));
+            self.groups.push(item);
+        }
     }
-    if let Some(p) = &r.prefix_list_id {
-        ranges.push_str(&format!(
-            "<prefixListIds><item>{}{}</item></prefixListIds>",
-            ec2_elem("prefixListId", p),
-            ec2_elem("description", &r.description)
-        ));
+
+    /// Render each non-empty list under one wrapper. Repeating a wrapper per
+    /// item (`<ipRanges><item/></ipRanges><ipRanges><item/></ipRanges>`) is not
+    /// a valid EC2 list: botocore decodes it as a list of empty structs and
+    /// the Rust SDK keeps only one of the ranges.
+    fn xml(&self) -> String {
+        let mut out = String::new();
+        for (name, items) in [
+            ("ipRanges", &self.ipv4),
+            ("ipv6Ranges", &self.ipv6),
+            ("prefixListIds", &self.prefix_lists),
+            ("groups", &self.groups),
+        ] {
+            if !items.is_empty() {
+                out.push_str(&ec2_list(name, items));
+            }
+        }
+        out
     }
-    if r.referenced_group_id.is_some() || r.referenced_group_name.is_some() {
-        let mut item = String::new();
-        if let Some(u) = &r.referenced_user_id {
-            item.push_str(&ec2_elem("userId", u));
-        }
-        if let Some(g) = &r.referenced_group_id {
-            item.push_str(&ec2_elem("groupId", g));
-        }
-        if let Some(n) = &r.referenced_group_name {
-            item.push_str(&ec2_elem("groupName", n));
-        }
-        if !r.description.is_empty() {
-            item.push_str(&ec2_elem("description", &r.description));
-        }
-        ranges.push_str(&format!("<groups><item>{item}</item></groups>"));
-    }
-    ranges
 }
 
 /// Aggregate stored rules into IpPermission `<item>` bodies for
 /// DescribeSecurityGroups. Records that share the same protocol/from-port/
 /// to-port collapse into ONE permission entry -- matching how real EC2 groups
-/// ranges -- concatenating each record's range children. Description is
-/// per-range (attached to each range child), so it is NOT part of the group
+/// ranges -- with every record's range item gathered under the permission's
+/// single `ipRanges`/`ipv6Ranges`/`prefixListIds`/`groups` list. Description is
+/// per-range (attached to each range item), so it is NOT part of the group
 /// key. Stored order is preserved: groups appear in first-seen order and range
-/// children within a group keep their stored order, making the output
+/// items within a list keep their stored order, making the output
 /// deterministic.
-fn grouped_permissions<'a>(rules: impl Iterator<Item = &'a SecurityGroupRule>) -> Vec<String> {
-    // Parallel vectors keyed by (protocol, from_port, to_port); `bodies[i]` is
-    // the accumulating `<item>` inner XML for `keys[i]`.
+fn grouped_permissions<'a>(
+    rules: impl Iterator<Item = &'a SecurityGroupRule>,
+    owner: &str,
+) -> Vec<String> {
+    // Parallel vectors keyed by (protocol, from_port, to_port); `groups[i]`
+    // holds the permission header and accumulated ranges for `keys[i]`.
     let mut keys: Vec<(String, i64, i64)> = Vec::new();
-    let mut bodies: Vec<String> = Vec::new();
+    let mut groups: Vec<(String, PermissionRanges)> = Vec::new();
     for r in rules {
         let key = (r.ip_protocol.clone(), r.from_port, r.to_port);
-        let ranges = ip_permission_ranges(r);
-        if let Some(pos) = keys.iter().position(|k| *k == key) {
-            bodies[pos].push_str(&ranges);
-        } else {
-            keys.push(key);
-            bodies.push(format!("{}{}", ip_permission_header(r), ranges));
-        }
+        let pos = match keys.iter().position(|k| *k == key) {
+            Some(pos) => pos,
+            None => {
+                keys.push(key);
+                groups.push((ip_permission_header(r), PermissionRanges::default()));
+                groups.len() - 1
+            }
+        };
+        groups[pos].1.push(r, owner);
     }
-    bodies
+    groups
+        .into_iter()
+        .map(|(header, ranges)| format!("{header}{}", ranges.xml()))
+        .collect()
 }
 
 fn sg_xml(sg: &SecurityGroup, tags: &[Tag], owner: &str, region: &str) -> String {
-    let ingress = grouped_permissions(sg.rules.iter().filter(|r| !r.is_egress));
-    let egress = grouped_permissions(sg.rules.iter().filter(|r| r.is_egress));
+    let ingress = grouped_permissions(sg.rules.iter().filter(|r| !r.is_egress), owner);
+    let egress = grouped_permissions(sg.rules.iter().filter(|r| r.is_egress), owner);
     format!(
         "{}{}{}{}{}{}{}{}",
         ec2_elem("groupId", &sg.group_id),
@@ -463,19 +508,15 @@ pub(crate) fn delete_security_group(
         ));
     }
 
-    if let Some(id) = req.query_params.get("GroupId") {
-        state.security_groups.remove(id);
-        state.tags.remove(id);
-    } else if let Some(name) = req.query_params.get("GroupName") {
-        let ids: Vec<String> = state
-            .security_groups
-            .values()
-            .filter(|g| &g.group_name == name)
-            .map(|g| g.group_id.clone())
-            .collect();
-        for id in ids {
-            state.security_groups.remove(&id);
+    let ids: Vec<String> = targets.iter().map(|g| g.group_id.clone()).collect();
+    for id in ids {
+        // The group's tags and its rules' tags go with it.
+        if let Some(sg) = state.security_groups.remove(&id) {
+            for r in &sg.rules {
+                state.tags.remove(&r.rule_id);
+            }
         }
+        state.tags.remove(&id);
     }
     Ok(Ec2Service::respond(
         "DeleteSecurityGroup",
@@ -634,7 +675,7 @@ fn authorize(
     let region = req.region.clone();
     // Resolved before the EC2 lock is taken: Service Quotas answers it.
     let rule_limit = svc.enforced_rules_per_security_group(&req.account_id, &req.region);
-    {
+    let rule_items = {
         let mut accounts = svc.state.write();
         let state = accounts.get_or_create(&req.account_id);
         // A missing or empty GroupId (or a nonexistent one) is a hard error on
@@ -648,13 +689,23 @@ fn authorize(
             sg.rules.iter().chain(new_rules.iter()).cloned().collect();
         weights.check_edit(&group_id, &sg.rules, &after, rule_limit)?;
         sg.rules = after;
-    }
+        // `TagSpecification.N.ResourceType=security-group-rule` tags every
+        // rule the request creates.
+        for r in &new_rules {
+            crate::service::tags::apply_tag_specifications(
+                state,
+                &req.query_params,
+                &r.rule_id,
+                "security-group-rule",
+            );
+        }
+        new_rules
+            .iter()
+            .map(|r| rule_xml(r, state.tags_for(&r.rule_id), &owner, &region))
+            .collect::<Vec<String>>()
+    };
     // New rules change what traffic is allowed — re-apply the firewall (ph3).
     svc.spawn_firewall_reconcile();
-    let rule_items: Vec<String> = new_rules
-        .iter()
-        .map(|r| rule_xml(r, &owner, &region))
-        .collect();
     let body = format!(
         "{}{}",
         ec2_return(true),
@@ -698,6 +749,7 @@ fn revoke(
             .security_groups
             .get_mut(&group_id)
             .ok_or_else(|| sg_not_found(&group_id))?;
+        let before: Vec<String> = sg.rules.iter().map(|r| r.rule_id.clone()).collect();
         if !rule_ids.is_empty() {
             sg.rules.retain(|r| !rule_ids.contains(&r.rule_id));
         } else {
@@ -705,6 +757,14 @@ fn revoke(
             // matched by protocol/port/source — never the whole direction.
             sg.rules
                 .retain(|r| !described.iter().any(|d| same_permission(r, d)));
+        }
+        let kept: Vec<&str> = sg.rules.iter().map(|r| r.rule_id.as_str()).collect();
+        let removed: Vec<String> = before
+            .into_iter()
+            .filter(|id| !kept.contains(&id.as_str()))
+            .collect();
+        for id in removed {
+            state.tags.remove(&id);
         }
     }
     // Removing rules tightens the firewall — re-apply (ph3).
@@ -736,6 +796,7 @@ pub(crate) fn describe_security_group_rules(
 ) -> Result<AwsResponse, AwsServiceError> {
     validate_max_results(&req.query_params, 5, 1000)?;
     let wanted = indexed_list(&req.query_params, "SecurityGroupRuleId");
+    let filters = parse_filters(&req.query_params);
     let owner = req.account_id.clone();
     let region = req.region.clone();
 
@@ -747,15 +808,45 @@ pub(crate) fn describe_security_group_rules(
         .values()
         .flat_map(|g| g.rules.iter())
         .filter(|r| wanted.is_empty() || wanted.contains(&r.rule_id))
-        .map(|r| rule_xml(r, &owner, &region))
+        .filter(|r| rule_matches(r, state.tags_for(&r.rule_id), &filters))
+        .map(|r| rule_xml(r, state.tags_for(&r.rule_id), &owner, &region))
         .collect();
     items.sort();
+    // MaxResults/NextToken paging is applied by the dispatch-level pagination
+    // table.
     let body = ec2_list("securityGroupRuleSet", &items);
     Ok(Ec2Service::respond(
         "DescribeSecurityGroupRules",
         &req.request_id,
         &body,
     ))
+}
+
+/// DescribeSecurityGroupRules filters: `group-id`, `security-group-rule-id`,
+/// and the tag family (`tag:<key>`, `tag-key`, `tag-value`).
+fn rule_matches(r: &SecurityGroupRule, tags: &[Tag], filters: &[Filter]) -> bool {
+    filters.iter().all(|f| {
+        let candidates: Vec<String> = match f.name.as_str() {
+            "group-id" => vec![r.group_id.clone()],
+            "security-group-rule-id" => vec![r.rule_id.clone()],
+            "tag-key" => tags.iter().map(|t| t.key.clone()).collect(),
+            "tag-value" => tags.iter().map(|t| t.value.clone()).collect(),
+            name => {
+                if let Some(key) = name.strip_prefix("tag:") {
+                    tags.iter()
+                        .filter(|t| t.key == key)
+                        .map(|t| t.value.clone())
+                        .collect()
+                } else {
+                    // Unknown filter: match nothing (never silently match all).
+                    return false;
+                }
+            }
+        };
+        f.values
+            .iter()
+            .any(|v| candidates.iter().any(|c| filter_value_matches(v, c)))
+    })
 }
 
 pub(crate) fn modify_security_group_rules(
@@ -1639,6 +1730,190 @@ mod modify_tests {
             egress.contains("<ipv6Ranges><item><cidrIpv6>::/0</cidrIpv6>"),
             "aggregated permission missing ipv6Ranges: {egress}"
         );
+    }
+
+    #[test]
+    fn describe_lists_every_range_of_a_permission_under_one_wrapper() {
+        let svc = Ec2Service::new();
+        empty_group(&svc);
+        // Two CIDRs (with descriptions) plus one without, all in one permission.
+        authorize_security_group_ingress(
+            &svc,
+            &req(
+                "AuthorizeSecurityGroupIngress",
+                &[
+                    ("GroupId", "sg-1"),
+                    ("IpPermissions.1.IpProtocol", "tcp"),
+                    ("IpPermissions.1.FromPort", "22"),
+                    ("IpPermissions.1.ToPort", "22"),
+                    ("IpPermissions.1.IpRanges.1.CidrIp", "172.0.0.0/12"),
+                    ("IpPermissions.1.IpRanges.1.Description", "Allow SSH"),
+                    ("IpPermissions.1.IpRanges.2.CidrIp", "192.168.0.0/16"),
+                    ("IpPermissions.1.IpRanges.2.Description", "Allow SSH"),
+                    ("IpPermissions.1.IpRanges.3.CidrIp", "10.0.0.0/8"),
+                ],
+            ),
+        )
+        .unwrap();
+
+        let body = sg_describe_body(&svc, &[]);
+        let ingress = body
+            .split("<ipPermissions>")
+            .nth(1)
+            .and_then(|s| s.split("</ipPermissions>").next())
+            .expect("no ipPermissions in describe body");
+        assert_eq!(
+            ingress,
+            "<item><ipProtocol>tcp</ipProtocol><fromPort>22</fromPort><toPort>22</toPort>\
+             <ipRanges>\
+             <item><cidrIp>172.0.0.0/12</cidrIp><description>Allow SSH</description></item>\
+             <item><cidrIp>192.168.0.0/16</cidrIp><description>Allow SSH</description></item>\
+             <item><cidrIp>10.0.0.0/8</cidrIp></item>\
+             </ipRanges></item>"
+        );
+    }
+
+    #[test]
+    fn same_account_group_references_name_the_owning_account() {
+        let svc = Ec2Service::new();
+        let mut rule = base_rule();
+        rule.cidr_ipv4 = None;
+        rule.referenced_group_id = Some("sg-1".into());
+        rule.description = String::new();
+        seed_group(&svc, rule);
+
+        let body = sg_describe_body(&svc, &[("GroupId.1", "sg-1")]);
+        assert!(
+            body.contains(
+                "<groups><item><userId>000000000000</userId><groupId>sg-1</groupId></item></groups>"
+            ),
+            "{body}"
+        );
+        let body = rules_describe_body(&svc, &[("SecurityGroupRuleId.1", "sgr-1")]);
+        assert!(
+            body.contains(
+                "<referencedGroupInfo><groupId>sg-1</groupId><userId>000000000000</userId></referencedGroupInfo>"
+            ),
+            "{body}"
+        );
+    }
+
+    fn rules_describe_body(svc: &Ec2Service, query: &[(&str, &str)]) -> String {
+        let resp =
+            describe_security_group_rules(svc, &req("DescribeSecurityGroupRules", query)).unwrap();
+        String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap()
+    }
+
+    fn seed_two_groups(svc: &Ec2Service) {
+        let mut a = ingress_rule("sgr-a", 22, "10.0.0.0/8");
+        a.group_id = "sg-a".into();
+        let mut b = ingress_rule("sgr-b", 443, "0.0.0.0/0");
+        b.group_id = "sg-b".into();
+        let mut accounts = svc.state.write();
+        let state = accounts.get_or_create("000000000000");
+        for (id, rule) in [("sg-a", a), ("sg-b", b)] {
+            state.security_groups.insert(
+                id.to_string(),
+                SecurityGroup {
+                    group_id: id.into(),
+                    group_name: id.into(),
+                    description: "d".into(),
+                    vpc_id: "vpc-1".into(),
+                    rules: vec![rule],
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn describe_security_group_rules_filters_by_group_and_rule_id() {
+        let svc = Ec2Service::new();
+        seed_two_groups(&svc);
+
+        let body = rules_describe_body(
+            &svc,
+            &[("Filter.1.Name", "group-id"), ("Filter.1.Value.1", "sg-a")],
+        );
+        assert!(body.contains("sgr-a"), "{body}");
+        assert!(!body.contains("sgr-b"), "group-id filter leaked: {body}");
+        // Only sg-a's rule matches: the account's default-VPC group rules too
+        // are filtered out.
+        assert_eq!(body.matches("<securityGroupRuleId>").count(), 1, "{body}");
+
+        let body = rules_describe_body(
+            &svc,
+            &[
+                ("Filter.1.Name", "security-group-rule-id"),
+                ("Filter.1.Value.1", "sgr-b"),
+            ],
+        );
+        assert_eq!(body.matches("<securityGroupRuleId>").count(), 1, "{body}");
+        assert!(body.contains("sgr-b"), "{body}");
+
+        let body = rules_describe_body(
+            &svc,
+            &[("Filter.1.Name", "bogus"), ("Filter.1.Value.1", "x")],
+        );
+        assert!(!body.contains("<securityGroupRuleId>"), "{body}");
+    }
+
+    #[test]
+    fn security_group_rule_tags_round_trip_and_filter() {
+        let svc = Ec2Service::new();
+        empty_group(&svc);
+        let resp = authorize_security_group_ingress(
+            &svc,
+            &req(
+                "AuthorizeSecurityGroupIngress",
+                &[
+                    ("GroupId", "sg-1"),
+                    ("IpPermissions.1.IpProtocol", "tcp"),
+                    ("IpPermissions.1.FromPort", "22"),
+                    ("IpPermissions.1.ToPort", "22"),
+                    ("IpPermissions.1.IpRanges.1.CidrIp", "10.0.0.0/8"),
+                    ("TagSpecification.1.ResourceType", "security-group-rule"),
+                    ("TagSpecification.1.Tag.1.Key", "team"),
+                    ("TagSpecification.1.Tag.1.Value", "net"),
+                ],
+            ),
+        )
+        .unwrap();
+        let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
+        assert!(
+            body.contains("<tagSet><item><key>team</key><value>net</value></item></tagSet>"),
+            "authorize response missing rule tags: {body}"
+        );
+        // No description was given: the member is omitted, not emitted empty.
+        assert!(!body.contains("<description>"), "{body}");
+
+        let body = rules_describe_body(
+            &svc,
+            &[("Filter.1.Name", "tag:team"), ("Filter.1.Value.1", "net")],
+        );
+        assert_eq!(body.matches("<securityGroupRuleId>").count(), 1, "{body}");
+        assert!(body.contains("<key>team</key>"), "{body}");
+        let rule_id = body
+            .split("<securityGroupRuleId>")
+            .nth(1)
+            .and_then(|s| s.split('<').next())
+            .unwrap()
+            .to_string();
+
+        // Revoking the rule drops its tags with it.
+        revoke_security_group_ingress(
+            &svc,
+            &req(
+                "RevokeSecurityGroupIngress",
+                &[("GroupId", "sg-1"), ("SecurityGroupRuleId.1", &rule_id)],
+            ),
+        )
+        .unwrap();
+        let accounts = svc.state.read();
+        assert!(accounts
+            .get("000000000000")
+            .unwrap()
+            .tags_for(&rule_id)
+            .is_empty());
     }
 
     #[test]

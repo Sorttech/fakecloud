@@ -91,6 +91,10 @@ fn resource_exists(state: &Ec2State, id: &str) -> Option<bool> {
         "vpc" => state.vpcs.contains_key(id),
         "subnet" => state.subnets.contains_key(id),
         "sg" => state.security_groups.contains_key(id),
+        "sgr" => state
+            .security_groups
+            .values()
+            .any(|g| g.rules.iter().any(|r| r.rule_id == id)),
         "vol" => state.volumes.contains_key(id),
         "snap" => state.snapshots.contains_key(id),
         "ami" => state.images.contains_key(id),
@@ -270,6 +274,7 @@ pub(crate) fn infer_resource_type(resource_id: &str) -> String {
         "vpc" => "vpc",
         "subnet" => "subnet",
         "sg" => "security-group",
+        "sgr" => "security-group-rule",
         "vol" => "volume",
         "snap" => "snapshot",
         "ami" => "image",
@@ -288,6 +293,24 @@ pub(crate) fn infer_resource_type(resource_id: &str) -> String {
 mod tests {
     use super::*;
     use crate::test_support::{ec2_request as req, err_of};
+
+    #[test]
+    fn security_group_rule_ids_are_taggable_and_typed() {
+        assert_eq!(infer_resource_type("sgr-0123"), "security-group-rule");
+        let svc = Ec2Service::new();
+        let err = err_of(create_tags(
+            &svc,
+            &req(
+                "CreateTags",
+                &[
+                    ("ResourceId.1", "sgr-doesnotexist0000"),
+                    ("Tag.1.Key", "Name"),
+                    ("Tag.1.Value", "x"),
+                ],
+            ),
+        ));
+        assert_eq!(err.code(), "InvalidID");
+    }
 
     #[test]
     fn create_tags_rejects_nonexistent_resource() {
