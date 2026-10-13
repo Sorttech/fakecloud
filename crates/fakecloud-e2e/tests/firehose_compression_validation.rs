@@ -551,7 +551,7 @@ async fn firehose_sdk_all_valid_compression_values_round_trip() {
                 .as_str(),
             format
         );
-        if ["ZIP", "Snappy", "HADOOP_SNAPPY"].contains(&format) {
+        if ["ZIP", "HADOOP_SNAPPY"].contains(&format) {
             assert_unsupported_admission(&client, &name, format).await;
         }
         client
@@ -581,7 +581,7 @@ async fn firehose_sdk_all_valid_compression_values_round_trip() {
             .unwrap();
         assert_eq!(s3.compression_format().as_str(), updated_format);
         assert_eq!(s3.prefix(), Some("after/"));
-        if ["ZIP", "Snappy", "HADOOP_SNAPPY"].contains(&updated_format) {
+        if ["ZIP", "HADOOP_SNAPPY"].contains(&updated_format) {
             assert_unsupported_admission(&client, &name, updated_format).await;
         }
     }

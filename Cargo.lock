@@ -5653,6 +5653,7 @@ dependencies = [
  "serde_urlencoded",
  "sha1 0.10.6",
  "sha2 0.10.9",
+ "snap",
  "tempfile",
  "tokio",
  "tokio-postgres",
@@ -5929,6 +5930,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "serde_json",
+ "snap",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -11110,6 +11112,12 @@ dependencies = [
  "borsh",
  "serde_core",
 ]
+
+[[package]]
+name = "snap"
+version = "1.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "199905e6153d6405f9728fe44daace35f8f837bbf830bb6e85fbd5828709a886"
 
 [[package]]
 name = "socket2"

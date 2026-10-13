@@ -1287,7 +1287,6 @@ mod tests {
         for setting in [
             json!({"CompressionFormat": "ZIP"}),
             json!({"CompressionFormat": "HADOOP_SNAPPY"}),
-            json!({"CompressionFormat": "Snappy"}),
             json!({"Prefix": "!{timestamp:yyyy}/"}),
             json!({"CustomTimeZone": "America/New_York"}),
             json!({"ProcessingConfiguration": {"Enabled": true}}),
@@ -2530,6 +2529,39 @@ mod tests {
             }),
         ))
         .unwrap();
+    }
+
+    #[test]
+    fn snappy_delivery_uses_the_modeled_enum_and_xerial_metadata() {
+        use crate::test_xerial_decoder::{decode, multiblock_input};
+
+        let (svc, disk, _tmp) = firehose_with_disk_s3("fh-snappy");
+        create_s3_stream_with_compression(&svc, "snappy", "fh-snappy", Some("Snappy"));
+        let input = multiblock_input();
+        svc.deliver_records(
+            S3_ACCOUNT,
+            "us-east-1",
+            "snappy",
+            vec![b"abc".to_vec(), b"def\n".to_vec(), input.clone()],
+        )
+        .unwrap();
+        let s3 = svc.s3.as_ref().unwrap().read();
+        let bucket = &s3.get(S3_ACCOUNT).unwrap().buckets["fh-snappy"];
+        assert_eq!(bucket.objects.len(), 1);
+        let object = bucket.objects.values().next().unwrap();
+        assert!(object.key.ends_with(".snappy"));
+        assert_eq!(object.content_encoding.as_deref(), Some("snappy-java"));
+        assert_eq!(object.content_type, "application/octet-stream");
+        let raw = disk.open_object_body(&object.body).unwrap();
+        assert_eq!(object.size, raw.len() as u64);
+        let blocks = decode(&raw).unwrap();
+        assert_eq!(
+            blocks.iter().map(Vec::len).collect::<Vec<_>>(),
+            [32768, 32768, 4471]
+        );
+        let decoded = blocks.concat();
+        assert_eq!(&decoded[..7], b"abcdef\n");
+        assert_eq!(&decoded[7..], input);
     }
 
     #[test]
