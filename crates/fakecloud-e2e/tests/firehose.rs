@@ -229,7 +229,7 @@ async fn firehose_put_record_writes_to_s3() {
         .await
         .expect("get");
     let bytes = obj.body.collect().await.expect("collect").into_bytes();
-    assert!(bytes.starts_with(b"hello-firehose"));
+    assert_eq!(bytes.as_ref(), b"hello-firehose");
 }
 
 #[tokio::test]
@@ -249,24 +249,9 @@ async fn firehose_put_record_batch_aggregates_payloads() {
     let resp = firehose
         .put_record_batch()
         .delivery_stream_name("fh-batch-stream")
-        .records(
-            Record::builder()
-                .data(Blob::new(b"line-a"))
-                .build()
-                .unwrap(),
-        )
-        .records(
-            Record::builder()
-                .data(Blob::new(b"line-b"))
-                .build()
-                .unwrap(),
-        )
-        .records(
-            Record::builder()
-                .data(Blob::new(b"line-c"))
-                .build()
-                .unwrap(),
-        )
+        .records(Record::builder().data(Blob::new(b"abc")).build().unwrap())
+        .records(Record::builder().data(Blob::new(b"def\n")).build().unwrap())
+        .records(Record::builder().data(Blob::new([0, 255])).build().unwrap())
         .send()
         .await
         .expect("put batch");
@@ -295,10 +280,147 @@ async fn firehose_put_record_batch_aggregates_payloads() {
         .await
         .expect("get");
     let bytes = obj.body.collect().await.expect("collect").into_bytes();
-    let s = std::str::from_utf8(&bytes).unwrap();
-    assert!(s.contains("line-a"));
-    assert!(s.contains("line-b"));
-    assert!(s.contains("line-c"));
+    assert_eq!(listing.contents().len(), 1);
+    assert_eq!(bytes.as_ref(), b"abcdef\n\x00\xff");
+}
+
+#[tokio::test]
+async fn firehose_s3_static_prefixes_extensions_and_utc_names() {
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+    let firehose = server.firehose_client().await;
+
+    for (i, (prefix, extension)) in [
+        (None, None),
+        (Some(""), Some("")),
+        (Some("events/"), Some(".custom.log")),
+        (Some("events"), None),
+        (Some("../logical/"), Some(".log")),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let bucket = format!("fh-output-{i}");
+        let stream = format!("fh-output-stream-{i}");
+        s3.create_bucket().bucket(&bucket).send().await.unwrap();
+        firehose
+            .create_delivery_stream()
+            .delivery_stream_name(&stream)
+            .extended_s3_destination_configuration(
+                ExtendedS3DestinationConfiguration::builder()
+                    .role_arn("arn:aws:iam::123456789012:role/firehose")
+                    .bucket_arn(format!("arn:aws:s3:::{bucket}"))
+                    .set_prefix(prefix.map(str::to_owned))
+                    .set_file_extension(extension.map(str::to_owned))
+                    .build()
+                    .unwrap(),
+            )
+            .send()
+            .await
+            .unwrap();
+        let before = chrono::Utc::now();
+        firehose
+            .put_record()
+            .delivery_stream_name(&stream)
+            .record(Record::builder().data(Blob::new([0, 255])).build().unwrap())
+            .send()
+            .await
+            .unwrap();
+        let after = chrono::Utc::now();
+
+        let listing = s3.list_objects_v2().bucket(&bucket).send().await.unwrap();
+        assert_eq!(listing.contents().len(), 1);
+        let key = listing.contents()[0].key().unwrap();
+        let name = key.strip_prefix(prefix.unwrap_or_default()).unwrap();
+        let (hierarchy, suffix) = name.split_at(14);
+        let suffix = suffix.strip_prefix(&format!("{stream}-1-")).unwrap();
+        let (timestamp, uuid_and_extension) = suffix.split_at(19);
+        let time = chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%d-%H-%M-%S")
+            .expect("AWS suffix timestamp")
+            .and_utc();
+        assert!((before.timestamp()..=after.timestamp()).contains(&time.timestamp()));
+        assert_eq!(hierarchy, time.format("%Y/%m/%d/%H/").to_string());
+        let uuid = uuid_and_extension
+            .strip_prefix('-')
+            .unwrap()
+            .strip_suffix(extension.unwrap_or_default())
+            .unwrap();
+        assert_eq!(uuid.len(), 36);
+        assert_eq!(uuid::Uuid::parse_str(uuid).unwrap().to_string(), uuid);
+
+        let object = s3
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(object.content_type(), Some("application/octet-stream"));
+        assert_eq!(object.content_encoding(), None);
+        assert_eq!(object.content_length(), Some(2));
+        assert_eq!(
+            object.body.collect().await.unwrap().into_bytes().as_ref(),
+            &[0, 255]
+        );
+    }
+}
+
+#[tokio::test]
+async fn firehose_destination_update_changes_output_version_and_extension() {
+    let server = TestServer::start().await;
+    let firehose = setup(&server, "fh-update-output").await;
+    firehose
+        .create_delivery_stream()
+        .delivery_stream_name("updated-output")
+        .extended_s3_destination_configuration(ext_s3("arn:aws:s3:::fh-update-output"))
+        .send()
+        .await
+        .unwrap();
+    let description = firehose
+        .describe_delivery_stream()
+        .delivery_stream_name("updated-output")
+        .send()
+        .await
+        .unwrap();
+    let stream = description.delivery_stream_description().unwrap();
+    firehose
+        .update_destination()
+        .delivery_stream_name("updated-output")
+        .current_delivery_stream_version_id(stream.version_id())
+        .destination_id(stream.destinations()[0].destination_id())
+        .extended_s3_destination_update(
+            aws_sdk_firehose::types::ExtendedS3DestinationUpdate::builder()
+                .prefix("updated/")
+                .file_extension(".log")
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    firehose
+        .put_record()
+        .delivery_stream_name("updated-output")
+        .record(
+            Record::builder()
+                .data(Blob::new(b"after-update"))
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let s3 = server.s3_client().await;
+    let listing = s3
+        .list_objects_v2()
+        .bucket("fh-update-output")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listing.contents().len(), 1);
+    let key = listing.contents()[0].key().unwrap();
+    assert!(key.starts_with("updated/"));
+    assert!(key.contains("/updated-output-2-"));
+    assert!(key.ends_with(".log"));
 }
 
 #[tokio::test]

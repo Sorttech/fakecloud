@@ -156,7 +156,7 @@ async fn persistence_delivered_records_survive_restart() {
         .await
         .expect("get delivered object");
     let bytes = obj.body.collect().await.expect("collect").into_bytes();
-    assert!(bytes.starts_with(b"persist-me"));
+    assert_eq!(bytes.as_ref(), b"persist-me");
 }
 
 /// DeleteDeliveryStream durability: a deleted stream stays gone after restart.

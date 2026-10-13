@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use base64::Engine;
-use bytes::Bytes;
 use chrono::Utc;
 use fakecloud_aws::arn::Arn;
 use http::StatusCode;
@@ -16,6 +15,7 @@ use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceErr
 use fakecloud_persistence::{BodySource, S3Store, SnapshotStore};
 use fakecloud_s3::{memory_body, S3Object, SharedS3State};
 
+use crate::output::{encode_records, object_key, OutputConfig};
 use crate::state::{
     DeliveryStream, EncryptionConfig, FirehoseAccounts, FirehoseSnapshot, S3Destination,
     SharedFirehoseState, FIREHOSE_SNAPSHOT_SCHEMA_VERSION,
@@ -1063,7 +1063,7 @@ impl FirehoseService {
         stream_name: &str,
         datas: Vec<Vec<u8>>,
     ) -> Result<(), AwsServiceError> {
-        let dest = {
+        let (dest, version_id) = {
             let accounts = self.state.read();
             let state = accounts
                 .get(account_id)
@@ -1072,7 +1072,7 @@ impl FirehoseService {
                 .streams(region)
                 .and_then(|s| s.get(stream_name))
                 .ok_or_else(|| not_found(stream_name))?;
-            stream.destination.clone()
+            (stream.destination.clone(), stream.version_id.clone())
         };
         let Some(dest) = dest else {
             return Ok(());
@@ -1093,29 +1093,19 @@ impl FirehoseService {
             );
             return Ok(());
         };
-        let mut payload = Vec::new();
-        for d in datas {
-            payload.extend_from_slice(&d);
-            if !d.last().map(|b| *b == b'\n').unwrap_or(false) {
-                payload.push(b'\n');
-            }
-        }
-        if payload.is_empty() {
+        let bytes = encode_records(&datas);
+        if bytes.is_empty() {
             return Ok(());
         }
         let now = Utc::now();
-        let prefix = dest.prefix.clone().unwrap_or_default();
-        let key = format!(
-            "{prefix}{date}/{stream_name}-{ts}-{rand}",
-            date = now.format("%Y/%m/%d/%H"),
-            ts = now.timestamp(),
-            rand = &Uuid::new_v4().to_string()[..8],
-        );
-        let size = payload.len() as u64;
+        let output = OutputConfig {
+            prefix: dest.prefix.as_deref().unwrap_or_default(),
+            file_extension: dest.file_extension.as_deref(),
+        };
+        let key = object_key(stream_name, &version_id, &output, now, now, Uuid::new_v4());
+        let size = bytes.len() as u64;
         let etag = format!("\"{}\"", Uuid::new_v4().simple());
-        let bytes = Bytes::from(payload);
         let body = memory_body(bytes.clone());
-        let _ = region;
         // Snapshot the durable store handle before taking the S3 state lock so we
         // never hold two locks at once.
         let store = self.s3_store.read().clone();
@@ -1213,6 +1203,7 @@ fn not_found(name: &str) -> AwsServiceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use http::{HeaderMap, Method};
 
     fn request(action: &str, body: Value) -> AwsRequest {
@@ -1858,6 +1849,123 @@ mod tests {
             }),
         ))
         .unwrap();
+    }
+
+    #[test]
+    fn delivery_preserves_binary_bytes_and_producer_delimiters() {
+        let (svc, disk, _tmp) = firehose_with_disk_s3("fh-bytes");
+        create_s3_stream(&svc, "verbatim", "fh-bytes");
+        svc.deliver_records(
+            S3_ACCOUNT,
+            "us-east-1",
+            "verbatim",
+            vec![b"abc".to_vec(), b"def\n".to_vec(), vec![0, 255]],
+        )
+        .unwrap();
+
+        let s3 = svc.s3.as_ref().unwrap().read();
+        let bucket = &s3.get(S3_ACCOUNT).unwrap().buckets["fh-bytes"];
+        assert_eq!(bucket.objects.len(), 1);
+        let object = bucket.objects.values().next().unwrap();
+        assert_eq!(
+            disk.open_object_body(&object.body).unwrap().as_ref(),
+            b"abcdef\n\x00\xff"
+        );
+        assert_eq!(object.size, 9);
+    }
+
+    #[test]
+    fn delivery_names_use_stream_version_utc_and_custom_extension() {
+        for (prefix, extension) in [
+            (None, None),
+            (Some("events/"), Some(".custom.log")),
+            (Some("events"), Some("")),
+            (Some("../logical/"), Some(".log")),
+        ] {
+            let (svc, disk, _tmp) = firehose_with_disk_s3("fh-names");
+            create_s3_stream(&svc, "named", "fh-names");
+            let destination_id = svc
+                .state
+                .read()
+                .get(S3_ACCOUNT)
+                .unwrap()
+                .streams("us-east-1")
+                .unwrap()["named"]
+                .destination
+                .as_ref()
+                .unwrap()
+                .destination_id
+                .clone();
+            svc.update_destination(&request(
+                "UpdateDestination",
+                json!({
+                    "DeliveryStreamName": "named",
+                    "CurrentDeliveryStreamVersionId": "1",
+                    "DestinationId": destination_id,
+                    "ExtendedS3DestinationUpdate": {"Prefix": prefix, "FileExtension": extension}
+                }),
+            ))
+            .unwrap();
+            svc.deliver_records(S3_ACCOUNT, "us-east-1", "named", vec![b"x".to_vec()])
+                .unwrap();
+
+            let s3 = svc.s3.as_ref().unwrap().read();
+            let bucket = &s3.get(S3_ACCOUNT).unwrap().buckets["fh-names"];
+            let object = bucket.objects.values().next().unwrap();
+            let expected_start = format!(
+                "{}{}named-2-{}-",
+                prefix.unwrap_or_default(),
+                object.last_modified.format("%Y/%m/%d/%H/"),
+                object.last_modified.format("%Y-%m-%d-%H-%M-%S"),
+            );
+            let uuid_and_extension = object
+                .key
+                .strip_prefix(&expected_start)
+                .expect("key must contain UTC hierarchy and stream/version/time suffix");
+            let uuid = uuid_and_extension
+                .strip_suffix(extension.unwrap_or_default())
+                .unwrap();
+            assert_eq!(uuid.len(), 36);
+            assert_eq!(Uuid::parse_str(uuid).unwrap().to_string(), uuid);
+            assert_eq!(disk.open_object_body(&object.body).unwrap().as_ref(), b"x");
+        }
+    }
+
+    #[test]
+    fn internal_delivery_preserves_exact_bytes() {
+        use fakecloud_core::delivery::FirehoseDelivery;
+
+        let (svc, disk, _tmp) = firehose_with_disk_s3("fh-hook");
+        create_s3_stream(&svc, "hook", "fh-hook");
+        let hook =
+            crate::FirehoseDeliveryImpl::new(svc.shared_state(), svc.s3.as_ref().unwrap().clone());
+        hook.set_s3_store(disk.clone());
+        hook.put_record(
+            "arn:aws:firehose:us-east-1:123456789012:deliverystream/hook",
+            b"\x00\xff",
+        );
+
+        let s3 = svc.s3.as_ref().unwrap().read();
+        let bucket = &s3.get(S3_ACCOUNT).unwrap().buckets["fh-hook"];
+        assert_eq!(bucket.objects.len(), 1);
+        assert_eq!(
+            disk.open_object_body(&bucket.objects.values().next().unwrap().body)
+                .unwrap()
+                .as_ref(),
+            b"\x00\xff"
+        );
+    }
+
+    #[test]
+    fn empty_delivery_does_not_create_an_object() {
+        let (svc, _disk, _tmp) = firehose_with_disk_s3("fh-empty");
+        create_s3_stream(&svc, "empty", "fh-empty");
+        svc.deliver_records(S3_ACCOUNT, "us-east-1", "empty", vec![vec![], vec![]])
+            .unwrap();
+        let s3 = svc.s3.as_ref().unwrap().read();
+        assert!(s3.get(S3_ACCOUNT).unwrap().buckets["fh-empty"]
+            .objects
+            .is_empty());
     }
 
     #[test]
