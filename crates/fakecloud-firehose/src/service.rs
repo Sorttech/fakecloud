@@ -13,9 +13,14 @@ use uuid::Uuid;
 
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_persistence::{S3Store, SnapshotStore};
+use fakecloud_s3::delivery::{
+    put_object_via_store_with_options, DeliveryObjectOptions, DeliveryObjectRequest,
+};
 use fakecloud_s3::SharedS3State;
 
-use crate::output::{append_delimiter_enabled, encode_records, object_key, OutputConfig};
+use crate::output::{
+    append_delimiter_enabled, encode_records, object_key, Compression, OutputConfig,
+};
 use crate::state::{
     DeliveryStream, EncryptionConfig, FirehoseAccounts, FirehoseSnapshot, S3Destination,
     SharedFirehoseState, FIREHOSE_SNAPSHOT_SCHEMA_VERSION,
@@ -1207,12 +1212,26 @@ impl FirehoseService {
         let output = OutputConfig {
             prefix: dest.prefix.as_deref().unwrap_or_default(),
             file_extension: dest.file_extension.as_deref(),
+            compression: match dest.compression_format.as_deref() {
+                Some("GZIP") => Compression::Gzip,
+                _ => Compression::Uncompressed,
+            },
             append_delimiter: append_delimiter_enabled(dest.processing_configuration.as_ref()),
         };
-        let bytes = encode_records(&datas, &output);
-        if bytes.is_empty() {
+        // Judge emptiness by the uncompressed payload: GZIP encodes even an
+        // empty payload into nonempty bytes, while an appended delimiter makes
+        // any record nonempty.
+        let delimited = output.append_delimiter && !datas.is_empty();
+        if !delimited && datas.iter().all(Vec::is_empty) {
             return Ok(());
         }
+        let bytes = match encode_records(&datas, &output) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::error!(stream = %stream_name, %err, "failed to encode firehose S3 delivery; records not delivered");
+                return Ok(());
+            }
+        };
         let now = Utc::now();
         let key = object_key(stream_name, &version_id, &output, now, now, Uuid::new_v4());
         // Snapshot the durable store handle before taking the S3 state lock so we
@@ -1221,14 +1240,19 @@ impl FirehoseService {
         // The batch is an ordinary new object version in the destination
         // bucket: versioning and default retention apply as for PutObject, and
         // it is written through the durable store so it survives a restart.
-        if let Err(err) = fakecloud_s3::delivery::put_object_via_store(
+        if let Err(err) = put_object_via_store_with_options(
             s3,
             store.as_deref(),
-            account_id,
-            bucket_name,
-            &key,
-            bytes.to_vec(),
-            None,
+            DeliveryObjectRequest {
+                account: account_id,
+                bucket: bucket_name,
+                key: &key,
+                body: bytes,
+                options: DeliveryObjectOptions {
+                    content_type: None,
+                    content_encoding: output.compression.content_encoding().map(str::to_owned),
+                },
+            },
         ) {
             // AWS acknowledges the records (async delivery) even when the
             // destination bucket is absent or the write fails; it reports the
@@ -2291,6 +2315,15 @@ mod tests {
     }
 
     fn create_s3_stream(svc: &FirehoseService, name: &str, bucket: &str) {
+        create_s3_stream_with_compression(svc, name, bucket, None);
+    }
+
+    fn create_s3_stream_with_compression(
+        svc: &FirehoseService,
+        name: &str,
+        bucket: &str,
+        compression: Option<&str>,
+    ) {
         svc.create_delivery_stream(&request(
             "CreateDeliveryStream",
             json!({
@@ -2298,10 +2331,100 @@ mod tests {
                 "ExtendedS3DestinationConfiguration": {
                     "RoleARN": "arn:aws:iam::123456789012:role/fh",
                     "BucketARN": format!("arn:aws:s3:::{bucket}"),
+                    "CompressionFormat": compression,
                 }
             }),
         ))
         .unwrap();
+    }
+
+    #[test]
+    fn gzip_delivery_encodes_bytes_and_persists_metadata() {
+        use std::io::Read;
+
+        let (svc, disk, _tmp) = firehose_with_disk_s3("fh-gzip");
+        create_s3_stream_with_compression(&svc, "gzip", "fh-gzip", Some("GZIP"));
+        svc.deliver_records(
+            S3_ACCOUNT,
+            "us-east-1",
+            "gzip",
+            vec![b"abc".to_vec(), b"def\n".to_vec(), vec![0, 255]],
+        )
+        .unwrap();
+        let s3 = svc.s3.as_ref().unwrap().read();
+        let bucket = &s3.get(S3_ACCOUNT).unwrap().buckets["fh-gzip"];
+        assert_eq!(bucket.objects.len(), 1);
+        let object = bucket.objects.values().next().unwrap();
+        assert!(object.key.ends_with(".gz"));
+        assert_eq!(object.content_type, "application/octet-stream");
+        assert_eq!(object.content_encoding.as_deref(), Some("gzip"));
+        let raw = disk.open_object_body(&object.body).unwrap();
+        assert!(raw.starts_with(&[0x1f, 0x8b, 8]));
+        assert_eq!(object.size, raw.len() as u64);
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(raw.as_ref())
+            .read_to_end(&mut decoded)
+            .unwrap();
+        assert_eq!(decoded, b"abcdef\n\x00\xff");
+        let key = object.key.clone();
+        drop(s3);
+
+        let loaded = disk.load().unwrap();
+        let persisted = &loaded.buckets["fh-gzip"].objects[&key];
+        assert_eq!(persisted.meta.content_type, "application/octet-stream");
+        assert_eq!(persisted.meta.content_encoding.as_deref(), Some("gzip"));
+        assert_eq!(disk.open_object_body(&persisted.body).unwrap(), raw);
+    }
+
+    #[test]
+    fn gzip_store_failure_does_not_publish_memory_success() {
+        use fakecloud_persistence::{cache::BodyCache, s3::DiskS3Store};
+
+        for fail_staging in [true, false] {
+            let (svc, _disk, tmp) = firehose_with_disk_s3("fh-fallback");
+            create_s3_stream_with_compression(&svc, "fallback", "fh-fallback", Some("GZIP"));
+            if fail_staging {
+                let blocked = tmp.path().join("not-a-directory");
+                std::fs::write(&blocked, b"blocks persistent writes").unwrap();
+                svc.set_s3_store(Arc::new(DiskS3Store::new(
+                    blocked,
+                    Arc::new(BodyCache::new(1024)),
+                )));
+            } else {
+                // Staging can succeed, but the final object directory cannot be created.
+                std::fs::write(
+                    tmp.path().join("s3/buckets/fh-fallback/objects"),
+                    b"blocks commit",
+                )
+                .unwrap();
+            }
+            let response = svc.put_record(&request("PutRecord", json!({
+            "DeliveryStreamName": "fallback",
+            "Record": {"Data": base64::engine::general_purpose::STANDARD.encode(b"\x00\xff")}
+        }))).unwrap();
+            let response: Value = serde_json::from_slice(response.body.expect_bytes()).unwrap();
+            assert!(response["RecordId"].as_str().is_some());
+
+            let s3 = svc.s3.as_ref().unwrap().read();
+            let bucket = &s3.get(S3_ACCOUNT).unwrap().buckets["fh-fallback"];
+            assert!(
+                bucket.objects.is_empty(),
+                "failed persistence must not publish an object"
+            );
+            assert!(bucket.object_versions.is_empty());
+        }
+    }
+
+    #[test]
+    fn empty_gzip_delivery_does_not_create_an_object() {
+        let (svc, _disk, _tmp) = firehose_with_disk_s3("fh-empty-gzip");
+        create_s3_stream_with_compression(&svc, "empty-gzip", "fh-empty-gzip", Some("GZIP"));
+        svc.deliver_records(S3_ACCOUNT, "us-east-1", "empty-gzip", vec![vec![], vec![]])
+            .unwrap();
+        let s3 = svc.s3.as_ref().unwrap().read();
+        assert!(s3.get(S3_ACCOUNT).unwrap().buckets["fh-empty-gzip"]
+            .objects
+            .is_empty());
     }
 
     fn kinesis_source_body(name: &str) -> Value {
@@ -2669,42 +2792,25 @@ mod tests {
                 }),
             ))
             .unwrap();
+            let before = Utc::now();
             svc.deliver_records(S3_ACCOUNT, "us-east-1", "named", vec![b"x".to_vec()])
                 .unwrap();
+            let after = Utc::now();
 
             let s3 = svc.s3.as_ref().unwrap().read();
             let bucket = &s3.get(S3_ACCOUNT).unwrap().buckets["fh-names"];
             let object = bucket.objects.values().next().unwrap();
-            // The key carries the flush time; S3 stamps LastModified when it
-            // commits the version a moment later, so derive the expected key
-            // from the key's own timestamp and only require it to be close.
-            let rest = object
-                .key
-                .strip_prefix(prefix.unwrap_or_default())
-                .expect("key starts with the prefix");
-            let file_name = rest.splitn(5, '/').nth(4).expect("UTC hierarchy");
-            let stamp = file_name
-                .strip_prefix("named-2-")
-                .and_then(|s| s.get(..19))
-                .expect("stream/version/time suffix");
-            let flushed = chrono::NaiveDateTime::parse_from_str(stamp, "%Y-%m-%d-%H-%M-%S")
-                .expect("UTC timestamp")
+            // S3's LastModified is assigned after staging, so it need not share
+            // the key's delivery second when disk I/O spans a time boundary.
+            let name = object.key.strip_prefix(prefix.unwrap_or_default()).unwrap();
+            let (hierarchy, suffix) = name.rsplit_once("/named-2-").unwrap();
+            let (timestamp, uuid_and_extension) = suffix.split_at(19);
+            let time = chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%d-%H-%M-%S")
+                .unwrap()
                 .and_utc();
-            assert!(
-                (object.last_modified - flushed).num_seconds().abs() <= 2,
-                "key time {flushed} far from LastModified {}",
-                object.last_modified
-            );
-            let expected_start = format!(
-                "{}{}named-2-{}-",
-                prefix.unwrap_or_default(),
-                flushed.format("%Y/%m/%d/%H/"),
-                flushed.format("%Y-%m-%d-%H-%M-%S"),
-            );
-            let uuid_and_extension = object
-                .key
-                .strip_prefix(&expected_start)
-                .expect("key must contain UTC hierarchy and stream/version/time suffix");
+            assert!((before.timestamp()..=after.timestamp()).contains(&time.timestamp()));
+            assert_eq!(hierarchy, time.format("%Y/%m/%d/%H").to_string());
+            let uuid_and_extension = uuid_and_extension.strip_prefix('-').unwrap();
             let uuid = uuid_and_extension
                 .strip_suffix(extension.unwrap_or_default())
                 .unwrap();
