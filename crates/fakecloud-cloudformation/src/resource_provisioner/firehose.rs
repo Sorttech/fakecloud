@@ -154,3 +154,75 @@ impl ResourceProvisioner {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{make_provisioner, make_resource};
+    use super::*;
+    use serde_json::{json, Value};
+
+    fn delivery_stream(extended_s3: Value) -> ResourceDefinition {
+        make_resource(
+            "AWS::KinesisFirehose::DeliveryStream",
+            "Firehose",
+            json!({
+                "DeliveryStreamName": "events",
+                "ExtendedS3DestinationConfiguration": extended_s3,
+            }),
+        )
+    }
+
+    fn destination(file_extension: Value) -> Value {
+        json!({
+            "RoleARN": "arn:aws:iam::123456789012:role/fh",
+            "BucketARN": "arn:aws:s3:::bucket",
+            "FileExtension": file_extension,
+        })
+    }
+
+    fn stored_file_extension(prov: &ResourceProvisioner) -> Option<String> {
+        prov.firehose_state
+            .read()
+            .get("123456789012")
+            .unwrap()
+            .streams("us-east-1")
+            .unwrap()["events"]
+            .destination
+            .as_ref()
+            .unwrap()
+            .file_extension
+            .clone()
+    }
+
+    #[test]
+    fn firehose_cfn_stores_file_extension_on_create_and_update() {
+        let prov = make_provisioner();
+        let existing = prov
+            .create_resource(&delivery_stream(destination(json!(".json"))))
+            .unwrap();
+        assert_eq!(stored_file_extension(&prov).as_deref(), Some(".json"));
+
+        prov.update_resource(&existing, &delivery_stream(destination(json!(".log"))))
+            .unwrap();
+        assert_eq!(stored_file_extension(&prov).as_deref(), Some(".log"));
+    }
+
+    #[test]
+    fn firehose_cfn_rejects_invalid_file_extension() {
+        let prov = make_provisioner();
+        for invalid in [json!("json"), json!(".JSON"), json!(1)] {
+            let err = prov
+                .create_resource(&delivery_stream(destination(invalid.clone())))
+                .expect_err("invalid FileExtension must fail the resource");
+            assert!(err.contains("FileExtension"), "{err}");
+        }
+        let existing = prov
+            .create_resource(&delivery_stream(destination(json!(".json"))))
+            .unwrap();
+        let err = prov
+            .update_resource(&existing, &delivery_stream(destination(json!(".JSON"))))
+            .expect_err("invalid FileExtension must fail the update");
+        assert!(err.contains("FileExtension"), "{err}");
+        assert_eq!(stored_file_extension(&prov).as_deref(), Some(".json"));
+    }
+}

@@ -155,6 +155,7 @@ async fn persistence_delivered_records_survive_restart() {
         .send()
         .await
         .expect("get delivered object");
+    assert_eq!(obj.e_tag(), Some("\"54fb147ea78d53414d5d89976f5bd218\""));
     let bytes = obj.body.collect().await.expect("collect").into_bytes();
     assert_eq!(bytes.as_ref(), b"persist-me");
 }

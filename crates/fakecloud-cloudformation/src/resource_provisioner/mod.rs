@@ -4270,6 +4270,12 @@ fn parse_firehose_s3_destination(value: &serde_json::Value) -> Result<S3Destinat
         .get("CompressionFormat")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    // Same FileExtension rules as CreateDeliveryStream / UpdateDestination.
+    fakecloud_firehose::validate_s3_file_extension(value).map_err(|e| e.to_string())?;
+    let file_extension = value
+        .get("FileExtension")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     Ok(S3Destination {
         destination_id: "destination-1".to_string(),
@@ -4285,7 +4291,7 @@ fn parse_firehose_s3_destination(value: &serde_json::Value) -> Result<S3Destinat
         cloudwatch_logging_options: None,
         custom_time_zone: None,
         s3_backup_mode: None,
-        file_extension: None,
+        file_extension,
         dynamic_partitioning_configuration: None,
         encryption_configuration: None,
         s3_backup_description: None,

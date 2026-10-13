@@ -431,8 +431,11 @@ fn deliver_event(
                     event_type = ?event_type,
                     "SES event fanout -> Firehose"
                 );
+                // SES follows each JSON record it publishes to Firehose with a
+                // newline; Firehose itself concatenates record bytes verbatim.
+                let record = format!("{event_json}\n");
                 ctx.delivery_bus
-                    .put_record_to_firehose(ds_arn, event_json.as_bytes());
+                    .put_record_to_firehose(ds_arn, record.as_bytes());
                 dispatches.push(EventDestinationDispatch {
                     destination_name: dest.name.clone(),
                     destination_type: "firehose".to_string(),
@@ -1247,5 +1250,89 @@ mod tests {
             SesEventType::Send,
             "cs",
         );
+    }
+
+    #[derive(Default)]
+    struct FirehoseRecorder(std::sync::Mutex<Vec<(String, Vec<u8>)>>);
+
+    impl fakecloud_core::delivery::FirehoseDelivery for FirehoseRecorder {
+        fn put_record(&self, delivery_stream_arn: &str, data: &[u8]) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((delivery_stream_arn.to_string(), data.to_vec()));
+        }
+    }
+
+    /// AWS: "When publishing events to Firehose, Amazon SES follows each JSON
+    /// record with a newline character." Firehose itself concatenates record
+    /// bytes verbatim, so the delimiter must come from the SES record.
+    #[test]
+    fn firehose_event_records_end_with_a_newline() {
+        let state = shared_state();
+        let ds_arn = "arn:aws:firehose:us-east-1:123456789012:deliverystream/ses-events";
+        state.write().default_mut().event_destinations.insert(
+            "cs".to_string(),
+            vec![EventDestination {
+                name: "fh".to_string(),
+                enabled: true,
+                matching_event_types: vec!["SEND".to_string()],
+                kinesis_firehose_destination: Some(serde_json::json!({
+                    "DeliveryStreamARN": ds_arn,
+                    "IamRoleARN": "arn:aws:iam::123456789012:role/ses-firehose"
+                })),
+                cloud_watch_destination: None,
+                sns_destination: None,
+                event_bridge_destination: None,
+                pinpoint_destination: None,
+            }],
+        );
+        let recorder = Arc::new(FirehoseRecorder::default());
+        let ctx = SesDeliveryContext {
+            ses_state: state,
+            delivery_bus: Arc::new(DeliveryBus::new().with_firehose(recorder.clone())),
+        };
+        let event = build_ses_event(
+            SesEventType::Send,
+            &SentEmail {
+                message_id: "msg-1".to_string(),
+                from: "sender@example.com".to_string(),
+                to: vec!["recipient@example.com".to_string()],
+                cc: vec![],
+                bcc: vec![],
+                subject: None,
+                html_body: None,
+                text_body: None,
+                raw_data: None,
+                template_name: None,
+                template_data: None,
+                dkim_signature: None,
+                headers: Vec::new(),
+                timestamp: Utc::now(),
+                email_tags: Vec::new(),
+                delivery_insights: Vec::new(),
+            },
+        );
+        deliver_event(
+            &ctx,
+            SendScope {
+                account_id: "123456789012",
+                region: "us-east-1",
+            },
+            &event,
+            SesEventType::Send,
+            "cs",
+        );
+
+        let records = recorder.0.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        let (arn, data) = &records[0];
+        assert_eq!(arn, ds_arn);
+        let json = data
+            .strip_suffix(b"\n")
+            .expect("SES Firehose record must end with a newline");
+        assert!(!json.ends_with(b"\n"), "exactly one trailing newline");
+        let parsed: serde_json::Value = serde_json::from_slice(json).unwrap();
+        assert_eq!(parsed, event);
     }
 }
