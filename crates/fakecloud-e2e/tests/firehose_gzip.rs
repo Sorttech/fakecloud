@@ -2,8 +2,8 @@ use std::io::Read;
 
 use aws_sdk_firehose::primitives::Blob;
 use aws_sdk_firehose::types::{
-    CompressionFormat, ExtendedS3DestinationConfiguration, ProcessingConfiguration, Processor,
-    ProcessorType, Record, S3DestinationConfiguration,
+    BufferingHints, CompressionFormat, ExtendedS3DestinationConfiguration, ProcessingConfiguration,
+    Processor, ProcessorType, Record, S3DestinationConfiguration,
 };
 use aws_sdk_s3::types::ChecksumMode;
 use base64::Engine;
@@ -30,13 +30,23 @@ async fn gzip_object(
     prefix: &str,
     extension: &str,
 ) -> (String, Vec<u8>, Vec<u8>) {
-    let listing = s3
-        .list_objects_v2()
-        .bucket(bucket)
-        .prefix(prefix)
-        .send()
-        .await
-        .unwrap();
+    let listing = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let listing = s3
+                .list_objects_v2()
+                .bucket(bucket)
+                .prefix(prefix)
+                .send()
+                .await
+                .unwrap();
+            if !listing.contents().is_empty() {
+                return listing;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("Firehose GZIP object within 10s");
     assert_eq!(listing.contents().len(), 1);
     assert_eq!(
         listing.contents()[0]
@@ -151,6 +161,12 @@ async fn firehose_gzip_batch_preserves_bytes_and_extension_overrides() {
                 S3DestinationConfiguration::builder()
                     .role_arn("arn:aws:iam::123456789012:role/firehose")
                     .bucket_arn(format!("arn:aws:s3:::{bucket}"))
+                    .buffering_hints(
+                        BufferingHints::builder()
+                            .size_in_mbs(5)
+                            .interval_in_seconds(0)
+                            .build(),
+                    )
                     .compression_format(CompressionFormat::Gzip)
                     .build()
                     .unwrap(),
@@ -161,6 +177,12 @@ async fn firehose_gzip_batch_preserves_bytes_and_extension_overrides() {
                 ExtendedS3DestinationConfiguration::builder()
                     .role_arn("arn:aws:iam::123456789012:role/firehose")
                     .bucket_arn(format!("arn:aws:s3:::{bucket}"))
+                    .buffering_hints(
+                        BufferingHints::builder()
+                            .size_in_mbs(5)
+                            .interval_in_seconds(0)
+                            .build(),
+                    )
                     .compression_format(CompressionFormat::Gzip)
                     .set_file_extension(extension.map(str::to_owned))
                     .build()
@@ -200,6 +222,14 @@ async fn firehose_gzip_compresses_records_after_append_delimiter() {
             ExtendedS3DestinationConfiguration::builder()
                 .role_arn("arn:aws:iam::123456789012:role/firehose")
                 .bucket_arn(format!("arn:aws:s3:::{bucket}"))
+                // Zero interval: the batch is due at admission; the helper
+                // polls for the asynchronous write.
+                .buffering_hints(
+                    BufferingHints::builder()
+                        .size_in_mbs(5)
+                        .interval_in_seconds(0)
+                        .build(),
+                )
                 .compression_format(CompressionFormat::Gzip)
                 .processing_configuration(
                     ProcessingConfiguration::builder()
@@ -398,6 +428,12 @@ async fn gzip_restart(kms_encrypted: bool) {
                 ExtendedS3DestinationConfiguration::builder()
                     .role_arn("arn:aws:iam::123456789012:role/firehose")
                     .bucket_arn(format!("arn:aws:s3:::{bucket}"))
+                    .buffering_hints(
+                        BufferingHints::builder()
+                            .size_in_mbs(5)
+                            .interval_in_seconds(0)
+                            .build(),
+                    )
                     .prefix(prefix)
                     .compression_format(CompressionFormat::Gzip)
                     .build()
@@ -475,7 +511,9 @@ async fn gzip_restart(kms_encrypted: bool) {
             assert_eq!(head.ssekms_key_id(), Some(key.as_str()));
         }
     }
-    // Logs sends raw GZIP bytes; Firehose adds an independent outer GZIP layer.
+    // A Logs record is already a GZIP-compressed envelope, so a GZIP stream
+    // compresses it a second time, as on AWS. The Firehose layer must preserve
+    // that producer GZIP member verbatim inside its own.
     let event: serde_json::Value = serde_json::from_slice(&decode_gzip(&hook_before.2)).unwrap();
     assert_eq!(event["messageType"], "DATA_MESSAGE");
     assert_eq!(event["logGroup"], "gzip-source");

@@ -1,7 +1,9 @@
 //! SES event publishing through the official SDKs and the real Firehose -> S3 path.
-//! Uses upstream's immediate, uncompressed delivery; SES supplies NDJSON framing.
+//! Uses short-interval uncompressed delivery; SES supplies NDJSON framing.
 
-use aws_sdk_firehose::types::{CompressionFormat, ExtendedS3DestinationConfiguration};
+use aws_sdk_firehose::types::{
+    BufferingHints, CompressionFormat, ExtendedS3DestinationConfiguration,
+};
 use fakecloud_testkit::TestServer;
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -416,6 +418,12 @@ async fn event_stream(server: &TestServer, bucket: &str) -> String {
                 .bucket_arn(format!("arn:aws:s3:::{bucket}"))
                 .role_arn(ROLE)
                 .compression_format(CompressionFormat::Uncompressed)
+                .buffering_hints(
+                    BufferingHints::builder()
+                        .size_in_mbs(1)
+                        .interval_in_seconds(1)
+                        .build(),
+                )
                 .build()
                 .unwrap(),
         )
