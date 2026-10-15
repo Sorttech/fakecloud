@@ -4668,20 +4668,21 @@ pub(crate) fn check_object_lock_for_overwrite(
             if mode == "COMPLIANCE" {
                 return Some("AccessDenied");
             }
-            if mode == "GOVERNANCE" {
-                let bypass = req
-                    .headers
-                    .get("x-amz-bypass-governance-retention")
-                    .and_then(|v| v.to_str().ok())
-                    .map(|s| s.eq_ignore_ascii_case("true"))
-                    .unwrap_or(false);
-                if !bypass {
-                    return Some("AccessDenied");
-                }
+            if mode == "GOVERNANCE" && !governance_bypass_requested(req) {
+                return Some("AccessDenied");
             }
         }
     }
     None
+}
+
+/// Whether the request carries `x-amz-bypass-governance-retention: true`,
+/// which lets a caller override an unexpired GOVERNANCE retention.
+pub(crate) fn governance_bypass_requested(req: &AwsRequest) -> bool {
+    req.headers
+        .get("x-amz-bypass-governance-retention")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| s.eq_ignore_ascii_case("true"))
 }
 
 #[cfg(test)]
