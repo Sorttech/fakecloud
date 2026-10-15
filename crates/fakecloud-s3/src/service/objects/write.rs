@@ -455,11 +455,20 @@ impl S3Service {
                         extract_xml_value(config, "Years").and_then(|y| y.parse::<i64>().ok());
                     // The configuration is range-checked when stored; a value
                     // persisted before that check must still not overflow.
-                    let days = days.or_else(|| years.and_then(|y| y.checked_mul(365)));
-                    if let Some(until) = days
-                        .and_then(chrono::Duration::try_days)
-                        .and_then(|d| Utc::now().checked_add_signed(d))
-                    {
+                    // Years are calendar years (leap days included), not
+                    // multiples of 365 days.
+                    let now = Utc::now();
+                    let until = match (days, years) {
+                        (Some(d), _) => {
+                            chrono::Duration::try_days(d).and_then(|d| now.checked_add_signed(d))
+                        }
+                        (None, Some(y)) => y
+                            .checked_mul(12)
+                            .and_then(|m| u32::try_from(m).ok())
+                            .and_then(|m| now.checked_add_months(chrono::Months::new(m))),
+                        (None, None) => None,
+                    };
+                    if let Some(until) = until {
                         lock_mode = Some(mode);
                         lock_retain_until = Some(until);
                     }

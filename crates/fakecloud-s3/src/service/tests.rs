@@ -8199,6 +8199,41 @@ async fn object_lock_default_retention_is_range_checked_and_never_overflows() {
         .unwrap();
 }
 
+#[tokio::test]
+async fn object_lock_default_retention_years_are_calendar_years() {
+    let svc = make_service();
+    let mut req = make_request(Method::PUT, "/oly", &[], b"");
+    req.headers
+        .insert("x-amz-bucket-object-lock-enabled", "true".parse().unwrap());
+    svc.create_bucket("123456789012", &req, "oly").unwrap();
+    let put = make_request(
+        Method::PUT,
+        "/oly",
+        &[("object-lock", "")],
+        &lock_config("<Years>4</Years>"),
+    );
+    svc.put_object_lock_config("123456789012", &put, "oly")
+        .unwrap();
+
+    // Any four-year span contains a leap day, so 4 * 365 days falls a day
+    // short of four calendar years.
+    let four_years = chrono::Months::new(48);
+    let before = chrono::Utc::now().checked_add_months(four_years).unwrap();
+    let put_req = make_request(Method::PUT, "/oly/k", &[], b"hello");
+    svc.put_object("123456789012", &put_req, "oly", "k")
+        .await
+        .unwrap();
+    let after = chrono::Utc::now().checked_add_months(four_years).unwrap();
+
+    let until = svc.state.read().default_ref().buckets["oly"].objects["k"]
+        .lock_retain_until
+        .unwrap();
+    assert!(
+        before <= until && until <= after,
+        "retain-until {until} should be four calendar years out ({before}..={after})"
+    );
+}
+
 // ── SelectObjectContent compression ──────────────────────────────
 
 fn select_request_xml(compression: &str) -> String {
