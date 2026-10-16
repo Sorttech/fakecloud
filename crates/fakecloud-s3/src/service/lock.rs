@@ -5,6 +5,8 @@ use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use crate::persistence::object_meta_snapshot;
 
+use crate::state::ObjectLockSettings;
+
 use super::{
     empty_response, extract_xml_value, governance_bypass_requested, no_such_bucket, no_such_key,
     resolve_object, s3_xml, xml_escape, S3Service,
@@ -357,4 +359,152 @@ fn malformed_object_lock(field: &str, value: &str) -> AwsServiceError {
             ("ArgumentValue".to_string(), value.to_string()),
         ],
     )
+}
+
+/// The `x-amz-object-lock-*` request headers that set an object's lock.
+const LOCK_MODE_HEADER: &str = "x-amz-object-lock-mode";
+const LOCK_RETAIN_UNTIL_HEADER: &str = "x-amz-object-lock-retain-until-date";
+const LOCK_LEGAL_HOLD_HEADER: &str = "x-amz-object-lock-legal-hold";
+
+/// Whether the request carries any Object Lock parameter header.
+pub(super) fn has_object_lock_headers(headers: &http::HeaderMap) -> bool {
+    [
+        LOCK_MODE_HEADER,
+        LOCK_RETAIN_UNTIL_HEADER,
+        LOCK_LEGAL_HOLD_HEADER,
+    ]
+    .iter()
+    .any(|h| headers.contains_key(*h))
+}
+
+/// Whether the request carries a payload integrity check S3 accepts for a
+/// PutObject with Object Lock parameters: `Content-MD5`, an
+/// `x-amz-checksum-<algorithm>` value header, or a flexible checksum sent as a
+/// trailer (`x-amz-trailer` naming an `x-amz-checksum-*` header, or the SDK's
+/// `x-amz-sdk-checksum-algorithm`).
+pub(super) fn has_payload_integrity_header(headers: &http::HeaderMap) -> bool {
+    headers.contains_key("content-md5")
+        || headers.contains_key("x-amz-sdk-checksum-algorithm")
+        || headers.keys().any(|name| {
+            name.as_str().starts_with("x-amz-checksum-") && name != "x-amz-checksum-algorithm"
+        })
+        || headers
+            .get_all("x-amz-trailer")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .any(|t| t.trim().to_ascii_lowercase().starts_with("x-amz-checksum-"))
+}
+
+fn invalid_lock_argument(message: &str) -> AwsServiceError {
+    AwsServiceError::aws_error(StatusCode::BAD_REQUEST, "InvalidArgument", message)
+}
+
+/// Lock resolution for a new object version. PutObject, CopyObject and
+/// CompleteMultipartUpload (with the headers given to CreateMultipartUpload)
+/// resolve their lock this way: the explicit `x-amz-object-lock-*` request
+/// headers when present, otherwise the bucket's default retention. A copy
+/// never inherits the source object's lock. Objects written by other services
+/// through `delivery::put_object_via_store` do not go through this yet and get
+/// no default retention.
+impl ObjectLockSettings {
+    /// The explicit lock a write request asks for, validated as S3 does. Lock
+    /// headers are only accepted on a bucket with Object Lock configured; then
+    /// mode and retain-until date must come together, the mode must be
+    /// GOVERNANCE or COMPLIANCE, the date must be ISO 8601 and in the future,
+    /// and the legal hold must be ON or OFF.
+    pub(super) fn from_request(
+        headers: &http::HeaderMap,
+        bucket_lock_config: Option<&str>,
+    ) -> Result<Self, AwsServiceError> {
+        if has_object_lock_headers(headers) && bucket_lock_config.is_none() {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                "Bucket is missing ObjectLockConfiguration",
+            ));
+        }
+        // A value that is not visible ASCII cannot be a valid mode, date or
+        // status; keep it (lossily) so it fails the checks below rather than
+        // reading as absent.
+        let header = |name: &str| {
+            headers
+                .get(name)
+                .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+        };
+        let mode = header(LOCK_MODE_HEADER);
+        let retain_until = header(LOCK_RETAIN_UNTIL_HEADER);
+        let legal_hold = header(LOCK_LEGAL_HOLD_HEADER);
+
+        if mode.is_some() != retain_until.is_some() {
+            return Err(invalid_lock_argument(
+                "x-amz-object-lock-retain-until-date and x-amz-object-lock-mode must both be supplied",
+            ));
+        }
+        let retain_until = match retain_until {
+            Some(date) => Some(date.trim().parse::<DateTime<Utc>>().map_err(|_| {
+                invalid_lock_argument("The retain until date must be provided in ISO 8601 format")
+            })?),
+            None => None,
+        };
+        if let Some(mode) = &mode {
+            if mode != "GOVERNANCE" && mode != "COMPLIANCE" {
+                return Err(invalid_lock_argument("Unknown wormMode directive."));
+            }
+        }
+        if retain_until.is_some_and(|until| until <= Utc::now()) {
+            return Err(invalid_lock_argument(
+                "The retain until date must be in the future!",
+            ));
+        }
+        if let Some(status) = &legal_hold {
+            if status != "ON" && status != "OFF" {
+                return Err(invalid_lock_argument(
+                    "Legal Hold must be either of 'ON' or 'OFF'",
+                ));
+            }
+        }
+        Ok(Self {
+            mode,
+            retain_until,
+            legal_hold,
+        })
+    }
+
+    /// These settings, falling back to the bucket's default retention when no
+    /// retention was asked for explicitly. The default is measured from `now`,
+    /// the moment the version is created.
+    pub(super) fn or_bucket_default(
+        mut self,
+        bucket_lock_config: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Self {
+        if self.mode.is_some() || self.retain_until.is_some() {
+            return self;
+        }
+        let Some(config) = bucket_lock_config else {
+            return self;
+        };
+        let Some(mode) = extract_xml_value(config, "Mode") else {
+            return self;
+        };
+        let days = extract_xml_value(config, "Days").and_then(|d| d.trim().parse::<i64>().ok());
+        let years = extract_xml_value(config, "Years").and_then(|y| y.trim().parse::<i64>().ok());
+        // The configuration is range-checked when stored; a value persisted
+        // before that check must still not overflow. Years are calendar years
+        // (leap days included), not multiples of 365 days.
+        let until = match (days, years) {
+            (Some(d), _) => chrono::Duration::try_days(d).and_then(|d| now.checked_add_signed(d)),
+            (None, Some(y)) => y
+                .checked_mul(12)
+                .and_then(|m| u32::try_from(m).ok())
+                .and_then(|m| now.checked_add_months(chrono::Months::new(m))),
+            (None, None) => None,
+        };
+        if let Some(until) = until {
+            self.mode = Some(mode);
+            self.retain_until = Some(until);
+        }
+        self
+    }
 }

@@ -2514,6 +2514,252 @@ async fn s3_put_object_retention_cannot_weaken_active_lock() {
     assert_eq!(retained_until("comp.txt").await, year(2100).secs());
 }
 
+/// Every new object version in a bucket with a default retention is locked,
+/// whichever operation creates it: CopyObject and CompleteMultipartUpload
+/// apply the bucket default (or their explicit lock headers) just like
+/// PutObject, so the version cannot be deleted without a governance bypass.
+#[tokio::test]
+async fn s3_object_lock_applies_to_copied_and_multipart_objects() {
+    use aws_sdk_s3::primitives::DateTime;
+    use aws_sdk_s3::types::{
+        CompletedMultipartUpload, CompletedPart, DefaultRetention, ObjectLockConfiguration,
+        ObjectLockEnabled, ObjectLockLegalHoldStatus, ObjectLockMode, ObjectLockRetentionMode,
+        ObjectLockRule,
+    };
+
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+    let bucket = "lock-default-copy-mpu";
+    s3.create_bucket()
+        .bucket(bucket)
+        .object_lock_enabled_for_bucket(true)
+        .send()
+        .await
+        .unwrap();
+    s3.put_object_lock_configuration()
+        .bucket(bucket)
+        .object_lock_configuration(
+            ObjectLockConfiguration::builder()
+                .object_lock_enabled(ObjectLockEnabled::Enabled)
+                .rule(
+                    ObjectLockRule::builder()
+                        .default_retention(
+                            DefaultRetention::builder()
+                                .mode(ObjectLockRetentionMode::Governance)
+                                .days(1)
+                                .build(),
+                        )
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    // The copy source lives in a plain bucket and carries no lock of its own.
+    s3.create_bucket()
+        .bucket("lock-copy-src")
+        .send()
+        .await
+        .unwrap();
+    s3.put_object()
+        .bucket("lock-copy-src")
+        .key("src.txt")
+        .body(ByteStream::from_static(b"source"))
+        .send()
+        .await
+        .unwrap();
+
+    let copied = s3
+        .copy_object()
+        .bucket(bucket)
+        .key("copied.txt")
+        .copy_source("lock-copy-src/src.txt")
+        .send()
+        .await
+        .unwrap();
+    let copied_version = copied.version_id().unwrap().to_string();
+
+    let upload = s3
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key("multipart.bin")
+        .send()
+        .await
+        .unwrap();
+    let upload_id = upload.upload_id().unwrap();
+    let part = s3
+        .upload_part()
+        .bucket(bucket)
+        .key("multipart.bin")
+        .upload_id(upload_id)
+        .part_number(1)
+        .body(ByteStream::from_static(b"multipart body"))
+        .send()
+        .await
+        .unwrap();
+    let completed = s3
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key("multipart.bin")
+        .upload_id(upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .parts(
+                    CompletedPart::builder()
+                        .part_number(1)
+                        .e_tag(part.e_tag().unwrap())
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let multipart_version = completed.version_id().unwrap().to_string();
+
+    let now = chrono::Utc::now().timestamp();
+    for (key, version) in [
+        ("copied.txt", &copied_version),
+        ("multipart.bin", &multipart_version),
+    ] {
+        let retention = s3
+            .get_object_retention()
+            .bucket(bucket)
+            .key(key)
+            .version_id(version)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("{key} has no retention: {e:?}"));
+        let retention = retention.retention().expect("retention present");
+        assert_eq!(
+            retention.mode(),
+            Some(&ObjectLockRetentionMode::Governance),
+            "{key}"
+        );
+        let until = retention.retain_until_date().unwrap().secs();
+        assert!(
+            (now + 86_400 - 120..=now + 86_400 + 120).contains(&until),
+            "{key}: retain-until {until} is not one day out from {now}"
+        );
+
+        let err = s3
+            .delete_object()
+            .bucket(bucket)
+            .key(key)
+            .version_id(version)
+            .send()
+            .await
+            .expect_err("deleting a retained version must be refused");
+        assert_eq!(
+            aws_sdk_s3::error::ProvideErrorMetadata::code(&err),
+            Some("AccessDenied"),
+            "{key}: {err:?}"
+        );
+        s3.delete_object()
+            .bucket(bucket)
+            .key(key)
+            .version_id(version)
+            .bypass_governance_retention(true)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("{key}: governance bypass delete failed: {e:?}"));
+    }
+
+    // Explicit lock headers on CopyObject and CreateMultipartUpload win over
+    // the bucket default.
+    let until = DateTime::from_secs(4_070_908_800); // 2099-01-01T00:00:00Z
+    let copied = s3
+        .copy_object()
+        .bucket(bucket)
+        .key("copied-explicit.txt")
+        .copy_source("lock-copy-src/src.txt")
+        .object_lock_mode(ObjectLockMode::Compliance)
+        .object_lock_retain_until_date(until)
+        .object_lock_legal_hold_status(ObjectLockLegalHoldStatus::On)
+        .send()
+        .await
+        .unwrap();
+    let upload = s3
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key("multipart-explicit.bin")
+        .object_lock_mode(ObjectLockMode::Compliance)
+        .object_lock_retain_until_date(until)
+        .object_lock_legal_hold_status(ObjectLockLegalHoldStatus::On)
+        .send()
+        .await
+        .unwrap();
+    let upload_id = upload.upload_id().unwrap();
+    let part = s3
+        .upload_part()
+        .bucket(bucket)
+        .key("multipart-explicit.bin")
+        .upload_id(upload_id)
+        .part_number(1)
+        .body(ByteStream::from_static(b"explicit"))
+        .send()
+        .await
+        .unwrap();
+    let completed = s3
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key("multipart-explicit.bin")
+        .upload_id(upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .parts(
+                    CompletedPart::builder()
+                        .part_number(1)
+                        .e_tag(part.e_tag().unwrap())
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    for (key, version) in [
+        ("copied-explicit.txt", copied.version_id().unwrap()),
+        ("multipart-explicit.bin", completed.version_id().unwrap()),
+    ] {
+        let head = s3
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .version_id(version)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            head.object_lock_mode(),
+            Some(&ObjectLockMode::Compliance),
+            "{key}"
+        );
+        assert_eq!(
+            head.object_lock_retain_until_date().map(|d| d.secs()),
+            Some(until.secs()),
+            "{key}"
+        );
+        assert_eq!(
+            head.object_lock_legal_hold_status(),
+            Some(&ObjectLockLegalHoldStatus::On),
+            "{key}"
+        );
+        // COMPLIANCE (and the legal hold) hold even against a governance
+        // bypass.
+        s3.delete_object()
+            .bucket(bucket)
+            .key(key)
+            .version_id(version)
+            .bypass_governance_retention(true)
+            .send()
+            .await
+            .expect_err("COMPLIANCE-locked version must not be deletable");
+    }
+}
+
 // ---- S3 Multipart Upload Tests ----
 
 #[tokio::test]
