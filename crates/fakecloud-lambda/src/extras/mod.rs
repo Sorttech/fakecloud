@@ -301,8 +301,26 @@ pub(crate) fn layer_name_label(req: &AwsRequest) -> Result<String, AwsServiceErr
         .get(2)
         .map(String::as_str)
         .unwrap_or_default();
-    validate_layer_name(raw)?;
+    if !is_own_layer_arn(raw, &req.region, &req.account_id) {
+        validate_layer_name(raw)?;
+    }
     Ok(raw.to_string())
+}
+
+/// A layer ARN fakecloud itself mints for the request's own region and
+/// account. Those are the server's `--region` / `--account-id`, which need
+/// not match AWS's region or 12-digit account shape (`--region local`), yet
+/// such an ARN must still address the layer it names.
+fn is_own_layer_arn(raw: &str, region: &str, account_id: &str) -> bool {
+    let parts: Vec<&str> = raw.split(':').collect();
+    matches!(
+        parts.as_slice(),
+        ["arn", partition, "lambda", r, a, "layer", name]
+            if partition.starts_with("aws")
+                && *r == region
+                && *a == account_id
+                && is_bare_layer_name(name)
+    ) && raw.chars().count() <= LAYER_NAME_MAX_LEN
 }
 
 /// AWS layer-version ARN: `arn:aws:lambda:<region>:<account>:layer:<name>:<version>`.
@@ -1338,6 +1356,32 @@ mod tests {
             assert!(validate_layer_name(ok).is_ok(), "{ok}");
         }
         assert!(validate_layer_name(&"a".repeat(140)).is_ok());
+    }
+
+    #[test]
+    fn own_layer_arns_pass_under_a_non_aws_region_or_account() {
+        use super::is_own_layer_arn;
+        assert!(is_own_layer_arn(
+            "arn:aws:lambda:local:000000000000:layer:x",
+            "local",
+            "000000000000"
+        ));
+        assert!(is_own_layer_arn(
+            "arn:aws:lambda:local:42:layer:x",
+            "local",
+            "42"
+        ));
+        // Only the server's own region and account get the exemption.
+        assert!(!is_own_layer_arn(
+            "arn:aws:lambda:local:000000000000:layer:x",
+            "us-east-1",
+            "000000000000"
+        ));
+        assert!(!is_own_layer_arn(
+            "arn:aws:lambda:local:000000000000:layer:bad!name",
+            "local",
+            "000000000000"
+        ));
     }
 
     #[test]
