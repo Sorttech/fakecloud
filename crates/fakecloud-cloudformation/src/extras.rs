@@ -1665,8 +1665,8 @@ impl CloudFormationService {
                 // Runs after the outputs are written, so a failing custom
                 // resource clears them rather than racing the write.
                 if settle_deferred {
-                    tokio::spawn(crate::service::settle_changeset_custom_resources(
-                        crate::service::ChangeSetSettleContext {
+                    tokio::spawn(crate::service::settle_custom_resources(
+                        crate::service::CustomResourceSettleContext {
                             state: self.state.clone(),
                             snapshot_store: self.snapshot_store.clone(),
                             snapshot_lock: self.snapshot_lock.clone(),
@@ -1677,7 +1677,8 @@ impl CloudFormationService {
                             region: region.clone(),
                             stack_id: sid.clone(),
                             stack_name: stack_name_owned.clone(),
-                            change_set_id: cs_id.clone(),
+                            change_set_id: Some(cs_id.clone()),
+                            notification_arns: Vec::new(),
                             in_progress,
                             complete,
                             failed,
