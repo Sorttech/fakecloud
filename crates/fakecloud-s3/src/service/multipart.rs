@@ -6,6 +6,7 @@ use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use fakecloud_persistence::{BodyRef, BodySource};
 
+use crate::checksum::{ChecksumAlgorithm, ChecksumType};
 use crate::persistence::{mpu_init_snapshot, object_meta_snapshot};
 use crate::state::{MultipartUpload, S3Object, UploadPart};
 
@@ -61,6 +62,263 @@ fn completion_xml_response(
     }
 }
 
+use crate::checksum::invalid_request;
+
+fn invalid_part() -> AwsServiceError {
+    AwsServiceError::aws_error(
+        StatusCode::BAD_REQUEST,
+        "InvalidPart",
+        "One or more of the specified parts could not be found. The part may not have been uploaded, or the specified entity tag may not have matched the part's entity tag.",
+    )
+}
+
+/// A part (or completion) checksum in a different algorithm than the
+/// upload was created with.
+fn checksum_type_mismatch(
+    expected: ChecksumAlgorithm,
+    actual: ChecksumAlgorithm,
+) -> AwsServiceError {
+    invalid_request(format!(
+        "Checksum Type mismatch occurred, expected checksum Type: {}, actual checksum Type: {}",
+        expected.lowercase_name(),
+        actual.lowercase_name()
+    ))
+}
+
+/// The checksum algorithm and type CreateMultipartUpload records: the
+/// `x-amz-checksum-algorithm` (the SDK's `x-amz-sdk-checksum-algorithm` is
+/// accepted as a fallback) and `x-amz-checksum-type`, which defaults per
+/// algorithm and must be a type the algorithm supports.
+fn multipart_checksum_settings(
+    headers: &HeaderMap,
+) -> Result<(Option<ChecksumAlgorithm>, Option<ChecksumType>), AwsServiceError> {
+    let algorithm =
+        match crate::checksum::parse_algorithm_header(headers, "x-amz-checksum-algorithm")? {
+            Some(a) => Some(a),
+            None => {
+                crate::checksum::parse_algorithm_header(headers, "x-amz-sdk-checksum-algorithm")?
+            }
+        };
+    let requested = crate::checksum::parse_type_header(headers)?;
+    match (algorithm, requested) {
+        (None, None) => Ok((None, None)),
+        (None, Some(_)) => Err(invalid_request(
+            "The x-amz-checksum-type header can only be used with the x-amz-checksum-algorithm \
+             header.",
+        )),
+        (Some(a), Some(t)) if !a.supports(t) => Err(invalid_request(format!(
+            "The {t} checksum type cannot be used with the {} checksum algorithm.",
+            a.lowercase_name()
+        ))),
+        (Some(a), t) => Ok((
+            Some(a),
+            Some(t.unwrap_or_else(|| a.default_multipart_type())),
+        )),
+    }
+}
+
+/// `<ChecksumX>..</ChecksumX><ChecksumType>..</ChecksumType>` for an object's
+/// stored checksum, or nothing.
+fn object_checksum_xml(obj: &S3Object) -> String {
+    match (
+        obj.checksum_algorithm,
+        obj.checksum_value.as_deref(),
+        obj.effective_checksum_type(),
+    ) {
+        (Some(a), Some(v), Some(t)) => format!(
+            "{}<ChecksumType>{t}</ChecksumType>",
+            crate::checksum::xml_element(a, v)
+        ),
+        _ => String::new(),
+    }
+}
+
+fn object_size_of(part_sizes: &[(u32, u64)]) -> u64 {
+    part_sizes.iter().map(|(_, size)| size).sum()
+}
+
+/// How CompleteMultipartUpload checksums the object it assembles, and what
+/// the request asserted about it.
+struct CompletionChecksums {
+    algorithm: ChecksumAlgorithm,
+    checksum_type: ChecksumType,
+    /// Whether per-part checksums are kept (the upload named an algorithm).
+    /// An upload created without one gets S3's default full-object CRC64NVME
+    /// checksum and no part-level checksums.
+    track_parts: bool,
+    /// The whole-object checksum the request asserted, when it is one S3
+    /// validates.
+    supplied: Option<crate::checksum::SuppliedChecksum>,
+    mp_object_size: Option<u64>,
+}
+
+impl CompletionChecksums {
+    fn resolve(
+        headers: &HeaderMap,
+        upload: &MultipartUpload,
+        parts: &[super::CompletedPartXml],
+    ) -> Result<Self, AwsServiceError> {
+        let (algorithm, checksum_type, track_parts) = match upload.checksum_algorithm {
+            Some(a) => (
+                a,
+                upload
+                    .checksum_type
+                    .unwrap_or_else(|| a.default_multipart_type()),
+                true,
+            ),
+            None => (
+                crate::checksum::DEFAULT_ALGORITHM,
+                ChecksumType::FullObject,
+                false,
+            ),
+        };
+
+        if let Some(requested) = crate::checksum::parse_type_header(headers)? {
+            if !track_parts {
+                return Err(invalid_request(
+                    "The x-amz-checksum-type header can only be used with the \
+                     x-amz-checksum-algorithm header.",
+                ));
+            }
+            if requested != checksum_type {
+                return Err(invalid_request(format!(
+                    "The upload was created using the {checksum_type} checksum mode. The \
+                     complete request must use the same checksum mode."
+                )));
+            }
+        }
+
+        // The whole-object checksum header; a COMPOSITE value carries a
+        // `-<part count>` suffix, so the completion form of the parser.
+        let asserted = crate::checksum::ChecksumHeaders::parse_completion(headers)?.value;
+        let supplied = match (asserted, upload.checksum_algorithm) {
+            (None, _) => None,
+            (Some(s), Some(expected)) if s.algorithm != expected => {
+                return Err(checksum_type_mismatch(expected, s.algorithm));
+            }
+            (Some(s), Some(_)) => Some(s),
+            // No algorithm at CreateMultipartUpload: the default CRC64NVME
+            // checksum is still computed, so a CRC64NVME value is validated.
+            (Some(s), None) if s.algorithm == crate::checksum::DEFAULT_ALGORITHM => Some(s),
+            // The original algorithms are accepted but neither validated nor
+            // stored (S3 user guide, "Using full object checksums for
+            // multipart upload").
+            (
+                Some(crate::checksum::SuppliedChecksum {
+                    algorithm:
+                        ChecksumAlgorithm::Crc32
+                        | ChecksumAlgorithm::Crc32c
+                        | ChecksumAlgorithm::Sha1
+                        | ChecksumAlgorithm::Sha256,
+                    ..
+                }),
+                None,
+            ) => None,
+            // The newer algorithms must be named at CreateMultipartUpload.
+            (Some(s), None) => {
+                return Err(invalid_request(format!(
+                    "The upload was not created with a {} checksum. Specify the checksum \
+                     algorithm in CreateMultipartUpload to provide a {} checksum in \
+                     CompleteMultipartUpload.",
+                    s.algorithm.lowercase_name(),
+                    s.algorithm.lowercase_name()
+                )));
+            }
+        };
+
+        for submitted in parts {
+            let stored = upload
+                .parts
+                .get(&submitted.part_number)
+                .and_then(|p| p.checksum.as_ref());
+            for (a, value) in &submitted.checksums {
+                // A part checksum in another algorithm than the upload's is
+                // the same type mismatch UploadPart rejects.
+                if track_parts && *a != algorithm {
+                    return Err(checksum_type_mismatch(algorithm, *a));
+                }
+                // Otherwise it has to be the checksum the part was stored
+                // with; a part stored without one (or with another
+                // algorithm's) cannot match.
+                match stored {
+                    Some((stored_algo, stored_value))
+                        if stored_algo == a && stored_value == value => {}
+                    _ => return Err(invalid_part()),
+                }
+            }
+            if track_parts
+                && checksum_type == ChecksumType::Composite
+                && !submitted.checksums.iter().any(|(a, _)| *a == algorithm)
+            {
+                return Err(invalid_request(format!(
+                    "The upload was created using a {} checksum. The complete request must \
+                     include the checksum for each part. It was missing for part {} in the \
+                     request.",
+                    algorithm.lowercase_name(),
+                    submitted.part_number
+                )));
+            }
+        }
+
+        let mp_object_size = match headers.get("x-amz-mp-object-size") {
+            None => None,
+            Some(v) => Some(
+                v.to_str()
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .ok_or_else(|| {
+                        invalid_request("Value for x-amz-mp-object-size header is invalid.")
+                    })?,
+            ),
+        };
+
+        Ok(Self {
+            algorithm,
+            checksum_type,
+            track_parts,
+            supplied,
+            mp_object_size,
+        })
+    }
+
+    /// Check the assembled object against the request's assertions. A
+    /// FULL_OBJECT value is a bare digest; a COMPOSITE value must carry
+    /// `-<part count>` matching the parts completed.
+    fn verify_object(
+        &self,
+        computed: &str,
+        size: u64,
+        part_count: usize,
+    ) -> Result<(), AwsServiceError> {
+        if let Some(expected) = self.mp_object_size {
+            if expected != size {
+                return Err(invalid_request(format!(
+                    "The provided 'x-amz-mp-object-size' header value {expected} does not match \
+                     what was computed: {size}"
+                )));
+            }
+        }
+        if let Some(s) = &self.supplied {
+            let (want, want_count) = crate::checksum::split_composite(&s.value);
+            let shape_ok = match (self.checksum_type, want_count) {
+                (ChecksumType::FullObject, None) => true,
+                (ChecksumType::Composite, Some(n)) => n.parse::<usize>().ok() == Some(part_count),
+                _ => false,
+            };
+            if !shape_ok {
+                return Err(invalid_request(format!(
+                    "Value for {} header is invalid.",
+                    s.algorithm.header_name()
+                )));
+            }
+            if want != crate::checksum::split_composite(computed).0 {
+                return Err(crate::checksum::bad_digest(s.algorithm));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl S3Service {
     pub(super) fn create_multipart_upload(
         &self,
@@ -110,12 +368,9 @@ impl S3Service {
             .map(|s| s.to_string());
         let write_acl = self.resolve_write_acl_headers(account_id, bucket, &req.headers)?;
 
-        let checksum_algorithm = req
-            .headers
-            .get("x-amz-checksum-algorithm")
-            .or_else(|| req.headers.get("x-amz-sdk-checksum-algorithm"))
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_uppercase());
+        // Validated now but reported after the bucket lookup, so a request to
+        // a missing bucket still answers NoSuchBucket.
+        let checksum_settings = multipart_checksum_settings(&req.headers);
 
         let mut accts = self.state.write();
         let state = accts.get_or_create(account_id);
@@ -123,6 +378,7 @@ impl S3Service {
             .buckets
             .get_mut(bucket)
             .ok_or_else(|| no_such_bucket(bucket))?;
+        let (checksum_algorithm, checksum_type) = checksum_settings?;
 
         // Explicit lock headers are validated now, like PutObject does, and
         // kept on the upload; the bucket default retention is applied when
@@ -146,6 +402,7 @@ impl S3Service {
             tagging,
             acl_grants,
             checksum_algorithm,
+            checksum_type,
             cache_control,
             content_disposition,
             content_language,
@@ -171,6 +428,16 @@ impl S3Service {
             if let Ok(val) = kid.parse() {
                 headers.insert("x-amz-server-side-encryption-aws-kms-key-id", val);
             }
+        }
+        if let (Some(algo), Some(checksum_type)) = (checksum_algorithm, checksum_type) {
+            headers.insert(
+                "x-amz-checksum-algorithm",
+                http::HeaderValue::from_static(algo.as_str()),
+            );
+            headers.insert(
+                "x-amz-checksum-type",
+                http::HeaderValue::from_static(checksum_type.as_str()),
+            );
         }
 
         let body = format!(
@@ -220,7 +487,7 @@ impl S3Service {
         // Pre-validate the bucket/upload/key under a short read guard
         // so a bogus request doesn't cause us to spool the whole body
         // to disk before returning the error.
-        {
+        let upload_algorithm = {
             let accts = self.state.read();
             let __empty = crate::state::S3State::new(account_id, "us-east-1");
             let state = accts.get(account_id).unwrap_or(&__empty);
@@ -235,7 +502,19 @@ impl S3Service {
             if upload.key != key {
                 return Err(no_such_upload(upload_id));
             }
+            upload.checksum_algorithm
+        };
+
+        // The part's checksum is in the upload's algorithm. A request
+        // asserting a different one is rejected before the body is read; an
+        // upload created without one keeps whatever the part asserts.
+        let checks = crate::checksum::ChecksumHeaders::parse(&req.headers)?;
+        if let (Some(expected), Some(actual)) = (upload_algorithm, checks.algorithm()) {
+            if expected != actual {
+                return Err(checksum_type_mismatch(expected, actual));
+            }
         }
+        let part_algorithm = upload_algorithm.or(checks.algorithm());
 
         // UploadPart is streaming-only: spool chunks to a tempfile
         // while computing MD5 + size in constant memory, then hand
@@ -247,12 +526,18 @@ impl S3Service {
                 "UploadPart requires a streaming request body",
             )
         })?;
-        let spooled = fakecloud_core::service::spool_request_stream(
+        // Verifies Content-MD5, the x-amz-checksum-* value or trailing
+        // checksum, and x-amz-content-sha256 against the part's bytes,
+        // computing the part checksum in the same pass.
+        let crate::checksum::VerifiedSpool { spooled, digests } = crate::checksum::spool_verified(
+            &req.headers,
             stream,
             self.store.spool_dir().as_deref(),
-            fakecloud_core::service::is_aws_chunked(&req.headers),
+            &checks,
+            part_algorithm,
         )
         .await?;
+        let part_checksum = part_algorithm.and_then(|a| digests.encoded(a).map(|value| (a, value)));
         let part_size = spooled.size;
         let etag = spooled.md5_hex.clone();
         let body_source = BodySource::File(spooled.path);
@@ -277,7 +562,19 @@ impl S3Service {
         // hyper frame buffer), `Memory` for memory-mode.
         let body_ref = self
             .store
-            .mpu_put_part(bucket, upload_id, pn, body_source, &etag)
+            .mpu_put_part(
+                bucket,
+                upload_id,
+                pn,
+                body_source,
+                &etag,
+                part_checksum
+                    .as_ref()
+                    .map(|(a, v)| fakecloud_persistence::PartChecksum {
+                        algorithm: a.as_str(),
+                        value: v,
+                    }),
+            )
             .map_err(super::persistence_error)?;
         let part = UploadPart {
             part_number: pn,
@@ -285,11 +582,15 @@ impl S3Service {
             etag: etag.clone(),
             size: part_size,
             last_modified: Utc::now(),
+            checksum: part_checksum.clone(),
         };
         upload.parts.insert(pn, part);
 
         let mut headers = HeaderMap::new();
         headers.insert("etag", format!("\"{etag}\"").parse().unwrap());
+        if let Some((algo, value)) = &part_checksum {
+            crate::checksum::insert_response_headers(&mut headers, *algo, value, None);
+        }
         if let Some(algo) = &upload.sse_algorithm {
             headers.insert("x-amz-server-side-encryption", algo.parse().unwrap());
         }
@@ -427,12 +728,16 @@ impl S3Service {
                 .buckets
                 .get(bucket)
                 .ok_or_else(|| no_such_bucket(bucket))?;
-            match b.multipart_uploads.get(upload_id) {
-                Some(upload) if upload.key == key => {}
+            let upload_algorithm = match b.multipart_uploads.get(upload_id) {
+                Some(upload) if upload.key == key => upload.checksum_algorithm,
                 _ => return Err(no_such_upload(upload_id)),
-            }
-            crate::body_io::ObjectBodyHandle::open(&src_obj.body).map_err(super::io_to_aws)?
+            };
+            (
+                crate::body_io::ObjectBodyHandle::open(&src_obj.body).map_err(super::io_to_aws)?,
+                upload_algorithm,
+            )
         };
+        let (src_handle, upload_algorithm) = src_handle;
 
         // Phase 2 (no lock): resolve x-amz-copy-source-range against the
         // source size and read only that range, then stage the part next to
@@ -476,6 +781,9 @@ impl S3Service {
 
         let data_len = src_data.len() as u64;
         let etag = compute_md5(&src_data);
+        // A copied part carries the upload's checksum, computed over the bytes
+        // copied (CopyPartResult returns it).
+        let part_checksum = upload_algorithm.map(|a| (a, crate::checksum::checksum(a, &src_data)));
         let mut staged = super::run_blocking_io(|| {
             crate::body_io::SpooledBody::spool(Some(&*self.store), src_data)
         })
@@ -508,6 +816,12 @@ impl S3Service {
                 part_number as u32,
                 staged.source(),
                 &etag,
+                part_checksum
+                    .as_ref()
+                    .map(|(a, v)| fakecloud_persistence::PartChecksum {
+                        algorithm: a.as_str(),
+                        value: v,
+                    }),
             )
             .map_err(super::persistence_error)?;
         let part = UploadPart {
@@ -516,14 +830,20 @@ impl S3Service {
             etag: etag.clone(),
             size: data_len,
             last_modified: Utc::now(),
+            checksum: part_checksum.clone(),
         };
         upload.parts.insert(part_number as u32, part);
 
+        let checksum_xml = part_checksum
+            .as_ref()
+            .map(|(a, v)| crate::checksum::xml_element(*a, v))
+            .unwrap_or_default();
         let body = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
              <CopyPartResult>\
              <ETag>&quot;{etag}&quot;</ETag>\
              <LastModified>{}</LastModified>\
+             {checksum_xml}\
              </CopyPartResult>",
             Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ"),
         );
@@ -585,7 +905,11 @@ impl S3Service {
                     // exists. IfNoneMatch does NOT apply to re-completions.
                     if let Some(obj) = b.objects.get(key) {
                         return Ok(completion_xml_response(
-                            bucket, &b.region, key, &obj.etag, "",
+                            bucket,
+                            &b.region,
+                            key,
+                            &obj.etag,
+                            &object_checksum_xml(obj),
                         ));
                     }
                     return Err(no_such_upload(upload_id));
@@ -616,7 +940,7 @@ impl S3Service {
 
         // Validate parts are in ascending order
         for window in submitted_parts.windows(2) {
-            if window[0].0 >= window[1].0 {
+            if window[0].part_number >= window[1].part_number {
                 return Err(AwsServiceError::aws_error(
                     StatusCode::BAD_REQUEST,
                     "InvalidPartOrder",
@@ -628,8 +952,8 @@ impl S3Service {
         let sorted_parts = submitted_parts;
 
         // Validate all specified parts exist in the upload
-        for (part_num, _) in &sorted_parts {
-            if !upload.parts.contains_key(part_num) {
+        for part in &sorted_parts {
+            if !upload.parts.contains_key(&part.part_number) {
                 return Err(AwsServiceError::aws_error(
                     StatusCode::BAD_REQUEST,
                     "InvalidPart",
@@ -641,11 +965,11 @@ impl S3Service {
         // Validate minimum part size: all non-last parts must be >= 5MB
         const MIN_PART_SIZE: usize = 5 * 1024 * 1024; // 5MB
         if sorted_parts.len() > 1 {
-            for (i, (part_num, _)) in sorted_parts.iter().enumerate() {
+            for (i, submitted) in sorted_parts.iter().enumerate() {
                 if i >= sorted_parts.len() - 1 {
                     break; // skip last part
                 }
-                if let Some(part) = upload.parts.get(part_num) {
+                if let Some(part) = upload.parts.get(&submitted.part_number) {
                     if part.size < MIN_PART_SIZE as u64 {
                         return Err(AwsServiceError::aws_error(
                             StatusCode::BAD_REQUEST,
@@ -656,6 +980,33 @@ impl S3Service {
                 }
             }
         }
+
+        // Every listed ETag must name the stored part before any checksum
+        // assertion is judged: an unknown part is InvalidPart first.
+        for submitted in &sorted_parts {
+            if upload
+                .parts
+                .get(&submitted.part_number)
+                .is_none_or(|p| p.etag != submitted.etag)
+            {
+                return Err(invalid_part());
+            }
+        }
+
+        let checksum_plan = CompletionChecksums::resolve(&req.headers, &upload, &sorted_parts)?;
+        // A FULL_OBJECT CRC is combined from the part CRCs verified at
+        // UploadPart (as aws-checksums' crc combine does) when every part has
+        // one; otherwise, and for the CRC64NVME default of an upload without an
+        // algorithm, it is folded over the bytes as they are read.
+        let combine_parts = checksum_plan.checksum_type == ChecksumType::FullObject
+            && crate::checksum::crc_combine(checksum_plan.algorithm, 0, 0, 0).is_some()
+            && sorted_parts.iter().all(|submitted| {
+                upload
+                    .parts
+                    .get(&submitted.part_number)
+                    .and_then(|p| p.checksum.as_ref())
+                    .is_some_and(|(a, _)| *a == checksum_plan.algorithm)
+            });
 
         // Assemble the object from its parts OFF-LOCK. Bodies are read via the
         // state-free `read_body_uncached`, so no S3 lock is held during the
@@ -668,18 +1019,25 @@ impl S3Service {
         // stalling them (and risking the client timeout) — the same helper
         // GetObject uses (bug-hunt 2026-07-19). Behavior/response are
         // unchanged; only where the CPU/IO runs differs.
-        let checksum_algorithm = upload.checksum_algorithm.clone();
-        let (combined_data, md5_digests, part_sizes, part_checksum_digests) =
+        let checksum_algorithm = checksum_plan.algorithm;
+        let checksum_type = checksum_plan.checksum_type;
+        let (combined_data, md5_digests, part_sizes, part_checksums, full_digest) =
             super::objects::run_blocking_io(|| {
                 let mut combined_data = Vec::new();
                 let mut md5_digests = Vec::new();
                 let mut part_sizes = Vec::new();
-                // Per-part raw additional-checksum digests, collected in
-                // part-number order so we can build the COMPOSITE checksum
-                // (hash-of-part-hashes) AWS returns for multipart objects.
-                let mut part_checksum_digests: Vec<Vec<u8>> = Vec::new();
+                // Per-part checksums in part-number order: the COMPOSITE
+                // checksum hashes their raw digests, and they are kept on the
+                // object for GetObjectAttributes / part-level GetObject.
+                let mut part_checksums: Vec<(u32, Vec<u8>)> = Vec::new();
+                // Otherwise a FULL_OBJECT checksum is folded over the parts as
+                // they are read, so the assembled object is not hashed in a
+                // second pass.
+                let mut full_hasher = (checksum_type == ChecksumType::FullObject && !combine_parts)
+                    .then(|| crate::checksum::Hasher::new(checksum_algorithm));
 
-                for (part_num, submitted_etag) in &sorted_parts {
+                for submitted in &sorted_parts {
+                    let part_num = &submitted.part_number;
                     let part = upload.parts.get(part_num).ok_or_else(|| {
                         AwsServiceError::aws_error(
                             StatusCode::BAD_REQUEST,
@@ -687,12 +1045,8 @@ impl S3Service {
                             "One or more of the specified parts could not be found.",
                         )
                     })?;
-                    if submitted_etag != &part.etag {
-                        return Err(AwsServiceError::aws_error(
-                            StatusCode::BAD_REQUEST,
-                            "InvalidPart",
-                            "One or more of the specified parts could not be found. The part may not have been uploaded, or the specified entity tag may not have matched the part's entity tag.",
-                        ));
+                    if submitted.etag != part.etag {
+                        return Err(invalid_part());
                     }
                     let part_bytes = crate::state::S3State::read_body_uncached(&part.body)
                         .map_err(super::io_to_aws)?;
@@ -715,8 +1069,22 @@ impl S3Service {
                             "One or more of the specified parts could not be found. The part may not have been uploaded, or the specified entity tag may not have matched the part's etag.",
                         ));
                     }
-                    if let Some(algo) = checksum_algorithm.as_deref() {
-                        part_checksum_digests.push(super::compute_checksum_raw(algo, &part_bytes));
+                    if checksum_plan.track_parts || combine_parts {
+                        // The checksum verified at UploadPart, else (a part
+                        // persisted before part checksums were kept) one
+                        // computed over the part now.
+                        let stored = part
+                            .checksum
+                            .as_ref()
+                            .filter(|(a, _)| *a == checksum_algorithm)
+                            .and_then(|(a, v)| crate::checksum::decode(*a, v));
+                        let raw = stored.unwrap_or_else(|| {
+                            crate::checksum::digest(checksum_algorithm, &part_bytes)
+                        });
+                        part_checksums.push((*part_num, raw));
+                    }
+                    if let Some(h) = full_hasher.as_mut() {
+                        h.update(&part_bytes);
                     }
                     combined_data.extend_from_slice(&part_bytes);
                     md5_digests.extend_from_slice(&part_md5);
@@ -726,20 +1094,40 @@ impl S3Service {
                     combined_data,
                     md5_digests,
                     part_sizes,
-                    part_checksum_digests,
+                    part_checksums,
+                    full_hasher.map(crate::checksum::Hasher::finalize),
                 ))
             })?;
 
         // Multipart ETag: MD5(concat(part_md5_digests))-N
         let combined_md5 = Md5::digest(&md5_digests);
         let etag = format!("{:x}-{}", combined_md5, sorted_parts.len());
-        // Additional-checksum for a multipart object is COMPOSITE:
-        // base64(HASH(concat(raw part digests)))-N - NOT a checksum over
-        // the whole reassembled object.
-        let checksum_value = upload
-            .checksum_algorithm
-            .as_deref()
-            .and_then(|algo| super::compute_composite_checksum(algo, &part_checksum_digests));
+        let checksum_value = if combine_parts {
+            let parts: Vec<(&[u8], u64)> = part_checksums
+                .iter()
+                .zip(&part_sizes)
+                .map(|((_, raw), (_, size))| (raw.as_slice(), *size))
+                .collect();
+            crate::checksum::combine_crc_digests(checksum_algorithm, &parts)
+                .map(|raw| crate::checksum::encode(&raw))
+                .unwrap_or_default()
+        } else {
+            match full_digest {
+                Some(raw) => crate::checksum::encode(&raw),
+                // COMPOSITE: base64(HASH(concat(raw part digests)))-N, not a
+                // checksum over the whole reassembled object.
+                None => {
+                    let raws: Vec<Vec<u8>> =
+                        part_checksums.iter().map(|(_, r)| r.clone()).collect();
+                    crate::checksum::composite(checksum_algorithm, &raws).unwrap_or_default()
+                }
+            }
+        };
+        checksum_plan.verify_object(
+            &checksum_value,
+            object_size_of(&part_sizes),
+            sorted_parts.len(),
+        )?;
         let data = Bytes::from(combined_data);
         let object_size = data.len() as u64;
 
@@ -772,8 +1160,15 @@ impl S3Service {
             sse_algorithm: upload.sse_algorithm.clone(),
             sse_kms_key_id: upload.sse_kms_key_id.clone(),
             version_id: version_id.clone(),
-            checksum_algorithm: upload.checksum_algorithm.clone(),
-            checksum_value: checksum_value.clone(),
+            checksum_algorithm: Some(checksum_algorithm),
+            checksum_value: Some(checksum_value.clone()),
+            checksum_type: Some(checksum_type),
+            part_checksums: checksum_plan.track_parts.then(|| {
+                part_checksums
+                    .iter()
+                    .map(|(n, raw)| (*n, crate::checksum::encode(raw)))
+                    .collect()
+            }),
             cache_control: upload.cache_control.clone(),
             content_disposition: upload.content_disposition.clone(),
             content_language: upload.content_language.clone(),
@@ -814,7 +1209,7 @@ impl S3Service {
                             &b.region,
                             key,
                             &existing.etag,
-                            "",
+                            &object_checksum_xml(existing),
                         ));
                     }
                     return Err(no_such_upload(upload_id));
@@ -935,14 +1330,10 @@ impl S3Service {
         // Surface the per-algorithm checksum element AWS emits so
         // SDK clients that round-trip Complete -> Get can verify
         // integrity end-to-end.
-        let checksum_xml = match (upload.checksum_algorithm.as_deref(), &checksum_value) {
-            (Some(algo), Some(value)) => format!(
-                "<Checksum{algo}>{val}</Checksum{algo}>",
-                algo = algo,
-                val = xml_escape(value),
-            ),
-            _ => String::new(),
-        };
+        let checksum_xml = format!(
+            "{}<ChecksumType>{checksum_type}</ChecksumType>",
+            crate::checksum::xml_element(checksum_algorithm, &checksum_value)
+        );
         let body = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
              <CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
@@ -1132,12 +1523,19 @@ impl S3Service {
                 common_prefixes.push(cp);
                 continue;
             }
+            let checksum_xml = match (upload.checksum_algorithm, upload.checksum_type) {
+                (Some(a), Some(t)) => format!(
+                    "<ChecksumAlgorithm>{a}</ChecksumAlgorithm><ChecksumType>{t}</ChecksumType>"
+                ),
+                _ => String::new(),
+            };
             uploads_xml.push_str(&format!(
                 "<Upload>\
                  <Key>{}</Key>\
                  <UploadId>{}</UploadId>\
                  <Initiated>{}</Initiated>\
                  <StorageClass>{}</StorageClass>\
+                 {checksum_xml}\
                  </Upload>",
                 xml_escape(&upload.key),
                 xml_escape(&upload.upload_id),
@@ -1296,12 +1694,18 @@ impl S3Service {
         let mut next_marker: i64 = 0;
         for part in &display_parts {
             next_marker = part.part_number as i64;
+            let checksum_xml = part
+                .checksum
+                .as_ref()
+                .map(|(a, v)| crate::checksum::xml_element(*a, v))
+                .unwrap_or_default();
             parts_xml.push_str(&format!(
                 "<Part>\
                  <PartNumber>{}</PartNumber>\
                  <ETag>&quot;{}&quot;</ETag>\
                  <Size>{}</Size>\
                  <LastModified>{}</LastModified>\
+                 {checksum_xml}\
                  </Part>",
                 part.part_number,
                 xml_escape(&part.etag),
@@ -1309,6 +1713,12 @@ impl S3Service {
                 part.last_modified.format("%Y-%m-%dT%H:%M:%S%.3fZ"),
             ));
         }
+        let upload_checksum_xml = match (upload.checksum_algorithm, upload.checksum_type) {
+            (Some(a), Some(t)) => format!(
+                "<ChecksumAlgorithm>{a}</ChecksumAlgorithm><ChecksumType>{t}</ChecksumType>"
+            ),
+            _ => String::new(),
+        };
 
         let body = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
@@ -1320,6 +1730,7 @@ impl S3Service {
              <NextPartNumberMarker>{next_marker}</NextPartNumberMarker>\
              <MaxParts>{max_parts}</MaxParts>\
              <IsTruncated>{is_truncated}</IsTruncated>\
+             {upload_checksum_xml}\
              {parts_xml}\
              </ListPartsResult>",
             xml_escape(bucket),

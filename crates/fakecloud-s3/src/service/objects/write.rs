@@ -74,6 +74,7 @@ impl S3Service {
             region,
             bucket_region,
             explicit_lock,
+            checks,
         ) = {
             let accts = self.state.read();
             let __empty = crate::state::S3State::new(account_id, "us-east-1");
@@ -105,13 +106,20 @@ impl S3Service {
                 }
             }
 
+            // Integrity headers are validated once the bucket and the
+            // conditional headers have been, so a request to a missing bucket
+            // answers NoSuchBucket and a failed precondition 412, never a
+            // digest error.
+            let checks = crate::checksum::ChecksumHeaders::parse(&req.headers)?;
+
             // Object lock: explicit lock headers need a bucket with object lock.
             let explicit_lock =
                 ObjectLockSettings::from_request(&req.headers, b.object_lock_config.as_deref())?;
             // A PutObject that sets an object lock must carry a payload
-            // integrity check (CopyObject and CreateMultipartUpload need none).
-            if has_object_lock_headers(&req.headers) && !has_payload_integrity_header(&req.headers)
-            {
+            // integrity check (CopyObject and CreateMultipartUpload need none):
+            // Content-MD5, an x-amz-checksum-* value, a checksum trailer, or
+            // the SDK's x-amz-sdk-checksum-algorithm.
+            if has_object_lock_headers(&req.headers) && !checks.has_integrity_check() {
                 return Err(AwsServiceError::aws_error(
                     StatusCode::BAD_REQUEST,
                     "InvalidRequest",
@@ -130,8 +138,31 @@ impl S3Service {
                 state.region.clone(),
                 b.region.clone(),
                 explicit_lock,
+                checks,
             )
         }; // read lock dropped
+
+        // The object keeps the algorithm the request's checksum is in; an
+        // upload naming none gets S3's default CRC64NVME full-object checksum.
+        let checksum_algorithm = checks
+            .algorithm()
+            .unwrap_or(crate::checksum::DEFAULT_ALGORITHM);
+
+        // Checked before the body is spooled: nothing unlinks the spool file
+        // on an error returned after it.
+        let storage_class = req
+            .headers
+            .get("x-amz-storage-class")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("STANDARD")
+            .to_string();
+        if !is_valid_storage_class(&storage_class) {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidStorageClass",
+                "The storage class you specified is not valid",
+            ));
+        }
 
         // --- Preparation phase: compute object data outside any lock ---
         // PutObject is a streaming-only route: dispatch always wires
@@ -149,67 +180,22 @@ impl S3Service {
                 "PutObject requires a streaming request body",
             )
         })?;
-        let spooled = fakecloud_core::service::spool_request_stream(
+        // Spool the body, folding the checksum digest into the same pass, and
+        // verify Content-MD5, the x-amz-checksum-* value or trailing checksum,
+        // and a hex x-amz-content-sha256 against the bytes received. A
+        // mismatch is BadDigest / XAmzContentSHA256Mismatch, as on S3.
+        let crate::checksum::VerifiedSpool { spooled, digests } = crate::checksum::spool_verified(
+            &req.headers,
             stream,
             self.store.spool_dir().as_deref(),
-            fakecloud_core::service::is_aws_chunked(&req.headers),
+            &checks,
+            Some(checksum_algorithm),
         )
         .await?;
+        let checksum_value = digests.encoded(checksum_algorithm);
         let data_size: u64 = spooled.size;
         let etag: String = spooled.md5_hex.clone();
 
-        // Content-MD5 integrity check: when the client sends the header,
-        // AWS verifies it against the body's MD5 and rejects a mismatch
-        // with `BadDigest` (bug-audit 2026-05-28, 1.9 — corrupt-digest
-        // writes used to be accepted silently). The header is the
-        // base64-encoded 128-bit MD5; the spool computed it as hex, so
-        // decode the hex to raw bytes and base64-encode to compare.
-        if let Some(content_md5) = req.headers.get("content-md5").and_then(|v| v.to_str().ok()) {
-            let supplied = content_md5.trim();
-            if !supplied.is_empty() {
-                let expected_b64 = hex_to_base64(&spooled.md5_hex);
-                if expected_b64.as_deref() != Some(supplied) {
-                    return Err(AwsServiceError::aws_error(
-                        StatusCode::BAD_REQUEST,
-                        "BadDigest",
-                        "The Content-MD5 you specified did not match what we received.",
-                    ));
-                }
-            }
-        }
-
-        // x-amz-content-sha256 payload-integrity check (bug-hunt 5.4). When a
-        // client sends the header as a real lowercase-hex SHA-256 digest — the
-        // default for SigV4-signed, non-chunked PutObject — AWS verifies it
-        // against the received bytes and rejects a mismatch with
-        // `XAmzContentSHA256Mismatch` (400). This lives at the S3 layer, NOT in
-        // sigv4 verification: the signed payload is not reliably re-derivable
-        // there (aws-chunked / streaming empties the buffered body). Here we
-        // hold the fully-decoded object bytes, so the hash is authoritative.
-        //
-        // Skip markers that are not a plain body hash: `UNSIGNED-PAYLOAD`, any
-        // `STREAMING-…` value, and aws-chunked uploads (the header then covers
-        // the chunk framing, and the spool's sha256 is over the decoded
-        // payload, so they would never match). Only a 64-char hex value is
-        // treated as an assertion about the payload.
-        if !fakecloud_core::service::is_aws_chunked(&req.headers) {
-            if let Some(hdr) = req
-                .headers
-                .get("x-amz-content-sha256")
-                .and_then(|v| v.to_str().ok())
-            {
-                let supplied = hdr.trim();
-                let is_hex_digest =
-                    supplied.len() == 64 && supplied.bytes().all(|b| b.is_ascii_hexdigit());
-                if is_hex_digest && !supplied.eq_ignore_ascii_case(&spooled.sha256_hex) {
-                    return Err(AwsServiceError::aws_error(
-                        StatusCode::BAD_REQUEST,
-                        "XAmzContentSHA256Mismatch",
-                        "The provided 'x-amz-content-sha256' header does not match what was computed.",
-                    ));
-                }
-            }
-        }
         let content_type = req
             .headers
             .get("content-type")
@@ -226,19 +212,6 @@ impl S3Service {
                 .get("content-encoding")
                 .and_then(|v| v.to_str().ok()),
         );
-        let storage_class = req
-            .headers
-            .get("x-amz-storage-class")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("STANDARD")
-            .to_string();
-        if !is_valid_storage_class(&storage_class) {
-            return Err(AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "InvalidStorageClass",
-                "The storage class you specified is not valid",
-            ));
-        }
         let website_redirect_location = req
             .headers
             .get("x-amz-website-redirect-location")
@@ -257,21 +230,6 @@ impl S3Service {
         let expires = header_str("expires");
 
         let metadata = extract_user_metadata(&req.headers);
-
-        // Extract checksum algorithm and value
-        let checksum_algorithm = req
-            .headers
-            .get("x-amz-sdk-checksum-algorithm")
-            .or_else(|| req.headers.get("x-amz-checksum-algorithm"))
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        let _checksum_from_header = checksum_algorithm.as_deref().and_then(|algo| {
-            let header_name = format!("x-amz-checksum-{}", algo.to_lowercase());
-            req.headers
-                .get(header_name.as_str())
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string())
-        });
 
         // Build ACL grants for object
         let acl_grants = if let Some(grants) = write_acl.grants_for(&acl_owner_id) {
@@ -364,73 +322,6 @@ impl S3Service {
             }
         }
 
-        // Checksum: detect algorithm from various headers
-        let explicit_checksum_algo = req
-            .headers
-            .get("x-amz-checksum-algorithm")
-            .or_else(|| req.headers.get("x-amz-sdk-checksum-algorithm"))
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_uppercase());
-        let checksum_algorithm = explicit_checksum_algo.clone().or_else(|| {
-            // Also detect from checksum value headers
-            if req.headers.contains_key("x-amz-checksum-crc32") {
-                Some("CRC32".to_string())
-            } else if req.headers.contains_key("x-amz-checksum-crc32c") {
-                Some("CRC32C".to_string())
-            } else if req.headers.contains_key("x-amz-checksum-crc64nvme") {
-                Some("CRC64NVME".to_string())
-            } else if req.headers.contains_key("x-amz-checksum-sha1") {
-                Some("SHA1".to_string())
-            } else if req.headers.contains_key("x-amz-checksum-sha256") {
-                Some("SHA256".to_string())
-            } else {
-                None
-            }
-        });
-        // Checksum computation: when the client requested an explicit
-        // algorithm, fold the spool through the hasher in 1 MiB chunks.
-        // Constant memory; skipped when no algorithm is requested.
-        let checksum_value = if let Some(algo) = &checksum_algorithm {
-            Some(
-                crate::service::compute_checksum_streaming(algo, &spooled.path)
-                    .await
-                    .map_err(crate::service::io_to_aws)?,
-            )
-        } else {
-            None
-        };
-
-        // Integrity check for the modern precomputed checksum headers. When
-        // the client sends a checksum *value* (`x-amz-checksum-<algo>`), S3
-        // compares it against the checksum it computes over the received body
-        // and rejects a mismatch with `BadDigest` — same contract as the
-        // Content-MD5 path above. Validate every supplied value header (a
-        // client/SDK may send more than one), not just the primary detected
-        // algorithm. Both values are base64, so compare exactly. Previously the
-        // supplied value was ignored and a corrupt upload stored silently.
-        for algo in ["CRC32", "CRC32C", "CRC64NVME", "SHA1", "SHA256"] {
-            let header_name = format!("x-amz-checksum-{}", algo.to_lowercase());
-            let Some(supplied) = req
-                .headers
-                .get(header_name.as_str())
-                .and_then(|v| v.to_str().ok())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            else {
-                continue;
-            };
-            let computed = crate::service::compute_checksum_streaming(algo, &spooled.path)
-                .await
-                .map_err(crate::service::io_to_aws)?;
-            if supplied != computed {
-                return Err(AwsServiceError::aws_error(
-                    StatusCode::BAD_REQUEST,
-                    "BadDigest",
-                    format!("The {algo} you specified did not match the calculated checksum."),
-                ));
-            }
-        }
-
         // Object lock - explicit headers or bucket default
         let lock = explicit_lock.or_bucket_default(object_lock_config.as_deref(), Utc::now());
 
@@ -486,8 +377,9 @@ impl S3Service {
             content_language,
             expires,
             website_redirect_location,
-            checksum_algorithm: checksum_algorithm.clone(),
+            checksum_algorithm: Some(checksum_algorithm),
             checksum_value: checksum_value.clone(),
+            checksum_type: Some(crate::checksum::ChecksumType::FullObject),
             lock_mode: lock.mode,
             lock_retain_until: lock.retain_until,
             lock_legal_hold: lock.legal_hold,
@@ -623,18 +515,15 @@ impl S3Service {
                 "true".parse().unwrap(),
             );
         }
-        // Checksum in response
-        if let (Some(algo), Some(val)) = (&checksum_algorithm, &checksum_value) {
-            let header_name = format!("x-amz-checksum-{}", algo.to_lowercase());
-            if let Ok(name) = header_name.parse::<http::header::HeaderName>() {
-                if let Ok(hval) = val.parse() {
-                    headers.insert(name, hval);
-                }
-            }
-            // Echo back the checksum algorithm only when explicitly requested
-            if explicit_checksum_algo.is_some() {
-                headers.insert("x-amz-sdk-checksum-algorithm", algo.parse().unwrap());
-            }
+        // The stored checksum, which S3 returns on every PutObject: a single
+        // part upload's checksum is always FULL_OBJECT.
+        if let Some(val) = &checksum_value {
+            crate::checksum::insert_response_headers(
+                &mut headers,
+                checksum_algorithm,
+                val,
+                Some(crate::checksum::ChecksumType::FullObject),
+            );
         }
 
         let obj_size = data_size;
@@ -782,13 +671,6 @@ impl S3Service {
             .get("x-amz-copy-source-if-none-match")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
-
-        let checksum_algorithm = req
-            .headers
-            .get("x-amz-checksum-algorithm")
-            .or_else(|| req.headers.get("x-amz-sdk-checksum-algorithm"))
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_uppercase());
 
         // CopyObject accepts the same ACL headers as PutObject: a canned
         // `x-amz-acl` or the `x-amz-grant-*` pair, never both. Ignoring them --
@@ -1066,6 +948,14 @@ impl S3Service {
             .buckets
             .get(dest_bucket)
             .map_or_else(|| state.region.clone(), |b| b.region.clone());
+        // The requested checksum algorithm is validated once the source and
+        // destination buckets are known to exist, so a copy into a missing
+        // bucket answers NoSuchBucket rather than a header error.
+        if !state.buckets.contains_key(dest_bucket) {
+            return Err(no_such_bucket(dest_bucket));
+        }
+        let checksum_algorithm =
+            crate::checksum::parse_algorithm_header(&req.headers, "x-amz-checksum-algorithm")?;
         let src_handle = crate::body_io::ObjectBodyHandle::open(&src_obj.body)
             .map_err(crate::service::io_to_aws)?;
         drop(accts_r);
@@ -1094,17 +984,23 @@ impl S3Service {
             } else {
                 raw_src_bytes
             };
-        let (new_checksum_algo, new_checksum_val) = if let Some(ref algo) = checksum_algorithm {
-            let val = compute_checksum(algo, &src_bytes);
-            (Some(algo.clone()), Some(val))
-        } else if src_obj.checksum_algorithm.is_some() {
-            (
-                src_obj.checksum_algorithm.clone(),
-                src_obj.checksum_value.clone(),
-            )
-        } else {
-            (None, None)
-        };
+        // The copy is written as a single object, so its checksum is always a
+        // FULL_OBJECT checksum of the whole body (S3 user guide: "With a copy
+        // command, the checksum of the object is a direct checksum of the full
+        // object"): in the requested algorithm, else the source's, else the
+        // CRC64NVME default. A source FULL_OBJECT checksum in that algorithm is
+        // already that value; a COMPOSITE (multipart) one is not, so the body
+        // is hashed.
+        let new_checksum_algo = checksum_algorithm
+            .or(src_obj.checksum_algorithm)
+            .unwrap_or(crate::checksum::DEFAULT_ALGORITHM);
+        let reusable = (src_obj.checksum_algorithm == Some(new_checksum_algo)
+            && src_obj.effective_checksum_type()
+                == Some(crate::checksum::ChecksumType::FullObject))
+        .then(|| src_obj.checksum_value.clone())
+        .flatten();
+        let new_checksum_val =
+            reusable.unwrap_or_else(|| crate::checksum::checksum(new_checksum_algo, &src_bytes));
         // Re-encrypt for the destination if it lands as SSE-KMS, so the
         // stored body is a fresh envelope with the dest's encryption
         // context (bucket arn), under a key in the destination bucket's
@@ -1191,8 +1087,10 @@ impl S3Service {
             content_language: new_content_language,
             expires: new_expires,
             website_redirect_location: new_redirect,
-            checksum_algorithm: new_checksum_algo.clone(),
-            checksum_value: new_checksum_val.clone(),
+            checksum_algorithm: Some(new_checksum_algo),
+            checksum_value: Some(new_checksum_val.clone()),
+            checksum_type: Some(crate::checksum::ChecksumType::FullObject),
+            part_checksums: None,
             // Lock status is not copied from the source object.
             lock_mode: dest_lock.mode,
             lock_retain_until: dest_lock.retain_until,
@@ -1304,13 +1202,10 @@ impl S3Service {
             );
         }
 
-        // Build checksum XML if present
-        let checksum_xml = if let (Some(algo), Some(val)) = (&new_checksum_algo, &new_checksum_val)
-        {
-            format!("<Checksum{algo}>{val}</Checksum{algo}>")
-        } else {
-            String::new()
-        };
+        let checksum_xml = format!(
+            "<ChecksumType>FULL_OBJECT</ChecksumType>{}",
+            crate::checksum::xml_element(new_checksum_algo, &new_checksum_val)
+        );
 
         // Capture notification config before dropping lock
         let notification_config = db.notification_config.clone();
@@ -1418,48 +1313,5 @@ impl S3Service {
             body: Bytes::new().into(),
             headers: HeaderMap::new(),
         })
-    }
-}
-
-/// Convert a lowercase hex MD5 digest to its base64 form, matching the
-/// `Content-MD5` header encoding AWS expects. Returns `None` if the input
-/// isn't valid hex of the right length.
-fn hex_to_base64(hex: &str) -> Option<String> {
-    use base64::Engine;
-    if !hex.len().is_multiple_of(2) {
-        return None;
-    }
-    let mut bytes = Vec::with_capacity(hex.len() / 2);
-    let h = hex.as_bytes();
-    let mut i = 0;
-    while i < h.len() {
-        let hi = (h[i] as char).to_digit(16)?;
-        let lo = (h[i + 1] as char).to_digit(16)?;
-        bytes.push((hi * 16 + lo) as u8);
-        i += 2;
-    }
-    Some(base64::engine::general_purpose::STANDARD.encode(bytes))
-}
-
-#[cfg(test)]
-mod content_md5_tests {
-    use super::hex_to_base64;
-
-    // bug-audit 2026-05-28, 1.9: the spool yields a hex MD5; the
-    // Content-MD5 header is base64 of the raw digest. Verify the
-    // conversion matches the canonical base64 form.
-    #[test]
-    fn hex_md5_converts_to_base64() {
-        // MD5("") = d41d8cd98f00b204e9800998ecf8427e
-        assert_eq!(
-            hex_to_base64("d41d8cd98f00b204e9800998ecf8427e").as_deref(),
-            Some("1B2M2Y8AsgTpgAmY7PhCfg==")
-        );
-    }
-
-    #[test]
-    fn rejects_malformed_hex() {
-        assert_eq!(hex_to_base64("xyz"), None); // odd length
-        assert_eq!(hex_to_base64("zz"), None); // non-hex digits
     }
 }

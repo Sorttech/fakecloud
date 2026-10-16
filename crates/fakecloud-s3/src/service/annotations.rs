@@ -13,6 +13,8 @@ use md5::{Digest, Md5};
 use bytes::Bytes;
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
+use crate::checksum::{ChecksumHeaders, ChecksumType};
+use crate::persistence::annotation_record;
 use crate::state::ObjectAnnotation;
 
 use super::{
@@ -20,10 +22,13 @@ use super::{
     S3Service,
 };
 
-/// AWS caps an object at 50 annotations.
-const MAX_ANNOTATIONS_PER_OBJECT: usize = 50;
-/// `AnnotationName` is capped at 255 characters.
-const MAX_ANNOTATION_NAME_LEN: usize = 255;
+/// AWS caps an object at 1,000 annotations (PutObjectAnnotation API reference).
+const MAX_ANNOTATIONS_PER_OBJECT: usize = 1000;
+/// `AnnotationName` is capped at 512 bytes.
+const MAX_ANNOTATION_NAME_BYTES: usize = 512;
+/// An annotation payload is 1 byte to 1 MiB.
+const MAX_ANNOTATION_PAYLOAD_BYTES: usize = 1024 * 1024;
+
 /// Wire name of the `AnnotationName` `@httpQuery` member. S3 query keys are
 /// case-sensitive, so the member name (`AnnotationName`) is not accepted.
 pub(super) const ANNOTATION_NAME_QUERY: &str = "annotationName";
@@ -62,11 +67,11 @@ fn require_annotation_name(req: &AwsRequest) -> Result<String, AwsServiceError> 
     if name.is_empty() {
         return Err(invalid_annotation_name("AnnotationName is required"));
     }
-    if name.chars().count() > MAX_ANNOTATION_NAME_LEN {
+    if name.len() > MAX_ANNOTATION_NAME_BYTES {
         return Err(AwsServiceError::aws_error(
             StatusCode::BAD_REQUEST,
             "AnnotationNameTooLong",
-            format!("AnnotationName exceeds {MAX_ANNOTATION_NAME_LEN} characters"),
+            format!("The annotation name exceeds {MAX_ANNOTATION_NAME_BYTES} bytes."),
         ));
     }
     if name.chars().any(|c| c.is_control()) {
@@ -111,12 +116,6 @@ impl S3Service {
     ) -> Result<AwsResponse, AwsServiceError> {
         let name = require_annotation_name(req)?;
         let version_id = req.query_params.get("versionId").cloned();
-        let payload = req.body.to_vec();
-        let checksum_algorithm = req
-            .headers
-            .get("x-amz-sdk-checksum-algorithm")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
 
         let mut accts = self.state.write();
         let state = accts.get_or_create(account_id);
@@ -124,8 +123,37 @@ impl S3Service {
             .buckets
             .get_mut(bucket)
             .ok_or_else(|| no_such_bucket(bucket))?;
+        // NoSuchBucket / NoSuchKey, then the object precondition (412), all
+        // before the payload's digests are judged.
         let obj = resolve_object_mut(b, key, version_id.as_ref())?;
         check_object_if_match(req, obj)?;
+
+        // The payload is a streaming blob: an SDK frames it with aws-chunked
+        // and sends its checksum as a trailer. Decode the framing and verify
+        // Content-MD5 / the x-amz-checksum-* value or trailer against the
+        // payload, computing the stored checksum in the same pass. Without an
+        // algorithm the annotation gets S3's default CRC64NVME checksum.
+        let checks = ChecksumHeaders::parse(&req.headers)?;
+        let algorithm = checks
+            .algorithm()
+            .unwrap_or(crate::checksum::DEFAULT_ALGORITHM);
+        let verified =
+            crate::checksum::verify_buffered(&req.headers, &req.body, &checks, Some(algorithm))?;
+        let payload = verified.payload;
+        if payload.is_empty() || payload.len() > MAX_ANNOTATION_PAYLOAD_BYTES {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                "The annotation payload must be between 1 byte and 1 MiB.",
+            ));
+        }
+        if std::str::from_utf8(&payload).is_err() {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "UnsupportedMediaType",
+                "The annotation payload is not valid UTF-8 encoded text.",
+            ));
+        }
 
         // The cap counts distinct names; overwriting an existing annotation is
         // always allowed.
@@ -142,23 +170,42 @@ impl S3Service {
         }
 
         let etag = annotation_etag(&payload);
-        let object_version_id = obj.version_id.clone();
-        obj.annotations.insert(
-            name.clone(),
-            ObjectAnnotation {
-                name: name.clone(),
-                payload,
-                etag: etag.clone(),
-                last_modified: chrono::Utc::now(),
-                checksum_algorithm,
-            },
-        );
+        let checksum_value = verified.digests.encoded(algorithm);
+        let annotation = ObjectAnnotation {
+            name: name.clone(),
+            payload,
+            etag: etag.clone(),
+            last_modified: chrono::Utc::now(),
+            checksum_algorithm: Some(algorithm),
+            checksum_value: checksum_value.clone(),
+        };
+        // Store-first, and only this annotation: its own record and payload,
+        // never the object's metadata or its other annotations.
+        self.store
+            .put_annotation(
+                bucket,
+                key,
+                obj.version_id.as_deref(),
+                &annotation_record(&annotation),
+                &annotation.payload,
+            )
+            .map_err(super::persistence_error)?;
+        obj.annotations.insert(name.clone(), annotation);
 
         let mut headers = HeaderMap::new();
         if let Ok(v) = etag.parse() {
             headers.insert("ETag", v);
         }
-        insert_object_version_id(&mut headers, object_version_id.as_deref());
+        insert_object_version_id(&mut headers, obj.version_id.as_deref());
+        if let Some(value) = &checksum_value {
+            crate::checksum::insert_response_headers(
+                &mut headers,
+                algorithm,
+                value,
+                Some(ChecksumType::FullObject),
+            );
+        }
+        insert_sse_header(&mut headers, obj.sse_algorithm.as_deref());
         let body = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
              <PutObjectAnnotationResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
@@ -210,22 +257,33 @@ impl S3Service {
             headers.insert("Last-Modified", v);
         }
         insert_object_version_id(&mut headers, obj.version_id.as_deref());
-        // `ChecksumMode: ENABLED` asks for the stored checksum back.
+        insert_sse_header(&mut headers, obj.sse_algorithm.as_deref());
+        if let Some(status) = obj
+            .replication_status
+            .as_deref()
+            .and_then(|v| v.parse().ok())
+        {
+            headers.insert("x-amz-replication-status", status);
+        }
+        // `ChecksumMode: ENABLED` asks for the stored checksum back: the
+        // payload's digest in the algorithm it was written with.
         if req
             .headers
             .get("x-amz-checksum-mode")
             .and_then(|v| v.to_str().ok())
             .is_some_and(|m| m.eq_ignore_ascii_case("ENABLED"))
         {
-            if let Some(algo) = annotation.checksum_algorithm.as_deref() {
-                let digest = base64::engine::general_purpose::STANDARD
-                    .encode(Md5::digest(&annotation.payload));
-                if let (Ok(header), Ok(value)) = (
-                    format!("x-amz-checksum-{}", algo.to_lowercase()).parse::<http::HeaderName>(),
-                    digest.parse(),
-                ) {
-                    headers.insert(header, value);
-                }
+            if let Some(algo) = annotation.checksum_algorithm {
+                let value = annotation
+                    .checksum_value
+                    .clone()
+                    .unwrap_or_else(|| crate::checksum::checksum(algo, &annotation.payload));
+                crate::checksum::insert_response_headers(
+                    &mut headers,
+                    algo,
+                    &value,
+                    Some(ChecksumType::FullObject),
+                );
             }
         }
 
@@ -259,7 +317,12 @@ impl S3Service {
         check_object_if_match(req, obj)?;
         // AWS deletes idempotently: removing an annotation that is not there
         // is still a 204, the same way DeleteObject is.
-        obj.annotations.remove(&name);
+        if obj.annotations.contains_key(&name) {
+            self.store
+                .delete_annotation(bucket, key, obj.version_id.as_deref(), &name)
+                .map_err(super::persistence_error)?;
+            obj.annotations.remove(&name);
+        }
         let object_version_id = obj.version_id.clone();
 
         let mut headers = HeaderMap::new();
@@ -366,10 +429,13 @@ impl S3Service {
                 xml_escape(&a.etag),
                 a.payload.len(),
             ));
-            if let Some(algo) = &a.checksum_algorithm {
+            if let Some(algo) = a.checksum_algorithm {
+                entries.push_str(&format!("<ChecksumAlgorithm>{algo}</ChecksumAlgorithm>"));
+            }
+            if let Some(status) = &obj.replication_status {
                 entries.push_str(&format!(
-                    "<ChecksumAlgorithm>{}</ChecksumAlgorithm>",
-                    xml_escape(algo)
+                    "<ReplicationStatus>{}</ReplicationStatus>",
+                    xml_escape(status)
                 ));
             }
             entries.push_str("</AnnotationEntry>");
@@ -398,7 +464,12 @@ impl S3Service {
                 xml_escape(tok)
             ));
         }
-        body.push_str(&entries);
+        // `Annotations` is a wrapped list: the entries sit inside it.
+        if !entries.is_empty() {
+            body.push_str("<Annotations>");
+            body.push_str(&entries);
+            body.push_str("</Annotations>");
+        }
         body.push_str("</ListObjectAnnotationsResult>");
 
         let mut resp = s3_xml(StatusCode::OK, body);
@@ -436,6 +507,14 @@ impl S3Service {
             headers: HeaderMap::new(),
             body: fakecloud_core::service::ResponseBody::Bytes(Bytes::new()),
         })
+    }
+}
+
+/// Annotations inherit their object's encryption; an object without
+/// server-side encryption is SSE-S3 (`AES256`), the default for new objects.
+fn insert_sse_header(headers: &mut HeaderMap, sse_algorithm: Option<&str>) {
+    if let Ok(v) = sse_algorithm.unwrap_or("AES256").parse() {
+        headers.insert("x-amz-server-side-encryption", v);
     }
 }
 

@@ -377,25 +377,6 @@ pub(super) fn has_object_lock_headers(headers: &http::HeaderMap) -> bool {
     .any(|h| headers.contains_key(*h))
 }
 
-/// Whether the request carries a payload integrity check S3 accepts for a
-/// PutObject with Object Lock parameters: `Content-MD5`, an
-/// `x-amz-checksum-<algorithm>` value header, or a flexible checksum sent as a
-/// trailer (`x-amz-trailer` naming an `x-amz-checksum-*` header, or the SDK's
-/// `x-amz-sdk-checksum-algorithm`).
-pub(super) fn has_payload_integrity_header(headers: &http::HeaderMap) -> bool {
-    headers.contains_key("content-md5")
-        || headers.contains_key("x-amz-sdk-checksum-algorithm")
-        || headers.keys().any(|name| {
-            name.as_str().starts_with("x-amz-checksum-") && name != "x-amz-checksum-algorithm"
-        })
-        || headers
-            .get_all("x-amz-trailer")
-            .iter()
-            .filter_map(|v| v.to_str().ok())
-            .flat_map(|v| v.split(','))
-            .any(|t| t.trim().to_ascii_lowercase().starts_with("x-amz-checksum-"))
-}
-
 fn invalid_lock_argument(message: &str) -> AwsServiceError {
     AwsServiceError::aws_error(StatusCode::BAD_REQUEST, "InvalidArgument", message)
 }

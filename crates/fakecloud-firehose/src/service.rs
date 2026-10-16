@@ -1247,6 +1247,8 @@ impl FirehoseService {
             restore_expiry: None,
             checksum_algorithm: None,
             checksum_value: None,
+            checksum_type: None,
+            part_checksums: None,
             lock_mode: None,
             lock_retain_until: None,
             lock_legal_hold: None,
