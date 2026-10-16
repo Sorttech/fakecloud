@@ -2464,3 +2464,39 @@ fn describe_and_update_workforce_return_the_stored_view_without_secrets() {
     assert_eq!(wf["SourceIpConfig"]["Cidrs"], json!(["10.1.0.0/16"]));
     assert!(wf["OidcConfig"].get("ClientSecret").is_none(), "{wf}");
 }
+
+// DescribeCluster renders the stored instance-group specifications as
+// `ClusterInstanceGroupDetails`: the requested count becomes the current and
+// target count, and specification-only members are not echoed.
+#[test]
+fn describe_cluster_renders_instance_group_details() {
+    let s = svc();
+    run(
+        &s,
+        "CreateCluster",
+        json!({"ClusterName": "c1", "InstanceGroups": [{
+            "InstanceGroupName": "workers",
+            "InstanceType": "ml.c5.xlarge",
+            "InstanceCount": 3,
+            "MinInstanceCount": 1,
+            "ExecutionRole": "arn:aws:iam::000000000000:role/r",
+            "LifeCycleConfig": {"SourceS3Uri": "s3://b/p", "OnCreate": "on_create.sh"}
+        }]}),
+    )
+    .unwrap();
+    let got = resp_json(&run(&s, "DescribeCluster", json!({"ClusterName": "c1"})).unwrap());
+    let group = &got["InstanceGroups"][0];
+    assert_eq!(group["InstanceGroupName"], "workers");
+    assert_eq!(group["InstanceType"], "ml.c5.xlarge");
+    assert_eq!(group["CurrentCount"], 3);
+    assert_eq!(group["TargetCount"], 3);
+    assert_eq!(group["MinCount"], 1);
+    assert_eq!(group["Status"], "InService");
+    assert_eq!(group["LifeCycleConfig"]["OnCreate"], "on_create.sh");
+    assert!(group.get("InstanceCount").is_none(), "{group}");
+    assert!(group.get("MinInstanceCount").is_none(), "{group}");
+    assert!(
+        expect_err(run(&s, "DescribeCluster", json!({"ClusterName": "nope"}))).code()
+            == "ResourceNotFound"
+    );
+}

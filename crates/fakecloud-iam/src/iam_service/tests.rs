@@ -3946,6 +3946,237 @@ fn simulate_custom_policy_returns_allow_when_action_matches() {
     assert!(body.contains("<EvalResourceName>arn:aws:s3:::b/k</EvalResourceName>"));
 }
 
+/// Run SimulateCustomPolicy and return the first result's EvalDecision.
+fn simulate_decision(
+    svc: &IamService,
+    params: Vec<(&str, &str)>,
+) -> Result<String, AwsServiceError> {
+    let resp = svc.simulate_custom_policy(&make_request("SimulateCustomPolicy", params))?;
+    let body = std::str::from_utf8(resp.body.expect_bytes()).unwrap();
+    Ok(body
+        .split("<EvalDecision>")
+        .nth(1)
+        .unwrap()
+        .split('<')
+        .next()
+        .unwrap()
+        .to_string())
+}
+
+#[test]
+fn simulate_custom_policy_evaluates_resource_policy_and_owner() {
+    let svc = make_service();
+    let caller = "arn:aws:iam::123456789012:user/alice";
+    let unrelated = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"sqs:SendMessage","Resource":"*"}]}"#;
+    let grant = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::123456789012:user/alice"},"Action":"s3:GetObject","Resource":"*"}]}"#;
+    let base = vec![
+        ("PolicyInputList.member.1", unrelated),
+        ("ActionNames.member.1", "s3:GetObject"),
+        ("ResourceArns.member.1", "arn:aws:s3:::b/k"),
+    ];
+    let with = |extra: &[(&'static str, &'static str)]| {
+        let mut p = base.clone();
+        p.extend_from_slice(extra);
+        p
+    };
+    // Without the resource policy the identity side grants nothing.
+    assert_eq!(simulate_decision(&svc, with(&[])).unwrap(), "implicitDeny");
+    // Same account: the resource policy grant alone allows.
+    assert_eq!(
+        simulate_decision(
+            &svc,
+            with(&[("ResourcePolicy", grant), ("CallerArn", caller)])
+        )
+        .unwrap(),
+        "allowed"
+    );
+    // Cross-account owner: identity AND resource must both allow.
+    assert_eq!(
+        simulate_decision(
+            &svc,
+            with(&[
+                ("ResourcePolicy", grant),
+                ("CallerArn", caller),
+                ("ResourceOwner", "arn:aws:iam::999999999999:root"),
+            ])
+        )
+        .unwrap(),
+        "implicitDeny"
+    );
+    // A resource policy needs a caller to evaluate against.
+    let err = simulate_decision(&svc, with(&[("ResourcePolicy", grant)]))
+        .err()
+        .unwrap();
+    assert_eq!(err.code(), "InvalidInput");
+}
+
+#[test]
+fn simulate_policy_derives_principal_and_resource_accounts() {
+    let svc = make_service();
+    let unrelated = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"sqs:ListQueues","Resource":"*"}]}"#;
+    let allow_send = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"sqs:SendMessage","Resource":"*"}]}"#;
+    let grant_bob = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::999999999999:user/bob"},"Action":"sqs:SendMessage","Resource":"*"}]}"#;
+    let bob = "arn:aws:iam::999999999999:user/bob";
+
+    // The caller's account comes from CallerArn: bob (999...) calling a
+    // resource with no account in its ARN and no ResourceOwner is a
+    // same-account call in 999..., so the resource policy alone allows.
+    let d = simulate_decision(
+        &svc,
+        vec![
+            ("PolicyInputList.member.1", unrelated),
+            ("ActionNames.member.1", "sqs:SendMessage"),
+            ("ResourcePolicy", grant_bob),
+            ("CallerArn", bob),
+        ],
+    )
+    .unwrap();
+    assert_eq!(d, "allowed");
+
+    // The resource ARN's account decides ownership when there is no
+    // ResourceOwner: a queue in 123456789012 is cross-account for bob, so the
+    // identity side must allow too.
+    let queue = "arn:aws:sqs:us-east-1:123456789012:q";
+    let d = simulate_decision(
+        &svc,
+        vec![
+            ("PolicyInputList.member.1", unrelated),
+            ("ActionNames.member.1", "sqs:SendMessage"),
+            ("ResourceArns.member.1", queue),
+            ("ResourcePolicy", grant_bob),
+            ("CallerArn", bob),
+        ],
+    )
+    .unwrap();
+    assert_eq!(d, "implicitDeny");
+    let d = simulate_decision(
+        &svc,
+        vec![
+            ("PolicyInputList.member.1", allow_send),
+            ("ActionNames.member.1", "sqs:SendMessage"),
+            ("ResourceArns.member.1", queue),
+            ("ResourcePolicy", grant_bob),
+            ("CallerArn", bob),
+        ],
+    )
+    .unwrap();
+    assert_eq!(d, "allowed");
+    // ResourceOwner overrides the account in the resource ARN.
+    let d = simulate_decision(
+        &svc,
+        vec![
+            ("PolicyInputList.member.1", unrelated),
+            ("ActionNames.member.1", "sqs:SendMessage"),
+            ("ResourceArns.member.1", queue),
+            ("ResourcePolicy", grant_bob),
+            ("CallerArn", bob),
+            ("ResourceOwner", "arn:aws:iam::999999999999:root"),
+        ],
+    )
+    .unwrap();
+    assert_eq!(d, "allowed");
+}
+
+#[test]
+fn simulate_principal_policy_only_uses_a_user_source_as_caller() {
+    let svc = make_service();
+    let grant = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"*"}]}"#;
+    let run = |source: &str| {
+        svc.simulate_principal_policy(&make_request(
+            "SimulatePrincipalPolicy",
+            vec![
+                ("PolicySourceArn", source),
+                ("ActionNames.member.1", "s3:GetObject"),
+                ("ResourcePolicy", grant),
+            ],
+        ))
+    };
+    // A user source stands in for CallerArn.
+    let resp = run("arn:aws:iam::123456789012:user/alice").unwrap();
+    let body = std::str::from_utf8(resp.body.expect_bytes()).unwrap();
+    assert!(
+        body.contains("<EvalDecision>allowed</EvalDecision>"),
+        "{body}"
+    );
+    // A role source does not: the resource policy needs an explicit caller.
+    let err = run("arn:aws:iam::123456789012:role/app").err().unwrap();
+    assert_eq!(err.code(), "InvalidInput");
+}
+
+#[test]
+fn simulate_policy_enforces_member_constraints_and_pages_results() {
+    let svc = make_service();
+    let policy = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*"}]}"#;
+    let base = vec![
+        ("PolicyInputList.member.1", policy),
+        ("ActionNames.member.1", "s3:GetObject"),
+        ("ActionNames.member.2", "s3:PutObject"),
+        ("ActionNames.member.3", "s3:DeleteObject"),
+    ];
+    for bad in [
+        ("CallerArn", ""),
+        ("Marker", ""),
+        ("MaxItems", "0"),
+        ("MaxItems", "1001"),
+        ("ResourceOwner", ""),
+        ("ResourceHandlingOption", ""),
+        ("ResourceHandlingOption", "EC2-Bogus"),
+        ("ResourcePolicy", ""),
+    ] {
+        let mut params = base.clone();
+        params.push(bad);
+        let err = svc
+            .simulate_custom_policy(&make_request("SimulateCustomPolicy", params))
+            .err()
+            .unwrap_or_else(|| panic!("{bad:?} accepted"));
+        assert_eq!(err.code(), "InvalidInput", "{bad:?}");
+    }
+    let err = svc
+        .simulate_principal_policy(&make_request(
+            "SimulatePrincipalPolicy",
+            vec![
+                ("PolicySourceArn", "arn:aws:iam::1"),
+                ("ActionNames.member.1", "s3:GetObject"),
+            ],
+        ))
+        .err()
+        .unwrap();
+    assert_eq!(err.code(), "InvalidInput");
+
+    // MaxItems=2 over three results: two, then the rest via Marker.
+    let mut params = base.clone();
+    params.push(("MaxItems", "2"));
+    params.push(("ResourceHandlingOption", "EC2-VPC-EBS"));
+    let resp = svc
+        .simulate_custom_policy(&make_request("SimulateCustomPolicy", params))
+        .unwrap();
+    let body = std::str::from_utf8(resp.body.expect_bytes())
+        .unwrap()
+        .to_string();
+    assert_eq!(body.matches("<EvalActionName>").count(), 2, "{body}");
+    assert!(body.contains("<IsTruncated>true</IsTruncated>"), "{body}");
+    let marker = body
+        .split("<Marker>")
+        .nth(1)
+        .unwrap()
+        .split("</Marker>")
+        .next()
+        .unwrap()
+        .to_string();
+    let mut params: Vec<(&str, &str)> = base.clone();
+    params.push(("MaxItems", "2"));
+    params.push(("Marker", &marker));
+    let resp = svc
+        .simulate_custom_policy(&make_request("SimulateCustomPolicy", params))
+        .unwrap();
+    let body = std::str::from_utf8(resp.body.expect_bytes())
+        .unwrap()
+        .to_string();
+    assert_eq!(body.matches("<EvalActionName>").count(), 1, "{body}");
+    assert!(body.contains("s3:DeleteObject"), "{body}");
+    assert!(body.contains("<IsTruncated>false</IsTruncated>"), "{body}");
+}
+
 #[test]
 fn simulate_custom_policy_returns_implicit_deny_when_action_unrelated() {
     let svc = make_service();

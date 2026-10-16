@@ -1505,7 +1505,6 @@ impl AppConfigService {
             .get("ExtensionVersionNumber")
             .cloned()
             .unwrap_or(json!(1));
-        let params = body.get("Parameters").cloned();
         let mut accounts = self.state.write();
         let st = accounts.get_or_create(&req.account_id);
         // Record the referenced extension so GetExtension can resolve it when
@@ -1517,9 +1516,11 @@ impl AppConfigService {
             ext.insert("Name".to_string(), json!(extension_identifier));
             ext.insert("VersionNumber".to_string(), ext_version);
             ext.insert("Arn".to_string(), json!(ext_arn));
-            if let Some(p) = params {
-                ext.insert("Parameters".to_string(), p);
-            }
+            // No `Parameters`: an extension's `Parameters` are its parameter
+            // *definitions* (`ParameterMap` of `Parameter {Description,
+            // Required, Dynamic}`), which are not known for an extension
+            // that was only referenced. The association's parameter *values*
+            // (`ParameterValueMap`) stay on the association.
             st.referenced_extensions
                 .insert(extension_identifier.clone(), Value::Object(ext));
         }
@@ -2140,5 +2141,69 @@ impl AppConfigService {
             set_header(&mut resp, "Version-Label", l);
         }
         Ok(resp)
+    }
+}
+
+#[cfg(test)]
+mod extension_association_tests {
+    use super::*;
+    use crate::service::AppConfigService;
+    use fakecloud_core::multi_account::MultiAccountState;
+    use std::sync::Arc;
+
+    fn req(method: http::Method, path: &str, body: Value) -> AwsRequest {
+        AwsRequest {
+            service: "appconfig".to_string(),
+            action: String::new(),
+            method,
+            raw_path: path.to_string(),
+            raw_query: String::new(),
+            path_segments: path
+                .trim_start_matches('/')
+                .split('/')
+                .map(str::to_string)
+                .collect(),
+            query_params: std::collections::HashMap::new(),
+            headers: http::HeaderMap::new(),
+            body: bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+            body_stream: parking_lot::Mutex::new(None),
+            account_id: "000000000000".to_string(),
+            region: "us-east-1".to_string(),
+            request_id: "rid".to_string(),
+            is_query_protocol: false,
+            access_key_id: None,
+            principal: None,
+        }
+    }
+
+    #[test]
+    fn referenced_extension_does_not_take_association_parameter_values() {
+        let svc = AppConfigService::new(Arc::new(parking_lot::RwLock::new(
+            MultiAccountState::new("000000000000", "us-east-1", ""),
+        )));
+        let created = svc
+            .create_extension_association(&req(
+                http::Method::POST,
+                "/extensionassociations",
+                json!({
+                    "ExtensionIdentifier": "AWS.AppConfig.Example",
+                    "ResourceIdentifier": "arn:aws:appconfig:us-east-1:000000000000:application/abc1234",
+                    "Parameters": {"k": "v"}
+                }),
+            ))
+            .unwrap();
+        let assoc: Value = serde_json::from_slice(created.body.expect_bytes()).unwrap();
+        // The values stay on the association...
+        assert_eq!(assoc["Parameters"], json!({"k": "v"}));
+        // ...and never become the referenced extension's parameter definitions.
+        let ext = svc
+            .get_extension(
+                &req(http::Method::GET, "/extensions/AWS.AppConfig.Example", Value::Null),
+                "AWS.AppConfig.Example",
+            )
+            .unwrap();
+        let ext: Value = serde_json::from_slice(ext.body.expect_bytes()).unwrap();
+        assert_eq!(ext["Name"], "AWS.AppConfig.Example");
+        assert!(ext.get("Parameters").is_none(), "{ext}");
     }
 }
