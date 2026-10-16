@@ -347,6 +347,7 @@ mod tests {
             resource_type: resource_type.to_string(),
             status: "CREATE_COMPLETE".to_string(),
             service_token: None,
+            properties: None,
             attributes: std::collections::BTreeMap::new(),
             deletion_policy: None,
             update_replace_policy: None,

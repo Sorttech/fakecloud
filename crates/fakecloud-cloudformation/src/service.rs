@@ -569,6 +569,7 @@ fn reconstruct_stack_resource(
         resource_type: type_name.to_string(),
         status: "CREATE_COMPLETE".to_string(),
         service_token: None,
+        properties: None,
         attributes: attributes.clone(),
         // Cloud Control has no CloudFormation DeletionPolicy concept.
         deletion_policy: None,
@@ -1210,25 +1211,6 @@ impl ContainerBackingHandles {
     }
 }
 
-/// Drain a provisioner's queued custom-resource Lambda invokes (`Custom::*`),
-/// running each off the request path in a detached task so a cold image pull
-/// never blocks the client or stalls the CFN state lock. Used by the
-/// update/delete paths (where `defer_custom_invokes` is set).
-///
-/// Fire-and-forget: the outcome is logged and discarded. Only for callers whose
-/// stack status does not depend on it. A caller that must report the outcome
-/// (`ExecuteChangeSet`) drains the queue itself and awaits
-/// [`run_custom_invokes`] instead.
-pub(crate) fn spawn_custom_invokes(provisioner: &ResourceProvisioner) {
-    let intents = std::mem::take(&mut *provisioner.pending_custom_invokes.lock());
-    for intent in intents {
-        let delivery = provisioner.delivery.clone();
-        tokio::spawn(async move {
-            let _ = invoke_custom_resource(&delivery, &intent).await;
-        });
-    }
-}
-
 /// Run a drained batch of custom-resource invokes to completion, reporting the
 /// first failure.
 ///
@@ -1238,44 +1220,66 @@ pub(crate) fn spawn_custom_invokes(provisioner: &ResourceProvisioner) {
 /// `ResponseURL` signal, because `cfn-response` reports FAILED out of band.
 /// Skipping both is how a changeset-provisioned custom resource that failed
 /// still produced a CREATE_COMPLETE stack.
+///
+/// A `Delete` here is for a resource the new template dropped. CloudFormation
+/// removes those in UPDATE_COMPLETE_CLEANUP_IN_PROGRESS, after the update has
+/// succeeded ("In this state, the stack has been updated and is usable, but
+/// CloudFormation is still deleting the old resources", User Guide, "Stack
+/// status codes", checked 2026-10-16), so its failure is logged and does not
+/// fail the update.
 pub(crate) async fn run_custom_invokes(
     delivery: &Arc<DeliveryBus>,
     responses: &SharedCustomResourceResponses,
     intents: Vec<CustomInvokeIntent>,
 ) -> Result<(), String> {
     for intent in intents {
-        invoke_custom_resource(delivery, &intent).await?;
-
-        // The handler PUTs its signal before returning, but the PUT can still
-        // be in flight as the invoke response comes back; wait the same 5s the
-        // synchronous arm does. `wait_for` parks the thread, so it goes to a
-        // blocking pool rather than a tokio worker.
-        let Some(request_id) = intent.signal_request_id else {
-            continue;
-        };
-        let responses = responses.clone();
-        let signal = tokio::task::spawn_blocking(move || {
-            responses.wait_for(&request_id, std::time::Duration::from_secs(5))
-        })
-        .await
-        .map_err(|e| format!("custom resource signal wait failed: {e}"))?;
-        // No signal is not a failure: a handler that never uses `cfn-response`
-        // never sends one (`await_custom_resource_signal`).
-        if let Some(signal) = signal {
-            if signal.failed() {
-                return Err(format!(
-                    "Custom resource failed: {}",
-                    signal.failure_reason()
-                ));
-            }
+        match run_custom_invoke(delivery, responses, &intent).await {
+            Err(msg) if intent.request_type == "Delete" => tracing::warn!(
+                "Custom resource cleanup delete for {} failed: {msg}",
+                intent.logical_id
+            ),
+            Err(msg) => return Err(msg),
+            Ok(()) => {}
         }
     }
     Ok(())
 }
 
-/// Everything the changeset settle task needs, as an owned struct so it can
-/// move into a detached `tokio::spawn`. Mirrors `CreateStackContext`.
-pub(crate) struct ChangeSetSettleContext {
+/// Invoke one queued handler and wait for its `ResponseURL` signal.
+async fn run_custom_invoke(
+    delivery: &Arc<DeliveryBus>,
+    responses: &SharedCustomResourceResponses,
+    intent: &CustomInvokeIntent,
+) -> Result<(), String> {
+    invoke_custom_resource(delivery, intent).await?;
+
+    // The handler PUTs its signal before returning, but the PUT can still
+    // be in flight as the invoke response comes back; wait the same 5s the
+    // synchronous arm does. `wait_for` parks the thread, so it goes to a
+    // blocking pool rather than a tokio worker.
+    let Some(request_id) = intent.signal_request_id.clone() else {
+        return Ok(());
+    };
+    let responses = responses.clone();
+    let signal = tokio::task::spawn_blocking(move || {
+        responses.wait_for(&request_id, std::time::Duration::from_secs(5))
+    })
+    .await
+    .map_err(|e| format!("custom resource signal wait failed: {e}"))?;
+    // No signal is not a failure: a handler that never uses `cfn-response`
+    // never sends one (`await_custom_resource_signal`).
+    match signal {
+        Some(signal) if signal.failed() => Err(format!(
+            "Custom resource failed: {}",
+            signal.failure_reason()
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Everything the custom-resource settle task needs, as an owned struct so it
+/// can move into a detached `tokio::spawn`. Mirrors `CreateStackContext`.
+pub(crate) struct CustomResourceSettleContext {
     pub state: SharedCloudFormationState,
     pub snapshot_store: Option<Arc<dyn SnapshotStore>>,
     pub snapshot_lock: Arc<AsyncMutex<()>>,
@@ -1283,12 +1287,17 @@ pub(crate) struct ChangeSetSettleContext {
     pub responses: SharedCustomResourceResponses,
     pub intents: Vec<CustomInvokeIntent>,
     pub account_id: String,
-    /// The region the change set (and so its stack) lives in.
+    /// The region the stack lives in.
     pub region: String,
     pub stack_id: String,
     pub stack_name: String,
-    pub change_set_id: String,
-    /// The status `ExecuteChangeSet` left the stack at. The settle task only
+    /// The change set being executed, whose `ExecutionStatus` the outcome
+    /// settles. `None` for `UpdateStack`.
+    pub change_set_id: Option<String>,
+    /// SNS topics told the terminal status. Empty for `ExecuteChangeSet`,
+    /// which sends no stack notifications.
+    pub notification_arns: Vec<String>,
+    /// The status the stack op left the stack at. The settle task only
     /// flips a stack still there, so it cannot clobber a delete or a newer
     /// execution that moved the stack on while the handlers ran.
     pub in_progress: &'static str,
@@ -1296,15 +1305,16 @@ pub(crate) struct ChangeSetSettleContext {
     pub failed: &'static str,
 }
 
-/// Run a changeset's deferred custom-resource invokes, then flip the stack to
+/// Run a stack op's deferred custom-resource invokes, then flip the stack to
 /// its terminal status.
 ///
-/// `ExecuteChangeSet` holds the stack at `*_IN_PROGRESS` while these are
-/// outstanding, because a custom resource's outcome is part of whether the
-/// stack succeeded -- real CloudFormation keeps the stack `CREATE_IN_PROGRESS`
-/// until every custom resource signals, and fails it when one signals FAILED.
-pub(crate) async fn settle_changeset_custom_resources(ctx: ChangeSetSettleContext) {
-    let ChangeSetSettleContext {
+/// `ExecuteChangeSet` and `UpdateStack` hold the stack at `*_IN_PROGRESS`
+/// while these are outstanding, because a custom resource's outcome is part of
+/// whether the stack succeeded -- real CloudFormation keeps the stack
+/// `*_IN_PROGRESS` until every custom resource signals, and rolls it back when
+/// one signals FAILED.
+pub(crate) async fn settle_custom_resources(ctx: CustomResourceSettleContext) {
+    let CustomResourceSettleContext {
         state,
         snapshot_store,
         snapshot_lock,
@@ -1316,6 +1326,7 @@ pub(crate) async fn settle_changeset_custom_resources(ctx: ChangeSetSettleContex
         stack_id,
         stack_name,
         change_set_id,
+        notification_arns,
         in_progress,
         complete,
         failed,
@@ -1352,7 +1363,7 @@ pub(crate) async fn settle_changeset_custom_resources(ctx: ChangeSetSettleContex
         stack.updated_at = Some(Utc::now());
         if reason.is_some() {
             // A rolled-back stack publishes no outputs, so it must not keep
-            // exporting the ones `ExecuteChangeSet` registered from them.
+            // exporting the ones the stack op registered from them.
             stack.outputs.clear();
             CloudFormationService::sync_exports_imports(st, &stack_id, &stack_name, &[], &[]);
         }
@@ -1364,10 +1375,9 @@ pub(crate) async fn settle_changeset_custom_resources(ctx: ChangeSetSettleContex
             status,
             reason,
         );
-        if let Some(e) = st
-            .extras
-            .get_mut("change_sets")
-            .and_then(|m| m.get_mut(&change_set_id))
+        if let Some(e) = change_set_id
+            .as_ref()
+            .and_then(|id| st.extras.get_mut("change_sets").and_then(|m| m.get_mut(id)))
         {
             e["ExecutionStatus"] = serde_json::json!(if reason.is_some() {
                 "EXECUTE_FAILED"
@@ -1377,6 +1387,139 @@ pub(crate) async fn settle_changeset_custom_resources(ctx: ChangeSetSettleContex
         }
     }
 
+    CloudFormationService::send_stack_notification(
+        &delivery,
+        &notification_arns,
+        &stack_name,
+        &stack_id,
+        status,
+    );
+    save_snapshot_static(state, snapshot_store, snapshot_lock).await;
+}
+
+/// Everything a `DeleteStack` of a stack holding custom resources needs, moved
+/// into a detached `tokio::spawn`.
+pub(crate) struct StackDeleteContext {
+    pub state: SharedCloudFormationState,
+    pub snapshot_store: Option<Arc<dyn SnapshotStore>>,
+    pub snapshot_lock: Arc<AsyncMutex<()>>,
+    pub snapshot_hooks: BTreeMap<&'static str, SnapshotHook>,
+    pub provisioner: ResourceProvisioner,
+    pub handles: ContainerBackingHandles,
+    /// The stack's resources, in creation order.
+    pub resources: Vec<StackResource>,
+    pub deleted_types: Vec<String>,
+    pub account_id: String,
+    pub region: String,
+    pub stack_id: String,
+    pub stack_name: String,
+    pub notification_arns: Vec<String>,
+}
+
+/// Delete a stack holding custom resources, awaiting each handler's Delete,
+/// then finish the delete or leave the stack DELETE_FAILED.
+///
+/// Resources go in reverse creation order, so a custom resource's Delete runs
+/// while the handler Lambda it depends on still exists. A Delete that fails
+/// stops the delete there: "DELETE_FAILED: Unsuccessful deletion of one or
+/// more stacks. Because the delete failed, you might have some resources that
+/// are still running" (User Guide, "Stack status codes", checked 2026-10-16).
+/// The stack keeps the failed resource and every one not yet deleted, so a
+/// retried `DeleteStack` picks up where this one stopped.
+pub(crate) async fn delete_stack_resources(ctx: StackDeleteContext) {
+    let StackDeleteContext {
+        state,
+        snapshot_store,
+        snapshot_lock,
+        snapshot_hooks,
+        provisioner,
+        handles,
+        mut resources,
+        deleted_types,
+        account_id,
+        region,
+        stack_id,
+        stack_name,
+        notification_arns,
+    } = ctx;
+
+    let mut failure = None;
+    while let Some(resource) = resources.pop() {
+        let _ = provisioner.delete_resource_respecting_policy(&resource);
+        let intents = std::mem::take(&mut *provisioner.pending_custom_invokes.lock());
+        for intent in intents {
+            if let Err(msg) = run_custom_invoke(
+                &provisioner.delivery,
+                &provisioner.custom_resource_responses,
+                &intent,
+            )
+            .await
+            {
+                failure = Some(msg);
+            }
+        }
+        if failure.is_some() {
+            resources.push(resource);
+            break;
+        }
+    }
+    // Reap the backing containers of whatever was deleted, as the synchronous
+    // path in `delete_stack` does.
+    handles.spawn_teardown_intents(std::mem::take(
+        &mut *provisioner.pending_container_teardowns.lock(),
+    ));
+    persist_touched_services(&snapshot_hooks, deleted_types).await;
+
+    let status = if failure.is_some() {
+        "DELETE_FAILED"
+    } else {
+        "DELETE_COMPLETE"
+    };
+    {
+        let mut accounts = state.write();
+        let Some(st) = accounts.regional_get_mut(&account_id, &region) else {
+            tracing::warn!(
+                "stack {stack_name}'s region {region} is gone before its delete \
+                 settled; not recording the outcome ({status})"
+            );
+            return;
+        };
+        let Some(stack) = st
+            .stacks
+            .values_mut()
+            .find(|s| s.stack_id == stack_id && s.status == "DELETE_IN_PROGRESS")
+        else {
+            tracing::warn!(
+                "stack {stack_name} moved on before its delete settled; \
+                 not recording the outcome ({status})"
+            );
+            return;
+        };
+        match &failure {
+            None => CloudFormationService::finish_stack_delete(st, &stack_id, &stack_name),
+            Some(reason) => {
+                stack.status = status.to_string();
+                stack.status_reason = Some(reason.clone());
+                stack.resources = resources;
+                record_stack_status_event_with_reason(
+                    st,
+                    &stack_id,
+                    &stack_name,
+                    "AWS::CloudFormation::Stack",
+                    status,
+                    Some(reason),
+                );
+            }
+        }
+    }
+
+    CloudFormationService::send_stack_notification(
+        &provisioner.delivery,
+        &notification_arns,
+        &stack_name,
+        &stack_id,
+        status,
+    );
     save_snapshot_static(state, snapshot_store, snapshot_lock).await;
 }
 
@@ -2661,6 +2804,15 @@ impl CloudFormationService {
             let stack = state.live_stack_mut(&stack_name);
 
             if let Some(stack) = stack {
+                // A delete still waiting on its custom resources is already
+                // under way; deleting again would send their handlers a second
+                // Delete.
+                if stack.status == "DELETE_IN_PROGRESS" {
+                    return Ok(AwsResponse::xml(
+                        StatusCode::OK,
+                        xml_responses::delete_stack_response(&req.request_id),
+                    ));
+                }
                 let stack_id = stack.stack_id.clone();
                 let stack_name_for_notif = stack.name.clone();
                 let notification_arns = stack.notification_arns.clone();
@@ -2743,76 +2895,77 @@ impl CloudFormationService {
                 let provisioner =
                     self.provisioner_deferred(&stack_id, &req.account_id, &req.region);
 
-                // Delete resources in reverse order, honoring each resource's
-                // DeletionPolicy (Retain/Snapshot leaves the physical resource
-                // in place instead of destroying it).
-                for resource in resources.iter().rev() {
-                    let _ = provisioner.delete_resource_respecting_policy(resource);
-                }
+                let handles = ContainerBackingHandles::from_provisioner(&provisioner)
+                    .with_snapshot_hooks(&self.snapshot_hooks);
 
-                // Reap the REAL backing containers for the deleted container
-                // resources (RDS / ElastiCache / ECS / ASG-EC2) off the request
-                // path, so a stack delete does not leak running containers (the
-                // create-side #2031-#2034 hardening reaching the delete path).
-                // Each delete_resource above only removed the in-memory record.
-                // The snapshot hooks let the detached teardown persist the EC2
-                // records it terminates, which this stack op has already
-                // serialized as still running.
-                ContainerBackingHandles::from_provisioner(&provisioner)
-                    .with_snapshot_hooks(&self.snapshot_hooks)
-                    .spawn_teardown_intents(std::mem::take(
+                // A custom resource's Delete runs its handler, which decides
+                // whether the stack is deleted at all and can take minutes on a
+                // cold image pull, and the handler Lambda (usually in this same
+                // stack) must outlive it. So such a stack is deleted in a
+                // detached task that awaits each handler in turn, and stays
+                // DELETE_IN_PROGRESS until it settles.
+                if resources.iter().any(|r| r.service_token.is_some()) {
+                    let mut accounts = self.state.write();
+                    if let Some(stack) = accounts
+                        .regional_get_mut(&req.account_id, &req.region)
+                        .and_then(|state| {
+                            state.stacks.values_mut().find(|s| s.stack_id == stack_id)
+                        })
+                    {
+                        stack.status = "DELETE_IN_PROGRESS".to_string();
+                        stack.status_reason = None;
+                    }
+                    drop(accounts);
+                    tokio::spawn(delete_stack_resources(StackDeleteContext {
+                        state: self.state.clone(),
+                        snapshot_store: self.snapshot_store.clone(),
+                        snapshot_lock: self.snapshot_lock.clone(),
+                        snapshot_hooks: self.snapshot_hooks.clone(),
+                        provisioner,
+                        handles,
+                        resources,
+                        deleted_types: std::mem::take(&mut deleted_types),
+                        account_id: req.account_id.clone(),
+                        region: req.region.clone(),
+                        stack_id,
+                        stack_name: stack_name_for_notif,
+                        notification_arns,
+                    }));
+                } else {
+                    // Delete resources in reverse order, honoring each resource's
+                    // DeletionPolicy (Retain/Snapshot leaves the physical resource
+                    // in place instead of destroying it).
+                    for resource in resources.iter().rev() {
+                        let _ = provisioner.delete_resource_respecting_policy(resource);
+                    }
+
+                    // Reap the REAL backing containers for the deleted container
+                    // resources (RDS / ElastiCache / ECS / ASG-EC2) off the request
+                    // path, so a stack delete does not leak running containers (the
+                    // create-side #2031-#2034 hardening reaching the delete path).
+                    // Each delete_resource above only removed the in-memory record.
+                    // The snapshot hooks let the detached teardown persist the EC2
+                    // records it terminates, which this stack op has already
+                    // serialized as still running.
+                    handles.spawn_teardown_intents(std::mem::take(
                         &mut *provisioner.pending_container_teardowns.lock(),
                     ));
-                spawn_custom_invokes(&provisioner);
 
-                // Re-acquire the write lock to update stack status
-                let mut accounts = self.state.write();
-                if let Some(state) = accounts.regional_get_mut(&req.account_id, &req.region) {
-                    if let Some(stack) = state.stacks.values_mut().find(|s| s.stack_id == stack_id)
-                    {
-                        stack.status = "DELETE_COMPLETE".to_string();
-                        // The reason belonged to the previous status (a failed
-                        // create/update); carrying it into DELETE_COMPLETE would
-                        // report a stale failure on a cleanly deleted stack.
-                        stack.status_reason = None;
-                        stack.resources.clear();
-                        stack.outputs.clear();
-                        // A deleted stack's policy goes with it; a later stack
-                        // of the same name starts without one. Only when this
-                        // call deleted the stack: a concurrent delete may have
-                        // finished first and the name been reused since.
-                        state.stack_policies.remove(&stack_name_for_notif);
+                    // Re-acquire the write lock to update stack status
+                    let mut accounts = self.state.write();
+                    if let Some(state) = accounts.regional_get_mut(&req.account_id, &req.region) {
+                        Self::finish_stack_delete(state, &stack_id, &stack_name_for_notif);
                     }
-                    // Drop this stack's exports + import-consumer entries.
-                    let stale_exports: Vec<String> = state
-                        .exports
-                        .iter()
-                        .filter(|(_, e)| e.exporting_stack_name == stack_name_for_notif)
-                        .map(|(k, _)| k.clone())
-                        .collect();
-                    for k in stale_exports {
-                        state.exports.remove(&k);
-                    }
-                    for entries in state.imports.values_mut() {
-                        entries.retain(|s| s != &stack_name_for_notif);
-                    }
-                    state.imports.retain(|_, v| !v.is_empty());
-                    // A stack's change sets go with it. Left behind, they would
-                    // still answer DescribeChangeSet, and a re-created stack of
-                    // the same name would find them by name.
-                    if let Some(change_sets) = state.extras.get_mut("change_sets") {
-                        change_sets.retain(|_, v| v["StackId"].as_str() != Some(stack_id.as_str()));
-                    }
+                    drop(accounts);
+
+                    Self::send_stack_notification(
+                        &self.deps.delivery,
+                        &notification_arns,
+                        &stack_name_for_notif,
+                        &stack_id,
+                        "DELETE_COMPLETE",
+                    );
                 }
-                drop(accounts);
-
-                Self::send_stack_notification(
-                    &self.deps.delivery,
-                    &notification_arns,
-                    &stack_name_for_notif,
-                    &stack_id,
-                    "DELETE_COMPLETE",
-                );
             }
         }
 
@@ -2825,6 +2978,48 @@ impl CloudFormationService {
             StatusCode::OK,
             xml_responses::delete_stack_response(&req.request_id),
         ))
+    }
+
+    /// Mark a stack DELETE_COMPLETE and drop everything that goes with it.
+    pub(crate) fn finish_stack_delete(
+        state: &mut CloudFormationState,
+        stack_id: &str,
+        stack_name: &str,
+    ) {
+        if let Some(stack) = state.stacks.values_mut().find(|s| s.stack_id == stack_id) {
+            stack.status = "DELETE_COMPLETE".to_string();
+            // The reason belonged to the previous status (a failed
+            // create/update); carrying it into DELETE_COMPLETE would
+            // report a stale failure on a cleanly deleted stack.
+            stack.status_reason = None;
+            stack.resources.clear();
+            stack.outputs.clear();
+            // A deleted stack's policy goes with it; a later stack
+            // of the same name starts without one. Only when this
+            // call deleted the stack: a concurrent delete may have
+            // finished first and the name been reused since.
+            state.stack_policies.remove(stack_name);
+        }
+        // Drop this stack's exports + import-consumer entries.
+        let stale_exports: Vec<String> = state
+            .exports
+            .iter()
+            .filter(|(_, e)| e.exporting_stack_name == stack_name)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in stale_exports {
+            state.exports.remove(&k);
+        }
+        for entries in state.imports.values_mut() {
+            entries.retain(|s| s != stack_name);
+        }
+        state.imports.retain(|_, v| !v.is_empty());
+        // A stack's change sets go with it. Left behind, they would
+        // still answer DescribeChangeSet, and a re-created stack of
+        // the same name would find them by name.
+        if let Some(change_sets) = state.extras.get_mut("change_sets") {
+            change_sets.retain(|_, v| v["StackId"].as_str() != Some(stack_id));
+        }
     }
 
     fn describe_stacks(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
@@ -3329,7 +3524,14 @@ impl CloudFormationService {
         // guard is released before the persist `.await` below, keeping the
         // handler future `Send`. The block yields everything the post-lock tail
         // needs, including the resource types touched by the update.
-        let (touched_types, stack_id, stack_name_for_notif, notification_arns, resources_snapshot) = {
+        let (
+            touched_types,
+            stack_id,
+            stack_name_for_notif,
+            notification_arns,
+            resources_snapshot,
+            deferred,
+        ) = {
             let mut accounts = self.state.write();
             let state = accounts.regional_get_mut(&req.account_id, &req.region);
             // UpdateStack declares only `InsufficientCapabilitiesException` and
@@ -3361,7 +3563,14 @@ impl CloudFormationService {
                     xml_responses::update_stack_response(&stack_id, &req.request_id),
                 ));
             };
-            let (update_result, stack_id, stack_name_owned, resources_snapshot, notification_arns) = {
+            let (
+                update_result,
+                stack_id,
+                stack_name_owned,
+                resources_snapshot,
+                notification_arns,
+                deferred,
+            ) = {
                 let stack = state
                     .live_stack_mut(&input.stack_name)
                     .expect("stack existence checked above");
@@ -3383,10 +3592,19 @@ impl CloudFormationService {
                 let stack_id = stack.stack_id.clone();
                 let stack_name_owned = stack.name.clone();
                 stack.template = input.template_body.clone();
+                // Custom-resource invokes were queued rather than run
+                // (`provisioner_deferred`), so their outcome is not known yet
+                // and it decides whether the update succeeded. Hold the stack
+                // UPDATE_IN_PROGRESS and let the settle task below flip it, as
+                // `ExecuteChangeSet` does. A failed update returns before the
+                // queue is used, so its invokes are dropped.
+                let deferred = std::mem::take(&mut *provisioner.pending_custom_invokes.lock());
                 stack.status = if update_result.is_err() {
                     "UPDATE_ROLLBACK_COMPLETE".to_string()
-                } else {
+                } else if deferred.is_empty() {
                     "UPDATE_COMPLETE".to_string()
+                } else {
+                    "UPDATE_IN_PROGRESS".to_string()
                 };
                 stack.status_reason = update_result.as_ref().err().map(ToString::to_string);
                 stack.parameters = input.parameters.clone();
@@ -3407,6 +3625,7 @@ impl CloudFormationService {
                     stack_name_owned,
                     stack.resources.clone(),
                     stack.notification_arns.clone(),
+                    deferred,
                 )
             };
 
@@ -3436,13 +3655,15 @@ impl CloudFormationService {
                         );
                     }
                     record_stack_events(state, &stack_id, &stack_name_owned, &changes);
-                    record_stack_status_event(
-                        state,
-                        &stack_id,
-                        &stack_name_owned,
-                        "AWS::CloudFormation::Stack",
-                        "UPDATE_COMPLETE",
-                    );
+                    if deferred.is_empty() {
+                        record_stack_status_event(
+                            state,
+                            &stack_id,
+                            &stack_name_owned,
+                            "AWS::CloudFormation::Stack",
+                            "UPDATE_COMPLETE",
+                        );
+                    }
                     Ok(touched_types)
                 }
                 Err(e) => {
@@ -3490,14 +3711,15 @@ impl CloudFormationService {
                 stack_name_for_notif,
                 notification_arns,
                 resources_snapshot,
+                deferred,
             )
         };
 
         // The update succeeded (failures returned above). Back any newly-added
         // container resources with REAL containers and reap any removed ones,
         // both off the request path (the #2031-#2034 create-side hardening
-        // reaching the update path), then run any deferred custom-resource
-        // invokes.
+        // reaching the update path). Deferred custom-resource invokes run in
+        // the settle task below, once the outputs are written.
         {
             let handles = ContainerBackingHandles::from_provisioner(&provisioner)
                 .with_snapshot_hooks(&self.snapshot_hooks);
@@ -3507,7 +3729,6 @@ impl CloudFormationService {
             handles.spawn_teardown_intents(std::mem::take(
                 &mut *provisioner.pending_container_teardowns.lock(),
             ));
-            spawn_custom_invokes(&provisioner);
         }
 
         let outputs = Self::resolve_template_outputs(
@@ -3600,13 +3821,35 @@ impl CloudFormationService {
             }
         }
 
-        Self::send_stack_notification(
-            &self.deps.delivery,
-            &notification_arns,
-            &stack_name_for_notif,
-            &stack_id,
-            "UPDATE_COMPLETE",
-        );
+        // Runs after the outputs are written, so a failing custom resource
+        // clears them rather than racing the write.
+        if deferred.is_empty() {
+            Self::send_stack_notification(
+                &self.deps.delivery,
+                &notification_arns,
+                &stack_name_for_notif,
+                &stack_id,
+                "UPDATE_COMPLETE",
+            );
+        } else {
+            tokio::spawn(settle_custom_resources(CustomResourceSettleContext {
+                state: self.state.clone(),
+                snapshot_store: self.snapshot_store.clone(),
+                snapshot_lock: self.snapshot_lock.clone(),
+                delivery: provisioner.delivery.clone(),
+                responses: provisioner.custom_resource_responses.clone(),
+                intents: deferred,
+                account_id: req.account_id.clone(),
+                region: req.region.clone(),
+                stack_id: stack_id.clone(),
+                stack_name: stack_name_for_notif,
+                change_set_id: None,
+                notification_arns,
+                in_progress: "UPDATE_IN_PROGRESS",
+                complete: "UPDATE_COMPLETE",
+                failed: "UPDATE_ROLLBACK_COMPLETE",
+            }));
+        }
 
         // Persist every snapshot-backed service the update touched, so created
         // or deleted resources are reflected on disk after a restart.
