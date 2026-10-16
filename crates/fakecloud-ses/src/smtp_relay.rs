@@ -28,6 +28,9 @@ pub struct OutboundMail<'a> {
     pub subject: Option<&'a str>,
     pub text_body: Option<&'a str>,
     pub html_body: Option<&'a str>,
+    /// The original message of a raw send (decoded). When present it is
+    /// relayed verbatim instead of rebuilding headers from the fields above.
+    pub raw_message: Option<&'a [u8]>,
 }
 
 /// Best-effort SMTP delivery. Returns `Err` only for caller visibility
@@ -60,6 +63,42 @@ pub fn relay(url: &str, mail: &OutboundMail<'_>) -> Result<(), String> {
     write_line(&mut stream, "DATA")?;
     expect_code(&mut reader, "354")?;
 
+    let data = match mail.raw_message {
+        Some(raw) => raw_data_section(raw),
+        None => built_data_section(mail).into_bytes(),
+    };
+    stream
+        .write_all(&data)
+        .map_err(|e| format!("write DATA: {e}"))?;
+    expect_code(&mut reader, "250")?;
+
+    write_line(&mut stream, "QUIT")?;
+    let _ = read_line(&mut reader);
+    Ok(())
+}
+
+/// DATA section for a raw message: CRLF line endings, dot-stuffed (RFC 5321
+/// section 4.5.2), terminated by `<CRLF>.<CRLF>`.
+fn raw_data_section(raw: &[u8]) -> Vec<u8> {
+    let mut data = Vec::with_capacity(raw.len() + 8);
+    let mut lines = raw.split(|b| *b == b'\n').peekable();
+    while let Some(line) = lines.next() {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if lines.peek().is_none() && line.is_empty() {
+            break;
+        }
+        if line.starts_with(b".") {
+            data.push(b'.');
+        }
+        data.extend_from_slice(line);
+        data.extend_from_slice(b"\r\n");
+    }
+    data.extend_from_slice(b".\r\n");
+    data
+}
+
+/// DATA section rebuilt from the message fields.
+fn built_data_section(mail: &OutboundMail<'_>) -> String {
     let mut data = String::new();
     data.push_str(&format!("From: {}\r\n", mail.from));
     if !mail.to.is_empty() {
@@ -69,7 +108,7 @@ pub fn relay(url: &str, mail: &OutboundMail<'_>) -> Result<(), String> {
         data.push_str(&format!("Cc: {}\r\n", mail.cc.join(", ")));
     }
     if let Some(s) = mail.subject {
-        data.push_str(&format!("Subject: {s}\r\n"));
+        data.push_str(&format!("Subject: {}\r\n", crate::mime::encode_header(s)));
     }
     if let (Some(text), Some(html)) = (mail.text_body, mail.html_body) {
         data.push_str("MIME-Version: 1.0\r\n");
@@ -92,14 +131,7 @@ pub fn relay(url: &str, mail: &OutboundMail<'_>) -> Result<(), String> {
         data.push_str("\r\n");
     }
     data.push_str("\r\n.\r\n");
-    stream
-        .write_all(data.as_bytes())
-        .map_err(|e| format!("write DATA: {e}"))?;
-    expect_code(&mut reader, "250")?;
-
-    write_line(&mut stream, "QUIT")?;
-    let _ = read_line(&mut reader);
-    Ok(())
+    data
 }
 
 fn write_line(stream: &mut TcpStream, line: &str) -> Result<(), String> {
@@ -165,6 +197,7 @@ mod tests {
                 subject: None,
                 text_body: None,
                 html_body: None,
+                raw_message: None,
             },
         );
         assert!(err.is_err());
@@ -242,6 +275,7 @@ mod integration {
                 subject: Some("Hello"),
                 text_body: Some("Body line 1"),
                 html_body: None,
+                raw_message: None,
             },
         )
         .unwrap();
@@ -255,5 +289,33 @@ mod integration {
             .any(|l| l.starts_with("RCPT TO:<recipient@example.com>")));
         assert!(log.iter().any(|l| l == "Subject: Hello"));
         assert!(log.iter().any(|l| l == "Body line 1"));
+    }
+
+    #[test]
+    fn built_subject_cannot_inject_headers() {
+        let mail = OutboundMail {
+            from: "sender@example.com",
+            to: &["recipient@example.com".to_string()],
+            cc: &[],
+            bcc: &[],
+            subject: Some("x\r\nBcc: evil@x"),
+            text_body: Some("body"),
+            html_body: None,
+            raw_message: None,
+        };
+        let data = built_data_section(&mail);
+        assert!(!data.contains("\r\nBcc:"), "{data}");
+        let subject = data.lines().find(|l| l.starts_with("Subject: ")).unwrap();
+        assert!(subject.starts_with("Subject: =?UTF-8?B?"), "{subject}");
+    }
+
+    #[test]
+    fn raw_message_is_relayed_verbatim_and_dot_stuffed() {
+        let raw = b"Subject: =?UTF-8?B?T2zDoQ==?=\nTo: a@b.com\n\n.leading dot\r\nend\n";
+        let data = raw_data_section(raw);
+        assert_eq!(
+            data,
+            b"Subject: =?UTF-8?B?T2zDoQ==?=\r\nTo: a@b.com\r\n\r\n..leading dot\r\nend\r\n.\r\n"
+        );
     }
 }

@@ -1,5 +1,13 @@
-//! Hand-rolled RFC 5322 / MIME builder for fakecloud SES.
+//! RFC 5322 / MIME parsing and building for fakecloud SES.
 //!
+//! Parsing: `RawMail` reads the header block of a raw message supplied to
+//! `SendRawEmail` (v1) or `SendEmail` with `Content.Raw` (v2): unfolded
+//! header lookup, RFC 2047 decoding of `Subject`, `X-SES-*` headers, and
+//! address fields. Address fields and API address members are validated as
+//! RFC 5322 mailboxes or groups via `mail-parser` (`parse_address_list`,
+//! `mailbox_address`, `api_recipients`).
+//!
+//! Building: `build_message` renders the outgoing MIME message.
 //! AWS SES `TestRenderEmailTemplate` returns the fully-formed MIME message
 //! that would be sent on `SendTemplatedEmail`. The previous implementation
 //! emitted only `Subject` + `MIME-Version` + `Content-Type` + body, which
@@ -43,7 +51,9 @@ impl RawMail {
                     value.push_str(line.trim());
                 }
             } else if let Some((name, value)) = line.split_once(':') {
-                headers.push((name.to_string(), value.trim().to_string()));
+                // Obsolete RFC 5322 syntax (section 4.5) allows whitespace
+                // between the field name and the colon (`To : a@b.com`).
+                headers.push((name.trim_end().to_string(), value.trim().to_string()));
             }
         }
         for (_, value) in &mut headers {
@@ -57,6 +67,18 @@ impl RawMail {
             .iter()
             .find(|(key, _)| key.eq_ignore_ascii_case(name))
             .map(|(_, value)| value.as_str())
+    }
+
+    /// The `Subject` header with RFC 2047 encoded-words decoded, as SES
+    /// reports it for raw sends.
+    pub(crate) fn subject(&self) -> Option<String> {
+        let value = self.header("Subject")?;
+        // The library field parser flushes its final token on the line terminator.
+        let field = format!("{value}\r\n");
+        match mail_parser::parsers::MessageStream::new(field.as_bytes()).parse_unstructured() {
+            mail_parser::HeaderValue::Text(text) => Some(text.into_owned()),
+            _ => Some(String::new()),
+        }
     }
 
     pub(crate) fn addresses(&self, name: &str) -> Result<Vec<String>, InvalidAddress> {
@@ -417,8 +439,14 @@ fn quoted_printable_encode(input: &str) -> String {
 }
 
 /// RFC 2047 encoded-word for non-ASCII headers; raw otherwise.
-fn encode_header(value: &str) -> String {
-    if value.is_ascii() {
+/// Render an unstructured header value (e.g. `Subject`) for the wire. Plain
+/// printable ASCII passes through; anything else, including CR/LF that would
+/// otherwise inject header lines, becomes an RFC 2047 encoded-word.
+pub(crate) fn encode_header(value: &str) -> String {
+    if value
+        .bytes()
+        .all(|b| b == b'\t' || (0x20..0x7f).contains(&b))
+    {
         value.to_string()
     } else {
         let b64 = base64::engine::general_purpose::STANDARD.encode(value.as_bytes());
@@ -433,6 +461,28 @@ fn rfc2822_now() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn raw(text: &str) -> RawMail {
+        RawMail::parse(&base64::engine::general_purpose::STANDARD.encode(text)).unwrap()
+    }
+
+    #[test]
+    fn raw_subject_decodes_rfc2047_including_folded_words() {
+        let mail = raw("Subject: =?UTF-8?B?T2zDoQ==?=\r\n =?UTF-8?Q?_mundo?=\r\n\r\nBody");
+        assert_eq!(mail.subject().as_deref(), Some("Ol\u{e1} mundo"));
+        assert_eq!(
+            raw("Subject: plain text\r\n\r\n").subject().as_deref(),
+            Some("plain text")
+        );
+        assert_eq!(raw("To: a@b.com\r\n\r\n").subject(), None);
+    }
+
+    #[test]
+    fn raw_header_names_tolerate_whitespace_before_colon() {
+        let mail = raw("To : a@example.com\r\nCc\t: b@example.com\r\n\r\n");
+        assert_eq!(mail.addresses("To").unwrap(), ["a@example.com"]);
+        assert_eq!(mail.addresses("Cc").unwrap(), ["b@example.com"]);
+    }
 
     #[test]
     fn optional_group_comments_preserve_comments_inside_mailboxes() {
@@ -533,6 +583,20 @@ mod tests {
             html: None,
         });
         assert!(mime.contains("Subject: =?UTF-8?B?"));
+    }
+
+    #[test]
+    fn header_encoding_never_emits_line_breaks() {
+        let encoded = encode_header("x\r\nBcc: evil@x");
+        assert!(!encoded.contains(['\r', '\n']));
+        assert!(encoded.starts_with("=?UTF-8?B?"));
+        let mime = build_message(&MimeInputs {
+            subject: "x\r\nBcc: evil@x",
+            text: Some("body"),
+            html: None,
+        });
+        assert!(!mime.contains("\r\nBcc:"));
+        assert_eq!(encode_header("plain subject"), "plain subject");
     }
 
     #[test]

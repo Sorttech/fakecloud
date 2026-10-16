@@ -37,6 +37,7 @@ const COMPLAINT_ADDR: &str = "complaint@simulator.amazonses.com";
 #[cfg(test)]
 const SUCCESS_ADDR: &str = "success@simulator.amazonses.com";
 const SUPPRESSION_ADDR: &str = "suppressionlist@simulator.amazonses.com";
+#[cfg(test)]
 const OOTO_ADDR: &str = "ooto@simulator.amazonses.com";
 const SOFTBOUNCE_ADDR: &str = "softbounce@simulator.amazonses.com";
 const TRANSIENT_BOUNCE_ADDR: &str = "transient-bounce@simulator.amazonses.com";
@@ -217,26 +218,6 @@ fn build_published_event(
     event
 }
 
-/// Determine which event types to generate based on recipient addresses.
-/// Returns the list of event types to emit and whether to add to suppression list.
-pub fn classify_recipients(recipients: &[String]) -> (Vec<SesEventType>, bool) {
-    let mut events = vec![SesEventType::Send];
-    let mut suppress = false;
-    for recipient in recipients
-        .iter()
-        .filter_map(|r| crate::mime::mailbox_address(r))
-    {
-        let (types, add_to_suppression) = recipient_event_types(&recipient);
-        suppress |= add_to_suppression;
-        for event in types {
-            if !events.contains(event) {
-                events.push(*event);
-            }
-        }
-    }
-    (events, suppress)
-}
-
 /// Simulator outcomes are per mailbox. A bounce must not mask delivery or a
 /// complaint for another recipient of the same message.
 fn recipient_event_types(recipient: &str) -> (&'static [SesEventType], bool) {
@@ -244,8 +225,10 @@ fn recipient_event_types(recipient: &str) -> (&'static [SesEventType], bool) {
     match recipient {
         SUPPRESSION_ADDR => (&[Send, Bounce], true),
         BOUNCE_ADDR | SOFTBOUNCE_ADDR | TRANSIENT_BOUNCE_ADDR => (&[Send, Bounce], false),
-        COMPLAINT_ADDR | OOTO_ADDR => (&[Send, Delivery, Complaint], false),
-        // Normal, success and forwarding mailboxes all deliver.
+        COMPLAINT_ADDR => (&[Send, Delivery, Complaint], false),
+        // Normal, success, forwarding and out-of-office mailboxes all
+        // deliver. The out-of-office simulator only sends an auto-reply;
+        // it never files a complaint.
         _ => (&[Send, Delivery], false),
     }
 }
@@ -286,16 +269,20 @@ pub fn resolve_config_set(
     let from_address = crate::mime::mailbox_address(from_address)?;
     let mas = ses_state.read();
     let state = mas.get(account_id)?;
-    if let Some(identity) = state.identities.get(&from_address) {
-        return identity.configuration_set_name.clone();
+    // An address identity without its own default falls through to its
+    // domain identity's default.
+    if let Some(name) = state
+        .identities
+        .get(&from_address)
+        .and_then(|identity| identity.configuration_set_name.clone())
+    {
+        return Some(name);
     }
-    // Also check domain identity
-    if let Some((_, domain)) = from_address.rsplit_once('@') {
-        if let Some(identity) = state.identities.get(domain) {
-            return identity.configuration_set_name.clone();
-        }
-    }
-    None
+    let (_, domain) = from_address.rsplit_once('@')?;
+    state
+        .identities
+        .get(domain)
+        .and_then(|identity| identity.configuration_set_name.clone())
 }
 
 /// Get enabled event destinations for a configuration set that match the given event type.
@@ -318,16 +305,10 @@ fn get_matching_destinations(
                 .filter(|d| {
                     d.enabled
                         && d.matching_event_types.iter().any(|t| {
-                            // v1 uses lowercase/camelCase (renderingFailure), v2
-                            // uppercase/snake_case (RENDERING_FAILURE). Normalize
-                            // only while matching so API roundtrips retain spelling.
-                            t.bytes()
-                                .filter(|b| *b != b'_')
-                                .map(|b| b.to_ascii_uppercase())
-                                .eq(event_type
-                                    .bytes()
-                                    .filter(|b| *b != b'_')
-                                    .map(|b| b.to_ascii_uppercase()))
+                            // Stored as created: v1 `renderingFailure`, v2
+                            // `RENDERING_FAILURE`. Normalize only while matching
+                            // so API roundtrips retain spelling.
+                            crate::state::v2_event_type_name(t) == event_type
                         })
                 })
                 .cloned()
@@ -358,28 +339,23 @@ fn deliver_event(
         .to_string();
     for dest in destinations {
         // SNS destination
-        if let Some(ref sns_dest) = dest.sns_destination {
-            if let Some(topic_arn) = sns_dest["TopicArn"].as_str() {
-                let message = event.to_string();
-                tracing::info!(
-                    topic_arn = %topic_arn,
-                    event_type = ?event_type,
-                    "SES event fanout -> SNS"
-                );
-                ctx.delivery_bus.publish_to_sns(
-                    topic_arn,
-                    &message,
-                    Some("Amazon SES Email Event"),
-                );
-                dispatches.push(EventDestinationDispatch {
-                    destination_name: dest.name.clone(),
-                    destination_type: "sns".to_string(),
-                    event_type: event_type.as_str().to_string(),
-                    message_id: message_id.clone(),
-                    dispatched_at: Utc::now(),
-                    target_arn: topic_arn.to_string(),
-                });
-            }
+        if let Some(topic_arn) = dest.sns_topic_arn() {
+            let message = event.to_string();
+            tracing::info!(
+                topic_arn = %topic_arn,
+                event_type = ?event_type,
+                "SES event fanout -> SNS"
+            );
+            ctx.delivery_bus
+                .publish_to_sns(topic_arn, &message, Some("Amazon SES Email Event"));
+            dispatches.push(EventDestinationDispatch {
+                destination_name: dest.name.clone(),
+                destination_type: "sns".to_string(),
+                event_type: event_type.as_str().to_string(),
+                message_id: message_id.clone(),
+                dispatched_at: Utc::now(),
+                target_arn: topic_arn.to_string(),
+            });
         }
 
         // EventBridge destination
@@ -435,11 +411,7 @@ fn deliver_event(
         // Kinesis / Firehose destination
         if let Some(ref kf) = dest.kinesis_firehose_destination {
             let event_json = event.to_string();
-            if let Some(ds_arn) = kf
-                .get("DeliveryStreamArn")
-                .or_else(|| kf.get("DeliveryStreamARN"))
-                .and_then(|v| v.as_str())
-            {
+            if let Some(ds_arn) = dest.firehose_arns().and_then(|(_, stream)| stream) {
                 tracing::info!(
                     delivery_stream_arn = %ds_arn,
                     event_type = ?event_type,
@@ -685,49 +657,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn classify_normal_recipients() {
-        let (events, suppress) = classify_recipients(&["user@example.com".to_string()]);
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0], SesEventType::Send);
-        assert_eq!(events[1], SesEventType::Delivery);
-        assert!(!suppress);
-    }
-
-    #[test]
-    fn classify_bounce_simulator() {
-        let (events, suppress) = classify_recipients(&[BOUNCE_ADDR.to_string()]);
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0], SesEventType::Send);
-        assert_eq!(events[1], SesEventType::Bounce);
-        assert!(!suppress);
-    }
-
-    #[test]
-    fn classify_complaint_simulator() {
-        let (events, suppress) = classify_recipients(&[COMPLAINT_ADDR.to_string()]);
-        assert_eq!(events.len(), 3);
-        assert_eq!(events[0], SesEventType::Send);
-        assert_eq!(events[1], SesEventType::Delivery);
-        assert_eq!(events[2], SesEventType::Complaint);
-        assert!(!suppress);
-    }
-
-    #[test]
-    fn classify_suppression_simulator() {
-        let (events, suppress) = classify_recipients(&[SUPPRESSION_ADDR.to_string()]);
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0], SesEventType::Send);
-        assert_eq!(events[1], SesEventType::Bounce);
-        assert!(suppress);
-    }
-
-    #[test]
-    fn classify_success_simulator() {
-        let (events, suppress) = classify_recipients(&[SUCCESS_ADDR.to_string()]);
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0], SesEventType::Send);
-        assert_eq!(events[1], SesEventType::Delivery);
-        assert!(!suppress);
+    fn simulator_mailboxes_map_to_aws_event_types() {
+        use SesEventType::{Bounce, Complaint, Delivery, Send};
+        let cases: &[(&str, &[SesEventType], bool)] = &[
+            ("user@example.com", &[Send, Delivery], false),
+            (SUCCESS_ADDR, &[Send, Delivery], false),
+            (BOUNCE_ADDR, &[Send, Bounce], false),
+            (SOFTBOUNCE_ADDR, &[Send, Bounce], false),
+            (TRANSIENT_BOUNCE_ADDR, &[Send, Bounce], false),
+            (COMPLAINT_ADDR, &[Send, Delivery, Complaint], false),
+            (SUPPRESSION_ADDR, &[Send, Bounce], true),
+            // Out-of-office only auto-replies: delivered, never a complaint.
+            (OOTO_ADDR, &[Send, Delivery], false),
+        ];
+        for (recipient, expected, suppress) in cases {
+            let (types, add) = recipient_event_types(recipient);
+            assert_eq!(types, *expected, "{recipient}");
+            assert_eq!(add, *suppress, "{recipient}");
+        }
     }
 
     #[test]
@@ -834,26 +781,6 @@ mod tests {
         assert_eq!(event["complaint"]["complaintFeedbackType"], "abuse");
     }
 
-    #[test]
-    fn classify_multiple_recipients_no_simulator() {
-        let recipients = vec![
-            "a@example.com".to_string(),
-            "b@example.com".to_string(),
-            "c@example.com".to_string(),
-        ];
-        let (events, suppress) = classify_recipients(&recipients);
-        assert!(events.contains(&SesEventType::Send));
-        assert!(events.contains(&SesEventType::Delivery));
-        assert!(!suppress);
-    }
-
-    #[test]
-    fn classify_empty_recipients() {
-        let (events, suppress) = classify_recipients(&[]);
-        assert!(!events.is_empty());
-        assert!(!suppress);
-    }
-
     fn shared_state() -> SharedSesState {
         use fakecloud_core::multi_account::MultiAccountState;
         Arc::new(parking_lot::RwLock::new(MultiAccountState::new(
@@ -877,16 +804,25 @@ mod tests {
 
     #[test]
     fn firehose_fanout_accepts_both_api_destination_spellings_and_frames_records() {
-        for key in ["DeliveryStreamArn", "DeliveryStreamARN"] {
+        let arn = "arn:aws:firehose:us-east-1:123456789012:deliverystream/events";
+        for (key, firehose, expected) in [
+            ("DeliveryStreamArn", json!({"DeliveryStreamArn": arn}), 1),
+            ("DeliveryStreamARN", json!({"DeliveryStreamARN": arn}), 1),
+            // v1 create stores "" for omitted members: nothing to deliver to.
+            (
+                "empty",
+                json!({"IAMRoleARN": "", "DeliveryStreamARN": ""}),
+                0,
+            ),
+        ] {
             let state = shared_state();
-            let arn = "arn:aws:firehose:us-east-1:123456789012:deliverystream/events";
             state.write().default_mut().event_destinations.insert(
                 "cs".to_string(),
                 vec![EventDestination {
                     name: "fh".to_string(),
                     enabled: true,
                     matching_event_types: vec!["SEND".to_string()],
-                    kinesis_firehose_destination: Some(json!({key: arn})),
+                    kinesis_firehose_destination: Some(firehose),
                     cloud_watch_destination: None,
                     sns_destination: None,
                     event_bridge_destination: None,
@@ -910,9 +846,52 @@ mod tests {
                 "cs",
             );
             let calls = recorder.0.lock().unwrap();
-            assert_eq!(calls.len(), 1, "destination key {key}");
-            assert_eq!(calls[0].0, arn);
-            assert_eq!(calls[0].1, format!("{event}\n").as_bytes());
+            assert_eq!(calls.len(), expected, "destination key {key}");
+            if expected == 1 {
+                assert_eq!(calls[0].0, arn);
+                assert_eq!(calls[0].1, format!("{event}\n").as_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn sns_fanout_accepts_cloudformation_topic_arn_spelling() {
+        let topic = "arn:aws:sns:us-east-1:123456789012:events";
+        for sns in [json!({"TopicArn": topic}), json!({"TopicARN": topic})] {
+            let state = shared_state();
+            state.write().default_mut().event_destinations.insert(
+                "cs".to_string(),
+                vec![EventDestination {
+                    name: "sns".to_string(),
+                    enabled: true,
+                    matching_event_types: vec!["send".to_string()],
+                    kinesis_firehose_destination: None,
+                    cloud_watch_destination: None,
+                    sns_destination: Some(sns.clone()),
+                    event_bridge_destination: None,
+                    pinpoint_destination: None,
+                }],
+            );
+            let ctx = SesDeliveryContext {
+                ses_state: state.clone(),
+                delivery_bus: Arc::new(DeliveryBus::new()),
+            };
+            let event = json!({"eventType": "Send", "mail": {"messageId": "id"}, "send": {}});
+            deliver_event(
+                &ctx,
+                SendScope {
+                    account_id: "123456789012",
+                    region: "us-east-1",
+                },
+                &event,
+                SesEventType::Send,
+                "cs",
+            );
+            let mas = state.read();
+            let dispatches = &mas.default_ref().event_destination_dispatches;
+            assert_eq!(dispatches.len(), 1, "{sns}");
+            assert_eq!(dispatches[0].destination_type, "sns");
+            assert_eq!(dispatches[0].target_arn, topic);
         }
     }
 
@@ -1157,6 +1136,25 @@ mod tests {
             "example.com".to_string(),
             make_identity("example.com", Some("domain-cs")),
         );
+        let resolved = resolve_config_set(&state, "123456789012", None, "sender@example.com");
+        assert_eq!(resolved.as_deref(), Some("domain-cs"));
+    }
+
+    #[test]
+    fn resolve_config_set_address_without_default_falls_through_to_domain() {
+        let state = shared_state();
+        {
+            let mut mas = state.write();
+            let st = mas.default_mut();
+            st.identities.insert(
+                "sender@example.com".to_string(),
+                make_identity("sender@example.com", None),
+            );
+            st.identities.insert(
+                "example.com".to_string(),
+                make_identity("example.com", Some("domain-cs")),
+            );
+        }
         let resolved = resolve_config_set(&state, "123456789012", None, "sender@example.com");
         assert_eq!(resolved.as_deref(), Some("domain-cs"));
     }

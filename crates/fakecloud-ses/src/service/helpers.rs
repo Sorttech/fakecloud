@@ -562,16 +562,46 @@ pub(crate) fn event_destination_to_json(dest: &EventDestination) -> Value {
     let mut obj = json!({
         "Name": dest.name,
         "Enabled": dest.enabled,
-        "MatchingEventTypes": dest.matching_event_types,
+        "MatchingEventTypes": dest
+            .matching_event_types
+            .iter()
+            .map(|t| crate::state::v2_event_type_name(t))
+            .collect::<Vec<_>>(),
     });
-    if let Some(ref v) = dest.kinesis_firehose_destination {
-        obj["KinesisFirehoseDestination"] = v.clone();
+    // A v1-created destination stores the v1 member spellings; render the
+    // v2 shape.
+    if let Some((role, stream)) = dest.firehose_arns() {
+        let mut firehose = serde_json::Map::new();
+        if let Some(role) = role {
+            firehose.insert("IamRoleArn".to_string(), json!(role));
+        }
+        if let Some(stream) = stream {
+            firehose.insert("DeliveryStreamArn".to_string(), json!(stream));
+        }
+        obj["KinesisFirehoseDestination"] = Value::Object(firehose);
     }
     if let Some(ref v) = dest.cloud_watch_destination {
-        obj["CloudWatchDestination"] = v.clone();
+        // v1 stores `messageTag`-style sources; v2 names them `MESSAGE_TAG`.
+        let mut cw = v.clone();
+        if let Some(dims) = cw
+            .get_mut("DimensionConfigurations")
+            .and_then(Value::as_array_mut)
+        {
+            for dim in dims {
+                if let Some(source) = dim["DimensionValueSource"].as_str() {
+                    let source = crate::state::v2_dimension_value_source(source).to_string();
+                    dim["DimensionValueSource"] = json!(source);
+                }
+            }
+        }
+        obj["CloudWatchDestination"] = cw;
     }
-    if let Some(ref v) = dest.sns_destination {
-        obj["SnsDestination"] = v.clone();
+    if dest.sns_destination.is_some() {
+        let mut sns = serde_json::Map::new();
+        if let Some(topic) = dest.sns_topic_arn() {
+            sns.insert("TopicArn".to_string(), json!(topic));
+        }
+        obj["SnsDestination"] = Value::Object(sns);
     }
     if let Some(ref v) = dest.event_bridge_destination {
         obj["EventBridgeDestination"] = v.clone();

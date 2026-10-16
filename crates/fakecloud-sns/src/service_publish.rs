@@ -1079,6 +1079,7 @@ pub(crate) fn deliver_to_email_subscribers(
                 subject: Some(&subject),
                 text_body: Some(&relay_body),
                 html_body: None,
+                raw_message: None,
             };
             if let Err(err) = fakecloud_ses::smtp_relay::relay(&relay_url, &mail) {
                 tracing::warn!(

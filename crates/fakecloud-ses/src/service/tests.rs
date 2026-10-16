@@ -1578,7 +1578,7 @@ async fn test_send_email_raw_content() {
     // Raw.Data is a JSON-protocol blob, serialized as base64 by the SDK.
     let raw = base64::Engine::encode(
         &base64::engine::general_purpose::STANDARD,
-        "From: sender@example.com\r\nTo: to@example.com\r\nSubject: Raw\r\n\r\nBody",
+        "From: sender@example.com\r\nTo: to@example.com\r\nSubject: =?UTF-8?B?UmF3IGjDqQ==?=\r\n\r\nBody",
     );
     let request_body = json!({
         "FromEmailAddress":"sender@example.com", "Destination":{"ToAddresses":["to@example.com"]},
@@ -1599,10 +1599,8 @@ async fn test_send_email_raw_content() {
     let s = _mas_r.default_ref();
     assert_eq!(s.sent_emails.len(), 1);
     assert_eq!(s.sent_emails[0].raw_data.as_deref(), Some(raw.as_str()));
-    assert!(
-        s.sent_emails[0].subject.is_none(),
-        "Raw emails should not have parsed subject"
-    );
+    // The RFC 2047 Subject is decoded, matching v1 SendRawEmail.
+    assert_eq!(s.sent_emails[0].subject.as_deref(), Some("Raw h\u{e9}"));
 }
 
 #[tokio::test]
@@ -5845,8 +5843,8 @@ async fn test_event_destination_kinesis_firehose_cloudwatch() {
                 "Enabled": true,
                 "MatchingEventTypes": ["SEND", "DELIVERY"],
                 "KinesisFirehoseDestination": {
-                    "DeliveryStreamARN": "arn:aws:firehose:us-east-1:123456789012:deliverystream/my-stream",
-                    "StreamARN": "arn:aws:kinesis:us-east-1:123456789012:stream/my-kinesis"
+                    "IamRoleArn": "arn:aws:iam::123456789012:role/firehose",
+                    "DeliveryStreamArn": "arn:aws:firehose:us-east-1:123456789012:deliverystream/my-stream"
                 },
                 "CloudWatchDestination": {
                     "DimensionConfigurations": [
@@ -5876,12 +5874,11 @@ async fn test_event_destination_kinesis_firehose_cloudwatch() {
     assert_eq!(dests.len(), 1);
     assert_eq!(dests[0]["Name"], "multi-dest");
     assert_eq!(
-        dests[0]["KinesisFirehoseDestination"]["DeliveryStreamARN"],
-        "arn:aws:firehose:us-east-1:123456789012:deliverystream/my-stream"
-    );
-    assert_eq!(
-        dests[0]["KinesisFirehoseDestination"]["StreamARN"],
-        "arn:aws:kinesis:us-east-1:123456789012:stream/my-kinesis"
+        dests[0]["KinesisFirehoseDestination"],
+        json!({
+            "IamRoleArn": "arn:aws:iam::123456789012:role/firehose",
+            "DeliveryStreamArn": "arn:aws:firehose:us-east-1:123456789012:deliverystream/my-stream"
+        })
     );
     assert_eq!(
         dests[0]["CloudWatchDestination"]["DimensionConfigurations"][0]["DimensionName"],
@@ -6682,4 +6679,135 @@ async fn list_tenants_filters_and_reports_sending_status() {
     assert_eq!(tenants.len(), 1);
     assert_eq!(tenants[0]["TenantName"], "acme-us");
     assert_eq!(tenants[0]["SendingStatus"], "DISABLED");
+}
+
+#[tokio::test]
+async fn get_event_destinations_renders_v1_created_destination_in_v2_shape() {
+    use crate::v1::tests::make_v1_request;
+    let state = make_state();
+    let svc = SesV2Service::new(state.clone());
+    for req in [
+        make_v1_request(
+            "CreateConfigurationSet",
+            vec![("ConfigurationSet.Name", "cs")],
+        ),
+        make_v1_request(
+            "CreateConfigurationSetEventDestination",
+            vec![
+                ("ConfigurationSetName", "cs"),
+                ("EventDestination.Name", "fh"),
+                ("EventDestination.Enabled", "true"),
+                ("EventDestination.MatchingEventTypes.member.1", "send"),
+                (
+                    "EventDestination.MatchingEventTypes.member.2",
+                    "renderingFailure",
+                ),
+                (
+                    "EventDestination.KinesisFirehoseDestination.IAMRoleARN",
+                    "arn:aws:iam::123456789012:role/r",
+                ),
+                (
+                    "EventDestination.KinesisFirehoseDestination.DeliveryStreamARN",
+                    "arn:aws:firehose:us-east-1:123456789012:deliverystream/s",
+                ),
+            ],
+        ),
+        // Role omitted: v1 stores "", which v2 must not render.
+        make_v1_request(
+            "CreateConfigurationSetEventDestination",
+            vec![
+                ("ConfigurationSetName", "cs"),
+                ("EventDestination.Name", "fh-no-role"),
+                ("EventDestination.Enabled", "true"),
+                ("EventDestination.MatchingEventTypes.member.1", "send"),
+                (
+                    "EventDestination.KinesisFirehoseDestination.DeliveryStreamARN",
+                    "arn:aws:firehose:us-east-1:123456789012:deliverystream/s",
+                ),
+            ],
+        ),
+        make_v1_request(
+            "CreateConfigurationSetEventDestination",
+            vec![
+                ("ConfigurationSetName", "cs"),
+                ("EventDestination.Name", "cw"),
+                ("EventDestination.Enabled", "true"),
+                ("EventDestination.MatchingEventTypes.member.1", "send"),
+                (
+                    "EventDestination.CloudWatchDestination.DimensionConfigurations.member.1.DimensionName",
+                    "tag",
+                ),
+                (
+                    "EventDestination.CloudWatchDestination.DimensionConfigurations.member.1.DimensionValueSource",
+                    "messageTag",
+                ),
+                (
+                    "EventDestination.CloudWatchDestination.DimensionConfigurations.member.1.DefaultDimensionValue",
+                    "none",
+                ),
+            ],
+        ),
+    ] {
+        assert_eq!(svc.handle(req).await.unwrap().status, StatusCode::OK);
+    }
+    // As the CloudFormation provisioner stores it: the template's `TopicARN`.
+    state
+        .write()
+        .default_mut()
+        .event_destinations
+        .get_mut("cs")
+        .unwrap()
+        .push(parse_event_destination_definition(
+            "cfn-sns",
+            &json!({
+                "Enabled": true,
+                "MatchingEventTypes": ["send"],
+                "SnsDestination": {"TopicARN": "arn:aws:sns:us-east-1:123456789012:t"}
+            }),
+        ));
+
+    let req = make_request(
+        Method::GET,
+        "/v2/email/configuration-sets/cs/event-destinations",
+        "",
+    );
+    let resp = svc.handle(req).await.unwrap();
+    assert_eq!(resp.status, StatusCode::OK);
+    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    let dest = &body["EventDestinations"][0];
+    assert_eq!(
+        dest["MatchingEventTypes"],
+        json!(["SEND", "RENDERING_FAILURE"])
+    );
+    assert_eq!(
+        dest["KinesisFirehoseDestination"],
+        json!({
+            "IamRoleArn": "arn:aws:iam::123456789012:role/r",
+            "DeliveryStreamArn": "arn:aws:firehose:us-east-1:123456789012:deliverystream/s"
+        })
+    );
+    let dests = body["EventDestinations"].as_array().unwrap();
+    let by_name = |name: &str| {
+        dests
+            .iter()
+            .find(|d| d["Name"] == name)
+            .unwrap_or_else(|| panic!("{name} missing: {body}"))
+    };
+    assert_eq!(
+        by_name("fh-no-role")["KinesisFirehoseDestination"],
+        json!({"DeliveryStreamArn": "arn:aws:firehose:us-east-1:123456789012:deliverystream/s"})
+    );
+    assert_eq!(
+        by_name("cw")["CloudWatchDestination"]["DimensionConfigurations"][0]
+            ["DimensionValueSource"],
+        "MESSAGE_TAG"
+    );
+    assert_eq!(
+        by_name("cfn-sns")["SnsDestination"],
+        json!({"TopicArn": "arn:aws:sns:us-east-1:123456789012:t"})
+    );
+    // Stored spelling is untouched, so v1 still round-trips its own names.
+    let mas = state.read();
+    let stored = &mas.default_ref().event_destinations["cs"][0];
+    assert_eq!(stored.matching_event_types, ["send", "renderingFailure"]);
 }

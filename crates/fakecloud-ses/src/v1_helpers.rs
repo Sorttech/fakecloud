@@ -38,15 +38,10 @@ pub(crate) fn verification_token_for(name: &str) -> String {
         .collect()
 }
 
-/// Dispatch a v1 Query protocol action.
-pub fn handle_v1_action(
-    state: &SharedSesState,
-    req: &AwsRequest,
-) -> Result<AwsResponse, AwsServiceError> {
-    handle_v1_action_with_delivery(state, req, None)
-}
-
-pub(crate) fn handle_v1_action_with_delivery(
+/// Dispatch a v1 Query protocol action. `delivery_ctx` carries the
+/// cross-service delivery wiring for event fanout; `None` sends without
+/// publishing configuration-set events.
+pub(crate) fn handle_v1_action(
     state: &SharedSesState,
     req: &AwsRequest,
     delivery_ctx: Option<&crate::fanout::SesDeliveryContext>,
@@ -1625,7 +1620,7 @@ pub(crate) fn send_raw_email(
         to,
         cc,
         bcc,
-        subject: raw_mail.header("Subject").map(str::to_string),
+        subject: raw_mail.subject(),
         html_body: None,
         text_body: None,
         raw_data: Some(raw_data.to_string()),
@@ -1808,11 +1803,17 @@ pub(crate) fn send_bulk_templated_email(
             .cloned()
             .collect();
         if let Err(err) = check_v1_verified_recipients(state, &req.account_id, &recipients) {
-            // Real SES surfaces unverified recipients per-destination
-            // rather than aborting the whole batch. (From-domain gate is
-            // enforced up-front by `check_v1_verified_sender`.)
+            // Real SES surfaces recipient failures per-destination rather
+            // than aborting the whole batch. (From-domain gate is enforced
+            // up-front by `check_v1_verified_sender`.) The BulkEmailStatus
+            // mirrors the error: a malformed recipient list is
+            // InvalidParameterValue, an unverified recipient MessageRejected.
+            let status = match err.code() {
+                "InvalidParameterValue" => "InvalidParameterValue",
+                _ => "MessageRejected",
+            };
             inner.push_str(&format!(
-                "<member><Status>MessageRejected</Status><Error>{}</Error></member>",
+                "<member><Status>{status}</Status><Error>{}</Error></member>",
                 xml_escape(&err.message()),
             ));
             continue;
@@ -2247,21 +2248,25 @@ pub(crate) fn describe_configuration_set(
                 dest.enabled,
             ));
             for et in &dest.matching_event_types {
-                inner.push_str(&format!("<member>{}</member>", xml_escape(et)));
+                inner.push_str(&format!(
+                    "<member>{}</member>",
+                    xml_escape(crate::state::v1_event_type_name(et))
+                ));
             }
             inner.push_str("</MatchingEventTypes>");
             // Echo the configured destination target(s). Previously the
             // describe response dropped these entirely, so a Kinesis /
             // CloudWatch / SNS destination created against the set was
             // invisible on read.
-            if let Some(k) = &dest.kinesis_firehose_destination {
+            // A v2-created destination stores the v2 member spellings.
+            if let Some((role, stream)) = dest.firehose_arns() {
                 inner.push_str(&format!(
                     "<KinesisFirehoseDestination>\
                      <IAMRoleARN>{}</IAMRoleARN>\
                      <DeliveryStreamARN>{}</DeliveryStreamARN>\
                      </KinesisFirehoseDestination>",
-                    xml_escape(k["IAMRoleARN"].as_str().unwrap_or("")),
-                    xml_escape(k["DeliveryStreamARN"].as_str().unwrap_or("")),
+                    xml_escape(role.unwrap_or("")),
+                    xml_escape(stream.unwrap_or("")),
                 ));
             }
             if let Some(cw) = &dest.cloud_watch_destination {
@@ -2275,17 +2280,19 @@ pub(crate) fn describe_configuration_set(
                              <DefaultDimensionValue>{}</DefaultDimensionValue>\
                              </member>",
                             xml_escape(dc["DimensionName"].as_str().unwrap_or("")),
-                            xml_escape(dc["DimensionValueSource"].as_str().unwrap_or("")),
+                            xml_escape(crate::state::v1_dimension_value_source(
+                                dc["DimensionValueSource"].as_str().unwrap_or("")
+                            )),
                             xml_escape(dc["DefaultDimensionValue"].as_str().unwrap_or("")),
                         ));
                     }
                 }
                 inner.push_str("</DimensionConfigurations></CloudWatchDestination>");
             }
-            if let Some(sns) = &dest.sns_destination {
+            if dest.sns_destination.is_some() {
                 inner.push_str(&format!(
                     "<SNSDestination><TopicARN>{}</TopicARN></SNSDestination>",
-                    xml_escape(sns["TopicArn"].as_str().unwrap_or("")),
+                    xml_escape(dest.sns_topic_arn().unwrap_or("")),
                 ));
             }
             inner.push_str("</member>");
