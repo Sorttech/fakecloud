@@ -1996,6 +1996,7 @@ impl AwsService for S3Service {
         if let Some(source) = self.copy_source_read_action(request) {
             actions.push(source);
         }
+        actions.extend(governance_bypass_actions(request, &actions[0]));
         actions
     }
 
@@ -4683,6 +4684,32 @@ pub(crate) fn governance_bypass_requested(req: &AwsRequest) -> bool {
         .get("x-amz-bypass-governance-retention")
         .and_then(|v| v.to_str().ok())
         .is_some_and(|s| s.eq_ignore_ascii_case("true"))
+}
+
+/// The `s3:BypassGovernanceRetention` checks a request asking to bypass
+/// GOVERNANCE retention must also pass. The S3 model documents the header on
+/// DeleteObject / DeleteObjects as "To use this header, you must have the
+/// `s3:BypassGovernanceRetention` permission", and PutObjectRetention takes the
+/// same header. The permission is evaluated on the addressed object.
+/// DeleteObjects is not covered here: AWS authorizes it per key and reports a
+/// denied key as an `<Error>` entry in a 200 response, which an all-or-nothing
+/// request-level check cannot express.
+fn governance_bypass_actions(
+    request: &AwsRequest,
+    primary: &fakecloud_core::auth::IamAction,
+) -> Vec<fakecloud_core::auth::IamAction> {
+    if primary.service != "s3" || !governance_bypass_requested(request) {
+        return Vec::new();
+    }
+    let bypass = |resource: String| fakecloud_core::auth::IamAction {
+        service: "s3",
+        action: "BypassGovernanceRetention",
+        resource,
+    };
+    match primary.action {
+        "DeleteObject" | "PutObjectRetention" => vec![bypass(primary.resource.clone())],
+        _ => Vec::new(),
+    }
 }
 
 #[cfg(test)]

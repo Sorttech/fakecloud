@@ -7652,6 +7652,75 @@ async fn put_object_retention_by_version_id_respects_the_lock() {
 }
 
 #[test]
+fn governance_bypass_requires_bypass_governance_retention_permission() {
+    use fakecloud_core::service::AwsService as _;
+
+    let svc = make_service();
+    let actions = |req: &AwsRequest| -> Vec<(&'static str, String)> {
+        svc.iam_actions_for(req)
+            .into_iter()
+            .map(|a| (a.action, a.resource))
+            .collect()
+    };
+    let with_bypass = |mut req: AwsRequest, value: &str| {
+        req.headers
+            .insert("x-amz-bypass-governance-retention", value.parse().unwrap());
+        req
+    };
+
+    let body = retention_body("GOVERNANCE", "2098-01-01T00:00:00Z");
+    let retention = make_request(Method::PUT, "/b/k", &[("retention", "")], &body);
+    assert_eq!(
+        actions(&retention),
+        vec![("PutObjectRetention", "arn:aws:s3:::b/k".to_string())]
+    );
+    assert_eq!(
+        actions(&with_bypass(retention, "true")),
+        vec![
+            ("PutObjectRetention", "arn:aws:s3:::b/k".to_string()),
+            ("BypassGovernanceRetention", "arn:aws:s3:::b/k".to_string()),
+        ]
+    );
+
+    let delete = make_request(Method::DELETE, "/b/k", &[("versionId", "v1")], b"");
+    assert_eq!(actions(&delete).len(), 1);
+    // Only an explicit `true` asks for the bypass.
+    assert_eq!(
+        actions(&with_bypass(
+            make_request(Method::DELETE, "/b/k", &[], b""),
+            "false"
+        ))
+        .len(),
+        1
+    );
+    assert_eq!(
+        actions(&with_bypass(delete, "TRUE")),
+        vec![
+            ("DeleteObject", "arn:aws:s3:::b/k".to_string()),
+            ("BypassGovernanceRetention", "arn:aws:s3:::b/k".to_string()),
+        ]
+    );
+
+    // Other operations ignore the header. DeleteObjects is authorized per key
+    // by AWS, so a request-level check would wrongly fail the whole batch.
+    let put = with_bypass(make_request(Method::PUT, "/b/k", &[], b"x"), "true");
+    assert_eq!(
+        actions(&put),
+        vec![("PutObject", "arn:aws:s3:::b/k".to_string())]
+    );
+    let batch = make_request(
+        Method::POST,
+        "/b",
+        &[("delete", "")],
+        b"<Delete><Object><Key>a/1</Key></Object></Delete>",
+    );
+    assert_eq!(
+        actions(&with_bypass(batch, "true")),
+        vec![("DeleteObjects", "arn:aws:s3:::b".to_string())]
+    );
+}
+
+#[test]
 fn list_objects_v2_rejects_non_integer_max_keys() {
     // A non-integer / out-of-range max-keys is a 400 InvalidArgument, not a
     // silent coercion to 1000 (bug-hunt 2026-07-13).
@@ -8232,6 +8301,35 @@ async fn object_lock_default_retention_years_are_calendar_years() {
         before <= until && until <= after,
         "retain-until {until} should be four calendar years out ({before}..={after})"
     );
+}
+
+#[tokio::test]
+async fn object_lock_default_retention_tolerates_whitespace_around_period() {
+    // The stored configuration is validated with surrounding whitespace
+    // trimmed, so applying it must trim too or the default silently drops.
+    let svc = make_service();
+    let mut req = make_request(Method::PUT, "/olw", &[], b"");
+    req.headers
+        .insert("x-amz-bucket-object-lock-enabled", "true".parse().unwrap());
+    svc.create_bucket("123456789012", &req, "olw").unwrap();
+    for (key, period) in [("d", "<Days> 3 </Days>"), ("y", "<Years> 1 </Years>")] {
+        let put = make_request(
+            Method::PUT,
+            "/olw",
+            &[("object-lock", "")],
+            &lock_config(period),
+        );
+        svc.put_object_lock_config("123456789012", &put, "olw")
+            .unwrap();
+        let put_req = make_request(Method::PUT, &format!("/olw/{key}"), &[], b"hello");
+        svc.put_object("123456789012", &put_req, "olw", key)
+            .await
+            .unwrap();
+        let state = svc.state.read();
+        let obj = &state.default_ref().buckets["olw"].objects[key];
+        assert_eq!(obj.lock_mode.as_deref(), Some("GOVERNANCE"), "{period}");
+        assert!(obj.lock_retain_until.is_some(), "{period}");
+    }
 }
 
 // ── SelectObjectContent compression ──────────────────────────────

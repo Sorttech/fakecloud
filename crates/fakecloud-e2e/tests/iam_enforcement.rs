@@ -789,6 +789,101 @@ async fn s3_create_bucket_with_object_lock_needs_its_permissions() {
         .unwrap();
 }
 
+/// Sending `x-amz-bypass-governance-retention: true` also needs
+/// `s3:BypassGovernanceRetention` on PutObjectRetention and DeleteObject.
+#[tokio::test]
+async fn s3_governance_bypass_needs_bypass_governance_retention() {
+    use aws_sdk_s3::primitives::{ByteStream, DateTime};
+    use aws_sdk_s3::types::{ObjectLockMode, ObjectLockRetention, ObjectLockRetentionMode};
+
+    let server = start_strict().await;
+    let bucket = "bypass-perm-bucket";
+    let root = path_style_s3(&sdk_config_with(&server, "test", "test").await);
+    root.create_bucket()
+        .bucket(bucket)
+        .object_lock_enabled_for_bucket(true)
+        .send()
+        .await
+        .unwrap();
+    let far = DateTime::from_secs(4_070_908_800); // 2099-01-01
+    let nearer = DateTime::from_secs(4_039_372_800); // 2098-01-01
+    let version = root
+        .put_object()
+        .bucket(bucket)
+        .key("a.txt")
+        .body(ByteStream::from_static(b"x"))
+        .object_lock_mode(ObjectLockMode::Governance)
+        .object_lock_retain_until_date(far)
+        .send()
+        .await
+        .unwrap()
+        .version_id()
+        .unwrap()
+        .to_string();
+
+    let (akid, secret) = bootstrap_user(&server, "s3bypass").await;
+    attach_inline_policy(
+        &server,
+        "s3bypass",
+        "all",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*"}]}"#,
+    )
+    .await;
+    attach_inline_policy(
+        &server,
+        "s3bypass",
+        "no-bypass",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"s3:BypassGovernanceRetention","Resource":"*"}]}"#,
+    )
+    .await;
+    let s3 = path_style_s3(&sdk_config_with(&server, &akid, &secret).await);
+    let shorten = || {
+        s3.put_object_retention()
+            .bucket(bucket)
+            .key("a.txt")
+            .bypass_governance_retention(true)
+            .retention(
+                ObjectLockRetention::builder()
+                    .mode(ObjectLockRetentionMode::Governance)
+                    .retain_until_date(nearer)
+                    .build(),
+            )
+    };
+    let delete_one = || {
+        s3.delete_object()
+            .bucket(bucket)
+            .key("a.txt")
+            .version_id(&version)
+            .bypass_governance_retention(true)
+    };
+
+    for err in [
+        format!(
+            "{:?}",
+            shorten().send().await.expect_err("retention bypass")
+        ),
+        format!(
+            "{:?}",
+            delete_one().send().await.expect_err("delete bypass")
+        ),
+    ] {
+        assert!(err.contains("AccessDenied"), "unexpected error: {err}");
+    }
+
+    IamClient::new(&sdk_config_with(&server, "test", "test").await)
+        .delete_user_policy()
+        .user_name("s3bypass")
+        .policy_name("no-bypass")
+        .send()
+        .await
+        .unwrap();
+    shorten().send().await.expect("bypass allowed once granted");
+    delete_one()
+        .send()
+        .await
+        .expect("delete allowed once granted");
+}
+
 /// A create carrying both tags and an ACL is several authorizations, and AWS
 /// evaluates them all against ONE request context. A tag-scoped guardrail that
 /// permits the create must therefore permit the `s3:PutBucketAcl` it implies:

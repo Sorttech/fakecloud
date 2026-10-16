@@ -108,17 +108,8 @@ impl S3Service {
                             if mode == "COMPLIANCE" {
                                 return Some("AccessDenied");
                             }
-                            if mode == "GOVERNANCE" {
-                                // Check bypass header
-                                let bypass = req
-                                    .headers
-                                    .get("x-amz-bypass-governance-retention")
-                                    .and_then(|v| v.to_str().ok())
-                                    .map(|s| s.eq_ignore_ascii_case("true"))
-                                    .unwrap_or(false);
-                                if !bypass {
-                                    return Some("AccessDenied");
-                                }
+                            if mode == "GOVERNANCE" && !governance_bypass_requested(req) {
+                                return Some("AccessDenied");
                             }
                         }
                     }
@@ -422,12 +413,7 @@ impl S3Service {
             .get_mut(bucket)
             .ok_or_else(|| no_such_bucket(bucket))?;
 
-        let bypass = req
-            .headers
-            .get("x-amz-bypass-governance-retention")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        let bypass = governance_bypass_requested(req);
 
         let versioning_enabled = b.versioning.as_deref() == Some("Enabled");
         let versioning_configured = b.versioning.is_some();

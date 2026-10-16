@@ -449,10 +449,10 @@ impl S3Service {
         if lock_mode.is_none() && lock_retain_until.is_none() {
             if let Some(ref config) = object_lock_config {
                 if let Some(mode) = extract_xml_value(config, "Mode") {
-                    let days =
-                        extract_xml_value(config, "Days").and_then(|d| d.parse::<i64>().ok());
-                    let years =
-                        extract_xml_value(config, "Years").and_then(|y| y.parse::<i64>().ok());
+                    let days = extract_xml_value(config, "Days")
+                        .and_then(|d| d.trim().parse::<i64>().ok());
+                    let years = extract_xml_value(config, "Years")
+                        .and_then(|y| y.trim().parse::<i64>().ok());
                     // The configuration is range-checked when stored; a value
                     // persisted before that check must still not overflow.
                     // Years are calendar years (leap days included), not
