@@ -142,8 +142,8 @@ pub fn signed_headers_for_sent_email(
     state: &SesState,
     sent: &SentEmail,
 ) -> Option<(String, Vec<(String, String)>)> {
-    let address = address_part(&sent.from);
-    let domain = address.split('@').nth(1)?;
+    let address = crate::mime::mailbox_address(&sent.from)?.to_lowercase();
+    let domain = address.rsplit_once('@')?.1;
     let identity = state
         .identities
         .get(&address)
@@ -170,9 +170,11 @@ pub fn signed_headers_for_sent_email(
     let signed_headers = vec![
         ("From".to_string(), sent.from.clone()),
         ("To".to_string(), to_header),
+        // Sign the wire form of the subject: a decoded raw subject may hold
+        // non-ASCII or line breaks, which only travel as an encoded-word.
         (
             "Subject".to_string(),
-            sent.subject.clone().unwrap_or_default(),
+            crate::mime::encode_header(sent.subject.as_deref().unwrap_or_default()),
         ),
         ("Date".to_string(), date),
         (
@@ -185,15 +187,6 @@ pub fn signed_headers_for_sent_email(
     all_headers.push(("DKIM-Signature".to_string(), signature.clone()));
     all_headers.extend(signed_headers);
     Some((signature, all_headers))
-}
-
-fn address_part(from: &str) -> String {
-    if let (Some(open), Some(close)) = (from.find('<'), from.rfind('>')) {
-        if open < close {
-            return from[open + 1..close].trim().to_lowercase();
-        }
-    }
-    from.trim().to_lowercase()
 }
 
 fn parse_private_key(pem: &str) -> Option<RsaPrivateKey> {
@@ -376,6 +369,58 @@ mod tests {
             canonicalize_header_relaxed("Subject", "  hello   world  "),
             "subject:hello world\r\n"
         );
+    }
+
+    #[test]
+    fn signed_subject_is_wire_encoded_not_injectable() {
+        let (pem, _) = generate_easy_dkim_keypair();
+        let mut state = SesState::new("123456789012", "us-east-1");
+        state.identities.insert(
+            "example.com".to_string(),
+            crate::state::EmailIdentity {
+                identity_name: "example.com".to_string(),
+                identity_type: "DOMAIN".to_string(),
+                verified: true,
+                created_at: chrono::Utc::now(),
+                dkim_signing_enabled: true,
+                dkim_signing_attributes_origin: "AWS_SES".to_string(),
+                dkim_domain_signing_private_key: Some(pem),
+                dkim_domain_signing_selector: None,
+                dkim_next_signing_key_length: None,
+                dkim_public_key_b64: None,
+                email_forwarding_enabled: true,
+                mail_from_domain: None,
+                mail_from_behavior_on_mx_failure: "USE_DEFAULT_VALUE".to_string(),
+                mail_from_domain_status: "NotStarted".to_string(),
+                configuration_set_name: None,
+                bounce_topic: None,
+                complaint_topic: None,
+                delivery_topic: None,
+                verification_token: None,
+            },
+        );
+        let sent = SentEmail {
+            message_id: "m".to_string(),
+            from: "sender@example.com".to_string(),
+            to: vec!["to@example.com".to_string()],
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            subject: Some("x\r\nBcc: evil@x".to_string()),
+            html_body: None,
+            text_body: Some("body".to_string()),
+            raw_data: None,
+            template_name: None,
+            template_data: None,
+            dkim_signature: None,
+            headers: Vec::new(),
+            timestamp: chrono::Utc::now(),
+            email_tags: Vec::new(),
+            delivery_insights: Vec::new(),
+        };
+        let (_, headers) = signed_headers_for_sent_email(&state, &sent).unwrap();
+        let subject = &headers.iter().find(|(n, _)| n == "Subject").unwrap().1;
+        assert!(subject.starts_with("=?UTF-8?B?"), "{subject}");
+        assert!(!subject.contains(['\r', '\n']));
     }
 
     #[test]

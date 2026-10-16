@@ -269,6 +269,91 @@ pub struct EventDestination {
     pub pinpoint_destination: Option<serde_json::Value>,
 }
 
+impl EventDestination {
+    /// The Firehose destination's `(IAM role ARN, delivery stream ARN)`.
+    /// Destinations are stored as created, so v1 (`IAMRoleARN`,
+    /// `DeliveryStreamARN`) and v2 (`IamRoleArn`, `DeliveryStreamArn`)
+    /// member spellings both appear; each API renders its own. Empty or
+    /// null members (v1 create stores "" for an omitted field) are absent.
+    pub(crate) fn firehose_arns(&self) -> Option<(Option<&str>, Option<&str>)> {
+        let k = self.kinesis_firehose_destination.as_ref()?;
+        Some((
+            spelled_member(k, ["IamRoleArn", "IAMRoleARN"]),
+            spelled_member(k, ["DeliveryStreamArn", "DeliveryStreamARN"]),
+        ))
+    }
+
+    /// The SNS destination's topic ARN. The APIs store `TopicArn`; a
+    /// CloudFormation-provisioned destination keeps the template's `TopicARN`.
+    pub(crate) fn sns_topic_arn(&self) -> Option<&str> {
+        spelled_member(self.sns_destination.as_ref()?, ["TopicArn", "TopicARN"])
+    }
+}
+
+/// First non-empty string value among the alternative member spellings.
+fn spelled_member<'a>(value: &'a serde_json::Value, names: [&str; 2]) -> Option<&'a str> {
+    names
+        .iter()
+        .find_map(|n| value.get(*n)?.as_str().filter(|s| !s.is_empty()))
+}
+
+/// `(v1, v2)` spellings of every SES event type.
+const EVENT_TYPE_NAMES: &[(&str, &str)] = &[
+    ("send", "SEND"),
+    ("reject", "REJECT"),
+    ("bounce", "BOUNCE"),
+    ("complaint", "COMPLAINT"),
+    ("delivery", "DELIVERY"),
+    ("open", "OPEN"),
+    ("click", "CLICK"),
+    ("renderingFailure", "RENDERING_FAILURE"),
+    ("deliveryDelay", "DELIVERY_DELAY"),
+    ("subscription", "SUBSCRIPTION"),
+];
+
+/// `(v1, v2)` spellings of every CloudWatch `DimensionValueSource`.
+const DIMENSION_VALUE_SOURCES: &[(&str, &str)] = &[
+    ("messageTag", "MESSAGE_TAG"),
+    ("emailHeader", "EMAIL_HEADER"),
+    ("linkTag", "LINK_TAG"),
+];
+
+fn v1_spelling<'a>(table: &[(&'static str, &'static str)], value: &'a str) -> &'a str {
+    table
+        .iter()
+        .find(|(v1, v2)| value == *v1 || value == *v2)
+        .map_or(value, |(v1, _)| v1)
+}
+
+fn v2_spelling<'a>(table: &[(&'static str, &'static str)], value: &'a str) -> &'a str {
+    table
+        .iter()
+        .find(|(v1, v2)| value == *v1 || value == *v2)
+        .map_or(value, |(_, v2)| v2)
+}
+
+/// An event type in SES v1 spelling (`renderingFailure`), whichever API
+/// stored it. Unknown values pass through unchanged.
+pub(crate) fn v1_event_type_name(event_type: &str) -> &str {
+    v1_spelling(EVENT_TYPE_NAMES, event_type)
+}
+
+/// An event type in SES v2 spelling (`RENDERING_FAILURE`), whichever API
+/// stored it. Unknown values pass through unchanged.
+pub(crate) fn v2_event_type_name(event_type: &str) -> &str {
+    v2_spelling(EVENT_TYPE_NAMES, event_type)
+}
+
+/// A `DimensionValueSource` in SES v1 spelling (`messageTag`).
+pub(crate) fn v1_dimension_value_source(source: &str) -> &str {
+    v1_spelling(DIMENSION_VALUE_SOURCES, source)
+}
+
+/// A `DimensionValueSource` in SES v2 spelling (`MESSAGE_TAG`).
+pub(crate) fn v2_dimension_value_source(source: &str) -> &str {
+    v2_spelling(DIMENSION_VALUE_SOURCES, source)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DedicatedIpPool {
     pub pool_name: String,
@@ -742,6 +827,59 @@ impl fakecloud_core::multi_account::AccountState for SesState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn event_type_names_convert_between_api_spellings() {
+        for (v1, v2) in EVENT_TYPE_NAMES {
+            assert_eq!(v1_event_type_name(v1), *v1);
+            assert_eq!(v1_event_type_name(v2), *v1);
+            assert_eq!(v2_event_type_name(v1), *v2);
+            assert_eq!(v2_event_type_name(v2), *v2);
+        }
+        // Unknown values pass through untouched in both directions.
+        assert_eq!(v1_event_type_name("SOME_NEW_TYPE"), "SOME_NEW_TYPE");
+        assert_eq!(v2_event_type_name("someNewType"), "someNewType");
+    }
+
+    #[test]
+    fn dimension_value_sources_convert_between_api_spellings() {
+        for (v1, v2) in DIMENSION_VALUE_SOURCES {
+            assert_eq!(v1_dimension_value_source(v2), *v1);
+            assert_eq!(v2_dimension_value_source(v1), *v2);
+            assert_eq!(v1_dimension_value_source(v1), *v1);
+            assert_eq!(v2_dimension_value_source(v2), *v2);
+        }
+        assert_eq!(v2_dimension_value_source("custom"), "custom");
+    }
+
+    fn destination(firehose: serde_json::Value, sns: serde_json::Value) -> EventDestination {
+        EventDestination {
+            name: "d".to_string(),
+            enabled: true,
+            matching_event_types: Vec::new(),
+            kinesis_firehose_destination: Some(firehose),
+            cloud_watch_destination: None,
+            sns_destination: Some(sns),
+            event_bridge_destination: None,
+            pinpoint_destination: None,
+        }
+    }
+
+    #[test]
+    fn destination_members_accept_both_spellings_and_skip_empty() {
+        let d = destination(
+            serde_json::json!({"IAMRoleARN": "", "DeliveryStreamARN": "arn:s"}),
+            serde_json::json!({"TopicARN": "arn:t"}),
+        );
+        assert_eq!(d.firehose_arns(), Some((None, Some("arn:s"))));
+        assert_eq!(d.sns_topic_arn(), Some("arn:t"));
+        let d = destination(
+            serde_json::json!({"IamRoleArn": "arn:r", "DeliveryStreamArn": null}),
+            serde_json::json!({"TopicArn": ""}),
+        );
+        assert_eq!(d.firehose_arns(), Some((Some("arn:r"), None)));
+        assert_eq!(d.sns_topic_arn(), None);
+    }
 
     #[test]
     fn new_initializes_defaults() {

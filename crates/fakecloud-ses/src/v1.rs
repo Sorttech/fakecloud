@@ -114,4 +114,4 @@ pub use v1_helpers::*;
 
 #[cfg(test)]
 #[path = "v1_tests.rs"]
-mod tests;
+pub(crate) mod tests;

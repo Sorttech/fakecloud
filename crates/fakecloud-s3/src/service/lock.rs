@@ -6,8 +6,8 @@ use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 use crate::persistence::object_meta_snapshot;
 
 use super::{
-    empty_response, extract_xml_value, no_such_bucket, no_such_key, resolve_object, s3_xml,
-    xml_escape, S3Service,
+    empty_response, extract_xml_value, governance_bypass_requested, no_such_bucket, no_such_key,
+    resolve_object, s3_xml, xml_escape, S3Service,
 };
 
 /// Whether `obj` is the version the request addressed. `"null"` addresses the
@@ -20,6 +20,36 @@ fn version_matches(obj: &crate::state::S3Object, vid: &str) -> bool {
         return false;
     }
     obj.version_id.as_deref() == Some(vid) || (vid == "null" && obj.version_id.is_none())
+}
+
+/// Whether replacing `obj`'s retention with `mode` / `retain_until` must be
+/// refused. While a retention is unexpired, shortening the retain-until date,
+/// changing the mode, or clearing the retention is denied: always under
+/// COMPLIANCE, and under GOVERNANCE unless the caller bypasses it. Keeping the
+/// mode and extending (or restating) the date is always allowed.
+fn retention_change_denied(
+    obj: &crate::state::S3Object,
+    mode: Option<&str>,
+    retain_until: Option<DateTime<Utc>>,
+    bypass: bool,
+) -> bool {
+    let (Some(current_mode), Some(current_until)) =
+        (obj.lock_mode.as_deref(), obj.lock_retain_until)
+    else {
+        return false;
+    };
+    if current_until <= Utc::now() {
+        return false;
+    }
+    let weakens = mode != Some(current_mode) || retain_until.is_none_or(|u| u < current_until);
+    if !weakens {
+        return false;
+    }
+    match current_mode {
+        "COMPLIANCE" => true,
+        "GOVERNANCE" => !bypass,
+        _ => false,
+    }
 }
 
 impl S3Service {
@@ -63,6 +93,26 @@ impl S3Service {
             .buckets
             .get_mut(bucket)
             .ok_or_else(|| no_such_bucket(bucket))?;
+
+        // An active retention can only be weakened as Object Lock allows.
+        let current = match version_id.as_deref() {
+            Some(vid) => b
+                .object_versions
+                .get(key)
+                .and_then(|vs| vs.iter().find(|o| version_matches(o, vid)))
+                .or_else(|| b.objects.get(key).filter(|o| version_matches(o, vid))),
+            None => b.objects.get(key),
+        };
+        let bypass = governance_bypass_requested(req);
+        if current
+            .is_some_and(|obj| retention_change_denied(obj, mode.as_deref(), retain_until, bypass))
+        {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::FORBIDDEN,
+                "AccessDenied",
+                "Access Denied",
+            ));
+        }
 
         // Find and update the object (either current or specific version)
         if let Some(ref vid) = version_id {
