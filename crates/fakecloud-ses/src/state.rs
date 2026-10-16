@@ -225,7 +225,10 @@ pub struct ContactList {
 pub struct Topic {
     pub topic_name: String,
     pub display_name: String,
-    pub description: String,
+    /// Optional in the model; absent when the caller sent none. Snapshots
+    /// written before this was optional stored `""` for "no description".
+    #[serde(default)]
+    pub description: Option<String>,
     pub default_subscription_status: String,
 }
 
@@ -594,6 +597,10 @@ pub struct SesState {
     pub tags: BTreeMap<String, BTreeMap<String, String>>,
     /// Suppression list: email → suppressed destination info.
     pub suppressed_destinations: BTreeMap<String, SuppressedDestination>,
+    /// Tenant-level suppression lists: tenant name -> email -> entry.
+    /// Applies to sends made on behalf of that tenant (`TenantName`).
+    #[serde(default)]
+    pub tenant_suppressed_destinations: BTreeMap<String, BTreeMap<String, SuppressedDestination>>,
     /// Event destinations: config set name → list of event destinations.
     pub event_destinations: BTreeMap<String, Vec<EventDestination>>,
     /// Identity policies: identity name → policy name → policy JSON document.
@@ -722,6 +729,7 @@ impl SesState {
             contacts: BTreeMap::new(),
             tags: BTreeMap::new(),
             suppressed_destinations: BTreeMap::new(),
+            tenant_suppressed_destinations: BTreeMap::new(),
             event_destinations: BTreeMap::new(),
             identity_policies: BTreeMap::new(),
             identity_certificates: BTreeMap::new(),
@@ -788,6 +796,28 @@ impl SesState {
             return self.account_settings.suppressed_reasons.clone();
         }
         vec!["BOUNCE".to_string(), "COMPLAINT".to_string()]
+    }
+
+    /// Like [`Self::suppressed_match`], but for a send made on behalf of a
+    /// tenant (`tenant_name`) an entry on that tenant's suppression list
+    /// blocks the address too. Tenant entries are subject to the same
+    /// effective `SuppressedReasons` filter as account-level ones.
+    pub fn suppressed_match_for_tenant(
+        &self,
+        address: &str,
+        config_set_name: Option<&str>,
+        tenant_name: Option<&str>,
+    ) -> Option<&SuppressedDestination> {
+        if let Some(hit) = self.suppressed_match(address, config_set_name) {
+            return Some(hit);
+        }
+        let list = self.tenant_suppressed_destinations.get(tenant_name?)?;
+        let key = address.trim();
+        let (_, entry) = list
+            .iter()
+            .find(|(k, _)| k.trim().eq_ignore_ascii_case(key))?;
+        let reasons = self.effective_suppressed_reasons(config_set_name);
+        reasons.iter().any(|r| r == &entry.reason).then_some(entry)
     }
 
     /// Look up `address` against the suppression list (case-insensitive,

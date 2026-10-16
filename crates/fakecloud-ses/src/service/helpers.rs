@@ -476,7 +476,7 @@ pub(crate) fn parse_topics(value: &Value) -> Vec<Topic> {
                 .filter_map(|v| {
                     let topic_name = v["TopicName"].as_str()?.to_string();
                     let display_name = v["DisplayName"].as_str().unwrap_or("").to_string();
-                    let description = v["Description"].as_str().unwrap_or("").to_string();
+                    let description = v["Description"].as_str().map(str::to_string);
                     let default_subscription_status = v["DefaultSubscriptionStatus"]
                         .as_str()
                         .unwrap_or("OPT_OUT")
