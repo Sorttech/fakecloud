@@ -11930,6 +11930,7 @@ async fn main() {
                                 "output": inv.output,
                                 "timestamp": inv.timestamp.to_rfc3339(),
                                 "error": inv.error,
+                                "requestMetadata": inv.request_metadata,
                             })
                         })
                         .collect();

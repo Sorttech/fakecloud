@@ -4,6 +4,7 @@ use serde_json::{json, Value};
 
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
+use crate::runtime_validation::RequestMetadata;
 use crate::state::SharedBedrockState;
 
 /// Invoke a model and return a provider-specific canned response.
@@ -13,6 +14,7 @@ pub(crate) fn invoke_model(
     req: &AwsRequest,
     model_id: &str,
     body: &[u8],
+    request_metadata: Option<&RequestMetadata>,
 ) -> Result<AwsResponse, AwsServiceError> {
     // Validate model ID
     if model_id.is_empty() {
@@ -25,7 +27,14 @@ pub(crate) fn invoke_model(
 
     // Fault injection: if a matching rule is queued, record the attempt and fail.
     if let Some(fault) = crate::faults::take_matching_fault(state, req, model_id, "InvokeModel") {
-        crate::faults::record_faulted_invocation(state, req, model_id, body, &fault);
+        crate::faults::record_faulted_invocation(
+            state,
+            req,
+            model_id,
+            body,
+            &fault,
+            request_metadata,
+        );
         return Err(crate::faults::fault_to_error(&fault));
     }
 
@@ -41,6 +50,7 @@ pub(crate) fn invoke_model(
         body,
         &input,
         response_body,
+        request_metadata,
     ))
 }
 
@@ -52,6 +62,7 @@ pub(crate) fn record_invocation(
     body: &[u8],
     output: &str,
     error: Option<String>,
+    request_metadata: Option<&RequestMetadata>,
 ) {
     let mut accts = state.write();
     let s = accts.get_or_create(&req.account_id);
@@ -61,6 +72,7 @@ pub(crate) fn record_invocation(
         output: output.to_string(),
         timestamp: Utc::now(),
         error,
+        request_metadata: request_metadata.cloned(),
     });
 }
 
@@ -107,8 +119,17 @@ pub(crate) fn respond_with_body(
     body: &[u8],
     input: &Value,
     response_body: String,
+    request_metadata: Option<&RequestMetadata>,
 ) -> AwsResponse {
-    record_invocation(state, req, model_id, body, &response_body, None);
+    record_invocation(
+        state,
+        req,
+        model_id,
+        body,
+        &response_body,
+        None,
+        request_metadata,
+    );
 
     // Real Bedrock returns dynamic input/output token counts. Approximate
     // each by whitespace-splitting the relevant text — close enough for
@@ -552,7 +573,7 @@ mod tests {
     #[test]
     fn invoke_empty_model_id_errors() {
         let s = shared();
-        let err = invoke_model(&s, &req(), "", b"{}").err().unwrap();
+        let err = invoke_model(&s, &req(), "", b"{}", None).err().unwrap();
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -561,7 +582,7 @@ mod tests {
         let s = shared();
         // Anthropic-shaped body: 5 whitespace-separated tokens.
         let body = br#"{"messages":[{"role":"user","content":"please count my tokens here"}]}"#;
-        let resp = invoke_model(&s, &req(), "anthropic.claude-3", body).unwrap();
+        let resp = invoke_model(&s, &req(), "anthropic.claude-3", body, None).unwrap();
         let input_hdr = resp
             .headers
             .get("x-amzn-bedrock-input-token-count")
@@ -595,7 +616,7 @@ mod tests {
 
         let s = shared();
         let body = br#"{"messages":[{"role":"user","content":"hello world from echo mode"}]}"#;
-        let resp = invoke_model(&s, &req(), "anthropic.claude-3", body).unwrap();
+        let resp = invoke_model(&s, &req(), "anthropic.claude-3", body, None).unwrap();
         let v: Value =
             serde_json::from_str(std::str::from_utf8(resp.body.expect_bytes()).unwrap()).unwrap();
         let text = v["content"][0]["text"].as_str().unwrap();
@@ -621,7 +642,7 @@ mod tests {
         // otherwise have them observe the echo branch mid-flip.
         let _g = echo_lock().lock();
         let s = shared();
-        let resp = invoke_model(&s, &req(), "anthropic.claude-3", b"{}").unwrap();
+        let resp = invoke_model(&s, &req(), "anthropic.claude-3", b"{}", None).unwrap();
         let v: Value =
             serde_json::from_str(std::str::from_utf8(resp.body.expect_bytes()).unwrap()).unwrap();
         assert_eq!(v["type"], "message");
@@ -633,7 +654,7 @@ mod tests {
     fn invoke_amazon_titan_text_returns_results() {
         let _g = echo_lock().lock();
         let s = shared();
-        let resp = invoke_model(&s, &req(), "amazon.titan-text-express-v1", b"{}").unwrap();
+        let resp = invoke_model(&s, &req(), "amazon.titan-text-express-v1", b"{}", None).unwrap();
         let v: Value =
             serde_json::from_str(std::str::from_utf8(resp.body.expect_bytes()).unwrap()).unwrap();
         assert!(v["results"].is_array());
@@ -645,7 +666,7 @@ mod tests {
         // observe the echo branch's text when the flag is mid-flip.
         let _g = echo_lock().lock();
         let s = shared();
-        let resp = invoke_model(&s, &req(), "amazon.titan-embed-text-v1", b"{}").unwrap();
+        let resp = invoke_model(&s, &req(), "amazon.titan-embed-text-v1", b"{}", None).unwrap();
         let v: Value =
             serde_json::from_str(std::str::from_utf8(resp.body.expect_bytes()).unwrap()).unwrap();
         assert!(v["embedding"].is_array());
@@ -655,7 +676,7 @@ mod tests {
     fn invoke_meta_returns_generation() {
         let _g = echo_lock().lock();
         let s = shared();
-        let resp = invoke_model(&s, &req(), "meta.llama3", b"{}").unwrap();
+        let resp = invoke_model(&s, &req(), "meta.llama3", b"{}", None).unwrap();
         let v: Value =
             serde_json::from_str(std::str::from_utf8(resp.body.expect_bytes()).unwrap()).unwrap();
         assert!(v["generation"].is_string());
@@ -665,7 +686,7 @@ mod tests {
     fn invoke_cohere_returns_generations() {
         let _g = echo_lock().lock();
         let s = shared();
-        let resp = invoke_model(&s, &req(), "cohere.command", b"{}").unwrap();
+        let resp = invoke_model(&s, &req(), "cohere.command", b"{}", None).unwrap();
         let v: Value =
             serde_json::from_str(std::str::from_utf8(resp.body.expect_bytes()).unwrap()).unwrap();
         assert!(v["generations"].is_array());
@@ -675,7 +696,7 @@ mod tests {
     fn invoke_mistral_returns_outputs() {
         let _g = echo_lock().lock();
         let s = shared();
-        let resp = invoke_model(&s, &req(), "mistral.7b", b"{}").unwrap();
+        let resp = invoke_model(&s, &req(), "mistral.7b", b"{}", None).unwrap();
         let v: Value =
             serde_json::from_str(std::str::from_utf8(resp.body.expect_bytes()).unwrap()).unwrap();
         assert!(v["outputs"].is_array());
@@ -685,7 +706,7 @@ mod tests {
     fn invoke_unknown_provider_returns_generic() {
         let _g = echo_lock().lock();
         let s = shared();
-        let resp = invoke_model(&s, &req(), "stability.diffusion", b"{}").unwrap();
+        let resp = invoke_model(&s, &req(), "stability.diffusion", b"{}", None).unwrap();
         let v: Value =
             serde_json::from_str(std::str::from_utf8(resp.body.expect_bytes()).unwrap()).unwrap();
         assert_eq!(
@@ -697,7 +718,7 @@ mod tests {
     #[test]
     fn invoke_records_invocation_entry() {
         let s = shared();
-        invoke_model(&s, &req(), "anthropic.claude", b"{}").unwrap();
+        invoke_model(&s, &req(), "anthropic.claude", b"{}", None).unwrap();
         let state = s.read();
         assert_eq!(state.default_ref().invocations.len(), 1);
     }
@@ -705,7 +726,7 @@ mod tests {
     #[test]
     fn invoke_returns_bedrock_headers() {
         let s = shared();
-        let resp = invoke_model(&s, &req(), "anthropic.claude", b"{}").unwrap();
+        let resp = invoke_model(&s, &req(), "anthropic.claude", b"{}", None).unwrap();
         assert!(resp
             .headers
             .get("x-amzn-bedrock-input-token-count")
@@ -730,7 +751,7 @@ mod tests {
                 model_id: None,
                 operation: None,
             });
-        let err = invoke_model(&s, &req(), "m", b"{}").err().unwrap();
+        let err = invoke_model(&s, &req(), "m", b"{}", None).err().unwrap();
         assert_eq!(err.status(), StatusCode::TOO_MANY_REQUESTS);
         let state = s.read();
         let acct = state.default_ref();

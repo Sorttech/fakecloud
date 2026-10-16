@@ -33,6 +33,7 @@ use serde_json::{json, Value};
 
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
+use crate::runtime_validation::RequestMetadata;
 use crate::state::SharedBedrockState;
 
 /// Upstream wire protocol selector.
@@ -1223,6 +1224,7 @@ fn record_error(
     model_id: &str,
     body: &[u8],
     err: AwsServiceError,
+    request_metadata: Option<&RequestMetadata>,
 ) -> AwsServiceError {
     crate::invoke::record_invocation(
         state,
@@ -1231,6 +1233,7 @@ fn record_error(
         body,
         "",
         Some(format!("{}: {}", err.code(), err.message())),
+        request_metadata,
     );
     err
 }
@@ -1244,9 +1247,17 @@ pub(crate) async fn invoke_model_upstream(
     model_id: &str,
     body: &[u8],
     cfg: &UpstreamConfig,
+    request_metadata: Option<&RequestMetadata>,
 ) -> Result<AwsResponse, AwsServiceError> {
     if let Some(fault) = crate::faults::take_matching_fault(state, req, model_id, "InvokeModel") {
-        crate::faults::record_faulted_invocation(state, req, model_id, body, &fault);
+        crate::faults::record_faulted_invocation(
+            state,
+            req,
+            model_id,
+            body,
+            &fault,
+            request_metadata,
+        );
         return Err(crate::faults::fault_to_error(&fault));
     }
 
@@ -1256,7 +1267,13 @@ pub(crate) async fn invoke_model_upstream(
     // keep working even with an upstream configured.
     if let Some(custom) = crate::prompt::resolve_override(state, req, model_id, body) {
         return Ok(crate::invoke::respond_with_body(
-            state, req, model_id, body, &input, custom,
+            state,
+            req,
+            model_id,
+            body,
+            &input,
+            custom,
+            request_metadata,
         ));
     }
 
@@ -1274,14 +1291,29 @@ pub(crate) async fn invoke_model_upstream(
 
     match result {
         Ok((response_body, in_t, out_t)) => {
-            crate::invoke::record_invocation(state, req, model_id, body, &response_body, None);
+            crate::invoke::record_invocation(
+                state,
+                req,
+                model_id,
+                body,
+                &response_body,
+                None,
+                request_metadata,
+            );
             Ok(crate::invoke::runtime_response_with_tokens(
                 response_body,
                 in_t,
                 out_t,
             ))
         }
-        Err(e) => Err(record_error(state, req, model_id, body, e)),
+        Err(e) => Err(record_error(
+            state,
+            req,
+            model_id,
+            body,
+            e,
+            request_metadata,
+        )),
     }
 }
 
@@ -1292,9 +1324,17 @@ pub(crate) async fn converse_upstream(
     model_id: &str,
     body: &[u8],
     cfg: &UpstreamConfig,
+    request_metadata: Option<&RequestMetadata>,
 ) -> Result<AwsResponse, AwsServiceError> {
     if let Some(fault) = crate::faults::take_matching_fault(state, req, model_id, "Converse") {
-        crate::faults::record_faulted_invocation(state, req, model_id, body, &fault);
+        crate::faults::record_faulted_invocation(
+            state,
+            req,
+            model_id,
+            body,
+            &fault,
+            request_metadata,
+        );
         return Err(crate::faults::fault_to_error(&fault));
     }
 
@@ -1304,7 +1344,16 @@ pub(crate) async fn converse_upstream(
 
     let completion = match call_chat(cfg, &upstream_model, &chat).await {
         Ok(c) => c,
-        Err(e) => return Err(record_error(state, req, model_id, body, e)),
+        Err(e) => {
+            return Err(record_error(
+                state,
+                req,
+                model_id,
+                body,
+                e,
+                request_metadata,
+            ))
+        }
     };
 
     // Build Converse content blocks: the assistant text, then a `toolUse`
@@ -1347,7 +1396,15 @@ pub(crate) async fn converse_upstream(
     let response_str =
         serde_json::to_string(&response).expect("serde_json::Value serialization is infallible");
 
-    crate::invoke::record_invocation(state, req, model_id, body, &response_str, None);
+    crate::invoke::record_invocation(
+        state,
+        req,
+        model_id,
+        body,
+        &response_str,
+        None,
+        request_metadata,
+    );
     Ok(AwsResponse::json(StatusCode::OK, response_str))
 }
 
@@ -1359,6 +1416,7 @@ pub(crate) async fn invoke_stream_upstream(
     model_id: &str,
     body: &[u8],
     cfg: &UpstreamConfig,
+    request_metadata: Option<&RequestMetadata>,
 ) -> Result<AwsResponse, AwsServiceError> {
     // A configured simulation override wins over the live upstream, same as
     // the non-streaming path: stream the override text deterministically.
@@ -1375,7 +1433,15 @@ pub(crate) async fn invoke_stream_upstream(
             in_t,
             out_t,
         );
-        crate::invoke::record_invocation(state, req, model_id, body, &deltas.concat(), None);
+        crate::invoke::record_invocation(
+            state,
+            req,
+            model_id,
+            body,
+            &deltas.concat(),
+            None,
+            request_metadata,
+        );
         return Ok(eventstream_response(event_body));
     }
 
@@ -1385,7 +1451,16 @@ pub(crate) async fn invoke_stream_upstream(
 
     let result = match call_chat_stream(cfg, &upstream_model, &chat).await {
         Ok(t) => t,
-        Err(e) => return Err(record_error(state, req, model_id, body, e)),
+        Err(e) => {
+            return Err(record_error(
+                state,
+                req,
+                model_id,
+                body,
+                e,
+                request_metadata,
+            ))
+        }
     };
 
     let event_body = crate::streaming::build_invoke_stream_from_deltas(
@@ -1396,7 +1471,15 @@ pub(crate) async fn invoke_stream_upstream(
         result.output_tokens,
     );
 
-    crate::invoke::record_invocation(state, req, model_id, body, &result.deltas.concat(), None);
+    crate::invoke::record_invocation(
+        state,
+        req,
+        model_id,
+        body,
+        &result.deltas.concat(),
+        None,
+        request_metadata,
+    );
     Ok(eventstream_response(event_body))
 }
 
@@ -1416,6 +1499,7 @@ pub(crate) async fn converse_stream_upstream(
     model_id: &str,
     body: &[u8],
     cfg: &UpstreamConfig,
+    request_metadata: Option<&RequestMetadata>,
 ) -> Result<AwsResponse, AwsServiceError> {
     // A configured simulation override wins over the live upstream.
     if let Some(custom) = crate::prompt::resolve_override(state, req, model_id, body) {
@@ -1429,7 +1513,15 @@ pub(crate) async fn converse_stream_upstream(
             in_t,
             out_t,
         );
-        crate::invoke::record_invocation(state, req, model_id, body, &deltas.concat(), None);
+        crate::invoke::record_invocation(
+            state,
+            req,
+            model_id,
+            body,
+            &deltas.concat(),
+            None,
+            request_metadata,
+        );
         return Ok(eventstream_response(event_body));
     }
 
@@ -1439,7 +1531,16 @@ pub(crate) async fn converse_stream_upstream(
 
     let result = match call_chat_stream(cfg, &upstream_model, &chat).await {
         Ok(t) => t,
-        Err(e) => return Err(record_error(state, req, model_id, body, e)),
+        Err(e) => {
+            return Err(record_error(
+                state,
+                req,
+                model_id,
+                body,
+                e,
+                request_metadata,
+            ))
+        }
     };
 
     let event_body = crate::streaming::build_converse_stream_from_deltas(
@@ -1449,7 +1550,15 @@ pub(crate) async fn converse_stream_upstream(
         result.output_tokens,
     );
 
-    crate::invoke::record_invocation(state, req, model_id, body, &result.deltas.concat(), None);
+    crate::invoke::record_invocation(
+        state,
+        req,
+        model_id,
+        body,
+        &result.deltas.concat(),
+        None,
+        request_metadata,
+    );
     Ok(eventstream_response(event_body))
 }
 
@@ -1583,6 +1692,7 @@ mod tests {
             "anthropic.claude-3-5-sonnet-20240620-v1:0",
             body,
             &c,
+            None,
         )
         .await
         .unwrap();
@@ -1613,9 +1723,10 @@ mod tests {
         let s = shared();
         let body = br#"{"inputText":"hi there","textGenerationConfig":{"maxTokenCount":32}}"#;
 
-        let resp = invoke_model_upstream(&s, &req(), "amazon.titan-text-express-v1", body, &c)
-            .await
-            .unwrap();
+        let resp =
+            invoke_model_upstream(&s, &req(), "amazon.titan-text-express-v1", body, &c, None)
+                .await
+                .unwrap();
 
         let v: Value = serde_json::from_slice(&body_bytes(&resp)).unwrap();
         assert_eq!(v["results"][0]["outputText"], "titan-style answer");
@@ -1642,7 +1753,7 @@ mod tests {
         let s = shared();
         let body = br#"{"messages":[{"role":"user","content":[{"text":"convo prompt"}]}]}"#;
 
-        let resp = converse_upstream(&s, &req(), "anthropic.claude-3", body, &c)
+        let resp = converse_upstream(&s, &req(), "anthropic.claude-3", body, &c, None)
             .await
             .unwrap();
 
@@ -1676,7 +1787,7 @@ mod tests {
         let s = shared();
         let body = br#"{"messages":[{"role":"user","content":"stream please"}]}"#;
 
-        let resp = invoke_stream_upstream(&s, &req(), "anthropic.claude-3", body, &c)
+        let resp = invoke_stream_upstream(&s, &req(), "anthropic.claude-3", body, &c, None)
             .await
             .unwrap();
 
@@ -1723,7 +1834,7 @@ mod tests {
         let s = shared();
         let body = br#"{"messages":[{"role":"user","content":[{"text":"hi"}]}]}"#;
 
-        let resp = converse_stream_upstream(&s, &req(), "anthropic.claude-3", body, &c)
+        let resp = converse_stream_upstream(&s, &req(), "anthropic.claude-3", body, &c, None)
             .await
             .unwrap();
 
@@ -1757,7 +1868,7 @@ mod tests {
         let s = shared();
         let body = br#"{"messages":[{"role":"user","content":"hi"}]}"#;
 
-        let err = invoke_model_upstream(&s, &req(), "anthropic.claude-3", body, &c)
+        let err = invoke_model_upstream(&s, &req(), "anthropic.claude-3", body, &c, None)
             .await
             .err()
             .expect("upstream 500 should surface as an error");
@@ -1780,7 +1891,7 @@ mod tests {
         let s = shared();
         let body = br#"{"messages":[{"role":"user","content":"hi"}]}"#;
 
-        let err = invoke_model_upstream(&s, &req(), "anthropic.claude-3", body, &c)
+        let err = invoke_model_upstream(&s, &req(), "anthropic.claude-3", body, &c, None)
             .await
             .err()
             .unwrap();
@@ -1799,7 +1910,7 @@ mod tests {
         let s = shared();
         let body = br#"{"messages":[{"role":"user","content":"hi"}]}"#;
 
-        let err = invoke_model_upstream(&s, &req(), "anthropic.claude-3", body, &c)
+        let err = invoke_model_upstream(&s, &req(), "anthropic.claude-3", body, &c, None)
             .await
             .err()
             .unwrap();
@@ -1822,7 +1933,7 @@ mod tests {
         let s = shared();
         let body = br#"{"inputText":"embed me"}"#;
 
-        let resp = invoke_model_upstream(&s, &req(), "amazon.titan-embed-text-v1", body, &c)
+        let resp = invoke_model_upstream(&s, &req(), "amazon.titan-embed-text-v1", body, &c, None)
             .await
             .unwrap();
         let v: Value = serde_json::from_slice(&body_bytes(&resp)).unwrap();
@@ -1839,7 +1950,7 @@ mod tests {
         let c = cfg("http://127.0.0.1:1".to_string(), Protocol::Anthropic);
         let s = shared();
         let body = br#"{"inputText":"embed me"}"#;
-        let err = invoke_model_upstream(&s, &req(), "amazon.titan-embed-text-v1", body, &c)
+        let err = invoke_model_upstream(&s, &req(), "amazon.titan-embed-text-v1", body, &c, None)
             .await
             .err()
             .expect("anthropic embeddings should error, not fabricate a vector");
@@ -1883,9 +1994,10 @@ mod tests {
         let s = shared();
         let body = br#"{"prompt":"hello llama","max_gen_len":16}"#;
 
-        let resp = invoke_stream_upstream(&s, &req(), "meta.llama3-70b-instruct-v1:0", body, &c)
-            .await
-            .unwrap();
+        let resp =
+            invoke_stream_upstream(&s, &req(), "meta.llama3-70b-instruct-v1:0", body, &c, None)
+                .await
+                .unwrap();
 
         let frames = split_frames(&body_bytes(&resp));
         let mut gens = Vec::new();
@@ -1929,6 +2041,7 @@ mod tests {
             "us.anthropic.claude-3-5-sonnet-20240620-v1:0",
             body,
             &c,
+            None,
         )
         .await
         .unwrap();
@@ -2009,7 +2122,7 @@ mod tests {
             "toolConfig":{"tools":[{"toolSpec":{"name":"get_weather","description":"weather","inputSchema":{"json":{"type":"object"}}}}]}
         }"#;
 
-        let resp = converse_upstream(&s, &req(), "anthropic.claude-3", body, &c)
+        let resp = converse_upstream(&s, &req(), "anthropic.claude-3", body, &c, None)
             .await
             .unwrap();
         let v: Value = serde_json::from_slice(&body_bytes(&resp)).unwrap();
@@ -2042,7 +2155,7 @@ mod tests {
         let s = shared();
         let body = br#"{"messages":[{"role":"user","content":[{"text":"hi"}]}],"inferenceConfig":{"maxTokens":2}}"#;
 
-        let resp = converse_upstream(&s, &req(), "anthropic.claude-3", body, &c)
+        let resp = converse_upstream(&s, &req(), "anthropic.claude-3", body, &c, None)
             .await
             .unwrap();
         let v: Value = serde_json::from_slice(&body_bytes(&resp)).unwrap();
@@ -2056,7 +2169,7 @@ mod tests {
         // than being coerced to null and forwarded.
         let c = cfg("http://127.0.0.1:1".to_string(), Protocol::OpenAi);
         let s = shared();
-        let err = invoke_model_upstream(&s, &req(), "anthropic.claude-3", b"not json {", &c)
+        let err = invoke_model_upstream(&s, &req(), "anthropic.claude-3", b"not json {", &c, None)
             .await
             .err()
             .expect("malformed body must be rejected");
@@ -2078,7 +2191,7 @@ mod tests {
             );
         }
         let body = br#"{"messages":[{"role":"user","content":"hi"}]}"#;
-        let resp = invoke_stream_upstream(&s, &req(), "anthropic.claude-3", body, &c)
+        let resp = invoke_stream_upstream(&s, &req(), "anthropic.claude-3", body, &c, None)
             .await
             .expect("override path should not touch the dead upstream");
         let frames = split_frames(&body_bytes(&resp));
@@ -2171,9 +2284,16 @@ mod tests {
         let c = cfg(url, Protocol::OpenAi);
         let s = shared();
         let body = br#"{"inputText":"embed me"}"#;
-        let resp = invoke_model_upstream(&s, &req(), "us.amazon.titan-embed-text-v2:0", body, &c)
-            .await
-            .expect("region-prefixed embed model should route to embeddings");
+        let resp = invoke_model_upstream(
+            &s,
+            &req(),
+            "us.amazon.titan-embed-text-v2:0",
+            body,
+            &c,
+            None,
+        )
+        .await
+        .expect("region-prefixed embed model should route to embeddings");
         let v: Value = serde_json::from_slice(&body_bytes(&resp)).unwrap();
         assert_eq!(v["embedding"], json!([0.1, 0.2, 0.3]));
         assert_eq!(v["inputTextTokenCount"], 4);

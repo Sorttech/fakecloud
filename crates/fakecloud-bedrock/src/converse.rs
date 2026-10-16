@@ -1,4 +1,3 @@
-use chrono::Utc;
 use http::StatusCode;
 use serde_json::{json, Value};
 
@@ -12,9 +11,17 @@ pub(crate) fn converse(
     req: &AwsRequest,
     model_id: &str,
     body: &[u8],
+    request_metadata: Option<&crate::runtime_validation::RequestMetadata>,
 ) -> Result<AwsResponse, AwsServiceError> {
     if let Some(fault) = crate::faults::take_matching_fault(state, req, model_id, "Converse") {
-        crate::faults::record_faulted_invocation(state, req, model_id, body, &fault);
+        crate::faults::record_faulted_invocation(
+            state,
+            req,
+            model_id,
+            body,
+            &fault,
+            request_metadata,
+        );
         return Err(crate::faults::fault_to_error(&fault));
     }
 
@@ -122,17 +129,15 @@ pub(crate) fn converse(
     let response_str = serde_json::to_string(&response).unwrap();
 
     // Record invocation for introspection
-    {
-        let mut accts = state.write();
-        let s = accts.get_or_create(&req.account_id);
-        s.invocations.push(crate::state::ModelInvocation {
-            model_id: model_id.to_string(),
-            input: String::from_utf8_lossy(body).to_string(),
-            output: response_str.clone(),
-            timestamp: Utc::now(),
-            error: None,
-        });
-    }
+    crate::invoke::record_invocation(
+        state,
+        req,
+        model_id,
+        body,
+        &response_str,
+        None,
+        request_metadata,
+    );
 
     Ok(AwsResponse::json(StatusCode::OK, response_str))
 }
@@ -268,7 +273,7 @@ mod tests {
     fn converse_default_response_no_fault_no_override() {
         let s = shared();
         let body = br#"{"messages":[{"content":[{"text":"hi"}]}]}"#;
-        let resp = converse(&s, &req(), "anthropic.claude-v2", body).unwrap();
+        let resp = converse(&s, &req(), "anthropic.claude-v2", body, None).unwrap();
         let v: Value =
             serde_json::from_str(std::str::from_utf8(resp.body.expect_bytes()).unwrap()).unwrap();
         assert_eq!(v["output"]["message"]["role"], "assistant");
@@ -280,7 +285,7 @@ mod tests {
     fn converse_truncates_via_max_tokens() {
         let s = shared();
         let body = br#"{"messages":[], "inferenceConfig": {"maxTokens": 2}}"#;
-        let resp = converse(&s, &req(), "m", body).unwrap();
+        let resp = converse(&s, &req(), "m", body, None).unwrap();
         let v: Value =
             serde_json::from_str(std::str::from_utf8(resp.body.expect_bytes()).unwrap()).unwrap();
         let text = v["output"]["message"]["content"][0]["text"]
@@ -299,7 +304,7 @@ mod tests {
             "messages": [],
             "toolConfig": {"tools": [{"toolSpec": {"name": "calculator"}}]}
         }"#;
-        let resp = converse(&s, &req(), "m", body).unwrap();
+        let resp = converse(&s, &req(), "m", body, None).unwrap();
         let v: Value =
             serde_json::from_str(std::str::from_utf8(resp.body.expect_bytes()).unwrap()).unwrap();
         assert_eq!(v["stopReason"], "end_turn");
@@ -318,7 +323,7 @@ mod tests {
                 "toolChoice": {"any": {}}
             }
         }"#;
-        let resp = converse(&s, &req(), "m", body).unwrap();
+        let resp = converse(&s, &req(), "m", body, None).unwrap();
         let v: Value =
             serde_json::from_str(std::str::from_utf8(resp.body.expect_bytes()).unwrap()).unwrap();
         assert_eq!(v["stopReason"], "tool_use");
@@ -340,7 +345,7 @@ mod tests {
                 "toolChoice": {"tool": {"name": "weather"}}
             }
         }"#;
-        let resp = converse(&s, &req(), "m", body).unwrap();
+        let resp = converse(&s, &req(), "m", body, None).unwrap();
         let v: Value =
             serde_json::from_str(std::str::from_utf8(resp.body.expect_bytes()).unwrap()).unwrap();
         assert_eq!(v["stopReason"], "tool_use");
@@ -359,7 +364,7 @@ mod tests {
             r#"{{"messages":[],"inferenceConfig":{{"maxTokens":{}}}}}"#,
             u64::MAX - 1
         );
-        let resp = converse(&s, &req(), "m", body.as_bytes()).unwrap();
+        let resp = converse(&s, &req(), "m", body.as_bytes(), None).unwrap();
         let v: Value =
             serde_json::from_str(std::str::from_utf8(resp.body.expect_bytes()).unwrap()).unwrap();
         // No truncation happened, so it's a normal end_turn reply.
@@ -374,7 +379,7 @@ mod tests {
     fn converse_reports_max_tokens_stop_reason_on_truncation() {
         let s = shared();
         let body = br#"{"messages":[], "inferenceConfig": {"maxTokens": 1}}"#;
-        let resp = converse(&s, &req(), "m", body).unwrap();
+        let resp = converse(&s, &req(), "m", body, None).unwrap();
         let v: Value =
             serde_json::from_str(std::str::from_utf8(resp.body.expect_bytes()).unwrap()).unwrap();
         // The canned reply is longer than 1*4 chars, so it was truncated.
@@ -412,7 +417,7 @@ mod tests {
     fn converse_records_invocation() {
         let s = shared();
         let body = br#"{"messages":[]}"#;
-        converse(&s, &req(), "model-x", body).unwrap();
+        converse(&s, &req(), "model-x", body, None).unwrap();
         let state = s.read();
         let acct = state.default_ref();
         assert_eq!(acct.invocations.len(), 1);
@@ -428,7 +433,7 @@ mod tests {
             .custom_responses
             .insert("model-y".to_string(), "override-output".to_string());
         let body = br#"{"messages":[]}"#;
-        let resp = converse(&s, &req(), "model-y", body).unwrap();
+        let resp = converse(&s, &req(), "model-y", body, None).unwrap();
         let v: Value =
             serde_json::from_str(std::str::from_utf8(resp.body.expect_bytes()).unwrap()).unwrap();
         assert_eq!(
@@ -446,7 +451,7 @@ mod tests {
             .custom_responses
             .insert("model-z".to_string(), payload.to_string());
         let body = br#"{"messages":[]}"#;
-        let resp = converse(&s, &req(), "model-z", body).unwrap();
+        let resp = converse(&s, &req(), "model-z", body, None).unwrap();
         let v: Value =
             serde_json::from_str(std::str::from_utf8(resp.body.expect_bytes()).unwrap()).unwrap();
         assert_eq!(v["output"]["message"]["content"][0]["text"], "nested-hello");
@@ -461,7 +466,7 @@ mod tests {
 
         let s = shared();
         let body = br#"{"messages":[{"role":"user","content":[{"text":"hello echo"}]}]}"#;
-        let resp = converse(&s, &req(), "anthropic.claude-v2", body).unwrap();
+        let resp = converse(&s, &req(), "anthropic.claude-v2", body, None).unwrap();
         let v: Value =
             serde_json::from_str(std::str::from_utf8(resp.body.expect_bytes()).unwrap()).unwrap();
         let text = v["output"]["message"]["content"][0]["text"]
@@ -484,8 +489,8 @@ mod tests {
         let s = shared();
         let short = br#"{"messages":[{"content":[{"text":"hi"}]}]}"#;
         let long = br#"{"messages":[{"content":[{"text":"please count many words across this longer message body"}]}]}"#;
-        let r1 = converse(&s, &req(), "m", short).unwrap();
-        let r2 = converse(&s, &req(), "m", long).unwrap();
+        let r1 = converse(&s, &req(), "m", short, None).unwrap();
+        let r2 = converse(&s, &req(), "m", long, None).unwrap();
         let v1: Value =
             serde_json::from_str(std::str::from_utf8(r1.body.expect_bytes()).unwrap()).unwrap();
         let v2: Value =
@@ -513,7 +518,7 @@ mod tests {
                 operation: None,
             });
         let body = br#"{"messages":[]}"#;
-        let err = converse(&s, &req(), "m", body).err().unwrap();
+        let err = converse(&s, &req(), "m", body, None).err().unwrap();
         assert_eq!(err.status(), StatusCode::TOO_MANY_REQUESTS);
         let state = s.read();
         let acct = state.default_ref();

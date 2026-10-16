@@ -660,7 +660,12 @@ public sealed record SfnEnqueueActivityTaskResponse(string? TaskToken);
 
 // ── Bedrock ────────────────────────────────────────────────────
 public sealed record BedrockInvocation(
-    string? ModelId, string? Input, string? Output, string? Timestamp, string? Error);
+    string? ModelId,
+    string? Input,
+    string? Output,
+    string? Timestamp,
+    string? Error,
+    IReadOnlyDictionary<string, string>? RequestMetadata);
 
 public sealed record BedrockInvocationsResponse(IReadOnlyList<BedrockInvocation>? Invocations);
 

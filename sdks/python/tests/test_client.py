@@ -512,6 +512,29 @@ def test_bedrock_invocation_decodes_error_field(
 # ── Unit tests for serialization logic ────────────────────────────────
 
 
+def test_bedrock_invocation_keeps_request_metadata_keys_verbatim() -> None:
+    from fakecloud.types import BedrockInvocation
+
+    inv = BedrockInvocation.from_dict(
+        {
+            "modelId": "m",
+            "input": "{}",
+            "output": "{}",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "error": None,
+            "requestMetadata": {"costCenter": "eng", "team": "search"},
+        }
+    )
+    assert inv.model_id == "m"
+    # User-chosen metadata keys are data, not wire fields: no snake_casing.
+    assert inv.request_metadata == {"costCenter": "eng", "team": "search"}
+
+    bare = BedrockInvocation.from_dict(
+        {"modelId": "m", "input": "", "output": "", "timestamp": "t", "error": None}
+    )
+    assert bare.request_metadata is None
+
+
 def test_inbound_email_request_to_dict() -> None:
     req = InboundEmailRequest(
         from_addr="a@b.com", to=["c@d.com"], subject="Hi", body="Hello"

@@ -604,31 +604,16 @@ fn evaluate_content_view(guardrail: &GuardrailView<'_>, text: &str) -> Vec<Value
                 let entity_type = entity["type"].as_str().unwrap_or("");
                 let action = entity["action"].as_str().unwrap_or("BLOCK");
 
-                let pattern = match entity_type {
-                    "EMAIL" => Some(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"),
-                    "PHONE" => Some(r"\b\d{3}[-.]?\d{3}[-.]?\d{4}\b"),
-                    "US_SOCIAL_SECURITY_NUMBER" => Some(r"\b\d{3}-\d{2}-\d{4}\b"),
-                    "CREDIT_DEBIT_CARD_NUMBER" => {
-                        Some(r"\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b")
-                    }
-                    "IP_ADDRESS" => Some(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b"),
-                    _ => None,
-                };
-
-                if let Some(pat) = pattern {
-                    if let Ok(re) = Regex::new(pat) {
-                        for m in re.find_iter(text) {
-                            assessments.push(json!({
-                                "sensitiveInformationPolicy": {
-                                    "piiEntities": [{
-                                        "type": entity_type,
-                                        "match": m.as_str(),
-                                        "action": action
-                                    }]
-                                }
-                            }));
+                for range in crate::guardrail_checks::pii_matches(entity_type, text) {
+                    assessments.push(json!({
+                        "sensitiveInformationPolicy": {
+                            "piiEntities": [{
+                                "type": entity_type,
+                                "match": &text[range],
+                                "action": action
+                            }]
                         }
-                    }
+                    }));
                 }
             }
         }
@@ -910,6 +895,56 @@ mod tests {
         }));
         let a = evaluate_content(&g, "call 555-123-4567 now");
         assert_eq!(a.len(), 1);
+    }
+
+    fn pii_hits(entity: &str, text: &str) -> Vec<String> {
+        let mut g = empty_guardrail("g1");
+        g.sensitive_information_policy = Some(json!({
+            "piiEntitiesConfig": [{"type": entity, "action": "BLOCK"}]
+        }));
+        evaluate_content(&g, text)
+            .iter()
+            .map(|a| {
+                a["sensitiveInformationPolicy"]["piiEntities"][0]["match"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn evaluate_content_pii_phone_international_formats() {
+        assert_eq!(
+            pii_hits("PHONE", "ring +1 (555) 123-4567 today"),
+            vec!["+1 (555) 123-4567"]
+        );
+        assert_eq!(
+            pii_hits("PHONE", "london +44 20 7946 0958."),
+            vec!["+44 20 7946 0958"]
+        );
+        assert_eq!(pii_hits("PHONE", "dot 555.123.4567"), vec!["555.123.4567"]);
+    }
+
+    #[test]
+    fn evaluate_content_pii_card_numbers_13_to_19_digits() {
+        // Amex 4-6-5 (15 digits).
+        assert_eq!(
+            pii_hits("CREDIT_DEBIT_CARD_NUMBER", "amex 3782 822463 10005 ok"),
+            vec!["3782 822463 10005"]
+        );
+        // 13-digit Visa, contiguous.
+        assert_eq!(
+            pii_hits("CREDIT_DEBIT_CARD_NUMBER", "visa 4222222222222 ok"),
+            vec!["4222222222222"]
+        );
+        // 4-4-4-4 with dashes.
+        assert_eq!(
+            pii_hits("CREDIT_DEBIT_CARD_NUMBER", "card 4111-1111-1111-1111"),
+            vec!["4111-1111-1111-1111"]
+        );
+        // Luhn-invalid digit runs are not cards.
+        assert!(pii_hits("CREDIT_DEBIT_CARD_NUMBER", "order 1234567890123").is_empty());
     }
 
     #[test]

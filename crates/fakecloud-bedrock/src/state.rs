@@ -353,6 +353,13 @@ pub struct ModelInvocation {
     /// `Some("<errorType>: <message>")` when the call was faulted by an
     /// injected fault rule; `None` for successful calls.
     pub error: Option<String>,
+    /// The caller's `requestMetadata` key-value pairs (the
+    /// `X-Amzn-Bedrock-Request-Metadata` JSON header on InvokeModel /
+    /// InvokeModelWithResponseStream, the `requestMetadata` map on Converse /
+    /// ConverseStream). AWS attaches these to the invocation-log record so
+    /// logs can be filtered by them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_metadata: Option<std::collections::BTreeMap<String, String>>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
