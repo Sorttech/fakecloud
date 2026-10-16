@@ -255,16 +255,28 @@ fn enum_query_params(action: &str) -> &'static [(&'static str, &'static [&'stati
     }
 }
 
-/// Validate the shared `MaxResults` range (1..=1000) and enum-valued query
-/// filters up front. All affected ops declare `InvalidParameterValueException`.
+/// Upper bound of the `MaxResults` range for a list op. The backup access
+/// point list ops cap at 100; every other paginated op caps at 1000.
+fn max_results_cap(action: &str) -> i64 {
+    match action {
+        "ListBackupAccessPoints"
+        | "ListBackupAccessPointsByRecoveryPoint"
+        | "ListBackupAccessPointsByResource" => 100,
+        _ => 1000,
+    }
+}
+
+/// Validate the per-op `MaxResults` range and enum-valued query filters up
+/// front. All affected ops declare `InvalidParameterValueException`.
 fn validate_query_constraints(action: &str, req: &AwsRequest) -> Result<(), AwsServiceError> {
+    let cap = max_results_cap(action);
     for key in ["maxResults", "MaxResults"] {
         if let Some(raw) = req.query_params.get(key) {
             let n: i64 = raw
                 .parse()
                 .map_err(|_| invalid_param(format!("{key} must be an integer")))?;
-            if !(1..=1000).contains(&n) {
-                return Err(invalid_param(format!("{key} must be between 1 and 1000")));
+            if !(1..=cap).contains(&n) {
+                return Err(invalid_param(format!("{key} must be between 1 and {cap}")));
             }
         }
     }
@@ -3101,6 +3113,7 @@ impl BackupService {
         req: &AwsRequest,
         recovery_point_arn: &str,
     ) -> Result<AwsResponse, AwsServiceError> {
+        check_label(recovery_point_arn, "RecoveryPointArn")?;
         let accounts = self.state.read();
         let items: Vec<Value> = accounts
             .get(&req.account_id)
@@ -3120,6 +3133,7 @@ impl BackupService {
         req: &AwsRequest,
         resource_arn: &str,
     ) -> Result<AwsResponse, AwsServiceError> {
+        check_label(resource_arn, "ResourceArn")?;
         let accounts = self.state.read();
         let items: Vec<Value> = accounts
             .get(&req.account_id)

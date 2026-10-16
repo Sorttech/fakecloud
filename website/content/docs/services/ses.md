@@ -18,7 +18,7 @@ fakecloud implements **116 of 116** SES v2 operations at 100% Smithy conformance
 - **Templates** — email templates, custom verification templates, and `TestRenderEmailTemplate` which produces a full RFC 5322 / MIME message (Subject, From, To, CC, BCC, Reply-To, Date, Message-ID, multipart bodies, attachments) from the stored template + JSON template data
 - **Contact lists** — CRUD, contacts, subscription topics
 - **Dedicated IPs** — pools, warmup, scaling
-- **Suppression list** — CRUD, account-level suppression
+- **Suppression list** — CRUD with `Reason` / `StartDate` / `EndDate` filters and pagination; account-level and per-tenant lists (`TenantName`), with a tenant's list also blocking sends made on behalf of that tenant
 - **Event destinations** — fan out to **SNS, EventBridge, Kinesis Data Streams, Kinesis Data Firehose, and CloudWatch** on send/delivery/bounce/complaint/click/open/reject/rendering-failure
 - **EventBridge events**: published with the AWS detail-types (`Email Sent`, `Email Delivered`, `Email Bounced`, `Email Complaint Received`), the sending identity ARN in `resources`, and the full event as `detail` (`mail` carries `sendingAccountId`, `sourceArn`, `headersTruncated` and the `ses:` auto-tags plus message tags). Configuration sets, the suppression list and destinations are resolved in the sending account and region.
 - **GetMessageInsights** — per-message delivery / engagement timeline (send + delivery + bounce + complaint + open + click events) keyed by `MessageId`

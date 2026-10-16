@@ -2293,3 +2293,174 @@ fn describe_training_plan_accepts_name_or_arn() {
     assert_eq!(by_name["TrainingPlanArn"], by_arn["TrainingPlanArn"]);
     assert_eq!(by_arn["TrainingPlanName"], "plan1");
 }
+
+#[test]
+fn model_card_export_job_requires_existing_model_card() {
+    let s = svc();
+    let export = |name: &str, card: &str| {
+        json!({
+            "ModelCardName": card,
+            "ModelCardExportJobName": name,
+            "OutputConfig": { "S3OutputPath": "s3://bucket/out" }
+        })
+    };
+    let err = expect_err(run(
+        &s,
+        "CreateModelCardExportJob",
+        export("job1", "missing"),
+    ));
+    assert_eq!(err.code(), "ResourceNotFound");
+
+    let card = resp_json(
+        &run(
+            &s,
+            "CreateModelCard",
+            json!({ "ModelCardName": "card1", "Content": "{}", "ModelCardStatus": "Draft" }),
+        )
+        .unwrap(),
+    );
+    let card_arn = card["ModelCardArn"].as_str().unwrap().to_string();
+    // By name and by ARN.
+    run(&s, "CreateModelCardExportJob", export("job2", "card1")).unwrap();
+    run(&s, "CreateModelCardExportJob", export("job3", &card_arn)).unwrap();
+}
+
+#[test]
+fn workforce_views_never_return_the_oidc_client_secret() {
+    let s = svc();
+    run(
+        &s,
+        "CreateWorkforce",
+        json!({
+            "WorkforceName": "wf1",
+            "OidcConfig": {
+                "ClientId": "client",
+                "ClientSecret": "s3cret",
+                "Issuer": "https://issuer",
+                "AuthorizationEndpoint": "https://issuer/auth",
+                "TokenEndpoint": "https://issuer/token",
+                "UserInfoEndpoint": "https://issuer/userinfo",
+                "LogoutEndpoint": "https://issuer/logout",
+                "JwksUri": "https://issuer/jwks"
+            },
+            "WorkforceVpcConfig": {
+                "VpcId": "vpc-1",
+                "SecurityGroupIds": ["sg-1"],
+                "Subnets": ["subnet-1"]
+            }
+        }),
+    )
+    .unwrap();
+    let listed = resp_json(&run(&s, "ListWorkforces", json!({})).unwrap());
+    let wf = &listed["Workforces"][0];
+    assert_eq!(wf["OidcConfig"]["ClientId"], "client");
+    assert!(wf["OidcConfig"].get("ClientSecret").is_none(), "{wf}");
+    assert_eq!(wf["WorkforceVpcConfig"]["Subnets"], json!(["subnet-1"]));
+
+    // An incomplete VPC configuration is rejected.
+    let err = expect_err(run(
+        &s,
+        "CreateWorkforce",
+        json!({ "WorkforceName": "wf2", "WorkforceVpcConfig": { "VpcId": "vpc-1" } }),
+    ));
+    assert_eq!(err.code(), "ValidationException");
+}
+
+/// Every SageMaker op whose output is a single structure member is in
+/// `WRAPPED_OUTPUTS`, and its paired list op's element shape is either that
+/// same structure or a member-subset of it (so the projection never emits a
+/// member the wrapped shape doesn't model).
+#[test]
+fn wrapped_outputs_match_the_model() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../aws-models/sagemaker.json"
+    );
+    let model: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let shapes = model["shapes"].as_object().unwrap();
+    let p = |n: &str| format!("com.amazonaws.sagemaker#{n}");
+    let members = |id: &str| shapes[id]["members"].as_object().unwrap().clone();
+
+    let wrapped: Vec<&str> = OPS
+        .iter()
+        .filter(|m| {
+            matches!(m.verb, Verb::Get | Verb::Create | Verb::Update)
+                && matches!(m.omembers, [(_, K::Struct)])
+        })
+        .map(|m| m.op)
+        .collect();
+    let table: Vec<&str> = engine::WRAPPED_OUTPUTS.iter().map(|(op, _)| *op).collect();
+    assert_eq!(wrapped, table, "wrapped-output ops drifted from the table");
+
+    for (op, list_op) in engine::WRAPPED_OUTPUTS {
+        let meta = OPS.iter().find(|m| m.op == *op).unwrap();
+        let wrapper = meta.omembers[0].0;
+        let out_id = shapes[&p(op)]["output"]["target"].as_str().unwrap();
+        let wrapped_id = members(out_id)[wrapper]["target"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let list_out = shapes[&p(list_op)]["output"]["target"].as_str().unwrap();
+        let list_meta = OPS.iter().find(|m| m.op == *list_op).unwrap();
+        let list_member = members(list_out)[list_meta.list_field.unwrap()]["target"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let elem_id = shapes[&list_member]["member"]["target"].as_str().unwrap();
+        let wrapped_members = members(&wrapped_id);
+        for name in members(elem_id).keys() {
+            assert!(
+                wrapped_members.contains_key(name),
+                "{op}: {list_op} element member {name} is not on {wrapped_id}"
+            );
+        }
+    }
+}
+
+#[test]
+fn describe_and_update_workforce_return_the_stored_view_without_secrets() {
+    let s = svc();
+    let oidc = json!({
+        "ClientId": "client",
+        "ClientSecret": "s3cret",
+        "Issuer": "https://issuer",
+        "AuthorizationEndpoint": "https://issuer/auth",
+        "TokenEndpoint": "https://issuer/token",
+        "UserInfoEndpoint": "https://issuer/userinfo",
+        "LogoutEndpoint": "https://issuer/logout",
+        "JwksUri": "https://issuer/jwks"
+    });
+    run(
+        &s,
+        "CreateWorkforce",
+        json!({
+            "WorkforceName": "wf1",
+            "OidcConfig": oidc,
+            "SourceIpConfig": { "Cidrs": ["10.0.0.0/16"] }
+        }),
+    )
+    .unwrap();
+    let described =
+        resp_json(&run(&s, "DescribeWorkforce", json!({ "WorkforceName": "wf1" })).unwrap());
+    let wf = &described["Workforce"];
+    assert_eq!(wf["WorkforceName"], "wf1");
+    assert!(wf["WorkforceArn"]
+        .as_str()
+        .unwrap()
+        .ends_with(":workforce/wf1"));
+    assert_eq!(wf["OidcConfig"]["ClientId"], "client");
+    assert!(wf["OidcConfig"].get("ClientSecret").is_none(), "{wf}");
+    assert_eq!(wf["SourceIpConfig"]["Cidrs"], json!(["10.0.0.0/16"]));
+
+    let updated = resp_json(
+        &run(
+            &s,
+            "UpdateWorkforce",
+            json!({ "WorkforceName": "wf1", "SourceIpConfig": { "Cidrs": ["10.1.0.0/16"] } }),
+        )
+        .unwrap(),
+    );
+    let wf = &updated["Workforce"];
+    assert_eq!(wf["SourceIpConfig"]["Cidrs"], json!(["10.1.0.0/16"]));
+    assert!(wf["OidcConfig"].get("ClientSecret").is_none(), "{wf}");
+}

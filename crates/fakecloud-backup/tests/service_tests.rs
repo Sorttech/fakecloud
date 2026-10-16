@@ -1347,3 +1347,58 @@ async fn deleted_vault_tags_do_not_resurrect_on_recreate() {
     let l = body_of(&call(&svc, req(Method::GET, &format!("/tags/{enc}"), json!({}))).await);
     assert!(l["Tags"].get("env").is_none(), "{l}");
 }
+
+#[tokio::test]
+async fn access_point_list_ops_cap_max_results_at_100() {
+    let svc = service();
+    let rp = percent("arn:aws:backup:us-east-1:000000000000:recovery-point:rp-1");
+    let res = percent("arn:aws:ec2:us-east-1:000000000000:volume/vol-1");
+    let cases = [
+        (Method::GET, "/backup-access-point".to_string()),
+        (
+            Method::POST,
+            format!("/backup-access-point/recovery-point/{rp}"),
+        ),
+        (Method::POST, format!("/backup-access-point/resource/{res}")),
+    ];
+    for (method, path) in cases {
+        let (status, code) = call_err(
+            &svc,
+            req(method.clone(), &format!("{path}?MaxResults=101"), json!({})),
+        )
+        .await;
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "InvalidParameterValueException")
+        );
+        let ok = body_of(
+            &call(
+                &svc,
+                req(method, &format!("{path}?MaxResults=100"), json!({})),
+            )
+            .await,
+        );
+        assert!(ok["BackupAccessPoints"].is_array(), "{ok}");
+    }
+    // Other list ops keep the 1..=1000 range.
+    call(
+        &svc,
+        req(Method::GET, "/backup-vaults?MaxResults=1000", json!({})),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn access_point_list_by_arn_rejects_empty_label() {
+    let svc = service();
+    for path in [
+        "/backup-access-point/recovery-point/",
+        "/backup-access-point/resource/",
+    ] {
+        let (status, code) = call_err(&svc, req(Method::POST, path, json!({}))).await;
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "InvalidParameterValueException")
+        );
+    }
+}

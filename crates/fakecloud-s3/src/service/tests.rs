@@ -1104,14 +1104,14 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-fn make_service() -> S3Service {
+pub(super) fn make_service() -> S3Service {
     let state: SharedS3State = Arc::new(RwLock::new(
         fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
     ));
     S3Service::new(state, Arc::new(DeliveryBus::new()))
 }
 
-fn seed_bucket(svc: &S3Service, name: &str) {
+pub(super) fn seed_bucket(svc: &S3Service, name: &str) {
     let mut mas = svc.state.write();
     let state = mas.default_mut();
     state
@@ -1119,7 +1119,7 @@ fn seed_bucket(svc: &S3Service, name: &str) {
         .insert(name.to_string(), S3Bucket::new(name, "us-east-1", "owner"));
 }
 
-fn seed_object(svc: &S3Service, bucket: &str, key: &str, body: &[u8]) {
+pub(super) fn seed_object(svc: &S3Service, bucket: &str, key: &str, body: &[u8]) {
     let mut mas = svc.state.write();
     let state = mas.default_mut();
     let b = state.buckets.get_mut(bucket).expect("bucket seeded");
@@ -1136,7 +1136,12 @@ fn seed_object(svc: &S3Service, bucket: &str, key: &str, body: &[u8]) {
     b.objects.insert(key.to_string(), obj);
 }
 
-fn make_request(method: Method, path: &str, query: &[(&str, &str)], body: &[u8]) -> AwsRequest {
+pub(super) fn make_request(
+    method: Method,
+    path: &str,
+    query: &[(&str, &str)],
+    body: &[u8],
+) -> AwsRequest {
     let segments: Vec<String> = path
         .trim_start_matches('/')
         .split('/')
@@ -7970,7 +7975,10 @@ fn put_annotation(
     let req = make_request(
         Method::PUT,
         &format!("/{bucket}/{key}"),
-        &[("annotation", ""), ("AnnotationName", name)],
+        &[
+            ("annotation", ""),
+            (super::annotations::ANNOTATION_NAME_QUERY, name),
+        ],
         payload,
     );
     svc.put_object_annotation("123456789012", &req, bucket, key)
@@ -7989,7 +7997,10 @@ fn object_annotations_round_trip_independently_of_the_object() {
     let req = make_request(
         Method::GET,
         "/annot/doc.txt",
-        &[("annotation", ""), ("AnnotationName", "review")],
+        &[
+            ("annotation", ""),
+            (super::annotations::ANNOTATION_NAME_QUERY, "review"),
+        ],
         b"",
     );
     let resp = svc
@@ -8011,7 +8022,10 @@ fn object_annotations_round_trip_independently_of_the_object() {
     let req = make_request(
         Method::GET,
         "/annot/doc.txt",
-        &[("annotation", ""), ("AnnotationName", "review")],
+        &[
+            ("annotation", ""),
+            (super::annotations::ANNOTATION_NAME_QUERY, "review"),
+        ],
         b"",
     );
     let resp = svc
@@ -8024,7 +8038,10 @@ fn object_annotations_round_trip_independently_of_the_object() {
         let req = make_request(
             Method::DELETE,
             "/annot/doc.txt",
-            &[("annotation", ""), ("AnnotationName", "review")],
+            &[
+                ("annotation", ""),
+                (super::annotations::ANNOTATION_NAME_QUERY, "review"),
+            ],
             b"",
         );
         let resp = svc
@@ -8035,7 +8052,10 @@ fn object_annotations_round_trip_independently_of_the_object() {
     let req = make_request(
         Method::GET,
         "/annot/doc.txt",
-        &[("annotation", ""), ("AnnotationName", "review")],
+        &[
+            ("annotation", ""),
+            (super::annotations::ANNOTATION_NAME_QUERY, "review"),
+        ],
         b"",
     );
     assert_aws_err(
@@ -8072,13 +8092,13 @@ fn list_object_annotations_filters_by_prefix_and_pages() {
     // Size is the payload length, not the object's.
     assert!(all.contains("<Size>5</Size>"), "{all}");
 
-    let prefixed = list(&[("AnnotationPrefix", "a-")]);
+    let prefixed = list(&[(super::annotations::ANNOTATION_PREFIX_QUERY, "a-")]);
     assert!(prefixed.contains("<AnnotationCount>3</AnnotationCount>"));
     assert!(!prefixed.contains("b-one"));
 
     // A short page reports a continuation token; following it returns the rest
     // without repeating an entry.
-    let page1 = list(&[("MaxAnnotationResults", "2")]);
+    let page1 = list(&[(super::annotations::MAX_ANNOTATION_RESULTS_QUERY, "2")]);
     assert!(
         page1.contains("<AnnotationCount>2</AnnotationCount>"),
         "{page1}"
@@ -8089,7 +8109,10 @@ fn list_object_annotations_filters_by_prefix_and_pages() {
         .and_then(|s| s.split("</NextContinuationToken>").next())
         .expect("continuation token")
         .to_string();
-    let page2 = list(&[("MaxAnnotationResults", "2"), ("ContinuationToken", &token)]);
+    let page2 = list(&[
+        (super::annotations::MAX_ANNOTATION_RESULTS_QUERY, "2"),
+        (super::annotations::CONTINUATION_TOKEN_QUERY, &token),
+    ]);
     assert!(
         page2.contains("<AnnotationCount>2</AnnotationCount>"),
         "{page2}"
@@ -8126,6 +8149,23 @@ fn object_annotations_validate_names_and_missing_resources() {
         put_annotation(&svc, "annot", "k", "bad\nname", b"x"),
         "InvalidAnnotationName",
     );
+    assert_aws_err(
+        put_annotation(&svc, "annot", "k", "", b"x"),
+        "InvalidAnnotationName",
+    );
+    // Exactly the documented maximum is accepted.
+    put_annotation(&svc, "annot", "k", &"n".repeat(255), b"x").unwrap();
+    let at_limit = make_request(
+        Method::DELETE,
+        "/annot/k",
+        &[
+            ("annotation", ""),
+            (super::annotations::ANNOTATION_NAME_QUERY, &"n".repeat(255)),
+        ],
+        b"",
+    );
+    svc.delete_object_annotation("123456789012", &at_limit, "annot", "k")
+        .unwrap();
 
     // Missing bucket / key report the object-level codes.
     assert_aws_err(

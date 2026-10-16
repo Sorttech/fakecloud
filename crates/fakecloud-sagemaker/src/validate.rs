@@ -25,8 +25,41 @@ pub fn invalid(msg: impl Into<String>) -> AwsServiceError {
     AwsServiceError::aws_error(StatusCode::BAD_REQUEST, VALIDATION_ERROR, msg)
 }
 
+/// A workforce's VPC configuration is only usable (and is only ever reported
+/// back, as `WorkforceVpcConfigResponse`, where all three are required) with a
+/// VPC, at least one security group and at least one subnet. The request shape
+/// leaves each optional, so an incomplete configuration is rejected here.
+fn validate_workforce_vpc_config(
+    meta: &OpMeta,
+    body: &Map<String, Value>,
+) -> Result<(), AwsServiceError> {
+    if !matches!(meta.op, "CreateWorkforce" | "UpdateWorkforce") {
+        return Ok(());
+    }
+    let Some(cfg) = body.get("WorkforceVpcConfig").filter(|v| !v.is_null()) else {
+        return Ok(());
+    };
+    let non_empty_list = |k: &str| {
+        cfg.get(k)
+            .and_then(Value::as_array)
+            .is_some_and(|a| !a.is_empty())
+    };
+    let has_vpc = cfg
+        .get("VpcId")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.is_empty());
+    if !has_vpc || !non_empty_list("SecurityGroupIds") || !non_empty_list("Subnets") {
+        return Err(invalid(
+            "WorkforceVpcConfig must specify VpcId, at least one SecurityGroupIds entry \
+             and at least one Subnets entry.",
+        ));
+    }
+    Ok(())
+}
+
 /// Validate a request body against the operation's model-derived constraints.
 pub fn validate(meta: &OpMeta, body: &Map<String, Value>) -> Result<(), AwsServiceError> {
+    validate_workforce_vpc_config(meta, body)?;
     for rule in meta.rules {
         let present = body.get(rule.wire).map(|v| !v.is_null()).unwrap_or(false);
         if rule.req && !present {
@@ -105,6 +138,40 @@ mod tests {
 
     fn meta(op: &str) -> &'static OpMeta {
         OPS.iter().find(|m| m.op == op).unwrap()
+    }
+
+    #[test]
+    fn workforce_vpc_config_must_be_complete() {
+        let m = meta("CreateWorkforce");
+        let body = |cfg: Value| {
+            let mut b = Map::new();
+            b.insert("WorkforceName".to_string(), Value::String("wf".to_string()));
+            b.insert("WorkforceVpcConfig".to_string(), cfg);
+            b
+        };
+        assert!(validate(m, &body(serde_json::json!({"VpcId": "vpc-1"}))).is_err());
+        assert!(validate(
+            m,
+            &body(serde_json::json!({
+                "VpcId": "vpc-1",
+                "SecurityGroupIds": [],
+                "Subnets": ["subnet-1"]
+            }))
+        )
+        .is_err());
+        assert!(validate(
+            m,
+            &body(serde_json::json!({
+                "VpcId": "vpc-1",
+                "SecurityGroupIds": ["sg-1"],
+                "Subnets": ["subnet-1"]
+            }))
+        )
+        .is_ok());
+        // Without a VPC config the workforce is valid.
+        let mut plain = Map::new();
+        plain.insert("WorkforceName".to_string(), Value::String("wf".to_string()));
+        assert!(validate(m, &plain).is_ok());
     }
 
     #[test]
