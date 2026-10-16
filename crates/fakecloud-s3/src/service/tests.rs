@@ -7453,6 +7453,273 @@ fn put_object_retention_mode_without_date_is_malformed_xml() {
         .expect("valid retention must succeed");
 }
 
+fn retention_body(mode: &str, until: &str) -> Vec<u8> {
+    format!("<Retention><Mode>{mode}</Mode><RetainUntilDate>{until}</RetainUntilDate></Retention>")
+        .into_bytes()
+}
+
+fn put_retention(
+    svc: &S3Service,
+    bucket: &str,
+    key: &str,
+    body: &[u8],
+    bypass: bool,
+) -> Result<AwsResponse, AwsServiceError> {
+    let mut req = make_request(
+        Method::PUT,
+        &format!("/{bucket}/{key}"),
+        &[("retention", "")],
+        body,
+    );
+    if bypass {
+        req.headers
+            .insert("x-amz-bypass-governance-retention", "true".parse().unwrap());
+    }
+    svc.put_object_retention("123456789012", &req, bucket, key)
+}
+
+fn stored_retention(svc: &S3Service, bucket: &str, key: &str) -> (Option<String>, Option<String>) {
+    let accts = svc.state.read();
+    let obj = &accts.default_ref().buckets[bucket].objects[key];
+    (
+        obj.lock_mode.clone(),
+        obj.lock_retain_until.map(|u| u.to_rfc3339()),
+    )
+}
+
+#[test]
+fn put_object_retention_governance_cannot_be_weakened_without_bypass() {
+    let svc = make_service();
+    seed_bucket(&svc, "b");
+    seed_object(&svc, "b", "k", b"payload");
+    put_retention(
+        &svc,
+        "b",
+        "k",
+        &retention_body("GOVERNANCE", "2099-01-01T00:00:00Z"),
+        false,
+    )
+    .unwrap();
+
+    // Shortening, switching mode, and clearing are all refused while the
+    // retention is active, and leave it untouched.
+    for body in [
+        retention_body("GOVERNANCE", "2098-01-01T00:00:00Z"),
+        retention_body("COMPLIANCE", "2099-06-01T00:00:00Z"),
+        b"<Retention/>".to_vec(),
+    ] {
+        let err = assert_aws_err(put_retention(&svc, "b", "k", &body, false), "AccessDenied");
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+    assert_eq!(
+        stored_retention(&svc, "b", "k"),
+        (
+            Some("GOVERNANCE".to_string()),
+            Some("2099-01-01T00:00:00+00:00".to_string())
+        )
+    );
+
+    // Extending needs no bypass.
+    put_retention(
+        &svc,
+        "b",
+        "k",
+        &retention_body("GOVERNANCE", "2100-01-01T00:00:00Z"),
+        false,
+    )
+    .expect("extending a GOVERNANCE retention must succeed");
+
+    // With the bypass header the retention can be shortened.
+    put_retention(
+        &svc,
+        "b",
+        "k",
+        &retention_body("GOVERNANCE", "2098-01-01T00:00:00Z"),
+        true,
+    )
+    .expect("bypass must allow shortening a GOVERNANCE retention");
+    assert_eq!(
+        stored_retention(&svc, "b", "k").1.as_deref(),
+        Some("2098-01-01T00:00:00+00:00")
+    );
+}
+
+#[test]
+fn put_object_retention_compliance_cannot_be_weakened_even_with_bypass() {
+    let svc = make_service();
+    seed_bucket(&svc, "b");
+    seed_object(&svc, "b", "k", b"payload");
+    put_retention(
+        &svc,
+        "b",
+        "k",
+        &retention_body("COMPLIANCE", "2099-01-01T00:00:00Z"),
+        false,
+    )
+    .unwrap();
+
+    for body in [
+        retention_body("COMPLIANCE", "2098-01-01T00:00:00Z"),
+        retention_body("GOVERNANCE", "2099-06-01T00:00:00Z"),
+        b"<Retention/>".to_vec(),
+    ] {
+        for bypass in [false, true] {
+            let err = assert_aws_err(put_retention(&svc, "b", "k", &body, bypass), "AccessDenied");
+            assert_eq!(err.status(), StatusCode::FORBIDDEN);
+        }
+    }
+    assert_eq!(
+        stored_retention(&svc, "b", "k"),
+        (
+            Some("COMPLIANCE".to_string()),
+            Some("2099-01-01T00:00:00+00:00".to_string())
+        )
+    );
+
+    put_retention(
+        &svc,
+        "b",
+        "k",
+        &retention_body("COMPLIANCE", "2100-01-01T00:00:00Z"),
+        false,
+    )
+    .expect("extending a COMPLIANCE retention must succeed");
+}
+
+#[test]
+fn put_object_retention_expired_retention_can_be_replaced() {
+    let svc = make_service();
+    seed_bucket(&svc, "b");
+    seed_object(&svc, "b", "k", b"payload");
+    {
+        let mut accts = svc.state.write();
+        let obj = accts
+            .default_mut()
+            .buckets
+            .get_mut("b")
+            .unwrap()
+            .objects
+            .get_mut("k")
+            .unwrap();
+        obj.lock_mode = Some("COMPLIANCE".to_string());
+        obj.lock_retain_until = Some(chrono::Utc::now() - chrono::Duration::days(1));
+    }
+    put_retention(
+        &svc,
+        "b",
+        "k",
+        &retention_body("GOVERNANCE", "2099-01-01T00:00:00Z"),
+        false,
+    )
+    .expect("an expired retention no longer protects the object");
+}
+
+#[tokio::test]
+async fn put_object_retention_by_version_id_respects_the_lock() {
+    let svc = make_service();
+    let mut req = make_request(Method::PUT, "/vlock", &[], b"");
+    req.headers
+        .insert("x-amz-bucket-object-lock-enabled", "true".parse().unwrap());
+    svc.create_bucket("123456789012", &req, "vlock").unwrap();
+
+    let mut put = make_request(Method::PUT, "/vlock/k", &[], b"hello");
+    put.headers
+        .insert("x-amz-object-lock-mode", "GOVERNANCE".parse().unwrap());
+    put.headers.insert(
+        "x-amz-object-lock-retain-until-date",
+        "2099-01-01T00:00:00Z".parse().unwrap(),
+    );
+    let resp = svc
+        .put_object("123456789012", &put, "vlock", "k")
+        .await
+        .unwrap();
+    let vid = resp.headers["x-amz-version-id"]
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let body = retention_body("GOVERNANCE", "2098-01-01T00:00:00Z");
+    let req = make_request(
+        Method::PUT,
+        "/vlock/k",
+        &[("retention", ""), ("versionId", &vid)],
+        &body,
+    );
+    assert_aws_err(
+        svc.put_object_retention("123456789012", &req, "vlock", "k"),
+        "AccessDenied",
+    );
+}
+
+#[test]
+fn governance_bypass_requires_bypass_governance_retention_permission() {
+    use fakecloud_core::service::AwsService as _;
+
+    let svc = make_service();
+    let actions = |req: &AwsRequest| -> Vec<(&'static str, String)> {
+        svc.iam_actions_for(req)
+            .into_iter()
+            .map(|a| (a.action, a.resource))
+            .collect()
+    };
+    let with_bypass = |mut req: AwsRequest, value: &str| {
+        req.headers
+            .insert("x-amz-bypass-governance-retention", value.parse().unwrap());
+        req
+    };
+
+    let body = retention_body("GOVERNANCE", "2098-01-01T00:00:00Z");
+    let retention = make_request(Method::PUT, "/b/k", &[("retention", "")], &body);
+    assert_eq!(
+        actions(&retention),
+        vec![("PutObjectRetention", "arn:aws:s3:::b/k".to_string())]
+    );
+    assert_eq!(
+        actions(&with_bypass(retention, "true")),
+        vec![
+            ("PutObjectRetention", "arn:aws:s3:::b/k".to_string()),
+            ("BypassGovernanceRetention", "arn:aws:s3:::b/k".to_string()),
+        ]
+    );
+
+    let delete = make_request(Method::DELETE, "/b/k", &[("versionId", "v1")], b"");
+    assert_eq!(actions(&delete).len(), 1);
+    // Only an explicit `true` asks for the bypass.
+    assert_eq!(
+        actions(&with_bypass(
+            make_request(Method::DELETE, "/b/k", &[], b""),
+            "false"
+        ))
+        .len(),
+        1
+    );
+    assert_eq!(
+        actions(&with_bypass(delete, "TRUE")),
+        vec![
+            ("DeleteObject", "arn:aws:s3:::b/k".to_string()),
+            ("BypassGovernanceRetention", "arn:aws:s3:::b/k".to_string()),
+        ]
+    );
+
+    // Other operations ignore the header. DeleteObjects is authorized per key
+    // by AWS, so a request-level check would wrongly fail the whole batch.
+    let put = with_bypass(make_request(Method::PUT, "/b/k", &[], b"x"), "true");
+    assert_eq!(
+        actions(&put),
+        vec![("PutObject", "arn:aws:s3:::b/k".to_string())]
+    );
+    let batch = make_request(
+        Method::POST,
+        "/b",
+        &[("delete", "")],
+        b"<Delete><Object><Key>a/1</Key></Object></Delete>",
+    );
+    assert_eq!(
+        actions(&with_bypass(batch, "true")),
+        vec![("DeleteObjects", "arn:aws:s3:::b".to_string())]
+    );
+}
+
 #[test]
 fn list_objects_v2_rejects_non_integer_max_keys() {
     // A non-integer / out-of-range max-keys is a 400 InvalidArgument, not a
@@ -7999,6 +8266,70 @@ async fn object_lock_default_retention_is_range_checked_and_never_overflows() {
     svc.put_object("123456789012", &put_req, "olr", "k")
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn object_lock_default_retention_years_are_calendar_years() {
+    let svc = make_service();
+    let mut req = make_request(Method::PUT, "/oly", &[], b"");
+    req.headers
+        .insert("x-amz-bucket-object-lock-enabled", "true".parse().unwrap());
+    svc.create_bucket("123456789012", &req, "oly").unwrap();
+    let put = make_request(
+        Method::PUT,
+        "/oly",
+        &[("object-lock", "")],
+        &lock_config("<Years>4</Years>"),
+    );
+    svc.put_object_lock_config("123456789012", &put, "oly")
+        .unwrap();
+
+    // Any four-year span contains a leap day, so 4 * 365 days falls a day
+    // short of four calendar years.
+    let four_years = chrono::Months::new(48);
+    let before = chrono::Utc::now().checked_add_months(four_years).unwrap();
+    let put_req = make_request(Method::PUT, "/oly/k", &[], b"hello");
+    svc.put_object("123456789012", &put_req, "oly", "k")
+        .await
+        .unwrap();
+    let after = chrono::Utc::now().checked_add_months(four_years).unwrap();
+
+    let until = svc.state.read().default_ref().buckets["oly"].objects["k"]
+        .lock_retain_until
+        .unwrap();
+    assert!(
+        before <= until && until <= after,
+        "retain-until {until} should be four calendar years out ({before}..={after})"
+    );
+}
+
+#[tokio::test]
+async fn object_lock_default_retention_tolerates_whitespace_around_period() {
+    // The stored configuration is validated with surrounding whitespace
+    // trimmed, so applying it must trim too or the default silently drops.
+    let svc = make_service();
+    let mut req = make_request(Method::PUT, "/olw", &[], b"");
+    req.headers
+        .insert("x-amz-bucket-object-lock-enabled", "true".parse().unwrap());
+    svc.create_bucket("123456789012", &req, "olw").unwrap();
+    for (key, period) in [("d", "<Days> 3 </Days>"), ("y", "<Years> 1 </Years>")] {
+        let put = make_request(
+            Method::PUT,
+            "/olw",
+            &[("object-lock", "")],
+            &lock_config(period),
+        );
+        svc.put_object_lock_config("123456789012", &put, "olw")
+            .unwrap();
+        let put_req = make_request(Method::PUT, &format!("/olw/{key}"), &[], b"hello");
+        svc.put_object("123456789012", &put_req, "olw", key)
+            .await
+            .unwrap();
+        let state = svc.state.read();
+        let obj = &state.default_ref().buckets["olw"].objects[key];
+        assert_eq!(obj.lock_mode.as_deref(), Some("GOVERNANCE"), "{period}");
+        assert!(obj.lock_retain_until.is_some(), "{period}");
+    }
 }
 
 // ── SelectObjectContent compression ──────────────────────────────

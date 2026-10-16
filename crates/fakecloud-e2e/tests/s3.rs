@@ -2390,6 +2390,130 @@ async fn s3_object_lock_prevents_overwrite() {
     assert_eq!(body.as_ref(), b"overwritten");
 }
 
+/// PutObjectRetention must not weaken an active lock: shortening a GOVERNANCE
+/// retention needs `x-amz-bypass-governance-retention`, a COMPLIANCE retention
+/// can never be shortened, and extending either is always allowed (#2717).
+#[tokio::test]
+async fn s3_put_object_retention_cannot_weaken_active_lock() {
+    use aws_sdk_s3::primitives::DateTime;
+    use aws_sdk_s3::types::{ObjectLockMode, ObjectLockRetention, ObjectLockRetentionMode};
+
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+    let bucket = "retention-weaken-bucket";
+    s3.create_bucket()
+        .bucket(bucket)
+        .object_lock_enabled_for_bucket(true)
+        .send()
+        .await
+        .unwrap();
+
+    let year = |y: i64| DateTime::from_secs((y - 1970) * 31_556_952);
+    let retention = |mode: ObjectLockRetentionMode, until: DateTime| {
+        ObjectLockRetention::builder()
+            .mode(mode)
+            .retain_until_date(until)
+            .build()
+    };
+    fn assert_denied<T: std::fmt::Debug, E: aws_sdk_s3::error::ProvideErrorMetadata>(
+        res: Result<T, aws_sdk_s3::error::SdkError<E>>,
+        what: &str,
+    ) where
+        aws_sdk_s3::error::SdkError<E>: std::fmt::Debug,
+    {
+        let err = res.expect_err(what);
+        let code = aws_sdk_s3::error::ProvideErrorMetadata::code(&err).map(str::to_string);
+        assert_eq!(code.as_deref(), Some("AccessDenied"), "{what}: {err:?}");
+    }
+    let retained_until = |key: &'static str| {
+        let s3 = s3.clone();
+        async move {
+            s3.get_object_retention()
+                .bucket(bucket)
+                .key(key)
+                .send()
+                .await
+                .unwrap()
+                .retention()
+                .and_then(|r| r.retain_until_date().copied())
+                .unwrap()
+                .secs()
+        }
+    };
+
+    // GOVERNANCE: shortening without bypass is refused and leaves the lock.
+    s3.put_object()
+        .bucket(bucket)
+        .key("gov.txt")
+        .body(ByteStream::from_static(b"gov"))
+        .object_lock_mode(ObjectLockMode::Governance)
+        .object_lock_retain_until_date(year(2099))
+        .send()
+        .await
+        .unwrap();
+    assert_denied(
+        s3.put_object_retention()
+            .bucket(bucket)
+            .key("gov.txt")
+            .retention(retention(ObjectLockRetentionMode::Governance, year(2098)))
+            .send()
+            .await,
+        "shortening GOVERNANCE without bypass must be denied",
+    );
+    assert_eq!(retained_until("gov.txt").await, year(2099).secs());
+
+    // Extending needs no bypass.
+    s3.put_object_retention()
+        .bucket(bucket)
+        .key("gov.txt")
+        .retention(retention(ObjectLockRetentionMode::Governance, year(2100)))
+        .send()
+        .await
+        .expect("extending GOVERNANCE must succeed");
+    assert_eq!(retained_until("gov.txt").await, year(2100).secs());
+
+    // With bypass the GOVERNANCE retention can be shortened.
+    s3.put_object_retention()
+        .bucket(bucket)
+        .key("gov.txt")
+        .bypass_governance_retention(true)
+        .retention(retention(ObjectLockRetentionMode::Governance, year(2098)))
+        .send()
+        .await
+        .expect("bypass must allow shortening GOVERNANCE");
+    assert_eq!(retained_until("gov.txt").await, year(2098).secs());
+
+    // COMPLIANCE: shortening is refused even with bypass; extending works.
+    s3.put_object()
+        .bucket(bucket)
+        .key("comp.txt")
+        .body(ByteStream::from_static(b"comp"))
+        .object_lock_mode(ObjectLockMode::Compliance)
+        .object_lock_retain_until_date(year(2099))
+        .send()
+        .await
+        .unwrap();
+    assert_denied(
+        s3.put_object_retention()
+            .bucket(bucket)
+            .key("comp.txt")
+            .bypass_governance_retention(true)
+            .retention(retention(ObjectLockRetentionMode::Compliance, year(2098)))
+            .send()
+            .await,
+        "shortening COMPLIANCE must be denied even with bypass",
+    );
+    assert_eq!(retained_until("comp.txt").await, year(2099).secs());
+    s3.put_object_retention()
+        .bucket(bucket)
+        .key("comp.txt")
+        .retention(retention(ObjectLockRetentionMode::Compliance, year(2100)))
+        .send()
+        .await
+        .expect("extending COMPLIANCE must succeed");
+    assert_eq!(retained_until("comp.txt").await, year(2100).secs());
+}
+
 // ---- S3 Multipart Upload Tests ----
 
 #[tokio::test]

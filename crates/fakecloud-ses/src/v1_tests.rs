@@ -5,7 +5,7 @@ use http::HeaderMap;
 use parking_lot::RwLock;
 use std::sync::Arc;
 
-fn make_state() -> SharedSesState {
+pub(crate) fn make_state() -> SharedSesState {
     Arc::new(RwLock::new(
         fakecloud_core::multi_account::MultiAccountState::new(
             "123456789012",
@@ -66,7 +66,7 @@ fn disable_production_access(state: &SharedSesState) {
     st.account_settings.production_access_enabled = false;
 }
 
-fn make_v1_request(action: &str, params: Vec<(&str, &str)>) -> AwsRequest {
+pub(crate) fn make_v1_request(action: &str, params: Vec<(&str, &str)>) -> AwsRequest {
     let mut query_params: HashMap<String, String> = HashMap::new();
     query_params.insert("Action".to_string(), action.to_string());
     for (k, v) in params {
@@ -96,14 +96,14 @@ fn make_v1_request(action: &str, params: Vec<(&str, &str)>) -> AwsRequest {
 fn test_create_receipt_rule_set() {
     let state = make_state();
     let req = make_v1_request("CreateReceiptRuleSet", vec![("RuleSetName", "my-rules")]);
-    let resp = handle_v1_action(&state, &req).unwrap();
+    let resp = handle_v1_action(&state, &req, None).unwrap();
     assert_eq!(resp.status, StatusCode::OK);
     let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
     assert!(body.contains("CreateReceiptRuleSetResponse"));
 
     // Duplicate should fail
     let req = make_v1_request("CreateReceiptRuleSet", vec![("RuleSetName", "my-rules")]);
-    match handle_v1_action(&state, &req) {
+    match handle_v1_action(&state, &req, None) {
         Err(e) => assert_eq!(e.code(), "AlreadyExistsException"),
         Ok(_) => panic!("expected error"),
     }
@@ -116,16 +116,18 @@ fn test_list_receipt_rule_sets() {
     handle_v1_action(
         &state,
         &make_v1_request("CreateReceiptRuleSet", vec![("RuleSetName", "set-a")]),
+        None,
     )
     .unwrap();
     handle_v1_action(
         &state,
         &make_v1_request("CreateReceiptRuleSet", vec![("RuleSetName", "set-b")]),
+        None,
     )
     .unwrap();
 
     let req = make_v1_request("ListReceiptRuleSets", vec![]);
-    let resp = handle_v1_action(&state, &req).unwrap();
+    let resp = handle_v1_action(&state, &req, None).unwrap();
     let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
     assert!(body.contains("<Name>set-a</Name>"));
     assert!(body.contains("<Name>set-b</Name>"));
@@ -137,14 +139,15 @@ fn test_delete_receipt_rule_set() {
     handle_v1_action(
         &state,
         &make_v1_request("CreateReceiptRuleSet", vec![("RuleSetName", "to-delete")]),
+        None,
     )
     .unwrap();
     let req = make_v1_request("DeleteReceiptRuleSet", vec![("RuleSetName", "to-delete")]);
-    let resp = handle_v1_action(&state, &req).unwrap();
+    let resp = handle_v1_action(&state, &req, None).unwrap();
     assert_eq!(resp.status, StatusCode::OK);
 
     // Should not exist anymore
-    match handle_v1_action(&state, &req) {
+    match handle_v1_action(&state, &req, None) {
         Err(e) => assert_eq!(e.code(), "RuleSetDoesNotExistException"),
         Ok(_) => panic!("expected error"),
     }
@@ -156,6 +159,7 @@ fn test_cannot_delete_active_rule_set() {
     handle_v1_action(
         &state,
         &make_v1_request("CreateReceiptRuleSet", vec![("RuleSetName", "active-set")]),
+        None,
     )
     .unwrap();
     handle_v1_action(
@@ -164,12 +168,14 @@ fn test_cannot_delete_active_rule_set() {
             "SetActiveReceiptRuleSet",
             vec![("RuleSetName", "active-set")],
         ),
+        None,
     )
     .unwrap();
 
     match handle_v1_action(
         &state,
         &make_v1_request("DeleteReceiptRuleSet", vec![("RuleSetName", "active-set")]),
+        None,
     ) {
         Err(e) => assert_eq!(e.code(), "CannotDeleteException"),
         Ok(_) => panic!("expected error"),
@@ -183,6 +189,7 @@ fn test_clone_receipt_rule_set() {
     handle_v1_action(
         &state,
         &make_v1_request("CreateReceiptRuleSet", vec![("RuleSetName", "source")]),
+        None,
     )
     .unwrap();
     handle_v1_action(
@@ -195,6 +202,7 @@ fn test_clone_receipt_rule_set() {
                 ("Rule.Enabled", "true"),
             ],
         ),
+        None,
     )
     .unwrap();
 
@@ -203,7 +211,7 @@ fn test_clone_receipt_rule_set() {
         "CloneReceiptRuleSet",
         vec![("RuleSetName", "cloned"), ("OriginalRuleSetName", "source")],
     );
-    handle_v1_action(&state, &req).unwrap();
+    handle_v1_action(&state, &req, None).unwrap();
 
     // Verify clone has the rule
     {
@@ -221,6 +229,7 @@ fn test_set_active_receipt_rule_set() {
     handle_v1_action(
         &state,
         &make_v1_request("CreateReceiptRuleSet", vec![("RuleSetName", "my-set")]),
+        None,
     )
     .unwrap();
 
@@ -228,6 +237,7 @@ fn test_set_active_receipt_rule_set() {
     handle_v1_action(
         &state,
         &make_v1_request("SetActiveReceiptRuleSet", vec![("RuleSetName", "my-set")]),
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -243,6 +253,7 @@ fn test_set_active_receipt_rule_set() {
     handle_v1_action(
         &state,
         &make_v1_request("SetActiveReceiptRuleSet", vec![("RuleSetName", "")]),
+        None,
     )
     .unwrap();
     assert!(state.read().default_ref().active_receipt_rule_set.is_none());
@@ -254,6 +265,7 @@ fn test_create_and_describe_receipt_rule() {
     handle_v1_action(
         &state,
         &make_v1_request("CreateReceiptRuleSet", vec![("RuleSetName", "my-set")]),
+        None,
     )
     .unwrap();
 
@@ -272,14 +284,14 @@ fn test_create_and_describe_receipt_rule() {
             ("Rule.Actions.member.1.S3Action.ObjectKeyPrefix", "emails/"),
         ],
     );
-    handle_v1_action(&state, &req).unwrap();
+    handle_v1_action(&state, &req, None).unwrap();
 
     // Describe the rule
     let req = make_v1_request(
         "DescribeReceiptRule",
         vec![("RuleSetName", "my-set"), ("RuleName", "store-email")],
     );
-    let resp = handle_v1_action(&state, &req).unwrap();
+    let resp = handle_v1_action(&state, &req, None).unwrap();
     let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
     assert!(body.contains("<Name>store-email</Name>"));
     assert!(body.contains("<Enabled>true</Enabled>"));
@@ -296,6 +308,7 @@ fn test_update_receipt_rule() {
     handle_v1_action(
         &state,
         &make_v1_request("CreateReceiptRuleSet", vec![("RuleSetName", "my-set")]),
+        None,
     )
     .unwrap();
     handle_v1_action(
@@ -308,6 +321,7 @@ fn test_update_receipt_rule() {
                 ("Rule.Enabled", "true"),
             ],
         ),
+        None,
     )
     .unwrap();
 
@@ -324,7 +338,7 @@ fn test_update_receipt_rule() {
             ),
         ],
     );
-    handle_v1_action(&state, &req).unwrap();
+    handle_v1_action(&state, &req, None).unwrap();
 
     {
         let mas = state.read();
@@ -342,6 +356,7 @@ fn test_delete_receipt_rule() {
     handle_v1_action(
         &state,
         &make_v1_request("CreateReceiptRuleSet", vec![("RuleSetName", "my-set")]),
+        None,
     )
     .unwrap();
     handle_v1_action(
@@ -350,6 +365,7 @@ fn test_delete_receipt_rule() {
             "CreateReceiptRule",
             vec![("RuleSetName", "my-set"), ("Rule.Name", "rule1")],
         ),
+        None,
     )
     .unwrap();
 
@@ -357,7 +373,7 @@ fn test_delete_receipt_rule() {
         "DeleteReceiptRule",
         vec![("RuleSetName", "my-set"), ("RuleName", "rule1")],
     );
-    handle_v1_action(&state, &req).unwrap();
+    handle_v1_action(&state, &req, None).unwrap();
 
     {
         let mas = state.read();
@@ -372,6 +388,7 @@ fn test_reorder_receipt_rule_set() {
     handle_v1_action(
         &state,
         &make_v1_request("CreateReceiptRuleSet", vec![("RuleSetName", "my-set")]),
+        None,
     )
     .unwrap();
     for name in &["a", "b", "c"] {
@@ -381,6 +398,7 @@ fn test_reorder_receipt_rule_set() {
                 "CreateReceiptRule",
                 vec![("RuleSetName", "my-set"), ("Rule.Name", name)],
             ),
+            None,
         )
         .unwrap();
     }
@@ -395,7 +413,7 @@ fn test_reorder_receipt_rule_set() {
             ("RuleNames.member.3", "b"),
         ],
     );
-    handle_v1_action(&state, &req).unwrap();
+    handle_v1_action(&state, &req, None).unwrap();
 
     {
         let mas = state.read();
@@ -425,11 +443,11 @@ fn test_receipt_filter_lifecycle() {
             ("Filter.IpFilter.Policy", "Allow"),
         ],
     );
-    handle_v1_action(&state, &req).unwrap();
+    handle_v1_action(&state, &req, None).unwrap();
 
     // List filters
     let req = make_v1_request("ListReceiptFilters", vec![]);
-    let resp = handle_v1_action(&state, &req).unwrap();
+    let resp = handle_v1_action(&state, &req, None).unwrap();
     let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
     assert!(body.contains("<Name>allow-internal</Name>"));
     assert!(body.contains("<Cidr>10.0.0.0/8</Cidr>"));
@@ -440,11 +458,11 @@ fn test_receipt_filter_lifecycle() {
         "DeleteReceiptFilter",
         vec![("FilterName", "allow-internal")],
     );
-    handle_v1_action(&state, &req).unwrap();
+    handle_v1_action(&state, &req, None).unwrap();
 
     // List should be empty
     let req = make_v1_request("ListReceiptFilters", vec![]);
-    let resp = handle_v1_action(&state, &req).unwrap();
+    let resp = handle_v1_action(&state, &req, None).unwrap();
     let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
     assert!(!body.contains("allow-internal"));
 }
@@ -472,6 +490,7 @@ fn test_evaluate_inbound_email_matching_rule() {
     handle_v1_action(
         &state,
         &make_v1_request("CreateReceiptRuleSet", vec![("RuleSetName", "active")]),
+        None,
     )
     .unwrap();
     handle_v1_action(
@@ -485,11 +504,13 @@ fn test_evaluate_inbound_email_matching_rule() {
                 ("Rule.Actions.member.1.S3Action.BucketName", "emails-bucket"),
             ],
         ),
+        None,
     )
     .unwrap();
     handle_v1_action(
         &state,
         &make_v1_request("SetActiveReceiptRuleSet", vec![("RuleSetName", "active")]),
+        None,
     )
     .unwrap();
 
@@ -513,6 +534,7 @@ fn test_evaluate_inbound_email_recipient_filter() {
     handle_v1_action(
         &state,
         &make_v1_request("CreateReceiptRuleSet", vec![("RuleSetName", "set")]),
+        None,
     )
     .unwrap();
     handle_v1_action(
@@ -530,11 +552,13 @@ fn test_evaluate_inbound_email_recipient_filter() {
                 ),
             ],
         ),
+        None,
     )
     .unwrap();
     handle_v1_action(
         &state,
         &make_v1_request("SetActiveReceiptRuleSet", vec![("RuleSetName", "set")]),
+        None,
     )
     .unwrap();
 
@@ -565,6 +589,7 @@ fn test_evaluate_inbound_email_stop_action() {
     handle_v1_action(
         &state,
         &make_v1_request("CreateReceiptRuleSet", vec![("RuleSetName", "set")]),
+        None,
     )
     .unwrap();
     // Rule 1: stop action
@@ -579,6 +604,7 @@ fn test_evaluate_inbound_email_stop_action() {
                 ("Rule.Actions.member.1.StopAction.Scope", "RuleSet"),
             ],
         ),
+        None,
     )
     .unwrap();
     // Rule 2: should not be reached
@@ -593,11 +619,13 @@ fn test_evaluate_inbound_email_stop_action() {
                 ("Rule.Actions.member.1.S3Action.BucketName", "bucket"),
             ],
         ),
+        None,
     )
     .unwrap();
     handle_v1_action(
         &state,
         &make_v1_request("SetActiveReceiptRuleSet", vec![("RuleSetName", "set")]),
+        None,
     )
     .unwrap();
 
@@ -620,6 +648,7 @@ fn test_describe_receipt_rule_set() {
     handle_v1_action(
         &state,
         &make_v1_request("CreateReceiptRuleSet", vec![("RuleSetName", "my-set")]),
+        None,
     )
     .unwrap();
     handle_v1_action(
@@ -632,11 +661,12 @@ fn test_describe_receipt_rule_set() {
                 ("Rule.Enabled", "true"),
             ],
         ),
+        None,
     )
     .unwrap();
 
     let req = make_v1_request("DescribeReceiptRuleSet", vec![("RuleSetName", "my-set")]);
-    let resp = handle_v1_action(&state, &req).unwrap();
+    let resp = handle_v1_action(&state, &req, None).unwrap();
     let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
     assert!(body.contains("<Name>my-set</Name>"));
     assert!(body.contains("<Name>rule1</Name>"));
@@ -649,6 +679,7 @@ fn test_all_action_types_parsing() {
     handle_v1_action(
         &state,
         &make_v1_request("CreateReceiptRuleSet", vec![("RuleSetName", "set")]),
+        None,
     )
     .unwrap();
 
@@ -680,7 +711,7 @@ fn test_all_action_types_parsing() {
             ("Rule.Actions.member.6.StopAction.Scope", "RuleSet"),
         ],
     );
-    handle_v1_action(&state, &req).unwrap();
+    handle_v1_action(&state, &req, None).unwrap();
 
     {
         let mas = state.read();
@@ -705,7 +736,7 @@ fn test_verify_email_identity() {
         "VerifyEmailIdentity",
         vec![("EmailAddress", "test@example.com")],
     );
-    let resp = handle_v1_action(&state, &req).unwrap();
+    let resp = handle_v1_action(&state, &req, None).unwrap();
     assert_eq!(resp.status, StatusCode::OK);
 
     {
@@ -721,7 +752,7 @@ fn test_verify_email_identity() {
 fn test_verify_email_address_legacy_alias() {
     let state = make_state();
     let req = make_v1_request("VerifyEmailAddress", vec![("EmailAddress", "legacy@x.io")]);
-    let resp = handle_v1_action(&state, &req).unwrap();
+    let resp = handle_v1_action(&state, &req, None).unwrap();
     assert_eq!(resp.status, StatusCode::OK);
     let mas = state.read();
     let st = mas.default_ref();
@@ -736,22 +767,26 @@ fn test_list_verified_email_addresses_returns_only_email_identities() {
     handle_v1_action(
         &state,
         &make_v1_request("VerifyEmailAddress", vec![("EmailAddress", "u1@x.io")]),
+        None,
     )
     .unwrap();
     handle_v1_action(
         &state,
         &make_v1_request("VerifyEmailAddress", vec![("EmailAddress", "u2@x.io")]),
+        None,
     )
     .unwrap();
     handle_v1_action(
         &state,
         &make_v1_request("VerifyDomainIdentity", vec![("Domain", "x.io")]),
+        None,
     )
     .unwrap();
 
     let resp = handle_v1_action(
         &state,
         &make_v1_request("ListVerifiedEmailAddresses", vec![]),
+        None,
     )
     .unwrap();
     let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
@@ -768,6 +803,7 @@ fn test_delete_verified_email_address_legacy_alias() {
     handle_v1_action(
         &state,
         &make_v1_request("VerifyEmailAddress", vec![("EmailAddress", "drop@x.io")]),
+        None,
     )
     .unwrap();
     let resp = handle_v1_action(
@@ -776,6 +812,7 @@ fn test_delete_verified_email_address_legacy_alias() {
             "DeleteVerifiedEmailAddress",
             vec![("EmailAddress", "drop@x.io")],
         ),
+        None,
     )
     .unwrap();
     assert_eq!(resp.status, StatusCode::OK);
@@ -787,7 +824,7 @@ fn test_delete_verified_email_address_legacy_alias() {
 fn test_verify_domain_identity() {
     let state = make_state();
     let req = make_v1_request("VerifyDomainIdentity", vec![("Domain", "example.com")]);
-    let resp = handle_v1_action(&state, &req).unwrap();
+    let resp = handle_v1_action(&state, &req, None).unwrap();
     assert_eq!(resp.status, StatusCode::OK);
     let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
     assert!(body.contains("<VerificationToken>"));
@@ -805,7 +842,7 @@ fn test_verify_domain_identity() {
 fn test_verify_domain_dkim() {
     let state = make_state();
     let req = make_v1_request("VerifyDomainDkim", vec![("Domain", "example.com")]);
-    let resp = handle_v1_action(&state, &req).unwrap();
+    let resp = handle_v1_action(&state, &req, None).unwrap();
     let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
     assert!(body.contains("<DkimTokens>"));
     // Should return 3 tokens
@@ -819,16 +856,18 @@ fn test_list_identities() {
     handle_v1_action(
         &state,
         &make_v1_request("VerifyEmailIdentity", vec![("EmailAddress", "a@test.com")]),
+        None,
     )
     .unwrap();
     handle_v1_action(
         &state,
         &make_v1_request("VerifyDomainIdentity", vec![("Domain", "test.com")]),
+        None,
     )
     .unwrap();
 
     // List all
-    let resp = handle_v1_action(&state, &make_v1_request("ListIdentities", vec![])).unwrap();
+    let resp = handle_v1_action(&state, &make_v1_request("ListIdentities", vec![]), None).unwrap();
     let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
     assert!(body.contains("a@test.com"));
     assert!(body.contains("test.com"));
@@ -837,6 +876,7 @@ fn test_list_identities() {
     let resp = handle_v1_action(
         &state,
         &make_v1_request("ListIdentities", vec![("IdentityType", "EmailAddress")]),
+        None,
     )
     .unwrap();
     let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
@@ -847,6 +887,7 @@ fn test_list_identities() {
     let resp = handle_v1_action(
         &state,
         &make_v1_request("ListIdentities", vec![("IdentityType", "Domain")]),
+        None,
     )
     .unwrap();
     let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
@@ -860,6 +901,7 @@ fn test_get_identity_verification_attributes() {
     handle_v1_action(
         &state,
         &make_v1_request("VerifyEmailIdentity", vec![("EmailAddress", "a@test.com")]),
+        None,
     )
     .unwrap();
 
@@ -870,7 +912,7 @@ fn test_get_identity_verification_attributes() {
             ("Identities.member.2", "unknown@test.com"),
         ],
     );
-    let resp = handle_v1_action(&state, &req).unwrap();
+    let resp = handle_v1_action(&state, &req, None).unwrap();
     let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
     assert!(body.contains("<VerificationStatus>Success</VerificationStatus>"));
     // AWS omits unknown identities from the VerificationAttributes map entirely
@@ -888,11 +930,12 @@ fn test_delete_identity() {
     handle_v1_action(
         &state,
         &make_v1_request("VerifyEmailIdentity", vec![("EmailAddress", "a@test.com")]),
+        None,
     )
     .unwrap();
 
     let req = make_v1_request("DeleteIdentity", vec![("Identity", "a@test.com")]);
-    handle_v1_action(&state, &req).unwrap();
+    handle_v1_action(&state, &req, None).unwrap();
     assert!(!state
         .read()
         .default_ref()
@@ -906,6 +949,7 @@ fn test_set_identity_dkim_enabled() {
     handle_v1_action(
         &state,
         &make_v1_request("VerifyEmailIdentity", vec![("EmailAddress", "a@test.com")]),
+        None,
     )
     .unwrap();
     assert!(
@@ -924,6 +968,7 @@ fn test_set_identity_dkim_enabled() {
             "SetIdentityDkimEnabled",
             vec![("Identity", "a@test.com"), ("DkimEnabled", "true")],
         ),
+        None,
     )
     .unwrap();
     assert!(
@@ -943,6 +988,7 @@ fn test_get_identity_dkim_attributes() {
     handle_v1_action(
         &state,
         &make_v1_request("VerifyDomainIdentity", vec![("Domain", "example.com")]),
+        None,
     )
     .unwrap();
 
@@ -950,7 +996,7 @@ fn test_get_identity_dkim_attributes() {
         "GetIdentityDkimAttributes",
         vec![("Identities.member.1", "example.com")],
     );
-    let resp = handle_v1_action(&state, &req).unwrap();
+    let resp = handle_v1_action(&state, &req, None).unwrap();
     let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
     assert!(body.contains("<DkimEnabled>"));
     assert!(body.contains("<DkimVerificationStatus>"));
@@ -965,6 +1011,7 @@ fn test_set_identity_feedback_forwarding() {
     handle_v1_action(
         &state,
         &make_v1_request("VerifyEmailIdentity", vec![("EmailAddress", "a@test.com")]),
+        None,
     )
     .unwrap();
 
@@ -974,6 +1021,7 @@ fn test_set_identity_feedback_forwarding() {
             "SetIdentityFeedbackForwardingEnabled",
             vec![("Identity", "a@test.com"), ("ForwardingEnabled", "false")],
         ),
+        None,
     )
     .unwrap();
     assert!(
@@ -993,6 +1041,7 @@ fn test_get_identity_notification_attributes() {
     handle_v1_action(
         &state,
         &make_v1_request("VerifyEmailIdentity", vec![("EmailAddress", "a@test.com")]),
+        None,
     )
     .unwrap();
 
@@ -1000,7 +1049,7 @@ fn test_get_identity_notification_attributes() {
         "GetIdentityNotificationAttributes",
         vec![("Identities.member.1", "a@test.com")],
     );
-    let resp = handle_v1_action(&state, &req).unwrap();
+    let resp = handle_v1_action(&state, &req, None).unwrap();
     let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
     assert!(body.contains("<ForwardingEnabled>true</ForwardingEnabled>"));
 }
@@ -1011,6 +1060,7 @@ fn test_set_identity_mail_from_domain() {
     handle_v1_action(
         &state,
         &make_v1_request("VerifyDomainIdentity", vec![("Domain", "example.com")]),
+        None,
     )
     .unwrap();
 
@@ -1024,6 +1074,7 @@ fn test_set_identity_mail_from_domain() {
                 ("BehaviorOnMXFailure", "RejectMessage"),
             ],
         ),
+        None,
     )
     .unwrap();
 
@@ -1042,6 +1093,7 @@ fn test_get_identity_mail_from_domain_attributes() {
     handle_v1_action(
         &state,
         &make_v1_request("VerifyDomainIdentity", vec![("Domain", "example.com")]),
+        None,
     )
     .unwrap();
 
@@ -1049,7 +1101,7 @@ fn test_get_identity_mail_from_domain_attributes() {
         "GetIdentityMailFromDomainAttributes",
         vec![("Identities.member.1", "example.com")],
     );
-    let resp = handle_v1_action(&state, &req).unwrap();
+    let resp = handle_v1_action(&state, &req, None).unwrap();
     let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
     assert!(body.contains("<BehaviorOnMXFailure>"));
     assert!(body.contains("<MailFromDomainStatus>"));
@@ -1073,7 +1125,7 @@ fn test_send_email_v1() {
             ("Message.Body.Text.Data", "Hello"),
         ],
     );
-    let resp = handle_v1_action(&state, &req).unwrap();
+    let resp = handle_v1_action(&state, &req, None).unwrap();
     assert_eq!(resp.status, StatusCode::OK);
     let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
     assert!(body.contains("<MessageId>"));
@@ -1106,7 +1158,7 @@ fn send_email_v1_same_path() {
             ("Message.Body.Text.Data", "Hello"),
         ],
     );
-    match handle_v1_action(&state, &req) {
+    match handle_v1_action(&state, &req, None) {
         Err(e) => assert_eq!(e.code(), "MessageRejected"),
         Ok(_) => panic!("expected MessageRejected"),
     }
@@ -1129,7 +1181,7 @@ fn send_email_v1_rejects_unverified_recipient_in_sandbox() {
             ("Message.Body.Text.Data", "Hello"),
         ],
     );
-    match handle_v1_action(&state, &req) {
+    match handle_v1_action(&state, &req, None) {
         Err(e) => {
             assert_eq!(e.code(), "MessageRejected");
             assert!(e.message().contains("unverified@elsewhere.com"));
@@ -1155,7 +1207,7 @@ fn send_email_v1_skips_recipient_check_in_production() {
             ("Message.Body.Text.Data", "Hello"),
         ],
     );
-    let resp = handle_v1_action(&state, &req).unwrap();
+    let resp = handle_v1_action(&state, &req, None).unwrap();
     assert_eq!(resp.status, StatusCode::OK);
 }
 
@@ -1181,7 +1233,7 @@ fn send_email_v1_accepts_simulator_recipients_in_sandbox() {
                 ("Message.Body.Text.Data", "Hello"),
             ],
         );
-        let resp = handle_v1_action(&state, &req)
+        let resp = handle_v1_action(&state, &req, None)
             .unwrap_or_else(|e| panic!("simulator recipient {recipient}: {}", e.message()));
         assert_eq!(resp.status, StatusCode::OK);
     }
@@ -1203,7 +1255,7 @@ fn send_email_v1_accepts_simulator_sender_without_verified_identity() {
             ("Message.Body.Text.Data", "Hello"),
         ],
     );
-    let resp = handle_v1_action(&state, &req).unwrap();
+    let resp = handle_v1_action(&state, &req, None).unwrap();
     assert_eq!(resp.status, StatusCode::OK);
 }
 
@@ -1212,18 +1264,20 @@ fn test_send_raw_email() {
     let state = make_state();
     seed_identity(&state, "sender@example.com");
     enable_production_access(&state);
+    // RawMessage.Data is a Query-protocol blob, encoded as base64 on the wire.
+    let raw = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        "From: sender@example.com\r\nTo: to@example.com\r\nSubject: Test\r\n\r\nBody",
+    );
     let req = make_v1_request(
         "SendRawEmail",
         vec![
             ("Source", "sender@example.com"),
             ("Destinations.member.1", "to@example.com"),
-            (
-                "RawMessage.Data",
-                "From: sender@example.com\r\nTo: to@example.com\r\nSubject: Test\r\n\r\nBody",
-            ),
+            ("RawMessage.Data", &raw),
         ],
     );
-    let resp = handle_v1_action(&state, &req).unwrap();
+    let resp = handle_v1_action(&state, &req, None).unwrap();
     assert_eq!(resp.status, StatusCode::OK);
 
     {
@@ -1250,6 +1304,7 @@ fn test_send_templated_email() {
                 ("Template.HtmlPart", "<p>Hi {{name}}</p>"),
             ],
         ),
+        None,
     )
     .unwrap();
 
@@ -1262,7 +1317,7 @@ fn test_send_templated_email() {
             ("TemplateData", "{\"name\":\"World\"}"),
         ],
     );
-    let resp = handle_v1_action(&state, &req).unwrap();
+    let resp = handle_v1_action(&state, &req, None).unwrap();
     assert_eq!(resp.status, StatusCode::OK);
 
     {
@@ -1289,7 +1344,7 @@ fn test_send_templated_email_missing_template() {
             ("TemplateData", "{}"),
         ],
     );
-    match handle_v1_action(&state, &req) {
+    match handle_v1_action(&state, &req, None) {
         Err(e) => assert_eq!(e.code(), "TemplateDoesNotExistException"),
         Ok(_) => panic!("expected error"),
     }
@@ -1309,6 +1364,7 @@ fn test_send_bulk_templated_email() {
                 ("Template.SubjectPart", "Hi"),
             ],
         ),
+        None,
     )
     .unwrap();
 
@@ -1332,7 +1388,7 @@ fn test_send_bulk_templated_email() {
             ),
         ],
     );
-    let resp = handle_v1_action(&state, &req).unwrap();
+    let resp = handle_v1_action(&state, &req, None).unwrap();
     let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
     assert!(body.contains("<Status>Success</Status>"));
 
@@ -1361,6 +1417,7 @@ fn test_template_lifecycle() {
                 ("Template.TextPart", "text"),
             ],
         ),
+        None,
     )
     .unwrap();
 
@@ -1368,6 +1425,7 @@ fn test_template_lifecycle() {
     match handle_v1_action(
         &state,
         &make_v1_request("CreateTemplate", vec![("Template.TemplateName", "t1")]),
+        None,
     ) {
         Err(e) => assert_eq!(e.code(), "AlreadyExistsException"),
         Ok(_) => panic!("expected error"),
@@ -1377,6 +1435,7 @@ fn test_template_lifecycle() {
     let resp = handle_v1_action(
         &state,
         &make_v1_request("GetTemplate", vec![("TemplateName", "t1")]),
+        None,
     )
     .unwrap();
     let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
@@ -1384,7 +1443,7 @@ fn test_template_lifecycle() {
     assert!(body.contains("<SubjectPart>Subject</SubjectPart>"));
 
     // List
-    let resp = handle_v1_action(&state, &make_v1_request("ListTemplates", vec![])).unwrap();
+    let resp = handle_v1_action(&state, &make_v1_request("ListTemplates", vec![]), None).unwrap();
     let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
     assert!(body.contains("<Name>t1</Name>"));
 
@@ -1398,6 +1457,7 @@ fn test_template_lifecycle() {
                 ("Template.SubjectPart", "Updated"),
             ],
         ),
+        None,
     )
     .unwrap();
     {
@@ -1413,6 +1473,7 @@ fn test_template_lifecycle() {
     handle_v1_action(
         &state,
         &make_v1_request("DeleteTemplate", vec![("TemplateName", "t1")]),
+        None,
     )
     .unwrap();
     assert!(!state.read().default_ref().templates.contains_key("t1"));
@@ -1431,6 +1492,7 @@ fn test_configuration_set_lifecycle() {
             "CreateConfigurationSet",
             vec![("ConfigurationSet.Name", "my-config")],
         ),
+        None,
     )
     .unwrap();
 
@@ -1441,13 +1503,19 @@ fn test_configuration_set_lifecycle() {
             "CreateConfigurationSet",
             vec![("ConfigurationSet.Name", "my-config")],
         ),
+        None,
     ) {
         Err(e) => assert_eq!(e.code(), "ConfigurationSetAlreadyExistsException"),
         Ok(_) => panic!("expected error"),
     }
 
     // List
-    let resp = handle_v1_action(&state, &make_v1_request("ListConfigurationSets", vec![])).unwrap();
+    let resp = handle_v1_action(
+        &state,
+        &make_v1_request("ListConfigurationSets", vec![]),
+        None,
+    )
+    .unwrap();
     let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
     assert!(body.contains("<Name>my-config</Name>"));
 
@@ -1458,6 +1526,7 @@ fn test_configuration_set_lifecycle() {
             "DescribeConfigurationSet",
             vec![("ConfigurationSetName", "my-config")],
         ),
+        None,
     )
     .unwrap();
     let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
@@ -1470,6 +1539,7 @@ fn test_configuration_set_lifecycle() {
             "DeleteConfigurationSet",
             vec![("ConfigurationSetName", "my-config")],
         ),
+        None,
     )
     .unwrap();
     assert!(!state
@@ -1488,6 +1558,7 @@ fn test_configuration_set_event_destination_lifecycle() {
             "CreateConfigurationSet",
             vec![("ConfigurationSet.Name", "cs")],
         ),
+        None,
     )
     .unwrap();
 
@@ -1508,6 +1579,7 @@ fn test_configuration_set_event_destination_lifecycle() {
                 ),
             ],
         ),
+        None,
     )
     .unwrap();
 
@@ -1531,6 +1603,7 @@ fn test_configuration_set_event_destination_lifecycle() {
                 ("EventDestination.Enabled", "false"),
             ],
         ),
+        None,
     )
     .unwrap();
     assert!(
@@ -1553,6 +1626,7 @@ fn test_configuration_set_event_destination_lifecycle() {
                 ("EventDestinationName", "sns-dest"),
             ],
         ),
+        None,
     )
     .unwrap();
     assert!(state
@@ -1573,6 +1647,7 @@ fn test_event_destination_kinesis_and_cloudwatch_persist_and_describe() {
             "CreateConfigurationSet",
             vec![("ConfigurationSet.Name", "cs2")],
         ),
+        None,
     )
     .unwrap();
 
@@ -1596,6 +1671,7 @@ fn test_event_destination_kinesis_and_cloudwatch_persist_and_describe() {
                 ),
             ],
         ),
+        None,
     )
     .unwrap();
 
@@ -1623,6 +1699,7 @@ fn test_event_destination_kinesis_and_cloudwatch_persist_and_describe() {
                 ),
             ],
         ),
+        None,
     )
     .unwrap();
 
@@ -1658,6 +1735,7 @@ fn test_event_destination_kinesis_and_cloudwatch_persist_and_describe() {
                 ),
             ],
         ),
+        None,
     )
     .unwrap();
     let xml = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
@@ -1680,6 +1758,7 @@ fn test_event_destination_rejects_multiple_and_zero_targets() {
             "CreateConfigurationSet",
             vec![("ConfigurationSet.Name", "cs3")],
         ),
+        None,
     )
     .unwrap();
 
@@ -1709,6 +1788,7 @@ fn test_event_destination_rejects_multiple_and_zero_targets() {
                 ),
             ],
         ),
+        None,
     ) {
         Err(e) => e,
         Ok(_) => panic!("multiple targets must be rejected"),
@@ -1726,6 +1806,7 @@ fn test_event_destination_rejects_multiple_and_zero_targets() {
                 ("EventDestination.MatchingEventTypes.member.1", "send"),
             ],
         ),
+        None,
     ) {
         Err(e) => e,
         Ok(_) => panic!("zero targets must be rejected"),
@@ -1742,6 +1823,7 @@ fn test_event_destination_update_switches_target_type() {
             "CreateConfigurationSet",
             vec![("ConfigurationSet.Name", "cs4")],
         ),
+        None,
     )
     .unwrap();
 
@@ -1760,6 +1842,7 @@ fn test_event_destination_update_switches_target_type() {
                 ),
             ],
         ),
+        None,
     )
     .unwrap();
 
@@ -1781,6 +1864,7 @@ fn test_event_destination_update_switches_target_type() {
                 ),
             ],
         ),
+        None,
     )
     .unwrap();
 
@@ -1804,6 +1888,7 @@ fn test_event_destination_update_multiple_targets_is_atomic() {
             "CreateConfigurationSet",
             vec![("ConfigurationSet.Name", "cs5")],
         ),
+        None,
     )
     .unwrap();
     handle_v1_action(
@@ -1821,6 +1906,7 @@ fn test_event_destination_update_multiple_targets_is_atomic() {
                 ),
             ],
         ),
+        None,
     )
     .unwrap();
 
@@ -1849,6 +1935,7 @@ fn test_event_destination_update_multiple_targets_is_atomic() {
                 ),
             ],
         ),
+        None,
     ) {
         Err(e) => e,
         Ok(_) => panic!("multiple-target update must be rejected"),
@@ -1873,7 +1960,7 @@ fn test_event_destination_update_multiple_targets_is_atomic() {
 #[test]
 fn test_get_send_quota() {
     let state = make_state();
-    let resp = handle_v1_action(&state, &make_v1_request("GetSendQuota", vec![])).unwrap();
+    let resp = handle_v1_action(&state, &make_v1_request("GetSendQuota", vec![]), None).unwrap();
     let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
     assert!(body.contains("<Max24HourSend>50000.0</Max24HourSend>"));
     assert!(body.contains("<MaxSendRate>14.0</MaxSendRate>"));
@@ -1896,10 +1983,12 @@ fn test_get_send_statistics() {
                 ("Message.Body.Text.Data", "Hello"),
             ],
         ),
+        None,
     )
     .unwrap();
 
-    let resp = handle_v1_action(&state, &make_v1_request("GetSendStatistics", vec![])).unwrap();
+    let resp =
+        handle_v1_action(&state, &make_v1_request("GetSendStatistics", vec![]), None).unwrap();
     let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
     assert!(body.contains("<DeliveryAttempts>1</DeliveryAttempts>"));
 }
@@ -1907,8 +1996,12 @@ fn test_get_send_statistics() {
 #[test]
 fn test_get_account_sending_enabled() {
     let state = make_state();
-    let resp =
-        handle_v1_action(&state, &make_v1_request("GetAccountSendingEnabled", vec![])).unwrap();
+    let resp = handle_v1_action(
+        &state,
+        &make_v1_request("GetAccountSendingEnabled", vec![]),
+        None,
+    )
+    .unwrap();
     let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
     assert!(body.contains("<Enabled>true</Enabled>"));
 }
@@ -1934,7 +2027,7 @@ fn send_email_v1_account_pause() {
             ("Message.Body.Text.Data", "Hello"),
         ],
     );
-    match handle_v1_action(&state, &req) {
+    match handle_v1_action(&state, &req, None) {
         Err(e) => {
             assert_eq!(e.code(), "MessageRejected");
             assert_eq!(e.message(), "Email sending for the account is paused.");
@@ -1981,7 +2074,7 @@ fn send_email_v1_config_set_pause() {
             ("ConfigurationSetName", "my-cs"),
         ],
     );
-    match handle_v1_action(&state, &req) {
+    match handle_v1_action(&state, &req, None) {
         Err(e) => {
             assert_eq!(e.code(), "MessageRejected");
             assert_eq!(
@@ -2020,7 +2113,7 @@ fn send_email_v1_skips_suppressed_recipient() {
             ("Message.Body.Text.Data", "Hello"),
         ],
     );
-    match handle_v1_action(&state, &req) {
+    match handle_v1_action(&state, &req, None) {
         Err(e) => {
             assert_eq!(e.code(), "MessageRejected");
             assert_eq!(e.message(), "Address is on the suppression list");
@@ -2049,7 +2142,7 @@ fn test_send_bounce_v1() {
             ),
         ],
     );
-    let resp = handle_v1_action(&state, &req).unwrap();
+    let resp = handle_v1_action(&state, &req, None).unwrap();
     let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
     assert!(body.contains("<MessageId>"));
     assert!(body.contains("<BouncedRecipientInfoList>"));
@@ -2095,7 +2188,7 @@ fn test_send_bounce_v1_custom_dsn_fields() {
             ),
         ],
     );
-    let resp = handle_v1_action(&state, &req).unwrap();
+    let resp = handle_v1_action(&state, &req, None).unwrap();
     let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
     assert!(body.contains("<BounceType>DoesNotExist</BounceType>"));
     assert!(body.contains("<StatusCode>5.1.1</StatusCode>"));
@@ -2124,7 +2217,7 @@ fn test_send_bounce_v1_xml_escapes_user_fields() {
             ),
         ],
     );
-    let resp = handle_v1_action(&state, &req).unwrap();
+    let resp = handle_v1_action(&state, &req, None).unwrap();
     let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
 
     // The raw injected `<...>` / `&` must not appear verbatim inside the body.
@@ -2159,7 +2252,7 @@ fn test_send_bounce_v1_missing_recipient() {
             ("OriginalMessageId", "msg-123"),
         ],
     );
-    match handle_v1_action(&state, &req) {
+    match handle_v1_action(&state, &req, None) {
         Err(e) => assert_eq!(e.code(), "MissingParameter"),
         Ok(_) => panic!("expected MissingParameter"),
     }
@@ -2174,6 +2267,7 @@ fn set_and_get_identity_notification_topic() {
     handle_v1_action(
         &state,
         &make_v1_request("VerifyEmailIdentity", vec![("EmailAddress", "a@test.com")]),
+        None,
     )
     .unwrap();
 
@@ -2187,6 +2281,7 @@ fn set_and_get_identity_notification_topic() {
                 ("SnsTopic", "arn:aws:sns:us-east-1:123456789012:bounces"),
             ],
         ),
+        None,
     )
     .unwrap();
 
@@ -2196,6 +2291,7 @@ fn set_and_get_identity_notification_topic() {
             "GetIdentityNotificationAttributes",
             vec![("Identities.member.1", "a@test.com")],
         ),
+        None,
     )
     .unwrap();
     let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
@@ -2217,6 +2313,7 @@ fn set_and_get_identity_notification_topic() {
                 ("SnsTopic", ""),
             ],
         ),
+        None,
     )
     .unwrap();
     let resp = handle_v1_action(
@@ -2225,6 +2322,7 @@ fn set_and_get_identity_notification_topic() {
             "GetIdentityNotificationAttributes",
             vec![("Identities.member.1", "a@test.com")],
         ),
+        None,
     )
     .unwrap();
     let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
@@ -2244,6 +2342,7 @@ fn v1_write_action_response_includes_result_node() {
             "CreateConfigurationSet",
             vec![("ConfigurationSet.Name", "cs1")],
         ),
+        None,
     )
     .unwrap();
     let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
@@ -2252,4 +2351,190 @@ fn v1_write_action_response_includes_result_node() {
         "response must carry the result node: {body}"
     );
     assert!(body.contains("<CreateConfigurationSetResponse"));
+}
+
+#[test]
+fn bulk_templated_status_mirrors_recipient_error_code() {
+    let state = make_state();
+    seed_identity(&state, "sender@example.com");
+    seed_identity(&state, "ok@example.com");
+    disable_production_access(&state);
+    handle_v1_action(
+        &state,
+        &make_v1_request(
+            "CreateTemplate",
+            vec![
+                ("Template.TemplateName", "bulk-tmpl"),
+                ("Template.SubjectPart", "Hi"),
+            ],
+        ),
+        None,
+    )
+    .unwrap();
+
+    let req = make_v1_request(
+        "SendBulkTemplatedEmail",
+        vec![
+            ("Source", "sender@example.com"),
+            ("Template", "bulk-tmpl"),
+            (
+                "Destinations.member.1.Destination.ToAddresses.member.1",
+                "Grp: a@b.com;",
+            ),
+            (
+                "Destinations.member.2.Destination.ToAddresses.member.1",
+                "not an address",
+            ),
+            (
+                "Destinations.member.3.Destination.ToAddresses.member.1",
+                "unverified@example.com",
+            ),
+            (
+                "Destinations.member.4.Destination.ToAddresses.member.1",
+                "ok@example.com",
+            ),
+        ],
+    );
+    let resp = handle_v1_action(&state, &req, None).unwrap();
+    let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
+    let statuses: Vec<&str> = body
+        .split("<member><Status>")
+        .skip(1)
+        .map(|chunk| chunk.split('<').next().unwrap())
+        .collect();
+    assert_eq!(
+        statuses,
+        [
+            "InvalidParameterValue",
+            "InvalidParameterValue",
+            "MessageRejected",
+            "Success"
+        ],
+        "{body}"
+    );
+    assert_eq!(state.read().default_ref().sent_emails.len(), 1);
+}
+
+#[test]
+fn send_raw_email_decodes_rfc2047_subject_and_spaced_header_names() {
+    let state = make_state();
+    seed_identity(&state, "sender@example.com");
+    enable_production_access(&state);
+    // Obsolete RFC 5322 syntax: whitespace before the header colon.
+    let raw = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        "From: sender@example.com\r\nTo : to@example.com\r\n\
+         Subject: =?UTF-8?B?T2zDoQ==?= world\r\n\r\nBody",
+    );
+    let req = make_v1_request("SendRawEmail", vec![("RawMessage.Data", &raw)]);
+    handle_v1_action(&state, &req, None).unwrap();
+
+    let mas = state.read();
+    let sent = &mas.default_ref().sent_emails[0];
+    assert_eq!(sent.to, ["to@example.com"]);
+    assert_eq!(sent.subject.as_deref(), Some("Ol\u{e1} world"));
+}
+
+#[test]
+fn describe_configuration_set_renders_v2_created_destination_in_v1_shape() {
+    let state = make_state();
+    handle_v1_action(
+        &state,
+        &make_v1_request(
+            "CreateConfigurationSet",
+            vec![("ConfigurationSet.Name", "cs")],
+        ),
+        None,
+    )
+    .unwrap();
+    // Stored as the v2 API creates it.
+    state
+        .write()
+        .default_mut()
+        .event_destinations
+        .entry("cs".to_string())
+        .or_default()
+        .push(crate::service::parse_event_destination_definition(
+            "fh",
+            &serde_json::json!({
+                "Enabled": true,
+                "MatchingEventTypes": ["SEND", "RENDERING_FAILURE"],
+                "KinesisFirehoseDestination": {
+                    "IamRoleArn": "arn:aws:iam::123456789012:role/r",
+                    "DeliveryStreamArn": "arn:aws:firehose:us-east-1:123456789012:deliverystream/s"
+                }
+            }),
+        ));
+    for (name, def) in [
+        (
+            "cw",
+            serde_json::json!({
+                "Enabled": true,
+                "MatchingEventTypes": ["SEND"],
+                "CloudWatchDestination": {"DimensionConfigurations": [{
+                    "DimensionName": "tag",
+                    "DimensionValueSource": "EMAIL_HEADER",
+                    "DefaultDimensionValue": "none"
+                }]}
+            }),
+        ),
+        // CloudFormation keeps the template's `TopicARN` spelling.
+        (
+            "cfn-sns",
+            serde_json::json!({
+                "Enabled": true,
+                "MatchingEventTypes": ["send"],
+                "SnsDestination": {"TopicARN": "arn:aws:sns:us-east-1:123456789012:t"}
+            }),
+        ),
+    ] {
+        state
+            .write()
+            .default_mut()
+            .event_destinations
+            .get_mut("cs")
+            .unwrap()
+            .push(crate::service::parse_event_destination_definition(
+                name, &def,
+            ));
+    }
+
+    let resp = handle_v1_action(
+        &state,
+        &make_v1_request(
+            "DescribeConfigurationSet",
+            vec![
+                ("ConfigurationSetName", "cs"),
+                (
+                    "ConfigurationSetAttributeNames.member.1",
+                    "eventDestinations",
+                ),
+            ],
+        ),
+        None,
+    )
+    .unwrap();
+    let body = String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap();
+    assert!(
+        body.contains("<IAMRoleARN>arn:aws:iam::123456789012:role/r</IAMRoleARN>"),
+        "{body}"
+    );
+    assert!(
+        body.contains(
+            "<DeliveryStreamARN>arn:aws:firehose:us-east-1:123456789012:deliverystream/s</DeliveryStreamARN>"
+        ),
+        "{body}"
+    );
+    assert!(
+        body.contains("<member>send</member><member>renderingFailure</member>"),
+        "{body}"
+    );
+    assert!(
+        body.contains("<DimensionValueSource>emailHeader</DimensionValueSource>"),
+        "{body}"
+    );
+    assert!(
+        body.contains("<TopicARN>arn:aws:sns:us-east-1:123456789012:t</TopicARN>"),
+        "{body}"
+    );
 }
