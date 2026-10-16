@@ -1071,12 +1071,6 @@ impl S3Service {
             .get_mut(dest_bucket)
             .ok_or_else(|| no_such_bucket(dest_bucket))?;
 
-        let version_id = if db.versioning.as_deref() == Some("Enabled") {
-            Some(uuid::Uuid::new_v4().to_string())
-        } else {
-            None
-        };
-
         // The destination's current default retention, measured from now, when
         // the version is created.
         let dest_lock =
@@ -1118,7 +1112,8 @@ impl S3Service {
             sse_algorithm: new_sse.clone(),
             sse_kms_key_id: new_kms.clone(),
             bucket_key_enabled: new_bke,
-            version_id: version_id.clone(),
+            // Assigned at commit from the destination's versioning state.
+            version_id: None,
             content_encoding: src_obj.content_encoding,
             cache_control: new_cache_control,
             content_disposition: new_content_disposition,

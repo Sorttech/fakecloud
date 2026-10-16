@@ -75,7 +75,10 @@ pub fn put_object_via_store(
 /// exactly as PutObject writes one: the bucket's versioning decides its
 /// version id and history, and on an Object Lock bucket the default retention
 /// applies. The body is persisted through `store` when one is configured, so
-/// the object (and every version it displaces) survives a restart.
+/// the object (and every version it displaces) survives a restart. A failed
+/// store write does not lose the delivery: the object is kept in memory for
+/// the session and logged as not durable, since the producer has already
+/// handed the data over. Only a missing bucket is an error.
 ///
 /// The payload is staged next to the store with no S3 lock held; the global
 /// S3 write lock is taken only for the rename-into-place and the in-memory
@@ -106,9 +109,17 @@ pub fn put_delivered_object(
     // Stage the payload with no S3 lock held: the global S3 lock is shared by
     // every bucket in every account, so a large export or log delivery written
     // to disk under it would stall all of S3.
-    let mut spooled =
-        crate::service::run_blocking_io(|| crate::body_io::SpooledBody::spool(store, body.clone()))
-            .map_err(|e| format!("failed to stage object {key} for bucket {bucket}: {e}"))?;
+    // A staging failure degrades the delivery to memory-only (see below)
+    // rather than dropping it.
+    let mut spooled = match crate::service::run_blocking_io(|| {
+        crate::body_io::SpooledBody::spool(store, body.clone())
+    }) {
+        Ok(spooled) => Some(spooled),
+        Err(err) => {
+            warn_not_durable(bucket, &key, &err.to_string());
+            None
+        }
+    };
 
     obj.body = memory_body(body);
     if obj.storage_class.is_empty() {
@@ -140,8 +151,40 @@ pub fn put_delivered_object(
     // and the in-memory metadata of concurrent writers to one key stay in
     // step. The payload is already staged next to the store, so the store
     // write is a rename, not a body copy.
-    crate::service::commit_object_version(bucket_ref, bucket, store, obj, spooled.source())
-        .map_err(|e| format!("failed to persist object {key} to bucket {bucket}: {e}"))
+    if let (Some(store), Some(spooled)) = (store, spooled.as_mut()) {
+        match crate::service::commit_object_version(
+            bucket_ref,
+            bucket,
+            Some(store),
+            obj.clone(),
+            spooled.source(),
+        ) {
+            Ok(version_id) => return Ok(version_id),
+            // The producer already handed the data over (AWS acknowledged it),
+            // so a disk hiccup must not lose it: keep the object in memory for
+            // this session and say it is not durable. The commit made no
+            // in-memory change it did not persist, so committing again without
+            // the store records the object exactly once.
+            Err(err) => warn_not_durable(bucket, &key, &err.to_string()),
+        }
+    }
+    crate::service::commit_object_version(
+        bucket_ref,
+        bucket,
+        None,
+        obj,
+        fakecloud_persistence::BodySource::Bytes(Bytes::new()),
+    )
+    .map_err(|e| format!("failed to store object {key} in bucket {bucket}: {e}"))
+}
+
+fn warn_not_durable(bucket: &str, key: &str, err: &str) {
+    tracing::error!(
+        bucket = %bucket,
+        key = %key,
+        error = %err,
+        "failed to persist delivered S3 object; keeping it in memory only (not durable)"
+    );
 }
 
 impl S3Delivery for S3DeliveryImpl {
@@ -564,6 +607,155 @@ mod tests {
                 assert_eq!(std::fs::read(path).unwrap(), b"two");
             }
             fakecloud_persistence::BodyRef::Memory(_) => panic!("expected a disk body"),
+        }
+    }
+
+    /// A store whose object writes always fail, standing in for a disk error.
+    struct FailingStore {
+        inner: fakecloud_persistence::MemoryS3Store,
+        fail_meta: bool,
+    }
+
+    fn disk_full() -> fakecloud_persistence::StoreError {
+        fakecloud_persistence::StoreError::Other("disk full".to_string())
+    }
+
+    impl S3Store for FailingStore {
+        fn load(
+            &self,
+        ) -> fakecloud_persistence::StoreResult<fakecloud_persistence::S3StateSnapshot> {
+            self.inner.load()
+        }
+        fn put_bucket_meta(
+            &self,
+            bucket: &str,
+            meta: &fakecloud_persistence::BucketMeta,
+        ) -> fakecloud_persistence::StoreResult<()> {
+            self.inner.put_bucket_meta(bucket, meta)
+        }
+        fn put_bucket_subresource(
+            &self,
+            bucket: &str,
+            kind: fakecloud_persistence::BucketSubresource,
+            payload: &str,
+        ) -> fakecloud_persistence::StoreResult<()> {
+            self.inner.put_bucket_subresource(bucket, kind, payload)
+        }
+        fn delete_bucket_subresource(
+            &self,
+            bucket: &str,
+            kind: fakecloud_persistence::BucketSubresource,
+        ) -> fakecloud_persistence::StoreResult<()> {
+            self.inner.delete_bucket_subresource(bucket, kind)
+        }
+        fn delete_bucket(&self, bucket: &str) -> fakecloud_persistence::StoreResult<()> {
+            self.inner.delete_bucket(bucket)
+        }
+        fn put_object(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _version: Option<&str>,
+            _body: fakecloud_persistence::BodySource,
+            _meta: &fakecloud_persistence::ObjectMeta,
+        ) -> fakecloud_persistence::StoreResult<fakecloud_persistence::BodyRef> {
+            Err(disk_full())
+        }
+        fn put_object_meta(
+            &self,
+            bucket: &str,
+            key: &str,
+            version: Option<&str>,
+            meta: &fakecloud_persistence::ObjectMeta,
+        ) -> fakecloud_persistence::StoreResult<()> {
+            if self.fail_meta {
+                return Err(disk_full());
+            }
+            self.inner.put_object_meta(bucket, key, version, meta)
+        }
+        fn delete_object(
+            &self,
+            bucket: &str,
+            key: &str,
+            version: Option<&str>,
+        ) -> fakecloud_persistence::StoreResult<()> {
+            self.inner.delete_object(bucket, key, version)
+        }
+        fn open_object_body(
+            &self,
+            body: &fakecloud_persistence::BodyRef,
+        ) -> fakecloud_persistence::StoreResult<Bytes> {
+            self.inner.open_object_body(body)
+        }
+        fn mpu_create(
+            &self,
+            bucket: &str,
+            upload_id: &str,
+            init: &fakecloud_persistence::MpuInit,
+        ) -> fakecloud_persistence::StoreResult<()> {
+            self.inner.mpu_create(bucket, upload_id, init)
+        }
+        fn mpu_put_part(
+            &self,
+            bucket: &str,
+            upload_id: &str,
+            part_number: u32,
+            body: fakecloud_persistence::BodySource,
+            etag: &str,
+        ) -> fakecloud_persistence::StoreResult<fakecloud_persistence::BodyRef> {
+            self.inner
+                .mpu_put_part(bucket, upload_id, part_number, body, etag)
+        }
+        fn mpu_abort(
+            &self,
+            bucket: &str,
+            upload_id: &str,
+        ) -> fakecloud_persistence::StoreResult<()> {
+            self.inner.mpu_abort(bucket, upload_id)
+        }
+        fn mpu_complete(
+            &self,
+            bucket: &str,
+            upload_id: &str,
+            final_key: &str,
+            version: Option<&str>,
+            meta: &fakecloud_persistence::ObjectMeta,
+        ) -> fakecloud_persistence::StoreResult<fakecloud_persistence::BodyRef> {
+            self.inner
+                .mpu_complete(bucket, upload_id, final_key, version, meta)
+        }
+    }
+
+    /// A failed store write does not lose a delivery: the producer already
+    /// handed the data over, so the object is kept in memory (not durable),
+    /// versioned exactly once, instead of being dropped.
+    #[test]
+    fn store_failure_keeps_delivery_in_memory() {
+        for fail_meta in [false, true] {
+            let store = FailingStore {
+                inner: fakecloud_persistence::MemoryS3Store::new(),
+                fail_meta,
+            };
+            let state = shared_state();
+            // Unversioned: kept as the current object.
+            deliver(&state, Some(&store), "k", b"pre");
+            let b = bucket(&state);
+            assert_eq!(read(&state, &b.objects["k"].body), b"pre");
+
+            // Versioned: the earlier object becomes the null version and the
+            // delivery is one new version, even though every store write fails.
+            set_bucket(&state, |b| b.versioning = Some("Enabled".to_string()));
+            deliver(&state, Some(&store), "k", b"one");
+            let b = bucket(&state);
+            let versions = &b.object_versions["k"];
+            assert_eq!(versions.len(), 2, "fail_meta={fail_meta}: {versions:?}");
+            assert_eq!(versions[0].version_id.as_deref(), Some("null"));
+            assert_eq!(read(&state, &versions[0].body), b"pre");
+            let vid = versions[1].version_id.clone().unwrap();
+            assert_ne!(vid, "null");
+            assert_eq!(read(&state, &versions[1].body), b"one");
+            assert_eq!(b.objects["k"].version_id.as_deref(), Some(vid.as_str()));
+            assert_eq!(read(&state, &b.objects["k"].body), b"one");
         }
     }
 

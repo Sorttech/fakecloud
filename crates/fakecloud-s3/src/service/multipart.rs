@@ -6,7 +6,7 @@ use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use fakecloud_persistence::{BodyRef, BodySource};
 
-use crate::persistence::{mpu_init_snapshot, object_meta_snapshot};
+use crate::persistence::mpu_init_snapshot;
 use crate::state::{MultipartUpload, S3Object, UploadPart};
 
 use md5::{Digest, Md5};
@@ -561,16 +561,7 @@ impl S3Service {
         // disk persist below runs OFF-LOCK instead of holding the global S3
         // write lock and serializing every other S3 operation server-wide
         // while it runs (bug-audit 2026-05-28, 4.7).
-        let (
-            upload,
-            already_has_object,
-            region,
-            bucket_region,
-            notification_config,
-            versioning_enabled,
-            versioning_suspended,
-            acl_owner_id,
-        ) = {
+        let (upload, already_has_object, region, bucket_region, notification_config, acl_owner_id) = {
             let accts = self.state.read();
             let empty = crate::state::S3State::new(account_id, "us-east-1");
             let state = accts.get(account_id).unwrap_or(&empty);
@@ -597,8 +588,6 @@ impl S3Service {
                 state.region.clone(),
                 b.region.clone(),
                 b.notification_config.clone(),
-                b.versioning.as_deref() == Some("Enabled"),
-                b.versioning.as_deref() == Some("Suspended"),
                 b.acl_owner_id.clone(),
             )
         };
@@ -749,12 +738,9 @@ impl S3Service {
             std::collections::BTreeMap::new()
         };
 
-        let version_id = if versioning_enabled {
-            Some(uuid::Uuid::new_v4().to_string())
-        } else {
-            None
-        };
-
+        // Kept to serve the body in memory mode, where `mpu_complete` returns
+        // only a placeholder.
+        let memory_body = crate::state::memory_body(data.clone());
         let obj = S3Object {
             key: key.to_string(),
             size: data.len() as u64,
@@ -771,7 +757,8 @@ impl S3Service {
             part_sizes: Some(part_sizes),
             sse_algorithm: upload.sse_algorithm.clone(),
             sse_kms_key_id: upload.sse_kms_key_id.clone(),
-            version_id: version_id.clone(),
+            // Assigned at commit from the bucket's versioning state.
+            version_id: None,
             checksum_algorithm: upload.checksum_algorithm.clone(),
             checksum_value: checksum_value.clone(),
             cache_control: upload.cache_control.clone(),
@@ -791,131 +778,77 @@ impl S3Service {
         // concurrent complete). A concurrent Abort/Complete that removed the
         // upload during assembly is honored (idempotent re-completion) rather
         // than resurrected (bug-audit 2026-05-28, 4.3 class).
-        // A suspended-bucket completion owns the "null" version. Tag it before
-        // the snapshot so the persisted sidecar carries that id; a `null` slot
-        // whose metadata has no version id is loaded as a bare current object
-        // and then overwritten by the newest real version on restart.
-        let mut obj = obj;
-        if versioning_suspended {
-            obj.version_id = Some("null".to_string());
-        }
-        {
+        let version_id = {
             let mut accts = self.state.write();
-            {
-                let b = accts
-                    .get_or_create(account_id)
-                    .buckets
-                    .get_mut(bucket)
-                    .ok_or_else(|| no_such_bucket(bucket))?;
-                if !b.multipart_uploads.contains_key(upload_id) {
-                    if let Some(existing) = b.objects.get(key) {
-                        return Ok(completion_xml_response(
-                            bucket,
-                            &b.region,
-                            key,
-                            &existing.etag,
-                            "",
-                        ));
-                    }
-                    return Err(no_such_upload(upload_id));
-                }
-                // The object may have been created concurrently after the
-                // phase-1 snapshot, so revalidate `If-None-Match: *` here rather
-                // than trusting the stale `already_has_object`. Leave the upload
-                // intact for retry/abort; nothing has been persisted yet.
-                if if_none_match.as_deref() == Some("*") && b.objects.contains_key(key) {
-                    return Err(precondition_failed("If-None-Match"));
-                }
-                // The lock requested at CreateMultipartUpload, else the
-                // bucket's current default retention measured from now, when
-                // the version is created.
-                let lock = upload
-                    .lock
-                    .clone()
-                    .or_bucket_default(b.object_lock_config.as_deref(), Utc::now());
-                obj.lock_mode = lock.mode;
-                obj.lock_retain_until = lock.retain_until;
-                obj.lock_legal_hold = lock.legal_hold;
-            }
-            let meta = object_meta_snapshot(&obj);
-            // Record the preserved null version -- sidecar, history entry and
-            // the retag of the current object -- before the completion runs.
-            // It describes the object that is ALREADY there: on a
-            // versioning-enabled bucket the pre-versioning object is the null
-            // version whether or not this upload completes. Doing all three
-            // together means a failed `mpu_complete` leaves disk and memory
-            // agreeing, instead of a sidecar that claims a version memory
-            // does not have.
-            if versioning_enabled {
-                let preserved = {
-                    let b = accts
-                        .get_or_create(account_id)
-                        .buckets
-                        .get(bucket)
-                        .ok_or_else(|| no_such_bucket(bucket))?;
-                    crate::service::objects::null_version_to_preserve(b, key)
-                };
-                if let Some(preserved) = preserved {
-                    let preserved_meta = object_meta_snapshot(&preserved);
-                    let store = self.store.clone();
-                    crate::service::objects::run_blocking_io(|| {
-                        store.put_object_meta(bucket, key, Some("null"), &preserved_meta)
-                    })
-                    .map_err(super::persistence_error)?;
-                    let b = accts
-                        .get_or_create(account_id)
-                        .buckets
-                        .get_mut(bucket)
-                        .ok_or_else(|| no_such_bucket(bucket))?;
-                    crate::service::objects::record_preserved_null(b, key, preserved);
-                }
-            }
-            // Checks passed — persist, then commit to memory, all under the
-            // lock. In disk mode `mpu_complete` streams the parts straight into
-            // the object file and returns a disk-backed ref; use it as the
-            // object body instead of writing the whole object a SECOND time
-            // from RAM via `put_object`. The old double-write held the entire
-            // object resident twice and wrote it to disk twice, OOMing large
-            // completes (bug-hunt 2026-06-24, 4.1). In memory mode
-            // `mpu_complete` returns an empty placeholder, so the in-memory
-            // body set at construction is kept.
-            // `mpu_complete` streams every part into the object file in disk
-            // mode — more blocking disk IO — so run it under `run_blocking_io`
-            // too. `block_in_place` keeps running on this thread (holding the
-            // write lock), it just lets the runtime spin up a replacement worker
-            // for other tasks; no await happens here, so the lock is safe.
-            let assembled_body = super::objects::run_blocking_io(|| {
-                self.store
-                    .mpu_complete(bucket, upload_id, key, meta.version_id.as_deref(), &meta)
-            })
-            .map_err(super::persistence_error)?;
-            if !matches!(assembled_body, BodyRef::Memory(_)) {
-                obj.body = assembled_body;
-            }
             let b = accts
                 .get_or_create(account_id)
                 .buckets
                 .get_mut(bucket)
                 .ok_or_else(|| no_such_bucket(bucket))?;
-            b.multipart_uploads.remove(upload_id);
-            // On a versioned bucket the completed upload is a NEW version. The
-            // old code never pushed it -- it mutated the last existing version's
-            // body in place (corrupting a prior version, or no-op'ing when none
-            // existed), so the MPU version was missing from ListObjectVersions
-            // and `?versionId=<mpu>` 404'd. Mirror put_object: push the new
-            // object as a version (bug-audit 2026-06-20, 4.1).
-            if versioning_enabled {
-                // The completed upload is a new version of its own; the null
-                // version it may have displaced was recorded above.
-                b.object_versions
-                    .entry(key.to_string())
-                    .or_default()
-                    .push(obj.clone());
-            } else if versioning_suspended {
-                crate::service::objects::replace_null_version(b, key, &obj);
+            if !b.multipart_uploads.contains_key(upload_id) {
+                if let Some(existing) = b.objects.get(key) {
+                    return Ok(completion_xml_response(
+                        bucket,
+                        &b.region,
+                        key,
+                        &existing.etag,
+                        "",
+                    ));
+                }
+                return Err(no_such_upload(upload_id));
             }
-            b.objects.insert(key.to_string(), obj);
-        }
+            // The object may have been created concurrently after the
+            // phase-1 snapshot, so revalidate `If-None-Match: *` here rather
+            // than trusting the stale `already_has_object`. Leave the upload
+            // intact for retry/abort; nothing has been persisted yet.
+            if if_none_match.as_deref() == Some("*") && b.objects.contains_key(key) {
+                return Err(precondition_failed("If-None-Match"));
+            }
+            // Checks passed -- persist, then commit to memory, all under the
+            // lock, recording the completed upload as a new version the way
+            // every write does (a pre-versioning object is preserved as the
+            // null version on an enabled bucket; a suspended bucket's
+            // completion takes over the null version). In disk mode
+            // `mpu_complete` streams the parts straight into the object file
+            // and returns a disk-backed ref, so the object is never written a
+            // second time from RAM (bug-hunt 2026-06-24, 4.1). In memory mode
+            // it returns an empty placeholder, so the assembled in-memory body
+            // is kept.
+            // The lock requested at CreateMultipartUpload, else the bucket's
+            // current default retention measured from now, when the version
+            // is created.
+            let lock = upload
+                .lock
+                .clone()
+                .or_bucket_default(b.object_lock_config.as_deref(), Utc::now());
+            let mut obj = obj;
+            obj.lock_mode = lock.mode;
+            obj.lock_retain_until = lock.retain_until;
+            obj.lock_legal_hold = lock.legal_hold;
+            let store = self.store.clone();
+            let version_id = crate::service::objects::commit_object_version_with(
+                b,
+                bucket,
+                Some(&*store),
+                obj,
+                |store, key, meta| {
+                    let assembled = store.mpu_complete(
+                        bucket,
+                        upload_id,
+                        key,
+                        meta.version_id.as_deref(),
+                        meta,
+                    )?;
+                    Ok(match assembled {
+                        BodyRef::Memory(_) => memory_body,
+                        disk => disk,
+                    })
+                },
+            )
+            .map_err(super::persistence_error)?;
+            b.multipart_uploads.remove(upload_id);
+            version_id
+        };
 
         let mut headers = HeaderMap::new();
         if let Some(vid) = &version_id {

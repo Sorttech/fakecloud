@@ -129,9 +129,33 @@ pub(crate) fn commit_object_version(
     b: &mut crate::state::S3Bucket,
     bucket: &str,
     store: Option<&dyn fakecloud_persistence::S3Store>,
-    mut obj: S3Object,
+    obj: S3Object,
     body: BodySource,
 ) -> fakecloud_persistence::StoreResult<Option<String>> {
+    commit_object_version_with(b, bucket, store, obj, |store, key, meta| {
+        store.put_object(bucket, key, meta.version_id.as_deref(), body, meta)
+    })
+}
+
+/// [`commit_object_version`] with the body write supplied by the caller:
+/// `write_body` persists the new version's body (given the store, the key and
+/// the version's metadata, carrying its final version id) and returns the
+/// body ref to keep in memory. CompleteMultipartUpload uses it to assemble
+/// the parts in the store instead of writing the object a second time.
+pub(crate) fn commit_object_version_with<F>(
+    b: &mut crate::state::S3Bucket,
+    bucket: &str,
+    store: Option<&dyn fakecloud_persistence::S3Store>,
+    mut obj: S3Object,
+    write_body: F,
+) -> fakecloud_persistence::StoreResult<Option<String>>
+where
+    F: FnOnce(
+        &dyn fakecloud_persistence::S3Store,
+        &str,
+        &fakecloud_persistence::ObjectMeta,
+    ) -> fakecloud_persistence::StoreResult<fakecloud_persistence::BodyRef>,
+{
     let key = obj.key.clone();
     let versioning_enabled = b.versioning.as_deref() == Some("Enabled");
     let versioning_suspended = b.versioning.as_deref() == Some("Suspended");
@@ -164,16 +188,15 @@ pub(crate) fn commit_object_version(
 
     if let Some(store) = store {
         let meta = object_meta_snapshot(&obj);
-        obj.body = run_blocking_io(|| {
-            store.put_object(bucket, &key, meta.version_id.as_deref(), body, &meta)
-        })?;
+        obj.body = run_blocking_io(|| write_body(store, &key, &meta))?;
     }
 
     if versioning_enabled {
-        b.object_versions
-            .entry(key.clone())
-            .or_default()
-            .push(obj.clone());
+        let versions = b.object_versions.entry(key.clone()).or_default();
+        // A caller-supplied id names one version: writing it again (a replica
+        // of the same source version) replaces that entry, never duplicates it.
+        versions.retain(|o| o.version_id != obj.version_id);
+        versions.push(obj.clone());
     } else if versioning_suspended {
         replace_null_version(b, &key, &obj);
     }
@@ -192,7 +215,7 @@ pub(crate) fn commit_object_version(
 pub(crate) fn apply_bucket_default_retention(
     obj: &mut S3Object,
     bucket_lock_config: Option<&str>,
-    now: DateTime<Utc>,
+    now: chrono::DateTime<Utc>,
 ) {
     if obj.lock_mode.is_some() || obj.lock_retain_until.is_some() {
         return;

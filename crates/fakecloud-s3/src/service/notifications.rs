@@ -347,9 +347,16 @@ pub(crate) fn replicate_through_store(
         replica.storage_class = "STANDARD".to_string();
         replica.replication_status = Some("REPLICA".to_string());
         translate_replica_owner(&mut replica, dest_bucket, rule.owner_override);
-        // The replica is a new version in the destination, versioned by the
-        // destination's own state; the store write below replaces this seed.
-        replica.version_id = None;
+        // The replica keeps the source version's id, as S3 replication does;
+        // the destination's own versioning state still decides how it is
+        // recorded (a source without a real id gets a fresh one on an enabled
+        // destination). A source version that carries no retention of its own
+        // takes the destination's default retention; one that does keeps it.
+        crate::service::apply_bucket_default_retention(
+            &mut replica,
+            dest_bucket.object_lock_config.as_deref(),
+            chrono::Utc::now(),
+        );
         replica.body = match (&src_disk_path, &src_bytes_opt) {
             (Some(_), _) => src_obj.body.clone(),
             (None, Some(b)) => crate::state::memory_body(b.clone()),
