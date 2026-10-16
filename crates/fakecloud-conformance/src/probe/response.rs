@@ -439,6 +439,20 @@ pub(super) fn service_common_errors(service_name: &str) -> &'static [&'static st
             "ConflictException",
             "ValidationException",
         ],
+        // AWS Support (awsJson1_1) declares no validation error shape, yet the
+        // model documents request constraints that have no declared error to
+        // carry them: `UploadRange` is half-open (`endIndex` must exceed
+        // `startIndex`) and "the range size (endIndex - startIndex) must not
+        // exceed 10" (GetAttachmentUploadLinks). The service's "Common Error
+        // Types" list a 400 input-validation error for every action; on this
+        // JSON protocol it is the framework's `ValidationException` (the same
+        // code, with the "1 validation error detected: ..." message shape, that
+        // the service returns for its modelled @length / @range / @required
+        // violations). Unknown or unfinished `uploadIds` use the declared
+        // `AttachmentSetIdNotFound` / `AttachmentSetExpired`, not this. Source:
+        // https://docs.aws.amazon.com/awssupport/latest/APIReference/API_UploadRange.html
+        // https://docs.aws.amazon.com/awssupport/latest/APIReference/CommonErrors.html
+        "support" => &["ValidationException"],
         _ => &[],
     }
 }

@@ -588,6 +588,44 @@ fn public_view(data: &KafkaData, arn: &str, obj: &Value) -> Value {
     Value::Object(out)
 }
 
+/// The error for an unknown cluster ARN, in the operation's declared code:
+/// `NotFoundException` where the op models it (`declares_not_found`), else the
+/// `BadRequestException` every MSK op declares.
+fn cluster_missing(arn: &str, declares_not_found: bool) -> AwsServiceError {
+    let msg = format!("The cluster '{arn}' does not exist.");
+    if declares_not_found {
+        not_found(&msg)
+    } else {
+        bad_request(&msg)
+    }
+}
+
+/// Fail with [`cluster_missing`] unless the account has cluster `arn`.
+fn ensure_cluster(
+    data: &KafkaData,
+    arn: &str,
+    declares_not_found: bool,
+) -> Result<(), AwsServiceError> {
+    if data.clusters.contains_key(arn) {
+        Ok(())
+    } else {
+        Err(cluster_missing(arn, declares_not_found))
+    }
+}
+
+/// [`ensure_cluster`] for a read path, where the account may have no state
+/// yet (and none should be created just to answer "not found").
+fn ensure_cluster_in<'a>(
+    data: Option<&'a KafkaData>,
+    arn: &str,
+    declares_not_found: bool,
+) -> Result<&'a KafkaData, AwsServiceError> {
+    match data {
+        Some(d) if d.clusters.contains_key(arn) => Ok(d),
+        _ => Err(cluster_missing(arn, declares_not_found)),
+    }
+}
+
 /// Whether an ARN refers to any taggable MSK resource in this account (cluster,
 /// configuration, replicator, or VPC connection). Used by the tag operations,
 /// which return a declared `NotFoundException` for an unknown resource.
@@ -987,7 +1025,7 @@ impl KafkaService {
             .clusters
             .get(arn)
             .cloned()
-            .ok_or_else(|| not_found(&format!("The cluster '{arn}' does not exist.")))?;
+            .ok_or_else(|| cluster_missing(arn, true))?;
         let info = if v2 {
             render_cluster_v2(data, arn, &cluster)
         } else {
@@ -1002,7 +1040,7 @@ impl KafkaService {
         let cluster = data
             .clusters
             .get_mut(arn)
-            .ok_or_else(|| not_found(&format!("The cluster '{arn}' does not exist.")))?;
+            .ok_or_else(|| cluster_missing(arn, true))?;
         let serverless = cluster_is_serverless(cluster);
         cluster
             .as_object_mut()
@@ -1027,7 +1065,7 @@ impl KafkaService {
         let cluster = data
             .clusters
             .get(arn)
-            .ok_or_else(|| bad_request(&format!("The cluster '{arn}' does not exist.")))?;
+            .ok_or_else(|| cluster_missing(arn, false))?;
         // Synthesize exactly the encryption-in-transit + client-auth-gated set of
         // bootstrap-broker strings MSK would advertise for this cluster's config
         // (AWS omits every variant the cluster does not enable; the provider
@@ -1060,7 +1098,7 @@ impl KafkaService {
         let cluster = data
             .clusters
             .get(arn)
-            .ok_or_else(|| not_found(&format!("The cluster '{arn}' does not exist.")))?;
+            .ok_or_else(|| cluster_missing(arn, true))?;
         let num = cluster_num_brokers(cluster);
         let kv = cluster_kafka_version(cluster);
         let mut nodes = shared::synthesize_nodes(arn, num, &kv);
@@ -1392,14 +1430,7 @@ impl KafkaService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let mut guard = self.state.write();
         let data = guard.get_or_create(&ctx.account);
-        if !data.clusters.contains_key(arn) {
-            let msg = format!("The cluster '{arn}' does not exist.");
-            return Err(if missing_declares_not_found {
-                not_found(&msg)
-            } else {
-                bad_request(&msg)
-            });
-        }
+        ensure_cluster(data, arn, missing_declares_not_found)?;
         if let Some(obj) = data.clusters.get_mut(arn).and_then(Value::as_object_mut) {
             mutate(obj);
         }
@@ -1703,9 +1734,7 @@ impl KafkaService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let mut guard = self.state.write();
         let data = guard.get_or_create(&ctx.account);
-        if !data.clusters.contains_key(arn) {
-            return Err(not_found(&format!("The cluster '{arn}' does not exist.")));
-        }
+        ensure_cluster(data, arn, true)?;
         let serverless = data
             .clusters
             .get(arn)
@@ -1746,14 +1775,7 @@ impl KafkaService {
         // ListClusterOperationsV2 declares NotFoundException; the V1 variant does
         // not, so a missing cluster there surfaces as its (declared)
         // BadRequestException.
-        if !data.clusters.contains_key(arn) {
-            let msg = format!("The cluster '{arn}' does not exist.");
-            return Err(if v2 {
-                not_found(&msg)
-            } else {
-                bad_request(&msg)
-            });
-        }
+        ensure_cluster(data, arn, v2)?;
         let items: Vec<Value> = data
             .operations
             .values()
@@ -1838,9 +1860,7 @@ impl KafkaService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let mut guard = self.state.write();
         let data = guard.get_or_create(&ctx.account);
-        if !data.clusters.contains_key(arn) {
-            return Err(not_found(&format!("The cluster '{arn}' does not exist.")));
-        }
+        ensure_cluster(data, arn, true)?;
         let secrets: Vec<Value> = data
             .scram_secrets
             .get(arn)
@@ -1863,9 +1883,7 @@ impl KafkaService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let mut guard = self.state.write();
         let data = guard.get_or_create(&ctx.account);
-        if !data.clusters.contains_key(arn) {
-            return Err(not_found(&format!("The cluster '{arn}' does not exist.")));
-        }
+        ensure_cluster(data, arn, true)?;
         let secrets: Vec<String> = b
             .get("secretArnList")
             .and_then(Value::as_array)
@@ -1891,9 +1909,7 @@ impl KafkaService {
     fn get_cluster_policy(&self, ctx: &Ctx, arn: &str) -> Result<AwsResponse, AwsServiceError> {
         let mut guard = self.state.write();
         let data = guard.get_or_create(&ctx.account);
-        if !data.clusters.contains_key(arn) {
-            return Err(not_found(&format!("The cluster '{arn}' does not exist.")));
-        }
+        ensure_cluster(data, arn, true)?;
         let policy = data
             .policies
             .get(arn)
@@ -1913,9 +1929,7 @@ impl KafkaService {
         let mut guard = self.state.write();
         let data = guard.get_or_create(&ctx.account);
         // PutClusterPolicy declares no NotFoundException.
-        if !data.clusters.contains_key(arn) {
-            return Err(bad_request(&format!("The cluster '{arn}' does not exist.")));
-        }
+        ensure_cluster(data, arn, false)?;
         let policy = b.get("policy").cloned().unwrap_or(json!(""));
         let version = b
             .get("currentVersion")
@@ -1932,9 +1946,7 @@ impl KafkaService {
     fn delete_cluster_policy(&self, ctx: &Ctx, arn: &str) -> Result<AwsResponse, AwsServiceError> {
         let mut guard = self.state.write();
         let data = guard.get_or_create(&ctx.account);
-        if !data.clusters.contains_key(arn) {
-            return Err(not_found(&format!("The cluster '{arn}' does not exist.")));
-        }
+        ensure_cluster(data, arn, true)?;
         data.policies.remove(arn);
         ok(json!({}))
     }
@@ -1949,9 +1961,7 @@ impl KafkaService {
         let data = guard.get_or_create(&ctx.account);
         // No NotFoundException declared: a missing cluster surfaces as the
         // (declared) BadRequestException.
-        if !data.clusters.contains_key(arn) {
-            return Err(bad_request(&format!("The cluster '{arn}' does not exist.")));
-        }
+        ensure_cluster(data, arn, false)?;
         let items: Vec<Value> = data
             .vpc_connections
             .values()
@@ -1983,9 +1993,7 @@ impl KafkaService {
         let mut guard = self.state.write();
         let data = guard.get_or_create(&ctx.account);
         // No NotFoundException declared.
-        if !data.clusters.contains_key(arn) {
-            return Err(bad_request(&format!("The cluster '{arn}' does not exist.")));
-        }
+        ensure_cluster(data, arn, false)?;
         if let Some(vpc_arn) = b.get("vpcConnectionArn").and_then(Value::as_str) {
             if let Some(obj) = data
                 .vpc_connections
@@ -2046,11 +2054,7 @@ impl KafkaService {
         {
             let mut guard = self.state.write();
             let data = guard.get_or_create(&ctx.account);
-            if !data.clusters.contains_key(cluster_arn) {
-                return Err(bad_request(&format!(
-                    "The cluster '{cluster_arn}' does not exist."
-                )));
-            }
+            ensure_cluster(data, cluster_arn, false)?;
             if data
                 .topics
                 .get(cluster_arn)
@@ -2384,16 +2388,8 @@ impl KafkaService {
 
         // A missing cluster surfaces as the (declared) BadRequestException.
         {
-            let mut guard = self.state.write();
-            if !guard
-                .get_or_create(&ctx.account)
-                .clusters
-                .contains_key(cluster_arn)
-            {
-                return Err(bad_request(&format!(
-                    "The cluster '{cluster_arn}' does not exist."
-                )));
-            }
+            let guard = self.state.read();
+            ensure_cluster_in(guard.get(&ctx.account), cluster_arn, false)?;
         }
 
         if let (Some(cid), Some(runtime)) = (
@@ -2815,11 +2811,7 @@ impl KafkaService {
         }
         let mut guard = self.state.write();
         let data = guard.get_or_create(&ctx.account);
-        if !data.clusters.contains_key(cluster_arn) {
-            return Err(not_found(&format!(
-                "The cluster '{cluster_arn}' does not exist."
-            )));
-        }
+        ensure_cluster(data, cluster_arn, true)?;
         let n = data.next_seq();
         let uuid = Uuid::new_v4().to_string();
         let arn = shared::channel_arn(&ctx.region, &ctx.account, &name, &uuid, n);
@@ -2871,8 +2863,8 @@ impl KafkaService {
         cluster_arn: &str,
         q: &[(String, String)],
     ) -> Result<AwsResponse, AwsServiceError> {
-        let mut guard = self.state.write();
-        let data = guard.get_or_create(&ctx.account);
+        let guard = self.state.read();
+        let data = ensure_cluster_in(guard.get(&ctx.account), cluster_arn, true)?;
         let topic_filter = query_one(q, "topicNameFilter");
         let items: Vec<Value> = data
             .channels
@@ -3259,6 +3251,43 @@ mod tests {
         settle(&s, &c);
         let described = json_of(s.describe_cluster(&c, &arn, false).unwrap());
         assert_eq!(described["clusterInfo"]["state"].as_str(), Some("ACTIVE"));
+    }
+
+    #[test]
+    fn cluster_missing_uses_the_declared_code() {
+        assert_eq!(cluster_missing("a", true).status(), StatusCode::NOT_FOUND);
+        assert_eq!(cluster_missing("a", true).code(), "NotFoundException");
+        assert_eq!(
+            cluster_missing("a", false).status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(cluster_missing("a", false).code(), "BadRequestException");
+    }
+
+    #[test]
+    fn list_channels_requires_existing_cluster() {
+        let s = svc();
+        let c = ctx("us-east-1");
+        let Err(err) = s.list_channels(
+            &c,
+            "arn:aws:kafka:us-east-1:123456789012:cluster/nope/abc-1",
+            &[],
+        ) else {
+            panic!("unknown cluster must be rejected");
+        };
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
+        // The read path must not materialize account state just to say no.
+        let other = Ctx {
+            account: "999999999999".to_string(),
+            region: "us-east-1".to_string(),
+        };
+        assert!(s.list_channels(&other, "arn:x", &[]).is_err());
+        assert!(s.state.read().get(&other.account).is_none());
+
+        let created = json_of(s.create_cluster(&c, &cluster_body("chan"), false).unwrap());
+        let arn = created["clusterArn"].as_str().unwrap().to_string();
+        let listed = json_of(s.list_channels(&c, &arn, &[]).unwrap());
+        assert_eq!(listed["channels"], json!([]));
     }
 
     #[test]

@@ -985,7 +985,7 @@ impl StsService {
             if !enabled {
                 return Err(AwsServiceError::aws_error(
                     StatusCode::FORBIDDEN,
-                    "AccessDeniedException",
+                    "AccessDenied",
                     "AssumeRoot into another account requires centralized root access \
                      (RootSessions) to be enabled for the organization \
                      (EnableOrganizationsRootSessions).",
@@ -1004,7 +1004,7 @@ impl StsService {
             if !org_permits {
                 return Err(AwsServiceError::aws_error(
                     StatusCode::FORBIDDEN,
-                    "AccessDeniedException",
+                    "AccessDenied",
                     "AssumeRoot into another account is permitted only for the organization's \
                      management account (or a delegated administrator for centralized root \
                      access) targeting a member account of the same organization.",

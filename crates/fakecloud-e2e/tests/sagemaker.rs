@@ -778,3 +778,102 @@ async fn sagemaker_search_and_missing_lifecycle_target() {
     assert_eq!(err.meta().code(), Some("ValidationException"));
     assert_eq!(err.meta().message(), Some("RecordNotFound"));
 }
+
+#[tokio::test]
+async fn sagemaker_model_card_export_job_requires_existing_card() {
+    use aws_sdk_sagemaker::types::{ModelCardExportOutputConfig, ModelCardStatus};
+    let server = TestServer::start().await;
+    let client = sagemaker_client(&server).await;
+    let output = ModelCardExportOutputConfig::builder()
+        .s3_output_path("s3://bucket/out")
+        .build();
+
+    let err = client
+        .create_model_card_export_job()
+        .model_card_name("no-such-card")
+        .model_card_export_job_name("job1")
+        .output_config(output.clone())
+        .send()
+        .await
+        .expect_err("exporting a missing model card must fail");
+    assert!(
+        err.as_service_error()
+            .is_some_and(|e| e.is_resource_not_found()),
+        "{err:?}"
+    );
+
+    client
+        .create_model_card()
+        .model_card_name("card1")
+        .content("{}")
+        .model_card_status(ModelCardStatus::Draft)
+        .send()
+        .await
+        .unwrap();
+    let job = client
+        .create_model_card_export_job()
+        .model_card_name("card1")
+        .model_card_export_job_name("job2")
+        .output_config(output)
+        .send()
+        .await
+        .unwrap();
+    assert!(job.model_card_export_job_arn().is_some());
+}
+
+#[tokio::test]
+async fn sagemaker_workforce_vpc_config_must_be_complete() {
+    use aws_sdk_sagemaker::error::ProvideErrorMetadata;
+    use aws_sdk_sagemaker::types::WorkforceVpcConfigRequest;
+    let server = TestServer::start().await;
+    let client = sagemaker_client(&server).await;
+
+    let err = client
+        .create_workforce()
+        .workforce_name("wf-partial")
+        .workforce_vpc_config(WorkforceVpcConfigRequest::builder().vpc_id("vpc-1").build())
+        .send()
+        .await
+        .expect_err("a VPC config without subnets / security groups must be rejected");
+    assert_eq!(
+        err.as_service_error().and_then(|e| e.code()),
+        Some("ValidationException")
+    );
+
+    client
+        .create_workforce()
+        .workforce_name("wf-vpc")
+        .workforce_vpc_config(
+            WorkforceVpcConfigRequest::builder()
+                .vpc_id("vpc-1")
+                .security_group_ids("sg-1")
+                .subnets("subnet-1")
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let listed = client.list_workforces().send().await.unwrap();
+    let wf = listed
+        .workforces()
+        .iter()
+        .find(|w| w.workforce_name() == Some("wf-vpc"))
+        .expect("workforce listed");
+    let vpc = wf.workforce_vpc_config().expect("vpc config");
+    assert_eq!(vpc.vpc_id(), Some("vpc-1"));
+    assert_eq!(vpc.security_group_ids(), ["sg-1"]);
+    assert_eq!(vpc.subnets(), ["subnet-1"]);
+
+    // DescribeWorkforce returns the stored view under its `Workforce` wrapper.
+    let described = client
+        .describe_workforce()
+        .workforce_name("wf-vpc")
+        .send()
+        .await
+        .unwrap();
+    let wf = described.workforce().expect("workforce");
+    assert_eq!(wf.workforce_name(), Some("wf-vpc"));
+    let vpc = wf.workforce_vpc_config().expect("vpc config");
+    assert_eq!(vpc.vpc_id(), Some("vpc-1"));
+    assert_eq!(vpc.subnets(), ["subnet-1"]);
+}
