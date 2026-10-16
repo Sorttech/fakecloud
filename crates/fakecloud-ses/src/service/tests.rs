@@ -5929,10 +5929,12 @@ async fn test_create_email_identity_byodkim() {
         body["DkimAttributes"]["SigningAttributesOrigin"], "EXTERNAL",
         "BYODKIM must report EXTERNAL origin"
     );
-    assert_eq!(
-        body["DkimAttributes"]["DomainSigningSelector"],
-        "myselector"
-    );
+    // DkimAttributes carries the BYODKIM selector in Tokens; it has no
+    // DomainSigningSelector member.
+    assert_eq!(body["DkimAttributes"]["Tokens"], json!(["myselector"]));
+    assert!(body["DkimAttributes"]
+        .get("DomainSigningSelector")
+        .is_none());
 
     // Persisted: the caller's private key + selector are stored, not a
     // freshly generated Easy-DKIM keypair.
@@ -5959,10 +5961,12 @@ async fn test_create_email_identity_byodkim() {
         body["DkimAttributes"]["SigningAttributesOrigin"],
         "EXTERNAL"
     );
-    assert_eq!(
-        body["DkimAttributes"]["DomainSigningSelector"],
-        "myselector"
-    );
+    // DkimAttributes carries the BYODKIM selector in Tokens; it has no
+    // DomainSigningSelector member.
+    assert_eq!(body["DkimAttributes"]["Tokens"], json!(["myselector"]));
+    assert!(body["DkimAttributes"]
+        .get("DomainSigningSelector")
+        .is_none());
 }
 
 #[tokio::test]
@@ -6810,4 +6814,240 @@ async fn get_event_destinations_renders_v1_created_destination_in_v2_shape() {
     let mas = state.read();
     let stored = &mas.default_ref().event_destinations["cs"][0];
     assert_eq!(stored.matching_event_types, ["send", "renderingFailure"]);
+}
+
+/// Status (and the response, on success) of a handler call, mapping an
+/// `AwsServiceError` to its HTTP status.
+fn status_of(r: Result<AwsResponse, AwsServiceError>) -> (StatusCode, Option<AwsResponse>) {
+    match r {
+        Ok(resp) => (resp.status, Some(resp)),
+        Err(e) => (e.status(), None),
+    }
+}
+
+fn q(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+#[tokio::test]
+async fn suppressed_destinations_are_scoped_per_tenant() {
+    let state = make_state();
+    seed_identity(&state, "example.com");
+    let svc = SesV2Service::new(state);
+    let put = |body: &str| make_request(Method::PUT, "/v2/email/suppression/addresses", body);
+
+    // An empty TenantName violates @length(min: 1).
+    let resp = status_of(
+        svc.handle(put(
+            r#"{"EmailAddress":"a@x.com","Reason":"BOUNCE","TenantName":""}"#,
+        ))
+        .await,
+    );
+    assert_eq!(resp.0, StatusCode::BAD_REQUEST);
+    let resp = status_of(
+        svc.handle(make_request_with_query(
+            Method::GET,
+            "/v2/email/suppression/addresses",
+            "",
+            "TenantName=",
+            q(&[("TenantName", "")]),
+        ))
+        .await,
+    );
+    assert_eq!(resp.0, StatusCode::BAD_REQUEST);
+
+    // An unknown tenant is not found.
+    let resp = status_of(
+        svc.handle(put(
+            r#"{"EmailAddress":"a@x.com","Reason":"BOUNCE","TenantName":"ghost"}"#,
+        ))
+        .await,
+    );
+    assert_eq!(resp.0, StatusCode::NOT_FOUND);
+
+    let resp = status_of(
+        svc.handle(make_request(
+            Method::POST,
+            "/v2/email/tenants",
+            r#"{"TenantName":"t1"}"#,
+        ))
+        .await,
+    );
+    assert_eq!(resp.0, StatusCode::OK);
+    let resp = status_of(
+        svc.handle(put(
+            r#"{"EmailAddress":"tenant@x.com","Reason":"COMPLAINT","TenantName":"t1"}"#,
+        ))
+        .await,
+    );
+    assert_eq!(resp.0, StatusCode::OK);
+    let resp = status_of(
+        svc.handle(put(r#"{"EmailAddress":"acct@x.com","Reason":"BOUNCE"}"#))
+            .await,
+    );
+    assert_eq!(resp.0, StatusCode::OK);
+
+    let list = |query: Vec<(&str, &str)>| {
+        let raw = query
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        make_request_with_query(
+            Method::GET,
+            "/v2/email/suppression/addresses",
+            "",
+            &raw,
+            q(&query),
+        )
+    };
+    let emails = |resp: &AwsResponse| -> Vec<String> {
+        let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        body["SuppressedDestinationSummaries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["EmailAddress"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let resp = status_of(svc.handle(list(vec![])).await);
+    assert_eq!(emails(resp.1.as_ref().unwrap()), vec!["acct@x.com"]);
+    let resp = status_of(svc.handle(list(vec![("TenantName", "t1")])).await);
+    assert_eq!(emails(resp.1.as_ref().unwrap()), vec!["tenant@x.com"]);
+    let resp = status_of(
+        svc.handle(list(vec![("TenantName", "t1"), ("Reason", "BOUNCE")]))
+            .await,
+    );
+    assert!(emails(resp.1.as_ref().unwrap()).is_empty());
+
+    // Get / Delete honor the tenant scope too.
+    let resp = status_of(
+        svc.handle(make_request_with_query(
+            Method::GET,
+            "/v2/email/suppression/addresses/tenant@x.com",
+            "",
+            "TenantName=t1",
+            q(&[("TenantName", "t1")]),
+        ))
+        .await,
+    );
+    assert_eq!(resp.0, StatusCode::OK);
+    let resp = status_of(
+        svc.handle(make_request(
+            Method::GET,
+            "/v2/email/suppression/addresses/tenant@x.com",
+            "",
+        ))
+        .await,
+    );
+    assert_eq!(resp.0, StatusCode::NOT_FOUND);
+
+    // A send on behalf of the tenant is blocked by the tenant's list; the
+    // same recipient is deliverable outside the tenant.
+    let send = |tenant: Option<&str>| {
+        let mut body = json!({
+            "FromEmailAddress": "sender@example.com",
+            "Destination": {"ToAddresses": ["tenant@x.com"]},
+            "Content": {"Simple": {"Subject": {"Data": "s"}, "Body": {"Text": {"Data": "b"}}}}
+        });
+        if let Some(t) = tenant {
+            body["TenantName"] = json!(t);
+        }
+        make_request(Method::POST, "/v2/email/outbound-emails", &body.to_string())
+    };
+    let resp = status_of(svc.handle(send(Some("t1"))).await);
+    assert_eq!(resp.0, StatusCode::BAD_REQUEST);
+    let resp = status_of(svc.handle(send(None)).await);
+    assert_eq!(resp.0, StatusCode::OK);
+
+    let resp = status_of(
+        svc.handle(make_request_with_query(
+            Method::DELETE,
+            "/v2/email/suppression/addresses/tenant@x.com",
+            "",
+            "TenantName=t1",
+            q(&[("TenantName", "t1")]),
+        ))
+        .await,
+    );
+    assert_eq!(resp.0, StatusCode::OK);
+    let resp = status_of(svc.handle(send(Some("t1"))).await);
+    assert_eq!(resp.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn suppression_tenant_delete_miss_and_bad_dates() {
+    let state = make_state();
+    let svc = SesV2Service::new(state.clone());
+    let resp = status_of(
+        svc.handle(make_request(
+            Method::POST,
+            "/v2/email/tenants",
+            r#"{"TenantName":"t2"}"#,
+        ))
+        .await,
+    );
+    assert_eq!(resp.0, StatusCode::OK);
+    // Deleting an address the tenant never suppressed is a miss, and must not
+    // materialize an empty list for the tenant.
+    let resp = status_of(
+        svc.handle(make_request_with_query(
+            Method::DELETE,
+            "/v2/email/suppression/addresses/nobody@x.com",
+            "",
+            "TenantName=t2",
+            q(&[("TenantName", "t2")]),
+        ))
+        .await,
+    );
+    assert_eq!(resp.0, StatusCode::NOT_FOUND);
+    assert!(!state
+        .read()
+        .default_ref()
+        .tenant_suppressed_destinations
+        .contains_key("t2"));
+
+    for bad in ["NaN", "inf", "-inf", "1e300", "yesterday"] {
+        let resp = status_of(
+            svc.handle(make_request_with_query(
+                Method::GET,
+                "/v2/email/suppression/addresses",
+                "",
+                &format!("StartDate={bad}"),
+                q(&[("StartDate", bad)]),
+            ))
+            .await,
+        );
+        assert_eq!(resp.0, StatusCode::BAD_REQUEST, "{bad}");
+    }
+}
+
+#[tokio::test]
+async fn contact_list_topic_description_is_omitted_when_unset() {
+    let svc = SesV2Service::new(make_state());
+    let resp = svc
+        .handle(make_request(
+            Method::POST,
+            "/v2/email/contact-lists",
+            r#"{"ContactListName":"cl","Topics":[
+                {"TopicName":"t","DisplayName":"T","DefaultSubscriptionStatus":"OPT_IN"},
+                {"TopicName":"u","DisplayName":"U","Description":"news","DefaultSubscriptionStatus":"OPT_OUT"}
+            ]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status, StatusCode::OK);
+    let resp = svc
+        .handle(make_request(Method::GET, "/v2/email/contact-lists/cl", ""))
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    assert_eq!(
+        body["Topics"][0],
+        json!({"TopicName":"t","DisplayName":"T","DefaultSubscriptionStatus":"OPT_IN"})
+    );
+    assert_eq!(body["Topics"][1]["Description"], "news");
 }

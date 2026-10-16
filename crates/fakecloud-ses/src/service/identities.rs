@@ -166,15 +166,8 @@ impl SesV2Service {
             "SigningEnabled": true,
             "Status": "SUCCESS",
             "SigningAttributesOrigin": dkim_origin_resp,
-            "Tokens": [
-                "token1",
-                "token2",
-                "token3",
-            ],
+            "Tokens": dkim_tokens(&dkim_origin_resp, dkim_selector_resp.as_deref()),
         });
-        if let Some(ref selector) = dkim_selector_resp {
-            dkim_attrs["DomainSigningSelector"] = json!(selector);
-        }
         if let Some(ref len) = dkim_key_length_resp {
             dkim_attrs["CurrentSigningKeyLength"] = json!(len);
             dkim_attrs["NextSigningKeyLength"] = json!(len);
@@ -280,9 +273,12 @@ impl SesV2Service {
             "SigningEnabled": identity.dkim_signing_enabled,
             "Status": "SUCCESS",
             "SigningAttributesOrigin": identity.dkim_signing_attributes_origin,
-            "Tokens": ["token1", "token2", "token3"],
+            "Tokens": dkim_tokens(
+                &identity.dkim_signing_attributes_origin,
+                identity.dkim_domain_signing_selector.as_deref(),
+            ),
         });
-        if let Some(ref selector) = identity.dkim_domain_signing_selector {
+        if identity.dkim_domain_signing_selector.is_some() {
             dkim_attrs["LastKeyGenerationTimestamp"] = json!(identity.created_at.timestamp());
             dkim_attrs["CurrentSigningKeyLength"] = json!(identity
                 .dkim_next_signing_key_length
@@ -292,7 +288,6 @@ impl SesV2Service {
                 .dkim_next_signing_key_length
                 .as_deref()
                 .unwrap_or("RSA_2048_BIT"));
-            dkim_attrs["DomainSigningSelector"] = json!(selector);
         }
         let mut response = json!({
             "IdentityType": identity.identity_type,
@@ -655,7 +650,10 @@ impl SesV2Service {
 
         let response = json!({
             "DkimStatus": "SUCCESS",
-            "DkimTokens": ["token1", "token2", "token3"],
+            "DkimTokens": dkim_tokens(
+                &identity.dkim_signing_attributes_origin,
+                identity.dkim_domain_signing_selector.as_deref(),
+            ),
         });
 
         Ok(AwsResponse::json(StatusCode::OK, response.to_string()))
@@ -1062,5 +1060,16 @@ pub(crate) fn certificate_from_address(
             "FromAddress {addr} does not belong to domain identity {}",
             identity.identity_name
         ))
+    }
+}
+
+/// The `DkimAttributes.Tokens` for an identity. SES reports the BYODKIM
+/// selector there for an `EXTERNAL` signing origin (the record to publish is
+/// `<selector>._domainkey.<domain>`); `DkimAttributes` has no separate selector
+/// member. Easy DKIM (`AWS_SES`) reports its CNAME tokens.
+fn dkim_tokens(origin: &str, selector: Option<&str>) -> Vec<String> {
+    match (origin, selector) {
+        ("EXTERNAL", Some(selector)) => vec![selector.to_string()],
+        _ => vec!["token1".into(), "token2".into(), "token3".into()],
     }
 }

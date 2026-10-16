@@ -686,7 +686,7 @@ impl SupportService {
             };
             let start = range_start.unwrap_or(default_start);
             let end = range_end.unwrap_or(start + MAX_UPLOAD_URLS_PER_CALL);
-            let end = validate_upload_range(&upload_id, start, end, total_parts)?;
+            let end = validate_upload_range(start, end, total_parts)?;
             if let Some(upload) = new_upload {
                 d.attachment_uploads.insert(upload_id.clone(), upload);
             }
@@ -1199,22 +1199,15 @@ fn link_region(req: &AwsRequest, d: &SupportData) -> String {
 /// for into the exclusive end index to hand links out up to. `startIndex` is
 /// inclusive and `endIndex` exclusive, the range covers at most
 /// [`MAX_UPLOAD_URLS_PER_CALL`] parts, and an end past the last part is capped
-/// there rather than refused (the file simply has fewer parts left).
-fn validate_upload_range(
-    upload_id: &str,
-    start: i64,
-    end: i64,
-    total_parts: i64,
-) -> Result<i64, AwsServiceError> {
+/// there rather than refused (the file simply has fewer parts left). A range
+/// that starts past the last part therefore holds no parts at all: the call
+/// returns no links and a null `nextIndex`, the documented "every link has
+/// been returned" answer.
+fn validate_upload_range(start: i64, end: i64, total_parts: i64) -> Result<i64, AwsServiceError> {
     if start < 1 {
         return Err(validation_error(
             "uploadRange.startIndex must be at least 1; part indexes start at 1.",
         ));
-    }
-    if start > total_parts {
-        return Err(validation_error(format!(
-            "uploadRange.startIndex {start} is past the last part of upload {upload_id}, which has {total_parts} parts."
-        )));
     }
     if end <= start {
         return Err(validation_error(format!(
@@ -1304,30 +1297,46 @@ fn is_dry_run(body: &Value) -> bool {
 }
 
 /// Resolve `uploadIds` to the attachments their completed uploads produced.
-/// Neither `CreateCase` nor `AddCommunicationToCase` models `UploadIdNotFound`,
-/// so an unknown or unfinished upload is reported as a request-validation
-/// failure, which both operations can express.
+/// Neither `CreateCase` nor `AddCommunicationToCase` models `UploadIdNotFound`;
+/// both declare the attachment-lookup errors, which describe exactly these
+/// failures: an upload that doesn't exist or has produced no attachment yet is
+/// `AttachmentSetIdNotFound` (its attachments "could not be found"), and one
+/// whose deadline passed or that failed is `AttachmentSetExpired`.
 fn uploads_to_attachment_details(
     d: &SupportData,
     upload_ids: &[String],
 ) -> Result<Vec<Value>, AwsServiceError> {
+    let now = iso_now();
     let mut details = Vec::with_capacity(upload_ids.len());
     for upload_id in upload_ids {
-        let upload = d
-            .attachment_uploads
-            .get(upload_id)
-            .ok_or_else(|| validation_error(format!("Upload {upload_id} was not found.")))?;
-        let attachment_id = upload.attachment_id.as_ref().ok_or_else(|| {
-            validation_error(format!(
-                "Upload {upload_id} has not been completed; call CompleteAttachmentUpload first."
-            ))
+        let upload = d.attachment_uploads.get(upload_id).ok_or_else(|| {
+            upload_attachments_not_found(format!("Upload {upload_id} was not found."))
         })?;
+        let attachment_id = match &upload.attachment_id {
+            Some(id) => id,
+            None if upload.status == UPLOAD_FAILED || upload.expiry <= now => {
+                return Err(AwsServiceError::aws_error(
+                    StatusCode::BAD_REQUEST,
+                    "AttachmentSetExpired",
+                    format!("Upload {upload_id} has expired."),
+                ));
+            }
+            None => {
+                return Err(upload_attachments_not_found(format!(
+                "Upload {upload_id} has not been completed; call CompleteAttachmentUpload first."
+            )))
+            }
+        };
         details.push(json!({
             "attachmentId": attachment_id,
             "fileName": upload.file_name,
         }));
     }
     Ok(details)
+}
+
+fn upload_attachments_not_found(msg: String) -> AwsServiceError {
+    AwsServiceError::aws_error(StatusCode::BAD_REQUEST, "AttachmentSetIdNotFound", msg)
 }
 
 fn string_list(body: &Value, name: &str) -> Vec<String> {
@@ -1913,12 +1922,16 @@ mod tests {
             "{err:?}"
         );
 
-        // A start past the last part.
-        let err = expect_err(svc.get_attachment_upload_links(
-            &req("GetAttachmentUploadLinks", json!({})),
-            &range(26, 27),
-        ));
-        assert!(format!("{err:?}").contains("past the last part"), "{err:?}");
+        // A start past the last part has no parts left to hand out.
+        let past = body_of(
+            &svc.get_attachment_upload_links(
+                &req("GetAttachmentUploadLinks", json!({})),
+                &range(26, 27),
+            )
+            .unwrap(),
+        );
+        assert!(issued_parts(&past).is_empty(), "{past}");
+        assert!(past["nextIndex"].is_null(), "{past}");
 
         // Exactly ten is allowed, and an end past the last part is capped
         // there rather than refused.
@@ -2416,6 +2429,18 @@ mod tests {
             }),
         ));
         assert!(format!("{err:?}").contains("has not been completed"));
+        assert_eq!(err.code(), "AttachmentSetIdNotFound");
+
+        // An unknown upload is not found either.
+        let err = expect_err(svc.add_communication_to_case(
+            &req("AddCommunicationToCase", json!({})),
+            &json!({
+                "caseId": case_id,
+                "communicationBody": "and another",
+                "uploadIds": ["upload-missing"],
+            }),
+        ));
+        assert_eq!(err.code(), "AttachmentSetIdNotFound");
     }
 
     #[tokio::test]
