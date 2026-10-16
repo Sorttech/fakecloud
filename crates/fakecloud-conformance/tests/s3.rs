@@ -2139,7 +2139,7 @@ async fn s3_object_annotations_round_trip() {
     let base = format!("{}/annot-bkt/doc.txt?annotation", server.endpoint());
 
     let resp = http
-        .put(format!("{base}&AnnotationName=review"))
+        .put(format!("{base}&annotationName=review"))
         .header("Authorization", S3_AUTH)
         .body("looks good")
         .send()
@@ -2148,7 +2148,7 @@ async fn s3_object_annotations_round_trip() {
     assert!(resp.status().is_success(), "put: {}", resp.status());
 
     let resp = http
-        .get(format!("{base}&AnnotationName=review"))
+        .get(format!("{base}&annotationName=review"))
         .header("Authorization", S3_AUTH)
         .send()
         .await
@@ -2170,7 +2170,7 @@ async fn s3_object_annotations_round_trip() {
     );
 
     let resp = http
-        .delete(format!("{base}&AnnotationName=review"))
+        .delete(format!("{base}&annotationName=review"))
         .header("Authorization", S3_AUTH)
         .send()
         .await
