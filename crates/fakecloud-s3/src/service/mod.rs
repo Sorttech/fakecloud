@@ -572,10 +572,7 @@ impl S3Service {
             .bucket_region(bucket)
             .unwrap_or_else(|| req.region.clone());
         self.authorize_kms_key_use(req, key_account, &region, key, "Decrypt")?;
-        let bucket_arn = Arn::s3(bucket).to_string();
-        let mut ctx = std::collections::HashMap::new();
-        ctx.insert("aws:s3:arn".to_string(), bucket_arn);
-        hook.decrypt(key_account, envelope, "s3.amazonaws.com", ctx)
+        crate::sse::decrypt_envelope(hook.as_ref(), account_id, bucket, Some(key), envelope)
             .map(bytes::Bytes::from)
             .map_err(|err| {
                 tracing::warn!(bucket = %bucket, error = %err, "SSE-KMS decrypt failed");
