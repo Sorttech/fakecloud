@@ -189,6 +189,7 @@ impl ResourceProvisioner {
                 })
                 .collect(),
             enable_termination_protection: false,
+            reapply_logical_ids: Default::default(),
         };
 
         {

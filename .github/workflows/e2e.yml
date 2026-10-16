@@ -217,24 +217,40 @@ jobs:
       # fakecloud uses a cached image without pulling. ECR Public stays the
       # fallback, and a partition that fails to warm an image still runs:
       # fakecloud's own pull, with retries, is the last resort.
-      - name: Warm Docker Official Images
+      - name: Warm container images the tests reference
         run: |
-          # alpine:latest is the most-used tag across the ECS suites; it was
-          # missing here because those suites referenced it under
-          # `public.ecr.aws/library/alpine`, a path ECR Public does not serve, so
-          # the warm target never matched what the tests asked for.
-          images="alpine:latest alpine:3.20 alpine:3.19 ubuntu:22.04 nginx:alpine busybox:1.36"
+          # Every ECR Public image reference in the E2E sources, so an image a
+          # test starts using is warmed without anyone remembering to list it
+          # here (the aws-cli image the ECS task-role test runs was missing,
+          # and failed its partition on "Data limit exceeded").
+          # ubuntu:22.04 is not named by any test: fakecloud runs it for EC2
+          # instances launched from its default AMIs.
+          images=$( (grep -rhoE 'public\.ecr\.aws/[a-z0-9._/-]+:[A-Za-z0-9._-]+' \
+            crates/fakecloud-e2e/tests; echo public.ecr.aws/docker/library/ubuntu:22.04) | sort -u)
+          # Mirrors that serve the same image without ECR Public's anonymous
+          # data cap, in the order to try them. Unmapped images fall back to
+          # ECR Public itself.
+          mirrors_for() {
+            case "$1" in
+              public.ecr.aws/docker/library/*)
+                echo "mirror.gcr.io/library/${1#public.ecr.aws/docker/library/}" ;;
+              public.ecr.aws/aws-cli/aws-cli:*)
+                tag="${1##*:}"
+                echo "mirror.gcr.io/amazon/aws-cli:$tag docker.io/amazon/aws-cli:$tag" ;;
+            esac
+          }
           clis=docker
           if [ "$INSTALL_PODMAN" = "true" ]; then clis="docker podman"; fi
           for cli in $clis; do
-            for img in $images; do
-              target="public.ecr.aws/docker/library/$img"
+            for target in $images; do
               ok=
               for attempt in 1 2 3; do
-                if $cli pull -q "mirror.gcr.io/library/$img" \
-                  && $cli tag "mirror.gcr.io/library/$img" "$target"; then
-                  ok=1; break
-                fi
+                for src in $(mirrors_for "$target"); do
+                  if $cli pull -q "$src" && $cli tag "$src" "$target"; then
+                    ok=1; break
+                  fi
+                done
+                [ -n "$ok" ] && break
                 if $cli pull -q "$target"; then ok=1; break; fi
                 sleep $((attempt * 10))
               done
