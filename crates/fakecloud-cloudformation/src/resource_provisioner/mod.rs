@@ -1257,6 +1257,7 @@ mod codepipeline;
 mod cognito;
 mod config;
 mod cwlogs;
+mod dynamic_references;
 mod dynamodb;
 mod ec2;
 mod ec2_network;
