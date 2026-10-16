@@ -6,20 +6,18 @@
 use super::*;
 
 /// CFN currently provisions the classic and Extended S3 configurations. Check
-/// their enum inputs, including Extended S3's backup, before parsing or locking
-/// state; the CFN parser otherwise silently discards non-string enum values.
+/// their enum inputs, including the backup blocks, with the same validator the
+/// Firehose API uses before parsing or locking state; the CFN parser otherwise
+/// silently discards non-string enum values.
 fn validate_firehose_compression(props: &serde_json::Value) -> Result<(), String> {
     for member in [
         "S3DestinationConfiguration",
         "ExtendedS3DestinationConfiguration",
     ] {
-        fakecloud_firehose::validate_s3_compression(&props[member])
+        fakecloud_firehose::validate_s3_destination_compression(&props[member], false)
             .map_err(|err| err.to_string())?;
     }
-    fakecloud_firehose::validate_s3_compression(
-        &props["ExtendedS3DestinationConfiguration"]["S3BackupConfiguration"],
-    )
-    .map_err(|err| err.to_string())
+    Ok(())
 }
 
 impl ResourceProvisioner {
@@ -255,6 +253,24 @@ mod tests {
         changed.properties[base]["S3BackupConfiguration"] = json!({"CompressionFormat": 42});
         assert!(prov.update_resource(&existing, &changed).is_err());
         assert_eq!(firehose_state(&prov), before);
+    }
+
+    #[test]
+    fn firehose_compression_backup_validated_for_both_s3_shapes() {
+        for base in [
+            "S3DestinationConfiguration",
+            "ExtendedS3DestinationConfiguration",
+        ] {
+            let prov = make_provisioner();
+            let mut resource = firehose_resource(base);
+            resource.properties[base]["S3BackupConfiguration"] =
+                json!({"CompressionFormat": "BROTLI"});
+            let err = prov
+                .create_resource(&resource)
+                .expect_err("invalid backup enum must fail provisioning");
+            assert!(err.contains("CompressionFormat"), "{base}: {err}");
+            assert!(prov.firehose_state.read().accounts.is_empty());
+        }
     }
 
     #[test]

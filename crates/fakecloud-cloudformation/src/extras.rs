@@ -1076,6 +1076,7 @@ impl CloudFormationService {
                                     notification_arns: Vec::new(),
                                     outputs: Vec::new(),
                                     enable_termination_protection: false,
+                                    reapply_logical_ids: Default::default(),
                                 },
                             );
                             // Real CloudFormation emits a stack event when a
@@ -3257,6 +3258,7 @@ pub(crate) mod tests {
                     notification_arns: vec![],
                     outputs: vec![],
                     enable_termination_protection: false,
+                    reapply_logical_ids: Default::default(),
                 },
             );
 
@@ -3432,6 +3434,7 @@ pub(crate) mod tests {
                     notification_arns: vec![],
                     outputs: vec![],
                     enable_termination_protection: false,
+                    reapply_logical_ids: Default::default(),
                 },
             );
 

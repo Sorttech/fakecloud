@@ -2143,6 +2143,7 @@ impl CloudFormationService {
                     notification_arns: notification_arns.clone(),
                     outputs: Vec::new(),
                     enable_termination_protection,
+                    reapply_logical_ids: Default::default(),
                 },
             );
             record_stack_status_event(
@@ -3732,6 +3733,14 @@ impl ResourceChangeAction {
 /// in-place update resources whose properties changed. Returns the list of
 /// changes applied (for event emission) on success or `Err(msg)` if any
 /// resource operation fails.
+///
+/// A failed run does not roll back, and its callers keep the previous
+/// template, so a resource it already updated no longer matches that
+/// template. Those logical ids are recorded in `stack.reapply_logical_ids`
+/// and re-applied by the next update rather than skipped as unchanged; a
+/// successful run reconciles every resource and clears them. (Resources a
+/// failed run created or removed need no record: the stored template lacks or
+/// still declares them, so the next update's add/remove diff handles them.)
 pub(crate) fn apply_resource_updates(
     stack: &mut crate::state::Stack,
     new_resource_defs: &[template::ResourceDefinition],
@@ -3741,6 +3750,42 @@ pub(crate) fn apply_resource_updates(
     imports: &BTreeMap<String, String>,
 ) -> Result<Vec<ResourceChange>, String> {
     let mut changes: Vec<ResourceChange> = Vec::new();
+    match apply_resource_changes(
+        stack,
+        new_resource_defs,
+        template_body,
+        parameters,
+        provisioner,
+        imports,
+        &mut changes,
+    ) {
+        Ok(()) => {
+            stack.reapply_logical_ids.clear();
+            Ok(changes)
+        }
+        Err(err) => {
+            stack.reapply_logical_ids.extend(
+                changes
+                    .iter()
+                    .filter(|c| c.action == ResourceChangeAction::Update)
+                    .map(|c| c.logical_id.clone()),
+            );
+            Err(err)
+        }
+    }
+}
+
+/// The body of `apply_resource_updates`, recording each applied change in
+/// `changes` as it goes so a failure still reports what was applied before it.
+fn apply_resource_changes(
+    stack: &mut crate::state::Stack,
+    new_resource_defs: &[template::ResourceDefinition],
+    template_body: &str,
+    parameters: &BTreeMap<String, String>,
+    provisioner: &crate::resource_provisioner::ResourceProvisioner,
+    imports: &BTreeMap<String, String>,
+    changes: &mut Vec<ResourceChange>,
+) -> Result<(), String> {
     let old_logical_ids: std::collections::HashSet<String> = stack
         .resources
         .iter()
@@ -3895,9 +3940,12 @@ pub(crate) fn apply_resource_updates(
             // replacement fallback (`reprovision_resource`) from destroying and
             // recreating a stateful backing resource (cache/db/instance) or
             // cascading a Glue-database delete on an unrelated stack update.
-            if old_resolved
-                .get(&resource_def.logical_id)
-                .is_some_and(|old_props| *old_props == resolved_def.properties)
+            // A resource an earlier failed update already changed no longer
+            // matches the stored template, so it is never "unchanged".
+            if !stack.reapply_logical_ids.contains(&resource_def.logical_id)
+                && old_resolved
+                    .get(&resource_def.logical_id)
+                    .is_some_and(|old_props| *old_props == resolved_def.properties)
             {
                 continue;
             }
@@ -3956,7 +4004,7 @@ pub(crate) fn apply_resource_updates(
         }
     }
 
-    Ok(changes)
+    Ok(())
 }
 
 /// Pushes a single `StackEvent` row onto the per-stack event log so
@@ -4931,6 +4979,112 @@ mod tests {
     #[tokio::test]
     async fn firehose_execute_change_set_rejects_retry_and_preserves_applied_metadata() {
         firehose_retry_preserves_applied_metadata(true).await;
+    }
+
+    /// A gets the prefix, B (DependsOn A) the codec.
+    fn firehose_drift_template(prefix_a: &str, codec_b: &str) -> String {
+        let stream = |name: &str, prefix: &str, codec: &str| {
+            serde_json::json!({
+                "Type": "AWS::KinesisFirehose::DeliveryStream",
+                "Properties": {
+                    "DeliveryStreamName": name,
+                    "ExtendedS3DestinationConfiguration": {
+                        "RoleARN": "arn:aws:iam::123456789012:role/fh",
+                        "BucketARN": "arn:aws:s3:::bucket",
+                        "Prefix": prefix,
+                        "CompressionFormat": codec
+                    }
+                }
+            })
+        };
+        let mut b = stream("drift-b", "b/", codec_b);
+        b["DependsOn"] = serde_json::json!("A");
+        serde_json::json!({"Resources": {"A": stream("drift-a", prefix_a, "GZIP"), "B": b}})
+            .to_string()
+    }
+
+    fn firehose_drift_stream(svc: &CloudFormationService, name: &str) -> (String, String) {
+        let firehose = svc.deps.firehose.read();
+        let dest = firehose
+            .get("123456789012")
+            .unwrap()
+            .streams("us-east-1")
+            .unwrap()[name]
+            .destination
+            .clone()
+            .unwrap();
+        (
+            dest.prefix.unwrap_or_default(),
+            dest.compression_format.unwrap_or_default(),
+        )
+    }
+
+    async fn firehose_failed_update_reapplies_changed_resources(change_set: bool) {
+        let svc = make_service();
+        let params = |body: &str| {
+            HashMap::from([
+                ("StackName".to_string(), "firehose-retry".to_string()),
+                ("TemplateBody".to_string(), body.to_string()),
+            ])
+        };
+        let original = firehose_drift_template("a1/", "GZIP");
+        svc.handle(make_request("CreateStack", params(&original)))
+            .await
+            .unwrap();
+        assert_eq!(firehose_retry_stack(&svc).status, "CREATE_COMPLETE");
+
+        // A's in-place change applies before B fails validation; the failed
+        // update keeps the old template, which no longer describes A.
+        let bad = firehose_drift_template("a2/", "BROTLI");
+        let err = firehose_retry_apply(&svc, params(&bad), change_set, "bad-1")
+            .await
+            .err()
+            .expect("invalid CompressionFormat must fail");
+        assert!(err.message().contains("CompressionFormat"));
+        let stack = firehose_retry_stack(&svc);
+        assert_eq!(stack.status, "UPDATE_ROLLBACK_COMPLETE");
+        assert_eq!(stack.template, original);
+        assert_eq!(firehose_drift_stream(&svc, "drift-a").0, "a2/");
+        assert!(stack.reapply_logical_ids.contains("A"));
+        assert!(!stack.reapply_logical_ids.contains("B"));
+
+        // The identical bad retry still reaches validation.
+        let err = firehose_retry_apply(&svc, params(&bad), change_set, "bad-2")
+            .await
+            .err()
+            .expect("identical invalid retry must fail");
+        assert!(err.message().contains("CompressionFormat"));
+
+        // Redeploying the OLD template re-applies A instead of skipping it as
+        // unchanged against the stored template.
+        firehose_retry_apply(&svc, params(&original), change_set, "old")
+            .await
+            .unwrap();
+        let stack = firehose_retry_stack(&svc);
+        assert_eq!(stack.status, "UPDATE_COMPLETE");
+        assert!(stack.reapply_logical_ids.is_empty());
+        assert_eq!(firehose_drift_stream(&svc, "drift-a").0, "a1/");
+
+        // A subsequent good update applies in full.
+        let good = firehose_drift_template("a3/", "Snappy");
+        firehose_retry_apply(&svc, params(&good), change_set, "good")
+            .await
+            .unwrap();
+        let stack = firehose_retry_stack(&svc);
+        assert_eq!(stack.status, "UPDATE_COMPLETE");
+        assert_eq!(stack.template, good);
+        assert_eq!(firehose_drift_stream(&svc, "drift-a").0, "a3/");
+        assert_eq!(firehose_drift_stream(&svc, "drift-b").1, "Snappy");
+    }
+
+    #[tokio::test]
+    async fn firehose_update_stack_failure_reapplies_changed_resources() {
+        firehose_failed_update_reapplies_changed_resources(false).await;
+    }
+
+    #[tokio::test]
+    async fn firehose_execute_change_set_failure_reapplies_changed_resources() {
+        firehose_failed_update_reapplies_changed_resources(true).await;
     }
 
     #[tokio::test]
