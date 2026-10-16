@@ -182,6 +182,129 @@ pub(crate) fn function_code_url(
     )
 }
 
+/// Smithy `LayerName` `@pattern`, quoted verbatim in the validation message.
+const LAYER_NAME_PATTERN: &str = "(arn:(aws[a-zA-Z-]*)?:lambda:(eusc-)?[a-z]{2}((-gov)|(-iso([a-z]?)))?-[a-z]+-\\d{1}:\\d{12}:layer:[a-zA-Z0-9-_]+)|[a-zA-Z0-9-_]+";
+
+/// Smithy `LayerName` `@length` max. It bounds the whole value, so it caps
+/// the layer-ARN form too.
+const LAYER_NAME_MAX_LEN: usize = 140;
+
+/// Lambda's answer to a request member that violates its Smithy `@length`
+/// or `@pattern`: the request is refused by input validation before the
+/// operation runs, with `ValidationException` and the "1 validation error
+/// detected" wording.
+pub(crate) fn constraint_violation(value: &str, member: &str, constraint: &str) -> AwsServiceError {
+    AwsServiceError::aws_error(
+        StatusCode::BAD_REQUEST,
+        "ValidationException",
+        format!(
+            "1 validation error detected: Value '{value}' at '{member}' failed to satisfy constraint: {constraint}"
+        ),
+    )
+}
+
+/// `[a-zA-Z0-9-_]+`: a bare layer name.
+fn is_bare_layer_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// `(eusc-)?[a-z]{2}((-gov)|(-iso([a-z]?)))?-[a-z]+-\d{1}`: the region part of
+/// a layer ARN (`us-east-1`, `us-gov-west-1`, `us-isob-east-1`,
+/// `eusc-de-east-1`).
+fn is_layer_arn_region(region: &str) -> bool {
+    let rest = region.strip_prefix("eusc-").unwrap_or(region);
+    let mut parts: Vec<&str> = rest.split('-').collect();
+    // Trailing `\d{1}`.
+    match parts.pop() {
+        Some(d) if d.len() == 1 && d.as_bytes()[0].is_ascii_digit() => {}
+        _ => return false,
+    }
+    // `[a-z]+` before it.
+    match parts.pop() {
+        Some(p) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_lowercase()) => {}
+        _ => return false,
+    }
+    let lower = |s: &str| s.bytes().all(|b| b.is_ascii_lowercase());
+    match parts.as_slice() {
+        [cc] => cc.len() == 2 && lower(cc),
+        [cc, partition] => {
+            cc.len() == 2
+                && lower(cc)
+                && (*partition == "gov"
+                    || partition
+                        .strip_prefix("iso")
+                        .is_some_and(|s| s.len() <= 1 && lower(s)))
+        }
+        _ => false,
+    }
+}
+
+/// The ARN alternative of the `LayerName` pattern:
+/// `arn:(aws[a-zA-Z-]*)?:lambda:<region>:\d{12}:layer:[a-zA-Z0-9-_]+`.
+fn is_layer_name_arn(arn: &str) -> bool {
+    let parts: Vec<&str> = arn.split(':').collect();
+    let [prefix, partition, service, region, account, kind, name] = parts.as_slice() else {
+        return false;
+    };
+    let partition_ok = partition.is_empty()
+        || partition
+            .strip_prefix("aws")
+            .is_some_and(|rest| rest.bytes().all(|b| b.is_ascii_alphabetic() || b == b'-'));
+    *prefix == "arn"
+        && partition_ok
+        && *service == "lambda"
+        && is_layer_arn_region(region)
+        && account.len() == 12
+        && account.bytes().all(|b| b.is_ascii_digit())
+        && *kind == "layer"
+        && is_bare_layer_name(name)
+}
+
+/// Validate a `LayerName` value against its Smithy constraints: `@length
+/// 1..140` and the `@pattern` (a bare name or a layer ARN). Lambda rejects a
+/// malformed name before looking anything up, so this applies equally to
+/// `PublishLayerVersion` (which would otherwise create the layer) and the
+/// idempotent `DeleteLayerVersion`.
+pub(crate) fn validate_layer_name(raw: &str) -> Result<(), AwsServiceError> {
+    let len = raw.chars().count();
+    if len < 1 {
+        return Err(constraint_violation(
+            raw,
+            "layerName",
+            "Member must have length greater than or equal to 1",
+        ));
+    }
+    if len > LAYER_NAME_MAX_LEN {
+        return Err(constraint_violation(
+            raw,
+            "layerName",
+            &format!("Member must have length less than or equal to {LAYER_NAME_MAX_LEN}"),
+        ));
+    }
+    if is_bare_layer_name(raw) || is_layer_name_arn(raw) {
+        return Ok(());
+    }
+    Err(constraint_violation(
+        raw,
+        "layerName",
+        &format!("Member must satisfy regular expression pattern: {LAYER_NAME_PATTERN}"),
+    ))
+}
+
+/// The validated `LayerName` path label (`/2018-10-31/layers/{LayerName}/...`)
+/// of a layer operation, as sent.
+pub(crate) fn layer_name_label(req: &AwsRequest) -> Result<String, AwsServiceError> {
+    let raw = req
+        .path_segments
+        .get(2)
+        .map(String::as_str)
+        .unwrap_or_default();
+    validate_layer_name(raw)?;
+    Ok(raw.to_string())
+}
+
 /// AWS layer-version ARN: `arn:aws:lambda:<region>:<account>:layer:<name>:<version>`.
 /// Returns `(account_id, layer_name, version)`. Used to resolve cross-account
 /// layer references attached to a function.
@@ -1169,7 +1292,14 @@ mod tests {
         run(&s, "GetAccountSettings", "", None, &[]).await;
         run(&s, "InvokeAsync", r#"{}"#, Some("fn"), &[]).await;
         run(&s, "ListLayers", "", None, &[]).await;
-        run(&s, "ListLayerVersions", "", Some("layer"), &[]).await;
+        run(
+            &s,
+            "ListLayerVersions",
+            "",
+            Some("layer"),
+            &["2018-10-31", "layers", "layer", "versions"],
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -1184,7 +1314,126 @@ mod tests {
         )
         .await;
         run(&s, "ListLayers", "", None, &[]).await;
-        run(&s, "ListLayerVersions", "", Some("layer1"), &[]).await;
+        run(
+            &s,
+            "ListLayerVersions",
+            "",
+            Some("layer1"),
+            &["2018-10-31", "layers", "layer1", "versions"],
+        )
+        .await;
+    }
+
+    #[test]
+    fn layer_name_accepts_bare_names_and_the_layer_arn_form() {
+        use super::validate_layer_name;
+        for ok in [
+            "my-layer_1",
+            "arn:aws:lambda:us-east-1:123456789012:layer:my-layer",
+            "arn:aws-cn:lambda:cn-north-1:123456789012:layer:l",
+            "arn:aws-us-gov:lambda:us-gov-west-1:123456789012:layer:l",
+            "arn:aws-iso-b:lambda:us-isob-east-1:123456789012:layer:l",
+            "arn:aws:lambda:eusc-de-east-1:123456789012:layer:l",
+        ] {
+            assert!(validate_layer_name(ok).is_ok(), "{ok}");
+        }
+        assert!(validate_layer_name(&"a".repeat(140)).is_ok());
+    }
+
+    #[test]
+    fn layer_name_constraint_violations_are_validation_exceptions() {
+        use super::validate_layer_name;
+        let long_bare = "a".repeat(141);
+        let long_arn = format!(
+            "arn:aws:lambda:us-east-1:123456789012:layer:{}",
+            "a".repeat(100)
+        );
+        for (bad, constraint) in [
+            ("", "Member must have length greater than or equal to 1"),
+            (
+                long_bare.as_str(),
+                "Member must have length less than or equal to 140",
+            ),
+            // The 140-character @length bounds the whole value, ARN included.
+            (
+                long_arn.as_str(),
+                "Member must have length less than or equal to 140",
+            ),
+            (
+                "INVALID!OMITTED!LABEL",
+                "Member must satisfy regular expression pattern",
+            ),
+            ("dot.ted", "Member must satisfy regular expression pattern"),
+            (
+                "arn:aws:lambda:us-east-1:123456789012:function:f",
+                "regular expression pattern",
+            ),
+            (
+                "arn:aws:lambda:us-east-1:12345:layer:l",
+                "regular expression pattern",
+            ),
+            (
+                "arn:aws:lambda:useast1:123456789012:layer:l",
+                "regular expression pattern",
+            ),
+            // A layer *version* ARN is not a `LayerName`.
+            (
+                "arn:aws:lambda:us-east-1:123456789012:layer:l:1",
+                "regular expression pattern",
+            ),
+            (
+                "arn:gcp:lambda:us-east-1:123456789012:layer:l",
+                "regular expression pattern",
+            ),
+        ] {
+            let err = validate_layer_name(bad).expect_err(bad);
+            assert_eq!(err.code(), "ValidationException", "{bad}");
+            assert!(
+                err.message().starts_with(&format!(
+                    "1 validation error detected: Value '{bad}' at 'layerName'"
+                )),
+                "{bad}: {}",
+                err.message()
+            );
+            assert!(
+                err.message().contains(constraint),
+                "{bad}: {}",
+                err.message()
+            );
+        }
+    }
+
+    /// A malformed `LayerName` is rejected before any lookup: publishing
+    /// must not create the layer, and the otherwise idempotent delete and
+    /// the listing must fail too.
+    #[tokio::test]
+    async fn layer_ops_reject_a_pattern_invalid_layer_name() {
+        let s = svc();
+        let bad = "bad!name";
+        let segs = ["2018-10-31", "layers", bad, "versions", "1"];
+        for (action, body) in [
+            ("PublishLayerVersion", r#"{"Content":{"ZipFile":""}}"#),
+            ("ListLayerVersions", ""),
+            ("DeleteLayerVersion", ""),
+            ("GetLayerVersion", ""),
+            ("GetLayerVersionPolicy", ""),
+            (
+                "AddLayerVersionPermission",
+                r#"{"StatementId":"s","Action":"lambda:GetLayerVersion","Principal":"*"}"#,
+            ),
+            ("RemoveLayerVersionPermission", ""),
+        ] {
+            let err = s
+                .handle_extra(action, Some(bad), &req(action, body, &segs))
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{action} accepted a malformed LayerName"));
+            assert_eq!(err.code(), "ValidationException", "{action}");
+        }
+        let accounts = s.state.read();
+        assert!(accounts
+            .regional("000000000000", "us-east-1")
+            .is_none_or(|st| st.layers.is_empty()));
     }
 
     #[tokio::test]

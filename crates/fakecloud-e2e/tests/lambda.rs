@@ -1665,3 +1665,50 @@ async fn lambda_accepts_every_newly_modeled_runtime() {
             .unwrap_or_else(|e| panic!("CompatibleRuntime {rt} rejected: {e:?}"));
     }
 }
+
+/// Durable-execution callback ids are base64 tokens (`CallbackId` `@pattern`
+/// `^[A-Za-z0-9+/]+={0,2}$`); an id outside it is rejected for all three
+/// callback operations, while a well-formed one is accepted.
+#[tokio::test]
+async fn durable_execution_callback_id_must_match_its_pattern() {
+    let server = TestServer::start().await;
+    let client = server.lambda_client().await;
+
+    client
+        .send_durable_execution_callback_success()
+        .callback_id("Y2Itb2s=")
+        .send()
+        .await
+        .expect("well-formed callback id");
+
+    let e = client
+        .send_durable_execution_callback_success()
+        .callback_id("not_base64")
+        .send()
+        .await
+        .expect_err("success with a malformed id");
+    assert_eq!(
+        e.into_service_error().meta().code(),
+        Some("ValidationException")
+    );
+    let e = client
+        .send_durable_execution_callback_failure()
+        .callback_id("not-base64")
+        .send()
+        .await
+        .expect_err("failure with a malformed id");
+    assert_eq!(
+        e.into_service_error().meta().code(),
+        Some("ValidationException")
+    );
+    let e = client
+        .send_durable_execution_callback_heartbeat()
+        .callback_id("a=b")
+        .send()
+        .await
+        .expect_err("heartbeat with a malformed id");
+    assert_eq!(
+        e.into_service_error().meta().code(),
+        Some("ValidationException")
+    );
+}

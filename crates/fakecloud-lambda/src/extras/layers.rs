@@ -7,24 +7,10 @@ impl LambdaService {
 
     pub(super) fn publish_layer_version(
         &self,
-        layer_name: &str,
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
-        if layer_name.is_empty() {
-            return Err(missing("LayerName"));
-        }
-        let limit = if layer_name.starts_with("arn:") {
-            200
-        } else {
-            140
-        };
-        if layer_name.chars().count() > limit {
-            return Err(AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "InvalidParameterValueException",
-                "LayerName exceeds the 140-character maximum",
-            ));
-        }
+        let layer_name = layer_name_label(req)?;
+        let layer_name = layer_name.as_str();
         let body = body(req);
         // `Content` is `@required` on `PublishLayerVersionRequest` —
         // reject when missing rather than silently publishing a
@@ -186,10 +172,11 @@ impl LambdaService {
 
     pub(super) fn list_layer_versions(
         &self,
-        layer_name: &str,
         account_id: &str,
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
+        let layer_name = layer_name_label(req)?;
+        let layer_name = layer_name.as_str();
         let marker = req.query_params.get("Marker").map(String::as_str);
         let max_items = crate::service::marker_page_size(req);
         let region = req.region.clone();
@@ -228,7 +215,7 @@ impl LambdaService {
         &self,
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
-        let layer_name = req.path_segments.get(2).cloned().unwrap_or_default();
+        let layer_name = layer_name_label(req)?;
         let version: i64 = req
             .path_segments
             .get(4)
@@ -318,22 +305,7 @@ impl LambdaService {
         &self,
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
-        let layer_name = req.path_segments.get(2).cloned().unwrap_or_default();
-        if layer_name.is_empty() {
-            return Err(missing("LayerName"));
-        }
-        let limit = if layer_name.starts_with("arn:") {
-            200
-        } else {
-            140
-        };
-        if layer_name.chars().count() > limit {
-            return Err(AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "InvalidParameterValueException",
-                "LayerName exceeds the 140-character maximum",
-            ));
-        }
+        let layer_name = layer_name_label(req)?;
         let version_raw = req.path_segments.get(4).map(|s| s.as_str()).unwrap_or("");
         if version_raw.is_empty() {
             return Err(missing("VersionNumber"));
@@ -357,7 +329,7 @@ impl LambdaService {
         &self,
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
-        let layer_name = req.path_segments.get(2).cloned().unwrap_or_default();
+        let layer_name = layer_name_label(req)?;
         let version: i64 = req
             .path_segments
             .get(4)
@@ -379,7 +351,7 @@ impl LambdaService {
         &self,
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
-        let layer_name = req.path_segments.get(2).cloned().unwrap_or_default();
+        let layer_name = layer_name_label(req)?;
         let version: i64 = req
             .path_segments
             .get(4)
@@ -418,7 +390,7 @@ impl LambdaService {
         &self,
         req: &AwsRequest,
     ) -> Result<AwsResponse, AwsServiceError> {
-        let layer_name = req.path_segments.get(2).cloned().unwrap_or_default();
+        let layer_name = layer_name_label(req)?;
         let version: i64 = req
             .path_segments
             .get(4)

@@ -392,6 +392,12 @@ fn run_probes(
                 }
             }
 
+            // Per-op seed for state one operation's documented `@examples`
+            // assume. The guard undoes it when this iteration ends -- normally,
+            // or by unwinding from a panicking variant thread -- so no other op
+            // sees it.
+            let _op_seed = seed_operation_state(&client, &endpoint, service_name, &op.name);
+
             // Get output shape for shape validation
             let output_shape_id = op.output_shape.as_deref();
 
@@ -532,6 +538,96 @@ fn seed_secretsmanager(client: &reqwest::blocking::Client, endpoint: &str) {
         "PutResourcePolicy",
         r#"{"SecretId":"MyTestDatabaseSecret","ResourcePolicy":"{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::123456789012:root\"},\"Action\":\"secretsmanager:GetSecretValue\",\"Resource\":\"*\"}]}"}"#,
     );
+}
+
+const LAMBDA_SEED_AUTH: &str =
+    "AWS4-HMAC-SHA256 Credential=test/20240101/us-east-1/lambda/aws4_request, \
+                                SignedHeaders=host;x-amz-date, Signature=00";
+
+/// State seeded for a single operation. Dropping it puts back what was there
+/// before, so the seed cannot outlive its operation even if probing panics.
+struct OperationSeedGuard<'a> {
+    client: &'a reqwest::blocking::Client,
+    endpoint: &'a str,
+    seed: OperationSeed,
+}
+
+enum OperationSeed {
+    /// `my-function`'s reserved concurrency before the seed (`None`: unset).
+    LambdaReservedConcurrency(Option<i64>),
+}
+
+impl Drop for OperationSeedGuard<'_> {
+    fn drop(&mut self) {
+        match self.seed {
+            OperationSeed::LambdaReservedConcurrency(previous) => {
+                let url = lambda_example_concurrency_url(self.endpoint);
+                let _ = match previous {
+                    Some(n) => self
+                        .client
+                        .put(&url)
+                        .header("Content-Type", "application/json")
+                        .header("Authorization", LAMBDA_SEED_AUTH)
+                        .body(format!(r#"{{"ReservedConcurrentExecutions":{n}}}"#))
+                        .send(),
+                    None => self
+                        .client
+                        .delete(&url)
+                        .header("Authorization", LAMBDA_SEED_AUTH)
+                        .send(),
+                };
+            }
+        }
+    }
+}
+
+fn lambda_example_concurrency_url(endpoint: &str) -> String {
+    format!("{endpoint}/2017-10-31/functions/my-function/concurrency")
+}
+
+/// Seed state that exactly one operation's documented `@examples` assume,
+/// right before that operation's variants run.
+///
+/// Lambda `GetFunctionConcurrency`: its example reads `my-function` (created
+/// by the `CreateFunction` example) expecting `ReservedConcurrentExecutions:
+/// 250`. Without a reservation AWS (and fakecloud) answer with an empty body,
+/// and `DeleteFunctionConcurrency`'s example, which runs earlier, clears any
+/// reservation. The previous setting is recorded so dropping the returned
+/// guard leaves every other operation's view of the function unchanged. Best-effort:
+/// when `my-function` doesn't exist the seed is a 404 and the restore a no-op.
+fn seed_operation_state<'a>(
+    client: &'a reqwest::blocking::Client,
+    endpoint: &'a str,
+    service_name: &str,
+    op_name: &str,
+) -> Option<OperationSeedGuard<'a>> {
+    if (service_name, op_name) != ("lambda", "GetFunctionConcurrency") {
+        return None;
+    }
+    let url = lambda_example_concurrency_url(endpoint);
+    let current = client
+        .get(&url)
+        .header("Authorization", LAMBDA_SEED_AUTH)
+        .send()
+        .ok()
+        .filter(|r| r.status().is_success())?;
+    let previous = current
+        .json::<serde_json::Value>()
+        .ok()
+        .and_then(|v| v["ReservedConcurrentExecutions"].as_i64());
+    client
+        .put(&url)
+        .header("Content-Type", "application/json")
+        .header("Authorization", LAMBDA_SEED_AUTH)
+        .body(r#"{"ReservedConcurrentExecutions":250}"#)
+        .send()
+        .ok()
+        .filter(|r| r.status().is_success())?;
+    Some(OperationSeedGuard {
+        client,
+        endpoint,
+        seed: OperationSeed::LambdaReservedConcurrency(previous),
+    })
 }
 
 fn load_models(models_dir: &std::path::Path) -> Vec<(String, smithy::ServiceModel)> {
@@ -805,6 +901,100 @@ fn cmd_update_baseline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A one-request-per-connection HTTP stub that answers `GET` with
+    /// `get_body` and everything else with an empty 200, recording each
+    /// request as `"METHOD path body"`.
+    fn concurrency_stub(
+        get_body: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let mut len = 0usize;
+                loop {
+                    let mut h = String::new();
+                    reader.read_line(&mut h).unwrap();
+                    if h == "\r\n" || h.is_empty() {
+                        break;
+                    }
+                    if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
+                        len = v.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; len];
+                reader.read_exact(&mut body).unwrap();
+                let mut parts = line.split_whitespace();
+                let (method, path) = (parts.next().unwrap(), parts.next().unwrap());
+                log.lock().unwrap().push(format!(
+                    "{method} {path} {}",
+                    String::from_utf8_lossy(&body)
+                ));
+                let reply = if method == "GET" { get_body } else { "{}" };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                )
+                .unwrap();
+            }
+        });
+        (endpoint, seen)
+    }
+
+    #[test]
+    fn concurrency_seed_only_applies_to_get_function_concurrency() {
+        let (endpoint, seen) = concurrency_stub("{}");
+        let client = reqwest::blocking::Client::new();
+        assert!(seed_operation_state(&client, &endpoint, "lambda", "GetFunction").is_none());
+        assert!(seed_operation_state(&client, &endpoint, "s3", "GetFunctionConcurrency").is_none());
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn concurrency_seed_is_removed_when_none_was_set() {
+        let (endpoint, seen) = concurrency_stub("{}");
+        let client = reqwest::blocking::Client::new();
+        let guard = seed_operation_state(&client, &endpoint, "lambda", "GetFunctionConcurrency")
+            .expect("seeded");
+        drop(guard);
+        let seen = seen.lock().unwrap().clone();
+        let path = "/2017-10-31/functions/my-function/concurrency";
+        assert_eq!(
+            seen,
+            vec![
+                format!("GET {path} "),
+                format!(r#"PUT {path} {{"ReservedConcurrentExecutions":250}}"#),
+                format!("DELETE {path} "),
+            ]
+        );
+    }
+
+    #[test]
+    fn concurrency_seed_restores_the_previous_value_even_on_panic() {
+        let (endpoint, seen) = concurrency_stub(r#"{"ReservedConcurrentExecutions":7}"#);
+        let client = reqwest::blocking::Client::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard =
+                seed_operation_state(&client, &endpoint, "lambda", "GetFunctionConcurrency")
+                    .expect("seeded");
+            panic!("a variant thread panicked");
+        }));
+        assert!(result.is_err());
+        let last = seen.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(
+            last,
+            r#"PUT /2017-10-31/functions/my-function/concurrency {"ReservedConcurrentExecutions":7}"#
+        );
+    }
 
     #[test]
     fn sweep_disables_containers_when_cli_unset() {
