@@ -243,6 +243,91 @@ fn extract_extra_destinations(body: &Value, suffix: &str) -> BTreeMap<String, Va
     out
 }
 
+/// Validate the optional CompressionFormat member of an S3 configuration or
+/// update object. Absence is allowed;
+/// a present value (including null) must be one of the exact AWS enum strings.
+/// Non-object containers are left to the caller's existing shape handling.
+fn validate_s3_compression(config: &Value) -> Result<(), AwsServiceError> {
+    let Some(format) = config.get("CompressionFormat") else {
+        return Ok(());
+    };
+    if matches!(
+        format.as_str(),
+        Some("UNCOMPRESSED" | "GZIP" | "ZIP" | "Snappy" | "HADOOP_SNAPPY")
+    ) {
+        return Ok(());
+    }
+    Err(invalid_argument(
+        "CompressionFormat must be one of UNCOMPRESSED, GZIP, ZIP, Snappy, HADOOP_SNAPPY",
+    ))
+}
+
+/// Redshift loads from its intermediate S3 location with the COPY command,
+/// which cannot read Snappy or ZIP objects; the API model documents both as
+/// disallowed for `RedshiftDestinationConfiguration.S3Configuration` and
+/// `RedshiftDestinationUpdate.S3Update`. (The S3 backup is never read by COPY,
+/// so it accepts every format.) Run after `validate_s3_compression`.
+fn validate_redshift_intermediate_compression(config: &Value) -> Result<(), AwsServiceError> {
+    match config.get("CompressionFormat").and_then(Value::as_str) {
+        Some(format @ ("Snappy" | "ZIP")) => Err(invalid_argument(format!(
+            "CompressionFormat {format} is not supported for the intermediate Amazon S3 \
+             location of an Amazon Redshift destination because the Amazon Redshift COPY \
+             operation cannot read it."
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Validate a classic or Extended S3 destination block plus every backup
+/// block stored from it. `parse_s3_destination` keeps `S3BackupConfiguration`
+/// and `apply_s3_update` keeps `S3BackupUpdate`, whichever destination shape
+/// carried them; an update can take either path (a full parse when the stream
+/// has no S3 destination yet), so it checks both. Shared with CloudFormation
+/// provisioning (`update == false`).
+pub fn validate_s3_destination_compression(
+    config: &Value,
+    update: bool,
+) -> Result<(), AwsServiceError> {
+    validate_s3_compression(config)?;
+    validate_s3_compression(&config["S3BackupConfiguration"])?;
+    if update {
+        validate_s3_compression(&config["S3BackupUpdate"])?;
+    }
+    Ok(())
+}
+
+/// Preflight only the S3 destination members in the Firehose input model,
+/// including raw-JSON destinations, before any stream mutation. No recursive
+/// JSON walk: similarly named fields in processing/HTTP options are unrelated.
+/// This is the only CompressionFormat check on the create/update paths, so it
+/// covers every S3 block `parse_s3_destination`/`apply_s3_update` store.
+fn validate_destination_compression(body: &Value, suffix: &str) -> Result<(), AwsServiceError> {
+    let update = suffix == "Update";
+    for base in ["S3Destination", "ExtendedS3Destination"] {
+        validate_s3_destination_compression(&body[format!("{base}{suffix}")], update)?;
+    }
+    let backup_member = if update {
+        "S3BackupUpdate"
+    } else {
+        "S3BackupConfiguration"
+    };
+    for base in EXTRA_DESTINATION_BASES {
+        let config = &body[format!("{base}{suffix}")];
+        // IcebergDestinationUpdate has S3Configuration, not S3Update.
+        let s3_member = if update && *base != "IcebergDestination" {
+            "S3Update"
+        } else {
+            "S3Configuration"
+        };
+        validate_s3_compression(&config[s3_member])?;
+        if *base == "RedshiftDestination" {
+            validate_redshift_intermediate_compression(&config[s3_member])?;
+            validate_s3_compression(&config[backup_member])?;
+        }
+    }
+    Ok(())
+}
+
 fn parse_s3_destination(val: &Value) -> Result<Option<S3Destination>, AwsServiceError> {
     if !val.is_object() {
         return Ok(None);
@@ -325,6 +410,8 @@ pub(crate) fn validate_file_extension(value: &Value) -> Result<(), AwsServiceErr
 /// caller supplied are changed; the destination's stable `DestinationId` is
 /// preserved. Buffering values are validated when present.
 fn apply_s3_update(dest: &mut S3Destination, val: &Value) -> Result<(), AwsServiceError> {
+    // CompressionFormat (here and in S3BackupUpdate) was already checked by
+    // `validate_destination_compression` before the stream was touched.
     let buf = &val["BufferingHints"];
     let size = buf["SizeInMBs"].as_i64();
     let interval = buf["IntervalInSeconds"].as_i64();
@@ -596,6 +683,8 @@ impl FirehoseService {
                 "Invalid DeliveryStreamType: {stream_type}"
             )));
         }
+
+        validate_destination_compression(&body, "Configuration")?;
 
         let s3_dest = match parse_s3_destination(&body["S3DestinationConfiguration"])? {
             Some(d) => Some(d),
@@ -946,6 +1035,7 @@ impl FirehoseService {
         let destination_id = body["DestinationId"]
             .as_str()
             .ok_or_else(|| missing("DestinationId"))?;
+        validate_destination_compression(&body, "Update")?;
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id, &req.region);
         let stream = state
@@ -1517,6 +1607,407 @@ mod tests {
         serde_json::from_slice::<Value>(resp.body.expect_bytes()).unwrap()
             ["DeliveryStreamDescription"]
             .clone()
+    }
+
+    fn compression_s3_config() -> Value {
+        json!({
+            "RoleARN": "arn:aws:iam::123456789012:role/fh",
+            "BucketARN": "arn:aws:s3:::bucket",
+            "Prefix": "before/"
+        })
+    }
+
+    fn compression_state(svc: &FirehoseService) -> Value {
+        // Include full-precision timestamps and every stored field, not just
+        // Describe's timestamps rounded to seconds.
+        serde_json::to_value(&*svc.state.read()).unwrap()
+    }
+
+    #[test]
+    fn compression_valid_values_and_omission_preserve_s3_semantics() {
+        for base in ["S3Destination", "ExtendedS3Destination"] {
+            for format in [
+                None,
+                Some("UNCOMPRESSED"),
+                Some("GZIP"),
+                Some("ZIP"),
+                Some("Snappy"),
+                Some("HADOOP_SNAPPY"),
+            ] {
+                let svc = service();
+                let mut config = compression_s3_config();
+                if let Some(format) = format {
+                    config["CompressionFormat"] = json!(format);
+                }
+                let mut body = json!({"DeliveryStreamName": "compression"});
+                body[format!("{base}Configuration")] = config;
+                svc.create_delivery_stream(&request("CreateDeliveryStream", body))
+                    .unwrap();
+                let before = describe(&svc, "compression");
+                assert_eq!(
+                    before["Destinations"][0]["S3DestinationDescription"]["CompressionFormat"],
+                    format.unwrap_or("UNCOMPRESSED")
+                );
+
+                let mut update = json!({
+                    "DeliveryStreamName": "compression",
+                    "CurrentDeliveryStreamVersionId": "1",
+                    "DestinationId": before["Destinations"][0]["DestinationId"]
+                });
+                update[format!("{base}Update")] = json!({"Prefix": "after/"});
+                svc.update_destination(&request("UpdateDestination", update))
+                    .unwrap();
+                let after = describe(&svc, "compression");
+                assert_eq!(
+                    after["Destinations"][0]["S3DestinationDescription"]["CompressionFormat"],
+                    format.unwrap_or("UNCOMPRESSED")
+                );
+                assert_eq!(
+                    after["Destinations"][0]["S3DestinationDescription"]["Prefix"],
+                    "after/"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compression_invalid_create_leaves_no_stream() {
+        for base in ["S3Destination", "ExtendedS3Destination"] {
+            for format in [
+                json!("BROTLI"),
+                json!("gzip"),
+                json!("SNAPPY"),
+                json!("snappy"),
+                json!(""),
+                json!(null),
+                json!(7),
+                json!(true),
+                json!([]),
+                json!({}),
+            ] {
+                let svc = service();
+                let before = compression_state(&svc);
+                let mut config = compression_s3_config();
+                config["CompressionFormat"] = format.clone();
+                let mut body = json!({"DeliveryStreamName": "bad-compression", "Tags": [{"Key": "env", "Value": "bad"}]});
+                body[format!("{base}Configuration")] = config;
+                let err = svc
+                    .create_delivery_stream(&request("CreateDeliveryStream", body))
+                    .err()
+                    .expect("invalid compression must fail");
+                assert_eq!(err.code(), "InvalidArgumentException", "{base}: {format}");
+                assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+                assert_eq!(compression_state(&svc), before);
+            }
+        }
+    }
+
+    #[test]
+    fn compression_invalid_update_is_atomic() {
+        for base in ["S3Destination", "ExtendedS3Destination"] {
+            let svc = service();
+            let mut body = json!({"DeliveryStreamName": "compression"});
+            body[format!("{base}Configuration")] = compression_s3_config();
+            svc.create_delivery_stream(&request("CreateDeliveryStream", body))
+                .unwrap();
+            let description = describe(&svc, "compression");
+            let before = compression_state(&svc);
+            for format in [
+                json!("BROTLI"),
+                json!("Gzip"),
+                json!(null),
+                json!(42),
+                json!(["GZIP"]),
+            ] {
+                let mut update = json!({
+                    "DeliveryStreamName": "compression",
+                    "CurrentDeliveryStreamVersionId": "1",
+                    "DestinationId": description["Destinations"][0]["DestinationId"],
+                    "HttpEndpointDestinationUpdate": {"RoleARN": "changed"}
+                });
+                update[format!("{base}Update")] = json!({
+                    "RoleARN": "changed", "BucketARN": "arn:aws:s3:::changed",
+                    "Prefix": "changed/", "BufferingHints": {"SizeInMBs": 10},
+                    "CompressionFormat": format
+                });
+                let err = svc
+                    .update_destination(&request("UpdateDestination", update))
+                    .err()
+                    .expect("invalid compression must fail");
+                assert_eq!(err.code(), "InvalidArgumentException");
+                assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+                assert_eq!(compression_state(&svc), before);
+            }
+        }
+    }
+
+    // Literal model paths: Iceberg deliberately uses S3Configuration on
+    // update too. These blocks are otherwise stored/merged as raw JSON.
+    const COMPRESSION_NESTED_PATHS: &[(&str, &str, &str)] = &[
+        (
+            "ExtendedS3Destination",
+            "S3BackupConfiguration",
+            "S3BackupUpdate",
+        ),
+        ("RedshiftDestination", "S3Configuration", "S3Update"),
+        (
+            "RedshiftDestination",
+            "S3BackupConfiguration",
+            "S3BackupUpdate",
+        ),
+        ("ElasticsearchDestination", "S3Configuration", "S3Update"),
+        (
+            "AmazonopensearchserviceDestination",
+            "S3Configuration",
+            "S3Update",
+        ),
+        (
+            "AmazonOpenSearchServerlessDestination",
+            "S3Configuration",
+            "S3Update",
+        ),
+        ("SplunkDestination", "S3Configuration", "S3Update"),
+        ("HttpEndpointDestination", "S3Configuration", "S3Update"),
+        ("SnowflakeDestination", "S3Configuration", "S3Update"),
+        ("IcebergDestination", "S3Configuration", "S3Configuration"),
+    ];
+
+    #[test]
+    fn compression_nested_s3_create_is_validated_atomically() {
+        for &(base, create_member, _) in COMPRESSION_NESTED_PATHS {
+            let svc = service();
+            let mut config = compression_s3_config();
+            config[create_member] = compression_s3_config();
+            let mut body = json!({"DeliveryStreamName": "nested"});
+            body[format!("{base}Configuration")] = config;
+            for bad in [json!("BROTLI"), json!(false)] {
+                let mut invalid = body.clone();
+                invalid[format!("{base}Configuration")][create_member]["CompressionFormat"] = bad;
+                let before = compression_state(&svc);
+                let err = svc
+                    .create_delivery_stream(&request("CreateDeliveryStream", invalid))
+                    .err()
+                    .expect("invalid nested create must fail");
+                assert_eq!(
+                    err.code(),
+                    "InvalidArgumentException",
+                    "{base}.{create_member}"
+                );
+                assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+                assert_eq!(compression_state(&svc), before);
+            }
+        }
+    }
+
+    #[test]
+    fn compression_nested_s3_update_is_validated_atomically() {
+        for &(base, create_member, update_member) in COMPRESSION_NESTED_PATHS {
+            let svc = service();
+            let mut config = compression_s3_config();
+            config[create_member] = compression_s3_config();
+            let mut body = json!({"DeliveryStreamName": "nested"});
+            body[format!("{base}Configuration")] = config;
+            // HADOOP_SNAPPY is valid on every S3 member, including Redshift's
+            // intermediate location (which rejects Snappy and ZIP).
+            body[format!("{base}Configuration")][create_member]["CompressionFormat"] =
+                json!("HADOOP_SNAPPY");
+            svc.create_delivery_stream(&request("CreateDeliveryStream", body))
+                .unwrap();
+            let description = describe(&svc, "nested");
+            let before = compression_state(&svc);
+            for bad in [json!("SNAPPY"), json!(null)] {
+                let mut update = json!({
+                    "DeliveryStreamName": "nested",
+                    "CurrentDeliveryStreamVersionId": "1",
+                    "DestinationId": description["Destinations"][0]["DestinationId"],
+                    "S3DestinationUpdate": {"Prefix": "must-not-change/"}
+                });
+                update[format!("{base}Update")] =
+                    json!({"Prefix": "changed/", "RoleARN": "changed"});
+                update[format!("{base}Update")][update_member] =
+                    json!({"CompressionFormat": bad, "Prefix": "changed-backup/"});
+                let err = svc
+                    .update_destination(&request("UpdateDestination", update))
+                    .err()
+                    .expect("invalid nested update must fail");
+                assert_eq!(
+                    err.code(),
+                    "InvalidArgumentException",
+                    "{base}.{update_member}"
+                );
+                assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+                assert_eq!(compression_state(&svc), before);
+            }
+        }
+    }
+
+    fn redshift_config(intermediate: &str, backup: &str) -> Value {
+        let mut config = json!({
+            "RoleARN": "arn:aws:iam::123456789012:role/fh",
+            "ClusterJDBCURL": "jdbc:redshift://cluster:5439/db",
+            "CopyCommand": {"DataTableName": "events"},
+            "Username": "user",
+            "Password": "password",
+            "S3Configuration": compression_s3_config(),
+            "S3BackupMode": "Enabled",
+            "S3BackupConfiguration": compression_s3_config()
+        });
+        config["S3Configuration"]["CompressionFormat"] = json!(intermediate);
+        config["S3BackupConfiguration"]["CompressionFormat"] = json!(backup);
+        config
+    }
+
+    #[test]
+    fn redshift_intermediate_s3_rejects_snappy_and_zip_on_create() {
+        for format in ["Snappy", "ZIP"] {
+            let svc = service();
+            let before = compression_state(&svc);
+            let err = svc
+                .create_delivery_stream(&request(
+                    "CreateDeliveryStream",
+                    json!({
+                        "DeliveryStreamName": "redshift",
+                        "RedshiftDestinationConfiguration": redshift_config(format, "GZIP")
+                    }),
+                ))
+                .err()
+                .expect("COPY-unreadable format must fail");
+            assert_eq!(err.code(), "InvalidArgumentException", "{format}");
+            assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+            assert!(err.message().contains(format), "{}", err.message());
+            assert!(err.message().contains("Redshift"), "{}", err.message());
+            assert_eq!(compression_state(&svc), before);
+        }
+        // COPY never reads the backup, and the other enum values are loadable.
+        for (intermediate, backup) in [
+            ("UNCOMPRESSED", "Snappy"),
+            ("GZIP", "ZIP"),
+            ("HADOOP_SNAPPY", "Snappy"),
+        ] {
+            let svc = service();
+            svc.create_delivery_stream(&request(
+                "CreateDeliveryStream",
+                json!({
+                    "DeliveryStreamName": "redshift",
+                    "RedshiftDestinationConfiguration": redshift_config(intermediate, backup)
+                }),
+            ))
+            .unwrap_or_else(|e| panic!("{intermediate}/{backup}: {}", e.message()));
+        }
+    }
+
+    #[test]
+    fn redshift_intermediate_s3_update_rejects_snappy_and_zip_atomically() {
+        let svc = service();
+        svc.create_delivery_stream(&request(
+            "CreateDeliveryStream",
+            json!({
+                "DeliveryStreamName": "redshift",
+                "RedshiftDestinationConfiguration": redshift_config("GZIP", "GZIP")
+            }),
+        ))
+        .unwrap();
+        let description = describe(&svc, "redshift");
+        let destination_id = description["Destinations"][0]["DestinationId"].clone();
+        let before = compression_state(&svc);
+        for format in ["Snappy", "ZIP"] {
+            let err = svc
+                .update_destination(&request(
+                    "UpdateDestination",
+                    json!({
+                        "DeliveryStreamName": "redshift",
+                        "CurrentDeliveryStreamVersionId": "1",
+                        "DestinationId": destination_id,
+                        "RedshiftDestinationUpdate": {
+                            "Username": "changed",
+                            "S3Update": {"Prefix": "changed/", "CompressionFormat": format}
+                        }
+                    }),
+                ))
+                .err()
+                .expect("COPY-unreadable format must fail");
+            assert_eq!(err.code(), "InvalidArgumentException", "{format}");
+            assert_eq!(compression_state(&svc), before);
+        }
+        // The backup accepts them; the intermediate location accepts the rest.
+        svc.update_destination(&request(
+            "UpdateDestination",
+            json!({
+                "DeliveryStreamName": "redshift",
+                "CurrentDeliveryStreamVersionId": "1",
+                "DestinationId": destination_id,
+                "RedshiftDestinationUpdate": {
+                    "S3Update": {"CompressionFormat": "UNCOMPRESSED"},
+                    "S3BackupUpdate": {"CompressionFormat": "ZIP"}
+                }
+            }),
+        ))
+        .unwrap();
+        assert_eq!(describe(&svc, "redshift")["VersionId"], "2");
+    }
+
+    #[test]
+    fn compression_validation_is_limited_to_s3_member_objects() {
+        let svc = service();
+        svc.create_delivery_stream(&request(
+            "CreateDeliveryStream",
+            json!({
+                "DeliveryStreamName": "opaque",
+                "HttpEndpointDestinationConfiguration": {
+                    "CompressionFormat": "BROTLI",
+                    "RequestConfiguration": {"CompressionFormat": "BROTLI"},
+                    "S3Configuration": [{"CompressionFormat": "BROTLI"}]
+                }
+            }),
+        ))
+        .unwrap();
+        assert_eq!(
+            describe(&svc, "opaque")["Destinations"][0]["HttpEndpointDestinationDescription"]
+                ["RequestConfiguration"]["CompressionFormat"],
+            "BROTLI"
+        );
+    }
+
+    /// With no S3 destination yet, UpdateDestination fully parses the S3
+    /// update, which keeps its `S3BackupConfiguration`: that block must be
+    /// validated too.
+    #[test]
+    fn compression_update_fallback_parse_validates_backup_configuration() {
+        for base in ["S3Destination", "ExtendedS3Destination"] {
+            let svc = service();
+            svc.create_delivery_stream(&request(
+                "CreateDeliveryStream",
+                json!({
+                    "DeliveryStreamName": "fallback",
+                    "HttpEndpointDestinationConfiguration": {
+                        "EndpointConfiguration": {"Url": "https://example.com"},
+                        "S3Configuration": compression_s3_config()
+                    }
+                }),
+            ))
+            .unwrap();
+            let destination_id =
+                describe(&svc, "fallback")["Destinations"][0]["DestinationId"].clone();
+            let before = compression_state(&svc);
+            let update = |backup: &str| {
+                let mut config = compression_s3_config();
+                config["S3BackupConfiguration"] = json!({"CompressionFormat": backup});
+                let mut body = json!({
+                    "DeliveryStreamName": "fallback",
+                    "CurrentDeliveryStreamVersionId": "1",
+                    "DestinationId": destination_id
+                });
+                body[format!("{base}Update")] = config;
+                request("UpdateDestination", body)
+            };
+            let err = svc
+                .update_destination(&update("BROTLI"))
+                .err()
+                .expect("invalid backup compression must fail");
+            assert_eq!(err.code(), "InvalidArgumentException", "{base}");
+            assert_eq!(compression_state(&svc), before, "{base}");
+            svc.update_destination(&update("ZIP")).unwrap();
+        }
     }
 
     #[test]

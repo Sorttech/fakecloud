@@ -25,6 +25,8 @@ mod buckets;
 pub(crate) mod config;
 mod control_tags;
 mod lock;
+use crate::state::ObjectLockSettings;
+use lock::{has_object_lock_headers, has_payload_integrity_header};
 mod multipart;
 pub(crate) mod notifications;
 mod objects;
@@ -1997,6 +1999,7 @@ impl AwsService for S3Service {
             actions.push(source);
         }
         actions.extend(governance_bypass_actions(request, &actions[0]));
+        actions.extend(object_lock_header_actions(request, &actions[0]));
         actions
     }
 
@@ -4710,6 +4713,42 @@ fn governance_bypass_actions(
         "DeleteObject" | "PutObjectRetention" => vec![bypass(primary.resource.clone())],
         _ => Vec::new(),
     }
+}
+
+/// The extra permissions a write that sets an object's lock must hold. The S3
+/// model documents the PutObject / CopyObject / CreateMultipartUpload lock
+/// headers as needing `s3:PutObjectRetention` (mode, retain-until date) and
+/// `s3:PutObjectLegalHold` (legal hold), evaluated on the object written --
+/// the destination for a copy.
+fn object_lock_header_actions(
+    request: &AwsRequest,
+    primary: &fakecloud_core::auth::IamAction,
+) -> Vec<fakecloud_core::auth::IamAction> {
+    if primary.service != "s3"
+        || !matches!(
+            primary.action,
+            "PutObject" | "CopyObject" | "CreateMultipartUpload"
+        )
+    {
+        return Vec::new();
+    }
+    let present = |name: &str| request.headers.contains_key(name);
+    let mut actions = Vec::new();
+    if present("x-amz-object-lock-mode") || present("x-amz-object-lock-retain-until-date") {
+        actions.push(fakecloud_core::auth::IamAction {
+            service: "s3",
+            action: "PutObjectRetention",
+            resource: primary.resource.clone(),
+        });
+    }
+    if present("x-amz-object-lock-legal-hold") {
+        actions.push(fakecloud_core::auth::IamAction {
+            service: "s3",
+            action: "PutObjectLegalHold",
+            resource: primary.resource.clone(),
+        });
+    }
+    actions
 }
 
 #[cfg(test)]

@@ -102,6 +102,9 @@ pub fn mpu_init_snapshot(m: &MultipartUpload) -> MpuInit {
         content_disposition: m.content_disposition.clone(),
         content_language: m.content_language.clone(),
         expires: m.expires.clone(),
+        lock_mode: m.lock.mode.clone(),
+        lock_retain_until: m.lock.retain_until,
+        lock_legal_hold: m.lock.legal_hold.clone(),
     }
 }
 
@@ -238,6 +241,11 @@ pub fn multipart_upload_from_loaded(lm: LoadedMpu) -> MultipartUpload {
         content_disposition: init.content_disposition,
         content_language: init.content_language,
         expires: init.expires,
+        lock: crate::state::ObjectLockSettings {
+            mode: init.lock_mode,
+            retain_until: init.lock_retain_until,
+            legal_hold: init.lock_legal_hold,
+        },
     }
 }
 
@@ -625,6 +633,7 @@ permission = "READ"
     #[test]
     fn mpu_init_snapshot_captures_metadata() {
         use std::collections::BTreeMap;
+        let until = chrono::Utc::now() + chrono::Duration::days(3);
         let mpu = MultipartUpload {
             upload_id: "up-1".to_string(),
             key: "k".to_string(),
@@ -642,10 +651,24 @@ permission = "READ"
             content_disposition: None,
             content_language: None,
             expires: None,
+            lock: crate::state::ObjectLockSettings {
+                mode: Some("GOVERNANCE".to_string()),
+                retain_until: Some(until),
+                legal_hold: Some("ON".to_string()),
+            },
         };
         let snap = mpu_init_snapshot(&mpu);
         assert_eq!(snap.upload_id, "up-1");
         assert_eq!(snap.content_type, "application/octet-stream");
+        assert_eq!(snap.lock_mode.as_deref(), Some("GOVERNANCE"));
+        assert_eq!(snap.lock_retain_until, Some(until));
+        assert_eq!(snap.lock_legal_hold.as_deref(), Some("ON"));
+        // The snapshot round-trips through the loader with the lock intact.
+        let loaded = multipart_upload_from_loaded(fakecloud_persistence::LoadedMpu {
+            init: snap,
+            parts: BTreeMap::new(),
+        });
+        assert_eq!(loaded.lock, mpu.lock);
     }
 
     #[test]
