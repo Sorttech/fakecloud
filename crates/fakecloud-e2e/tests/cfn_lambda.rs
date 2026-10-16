@@ -646,6 +646,327 @@ async fn cfn_changeset_holds_the_stack_in_progress_until_custom_resources_finish
     );
 }
 
+/// Regression: changing a custom resource's properties sent the handler a
+/// Delete and then a Create, never an Update. The Delete also carried no
+/// `ResourceProperties`, so CDK's `BucketDeployment` handler failed with
+/// "Missing key 'ResourceProperties'" on every redeploy.
+///
+/// Real CloudFormation sends one Update carrying the current
+/// `PhysicalResourceId`, the new `ResourceProperties` and the previous ones as
+/// `OldResourceProperties`, and a Delete carries `ResourceProperties` too.
+#[tokio::test]
+async fn cfn_update_sends_a_custom_resource_an_update_event() {
+    if !docker_available() {
+        eprintln!("docker required for Lambda execution; skipping");
+        return;
+    }
+    let server = TestServer::start().await;
+    let cfn = server.cloudformation_client().await;
+    let stack = "cfn-custom-update-event";
+    let function = "cr-update-event";
+    upload_custom_resource_handler(&server, "cfn-cr-update-event-code", None).await;
+
+    cfn.create_stack()
+        .stack_name(stack)
+        .template_body(versioned_custom_resource_template(
+            "cfn-cr-update-event-code",
+            function,
+            "1",
+        ))
+        .send()
+        .await
+        .expect("create_stack");
+    let (status, reason) = await_terminal_status(&cfn, stack).await;
+    assert_eq!(status, "CREATE_COMPLETE", "reason: {reason}");
+    let physical_id = custom_physical_id(&cfn, stack).await;
+
+    cfn.update_stack()
+        .stack_name(stack)
+        .template_body(versioned_custom_resource_template(
+            "cfn-cr-update-event-code",
+            function,
+            "2",
+        ))
+        .send()
+        .await
+        .expect("update_stack");
+    let (status, reason) = await_terminal_status(&cfn, stack).await;
+    assert_eq!(status, "UPDATE_COMPLETE", "reason: {reason}");
+    assert_eq!(
+        custom_physical_id(&cfn, stack).await,
+        physical_id,
+        "an in-place update keeps the physical id"
+    );
+
+    let events = custom_resource_events(&server, function, 2).await;
+    let types: Vec<&str> = events
+        .iter()
+        .map(|e| e["RequestType"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(types, ["Create", "Update"], "events: {events:#?}");
+    let update = &events[1];
+    assert_eq!(update["PhysicalResourceId"], physical_id.as_str());
+    assert_eq!(update["LogicalResourceId"], "Custom");
+    assert_eq!(update["ResourceType"], "Custom::Thing");
+    assert_eq!(update["ResourceProperties"]["Version"], "2");
+    assert_eq!(update["OldResourceProperties"]["Version"], "1");
+    assert!(
+        update["ServiceToken"]
+            .as_str()
+            .is_some_and(|t| t.ends_with(&format!(":function:{function}"))),
+        "update event: {update:#}"
+    );
+    assert!(
+        update["ResponseURL"].is_string(),
+        "update event: {update:#}"
+    );
+
+    cfn.delete_stack()
+        .stack_name(stack)
+        .send()
+        .await
+        .expect("delete_stack");
+    let events = custom_resource_events(&server, function, 3).await;
+    let delete = &events[2];
+    assert_eq!(delete["RequestType"], "Delete");
+    assert_eq!(delete["PhysicalResourceId"], physical_id.as_str());
+    assert_eq!(delete["ResourceProperties"]["Version"], "2");
+}
+
+/// Regression: `UpdateStack` ran its custom-resource invokes fire-and-forget,
+/// so a handler that raised left the stack UPDATE_COMPLETE. Real
+/// CloudFormation marks the resource UPDATE_FAILED and rolls the stack back to
+/// UPDATE_ROLLBACK_COMPLETE.
+#[tokio::test]
+async fn cfn_update_rolls_back_when_a_custom_resource_update_fails() {
+    if !docker_available() {
+        eprintln!("docker required for Lambda execution; skipping");
+        return;
+    }
+    let server = TestServer::start().await;
+    let cfn = server.cloudformation_client().await;
+    let stack = "cfn-custom-update-fails";
+    let bucket = "cfn-cr-update-fails-code";
+    upload_custom_resource_handler(&server, bucket, Some("Update")).await;
+
+    cfn.create_stack()
+        .stack_name(stack)
+        .template_body(versioned_custom_resource_template(
+            bucket,
+            "cr-update-fails",
+            "1",
+        ))
+        .send()
+        .await
+        .expect("create_stack");
+    let (status, reason) = await_terminal_status(&cfn, stack).await;
+    assert_eq!(status, "CREATE_COMPLETE", "reason: {reason}");
+
+    cfn.update_stack()
+        .stack_name(stack)
+        .template_body(versioned_custom_resource_template(
+            bucket,
+            "cr-update-fails",
+            "2",
+        ))
+        .send()
+        .await
+        .expect("update_stack");
+    let (status, reason) = await_terminal_status(&cfn, stack).await;
+    assert_eq!(status, "UPDATE_ROLLBACK_COMPLETE", "reason: {reason}");
+    assert!(
+        reason.contains("Update handler blew up"),
+        "failure reason should name the handler's error, got: {reason}"
+    );
+}
+
+/// Regression: `DeleteStack` ran its custom-resource Delete invokes
+/// fire-and-forget and reported DELETE_COMPLETE at once, so a handler that
+/// raised went unnoticed. It also deleted the handler Lambda before the queued
+/// Delete ran, so the handler was never reached. Real CloudFormation deletes
+/// the custom resource first and, when its handler fails, leaves the stack
+/// DELETE_FAILED, still holding that resource and the handler it depends on.
+#[tokio::test]
+async fn cfn_delete_fails_when_a_custom_resource_delete_fails() {
+    if !docker_available() {
+        eprintln!("docker required for Lambda execution; skipping");
+        return;
+    }
+    let server = TestServer::start().await;
+    let cfn = server.cloudformation_client().await;
+    let stack = "cfn-custom-delete-fails";
+    let bucket = "cfn-cr-delete-fails-code";
+    upload_custom_resource_handler(&server, bucket, Some("Delete")).await;
+
+    cfn.create_stack()
+        .stack_name(stack)
+        .template_body(versioned_custom_resource_template(
+            bucket,
+            "cr-delete-fails",
+            "1",
+        ))
+        .send()
+        .await
+        .expect("create_stack");
+    let (status, reason) = await_terminal_status(&cfn, stack).await;
+    assert_eq!(status, "CREATE_COMPLETE", "reason: {reason}");
+
+    cfn.delete_stack()
+        .stack_name(stack)
+        .send()
+        .await
+        .expect("delete_stack");
+
+    // A deleted stack no longer answers DescribeStacks by name, so a missing
+    // stack reads as DELETE_COMPLETE.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    let (status, reason) = loop {
+        let Ok(described) = cfn.describe_stacks().stack_name(stack).send().await else {
+            break ("DELETE_COMPLETE".to_string(), String::new());
+        };
+        let s = described.stacks().first().expect("stack").clone();
+        let status = s.stack_status().unwrap().as_str().to_string();
+        if !status.ends_with("_IN_PROGRESS") {
+            break (
+                status,
+                s.stack_status_reason().unwrap_or_default().to_string(),
+            );
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "stack never reached a terminal status"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    };
+    assert_eq!(status, "DELETE_FAILED", "reason: {reason}");
+    assert!(
+        reason.contains("Delete handler blew up"),
+        "failure reason should name the handler's error, got: {reason}"
+    );
+    let resources = cfn
+        .describe_stack_resources()
+        .stack_name(stack)
+        .send()
+        .await
+        .expect("describe_stack_resources");
+    let mut logical_ids: Vec<&str> = resources
+        .stack_resources()
+        .iter()
+        .filter_map(|r| r.logical_resource_id())
+        .collect();
+    logical_ids.sort_unstable();
+    assert_eq!(
+        logical_ids,
+        ["Custom", "Handler"],
+        "the resource that failed to delete, and the handler it depends on, remain"
+    );
+}
+
+/// Upload a handler to `s3://{bucket}/cr.zip` that succeeds, or raises
+/// "<RequestType> handler blew up" for the request type `fail_on`.
+async fn upload_custom_resource_handler(server: &TestServer, bucket: &str, fail_on: Option<&str>) {
+    let s3 = server.s3_client().await;
+    s3.create_bucket()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("create_bucket");
+    let fail_on = fail_on.unwrap_or("");
+    s3.put_object()
+        .bucket(bucket)
+        .key("cr.zip")
+        .body(ByteStream::from(build_python_handler_zip(&format!(
+            "def handler(event, context):\n    if event['RequestType'] == '{fail_on}':\n        raise RuntimeError('{fail_on} handler blew up')\n    return {{}}\n"
+        ))))
+        .send()
+        .await
+        .expect("put_object");
+}
+
+/// A custom resource carrying `Version` as its one property, backed by the
+/// handler at `s3://{bucket}/cr.zip`.
+fn versioned_custom_resource_template(bucket: &str, function_name: &str, version: &str) -> String {
+    format!(
+        r#"{{
+  "Resources": {{
+    "Handler": {{
+      "Type": "AWS::Lambda::Function",
+      "Properties": {{
+        "FunctionName": "{function_name}",
+        "Runtime": "python3.12",
+        "Handler": "index.handler",
+        "Timeout": 30,
+        "Role": "arn:aws:iam::123456789012:role/cr-role",
+        "Code": {{"S3Bucket": "{bucket}", "S3Key": "cr.zip"}}
+      }}
+    }},
+    "Custom": {{
+      "Type": "Custom::Thing",
+      "Properties": {{
+        "ServiceToken": {{"Fn::GetAtt": ["Handler", "Arn"]}},
+        "Version": "{version}"
+      }}
+    }}
+  }}
+}}"#
+    )
+}
+
+/// The `Custom` resource's physical id.
+async fn custom_physical_id(cfn: &aws_sdk_cloudformation::Client, stack_name: &str) -> String {
+    cfn.describe_stack_resource()
+        .stack_name(stack_name)
+        .logical_resource_id("Custom")
+        .send()
+        .await
+        .expect("describe_stack_resource")
+        .stack_resource_detail()
+        .and_then(|r| r.physical_resource_id())
+        .expect("physical id")
+        .to_string()
+}
+
+/// The custom-resource events delivered to `function_name`, oldest first,
+/// waiting until at least `count` have arrived.
+async fn custom_resource_events(
+    server: &TestServer,
+    function_name: &str,
+    count: usize,
+) -> Vec<serde_json::Value> {
+    let suffix = format!(":function:{function_name}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let body: serde_json::Value = reqwest::get(format!(
+            "{}/_fakecloud/lambda/invocations",
+            server.endpoint()
+        ))
+        .await
+        .expect("invocations")
+        .json()
+        .await
+        .expect("invocations json");
+        let events: Vec<serde_json::Value> = body["invocations"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|i| {
+                i["functionArn"]
+                    .as_str()
+                    .is_some_and(|a| a.ends_with(&suffix))
+            })
+            .filter_map(|i| serde_json::from_str(i["payload"].as_str()?).ok())
+            .collect();
+        if events.len() >= count {
+            return events;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "expected {count} events, got: {events:#?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
 /// `ExecutionStatus` of a change set, as DescribeChangeSet reports it.
 async fn change_set_execution_status(
     cfn: &aws_sdk_cloudformation::Client,

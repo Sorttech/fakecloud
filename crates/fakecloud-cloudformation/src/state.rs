@@ -14,6 +14,11 @@ pub struct StackResource {
     pub status: String,
     /// For custom resources, the Lambda ARN (ServiceToken) used for invocation.
     pub service_token: Option<String>,
+    /// For custom resources, the resolved `Properties` last sent to the
+    /// handler. An Update event carries them as `OldResourceProperties` and a
+    /// Delete event as `ResourceProperties`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub properties: Option<serde_json::Value>,
     /// Per-resource attributes resolvable via `Fn::GetAtt`. Populated at
     /// provisioning time by each resource type's create handler.
     #[serde(default)]
