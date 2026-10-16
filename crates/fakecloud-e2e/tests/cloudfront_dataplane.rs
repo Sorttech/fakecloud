@@ -708,6 +708,44 @@ async fn routes_by_alias_cname() {
 }
 
 #[tokio::test]
+async fn routes_by_wildcard_alias_cname() {
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+    make_website_bucket(&s3, "wildcardsite").await;
+    let cf = server.cloudfront_client().await;
+
+    // A wildcard alternate domain name routes every subdomain under it, which is
+    // how a stack fronting *.example.test reaches its distribution.
+    let config = spa_config(
+        "wildcardsite.s3-website-us-east-1.amazonaws.com",
+        None,
+        &format!("wildcard-{}", uuid_like()),
+        true,
+        true,
+        &["*.example.test"],
+    );
+    let dist = cf
+        .create_distribution()
+        .distribution_config(config)
+        .send()
+        .await
+        .expect("create_distribution")
+        .distribution()
+        .expect("distribution")
+        .clone();
+    assert!(wait_for_served(&server, dist.id(), Duration::from_secs(10)).await);
+
+    let r = viewer_get(&server, "app.example.test", "/").await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.text().await.unwrap(), "<html>HOME</html>");
+
+    // The apex is not covered by the wildcard, so it is not our traffic: it
+    // falls through to the normal dispatch stack instead of being served.
+    let r = viewer_get(&server, "example.test", "/").await;
+    assert_ne!(r.status(), 200);
+}
+
+#[tokio::test]
 async fn api_traffic_is_not_intercepted() {
     // The viewer middleware must only intercept requests whose Host matches a
     // distribution. Normal AWS API calls (Host = the endpoint authority, not a
