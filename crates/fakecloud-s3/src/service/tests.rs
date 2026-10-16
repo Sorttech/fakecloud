@@ -9711,3 +9711,83 @@ async fn mpu_complete_follows_enabled_then_suspended_versioning() {
         Bytes::from_static(b"mpu-suspended")
     );
 }
+
+/// Every kind of new version -- an object another service delivers, a copy,
+/// a completed multipart upload and a replica -- takes the destination
+/// bucket's default retention through the one commit path, measured from the
+/// commit.
+#[tokio::test]
+async fn every_new_version_kind_gets_the_destination_default_retention() {
+    let svc = make_service();
+    seed_bucket(&svc, "src");
+    seed_bucket(&svc, "locked");
+    {
+        let mut mas = svc.state.write();
+        let buckets = &mut mas.default_mut().buckets;
+        let src = buckets.get_mut("src").unwrap();
+        src.versioning = Some("Enabled".to_string());
+        src.replication_config = Some(
+            "<ReplicationConfiguration><Rule><Status>Enabled</Status>\
+             <Filter><Prefix>rep</Prefix></Filter>\
+             <Destination><Bucket>arn:aws:s3:::locked</Bucket></Destination>\
+             </Rule></ReplicationConfiguration>"
+                .to_string(),
+        );
+        let locked = buckets.get_mut("locked").unwrap();
+        locked.versioning = Some("Enabled".to_string());
+        locked.object_lock_config = Some(
+            "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled>\
+             <Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>2</Days>\
+             </DefaultRetention></Rule></ObjectLockConfiguration>"
+                .to_string(),
+        );
+    }
+    let before = Utc::now();
+
+    // Replica: a lock-less source version replicated into the lock bucket.
+    let req = make_request(Method::PUT, "/src/rep", &[], b"replicated");
+    svc.put_object("123456789012", &req, "src", "rep")
+        .await
+        .unwrap();
+    // Copy.
+    let mut req = make_request(Method::PUT, "/locked/copy", &[], b"");
+    req.headers
+        .insert("x-amz-copy-source", "src/rep".parse().unwrap());
+    svc.copy_object("123456789012", &req, "locked", "copy")
+        .unwrap();
+    // Completed multipart upload.
+    complete_single_part_mpu(&svc, "locked", "mpu", b"assembled").await;
+    // Object delivered by another service.
+    crate::delivery::put_object_via_store(
+        &svc.state,
+        Some(&*svc.store),
+        "123456789012",
+        "locked",
+        "delivered",
+        b"delivered".to_vec(),
+        None,
+    )
+    .unwrap();
+    let after = Utc::now();
+
+    let mas = svc.state.read();
+    let locked = mas.default_ref().buckets.get("locked").unwrap();
+    for key in ["rep", "copy", "mpu", "delivered"] {
+        let obj = locked
+            .objects
+            .get(key)
+            .unwrap_or_else(|| panic!("{key} missing"));
+        assert_eq!(obj.lock_mode.as_deref(), Some("GOVERNANCE"), "{key}");
+        let until = obj.lock_retain_until.expect(key);
+        assert!(until >= before + chrono::Duration::days(2), "{key}");
+        assert!(until <= after + chrono::Duration::days(2), "{key}");
+        // The history entry carries the same lock.
+        let version = locked.object_versions[key].last().unwrap();
+        assert_eq!(version.lock_retain_until, Some(until), "{key}");
+    }
+    // The source bucket has no lock configuration, so its object has none.
+    assert_eq!(
+        mas.default_ref().buckets["src"].objects["rep"].lock_mode,
+        None
+    );
+}

@@ -133,11 +133,6 @@ pub fn put_delivered_object(
             permission: "FULL_CONTROL".to_string(),
         }];
     }
-    crate::service::apply_bucket_default_retention(
-        &mut obj,
-        bucket_ref.object_lock_config.as_deref(),
-        now,
-    );
     // Commit under the same guard as the existence check, so the on-disk body
     // and the in-memory metadata of concurrent writers to one key stay in
     // step. The payload is already staged next to the store, so the store

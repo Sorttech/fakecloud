@@ -67,7 +67,6 @@ impl S3Service {
         let (
             acl_owner_id,
             encryption_config,
-            object_lock_config,
             notification_config,
             region,
             bucket_region,
@@ -121,7 +120,6 @@ impl S3Service {
             (
                 b.acl_owner_id.clone(),
                 b.encryption_config.clone(),
-                b.object_lock_config.clone(),
                 b.notification_config.clone(),
                 state.region.clone(),
                 b.region.clone(),
@@ -422,8 +420,9 @@ impl S3Service {
             }
         }
 
-        // Object lock - explicit headers or bucket default
-        let lock = explicit_lock.or_bucket_default(object_lock_config.as_deref(), Utc::now());
+        // Object lock: the explicit headers. The bucket's default retention is
+        // applied at commit when none was asked for.
+        let lock = explicit_lock;
 
         // SSE-KMS: read the spool back into memory so the KMS hook can
         // produce an envelope-encrypted blob (AES-GCM needs the whole
@@ -1071,10 +1070,9 @@ impl S3Service {
             .get_mut(dest_bucket)
             .ok_or_else(|| no_such_bucket(dest_bucket))?;
 
-        // The destination's current default retention, measured from now, when
-        // the version is created.
-        let dest_lock =
-            explicit_lock.or_bucket_default(db.object_lock_config.as_deref(), Utc::now());
+        // The destination's default retention is applied at commit when the
+        // request asked for none.
+        let dest_lock = explicit_lock;
 
         // The destination's ACL comes from this request, never from the source:
         // S3 treats a copy as a new object, so an unspecified ACL is the default

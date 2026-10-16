@@ -118,6 +118,9 @@ pub(crate) fn replace_null_version(
 ///   whatever held it (an older null object or a null delete marker).
 /// - Never enabled: the object replaces the current one and carries no id.
 ///
+/// An object with no explicit retention of its own gets the bucket's default
+/// retention, measured from the commit.
+///
 /// The body is written through `store` (when one is configured) before any
 /// in-memory state changes, so a failed write returns the error and leaves
 /// the bucket's in-memory state exactly as it was. With no store, `obj.body`
@@ -195,6 +198,20 @@ where
         obj.version_id = None;
     }
 
+    // The one place a new version falls back to the bucket's default
+    // retention: an object that carries no explicit retention (request
+    // headers, or a replica's source lock) gets the default, measured from
+    // now, the moment the version is committed.
+    let lock = crate::state::ObjectLockSettings {
+        mode: obj.lock_mode.take(),
+        retain_until: obj.lock_retain_until.take(),
+        legal_hold: obj.lock_legal_hold.take(),
+    }
+    .or_bucket_default(b.object_lock_config.as_deref(), Utc::now());
+    obj.lock_mode = lock.mode;
+    obj.lock_retain_until = lock.retain_until;
+    obj.lock_legal_hold = lock.legal_hold;
+
     if let Some(store) = store {
         let meta = object_meta_snapshot(&obj);
         obj.body = run_blocking_io(|| write_body(store, &obj, &meta))?;
@@ -223,42 +240,6 @@ where
     };
     b.objects.insert(key, obj);
     Ok(reported)
-}
-
-/// Apply the bucket's default Object Lock retention to a new object version
-/// that asked for no retention of its own, measured from `now`, when the
-/// version is created. Same computation as PutObject's bucket default.
-pub(crate) fn apply_bucket_default_retention(
-    obj: &mut S3Object,
-    bucket_lock_config: Option<&str>,
-    now: chrono::DateTime<Utc>,
-) {
-    if obj.lock_mode.is_some() || obj.lock_retain_until.is_some() {
-        return;
-    }
-    let Some(config) = bucket_lock_config else {
-        return;
-    };
-    let Some(mode) = extract_xml_value(config, "Mode") else {
-        return;
-    };
-    let days = extract_xml_value(config, "Days").and_then(|d| d.trim().parse::<i64>().ok());
-    let years = extract_xml_value(config, "Years").and_then(|y| y.trim().parse::<i64>().ok());
-    // The configuration is range-checked when stored; a value persisted before
-    // that check must still not overflow. Years are calendar years (leap days
-    // included), not multiples of 365 days.
-    let until = match (days, years) {
-        (Some(d), _) => chrono::Duration::try_days(d).and_then(|d| now.checked_add_signed(d)),
-        (None, Some(y)) => y
-            .checked_mul(12)
-            .and_then(|m| u32::try_from(m).ok())
-            .and_then(|m| now.checked_add_months(chrono::Months::new(m))),
-        (None, None) => None,
-    };
-    if let Some(until) = until {
-        obj.lock_mode = Some(mode);
-        obj.lock_retain_until = Some(until);
-    }
 }
 
 /// Run a blocking closure (synchronous disk IO) without starving the async

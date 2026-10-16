@@ -811,13 +811,9 @@ impl S3Service {
             // second time from RAM (bug-hunt 2026-06-24, 4.1). In memory mode
             // it returns an empty placeholder, so the assembled in-memory body
             // is kept.
-            // The lock requested at CreateMultipartUpload, else the bucket's
-            // current default retention measured from now, when the version
-            // is created.
-            let lock = upload
-                .lock
-                .clone()
-                .or_bucket_default(b.object_lock_config.as_deref(), Utc::now());
+            // The lock requested at CreateMultipartUpload; the bucket's
+            // default retention is applied at commit when none was.
+            let lock = upload.lock.clone();
             let mut obj = obj;
             obj.lock_mode = lock.mode;
             obj.lock_retain_until = lock.retain_until;
