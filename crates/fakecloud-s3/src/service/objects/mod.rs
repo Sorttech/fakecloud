@@ -106,6 +106,122 @@ pub(crate) fn replace_null_version(
     versions.push(obj.clone());
 }
 
+/// Commit `obj` as the newest version of its key in `b` (the bucket named
+/// `bucket`), following the
+/// bucket's versioning state the way every S3 write does:
+///
+/// - Enabled: the object gets a version id (the caller's, when it already
+///   assigned a real one, otherwise a fresh one), a pre-versioning object at
+///   the key is preserved as the `"null"` version, and the new version is
+///   appended to the history.
+/// - Suspended: the object takes over the `"null"` version, replacing
+///   whatever held it (an older null object or a null delete marker).
+/// - Never enabled: the object replaces the current one and carries no id.
+///
+/// The body is written through `store` (when one is configured) before any
+/// in-memory state changes, so a failed write leaves the bucket as it was,
+/// except for a preserved null version whose own sidecar was already
+/// persisted. With no store, `obj.body` must already hold the payload.
+///
+/// Returns the version id to report to the writer: the new id on a
+/// versioning-enabled bucket, `None` otherwise.
+pub(crate) fn commit_object_version(
+    b: &mut crate::state::S3Bucket,
+    bucket: &str,
+    store: Option<&dyn fakecloud_persistence::S3Store>,
+    mut obj: S3Object,
+    body: BodySource,
+) -> fakecloud_persistence::StoreResult<Option<String>> {
+    let key = obj.key.clone();
+    let versioning_enabled = b.versioning.as_deref() == Some("Enabled");
+    let versioning_suspended = b.versioning.as_deref() == Some("Suspended");
+
+    if versioning_enabled {
+        if obj.version_id.as_deref().is_none_or(|v| v == "null") {
+            obj.version_id = Some(Uuid::new_v4().to_string());
+        }
+        // The current object becomes the "null" version once a real version
+        // is stacked on top of it. Persist the rewritten sidecar BEFORE
+        // recording it in memory, so a failed write cannot leave a version in
+        // the history that disk lacks.
+        if let Some(preserved) = null_version_to_preserve(b, &key) {
+            if let Some(store) = store {
+                let preserved_meta = object_meta_snapshot(&preserved);
+                run_blocking_io(|| {
+                    store.put_object_meta(bucket, &key, Some("null"), &preserved_meta)
+                })?;
+            }
+            record_preserved_null(b, &key, preserved);
+        }
+    } else if versioning_suspended {
+        // Tagging it "null" also keeps the disk sidecar in the versioned set,
+        // so a restart-loaded bucket agrees with the live one about which
+        // object is current.
+        obj.version_id = Some("null".to_string());
+    } else {
+        obj.version_id = None;
+    }
+
+    if let Some(store) = store {
+        let meta = object_meta_snapshot(&obj);
+        obj.body = run_blocking_io(|| {
+            store.put_object(bucket, &key, meta.version_id.as_deref(), body, &meta)
+        })?;
+    }
+
+    if versioning_enabled {
+        b.object_versions
+            .entry(key.clone())
+            .or_default()
+            .push(obj.clone());
+    } else if versioning_suspended {
+        replace_null_version(b, &key, &obj);
+    }
+    let reported = if versioning_enabled {
+        obj.version_id.clone()
+    } else {
+        None
+    };
+    b.objects.insert(key, obj);
+    Ok(reported)
+}
+
+/// Apply the bucket's default Object Lock retention to a new object version
+/// that asked for no retention of its own, measured from `now`, when the
+/// version is created. Same computation as PutObject's bucket default.
+pub(crate) fn apply_bucket_default_retention(
+    obj: &mut S3Object,
+    bucket_lock_config: Option<&str>,
+    now: DateTime<Utc>,
+) {
+    if obj.lock_mode.is_some() || obj.lock_retain_until.is_some() {
+        return;
+    }
+    let Some(config) = bucket_lock_config else {
+        return;
+    };
+    let Some(mode) = extract_xml_value(config, "Mode") else {
+        return;
+    };
+    let days = extract_xml_value(config, "Days").and_then(|d| d.trim().parse::<i64>().ok());
+    let years = extract_xml_value(config, "Years").and_then(|y| y.trim().parse::<i64>().ok());
+    // The configuration is range-checked when stored; a value persisted before
+    // that check must still not overflow. Years are calendar years (leap days
+    // included), not multiples of 365 days.
+    let until = match (days, years) {
+        (Some(d), _) => chrono::Duration::try_days(d).and_then(|d| now.checked_add_signed(d)),
+        (None, Some(y)) => y
+            .checked_mul(12)
+            .and_then(|m| u32::try_from(m).ok())
+            .and_then(|m| now.checked_add_months(chrono::Months::new(m))),
+        (None, None) => None,
+    };
+    if let Some(until) = until {
+        obj.lock_mode = Some(mode);
+        obj.lock_retain_until = Some(until);
+    }
+}
+
 /// Run a blocking closure (synchronous disk IO) without starving the async
 /// runtime. On a multi-threaded tokio runtime this uses `block_in_place` so
 /// the worker hands its other tasks to a sibling thread for the duration of

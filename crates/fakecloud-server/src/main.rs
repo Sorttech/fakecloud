@@ -3451,6 +3451,7 @@ async fn main() {
         };
     let mut elasticache_service = ElastiCacheService::new(elasticache_state)
         .with_s3(s3_state.clone())
+        .with_s3_store(s3_store.clone())
         .with_ec2_state(ec2_state.clone());
     if let Some(ref rt) = elasticache_runtime {
         elasticache_service = elasticache_service.with_runtime(rt.clone());
@@ -3991,8 +3992,9 @@ async fn main() {
         } else {
             None
         };
-    let mut acmpca_inner =
-        fakecloud_acmpca::AcmPcaService::new(acmpca_state.clone()).with_s3(s3_state.clone());
+    let mut acmpca_inner = fakecloud_acmpca::AcmPcaService::new(acmpca_state.clone())
+        .with_s3(s3_state.clone())
+        .with_s3_store(s3_store.clone());
     if let Some(store) = acmpca_snapshot_store.clone() {
         acmpca_inner = acmpca_inner.with_snapshot_store(store);
     }
@@ -6410,11 +6412,15 @@ async fn main() {
         } else {
             None
         };
+    // Build artifacts are written through the durable S3 store, like every
+    // other object, so they survive a restart in persistent mode.
+    let s3_delivery_for_codebuild = Arc::new(fakecloud_s3::delivery::S3DeliveryImpl::new(
+        s3_state.clone(),
+    ));
+    s3_delivery_for_codebuild.set_s3_store(s3_store.clone());
     let mut codebuild_service = fakecloud_codebuild::CodeBuildService::new(codebuild_state.clone())
         .with_logs(logs_state.clone())
-        .with_s3(Arc::new(fakecloud_s3::delivery::S3DeliveryImpl::new(
-            s3_state.clone(),
-        )))
+        .with_s3(s3_delivery_for_codebuild)
         .with_secret_stores(ssm_state_for_codebuild, secretsmanager_state_for_codebuild)
         .with_backend_autodetect();
     if let Some(store) = codebuild_snapshot_store {
@@ -8269,7 +8275,7 @@ async fn main() {
                                 let now = chrono::Utc::now();
                                 let data = bytes::Bytes::from(augmented_body.clone());
                                 let size = data.len() as u64;
-                                let etag = format!("\"{:x}\"", md5::Md5::digest(&data));
+                                let etag = format!("{:x}", md5::Md5::digest(&data));
                                 // Encrypt via KMS when KmsKeyArn is configured.
                                 let (body_bytes, sse_algorithm, sse_kms_key_id) =
                                     if let Some(kms_key) = kms_key_arn {
@@ -8307,9 +8313,8 @@ async fn main() {
                                     };
                                 let obj = fakecloud_s3::S3Object {
                                     key: key.clone(),
-                                    body: fakecloud_persistence::BodyRef::Memory(body_bytes.clone()),
                                     content_type: "text/plain".to_string(),
-                                    etag: etag.clone(),
+                                    etag,
                                     size,
                                     last_modified: now,
                                     storage_class: "STANDARD".to_string(),
@@ -8317,38 +8322,31 @@ async fn main() {
                                     sse_kms_key_id,
                                     ..Default::default()
                                 };
-                                let mut mas = s3_for_inbound.write();
-                                let state = mas.default_mut();
-                                if let Some(bucket) = state.buckets.get_mut(bucket_name) {
-                                    tracing::info!(
+                                let s3_account =
+                                    s3_for_inbound.read().default_account_id().to_string();
+                                // The stored email is an ordinary new object
+                                // version: versioning and default retention
+                                // apply, and it is written through the store.
+                                match fakecloud_s3::delivery::put_delivered_object(
+                                    &s3_for_inbound,
+                                    Some(s3_store_for_inbound.as_ref()),
+                                    &s3_account,
+                                    bucket_name,
+                                    obj,
+                                    body_bytes,
+                                ) {
+                                    Ok(_) => tracing::info!(
                                         bucket = %bucket_name,
                                         key = %key,
                                         kms = kms_key_arn.is_some(),
                                         "SES inbound: stored email in S3"
-                                    );
-                                    let meta =
-                                        fakecloud_s3::persistence::object_meta_snapshot(&obj);
-                                    bucket.objects.insert(key.clone(), obj);
-                                    drop(mas);
-                                    if let Err(err) = s3_store_for_inbound.put_object(
-                                        bucket_name,
-                                        &key,
-                                        None,
-                                        fakecloud_persistence::BodySource::Bytes(body_bytes),
-                                        &meta,
-                                    ) {
-                                        tracing::error!(
-                                            bucket = %bucket_name,
-                                            key = %key,
-                                            error = %err,
-                                            "SES inbound: failed to persist S3 object via store"
-                                        );
-                                    }
-                                } else {
-                                    tracing::warn!(
+                                    ),
+                                    Err(err) => tracing::warn!(
                                         bucket = %bucket_name,
-                                        "SES inbound: S3 bucket not found, skipping S3 action"
-                                    );
+                                        key = %key,
+                                        error = %err,
+                                        "SES inbound: S3 action failed, email not stored"
+                                    ),
                                 }
                             }
                             fakecloud_ses::ReceiptAction::Sns { topic_arn, .. } => {
@@ -10538,9 +10536,11 @@ async fn main() {
             "/_fakecloud/rds/s3-export",
             axum::routing::post({
                 let s3 = rds_bridge_s3_state;
+                let s3_store = s3_store.clone();
                 move |headers: axum::http::HeaderMap,
                       axum::Json(body): axum::Json<types::RdsS3ExportRequest>| {
                     let s3 = s3.clone();
+                    let s3_store = s3_store.clone();
                     async move {
                         let account_id = headers
                             .get("x-fakecloud-account-id")
@@ -10563,35 +10563,38 @@ async fn main() {
                             }
                         };
                         let bytes_uploaded = bytes.len() as i64;
-                        let now = chrono::Utc::now();
-                        let etag = {
-                            use md5::{Digest, Md5};
-                            format!("\"{:x}\"", Md5::digest(&bytes))
-                        };
-                        let body_bytes = bytes::Bytes::from(bytes);
-                        {
-                            let mut mas = s3.write();
-                            let state = mas.get_or_create(&account_id);
-                            let Some(bucket) = state.buckets.get_mut(&body.bucket) else {
-                                return (
+                        // The exported file is an ordinary new object version
+                        // (versioning, default retention, durable store).
+                        if let Err(err) = fakecloud_s3::delivery::put_object_via_store(
+                            &s3,
+                            Some(s3_store.as_ref()),
+                            &account_id,
+                            &body.bucket,
+                            &body.key,
+                            bytes,
+                            None,
+                        ) {
+                            let exists = s3
+                                .read()
+                                .get(&account_id)
+                                .is_some_and(|a| a.buckets.contains_key(&body.bucket));
+                            return if exists {
+                                (
+                                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                    axum::Json(serde_json::json!({
+                                        "error": "InternalError",
+                                        "message": err,
+                                    })),
+                                )
+                            } else {
+                                (
                                     axum::http::StatusCode::NOT_FOUND,
                                     axum::Json(serde_json::json!({
                                         "error": "NoSuchBucket",
                                         "bucket": body.bucket,
                                     })),
-                                );
+                                )
                             };
-                            let object = fakecloud_s3::S3Object {
-                                key: body.key.clone(),
-                                body: fakecloud_s3::memory_body(body_bytes),
-                                content_type: "application/octet-stream".to_string(),
-                                etag,
-                                size: bytes_uploaded as u64,
-                                last_modified: now,
-                                storage_class: "STANDARD".to_string(),
-                                ..Default::default()
-                            };
-                            bucket.objects.insert(body.key.clone(), object);
                         }
                         let resp = types::RdsS3ExportResponse {
                             bucket: body.bucket,

@@ -16,7 +16,7 @@ use uuid::Uuid;
 use fakecloud_aws::arn::{arn_resource, Arn};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
 use fakecloud_persistence::SnapshotStore;
-use fakecloud_s3::{memory_body, S3Object, SharedS3State};
+use fakecloud_s3::SharedS3State;
 
 use crate::persistence::save_acmpca_snapshot;
 use crate::provision::{build_pending_ca, CaCreateParams};
@@ -94,6 +94,8 @@ pub struct AcmPcaService {
     /// delivers the generated report object into the target bucket here so the
     /// documented create-report -> read-from-S3 flow actually works.
     s3: Option<SharedS3State>,
+    /// Durable S3 store, so a delivered audit report survives a restart.
+    s3_store: Option<Arc<dyn fakecloud_persistence::S3Store>>,
 }
 
 impl AcmPcaService {
@@ -104,6 +106,7 @@ impl AcmPcaService {
             snapshot_lock: Arc::new(AsyncMutex::new(())),
             keygen_waiters: Arc::new(SyncMutex::new(HashMap::new())),
             s3: None,
+            s3_store: None,
         }
     }
 
@@ -116,6 +119,13 @@ impl AcmPcaService {
     /// into the caller-specified bucket/key.
     pub fn with_s3(mut self, s3: SharedS3State) -> Self {
         self.s3 = Some(s3);
+        self
+    }
+
+    /// Wire the durable S3 store so delivered audit reports persist across a
+    /// restart, like any other object written to a bucket.
+    pub fn with_s3_store(mut self, store: Arc<dyn fakecloud_persistence::S3Store>) -> Self {
+        self.s3_store = Some(store);
         self
     }
 
@@ -1373,24 +1383,18 @@ impl AcmPcaService {
         } else {
             "application/json"
         };
-        let size = body.len() as u64;
-        let etag = format!("\"{}\"", audit_report_etag(body.as_bytes()));
-        let now = Utc::now();
-        let object = S3Object {
-            key: key.to_string(),
-            body: memory_body(bytes::Bytes::from(body.into_bytes())),
-            content_type: content_type.to_string(),
-            etag,
-            size,
-            last_modified: now,
-            storage_class: "STANDARD".to_string(),
-            ..Default::default()
-        };
-        let mut s3_state = s3.write();
-        let account = account_id(req);
-        let state = s3_state.get_or_create(&account);
-        if let Some(bucket) = state.buckets.get_mut(bucket_name) {
-            bucket.objects.insert(key.to_string(), object);
+        // A new object version in the target bucket, written as PutObject
+        // writes one (versioning, default retention, durable store).
+        if let Err(err) = fakecloud_s3::delivery::put_object_via_store(
+            s3,
+            self.s3_store.as_deref(),
+            &account_id(req),
+            bucket_name,
+            key,
+            body.into_bytes(),
+            Some(content_type),
+        ) {
+            tracing::warn!(bucket = %bucket_name, %key, %err, "failed to deliver audit report");
         }
     }
 
@@ -1639,14 +1643,6 @@ fn paginate<T>(items: Vec<T>, max: Option<usize>, start: usize) -> (Vec<T>, Opti
         None
     };
     (page, next)
-}
-
-/// A stable 32-hex-char ETag for a delivered audit report object (S3 ETags are
-/// hex; the exact hash function is unobservable, so a SHA-256 prefix suffices).
-fn audit_report_etag(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(bytes);
-    hex::encode(&digest[..16])
 }
 
 fn ca_id_from_arn(arn: &str) -> &str {

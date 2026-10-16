@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use base64::Engine;
-use bytes::Bytes;
 use chrono::Utc;
 use fakecloud_aws::arn::Arn;
 use http::StatusCode;
@@ -13,8 +12,8 @@ use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceError};
-use fakecloud_persistence::{BodySource, S3Store, SnapshotStore};
-use fakecloud_s3::{memory_body, S3Object, SharedS3State};
+use fakecloud_persistence::{S3Store, SnapshotStore};
+use fakecloud_s3::SharedS3State;
 
 use crate::state::{
     DeliveryStream, EncryptionConfig, FirehoseAccounts, FirehoseSnapshot, S3Destination,
@@ -1106,92 +1105,31 @@ impl FirehoseService {
             ts = now.timestamp(),
             rand = &Uuid::new_v4().to_string()[..8],
         );
-        let size = payload.len() as u64;
-        let etag = format!("\"{}\"", Uuid::new_v4().simple());
-        let bytes = Bytes::from(payload);
-        let body = memory_body(bytes.clone());
         let _ = region;
         // Snapshot the durable store handle before taking the S3 state lock so we
         // never hold two locks at once.
         let store = self.s3_store.read().clone();
-        let mut s3_state = s3.write();
-        let s3 = s3_state.get_or_create(account_id);
-        let Some(bucket) = s3.buckets.get_mut(bucket_name) else {
-            // As above: AWS acknowledges the records (async delivery) even when
-            // the destination bucket is absent. Warn for observability rather
-            // than dropping silently, but don't fail the API call.
+        // The batch is an ordinary new object version in the destination
+        // bucket: versioning and default retention apply as for PutObject, and
+        // it is written through the durable store so it survives a restart.
+        if let Err(err) = fakecloud_s3::delivery::put_object_via_store(
+            s3,
+            store.as_deref(),
+            account_id,
+            bucket_name,
+            &key,
+            payload,
+            None,
+        ) {
+            // AWS acknowledges the records (async delivery) even when the
+            // destination bucket is absent or the write fails; it reports the
+            // failure through metrics / error output, never as an API error.
             tracing::warn!(
                 stream = %stream_name,
                 bucket = %bucket_name,
-                "firehose S3 destination bucket does not exist; records not delivered",
+                %err,
+                "firehose S3 delivery failed; records not delivered",
             );
-            return Ok(());
-        };
-        let object = S3Object {
-            key: key.clone(),
-            body,
-            content_type: "application/octet-stream".to_string(),
-            etag,
-            size,
-            last_modified: now,
-            metadata: BTreeMap::new(),
-            storage_class: "STANDARD".to_string(),
-            tags: BTreeMap::new(),
-            acl_grants: Vec::new(),
-            acl_owner_id: None,
-            replication_status: None,
-            parts_count: None,
-            part_sizes: None,
-            sse_algorithm: None,
-            sse_kms_key_id: None,
-            bucket_key_enabled: None,
-            version_id: None,
-            is_delete_marker: false,
-            content_encoding: None,
-            cache_control: None,
-            content_disposition: None,
-            content_language: None,
-            expires: None,
-            website_redirect_location: None,
-            restore_ongoing: None,
-            restore_expiry: None,
-            checksum_algorithm: None,
-            checksum_value: None,
-            lock_mode: None,
-            lock_retain_until: None,
-            lock_legal_hold: None,
-            annotations: BTreeMap::new(),
-        };
-        // Write through to the durable S3 store so delivered records survive a
-        // restart. S3 has no state snapshot: on boot it is rebuilt from this
-        // store, so an object that only lives in `s3_state` is lost. Mirror the
-        // S3 replication path (service/notifications.rs): persist via the store,
-        // then swap the in-memory body for the canonical (possibly disk-backed)
-        // ref the store returns.
-        if let Some(store) = &store {
-            let meta = fakecloud_s3::persistence::object_meta_snapshot(&object);
-            match store.put_object(bucket_name, &key, None, BodySource::Bytes(bytes), &meta) {
-                Ok(returned) => {
-                    let mut object = object;
-                    object.body = returned;
-                    bucket.objects.insert(key, object);
-                }
-                Err(err) => {
-                    // Store write (disk) failed. Don't fail the API (AWS wouldn't
-                    // for a backend hiccup); degrade to keeping the object in
-                    // memory for this session and warn that it isn't durable.
-                    tracing::error!(
-                        stream = %stream_name,
-                        bucket = %bucket_name,
-                        %err,
-                        "failed to persist firehose delivery to S3 store; keeping in memory only",
-                    );
-                    bucket.objects.insert(key, object);
-                }
-            }
-        } else {
-            // Memory mode: no durable store, keep the in-memory object only.
-            bucket.objects.insert(key, object);
         }
         Ok(())
     }
@@ -1219,7 +1157,7 @@ mod tests {
             request_id: "req-1".to_string(),
             headers: HeaderMap::new(),
             query_params: std::collections::HashMap::new(),
-            body: Bytes::from(serde_json::to_vec(&body).unwrap()),
+            body: bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
             body_stream: parking_lot::Mutex::new(None),
             path_segments: Vec::new(),
             raw_path: "/".to_string(),

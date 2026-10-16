@@ -4530,7 +4530,6 @@ version = "0.50.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
- "bytes",
  "chrono",
  "fakecloud-aws",
  "fakecloud-core",
@@ -4544,7 +4543,6 @@ dependencies = [
  "rsa",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "thiserror 2.0.18",
  "time",
  "tokio",
@@ -5765,7 +5763,6 @@ dependencies = [
  "http 1.4.0",
  "k8s-openapi",
  "kube",
- "md-5 0.10.6",
  "parking_lot",
  "serde",
  "serde_json",

@@ -2,11 +2,10 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use chrono::Utc;
-use fakecloud_persistence::{BodySource, S3Store};
+use fakecloud_persistence::S3Store;
 use md5::{Digest, Md5};
 use uuid::Uuid;
 
-use crate::persistence::object_meta_snapshot;
 use crate::state::{S3Object, SharedS3State};
 use crate::xml_util::extract_tag;
 
@@ -151,7 +150,6 @@ pub fn maybe_write_access_log(
 
     let log_object = S3Object {
         key: log_key.clone(),
-        body: crate::state::memory_body(data.clone()),
         content_type: "text/plain".to_string(),
         etag,
         size,
@@ -160,42 +158,28 @@ pub fn maybe_write_access_log(
         ..Default::default()
     };
 
-    let meta = object_meta_snapshot(&log_object);
-    {
-        let mut mas = state.write();
-        let target_acct = mas
-            .find_account(|s| s.buckets.contains_key(&config.target_bucket))
-            .map(|a| a.to_string());
-        let inserted = if let Some(acct) = target_acct {
-            if let Some(st) = mas.get_mut(&acct) {
-                if let Some(target) = st.buckets.get_mut(&config.target_bucket) {
-                    target.objects.insert(log_key.clone(), log_object);
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        if !inserted {
-            return;
-        }
-    }
-    if let Err(err) = store.put_object(
+    let target_acct = state
+        .read()
+        .find_account(|s| s.buckets.contains_key(&config.target_bucket))
+        .map(|a| a.to_string());
+    let Some(target_acct) = target_acct else {
+        return;
+    };
+    // A log object is a new object version in the target bucket, written the
+    // way PutObject writes one (versioning, default retention, durable store).
+    if let Err(err) = crate::delivery::put_delivered_object(
+        state,
+        Some(store.as_ref()),
+        &target_acct,
         &config.target_bucket,
-        &log_key,
-        None,
-        BodySource::Bytes(data),
-        &meta,
+        log_object,
+        data,
     ) {
         tracing::error!(
             bucket = %config.target_bucket,
             key = %log_key,
             error = %err,
-            "failed to persist S3 access log object via store"
+            "failed to deliver S3 access log object"
         );
     }
 }

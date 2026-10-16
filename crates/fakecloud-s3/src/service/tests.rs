@@ -841,6 +841,74 @@ fn test_replicate_object() {
     );
 }
 
+/// The replica is a new version in the destination, versioned by the
+/// destination's own state: on a versioning-enabled destination the object
+/// already at the key (written before versioning) is kept as the "null"
+/// version instead of vanishing, and on a suspended destination the replica
+/// takes over the null version.
+#[test]
+fn replica_follows_destination_versioning() {
+    use crate::state::S3Bucket;
+
+    for (versioning, expect_null_current) in [("Enabled", false), ("Suspended", true)] {
+        let mut accounts =
+            fakecloud_core::multi_account::MultiAccountState::<crate::state::S3State>::new(
+                "123456789012",
+                "us-east-1",
+                "",
+            );
+        let state = accounts.get_or_create("123456789012");
+        state.buckets.insert(
+            "source".to_string(),
+            replication_source(
+                "<ReplicationConfiguration>\
+                 <Rule><Status>Enabled</Status>\
+                 <Filter><Prefix></Prefix></Filter>\
+                 <Destination><Bucket>arn:aws:s3:::destination</Bucket></Destination>\
+                 </Rule></ReplicationConfiguration>",
+                "owner",
+            ),
+        );
+        let mut dest = S3Bucket::new("destination", "us-east-1", "owner");
+        dest.objects.insert(
+            "test-key".to_string(),
+            S3Object {
+                key: "test-key".to_string(),
+                body: crate::state::memory_body(Bytes::from_static(b"old")),
+                ..Default::default()
+            },
+        );
+        dest.versioning = Some(versioning.to_string());
+        state.buckets.insert("destination".to_string(), dest);
+
+        replicate(&mut accounts, "123456789012");
+
+        let state = accounts.get("123456789012").unwrap();
+        let dest = state.buckets.get("destination").unwrap();
+        let current = &dest.objects["test-key"];
+        assert_eq!(
+            state.read_body(&current.body).unwrap(),
+            Bytes::from_static(b"hello")
+        );
+        assert_eq!(current.replication_status.as_deref(), Some("REPLICA"));
+        if expect_null_current {
+            assert_eq!(current.version_id.as_deref(), Some("null"), "{versioning}");
+            assert!(!dest.object_versions.contains_key("test-key"));
+        } else {
+            let vid = current.version_id.clone().expect("replica version id");
+            assert_ne!(vid, "null");
+            let versions = &dest.object_versions["test-key"];
+            assert_eq!(versions.len(), 2, "{versions:?}");
+            assert_eq!(versions[0].version_id.as_deref(), Some("null"));
+            assert_eq!(
+                state.read_body(&versions[0].body).unwrap(),
+                Bytes::from_static(b"old")
+            );
+            assert_eq!(versions[1].version_id.as_deref(), Some(vid.as_str()));
+        }
+    }
+}
+
 /// Bucket names are global: a rule whose destination bucket lives in another
 /// account replicates into that account's bucket, and
 /// `AccessControlTranslation` `Owner=Destination` hands the replica to the

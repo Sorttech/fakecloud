@@ -5690,7 +5690,10 @@ async fn export_serverless_cache_snapshot_writes_object_to_s3() {
             .get("snap-x.rdb")
             .expect("export object written to S3");
         assert!(obj.size > 0);
-        assert!(obj.etag.starts_with('"') && obj.etag.ends_with('"'));
+        // Stored unquoted like every S3 ETag (GetObject adds the quotes): the
+        // hex MD5 of the body.
+        assert_eq!(obj.etag.len(), 32, "{}", obj.etag);
+        assert!(obj.etag.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     // A missing bucket is rejected the way AWS does, not silently dropped.

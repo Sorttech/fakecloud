@@ -523,27 +523,21 @@ impl AthenaService {
             "codeBlock": code_block.unwrap_or_default(),
         }))
         .unwrap_or_default();
-        let size = payload.len() as u64;
-        let etag = format!("\"{}\"", Uuid::new_v4().simple());
-
-        let mut guard = s3.write();
-        let acct = guard.get_or_create(account_id);
-        let Some(bucket) = acct.buckets.get_mut(&bucket_name) else {
+        // A new object version in the result bucket, written as PutObject
+        // writes one (versioning, default retention, durable store).
+        if fakecloud_s3::delivery::put_object_via_store(
+            s3,
+            self.s3_store.as_deref(),
+            account_id,
+            &bucket_name,
+            &key,
+            payload,
+            Some("application/json"),
+        )
+        .is_err()
+        {
             return (None, None);
-        };
-        bucket.objects.insert(
-            key.clone(),
-            fakecloud_s3::S3Object {
-                key: key.clone(),
-                body: fakecloud_s3::memory_body(bytes::Bytes::from(payload)),
-                content_type: "application/json".to_string(),
-                etag,
-                size,
-                last_modified: Utc::now(),
-                storage_class: "STANDARD".to_string(),
-                ..Default::default()
-            },
-        );
+        }
         (
             Some(format!("s3://{bucket_name}/{key}")),
             Some("JSON".to_string()),
