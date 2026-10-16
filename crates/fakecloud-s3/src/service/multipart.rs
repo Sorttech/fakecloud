@@ -762,6 +762,11 @@ impl S3Service {
             content_disposition: upload.content_disposition.clone(),
             content_language: upload.content_language.clone(),
             expires: upload.expires.clone(),
+            // The lock requested at CreateMultipartUpload; the bucket's
+            // default retention is applied at commit when none was.
+            lock_mode: upload.lock.mode.clone(),
+            lock_retain_until: upload.lock.retain_until,
+            lock_legal_hold: upload.lock.legal_hold.clone(),
             ..Default::default()
         };
 
@@ -811,13 +816,6 @@ impl S3Service {
             // second time from RAM (bug-hunt 2026-06-24, 4.1). In memory mode
             // it returns an empty placeholder, so the assembled in-memory body
             // is kept.
-            // The lock requested at CreateMultipartUpload; the bucket's
-            // default retention is applied at commit when none was.
-            let lock = upload.lock.clone();
-            let mut obj = obj;
-            obj.lock_mode = lock.mode;
-            obj.lock_retain_until = lock.retain_until;
-            obj.lock_legal_hold = lock.legal_hold;
             let store = self.store.clone();
             let version_id = crate::service::objects::commit_object_version_with(
                 b,

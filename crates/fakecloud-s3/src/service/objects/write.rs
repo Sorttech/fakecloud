@@ -420,10 +420,6 @@ impl S3Service {
             }
         }
 
-        // Object lock: the explicit headers. The bucket's default retention is
-        // applied at commit when none was asked for.
-        let lock = explicit_lock;
-
         // SSE-KMS: read the spool back into memory so the KMS hook can
         // produce an envelope-encrypted blob (AES-GCM needs the whole
         // plaintext at once — chunked AEAD isn't part of the AWS S3
@@ -451,8 +447,8 @@ impl S3Service {
         let obj = S3Object {
             key: key.to_string(),
             size: plaintext_size,
-            // The runtime body is filled in below with the BodyRef
-            // returned from self.store.put_object — for memory mode that
+            // The runtime body is filled in at commit with the BodyRef
+            // the store returns (`commit_object_version`) — for memory mode that
             // is a `Memory` variant, for persistent mode a `Disk`
             // variant pointing at the freshly written .bin file.
             // Constructing with an empty placeholder means streamed
@@ -479,9 +475,11 @@ impl S3Service {
             website_redirect_location,
             checksum_algorithm: checksum_algorithm.clone(),
             checksum_value: checksum_value.clone(),
-            lock_mode: lock.mode,
-            lock_retain_until: lock.retain_until,
-            lock_legal_hold: lock.legal_hold,
+            // The explicit lock headers; the bucket's default retention is
+            // applied at commit when none was asked for.
+            lock_mode: explicit_lock.mode,
+            lock_retain_until: explicit_lock.retain_until,
+            lock_legal_hold: explicit_lock.legal_hold,
             ..Default::default()
         };
 
@@ -1070,10 +1068,6 @@ impl S3Service {
             .get_mut(dest_bucket)
             .ok_or_else(|| no_such_bucket(dest_bucket))?;
 
-        // The destination's default retention is applied at commit when the
-        // request asked for none.
-        let dest_lock = explicit_lock;
-
         // The destination's ACL comes from this request, never from the source:
         // S3 treats a copy as a new object, so an unspecified ACL is the default
         // private one rather than whatever the source carried.
@@ -1092,7 +1086,7 @@ impl S3Service {
             // Copy is an independent object — never inherit the source's
             // disk-backed BodyRef (which would point at the source's file).
             // The source bytes are read above; the destination's own on-disk
-            // file is written below via `self.store.put_object`.
+            // file is written at commit by `commit_object_version`.
             body: crate::state::memory_body(dest_stored_bytes.clone()),
             // size tracks plaintext bytes (matches what a future GetObject
             // returns to the caller); see the put_object SSE-KMS path.
@@ -1121,9 +1115,11 @@ impl S3Service {
             checksum_algorithm: new_checksum_algo.clone(),
             checksum_value: new_checksum_val.clone(),
             // Lock status is not copied from the source object.
-            lock_mode: dest_lock.mode,
-            lock_retain_until: dest_lock.retain_until,
-            lock_legal_hold: dest_lock.legal_hold,
+            // The request's lock headers; the destination's default retention
+            // is applied at commit when they ask for none.
+            lock_mode: explicit_lock.mode,
+            lock_retain_until: explicit_lock.retain_until,
+            lock_legal_hold: explicit_lock.legal_hold,
             ..Default::default()
         };
 

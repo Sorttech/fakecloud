@@ -684,9 +684,11 @@ mod tests {
         }
     }
 
-    /// A failed store write is returned to the caller and changes nothing in
-    /// memory: no new object, no new version, and an object written before
-    /// versioning is not re-tagged or moved into the history.
+    /// A failed store write is returned to the caller and records no new
+    /// object or version in memory, and memory keeps agreeing with disk: when
+    /// only the body write fails, the pre-versioning object's sidecar was
+    /// already relabelled the "null" version, so memory records it as the null
+    /// version too; when that relabel itself fails, nothing changes.
     #[test]
     fn store_failure_is_returned_and_leaves_memory_unchanged() {
         for fail_meta in [false, true] {
@@ -725,11 +727,23 @@ mod tests {
             )
             .expect_err("store failure must be returned");
             let after = bucket(&state);
-            assert!(after.object_versions.is_empty(), "fail_meta={fail_meta}");
             let current = &after.objects["k"];
-            assert_eq!(current.version_id, before.objects["k"].version_id);
-            assert_eq!(current.version_id, None);
             assert_eq!(read(&state, &current.body), b"pre");
+            assert_eq!(before.objects["k"].version_id, None);
+            if fail_meta {
+                // The relabel failed: disk and memory both still hold the
+                // untagged pre-versioning object.
+                assert!(after.object_versions.is_empty());
+                assert_eq!(current.version_id, None);
+            } else {
+                // The relabel reached disk, so memory records the object as
+                // the null version, and no new version exists.
+                assert_eq!(current.version_id.as_deref(), Some("null"));
+                let versions = &after.object_versions["k"];
+                assert_eq!(versions.len(), 1, "{versions:?}");
+                assert_eq!(versions[0].version_id.as_deref(), Some("null"));
+                assert_eq!(read(&state, &versions[0].body), b"pre");
+            }
         }
     }
 

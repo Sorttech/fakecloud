@@ -121,10 +121,13 @@ pub(crate) fn replace_null_version(
 /// An object with no explicit retention of its own gets the bucket's default
 /// retention, measured from the commit.
 ///
-/// The body is written through `store` (when one is configured) before any
-/// in-memory state changes, so a failed write returns the error and leaves
-/// the bucket's in-memory state exactly as it was. With no store, `obj.body`
-/// must already hold the payload.
+/// The body is written through `store` (when one is configured) before the
+/// new version is recorded in memory, so a failed write returns the error and
+/// records no new version. A pre-versioning object relabelled as the null
+/// version stays relabelled (disk already says so). With no store, `obj.body`
+/// must already hold the payload. A caller-supplied id naming a version
+/// already in the history rewrites that version in place; it becomes the
+/// current object only if it is the newest.
 ///
 /// Returns the version id to report to the writer: the new id on a
 /// versioning-enabled bucket, `None` otherwise.
@@ -163,23 +166,28 @@ where
     let versioning_enabled = b.versioning.as_deref() == Some("Enabled");
     let versioning_suspended = b.versioning.as_deref() == Some("Suspended");
 
-    // Whether the caller named the version (a replica keeps its source
-    // version's id); only then can the history already hold that id.
-    let mut caller_supplied_id = false;
-    let mut preserved_null = None;
+    // The history position of an existing version the caller named again (a
+    // replica of a source version that was already replicated). Only a
+    // caller-supplied id can already be there; a freshly minted one cannot.
+    let mut existing_position = None;
     if versioning_enabled {
         if obj.version_id.as_deref().is_none_or(|v| v == "null") {
             obj.version_id = Some(Uuid::new_v4().to_string());
-        } else {
-            caller_supplied_id = true;
+        } else if let Some(versions) = b.object_versions.get(&key) {
+            existing_position = versions.iter().position(|o| o.version_id == obj.version_id);
+            // Rewriting a version keeps its place in the history, which the
+            // loader rebuilds from LastModified.
+            if let Some(pos) = existing_position {
+                obj.last_modified = versions[pos].last_modified;
+            }
         }
         // The current object becomes the "null" version once a real version
-        // is stacked on top of it. Its sidecar is rewritten with the "null"
-        // id first (the loader otherwise files an id-less null slot as the
-        // current object, which the newer version then replaces on restart).
-        // That rewrite only names the version the object already is, so it
-        // is harmless if the body write below fails; the in-memory record is
-        // deferred until the whole write has succeeded.
+        // is stacked on top of it. Persist the rewritten sidecar BEFORE
+        // recording it in memory, so a failed write cannot leave a version in
+        // the history that disk lacks; once it is persisted, record it at
+        // once. It only relabels the object already there, so it is right
+        // whether or not the body write below succeeds, and memory keeps
+        // agreeing with disk if that write fails.
         if let Some(preserved) = null_version_to_preserve(b, &key) {
             if let Some(store) = store {
                 let preserved_meta = object_meta_snapshot(&preserved);
@@ -187,7 +195,7 @@ where
                     store.put_object_meta(bucket, &key, Some("null"), &preserved_meta)
                 })?;
             }
-            preserved_null = Some(preserved);
+            record_preserved_null(b, &key, preserved);
         }
     } else if versioning_suspended {
         // Tagging it "null" also keeps the disk sidecar in the versioned set,
@@ -217,19 +225,20 @@ where
         obj.body = run_blocking_io(|| write_body(store, &obj, &meta))?;
     }
 
-    // Everything is persisted: only now record the write in memory, so a
-    // failure above leaves the bucket exactly as it was.
-    if let Some(preserved) = preserved_null {
-        record_preserved_null(b, &key, preserved);
-    }
+    // The body is persisted: only now record the new version in memory, so a
+    // failed write leaves no version in memory that disk lacks.
+    let mut becomes_current = true;
     if versioning_enabled {
         let versions = b.object_versions.entry(key.clone()).or_default();
-        // A caller-supplied id names one version: writing it again replaces
-        // that entry, never duplicates it. A freshly minted id cannot be there.
-        if caller_supplied_id {
-            versions.retain(|o| o.version_id != obj.version_id);
+        match existing_position {
+            // A version written again keeps its place; it is the current
+            // object only if it is still the newest.
+            Some(pos) => {
+                becomes_current = pos + 1 == versions.len();
+                versions[pos] = obj.clone();
+            }
+            None => versions.push(obj.clone()),
         }
-        versions.push(obj.clone());
     } else if versioning_suspended {
         replace_null_version(b, &key, &obj);
     }
@@ -238,7 +247,9 @@ where
     } else {
         None
     };
-    b.objects.insert(key, obj);
+    if becomes_current {
+        b.objects.insert(key, obj);
+    }
     Ok(reported)
 }
 

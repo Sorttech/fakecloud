@@ -9791,3 +9791,81 @@ async fn every_new_version_kind_gets_the_destination_default_retention() {
         None
     );
 }
+
+/// Re-replicating an older source version (v1) after a newer one (v2) has
+/// already landed rewrites v1 in place: the history keeps its order, v1 keeps
+/// its original LastModified, and v2 stays the current object.
+#[test]
+fn re_replicating_an_older_version_keeps_the_newer_one_current() {
+    use crate::state::S3Bucket;
+
+    let mut accounts =
+        fakecloud_core::multi_account::MultiAccountState::<crate::state::S3State>::new(
+            "123456789012",
+            "us-east-1",
+            "",
+        );
+    let state = accounts.get_or_create("123456789012");
+    state.buckets.insert(
+        "source".to_string(),
+        replication_source(
+            "<ReplicationConfiguration>\
+             <Rule><Status>Enabled</Status>\
+             <Filter><Prefix></Prefix></Filter>\
+             <Destination><Bucket>arn:aws:s3:::destination</Bucket></Destination>\
+             </Rule></ReplicationConfiguration>",
+            "owner",
+        ),
+    );
+    let mut dest = S3Bucket::new("destination", "us-east-1", "owner");
+    dest.versioning = Some("Enabled".to_string());
+    state.buckets.insert("destination".to_string(), dest);
+    let set_source =
+        |accounts: &mut fakecloud_core::multi_account::MultiAccountState<crate::state::S3State>,
+         vid: &str,
+         body: &'static [u8]| {
+            let obj = accounts
+                .get_mut("123456789012")
+                .unwrap()
+                .buckets
+                .get_mut("source")
+                .unwrap()
+                .objects
+                .get_mut("test-key")
+                .unwrap();
+            obj.version_id = Some(vid.to_string());
+            obj.body = crate::state::memory_body(Bytes::from_static(body));
+        };
+
+    // v1 then v2 replicate in order.
+    replicate(&mut accounts, "123456789012");
+    let v1_written = accounts.get("123456789012").unwrap().buckets["destination"].objects
+        ["test-key"]
+        .last_modified;
+    set_source(&mut accounts, "v2", b"second");
+    replicate(&mut accounts, "123456789012");
+
+    // v1 is replicated again, later.
+    set_source(&mut accounts, "v1", b"hello-again");
+    replicate(&mut accounts, "123456789012");
+
+    let state = accounts.get("123456789012").unwrap();
+    let dest = &state.buckets["destination"];
+    let ids: Vec<_> = dest.object_versions["test-key"]
+        .iter()
+        .map(|o| o.version_id.clone().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["v1".to_string(), "v2".to_string()]);
+    let current = &dest.objects["test-key"];
+    assert_eq!(current.version_id.as_deref(), Some("v2"));
+    assert_eq!(
+        state.read_body(&current.body).unwrap(),
+        Bytes::from_static(b"second")
+    );
+    let v1 = &dest.object_versions["test-key"][0];
+    assert_eq!(v1.last_modified, v1_written);
+    assert_eq!(
+        state.read_body(&v1.body).unwrap(),
+        Bytes::from_static(b"hello-again")
+    );
+}
