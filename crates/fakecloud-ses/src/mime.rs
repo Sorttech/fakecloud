@@ -1,5 +1,13 @@
-//! Hand-rolled RFC 5322 / MIME builder for fakecloud SES.
+//! RFC 5322 / MIME parsing and building for fakecloud SES.
 //!
+//! Parsing: `RawMail` reads the header block of a raw message supplied to
+//! `SendRawEmail` (v1) or `SendEmail` with `Content.Raw` (v2): unfolded
+//! header lookup, RFC 2047 decoding of `Subject`, `X-SES-*` headers, and
+//! address fields. Address fields and API address members are validated as
+//! RFC 5322 mailboxes or groups via `mail-parser` (`parse_address_list`,
+//! `mailbox_address`, `api_recipients`).
+//!
+//! Building: `build_message` renders the outgoing MIME message.
 //! AWS SES `TestRenderEmailTemplate` returns the fully-formed MIME message
 //! that would be sent on `SendTemplatedEmail`. The previous implementation
 //! emitted only `Subject` + `MIME-Version` + `Content-Type` + body, which
@@ -18,6 +26,286 @@
 use base64::Engine;
 use chrono::Utc;
 use uuid::Uuid;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct InvalidAddress;
+
+/// Shared raw-message metadata for both SES APIs. Header parsing stops at the
+/// body; address fields are validated only when used as the effective envelope.
+pub(crate) struct RawMail {
+    headers: Vec<(String, String)>,
+}
+
+impl RawMail {
+    pub(crate) fn parse(encoded: &str) -> Result<Self, base64::DecodeError> {
+        let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)?;
+        let text = String::from_utf8_lossy(&bytes);
+        let mut headers: Vec<(String, String)> = Vec::new();
+        for line in text.lines() {
+            if line.is_empty() {
+                break;
+            }
+            if line.starts_with([' ', '\t']) {
+                if let Some((_, value)) = headers.last_mut() {
+                    value.push(' ');
+                    value.push_str(line.trim());
+                }
+            } else if let Some((name, value)) = line.split_once(':') {
+                // Obsolete RFC 5322 syntax (section 4.5) allows whitespace
+                // between the field name and the colon (`To : a@b.com`).
+                headers.push((name.trim_end().to_string(), value.trim().to_string()));
+            }
+        }
+        for (_, value) in &mut headers {
+            *value = value.trim().to_string();
+        }
+        Ok(Self { headers })
+    }
+
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
+    /// The `Subject` header with RFC 2047 encoded-words decoded, as SES
+    /// reports it for raw sends.
+    pub(crate) fn subject(&self) -> Option<String> {
+        let value = self.header("Subject")?;
+        // The library field parser flushes its final token on the line terminator.
+        let field = format!("{value}\r\n");
+        match mail_parser::parsers::MessageStream::new(field.as_bytes()).parse_unstructured() {
+            mail_parser::HeaderValue::Text(text) => Some(text.into_owned()),
+            _ => Some(String::new()),
+        }
+    }
+
+    pub(crate) fn addresses(&self, name: &str) -> Result<Vec<String>, InvalidAddress> {
+        let mut addresses = Vec::new();
+        for (_, value) in self
+            .headers
+            .iter()
+            .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+        {
+            addresses.extend(parse_address_list(value)?);
+        }
+        Ok(addresses)
+    }
+
+    pub(crate) fn message_tags(&self) -> Vec<(String, String)> {
+        self.header("X-SES-MESSAGE-TAGS")
+            .map(|value| {
+                value
+                    .split(',')
+                    .filter_map(|tag| {
+                        let (name, value) = tag.split_once('=')?;
+                        Some((name.trim().to_string(), value.trim().to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// Parse a raw RFC 5322 address field. Empty groups are permitted, but every
+/// mailbox must have an addr-spec: name-only entries must never be filtered out.
+pub(crate) fn parse_address_list(value: &str) -> Result<Vec<String>, InvalidAddress> {
+    parse_address_field(value).map(|(_, addresses)| addresses)
+}
+
+/// An API address member is exactly one mailbox, never a group or a list.
+pub(crate) fn mailbox_address(value: &str) -> Option<String> {
+    let (group, mut addresses) = parse_address_field(value).ok()?;
+    if group || addresses.len() != 1 {
+        return None;
+    }
+    addresses.pop()
+}
+
+pub(crate) fn api_recipients<'a>(
+    values: impl IntoIterator<Item = &'a str>,
+) -> Result<Vec<String>, InvalidAddress> {
+    let addresses = values
+        .into_iter()
+        .map(|value| mailbox_address(value).ok_or(InvalidAddress))
+        .collect::<Result<Vec<_>, _>>()?;
+    if addresses.is_empty() {
+        Err(InvalidAddress)
+    } else {
+        Ok(addresses)
+    }
+}
+
+fn parse_address_field(value: &str) -> Result<(bool, Vec<String>), InvalidAddress> {
+    let (protected, quoted_locals) = normalize_address_field(value)?;
+    // The library field parser flushes its final token on the line terminator.
+    let field = format!("{protected}\r\n");
+    let mail_parser::HeaderValue::Address(parsed) =
+        mail_parser::parsers::MessageStream::new(field.as_bytes()).parse_address()
+    else {
+        return Err(InvalidAddress);
+    };
+    let group = matches!(parsed, mail_parser::Address::Group(_));
+    let addresses = parsed
+        .into_list()
+        .into_iter()
+        .map(|address| {
+            let address = address.address.ok_or(InvalidAddress)?;
+            let (local, domain) = address.rsplit_once('@').ok_or(InvalidAddress)?;
+            let local = quoted_locals
+                .iter()
+                .find(|(token, _)| token == local)
+                .map_or(local, |(_, original)| original.as_str());
+            if !valid_addr_spec(local, domain) {
+                return Err(InvalidAddress);
+            }
+            Ok(format!("{local}@{domain}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((group, addresses))
+}
+
+/// mail-parser 0.10 treats a bare quoted local part as a display name, and
+/// unescapes one inside angle brackets. Protect only quoted tokens followed by
+/// '@', then restore their exact spelling. The library still parses names,
+/// groups and mailbox boundaries. Skip group-boundary CFWS comments that the
+/// library represents as addressless members; leave comments inside mailboxes
+/// to the library. Actual name-only entries remain present and are rejected.
+fn normalize_address_field(value: &str) -> Result<(String, Vec<(String, String)>), InvalidAddress> {
+    if value.bytes().any(|b| (b < b' ' && b != b'\t') || b == 127) {
+        return Err(InvalidAddress);
+    }
+    let mut prefix = format!("fakecloud-quoted-local-{}-", Uuid::new_v4().simple());
+    while value.contains(&prefix) {
+        prefix = format!("fakecloud-quoted-local-{}-", Uuid::new_v4().simple());
+    }
+    let bytes = value.as_bytes();
+    let mut out = String::new();
+    let mut locals = Vec::new();
+    let (mut i, mut copied, mut comments) = (0, 0, 0usize);
+    let (mut angle, mut group, mut literal) = (false, false, false);
+    let (mut group_cfws, mut skip_comment) = (false, false);
+    while i < bytes.len() {
+        if comments == 0
+            && !bytes[i].is_ascii_whitespace()
+            && bytes[i] != b'('
+            && !matches!(bytes[i], b':' | b';')
+        {
+            group_cfws = false;
+        }
+        match bytes[i] {
+            b'\\' if comments > 0 => {
+                i += 2;
+                continue;
+            }
+            b'(' => {
+                if comments == 0 {
+                    skip_comment = group_cfws;
+                    if skip_comment {
+                        out.push_str(&value[copied..i]);
+                        out.push(' ');
+                    }
+                }
+                comments += 1;
+            }
+            b')' => {
+                if comments == 0 {
+                    return Err(InvalidAddress);
+                }
+                comments -= 1;
+                if comments == 0 && skip_comment {
+                    copied = i + 1;
+                }
+            }
+            b'<' if comments == 0 => {
+                if angle {
+                    return Err(InvalidAddress);
+                }
+                angle = true;
+            }
+            b'>' if comments == 0 => {
+                if !angle {
+                    return Err(InvalidAddress);
+                }
+                angle = false;
+            }
+            b'[' if comments == 0 && !angle => literal = true,
+            b']' if comments == 0 && !angle => literal = false,
+            b':' if comments == 0 && !angle && !literal => {
+                if group {
+                    return Err(InvalidAddress);
+                }
+                group = true;
+                group_cfws = true;
+            }
+            b';' if comments == 0 && !angle && !literal => {
+                if !group {
+                    return Err(InvalidAddress);
+                }
+                group = false;
+                group_cfws = true;
+            }
+            b'"' if comments == 0 => {
+                let start = i;
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                if i >= bytes.len() {
+                    return Err(InvalidAddress);
+                }
+                if i < bytes.len() && bytes.get(i + 1) == Some(&b'@') {
+                    let token = format!("{prefix}{}", locals.len());
+                    out.push_str(&value[copied..start]);
+                    out.push_str(&token);
+                    locals.push((token, value[start..=i].to_string()));
+                    copied = i + 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    // The library is best-effort; unclosed groups/comments are not valid empty
+    // groups and must not be admitted just because another field has a mailbox.
+    if comments != 0 || angle || group || literal {
+        return Err(InvalidAddress);
+    }
+    out.push_str(&value[copied..]);
+    Ok((out, locals))
+}
+
+fn valid_addr_spec(local: &str, domain: &str) -> bool {
+    if domain.is_empty()
+        || !domain
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".-[]:".contains(&b))
+    {
+        return false;
+    }
+    if local.starts_with('"') && local.ends_with('"') && local.len() >= 2 {
+        let mut escaped = false;
+        for b in local.as_bytes()[1..local.len() - 1].iter().copied() {
+            if !(b' '..=b'~').contains(&b) || (b == b'"' && !escaped) {
+                return false;
+            }
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            }
+        }
+        !escaped
+    } else {
+        local.split('.').all(|atom| {
+            !atom.is_empty()
+                && atom
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-/=?^_`{|}~".contains(&b))
+        })
+    }
+}
 
 /// Inputs for `build_message`.
 pub struct MimeInputs<'a> {
@@ -151,8 +439,14 @@ fn quoted_printable_encode(input: &str) -> String {
 }
 
 /// RFC 2047 encoded-word for non-ASCII headers; raw otherwise.
-fn encode_header(value: &str) -> String {
-    if value.is_ascii() {
+/// Render an unstructured header value (e.g. `Subject`) for the wire. Plain
+/// printable ASCII passes through; anything else, including CR/LF that would
+/// otherwise inject header lines, becomes an RFC 2047 encoded-word.
+pub(crate) fn encode_header(value: &str) -> String {
+    if value
+        .bytes()
+        .all(|b| b == b'\t' || (0x20..0x7f).contains(&b))
+    {
         value.to_string()
     } else {
         let b64 = base64::engine::general_purpose::STANDARD.encode(value.as_bytes());
@@ -167,6 +461,79 @@ fn rfc2822_now() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn raw(text: &str) -> RawMail {
+        RawMail::parse(&base64::engine::general_purpose::STANDARD.encode(text)).unwrap()
+    }
+
+    #[test]
+    fn raw_subject_decodes_rfc2047_including_folded_words() {
+        let mail = raw("Subject: =?UTF-8?B?T2zDoQ==?=\r\n =?UTF-8?Q?_mundo?=\r\n\r\nBody");
+        assert_eq!(mail.subject().as_deref(), Some("Ol\u{e1} mundo"));
+        assert_eq!(
+            raw("Subject: plain text\r\n\r\n").subject().as_deref(),
+            Some("plain text")
+        );
+        assert_eq!(raw("To: a@b.com\r\n\r\n").subject(), None);
+    }
+
+    #[test]
+    fn raw_header_names_tolerate_whitespace_before_colon() {
+        let mail = raw("To : a@example.com\r\nCc\t: b@example.com\r\n\r\n");
+        assert_eq!(mail.addresses("To").unwrap(), ["a@example.com"]);
+        assert_eq!(mail.addresses("Cc").unwrap(), ["b@example.com"]);
+    }
+
+    #[test]
+    fn optional_group_comments_preserve_comments_inside_mailboxes() {
+        assert_eq!(
+            parse_address_list("Team: Chris <c@(host)example.com>, good@example.com; (team)")
+                .unwrap(),
+            ["c@example.com", "good@example.com"]
+        );
+        assert_eq!(
+            parse_address_list("Team: good@example.com; (one) (two)").unwrap(),
+            ["good@example.com"]
+        );
+        assert_eq!(
+            parse_address_list("Empty: (nobody); (end), good@example.com").unwrap(),
+            ["good@example.com"]
+        );
+        assert!(parse_address_list("good@example.com, not-an-address (label)").is_err());
+    }
+
+    #[test]
+    fn admission_quoted_mailbox_normalization_is_idempotent() {
+        for (value, want) in [
+            (r#""a,b"@example.com"#, r#""a,b"@example.com"#),
+            (r#"<"a,b"@example.com>"#, r#""a,b"@example.com"#),
+            (r#"Name <"a,b"@example.com>"#, r#""a,b"@example.com"#),
+            (r#""a b"@example.com"#, r#""a b"@example.com"#),
+            (r#""a\"b"@example.com"#, r#""a\"b"@example.com"#),
+            (r#""Last, First" <user@example.com>"#, "user@example.com"),
+        ] {
+            let parsed = mailbox_address(value).expect(value);
+            assert_eq!(parsed, want, "{value}");
+            assert_eq!(mailbox_address(&parsed).as_deref(), Some(want));
+        }
+    }
+
+    #[test]
+    fn admission_raw_groups_preserve_multiple_quoted_local_parts() {
+        let want = vec![
+            r#""a,b"@example.com"#,
+            r#""a\"b"@example.com"#,
+            "normal@example.com",
+        ];
+        let raw = r#"Empty:;, Team: "a,b"@example.com, Escaped <"a\"b"@example.com>;, normal@example.com (Name)"#;
+        let parsed = parse_address_list(raw).unwrap();
+        assert_eq!(parsed, want);
+        for address in parsed {
+            assert_eq!(mailbox_address(&address).as_deref(), Some(address.as_str()));
+        }
+        assert!(parse_address_list(r#"good@example.com, "Display name only""#).is_err());
+        assert!(mailbox_address("One: good@example.com;").is_none());
+    }
 
     #[test]
     fn ascii_text_only_uses_7bit() {
@@ -216,6 +583,20 @@ mod tests {
             html: None,
         });
         assert!(mime.contains("Subject: =?UTF-8?B?"));
+    }
+
+    #[test]
+    fn header_encoding_never_emits_line_breaks() {
+        let encoded = encode_header("x\r\nBcc: evil@x");
+        assert!(!encoded.contains(['\r', '\n']));
+        assert!(encoded.starts_with("=?UTF-8?B?"));
+        let mime = build_message(&MimeInputs {
+            subject: "x\r\nBcc: evil@x",
+            text: Some("body"),
+            html: None,
+        });
+        assert!(!mime.contains("\r\nBcc:"));
+        assert_eq!(encode_header("plain subject"), "plain subject");
     }
 
     #[test]
