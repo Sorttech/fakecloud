@@ -461,12 +461,25 @@ impl AthenaService {
         // Write a small result object to the fake S3 store so the ResultS3Uri
         // resolves. Only when both a location and its bucket exist; otherwise no
         // result URI is advertised.
-        let (working_directory, result_type) = self.write_calculation_result(
-            &req.account_id,
-            output_location.as_deref(),
-            &id,
-            code_block.as_deref(),
-        );
+        // A result that could not be stored (a persistence failure) fails the
+        // calculation instead of reporting a completed one with no result.
+        let (calc_state, state_change_reason, working_directory, result_type) = match self
+            .write_calculation_result(
+                &req.account_id,
+                output_location.as_deref(),
+                &id,
+                code_block.as_deref(),
+            ) {
+            Ok((working_directory, result_type)) => {
+                ("COMPLETED", None, working_directory, result_type)
+            }
+            Err(err) => (
+                "FAILED",
+                Some(format!("Failed to write the calculation result: {err}")),
+                None,
+                None,
+            ),
+        };
 
         let mut state = self.state.write();
         let account = account_mut(&mut state, &req.account_id);
@@ -479,8 +492,8 @@ impl AthenaService {
                 calculation_execution_id: id.clone(),
                 session_id,
                 description,
-                state: "COMPLETED".to_string(),
-                state_change_reason: None,
+                state: calc_state.to_string(),
+                state_change_reason,
                 working_directory,
                 code_block,
                 submission_date_time: now,
@@ -492,7 +505,7 @@ impl AthenaService {
         );
         Ok(AwsResponse::ok_json(json!({
             "CalculationExecutionId": id,
-            "State": "COMPLETED",
+            "State": calc_state,
         })))
     }
 
@@ -501,18 +514,19 @@ impl AthenaService {
     /// result_type)`; both `None` when there is no configured result location,
     /// no S3 store wired, or the target bucket does not exist (in which case the
     /// calculation advertises no downloadable result rather than a dangling URI).
+    /// An error means the bucket exists but the result could not be stored.
     fn write_calculation_result(
         &self,
         account_id: &str,
         output_location: Option<&str>,
         calc_id: &str,
         code_block: Option<&str>,
-    ) -> (Option<String>, Option<String>) {
+    ) -> Result<(Option<String>, Option<String>), String> {
         let (Some(base), Some(s3)) = (output_location, self.s3.as_ref()) else {
-            return (None, None);
+            return Ok((None, None));
         };
         let Some((bucket_name, mut prefix)) = parse_s3_location(base) else {
-            return (None, None);
+            return Ok((None, None));
         };
         if !prefix.is_empty() && !prefix.ends_with('/') {
             prefix.push('/');
@@ -525,7 +539,7 @@ impl AthenaService {
         .unwrap_or_default();
         // A new object version in the result bucket, written as PutObject
         // writes one (versioning, default retention, durable store).
-        if fakecloud_s3::delivery::put_object_via_store(
+        if let Err(err) = fakecloud_s3::delivery::put_object_via_store(
             s3,
             self.s3_store.as_deref(),
             account_id,
@@ -533,15 +547,21 @@ impl AthenaService {
             &key,
             payload,
             Some("application/json"),
-        )
-        .is_err()
-        {
-            return (None, None);
+        ) {
+            let bucket_exists = s3
+                .read()
+                .get(account_id)
+                .is_some_and(|a| a.buckets.contains_key(&bucket_name));
+            return if bucket_exists {
+                Err(err)
+            } else {
+                Ok((None, None))
+            };
         }
-        (
+        Ok((
             Some(format!("s3://{bucket_name}/{key}")),
             Some("JSON".to_string()),
-        )
+        ))
     }
 
     pub(super) fn stop_calculation_execution(

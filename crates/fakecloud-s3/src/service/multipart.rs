@@ -738,9 +738,6 @@ impl S3Service {
             std::collections::BTreeMap::new()
         };
 
-        // Kept to serve the body in memory mode, where `mpu_complete` returns
-        // only a placeholder.
-        let memory_body = crate::state::memory_body(data.clone());
         let obj = S3Object {
             key: key.to_string(),
             size: data.len() as u64,
@@ -831,16 +828,18 @@ impl S3Service {
                 bucket,
                 Some(&*store),
                 obj,
-                |store, key, meta| {
+                |store, obj, meta| {
                     let assembled = store.mpu_complete(
                         bucket,
                         upload_id,
-                        key,
+                        &obj.key,
                         meta.version_id.as_deref(),
                         meta,
                     )?;
+                    // Memory mode returns only a placeholder; keep the
+                    // assembled in-memory body.
                     Ok(match assembled {
-                        BodyRef::Memory(_) => memory_body,
+                        BodyRef::Memory(_) => obj.body.clone(),
                         disk => disk,
                     })
                 },

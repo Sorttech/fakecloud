@@ -29,3 +29,6 @@ rand = { workspace = true }
 time = "0.3"
 tokio = { workspace = true }
 x509-parser = "0.16"
+
+[dev-dependencies]
+tempfile = { workspace = true }

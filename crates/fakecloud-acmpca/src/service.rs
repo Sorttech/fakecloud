@@ -1358,7 +1358,19 @@ impl AcmPcaService {
         // target bucket does not exist (fakecloud has no way to reach a bucket in
         // an account it does not manage), leaving the report still describable
         // via DescribeCertificateAuthorityAuditReport.
-        self.deliver_audit_report_to_s3(req, &s3_bucket, &s3_key, &format, report_body);
+        // A bucket that exists but could not store the report (a persistence
+        // failure) fails the report, as AWS reports a failed delivery.
+        if !self.deliver_audit_report_to_s3(req, &s3_bucket, &s3_key, &format, report_body) {
+            let mut accounts = self.state.write();
+            if let Some(report) = accounts
+                .accounts
+                .get_mut(&account_id(req))
+                .and_then(|a| a.authorities.get_mut(&arn))
+                .and_then(|ca| ca.audit_reports.get_mut(&report_id))
+            {
+                report.status = "FAILED".to_string();
+            }
+        }
 
         Ok(AwsResponse::ok_json(
             json!({ "AuditReportId": report_id, "S3Key": s3_key }),
@@ -1367,6 +1379,8 @@ impl AcmPcaService {
 
     /// Put the generated audit report body into the target S3 bucket as a real
     /// object at `s3_key`. No-op when S3 is not wired or the bucket is absent.
+    /// Returns `false` only when the bucket exists but the object could not be
+    /// stored.
     fn deliver_audit_report_to_s3(
         &self,
         req: &AwsRequest,
@@ -1374,10 +1388,11 @@ impl AcmPcaService {
         key: &str,
         format: &str,
         body: String,
-    ) {
+    ) -> bool {
         let Some(s3) = &self.s3 else {
-            return;
+            return true;
         };
+        let account = account_id(req);
         let content_type = if format == "CSV" {
             "text/csv"
         } else {
@@ -1385,17 +1400,21 @@ impl AcmPcaService {
         };
         // A new object version in the target bucket, written as PutObject
         // writes one (versioning, default retention, durable store).
-        if let Err(err) = fakecloud_s3::delivery::put_object_via_store(
+        let Err(err) = fakecloud_s3::delivery::put_object_via_store(
             s3,
             self.s3_store.as_deref(),
-            &account_id(req),
+            &account,
             bucket_name,
             key,
             body.into_bytes(),
             Some(content_type),
-        ) {
-            tracing::warn!(bucket = %bucket_name, %key, %err, "failed to deliver audit report");
-        }
+        ) else {
+            return true;
+        };
+        tracing::warn!(bucket = %bucket_name, %key, %err, "failed to deliver audit report");
+        !s3.read()
+            .get(&account)
+            .is_some_and(|a| a.buckets.contains_key(bucket_name))
     }
 
     fn describe_certificate_authority_audit_report(
@@ -2331,6 +2350,63 @@ mod tests {
                 .any(|e| e["certificateArn"].as_str() == Some(leaf_arn.as_str())),
             "delivered report must include the issued leaf certificate"
         );
+    }
+
+    /// A report the target bucket could not store (a persistence failure, here
+    /// a store rooted at a regular file) is reported as FAILED rather than
+    /// SUCCESS, and no object appears in the bucket.
+    #[tokio::test]
+    async fn audit_report_fails_when_the_bucket_cannot_store_it() {
+        use fakecloud_core::multi_account::MultiAccountState;
+        use fakecloud_s3::{S3Bucket, S3State, SharedS3State};
+
+        let s3: SharedS3State = Arc::new(RwLock::new(MultiAccountState::<S3State>::new(
+            TEST_ACCOUNT,
+            "us-east-1",
+            "http://localhost",
+        )));
+        s3.write().get_or_create(TEST_ACCOUNT).buckets.insert(
+            "audit-bucket".to_string(),
+            S3Bucket::new("audit-bucket", "us-east-1", TEST_ACCOUNT),
+        );
+        let tmp = tempfile::TempDir::new().unwrap();
+        let not_a_dir = tmp.path().join("s3");
+        std::fs::write(&not_a_dir, b"").unwrap();
+        let broken: Arc<dyn fakecloud_persistence::S3Store> =
+            Arc::new(fakecloud_persistence::s3::DiskS3Store::new(
+                not_a_dir,
+                Arc::new(fakecloud_persistence::cache::BodyCache::new(1024)),
+            ));
+
+        let svc = AcmPcaService::new(Arc::new(RwLock::new(AcmPcaAccounts::new())))
+            .with_s3(s3.clone())
+            .with_s3_store(broken);
+        let arn = create_active_root(&svc, "EC_prime256v1", "SHA256WITHECDSA").await;
+        let created = body_json(
+            &svc.create_certificate_authority_audit_report(&req(
+                "CreateCertificateAuthorityAuditReport",
+                json!({
+                    "CertificateAuthorityArn": arn,
+                    "S3BucketName": "audit-bucket",
+                    "AuditReportResponseFormat": "JSON"
+                }),
+            ))
+            .unwrap(),
+        );
+        let described = body_json(
+            &svc.describe_certificate_authority_audit_report(&req(
+                "DescribeCertificateAuthorityAuditReport",
+                json!({
+                    "CertificateAuthorityArn": arn,
+                    "AuditReportId": created["AuditReportId"],
+                }),
+            ))
+            .unwrap(),
+        );
+        assert_eq!(described["AuditReportStatus"], "FAILED");
+        assert!(s3.read().get(TEST_ACCOUNT).unwrap().buckets["audit-bucket"]
+            .objects
+            .is_empty());
     }
 
     /// Finding 4: a validity past the representable certificate-expiry ceiling

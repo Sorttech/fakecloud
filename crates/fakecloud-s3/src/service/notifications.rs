@@ -352,10 +352,15 @@ pub(crate) fn replicate_through_store(
         // recorded (a source without a real id gets a fresh one on an enabled
         // destination). A source version that carries no retention of its own
         // takes the destination's default retention; one that does keeps it.
+        // The replica is created now, in the destination: its LastModified
+        // (which also orders versions on reload) is the commit time, not the
+        // source's.
+        let now = chrono::Utc::now();
+        replica.last_modified = now;
         crate::service::apply_bucket_default_retention(
             &mut replica,
             dest_bucket.object_lock_config.as_deref(),
-            chrono::Utc::now(),
+            now,
         );
         replica.body = match (&src_disk_path, &src_bytes_opt) {
             (Some(_), _) => src_obj.body.clone(),

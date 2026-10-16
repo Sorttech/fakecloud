@@ -119,9 +119,9 @@ pub(crate) fn replace_null_version(
 /// - Never enabled: the object replaces the current one and carries no id.
 ///
 /// The body is written through `store` (when one is configured) before any
-/// in-memory state changes, so a failed write leaves the bucket as it was,
-/// except for a preserved null version whose own sidecar was already
-/// persisted. With no store, `obj.body` must already hold the payload.
+/// in-memory state changes, so a failed write returns the error and leaves
+/// the bucket's in-memory state exactly as it was. With no store, `obj.body`
+/// must already hold the payload.
 ///
 /// Returns the version id to report to the writer: the new id on a
 /// versioning-enabled bucket, `None` otherwise.
@@ -132,15 +132,15 @@ pub(crate) fn commit_object_version(
     obj: S3Object,
     body: BodySource,
 ) -> fakecloud_persistence::StoreResult<Option<String>> {
-    commit_object_version_with(b, bucket, store, obj, |store, key, meta| {
-        store.put_object(bucket, key, meta.version_id.as_deref(), body, meta)
+    commit_object_version_with(b, bucket, store, obj, |store, obj, meta| {
+        store.put_object(bucket, &obj.key, meta.version_id.as_deref(), body, meta)
     })
 }
 
 /// [`commit_object_version`] with the body write supplied by the caller:
-/// `write_body` persists the new version's body (given the store, the key and
-/// the version's metadata, carrying its final version id) and returns the
-/// body ref to keep in memory. CompleteMultipartUpload uses it to assemble
+/// `write_body` persists the new version's body (given the store, the object
+/// as it will be recorded and its metadata, carrying its final version id) and
+/// returns the body ref to keep in memory. CompleteMultipartUpload uses it to assemble
 /// the parts in the store instead of writing the object a second time.
 pub(crate) fn commit_object_version_with<F>(
     b: &mut crate::state::S3Bucket,
@@ -152,7 +152,7 @@ pub(crate) fn commit_object_version_with<F>(
 where
     F: FnOnce(
         &dyn fakecloud_persistence::S3Store,
-        &str,
+        &S3Object,
         &fakecloud_persistence::ObjectMeta,
     ) -> fakecloud_persistence::StoreResult<fakecloud_persistence::BodyRef>,
 {
@@ -160,14 +160,23 @@ where
     let versioning_enabled = b.versioning.as_deref() == Some("Enabled");
     let versioning_suspended = b.versioning.as_deref() == Some("Suspended");
 
+    // Whether the caller named the version (a replica keeps its source
+    // version's id); only then can the history already hold that id.
+    let mut caller_supplied_id = false;
+    let mut preserved_null = None;
     if versioning_enabled {
         if obj.version_id.as_deref().is_none_or(|v| v == "null") {
             obj.version_id = Some(Uuid::new_v4().to_string());
+        } else {
+            caller_supplied_id = true;
         }
         // The current object becomes the "null" version once a real version
-        // is stacked on top of it. Persist the rewritten sidecar BEFORE
-        // recording it in memory, so a failed write cannot leave a version in
-        // the history that disk lacks.
+        // is stacked on top of it. Its sidecar is rewritten with the "null"
+        // id first (the loader otherwise files an id-less null slot as the
+        // current object, which the newer version then replaces on restart).
+        // That rewrite only names the version the object already is, so it
+        // is harmless if the body write below fails; the in-memory record is
+        // deferred until the whole write has succeeded.
         if let Some(preserved) = null_version_to_preserve(b, &key) {
             if let Some(store) = store {
                 let preserved_meta = object_meta_snapshot(&preserved);
@@ -175,7 +184,7 @@ where
                     store.put_object_meta(bucket, &key, Some("null"), &preserved_meta)
                 })?;
             }
-            record_preserved_null(b, &key, preserved);
+            preserved_null = Some(preserved);
         }
     } else if versioning_suspended {
         // Tagging it "null" also keeps the disk sidecar in the versioned set,
@@ -188,14 +197,21 @@ where
 
     if let Some(store) = store {
         let meta = object_meta_snapshot(&obj);
-        obj.body = run_blocking_io(|| write_body(store, &key, &meta))?;
+        obj.body = run_blocking_io(|| write_body(store, &obj, &meta))?;
     }
 
+    // Everything is persisted: only now record the write in memory, so a
+    // failure above leaves the bucket exactly as it was.
+    if let Some(preserved) = preserved_null {
+        record_preserved_null(b, &key, preserved);
+    }
     if versioning_enabled {
         let versions = b.object_versions.entry(key.clone()).or_default();
-        // A caller-supplied id names one version: writing it again (a replica
-        // of the same source version) replaces that entry, never duplicates it.
-        versions.retain(|o| o.version_id != obj.version_id);
+        // A caller-supplied id names one version: writing it again replaces
+        // that entry, never duplicates it. A freshly minted id cannot be there.
+        if caller_supplied_id {
+            versions.retain(|o| o.version_id != obj.version_id);
+        }
         versions.push(obj.clone());
     } else if versioning_suspended {
         replace_null_version(b, &key, &obj);

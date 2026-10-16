@@ -852,6 +852,7 @@ fn replica_follows_destination_versioning() {
     use crate::state::S3Bucket;
 
     for (versioning, expect_null_current) in [("Enabled", false), ("Suspended", true)] {
+        let source_written = Utc::now() - chrono::Duration::hours(1);
         let mut accounts =
             fakecloud_core::multi_account::MultiAccountState::<crate::state::S3State>::new(
                 "123456789012",
@@ -859,17 +860,16 @@ fn replica_follows_destination_versioning() {
                 "",
             );
         let state = accounts.get_or_create("123456789012");
-        state.buckets.insert(
-            "source".to_string(),
-            replication_source(
-                "<ReplicationConfiguration>\
+        let mut src = replication_source(
+            "<ReplicationConfiguration>\
                  <Rule><Status>Enabled</Status>\
                  <Filter><Prefix></Prefix></Filter>\
                  <Destination><Bucket>arn:aws:s3:::destination</Bucket></Destination>\
                  </Rule></ReplicationConfiguration>",
-                "owner",
-            ),
+            "owner",
         );
+        src.objects.get_mut("test-key").unwrap().last_modified = source_written;
+        state.buckets.insert("source".to_string(), src);
         let mut dest = S3Bucket::new("destination", "us-east-1", "owner");
         dest.objects.insert(
             "test-key".to_string(),
@@ -892,6 +892,8 @@ fn replica_follows_destination_versioning() {
             Bytes::from_static(b"hello")
         );
         assert_eq!(current.replication_status.as_deref(), Some("REPLICA"));
+        // Created at replication time, after the source version.
+        assert!(current.last_modified > source_written, "{versioning}");
         if expect_null_current {
             assert_eq!(current.version_id.as_deref(), Some("null"), "{versioning}");
             assert!(!dest.object_versions.contains_key("test-key"));
