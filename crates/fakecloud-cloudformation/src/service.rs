@@ -476,7 +476,10 @@ pub(crate) fn provision_stack_resources(
                 )
             })?;
 
-            match provisioner.create_resource(&resolved_def) {
+            match provisioner
+                .resolve_dynamic_references(resolved_def)
+                .and_then(|def| provisioner.create_resource(&def))
+            {
                 Ok(mut stack_resource) => {
                     physical_ids.insert(
                         stack_resource.logical_id.clone(),
@@ -518,7 +521,10 @@ pub(crate) fn provision_stack_resources(
                 imports,
             )
             .unwrap_or_else(|_| resource_def.clone());
-            let err = provisioner.create_resource(&resolved_def).unwrap_err();
+            let err = provisioner
+                .resolve_dynamic_references(resolved_def)
+                .and_then(|def| provisioner.create_resource(&def))
+                .unwrap_err();
             for r in &resources {
                 let _ = provisioner.delete_resource(r);
             }
@@ -4273,7 +4279,10 @@ pub(crate) fn apply_resource_updates(
         })?;
 
         if !old_logical_ids.contains(&resource_def.logical_id) {
-            match provisioner.create_resource(&resolved_def) {
+            match provisioner
+                .resolve_dynamic_references(resolved_def)
+                .and_then(|def| provisioner.create_resource(&def))
+            {
                 Ok(stack_resource) => {
                     changes.push(ResourceChange {
                         action: ResourceChangeAction::Create,
@@ -4326,7 +4335,13 @@ pub(crate) fn apply_resource_updates(
                 .find(|r| r.logical_id == resource_def.logical_id)
                 .cloned();
             if let Some(existing) = existing {
-                match provisioner.update_resource(&existing, &resolved_def) {
+                // Dynamic references resolve only now, after the comparison
+                // above ran on their literal text: a changed secret or
+                // parameter alone does not update the resource.
+                match provisioner
+                    .resolve_dynamic_references(resolved_def)
+                    .and_then(|def| provisioner.update_resource(&existing, &def))
+                {
                     Ok(Some(mut updated)) => {
                         changes.push(ResourceChange {
                             action: ResourceChangeAction::Update,
