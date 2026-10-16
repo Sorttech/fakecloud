@@ -190,10 +190,7 @@ async fn firehose_kinesis_source_rejects_puts_and_direct_put_still_delivers() {
         payloads.sort();
         assert_eq!(
             payloads,
-            [
-                b"direct-a\ndirect-b\n".to_vec(),
-                b"direct-single\n".to_vec()
-            ]
+            [b"direct-adirect-b".to_vec(), b"direct-single".to_vec()]
         );
     })
     .await

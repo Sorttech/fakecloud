@@ -225,4 +225,46 @@ mod tests {
         assert!(err.contains("FileExtension"), "{err}");
         assert_eq!(stored_file_extension(&prov).as_deref(), Some(".json"));
     }
+    #[test]
+    fn firehose_cfn_stores_processing_configuration_on_create_and_update() {
+        let prov = make_provisioner();
+        let with_processing = |enabled: Value| {
+            json!({
+                "RoleARN": "arn:aws:iam::123456789012:role/fh",
+                "BucketARN": "arn:aws:s3:::bucket",
+                "ProcessingConfiguration": {
+                    "Enabled": enabled,
+                    "Processors": [{"Type": "AppendDelimiterToRecord"}]
+                }
+            })
+        };
+        let stored = |prov: &ResourceProvisioner| {
+            prov.firehose_state
+                .read()
+                .get("123456789012")
+                .unwrap()
+                .streams("us-east-1")
+                .unwrap()["events"]
+                .destination
+                .as_ref()
+                .unwrap()
+                .processing_configuration
+                .clone()
+                .expect("ProcessingConfiguration stored")
+        };
+
+        let existing = prov
+            .create_resource(&delivery_stream(with_processing(json!(true))))
+            .unwrap();
+        assert_eq!(stored(&prov)["Enabled"], json!(true));
+        assert_eq!(
+            stored(&prov)["Processors"][0]["Type"],
+            "AppendDelimiterToRecord"
+        );
+
+        // Template values can arrive as strings; they are stored as booleans.
+        prov.update_resource(&existing, &delivery_stream(with_processing(json!("false"))))
+            .unwrap();
+        assert_eq!(stored(&prov)["Enabled"], json!(false));
+    }
 }

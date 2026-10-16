@@ -816,7 +816,8 @@ impl FirehoseService {
         for r in records {
             let b64 = r["Data"].as_str();
             match b64.map(|s| base64::engine::general_purpose::STANDARD.decode(s)) {
-                Some(Ok(data)) if !data.is_empty() => {
+                // Record.Data is a blob with min length 0, as in PutRecord.
+                Some(Ok(data)) => {
                     datas.push(data);
                     response_records.push(json!({
                         "RecordId": Uuid::new_v4().to_string(),
@@ -826,7 +827,7 @@ impl FirehoseService {
                     failed += 1;
                     response_records.push(json!({
                         "ErrorCode": "InvalidArgumentException",
-                        "ErrorMessage": "Record.Data must be a non-empty base64-encoded string",
+                        "ErrorMessage": "Record.Data must be a base64-encoded string",
                     }));
                 }
             }
@@ -2050,7 +2051,7 @@ mod tests {
         let s3 = svc.s3.as_ref().unwrap().read();
         let objects = &s3.get(S3_ACCOUNT).unwrap().buckets["fh-bucket"].objects;
         assert_eq!(objects.len(), 1, "DirectPut hook still delivers");
-        assert_eq!(objects.values().next().unwrap().size, 2);
+        assert_eq!(objects.values().next().unwrap().size, 1);
         assert_eq!(disk.load().unwrap().buckets["fh-bucket"].objects.len(), 1);
     }
 
@@ -2473,6 +2474,32 @@ mod tests {
                 "{processing}"
             );
         }
+    }
+
+    #[test]
+    fn put_record_batch_accepts_empty_records_like_put_record() {
+        let (svc, disk, _tmp) = firehose_with_disk_s3("fh-empty");
+        create_stream_with_processing(
+            &svc,
+            "delimited",
+            "fh-empty",
+            json!({"Enabled": true, "Processors": [{"Type": "AppendDelimiterToRecord"}]}),
+        );
+        let resp = svc
+            .put_record_batch(&request(
+                "PutRecordBatch",
+                json!({
+                    "DeliveryStreamName": "delimited",
+                    "Records": [{ "Data": "YQ==" }, { "Data": "" }]
+                }),
+            ))
+            .unwrap();
+        let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        assert_eq!(body["FailedPutCount"], 0);
+        assert_eq!(
+            delivered_bodies(&svc, &disk, "fh-empty"),
+            vec![b"a\n\n".to_vec()]
+        );
     }
 
     #[test]

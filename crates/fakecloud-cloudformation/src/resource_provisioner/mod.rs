@@ -4276,6 +4276,19 @@ fn parse_firehose_s3_destination(value: &serde_json::Value) -> Result<S3Destinat
         .get("FileExtension")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    // CloudFormation uses the API's ProcessingConfiguration shape; template
+    // values may arrive as strings, so normalize `Enabled` to a boolean.
+    let processing_configuration = value
+        .get("ProcessingConfiguration")
+        .filter(|v| v.is_object())
+        .cloned()
+        .map(|mut processing| {
+            if let Some(enabled) = processing.get("Enabled").and_then(|v| v.as_str()) {
+                let enabled = enabled.eq_ignore_ascii_case("true");
+                processing["Enabled"] = serde_json::Value::Bool(enabled);
+            }
+            processing
+        });
 
     Ok(S3Destination {
         destination_id: "destination-1".to_string(),
@@ -4286,7 +4299,7 @@ fn parse_firehose_s3_destination(value: &serde_json::Value) -> Result<S3Destinat
         buffering_size_mb,
         buffering_interval_seconds,
         compression_format,
-        processing_configuration: None,
+        processing_configuration,
         data_format_conversion_configuration: None,
         cloudwatch_logging_options: None,
         custom_time_zone: None,
