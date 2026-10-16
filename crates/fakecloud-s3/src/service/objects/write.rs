@@ -449,17 +449,26 @@ impl S3Service {
         if lock_mode.is_none() && lock_retain_until.is_none() {
             if let Some(ref config) = object_lock_config {
                 if let Some(mode) = extract_xml_value(config, "Mode") {
-                    let days =
-                        extract_xml_value(config, "Days").and_then(|d| d.parse::<i64>().ok());
-                    let years =
-                        extract_xml_value(config, "Years").and_then(|y| y.parse::<i64>().ok());
+                    let days = extract_xml_value(config, "Days")
+                        .and_then(|d| d.trim().parse::<i64>().ok());
+                    let years = extract_xml_value(config, "Years")
+                        .and_then(|y| y.trim().parse::<i64>().ok());
                     // The configuration is range-checked when stored; a value
                     // persisted before that check must still not overflow.
-                    let days = days.or_else(|| years.and_then(|y| y.checked_mul(365)));
-                    if let Some(until) = days
-                        .and_then(chrono::Duration::try_days)
-                        .and_then(|d| Utc::now().checked_add_signed(d))
-                    {
+                    // Years are calendar years (leap days included), not
+                    // multiples of 365 days.
+                    let now = Utc::now();
+                    let until = match (days, years) {
+                        (Some(d), _) => {
+                            chrono::Duration::try_days(d).and_then(|d| now.checked_add_signed(d))
+                        }
+                        (None, Some(y)) => y
+                            .checked_mul(12)
+                            .and_then(|m| u32::try_from(m).ok())
+                            .and_then(|m| now.checked_add_months(chrono::Months::new(m))),
+                        (None, None) => None,
+                    };
+                    if let Some(until) = until {
                         lock_mode = Some(mode);
                         lock_retain_until = Some(until);
                     }
