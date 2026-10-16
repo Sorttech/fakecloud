@@ -116,6 +116,20 @@ pub struct MultipartUpload {
     pub content_disposition: Option<String>,
     pub content_language: Option<String>,
     pub expires: Option<String>,
+    /// Object Lock settings requested explicitly at CreateMultipartUpload
+    /// time. The bucket default retention is applied at completion instead,
+    /// when the object version is created.
+    pub lock: ObjectLockSettings,
+}
+
+/// Object Lock settings for an object version being written: retention mode,
+/// retain-until date and legal-hold status. Resolution and validation live in
+/// `service::lock`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ObjectLockSettings {
+    pub mode: Option<String>,
+    pub retain_until: Option<DateTime<Utc>>,
+    pub legal_hold: Option<String>,
 }
 
 #[derive(Debug, Clone)]

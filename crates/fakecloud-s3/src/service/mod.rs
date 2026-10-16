@@ -25,6 +25,8 @@ mod buckets;
 pub(crate) mod config;
 mod control_tags;
 mod lock;
+use crate::state::ObjectLockSettings;
+use lock::{has_object_lock_headers, has_payload_integrity_header};
 mod multipart;
 pub(crate) mod notifications;
 mod objects;
@@ -1457,9 +1459,12 @@ impl AwsService for S3Service {
                 }
                 (&Method::GET, Some(b), Some(k)) => {
                     if req.query_params.contains_key("annotation") {
-                        // Both `?annotation` reads share a URI; `AnnotationName`
+                        // Both `?annotation` reads share a URI; `annotationName`
                         // selects one annotation, its absence lists them.
-                        if req.query_params.contains_key("AnnotationName") {
+                        if req
+                            .query_params
+                            .contains_key(annotations::ANNOTATION_NAME_QUERY)
+                        {
                             self.get_object_annotation(account_id, &req, b, k)
                         } else {
                             self.list_object_annotations(account_id, &req, b, k)
@@ -1997,6 +2002,7 @@ impl AwsService for S3Service {
             actions.push(source);
         }
         actions.extend(governance_bypass_actions(request, &actions[0]));
+        actions.extend(object_lock_header_actions(request, &actions[0]));
         actions
     }
 
@@ -2371,9 +2377,9 @@ fn s3_detect_action(
     if has_key {
         if has("annotation") {
             return Some(match method {
-                // One URI serves both reads; `AnnotationName` picks a single
+                // One URI serves both reads; `annotationName` picks a single
                 // annotation, its absence lists them.
-                "GET" if has("AnnotationName") => "GetObjectAnnotation",
+                "GET" if has(annotations::ANNOTATION_NAME_QUERY) => "GetObjectAnnotation",
                 "GET" => "ListObjectAnnotations",
                 "PUT" => "PutObjectAnnotation",
                 "DELETE" => "DeleteObjectAnnotation",
@@ -4712,6 +4718,42 @@ fn governance_bypass_actions(
     }
 }
 
+/// The extra permissions a write that sets an object's lock must hold. The S3
+/// model documents the PutObject / CopyObject / CreateMultipartUpload lock
+/// headers as needing `s3:PutObjectRetention` (mode, retain-until date) and
+/// `s3:PutObjectLegalHold` (legal hold), evaluated on the object written --
+/// the destination for a copy.
+fn object_lock_header_actions(
+    request: &AwsRequest,
+    primary: &fakecloud_core::auth::IamAction,
+) -> Vec<fakecloud_core::auth::IamAction> {
+    if primary.service != "s3"
+        || !matches!(
+            primary.action,
+            "PutObject" | "CopyObject" | "CreateMultipartUpload"
+        )
+    {
+        return Vec::new();
+    }
+    let present = |name: &str| request.headers.contains_key(name);
+    let mut actions = Vec::new();
+    if present("x-amz-object-lock-mode") || present("x-amz-object-lock-retain-until-date") {
+        actions.push(fakecloud_core::auth::IamAction {
+            service: "s3",
+            action: "PutObjectRetention",
+            resource: primary.resource.clone(),
+        });
+    }
+    if present("x-amz-object-lock-legal-hold") {
+        actions.push(fakecloud_core::auth::IamAction {
+            service: "s3",
+            action: "PutObjectLegalHold",
+            resource: primary.resource.clone(),
+        });
+    }
+    actions
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -5030,6 +5072,41 @@ mod s3_detect_action_tests {
             &q(&[("select", ""), ("select-type", "2")]),
         );
         assert_eq!(action, Some("GetObject"));
+    }
+
+    #[test]
+    fn annotation_reads_split_on_the_annotation_name_wire_key() {
+        // GET /bucket/key?annotation&annotationName=n reads one annotation;
+        // without `annotationName` the same URI lists them. The member-name
+        // spelling `AnnotationName` is not the wire key and must not select
+        // the single-annotation read.
+        let get = s3_detect_action(
+            "GET",
+            Some("bucket"),
+            Some("key"),
+            &q(&[
+                ("annotation", ""),
+                (super::annotations::ANNOTATION_NAME_QUERY, "n"),
+            ]),
+        );
+        assert_eq!(get, Some("GetObjectAnnotation"));
+        let list = s3_detect_action(
+            "GET",
+            Some("bucket"),
+            Some("key"),
+            &q(&[("annotation", ""), ("AnnotationName", "n")]),
+        );
+        assert_eq!(list, Some("ListObjectAnnotations"));
+        let delete = s3_detect_action(
+            "DELETE",
+            Some("bucket"),
+            Some("key"),
+            &q(&[
+                ("annotation", ""),
+                (super::annotations::ANNOTATION_NAME_QUERY, "n"),
+            ]),
+        );
+        assert_eq!(delete, Some("DeleteObjectAnnotation"));
     }
 
     #[test]

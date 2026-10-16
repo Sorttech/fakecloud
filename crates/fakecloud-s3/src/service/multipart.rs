@@ -14,7 +14,7 @@ use md5::{Digest, Md5};
 use super::{
     canned_acl_grants, compute_md5, extract_user_metadata, no_such_bucket, no_such_key,
     no_such_upload, parse_complete_multipart_xml, parse_url_encoded_tags, precondition_failed,
-    resolve_object, s3_xml, xml_escape, S3Service,
+    resolve_object, s3_xml, xml_escape, ObjectLockSettings, S3Service,
 };
 
 /// The `Location` of a completed multipart object: its URL on the bucket's
@@ -124,6 +124,11 @@ impl S3Service {
             .get_mut(bucket)
             .ok_or_else(|| no_such_bucket(bucket))?;
 
+        // Explicit lock headers are validated now, like PutObject does, and
+        // kept on the upload; the bucket default retention is applied when
+        // the upload completes and the object version is created.
+        let lock = ObjectLockSettings::from_request(&req.headers, b.object_lock_config.as_deref())?;
+
         let acl_grants = write_acl
             .grants_for(&b.acl_owner_id)
             .unwrap_or_else(|| canned_acl_grants("private", &b.acl_owner_id));
@@ -145,6 +150,7 @@ impl S3Service {
             content_disposition,
             content_language,
             expires,
+            lock,
         };
         // Store-first: persist the MPU init before touching memory so a disk
         // write failure short-circuits the handler cleanly without leaving an
@@ -793,7 +799,6 @@ impl S3Service {
         if versioning_suspended {
             obj.version_id = Some("null".to_string());
         }
-        let meta = object_meta_snapshot(&obj);
         {
             let mut accts = self.state.write();
             {
@@ -821,7 +826,18 @@ impl S3Service {
                 if if_none_match.as_deref() == Some("*") && b.objects.contains_key(key) {
                     return Err(precondition_failed("If-None-Match"));
                 }
+                // The lock requested at CreateMultipartUpload, else the
+                // bucket's current default retention measured from now, when
+                // the version is created.
+                let lock = upload
+                    .lock
+                    .clone()
+                    .or_bucket_default(b.object_lock_config.as_deref(), Utc::now());
+                obj.lock_mode = lock.mode;
+                obj.lock_retain_until = lock.retain_until;
+                obj.lock_legal_hold = lock.legal_hold;
             }
+            let meta = object_meta_snapshot(&obj);
             // Record the preserved null version -- sidecar, history entry and
             // the retag of the current object -- before the completion runs.
             // It describes the object that is ALREADY there: on a

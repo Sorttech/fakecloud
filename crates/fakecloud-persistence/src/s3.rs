@@ -232,6 +232,13 @@ pub struct MpuInit {
     pub content_language: Option<String>,
     #[serde(default)]
     pub expires: Option<String>,
+    /// Object Lock settings requested at CreateMultipartUpload time.
+    #[serde(default)]
+    pub lock_mode: Option<String>,
+    #[serde(default)]
+    pub lock_retain_until: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub lock_legal_hold: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -2369,6 +2376,45 @@ mod disk_tests {
         assert_eq!(m.init.upload_id, "up1");
         assert_eq!(m.init.key, "k1");
         assert!(m.parts.is_empty());
+    }
+
+    #[test]
+    fn mpu_create_round_trips_the_requested_object_lock() {
+        let tmp = TempDir::new().unwrap();
+        let store = new_store(&tmp);
+        store
+            .put_bucket_meta(
+                "b",
+                &BucketMeta {
+                    name: "b".to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let until = chrono::Utc::now() + chrono::Duration::days(2);
+        let init = MpuInit {
+            lock_mode: Some("COMPLIANCE".to_string()),
+            lock_retain_until: Some(until),
+            lock_legal_hold: Some("ON".to_string()),
+            ..sample_mpu_init("up1", "k1")
+        };
+        store.mpu_create("b", "up1", &init).unwrap();
+        let loaded = store.load().unwrap();
+        let m = &loaded.buckets["b"].multipart_uploads["up1"];
+        assert_eq!(m.init.lock_mode.as_deref(), Some("COMPLIANCE"));
+        assert_eq!(m.init.lock_retain_until, Some(until));
+        assert_eq!(m.init.lock_legal_hold.as_deref(), Some("ON"));
+    }
+
+    #[test]
+    fn mpu_init_written_before_object_lock_fields_still_loads() {
+        let init: MpuInit =
+            toml::from_str("upload_id = \"up1\"\nkey = \"k1\"\ncontent_type = \"text/plain\"\n")
+                .unwrap();
+        assert_eq!(init.upload_id, "up1");
+        assert!(init.lock_mode.is_none());
+        assert!(init.lock_retain_until.is_none());
+        assert!(init.lock_legal_hold.is_none());
     }
 
     #[test]

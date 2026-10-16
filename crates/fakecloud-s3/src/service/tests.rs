@@ -1104,14 +1104,14 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-fn make_service() -> S3Service {
+pub(super) fn make_service() -> S3Service {
     let state: SharedS3State = Arc::new(RwLock::new(
         fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
     ));
     S3Service::new(state, Arc::new(DeliveryBus::new()))
 }
 
-fn seed_bucket(svc: &S3Service, name: &str) {
+pub(super) fn seed_bucket(svc: &S3Service, name: &str) {
     let mut mas = svc.state.write();
     let state = mas.default_mut();
     state
@@ -1119,7 +1119,7 @@ fn seed_bucket(svc: &S3Service, name: &str) {
         .insert(name.to_string(), S3Bucket::new(name, "us-east-1", "owner"));
 }
 
-fn seed_object(svc: &S3Service, bucket: &str, key: &str, body: &[u8]) {
+pub(super) fn seed_object(svc: &S3Service, bucket: &str, key: &str, body: &[u8]) {
     let mut mas = svc.state.write();
     let state = mas.default_mut();
     let b = state.buckets.get_mut(bucket).expect("bucket seeded");
@@ -1136,7 +1136,12 @@ fn seed_object(svc: &S3Service, bucket: &str, key: &str, body: &[u8]) {
     b.objects.insert(key.to_string(), obj);
 }
 
-fn make_request(method: Method, path: &str, query: &[(&str, &str)], body: &[u8]) -> AwsRequest {
+pub(super) fn make_request(
+    method: Method,
+    path: &str,
+    query: &[(&str, &str)],
+    body: &[u8],
+) -> AwsRequest {
     let segments: Vec<String> = path
         .trim_start_matches('/')
         .split('/')
@@ -1176,6 +1181,11 @@ fn make_request(method: Method, path: &str, query: &[(&str, &str)], body: &[u8])
         access_key_id: None,
         principal: None,
     }
+}
+
+/// The base64 `Content-MD5` header value for `body`.
+fn content_md5(body: &[u8]) -> String {
+    BASE64.encode(md5::Md5::digest(body))
 }
 
 fn assert_aws_err(
@@ -7624,6 +7634,8 @@ async fn put_object_retention_by_version_id_respects_the_lock() {
 
     let mut put = make_request(Method::PUT, "/vlock/k", &[], b"hello");
     put.headers
+        .insert("content-md5", content_md5(b"hello").parse().unwrap());
+    put.headers
         .insert("x-amz-object-lock-mode", "GOVERNANCE".parse().unwrap());
     put.headers.insert(
         "x-amz-object-lock-retain-until-date",
@@ -7649,6 +7661,89 @@ async fn put_object_retention_by_version_id_respects_the_lock() {
         svc.put_object_retention("123456789012", &req, "vlock", "k"),
         "AccessDenied",
     );
+}
+
+#[test]
+fn object_lock_headers_require_retention_and_legal_hold_permissions() {
+    use fakecloud_core::service::AwsService as _;
+
+    let svc = make_service();
+    let actions = |req: &AwsRequest| -> Vec<(&'static str, String)> {
+        svc.iam_actions_for(req)
+            .into_iter()
+            .map(|a| (a.action, a.resource))
+            .collect()
+    };
+    let with = |mut req: AwsRequest, headers: &[(&'static str, &str)]| {
+        for (name, value) in headers {
+            req.headers.insert(*name, value.parse().unwrap());
+        }
+        req
+    };
+    let retention = [
+        ("x-amz-object-lock-mode", "GOVERNANCE"),
+        (
+            "x-amz-object-lock-retain-until-date",
+            "2099-01-01T00:00:00Z",
+        ),
+    ];
+    let legal_hold = [("x-amz-object-lock-legal-hold", "ON")];
+    let all = [retention[0], retention[1], legal_hold[0]];
+    let obj = |key: &str| format!("arn:aws:s3:::b/{key}");
+
+    // PutObject.
+    let put = || make_request(Method::PUT, "/b/k", &[], b"x");
+    assert_eq!(actions(&put()), vec![("PutObject", obj("k"))]);
+    assert_eq!(
+        actions(&with(put(), &retention)),
+        vec![("PutObject", obj("k")), ("PutObjectRetention", obj("k"))]
+    );
+    // Either retention header alone asks for the permission.
+    assert_eq!(
+        actions(&with(put(), &retention[..1])),
+        vec![("PutObject", obj("k")), ("PutObjectRetention", obj("k"))]
+    );
+    assert_eq!(
+        actions(&with(put(), &retention[1..])),
+        vec![("PutObject", obj("k")), ("PutObjectRetention", obj("k"))]
+    );
+    assert_eq!(
+        actions(&with(put(), &legal_hold)),
+        vec![("PutObject", obj("k")), ("PutObjectLegalHold", obj("k"))]
+    );
+
+    // CopyObject: evaluated on the destination object; the source read is
+    // authorized separately.
+    let copy = with(
+        make_request(Method::PUT, "/b/dst", &[], b""),
+        &[("x-amz-copy-source", "src/k")],
+    );
+    let base = actions(&copy);
+    let copy_locked = actions(&with(copy, &all));
+    assert_eq!(copy_locked[..base.len()], base[..]);
+    assert_eq!(
+        copy_locked[base.len()..],
+        [
+            ("PutObjectRetention", obj("dst")),
+            ("PutObjectLegalHold", obj("dst"))
+        ]
+    );
+
+    // CreateMultipartUpload.
+    let create = || make_request(Method::POST, "/b/mpu", &[("uploads", "")], b"");
+    let base = actions(&create());
+    assert_eq!(base.len(), 1);
+    assert_eq!(
+        actions(&with(create(), &all))[1..],
+        [
+            ("PutObjectRetention", obj("mpu")),
+            ("PutObjectLegalHold", obj("mpu"))
+        ]
+    );
+
+    // Requests that do not create an object version ignore the headers.
+    let get = with(make_request(Method::GET, "/b/k", &[], b""), &all);
+    assert_eq!(actions(&get), vec![("GetObject", obj("k"))]);
 }
 
 #[test]
@@ -7880,7 +7975,10 @@ fn put_annotation(
     let req = make_request(
         Method::PUT,
         &format!("/{bucket}/{key}"),
-        &[("annotation", ""), ("AnnotationName", name)],
+        &[
+            ("annotation", ""),
+            (super::annotations::ANNOTATION_NAME_QUERY, name),
+        ],
         payload,
     );
     svc.put_object_annotation("123456789012", &req, bucket, key)
@@ -7899,7 +7997,10 @@ fn object_annotations_round_trip_independently_of_the_object() {
     let req = make_request(
         Method::GET,
         "/annot/doc.txt",
-        &[("annotation", ""), ("AnnotationName", "review")],
+        &[
+            ("annotation", ""),
+            (super::annotations::ANNOTATION_NAME_QUERY, "review"),
+        ],
         b"",
     );
     let resp = svc
@@ -7921,7 +8022,10 @@ fn object_annotations_round_trip_independently_of_the_object() {
     let req = make_request(
         Method::GET,
         "/annot/doc.txt",
-        &[("annotation", ""), ("AnnotationName", "review")],
+        &[
+            ("annotation", ""),
+            (super::annotations::ANNOTATION_NAME_QUERY, "review"),
+        ],
         b"",
     );
     let resp = svc
@@ -7934,7 +8038,10 @@ fn object_annotations_round_trip_independently_of_the_object() {
         let req = make_request(
             Method::DELETE,
             "/annot/doc.txt",
-            &[("annotation", ""), ("AnnotationName", "review")],
+            &[
+                ("annotation", ""),
+                (super::annotations::ANNOTATION_NAME_QUERY, "review"),
+            ],
             b"",
         );
         let resp = svc
@@ -7945,7 +8052,10 @@ fn object_annotations_round_trip_independently_of_the_object() {
     let req = make_request(
         Method::GET,
         "/annot/doc.txt",
-        &[("annotation", ""), ("AnnotationName", "review")],
+        &[
+            ("annotation", ""),
+            (super::annotations::ANNOTATION_NAME_QUERY, "review"),
+        ],
         b"",
     );
     assert_aws_err(
@@ -7982,13 +8092,13 @@ fn list_object_annotations_filters_by_prefix_and_pages() {
     // Size is the payload length, not the object's.
     assert!(all.contains("<Size>5</Size>"), "{all}");
 
-    let prefixed = list(&[("AnnotationPrefix", "a-")]);
+    let prefixed = list(&[(super::annotations::ANNOTATION_PREFIX_QUERY, "a-")]);
     assert!(prefixed.contains("<AnnotationCount>3</AnnotationCount>"));
     assert!(!prefixed.contains("b-one"));
 
     // A short page reports a continuation token; following it returns the rest
     // without repeating an entry.
-    let page1 = list(&[("MaxAnnotationResults", "2")]);
+    let page1 = list(&[(super::annotations::MAX_ANNOTATION_RESULTS_QUERY, "2")]);
     assert!(
         page1.contains("<AnnotationCount>2</AnnotationCount>"),
         "{page1}"
@@ -7999,7 +8109,10 @@ fn list_object_annotations_filters_by_prefix_and_pages() {
         .and_then(|s| s.split("</NextContinuationToken>").next())
         .expect("continuation token")
         .to_string();
-    let page2 = list(&[("MaxAnnotationResults", "2"), ("ContinuationToken", &token)]);
+    let page2 = list(&[
+        (super::annotations::MAX_ANNOTATION_RESULTS_QUERY, "2"),
+        (super::annotations::CONTINUATION_TOKEN_QUERY, &token),
+    ]);
     assert!(
         page2.contains("<AnnotationCount>2</AnnotationCount>"),
         "{page2}"
@@ -8036,6 +8149,23 @@ fn object_annotations_validate_names_and_missing_resources() {
         put_annotation(&svc, "annot", "k", "bad\nname", b"x"),
         "InvalidAnnotationName",
     );
+    assert_aws_err(
+        put_annotation(&svc, "annot", "k", "", b"x"),
+        "InvalidAnnotationName",
+    );
+    // Exactly the documented maximum is accepted.
+    put_annotation(&svc, "annot", "k", &"n".repeat(255), b"x").unwrap();
+    let at_limit = make_request(
+        Method::DELETE,
+        "/annot/k",
+        &[
+            ("annotation", ""),
+            (super::annotations::ANNOTATION_NAME_QUERY, &"n".repeat(255)),
+        ],
+        b"",
+    );
+    svc.delete_object_annotation("123456789012", &at_limit, "annot", "k")
+        .unwrap();
 
     // Missing bucket / key report the object-level codes.
     assert_aws_err(
@@ -8330,6 +8460,488 @@ async fn object_lock_default_retention_tolerates_whitespace_around_period() {
         assert_eq!(obj.lock_mode.as_deref(), Some("GOVERNANCE"), "{period}");
         assert!(obj.lock_retain_until.is_some(), "{period}");
     }
+}
+
+/// A bucket created with Object Lock, optionally with a default retention.
+fn seed_lock_bucket(svc: &S3Service, name: &str, default_retention: Option<&str>) {
+    let mut req = make_request(Method::PUT, &format!("/{name}"), &[], b"");
+    req.headers
+        .insert("x-amz-bucket-object-lock-enabled", "true".parse().unwrap());
+    svc.create_bucket("123456789012", &req, name).unwrap();
+    if let Some(retention) = default_retention {
+        let put = make_request(
+            Method::PUT,
+            &format!("/{name}"),
+            &[("object-lock", "")],
+            &lock_config(retention),
+        );
+        svc.put_object_lock_config("123456789012", &put, name)
+            .unwrap();
+    }
+}
+
+fn explicit_lock_headers(req: &mut AwsRequest, mode: &str, until: &str, legal_hold: &str) {
+    req.headers
+        .insert("x-amz-object-lock-mode", mode.parse().unwrap());
+    req.headers.insert(
+        "x-amz-object-lock-retain-until-date",
+        until.parse().unwrap(),
+    );
+    req.headers
+        .insert("x-amz-object-lock-legal-hold", legal_hold.parse().unwrap());
+}
+
+fn current_object(svc: &S3Service, bucket: &str, key: &str) -> S3Object {
+    svc.state.read().default_ref().buckets[bucket].objects[key].clone()
+}
+
+fn copy_request(dest_bucket: &str, dest_key: &str, source: &str) -> AwsRequest {
+    let mut req = make_request(Method::PUT, &format!("/{dest_bucket}/{dest_key}"), &[], b"");
+    req.headers
+        .insert("x-amz-copy-source", source.parse().unwrap());
+    req
+}
+
+#[tokio::test]
+async fn copy_object_applies_the_destination_default_retention() {
+    let svc = make_service();
+    seed_bucket(&svc, "plain-src");
+    seed_object(&svc, "plain-src", "k", b"payload");
+    seed_lock_bucket(&svc, "lock-default", Some("<Days>3</Days>"));
+
+    let before = chrono::Utc::now() + chrono::Duration::days(3);
+    svc.copy_object(
+        "123456789012",
+        &copy_request("lock-default", "copy", "plain-src/k"),
+        "lock-default",
+        "copy",
+    )
+    .unwrap();
+    let after = chrono::Utc::now() + chrono::Duration::days(3);
+
+    let obj = current_object(&svc, "lock-default", "copy");
+    assert_eq!(obj.lock_mode.as_deref(), Some("GOVERNANCE"));
+    let until = obj.lock_retain_until.expect("default retention applied");
+    assert!(before <= until && until <= after, "{until} not ~3 days out");
+    assert!(obj.lock_legal_hold.is_none());
+}
+
+#[tokio::test]
+async fn copy_object_applies_explicit_lock_headers() {
+    let svc = make_service();
+    seed_bucket(&svc, "plain-src");
+    seed_object(&svc, "plain-src", "k", b"payload");
+    seed_lock_bucket(&svc, "lock-default", Some("<Days>3</Days>"));
+
+    let mut req = copy_request("lock-default", "copy", "plain-src/k");
+    explicit_lock_headers(&mut req, "COMPLIANCE", "2099-01-01T00:00:00Z", "ON");
+    svc.copy_object("123456789012", &req, "lock-default", "copy")
+        .unwrap();
+
+    // The explicit headers win over the bucket default.
+    let obj = current_object(&svc, "lock-default", "copy");
+    assert_eq!(obj.lock_mode.as_deref(), Some("COMPLIANCE"));
+    assert_eq!(
+        obj.lock_retain_until,
+        Some("2099-01-01T00:00:00Z".parse().unwrap())
+    );
+    assert_eq!(obj.lock_legal_hold.as_deref(), Some("ON"));
+}
+
+#[tokio::test]
+async fn copy_object_does_not_inherit_the_source_lock() {
+    let svc = make_service();
+    seed_lock_bucket(&svc, "lock-src", None);
+    let mut put = make_request(Method::PUT, "/lock-src/k", &[], b"payload");
+    put.headers
+        .insert("content-md5", content_md5(b"payload").parse().unwrap());
+    explicit_lock_headers(&mut put, "COMPLIANCE", "2099-01-01T00:00:00Z", "ON");
+    svc.put_object("123456789012", &put, "lock-src", "k")
+        .await
+        .unwrap();
+    assert_eq!(
+        current_object(&svc, "lock-src", "k").lock_mode.as_deref(),
+        Some("COMPLIANCE")
+    );
+
+    // Into a lock bucket with no default retention, and into a plain bucket:
+    // neither copy carries the source's retention or legal hold.
+    seed_lock_bucket(&svc, "lock-nodefault", None);
+    seed_bucket(&svc, "plain-dst");
+    for dest in ["lock-nodefault", "plain-dst"] {
+        svc.copy_object(
+            "123456789012",
+            &copy_request(dest, "copy", "lock-src/k"),
+            dest,
+            "copy",
+        )
+        .unwrap();
+        let obj = current_object(&svc, dest, "copy");
+        assert!(obj.lock_mode.is_none(), "{dest}");
+        assert!(obj.lock_retain_until.is_none(), "{dest}");
+        assert!(obj.lock_legal_hold.is_none(), "{dest}");
+    }
+}
+
+#[tokio::test]
+async fn object_lock_headers_on_a_bucket_without_object_lock_are_refused_like_put_object() {
+    let svc = make_service();
+    seed_bucket(&svc, "plain");
+    seed_object(&svc, "plain", "src", b"payload");
+
+    let mut put = make_request(Method::PUT, "/plain/k", &[], b"payload");
+    explicit_lock_headers(&mut put, "GOVERNANCE", "2099-01-01T00:00:00Z", "OFF");
+    let put_err = match svc.put_object("123456789012", &put, "plain", "k").await {
+        Err(e) => e,
+        Ok(_) => panic!("PutObject accepted lock headers on a plain bucket"),
+    };
+
+    let mut copy = copy_request("plain", "copy", "plain/src");
+    explicit_lock_headers(&mut copy, "GOVERNANCE", "2099-01-01T00:00:00Z", "OFF");
+    let copy_err = assert_aws_err(
+        svc.copy_object("123456789012", &copy, "plain", "copy"),
+        "InvalidRequest",
+    );
+
+    let mut create = make_request(Method::POST, "/plain/mpu", &[("uploads", "")], b"");
+    explicit_lock_headers(&mut create, "GOVERNANCE", "2099-01-01T00:00:00Z", "OFF");
+    let create_err = assert_aws_err(
+        svc.create_multipart_upload("123456789012", &create, "plain", "mpu"),
+        "InvalidRequest",
+    );
+
+    let wire = |e: &AwsServiceError| match e {
+        AwsServiceError::AwsError {
+            status,
+            code,
+            message,
+            ..
+        } => (*status, code.clone(), message.clone()),
+        other => panic!("expected AwsError, got {other:?}"),
+    };
+    assert_eq!(
+        wire(&put_err),
+        (
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest".to_string(),
+            "Bucket is missing ObjectLockConfiguration".to_string()
+        )
+    );
+    assert_eq!(wire(&copy_err), wire(&put_err));
+    assert_eq!(wire(&create_err), wire(&put_err));
+    // Nothing was written by the refused requests.
+    let state = svc.state.read();
+    let b = &state.default_ref().buckets["plain"];
+    assert!(!b.objects.contains_key("copy"));
+    assert!(b.multipart_uploads.is_empty());
+}
+
+#[tokio::test]
+async fn object_lock_headers_are_validated_on_every_creating_operation() {
+    let svc = make_service();
+    seed_lock_bucket(&svc, "lockv", None);
+    seed_object(&svc, "lockv", "src", b"payload");
+    let past = (chrono::Utc::now() - chrono::Duration::minutes(5))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    let future = "2099-01-01T00:00:00Z";
+    let both =
+        "x-amz-object-lock-retain-until-date and x-amz-object-lock-mode must both be supplied";
+    let cases: Vec<(Vec<(&str, &str)>, &str)> = vec![
+        (vec![("x-amz-object-lock-mode", "GOVERNANCE")], both),
+        (vec![("x-amz-object-lock-retain-until-date", future)], both),
+        (
+            vec![
+                ("x-amz-object-lock-mode", "GOVERNANCE"),
+                ("x-amz-object-lock-retain-until-date", "tomorrow"),
+            ],
+            "The retain until date must be provided in ISO 8601 format",
+        ),
+        (
+            vec![
+                ("x-amz-object-lock-mode", "governance"),
+                ("x-amz-object-lock-retain-until-date", future),
+            ],
+            "Unknown wormMode directive.",
+        ),
+        (
+            vec![
+                ("x-amz-object-lock-mode", "COMPLIANCE"),
+                ("x-amz-object-lock-retain-until-date", &past),
+            ],
+            "The retain until date must be in the future!",
+        ),
+        (
+            vec![("x-amz-object-lock-legal-hold", "YES")],
+            "Legal Hold must be either of 'ON' or 'OFF'",
+        ),
+    ];
+    let check = |result: Result<AwsResponse, AwsServiceError>, message: &str, op: &str| {
+        match assert_aws_err(result, "InvalidArgument") {
+            AwsServiceError::AwsError {
+                status, message: m, ..
+            } => {
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{op}");
+                assert_eq!(m, message, "{op}");
+            }
+            other => panic!("{other:?}"),
+        }
+    };
+    for (headers, message) in &cases {
+        let apply = |mut req: AwsRequest| {
+            for (name, value) in headers {
+                req.headers.insert(*name, value.parse().unwrap());
+            }
+            req
+        };
+        let mut put = apply(make_request(Method::PUT, "/lockv/k", &[], b"payload"));
+        put.headers
+            .insert("content-md5", content_md5(b"payload").parse().unwrap());
+        check(
+            svc.put_object("123456789012", &put, "lockv", "k").await,
+            message,
+            "PutObject",
+        );
+        let copy = apply(copy_request("lockv", "copy", "lockv/src"));
+        check(
+            svc.copy_object("123456789012", &copy, "lockv", "copy"),
+            message,
+            "CopyObject",
+        );
+        let create = apply(make_request(
+            Method::POST,
+            "/lockv/mpu",
+            &[("uploads", "")],
+            b"",
+        ));
+        check(
+            svc.create_multipart_upload("123456789012", &create, "lockv", "mpu"),
+            message,
+            "CreateMultipartUpload",
+        );
+    }
+    let state = svc.state.read();
+    let b = &state.default_ref().buckets["lockv"];
+    assert!(!b.objects.contains_key("k") && !b.objects.contains_key("copy"));
+    assert!(b.multipart_uploads.is_empty());
+}
+
+#[tokio::test]
+async fn put_object_with_object_lock_requires_a_payload_integrity_header() {
+    let svc = make_service();
+    seed_lock_bucket(&svc, "lockmd5", None);
+    let locked_put = |key: &str| {
+        let mut req = make_request(Method::PUT, &format!("/lockmd5/{key}"), &[], b"payload");
+        req.headers
+            .insert("x-amz-object-lock-legal-hold", "ON".parse().unwrap());
+        req
+    };
+
+    let err = assert_aws_err(
+        svc.put_object("123456789012", &locked_put("none"), "lockmd5", "none")
+            .await,
+        "InvalidRequest",
+    );
+    match err {
+        AwsServiceError::AwsError {
+            status, message, ..
+        } => {
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(
+                message,
+                "Content-MD5 OR x-amz-checksum- HTTP header is required for Put Object \
+                 requests with Object Lock parameters"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+
+    let crc32 = compute_checksum("CRC32", b"payload");
+    let integrity: [(&str, &str, &str); 4] = [
+        ("md5", "content-md5", &content_md5(b"payload")),
+        ("crc", "x-amz-checksum-crc32", &crc32),
+        ("trailer", "x-amz-trailer", "x-amz-checksum-crc32"),
+        ("sdk", "x-amz-sdk-checksum-algorithm", "CRC32"),
+    ];
+    for (key, name, value) in integrity {
+        let mut req = locked_put(key);
+        req.headers.insert(name, value.parse().unwrap());
+        svc.put_object("123456789012", &req, "lockmd5", key)
+            .await
+            .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        assert_eq!(
+            current_object(&svc, "lockmd5", key)
+                .lock_legal_hold
+                .as_deref(),
+            Some("ON"),
+            "{name}"
+        );
+    }
+
+    // A PutObject without lock headers needs no integrity header; neither do
+    // CopyObject and CreateMultipartUpload with them.
+    svc.put_object(
+        "123456789012",
+        &make_request(Method::PUT, "/lockmd5/plain", &[], b"payload"),
+        "lockmd5",
+        "plain",
+    )
+    .await
+    .unwrap();
+    let mut copy = copy_request("lockmd5", "copy", "lockmd5/plain");
+    copy.headers
+        .insert("x-amz-object-lock-legal-hold", "ON".parse().unwrap());
+    svc.copy_object("123456789012", &copy, "lockmd5", "copy")
+        .unwrap();
+    let mut create = make_request(Method::POST, "/lockmd5/mpu", &[("uploads", "")], b"");
+    create
+        .headers
+        .insert("x-amz-object-lock-legal-hold", "ON".parse().unwrap());
+    svc.create_multipart_upload("123456789012", &create, "lockmd5", "mpu")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn copy_object_reads_the_destination_default_retention_when_it_copies() {
+    // The default is read from the destination bucket when the copy commits:
+    // with no default configured, a copy into the bucket stays unlocked.
+    let svc = make_service();
+    seed_bucket(&svc, "plain-src");
+    seed_object(&svc, "plain-src", "k", b"payload");
+    seed_lock_bucket(&svc, "lock-later", None);
+    svc.copy_object(
+        "123456789012",
+        &copy_request("lock-later", "before", "plain-src/k"),
+        "lock-later",
+        "before",
+    )
+    .unwrap();
+    assert!(current_object(&svc, "lock-later", "before")
+        .lock_mode
+        .is_none());
+    let put = make_request(
+        Method::PUT,
+        "/lock-later",
+        &[("object-lock", "")],
+        &lock_config("<Years>1</Years>"),
+    );
+    svc.put_object_lock_config("123456789012", &put, "lock-later")
+        .unwrap();
+    let before = chrono::Utc::now()
+        .checked_add_months(chrono::Months::new(12))
+        .unwrap();
+    svc.copy_object(
+        "123456789012",
+        &copy_request("lock-later", "after", "plain-src/k"),
+        "lock-later",
+        "after",
+    )
+    .unwrap();
+    let after = chrono::Utc::now()
+        .checked_add_months(chrono::Months::new(12))
+        .unwrap();
+    let until = current_object(&svc, "lock-later", "after")
+        .lock_retain_until
+        .unwrap();
+    assert!(before <= until && until <= after);
+}
+
+/// Create (with `lock` headers applied), upload one part and complete a
+/// multipart upload of `bucket/key`.
+async fn multipart_upload_with(
+    svc: &S3Service,
+    bucket: &str,
+    key: &str,
+    lock: Option<(&str, &str, &str)>,
+) {
+    let mut create = make_request(
+        Method::POST,
+        &format!("/{bucket}/{key}"),
+        &[("uploads", "")],
+        b"",
+    );
+    if let Some((mode, until, legal_hold)) = lock {
+        explicit_lock_headers(&mut create, mode, until, legal_hold);
+    }
+    let resp = svc
+        .create_multipart_upload("123456789012", &create, bucket, key)
+        .unwrap();
+    let body = std::str::from_utf8(resp.body.expect_bytes()).unwrap();
+    let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();
+    let end = body.find("</UploadId>").unwrap();
+    let upload_id = body[start..end].to_string();
+
+    let part = make_request(
+        Method::PUT,
+        &format!("/{bucket}/{key}"),
+        &[("partNumber", "1")],
+        b"hello",
+    );
+    let resp = svc
+        .upload_part("123456789012", &part, bucket, key, &upload_id, 1)
+        .await
+        .unwrap();
+    let etag = resp.headers["etag"].to_str().unwrap().to_string();
+    let complete_xml = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let complete = make_request(
+        Method::POST,
+        &format!("/{bucket}/{key}"),
+        &[("uploadId", &upload_id)],
+        complete_xml.as_bytes(),
+    );
+    svc.complete_multipart_upload("123456789012", &complete, bucket, key, &upload_id)
+        .unwrap();
+}
+
+#[tokio::test]
+async fn multipart_upload_applies_explicit_lock_headers() {
+    let svc = make_service();
+    seed_lock_bucket(&svc, "lock-default", Some("<Days>3</Days>"));
+    multipart_upload_with(
+        &svc,
+        "lock-default",
+        "k",
+        Some(("COMPLIANCE", "2099-01-01T00:00:00Z", "ON")),
+    )
+    .await;
+
+    let obj = current_object(&svc, "lock-default", "k");
+    assert_eq!(obj.lock_mode.as_deref(), Some("COMPLIANCE"));
+    assert_eq!(
+        obj.lock_retain_until,
+        Some("2099-01-01T00:00:00Z".parse().unwrap())
+    );
+    assert_eq!(obj.lock_legal_hold.as_deref(), Some("ON"));
+    // The version history carries the same lock as the current object.
+    let state = svc.state.read();
+    let versions = &state.default_ref().buckets["lock-default"].object_versions["k"];
+    assert_eq!(
+        versions.last().unwrap().lock_mode.as_deref(),
+        Some("COMPLIANCE")
+    );
+}
+
+#[tokio::test]
+async fn multipart_upload_applies_the_bucket_default_retention_at_completion() {
+    let svc = make_service();
+    seed_lock_bucket(&svc, "lock-default", Some("<Days>3</Days>"));
+    let before = chrono::Utc::now() + chrono::Duration::days(3);
+    multipart_upload_with(&svc, "lock-default", "k", None).await;
+    let after = chrono::Utc::now() + chrono::Duration::days(3);
+
+    let obj = current_object(&svc, "lock-default", "k");
+    assert_eq!(obj.lock_mode.as_deref(), Some("GOVERNANCE"));
+    let until = obj.lock_retain_until.expect("default retention applied");
+    assert!(before <= until && until <= after, "{until} not ~3 days out");
+    assert!(obj.lock_legal_hold.is_none());
+
+    // A lock bucket with no default retention leaves the object unlocked.
+    seed_lock_bucket(&svc, "lock-nodefault", None);
+    multipart_upload_with(&svc, "lock-nodefault", "k", None).await;
+    let obj = current_object(&svc, "lock-nodefault", "k");
+    assert!(obj.lock_mode.is_none() && obj.lock_retain_until.is_none());
 }
 
 // ── SelectObjectContent compression ──────────────────────────────

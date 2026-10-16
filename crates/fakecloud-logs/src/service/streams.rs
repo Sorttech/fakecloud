@@ -760,11 +760,11 @@ impl LogsService {
             self.delivery_bus
                 .send_to_kinesis(destination_arn, &encoded, &partition_key);
         } else if destination_arn.contains(":firehose:") {
-            // Firehose subscriptions get the same gzip+base64 envelope
-            // Lambda/Kinesis subscribers see, so a downstream consumer
-            // can decode with the standard CloudWatch-Logs format.
+            // The Firehose record is the gzip-compressed payload itself (the
+            // base64 above is only SQS/Lambda/Kinesis wire encoding), so the
+            // delivered S3 object is gzip, readable with `zcat`, as in AWS.
             self.delivery_bus
-                .put_record_to_firehose(destination_arn, encoded.as_bytes());
+                .put_record_to_firehose(destination_arn, &compressed);
         }
     }
 
@@ -2915,6 +2915,63 @@ mod tests {
         let resp = svc.describe_destinations(&req).unwrap();
         let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
         assert!(body["destinations"].is_array());
+    }
+
+    // ---- Subscription filter delivers raw gzip to Firehose ----
+
+    #[derive(Default)]
+    struct FirehoseRecorder {
+        records: parking_lot::Mutex<Vec<(String, Vec<u8>)>>,
+    }
+
+    impl fakecloud_core::delivery::FirehoseDelivery for FirehoseRecorder {
+        fn put_record(&self, delivery_stream_arn: &str, data: &[u8]) {
+            self.records
+                .lock()
+                .push((delivery_stream_arn.to_string(), data.to_vec()));
+        }
+    }
+
+    #[test]
+    fn subscription_filter_delivers_gzip_payload_to_firehose() {
+        use std::io::Read;
+        let recorder = std::sync::Arc::new(FirehoseRecorder::default());
+        let state = std::sync::Arc::new(parking_lot::RwLock::new(
+            fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+        ));
+        let bus = fakecloud_core::delivery::DeliveryBus::new().with_firehose(recorder.clone());
+        let svc = LogsService::new(state, std::sync::Arc::new(bus));
+        create_group(&svc, "sub-fh");
+        create_stream(&svc, "sub-fh", "s1");
+        let stream_arn = "arn:aws:firehose:us-east-1:123456789012:deliverystream/logs";
+        let req = make_request(
+            "PutSubscriptionFilter",
+            json!({
+                "logGroupName": "sub-fh",
+                "filterName": "to-firehose",
+                "filterPattern": "",
+                "destinationArn": stream_arn,
+                "roleArn": "arn:aws:iam::123456789012:role/cwl-to-firehose",
+            }),
+        );
+        svc.put_subscription_filter(&req).unwrap();
+
+        put_events(&svc, "sub-fh", "s1", &["hello firehose"]);
+
+        let records = recorder.records.lock();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].0, stream_arn);
+        // The record is gzip itself, not base64 text of it.
+        assert_eq!(&records[0].1[..2], &[0x1f, 0x8b]);
+        let mut decoded = String::new();
+        flate2::read::GzDecoder::new(&records[0].1[..])
+            .read_to_string(&mut decoded)
+            .unwrap();
+        let payload: Value = serde_json::from_str(&decoded).unwrap();
+        assert_eq!(payload["messageType"], "DATA_MESSAGE");
+        assert_eq!(payload["logGroup"], "sub-fh");
+        assert_eq!(payload["subscriptionFilters"][0], "to-firehose");
+        assert_eq!(payload["logEvents"][0]["message"], "hello firehose");
     }
 
     // ---- Metric filter publishes data to CloudWatch ----

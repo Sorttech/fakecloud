@@ -884,6 +884,132 @@ async fn s3_governance_bypass_needs_bypass_governance_retention() {
         .expect("delete allowed once granted");
 }
 
+/// Setting an object's lock while writing it needs the lock permissions too:
+/// `s3:PutObjectRetention` for the mode / retain-until headers and
+/// `s3:PutObjectLegalHold` for the legal-hold header, on PutObject, CopyObject
+/// and CreateMultipartUpload alike.
+#[tokio::test]
+async fn s3_object_lock_headers_need_retention_and_legal_hold_permissions() {
+    use aws_sdk_s3::primitives::{ByteStream, DateTime};
+    use aws_sdk_s3::types::{ObjectLockLegalHoldStatus, ObjectLockMode};
+
+    let server = start_strict().await;
+    let bucket = "lock-header-perm-bucket";
+    let root = path_style_s3(&sdk_config_with(&server, "test", "test").await);
+    root.create_bucket()
+        .bucket(bucket)
+        .object_lock_enabled_for_bucket(true)
+        .send()
+        .await
+        .unwrap();
+    root.put_object()
+        .bucket(bucket)
+        .key("src.txt")
+        .body(ByteStream::from_static(b"source"))
+        .send()
+        .await
+        .unwrap();
+    let far = DateTime::from_secs(4_070_908_800); // 2099-01-01
+
+    let (akid, secret) = bootstrap_user(&server, "s3lockhdr").await;
+    attach_inline_policy(
+        &server,
+        "s3lockhdr",
+        "all",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*"}]}"#,
+    )
+    .await;
+    attach_inline_policy(
+        &server,
+        "s3lockhdr",
+        "no-lock",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":["s3:PutObjectRetention","s3:PutObjectLegalHold"],"Resource":"*"}]}"#,
+    )
+    .await;
+    let s3 = path_style_s3(&sdk_config_with(&server, &akid, &secret).await);
+    let put_retained = || {
+        s3.put_object()
+            .bucket(bucket)
+            .key("put.txt")
+            .body(ByteStream::from_static(b"x"))
+            .object_lock_mode(ObjectLockMode::Governance)
+            .object_lock_retain_until_date(far)
+    };
+    let put_held = || {
+        s3.put_object()
+            .bucket(bucket)
+            .key("held.txt")
+            .body(ByteStream::from_static(b"x"))
+            .object_lock_legal_hold_status(ObjectLockLegalHoldStatus::On)
+    };
+    let copy_retained = || {
+        s3.copy_object()
+            .bucket(bucket)
+            .key("copy.txt")
+            .copy_source(format!("{bucket}/src.txt"))
+            .object_lock_mode(ObjectLockMode::Governance)
+            .object_lock_retain_until_date(far)
+    };
+    let create_retained = || {
+        s3.create_multipart_upload()
+            .bucket(bucket)
+            .key("mpu.bin")
+            .object_lock_mode(ObjectLockMode::Governance)
+            .object_lock_retain_until_date(far)
+    };
+
+    // Writes that set no lock are unaffected by the Deny.
+    s3.put_object()
+        .bucket(bucket)
+        .key("plain.txt")
+        .body(ByteStream::from_static(b"x"))
+        .send()
+        .await
+        .expect("a PutObject without lock headers needs no lock permission");
+
+    for err in [
+        format!(
+            "{:?}",
+            put_retained().send().await.expect_err("put retention")
+        ),
+        format!("{:?}", put_held().send().await.expect_err("put legal hold")),
+        format!(
+            "{:?}",
+            copy_retained().send().await.expect_err("copy retention")
+        ),
+        format!(
+            "{:?}",
+            create_retained().send().await.expect_err("mpu retention")
+        ),
+    ] {
+        assert!(err.contains("AccessDenied"), "unexpected error: {err}");
+    }
+
+    IamClient::new(&sdk_config_with(&server, "test", "test").await)
+        .delete_user_policy()
+        .user_name("s3lockhdr")
+        .policy_name("no-lock")
+        .send()
+        .await
+        .unwrap();
+    put_retained()
+        .send()
+        .await
+        .expect("PutObject with retention allowed once granted");
+    put_held()
+        .send()
+        .await
+        .expect("PutObject with legal hold allowed once granted");
+    copy_retained()
+        .send()
+        .await
+        .expect("CopyObject with retention allowed once granted");
+    create_retained()
+        .send()
+        .await
+        .expect("CreateMultipartUpload with retention allowed once granted");
+}
+
 /// A create carrying both tags and an ACL is several authorizations, and AWS
 /// evaluates them all against ONE request context. A tag-scoped guardrail that
 /// permits the create must therefore permit the `s3:PutBucketAcl` it implies:

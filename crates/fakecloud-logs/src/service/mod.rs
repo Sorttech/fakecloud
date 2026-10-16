@@ -281,12 +281,24 @@ impl AwsService for LogsService {
             "DescribeLookupTables" => self.describe_lookup_tables(&req),
             "DeleteLookupTable" => self.delete_lookup_table(&req),
             "UpdateLookupTable" => self.update_lookup_table(&req),
-            "CreateScheduledQuery" => self.create_scheduled_query(&req),
-            "GetScheduledQuery" => self.get_scheduled_query(&req),
-            "GetScheduledQueryHistory" => self.get_scheduled_query_history(&req),
-            "ListScheduledQueries" => self.list_scheduled_queries(&req),
-            "DeleteScheduledQuery" => self.delete_scheduled_query(&req),
-            "UpdateScheduledQuery" => self.update_scheduled_query(&req),
+            "CreateScheduledQuery" => self
+                .create_scheduled_query(&req)
+                .map_err(misc::scheduled_query_error),
+            "GetScheduledQuery" => self
+                .get_scheduled_query(&req)
+                .map_err(misc::scheduled_query_error),
+            "GetScheduledQueryHistory" => self
+                .get_scheduled_query_history(&req)
+                .map_err(misc::scheduled_query_error),
+            "ListScheduledQueries" => self
+                .list_scheduled_queries(&req)
+                .map_err(misc::scheduled_query_error),
+            "DeleteScheduledQuery" => self
+                .delete_scheduled_query(&req)
+                .map_err(misc::scheduled_query_error),
+            "UpdateScheduledQuery" => self
+                .update_scheduled_query(&req)
+                .map_err(misc::scheduled_query_error),
             "StartLiveTail" => self.start_live_tail(&req),
             "ListLogGroups" => self.list_log_groups(&req),
             "ListLogGroupsForQuery" => self.list_log_groups_for_query(&req),

@@ -394,7 +394,8 @@ async fn support_attachment_upload_errors() {
     assert_eq!(status, 400, "{err}");
     assert_eq!(err["__type"], "AttachmentIdNotFound", "{err}");
 
-    // An upload that was never completed cannot be attached to a case.
+    // An upload that was never completed cannot be attached to a case;
+    // CreateCase reports it with its declared `AttachmentSetIdNotFound`.
     let (status, links) = support(
         &server,
         "GetAttachmentUploadLinks",
@@ -414,7 +415,7 @@ async fn support_attachment_upload_errors() {
     )
     .await;
     assert_eq!(status, 400, "{err}");
-    assert_eq!(err["__type"], "ValidationException", "{err}");
+    assert_eq!(err["__type"], "AttachmentSetIdNotFound", "{err}");
 
     // Required members are still enforced ahead of any of this.
     let (status, err) = support(&server, "GetAttachmentUploadLinks", json!({})).await;
