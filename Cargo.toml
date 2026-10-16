@@ -66,6 +66,16 @@ debug = false
 [profile.dev.package."*"]
 debug = false
 
+# KMS CreateKey mints real RSA keypairs. Unoptimized big-integer prime search
+# takes 10-60s per RSA_4096 key in a debug build, long enough to trip client
+# timeouts (and the conformance probe's 30s budget). Optimizing just the RSA
+# math crates brings it to well under a second without slowing the build.
+[profile.dev.package.rsa]
+opt-level = 3
+
+[profile.dev.package.num-bigint-dig]
+opt-level = 3
+
 [workspace.dependencies.tokio]
 version = "1"
 features = [ "macros", "rt-multi-thread", "net", "io-util", "time", "signal", "sync", "process", "fs",]
