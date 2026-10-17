@@ -67,6 +67,7 @@ pub(super) fn dispatch(
         }
         "ListTrialComponents" => Ok(list_trial_components(svc, ctx, meta, body)),
         "ListClusterNodes" => Ok(Some(list_cluster_nodes(svc, ctx, meta, body))),
+        "DescribeCluster" => Ok(Some(describe_cluster(svc, ctx, meta, body)?)),
         "AttachClusterNodeNetworkInterface" => Ok(Some(attach_cluster_node_network_interface(
             svc, ctx, meta, body,
         )?)),
@@ -599,6 +600,93 @@ fn node_identifiers(rec: &Value) -> (Option<&str>, Option<&str>) {
         obj.and_then(|o| o.get("InstanceId"))
             .and_then(Value::as_str),
     )
+}
+
+/// `ClusterInstanceGroupSpecification` members that carry over unchanged to
+/// `ClusterInstanceGroupDetails`.
+const INSTANCE_GROUP_SHARED_MEMBERS: &[&str] = &[
+    "InstanceGroupName",
+    "InstanceType",
+    "InstanceRequirements",
+    "LifeCycleConfig",
+    "ExecutionRole",
+    "ThreadsPerCore",
+    "InstanceStorageConfigs",
+    "OnStartDeepHealthChecks",
+    "TrainingPlanArn",
+    "OverrideVpcConfig",
+    "ScheduledUpdateConfig",
+    "AutoPatchConfig",
+    "KubernetesConfig",
+    "CapacityRequirements",
+    "SlurmConfig",
+    "NetworkInterface",
+];
+
+/// Render a stored `ClusterInstanceGroupSpecification` (what CreateCluster /
+/// UpdateCluster take) as the `ClusterInstanceGroupDetails` DescribeCluster
+/// returns: the requested `InstanceCount` becomes the group's current and
+/// target count, `MinInstanceCount` its `MinCount`, the requested image its
+/// current and desired image, and a provisioned group is `InService`.
+fn instance_group_details(spec: &Value) -> Value {
+    // Already details-shaped (e.g. a required element the output builder
+    // synthesised): leave it.
+    let Some(spec) = spec.as_object().filter(|o| !o.contains_key("Status")) else {
+        return spec.clone();
+    };
+    let mut out = Map::new();
+    for key in INSTANCE_GROUP_SHARED_MEMBERS {
+        if let Some(v) = spec.get(*key) {
+            out.insert((*key).to_string(), v.clone());
+        }
+    }
+    if let Some(count) = spec.get("InstanceCount") {
+        out.insert("CurrentCount".to_string(), count.clone());
+        out.insert("TargetCount".to_string(), count.clone());
+    }
+    if let Some(min) = spec.get("MinInstanceCount") {
+        out.insert("MinCount".to_string(), min.clone());
+    }
+    if let Some(image) = spec.get("ImageId") {
+        out.insert("CurrentImageId".to_string(), image.clone());
+        out.insert("DesiredImageId".to_string(), image.clone());
+    }
+    if let Some(release) = spec.get("ImageReleaseVersion") {
+        out.insert("CurrentImageReleaseVersion".to_string(), release.clone());
+        out.insert("DesiredImageReleaseVersion".to_string(), release.clone());
+    }
+    out.insert("Status".to_string(), Value::String("InService".to_string()));
+    Value::Object(out)
+}
+
+/// `DescribeCluster`: the generic read, with the stored instance-group
+/// specifications rendered as `ClusterInstanceGroupDetails`.
+fn describe_cluster(
+    svc: &SageMakerService,
+    ctx: &Ctx,
+    meta: &OpMeta,
+    body: &Map<String, Value>,
+) -> Result<(AwsResponse, bool), AwsServiceError> {
+    let name = str_member(body, "ClusterName");
+    let g = svc.state.read();
+    let data = g.get(&ctx.account);
+    let resolved = data.and_then(|d| {
+        let key = d.resolve_key(meta.family, &name)?;
+        let record = d.get_resource(meta.family, &key)?;
+        Some((key, d.record_with_tags(meta.family, record)))
+    });
+    let Some((key, record)) = resolved else {
+        return Err(super::not_found(format!(
+            "Resource '{name}' does not exist."
+        )));
+    };
+    let mut out = engine::build_output(ctx, meta, &key, &record);
+    if let Some(groups) = out.get_mut("InstanceGroups").and_then(Value::as_array_mut) {
+        for group in groups.iter_mut() {
+            *group = instance_group_details(group);
+        }
+    }
+    Ok((ok_json(out), false))
 }
 
 /// Whether a stored node belongs to `cluster`.

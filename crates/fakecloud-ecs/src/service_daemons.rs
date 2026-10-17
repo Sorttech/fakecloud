@@ -54,6 +54,18 @@ impl EcsService {
             .cloned()
             .unwrap_or_default();
         let tags = parse_tags(&body);
+        // DaemonPidMode / DaemonIpcMode: `none` | `shared` (the daemon shares
+        // the host's PID / IPC namespace).
+        validate_enum_opt(&body, "pidMode", &["none", "shared"])?;
+        validate_enum_opt(&body, "ipcMode", &["none", "shared"])?;
+        let pid_mode = body
+            .get("pidMode")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let ipc_mode = body
+            .get("ipcMode")
+            .and_then(|v| v.as_str())
+            .map(String::from);
 
         let mut accounts = self.state.write();
         let account_id = request.account_id.clone();
@@ -77,6 +89,8 @@ impl EcsService {
             registered_at: Utc::now(),
             deregistered_at: None,
             tags,
+            pid_mode,
+            ipc_mode,
         };
 
         s.daemon_task_definitions
@@ -895,23 +909,40 @@ fn parse_family_revision(s: &str) -> Option<(String, i32)> {
 }
 
 fn daemon_task_definition_json(d: &DaemonTaskDefinition) -> Value {
-    json!({
+    // Keys follow the `DaemonTaskDefinition` output shape: the ARN member is
+    // `daemonTaskDefinitionArn`, deregistration is `deleteRequestedAt`, and
+    // tags are not part of the shape (ListTagsForResource returns them).
+    let mut v = json!({
+        "daemonTaskDefinitionArn": d.task_definition_arn,
         "family": d.family,
         "revision": d.revision,
-        "taskDefinitionArn": d.task_definition_arn,
         "status": d.status,
         "containerDefinitions": d.container_definitions,
-        "taskRoleArn": d.task_role_arn,
-        "executionRoleArn": d.execution_role_arn,
-        "cpu": d.cpu,
-        "memory": d.memory,
         "volumes": d.volumes,
         "registeredAt": d.registered_at.timestamp() as f64
             + d.registered_at.timestamp_subsec_micros() as f64 / 1_000_000.0,
-        "deregisteredAt": d.deregistered_at.map(|t|
-            t.timestamp() as f64 + t.timestamp_subsec_micros() as f64 / 1_000_000.0),
-        "tags": d.tags.iter().map(|t| json!({"key": t.key, "value": t.value})).collect::<Vec<_>>(),
-    })
+    });
+    let obj = v.as_object_mut().expect("object literal");
+    let optional = [
+        ("taskRoleArn", d.task_role_arn.as_deref()),
+        ("executionRoleArn", d.execution_role_arn.as_deref()),
+        ("cpu", d.cpu.as_deref()),
+        ("memory", d.memory.as_deref()),
+        ("pidMode", d.pid_mode.as_deref()),
+        ("ipcMode", d.ipc_mode.as_deref()),
+    ];
+    for (key, value) in optional {
+        if let Some(value) = value {
+            obj.insert(key.to_string(), json!(value));
+        }
+    }
+    if let Some(t) = d.deregistered_at {
+        obj.insert(
+            "deleteRequestedAt".to_string(),
+            json!(t.timestamp() as f64 + t.timestamp_subsec_micros() as f64 / 1_000_000.0),
+        );
+    }
+    v
 }
 
 fn daemon_task_definition_summary_json(d: &DaemonTaskDefinition) -> Value {

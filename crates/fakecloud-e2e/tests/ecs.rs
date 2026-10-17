@@ -1523,3 +1523,59 @@ async fn ecs_daemons_and_express_gateway_services_are_taggable() {
         assert_eq!(keys, vec!["team"], "{arn}");
     }
 }
+
+#[tokio::test]
+async fn ecs_describe_daemon_task_definition_matches_output_shape() {
+    // The DaemonTaskDefinition shape keys its ARN as daemonTaskDefinitionArn
+    // and deregistration as deleteRequestedAt; the SDK only sees them when
+    // the wire keys match.
+    use aws_sdk_ecs::types::DaemonContainerDefinition;
+    let server = TestServer::start().await;
+    let ecs = server.ecs_client().await;
+    let arn = ecs
+        .register_daemon_task_definition()
+        .family("agent")
+        .container_definitions(
+            DaemonContainerDefinition::builder()
+                .name("agent")
+                .image("busybox")
+                .build()
+                .unwrap(),
+        )
+        .cpu("256")
+        .send()
+        .await
+        .unwrap()
+        .daemon_task_definition_arn()
+        .unwrap()
+        .to_string();
+    let def = ecs
+        .describe_daemon_task_definition()
+        .daemon_task_definition(&arn)
+        .send()
+        .await
+        .unwrap()
+        .daemon_task_definition()
+        .cloned()
+        .unwrap();
+    assert_eq!(def.daemon_task_definition_arn(), Some(arn.as_str()));
+    assert_eq!(def.family(), Some("agent"));
+    assert_eq!(def.cpu(), Some("256"));
+    assert!(def.delete_requested_at().is_none());
+
+    ecs.delete_daemon_task_definition()
+        .daemon_task_definition(&arn)
+        .send()
+        .await
+        .unwrap();
+    let def = ecs
+        .describe_daemon_task_definition()
+        .daemon_task_definition(&arn)
+        .send()
+        .await
+        .unwrap()
+        .daemon_task_definition()
+        .cloned()
+        .unwrap();
+    assert!(def.delete_requested_at().is_some());
+}

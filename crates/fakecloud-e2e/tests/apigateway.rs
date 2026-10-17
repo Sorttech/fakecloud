@@ -1399,3 +1399,45 @@ async fn custom_domain_base_path_mapping_resolves_with_host_port() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(body, r#"{"api":"mapped"}"#);
 }
+
+#[tokio::test]
+async fn update_account_patches_only_supported_paths() {
+    use aws_sdk_apigateway::types::{Op, PatchOperation};
+    let server = TestServer::start().await;
+    let client = server.apigateway_client().await;
+    let role = "arn:aws:iam::123456789012:role/apigw-cloudwatch";
+
+    let account = client
+        .update_account()
+        .patch_operations(
+            PatchOperation::builder()
+                .op(Op::Replace)
+                .path("/cloudwatchRoleArn")
+                .value(role)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(account.cloudwatch_role_arn(), Some(role));
+
+    // A path the Account resource does not expose is a BadRequestException.
+    let err = client
+        .update_account()
+        .patch_operations(
+            PatchOperation::builder()
+                .op(Op::Replace)
+                .path("/throttleSettings")
+                .value("x")
+                .build(),
+        )
+        .send()
+        .await
+        .expect_err("unsupported patch path must be rejected");
+    assert_eq!(
+        err.into_service_error().meta().code(),
+        Some("BadRequestException")
+    );
+    let got = client.get_account().send().await.unwrap();
+    assert_eq!(got.cloudwatch_role_arn(), Some(role));
+}

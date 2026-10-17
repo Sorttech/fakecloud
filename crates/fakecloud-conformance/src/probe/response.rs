@@ -236,6 +236,14 @@ pub(super) fn service_common_errors(service_name: &str) -> &'static [&'static st
             // IPAM internet-registry associations: the probe addresses an
             // association by a synthetic id, which AWS answers with this code.
             "InvalidIpamInternetRegistryAssociationId.NotFound",
+            // IPAMs and IPAM resource discoveries: CreateIpamInternetRegistry-
+            // Association / GetIpamRouteProtectionFindings look the IPAM up in
+            // stored state and GetIpamDiscoveredRoutes looks the resource
+            // discovery up; the probe's synthetic ids answer with these codes
+            // from the EC2 "Error codes" reference
+            // (https://docs.aws.amazon.com/AWSEC2/latest/APIReference/errors-overview.html).
+            "InvalidIpamId.NotFound",
+            "InvalidIpamResourceDiscoveryId.NotFound",
             // Client VPN endpoints: Modify and the authorization-policy ops
             // address an endpoint by the probe's synthetic id, which AWS
             // answers with this code.
@@ -330,6 +338,14 @@ pub(super) fn service_common_errors(service_name: &str) -> &'static [&'static st
         // (https://docs.aws.amazon.com/elasticloadbalancing/latest/APIReference/CommonErrors.html).
         "elasticloadbalancing" => &["ValidationError"],
         "kms" => &["ValidationException"],
+        // EventBridge PutRule parses ScheduleExpression with the real
+        // `cron(...)` / `rate(...)` grammar that drives rule firing and
+        // rejects a malformed one the way AWS does:
+        // `ValidationException: Parameter ScheduleExpression is not valid.`
+        // (EventBridge User Guide, "Creating a rule that runs on a schedule"
+        // / PutRule). The PutRule model only declares the pattern/limit
+        // errors, not this one.
+        "events" => &["ValidationException"],
         "ssm" => &["InvalidNextToken", "ValidationException"],
         "eks" => &["ResourceNotFoundException", "ResourceInUseException"],
         // STS returns AccessDenied (HTTP 403) whenever a role can't be assumed

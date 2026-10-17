@@ -172,9 +172,26 @@ pub(super) fn run_round_trip_followup(
         });
         return violations;
     }
+    // The Get response must itself match the reader's output shape. The
+    // recursive probe already validated it; a mismatch there (a missing,
+    // mistyped or undeclared member) fails the round-trip variant rather
+    // than being dropped.
+    if let ProbeStatus::ShapeMismatch(message) = &get_result.status {
+        violations.push(shape_validator::ShapeViolation::FollowupShapeMismatch {
+            operation: followup.get_operation.clone(),
+            message: message.clone(),
+        });
+    }
     let get_body: serde_json::Value = match serde_json::from_str(&get_result.response_body) {
         Ok(v) => v,
         Err(_) => return violations,
+    };
+
+    // The reader output members, so each echoed field is compared against
+    // its declared shape.
+    let output_members = match model.shapes.get(get_output_shape).map(|s| &s.shape_type) {
+        Some(crate::smithy::ShapeType::Structure { members }) => members.as_slice(),
+        _ => &[],
     };
 
     // Pull each echo field from the Create variant's input and compare
@@ -184,7 +201,15 @@ pub(super) fn run_round_trip_followup(
             Some(v) => v,
             None => continue,
         };
-        if let Some(v) = shape_validator::echo_check(output_field, sent, &get_body) {
+        let target = output_members
+            .iter()
+            .find(|m| {
+                m.name == *output_field || m.traits.json_name.as_deref() == Some(output_field)
+            })
+            .map(|m| m.target.as_str());
+        if let Some(v) =
+            shape_validator::echo_check(output_field, sent, &get_body, Some(model), target)
+        {
             violations.push(v);
         }
     }

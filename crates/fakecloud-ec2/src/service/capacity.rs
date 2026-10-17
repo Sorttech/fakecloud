@@ -12,7 +12,7 @@ use crate::service_helpers::{
 };
 use crate::state::{
     CapacityReservation, CapacityReservationAdjustment, CapacityReservationCommitment,
-    CapacityReservationModificationQuote, Ec2State, Tag,
+    CapacityReservationModificationQuote, Ec2State, InterruptibleAllocation, Tag,
 };
 use chrono::{DateTime, Duration, Utc};
 
@@ -133,6 +133,7 @@ fn cr_xml(r: &CapacityReservation, tags: &[Tag], owner: &str) -> String {
         extra.push_str(&ec2_elem("originalStartDate", o));
     }
     extra.push_str(&adjustment_fields_xml(r));
+    extra.push_str(&interruptible_fields_xml(r));
     format!(
         "{}{}{}{}{}{}{}<totalInstanceCount>{}</totalInstanceCount><availableInstanceCount>{}</availableInstanceCount>\
          <ebsOptimized>{}</ebsOptimized><ephemeralStorage>{}</ephemeralStorage>{}{}{}{}{}{}{}",
@@ -155,6 +156,35 @@ fn cr_xml(r: &CapacityReservation, tags: &[Tag], owner: &str) -> String {
         super::tags::tag_set_xml(tags),
         extra,
     )
+}
+
+/// `interruptible` plus, for an interruptible reservation, its
+/// `interruptionInfo` / `zeroSizePreference`, and for a source reservation its
+/// `interruptibleCapacityAllocation`.
+fn interruptible_fields_xml(r: &CapacityReservation) -> String {
+    let mut out = format!("<interruptible>{}</interruptible>", r.interruptible);
+    if let Some(a) = &r.interruptible_allocation {
+        out.push_str(&format!(
+            "<interruptibleCapacityAllocation><instanceCount>{}</instanceCount><targetInstanceCount>{}</targetInstanceCount>{}{}{}{}</interruptibleCapacityAllocation>",
+            a.instance_count,
+            a.target_instance_count,
+            ec2_elem("status", &a.status),
+            ec2_elem("interruptibleCapacityReservationId", &a.interruptible_reservation_id),
+            ec2_elem("interruptionType", INTERRUPTION_TYPE),
+            ec2_elem("zeroSizePreference", &a.zero_size_preference),
+        ));
+    }
+    if let Some(src) = &r.interruption_source_id {
+        out.push_str(&format!(
+            "<interruptionInfo>{}{}</interruptionInfo>",
+            ec2_elem("sourceCapacityReservationId", src),
+            ec2_elem("interruptionType", INTERRUPTION_TYPE),
+        ));
+    }
+    if let Some(p) = &r.zero_size_preference {
+        out.push_str(&ec2_elem("zeroSizePreference", p));
+    }
+    out
 }
 
 /// `InvalidCapacityReservationId.NotFound` — the reservation does not exist.
@@ -271,6 +301,7 @@ pub(crate) fn create_capacity_reservation(
             .get("InstanceMatchCriteria")
             .cloned()
             .unwrap_or_else(|| "open".to_string()),
+        ..Default::default()
     };
     let owner = req.account_id.clone();
     let tags = {
@@ -296,6 +327,54 @@ pub(crate) fn create_capacity_reservation(
     ))
 }
 
+/// Keep an interruptible allocation consistent when either side of it is
+/// cancelled with `CancelCapacityReservation`.
+///
+/// - Cancelling the interruptible reservation ends the allocation the same
+///   way reducing it to zero under `default` does ("permanently remove the
+///   allocation and return all capacity", EC2 User Guide, "Interruptible
+///   Capacity Reservations for capacity owners"): the capacity goes back to
+///   the source and the source's allocation is marked `canceled`.
+/// - Cancelling the source ends the capacity the interruptible reservation
+///   was carved from, so the interruptible reservation is cancelled with it
+///   and the allocation is marked `canceled`. (The guide does not spell this
+///   case out; the interruptible reservation cannot outlive the reservation
+///   that owns its capacity.)
+fn cancel_interruptible_links(
+    state: &mut Ec2State,
+    cancelled_id: &str,
+    source_id: Option<String>,
+    allocation: Option<InterruptibleAllocation>,
+) {
+    if let Some(src) = source_id {
+        if let Some(source) = state.capacity_reservations.get_mut(&src) {
+            if let Some(a) = source.interruptible_allocation.as_mut().filter(|a| {
+                a.interruptible_reservation_id == cancelled_id && a.status != "canceled"
+            }) {
+                let returned = a.instance_count;
+                a.instance_count = 0;
+                a.target_instance_count = 0;
+                a.status = "canceled".to_string();
+                source.total_instance_count += returned;
+                source.available_instance_count += returned;
+            }
+        }
+    }
+    if let Some(a) = allocation.filter(|a| a.status != "canceled") {
+        if let Some(icr) = state
+            .capacity_reservations
+            .get_mut(&a.interruptible_reservation_id)
+        {
+            icr.state = "cancelled".to_string();
+        }
+        if let Some(source) = state.capacity_reservations.get_mut(cancelled_id) {
+            if let Some(sa) = source.interruptible_allocation.as_mut() {
+                sa.status = "canceled".to_string();
+            }
+        }
+    }
+}
+
 pub(crate) fn cancel_capacity_reservation(
     svc: &Ec2Service,
     req: &AwsRequest,
@@ -308,12 +387,15 @@ pub(crate) fn cancel_capacity_reservation(
     )?;
     {
         let mut accounts = svc.state.write();
-        let r = accounts
-            .get_or_create(&req.account_id)
+        let state = accounts.get_or_create(&req.account_id);
+        let r = state
             .capacity_reservations
             .get_mut(&id)
             .ok_or_else(|| cr_not_found(&id))?;
         r.state = "cancelled".to_string();
+        let source_id = r.interruption_source_id.clone();
+        let allocation = r.interruptible_allocation.clone();
+        cancel_interruptible_links(state, &id, source_id, allocation);
     }
     Ok(Ec2Service::respond(
         "CancelCapacityReservation",
@@ -914,6 +996,13 @@ pub(crate) fn create_capacity_reservation_by_splitting(
             d.id = dest.clone();
             d.total_instance_count = count;
             d.available_instance_count = count;
+            // The destination is a fresh on-demand reservation: it neither
+            // inherits the source's interruptible allocation nor is itself
+            // an interruptible reservation.
+            d.interruptible = false;
+            d.interruption_source_id = None;
+            d.zero_size_preference = None;
+            d.interruptible_allocation = None;
             state.capacity_reservations.insert(dest.clone(), d);
         }
     }
@@ -1162,16 +1251,137 @@ pub(crate) fn describe_capacity_reservation_topology(
 
 // ---- interruptible allocations ----
 
+const ZERO_SIZE_PREFERENCES: &[&str] = &["retain", "default"];
+
+/// Parse a required non-negative instance count.
+fn instance_count_param(req: &AwsRequest, key: &str) -> Result<i64, AwsServiceError> {
+    let raw = require(&req.query_params, key)?;
+    raw.parse::<i64>()
+        .ok()
+        .filter(|n| *n >= 0)
+        .ok_or_else(|| invalid_parameter_value(format!("Invalid value '{raw}' for {key}")))
+}
+
+fn interruptible_result_xml(source_id: &str, a: &InterruptibleAllocation) -> String {
+    format!(
+        "{}{}<instanceCount>{}</instanceCount><targetInstanceCount>{}</targetInstanceCount>{}{}",
+        ec2_elem(
+            "interruptibleCapacityReservationId",
+            &a.interruptible_reservation_id
+        ),
+        ec2_elem("sourceCapacityReservationId", source_id),
+        a.instance_count,
+        a.target_instance_count,
+        ec2_elem("status", &a.status),
+        ec2_elem("interruptionType", INTERRUPTION_TYPE),
+    )
+}
+
+/// The only `InterruptionType` EC2 defines: the source owner reclaims ad hoc.
+const INTERRUPTION_TYPE: &str = "adhoc";
+
+/// Carve `InstanceCount` unused instances out of an active source reservation
+/// into a new interruptible reservation. The source gives up that capacity
+/// (both total and available) and records the allocation; the interruptible
+/// reservation points back at its source through `InterruptionInfo`.
 pub(crate) fn create_interruptible_capacity_reservation_allocation(
-    _svc: &Ec2Service,
+    svc: &Ec2Service,
     req: &AwsRequest,
 ) -> Result<AwsResponse, AwsServiceError> {
-    let id = require(&req.query_params, "CapacityReservationId")?;
-    let count = require(&req.query_params, "InstanceCount")?;
+    let source_id = require(&req.query_params, "CapacityReservationId")?;
+    let count = instance_count_param(req, "InstanceCount")?;
+    validate_enum(
+        &req.query_params,
+        "ZeroSizePreference",
+        ZERO_SIZE_PREFERENCES,
+    )?;
+    let zero_pref = req
+        .query_params
+        .get("ZeroSizePreference")
+        .cloned()
+        .unwrap_or_else(|| "default".to_string());
+    if count < 1 {
+        return Err(invalid_parameter_value(
+            "InstanceCount must be at least 1".to_string(),
+        ));
+    }
+    let mut accounts = svc.state.write();
+    let state = accounts.get_or_create(&req.account_id);
+    let source = state
+        .capacity_reservations
+        .get(&source_id)
+        .ok_or_else(|| cr_not_found(&source_id))?;
+    if source.interruptible {
+        return Err(invalid_parameter_value(format!(
+            "Capacity Reservation {source_id} is itself interruptible and cannot be a source"
+        )));
+    }
+    if current_state(source, Utc::now()) != "active" || source.end_date.is_some() {
+        return Err(incorrect_state(format!(
+            "Capacity Reservation {source_id} must be active with no end date to allocate interruptible capacity"
+        )));
+    }
+    if source
+        .interruptible_allocation
+        .as_ref()
+        .is_some_and(|a| a.status != "canceled")
+    {
+        return Err(incorrect_state(format!(
+            "Capacity Reservation {source_id} already has an interruptible allocation"
+        )));
+    }
+    if count > source.available_instance_count {
+        return Err(invalid_parameter_value(format!(
+            "InstanceCount {count} exceeds the {} available instances in Capacity Reservation {source_id}",
+            source.available_instance_count
+        )));
+    }
+    let id = gen_id("cr");
+    let interruptible = CapacityReservation {
+        id: id.clone(),
+        instance_type: source.instance_type.clone(),
+        instance_platform: source.instance_platform.clone(),
+        availability_zone: source.availability_zone.clone(),
+        tenancy: source.tenancy.clone(),
+        total_instance_count: count,
+        available_instance_count: count,
+        state: "active".to_string(),
+        end_date_type: "unlimited".to_string(),
+        instance_match_criteria: source.instance_match_criteria.clone(),
+        ebs_optimized: source.ebs_optimized,
+        ephemeral_storage: source.ephemeral_storage,
+        interruptible: true,
+        interruption_source_id: Some(source_id.clone()),
+        zero_size_preference: Some(zero_pref.clone()),
+        ..Default::default()
+    };
+    let allocation = InterruptibleAllocation {
+        interruptible_reservation_id: id.clone(),
+        instance_count: count,
+        target_instance_count: count,
+        status: "active".to_string(),
+        zero_size_preference: zero_pref,
+    };
+    let source = state
+        .capacity_reservations
+        .get_mut(&source_id)
+        .expect("source looked up above");
+    source.total_instance_count -= count;
+    source.available_instance_count -= count;
+    source.interruptible_allocation = Some(allocation.clone());
+    crate::service::tags::apply_tag_specifications(
+        state,
+        &req.query_params,
+        &id,
+        "capacity-reservation",
+    );
+    state.capacity_reservations.insert(id, interruptible);
     let body = format!(
-        "{}<targetInstanceCount>{}</targetInstanceCount><status>active</status><interruptionType>spot</interruptionType>",
-        ec2_elem("sourceCapacityReservationId", &id),
-        count,
+        "{}<targetInstanceCount>{}</targetInstanceCount>{}{}",
+        ec2_elem("sourceCapacityReservationId", &source_id),
+        allocation.target_instance_count,
+        ec2_elem("status", &allocation.status),
+        ec2_elem("interruptionType", INTERRUPTION_TYPE),
     );
     Ok(Ec2Service::respond(
         "CreateInterruptibleCapacityReservationAllocation",
@@ -1180,22 +1390,93 @@ pub(crate) fn create_interruptible_capacity_reservation_allocation(
     ))
 }
 
+/// Resize (or reconfigure) the interruptible allocation of a source
+/// reservation. Growing takes more unused capacity from the source; shrinking
+/// returns it. Shrinking to zero keeps the interruptible reservation at zero
+/// capacity under `retain`, and cancels it under `default`.
 pub(crate) fn update_interruptible_capacity_reservation_allocation(
-    _svc: &Ec2Service,
+    svc: &Ec2Service,
     req: &AwsRequest,
 ) -> Result<AwsResponse, AwsServiceError> {
-    let id = require(&req.query_params, "CapacityReservationId")?;
-    let count = require(&req.query_params, "TargetInstanceCount")?;
-    let body = format!(
-        "{}{}<targetInstanceCount>{}</targetInstanceCount><status>active</status><interruptionType>spot</interruptionType>",
-        ec2_elem("interruptibleCapacityReservationId", &id),
-        ec2_elem("sourceCapacityReservationId", &id),
-        count,
-    );
+    let source_id = require(&req.query_params, "CapacityReservationId")?;
+    validate_enum(
+        &req.query_params,
+        "ZeroSizePreference",
+        ZERO_SIZE_PREFERENCES,
+    )?;
+    let target = match req.query_params.get("TargetInstanceCount") {
+        Some(_) => Some(instance_count_param(req, "TargetInstanceCount")?),
+        None => None,
+    };
+    let mut accounts = svc.state.write();
+    let state = accounts.get_or_create(&req.account_id);
+    let source = state
+        .capacity_reservations
+        .get(&source_id)
+        .ok_or_else(|| cr_not_found(&source_id))?;
+    // Allocations are made from, and modified through, an active source
+    // reservation with no end date.
+    if current_state(source, Utc::now()) != "active" || source.end_date.is_some() {
+        return Err(incorrect_state(format!(
+            "Capacity Reservation {source_id} must be active with no end date to modify its interruptible allocation"
+        )));
+    }
+    let mut allocation = source
+        .interruptible_allocation
+        .clone()
+        .filter(|a| a.status != "canceled")
+        .ok_or_else(|| {
+            incorrect_state(format!(
+                "Capacity Reservation {source_id} has no interruptible allocation"
+            ))
+        })?;
+    if let Some(p) = req.query_params.get("ZeroSizePreference") {
+        allocation.zero_size_preference = p.clone();
+    }
+    let current = allocation.instance_count;
+    let target = target.unwrap_or(current);
+    let delta = target - current;
+    if delta > source.available_instance_count {
+        return Err(invalid_parameter_value(format!(
+            "TargetInstanceCount {target} exceeds the capacity available in Capacity Reservation {source_id}"
+        )));
+    }
+    let cancel = target == 0 && allocation.zero_size_preference == "default";
+    allocation.instance_count = target;
+    allocation.target_instance_count = target;
+    if cancel {
+        allocation.status = "canceled".to_string();
+    }
+    let source = state
+        .capacity_reservations
+        .get_mut(&source_id)
+        .expect("source looked up above");
+    source.total_instance_count -= delta;
+    source.available_instance_count -= delta;
+    source.interruptible_allocation = Some(allocation.clone());
+    if let Some(r) = state
+        .capacity_reservations
+        .get_mut(&allocation.interruptible_reservation_id)
+    {
+        // Resize the interruptible reservation. Growing adds available
+        // capacity. Shrinking reclaims available instances first, then
+        // instances in use, until the target is met (EC2 User Guide,
+        // "Interruptible Capacity Reservations for capacity owners": "we
+        // first reclaim available instances, then running instances");
+        // the reclaimed in-use capacity is gone from the reservation.
+        let in_use = (r.total_instance_count - r.available_instance_count).max(0);
+        let in_use_after = in_use.min(target);
+        r.total_instance_count = target;
+        r.available_instance_count = target - in_use_after;
+        r.zero_size_preference = Some(allocation.zero_size_preference.clone());
+        if cancel {
+            r.state = "cancelled".to_string();
+        }
+    }
     Ok(Ec2Service::respond(
         "UpdateInterruptibleCapacityReservationAllocation",
         &req.request_id,
-        &body,
+        &interruptible_result_xml(&source_id, &allocation),
     ))
 }
 
@@ -1206,6 +1487,369 @@ mod crfleet_tests {
 
     fn body(resp: AwsResponse) -> String {
         String::from_utf8_lossy(resp.body.expect_bytes()).to_string()
+    }
+
+    fn new_cr(svc: &Ec2Service, count: &str) -> String {
+        let created = body(
+            create_capacity_reservation(
+                svc,
+                &req(
+                    "CreateCapacityReservation",
+                    &[
+                        ("InstanceType", "t3.micro"),
+                        ("InstancePlatform", "Linux/UNIX"),
+                        ("AvailabilityZone", "us-east-1a"),
+                        ("InstanceCount", count),
+                    ],
+                ),
+            )
+            .unwrap(),
+        );
+        created
+            .split("<capacityReservationId>")
+            .nth(1)
+            .unwrap()
+            .split("</capacityReservationId>")
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    fn cr(svc: &Ec2Service, id: &str) -> CapacityReservation {
+        svc.state
+            .read()
+            .get("000000000000")
+            .unwrap()
+            .capacity_reservations[id]
+            .clone()
+    }
+
+    #[test]
+    fn interruptible_allocation_carves_capacity_from_the_source() {
+        let svc = Ec2Service::new();
+        let src = new_cr(&svc, "10");
+
+        // Validation: unknown source, off-enum preference, over-allocation.
+        let e = err_of(create_interruptible_capacity_reservation_allocation(
+            &svc,
+            &req(
+                "CreateInterruptibleCapacityReservationAllocation",
+                &[
+                    ("CapacityReservationId", "cr-0000000000000000"),
+                    ("InstanceCount", "1"),
+                ],
+            ),
+        ));
+        assert_eq!(e.code(), "InvalidCapacityReservationId.NotFound");
+        let e = err_of(create_interruptible_capacity_reservation_allocation(
+            &svc,
+            &req(
+                "CreateInterruptibleCapacityReservationAllocation",
+                &[
+                    ("CapacityReservationId", &src),
+                    ("InstanceCount", "1"),
+                    ("ZeroSizePreference", "keep"),
+                ],
+            ),
+        ));
+        assert_eq!(e.code(), "InvalidParameterValue");
+        let e = err_of(create_interruptible_capacity_reservation_allocation(
+            &svc,
+            &req(
+                "CreateInterruptibleCapacityReservationAllocation",
+                &[("CapacityReservationId", &src), ("InstanceCount", "11")],
+            ),
+        ));
+        assert_eq!(e.code(), "InvalidParameterValue");
+
+        let out = body(
+            create_interruptible_capacity_reservation_allocation(
+                &svc,
+                &req(
+                    "CreateInterruptibleCapacityReservationAllocation",
+                    &[
+                        ("CapacityReservationId", &src),
+                        ("InstanceCount", "4"),
+                        ("ZeroSizePreference", "retain"),
+                    ],
+                ),
+            )
+            .unwrap(),
+        );
+        assert!(
+            out.contains("<targetInstanceCount>4</targetInstanceCount>"),
+            "{out}"
+        );
+        assert!(
+            out.contains("<interruptionType>adhoc</interruptionType>"),
+            "{out}"
+        );
+
+        let source = cr(&svc, &src);
+        assert_eq!(source.total_instance_count, 6);
+        assert_eq!(source.available_instance_count, 6);
+        let alloc = source.interruptible_allocation.clone().unwrap();
+        assert_eq!(alloc.instance_count, 4);
+        assert_eq!(alloc.zero_size_preference, "retain");
+        let icr = cr(&svc, &alloc.interruptible_reservation_id);
+        assert!(icr.interruptible);
+        assert_eq!(icr.total_instance_count, 4);
+        assert_eq!(icr.interruption_source_id.as_deref(), Some(src.as_str()));
+
+        // A second allocation from the same source is refused.
+        let e = err_of(create_interruptible_capacity_reservation_allocation(
+            &svc,
+            &req(
+                "CreateInterruptibleCapacityReservationAllocation",
+                &[("CapacityReservationId", &src), ("InstanceCount", "1")],
+            ),
+        ));
+        assert_eq!(e.code(), "IncorrectState");
+
+        // Describe exposes both sides of the allocation.
+        let desc = body(
+            describe_capacity_reservations(&svc, &req("DescribeCapacityReservations", &[]))
+                .unwrap(),
+        );
+        assert!(desc.contains("<interruptibleCapacityAllocation>"), "{desc}");
+        assert!(desc.contains("<interruptionInfo>"), "{desc}");
+        assert!(
+            desc.contains("<interruptible>true</interruptible>"),
+            "{desc}"
+        );
+
+        // Grow by 2, then shrink to zero: `retain` keeps the reservation.
+        update_interruptible_capacity_reservation_allocation(
+            &svc,
+            &req(
+                "UpdateInterruptibleCapacityReservationAllocation",
+                &[
+                    ("CapacityReservationId", &src),
+                    ("TargetInstanceCount", "6"),
+                ],
+            ),
+        )
+        .unwrap();
+        assert_eq!(cr(&svc, &src).available_instance_count, 4);
+        assert_eq!(
+            cr(&svc, &alloc.interruptible_reservation_id).total_instance_count,
+            6
+        );
+        let e = err_of(update_interruptible_capacity_reservation_allocation(
+            &svc,
+            &req(
+                "UpdateInterruptibleCapacityReservationAllocation",
+                &[
+                    ("CapacityReservationId", &src),
+                    ("TargetInstanceCount", "11"),
+                ],
+            ),
+        ));
+        assert_eq!(e.code(), "InvalidParameterValue");
+        update_interruptible_capacity_reservation_allocation(
+            &svc,
+            &req(
+                "UpdateInterruptibleCapacityReservationAllocation",
+                &[
+                    ("CapacityReservationId", &src),
+                    ("TargetInstanceCount", "0"),
+                ],
+            ),
+        )
+        .unwrap();
+        assert_eq!(cr(&svc, &src).available_instance_count, 10);
+        assert_eq!(
+            cr(&svc, &alloc.interruptible_reservation_id).state,
+            "active"
+        );
+
+        // Switching to `default` at zero cancels the interruptible reservation.
+        let out = body(
+            update_interruptible_capacity_reservation_allocation(
+                &svc,
+                &req(
+                    "UpdateInterruptibleCapacityReservationAllocation",
+                    &[
+                        ("CapacityReservationId", &src),
+                        ("TargetInstanceCount", "0"),
+                        ("ZeroSizePreference", "default"),
+                    ],
+                ),
+            )
+            .unwrap(),
+        );
+        assert!(out.contains("<status>canceled</status>"), "{out}");
+        assert_eq!(
+            cr(&svc, &alloc.interruptible_reservation_id).state,
+            "cancelled"
+        );
+    }
+
+    fn allocate(svc: &Ec2Service, src: &str, count: &str) -> String {
+        create_interruptible_capacity_reservation_allocation(
+            svc,
+            &req(
+                "CreateInterruptibleCapacityReservationAllocation",
+                &[("CapacityReservationId", src), ("InstanceCount", count)],
+            ),
+        )
+        .unwrap();
+        cr(svc, src)
+            .interruptible_allocation
+            .unwrap()
+            .interruptible_reservation_id
+    }
+
+    fn update_alloc(
+        svc: &Ec2Service,
+        src: &str,
+        target: &str,
+    ) -> Result<AwsResponse, AwsServiceError> {
+        update_interruptible_capacity_reservation_allocation(
+            svc,
+            &req(
+                "UpdateInterruptibleCapacityReservationAllocation",
+                &[
+                    ("CapacityReservationId", src),
+                    ("TargetInstanceCount", target),
+                ],
+            ),
+        )
+    }
+
+    #[test]
+    fn cancelling_the_interruptible_reservation_returns_capacity_to_the_source() {
+        let svc = Ec2Service::new();
+        let src = new_cr(&svc, "10");
+        let icr = allocate(&svc, &src, "4");
+        cancel_capacity_reservation(
+            &svc,
+            &req(
+                "CancelCapacityReservation",
+                &[("CapacityReservationId", &icr)],
+            ),
+        )
+        .unwrap();
+        assert_eq!(cr(&svc, &icr).state, "cancelled");
+        let source = cr(&svc, &src);
+        assert_eq!(source.total_instance_count, 10);
+        assert_eq!(source.available_instance_count, 10);
+        let a = source.interruptible_allocation.unwrap();
+        assert_eq!(a.status, "canceled");
+        assert_eq!(a.instance_count, 0);
+        // The allocation is gone, so a new one can be made.
+        allocate(&svc, &src, "2");
+    }
+
+    #[test]
+    fn cancelling_the_source_cancels_its_interruptible_reservation() {
+        let svc = Ec2Service::new();
+        let src = new_cr(&svc, "10");
+        let icr = allocate(&svc, &src, "4");
+        cancel_capacity_reservation(
+            &svc,
+            &req(
+                "CancelCapacityReservation",
+                &[("CapacityReservationId", &src)],
+            ),
+        )
+        .unwrap();
+        assert_eq!(cr(&svc, &src).state, "cancelled");
+        assert_eq!(cr(&svc, &icr).state, "cancelled");
+        assert_eq!(
+            cr(&svc, &src).interruptible_allocation.unwrap().status,
+            "canceled"
+        );
+        // A cancelled source can no longer be modified.
+        let e = err_of(update_alloc(&svc, &src, "2"));
+        assert_eq!(e.code(), "IncorrectState");
+    }
+
+    #[test]
+    fn update_requires_an_active_source_without_end_date() {
+        let svc = Ec2Service::new();
+        let src = new_cr(&svc, "10");
+        allocate(&svc, &src, "4");
+        {
+            let mut accounts = svc.state.write();
+            let r = accounts
+                .get_or_create("000000000000")
+                .capacity_reservations
+                .get_mut(&src)
+                .unwrap();
+            r.end_date = Some("2030-01-01T00:00:00.000Z".to_string());
+        }
+        let e = err_of(update_alloc(&svc, &src, "2"));
+        assert_eq!(e.code(), "IncorrectState");
+    }
+
+    #[test]
+    fn shrinking_reclaims_available_then_in_use_capacity() {
+        let svc = Ec2Service::new();
+        let src = new_cr(&svc, "10");
+        let icr = allocate(&svc, &src, "6");
+        // Three of the six interruptible instances are in use.
+        {
+            let mut accounts = svc.state.write();
+            accounts
+                .get_or_create("000000000000")
+                .capacity_reservations
+                .get_mut(&icr)
+                .unwrap()
+                .available_instance_count = 3;
+        }
+        // 6 -> 4 reclaims two available instances only.
+        update_alloc(&svc, &src, "4").unwrap();
+        let r = cr(&svc, &icr);
+        assert_eq!((r.total_instance_count, r.available_instance_count), (4, 1));
+        // 4 -> 2 reclaims the last available one, then one in use.
+        update_alloc(&svc, &src, "2").unwrap();
+        let r = cr(&svc, &icr);
+        assert_eq!((r.total_instance_count, r.available_instance_count), (2, 0));
+        // The source got every reclaimed instance back exactly once.
+        let s = cr(&svc, &src);
+        assert_eq!((s.total_instance_count, s.available_instance_count), (8, 8));
+        // Growing again adds available capacity only.
+        update_alloc(&svc, &src, "5").unwrap();
+        let r = cr(&svc, &icr);
+        assert_eq!((r.total_instance_count, r.available_instance_count), (5, 3));
+        let s = cr(&svc, &src);
+        assert_eq!((s.total_instance_count, s.available_instance_count), (5, 5));
+    }
+
+    #[test]
+    fn splitting_does_not_copy_interruptible_state() {
+        let svc = Ec2Service::new();
+        let src = new_cr(&svc, "10");
+        let icr = allocate(&svc, &src, "4");
+        for from in [&src, &icr] {
+            let out = body(
+                create_capacity_reservation_by_splitting(
+                    &svc,
+                    &req(
+                        "CreateCapacityReservationBySplitting",
+                        &[
+                            ("SourceCapacityReservationId", from),
+                            ("InstanceCount", "1"),
+                        ],
+                    ),
+                )
+                .unwrap(),
+            );
+            let dest = out
+                .split("<destinationCapacityReservation><capacityReservationId>")
+                .nth(1)
+                .unwrap()
+                .split('<')
+                .next()
+                .unwrap()
+                .to_string();
+            let d = cr(&svc, &dest);
+            assert!(!d.interruptible);
+            assert!(d.interruption_source_id.is_none());
+            assert!(d.zero_size_preference.is_none());
+            assert!(d.interruptible_allocation.is_none());
+        }
     }
 
     #[test]
