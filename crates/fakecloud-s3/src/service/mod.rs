@@ -524,6 +524,90 @@ impl S3Service {
         self
     }
 
+    /// The encryption a new object takes, as every object-creating request
+    /// (PutObject, POST Object, CreateMultipartUpload) resolves it: the
+    /// request's `x-amz-server-side-encryption*` headers, else the bucket's
+    /// default encryption (`encryption_config`). An SSE-KMS key is recorded
+    /// by its ARN, resolved in the bucket's region; with no key named, S3
+    /// uses the account's AWS-managed `aws/s3` key and reports that key.
+    pub(crate) fn object_encryption(
+        &self,
+        headers: &http::HeaderMap,
+        encryption_config: Option<&str>,
+        account_id: &str,
+        bucket_region: &str,
+    ) -> crate::side_effects::ObjectEncryption {
+        let header = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        let mut algorithm = header("x-amz-server-side-encryption");
+        let mut kms_key_id = header("x-amz-server-side-encryption-aws-kms-key-id");
+        let mut bucket_key_enabled = header("x-amz-server-side-encryption-bucket-key-enabled")
+            .map(|v| v.eq_ignore_ascii_case("true"));
+        if algorithm.is_none() {
+            if let Some(default) =
+                encryption_config.and_then(crate::side_effects::bucket_default_encryption)
+            {
+                if kms_key_id.is_none() {
+                    kms_key_id = default.kms_key_id;
+                }
+                if bucket_key_enabled.is_none() {
+                    bucket_key_enabled = default.bucket_key_enabled;
+                }
+                algorithm = Some(default.algorithm);
+            }
+        }
+        if algorithm.as_deref() == Some("aws:kms") {
+            kms_key_id = self.resolve_object_kms_key(account_id, bucket_region, kms_key_id);
+        }
+        crate::side_effects::ObjectEncryption {
+            algorithm,
+            kms_key_id,
+            bucket_key_enabled,
+        }
+    }
+
+    /// The ARN of the SSE-KMS key `key_id` names (the AWS-managed `aws/s3`
+    /// key when it names none). A key or alias ARN names its account
+    /// (possibly the requester's); a bare id or alias resolves in the bucket
+    /// owner's account, in the bucket's region. Through the hook an
+    /// AWS-managed reference mints its key. A key that cannot be resolved is
+    /// kept as given.
+    fn resolve_object_kms_key(
+        &self,
+        account_id: &str,
+        bucket_region: &str,
+        key_id: Option<String>,
+    ) -> Option<String> {
+        let reference = key_id.clone().unwrap_or_else(|| "aws/s3".to_string());
+        let key_account = kms_reference_account(&reference).unwrap_or(account_id);
+        let resolved = self
+            .kms_hook
+            .as_ref()
+            .and_then(|hook| {
+                hook.resolve_key_arn(key_account, bucket_region, &reference, "s3.amazonaws.com")
+                    .ok()
+            })
+            .or_else(|| {
+                let kms = self.kms_state.as_ref()?;
+                let kms_accounts = kms.read();
+                kms_accounts
+                    .get(key_account)
+                    .unwrap_or(kms_accounts.default_ref())
+                    .resolve_key_arn(bucket_region, &reference)
+                    .map(str::to_string)
+            });
+        if resolved.is_none() {
+            if let Some(key) = &key_id {
+                tracing::debug!(key_id = %key, "KMS key not found in state, proceeding anyway");
+            }
+        }
+        resolved.or(key_id)
+    }
+
     /// Encrypt object body bytes for SSE-KMS storage. Returns ciphertext as
     /// raw bytes (a UTF-8 fakecloud-kms envelope) on success.
     ///

@@ -224,86 +224,17 @@ impl S3Service {
             }]
         };
 
-        // SSE headers
-        let mut sse_algorithm = req
-            .headers
-            .get("x-amz-server-side-encryption")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        let mut sse_kms_key_id = req
-            .headers
-            .get("x-amz-server-side-encryption-aws-kms-key-id")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        let mut bucket_key_enabled = req
-            .headers
-            .get("x-amz-server-side-encryption-bucket-key-enabled")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.eq_ignore_ascii_case("true"));
-
-        // Apply bucket default encryption if no explicit SSE headers
-        if sse_algorithm.is_none() {
-            if let Some(default) = encryption_config
-                .as_deref()
-                .and_then(crate::side_effects::bucket_default_encryption)
-            {
-                if sse_kms_key_id.is_none() {
-                    sse_kms_key_id = default.kms_key_id;
-                }
-                if bucket_key_enabled.is_none() {
-                    bucket_key_enabled = default.bucket_key_enabled;
-                }
-                sse_algorithm = Some(default.algorithm);
-            }
-        }
-
-        // Validate KMS key exists when using aws:kms encryption
-        if sse_algorithm.as_deref() == Some("aws:kms") {
-            if let Some(ref kms) = self.kms_state {
-                if let Some(ref key_id) = sse_kms_key_id {
-                    // A key or alias ARN names its account (possibly the
-                    // requester's); a bare id or alias resolves in the
-                    // bucket owner's account.
-                    let key_account =
-                        crate::service::kms_reference_account(key_id).unwrap_or(account_id);
-                    // The key (or alias) lives in the bucket's region; an
-                    // alias ARN names its own region. Through the hook an
-                    // AWS-managed `aws/s3` reference mints its key, so the
-                    // object records the key's ARN as on AWS.
-                    let resolved = self
-                        .kms_hook
-                        .as_ref()
-                        .and_then(|hook| {
-                            hook.resolve_key_arn(
-                                key_account,
-                                &bucket_region,
-                                key_id,
-                                "s3.amazonaws.com",
-                            )
-                            .ok()
-                        })
-                        .or_else(|| {
-                            let kms_accounts = kms.read();
-                            kms_accounts
-                                .get(key_account)
-                                .unwrap_or(kms_accounts.default_ref())
-                                .resolve_key_arn(&bucket_region, key_id)
-                                .map(str::to_string)
-                        });
-                    match resolved {
-                        Some(arn) => sse_kms_key_id = Some(arn),
-                        None => {
-                            // Still allow it — AWS doesn't always reject unknown keys
-                            // for emulation purposes, just set the key ID
-                            tracing::debug!(
-                                key_id = %key_id,
-                                "KMS key not found in state, proceeding anyway"
-                            );
-                        }
-                    }
-                }
-            }
-        }
+        // The request's SSE headers, else the bucket's default encryption.
+        let crate::side_effects::ObjectEncryption {
+            algorithm: sse_algorithm,
+            kms_key_id: sse_kms_key_id,
+            bucket_key_enabled,
+        } = self.object_encryption(
+            &req.headers,
+            encryption_config.as_deref(),
+            account_id,
+            &bucket_region,
+        );
 
         // SSE-KMS: read the spool back into memory so the KMS hook can
         // produce an envelope-encrypted blob (AES-GCM needs the whole
@@ -428,23 +359,12 @@ impl S3Service {
             headers.insert("x-amz-version-id", vid.parse().unwrap());
         }
         // Return SSE headers
-        if let Some(algo) = &sse_algorithm {
-            headers.insert("x-amz-server-side-encryption", algo.parse().unwrap());
-        } else {
-            headers.insert("x-amz-server-side-encryption", "AES256".parse().unwrap());
+        crate::side_effects::ObjectEncryption {
+            algorithm: sse_algorithm.clone(),
+            kms_key_id: sse_kms_key_id.clone(),
+            bucket_key_enabled,
         }
-        if let Some(kid) = &sse_kms_key_id {
-            headers.insert(
-                "x-amz-server-side-encryption-aws-kms-key-id",
-                kid.parse().unwrap(),
-            );
-        }
-        if bucket_key_enabled == Some(true) {
-            headers.insert(
-                "x-amz-server-side-encryption-bucket-key-enabled",
-                "true".parse().unwrap(),
-            );
-        }
+        .insert_response_headers(&mut headers);
         // The stored checksum, which S3 returns on every PutObject: a single
         // part upload's checksum is always FULL_OBJECT.
         if let Some(val) = &checksum_value {

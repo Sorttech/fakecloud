@@ -53,6 +53,31 @@ pub fn put_object_via_store(
     body: Vec<u8>,
     content_type: Option<&str>,
 ) -> Result<(), String> {
+    put_object_via_store_with_encryption(
+        state,
+        store,
+        account_id,
+        bucket,
+        key,
+        body,
+        content_type,
+        DeliveredEncryption::AsDelivered,
+    )
+}
+
+/// [`put_object_via_store`] with the encryption the producer asked for (see
+/// [`DeliveredEncryption`]); `body` is the plaintext.
+#[allow(clippy::too_many_arguments)]
+pub fn put_object_via_store_with_encryption(
+    state: &SharedS3State,
+    store: Option<&dyn S3Store>,
+    account_id: &str,
+    bucket: &str,
+    key: &str,
+    body: Vec<u8>,
+    content_type: Option<&str>,
+    encryption: DeliveredEncryption,
+) -> Result<(), String> {
     let bytes = Bytes::from(body);
     let obj = S3Object {
         key: key.to_string(),
@@ -63,7 +88,8 @@ pub fn put_object_via_store(
         size: bytes.len() as u64,
         ..Default::default()
     };
-    put_delivered_object(state, store, account_id, bucket, obj, bytes).map(|_| ())
+    put_delivered_object_with_encryption(state, store, account_id, bucket, obj, bytes, encryption)
+        .map(|_| ())
 }
 
 /// Write an object another service produced (a log export, a delivery
@@ -106,8 +132,48 @@ pub fn put_delivered_object(
     store: Option<&dyn S3Store>,
     account_id: &str,
     bucket: &str,
+    obj: S3Object,
+    body: Bytes,
+) -> Result<Option<String>, String> {
+    put_delivered_object_with_encryption(
+        state,
+        store,
+        account_id,
+        bucket,
+        obj,
+        body,
+        DeliveredEncryption::AsDelivered,
+    )
+}
+
+/// The server-side encryption a producing service asks for on an object it
+/// delivers, the way its own API names it (a DynamoDB export's
+/// `S3SseAlgorithm` / `S3SseKmsKeyId`, for one). An explicit choice
+/// overrides the bucket's default encryption, as SSE headers on a PutObject
+/// do.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum DeliveredEncryption {
+    /// The object's own `sse_*` fields describe the body as given (already
+    /// encrypted by the producer); with none, the bucket default applies.
+    #[default]
+    AsDelivered,
+    /// SSE-S3 (`AES256`).
+    SseS3,
+    /// SSE-KMS under `key_id`, or the AWS-managed `aws/s3` key when `None`;
+    /// the body is encrypted on the way in.
+    SseKms { key_id: Option<String> },
+}
+
+/// [`put_delivered_object`] with the encryption the producer asked for. See
+/// [`DeliveredEncryption`].
+pub fn put_delivered_object_with_encryption(
+    state: &SharedS3State,
+    store: Option<&dyn S3Store>,
+    account_id: &str,
+    bucket: &str,
     mut obj: S3Object,
     body: Bytes,
+    encryption: DeliveredEncryption,
 ) -> Result<Option<String>, String> {
     let key = obj.key.clone();
     let missing = || format!("bucket {bucket} not found in account {account_id}");
@@ -144,40 +210,54 @@ pub fn put_delivered_object(
         obj.checksum_type = Some(crate::checksum::ChecksumType::FullObject);
     }
 
-    // The bucket's default encryption, for an object the producer did not
-    // encrypt, as PutObject applies it to a request with no SSE headers.
+    // The encryption the producer asked for, else (for an object it did not
+    // encrypt itself) the bucket's default encryption, as PutObject applies
+    // it to a request with no SSE headers.
     let mut body = body;
-    if obj.sse_algorithm.is_none() {
-        if let Some(default) = default_encryption {
-            if default.algorithm.starts_with("aws:kms") {
-                let key_id = default.kms_key_id.clone();
-                body = crate::side_effects::kms_encrypt(
+    let apply = match encryption {
+        DeliveredEncryption::AsDelivered => {
+            default_encryption.filter(|_| obj.sse_algorithm.is_none())
+        }
+        DeliveredEncryption::SseS3 => Some(crate::side_effects::DefaultEncryption {
+            algorithm: "AES256".to_string(),
+            kms_key_id: None,
+            bucket_key_enabled: None,
+        }),
+        DeliveredEncryption::SseKms { key_id } => Some(crate::side_effects::DefaultEncryption {
+            algorithm: "aws:kms".to_string(),
+            kms_key_id: key_id,
+            bucket_key_enabled: None,
+        }),
+    };
+    if let Some(chosen) = apply {
+        if chosen.algorithm.starts_with("aws:kms") {
+            let key_id = chosen.kms_key_id.clone();
+            body = crate::side_effects::kms_encrypt(
+                kms_hook,
+                account_id,
+                &bucket_region,
+                bucket,
+                &body,
+                key_id.as_deref(),
+            )
+            .map_err(|e| format!("failed to encrypt object {key} for bucket {bucket}: {e}"))?;
+            // The object records the key's ARN, as S3 does (the
+            // AWS-managed `aws/s3` key when the default names none).
+            let resolve = |reference: &str| {
+                crate::side_effects::resolve_kms_key_arn(
                     kms_hook,
                     account_id,
                     &bucket_region,
-                    bucket,
-                    &body,
-                    key_id.as_deref(),
+                    reference,
                 )
-                .map_err(|e| format!("failed to encrypt object {key} for bucket {bucket}: {e}"))?;
-                // The object records the key's ARN, as S3 does (the
-                // AWS-managed `aws/s3` key when the default names none).
-                let resolve = |reference: &str| {
-                    crate::side_effects::resolve_kms_key_arn(
-                        kms_hook,
-                        account_id,
-                        &bucket_region,
-                        reference,
-                    )
-                };
-                obj.sse_kms_key_id = match key_id {
-                    Some(configured) => Some(resolve(&configured).unwrap_or(configured)),
-                    None => resolve("aws/s3"),
-                };
-            }
-            obj.sse_algorithm = Some(default.algorithm);
-            obj.bucket_key_enabled = default.bucket_key_enabled;
+            };
+            obj.sse_kms_key_id = match key_id {
+                Some(configured) => Some(resolve(&configured).unwrap_or(configured)),
+                None => resolve("aws/s3"),
+            };
         }
+        obj.sse_algorithm = Some(chosen.algorithm);
+        obj.bucket_key_enabled = chosen.bucket_key_enabled;
     }
 
     // Stage the payload with no S3 lock held: the global S3 lock is shared by
@@ -1204,6 +1284,67 @@ mod tests {
             let obj = &bucket(&state).objects["own"];
             assert_eq!(obj.sse_kms_key_id.as_deref(), Some("producer-key"));
             assert_eq!(read(&state, &obj.body), b"cipher");
+        }
+    }
+
+    /// An encryption the producer asks for overrides the bucket default:
+    /// SSE-KMS under the named key encrypts the body, SSE-S3 leaves it as is.
+    #[test]
+    fn requested_encryption_overrides_the_bucket_default() {
+        let state = shared_state();
+        let _svc = with_s3_service(
+            &state,
+            Arc::new(SqsRecorder::default()),
+            Some(Arc::new(ReadableKms)),
+        );
+        set_bucket(&state, |b| {
+            b.encryption_config = Some(
+                "<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault>\
+                 <SSEAlgorithm>aws:kms</SSEAlgorithm><KMSMasterKeyID>bucket-key</KMSMasterKeyID>\
+                 </ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>"
+                    .to_string(),
+            );
+        });
+        for (key, encryption, sse, kms_key, stored) in [
+            (
+                "kms",
+                DeliveredEncryption::SseKms {
+                    key_id: Some("export-key".to_string()),
+                },
+                "aws:kms",
+                Some("arn:aws:kms:us-east-1:123456789012:key/export-key"),
+                &b"enc:export-key:rows"[..],
+            ),
+            (
+                "s3",
+                DeliveredEncryption::SseS3,
+                "AES256",
+                None,
+                &b"rows"[..],
+            ),
+            (
+                "default",
+                DeliveredEncryption::AsDelivered,
+                "aws:kms",
+                Some("arn:aws:kms:us-east-1:123456789012:key/bucket-key"),
+                &b"enc:bucket-key:rows"[..],
+            ),
+        ] {
+            put_object_via_store_with_encryption(
+                &state,
+                None,
+                ACCOUNT,
+                "logs-bucket",
+                key,
+                b"rows".to_vec(),
+                None,
+                encryption,
+            )
+            .unwrap();
+            let obj = &bucket(&state).objects[key];
+            assert_eq!(obj.sse_algorithm.as_deref(), Some(sse), "{key}");
+            assert_eq!(obj.sse_kms_key_id.as_deref(), kms_key, "{key}");
+            assert_eq!(read(&state, &obj.body), stored, "{key}");
         }
     }
 

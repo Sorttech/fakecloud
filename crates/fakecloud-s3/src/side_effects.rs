@@ -72,6 +72,39 @@ pub(crate) fn installed(
         .or_else(|| accounts.default_ref().side_effects.clone())
 }
 
+/// The server-side encryption a new object version is stored under.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ObjectEncryption {
+    /// `AES256`, `aws:kms`, `aws:kms:dsse`; `None` when neither the request
+    /// nor the bucket names one.
+    pub algorithm: Option<String>,
+    /// The SSE-KMS key, as its ARN once resolved.
+    pub kms_key_id: Option<String>,
+    pub bucket_key_enabled: Option<bool>,
+}
+
+impl ObjectEncryption {
+    /// The `x-amz-server-side-encryption*` response headers S3 returns on
+    /// every request that writes object data (PutObject, the multipart
+    /// calls). Every object is encrypted at rest on S3, so one with no other
+    /// encryption reports SSE-S3 (`AES256`).
+    pub(crate) fn insert_response_headers(&self, headers: &mut http::HeaderMap) {
+        let algorithm = self.algorithm.as_deref().unwrap_or("AES256");
+        if let Ok(v) = algorithm.parse() {
+            headers.insert("x-amz-server-side-encryption", v);
+        }
+        if let Some(Ok(v)) = self.kms_key_id.as_deref().map(str::parse) {
+            headers.insert("x-amz-server-side-encryption-aws-kms-key-id", v);
+        }
+        if self.bucket_key_enabled == Some(true) {
+            headers.insert(
+                "x-amz-server-side-encryption-bucket-key-enabled",
+                http::HeaderValue::from_static("true"),
+            );
+        }
+    }
+}
+
 /// A bucket's default encryption, from its `ServerSideEncryptionConfiguration`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DefaultEncryption {

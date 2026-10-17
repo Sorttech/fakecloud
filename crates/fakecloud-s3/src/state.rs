@@ -138,6 +138,7 @@ pub struct MultipartUpload {
     pub storage_class: String,
     pub sse_algorithm: Option<String>,
     pub sse_kms_key_id: Option<String>,
+    pub bucket_key_enabled: Option<bool>,
     pub tagging: Option<String>,
     pub acl_grants: Vec<AclGrant>,
     pub checksum_algorithm: Option<ChecksumAlgorithm>,

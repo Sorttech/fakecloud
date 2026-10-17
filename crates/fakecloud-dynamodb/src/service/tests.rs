@@ -1380,6 +1380,81 @@ fn failed_export_reports_failure_on_describe() {
     assert_eq!(body["ExportDescription"]["FailureCode"], "S3NoSuchBucket");
 }
 
+/// An export's `S3SseAlgorithm` / `S3SseKmsKeyId` decide how every object it
+/// writes is encrypted, overriding the bucket's default encryption; an export
+/// naming no algorithm takes the bucket default.
+#[test]
+fn export_objects_take_the_requested_encryption() {
+    let s3: fakecloud_s3::SharedS3State = Arc::new(RwLock::new(
+        fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+    ));
+    {
+        let mut accounts = s3.write();
+        let mut bucket = fakecloud_s3::S3Bucket::new("exports", "us-east-1", "owner");
+        bucket.encryption_config = Some(
+            "<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault>\
+             <SSEAlgorithm>aws:kms</SSEAlgorithm><KMSMasterKeyID>bucket-key</KMSMasterKeyID>\
+             </ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>"
+                .to_string(),
+        );
+        accounts
+            .get_or_create("123456789012")
+            .buckets
+            .insert("exports".to_string(), bucket);
+    }
+    let svc = make_service().with_s3(s3.clone());
+    create_test_table(&svc);
+
+    for (prefix, request, expected_sse, expected_key) in [
+        (
+            "kms",
+            json!({ "S3SseAlgorithm": "KMS", "S3SseKmsKeyId": "export-key" }),
+            "aws:kms",
+            Some("export-key"),
+        ),
+        ("aes", json!({ "S3SseAlgorithm": "AES256" }), "AES256", None),
+        ("default", json!({}), "aws:kms", Some("bucket-key")),
+    ] {
+        let mut body = json!({
+            "TableArn": "arn:aws:dynamodb:us-east-1:123456789012:table/test-table",
+            "S3Bucket": "exports",
+            "S3Prefix": prefix,
+        });
+        for (k, v) in request.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        let req = make_request("ExportTableToPointInTime", body);
+        let resp = svc.export_table_to_point_in_time(&req).unwrap();
+        let started: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        let export_arn = started["ExportDescription"]["ExportArn"].as_str().unwrap();
+        let req = make_request("DescribeExport", json!({ "ExportArn": export_arn }));
+        let resp = svc.describe_export(&req).unwrap();
+        let described: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        assert_eq!(
+            described["ExportDescription"]["ExportStatus"], "COMPLETED",
+            "{described}"
+        );
+
+        let accounts = s3.read();
+        let objects: Vec<_> = accounts.get("123456789012").unwrap().buckets["exports"]
+            .objects
+            .iter()
+            .filter(|(k, _)| k.starts_with(&format!("{prefix}/")))
+            .map(|(_, o)| o.clone())
+            .collect();
+        assert_eq!(objects.len(), 4, "{prefix}: _started, data, two manifests");
+        for obj in objects {
+            assert_eq!(
+                obj.sse_algorithm.as_deref(),
+                Some(expected_sse),
+                "{}",
+                obj.key
+            );
+            assert_eq!(obj.sse_kms_key_id.as_deref(), expected_key, "{}", obj.key);
+        }
+    }
+}
+
 #[test]
 fn import_lifecycle() {
     let svc = make_service();

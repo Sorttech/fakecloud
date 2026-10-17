@@ -269,6 +269,9 @@ pub struct MpuInit {
     pub sse_algorithm: Option<String>,
     #[serde(default)]
     pub sse_kms_key_id: Option<String>,
+    /// `x-amz-server-side-encryption-bucket-key-enabled` of the upload.
+    #[serde(default)]
+    pub bucket_key_enabled: Option<bool>,
     #[serde(default)]
     pub tagging: Option<String>,
     #[serde(default)]

@@ -11765,3 +11765,183 @@ fn sse_kms_objects_need_an_opted_in_rule_and_get_the_replica_key() {
         );
     }
 }
+
+// ---- Multipart uploads and encryption ----
+
+fn kms_service() -> S3Service {
+    let state: SharedS3State = Arc::new(RwLock::new(
+        fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+    ));
+    S3Service::new(state, Arc::new(DeliveryBus::new())).with_kms_hook(Arc::new(ReadableKms))
+}
+
+/// Create, upload one part and complete `bucket/key`; returns the three
+/// responses' headers.
+async fn single_part_upload(
+    svc: &S3Service,
+    bucket: &str,
+    key: &str,
+    create_headers: &[(&'static str, &'static str)],
+    body: &[u8],
+) -> [HeaderMap; 3] {
+    let path = format!("/{bucket}/{key}");
+    let mut init = make_request(Method::POST, &path, &[("uploads", "")], b"");
+    for (k, v) in create_headers {
+        init.headers.insert(*k, http::HeaderValue::from_static(v));
+    }
+    let created = svc
+        .create_multipart_upload("123456789012", &init, bucket, key)
+        .unwrap();
+    let text = std::str::from_utf8(created.body.expect_bytes()).unwrap();
+    let start = text.find("<UploadId>").unwrap() + "<UploadId>".len();
+    let upload_id = text[start..text.find("</UploadId>").unwrap()].to_string();
+    let req = make_request(Method::PUT, &path, &[("partNumber", "1")], body);
+    let part = svc
+        .upload_part("123456789012", &req, bucket, key, &upload_id, 1)
+        .await
+        .unwrap();
+    let xml = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part>\
+         </CompleteMultipartUpload>",
+        part.headers["etag"].to_str().unwrap()
+    );
+    let req = make_request(
+        Method::POST,
+        &path,
+        &[("uploadId", &upload_id)],
+        xml.as_bytes(),
+    );
+    let done = svc
+        .complete_multipart_upload("123456789012", &req, bucket, key, &upload_id)
+        .unwrap();
+    [created.headers, part.headers, done.headers]
+}
+
+/// A multipart upload with no SSE headers takes the bucket's default SSE-KMS
+/// encryption: every response reports it, and the completed object is stored
+/// as one envelope over the plaintext, which GetObject decrypts.
+#[tokio::test]
+async fn multipart_upload_takes_default_sse_kms_and_stores_an_envelope() {
+    let svc = kms_service();
+    seed_bucket(&svc, "enc");
+    svc.state
+        .write()
+        .default_mut()
+        .buckets
+        .get_mut("enc")
+        .unwrap()
+        .encryption_config = Some(
+        "<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault>\
+         <SSEAlgorithm>aws:kms</SSEAlgorithm><KMSMasterKeyID>k1</KMSMasterKeyID>\
+         </ApplyServerSideEncryptionByDefault><BucketKeyEnabled>true</BucketKeyEnabled>\
+         </Rule></ServerSideEncryptionConfiguration>"
+            .to_string(),
+    );
+    let responses = single_part_upload(&svc, "enc", "obj", &[], b"multipart-plaintext").await;
+    for headers in &responses {
+        assert_eq!(headers["x-amz-server-side-encryption"], "aws:kms");
+        assert_eq!(headers["x-amz-server-side-encryption-aws-kms-key-id"], "k1");
+        assert_eq!(
+            headers["x-amz-server-side-encryption-bucket-key-enabled"],
+            "true"
+        );
+    }
+
+    let obj = bucket_of(&svc, "enc").objects["obj"].clone();
+    assert_eq!(obj.sse_algorithm.as_deref(), Some("aws:kms"));
+    assert_eq!(obj.bucket_key_enabled, Some(true));
+    assert_eq!(obj.size, 19);
+    let stored = svc.state.read().default_ref().read_body(&obj.body).unwrap();
+    assert_eq!(&stored[..], b"enc:k1:multipart-plaintext");
+
+    let req = make_request(Method::GET, "/enc/obj", &[], b"");
+    let got = svc.get_object("123456789012", &req, "enc", "obj").unwrap();
+    assert_eq!(got.body.expect_bytes(), b"multipart-plaintext");
+}
+
+/// Without encryption headers or a bucket default, every multipart response
+/// reports SSE-S3 and the body is stored as uploaded.
+#[tokio::test]
+async fn multipart_upload_without_encryption_reports_sse_s3() {
+    let svc = kms_service();
+    seed_bucket(&svc, "plain");
+    let responses = single_part_upload(&svc, "plain", "obj", &[], b"data").await;
+    for headers in &responses {
+        assert_eq!(headers["x-amz-server-side-encryption"], "AES256");
+        assert!(!headers.contains_key("x-amz-server-side-encryption-aws-kms-key-id"));
+    }
+    let obj = bucket_of(&svc, "plain").objects["obj"].clone();
+    let stored = svc.state.read().default_ref().read_body(&obj.body).unwrap();
+    assert_eq!(&stored[..], b"data");
+}
+
+/// UploadPartCopy from an SSE-KMS source copies its plaintext, and an
+/// SSE-KMS upload stores the result encrypted under its own key.
+#[tokio::test]
+async fn upload_part_copy_reads_the_plaintext_of_an_sse_kms_source() {
+    let svc = kms_service();
+    seed_bucket(&svc, "b");
+    let responses = single_part_upload(
+        &svc,
+        "b",
+        "src",
+        &[
+            ("x-amz-server-side-encryption", "aws:kms"),
+            ("x-amz-server-side-encryption-aws-kms-key-id", "src-key"),
+        ],
+        b"0123456789",
+    )
+    .await;
+    assert_eq!(responses[2]["x-amz-server-side-encryption"], "aws:kms");
+
+    let mut init = make_request(Method::POST, "/b/dst", &[("uploads", "")], b"");
+    init.headers.insert(
+        "x-amz-server-side-encryption",
+        http::HeaderValue::from_static("aws:kms"),
+    );
+    init.headers.insert(
+        "x-amz-server-side-encryption-aws-kms-key-id",
+        http::HeaderValue::from_static("dst-key"),
+    );
+    let created = svc
+        .create_multipart_upload("123456789012", &init, "b", "dst")
+        .unwrap();
+    let text = std::str::from_utf8(created.body.expect_bytes()).unwrap();
+    let start = text.find("<UploadId>").unwrap() + "<UploadId>".len();
+    let upload_id = text[start..text.find("</UploadId>").unwrap()].to_string();
+    let mut req = make_request(
+        Method::PUT,
+        "/b/dst",
+        &[("partNumber", "1"), ("uploadId", &upload_id)],
+        b"",
+    );
+    req.headers
+        .insert("x-amz-copy-source", http::HeaderValue::from_static("b/src"));
+    req.headers.insert(
+        "x-amz-copy-source-range",
+        http::HeaderValue::from_static("bytes=2-5"),
+    );
+    let copied = svc
+        .upload_part_copy("123456789012", &req, "b", "dst", &upload_id, 1)
+        .unwrap();
+    assert_eq!(copied.headers["x-amz-server-side-encryption"], "aws:kms");
+    let text = std::str::from_utf8(copied.body.expect_bytes()).unwrap();
+    let start = text.find("<ETag>").unwrap() + "<ETag>".len();
+    let etag = text[start..text.find("</ETag>").unwrap()].replace("&quot;", "\"");
+    let xml = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part>\
+         </CompleteMultipartUpload>"
+    );
+    let req = make_request(
+        Method::POST,
+        "/b/dst",
+        &[("uploadId", &upload_id)],
+        xml.as_bytes(),
+    );
+    svc.complete_multipart_upload("123456789012", &req, "b", "dst", &upload_id)
+        .unwrap();
+
+    let obj = bucket_of(&svc, "b").objects["dst"].clone();
+    let stored = svc.state.read().default_ref().read_body(&obj.body).unwrap();
+    assert_eq!(&stored[..], b"enc:dst-key:2345");
+}

@@ -133,6 +133,18 @@ fn object_checksum_xml(obj: &S3Object) -> String {
     }
 }
 
+/// The encryption a multipart upload's object is stored under, as chosen at
+/// CreateMultipartUpload.
+fn upload_encryption(
+    upload: &crate::state::MultipartUpload,
+) -> crate::side_effects::ObjectEncryption {
+    crate::side_effects::ObjectEncryption {
+        algorithm: upload.sse_algorithm.clone(),
+        kms_key_id: upload.sse_kms_key_id.clone(),
+        bucket_key_enabled: upload.bucket_key_enabled,
+    }
+}
+
 fn object_size_of(part_sizes: &[(u32, u64)]) -> u64 {
     part_sizes.iter().map(|(_, size)| size).sum()
 }
@@ -351,16 +363,6 @@ impl S3Service {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("STANDARD")
             .to_string();
-        let sse_algorithm = req
-            .headers
-            .get("x-amz-server-side-encryption")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        let sse_kms_key_id = req
-            .headers
-            .get("x-amz-server-side-encryption-aws-kms-key-id")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
         let tagging = req
             .headers
             .get("x-amz-tagging")
@@ -371,6 +373,25 @@ impl S3Service {
         // Validated now but reported after the bucket lookup, so a request to
         // a missing bucket still answers NoSuchBucket.
         let checksum_settings = multipart_checksum_settings(&req.headers);
+
+        // The encryption the completed object will be stored under, resolved
+        // as PutObject resolves it (the request's SSE headers, else the
+        // bucket default). Resolved before the write lock: resolving an
+        // SSE-KMS key may mint the AWS-managed key in KMS.
+        let encryption = {
+            let accts = self.state.read();
+            let b = accts
+                .get(account_id)
+                .and_then(|s| s.buckets.get(bucket))
+                .ok_or_else(|| no_such_bucket(bucket))?;
+            (b.encryption_config.clone(), b.region.clone())
+        };
+        let encryption = self.object_encryption(
+            &req.headers,
+            encryption.0.as_deref(),
+            account_id,
+            &encryption.1,
+        );
 
         let mut accts = self.state.write();
         let state = accts.get_or_create(account_id);
@@ -397,8 +418,9 @@ impl S3Service {
             metadata,
             content_type,
             storage_class,
-            sse_algorithm: sse_algorithm.clone(),
-            sse_kms_key_id: sse_kms_key_id.clone(),
+            sse_algorithm: encryption.algorithm.clone(),
+            sse_kms_key_id: encryption.kms_key_id.clone(),
+            bucket_key_enabled: encryption.bucket_key_enabled,
             tagging,
             acl_grants,
             checksum_algorithm,
@@ -419,16 +441,7 @@ impl S3Service {
         b.multipart_uploads.insert(upload_id.clone(), upload);
 
         let mut headers = HeaderMap::new();
-        if let Some(algo) = &sse_algorithm {
-            if let Ok(val) = algo.parse() {
-                headers.insert("x-amz-server-side-encryption", val);
-            }
-        }
-        if let Some(kid) = &sse_kms_key_id {
-            if let Ok(val) = kid.parse() {
-                headers.insert("x-amz-server-side-encryption-aws-kms-key-id", val);
-            }
-        }
+        encryption.insert_response_headers(&mut headers);
         if let (Some(algo), Some(checksum_type)) = (checksum_algorithm, checksum_type) {
             headers.insert(
                 "x-amz-checksum-algorithm",
@@ -591,15 +604,7 @@ impl S3Service {
         if let Some((algo, value)) = &part_checksum {
             crate::checksum::insert_response_headers(&mut headers, *algo, value, None);
         }
-        if let Some(algo) = &upload.sse_algorithm {
-            headers.insert("x-amz-server-side-encryption", algo.parse().unwrap());
-        }
-        if let Some(kid) = &upload.sse_kms_key_id {
-            headers.insert(
-                "x-amz-server-side-encryption-aws-kms-key-id",
-                kid.parse().unwrap(),
-            );
-        }
+        upload_encryption(upload).insert_response_headers(&mut headers);
         Ok(AwsResponse {
             status: StatusCode::OK,
             content_type: "application/xml".to_string(),
@@ -680,10 +685,11 @@ impl S3Service {
             // The source bucket is read in the account that owns it, which is
             // not the destination's when copying out of another account's
             // bucket (authorized by s3:GetObject on the source at dispatch).
-            let src_state = accts
+            let src_owner = accts
                 .find_account(|s| s.buckets.contains_key(src_bucket))
-                .and_then(|owner| accts.get(owner))
-                .unwrap_or(state);
+                .unwrap_or(account_id)
+                .to_string();
+            let src_state = accts.get(&src_owner).unwrap_or(state);
             let sb = src_state
                 .buckets
                 .get(src_bucket)
@@ -732,17 +738,37 @@ impl S3Service {
                 Some(upload) if upload.key == key => upload.checksum_algorithm,
                 _ => return Err(no_such_upload(upload_id)),
             };
+            // An SSE-KMS source is stored as an envelope: the part is copied
+            // from its plaintext, as S3 copies object data, not ciphertext.
+            let src_kms = (src_obj.sse_algorithm.as_deref() == Some("aws:kms"))
+                .then(|| (src_owner.clone(), src_obj.sse_kms_key_id.clone()));
             (
                 crate::body_io::ObjectBodyHandle::open(&src_obj.body).map_err(super::io_to_aws)?,
                 upload_algorithm,
+                src_kms,
             )
         };
-        let (src_handle, upload_algorithm) = src_handle;
+        let (src_handle, upload_algorithm, src_kms) = src_handle;
+        // Exactly one of the two is set: the decrypted SSE-KMS source, or the
+        // handle a range is read from.
+        let mut src_handle = Some(src_handle);
+        let src_plaintext = match src_kms.filter(|_| self.kms_hook.is_some()) {
+            Some((owner, kms_key)) => {
+                let handle = src_handle.take().expect("handle not yet consumed");
+                let raw = super::run_blocking_io(|| handle.read_all()).map_err(super::io_to_aws)?;
+                Some(self.decrypt_object_body(req, &owner, src_bucket, &raw, kms_key.as_deref())?)
+            }
+            None => None,
+        };
 
         // Phase 2 (no lock): resolve x-amz-copy-source-range against the
         // source size and read only that range, then stage the part next to
         // the store.
-        let src_size = src_handle.size();
+        let src_size = match (&src_plaintext, &src_handle) {
+            (Some(plaintext), _) => plaintext.len() as u64,
+            (None, Some(handle)) => handle.size(),
+            (None, None) => 0,
+        };
         let (offset, len) = if let Some(range_str) = copy_range {
             let range_part = range_str.strip_prefix("bytes=").unwrap_or(range_str);
             let invalid_range = || {
@@ -776,8 +802,12 @@ impl S3Service {
         } else {
             (0, src_size)
         };
-        let src_data = super::run_blocking_io(|| src_handle.read_range(offset, len))
-            .map_err(super::io_to_aws)?;
+        let src_data = match (&src_plaintext, src_handle) {
+            (Some(plaintext), _) => plaintext.slice(offset as usize..(offset + len) as usize),
+            (None, Some(handle)) => super::run_blocking_io(|| handle.read_range(offset, len))
+                .map_err(super::io_to_aws)?,
+            (None, None) => Bytes::new(),
+        };
 
         let data_len = src_data.len() as u64;
         let etag = compute_md5(&src_data);
@@ -833,6 +863,7 @@ impl S3Service {
             checksum: part_checksum.clone(),
         };
         upload.parts.insert(part_number as u32, part);
+        let encryption = upload_encryption(upload);
 
         let checksum_xml = part_checksum
             .as_ref()
@@ -847,7 +878,9 @@ impl S3Service {
              </CopyPartResult>",
             Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ"),
         );
-        Ok(s3_xml(StatusCode::OK, body))
+        let mut resp = s3_xml(StatusCode::OK, body);
+        encryption.insert_response_headers(&mut resp.headers);
+        Ok(resp)
     }
 
     pub(super) fn complete_multipart_upload(
@@ -1117,6 +1150,23 @@ impl S3Service {
         )?;
         let data = Bytes::from(combined_data);
         let object_size = data.len() as u64;
+        // An SSE-KMS upload is stored as one envelope over the assembled
+        // plaintext, exactly as PutObject stores its body (the size, ETag and
+        // checksums above stay those of the plaintext). Done before the write
+        // lock: encryption calls into KMS. Fail-closed: a KMS error leaves the
+        // upload in place for a retry.
+        let encrypted = if upload.sse_algorithm.as_deref() == Some("aws:kms") {
+            Some(self.encrypt_object_body(
+                req,
+                account_id,
+                &bucket_region,
+                bucket,
+                &data,
+                upload.sse_kms_key_id.as_deref(),
+            )?)
+        } else {
+            None
+        };
 
         let tags = if let Some(ref tagging) = upload.tagging {
             parse_url_encoded_tags(tagging).into_iter().collect()
@@ -1126,8 +1176,8 @@ impl S3Service {
 
         let obj = S3Object {
             key: key.to_string(),
-            size: data.len() as u64,
-            body: crate::state::memory_body(data),
+            size: object_size,
+            body: crate::state::memory_body(encrypted.clone().unwrap_or(data)),
             content_type: upload.content_type.clone(),
             etag: etag.clone(),
             last_modified: Utc::now(),
@@ -1140,6 +1190,7 @@ impl S3Service {
             part_sizes: Some(part_sizes),
             sse_algorithm: upload.sse_algorithm.clone(),
             sse_kms_key_id: upload.sse_kms_key_id.clone(),
+            bucket_key_enabled: upload.bucket_key_enabled,
             // Assigned at commit from the bucket's versioning state.
             version_id: None,
             checksum_algorithm: Some(checksum_algorithm),
@@ -1219,6 +1270,29 @@ impl S3Service {
                 Some(&self.side_effects),
                 obj,
                 |store, obj, meta| {
+                    if let Some(cipher) = encrypted {
+                        // The stored body is the envelope, not the parts, so
+                        // it is written whole; the parts are then dropped as
+                        // completion drops them. The object is already
+                        // durable, so a failed cleanup only leaves part
+                        // files behind and is not reported as a failed write.
+                        let body = store.put_object(
+                            bucket,
+                            &obj.key,
+                            meta.version_id.as_deref(),
+                            BodySource::Bytes(cipher),
+                            meta,
+                        )?;
+                        if let Err(err) = store.mpu_abort(bucket, upload_id) {
+                            tracing::warn!(
+                                bucket,
+                                upload_id,
+                                error = %err,
+                                "failed to remove the parts of a completed SSE-KMS upload"
+                            );
+                        }
+                        return Ok(body);
+                    }
                     let assembled = store.mpu_complete(
                         bucket,
                         upload_id,
@@ -1249,15 +1323,7 @@ impl S3Service {
         if let Some(vid) = &version_id {
             headers.insert("x-amz-version-id", vid.parse().unwrap());
         }
-        if let Some(algo) = &upload.sse_algorithm {
-            headers.insert("x-amz-server-side-encryption", algo.parse().unwrap());
-        }
-        if let Some(kid) = &upload.sse_kms_key_id {
-            headers.insert(
-                "x-amz-server-side-encryption-aws-kms-key-id",
-                kid.parse().unwrap(),
-            );
-        }
+        upload_encryption(&upload).insert_response_headers(&mut headers);
 
         let location = xml_escape(&completion_location(bucket, &bucket_region, key));
         // Surface the per-algorithm checksum element AWS emits so
