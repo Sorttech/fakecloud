@@ -432,16 +432,52 @@ impl EcsService {
     ) -> Result<AwsResponse, AwsServiceError> {
         let body = request.json_body();
         let name = req_str(&body, "name")?.to_string();
-        if name.starts_with("aws") || name.starts_with("ecs") {
+        let lower = name.to_ascii_lowercase();
+        if ["aws", "ecs", "fargate"]
+            .iter()
+            .any(|prefix| lower.starts_with(prefix))
+        {
             return Err(invalid_parameter(format!(
-                "Capacity provider name cannot begin with 'aws' or 'ecs': {name}"
+                "Capacity provider name cannot begin with 'aws', 'ecs' or 'fargate': {name}"
             )));
         }
-        let auto_scaling_group_provider = body.get("autoScalingGroupProvider").cloned();
+        let present = |key: &str| body.get(key).filter(|v| !v.is_null()).cloned();
+        let auto_scaling_group_provider = present("autoScalingGroupProvider");
+        let managed_instances_provider = present("managedInstancesProvider");
+        // A capacity provider is backed by exactly one kind of capacity.
+        match (&auto_scaling_group_provider, &managed_instances_provider) {
+            (None, None) => return Err(invalid_parameter(
+                "Either autoScalingGroupProvider or managedInstancesProvider must be specified.",
+            )),
+            (Some(_), Some(_)) => return Err(invalid_parameter(
+                "autoScalingGroupProvider and managedInstancesProvider can't both be specified.",
+            )),
+            _ => {}
+        }
+        // Managed Instances providers are cluster-scoped and need the cluster;
+        // Auto Scaling group providers are account-level.
+        let cluster = match &managed_instances_provider {
+            Some(_) => {
+                let cluster_ref = opt_str(&body, "cluster")
+                    .filter(|c| !c.is_empty())
+                    .ok_or_else(|| {
+                        invalid_parameter(
+                            "cluster is required for a Managed Instances capacity provider.",
+                        )
+                    })?;
+                Some(EcsState::resolve_cluster_name(Some(cluster_ref)))
+            }
+            None => None,
+        };
         let tags = parse_tags(&body);
 
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&request.account_id);
+        if let Some(c) = &cluster {
+            if !state.clusters.contains_key(c) {
+                return Err(cluster_not_found(c));
+            }
+        }
         if state.capacity_providers.contains_key(&name) {
             return Err(client_exception(format!(
                 "Capacity provider already exists: {name}"
@@ -457,6 +493,8 @@ impl EcsService {
             arn,
             status: "ACTIVE".into(),
             auto_scaling_group_provider,
+            managed_instances_provider,
+            cluster,
             update_status: None,
             update_status_reason: None,
             created_at: Utc::now(),
@@ -503,27 +541,93 @@ impl EcsService {
                     .collect()
             })
             .unwrap_or_default();
+        let cluster_filter = opt_str(&body, "cluster")
+            .filter(|c| !c.is_empty())
+            .map(|c| EcsState::resolve_cluster_name(Some(c)));
+        // Unpaged calls return up to 10 providers (the documented default
+        // and maximum page size).
+        let max_results = body
+            .get("maxResults")
+            .and_then(|v| v.as_i64())
+            .filter(|n| (1..=10).contains(n))
+            .map(|n| n as usize)
+            .unwrap_or(10);
+        let next_token = opt_str(&body, "nextToken").unwrap_or("");
+        let region = request.region.as_str();
+        let account_id = request.account_id.as_str();
+
         let accounts = self.state.read();
+        let state = accounts.get(account_id);
         let mut found = Vec::new();
         let mut failures = Vec::new();
-        if let Some(state) = accounts.get(&request.account_id) {
-            if names.is_empty() {
-                for cp in state.capacity_providers.values() {
+        if !names.is_empty() {
+            for n in &names {
+                if let Some(cp) = state.and_then(|s| s.capacity_providers.get(n)) {
                     found.push(capacity_provider_to_json(cp));
-                }
-            } else {
-                for n in &names {
-                    match state.capacity_providers.get(n) {
-                        Some(cp) => found.push(capacity_provider_to_json(cp)),
-                        None => failures.push(json!({"arn": n, "reason": "MISSING"})),
-                    }
+                } else if BUILTIN_CAPACITY_PROVIDERS.contains(&n.as_str()) {
+                    found.push(builtin_capacity_provider_json(n, region, account_id));
+                } else {
+                    failures.push(json!({"arn": n, "reason": "MISSING"}));
                 }
             }
+            return Ok(AwsResponse::ok_json(json!({
+                "capacityProviders": found,
+                "failures": failures,
+            })));
         }
-        Ok(AwsResponse::ok_json(json!({
-            "capacityProviders": found,
+
+        // Listing: customer-created providers first, then the built-in
+        // Fargate providers. Without `cluster` only account-level providers
+        // are listed (Managed Instances providers are cluster-scoped); with
+        // it, the providers associated with that cluster are listed.
+        let associated: Option<Vec<String>> = match &cluster_filter {
+            Some(c) => {
+                let cluster = state
+                    .and_then(|s| s.clusters.get(c))
+                    .ok_or_else(|| cluster_not_found(c))?;
+                Some(cluster.capacity_providers.clone())
+            }
+            None => None,
+        };
+        let in_scope = |cp: &CapacityProvider| match (&cluster_filter, &associated) {
+            (Some(c), Some(attached)) => {
+                cp.cluster.as_deref() == Some(c.as_str()) || attached.contains(&cp.name)
+            }
+            _ => cp.cluster.is_none(),
+        };
+        // Sort keys put custom providers (by name) ahead of the built-ins.
+        let mut entries: Vec<(String, Value)> = state
+            .map(|s| {
+                s.capacity_providers
+                    .values()
+                    .filter(|cp| in_scope(cp))
+                    .map(|cp| (format!("0/{}", cp.name), capacity_provider_to_json(cp)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for builtin in BUILTIN_CAPACITY_PROVIDERS {
+            let listed = associated
+                .as_ref()
+                .is_none_or(|attached| attached.iter().any(|a| a == builtin));
+            if listed {
+                entries.push((
+                    format!("1/{builtin}"),
+                    builtin_capacity_provider_json(builtin, region, account_id),
+                ));
+            }
+        }
+        let keys: Vec<String> = entries.iter().map(|(k, _)| k.clone()).collect();
+        let (page, next) = paginate_arns(keys, next_token, max_results);
+        let mut by_key: std::collections::HashMap<String, Value> = entries.into_iter().collect();
+        let providers: Vec<Value> = page.iter().filter_map(|k| by_key.remove(k)).collect();
+        let mut out = json!({
+            "capacityProviders": providers,
             "failures": failures,
-        })))
+        });
+        if let Some(token) = next {
+            out["nextToken"] = json!(token);
+        }
+        Ok(AwsResponse::ok_json(out))
     }
 
     pub(super) fn update_capacity_provider(
@@ -533,7 +637,14 @@ impl EcsService {
         let body = request.json_body();
         let input = req_str(&body, "name")?.to_string();
         let name = capacity_provider_name_from_ref(&input);
-        let asg = body.get("autoScalingGroupProvider").cloned();
+        let asg = body
+            .get("autoScalingGroupProvider")
+            .filter(|v| !v.is_null())
+            .cloned();
+        let mip = body
+            .get("managedInstancesProvider")
+            .filter(|v| !v.is_null())
+            .cloned();
         let mut accounts = self.state.write();
         let state = accounts
             .get_mut(&request.account_id)
@@ -542,8 +653,23 @@ impl EcsService {
             .capacity_providers
             .get_mut(&name)
             .ok_or_else(|| capacity_provider_not_found(&name))?;
+        // An update carries the configuration for the provider's own kind.
+        let managed = cp.managed_instances_provider.is_some();
+        if (asg.is_some() && managed) || (mip.is_some() && !managed) {
+            return Err(invalid_parameter(format!(
+                "The capacity provider {name} is a {} capacity provider and can't be updated with that configuration.",
+                capacity_provider_type(cp)
+            )));
+        }
         if let Some(v) = asg {
             cp.auto_scaling_group_provider = Some(v);
+        }
+        if let Some(Value::Object(update)) = mip {
+            if let Some(Value::Object(current)) = cp.managed_instances_provider.as_mut() {
+                for (k, v) in update {
+                    current.insert(k, v);
+                }
+            }
         }
         cp.update_status = Some("UPDATE_COMPLETE".into());
         Ok(AwsResponse::ok_json(json!({

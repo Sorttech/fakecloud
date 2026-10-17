@@ -515,7 +515,18 @@ impl ResourceProvisioner {
             name: name.clone(),
             arn: arn.clone(),
             status: "ACTIVE".to_string(),
-            auto_scaling_group_provider: props.get("AutoScalingGroupProvider").cloned(),
+            // Stored in the camelCase API shape so Describe reads it back the
+            // same as a direct CreateCapacityProvider.
+            auto_scaling_group_provider: props
+                .get("AutoScalingGroupProvider")
+                .map(|v| cfn_props_to_camel(v, &[])),
+            managed_instances_provider: props
+                .get("ManagedInstancesProvider")
+                .map(|v| cfn_props_to_camel(v, &[])),
+            cluster: props
+                .get("ClusterName")
+                .and_then(|v| v.as_str())
+                .map(String::from),
             update_status: None,
             update_status_reason: None,
             created_at: Utc::now(),
@@ -750,8 +761,11 @@ impl ResourceProvisioner {
             .capacity_providers
             .get_mut(&name)
             .ok_or_else(|| format!("CapacityProvider {name} no longer exists"))?;
-        if props.get("AutoScalingGroupProvider").is_some() {
-            cp.auto_scaling_group_provider = props.get("AutoScalingGroupProvider").cloned();
+        if let Some(asg) = props.get("AutoScalingGroupProvider") {
+            cp.auto_scaling_group_provider = Some(cfn_props_to_camel(asg, &[]));
+        }
+        if let Some(mip) = props.get("ManagedInstancesProvider") {
+            cp.managed_instances_provider = Some(cfn_props_to_camel(mip, &[]));
         }
         if props.get("Tags").is_some() {
             cp.tags = parse_ecs_tags(props.get("Tags"));

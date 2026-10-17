@@ -113,6 +113,9 @@ impl GlueService {
         }
         if let Some(obj) = v.as_object_mut() {
             obj.insert("Status".into(), json!("DELETING"));
+            // DeleteIntegrationResponse is the Integration shape minus
+            // `IntegrationConfig`; AWS does not echo the config on delete.
+            obj.remove("IntegrationConfig");
         }
         Ok(AwsResponse::ok_json(v))
     }

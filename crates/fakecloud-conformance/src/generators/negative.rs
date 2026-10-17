@@ -57,11 +57,52 @@ fn member_is_wire_bound(model: &ServiceModel, member: &crate::smithy::Member) ->
     }
 }
 
+/// Whether an empty value for the `@httpLabel` member `label` collapses the
+/// request onto a *different* modeled operation. True when `label` is the
+/// final segment of `http_uri` and the URI with that segment removed is bound
+/// to another operation of the same model with the same HTTP method (e.g.
+/// `GET /foundation-models/{modelIdentifier}` with `""` is the wire request
+/// `GET /foundation-models/`, which is ListFoundationModels).
+///
+/// Such a too-short negative is unsendable by construction: Smithy clients
+/// reject an empty `@httpLabel` before serializing, and the bytes the probe
+/// would put on the wire ARE the other operation's request, so the server
+/// can only answer as that operation.
+fn empty_label_collapses_to_other_op(
+    model: &ServiceModel,
+    http_method: Option<&str>,
+    http_uri: Option<&str>,
+    label: &str,
+) -> bool {
+    let (Some(method), Some(uri)) = (http_method, http_uri) else {
+        return false;
+    };
+    let path = uri.split('?').next().unwrap_or(uri);
+    let Some(parent) = path
+        .strip_suffix(&format!("/{{{label}}}"))
+        .or_else(|| path.strip_suffix(&format!("/{{{label}+}}")))
+    else {
+        return false;
+    };
+    model.operations.iter().any(|op| {
+        let same_method = op
+            .http_method
+            .as_deref()
+            .is_some_and(|m| m.eq_ignore_ascii_case(method));
+        let op_path = op
+            .http_uri
+            .as_deref()
+            .map(|u| u.split('?').next().unwrap_or(u).trim_end_matches('/'));
+        same_method && op_path == Some(parent.trim_end_matches('/'))
+    })
+}
+
 pub fn generate(
     model: &ServiceModel,
     input_shape_id: &str,
     overrides: &HashMap<String, Value>,
     http_method: Option<&str>,
+    http_uri: Option<&str>,
 ) -> Vec<TestVariant> {
     let mut variants = Vec::new();
 
@@ -128,7 +169,14 @@ pub fn generate(
         // negative case without also rejecting every legitimate positive
         // call. Skip the variant rather than emit one that's unreachable
         // by construction.
-        if let Some(min) = traits.length_min {
+        // An empty (`min == 1`) value for a trailing `@httpLabel` whose
+        // collapsed URI is another operation's route is that operation's
+        // request on the wire; see `empty_label_collapses_to_other_op`.
+        let is_label = member.traits.http_label || traits.http_label;
+        let collapses = traits.length_min == Some(1)
+            && is_label
+            && empty_label_collapses_to_other_op(model, http_method, http_uri, &member.name);
+        if let Some(min) = traits.length_min.filter(|_| !collapses) {
             if min > 0 && (min as usize) <= 20 {
                 if let ShapeType::String { .. } = &shape.shape_type {
                     let mut input = build_required_input(model, input_shape_id, overrides);
@@ -260,4 +308,142 @@ pub fn generate(
     }
 
     variants
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::smithy::{Member, Operation, Shape, ShapeTraits};
+
+    fn op(name: &str, method: &str, uri: &str, input: &str) -> Operation {
+        Operation {
+            name: name.to_string(),
+            input_shape: Some(input.to_string()),
+            output_shape: None,
+            error_shapes: Vec::new(),
+            http_method: Some(method.to_string()),
+            http_uri: Some(uri.to_string()),
+            http_code: None,
+        }
+    }
+
+    /// Model with a `{Id}`-labelled input (`@length(min)` on the label) and
+    /// the given operations.
+    fn model(min: u64, ops: Vec<Operation>) -> ServiceModel {
+        let mut shapes = HashMap::new();
+        shapes.insert(
+            "t#Input".to_string(),
+            Shape {
+                shape_id: "t#Input".to_string(),
+                shape_type: ShapeType::Structure {
+                    members: vec![
+                        Member {
+                            name: "Id".to_string(),
+                            target: "t#Id".to_string(),
+                            required: true,
+                            traits: ShapeTraits {
+                                http_label: true,
+                                ..ShapeTraits::default()
+                            },
+                        },
+                        Member {
+                            name: "Sub".to_string(),
+                            target: "t#Id".to_string(),
+                            required: true,
+                            traits: ShapeTraits {
+                                http_label: true,
+                                ..ShapeTraits::default()
+                            },
+                        },
+                    ],
+                },
+                traits: ShapeTraits::default(),
+            },
+        );
+        shapes.insert(
+            "t#Id".to_string(),
+            Shape {
+                shape_id: "t#Id".to_string(),
+                shape_type: ShapeType::String { enum_values: None },
+                traits: ShapeTraits {
+                    length_min: Some(min),
+                    length_max: Some(64),
+                    ..ShapeTraits::default()
+                },
+            },
+        );
+        ServiceModel {
+            service_name: "t".to_string(),
+            operations: ops,
+            shapes,
+        }
+    }
+
+    fn names(m: &ServiceModel, method: &str, uri: &str) -> Vec<String> {
+        generate(m, "t#Input", &HashMap::new(), Some(method), Some(uri))
+            .into_iter()
+            .map(|v| v.name)
+            .collect()
+    }
+
+    #[test]
+    fn empty_trailing_label_collapsing_onto_another_op_is_skipped() {
+        let uri = "/things/{Sub}/items/{Id}";
+        let m = model(
+            1,
+            vec![
+                op("GetItem", "GET", uri, "t#Input"),
+                op("ListItems", "GET", "/things/{Sub}/items", "t#Input"),
+            ],
+        );
+        let got = names(&m, "GET", uri);
+        // Trailing label `Id`: `GET /things/x/items/` is ListItems.
+        assert!(
+            !got.contains(&"negative_too_short_Id".to_string()),
+            "{got:?}"
+        );
+        // Interior label `Sub` keeps its variant: `//` reaches GetItem.
+        assert!(
+            got.contains(&"negative_too_short_Sub".to_string()),
+            "{got:?}"
+        );
+        // Other negatives for the trailing label are unaffected.
+        assert!(got.contains(&"negative_too_long_Id".to_string()), "{got:?}");
+    }
+
+    #[test]
+    fn empty_trailing_label_without_same_method_parent_route_is_kept() {
+        let uri = "/things/{Sub}/items/{Id}";
+        // The collapsed URI is only bound to a POST, not a GET.
+        let m = model(
+            1,
+            vec![
+                op("GetItem", "GET", uri, "t#Input"),
+                op("CreateItem", "POST", "/things/{Sub}/items", "t#Input"),
+            ],
+        );
+        let got = names(&m, "GET", uri);
+        assert!(
+            got.contains(&"negative_too_short_Id".to_string()),
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn non_empty_too_short_trailing_label_is_kept() {
+        let uri = "/things/{Sub}/items/{Id}";
+        // min 3 -> the too-short value is "aa", which does not collapse.
+        let m = model(
+            3,
+            vec![
+                op("GetItem", "GET", uri, "t#Input"),
+                op("ListItems", "GET", "/things/{Sub}/items", "t#Input"),
+            ],
+        );
+        let got = names(&m, "GET", uri);
+        assert!(
+            got.contains(&"negative_too_short_Id".to_string()),
+            "{got:?}"
+        );
+    }
 }

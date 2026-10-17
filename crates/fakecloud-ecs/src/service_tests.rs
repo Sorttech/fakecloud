@@ -924,6 +924,164 @@ mod scheduler_reconcile {
         // ECS reports an unknown tag target as a ClientException.
         assert_eq!(err.code(), "ClientException");
     }
+
+    #[test]
+    fn capacity_providers_kinds_scoping_and_builtins() {
+        let svc = EcsService::new(empty_state());
+        let json_of = |resp: AwsResponse| -> Value {
+            serde_json::from_slice(resp.body.expect_bytes()).unwrap()
+        };
+        let asg =
+            json!({"autoScalingGroupArn": "arn:aws:autoscaling:us-east-1:1:autoScalingGroup:x"});
+        let mip = json!({
+            "infrastructureRoleArn": "arn:aws:iam::1:role/infra",
+            "instanceLaunchTemplate": {"ec2InstanceProfileArn": "arn:aws:iam::1:instance-profile/p",
+                "networkConfiguration": {"subnets": ["subnet-1"]}}
+        });
+
+        // A provider needs exactly one backing; reserved prefixes are refused.
+        for body in [
+            json!({"name": "bare"}),
+            json!({"name": "both", "autoScalingGroupProvider": asg, "managedInstancesProvider": mip, "cluster": "c1"}),
+            json!({"name": "FargateX", "autoScalingGroupProvider": asg}),
+        ] {
+            let err = svc
+                .create_capacity_provider(&ecs_request("CreateCapacityProvider", body))
+                .err()
+                .expect("invalid provider must be rejected");
+            assert_eq!(err.code(), "InvalidParameterException");
+        }
+        // Managed Instances providers need an existing cluster.
+        let err = svc
+            .create_capacity_provider(&ecs_request(
+                "CreateCapacityProvider",
+                json!({"name": "mi", "managedInstancesProvider": mip}),
+            ))
+            .err()
+            .unwrap();
+        assert_eq!(err.code(), "InvalidParameterException");
+        let err = svc
+            .create_capacity_provider(&ecs_request(
+                "CreateCapacityProvider",
+                json!({"name": "mi", "managedInstancesProvider": mip, "cluster": "nope"}),
+            ))
+            .err()
+            .unwrap();
+        assert_eq!(err.code(), "ClusterNotFoundException");
+
+        svc.create_cluster(&ecs_request("CreateCluster", json!({"clusterName": "c1"})))
+            .unwrap();
+        let created = json_of(
+            svc.create_capacity_provider(&ecs_request(
+                "CreateCapacityProvider",
+                json!({"name": "mi", "managedInstancesProvider": mip, "cluster": "c1"}),
+            ))
+            .unwrap(),
+        );
+        let cp = &created["capacityProvider"];
+        assert_eq!(cp["type"], "MANAGED_INSTANCES");
+        assert_eq!(cp["cluster"], "c1");
+        assert_eq!(cp["managedInstancesProvider"], mip);
+        assert!(cp.get("autoScalingGroupProvider").is_none(), "{cp}");
+        assert!(cp.get("updateStatus").is_none(), "no nulls: {cp}");
+
+        let created = json_of(
+            svc.create_capacity_provider(&ecs_request(
+                "CreateCapacityProvider",
+                json!({"name": "asg-cp", "autoScalingGroupProvider": asg}),
+            ))
+            .unwrap(),
+        );
+        assert_eq!(created["capacityProvider"]["type"], "EC2_AUTOSCALING");
+        assert!(created["capacityProvider"]
+            .get("managedInstancesProvider")
+            .is_none());
+
+        // Listing without a cluster: account-level providers, then FARGATE and
+        // FARGATE_SPOT; the cluster-scoped Managed Instances provider is not
+        // listed.
+        let all = json_of(
+            svc.describe_capacity_providers(&ecs_request("DescribeCapacityProviders", json!({})))
+                .unwrap(),
+        );
+        let names: Vec<&str> = all["capacityProviders"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["asg-cp", "FARGATE", "FARGATE_SPOT"]);
+        assert_eq!(all["capacityProviders"][1]["type"], "FARGATE");
+
+        // Listing for the cluster returns its Managed Instances provider.
+        let scoped = json_of(
+            svc.describe_capacity_providers(&ecs_request(
+                "DescribeCapacityProviders",
+                json!({"cluster": "c1"}),
+            ))
+            .unwrap(),
+        );
+        let names: Vec<&str> = scoped["capacityProviders"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["mi"]);
+
+        // Built-ins resolve by name; pagination walks the full list.
+        let by_name = json_of(
+            svc.describe_capacity_providers(&ecs_request(
+                "DescribeCapacityProviders",
+                json!({"capacityProviders": ["FARGATE_SPOT", "missing"]}),
+            ))
+            .unwrap(),
+        );
+        assert_eq!(by_name["capacityProviders"][0]["name"], "FARGATE_SPOT");
+        assert_eq!(by_name["failures"][0]["arn"], "missing");
+        let page = json_of(
+            svc.describe_capacity_providers(&ecs_request(
+                "DescribeCapacityProviders",
+                json!({"maxResults": 2}),
+            ))
+            .unwrap(),
+        );
+        assert_eq!(page["capacityProviders"].as_array().unwrap().len(), 2);
+        let token = page["nextToken"].as_str().unwrap().to_string();
+        let rest = json_of(
+            svc.describe_capacity_providers(&ecs_request(
+                "DescribeCapacityProviders",
+                json!({"maxResults": 2, "nextToken": token}),
+            ))
+            .unwrap(),
+        );
+        assert_eq!(rest["capacityProviders"][0]["name"], "FARGATE_SPOT");
+        assert!(rest.get("nextToken").is_none());
+
+        // An update must match the provider's kind.
+        let err = svc
+            .update_capacity_provider(&ecs_request(
+                "UpdateCapacityProvider",
+                json!({"name": "asg-cp", "managedInstancesProvider": {"propagateTags": "NONE"}}),
+            ))
+            .err()
+            .unwrap();
+        assert_eq!(err.code(), "InvalidParameterException");
+        let updated = json_of(
+            svc.update_capacity_provider(&ecs_request(
+                "UpdateCapacityProvider",
+                json!({"name": "mi", "cluster": "c1",
+                    "managedInstancesProvider": {"propagateTags": "CAPACITY_PROVIDER"}}),
+            ))
+            .unwrap(),
+        );
+        let mip_out = &updated["capacityProvider"]["managedInstancesProvider"];
+        assert_eq!(mip_out["propagateTags"], "CAPACITY_PROVIDER");
+        assert_eq!(
+            mip_out["infrastructureRoleArn"],
+            "arn:aws:iam::1:role/infra"
+        );
+    }
 }
 
 /// Trusts exactly one role, like a role whose trust policy names

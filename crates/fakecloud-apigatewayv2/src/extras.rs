@@ -1167,7 +1167,8 @@ impl ApiGatewayV2Service {
                 self.put_subresource(
                     req,
                     resource_id,
-                    segs.get(4).map(|s| s.to_string()),
+                    // Create mints the id; only Update addresses an existing page.
+                    None,
                     "product_pages",
                     aid,
                 )
@@ -1209,7 +1210,8 @@ impl ApiGatewayV2Service {
                 self.put_subresource(
                     req,
                     resource_id,
-                    segs.get(4).map(|s| s.to_string()),
+                    // Create mints the id; only Update addresses an existing page.
+                    None,
                     "product_rest_endpoint_pages",
                     aid,
                 )
@@ -1958,6 +1960,25 @@ impl ApiGatewayV2Service {
         account_id: &str,
     ) -> Result<AwsResponse, AwsServiceError> {
         let parent = parent_opt.ok_or_else(|| missing("Parent"))?.to_string();
+        // `id_opt` is set only by Update, which must address an existing page
+        // (NotFoundException otherwise) and is a partial update: members the
+        // request omits keep their stored value.
+        let existing = match &id_opt {
+            Some(id) => {
+                let accounts = self.state.read();
+                let found = accounts.get(account_id).and_then(|s| {
+                    let map = match store {
+                        "product_pages" => &s.product_pages,
+                        "product_rest_endpoint_pages" => &s.product_rest_endpoint_pages,
+                        _ => return None,
+                    };
+                    map.get(&parent).and_then(|m| m.get(id)).cloned()
+                });
+                Some(found.ok_or_else(|| not_found(store, id))?)
+            }
+            None => None,
+        };
+        let prior = |key: &str| existing.as_ref().and_then(|e| e.get(key)).cloned();
         let id = id_opt.unwrap_or_else(rand_id);
         let input = body(req);
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
@@ -1967,6 +1988,7 @@ impl ApiGatewayV2Service {
                 let mut dc = input
                     .get("DisplayContent")
                     .cloned()
+                    .or_else(|| prior("DisplayContent"))
                     .unwrap_or_else(|| json!({}));
                 if dc.get("title").and_then(|v| v.as_str()).is_none()
                     && dc.get("Title").and_then(|v| v.as_str()).is_none()
@@ -2023,10 +2045,23 @@ impl ApiGatewayV2Service {
                 if dc.get("Endpoint").and_then(|v| v.as_str()).is_none() {
                     dc["Endpoint"] = json!(id.clone());
                 }
+                if input.get("DisplayContent").is_none() {
+                    if let Some(prev) = prior("DisplayContent") {
+                        dc = prev;
+                    }
+                }
                 let rei = input
                     .get("RestEndpointIdentifier")
                     .cloned()
+                    .or_else(|| prior("RestEndpointIdentifier"))
                     .unwrap_or_else(|| json!({}));
+                // TryItState defaults to DISABLED when never set.
+                let try_it_state = input
+                    .get("TryItState")
+                    .filter(|v| v.is_string())
+                    .cloned()
+                    .or_else(|| prior("TryItState"))
+                    .unwrap_or_else(|| json!("DISABLED"));
                 json!({
                     "ProductRestEndpointPageId": id,
                     "ProductRestEndpointPageArn": crate::state::apigateway_arn(&req.region, "", &format!("/portalproducts/{}/productrestendpointpages/{}", parent, id)),
@@ -2037,7 +2072,7 @@ impl ApiGatewayV2Service {
                     "LastModified": now,
                     "DisplayContent": dc,
                     "StatusException": json!({}),
-                    "TryItState": "DISABLED",
+                    "TryItState": try_it_state,
                     "RestEndpointIdentifier": rei,
                 })
             }
@@ -2274,6 +2309,195 @@ mod tests {
         resource_id: Option<&str>,
     ) {
         run(&svc(), action, body, segs, api_id, resource_id);
+    }
+
+    #[test]
+    fn update_on_missing_portal_resources_is_not_found() {
+        let s = svc();
+        let cases: [(&str, &[&str], Option<&str>); 4] = [
+            (
+                "UpdateProductRestEndpointPage",
+                &[
+                    "v2",
+                    "portalproducts",
+                    "pp1",
+                    "productrestendpointpages",
+                    "nopage1234",
+                ],
+                Some("pp1"),
+            ),
+            (
+                "UpdateProductPage",
+                &["v2", "portalproducts", "pp1", "productpages", "nopage1234"],
+                Some("pp1"),
+            ),
+            (
+                "UpdatePortalProduct",
+                &["v2", "portalproducts", "noproduct1"],
+                Some("noproduct1"),
+            ),
+            (
+                "UpdatePortal",
+                &["v2", "portals", "noportal12"],
+                Some("noportal12"),
+            ),
+        ];
+        for (action, segs, resource_id) in cases {
+            let err = s
+                .handle_extra_action(action, &req(action, "{}", segs), None, resource_id)
+                .err()
+                .unwrap_or_else(|| panic!("{action} on a missing resource must fail"));
+            assert_eq!(err.code(), "NotFoundException", "{action}");
+        }
+        // Nothing was created by the failed updates.
+        let listed = s
+            .handle_extra_action(
+                "ListProductRestEndpointPages",
+                &req(
+                    "ListProductRestEndpointPages",
+                    "",
+                    &["v2", "portalproducts", "pp1", "productrestendpointpages"],
+                ),
+                None,
+                Some("pp1"),
+            )
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(listed.body.expect_bytes()).unwrap();
+        assert_eq!(v["items"], serde_json::json!([]), "{v}");
+    }
+
+    #[test]
+    fn product_page_update_keeps_omitted_display_content() {
+        let s = svc();
+        let base = ["v2", "portalproducts", "pp1", "productpages"];
+        let created = s
+            .handle_extra_action(
+                "CreateProductPage",
+                &req(
+                    "CreateProductPage",
+                    r#"{"displayContent":{"title":"Intro","body":"Hello"}}"#,
+                    &base,
+                ),
+                None,
+                Some("pp1"),
+            )
+            .unwrap();
+        let created: serde_json::Value =
+            serde_json::from_slice(created.body.expect_bytes()).unwrap();
+        let page_id = created["productPageId"].as_str().unwrap().to_string();
+        let segs = [
+            "v2",
+            "portalproducts",
+            "pp1",
+            "productpages",
+            page_id.as_str(),
+        ];
+        let updated = s
+            .handle_extra_action(
+                "UpdateProductPage",
+                &req("UpdateProductPage", "{}", &segs),
+                None,
+                Some("pp1"),
+            )
+            .unwrap();
+        let updated: serde_json::Value =
+            serde_json::from_slice(updated.body.expect_bytes()).unwrap();
+        assert_eq!(updated["displayContent"]["title"], "Intro", "{updated}");
+        assert_eq!(updated["displayContent"]["body"], "Hello", "{updated}");
+    }
+
+    #[test]
+    fn product_rest_endpoint_page_try_it_state_round_trips() {
+        let s = svc();
+        let json_of = |resp: fakecloud_core::service::AwsResponse| -> serde_json::Value {
+            serde_json::from_slice(resp.body.expect_bytes()).unwrap()
+        };
+        let base = ["v2", "portalproducts", "pp1", "productrestendpointpages"];
+
+        // Absent -> DISABLED default.
+        let created = json_of(
+            s.handle_extra_action(
+                "CreateProductRestEndpointPage",
+                &req(
+                    "CreateProductRestEndpointPage",
+                    r#"{"restEndpointIdentifier":{"identifierParts":{"restApiId":"a","stage":"s","method":"GET","path":"/"}}}"#,
+                    &base,
+                ),
+                None,
+                Some("pp1"),
+            )
+            .unwrap(),
+        );
+        assert_eq!(created["tryItState"], "DISABLED");
+
+        // Sent ENABLED -> stored and returned as sent.
+        let created = json_of(
+            s.handle_extra_action(
+                "CreateProductRestEndpointPage",
+                &req(
+                    "CreateProductRestEndpointPage",
+                    r#"{"tryItState":"ENABLED","restEndpointIdentifier":{"identifierParts":{"restApiId":"a","stage":"s","method":"GET","path":"/"}}}"#,
+                    &base,
+                ),
+                None,
+                Some("pp1"),
+            )
+            .unwrap(),
+        );
+        assert_eq!(created["tryItState"], "ENABLED");
+        let page_id = created["productRestEndpointPageId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let page_segs = [
+            "v2",
+            "portalproducts",
+            "pp1",
+            "productrestendpointpages",
+            page_id.as_str(),
+        ];
+
+        // Update without TryItState keeps the stored value and identifier.
+        let updated = json_of(
+            s.handle_extra_action(
+                "UpdateProductRestEndpointPage",
+                &req("UpdateProductRestEndpointPage", "{}", &page_segs),
+                None,
+                Some("pp1"),
+            )
+            .unwrap(),
+        );
+        assert_eq!(updated["tryItState"], "ENABLED");
+        assert_eq!(
+            updated["restEndpointIdentifier"]["identifierParts"]["restApiId"],
+            "a"
+        );
+
+        // Update with TryItState applies it; Get reads it back.
+        let updated = json_of(
+            s.handle_extra_action(
+                "UpdateProductRestEndpointPage",
+                &req(
+                    "UpdateProductRestEndpointPage",
+                    r#"{"tryItState":"DISABLED"}"#,
+                    &page_segs,
+                ),
+                None,
+                Some("pp1"),
+            )
+            .unwrap(),
+        );
+        assert_eq!(updated["tryItState"], "DISABLED");
+        let got = json_of(
+            s.handle_extra_action(
+                "GetProductRestEndpointPage",
+                &req("GetProductRestEndpointPage", "", &page_segs),
+                None,
+                Some("pp1"),
+            )
+            .unwrap(),
+        );
+        assert_eq!(got["tryItState"], "DISABLED");
     }
 
     #[test]

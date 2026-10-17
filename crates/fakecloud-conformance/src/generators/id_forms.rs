@@ -203,6 +203,7 @@ fn merged_traits(target: &ShapeTraits, member: &ShapeTraits) -> ShapeTraits {
             .clone()
             .or_else(|| target.ec2_query_name.clone()),
         xml_name: member.xml_name.clone().or_else(|| target.xml_name.clone()),
+        xml_flattened: member.xml_flattened || target.xml_flattened,
     }
 }
 
