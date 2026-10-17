@@ -1665,7 +1665,7 @@ mod tests {
         let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
         assert_eq!(archive.len(), 1);
         let entry = archive.by_index(0).unwrap();
-        assert_eq!(entry.name(), "a/b.txt");
+        assert_eq!(entry.name().unwrap(), "a/b.txt");
     }
 
     #[test]

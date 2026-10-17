@@ -1,30 +1,48 @@
 +++
 title = "Firehose"
-description = "Amazon Data Firehose delivery streams (control plane), JSON 1.1 protocol."
+description = "Amazon Data Firehose delivery streams and immediate uncompressed S3 delivery, JSON 1.1 protocol."
 weight = 32
 +++
 
-fakecloud implements Amazon Data Firehose's JSON 1.1 control plane: delivery stream CRUD + tagging. Records sent via `PutRecord` / `PutRecordBatch` are accepted and acked; data-plane fan-out to S3 / OpenSearch / Redshift / Splunk is not implemented (use the [S3](/docs/services/s3/) endpoints + a real Firehose if you need actual delivery).
+fakecloud implements Amazon Data Firehose's JSON 1.1 control plane and real uncompressed delivery to [S3](/docs/services/s3/). `PutRecord` writes one object; `PutRecordBatch` concatenates the valid records in that request into one object. Separate calls do not share a buffer.
 
-**Status: control-plane parity. Data plane stops at acknowledgement — records are not written to destinations.**
+**Status: control-plane parity and immediate uncompressed S3 delivery. Size/time buffering and compression are not implemented.**
 
 ## Supported today
 
-- **Delivery streams** — `CreateDeliveryStream` / `DescribeDeliveryStream` / `ListDeliveryStreams` / `DeleteDeliveryStream` / `UpdateDestination`. Both `DirectPut` and `KinesisStreamAsSource` source types round-trip. Streams progress through `CREATING -> ACTIVE` on create and `DELETING -> deleted` on delete.
-- **Destinations** — `ExtendedS3DestinationConfiguration`, `RedshiftDestinationConfiguration`, `ElasticsearchDestinationConfiguration`, `AmazonopensearchserviceDestinationConfiguration`, `SplunkDestinationConfiguration`, `HttpEndpointDestinationConfiguration`, `SnowflakeDestinationConfiguration`, `IcebergDestinationConfiguration`. Configuration round-trips verbatim through `UpdateDestination`.
-- **Buffering hints** — `BufferingHints` (`SizeInMBs`, `IntervalInSeconds`) are **range-checked** on `CreateDeliveryStream` and `UpdateDestination`:
+- **Delivery streams**: `CreateDeliveryStream` / `DescribeDeliveryStream` / `ListDeliveryStreams` / `DeleteDeliveryStream` / `UpdateDestination`. Both `DirectPut` and `KinesisStreamAsSource` source types round-trip; Kinesis-source polling is not implemented. Created streams are immediately `ACTIVE` and deletion removes them immediately.
+- **Destinations**: `ExtendedS3DestinationConfiguration`, `RedshiftDestinationConfiguration`, `ElasticsearchDestinationConfiguration`, `AmazonopensearchserviceDestinationConfiguration`, `SplunkDestinationConfiguration`, `HttpEndpointDestinationConfiguration`, `SnowflakeDestinationConfiguration`, `IcebergDestinationConfiguration`. Configuration round-trips verbatim through `UpdateDestination`.
+- **Buffering hints**: `BufferingHints` (`SizeInMBs`, `IntervalInSeconds`) are **range-checked** on `CreateDeliveryStream` and `UpdateDestination`:
   - `SizeInMBs`: 1 - 128 MB.
-  - `IntervalInSeconds`: `0` (disabled) or 60 - 900 s.
+  - `IntervalInSeconds`: `0` or 60 - 900 s.
 
-  Out-of-range values return `InvalidArgumentException` with the AWS-shaped message, matching real Firehose.
-- **Records** — `PutRecord` / `PutRecordBatch` accept records, assign per-record `RecordId`s, and update `DeliveryStreamStatus` / `LastUpdateTimestamp`. Batches up to 500 records / 4 MB are honoured; over-limit batches return `ServiceUnavailableException`.
-- **Tags** — `ListTagsForDeliveryStream` / `TagDeliveryStream` / `UntagDeliveryStream`. Keyed by stream ARN.
-- **Server-side encryption** — `StartDeliveryStreamEncryption` / `StopDeliveryStreamEncryption`. Start sets the stream's `DeliveryStreamEncryptionConfiguration` to `Status=ENABLED` with the requested `KeyType` (defaults `AWS_OWNED_CMK`; stores the `KeyARN` for `CUSTOMER_MANAGED_CMK`); Stop flips it to `DISABLED`. The config is surfaced on `DescribeDeliveryStream`. Unknown streams return `ResourceNotFoundException`.
+  Out-of-range values return `InvalidArgumentException`. These hints are configuration-only: delivery is immediate regardless of their values.
+- **Records**: `PutRecord` / `PutRecordBatch` assign per-record `RecordId`s and deliver valid decoded data to a configured S3 destination. Binary bytes and producer-supplied delimiters are preserved exactly; no separators are added unless the `AppendDelimiterToRecord` processor is enabled. Without it, an all-empty delivery produces no object.
+- **New line delimiter**: when `ProcessingConfiguration` has `Enabled: true` and its `Processors` include `AppendDelimiterToRecord`, a newline (`\n`) is written after every record, including the last one and empty records. This applies to API deliveries and to internal CloudWatch Logs and SES deliveries. The optional `Delimiter` parameter is stored but not interpreted: AWS documents only a new line delimiter. Other processors in the same configuration are not run. CloudFormation `AWS::KinesisFirehose::DeliveryStream` resources store the same `ProcessingConfiguration`.
+- **S3 output**: static prefixes, UTC date hierarchy, stream/version/time/UUID object names, and `FileExtension` overrides. Objects have `Content-Type: application/octet-stream`, no content encoding, and the body's MD5 as their `ETag`. Delivered objects survive a restart in persistent storage mode.
+- **Tags**: `ListTagsForDeliveryStream` / `TagDeliveryStream` / `UntagDeliveryStream`. Keyed by stream ARN.
+- **Server-side encryption**: `StartDeliveryStreamEncryption` / `StopDeliveryStreamEncryption`. Start sets the stream's `DeliveryStreamEncryptionConfiguration` to `Status=ENABLED` with the requested `KeyType` (defaults `AWS_OWNED_CMK`; stores the `KeyARN` for `CUSTOMER_MANAGED_CMK`); Stop flips it to `DISABLED`. The config is surfaced on `DescribeDeliveryStream`. Unknown streams return `ResourceNotFoundException`.
+
+## S3 object bytes and names
+
+Create the destination bucket before sending records. Within one `PutRecordBatch`, records `abc`, `def\n`, and the binary bytes `00 ff` become exactly `abcdef\n` followed by `00 ff`. Producers must supply their own delimiters, such as a newline for each JSON record, or enable `AppendDelimiterToRecord`, which writes the same records as exactly `abc\ndef\n\n` followed by `00 ff 0a`.
+
+For a static prefix, the key format is:
+
+```text
+<prefix>yyyy/MM/dd/HH/<stream>-<version>-yyyy-MM-dd-HH-mm-ss-<uuid><extension>
+```
+
+The prefix and suffix times are UTC. With immediate delivery they use the same delivery time. The version comes from the delivery stream configuration and increments on `UpdateDestination`. The UUID is a full hyphenated UUID.
+
+An absent or empty prefix starts at `yyyy/MM/dd/HH/`. A prefix of `events/` produces `events/yyyy/MM/dd/HH/`; `events` produces `eventsyyyy/MM/dd/HH/`, without an inserted slash. Uncompressed output has no default extension. `FileExtension: ".custom.log"` appends `.custom.log`; an absent or empty override appends nothing. `FileExtension` must be empty or a dot followed by lowercase letters, digits, or `!-_.*'()`, with at most 128 characters; other values return `InvalidArgumentException` from `CreateDeliveryStream` and `UpdateDestination`, and make a CloudFormation `AWS::KinesisFirehose::DeliveryStream` resource fail.
 
 ## Smoke test
 
 ```sh
 fakecloud &
+
+aws --endpoint-url http://localhost:4566 s3api create-bucket --bucket my-bucket
 
 aws --endpoint-url http://localhost:4566 firehose create-delivery-stream \
   --delivery-stream-name events \
@@ -32,7 +50,10 @@ aws --endpoint-url http://localhost:4566 firehose create-delivery-stream \
   --extended-s3-destination-configuration '{
     "RoleARN": "arn:aws:iam::000000000000:role/firehose",
     "BucketARN": "arn:aws:s3:::my-bucket",
-    "BufferingHints": {"SizeInMBs": 5, "IntervalInSeconds": 300}
+    "BufferingHints": {"SizeInMBs": 5, "IntervalInSeconds": 300},
+    "CompressionFormat": "UNCOMPRESSED",
+    "Prefix": "events/",
+    "FileExtension": ".json"
   }'
 
 aws --endpoint-url http://localhost:4566 firehose describe-delivery-stream \
@@ -42,13 +63,9 @@ aws --endpoint-url http://localhost:4566 firehose put-record \
   --delivery-stream-name events \
   --record Data=$(echo -n '{"id":"abc"}' | base64)
 
-# Out-of-range BufferingHints is rejected to match real Firehose.
-aws --endpoint-url http://localhost:4566 firehose update-destination \
-  --delivery-stream-name events \
-  --current-delivery-stream-version-id 1 \
-  --destination-id destinationId-000000000001 \
-  --extended-s3-destination-update 'BufferingHints={SizeInMBs=999,IntervalInSeconds=10}'
-# -> InvalidArgumentException
+# Delivery is immediate even with the buffering hints above.
+aws --endpoint-url http://localhost:4566 s3api list-objects-v2 --bucket my-bucket
+# Read the returned key with s3api get-object to inspect the original bytes.
 ```
 
 ## Introspection
@@ -94,9 +111,11 @@ See [`reference/introspection`](/docs/reference/introspection/) for the full end
 
 ## Caveats
 
-Data delivery is not implemented. `PutRecord` returns a `RecordId` but the bytes are dropped — no S3 object is written, no Redshift COPY is issued, no OpenSearch document is indexed, no HTTP endpoint is hit. Buffering, format conversion (Parquet/ORC), and dynamic partitioning are all configuration-only.
+Only uncompressed S3 delivery is implemented. `CompressionFormat` still round-trips as configuration, but selecting GZIP, Snappy, or another codec does not encode the body or add a codec extension. Use `UNCOMPRESSED` when testing delivered objects.
 
-This is enough to test IAM policy paths, SDK wiring, retry / batch logic, and BufferingHints validation. It is not enough to test downstream delivery semantics.
+Buffering hints do not aggregate separate calls or delay delivery. `Prefix` is used verbatim: `!{namespace:value}` expressions are not evaluated, so they appear literally in keys and the default `yyyy/MM/dd/HH/` hierarchy is still appended. Keys always use UTC; `CustomTimeZone` is stored but not applied. Processing configuration other than `AppendDelimiterToRecord` (Lambda and the other built-in processors), format conversion (Parquet/ORC), dynamic partitioning, delivered-object encryption, and S3 backup pipelines are configuration-only: records are written as received. Other destinations are not delivered to, and Firehose S3 writes do not dispatch S3 notifications.
+
+An acknowledgment does not guarantee delivery: a missing destination bucket or malformed bucket ARN is logged while the API still returns success. These failed deliveries are not retained or retried. If a persistent-store write fails, the object is kept in memory for the current session only. Model-level record and batch size limits are not enforced.
 
 ## Source
 

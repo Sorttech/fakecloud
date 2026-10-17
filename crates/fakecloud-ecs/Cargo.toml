@@ -29,11 +29,15 @@ sha2 = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+shlex = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+fakecloud-core = { workspace = true, features = ["test-support"] }
 
 [features]
 # Opt-in integration tests needing a real Kubernetes cluster (a local

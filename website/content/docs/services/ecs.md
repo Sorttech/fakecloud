@@ -20,7 +20,7 @@ fakecloud implements Amazon Elastic Container Service (ECS) with full API covera
 - **Attributes** — `PutAttributes`, `DeleteAttributes`, `ListAttributes`
 - **Capacity providers** — `CreateCapacityProvider`, `DeleteCapacityProvider`, `DescribeCapacityProviders`, `UpdateCapacityProvider`
 - **Task protection** — `GetTaskProtection`, `UpdateTaskProtection`
-- **ECS Exec** — `ExecuteCommand` proxies to `docker exec` against the task's running container
+- **ECS Exec** — `ExecuteCommand` starts the command detached in the task's running container (`docker exec` or `podman exec`; run as given rather than through a shell; stopped when the task stops, or after 20 minutes in images that ship `timeout`) and returns the session at once. Output is not streamed: the session has no `streamUrl`, so `aws ecs execute-command --interactive` cannot attach a shell.
 - **Agent surface** — `SubmitContainerStateChange`, `SubmitTaskStateChange`, `SubmitAttachmentStateChanges`, `DiscoverPollEndpoint`
 - **Tagging** — `TagResource`, `UntagResource`, `ListTagsForResource` (clusters and task definitions)
 - **Account settings** — `PutAccountSetting`, `PutAccountSettingDefault`, `DeleteAccountSetting`, `ListAccountSettings`
