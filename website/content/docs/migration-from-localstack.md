@@ -9,13 +9,13 @@ If your local development workflow is blocked by LocalStack's account requiremen
 ## Key Differences
 - **No API Key**: fakecloud is fully functional offline. No `ACTIVATE_PRO` or account login required.
 - **Single Binary**: Replace heavy Docker-in-Docker setups with a ~19MB binary that starts in <300ms.
-- **Parity**: 100% API conformance across 7,553 operations, including features LocalStack gates behind Pro (like ECR and Bedrock).
+- **Parity**: 100% API conformance across 7,612 operations, including features LocalStack gates behind Pro (like ECR and Bedrock).
 
 ## Service Mapping
 | Feature | LocalStack | fakecloud |
 | :--- | :--- | :--- |
 | **ECR** | Paid (Pro) | Included (Full OCI Support) |
-| **Bedrock** | Limited/Paid | Included (216 ops across 4 APIs) |
+| **Bedrock** | Limited/Paid | Included (222 ops across 4 APIs) |
 | **IAM** | Partial (Community) | 100% Conformance |
 | **S3/Lambda/SQS** | Included | Included (High Fidelity) |
 

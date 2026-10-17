@@ -4,7 +4,7 @@ description = "Tables, items, transactions, PartiQL, backups, global tables, str
 weight = 6
 +++
 
-fakecloud implements **57 of 57** DynamoDB operations at 100% Smithy conformance.
+fakecloud implements **58 of 58** DynamoDB operations at 100% Smithy conformance.
 
 ## Regions
 

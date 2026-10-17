@@ -4,7 +4,7 @@ description = "Data Streams, records, shard iterators, retention, tagging."
 weight = 16
 +++
 
-fakecloud implements **44 of 44** Kinesis operations at 100% Smithy conformance.
+fakecloud implements **45 of 45** Kinesis operations at 100% Smithy conformance.
 
 ## Supported features
 

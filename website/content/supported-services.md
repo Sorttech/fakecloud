@@ -1,14 +1,14 @@
 +++
 title = "AWS Service Coverage & API Conformance"
-description = "fakecloud provides 100% API conformance across 7,553 operations. Explore our supported AWS services for local development."
+description = "fakecloud provides 100% API conformance across 7,612 operations. Explore our supported AWS services for local development."
 template = "page.html"
 +++
 
-fakecloud provides 100% API conformance across 7,553 operations. Unlike mocks, fakecloud is built against official AWS Smithy models to ensure wire-protocol compatibility and deterministic behavior for local development.
+fakecloud provides 100% API conformance across 7,612 operations. Unlike mocks, fakecloud is built against official AWS Smithy models to ensure wire-protocol compatibility and deterministic behavior for local development.
 
 ## Coverage Summary
 - **Total Services**: 106
-- **Total Operations**: 7,553
+- **Total Operations**: 7,612
 - **Conformance Engine**: 257,288 Smithy-based test variants
 - **Startup Time**: ~300ms
 
@@ -16,14 +16,14 @@ fakecloud provides 100% API conformance across 7,553 operations. Unlike mocks, f
 
 ### Compute & Containers
 - **EC2**: 807 operations. The complete EC2 control plane — VPCs, subnets, security groups, route tables, gateways, instances, EBS, AMIs, the full 74-op Transit Gateway surface, Site-to-Site + Client VPN, IPAM, Verified Access, Network Insights, and Outpost / local-gateway networking. Instances run as real containers — Docker/Podman by default or native Kubernetes Pods (`FAKECLOUD_EC2_BACKEND=k8s`) — running user-data at boot, with start/stop/reboot/terminate mapped to the container lifecycle and `GetConsoleOutput` returning the container log; degrades to metadata-only when no container runtime is present.
-- **Lambda**: 73 operations. Full execution environment in real Docker containers across 31 runtimes, cross-service triggers (S3, SNS, SQS, EventBridge).
+- **Lambda**: 88 operations. Full execution environment in real Docker containers across 31 runtimes, cross-service triggers (S3, SNS, SQS, EventBridge).
 - **ECR**: 58 operations. Full OCI v2 Distribution protocol support for `docker push` and `docker pull`.
 - **ECS**: 77 operations. Real Fargate-style task execution via Docker, services with rolling deployments, ECS Exec.
 
 ### Storage & Databases
-- **S3**: 107 operations. Bucket lifecycle, Object tagging, Multipart uploads, real `SelectObjectContent` EventStream.
+- **S3**: 112 operations. Bucket lifecycle, Object tagging, Multipart uploads, real `SelectObjectContent` EventStream.
 - **DynamoDB**: 58 operations. TTL, GSI/LSI, and DynamoDB Streams.
-- **RDS**: 163 operations. Real Postgres, MySQL, MariaDB, Oracle, SQL Server, and Db2 via Docker.
+- **RDS**: 164 operations. Real Postgres, MySQL, MariaDB, Oracle, SQL Server, and Db2 via Docker.
 - **RDS Data API**: 6 operations. Real SQL (`ExecuteStatement`/`BatchExecuteStatement`) on the backing Postgres/MySQL container with typed parameters and results, plus transactions (`BeginTransaction`/`CommitTransaction`/`RollbackTransaction`).
 - **Redshift**: 141 operations. Full control plane — clusters, snapshots, parameter/subnet/security groups, snapshot schedules and copy grants, endpoint access, per-cluster logging, cross-region snapshot-copy config, and tagging. No SQL data plane (that is the separate `redshift-data` API).
 - **Database Migration Service (DMS)**: 119 operations. Full control plane — replication instances (settle to `available`), endpoints with per-engine settings, replication tasks (with assessment runs and table statistics), replication subnet groups, event subscriptions, certificates, connections (`TestConnection`), serverless replication configs and replications, data providers, instance profiles, migration projects, schema-conversion / metadata-model requests, Fleet Advisor, recommendations, account attributes, and tagging. Real CRUD with pagination and filters. No data-migration engine — the actual row movement is out of scope, matching how LocalStack Community mocks DMS.
@@ -39,10 +39,10 @@ fakecloud provides 100% API conformance across 7,553 operations. Unlike mocks, f
 - **Amazon MSK**: 64 operations (complete) with a real, connectable Kafka broker data plane. Signing as `kafka`, each provisioned cluster is backed by a REAL single-node Apache Kafka broker container (`apache/kafka:3.8.0`, KRaft combined mode): `CreateCluster` background-spawns the broker and settles `CREATING` -> `ACTIVE` only once it actually serves, `GetBootstrapBrokers` returns the REAL reachable `host:port` a genuine Kafka client produces and consumes through, and topic operations (`CreateTopic`/`DescribeTopic`/`ListTopics`/`UpdateTopic`/`DeleteTopic`/`DescribeTopicPartitions`) are driven against the live broker with its own `kafka-topics.sh`/`kafka-configs.sh` tools; `RebootBroker` restarts the container in place (preserving the topic log), `DeleteCluster` tears it down, and an ACTIVE cluster reconciles on restart by re-attaching its persisted container. Single-container simplification: replication factor is clamped to 1 and `ListNodes` surfaces broker 1 as the live node. Also the full control plane: provisioned and serverless clusters (`CreateCluster`/`CreateClusterV2`, monotonic `arn:aws:kafka:...:cluster/<name>/<uuid>-<n>` ARNs, `ClusterNameFilter`/`ClusterTypeFilter` + pagination, region-scoped, duplicate-name `ConflictException`, the `DescribeClusterV2` provisioned/serverless union), the eleven `Update*`/`RebootBroker` operations that each record a settling `ClusterOperation` and mutate the cluster, configurations (base64 `ServerProperties`, monotonic revisions), SCRAM secret association, cluster resource policies, client VPC connections and replicators (full CRUD), the supported/compatible Kafka version catalogs, and ARN-keyed tagging, with persistence (in-flight lifecycle transitions reconcile on restart). Degrades to control-plane-only (cosmetic bootstrap strings, in-memory topics) when no container runtime is available, or for serverless clusters. CloudFormation `AWS::MSK::*` provisioning is a later batch.
 - **Amazon S3 Glacier**: 33 operations (complete). Full Glacier surface with a real data plane: vaults (create/describe/delete/list), archive upload/delete storing the real bytes with a computed SHA-256 tree hash, multipart uploads assembled into a stored archive, retrieval and inventory jobs that settle to `Succeeded` on read so `GetJobOutput` returns the exact uploaded bytes (or a JSON inventory), vault notifications, vault access policy, the vault-lock state machine (`InProgress` -> `Locked` with a 24h lock-id expiry), per-vault tags, the account data-retrieval policy, and provisioned capacity, with persistence (archives survive restart). Account-scoped paths accept the literal `-`; archive/upload/job ids and `x-amz-sha256-tree-hash` / `Location` are mirrored in response headers.
 - **AWS AppConfig**: 58 operations (complete). Full AppConfig across both `appconfig` (56 ops) and `appconfigdata` (2 ops): applications, environments, configuration profiles, hosted configuration versions (the raw request bytes and content type are stored and returned verbatim, with an auto-incrementing version number), custom and AWS-predefined deployment strategies, deployments (settled to `COMPLETE` synchronously with an event log), extensions and extension associations, experiment definitions and runs, account settings, `ValidateConfiguration`, and tagging, with persistence. Real data plane: `StartConfigurationSession` -> `GetLatestConfiguration` resolves a session token to the latest deployed hosted-config bytes.
-- **AWS Backup**: 109 operations (complete). Full AWS Backup control plane: backup plans (with versions) + selections, backup vaults (standard / logically-air-gapped / restore-access) with notifications, access policies, and lock configuration, recovery points, backup / copy / restore / scan jobs (progressed synthetically to a terminal state so Describe/List show completed work; `StartBackupJob` records a synthetic recovery point that `DescribeRecoveryPoint` resolves), frameworks, report plans + jobs, legal holds, restore-testing plans + selections, tiering configurations, protected resources, tags, and account-scoped global / region settings, with persistence. No real backup engine runs (control-plane emulation, matching LocalStack Community).
+- **AWS Backup**: 115 operations (complete). Full AWS Backup control plane: backup plans (with versions) + selections, backup vaults (standard / logically-air-gapped / restore-access) with notifications, access policies, and lock configuration, recovery points, backup / copy / restore / scan jobs (progressed synthetically to a terminal state so Describe/List show completed work; `StartBackupJob` records a synthetic recovery point that `DescribeRecoveryPoint` resolves), frameworks, report plans + jobs, legal holds, restore-testing plans + selections, tiering configurations, protected resources, tags, and account-scoped global / region settings, with persistence. No real backup engine runs (control-plane emulation, matching LocalStack Community).
 
 ### AI & Machine Learning
-- **Bedrock**: 216 operations across 4 APIs (Bedrock 103, Bedrock Runtime 10, Bedrock Agent 72, Bedrock Agent Runtime 31). Guardrails, Model Customization, Provisioned Throughput, Agents, Knowledge Bases.
+- **Bedrock**: 222 operations across 4 APIs (Bedrock 108, Bedrock Runtime 11, Bedrock Agent 72, Bedrock Agent Runtime 31). Guardrails, Model Customization, Provisioned Throughput, Agents, Knowledge Bases.
 - **Bedrock Runtime**: Deterministic `InvokeModel`, `InvokeModelWithResponseStream`, and `Converse` APIs (echo / configurable-response mode; no real inference).
 
 ### Messaging & Integration

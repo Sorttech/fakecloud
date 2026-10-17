@@ -4,7 +4,7 @@ description = "User pools, app clients, MFA, identity providers, full authentica
 weight = 15
 +++
 
-fakecloud implements **126 of 126** Cognito User Pools operations at 100% Smithy conformance.
+fakecloud implements **132 of 132** Cognito User Pools operations at 100% Smithy conformance.
 
 ## Supported features
 

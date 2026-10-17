@@ -6,7 +6,7 @@ weight = 24
 
 fakecloud implements CloudFront's REST-XML control plane focused on the operations real applications and Terraform stacks rely on: distribution lifecycle, invalidations, alias and web ACL association, tags, the full policy resource surface (OAC + Cache/OriginRequest/ResponseHeaders/ContinuousDeployment), CloudFront Functions, public keys + key groups, key value stores, legacy origin access identities, per-distribution monitoring subscriptions, the legacy RTMP streaming distributions, field-level encryption configs + profiles, realtime log configs, VPC origins, anycast IP lists, trust stores, resource policies, connection groups, domain association + DNS verification, managed certificate details, and the promote-staging distribution swap. 147 operations.
 
-**Status: Batches 1-6b shipped, plus ConnectionFunctions, DistributionTenants, and real `boa_engine`-backed `TestFunction` / `TestConnectionFunction` execution.** 147 of 147 operations.
+**Status: Batches 1-6b shipped, plus ConnectionFunctions, DistributionTenants, and real `boa_engine`-backed `TestFunction` / `TestConnectionFunction` execution.** 167 of 167 operations.
 
 ## Supported today
 

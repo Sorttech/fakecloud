@@ -4,7 +4,7 @@ description = "AWS WAF v2 — Web ACLs, rule groups, IP sets, regex pattern sets
 weight = 28
 +++
 
-fakecloud implements AWS WAF v2's full JSON 1.1 control plane: 55 operations covering Web ACLs, rule groups, IP sets, regex pattern sets, API keys, logging, permission policies, the managed rule catalog, and mobile SDK lookups. 100% Smithy conformance.
+fakecloud implements AWS WAF v2's full JSON 1.1 control plane: 59 operations covering Web ACLs, rule groups, IP sets, regex pattern sets, API keys, logging, permission policies, the managed rule catalog, and mobile SDK lookups. 100% Smithy conformance.
 
 **Status: 100% control-plane coverage. No data-plane (no actual HTTP request inspection).**
 
