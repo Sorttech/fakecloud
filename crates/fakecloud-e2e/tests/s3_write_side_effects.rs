@@ -4,7 +4,9 @@
 //! (Firehose here), plus the replication rules S3 enforces around them.
 
 use aws_sdk_firehose::primitives::Blob;
-use aws_sdk_firehose::types::{BufferingHints, ExtendedS3DestinationConfiguration, Record};
+use aws_sdk_firehose::types::{
+    BufferingHints, CompressionFormat, ExtendedS3DestinationConfiguration, Record,
+};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, DeleteMarkerReplication,
@@ -120,6 +122,15 @@ async fn wire_created_events_to_queue(
 }
 
 async fn firehose_to(server: &TestServer, stream: &str, bucket: &str) -> aws_sdk_firehose::Client {
+    firehose_to_with_compression(server, stream, bucket, CompressionFormat::Uncompressed).await
+}
+
+async fn firehose_to_with_compression(
+    server: &TestServer,
+    stream: &str,
+    bucket: &str,
+    compression: CompressionFormat,
+) -> aws_sdk_firehose::Client {
     let firehose = server.firehose_client().await;
     firehose
         .create_delivery_stream()
@@ -129,10 +140,11 @@ async fn firehose_to(server: &TestServer, stream: &str, bucket: &str) -> aws_sdk
                 .role_arn("arn:aws:iam::123456789012:role/firehose")
                 .bucket_arn(format!("arn:aws:s3:::{bucket}"))
                 .prefix("delivered/")
+                .compression_format(compression)
                 .buffering_hints(
                     BufferingHints::builder()
                         .size_in_mbs(5)
-                        .interval_in_seconds(60)
+                        .interval_in_seconds(0)
                         .build(),
                 )
                 .build()
@@ -155,7 +167,17 @@ async fn put_record(firehose: &aws_sdk_firehose::Client, stream: &str, data: &[u
 }
 
 async fn only_key(s3: &aws_sdk_s3::Client, bucket: &str) -> String {
-    let listing = s3.list_objects_v2().bucket(bucket).send().await.unwrap();
+    let listing = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let listing = s3.list_objects_v2().bucket(bucket).send().await.unwrap();
+            if !listing.contents().is_empty() {
+                return listing;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("delivered object within 10s");
     let contents = listing.contents();
     assert_eq!(contents.len(), 1, "{contents:?}");
     contents[0].key().unwrap().to_string()
@@ -334,6 +356,118 @@ async fn firehose_delivery_fires_notification_and_is_replicated() {
     assert_eq!(replica.version_id(), source.version_id());
     let body = replica.body.collect().await.unwrap().into_bytes();
     assert_eq!(body.as_ref(), b"firehose-record");
+}
+
+#[tokio::test]
+async fn compressed_firehose_keeps_s3_side_effects_and_persistent_metadata() {
+    use aws_sdk_s3::types::ChecksumMode;
+    use std::io::Read;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut server = TestServer::start_persistent(tmp.path()).await;
+    let s3 = server.s3_client().await;
+    let sqs = server.sqs_client().await;
+    versioned_bucket(&s3, "gzip-fx-src").await;
+    versioned_bucket(&s3, "gzip-fx-dst").await;
+    s3.put_bucket_encryption()
+        .bucket("gzip-fx-src")
+        .server_side_encryption_configuration(
+            ServerSideEncryptionConfiguration::builder()
+                .rules(
+                    ServerSideEncryptionRule::builder()
+                        .apply_server_side_encryption_by_default(
+                            ServerSideEncryptionByDefault::builder()
+                                .sse_algorithm(ServerSideEncryption::Aes256)
+                                .build()
+                                .unwrap(),
+                        )
+                        .build(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    put_replication(
+        &s3,
+        "gzip-fx-src",
+        vec![rule("all", 1, "", "gzip-fx-dst", false)],
+    )
+    .await
+    .unwrap();
+    let queue = wire_created_events_to_queue(&s3, &sqs, "gzip-fx-src", "gzip-fx-events").await;
+    let firehose = firehose_to_with_compression(
+        &server,
+        "gzip-fx-stream",
+        "gzip-fx-src",
+        CompressionFormat::Gzip,
+    )
+    .await;
+    put_record(&firehose, "gzip-fx-stream", b"compressed\x00\xff").await;
+    let key = only_key(&s3, "gzip-fx-src").await;
+    assert!(key.ends_with(".gz"));
+    let source = s3
+        .get_object()
+        .bucket("gzip-fx-src")
+        .key(&key)
+        .checksum_mode(ChecksumMode::Enabled)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(source.content_encoding(), Some("gzip"));
+    assert_eq!(
+        source.server_side_encryption(),
+        Some(&ServerSideEncryption::Aes256)
+    );
+    assert_eq!(
+        source.replication_status(),
+        Some(&ReplicationStatus::Completed)
+    );
+    let version = source.version_id().unwrap().to_owned();
+    let checksum = source.checksum_crc64_nvme().unwrap().to_owned();
+    let raw = source.body.collect().await.unwrap().into_bytes();
+    let mut decoded = Vec::new();
+    flate2::read::GzDecoder::new(raw.as_ref())
+        .read_to_end(&mut decoded)
+        .unwrap();
+    assert_eq!(decoded, b"compressed\x00\xff");
+    let event = sqs
+        .receive_message()
+        .queue_url(&queue)
+        .wait_time_seconds(2)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(event.messages().len(), 1);
+    let event: serde_json::Value =
+        serde_json::from_str(event.messages()[0].body().unwrap()).unwrap();
+    assert_eq!(event["Records"][0]["eventName"], "ObjectCreated:Put");
+    assert_eq!(event["Records"][0]["s3"]["object"]["size"], raw.len());
+    assert_eq!(event["Records"][0]["s3"]["object"]["versionId"], version);
+    for restart in [false, true] {
+        if restart {
+            server.restart().await;
+        }
+        let s3 = server.s3_client().await;
+        for (bucket, status) in [
+            ("gzip-fx-src", ReplicationStatus::Completed),
+            ("gzip-fx-dst", ReplicationStatus::Replica),
+        ] {
+            let object = s3
+                .get_object()
+                .bucket(bucket)
+                .key(&key)
+                .checksum_mode(ChecksumMode::Enabled)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(object.version_id(), Some(version.as_str()));
+            assert_eq!(object.content_encoding(), Some("gzip"));
+            assert_eq!(object.replication_status(), Some(&status));
+            assert_eq!(object.checksum_crc64_nvme(), Some(checksum.as_str()));
+            assert_eq!(object.body.collect().await.unwrap().into_bytes(), raw);
+        }
+    }
 }
 
 /// A bucket whose default encryption is SSE-KMS stores a delivered object

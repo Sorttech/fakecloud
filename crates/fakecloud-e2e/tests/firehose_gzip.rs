@@ -234,12 +234,54 @@ async fn firehose_gzip_compresses_records_after_append_delimiter() {
 
 #[tokio::test]
 async fn firehose_gzip_public_and_internal_objects_survive_restart() {
+    gzip_restart(false).await;
+}
+
+#[tokio::test]
+async fn firehose_gzip_bucket_kms_encryption_survives_restart() {
+    gzip_restart(true).await;
+}
+
+async fn gzip_restart(kms_encrypted: bool) {
     let tmp = tempfile::tempdir().unwrap();
     let mut server = TestServer::start_persistent(tmp.path()).await;
     let s3 = server.s3_client().await;
     let firehose = server.firehose_client().await;
     let bucket = "fh-gzip-persistent";
     s3.create_bucket().bucket(bucket).send().await.unwrap();
+    let kms_key = if kms_encrypted {
+        use aws_sdk_s3::types::{
+            ServerSideEncryption, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration,
+            ServerSideEncryptionRule,
+        };
+        let kms = server.kms_client().await;
+        let key = kms.create_key().send().await.unwrap();
+        let key = key.key_metadata().unwrap().arn().unwrap().to_owned();
+        s3.put_bucket_encryption()
+            .bucket(bucket)
+            .server_side_encryption_configuration(
+                ServerSideEncryptionConfiguration::builder()
+                    .rules(
+                        ServerSideEncryptionRule::builder()
+                            .apply_server_side_encryption_by_default(
+                                ServerSideEncryptionByDefault::builder()
+                                    .sse_algorithm(ServerSideEncryption::AwsKms)
+                                    .kms_master_key_id(&key)
+                                    .build()
+                                    .unwrap(),
+                            )
+                            .build(),
+                    )
+                    .build()
+                    .unwrap(),
+            )
+            .send()
+            .await
+            .unwrap();
+        Some(key)
+    } else {
+        None
+    };
     for (stream, prefix) in [("gzip-direct", "direct/"), ("gzip-hook", "hook/")] {
         firehose
             .create_delivery_stream()
@@ -309,6 +351,22 @@ async fn firehose_gzip_public_and_internal_objects_survive_restart() {
     let direct_before = gzip_object(&s3, bucket, "direct/", ".gz").await;
     assert_eq!(direct_before.2, b"\x00\xffpersist\n");
     let hook_before = gzip_object(&s3, bucket, "hook/", ".gz").await;
+    if let Some(key) = &kms_key {
+        for object_key in [&direct_before.0, &hook_before.0] {
+            let head = s3
+                .head_object()
+                .bucket(bucket)
+                .key(object_key)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                head.server_side_encryption(),
+                Some(&aws_sdk_s3::types::ServerSideEncryption::AwsKms)
+            );
+            assert_eq!(head.ssekms_key_id(), Some(key.as_str()));
+        }
+    }
     // Logs sends raw GZIP bytes; Firehose adds an independent outer GZIP layer.
     let event: serde_json::Value = serde_json::from_slice(&decode_gzip(&hook_before.2)).unwrap();
     assert_eq!(event["messageType"], "DATA_MESSAGE");
@@ -323,4 +381,20 @@ async fn firehose_gzip_public_and_internal_objects_survive_restart() {
         direct_before
     );
     assert_eq!(gzip_object(&s3, bucket, "hook/", ".gz").await, hook_before);
+    if let Some(key) = &kms_key {
+        for object_key in [&direct_before.0, &hook_before.0] {
+            let head = s3
+                .head_object()
+                .bucket(bucket)
+                .key(object_key)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                head.server_side_encryption(),
+                Some(&aws_sdk_s3::types::ServerSideEncryption::AwsKms)
+            );
+            assert_eq!(head.ssekms_key_id(), Some(key.as_str()));
+        }
+    }
 }
