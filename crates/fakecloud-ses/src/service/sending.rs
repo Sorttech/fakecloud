@@ -139,18 +139,24 @@ impl SesV2Service {
     /// AND its stored reason matches the effective `SuppressedReasons`
     /// filter (configuration-set scope first, then account-level
     /// fallback). Address lookup is case-insensitive.
+    /// A send on behalf of a tenant (`TenantName`) is also checked against
+    /// that tenant's suppression list.
     pub(super) fn address_is_suppressed(
         &self,
         account_id: &str,
         address: &str,
         config_set_name: Option<&str>,
+        tenant_name: Option<&str>,
     ) -> bool {
         let accounts = self.state.read();
         let Some(state) = accounts.get(account_id) else {
             return false;
         };
-        crate::mime::mailbox_address(address)
-            .is_some_and(|bare| state.suppressed_match(&bare, config_set_name).is_some())
+        crate::mime::mailbox_address(address).is_some_and(|bare| {
+            state
+                .suppressed_match_for_tenant(&bare, config_set_name, tenant_name)
+                .is_some()
+        })
     }
 
     /// Increment the suppression-drop counter on the account state.
@@ -343,7 +349,12 @@ impl SesV2Service {
         // address was suppressed for `COMPLAINT` but the config set only
         // enforces `BOUNCE`, the send proceeds.
         for r in &recipients {
-            if self.address_is_suppressed(&req.account_id, r, config_set_name.as_deref()) {
+            if self.address_is_suppressed(
+                &req.account_id,
+                r,
+                config_set_name.as_deref(),
+                body["TenantName"].as_str(),
+            ) {
                 self.bump_suppression_drop(&req.account_id);
                 return Ok(Self::json_error(
                     StatusCode::BAD_REQUEST,
@@ -458,6 +469,7 @@ impl SesV2Service {
                 crate::fanout::SendScope {
                     account_id: &req.account_id,
                     region: &req.region,
+                    tenant_name: body["TenantName"].as_str(),
                 },
                 &mut sent,
                 config_set_name.as_deref(),
@@ -587,7 +599,12 @@ impl SesV2Service {
             // Honors the effective `SuppressedReasons` filter so callers
             // can scope suppression to BOUNCE-only or COMPLAINT-only.
             let any_suppressed = recipients.iter().any(|r| {
-                self.address_is_suppressed(&req.account_id, r, config_set_name.as_deref())
+                self.address_is_suppressed(
+                    &req.account_id,
+                    r,
+                    config_set_name.as_deref(),
+                    body["TenantName"].as_str(),
+                )
             });
             if any_suppressed {
                 self.bump_suppression_drop(&req.account_id);
@@ -661,6 +678,7 @@ impl SesV2Service {
                     crate::fanout::SendScope {
                         account_id: &req.account_id,
                         region: &req.region,
+                        tenant_name: body["TenantName"].as_str(),
                     },
                     &mut sent,
                     config_set_name.as_deref(),

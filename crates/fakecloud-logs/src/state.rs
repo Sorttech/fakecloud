@@ -501,6 +501,14 @@ pub struct ScheduledQuery {
     /// `status` (the server-derived lifecycle status).
     #[serde(default)]
     pub state: Option<String>,
+    #[serde(default)]
+    pub log_group_identifiers: Option<Vec<String>>,
+    #[serde(default)]
+    pub start_time_offset: Option<i64>,
+    #[serde(default)]
+    pub end_time_offset: Option<i64>,
+    #[serde(default)]
+    pub destination_configuration: Option<serde_json::Value>,
 }
 
 /// On-disk snapshot envelope for CloudWatch Logs state: per (account,

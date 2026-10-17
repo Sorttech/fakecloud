@@ -32,6 +32,46 @@ const MAX_PULL_ATTEMPTS: u32 = 5;
 /// Delay before the first retry; doubles on each further retry.
 const BASE_RETRY_DELAY: Duration = Duration::from_secs(1);
 
+/// Budget for one `pull`. Generous, since a multi-gigabyte image on a slow
+/// link legitimately takes minutes, but finite: the CLI has no deadline of
+/// its own, so a registry or CDN connection that stalls mid-download would
+/// otherwise hold the launch (and a task in `PENDING`) forever. A pull that
+/// outruns it is killed; see [`PULL_TOTAL_TIMEOUT`] for the retry.
+const PULL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// Budget for every attempt of one pull together, backoff included. Twice
+/// [`PULL_ATTEMPT_TIMEOUT`], so a pull that stalled for a whole attempt gets
+/// exactly one more: a stall is almost always one dead connection (one CDN
+/// edge, one NAT mapping), a fresh `pull` opens new ones, and the engine
+/// keeps the layers it already finished, so the retry rarely starts from
+/// zero. A third full-length attempt would mostly just double the wait on a
+/// registry that is really down.
+const PULL_TOTAL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// Budget for `image inspect`, a local lookup that only a wedged daemon
+/// makes slow; treated as "not cached" when it outruns it.
+const INSPECT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Budget for the cache check after a pull timed out. A healthy daemon
+/// answers `image inspect` in milliseconds, and if the timeout was the
+/// daemon's own (wedged, not the registry stalling) another full
+/// [`INSPECT_TIMEOUT`] would only add a minute to a launch that is failing.
+const INSPECT_AFTER_STALL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Retry and timeout knobs of a pull; tests shrink them.
+#[derive(Debug, Clone, Copy)]
+struct PullTiming {
+    retry_delay: Duration,
+    attempt_timeout: Duration,
+    total: Duration,
+}
+
+const PULL_TIMING: PullTiming = PullTiming {
+    retry_delay: BASE_RETRY_DELAY,
+    attempt_timeout: PULL_ATTEMPT_TIMEOUT,
+    total: PULL_TOTAL_TIMEOUT,
+};
+
 /// How the registry a pulled reference names is reached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegistryTransport {
@@ -84,7 +124,7 @@ pub async fn pull_image(
     reference: &str,
     transport: RegistryTransport,
 ) -> Result<PulledImage, String> {
-    pull_image_with(cli, docker_config, reference, transport, BASE_RETRY_DELAY).await
+    pull_image_with(cli, docker_config, reference, transport, PULL_TIMING).await
 }
 
 /// Make `reference` available locally, pulling it only when it is not
@@ -97,24 +137,54 @@ pub async fn ensure_image(
     docker_config: Option<&Path>,
     reference: &str,
 ) -> Result<PulledImage, String> {
-    ensure_image_with(cli, docker_config, reference, BASE_RETRY_DELAY).await
+    ensure_image_with(cli, docker_config, reference, PULL_TIMING).await
+}
+
+/// [`ensure_image`] for a caller with a budget of its own: the cache check
+/// and every pull attempt together end within `budget` (each attempt also
+/// still within the usual per-attempt limit). Every CLI call is killed when it
+/// outruns its share, so nothing is left running past the budget.
+pub async fn ensure_image_within(
+    cli: &str,
+    docker_config: Option<&Path>,
+    reference: &str,
+    budget: Duration,
+) -> Result<PulledImage, String> {
+    let timing = PullTiming {
+        attempt_timeout: PULL_ATTEMPT_TIMEOUT.min(budget),
+        total: budget,
+        ..PULL_TIMING
+    };
+    ensure_image_with(cli, docker_config, reference, timing).await
 }
 
 async fn ensure_image_with(
     cli: &str,
     docker_config: Option<&Path>,
     reference: &str,
-    base_delay: Duration,
+    timing: PullTiming,
 ) -> Result<PulledImage, String> {
-    if image_cached(cli, docker_config, reference).await {
+    let start = tokio::time::Instant::now();
+    if image_cached(
+        cli,
+        docker_config,
+        reference,
+        INSPECT_TIMEOUT.min(timing.total),
+    )
+    .await
+    {
         return Ok(PulledImage::Present);
     }
+    let timing = PullTiming {
+        total: timing.total.saturating_sub(start.elapsed()),
+        ..timing
+    };
     pull_image_with(
         cli,
         docker_config,
         reference,
         RegistryTransport::Https,
-        base_delay,
+        timing,
     )
     .await
 }
@@ -124,24 +194,54 @@ async fn pull_image_with(
     docker_config: Option<&Path>,
     reference: &str,
     transport: RegistryTransport,
-    base_delay: Duration,
+    timing: PullTiming,
 ) -> Result<PulledImage, String> {
     // Only a plain-HTTP pull branches on the engine, so only it pays for
     // (the first, then cached) engine probe.
     let podman = transport == RegistryTransport::PlainHttp
         && crate::container_net::is_podman_async(cli).await;
-    let mut delay = base_delay;
+    let deadline = tokio::time::Instant::now() + timing.total;
+    let remaining = || deadline.saturating_duration_since(tokio::time::Instant::now());
+    let mut delay = timing.retry_delay;
     let mut attempt = 1;
+    let mut stalled_once = false;
     loop {
+        let budget = timing.attempt_timeout.min(remaining());
         let mut cmd = Command::new(cli);
         if let Some(p) = docker_config {
             cmd.env("DOCKER_CONFIG", p);
         }
-        let out = cmd
-            .args(pull_args(podman, reference, transport))
-            .output()
-            .await
-            .map_err(|e| format!("{cli} pull: {e}"))?;
+        cmd.args(pull_args(podman, reference, transport));
+        let out = match crate::container_net::output_within(&mut cmd, budget).await {
+            Ok(out) => out,
+            Err(crate::container_net::CliRunError::TimedOut(_)) => {
+                let pull_error = format!(
+                    "{cli} pull {reference} did not finish within {}s and was killed",
+                    budget.as_secs_f64()
+                );
+                if image_cached(cli, docker_config, reference, INSPECT_AFTER_STALL_TIMEOUT).await {
+                    tracing::warn!(
+                        image = %reference,
+                        error = %pull_error,
+                        "image pull timed out; using the locally cached image"
+                    );
+                    return Ok(PulledImage::Cached { pull_error });
+                }
+                // One more attempt, on fresh connections, if the overall
+                // budget still has room for it.
+                if stalled_once || remaining().is_zero() {
+                    return Err(pull_error);
+                }
+                stalled_once = true;
+                tracing::warn!(
+                    image = %reference,
+                    error = %pull_error,
+                    "image pull timed out; retrying once"
+                );
+                continue;
+            }
+            Err(e) => return Err(format!("{cli} pull: {e}")),
+        };
         if out.status.success() {
             return Ok(PulledImage::Pulled);
         }
@@ -149,7 +249,10 @@ async fn pull_image_with(
         if !is_transient(&pull_error, reference) {
             return Err(pull_error);
         }
-        if image_cached(cli, docker_config, reference).await {
+        let check = INSPECT_TIMEOUT
+            .min(remaining())
+            .max(INSPECT_AFTER_STALL_TIMEOUT);
+        if image_cached(cli, docker_config, reference, check).await {
             tracing::warn!(
                 image = %reference,
                 error = %pull_error,
@@ -157,7 +260,7 @@ async fn pull_image_with(
             );
             return Ok(PulledImage::Cached { pull_error });
         }
-        if attempt >= MAX_PULL_ATTEMPTS {
+        if attempt >= MAX_PULL_ATTEMPTS || remaining() <= delay {
             return Err(pull_error);
         }
         tracing::info!(
@@ -189,18 +292,20 @@ fn pull_args(podman: bool, reference: &str, transport: RegistryTransport) -> Vec
 /// the same `DOCKER_CONFIG` as the pull: the config also selects the Docker
 /// context, so without it the check could consult a different daemon than
 /// the one that pulls and later runs the image.
-async fn image_cached(cli: &str, docker_config: Option<&Path>, reference: &str) -> bool {
+async fn image_cached(
+    cli: &str,
+    docker_config: Option<&Path>,
+    reference: &str,
+    timeout: Duration,
+) -> bool {
     let mut cmd = Command::new(cli);
     if let Some(p) = docker_config {
         cmd.env("DOCKER_CONFIG", p);
     }
-    cmd.args(["image", "inspect", reference])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
+    cmd.args(["image", "inspect", reference]);
+    crate::container_net::output_within(&mut cmd, timeout)
         .await
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .is_ok_and(|out| out.status.success())
 }
 
 /// Whether a pull error is one a later attempt could succeed past: the
@@ -322,7 +427,6 @@ fn has_server_error_status(message: &str) -> bool {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     /// A stand-in container CLI. `pull` fails with `pull_stderr` for the first
     /// `pull_failures` calls and succeeds after; `image inspect` succeeds only
@@ -386,27 +490,7 @@ exit 2
                 dir = dir.path().display(),
             );
             let path = dir.path().join(name);
-            std::fs::write(&path, script).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-            // Executing a file that another process holds open for writing
-            // fails with ETXTBSY. Tests run in parallel threads, and a child
-            // forked by another test while `fs::write` above had the script
-            // open inherits that descriptor until it execs. Run the script
-            // once, retrying until nothing holds it; after that no process can
-            // gain a writable descriptor to it again.
-            let mut attempts = 0;
-            loop {
-                match std::process::Command::new(&path).arg("probe").output() {
-                    Err(e)
-                        if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 200 =>
-                    {
-                        attempts += 1;
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(e) => panic!("fake CLI did not run: {e}"),
-                    Ok(_) => break,
-                }
-            }
+            crate::test_support::write_executable(&path, &script);
             let _ = std::fs::remove_file(dir.path().join("calls.log"));
             Self {
                 dir,
@@ -439,26 +523,120 @@ exit 2
             reference: &str,
             transport: RegistryTransport,
         ) -> Result<PulledImage, String> {
-            pull_image_with(
-                &self.cli(),
-                None,
-                reference,
-                transport,
-                Duration::from_millis(1),
-            )
-            .await
+            pull_image_with(&self.cli(), None, reference, transport, TEST_TIMING).await
         }
 
         async fn ensure(&self) -> Result<PulledImage, String> {
-            ensure_image_with(&self.cli(), None, "alpine:3.20", Duration::from_millis(1)).await
+            ensure_image_with(&self.cli(), None, "alpine:3.20", TEST_TIMING).await
         }
     }
+
+    const TEST_TIMING: PullTiming = PullTiming {
+        retry_delay: Duration::from_millis(1),
+        attempt_timeout: Duration::from_secs(30),
+        total: Duration::from_secs(120),
+    };
 
     fn is_transient_for_test(stderr: &str) -> bool {
         is_transient(stderr, "alpine:3.20")
     }
 
     const THROTTLED: &str = "Error response from daemon: unexpected status from HEAD request to https://public.ecr.aws/v2/docker/library/alpine/manifests/3.20: 429 Too Many Requests";
+
+    /// A fake CLI whose `pull` never finishes and whose `image inspect`
+    /// succeeds only when `cached`; calls go to `calls.log`.
+    fn stalling_cli(cached: bool) -> (tempfile::TempDir, String) {
+        crate::test_support::fake_cli(
+            "cli",
+            &format!(
+                "d=$(dirname \"$0\")\n[ \"$1\" = warmup ] && exit 0\necho \"$*\" >> \"$d/calls.log\"\n\
+                 case \"$1\" in\n  pull) exec sleep 1000 ;;\n  image) [ {cached} = true ] ;;\nesac\n"
+            ),
+        )
+    }
+
+    fn calls_in(dir: &tempfile::TempDir) -> Vec<String> {
+        std::fs::read_to_string(dir.path().join("calls.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(String::from)
+            .collect()
+    }
+
+    /// A pull whose download stalls is killed at its budget instead of holding
+    /// the launch forever, and falls back to a cached copy when there is one.
+    #[tokio::test]
+    async fn a_stalled_pull_falls_back_to_the_cache() {
+        let (dir, cli) = stalling_cli(true);
+        let timing = PullTiming {
+            retry_delay: Duration::from_millis(1),
+            attempt_timeout: Duration::from_millis(300),
+            total: Duration::from_secs(20),
+        };
+        let got =
+            pull_image_with(&cli, None, "alpine:3.20", RegistryTransport::Https, timing).await;
+        match got {
+            Ok(PulledImage::Cached { pull_error }) => {
+                assert!(
+                    pull_error.contains("did not finish within 0.3s"),
+                    "{pull_error}"
+                )
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(
+            calls_in(&dir),
+            ["pull alpine:3.20", "image inspect alpine:3.20"]
+        );
+    }
+
+    /// With nothing cached, a stalled pull gets exactly one more attempt on a
+    /// fresh connection, and then fails.
+    #[tokio::test]
+    async fn a_stalled_pull_is_retried_once() {
+        let (dir, cli) = stalling_cli(false);
+        let timing = PullTiming {
+            retry_delay: Duration::from_millis(1),
+            attempt_timeout: Duration::from_millis(300),
+            total: Duration::from_secs(20),
+        };
+        let start = std::time::Instant::now();
+        let err = pull_image_with(&cli, None, "alpine:3.20", RegistryTransport::Https, timing)
+            .await
+            .expect_err("nothing cached");
+        assert!(start.elapsed() < Duration::from_secs(10));
+        assert!(err.contains("did not finish within 0.3s"), "{err}");
+        assert_eq!(
+            calls_in(&dir),
+            [
+                "pull alpine:3.20",
+                "image inspect alpine:3.20",
+                "pull alpine:3.20",
+                "image inspect alpine:3.20"
+            ]
+        );
+    }
+
+    /// The overall budget caps the retry: it only gets what is left.
+    #[tokio::test]
+    async fn the_retry_after_a_stall_only_gets_the_remaining_budget() {
+        let (dir, cli) = stalling_cli(false);
+        let start = std::time::Instant::now();
+        let err = ensure_image_within(&cli, None, "alpine:3.20", Duration::from_millis(600))
+            .await
+            .expect_err("nothing cached");
+        assert!(start.elapsed() < Duration::from_secs(10));
+        assert!(err.contains("did not finish within"), "{err}");
+        // inspect, a 0.6s pull, then the budget is spent.
+        assert_eq!(
+            calls_in(&dir),
+            [
+                "image inspect alpine:3.20",
+                "pull alpine:3.20",
+                "image inspect alpine:3.20"
+            ]
+        );
+    }
 
     #[tokio::test]
     async fn ensure_image_uses_a_cached_image_without_contacting_the_registry() {

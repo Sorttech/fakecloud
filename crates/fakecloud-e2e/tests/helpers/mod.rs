@@ -474,3 +474,34 @@ pub async fn root_s3_client(server: &TestServer) -> aws_sdk_s3::Client {
             .build(),
     )
 }
+
+/// One-line summary of where an ECS task is in its lifecycle, for wait-loop
+/// failure messages: a task that never reaches its target status otherwise
+/// fails with nothing to say whether it hung in PENDING (pull, helper image),
+/// stopped early, or is still RUNNING.
+pub fn ecs_task_summary(task: &aws_sdk_ecs::types::Task) -> String {
+    let containers: Vec<String> = task
+        .containers()
+        .iter()
+        .map(|c| {
+            format!(
+                "{}: lastStatus={:?} exitCode={:?} reason={:?}",
+                c.name().unwrap_or_default(),
+                c.last_status(),
+                c.exit_code(),
+                c.reason()
+            )
+        })
+        .collect();
+    format!(
+        "lastStatus={:?} desiredStatus={:?} stopCode={:?} stoppedReason={:?} \
+         pullStartedAt={:?} pullStoppedAt={:?} containers=[{}]",
+        task.last_status(),
+        task.desired_status(),
+        task.stop_code().map(|c| c.as_str()),
+        task.stopped_reason(),
+        task.pull_started_at().map(|t| t.to_string()),
+        task.pull_stopped_at().map(|t| t.to_string()),
+        containers.join("; ")
+    )
+}
