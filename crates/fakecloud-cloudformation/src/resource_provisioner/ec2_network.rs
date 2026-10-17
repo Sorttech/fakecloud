@@ -99,12 +99,7 @@ impl ResourceProvisioner {
                     &self.ec2_state,
                     &self.account_id,
                     |state| {
-                        let default_vpc = state
-                            .vpcs
-                            .values()
-                            .find(|v| v.is_default)
-                            .map(|v| v.vpc_id.clone())
-                            .unwrap_or_default();
+                        let default_vpc = fakecloud_ec2::vpc_lookup::default_vpc_id_in(state)?;
                         state
                             .security_groups
                             .values()

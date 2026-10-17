@@ -340,10 +340,11 @@ impl ResourceProvisioner {
                 rec.endpoint.resolver_endpoint_type = t.to_string();
             }
             if let Some(p) = props.get("Protocols").and_then(|v| v.as_array()) {
-                rec.endpoint.protocols = p
-                    .iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect();
+                rec.endpoint.protocols = fakecloud_route53resolver::endpoint_protocols(
+                    p.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect(),
+                );
             }
             if let Some(v) = props.get("PreferredInstanceType").and_then(|v| v.as_str()) {
                 rec.endpoint.preferred_instance_type = Some(v.to_string());
