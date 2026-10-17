@@ -42,11 +42,15 @@ impl LambdaService {
         )?;
 
         let storage_limit = self.code_storage_limit(&req.account_id, &req.region);
+        let caller = self.layer_caller(req);
         let mut accounts = self.state.write();
         // Pre-resolve layer attachments before re-borrowing accounts mutably.
-        // Layer ARNs may live in sibling accounts.
-        let layer_attachments =
-            crate::extras::resolve_layer_attachments(&accounts, input.layer_arns.clone());
+        // Layer ARNs may live in sibling accounts, which must share them.
+        let layer_attachments = crate::layer_access::resolve_layer_attachments(
+            &accounts,
+            input.layer_arns.clone(),
+            &caller,
+        )?;
         let state = accounts.regional_mut(&req.account_id, &req.region);
 
         if state.functions.contains_key(&input.function_name) {

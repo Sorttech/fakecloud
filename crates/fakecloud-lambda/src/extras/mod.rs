@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
+use crate::layer_access::LayerArn;
 use crate::service::LambdaService;
 use crate::state::{function_arn, qualified_function_arn};
 use crate::state::{
@@ -16,30 +17,6 @@ use crate::state::{
     FunctionScalingConfig, FunctionUrlConfig, LambdaState, Layer, LayerVersion,
     ProvisionedConcurrencyConfig, RuntimeManagementConfig,
 };
-
-/// Resolve a layer-version ARN to its current `CodeSize` from the
-/// multi-account state. Returns 0 when the ARN is unparseable, when the
-/// referenced account/layer/version is unknown, or when the version was
-/// published without ZIP content (legacy snapshots).
-pub(crate) fn resolve_layer_attachments(
-    accounts: &fakecloud_core::multi_account::MultiRegionState<LambdaState>,
-    arns: Vec<String>,
-) -> Vec<AttachedLayer> {
-    arns.into_iter()
-        .map(|arn| {
-            let code_size = parse_layer_version_arn(&arn)
-                .and_then(|(_acct, name, ver)| {
-                    accounts
-                        .by_arn(&arn)
-                        .and_then(|s| s.layers.get(&name))
-                        .and_then(|l| l.versions.iter().find(|v| v.version == ver))
-                        .map(|v| v.code_size)
-                })
-                .unwrap_or(0);
-            AttachedLayer { arn, code_size }
-        })
-        .collect()
-}
 
 fn missing(name: &str) -> AwsServiceError {
     AwsServiceError::aws_error(
@@ -63,6 +40,14 @@ fn ok(body: Value) -> Result<AwsResponse, AwsServiceError> {
 
 fn empty() -> Result<AwsResponse, AwsServiceError> {
     Ok(AwsResponse::json(StatusCode::OK, "{}".to_string()))
+}
+
+fn created(body: Value) -> Result<AwsResponse, AwsServiceError> {
+    Ok(AwsResponse::json(StatusCode::CREATED, body.to_string()))
+}
+
+fn no_content() -> Result<AwsResponse, AwsServiceError> {
+    Ok(AwsResponse::json(StatusCode::NO_CONTENT, ""))
 }
 
 fn body(req: &AwsRequest) -> Value {
@@ -301,40 +286,39 @@ pub(crate) fn layer_name_label(req: &AwsRequest) -> Result<String, AwsServiceErr
         .get(2)
         .map(String::as_str)
         .unwrap_or_default();
-    if !is_own_layer_arn(raw, &req.region, &req.account_id) {
+    if !is_request_region_layer_arn(raw, &req.region) {
         validate_layer_name(raw)?;
     }
     Ok(raw.to_string())
 }
 
-/// A layer ARN fakecloud itself mints for the request's own region and
-/// account. Those are the server's `--region` / `--account-id`, which need
-/// not match AWS's region or 12-digit account shape (`--region local`), yet
-/// such an ARN must still address the layer it names.
-fn is_own_layer_arn(raw: &str, region: &str, account_id: &str) -> bool {
+/// A layer ARN whose region is the request's own region and which otherwise
+/// satisfies the model's `LayerName` pattern. Only the region is exempt from
+/// the pattern: it is the server's `--region`, which need not look like an
+/// AWS region (`--region local`), yet the ARNs fakecloud mints there (the
+/// caller's own layers, or another account's layer shared with it) must
+/// still address their layer. Partition, 12-digit account, layer name and
+/// length are checked as for any other ARN.
+fn is_request_region_layer_arn(raw: &str, region: &str) -> bool {
     let parts: Vec<&str> = raw.split(':').collect();
-    matches!(
-        parts.as_slice(),
-        ["arn", partition, "lambda", r, a, "layer", name]
-            if partition.starts_with("aws")
-                && *r == region
-                && *a == account_id
-                && is_bare_layer_name(name)
-    ) && raw.chars().count() <= LAYER_NAME_MAX_LEN
-}
-
-/// AWS layer-version ARN: `arn:aws:lambda:<region>:<account>:layer:<name>:<version>`.
-/// Returns `(account_id, layer_name, version)`. Used to resolve cross-account
-/// layer references attached to a function.
-pub fn parse_layer_version_arn(arn: &str) -> Option<(String, String, i64)> {
-    let parts: Vec<&str> = arn.split(':').collect();
-    if parts.len() != 8 || parts[0] != "arn" || parts[2] != "lambda" || parts[5] != "layer" {
-        return None;
+    let [prefix, partition, service, r, account, kind, name] = parts.as_slice() else {
+        return false;
+    };
+    if *r != region || raw.chars().count() > LAYER_NAME_MAX_LEN {
+        return false;
     }
-    let account = parts[4].to_string();
-    let name = parts[6].to_string();
-    let version: i64 = parts[7].parse().ok()?;
-    Some((account, name, version))
+    // Any pattern-valid region stands in for the request's own.
+    let substituted = [
+        *prefix,
+        *partition,
+        *service,
+        "us-east-1",
+        *account,
+        *kind,
+        *name,
+    ]
+    .join(":");
+    is_layer_name_arn(&substituted)
 }
 
 /// Validate the `CompatibleArchitecture` and `CompatibleRuntime` query
@@ -497,16 +481,21 @@ impl LambdaService {
         } else {
             None
         };
+        let caller = self.layer_caller(req);
         let mut accounts = self.state.write();
         // Pre-resolve layer attachments before re-borrowing accounts mutably
-        // for the function. Layer ARNs may live in sibling accounts.
-        let layer_attachments: Option<Vec<AttachedLayer>> = body["Layers"].as_array().map(|arr| {
-            let arns: Vec<String> = arr
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
-            resolve_layer_attachments(&accounts, arns)
-        });
+        // for the function. Layer ARNs may live in sibling accounts, which
+        // must share them.
+        let layer_attachments: Option<Vec<AttachedLayer>> = body["Layers"]
+            .as_array()
+            .map(|arr| {
+                let arns: Vec<String> = arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect();
+                crate::layer_access::resolve_layer_attachments(&accounts, arns, &caller)
+            })
+            .transpose()?;
         let state = accounts.regional_mut(&req.account_id, &req.region);
         let func = state
             .functions
@@ -1359,29 +1348,42 @@ mod tests {
     }
 
     #[test]
-    fn own_layer_arns_pass_under_a_non_aws_region_or_account() {
-        use super::is_own_layer_arn;
-        assert!(is_own_layer_arn(
+    fn request_region_layer_arns_pass_under_a_non_aws_region() {
+        use super::is_request_region_layer_arn;
+        for arn in [
             "arn:aws:lambda:local:000000000000:layer:x",
-            "local",
-            "000000000000"
-        ));
-        assert!(is_own_layer_arn(
-            "arn:aws:lambda:local:42:layer:x",
-            "local",
-            "42"
-        ));
-        // Only the server's own region and account get the exemption.
-        assert!(!is_own_layer_arn(
-            "arn:aws:lambda:local:000000000000:layer:x",
-            "us-east-1",
-            "000000000000"
-        ));
-        assert!(!is_own_layer_arn(
-            "arn:aws:lambda:local:000000000000:layer:bad!name",
-            "local",
-            "000000000000"
-        ));
+            // Another account's layer in the same region: cross-account
+            // sharing works under `--region local` too.
+            "arn:aws:lambda:local:222222222222:layer:x",
+            "arn:aws-cn:lambda:local:222222222222:layer:x",
+        ] {
+            assert!(is_request_region_layer_arn(arn, "local"), "{arn}");
+        }
+        // Only the region is exempt: the rest of the pattern still applies.
+        for (arn, region) in [
+            // Not the request's region.
+            ("arn:aws:lambda:local:000000000000:layer:x", "us-east-1"),
+            // Account must be 12 digits, even in the request's region.
+            ("arn:aws:lambda:local:42:layer:x", "local"),
+            ("arn:aws:lambda:us-east-1:42:layer:x", "us-east-1"),
+            ("arn:aws:lambda:local::layer:x", "local"),
+            ("arn:aws:lambda:local:000000000000:layer:bad!name", "local"),
+            ("arn:gcp:lambda:local:000000000000:layer:x", "local"),
+            ("arn:aws:s3:local:000000000000:layer:x", "local"),
+            ("arn:aws:lambda:local:000000000000:function:x", "local"),
+            // A version ARN is not a `LayerName`.
+            ("arn:aws:lambda:local:000000000000:layer:x:1", "local"),
+        ] {
+            assert!(
+                !is_request_region_layer_arn(arn, region),
+                "{arn} in {region}"
+            );
+        }
+        let long = format!(
+            "arn:aws:lambda:local:000000000000:layer:{}",
+            "a".repeat(120)
+        );
+        assert!(!is_request_region_layer_arn(&long, "local"));
     }
 
     #[test]

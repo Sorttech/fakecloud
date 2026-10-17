@@ -1239,6 +1239,10 @@ pub struct LambdaService {
     /// switched its enforcement on. Without one the AWS defaults are reported
     /// and nothing is enforced.
     pub(crate) quota_provider: Option<Arc<dyn fakecloud_core::quota::QuotaProvider>>,
+    /// Organizations membership, for layer version grants scoped to an
+    /// organization (`aws:PrincipalOrgID`). Without one no caller belongs
+    /// to an organization, so such grants admit nobody.
+    pub(crate) org_resolver: Option<Arc<dyn fakecloud_core::auth::ScpResolver>>,
 }
 
 mod functions;
@@ -1260,7 +1264,20 @@ impl LambdaService {
             inflight_invocations: Arc::new(parking_lot::RwLock::new(BTreeMap::new())),
             ec2_state: None,
             quota_provider: None,
+            org_resolver: None,
         }
+    }
+
+    /// Attach the Organizations membership graph (see the `org_resolver`
+    /// field).
+    pub fn with_org_resolver(mut self, orgs: Arc<dyn fakecloud_core::auth::ScpResolver>) -> Self {
+        self.org_resolver = Some(orgs);
+        self
+    }
+
+    /// The caller of `req` as layer version policies see it.
+    pub(crate) fn layer_caller(&self, req: &AwsRequest) -> crate::layer_access::LayerCaller {
+        crate::layer_access::LayerCaller::from_request(req, self.org_resolver.clone())
     }
 
     /// Attach Service Quotas (see the `quota_provider` field).
@@ -2111,6 +2128,12 @@ impl AwsService for LambdaService {
                     })
                     .unwrap_or_else(|| "*".to_string())
             }
+            // Layer operations are evaluated against `*` too, so dispatch
+            // takes the principal's own account as the resource account and
+            // never applies (or needs) a resource policy for them. Access to
+            // another account's layer is decided by the layer handlers
+            // against the version's policy (`crate::layer_access`); this
+            // path does not deny it.
             _ => "*".to_string(),
         };
         Some(fakecloud_core::auth::IamAction {

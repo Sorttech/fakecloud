@@ -269,6 +269,318 @@ def handler(event, context):
     );
 }
 
+// ── Cross-account layer sharing ──
+//
+// Account A owns the layer; B and C name it by ARN. A layer version is
+// readable and attachable from another account only once its policy grants
+// `lambda:GetLayerVersion` to that account (or to its organization).
+
+const LAYER_OWNER: &str = "111111111111";
+const LAYER_USER: &str = "222222222222";
+const OUTSIDER: &str = "333333333333";
+const XACCT_REGION: &str = "us-east-1";
+
+async fn start_multi_account() -> TestServer {
+    TestServer::start_with_env(&[
+        ("FAKECLOUD_IAM", "strict"),
+        ("FAKECLOUD_VERIFY_SIGV4", "true"),
+        ("FAKECLOUD_CONTAINER_CLI", "false"),
+    ])
+    .await
+}
+
+async fn sdk_config(server: &TestServer, akid: &str, secret: &str) -> aws_config::SdkConfig {
+    aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .endpoint_url(server.endpoint())
+        .region(aws_config::Region::new(XACCT_REGION))
+        .credentials_provider(aws_credential_types::Credentials::new(
+            akid,
+            secret,
+            None,
+            None,
+            "layers-x-acct",
+        ))
+        .load()
+        .await
+}
+
+async fn admin_config(server: &TestServer, account: &str) -> aws_config::SdkConfig {
+    let (akid, secret) = server.create_admin(account, "admin").await;
+    sdk_config(server, &akid, &secret).await
+}
+
+fn owner_layer_arn(name: &str) -> String {
+    format!("arn:aws:lambda:{XACCT_REGION}:{LAYER_OWNER}:layer:{name}")
+}
+
+async fn publish_zip(lambda: &aws_sdk_lambda::Client, name: &str) -> i64 {
+    lambda
+        .publish_layer_version()
+        .layer_name(name)
+        .content(
+            LayerVersionContentInput::builder()
+                .zip_file(Blob::new(make_zip(&[("python/shared.py", b"X = 1\n")])))
+                .build(),
+        )
+        .send()
+        .await
+        .expect("PublishLayerVersion")
+        .version()
+}
+
+/// The error code and message of a failed SDK call.
+fn error_of<T, E>(result: Result<T, aws_sdk_lambda::error::SdkError<E>>) -> (String, String)
+where
+    aws_sdk_lambda::error::SdkError<E>: aws_sdk_lambda::error::ProvideErrorMetadata,
+{
+    use aws_sdk_lambda::error::ProvideErrorMetadata;
+    let err = result.err().expect("call must fail");
+    (
+        err.code().unwrap_or_default().to_string(),
+        err.message().unwrap_or_default().to_string(),
+    )
+}
+
+/// An execution role Lambda may assume, in the caller's account.
+async fn lambda_role(cfg: &aws_config::SdkConfig, account: &str) -> String {
+    aws_sdk_iam::Client::new(cfg)
+        .create_role()
+        .role_name("layer-user-role")
+        .assume_role_policy_document(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}"#,
+        )
+        .send()
+        .await
+        .expect("CreateRole");
+    format!("arn:aws:iam::{account}:role/layer-user-role")
+}
+
+/// A CreateFunction request for a small Python function with `layers` attached.
+fn create_with_layers(
+    lambda: &aws_sdk_lambda::Client,
+    role: &str,
+    name: &str,
+    layers: &[String],
+) -> aws_sdk_lambda::operation::create_function::builders::CreateFunctionFluentBuilder {
+    let mut req = lambda
+        .create_function()
+        .function_name(name)
+        .runtime(Runtime::Python312)
+        .role(role)
+        .handler("index.handler")
+        .code(
+            FunctionCode::builder()
+                .zip_file(Blob::new(make_zip(&[(
+                    "index.py",
+                    b"def handler(e, c):\n    return 1\n",
+                )])))
+                .build(),
+        );
+    for layer in layers {
+        req = req.layers(layer);
+    }
+    req
+}
+
+#[tokio::test]
+async fn a_shared_layer_version_is_readable_and_attachable_cross_account() {
+    let server = start_multi_account().await;
+    let owner = aws_sdk_lambda::Client::new(&admin_config(&server, LAYER_OWNER).await);
+    let user_cfg = admin_config(&server, LAYER_USER).await;
+    let user = aws_sdk_lambda::Client::new(&user_cfg);
+    assert_eq!(publish_zip(&owner, "shared").await, 1);
+    assert_eq!(publish_zip(&owner, "shared").await, 2);
+    let arn = owner_layer_arn("shared");
+    let v1 = format!("{arn}:1");
+    let v2 = format!("{arn}:2");
+
+    // Before any grant: refused, and a version that does not exist is
+    // refused in exactly the same way.
+    let unshared = error_of(
+        user.get_layer_version()
+            .layer_name(&arn)
+            .version_number(1)
+            .send()
+            .await,
+    );
+    let missing = error_of(
+        user.get_layer_version()
+            .layer_name(&arn)
+            .version_number(42)
+            .send()
+            .await,
+    );
+    assert_eq!(unshared.0, "AccessDeniedException", "{}", unshared.1);
+    assert_eq!(missing.0, "AccessDeniedException", "{}", missing.1);
+    assert_eq!(
+        unshared.1.replace(":shared:1 ", ":shared:N "),
+        missing.1.replace(":shared:42 ", ":shared:N ")
+    );
+    assert!(
+        unshared.1.contains("lambda:GetLayerVersion"),
+        "{}",
+        unshared.1
+    );
+
+    let role = lambda_role(&user_cfg, LAYER_USER).await;
+    let refused = error_of(
+        create_with_layers(&user, &role, "consumer", std::slice::from_ref(&v1))
+            .send()
+            .await,
+    );
+    assert_eq!(refused.0, "AccessDeniedException", "{}", refused.1);
+
+    let granted = owner
+        .add_layer_version_permission()
+        .layer_name("shared")
+        .version_number(1)
+        .statement_id("to-user")
+        .action("lambda:GetLayerVersion")
+        .principal(LAYER_USER)
+        .send()
+        .await
+        .expect("AddLayerVersionPermission");
+    let stmt: serde_json::Value = serde_json::from_str(granted.statement().unwrap()).unwrap();
+    assert_eq!(
+        stmt["Principal"]["AWS"],
+        format!("arn:aws:iam::{LAYER_USER}:root")
+    );
+
+    let got = user
+        .get_layer_version()
+        .layer_name(&arn)
+        .version_number(1)
+        .send()
+        .await
+        .expect("shared version is readable");
+    assert_eq!(got.layer_version_arn(), Some(v1.as_str()));
+    let by_arn = user
+        .get_layer_version_by_arn()
+        .arn(&v1)
+        .send()
+        .await
+        .expect("GetLayerVersionByArn on a shared version");
+    assert_eq!(by_arn.version(), 1);
+    assert_eq!(by_arn.layer_arn(), Some(arn.as_str()));
+    // Version 2 was not shared.
+    let (code, _) = error_of(user.get_layer_version_by_arn().arn(&v2).send().await);
+    assert_eq!(code, "AccessDeniedException");
+    // A version policy never grants listing another account's versions.
+    let (code, msg) = error_of(user.list_layer_versions().layer_name(&arn).send().await);
+    assert_eq!(code, "AccessDeniedException");
+    assert!(msg.contains("lambda:ListLayerVersions"), "{msg}");
+
+    let created = create_with_layers(&user, &role, "consumer", std::slice::from_ref(&v1))
+        .send()
+        .await
+        .expect("a shared layer attaches");
+    let attached = created.layers();
+    assert_eq!(attached.len(), 1);
+    assert_eq!(attached[0].arn(), Some(v1.as_str()));
+    assert!(attached[0].code_size() > 0);
+    let (code, _) = error_of(
+        user.update_function_configuration()
+            .function_name("consumer")
+            .layers(&v2)
+            .send()
+            .await,
+    );
+    assert_eq!(code, "AccessDeniedException");
+
+    // Writing through the owner's ARN is refused and creates nothing on
+    // either side.
+    let (code, msg) = error_of(
+        user.publish_layer_version()
+            .layer_name(&arn)
+            .content(
+                LayerVersionContentInput::builder()
+                    .zip_file(Blob::new(make_zip(&[("x", b"x")])))
+                    .build(),
+            )
+            .send()
+            .await,
+    );
+    assert_eq!(code, "AccessDeniedException");
+    assert!(msg.contains("lambda:PublishLayerVersion"), "{msg}");
+    let (code, _) = error_of(
+        user.delete_layer_version()
+            .layer_name(&arn)
+            .version_number(1)
+            .send()
+            .await,
+    );
+    assert_eq!(code, "AccessDeniedException");
+    let (code, _) = error_of(
+        user.add_layer_version_permission()
+            .layer_name(&arn)
+            .version_number(2)
+            .statement_id("self-grant")
+            .action("lambda:GetLayerVersion")
+            .principal(LAYER_USER)
+            .send()
+            .await,
+    );
+    assert_eq!(code, "AccessDeniedException");
+    let owner_versions = owner
+        .list_layer_versions()
+        .layer_name("shared")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(owner_versions.layer_versions().len(), 2);
+    assert!(user.list_layers().send().await.unwrap().layers().is_empty());
+}
+
+#[tokio::test]
+async fn an_organization_scoped_grant_admits_member_accounts_only() {
+    let server = start_multi_account().await;
+    let owner_cfg = admin_config(&server, LAYER_OWNER).await;
+    let org_id = aws_sdk_organizations::Client::new(&owner_cfg)
+        .create_organization()
+        .send()
+        .await
+        .unwrap()
+        .organization()
+        .unwrap()
+        .id()
+        .unwrap()
+        .to_string();
+    let (akid, secret) = server
+        .create_admin_in_org(LAYER_USER, "member", &org_id)
+        .await;
+    let member = aws_sdk_lambda::Client::new(&sdk_config(&server, &akid, &secret).await);
+    let outsider = aws_sdk_lambda::Client::new(&admin_config(&server, OUTSIDER).await);
+    let owner = aws_sdk_lambda::Client::new(&owner_cfg);
+
+    publish_zip(&owner, "org-layer").await;
+    let granted = owner
+        .add_layer_version_permission()
+        .layer_name("org-layer")
+        .version_number(1)
+        .statement_id("org")
+        .action("lambda:GetLayerVersion")
+        .principal("*")
+        .organization_id(&org_id)
+        .send()
+        .await
+        .expect("org-scoped grant");
+    let stmt: serde_json::Value = serde_json::from_str(granted.statement().unwrap()).unwrap();
+    assert_eq!(
+        stmt["Condition"]["StringEquals"]["aws:PrincipalOrgID"],
+        org_id
+    );
+
+    let v1 = format!("{}:1", owner_layer_arn("org-layer"));
+    member
+        .get_layer_version_by_arn()
+        .arn(&v1)
+        .send()
+        .await
+        .expect("a member of the organization reads the layer");
+    let (code, _) = error_of(outsider.get_layer_version_by_arn().arn(&v1).send().await);
+    assert_eq!(code, "AccessDeniedException");
+}
+
 /// `LayerName` outside its `@pattern` is rejected before any lookup: the
 /// publish must not create a layer, and the otherwise idempotent delete and
 /// the listing fail the same way.

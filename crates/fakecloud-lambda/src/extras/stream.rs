@@ -61,20 +61,7 @@ impl LambdaService {
                     ),
                 )
             })?;
-            let mut zips: Vec<Vec<u8>> = Vec::with_capacity(func.layers.len());
-            for attached in &func.layers {
-                if let Some(b) =
-                    parse_layer_version_arn(&attached.arn).and_then(|(_acct, name, ver)| {
-                        accounts
-                            .by_arn(&attached.arn)
-                            .and_then(|s| s.layers.get(&name))
-                            .and_then(|l| l.versions.iter().find(|v| v.version == ver))
-                            .and_then(|v| v.code_zip.clone())
-                    })
-                {
-                    zips.push(b);
-                }
-            }
+            let zips = crate::state::attached_layer_zips(&accounts, &func);
             (func, zips)
         };
 

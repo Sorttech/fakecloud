@@ -1,6 +1,7 @@
 pub mod eventstream;
 pub mod extras;
 pub mod filter;
+pub mod layer_access;
 pub mod quota;
 pub mod resource_policy;
 pub mod runtime;

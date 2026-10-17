@@ -397,6 +397,13 @@ pub struct LayerVersion {
     pub compatible_runtimes: Vec<String>,
     pub license_info: String,
     pub policy: Option<String>,
+    /// `RevisionId` of `policy`: minted whenever the policy changes, so
+    /// `AddLayerVersionPermission` / `GetLayerVersionPolicy` report the same
+    /// value until then and a stale `RevisionId` precondition is refused.
+    /// `None` without a policy (or on snapshots that predate it, see
+    /// [`crate::layer_access::policy_revision_id`]).
+    #[serde(default)]
+    pub policy_revision_id: Option<String>,
     /// Raw ZIP bytes from `Content.ZipFile` on `PublishLayerVersion`.
     /// `None` only on legacy snapshots predating layer storage.
     #[serde(default)]
@@ -630,7 +637,8 @@ pub fn find_function<'a>(
 
 /// The ZIP bytes of every layer attached to `func`, in attach order. Each
 /// layer version ARN names the account and region the layer lives in;
-/// unresolvable layers are skipped.
+/// unresolvable layers (an external layer fakecloud holds no copy of, or a
+/// version deleted since) are skipped with a warning.
 pub fn attached_layer_zips(
     accounts: &MultiRegionState<LambdaState>,
     func: &LambdaFunction,
@@ -638,16 +646,16 @@ pub fn attached_layer_zips(
     func.layers
         .iter()
         .filter_map(|attached| {
-            let (_, name, version) = crate::extras::parse_layer_version_arn(&attached.arn)?;
-            accounts
-                .by_arn(&attached.arn)?
-                .layers
-                .get(&name)?
-                .versions
-                .iter()
-                .find(|v| v.version == version)?
-                .code_zip
-                .clone()
+            let zip = crate::layer_access::find_attached_version(accounts, &attached.arn)
+                .and_then(|v| v.code_zip.clone());
+            if zip.is_none() {
+                tracing::warn!(
+                    function = %func.function_name,
+                    layer_arn = %attached.arn,
+                    "attached layer not resolvable; skipping /opt mount for this layer"
+                );
+            }
+            zip
         })
         .collect()
 }
