@@ -122,12 +122,14 @@ impl S3Service {
                  <Size>{}</Size>\
                  <StorageClass>{}</StorageClass>\
                  <Owner><ID>{owner}</ID><DisplayName>{owner}</DisplayName></Owner>\
+                 {}\
                  </Contents>",
                 display_key,
                 obj.last_modified.format("%Y-%m-%dT%H:%M:%S%.3fZ"),
                 obj.etag,
                 obj.size,
                 obj.storage_class,
+                checksum_list_xml(obj),
                 owner = xml_escape(&b.acl_owner_id),
             ));
             last_key = key.clone();
@@ -333,14 +335,7 @@ impl S3Service {
                 String::new()
             };
 
-            let checksum_xml = if let Some(ref algo) = obj.checksum_algorithm {
-                format!(
-                    "<ChecksumAlgorithm>{}</ChecksumAlgorithm>",
-                    xml_escape(algo)
-                )
-            } else {
-                String::new()
-            };
+            let checksum_xml = checksum_list_xml(obj);
 
             let use_url_enc =
                 req.query_params.get("encoding-type").map(|s| s.as_str()) == Some("url");
@@ -632,6 +627,7 @@ impl S3Service {
                      <Size>{}</Size>\
                      <Owner><ID>{owner_id}</ID><DisplayName>{owner_id}</DisplayName></Owner>\
                      <StorageClass>{}</StorageClass>\
+                     {}\
                      </Version>",
                     enc(key),
                     obj.version_id.as_deref().unwrap_or("null"),
@@ -640,6 +636,7 @@ impl S3Service {
                     obj.etag,
                     obj.size,
                     obj.storage_class,
+                    checksum_list_xml(obj),
                 ));
             }
             next_markers = Some((
@@ -693,5 +690,16 @@ impl S3Service {
             km = enc(&key_marker),
         );
         Ok(s3_xml(StatusCode::OK, body))
+    }
+}
+
+/// The `ChecksumAlgorithm` / `ChecksumType` elements a listed object or
+/// version carries when it has an additional checksum.
+fn checksum_list_xml(obj: &crate::state::S3Object) -> String {
+    match (obj.checksum_algorithm, obj.effective_checksum_type()) {
+        (Some(algo), Some(checksum_type)) => format!(
+            "<ChecksumAlgorithm>{algo}</ChecksumAlgorithm><ChecksumType>{checksum_type}</ChecksumType>"
+        ),
+        _ => String::new(),
     }
 }

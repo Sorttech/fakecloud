@@ -105,6 +105,19 @@ pub fn put_delivered_object(
         }
     }
 
+    // Every new object carries an additional checksum, as on S3: the one the
+    // producer set (it must, for an encrypted payload, since the checksum
+    // covers the plaintext), else S3's default CRC64NVME full-object checksum
+    // of the body, the one PutObject stores for an upload that names none.
+    if obj.checksum_value.is_none() && obj.sse_algorithm.as_deref() != Some("aws:kms") {
+        let algorithm = obj
+            .checksum_algorithm
+            .unwrap_or(crate::checksum::DEFAULT_ALGORITHM);
+        obj.checksum_value = Some(crate::checksum::checksum(algorithm, &body));
+        obj.checksum_algorithm = Some(algorithm);
+        obj.checksum_type = Some(crate::checksum::ChecksumType::FullObject);
+    }
+
     // Stage the payload with no S3 lock held: the global S3 lock is shared by
     // every bucket in every account, so a large export or log delivery written
     // to disk under it would stall all of S3.
@@ -367,6 +380,69 @@ mod tests {
         assert_eq!(read(&state, &obj.body), b"two");
         assert!(b.object_versions.is_empty());
         assert_eq!(obj.lock_mode, None);
+    }
+
+    /// A delivered object carries S3's default CRC64NVME full-object
+    /// checksum of its body, like a PutObject that names no algorithm.
+    #[test]
+    fn delivery_stores_the_default_full_object_checksum() {
+        use crate::checksum::{ChecksumAlgorithm, ChecksumType};
+        let state = shared_state();
+        deliver(&state, None, "k", b"payload");
+        let obj = &bucket(&state).objects["k"];
+        assert_eq!(obj.checksum_algorithm, Some(ChecksumAlgorithm::Crc64Nvme));
+        assert_eq!(obj.checksum_type, Some(ChecksumType::FullObject));
+        assert_eq!(
+            obj.checksum_value.as_deref(),
+            Some(crate::checksum::checksum(ChecksumAlgorithm::Crc64Nvme, b"payload").as_str())
+        );
+        assert_eq!(obj.part_checksums, None);
+    }
+
+    /// A producer-supplied checksum (one over the plaintext of an encrypted
+    /// payload) is kept, and an encrypted body is never hashed for a default.
+    #[test]
+    fn delivery_keeps_a_supplied_checksum_and_skips_encrypted_bodies() {
+        use crate::checksum::{ChecksumAlgorithm, ChecksumType};
+        let state = shared_state();
+        let supplied = S3Object {
+            key: "with".to_string(),
+            sse_algorithm: Some("aws:kms".to_string()),
+            checksum_algorithm: Some(ChecksumAlgorithm::Crc64Nvme),
+            checksum_value: Some("plaintext-sum".to_string()),
+            checksum_type: Some(ChecksumType::FullObject),
+            ..Default::default()
+        };
+        put_delivered_object(
+            &state,
+            None,
+            ACCOUNT,
+            "logs-bucket",
+            supplied,
+            Bytes::from_static(b"cipher"),
+        )
+        .unwrap();
+        let encrypted = S3Object {
+            key: "without".to_string(),
+            sse_algorithm: Some("aws:kms".to_string()),
+            ..Default::default()
+        };
+        put_delivered_object(
+            &state,
+            None,
+            ACCOUNT,
+            "logs-bucket",
+            encrypted,
+            Bytes::from_static(b"cipher"),
+        )
+        .unwrap();
+        let b = bucket(&state);
+        assert_eq!(
+            b.objects["with"].checksum_value.as_deref(),
+            Some("plaintext-sum")
+        );
+        assert_eq!(b.objects["without"].checksum_value, None);
+        assert_eq!(b.objects["without"].checksum_algorithm, None);
     }
 
     #[test]
@@ -660,9 +736,10 @@ mod tests {
             part_number: u32,
             body: fakecloud_persistence::BodySource,
             etag: &str,
+            checksum: Option<fakecloud_persistence::PartChecksum<'_>>,
         ) -> fakecloud_persistence::StoreResult<fakecloud_persistence::BodyRef> {
             self.inner
-                .mpu_put_part(bucket, upload_id, part_number, body, etag)
+                .mpu_put_part(bucket, upload_id, part_number, body, etag, checksum)
         }
         fn mpu_abort(
             &self,

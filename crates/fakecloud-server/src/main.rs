@@ -8320,6 +8320,19 @@ async fn main() {
                                     storage_class: "STANDARD".to_string(),
                                     sse_algorithm,
                                     sse_kms_key_id,
+                                    // S3's default checksum, over the
+                                    // plaintext even when the stored body is a
+                                    // KMS envelope.
+                                    checksum_algorithm: Some(
+                                        fakecloud_s3::checksum::DEFAULT_ALGORITHM,
+                                    ),
+                                    checksum_value: Some(fakecloud_s3::checksum::checksum(
+                                        fakecloud_s3::checksum::DEFAULT_ALGORITHM,
+                                        &data,
+                                    )),
+                                    checksum_type: Some(
+                                        fakecloud_s3::checksum::ChecksumType::FullObject,
+                                    ),
                                     ..Default::default()
                                 };
                                 let s3_account =

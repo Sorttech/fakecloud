@@ -9,10 +9,10 @@ pub mod version;
 
 pub use config::{PersistenceConfig, StorageMode};
 pub use s3::{
-    AclGrantSnapshot, AclSnapshot, AnnotationSnapshot, BodyRef, BodySource, BucketMeta,
-    BucketSnapshot, BucketSubresource, InventorySnapshot, LoadedMpu, LoadedObject, LoadedPart,
-    MemoryS3Store, MpuInit, ObjectMeta, S3State as S3StateSnapshot, S3Store, StoreError,
-    StoreResult, TagsSnapshot, UploadPartMeta, ALL_SUBRESOURCES,
+    AclGrantSnapshot, AclSnapshot, AnnotationRecord, AnnotationSnapshot, BodyRef, BodySource,
+    BucketMeta, BucketSnapshot, BucketSubresource, InventorySnapshot, LoadedMpu, LoadedObject,
+    LoadedPart, MemoryS3Store, MpuInit, ObjectMeta, PartChecksum, S3State as S3StateSnapshot,
+    S3Store, StoreError, StoreResult, TagsSnapshot, UploadPartMeta, ALL_SUBRESOURCES,
 };
 pub use snapshot::{
     snapshot_hook, DiskSnapshotStore, MemorySnapshotStore, SnapshotHook, SnapshotStore,

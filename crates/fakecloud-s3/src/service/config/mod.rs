@@ -761,6 +761,21 @@ impl S3Service {
             )
         })
         .map_err(crate::service::persistence_error)?;
+        // Annotations travel with the object; they are stored per record, not
+        // in its metadata.
+        if let Some(o) = state.buckets.get(bucket).and_then(|bb| bb.objects.get(key)) {
+            for a in o.annotations.values() {
+                self.store
+                    .put_annotation(
+                        bucket,
+                        key,
+                        meta.version_id.as_deref(),
+                        &crate::persistence::annotation_record(a),
+                        &a.payload,
+                    )
+                    .map_err(crate::service::persistence_error)?;
+            }
+        }
         self.store
             .delete_object(bucket, &source_key, src_version.as_deref())
             .map_err(crate::service::persistence_error)?;

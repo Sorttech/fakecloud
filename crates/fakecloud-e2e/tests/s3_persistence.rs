@@ -2092,3 +2092,138 @@ async fn persistence_put_object_acl_survives_restart() {
         after.grants()
     );
 }
+
+/// Object checksums (algorithm, value, type, per-part checksums of a
+/// multipart object) and annotations with their checksums survive a restart.
+#[tokio::test]
+async fn persistence_checksums_and_annotations_survive_restart() {
+    use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumMode, ChecksumType, ObjectAttributes};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut server = TestServer::start_persistent(tmp.path()).await;
+    let client = server.s3_client().await;
+    client
+        .create_bucket()
+        .bucket("ck-persist")
+        .send()
+        .await
+        .unwrap();
+
+    let put = client
+        .put_object()
+        .bucket("ck-persist")
+        .key("single")
+        .body(ByteStream::from_static(b"hello world"))
+        .checksum_algorithm(ChecksumAlgorithm::Sha256)
+        .send()
+        .await
+        .unwrap();
+    let single_sha = put.checksum_sha256().unwrap().to_string();
+
+    let create = client
+        .create_multipart_upload()
+        .bucket("ck-persist")
+        .key("multi")
+        .checksum_algorithm(ChecksumAlgorithm::Crc32)
+        .send()
+        .await
+        .unwrap();
+    let upload_id = create.upload_id().unwrap().to_string();
+    let part = client
+        .upload_part()
+        .bucket("ck-persist")
+        .key("multi")
+        .upload_id(&upload_id)
+        .part_number(1)
+        .checksum_algorithm(ChecksumAlgorithm::Crc32)
+        .body(ByteStream::from_static(b"one part"))
+        .send()
+        .await
+        .unwrap();
+    let part_crc = part.checksum_crc32().unwrap().to_string();
+    let done = client
+        .complete_multipart_upload()
+        .bucket("ck-persist")
+        .key("multi")
+        .upload_id(&upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .parts(
+                    CompletedPart::builder()
+                        .part_number(1)
+                        .e_tag(part.e_tag().unwrap())
+                        .checksum_crc32(&part_crc)
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let composite = done.checksum_crc32().unwrap().to_string();
+
+    // An annotation with a SHA512 checksum (raw request: the pinned SDK
+    // predates the annotation API).
+    let sha512 = {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(b"note"))
+    };
+    let annotation_url =
+        |endpoint: &str| format!("{endpoint}/ck-persist/single?annotation&annotationName=review");
+    let auth = "AWS4-HMAC-SHA256 Credential=test/20240101/us-east-1/s3/aws4_request, \
+                SignedHeaders=host, Signature=00";
+    let resp = reqwest::Client::new()
+        .put(annotation_url(server.endpoint()))
+        .header("authorization", auth)
+        .header("x-amz-checksum-sha512", &sha512)
+        .body("note")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    server.restart().await;
+    let client = server.s3_client().await;
+
+    let head = client
+        .head_object()
+        .bucket("ck-persist")
+        .key("single")
+        .checksum_mode(ChecksumMode::Enabled)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.checksum_sha256(), Some(single_sha.as_str()));
+    assert_eq!(head.checksum_type(), Some(&ChecksumType::FullObject));
+
+    let attrs = client
+        .get_object_attributes()
+        .bucket("ck-persist")
+        .key("multi")
+        .object_attributes(ObjectAttributes::Checksum)
+        .object_attributes(ObjectAttributes::ObjectParts)
+        .send()
+        .await
+        .unwrap();
+    let checksum = attrs.checksum().unwrap();
+    assert_eq!(checksum.checksum_crc32(), Some(composite.as_str()));
+    assert_eq!(checksum.checksum_type(), Some(&ChecksumType::Composite));
+    assert_eq!(
+        attrs.object_parts().unwrap().parts()[0].checksum_crc32(),
+        Some(part_crc.as_str())
+    );
+
+    let got = reqwest::Client::new()
+        .get(format!(
+            "{}&x-id=GetObjectAnnotation",
+            annotation_url(server.endpoint())
+        ))
+        .header("authorization", auth)
+        .header("x-amz-checksum-mode", "ENABLED")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(got.status(), 200);
+    assert_eq!(got.headers()["x-amz-checksum-sha512"], sha512.as_str());
+    assert_eq!(&got.bytes().await.unwrap()[..], b"note");
+}

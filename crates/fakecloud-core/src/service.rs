@@ -170,6 +170,15 @@ pub struct SpooledBody {
     /// non-`aws-chunked` uploads where the header carries the real payload
     /// hash rather than a `STREAMING-…`/`UNSIGNED-PAYLOAD` marker.
     pub sha256_hex: String,
+    /// The raw MD5 digest `md5_hex` spells out.
+    pub md5: [u8; 16],
+    /// The raw SHA-256 digest `sha256_hex` spells out.
+    pub sha256: [u8; 32],
+    /// Trailing headers that followed the payload: the `aws-chunked` trailer
+    /// section (e.g. `x-amz-checksum-crc32:<base64>`) and any HTTP/1.1 chunked
+    /// trailers. Names are lowercased, values trimmed; the trailer signature
+    /// line of a signed streaming upload is not included.
+    pub trailers: Vec<(String, String)>,
 }
 
 /// Incremental decoder for the `aws-chunked` content-encoding that modern AWS
@@ -183,15 +192,17 @@ pub struct SpooledBody {
 /// hyper only strips HTTP `Transfer-Encoding: chunked`, NOT this
 /// `Content-Encoding: aws-chunked` framing — so without decoding, the size /
 /// signature lines and trailers get stored as the object's bytes (silent
-/// corruption + a wrong ETag). This fed-incrementally because network frames do
-/// not align to chunk boundaries; trailer checksums are consumed but not
-/// re-validated (fakecloud computes its own checksums over the decoded bytes).
+/// corruption + a wrong ETag). This is fed incrementally because network frames
+/// do not align to chunk boundaries. Trailer lines (`x-amz-checksum-<algo>:<v>`)
+/// are collected so the service can verify the trailing checksum against the
+/// decoded bytes; see [`AwsChunkedDecoder::trailers`].
 #[derive(Default)]
 pub struct AwsChunkedDecoder {
     state: ChunkState,
     line: Vec<u8>,
     remaining: usize,
     done: bool,
+    trailers: Vec<(String, String)>,
 }
 
 #[derive(Default, PartialEq)]
@@ -260,8 +271,9 @@ impl AwsChunkedDecoder {
                             } else if line.is_empty() {
                                 // Blank line ends the trailer section.
                                 self.done = true;
+                            } else {
+                                self.push_trailer(&line);
                             }
-                            // (a non-empty trailer line is consumed and ignored)
                             break;
                         } else if b != b'\r' {
                             self.line.push(b);
@@ -272,6 +284,50 @@ impl AwsChunkedDecoder {
         }
         Ok(out)
     }
+
+    /// Record one `name:value` trailer line. The signature of a signed
+    /// streaming upload (`x-amz-trailer-signature`) authenticates the trailer
+    /// rather than describing the payload, so it is not kept.
+    fn push_trailer(&mut self, line: &[u8]) {
+        let text = String::from_utf8_lossy(line);
+        let Some((name, value)) = text.split_once(':') else {
+            return;
+        };
+        let name = name.trim().to_ascii_lowercase();
+        if name.is_empty() || name == "x-amz-trailer-signature" {
+            return;
+        }
+        self.trailers.push((name, value.trim().to_string()));
+    }
+
+    /// The trailer headers read after the terminating zero-size chunk.
+    pub fn trailers(&self) -> &[(String, String)] {
+        &self.trailers
+    }
+
+    /// Consume the decoder, returning its trailer headers.
+    pub fn into_trailers(self) -> Vec<(String, String)> {
+        self.trailers
+    }
+}
+
+/// A fully decoded `aws-chunked` body held in memory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedAwsChunked {
+    pub payload: Vec<u8>,
+    pub trailers: Vec<(String, String)>,
+}
+
+/// Decode an already-buffered `aws-chunked` body (the framing a streaming
+/// payload carries when it reaches a handler through the buffered path, e.g.
+/// S3 `PutObjectAnnotation`).
+pub fn decode_aws_chunked(body: &[u8]) -> Result<DecodedAwsChunked, MalformedChunk> {
+    let mut decoder = AwsChunkedDecoder::default();
+    let payload = decoder.feed(body)?;
+    Ok(DecodedAwsChunked {
+        payload,
+        trailers: decoder.into_trailers(),
+    })
 }
 
 /// Whether a request body carries the `aws-chunked` content-encoding (so the
@@ -332,6 +388,19 @@ pub async fn spool_request_stream(
     dir: Option<&std::path::Path>,
     aws_chunked: bool,
 ) -> Result<SpooledBody, AwsServiceError> {
+    spool_request_stream_observed(stream, dir, aws_chunked, &mut |_| {}).await
+}
+
+/// [`spool_request_stream`], additionally handing every decoded payload chunk
+/// to `observer` in order. Lets a caller fold extra digests (S3's flexible
+/// checksums) into the same single pass over the body instead of re-reading
+/// the spooled file.
+pub async fn spool_request_stream_observed(
+    stream: RequestBodyStream,
+    dir: Option<&std::path::Path>,
+    aws_chunked: bool,
+    observer: &mut (dyn FnMut(&[u8]) + Send),
+) -> Result<SpooledBody, AwsServiceError> {
     use http_body_util::BodyExt;
     use tokio::io::AsyncWriteExt;
 
@@ -374,6 +443,7 @@ pub async fn spool_request_stream(
     let mut size: u64 = 0;
     let mut body = stream;
     let mut decoder = aws_chunked.then(AwsChunkedDecoder::default);
+    let mut http_trailers: Vec<(String, String)> = Vec::new();
 
     // Cleanup helper: drop the file handle before unlinking so
     // platforms that disallow removing an open file (Windows) still
@@ -387,6 +457,18 @@ pub async fn spool_request_stream(
     loop {
         match body.frame().await {
             Some(Ok(frame)) => {
+                let frame = match frame.into_trailers() {
+                    Ok(trailers) => {
+                        for (name, value) in trailers.iter() {
+                            if let Ok(v) = value.to_str() {
+                                http_trailers
+                                    .push((name.as_str().to_string(), v.trim().to_string()));
+                            }
+                        }
+                        continue;
+                    }
+                    Err(frame) => frame,
+                };
                 if let Ok(raw) = frame.into_data() {
                     if !raw.is_empty() {
                         // Decode aws-chunked framing into the real payload when
@@ -408,6 +490,7 @@ pub async fn spool_request_stream(
                         if !payload.is_empty() {
                             hasher.update(&payload);
                             sha.update(&payload);
+                            observer(&payload);
                             size += payload.len() as u64;
                             if let Err(e) = file.write_all(&payload).await {
                                 cleanup(file, &path).await;
@@ -420,8 +503,6 @@ pub async fn spool_request_stream(
                         }
                     }
                 }
-                // HTTP trailers are ignored; aws-chunked trailers are consumed
-                // inside the decoder.
             }
             Some(Err(e)) => {
                 cleanup(file, &path).await;
@@ -441,13 +522,22 @@ pub async fn spool_request_stream(
     }
     drop(file);
 
-    let md5_hex = hex_lower(&hasher.finalize());
-    let sha256_hex = hex_lower(&sha.finalize());
+    let md5: [u8; 16] = hasher.finalize().into();
+    let sha256: [u8; 32] = sha.finalize().into();
+    let md5_hex = hex_lower(&md5);
+    let sha256_hex = hex_lower(&sha256);
+    let mut trailers = decoder
+        .map(AwsChunkedDecoder::into_trailers)
+        .unwrap_or_default();
+    trailers.extend(http_trailers);
     Ok(SpooledBody {
         path,
         size,
         md5_hex,
         sha256_hex,
+        md5,
+        sha256,
+        trailers,
     })
 }
 
@@ -884,6 +974,64 @@ mod tests {
                 assert_eq!(decoded, payload, "feed={feed} trailer={with_trailer}");
             }
         }
+    }
+
+    #[test]
+    fn aws_chunked_decoder_collects_trailers_across_frame_boundaries() {
+        let payload: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
+        let body = aws_chunked_body(&payload, 1024, true);
+        for feed in [1usize, 5, 333, body.len()] {
+            let mut d = AwsChunkedDecoder::default();
+            for frame in body.chunks(feed) {
+                d.feed(frame).unwrap();
+            }
+            assert_eq!(
+                d.trailers(),
+                &[("x-amz-checksum-crc32".to_string(), "AAAAAA==".to_string())],
+                "feed={feed}"
+            );
+        }
+    }
+
+    #[test]
+    fn aws_chunked_trailer_signature_and_optional_newline_are_handled() {
+        // Signed trailer form: the checksum line (with the optional bare `\n`
+        // some clients emit), then the trailer signature, then the final CRLF.
+        let body = b"5\r\nhello\r\n0\r\nX-Amz-Checksum-Sha256: abc= \n\r\n";
+        let decoded = decode_aws_chunked(body).unwrap();
+        assert_eq!(decoded.payload, b"hello");
+        assert_eq!(
+            decoded.trailers,
+            vec![("x-amz-checksum-sha256".to_string(), "abc=".to_string())]
+        );
+        let signed =
+            b"3\r\nabc\r\n0\r\nx-amz-checksum-crc32c:Zm9v\r\nx-amz-trailer-signature:dead\r\n\r\n";
+        let decoded = decode_aws_chunked(signed).unwrap();
+        assert_eq!(decoded.payload, b"abc");
+        assert_eq!(
+            decoded.trailers,
+            vec![("x-amz-checksum-crc32c".to_string(), "Zm9v".to_string())]
+        );
+        assert!(decode_aws_chunked(b"zz\r\nabc").is_err());
+    }
+
+    #[tokio::test]
+    async fn spool_observer_sees_every_decoded_byte_and_trailers_are_returned() {
+        let payload: Vec<u8> = (0..9000u32).map(|i| (i % 251) as u8).collect();
+        let body = aws_chunked_body(&payload, 1024, true);
+        let mut seen = Vec::new();
+        let spooled =
+            spool_request_stream_observed(axum::body::Body::from(body), None, true, &mut |chunk| {
+                seen.extend_from_slice(chunk)
+            })
+            .await
+            .expect("spool ok");
+        assert_eq!(seen, payload);
+        assert_eq!(
+            spooled.trailers,
+            vec![("x-amz-checksum-crc32".to_string(), "AAAAAA==".to_string())]
+        );
+        let _ = std::fs::remove_file(&spooled.path);
     }
 
     #[test]

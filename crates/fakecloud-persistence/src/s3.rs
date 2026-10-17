@@ -159,6 +159,14 @@ pub struct ObjectMeta {
     pub checksum_algorithm: Option<String>,
     #[serde(default)]
     pub checksum_value: Option<String>,
+    /// `COMPOSITE` or `FULL_OBJECT`. Absent in state written before checksum
+    /// types were tracked; readers derive it from the object then.
+    #[serde(default)]
+    pub checksum_type: Option<String>,
+    /// Per-part additional checksums of a multipart object (part number,
+    /// base64 value in the object's `checksum_algorithm`), in part order.
+    #[serde(default)]
+    pub part_checksums: Option<Vec<(u32, String)>>,
     #[serde(default)]
     pub lock_mode: Option<String>,
     #[serde(default)]
@@ -200,6 +208,49 @@ pub struct AnnotationSnapshot {
     pub last_modified: DateTime<Utc>,
     #[serde(default)]
     pub checksum_algorithm: Option<String>,
+    /// Base64 checksum of the payload in `checksum_algorithm`.
+    #[serde(default)]
+    pub checksum_value: Option<String>,
+}
+
+/// The metadata of one annotation, persisted on its own record so writing or
+/// removing one annotation touches nothing else: the record lives beside the
+/// object version's sidecar and the payload in a sibling `.bin` file.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct AnnotationRecord {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub etag: String,
+    #[serde(default = "default_time")]
+    pub last_modified: DateTime<Utc>,
+    #[serde(default)]
+    pub checksum_algorithm: Option<String>,
+    #[serde(default)]
+    pub checksum_value: Option<String>,
+}
+
+impl AnnotationRecord {
+    fn into_snapshot(self, payload: Vec<u8>) -> AnnotationSnapshot {
+        AnnotationSnapshot {
+            name: self.name,
+            payload,
+            etag: self.etag,
+            last_modified: self.last_modified,
+            checksum_algorithm: self.checksum_algorithm,
+            checksum_value: self.checksum_value,
+        }
+    }
+
+    fn of(snapshot: &AnnotationSnapshot) -> Self {
+        Self {
+            name: snapshot.name.clone(),
+            etag: snapshot.etag.clone(),
+            last_modified: snapshot.last_modified,
+            checksum_algorithm: snapshot.checksum_algorithm.clone(),
+            checksum_value: snapshot.checksum_value.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -224,6 +275,9 @@ pub struct MpuInit {
     pub acl_grants: Vec<AclGrantSnapshot>,
     #[serde(default)]
     pub checksum_algorithm: Option<String>,
+    /// `x-amz-checksum-type` requested at CreateMultipartUpload.
+    #[serde(default)]
+    pub checksum_type: Option<String>,
     #[serde(default)]
     pub cache_control: Option<String>,
     #[serde(default)]
@@ -248,6 +302,19 @@ pub struct UploadPartMeta {
     pub size: u64,
     #[serde(default = "default_time")]
     pub last_modified: DateTime<Utc>,
+    /// The part's additional checksum (algorithm name, base64 value).
+    #[serde(default)]
+    pub checksum_algorithm: Option<String>,
+    #[serde(default)]
+    pub checksum_value: Option<String>,
+}
+
+/// A multipart part's additional checksum, handed to
+/// [`S3Store::mpu_put_part`] so it is persisted with the part.
+#[derive(Debug, Clone, Copy)]
+pub struct PartChecksum<'a> {
+    pub algorithm: &'a str,
+    pub value: &'a str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -471,6 +538,32 @@ pub trait S3Store: Send + Sync {
     fn delete_object(&self, bucket: &str, key: &str, version: Option<&str>) -> StoreResult<()>;
     fn open_object_body(&self, body: &BodyRef) -> StoreResult<Bytes>;
 
+    /// Persist one annotation of an object version (creating or replacing
+    /// it) without rewriting the object's metadata or its other annotations.
+    /// Memory-only stores keep annotations in the runtime state alone.
+    fn put_annotation(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _version: Option<&str>,
+        _record: &AnnotationRecord,
+        _payload: &[u8],
+    ) -> StoreResult<()> {
+        Ok(())
+    }
+
+    /// Remove one annotation of an object version. Removing one that is not
+    /// stored succeeds.
+    fn delete_annotation(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _version: Option<&str>,
+        _name: &str,
+    ) -> StoreResult<()> {
+        Ok(())
+    }
+
     fn mpu_create(&self, bucket: &str, upload_id: &str, init: &MpuInit) -> StoreResult<()>;
     /// Persist a multipart-upload part body. Returns the [`BodyRef`] the
     /// service should keep in its in-memory part map: `BodyRef::Disk`
@@ -484,6 +577,7 @@ pub trait S3Store: Send + Sync {
         part_number: u32,
         body: BodySource,
         etag: &str,
+        checksum: Option<PartChecksum<'_>>,
     ) -> StoreResult<BodyRef>;
     /// Where the streaming dispatch path should spool large request
     /// bodies to disk before handing them to [`Self::put_object`] /
@@ -587,6 +681,7 @@ impl S3Store for MemoryS3Store {
         _part_number: u32,
         body: BodySource,
         _etag: &str,
+        _checksum: Option<PartChecksum<'_>>,
     ) -> StoreResult<BodyRef> {
         // Memory mode keeps all part bodies in RAM. Absorb any tempfile
         // produced by the streaming dispatch path here.
@@ -663,6 +758,77 @@ impl DiskS3Store {
         (dir, bin, toml)
     }
 
+    /// Where an object version's annotations live: one `<id>.toml` record and
+    /// `<id>.bin` payload per annotation, `<id>` the SHA-256 of the name (a
+    /// name can be 512 bytes, too long for a file name once escaped).
+    fn annotation_dir(&self, bucket: &str, key: &str, version: Option<&str>) -> PathBuf {
+        Self::annotation_dir_in(&self.object_dir(bucket, key), &Self::version_tag(version))
+    }
+
+    fn annotation_dir_in(key_dir: &std::path::Path, version_tag: &str) -> PathBuf {
+        key_dir.join(format!("{version_tag}.annotations"))
+    }
+
+    fn annotation_file_stem(name: &str) -> String {
+        use sha2::Digest;
+        sha2::Sha256::digest(name.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    fn write_annotation(
+        dir: &std::path::Path,
+        record: &AnnotationRecord,
+        payload: &[u8],
+    ) -> StoreResult<()> {
+        std::fs::create_dir_all(dir)?;
+        let stem = Self::annotation_file_stem(&record.name);
+        // Payload first: `load` reads a record only together with its payload.
+        crate::atomic::write_atomic_bytes(&dir.join(format!("{stem}.bin")), payload)?;
+        crate::atomic::write_atomic_toml(&dir.join(format!("{stem}.toml")), record)?;
+        Ok(())
+    }
+
+    /// Read an object version's annotation records, and move any that an
+    /// older build embedded in the version's sidecar out into records of
+    /// their own (rewriting the sidecar without them), so a later metadata
+    /// write -- which no longer carries annotations -- cannot drop them.
+    fn load_annotations(
+        key_dir: &std::path::Path,
+        version_tag: &str,
+        sidecar: &std::path::Path,
+        meta: &mut ObjectMeta,
+    ) -> StoreResult<()> {
+        let dir = Self::annotation_dir_in(key_dir, version_tag);
+        let mut loaded: BTreeMap<String, AnnotationSnapshot> = BTreeMap::new();
+        if dir.is_dir() {
+            for entry in std::fs::read_dir(&dir)? {
+                let path = entry?.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                    continue;
+                }
+                let record: AnnotationRecord = toml::from_str(&std::fs::read_to_string(&path)?)
+                    .map_err(|e| StoreError::Serde(e.to_string()))?;
+                let payload = std::fs::read(path.with_extension("bin"))?;
+                loaded.insert(record.name.clone(), record.into_snapshot(payload));
+            }
+        }
+        let legacy = std::mem::take(&mut meta.annotations);
+        if !legacy.is_empty() {
+            for a in legacy {
+                if loaded.contains_key(&a.name) {
+                    continue;
+                }
+                Self::write_annotation(&dir, &AnnotationRecord::of(&a), &a.payload)?;
+                loaded.insert(a.name.clone(), a);
+            }
+            crate::atomic::write_atomic_toml(sidecar, &*meta)?;
+        }
+        meta.annotations = loaded.into_values().collect();
+        Ok(())
+    }
+
     fn subresource_filename(kind: BucketSubresource) -> &'static str {
         match kind {
             BucketSubresource::Tags => "tags.toml",
@@ -721,6 +887,13 @@ impl DiskS3Store {
             format!("__mpu__/{}", upload_id),
             Some(format!("part-{}", part_number)),
         )
+    }
+}
+
+fn remove_dir_if_present(dir: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(dir) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
     }
 }
 
@@ -795,8 +968,12 @@ impl S3Store for DiskS3Store {
                         let key_dir = okey_entry.path();
                         let mut versioned: Vec<LoadedObject> = Vec::new();
                         let mut key_name: Option<String> = None;
-                        for version_entry in std::fs::read_dir(&key_dir)? {
-                            let version_entry = version_entry?;
+                        // Listed up front: loading annotations can rewrite a
+                        // sidecar in this directory, and a directory changed
+                        // mid-listing may list an entry twice.
+                        let version_entries: Vec<std::fs::DirEntry> =
+                            std::fs::read_dir(&key_dir)?.collect::<Result<_, _>>()?;
+                        for version_entry in version_entries {
                             let path = version_entry.path();
                             let Some(fname) = path.file_name().and_then(|s| s.to_str()) else {
                                 continue;
@@ -806,8 +983,9 @@ impl S3Store for DiskS3Store {
                             }
                             let version_tag = &fname[..fname.len() - 5];
                             let toml_text = std::fs::read_to_string(&path)?;
-                            let obj_meta: ObjectMeta = toml::from_str(&toml_text)
+                            let mut obj_meta: ObjectMeta = toml::from_str(&toml_text)
                                 .map_err(|e| StoreError::Serde(e.to_string()))?;
+                            Self::load_annotations(&key_dir, version_tag, &path, &mut obj_meta)?;
                             let bin_path = key_dir.join(format!("{}.bin", version_tag));
                             let (body, size) = if obj_meta.is_delete_marker {
                                 (BodyRef::Memory(Bytes::new()), 0u64)
@@ -1080,6 +1258,9 @@ impl S3Store for DiskS3Store {
     ) -> StoreResult<BodyRef> {
         let (dir, bin_path, toml_path) = self.object_paths(bucket, key, version);
         std::fs::create_dir_all(&dir)?;
+        // A new object in this slot starts without annotations; the replaced
+        // object's go with it.
+        remove_dir_if_present(&self.annotation_dir(bucket, key, version))?;
 
         if meta.is_delete_marker {
             crate::atomic::write_atomic_toml(&toml_path, meta)?;
@@ -1169,6 +1350,16 @@ impl S3Store for DiskS3Store {
                 );
             }
         }
+        // Annotations without their sidecar are never loaded, so like the
+        // body a failure here only leaves residue.
+        let annotations = self.annotation_dir(bucket, key, version);
+        if let Err(e) = remove_dir_if_present(&annotations) {
+            tracing::warn!(
+                path = %annotations.display(),
+                error = %e,
+                "deleted object's annotations could not be removed",
+            );
+        }
         Self::cleanup_empty(&dir);
 
         self.cache.invalidate(&crate::cache::BodyKey::new(
@@ -1176,6 +1367,38 @@ impl S3Store for DiskS3Store {
             key.to_string(),
             version.map(|s| s.to_string()),
         ));
+        Ok(())
+    }
+
+    fn put_annotation(
+        &self,
+        bucket: &str,
+        key: &str,
+        version: Option<&str>,
+        record: &AnnotationRecord,
+        payload: &[u8],
+    ) -> StoreResult<()> {
+        Self::write_annotation(&self.annotation_dir(bucket, key, version), record, payload)
+    }
+
+    fn delete_annotation(
+        &self,
+        bucket: &str,
+        key: &str,
+        version: Option<&str>,
+        name: &str,
+    ) -> StoreResult<()> {
+        let dir = self.annotation_dir(bucket, key, version);
+        let stem = Self::annotation_file_stem(name);
+        // Record first: a payload without its record is never loaded.
+        for ext in ["toml", "bin"] {
+            match std::fs::remove_file(dir.join(format!("{stem}.{ext}"))) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Self::cleanup_empty(&dir);
         Ok(())
     }
 
@@ -1216,6 +1439,7 @@ impl S3Store for DiskS3Store {
         part_number: u32,
         body: BodySource,
         etag: &str,
+        checksum: Option<PartChecksum<'_>>,
     ) -> StoreResult<BodyRef> {
         let parts_dir = self.mpu_parts_dir(bucket, upload_id);
         std::fs::create_dir_all(&parts_dir)?;
@@ -1251,6 +1475,8 @@ impl S3Store for DiskS3Store {
             etag: etag.to_string(),
             size,
             last_modified: Utc::now(),
+            checksum_algorithm: checksum.map(|c| c.algorithm.to_string()),
+            checksum_value: checksum.map(|c| c.value.to_string()),
         };
         crate::atomic::write_atomic_toml(&toml_path, &meta)?;
         // Disk-mode parts live on disk; expose them as BodyRef::Disk so
@@ -1338,6 +1564,7 @@ impl S3Store for DiskS3Store {
 
         let (dir, bin_path, toml_path) = self.object_paths(bucket, final_key, version);
         std::fs::create_dir_all(&dir)?;
+        remove_dir_if_present(&self.annotation_dir(bucket, final_key, version))?;
 
         let total_size: u64 = if part_numbers.len() == 1 {
             let only = self.mpu_part_bin(bucket, upload_id, part_numbers[0]);
@@ -1754,6 +1981,142 @@ mod disk_tests {
         let loaded = store.load().unwrap();
         let obj = loaded.buckets.get("b").unwrap().objects.get("k").unwrap();
         assert_eq!(obj.meta.tags.get("x").map(String::as_str), Some("y"));
+    }
+
+    fn annotation(name: &str) -> AnnotationRecord {
+        AnnotationRecord {
+            name: name.to_string(),
+            etag: format!("\"{name}\""),
+            checksum_algorithm: Some("CRC64NVME".to_string()),
+            checksum_value: Some("AAAAAAAAAAA=".to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn store_with_object(tmp: &TempDir) -> DiskS3Store {
+        let store = new_store(tmp);
+        store
+            .put_bucket_meta(
+                "b",
+                &BucketMeta {
+                    name: "b".to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .put_object(
+                "b",
+                "k",
+                None,
+                BodySource::Bytes(Bytes::from_static(b"abc")),
+                &sample_meta("k", 3),
+            )
+            .unwrap();
+        store
+    }
+
+    fn loaded_annotations(store: &DiskS3Store) -> Vec<(String, Vec<u8>)> {
+        let loaded = store.load().unwrap();
+        let obj = &loaded.buckets["b"].objects["k"];
+        obj.meta
+            .annotations
+            .iter()
+            .map(|a| (a.name.clone(), a.payload.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn put_annotation_touches_only_that_annotation() {
+        let tmp = TempDir::new().unwrap();
+        let store = store_with_object(&tmp);
+        store
+            .put_annotation("b", "k", None, &annotation("a"), b"first")
+            .unwrap();
+        // Overwrite a's stored payload behind the store's back: if putting b
+        // rewrote a, this sentinel would be replaced.
+        let a_bin = store
+            .annotation_dir("b", "k", None)
+            .join(format!("{}.bin", DiskS3Store::annotation_file_stem("a")));
+        std::fs::write(&a_bin, b"sentinel").unwrap();
+        let (_, _, sidecar) = store.object_paths("b", "k", None);
+        let sidecar_before = std::fs::read(&sidecar).unwrap();
+
+        store
+            .put_annotation("b", "k", None, &annotation("b"), b"second")
+            .unwrap();
+        assert_eq!(std::fs::read(&a_bin).unwrap(), b"sentinel");
+        assert_eq!(std::fs::read(&sidecar).unwrap(), sidecar_before);
+        assert_eq!(
+            loaded_annotations(&store),
+            vec![
+                ("a".to_string(), b"sentinel".to_vec()),
+                ("b".to_string(), b"second".to_vec())
+            ]
+        );
+
+        store.delete_annotation("b", "k", None, "a").unwrap();
+        store.delete_annotation("b", "k", None, "missing").unwrap();
+        assert_eq!(
+            loaded_annotations(&store),
+            vec![("b".to_string(), b"second".to_vec())]
+        );
+        // A 512-byte name still maps to a short file name.
+        let long = "n".repeat(512);
+        store
+            .put_annotation("b", "k", None, &annotation(&long), b"long")
+            .unwrap();
+        assert!(loaded_annotations(&store).iter().any(|(n, _)| *n == long));
+    }
+
+    #[test]
+    fn legacy_embedded_annotations_move_to_their_own_records() {
+        let tmp = TempDir::new().unwrap();
+        let store = store_with_object(&tmp);
+        let mut meta = sample_meta("k", 3);
+        meta.annotations = vec![AnnotationSnapshot {
+            name: "old".to_string(),
+            payload: b"legacy".to_vec(),
+            etag: "e".to_string(),
+            ..Default::default()
+        }];
+        store.put_object_meta("b", "k", None, &meta).unwrap();
+
+        assert_eq!(
+            loaded_annotations(&store),
+            vec![("old".to_string(), b"legacy".to_vec())]
+        );
+        // The sidecar no longer embeds it, so deleting the record is final.
+        let (_, _, sidecar) = store.object_paths("b", "k", None);
+        let rewritten: ObjectMeta =
+            toml::from_str(&std::fs::read_to_string(&sidecar).unwrap()).unwrap();
+        assert!(rewritten.annotations.is_empty());
+        store.delete_annotation("b", "k", None, "old").unwrap();
+        assert!(loaded_annotations(&store).is_empty());
+    }
+
+    #[test]
+    fn replacing_or_deleting_an_object_drops_its_annotations() {
+        let tmp = TempDir::new().unwrap();
+        let store = store_with_object(&tmp);
+        store
+            .put_annotation("b", "k", None, &annotation("a"), b"x")
+            .unwrap();
+        store
+            .put_object(
+                "b",
+                "k",
+                None,
+                BodySource::Bytes(Bytes::from_static(b"new")),
+                &sample_meta("k", 3),
+            )
+            .unwrap();
+        assert!(loaded_annotations(&store).is_empty());
+        store
+            .put_annotation("b", "k", None, &annotation("a"), b"x")
+            .unwrap();
+        store.delete_object("b", "k", None).unwrap();
+        assert!(!store.annotation_dir("b", "k", None).exists());
     }
 
     #[test]
@@ -2447,6 +2810,10 @@ mod disk_tests {
                     n,
                     BodySource::Bytes(body.clone()),
                     &format!("et{}", n),
+                    Some(PartChecksum {
+                        algorithm: "CRC32",
+                        value: &format!("ck{n}"),
+                    }),
                 )
                 .unwrap();
         }
@@ -2460,6 +2827,8 @@ mod disk_tests {
             assert_eq!(part.meta.part_number, n);
             assert_eq!(part.meta.size, body.len() as u64);
             assert_eq!(part.meta.etag, format!("et{}", n));
+            assert_eq!(part.meta.checksum_algorithm.as_deref(), Some("CRC32"));
+            assert_eq!(part.meta.checksum_value, Some(format!("ck{n}")));
             match &part.body {
                 BodyRef::Disk { path, size, .. } => {
                     assert_eq!(*size, body.len() as u64);
@@ -2493,6 +2862,7 @@ mod disk_tests {
                 1,
                 BodySource::Bytes(Bytes::from_static(b"x")),
                 "e",
+                None,
             )
             .unwrap();
         store.mpu_abort("b", "up").unwrap();
@@ -2522,7 +2892,7 @@ mod disk_tests {
             .unwrap();
         let body = Bytes::from_static(b"only-part-bytes");
         store
-            .mpu_put_part("b", "up", 1, BodySource::Bytes(body.clone()), "et")
+            .mpu_put_part("b", "up", 1, BodySource::Bytes(body.clone()), "et", None)
             .unwrap();
         let meta = sample_meta("k", body.len() as u64);
         let body_ref = store.mpu_complete("b", "up", "k", None, &meta).unwrap();
@@ -2557,7 +2927,7 @@ mod disk_tests {
         let p3 = Bytes::from_static(b"CC");
         for (n, b) in [(1u32, &p1), (2, &p2), (3, &p3)] {
             store
-                .mpu_put_part("b", "up", n, BodySource::Bytes(b.clone()), "e")
+                .mpu_put_part("b", "up", n, BodySource::Bytes(b.clone()), "e", None)
                 .unwrap();
         }
         let mut expected = Vec::new();
@@ -2605,7 +2975,7 @@ mod disk_tests {
             std::fs::write(&src, &data).unwrap();
             expected.extend_from_slice(&data);
             store
-                .mpu_put_part("b", "up", (i + 1) as u32, BodySource::File(src), "et")
+                .mpu_put_part("b", "up", (i + 1) as u32, BodySource::File(src), "et", None)
                 .unwrap();
         }
         let meta = sample_meta("k", expected.len() as u64);
@@ -2642,10 +3012,10 @@ mod disk_tests {
         let p1 = Bytes::from_static(b"hello-");
         let p2 = Bytes::from_static(b"world-");
         store
-            .mpu_put_part("b", "up", 1, BodySource::Bytes(p1.clone()), "e1")
+            .mpu_put_part("b", "up", 1, BodySource::Bytes(p1.clone()), "e1", None)
             .unwrap();
         store
-            .mpu_put_part("b", "up", 2, BodySource::Bytes(p2.clone()), "e2")
+            .mpu_put_part("b", "up", 2, BodySource::Bytes(p2.clone()), "e2", None)
             .unwrap();
 
         // Simulate a restart: re-open the store on the same dir and load.
@@ -2660,7 +3030,7 @@ mod disk_tests {
         // Continue the upload on the fresh store.
         let p3 = Bytes::from_static(b"again!");
         store2
-            .mpu_put_part("b", "up", 3, BodySource::Bytes(p3.clone()), "e3")
+            .mpu_put_part("b", "up", 3, BodySource::Bytes(p3.clone()), "e3", None)
             .unwrap();
         let mut expected = Vec::new();
         expected.extend_from_slice(&p1);

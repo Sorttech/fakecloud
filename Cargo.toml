@@ -49,6 +49,10 @@ sqlparser = "0.61"
 multer = "3"
 futures-util = "0.3"
 
+[workspace.dependencies.xxhash-rust]
+version = "0.8"
+features = [ "xxh64", "xxh3",]
+
 [profile.test]
 debug = "line-tables-only"
 
