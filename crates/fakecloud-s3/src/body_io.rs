@@ -23,6 +23,121 @@ use std::path::PathBuf;
 use bytes::Bytes;
 use fakecloud_persistence::{BodyRef, BodySource, S3Store};
 
+/// An object's content as another service reads it: the stored body,
+/// opened under the S3 state guard, plus what is needed to undo its SSE-KMS
+/// encryption once the guard is dropped.
+///
+/// Every cross-service read of an object (a DynamoDB import, an Athena scan,
+/// a CloudFormation template, the S3 delivery bus, ...) goes through this, so
+/// an SSE-KMS object reads as its plaintext everywhere, exactly as GetObject
+/// returns it, never as the stored envelope.
+pub struct ObjectReader {
+    handle: ObjectBodyHandle,
+    /// Set for an SSE-KMS object: the hook decrypting it, and the bucket
+    /// owner, bucket and key id it was encrypted under.
+    kms: Option<KmsSource>,
+    size: u64,
+}
+
+struct KmsSource {
+    hook: Option<std::sync::Arc<dyn fakecloud_core::delivery::KmsHook>>,
+    owner_account: String,
+    bucket: String,
+    key_id: Option<String>,
+}
+
+impl ObjectReader {
+    /// Open `obj`, stored in `bucket` owned by `owner_account`. Call while
+    /// holding the S3 state guard `accounts` came from; it only opens a file
+    /// descriptor.
+    pub fn open(
+        accounts: &fakecloud_core::multi_account::MultiAccountState<crate::state::S3State>,
+        owner_account: &str,
+        bucket: &str,
+        obj: &crate::state::S3Object,
+    ) -> io::Result<Self> {
+        let kms =
+            crate::side_effects::is_sse_kms(obj.sse_algorithm.as_deref()).then(|| KmsSource {
+                hook: crate::side_effects::installed(accounts, owner_account)
+                    .and_then(|e| e.kms_hook.clone()),
+                owner_account: owner_account.to_string(),
+                bucket: bucket.to_string(),
+                key_id: obj.sse_kms_key_id.clone(),
+            });
+        Ok(Self {
+            handle: ObjectBodyHandle::open(&obj.body)?,
+            kms,
+            size: obj.size,
+        })
+    }
+
+    /// The object's size: that of its plaintext.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// Read the whole object, decrypting an SSE-KMS body. Call with no S3
+    /// lock held.
+    pub fn read_all(self) -> io::Result<Bytes> {
+        let stored = self.handle.read_all()?;
+        match self.kms {
+            None => Ok(stored),
+            Some(kms) => crate::side_effects::kms_decrypt(
+                kms.hook.as_ref(),
+                &kms.owner_account,
+                &kms.bucket,
+                &stored,
+                kms.key_id.as_deref(),
+            )
+            .map_err(|e| io::Error::other(format!("SSE-KMS decrypt failed: {e}"))),
+        }
+    }
+}
+
+/// Read `bucket/key` (the current version) in `owner_account` as its
+/// plaintext, the way another service reads an object. `None` when the
+/// bucket or key does not exist or is a delete marker. The body is read
+/// after the S3 guard is released.
+pub fn read_object(
+    state: &crate::state::SharedS3State,
+    owner_account: &str,
+    bucket: &str,
+    key: &str,
+) -> Option<io::Result<Bytes>> {
+    read_object_version(state, owner_account, bucket, key, None)
+}
+
+/// [`read_object`] of a specific version (`None` = the current one): the
+/// current object when it carries that id, else the version history.
+pub fn read_object_version(
+    state: &crate::state::SharedS3State,
+    owner_account: &str,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+) -> Option<io::Result<Bytes>> {
+    let reader = {
+        let accounts = state.read();
+        let b = accounts.get(owner_account)?.buckets.get(bucket)?;
+        let obj = match version_id {
+            None => b.objects.get(key),
+            Some(vid) => b
+                .objects
+                .get(key)
+                .filter(|o| o.version_id.as_deref() == Some(vid))
+                .or_else(|| {
+                    b.object_versions
+                        .get(key)?
+                        .iter()
+                        .find(|o| o.version_id.as_deref() == Some(vid))
+                }),
+        }
+        .filter(|o| !o.is_delete_marker)?;
+        ObjectReader::open(&accounts, owner_account, bucket, obj)
+    };
+    Some(reader.and_then(|r| crate::service::run_blocking_io(|| r.read_all())))
+}
+
 /// An object body resolved under the S3 state guard, readable after the
 /// guard is dropped.
 #[derive(Debug)]

@@ -227,6 +227,9 @@ fn invalid_request(message: impl Into<String>) -> AwsServiceError {
 /// - two rules with the same `Priority`: the priority is what decides which
 ///   rule applies when several select the same object for one destination,
 ///   so it must be unique among the rules;
+/// - a rule opting in to SSE-KMS objects (`SourceSelectionCriteria`
+///   `SseKmsEncryptedObjects` `Enabled`) without the destination's
+///   `EncryptionConfiguration` `ReplicaKmsKeyID` to encrypt replicas under;
 /// - a tag-based rule with delete marker replication enabled ("If your
 ///   `Filter` includes a `Tag` element, the `DeleteMarkerReplication`
 ///   `Status` must be set to Disabled", API Reference, `ReplicationRule`).
@@ -241,6 +244,11 @@ pub(crate) fn validate_replication_config(xml: &str) -> Result<(), AwsServiceErr
                      be unique."
                 )));
             }
+        }
+        if rule.sse_kms_encrypted_objects && rule.replica_kms_key_id.is_none() {
+            return Err(invalid_request(
+                "ReplicaKmsKeyID must be specified if SseKmsEncryptedObjects tag is present.",
+            ));
         }
         if rule.v2 && !rule.tags.is_empty() && rule.delete_marker_replication {
             return Err(invalid_request(
@@ -362,13 +370,21 @@ pub(crate) fn rules_for_object<'a>(
     {
         return Vec::new();
     }
+    // The opt-in covers SSE-KMS and DSSE-KMS objects alike ("By default,
+    // Amazon S3 doesn't replicate objects that are encrypted by using SSE-KMS
+    // or DSSE-KMS"), so this is a prefix match, unlike the envelope check.
     let kms_encrypted = obj
         .sse_algorithm
         .as_deref()
         .is_some_and(|a| a.starts_with("aws:kms"));
-    winning_rules(rules, |r| {
-        r.selects(&obj.key, &obj.tags) && (!kms_encrypted || r.sse_kms_encrypted_objects)
-    })
+    // The rule that applies to a destination is chosen by filter and
+    // priority alone; its own criteria (the SSE-KMS opt-in) then decide
+    // whether the object goes there. A lower-priority rule never stands in
+    // for a winning rule that declines the object.
+    winning_rules(rules, |r| r.selects(&obj.key, &obj.tags))
+        .into_iter()
+        .filter(|r| !kms_encrypted || r.sse_kms_encrypted_objects)
+        .collect()
 }
 
 /// The rules that replicate a delete marker for `key`, one per destination:
@@ -461,6 +477,16 @@ fn resolve_destination(
 /// every applicable rule replicated it and `FAILED` otherwise (S3 reports
 /// `PENDING` until it finishes; here replication finishes with the write);
 /// replicas are marked `REPLICA`.
+///
+/// The source write has already succeeded when this runs, so nothing here
+/// fails it: a replica that cannot be read, encrypted or stored fails that
+/// replication, which the source reports as `FAILED`, as on AWS.
+///
+/// It runs under the S3 write guard that committed the source, so a newer
+/// version of the key cannot be replicated ahead of this one (the
+/// destination history keeps the source's order). That includes re-encrypting
+/// an SSE-KMS replica: an in-memory envelope operation through the KMS hook,
+/// with no disk or network IO.
 pub(crate) fn replicate_through_store(
     accounts: &mut MultiAccountState<S3State>,
     source_account: &str,
@@ -468,23 +494,23 @@ pub(crate) fn replicate_through_store(
     source_bucket: &str,
     key: &str,
     effects: Option<&S3SideEffects>,
-) -> StoreResult<()> {
+) {
     let Some(state) = accounts.get(source_account) else {
-        return Ok(());
+        return;
     };
     let Some(src_bucket) = state.buckets.get(source_bucket) else {
-        return Ok(());
+        return;
     };
     let Some(replication_config) = src_bucket.replication_config.clone() else {
-        return Ok(());
+        return;
     };
     let Some(src_obj) = src_bucket.objects.get(key).cloned() else {
-        return Ok(());
+        return;
     };
     let rules = parse_replication_rules(&replication_config);
     let applicable = rules_for_object(&rules, &src_obj);
     if applicable.is_empty() {
-        return Ok(());
+        return;
     }
     let role = extract_xml_value(&replication_config, "Role");
     let iam_mode = effects.map(|e| e.iam_mode).unwrap_or_default();
@@ -497,13 +523,24 @@ pub(crate) fn replicate_through_store(
         fakecloud_persistence::BodyRef::Memory(_) => None,
     };
     let mut src_bytes: Option<bytes::Bytes> = None;
-    let mut read_source = |state: &S3State| -> StoreResult<bytes::Bytes> {
+    let mut read_source = |accounts: &MultiAccountState<S3State>| -> StoreResult<bytes::Bytes> {
         if let Some(b) = &src_bytes {
             return Ok(b.clone());
         }
+        let state = accounts
+            .get(source_account)
+            .ok_or_else(|| StoreError::Other("source account vanished".to_string()))?;
         let b = state.read_body(&src_obj.body).map_err(StoreError::Io)?;
         src_bytes = Some(b.clone());
         Ok(b)
+    };
+    let replication_failed = |what: &str, err: &dyn std::fmt::Display, dest: &str| {
+        tracing::warn!(
+            source_bucket,
+            destination_bucket = dest,
+            error = %err,
+            "S3 replication failed: {what}"
+        );
     };
 
     let mut failed = false;
@@ -545,15 +582,18 @@ pub(crate) fn replicate_through_store(
 
         // An SSE-KMS replica is encrypted under the destination's replica
         // key: decrypt the source envelope and encrypt it again.
-        let reencrypt = rule
-            .replica_kms_key_id
-            .as_deref()
-            .filter(|_| src_obj.sse_algorithm.as_deref() == Some("aws:kms") && kms_hook.is_some());
+        let reencrypt = rule.replica_kms_key_id.as_deref().filter(|_| {
+            crate::side_effects::is_sse_kms(src_obj.sse_algorithm.as_deref()) && kms_hook.is_some()
+        });
         let body_source = if let Some(replica_key) = reencrypt {
-            let source_state = accounts
-                .get(source_account)
-                .ok_or_else(|| StoreError::Other("source account vanished".to_string()))?;
-            let stored = read_source(source_state)?;
+            let stored = match read_source(accounts) {
+                Ok(b) => b,
+                Err(e) => {
+                    replication_failed("the source could not be read", &e, &rule.dest_bucket);
+                    failed = true;
+                    continue;
+                }
+            };
             let plaintext = crate::side_effects::kms_decrypt(
                 kms_hook,
                 source_account,
@@ -586,11 +626,10 @@ pub(crate) fn replicate_through_store(
                     BodySource::Bytes(cipher)
                 }
                 Err(err) => {
-                    tracing::warn!(
-                        source_bucket,
-                        destination_bucket = %rule.dest_bucket,
-                        error = %err,
-                        "S3 replication failed: the replica could not be encrypted"
+                    replication_failed(
+                        "the replica could not be encrypted",
+                        &err,
+                        &rule.dest_bucket,
                     );
                     failed = true;
                     continue;
@@ -599,10 +638,14 @@ pub(crate) fn replicate_through_store(
         } else if let Some(path) = &src_disk_path {
             BodySource::FileCopy(path.clone())
         } else {
-            let source_state = accounts
-                .get(source_account)
-                .ok_or_else(|| StoreError::Other("source account vanished".to_string()))?;
-            let bytes = read_source(source_state)?;
+            let bytes = match read_source(accounts) {
+                Ok(b) => b,
+                Err(e) => {
+                    replication_failed("the source could not be read", &e, &rule.dest_bucket);
+                    failed = true;
+                    continue;
+                }
+            };
             replica.body = crate::state::memory_body(bytes.clone());
             BodySource::Bytes(bytes)
         };
@@ -615,13 +658,18 @@ pub(crate) fn replicate_through_store(
             continue;
         };
         translate_replica_owner(&mut replica, dest_bucket, rule.owner_override);
-        crate::service::commit_object_version(
+        // A failed store write leaves the destination untouched (the commit
+        // records nothing it could not persist).
+        if let Err(e) = crate::service::commit_object_version(
             dest_bucket,
             &rule.dest_bucket,
             store,
             replica,
             body_source,
-        )?;
+        ) {
+            replication_failed("the replica could not be stored", &e, &rule.dest_bucket);
+            failed = true;
+        }
     }
     let status = if failed { "FAILED" } else { "COMPLETED" };
     mark_source_replication_status(
@@ -632,7 +680,7 @@ pub(crate) fn replicate_through_store(
         key,
         src_obj.version_id.as_deref(),
         status,
-    )
+    );
 }
 
 /// Replicate the delete marker `marker_version_id` just added for `key` in
@@ -640,8 +688,9 @@ pub(crate) fn replicate_through_store(
 /// markers for it (see [`rules_for_delete_marker`]). The replicated marker
 /// keeps the source marker's version id. A destination that cannot take it
 /// (missing, not versioning-enabled, or refusing `s3:ReplicateDelete` to
-/// another account's replication role under strict IAM) is skipped: a delete
-/// marker has no replication status to record the failure on.
+/// another account's replication role under strict IAM, or failing to store
+/// it) is skipped: a delete marker has no replication status to record the
+/// failure on, and the source delete itself has already succeeded.
 pub(crate) fn replicate_delete_marker(
     accounts: &mut MultiAccountState<S3State>,
     source_account: &str,
@@ -650,18 +699,18 @@ pub(crate) fn replicate_delete_marker(
     key: &str,
     marker_version_id: &str,
     effects: Option<&S3SideEffects>,
-) -> StoreResult<()> {
+) {
     let Some(replication_config) = accounts
         .get(source_account)
         .and_then(|s| s.buckets.get(source_bucket))
         .and_then(|b| b.replication_config.clone())
     else {
-        return Ok(());
+        return;
     };
     let rules = parse_replication_rules(&replication_config);
     let applicable = rules_for_delete_marker(&rules, key);
     if applicable.is_empty() {
-        return Ok(());
+        return;
     }
     let role = extract_xml_value(&replication_config, "Role");
     let iam_mode = effects.map(|e| e.iam_mode).unwrap_or_default();
@@ -685,15 +734,21 @@ pub(crate) fn replicate_delete_marker(
             continue;
         };
         let marker = crate::service::make_delete_marker(key, marker_version_id);
-        crate::service::commit_object_version(
+        if let Err(e) = crate::service::commit_object_version(
             dest_bucket,
             &rule.dest_bucket,
             store,
             marker,
             BodySource::Bytes(bytes::Bytes::new()),
-        )?;
+        ) {
+            tracing::warn!(
+                source_bucket,
+                destination_bucket = %rule.dest_bucket,
+                error = %e,
+                "S3 delete marker replication failed: the marker could not be stored"
+            );
+        }
     }
-    Ok(())
 }
 
 /// Record `status` as the source object's `x-amz-replication-status` (the
@@ -706,12 +761,12 @@ fn mark_source_replication_status(
     key: &str,
     version_id: Option<&str>,
     status: &str,
-) -> StoreResult<()> {
+) {
     let Some(bucket) = accounts
         .get_mut(source_account)
         .and_then(|s| s.buckets.get_mut(source_bucket))
     else {
-        return Ok(());
+        return;
     };
     let mut meta = None;
     if let Some(obj) = bucket.objects.get_mut(key) {
@@ -729,9 +784,17 @@ fn mark_source_replication_status(
             v.replication_status = Some(status.to_string());
         }
     }
-    match (meta, store) {
-        (Some(meta), Some(store)) => store.put_object_meta(source_bucket, key, version_id, &meta),
-        _ => Ok(()),
+    // The source write already succeeded; a status that cannot be persisted
+    // is logged (memory keeps it) rather than failing that write.
+    if let (Some(meta), Some(store)) = (meta, store) {
+        if let Err(e) = store.put_object_meta(source_bucket, key, version_id, &meta) {
+            tracing::warn!(
+                source_bucket,
+                key,
+                error = %e,
+                "failed to persist the replication status of a source object"
+            );
+        }
     }
 }
 
@@ -1077,6 +1140,49 @@ mod tests {
         let mut opted_in = rule("dst", Some(1), "");
         opted_in.sse_kms_encrypted_objects = true;
         assert_eq!(rules_for_object(&[opted_in], &kms).len(), 1);
+    }
+
+    /// The winning rule for a destination is chosen by filter and priority
+    /// before its SSE-KMS opt-in is consulted: a top-priority rule that does
+    /// not opt in keeps an SSE-KMS object out of that destination even when
+    /// a lower-priority rule to it would have replicated it.
+    #[test]
+    fn the_winning_rule_decides_sse_kms_objects() {
+        let top = rule("dst", Some(5), "");
+        let mut lower = rule("dst", Some(1), "");
+        lower.sse_kms_encrypted_objects = true;
+        let mut other = rule("other", Some(2), "");
+        other.sse_kms_encrypted_objects = true;
+        let rules = vec![top, lower, other];
+        let mut kms = object("k");
+        kms.sse_algorithm = Some("aws:kms".to_string());
+        let chosen = rules_for_object(&rules, &kms);
+        assert_eq!(chosen.len(), 1);
+        assert_eq!(chosen[0].dest_bucket, "other");
+        // An unencrypted object follows the top rule as usual.
+        let chosen = rules_for_object(&rules, &object("k"));
+        assert_eq!(chosen[0].priority, Some(5));
+    }
+
+    #[test]
+    fn validation_requires_a_replica_key_for_sse_kms_objects() {
+        let xml = "<ReplicationConfiguration><Rule><Priority>1</Priority><Status>Enabled</Status>\
+            <Filter><Prefix></Prefix></Filter>\
+            <SourceSelectionCriteria><SseKmsEncryptedObjects><Status>Enabled</Status>\
+            </SseKmsEncryptedObjects></SourceSelectionCriteria>\
+            <Destination><Bucket>arn:aws:s3:::x</Bucket></Destination></Rule>\
+            </ReplicationConfiguration>";
+        let err = validate_replication_config(xml).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("ReplicaKmsKeyID must be specified"),
+            "{err:?}"
+        );
+        let with_key = xml.replace(
+            "<Bucket>arn:aws:s3:::x</Bucket>",
+            "<Bucket>arn:aws:s3:::x</Bucket><EncryptionConfiguration>\
+             <ReplicaKmsKeyID>k</ReplicaKmsKeyID></EncryptionConfiguration>",
+        );
+        assert!(validate_replication_config(&with_key).is_ok());
     }
 
     /// The winning rule for a destination decides whether a delete marker

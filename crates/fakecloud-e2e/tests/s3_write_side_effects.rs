@@ -558,3 +558,53 @@ async fn replication_source_versioning_and_delete_markers() {
     assert_eq!(markers, vec!["logs/a"]);
     assert_eq!(listing.versions().len(), 2);
 }
+
+/// A delivered object in a bucket whose default is DSSE-KMS
+/// (`aws:kms:dsse`) records that encryption and reads back as delivered,
+/// like a PutObject into the same bucket.
+#[tokio::test]
+async fn delivered_object_in_a_dsse_kms_bucket_is_readable() {
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+    let kms = server.kms_client().await;
+    let key = kms.create_key().send().await.unwrap();
+    let key_arn = key.key_metadata().unwrap().arn().unwrap().to_string();
+    s3.create_bucket().bucket("fh-dsse").send().await.unwrap();
+    s3.put_bucket_encryption()
+        .bucket("fh-dsse")
+        .server_side_encryption_configuration(
+            ServerSideEncryptionConfiguration::builder()
+                .rules(
+                    ServerSideEncryptionRule::builder()
+                        .apply_server_side_encryption_by_default(
+                            ServerSideEncryptionByDefault::builder()
+                                .sse_algorithm(ServerSideEncryption::AwsKmsDsse)
+                                .kms_master_key_id(&key_arn)
+                                .build()
+                                .unwrap(),
+                        )
+                        .build(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let firehose = firehose_to(&server, "fh-dsse-stream", "fh-dsse").await;
+    put_record(&firehose, "fh-dsse-stream", b"dual-layer record").await;
+    let object_key = only_key(&s3, "fh-dsse").await;
+    let got = s3
+        .get_object()
+        .bucket("fh-dsse")
+        .key(&object_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        got.server_side_encryption(),
+        Some(&ServerSideEncryption::AwsKmsDsse)
+    );
+    let body = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(body.as_ref(), b"dual-layer record");
+}

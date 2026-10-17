@@ -1960,12 +1960,8 @@ impl Route53ResolverService {
     fn fetch_domain_file(&self, account: &str, url: &str) -> Option<Vec<String>> {
         let s3 = self.s3_state.as_ref()?;
         let (bucket, key) = parse_s3_url(url)?;
-        let bytes = {
-            let guard = s3.read();
-            let s3_state = guard.get(account)?;
-            let obj = s3_state.buckets.get(&bucket)?.objects.get(&key)?;
-            s3_state.read_body(&obj.body).ok()?
-        };
+        // Read as GetObject returns it: an SSE-KMS object decrypts.
+        let bytes = fakecloud_s3::body_io::read_object(s3, account, &bucket, &key)?.ok()?;
         let text = String::from_utf8_lossy(&bytes);
         Some(
             text.lines()

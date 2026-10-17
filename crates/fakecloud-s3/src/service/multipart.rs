@@ -740,7 +740,7 @@ impl S3Service {
             };
             // An SSE-KMS source is stored as an envelope: the part is copied
             // from its plaintext, as S3 copies object data, not ciphertext.
-            let src_kms = (src_obj.sse_algorithm.as_deref() == Some("aws:kms"))
+            let src_kms = crate::side_effects::is_sse_kms(src_obj.sse_algorithm.as_deref())
                 .then(|| (src_owner.clone(), src_obj.sse_kms_key_id.clone()));
             (
                 crate::body_io::ObjectBodyHandle::open(&src_obj.body).map_err(super::io_to_aws)?,
@@ -1155,7 +1155,7 @@ impl S3Service {
         // checksums above stay those of the plaintext). Done before the write
         // lock: encryption calls into KMS. Fail-closed: a KMS error leaves the
         // upload in place for a retry.
-        let encrypted = if upload.sse_algorithm.as_deref() == Some("aws:kms") {
+        let encrypted = if crate::side_effects::is_sse_kms(upload.sse_algorithm.as_deref()) {
             Some(self.encrypt_object_body(
                 req,
                 account_id,

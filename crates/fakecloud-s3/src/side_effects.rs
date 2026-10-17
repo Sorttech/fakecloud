@@ -134,6 +134,14 @@ pub(crate) fn bucket_default_encryption(config: &str) -> Option<DefaultEncryptio
     })
 }
 
+/// Whether `algorithm` is the SSE-KMS fakecloud stores as a KMS envelope.
+/// Exactly `aws:kms`, on every write, read and copy path alike:
+/// `aws:kms:dsse` (dual-layer) is recorded as requested but its body is not
+/// enveloped, so it reads back as stored.
+pub fn is_sse_kms(algorithm: Option<&str>) -> bool {
+    algorithm == Some("aws:kms")
+}
+
 /// Encrypt `plaintext` for SSE-KMS storage in `bucket` under `kms_key_id`
 /// (the AWS-managed `aws/s3` key when none is named), in `account_id`'s KMS
 /// unless the key is an ARN naming another account. Returns the stored
@@ -298,9 +306,11 @@ where
         .ok_or_else(|| missing(bucket))?;
     let notification_config = b.notification_config.clone();
     let version_id = crate::service::commit_object_version_with(b, bucket, store, obj, write_body)?;
+    // The new version is committed: a replication that fails from here on
+    // marks it FAILED instead of failing the write.
     crate::service::replication::replicate_through_store(
         accounts, account_id, store, bucket, &key, effects,
-    )?;
+    );
     Ok(CommittedObject {
         version_id,
         notification_config,

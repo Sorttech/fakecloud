@@ -1380,6 +1380,44 @@ fn failed_export_reports_failure_on_describe() {
     assert_eq!(body["ExportDescription"]["FailureCode"], "S3NoSuchBucket");
 }
 
+/// A KMS hook with a readable envelope: `enc:<key>:<plaintext>`.
+struct EnvelopeKms;
+
+impl fakecloud_core::delivery::KmsHook for EnvelopeKms {
+    fn encrypt(
+        &self,
+        _account_id: &str,
+        _region: &str,
+        key_id: &str,
+        plaintext: &[u8],
+        _service_principal: &str,
+        _encryption_context: std::collections::HashMap<String, String>,
+    ) -> Result<String, String> {
+        use base64::Engine as _;
+        Ok(format!(
+            "enc:{key_id}:{}",
+            base64::engine::general_purpose::STANDARD.encode(plaintext)
+        ))
+    }
+
+    fn decrypt(
+        &self,
+        _account_id: &str,
+        ciphertext_b64: &str,
+        _service_principal: &str,
+        _encryption_context: std::collections::HashMap<String, String>,
+    ) -> Result<Vec<u8>, String> {
+        use base64::Engine as _;
+        let (_, data) = ciphertext_b64
+            .strip_prefix("enc:")
+            .and_then(|r| r.split_once(':'))
+            .ok_or("not an envelope")?;
+        base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .map_err(|e| e.to_string())
+    }
+}
+
 /// An export's `S3SseAlgorithm` / `S3SseKmsKeyId` decide how every object it
 /// writes is encrypted, overriding the bucket's default encryption; an export
 /// naming no algorithm takes the bucket default.
@@ -1402,8 +1440,19 @@ fn export_objects_take_the_requested_encryption() {
             .buckets
             .insert("exports".to_string(), bucket);
     }
+    // The S3 service installs the KMS SSE-KMS objects are encrypted with.
+    let _s3_service = fakecloud_s3::S3Service::new(
+        s3.clone(),
+        Arc::new(fakecloud_core::delivery::DeliveryBus::new()),
+    )
+    .with_kms_hook(Arc::new(EnvelopeKms));
     let svc = make_service().with_s3(s3.clone());
     create_test_table(&svc);
+    svc.put_item(&make_request(
+        "PutItem",
+        json!({ "TableName": "test-table", "Item": { "pk": { "S": "row-1" } } }),
+    ))
+    .unwrap();
 
     for (prefix, request, expected_sse, expected_key) in [
         (
@@ -1452,6 +1501,42 @@ fn export_objects_take_the_requested_encryption() {
             );
             assert_eq!(obj.sse_kms_key_id.as_deref(), expected_key, "{}", obj.key);
         }
+        drop(accounts);
+
+        // ImportTable reads the export back through S3's object reader, so
+        // an SSE-KMS export decrypts and re-imports to the same items.
+        let export_id = export_arn.rsplit('/').next().unwrap();
+        let table = format!("reimported-{prefix}");
+        let req = make_request(
+            "ImportTable",
+            json!({
+                "InputFormat": "DYNAMODB_JSON",
+                "InputCompressionType": "GZIP",
+                "S3BucketSource": {
+                    "S3Bucket": "exports",
+                    "S3KeyPrefix": format!("{prefix}/AWSDynamoDB/{export_id}/data/"),
+                },
+                "TableCreationParameters": {
+                    "TableName": table,
+                    "KeySchema": [{ "AttributeName": "pk", "KeyType": "HASH" }],
+                    "AttributeDefinitions": [{ "AttributeName": "pk", "AttributeType": "S" }],
+                    "BillingMode": "PAY_PER_REQUEST"
+                }
+            }),
+        );
+        let resp = svc.import_table(&req).unwrap();
+        let started: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        let import_arn = started["ImportTableDescription"]["ImportArn"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let req = make_request("DescribeImport", json!({ "ImportArn": import_arn }));
+        let resp = svc.describe_import(&req).unwrap();
+        let described: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        let d = &described["ImportTableDescription"];
+        assert_eq!(d["ImportStatus"], "COMPLETED", "{prefix}: {described}");
+        assert_eq!(d["ErrorCount"], 0, "{prefix}: {described}");
+        assert_eq!(d["ImportedItemCount"], 1, "{prefix}: {described}");
     }
 }
 

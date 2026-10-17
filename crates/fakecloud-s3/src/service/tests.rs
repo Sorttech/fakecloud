@@ -809,8 +809,7 @@ fn replicate_with_mode(
         "source",
         "test-key",
         Some(&effects),
-    )
-    .unwrap();
+    );
 }
 
 #[test]
@@ -7332,6 +7331,8 @@ async fn mpu_complete_on_versioned_bucket_pushes_new_version() {
 struct RecordingStore {
     inner: fakecloud_persistence::MemoryS3Store,
     calls: parking_lot::Mutex<Vec<String>>,
+    /// `bucket/key` whose object writes fail, standing in for a disk error.
+    fail_put: parking_lot::Mutex<Option<String>>,
 }
 
 impl RecordingStore {
@@ -7339,6 +7340,7 @@ impl RecordingStore {
         std::sync::Arc::new(Self {
             inner: fakecloud_persistence::MemoryS3Store::new(),
             calls: parking_lot::Mutex::new(Vec::new()),
+            fail_put: parking_lot::Mutex::new(None),
         })
     }
     fn record(&self, call: String) {
@@ -7391,6 +7393,11 @@ impl fakecloud_persistence::S3Store for RecordingStore {
         meta: &fakecloud_persistence::ObjectMeta,
     ) -> fakecloud_persistence::StoreResult<fakecloud_persistence::BodyRef> {
         self.record(format!("put_object:{bucket}/{key}"));
+        if self.fail_put.lock().as_deref() == Some(format!("{bucket}/{key}").as_str()) {
+            return Err(fakecloud_persistence::StoreError::Other(
+                "disk full".to_string(),
+            ));
+        }
         self.inner.put_object(bucket, key, version, body, meta)
     }
     fn put_object_meta(
@@ -11744,8 +11751,7 @@ fn sse_kms_objects_need_an_opted_in_rule_and_get_the_replica_key() {
             "source",
             "test-key",
             Some(&effects),
-        )
-        .unwrap();
+        );
 
         let state = accounts.get("123456789012").unwrap();
         let replica = state.buckets["destination"].objects.get("test-key");
@@ -11944,4 +11950,20 @@ async fn upload_part_copy_reads_the_plaintext_of_an_sse_kms_source() {
     let obj = bucket_of(&svc, "b").objects["dst"].clone();
     let stored = svc.state.read().default_ref().read_body(&obj.body).unwrap();
     assert_eq!(&stored[..], b"enc:dst-key:2345");
+}
+
+/// A DeleteObjects batch stopped by a persistence failure still replicates
+/// the delete markers it committed before the failure; the failed key leaves
+/// no marker anywhere.
+#[test]
+fn delete_objects_replicates_markers_committed_before_a_failure() {
+    let (svc, store) = make_recording_service();
+    seed_replication(&svc, REPLICATE_ALL_TO_DST, &["dst"]);
+    *store.fail_put.lock() = Some("src/b".to_string());
+    let body = b"<Delete><Object><Key>a</Key></Object><Object><Key>b</Key></Object></Delete>";
+    let req = make_request(Method::POST, "/src", &[("delete", "")], body);
+    assert!(svc.delete_objects("123456789012", &req, "src").is_err());
+    let dst = bucket_of(&svc, "dst");
+    assert!(dst.objects["a"].is_delete_marker);
+    assert!(!dst.objects.contains_key("b"));
 }

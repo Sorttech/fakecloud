@@ -201,7 +201,9 @@ pub fn put_delivered_object_with_encryption(
     // producer set (it must, for an encrypted payload, since the checksum
     // covers the plaintext), else S3's default CRC64NVME full-object checksum
     // of the body, the one PutObject stores for an upload that names none.
-    if obj.checksum_value.is_none() && obj.sse_algorithm.as_deref() != Some("aws:kms") {
+    if obj.checksum_value.is_none()
+        && !crate::side_effects::is_sse_kms(obj.sse_algorithm.as_deref())
+    {
         let algorithm = obj
             .checksum_algorithm
             .unwrap_or(crate::checksum::DEFAULT_ALGORITHM);
@@ -230,7 +232,19 @@ pub fn put_delivered_object_with_encryption(
         }),
     };
     if let Some(chosen) = apply {
-        if chosen.algorithm.starts_with("aws:kms") {
+        // Only SSE-KMS proper is stored as an envelope, as on the PutObject
+        // path (`aws:kms:dsse` is recorded, not enveloped).
+        if crate::side_effects::is_sse_kms(Some(&chosen.algorithm)) {
+            // An object marked SSE-KMS must really be encrypted: without a
+            // KMS to encrypt it the write fails, as S3 fails a write it
+            // cannot encrypt, rather than storing plaintext labelled
+            // `aws:kms` (which no reader could then decrypt).
+            if kms_hook.is_none() {
+                return Err(format!(
+                    "cannot store {key} in bucket {bucket}: SSE-KMS encryption is required but \
+                     no KMS is available"
+                ));
+            }
             let key_id = chosen.kms_key_id.clone();
             body = crate::side_effects::kms_encrypt(
                 kms_hook,
@@ -353,27 +367,24 @@ impl S3Delivery for S3DeliveryImpl {
     }
 
     fn get_object(&self, account_id: &str, bucket: &str, key: &str) -> Result<Vec<u8>, String> {
-        // Resolve and open the body under the guard, read it after the guard
-        // is dropped (the open fd pins the inode against a concurrent PUT).
-        let handle = {
-            let accounts = self.state.read();
-            let state = accounts
-                .get(account_id)
-                .ok_or_else(|| format!("account {account_id} has no S3 state"))?;
-            let bucket_ref = state
-                .buckets
-                .get(bucket)
-                .ok_or_else(|| format!("bucket {bucket} not found in account {account_id}"))?;
-            let object = bucket_ref
-                .objects
-                .get(key)
-                .ok_or_else(|| format!("key {key} not found in bucket {bucket}"))?;
-            crate::body_io::ObjectBodyHandle::open(&object.body)
-                .map_err(|e| format!("failed to read body: {e}"))?
-        };
-        let body = crate::service::run_blocking_io(|| handle.read_all())
-            .map_err(|e| format!("failed to read body: {e}"))?;
-        Ok(body.to_vec())
+        // Read as GetObject returns it (an SSE-KMS object decrypts), with the
+        // body read after the S3 guard is released.
+        match crate::body_io::read_object(&self.state, account_id, bucket, key) {
+            Some(Ok(body)) => Ok(body.to_vec()),
+            Some(Err(e)) => Err(format!("failed to read body: {e}")),
+            None => {
+                let exists = self
+                    .state
+                    .read()
+                    .get(account_id)
+                    .is_some_and(|s| s.buckets.contains_key(bucket));
+                Err(if exists {
+                    format!("key {key} not found in bucket {bucket}")
+                } else {
+                    format!("bucket {bucket} not found in account {account_id}")
+                })
+            }
+        }
     }
 }
 
@@ -815,10 +826,12 @@ mod tests {
         }
     }
 
-    /// A store whose object writes always fail, standing in for a disk error.
+    /// A store whose object writes fail, standing in for a disk error: every
+    /// write, or (with `only_bucket`) the writes into that one bucket.
     struct FailingStore {
         inner: fakecloud_persistence::MemoryS3Store,
         fail_meta: bool,
+        only_bucket: Option<&'static str>,
     }
 
     fn disk_full() -> fakecloud_persistence::StoreError {
@@ -858,13 +871,16 @@ mod tests {
         }
         fn put_object(
             &self,
-            _bucket: &str,
-            _key: &str,
-            _version: Option<&str>,
-            _body: fakecloud_persistence::BodySource,
-            _meta: &fakecloud_persistence::ObjectMeta,
+            bucket: &str,
+            key: &str,
+            version: Option<&str>,
+            body: fakecloud_persistence::BodySource,
+            meta: &fakecloud_persistence::ObjectMeta,
         ) -> fakecloud_persistence::StoreResult<fakecloud_persistence::BodyRef> {
-            Err(disk_full())
+            if self.only_bucket.is_none_or(|b| b == bucket) {
+                return Err(disk_full());
+            }
+            self.inner.put_object(bucket, key, version, body, meta)
         }
         fn put_object_meta(
             &self,
@@ -943,6 +959,7 @@ mod tests {
             let store = FailingStore {
                 inner: fakecloud_persistence::MemoryS3Store::new(),
                 fail_meta,
+                only_bucket: None,
             };
             let state = shared_state();
             // An unversioned write that fails stores nothing.
@@ -1346,6 +1363,143 @@ mod tests {
             assert_eq!(obj.sse_kms_key_id.as_deref(), kms_key, "{key}");
             assert_eq!(read(&state, &obj.body), stored, "{key}");
         }
+    }
+
+    /// The delivered object is committed before it is replicated, so a
+    /// replica the destination cannot store fails that replication (the
+    /// source reports FAILED) without failing the delivery.
+    #[test]
+    fn replica_store_failure_marks_the_source_failed_not_the_write() {
+        let state = shared_state();
+        let _svc = with_s3_service(&state, Arc::new(SqsRecorder::default()), None);
+        set_bucket(&state, |b| {
+            b.versioning = Some("Enabled".to_string());
+            b.replication_config = Some(
+                "<ReplicationConfiguration><Rule><Priority>1</Priority><Status>Enabled</Status>\
+                 <Filter><Prefix></Prefix></Filter>\
+                 <Destination><Bucket>arn:aws:s3:::replica-bucket</Bucket></Destination>\
+                 </Rule></ReplicationConfiguration>"
+                    .to_string(),
+            );
+        });
+        {
+            let mut accounts = state.write();
+            let mut dest = S3Bucket::new("replica-bucket", "us-east-1", "owner-id");
+            dest.versioning = Some("Enabled".to_string());
+            accounts
+                .get_mut(ACCOUNT)
+                .unwrap()
+                .buckets
+                .insert("replica-bucket".to_string(), dest);
+        }
+        let store = FailingStore {
+            inner: fakecloud_persistence::MemoryS3Store::new(),
+            fail_meta: false,
+            only_bucket: Some("replica-bucket"),
+        };
+        put_object_via_store(
+            &state,
+            Some(&store),
+            ACCOUNT,
+            "logs-bucket",
+            "k",
+            b"data".to_vec(),
+            None,
+        )
+        .expect("the delivery itself succeeds");
+        let accounts = state.read();
+        let st = accounts.get(ACCOUNT).unwrap();
+        assert_eq!(
+            st.buckets["logs-bucket"].objects["k"]
+                .replication_status
+                .as_deref(),
+            Some("FAILED")
+        );
+        assert!(st.buckets["replica-bucket"].objects.is_empty());
+    }
+
+    /// SSE-KMS (the bucket default or an explicit request) with no KMS to
+    /// encrypt under fails the delivery instead of storing plaintext marked
+    /// `aws:kms`. `aws:kms:dsse` is recorded and stored as delivered, as on
+    /// the PutObject path, so it reads back.
+    #[test]
+    fn sse_kms_without_kms_fails_and_dsse_is_stored_readable() {
+        let state = shared_state();
+        set_bucket(&state, |b| {
+            b.encryption_config = Some(
+                "<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault>\
+                 <SSEAlgorithm>aws:kms</SSEAlgorithm></ApplyServerSideEncryptionByDefault>\
+                 </Rule></ServerSideEncryptionConfiguration>"
+                    .to_string(),
+            );
+        });
+        let err = put_object_via_store(
+            &state,
+            None,
+            ACCOUNT,
+            "logs-bucket",
+            "k",
+            b"x".to_vec(),
+            None,
+        )
+        .expect_err("no KMS to encrypt with");
+        assert!(err.contains("SSE-KMS"), "{err}");
+        assert!(bucket(&state).objects.is_empty());
+
+        let _svc = with_s3_service(
+            &state,
+            Arc::new(SqsRecorder::default()),
+            Some(Arc::new(ReadableKms)),
+        );
+        set_bucket(&state, |b| {
+            b.encryption_config = Some(
+                "<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault>\
+                 <SSEAlgorithm>aws:kms:dsse</SSEAlgorithm><KMSMasterKeyID>k1</KMSMasterKeyID>\
+                 </ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>"
+                    .to_string(),
+            );
+        });
+        deliver(&state, None, "dsse", b"dual-layer");
+        let obj = &bucket(&state).objects["dsse"];
+        assert_eq!(obj.sse_algorithm.as_deref(), Some("aws:kms:dsse"));
+        assert_eq!(read(&state, &obj.body), b"dual-layer");
+        let delivery = S3DeliveryImpl::new(state.clone());
+        assert_eq!(
+            delivery.get_object(ACCOUNT, "logs-bucket", "dsse").unwrap(),
+            b"dual-layer".to_vec()
+        );
+    }
+
+    /// Reads through the delivery bus return what GetObject returns: an
+    /// SSE-KMS object's plaintext, not its stored envelope.
+    #[test]
+    fn get_object_decrypts_sse_kms_objects() {
+        let state = shared_state();
+        let _svc = with_s3_service(
+            &state,
+            Arc::new(SqsRecorder::default()),
+            Some(Arc::new(ReadableKms)),
+        );
+        put_object_via_store_with_encryption(
+            &state,
+            None,
+            ACCOUNT,
+            "logs-bucket",
+            "k",
+            b"secret".to_vec(),
+            None,
+            DeliveredEncryption::SseKms { key_id: None },
+        )
+        .unwrap();
+        assert_eq!(
+            read(&state, &bucket(&state).objects["k"].body),
+            b"enc:aws/s3:secret"
+        );
+        let delivery = S3DeliveryImpl::new(state.clone());
+        assert_eq!(
+            delivery.get_object(ACCOUNT, "logs-bucket", "k").unwrap(),
+            b"secret".to_vec()
+        );
     }
 
     /// The side effects survive an account that did not exist when the S3

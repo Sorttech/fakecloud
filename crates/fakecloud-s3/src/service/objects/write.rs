@@ -243,7 +243,7 @@ impl S3Service {
         // before any mutation. Non-KMS uploads pass `BodySource::File`
         // straight to the store and never copy the payload into RAM.
         let plaintext_size = data_size;
-        let body_source: BodySource = if sse_algorithm.as_deref() == Some("aws:kms") {
+        let body_source: BodySource = if crate::side_effects::is_sse_kms(sse_algorithm.as_deref()) {
             let bytes = tokio::fs::read(&spooled.path)
                 .await
                 .map_err(crate::service::io_to_aws)?;
@@ -810,18 +810,19 @@ impl S3Service {
         // copy.
         let raw_src_bytes =
             super::run_blocking_io(|| src_handle.read_all()).map_err(crate::service::io_to_aws)?;
-        let src_bytes =
-            if src_obj.sse_algorithm.as_deref() == Some("aws:kms") && self.kms_hook.is_some() {
-                self.decrypt_object_body(
-                    req,
-                    &src_account,
-                    src_bucket,
-                    &raw_src_bytes,
-                    src_obj.sse_kms_key_id.as_deref(),
-                )?
-            } else {
-                raw_src_bytes
-            };
+        let src_bytes = if crate::side_effects::is_sse_kms(src_obj.sse_algorithm.as_deref())
+            && self.kms_hook.is_some()
+        {
+            self.decrypt_object_body(
+                req,
+                &src_account,
+                src_bucket,
+                &raw_src_bytes,
+                src_obj.sse_kms_key_id.as_deref(),
+            )?
+        } else {
+            raw_src_bytes
+        };
         // The copy is written as a single object, so its checksum is always a
         // FULL_OBJECT checksum of the whole body (S3 user guide: "With a copy
         // command, the checksum of the object is a direct checksum of the full
@@ -843,19 +844,19 @@ impl S3Service {
         // stored body is a fresh envelope with the dest's encryption
         // context (bucket arn), under a key in the destination bucket's
         // region.
-        let dest_stored_bytes = if new_sse.as_deref() == Some("aws:kms") && self.kms_hook.is_some()
-        {
-            self.encrypt_object_body(
-                req,
-                account_id,
-                &dest_region,
-                dest_bucket,
-                &src_bytes,
-                new_kms.as_deref(),
-            )?
-        } else {
-            src_bytes.clone()
-        };
+        let dest_stored_bytes =
+            if crate::side_effects::is_sse_kms(new_sse.as_deref()) && self.kms_hook.is_some() {
+                self.encrypt_object_body(
+                    req,
+                    account_id,
+                    &dest_region,
+                    dest_bucket,
+                    &src_bytes,
+                    new_kms.as_deref(),
+                )?
+            } else {
+                src_bytes.clone()
+            };
         let mut staged_dest = super::run_blocking_io(|| {
             crate::body_io::SpooledBody::spool(Some(&*self.store), dest_stored_bytes.clone())
         })

@@ -321,8 +321,7 @@ impl S3Service {
                     key,
                     &dm_id,
                     Some(&self.side_effects),
-                )
-                .map_err(crate::service::persistence_error)?;
+                );
             }
             drop(accts);
             if let Some(ref config) = notification_config {
@@ -711,11 +710,10 @@ impl S3Service {
         // service to read bucket state.
         let notification_config = b.notification_config.clone();
         let region = state.region.clone();
+        // Every marker committed before a persistence failure stopped the
+        // batch is replicated: those deletes happened.
         for (key, dm_id) in &new_markers {
-            if persist_error.is_some() {
-                break;
-            }
-            if let Err(e) = crate::service::replication::replicate_delete_marker(
+            crate::service::replication::replicate_delete_marker(
                 &mut accts,
                 account_id,
                 Some(&*self.store),
@@ -723,9 +721,7 @@ impl S3Service {
                 key,
                 dm_id,
                 Some(&self.side_effects),
-            ) {
-                persist_error = Some(crate::service::persistence_error(e));
-            }
+            );
         }
         drop(accts);
         if let Some(ref config) = notification_config {

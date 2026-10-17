@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use bytes::Bytes;
 use fakecloud_glue::{SharedGlueState, StorageDescriptor};
 use fakecloud_persistence::S3Store;
-use fakecloud_s3::body_io::ObjectBodyHandle;
+use fakecloud_s3::body_io::ObjectReader;
 use fakecloud_s3::compression::{decompress, Codec};
 use fakecloud_s3::SharedS3State;
 use sqlparser::ast::{
@@ -594,7 +594,7 @@ fn read_csv_under_prefix(
     // Resolve the objects and open their bodies under the read guard (only
     // metadata work and fd opens), then read and decode them after the guard
     // drops so a large table scan never stalls S3 writers.
-    let mut objects: Vec<(String, Codec, ObjectBodyHandle)> = Vec::new();
+    let mut objects: Vec<(String, Codec, ObjectReader)> = Vec::new();
     {
         let s3_guard = s3.read();
         let acct = s3_guard
@@ -619,7 +619,8 @@ fn read_csv_under_prefix(
             if obj.is_delete_marker {
                 continue;
             }
-            let handle = ObjectBodyHandle::open(&obj.body)
+            // Read as GetObject returns it: an SSE-KMS object decrypts.
+            let handle = ObjectReader::open(&s3_guard, account_id, bucket_name, obj)
                 .map_err(|e| SqlError::S3Read(format!("{key}: {e}")))?;
             let codec = Codec::from_key(key, obj.content_encoding.as_deref());
             objects.push((key.clone(), codec, handle));

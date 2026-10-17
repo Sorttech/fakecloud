@@ -24,7 +24,7 @@ use serde_json::{json, Value};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 use fakecloud_core::validation::*;
 use fakecloud_persistence::{S3Store, SnapshotStore};
-use fakecloud_s3::body_io::ObjectBodyHandle;
+use fakecloud_s3::body_io::ObjectReader;
 use fakecloud_s3::SharedS3State;
 
 use crate::state::{
@@ -126,7 +126,8 @@ impl JobContext {
 /// An S3 source object opened under the S3 read guard.
 struct SourceObject {
     size: u64,
-    body: ObjectBodyHandle,
+    /// Reads the object's plaintext (an SSE-KMS export decrypts).
+    body: ObjectReader,
 }
 
 enum SourceError {
@@ -145,6 +146,7 @@ fn open_source_objects(
 ) -> Result<Vec<SourceObject>, SourceError> {
     let guard = s3.read();
     let acct = guard.get(account).ok_or(SourceError::NoSuchBucket)?;
+    let bucket_name = bucket;
     let bucket = acct.buckets.get(bucket).ok_or(SourceError::NoSuchBucket)?;
     let mut keys: Vec<&String> = bucket
         .objects
@@ -158,7 +160,7 @@ fn open_source_objects(
         if obj.is_delete_marker {
             continue;
         }
-        let body = ObjectBodyHandle::open(&obj.body)
+        let body = ObjectReader::open(&guard, account, bucket_name, obj)
             .map_err(|e| SourceError::Read(format!("failed to open s3://{key}: {e}")))?;
         out.push(SourceObject {
             size: obj.size,

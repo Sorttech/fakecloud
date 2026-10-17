@@ -590,13 +590,9 @@ impl CloudFormationService {
     /// tell those apart should use `resolve_template_url`.
     pub(crate) fn fetch_template_from_url(&self, account_id: &str, url: &str) -> Option<String> {
         let (bucket, key) = parse_s3_url(url)?;
-        let mut accounts = self.deps.s3.write();
-        let state = accounts.get_or_create(account_id);
-        let body_ref = {
-            let b = state.buckets.get(&bucket)?;
-            b.objects.get(&key)?.body.clone()
-        };
-        let bytes = state.read_body(&body_ref).ok()?;
+        // Read as GetObject returns it: an SSE-KMS template decrypts.
+        let bytes =
+            fakecloud_s3::body_io::read_object(&self.deps.s3, account_id, &bucket, &key)?.ok()?;
         String::from_utf8(bytes.to_vec()).ok()
     }
 

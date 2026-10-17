@@ -560,7 +560,7 @@ impl S3Service {
                 algorithm = Some(default.algorithm);
             }
         }
-        if algorithm.as_deref() == Some("aws:kms") {
+        if crate::side_effects::is_sse_kms(algorithm.as_deref()) {
             kms_key_id = self.resolve_object_kms_key(account_id, bucket_region, kms_key_id);
         }
         crate::side_effects::ObjectEncryption {

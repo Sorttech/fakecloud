@@ -7952,5 +7952,80 @@ async fn dynamodb_export_applies_requested_s3_encryption() {
             std::str::from_utf8(&data).unwrap().contains("secret-row"),
             "the data file decrypts to the exported items"
         );
+
+        // The export (encrypted at rest) re-imports: ImportTable reads it the
+        // way GetObject returns it.
+        let export_id = export_arn.rsplit('/').next().unwrap();
+        let table = format!("Reimported-{prefix}");
+        let import_arn = ddb
+            .import_table()
+            .input_format(aws_sdk_dynamodb::types::InputFormat::DynamodbJson)
+            .input_compression_type(aws_sdk_dynamodb::types::InputCompressionType::Gzip)
+            .s3_bucket_source(
+                aws_sdk_dynamodb::types::S3BucketSource::builder()
+                    .s3_bucket("enc-exports")
+                    .s3_key_prefix(format!("{prefix}/AWSDynamoDB/{export_id}/data/"))
+                    .build()
+                    .unwrap(),
+            )
+            .table_creation_parameters(
+                aws_sdk_dynamodb::types::TableCreationParameters::builder()
+                    .table_name(&table)
+                    .key_schema(
+                        KeySchemaElement::builder()
+                            .attribute_name("pk")
+                            .key_type(KeyType::Hash)
+                            .build()
+                            .unwrap(),
+                    )
+                    .attribute_definitions(
+                        AttributeDefinition::builder()
+                            .attribute_name("pk")
+                            .attribute_type(ScalarAttributeType::S)
+                            .build()
+                            .unwrap(),
+                    )
+                    .billing_mode(BillingMode::PayPerRequest)
+                    .build()
+                    .unwrap(),
+            )
+            .send()
+            .await
+            .unwrap()
+            .import_table_description()
+            .unwrap()
+            .import_arn()
+            .unwrap()
+            .to_string();
+        let mut imported = None;
+        for _ in 0..200 {
+            let d = ddb
+                .describe_import()
+                .import_arn(&import_arn)
+                .send()
+                .await
+                .unwrap();
+            let d = d.import_table_description().unwrap().clone();
+            if d.import_status() != Some(&aws_sdk_dynamodb::types::ImportStatus::InProgress) {
+                imported = Some(d);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let imported = imported.expect("import settled");
+        assert_eq!(
+            imported.import_status(),
+            Some(&aws_sdk_dynamodb::types::ImportStatus::Completed),
+            "{imported:?}"
+        );
+        assert_eq!(imported.error_count(), 0, "{imported:?}");
+        let row = ddb
+            .get_item()
+            .table_name(&table)
+            .key("pk", AttributeValue::S("secret-row".into()))
+            .send()
+            .await
+            .unwrap();
+        assert!(row.item().is_some(), "the re-imported table holds the row");
     }
 }
