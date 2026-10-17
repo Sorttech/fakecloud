@@ -6761,26 +6761,38 @@ async fn bucket_owner_enforced_rejects_put_object_with_acl_header() {
     assert_eq!(err.status(), StatusCode::BAD_REQUEST);
 }
 
-#[test]
-fn put_bucket_encryption_aws_kms_requires_kms_master_key_id() {
-    // AWS rejects PutBucketEncryption with aws:kms but no
-    // KMSMasterKeyID — there's no key for the bucket to default
-    // encrypt against. fakecloud was silently accepting it.
-    let svc = make_service();
+/// A default of aws:kms without a KMSMasterKeyID is accepted, as on AWS,
+/// stored and returned without a key, and objects written under it are
+/// encrypted under the account's AWS-managed `aws/s3` key.
+#[tokio::test]
+async fn put_bucket_encryption_aws_kms_without_a_key_uses_aws_s3() {
+    let svc = kms_service();
     seed_bucket(&svc, "kmsenc");
 
     let body = b"<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>aws:kms</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>";
     let req = make_request(Method::PUT, "/kmsenc", &[("encryption", "")], body);
-    let err = match svc.put_bucket_encryption("123456789012", &req, "kmsenc") {
-        Err(e) => e,
-        Ok(_) => panic!("expected InvalidArgument when KMSMasterKeyID is missing"),
-    };
-    assert_eq!(err.status(), StatusCode::BAD_REQUEST);
-
-    let body = b"<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>aws:kms</SSEAlgorithm><KMSMasterKeyID>alias/aws/s3</KMSMasterKeyID></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>";
-    let req = make_request(Method::PUT, "/kmsenc", &[("encryption", "")], body);
     svc.put_bucket_encryption("123456789012", &req, "kmsenc")
+        .expect("aws:kms with no KMSMasterKeyID is valid");
+    let got = svc.get_bucket_encryption("123456789012", "kmsenc").unwrap();
+    let xml = std::str::from_utf8(got.body.expect_bytes()).unwrap();
+    assert!(
+        xml.contains("<SSEAlgorithm>aws:kms</SSEAlgorithm>"),
+        "{xml}"
+    );
+    assert!(!xml.contains("KMSMasterKeyID"), "{xml}");
+
+    let req = make_request(Method::PUT, "/kmsenc/k", &[], b"payload");
+    let resp = svc
+        .put_object("123456789012", &req, "kmsenc", "k")
+        .await
         .unwrap();
+    assert_eq!(resp.headers["x-amz-server-side-encryption"], "aws:kms");
+    let obj = bucket_of(&svc, "kmsenc").objects["k"].clone();
+    let stored = svc.state.read().default_ref().read_body(&obj.body).unwrap();
+    assert_eq!(&stored[..], b"enc:aws/s3:payload");
+    let req = make_request(Method::GET, "/kmsenc/k", &[], b"");
+    let got = svc.get_object("123456789012", &req, "kmsenc", "k").unwrap();
+    assert_eq!(got.body.expect_bytes(), b"payload");
 }
 
 #[test]

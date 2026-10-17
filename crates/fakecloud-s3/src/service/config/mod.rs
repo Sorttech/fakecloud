@@ -53,21 +53,6 @@ impl PublicAccessBlockFlags {
     }
 }
 
-/// Validate that a `PutBucketEncryption` body referencing `aws:kms`
-/// or `aws:kms:dsse` includes a non-empty `KMSMasterKeyID`. Real
-/// AWS rejects these as `InvalidArgument` since there's no key the
-/// bucket can encrypt against.
-fn has_kms_master_key_id(xml: &str) -> bool {
-    let Some(start) = xml.find("<KMSMasterKeyID>") else {
-        return false;
-    };
-    let value_start = start + "<KMSMasterKeyID>".len();
-    let Some(end_offset) = xml[value_start..].find("</KMSMasterKeyID>") else {
-        return false;
-    };
-    !xml[value_start..value_start + end_offset].trim().is_empty()
-}
-
 /// Detect whether a parsed bucket-policy document grants access to an
 /// anonymous principal. Mirrors AWS's "is public" classifier:
 /// `Effect=Allow` with `Principal:"*"` or `{"AWS":"*"}` (or a list

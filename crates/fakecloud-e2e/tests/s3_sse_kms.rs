@@ -521,3 +521,106 @@ async fn s3_multipart_sse_kms_is_encrypted_at_rest_and_survives_restart() {
         .await;
     }
 }
+
+/// PutBucketEncryption accepts an `aws:kms` default with no
+/// `KMSMasterKeyID`, as AWS does, and GetBucketEncryption returns it as
+/// stored. Objects written under it are encrypted under the account's
+/// AWS-managed `aws/s3` key, which HeadObject reports by ARN; GetObject
+/// returns the plaintext.
+#[tokio::test]
+async fn s3_default_sse_kms_without_a_key_uses_aws_s3() {
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+    s3.create_bucket()
+        .bucket("kms-no-key")
+        .send()
+        .await
+        .unwrap();
+    s3.put_bucket_encryption()
+        .bucket("kms-no-key")
+        .server_side_encryption_configuration(
+            ServerSideEncryptionConfiguration::builder()
+                .rules(
+                    ServerSideEncryptionRule::builder()
+                        .apply_server_side_encryption_by_default(
+                            ServerSideEncryptionByDefault::builder()
+                                .sse_algorithm(ServerSideEncryption::AwsKms)
+                                .build()
+                                .unwrap(),
+                        )
+                        .build(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .expect("aws:kms without KMSMasterKeyID is accepted");
+
+    let config = s3
+        .get_bucket_encryption()
+        .bucket("kms-no-key")
+        .send()
+        .await
+        .unwrap();
+    let default = config
+        .server_side_encryption_configuration()
+        .unwrap()
+        .rules()[0]
+        .apply_server_side_encryption_by_default()
+        .unwrap()
+        .clone();
+    assert_eq!(default.sse_algorithm(), &ServerSideEncryption::AwsKms);
+    assert_eq!(default.kms_master_key_id(), None);
+
+    let put = s3
+        .put_object()
+        .bucket("kms-no-key")
+        .key("doc.txt")
+        .body(ByteStream::from_static(b"under the managed key"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        put.server_side_encryption(),
+        Some(&ServerSideEncryption::AwsKms)
+    );
+
+    let managed_key = server
+        .kms_client()
+        .await
+        .describe_key()
+        .key_id("alias/aws/s3")
+        .send()
+        .await
+        .unwrap()
+        .key_metadata()
+        .unwrap()
+        .arn()
+        .unwrap()
+        .to_string();
+    assert_eq!(put.ssekms_key_id(), Some(managed_key.as_str()));
+
+    let head = s3
+        .head_object()
+        .bucket("kms-no-key")
+        .key("doc.txt")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        head.server_side_encryption(),
+        Some(&ServerSideEncryption::AwsKms)
+    );
+    assert_eq!(head.ssekms_key_id(), Some(managed_key.as_str()));
+
+    let got = s3
+        .get_object()
+        .bucket("kms-no-key")
+        .key("doc.txt")
+        .send()
+        .await
+        .unwrap();
+    let body = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(&body[..], b"under the managed key");
+}

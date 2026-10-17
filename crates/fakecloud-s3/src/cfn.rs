@@ -865,6 +865,29 @@ mod tests {
         assert!(xml.contains("<BucketKeyEnabled>true</BucketKeyEnabled>"));
     }
 
+    /// `AWS::S3::Bucket` takes an aws:kms default with no KMSMasterKeyID,
+    /// as AWS does (objects then use the `aws/s3` key); it is stored
+    /// without a key.
+    #[test]
+    fn encryption_kms_rule_without_a_key() {
+        let mut b = bucket();
+        apply_cfn_bucket_properties(
+            &mut b,
+            &json!({
+                "BucketEncryption": {
+                    "ServerSideEncryptionConfiguration": [{
+                        "ServerSideEncryptionByDefault": { "SSEAlgorithm": "aws:kms" }
+                    }]
+                }
+            }),
+            &store(),
+        )
+        .unwrap();
+        let xml = b.encryption_config.unwrap();
+        assert!(xml.contains("<SSEAlgorithm>aws:kms</SSEAlgorithm>"));
+        assert!(!xml.contains("KMSMasterKeyID"));
+    }
+
     #[test]
     fn encryption_aes256_defaults_bucket_key_false() {
         let mut b = bucket();
