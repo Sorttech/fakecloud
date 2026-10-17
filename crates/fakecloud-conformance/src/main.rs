@@ -306,7 +306,7 @@ fn run_probes(
     let (endpoint, _server) = if let Some(ep) = endpoint {
         (ep, None)
     } else {
-        let (ep, child) = start_fakecloud(None);
+        let (ep, child) = start_fakecloud();
         (ep, Some(ChildGuard(child)))
     };
     // Variants re-probed against a container-backed server (see
@@ -628,8 +628,13 @@ fn disabling_container_cli(current: Option<std::ffi::OsString>) -> Option<&'stat
 /// not report an instance it cannot back with a real database). Such a
 /// variant says nothing about API conformance until it runs where a runtime
 /// exists.
+///
+/// Only a 5xx refusal counts: the hint can also appear as data in a successful
+/// response (an ECS task's `stoppedReason`), and a shape failure on such a
+/// response is a real finding that a fresh server must not paper over.
 fn needs_container_runtime(result: &probe::ProbeResult) -> bool {
     result.status != probe::ProbeStatus::Pass
+        && result.http_status >= 500
         && result
             .response_body
             .contains(fakecloud_core::container_net::CONTAINER_RUNTIME_HINT)
@@ -662,23 +667,110 @@ fn probe_with_container_runtime(
     variant: &generators::TestVariant,
     model_info: Option<(&smithy::ServiceModel, &str)>,
 ) -> probe::ProbeResult {
-    let (endpoint, child) = start_fakecloud(Some(cli));
-    let _server = GracefulChild(child);
+    let (endpoint, child) = match try_start_fakecloud(Some(cli), Duration::from_secs(60)) {
+        Ok(started) => started,
+        Err(e) => {
+            eprintln!("  could not start a {cli}-backed server: {e}");
+            return probe::ProbeResult {
+                variant_name: variant.name.clone(),
+                status: probe::ProbeStatus::UnexpectedResult(format!(
+                    "needs a container runtime, but a {cli}-backed server failed to start: {e}"
+                )),
+                http_status: 0,
+                response_body: String::new(),
+                duration_ms: 0,
+            };
+        }
+    };
+    let pid = child.id();
+    let server = GracefulChild(child);
     seed_service_resources(client, &endpoint, service_name);
-    probe::probe_variant_with_model(
+    let result = probe::probe_variant_with_model(
         client,
         &endpoint,
         service_name,
         op_name,
         variant,
         model_info,
-    )
+    );
+    // The operation may have started a container in the background (RDS
+    // CreateDBInstance returns `creating` and runs the engine afterwards). A
+    // container is only tracked for shutdown once its `run` returns, so let
+    // the server's container-CLI children finish before asking it to stop.
+    wait_for_child_processes(pid, Duration::from_secs(300));
+    drop(server);
+    remove_labelled_leftovers(cli, pid);
+    result
+}
+
+/// Wait until `pid` has had no child processes for a short settle period, or
+/// `limit` elapses. fakecloud drives the container runtime through its CLI, so
+/// a live child means a container operation is still in flight.
+fn wait_for_child_processes(pid: u32, limit: Duration) {
+    let deadline = std::time::Instant::now() + limit;
+    let mut quiet = 0;
+    while std::time::Instant::now() < deadline && quiet < 4 {
+        let busy = ProcessCommand::new("pgrep")
+            .arg("-P")
+            .arg(pid.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        quiet = if busy { 0 } else { quiet + 1 };
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Remove any container or volume still carrying the stopped server's
+/// ownership label. Graceful shutdown already removes what the server tracked;
+/// this catches anything created too late for it to see.
+fn remove_labelled_leftovers(cli: &str, pid: u32) {
+    let label = format!("label=fakecloud-instance=fakecloud-{pid}");
+    for (list, remove) in [
+        (&["ps", "-aq", "--filter"][..], &["rm", "-f"][..]),
+        (
+            &["volume", "ls", "-q", "--filter"][..],
+            &["volume", "rm", "-f"][..],
+        ),
+    ] {
+        let Ok(out) = ProcessCommand::new(cli).args(list).arg(&label).output() else {
+            continue;
+        };
+        let ids: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        if !ids.is_empty() {
+            let _ = ProcessCommand::new(cli)
+                .args(remove)
+                .args(&ids)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+}
+
+/// Start the main sweep server (containers disabled, see `try_start_fakecloud`),
+/// exiting the process if it cannot come up: nothing can be probed without it.
+fn start_fakecloud() -> (String, Child) {
+    try_start_fakecloud(None, Duration::from_secs(5)).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    })
 }
 
 /// Start a fakecloud server for the sweep. `container_cli` is `None` for the
 /// main sweep server (containers disabled, see below) and `Some(cli)` for the
-/// short-lived servers that re-probe runtime-dependent variants.
-fn start_fakecloud(container_cli: Option<&str>) -> (String, Child) {
+/// short-lived servers that re-probe runtime-dependent variants, which get a
+/// longer `ready_within`: with a runtime enabled the server reaps stale
+/// containers before it binds, which can take several bounded CLI calls.
+fn try_start_fakecloud(
+    container_cli: Option<&str>,
+    ready_within: Duration,
+) -> Result<(String, Child), String> {
     let port = find_available_port();
     let endpoint = format!("http://127.0.0.1:{}", port);
 
@@ -717,22 +809,28 @@ fn start_fakecloud(container_cli: Option<&str>) -> (String, Child) {
         cmd.env("FAKECLOUD_CONTAINER_CLI", sentinel);
     }
 
-    let child = cmd.spawn().unwrap_or_else(|e| {
-        eprintln!("Failed to start fakecloud ({}): {}", bin, e);
-        std::process::exit(1);
-    });
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to start fakecloud ({bin}): {e}"))?;
 
-    // Wait for server to be ready
-    for _ in 0..50 {
+    let deadline = std::time::Instant::now() + ready_within;
+    while std::time::Instant::now() < deadline {
         if std::net::TcpStream::connect(format!("127.0.0.1:{}", port)).is_ok() {
             eprintln!("fakecloud started on {}", endpoint);
-            return (endpoint, child);
+            return Ok((endpoint, child));
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(format!("fakecloud exited during startup ({status})"));
         }
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    eprintln!("fakecloud did not start within 5 seconds");
-    std::process::exit(1);
+    let _ = child.kill();
+    let _ = child.wait();
+    Err(format!(
+        "fakecloud did not start within {} seconds",
+        ready_within.as_secs()
+    ))
 }
 
 fn find_available_port() -> u16 {
@@ -998,6 +1096,11 @@ mod tests {
             probe::ProbeStatus::Pass,
             &body
         )));
+        // The hint as data in a 2xx body (an ECS task's stoppedReason) is a
+        // real shape finding, not a missing runtime.
+        let mut ok_body = result(probe::ProbeStatus::ShapeMismatch("x".into()), &body);
+        ok_body.http_status = 200;
+        assert!(!needs_container_runtime(&ok_body));
         assert!(!needs_container_runtime(&result(
             probe::ProbeStatus::UnexpectedResult("Expected success, got HTTP 400".into()),
             "<Error><Code>InvalidParameterValue</Code></Error>",
