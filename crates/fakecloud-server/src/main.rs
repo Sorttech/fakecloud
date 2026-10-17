@@ -2685,9 +2685,6 @@ async fn main() {
     // RDS S3 exports go through this Arc): route its writes through the durable
     // store so delivered objects survive a restart.
     s3_delivery_for_logs.set_s3_store(s3_store.clone());
-    // Export tasks a previous process left PENDING/RUNNING can run now that
-    // their S3 destination is durable.
-    logs_service.resume_interrupted_export_tasks();
     let s3_store_for_inbound = s3_store.clone();
     if let Some(ref cache) = shared_body_cache {
         // Share the cache between the S3Store and S3State so read_body honors
@@ -2706,6 +2703,11 @@ async fn main() {
                 ),
             ),
     ));
+    // Export tasks a previous process left PENDING/RUNNING can run now that
+    // their S3 destination is durable and the S3 service has installed the
+    // write side effects (notifications, replication, SSE-KMS encryption)
+    // their objects get.
+    logs_service.resume_interrupted_export_tasks();
     // Snapshot store is only wired in persistent mode. In memory mode we
     // leave it unset so the service doesn't pay the per-mutation
     // serialization cost for a store that would just drop the bytes.
@@ -10499,39 +10501,72 @@ async fn main() {
                             .and_then(|v| v.to_str().ok())
                             .unwrap_or("000000000000")
                             .to_string();
-                        let bytes = {
+                        // The account whose bucket is read (the default
+                        // account when the caller's has no S3 state), and
+                        // whether the bucket and key exist there.
+                        let (owner, has_bucket, has_key) = {
                             let mas = s3.read();
-                            let state = mas.get(&account_id).unwrap_or_else(|| mas.default_ref());
-                            let Some(bucket) = state.buckets.get(&body.bucket) else {
+                            let owner = if mas.get(&account_id).is_some() {
+                                account_id.clone()
+                            } else {
+                                mas.default_account_id().to_string()
+                            };
+                            let bucket = mas.get(&owner).and_then(|s| s.buckets.get(&body.bucket));
+                            (
+                                owner,
+                                bucket.is_some(),
+                                bucket.is_some_and(|b| b.objects.contains_key(&body.key)),
+                            )
+                        };
+                        if !has_bucket {
+                            return (
+                                axum::http::StatusCode::NOT_FOUND,
+                                axum::Json(serde_json::json!({
+                                    "error": "NoSuchBucket",
+                                    "bucket": body.bucket,
+                                })),
+                            );
+                        }
+                        let not_found = (
+                            axum::http::StatusCode::NOT_FOUND,
+                            axum::Json(serde_json::json!({
+                                "error": "NoSuchKey",
+                                "bucket": body.bucket,
+                                "key": body.key,
+                            })),
+                        );
+                        if !has_key {
+                            return not_found;
+                        }
+                        // Read as GetObject returns it: an SSE-KMS object
+                        // decrypts.
+                        let bytes = match fakecloud_s3::body_io::read_object(
+                            &s3,
+                            &owner,
+                            &body.bucket,
+                            &body.key,
+                        ) {
+                            Some(Ok(b)) => b,
+                            None => return not_found,
+                            // An SSE-KMS object whose key refuses to decrypt
+                            // it is an access failure, not a server error.
+                            Some(Err(e)) if e.is_kms() => {
                                 return (
-                                    axum::http::StatusCode::NOT_FOUND,
+                                    axum::http::StatusCode::FORBIDDEN,
                                     axum::Json(serde_json::json!({
-                                        "error": "NoSuchBucket",
-                                        "bucket": body.bucket,
+                                        "error": "AccessDenied",
+                                        "message": e.to_string(),
                                     })),
                                 );
-                            };
-                            let Some(object) = bucket.objects.get(&body.key) else {
+                            }
+                            Some(Err(e)) => {
                                 return (
-                                    axum::http::StatusCode::NOT_FOUND,
+                                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                                     axum::Json(serde_json::json!({
-                                        "error": "NoSuchKey",
-                                        "bucket": body.bucket,
-                                        "key": body.key,
+                                        "error": "ReadBodyFailed",
+                                        "message": e.to_string(),
                                     })),
                                 );
-                            };
-                            match state.read_body(&object.body) {
-                                Ok(b) => b,
-                                Err(e) => {
-                                    return (
-                                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                                        axum::Json(serde_json::json!({
-                                            "error": "ReadBodyFailed",
-                                            "message": e.to_string(),
-                                        })),
-                                    );
-                                }
                             }
                         };
                         let len = bytes.len() as i64;

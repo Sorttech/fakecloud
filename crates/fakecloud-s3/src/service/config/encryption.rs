@@ -52,19 +52,10 @@ impl S3Service {
                 ));
             }
         }
-        // aws:kms / aws:kms:dsse rules require KMSMasterKeyID — AWS
-        // rejects these with InvalidArgument when the field is
-        // missing or empty, since the bucket would otherwise have
-        // no key to encrypt against.
-        if (body_str.contains("aws:kms") || body_str.contains("aws:kms:dsse"))
-            && !has_kms_master_key_id(&body_str)
-        {
-            return Err(AwsServiceError::aws_error(
-                StatusCode::BAD_REQUEST,
-                "InvalidArgument",
-                "Default KMS encryption requires KMSMasterKeyID",
-            ));
-        }
+        // An aws:kms / aws:kms:dsse default without a KMSMasterKeyID is
+        // valid, as on AWS: objects written under it use the account's
+        // AWS-managed `aws/s3` key. The configuration is stored (and
+        // returned by GetBucketEncryption) without a key.
         let mut accts = self.state.write();
         let state = accts.get_or_create(account_id);
         let b = state

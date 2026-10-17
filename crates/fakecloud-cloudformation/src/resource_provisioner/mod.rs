@@ -3192,25 +3192,7 @@ impl ResourceProvisioner {
     // --- CloudWatch Logs ---
 
     fn read_s3_object_bytes(&self, bucket: &str, key: &str) -> Result<Vec<u8>, String> {
-        let mut accounts = self.s3_state.write();
-        let state = accounts.get_or_create(&self.account_id);
-        let body_ref = {
-            let b = state
-                .buckets
-                .get(bucket)
-                .ok_or_else(|| format!("S3 bucket {bucket} does not exist"))?;
-            let object = b
-                .objects
-                .get(key)
-                .ok_or_else(|| format!("S3 object s3://{bucket}/{key} does not exist"))?;
-            object.body.clone()
-        };
-        // `read_body` consults the body cache (which is owned by the state),
-        // so re-borrow `state` after dropping the bucket borrow above.
-        state
-            .read_body(&body_ref)
-            .map(|b| b.to_vec())
-            .map_err(|e| format!("S3 read failed: {e}"))
+        self.read_s3_object(bucket, key, None)
     }
 
     /// Read a specific object version's bytes. Used when a CFN property
@@ -3224,35 +3206,41 @@ impl ResourceProvisioner {
         key: &str,
         version_id: &str,
     ) -> Result<Vec<u8>, String> {
-        let mut accounts = self.s3_state.write();
-        let state = accounts.get_or_create(&self.account_id);
-        let body_ref = {
-            let b = state
-                .buckets
-                .get(bucket)
-                .ok_or_else(|| format!("S3 bucket {bucket} does not exist"))?;
-            let from_current = b
-                .objects
-                .get(key)
-                .filter(|o| o.version_id.as_deref() == Some(version_id))
-                .map(|o| o.body.clone());
-            from_current
-                .or_else(|| {
-                    b.object_versions.get(key).and_then(|versions| {
-                        versions
-                            .iter()
-                            .find(|o| o.version_id.as_deref() == Some(version_id))
-                            .map(|o| o.body.clone())
-                    })
+        self.read_s3_object(bucket, key, Some(version_id))
+    }
+
+    /// Read an object (or one version of it) as S3's GetObject returns it --
+    /// an SSE-KMS body is decrypted -- through S3's shared object reader.
+    fn read_s3_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+    ) -> Result<Vec<u8>, String> {
+        match fakecloud_s3::body_io::read_object_version(
+            &self.s3_state,
+            &self.account_id,
+            bucket,
+            key,
+            version_id,
+        ) {
+            Some(Ok(bytes)) => Ok(bytes.to_vec()),
+            Some(Err(e)) => Err(format!("S3 read failed: {e}")),
+            None => {
+                let bucket_exists = self
+                    .s3_state
+                    .read()
+                    .get(&self.account_id)
+                    .is_some_and(|s| s.buckets.contains_key(bucket));
+                Err(match (bucket_exists, version_id) {
+                    (false, _) => format!("S3 bucket {bucket} does not exist"),
+                    (true, None) => format!("S3 object s3://{bucket}/{key} does not exist"),
+                    (true, Some(v)) => {
+                        format!("S3 object s3://{bucket}/{key} version {v} does not exist")
+                    }
                 })
-                .ok_or_else(|| {
-                    format!("S3 object s3://{bucket}/{key} version {version_id} does not exist")
-                })?
-        };
-        state
-            .read_body(&body_ref)
-            .map(|b| b.to_vec())
-            .map_err(|e| format!("S3 read failed: {e}"))
+            }
+        }
     }
 
     /// Build a canonical Lambda resource-policy statement from a CFN
@@ -3648,19 +3636,24 @@ impl ResourceProvisioner {
     }
 
     fn fetch_s3_template(&self, bucket: &str, key: &str) -> Result<String, String> {
-        let mut s3_accounts = self.s3_state.write();
-        let s3_state = s3_accounts.get_or_create(&self.account_id);
-        let bucket_obj = s3_state
-            .buckets
-            .get(bucket)
-            .ok_or_else(|| format!("S3 bucket not found: {bucket}"))?;
-        let obj = bucket_obj
-            .objects
-            .get(key)
-            .ok_or_else(|| format!("S3 object not found: {bucket}/{key}"))?;
-        let bytes = s3_state
-            .read_body(&obj.body)
-            .map_err(|e| format!("Failed to read S3 object body: {e}"))?;
+        let bytes =
+            match fakecloud_s3::body_io::read_object(&self.s3_state, &self.account_id, bucket, key)
+            {
+                Some(Ok(bytes)) => bytes,
+                Some(Err(e)) => return Err(format!("Failed to read S3 object body: {e}")),
+                None => {
+                    let bucket_exists = self
+                        .s3_state
+                        .read()
+                        .get(&self.account_id)
+                        .is_some_and(|s| s.buckets.contains_key(bucket));
+                    return Err(if bucket_exists {
+                        format!("S3 object not found: {bucket}/{key}")
+                    } else {
+                        format!("S3 bucket not found: {bucket}")
+                    });
+                }
+            };
         String::from_utf8(bytes.to_vec()).map_err(|e| format!("S3 object is not valid UTF-8: {e}"))
     }
 }

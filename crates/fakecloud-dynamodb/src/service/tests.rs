@@ -1380,6 +1380,274 @@ fn failed_export_reports_failure_on_describe() {
     assert_eq!(body["ExportDescription"]["FailureCode"], "S3NoSuchBucket");
 }
 
+/// A KMS hook with a readable envelope: `enc:<key>:<plaintext>`.
+struct EnvelopeKms;
+
+impl fakecloud_core::delivery::KmsHook for EnvelopeKms {
+    fn encrypt(
+        &self,
+        _account_id: &str,
+        _region: &str,
+        key_id: &str,
+        plaintext: &[u8],
+        _service_principal: &str,
+        _encryption_context: std::collections::HashMap<String, String>,
+    ) -> Result<String, String> {
+        use base64::Engine as _;
+        Ok(format!(
+            "enc:{key_id}:{}",
+            base64::engine::general_purpose::STANDARD.encode(plaintext)
+        ))
+    }
+
+    fn decrypt(
+        &self,
+        _account_id: &str,
+        ciphertext_b64: &str,
+        _service_principal: &str,
+        _encryption_context: std::collections::HashMap<String, String>,
+    ) -> Result<Vec<u8>, String> {
+        use base64::Engine as _;
+        let (_, data) = ciphertext_b64
+            .strip_prefix("enc:")
+            .and_then(|r| r.split_once(':'))
+            .ok_or("not an envelope")?;
+        base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// An export's `S3SseAlgorithm` / `S3SseKmsKeyId` decide how every object it
+/// writes is encrypted, overriding the bucket's default encryption; an export
+/// naming no algorithm takes the bucket default.
+#[test]
+fn export_objects_take_the_requested_encryption() {
+    let s3: fakecloud_s3::SharedS3State = Arc::new(RwLock::new(
+        fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+    ));
+    {
+        let mut accounts = s3.write();
+        let mut bucket = fakecloud_s3::S3Bucket::new("exports", "us-east-1", "owner");
+        bucket.encryption_config = Some(
+            "<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault>\
+             <SSEAlgorithm>aws:kms</SSEAlgorithm><KMSMasterKeyID>bucket-key</KMSMasterKeyID>\
+             </ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>"
+                .to_string(),
+        );
+        accounts
+            .get_or_create("123456789012")
+            .buckets
+            .insert("exports".to_string(), bucket);
+    }
+    // The S3 service installs the KMS SSE-KMS objects are encrypted with.
+    let _s3_service = fakecloud_s3::S3Service::new(
+        s3.clone(),
+        Arc::new(fakecloud_core::delivery::DeliveryBus::new()),
+    )
+    .with_kms_hook(Arc::new(EnvelopeKms));
+    let svc = make_service().with_s3(s3.clone());
+    create_test_table(&svc);
+    svc.put_item(&make_request(
+        "PutItem",
+        json!({ "TableName": "test-table", "Item": { "pk": { "S": "row-1" } } }),
+    ))
+    .unwrap();
+
+    for (prefix, request, expected_sse, expected_key) in [
+        (
+            "kms",
+            json!({ "S3SseAlgorithm": "KMS", "S3SseKmsKeyId": "export-key" }),
+            "aws:kms",
+            Some("export-key"),
+        ),
+        ("aes", json!({ "S3SseAlgorithm": "AES256" }), "AES256", None),
+        ("default", json!({}), "aws:kms", Some("bucket-key")),
+    ] {
+        let mut body = json!({
+            "TableArn": "arn:aws:dynamodb:us-east-1:123456789012:table/test-table",
+            "S3Bucket": "exports",
+            "S3Prefix": prefix,
+        });
+        for (k, v) in request.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        let req = make_request("ExportTableToPointInTime", body);
+        let resp = svc.export_table_to_point_in_time(&req).unwrap();
+        let started: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        let export_arn = started["ExportDescription"]["ExportArn"].as_str().unwrap();
+        let req = make_request("DescribeExport", json!({ "ExportArn": export_arn }));
+        let resp = svc.describe_export(&req).unwrap();
+        let described: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        assert_eq!(
+            described["ExportDescription"]["ExportStatus"], "COMPLETED",
+            "{described}"
+        );
+
+        let accounts = s3.read();
+        let objects: Vec<_> = accounts.get("123456789012").unwrap().buckets["exports"]
+            .objects
+            .iter()
+            .filter(|(k, _)| k.starts_with(&format!("{prefix}/")))
+            .map(|(_, o)| o.clone())
+            .collect();
+        assert_eq!(objects.len(), 4, "{prefix}: _started, data, two manifests");
+        for obj in objects {
+            assert_eq!(
+                obj.sse_algorithm.as_deref(),
+                Some(expected_sse),
+                "{}",
+                obj.key
+            );
+            assert_eq!(obj.sse_kms_key_id.as_deref(), expected_key, "{}", obj.key);
+        }
+        drop(accounts);
+
+        // ImportTable reads the export back through S3's object reader, so
+        // an SSE-KMS export decrypts and re-imports to the same items.
+        let export_id = export_arn.rsplit('/').next().unwrap();
+        let table = format!("reimported-{prefix}");
+        let req = make_request(
+            "ImportTable",
+            json!({
+                "InputFormat": "DYNAMODB_JSON",
+                "InputCompressionType": "GZIP",
+                "S3BucketSource": {
+                    "S3Bucket": "exports",
+                    "S3KeyPrefix": format!("{prefix}/AWSDynamoDB/{export_id}/data/"),
+                },
+                "TableCreationParameters": {
+                    "TableName": table,
+                    "KeySchema": [{ "AttributeName": "pk", "KeyType": "HASH" }],
+                    "AttributeDefinitions": [{ "AttributeName": "pk", "AttributeType": "S" }],
+                    "BillingMode": "PAY_PER_REQUEST"
+                }
+            }),
+        );
+        let resp = svc.import_table(&req).unwrap();
+        let started: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        let import_arn = started["ImportTableDescription"]["ImportArn"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let req = make_request("DescribeImport", json!({ "ImportArn": import_arn }));
+        let resp = svc.describe_import(&req).unwrap();
+        let described: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        let d = &described["ImportTableDescription"];
+        assert_eq!(d["ImportStatus"], "COMPLETED", "{prefix}: {described}");
+        assert_eq!(d["ErrorCount"], 0, "{prefix}: {described}");
+        assert_eq!(d["ImportedItemCount"], 1, "{prefix}: {described}");
+    }
+}
+
+/// A KMS whose keys encrypt but refuse to decrypt (a disabled key, a key
+/// policy that denies the reader).
+struct DenyingKms;
+
+impl fakecloud_core::delivery::KmsHook for DenyingKms {
+    fn encrypt(
+        &self,
+        _account_id: &str,
+        _region: &str,
+        key_id: &str,
+        _plaintext: &[u8],
+        _service_principal: &str,
+        _encryption_context: std::collections::HashMap<String, String>,
+    ) -> Result<String, String> {
+        Ok(format!("envelope-under-{key_id}"))
+    }
+
+    fn decrypt(
+        &self,
+        _account_id: &str,
+        _ciphertext_b64: &str,
+        _service_principal: &str,
+        _encryption_context: std::collections::HashMap<String, String>,
+    ) -> Result<Vec<u8>, String> {
+        Err("kms key is disabled".to_string())
+    }
+}
+
+/// Install an S3 service on `s3` whose KMS refuses every decrypt, and
+/// store `body` as an SSE-KMS object at `bucket/key` in `account`.
+fn put_undecryptable(
+    s3: &fakecloud_s3::SharedS3State,
+    account: &str,
+    bucket: &str,
+    key: &str,
+    body: &[u8],
+) -> fakecloud_s3::S3Service {
+    let svc = fakecloud_s3::S3Service::new(
+        s3.clone(),
+        std::sync::Arc::new(fakecloud_core::delivery::DeliveryBus::new()),
+    )
+    .with_kms_hook(std::sync::Arc::new(DenyingKms));
+    fakecloud_s3::delivery::put_object_via_store_with_encryption(
+        s3,
+        None,
+        account,
+        bucket,
+        key,
+        body.to_vec(),
+        None,
+        fakecloud_s3::delivery::DeliveredEncryption::SseKms { key_id: None },
+    )
+    .unwrap();
+    svc
+}
+
+/// An import whose source object cannot be decrypted (its SSE-KMS key
+/// refuses) fails as a whole with the S3 access failure, and the table it
+/// was creating is dropped, instead of completing with row errors.
+#[test]
+fn import_of_an_undecryptable_source_fails() {
+    let s3: fakecloud_s3::SharedS3State = Arc::new(RwLock::new(
+        fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+    ));
+    s3.write().get_or_create("123456789012").buckets.insert(
+        "src".to_string(),
+        fakecloud_s3::S3Bucket::new("src", "us-east-1", "owner"),
+    );
+    let _s3_service = put_undecryptable(
+        &s3,
+        "123456789012",
+        "src",
+        "data/part-0.json",
+        b"{\"Item\":{\"pk\":{\"S\":\"a\"}}}\n",
+    );
+    let svc = make_service().with_s3(s3);
+    let req = make_request(
+        "ImportTable",
+        json!({
+            "InputFormat": "DYNAMODB_JSON",
+            "S3BucketSource": { "S3Bucket": "src", "S3KeyPrefix": "data/" },
+            "TableCreationParameters": {
+                "TableName": "from-kms",
+                "KeySchema": [{ "AttributeName": "pk", "KeyType": "HASH" }],
+                "AttributeDefinitions": [{ "AttributeName": "pk", "AttributeType": "S" }],
+                "BillingMode": "PAY_PER_REQUEST"
+            }
+        }),
+    );
+    let resp = svc.import_table(&req).unwrap();
+    let started: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    let import_arn = started["ImportTableDescription"]["ImportArn"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let req = make_request("DescribeImport", json!({ "ImportArn": import_arn }));
+    let resp = svc.describe_import(&req).unwrap();
+    let described: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    let d = &described["ImportTableDescription"];
+    assert_eq!(d["ImportStatus"], "FAILED", "{described}");
+    assert_eq!(d["FailureCode"], "S3AccessDenied", "{described}");
+    let message = d["FailureMessage"].as_str().unwrap();
+    assert!(message.contains("src/data/part-0.json"), "{message}");
+    assert!(message.contains("kms key is disabled"), "{message}");
+    let req = make_request("DescribeTable", json!({ "TableName": "from-kms" }));
+    assert!(svc.describe_table(&req).is_err(), "the table is dropped");
+}
+
 #[test]
 fn import_lifecycle() {
     let svc = make_service();

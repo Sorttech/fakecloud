@@ -523,7 +523,19 @@ impl ResetState {
                         .iter()
                         .flat_map(|(_, s)| s.buckets.keys().cloned())
                         .collect();
+                    // The recreated default account must keep the shared
+                    // runtime wiring (body cache, write side effects) the
+                    // server installed; it is not account data.
+                    let mut runtime = fakecloud_s3::S3State::new("", "");
+                    fakecloud_core::multi_account::AccountState::inherit_from(
+                        &mut runtime,
+                        mas.default_ref(),
+                    );
                     mas.reset();
+                    fakecloud_core::multi_account::AccountState::inherit_from(
+                        mas.default_mut(),
+                        &runtime,
+                    );
                     buckets
                 }
                 Some(account) => match mas.get_mut(account) {
@@ -1318,5 +1330,22 @@ mod tests {
         assert!(!store.bucket_state_exists("kept"));
         teardown.run().await;
         assert!(state.s3.read().default_ref().buckets.is_empty());
+    }
+
+    /// A full reset recreates the default S3 account; it must keep the write
+    /// side effects the S3 service installed, or objects other services
+    /// deliver after a reset would silently stop firing notifications and
+    /// replicating.
+    #[tokio::test]
+    async fn full_s3_reset_keeps_the_installed_write_side_effects() {
+        let state = test_state();
+        let _svc = fakecloud_s3::S3Service::new(
+            state.s3.clone(),
+            Arc::new(fakecloud_core::delivery::DeliveryBus::new()),
+        );
+        assert!(state.s3.read().default_ref().side_effects.is_some());
+        let (_, teardown) = state.reset();
+        teardown.run().await;
+        assert!(state.s3.read().default_ref().side_effects.is_some());
     }
 }

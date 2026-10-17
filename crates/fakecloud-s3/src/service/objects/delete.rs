@@ -309,6 +309,20 @@ impl S3Service {
             let notification_config = b.notification_config.clone();
             let bucket_name = bucket.to_string();
             let obj_key = key.to_string();
+            // A delete marker on a replication source is replicated by the
+            // rules that replicate delete markers (only a versioning-enabled
+            // bucket can be a source).
+            if versioning_enabled {
+                crate::service::replication::replicate_delete_marker(
+                    &mut accts,
+                    account_id,
+                    Some(&*self.store),
+                    bucket,
+                    key,
+                    &dm_id,
+                    Some(&self.side_effects),
+                );
+            }
             drop(accts);
             if let Some(ref config) = notification_config {
                 deliver_notifications(
@@ -417,6 +431,8 @@ impl S3Service {
 
         let versioning_enabled = b.versioning.as_deref() == Some("Enabled");
         let versioning_configured = b.versioning.is_some();
+        // Delete markers this batch added, replicated once the loop is done.
+        let mut new_markers: Vec<(String, String)> = Vec::new();
         let mut deleted_xml = String::new();
         let mut error_xml = String::new();
         // (event name, key, version id) for every object this batch actually
@@ -632,6 +648,9 @@ impl S3Service {
                     persist_error = Some(crate::service::persistence_error(e));
                     break;
                 }
+                if versioning_enabled {
+                    new_markers.push((key.to_string(), dm_id.clone()));
+                }
                 pending_events.push((
                     "ObjectRemoved:DeleteMarkerCreated",
                     key.to_string(),
@@ -691,6 +710,19 @@ impl S3Service {
         // service to read bucket state.
         let notification_config = b.notification_config.clone();
         let region = state.region.clone();
+        // Every marker committed before a persistence failure stopped the
+        // batch is replicated: those deletes happened.
+        for (key, dm_id) in &new_markers {
+            crate::service::replication::replicate_delete_marker(
+                &mut accts,
+                account_id,
+                Some(&*self.store),
+                bucket,
+                key,
+                dm_id,
+                Some(&self.side_effects),
+            );
+        }
         drop(accts);
         if let Some(ref config) = notification_config {
             let events: Vec<crate::service::notifications::ObjectEvent<'_>> = pending_events

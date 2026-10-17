@@ -209,7 +209,9 @@ impl S3Service {
         // a KMS error surfaces as 500 KMS.InternalFailureException
         // instead of returning the raw envelope to the caller.
         let decrypted_body: Option<Bytes> =
-            if obj.sse_algorithm.as_deref() == Some("aws:kms") && self.kms_hook.is_some() {
+            if crate::side_effects::is_sse_kms(obj.sse_algorithm.as_deref())
+                && self.kms_hook.is_some()
+            {
                 // Offload the (potentially multi-GB) full-object disk read
                 // onto a blocking thread so it doesn't stall the tokio worker
                 // while we decrypt the envelope, mirroring the multipart

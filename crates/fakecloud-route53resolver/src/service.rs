@@ -1923,13 +1923,19 @@ impl Route53ResolverService {
         if !acc.firewall_domain_lists.contains_key(&id) {
             return Err(not_found(format!("Firewall domain list '{id}' not found")));
         }
-        let (count, status_message) = match imported {
-            Some(domains) => {
+        let (count, status, status_message) = match imported {
+            Ok(Some(domains)) => {
                 let n = domains.len() as i64;
                 acc.firewall_domains.insert(id.clone(), domains);
-                (n, "Successfully imported domains from the file".to_string())
+                (
+                    n,
+                    "COMPLETE",
+                    "Successfully imported domains from the file".to_string(),
+                )
             }
-            None => {
+            // The file exists but could not be read (an SSE-KMS object whose
+            // key refuses to decrypt it): the import failed, and says why.
+            Err(reason) => {
                 let n = acc
                     .firewall_domains
                     .get(&id)
@@ -1937,6 +1943,21 @@ impl Route53ResolverService {
                     .unwrap_or(0);
                 (
                     n,
+                    "COMPLETE_IMPORT_FAILED",
+                    format!(
+                        "The domains file could not be read: {reason}; the domain list is unchanged"
+                    ),
+                )
+            }
+            Ok(None) => {
+                let n = acc
+                    .firewall_domains
+                    .get(&id)
+                    .map(|d| d.len() as i64)
+                    .unwrap_or(0);
+                (
+                    n,
+                    "COMPLETE",
                     "The domains file could not be retrieved; the domain list is unchanged"
                         .to_string(),
                 )
@@ -1944,7 +1965,7 @@ impl Route53ResolverService {
         };
         let list = acc.firewall_domain_lists.get_mut(&id).unwrap();
         list.domain_count = count;
-        list.status = "COMPLETE".to_string();
+        list.status = status.to_string();
         list.modification_time = now_rfc3339();
         Ok(AwsResponse::ok_json(json!({
             "Id": list.id,
@@ -1955,25 +1976,27 @@ impl Route53ResolverService {
     }
 
     /// Read the domains file referenced by an S3 URL and return one trimmed,
-    /// non-empty domain per line. Returns `None` when S3 state is not wired, the
-    /// URL is unparseable, or the object is absent/unreadable.
-    fn fetch_domain_file(&self, account: &str, url: &str) -> Option<Vec<String>> {
-        let s3 = self.s3_state.as_ref()?;
-        let (bucket, key) = parse_s3_url(url)?;
-        let bytes = {
-            let guard = s3.read();
-            let s3_state = guard.get(account)?;
-            let obj = s3_state.buckets.get(&bucket)?.objects.get(&key)?;
-            s3_state.read_body(&obj.body).ok()?
+    /// non-empty domain per line. `Ok(None)` when S3 state is not wired, the
+    /// URL is unparseable, or the object is absent; an error when it exists but
+    /// cannot be read (an SSE-KMS object that does not decrypt).
+    fn fetch_domain_file(&self, account: &str, url: &str) -> Result<Option<Vec<String>>, String> {
+        let (Some(s3), Some((bucket, key))) = (self.s3_state.as_ref(), parse_s3_url(url)) else {
+            return Ok(None);
+        };
+        // Read as GetObject returns it: an SSE-KMS object decrypts.
+        let bytes = match fakecloud_s3::body_io::read_object(s3, account, &bucket, &key) {
+            None => return Ok(None),
+            Some(Ok(bytes)) => bytes,
+            Some(Err(e)) => return Err(e.to_string()),
         };
         let text = String::from_utf8_lossy(&bytes);
-        Some(
+        Ok(Some(
             text.lines()
                 .map(str::trim)
                 .filter(|l| !l.is_empty())
                 .map(str::to_string)
                 .collect(),
-        )
+        ))
     }
 
     fn update_firewall_domains(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
@@ -4130,6 +4153,115 @@ mod tests {
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
         assert_eq!(domains, ["example.com", "bad.example.org", "foo.test"]);
+    }
+
+    /// A KMS whose keys encrypt but refuse to decrypt (a disabled key, a key
+    /// policy that denies the reader).
+    struct DenyingKms;
+
+    impl fakecloud_core::delivery::KmsHook for DenyingKms {
+        fn encrypt(
+            &self,
+            _account_id: &str,
+            _region: &str,
+            key_id: &str,
+            _plaintext: &[u8],
+            _service_principal: &str,
+            _encryption_context: std::collections::HashMap<String, String>,
+        ) -> Result<String, String> {
+            Ok(format!("envelope-under-{key_id}"))
+        }
+
+        fn decrypt(
+            &self,
+            _account_id: &str,
+            _ciphertext_b64: &str,
+            _service_principal: &str,
+            _encryption_context: std::collections::HashMap<String, String>,
+        ) -> Result<Vec<u8>, String> {
+            Err("kms key is disabled".to_string())
+        }
+    }
+
+    /// Install an S3 service on `s3` whose KMS refuses every decrypt, and
+    /// store `body` as an SSE-KMS object at `bucket/key` in `account`.
+    fn put_undecryptable(
+        s3: &fakecloud_s3::SharedS3State,
+        account: &str,
+        bucket: &str,
+        key: &str,
+        body: &[u8],
+    ) -> fakecloud_s3::S3Service {
+        let svc = fakecloud_s3::S3Service::new(
+            s3.clone(),
+            std::sync::Arc::new(fakecloud_core::delivery::DeliveryBus::new()),
+        )
+        .with_kms_hook(std::sync::Arc::new(DenyingKms));
+        fakecloud_s3::delivery::put_object_via_store_with_encryption(
+            s3,
+            None,
+            account,
+            bucket,
+            key,
+            body.to_vec(),
+            None,
+            fakecloud_s3::delivery::DeliveredEncryption::SseKms { key_id: None },
+        )
+        .unwrap();
+        svc
+    }
+
+    /// A domains file that exists but whose SSE-KMS key refuses to decrypt it
+    /// fails the import (`COMPLETE_IMPORT_FAILED`, with the reason) and
+    /// leaves the list unchanged, rather than importing the envelope's text.
+    #[tokio::test]
+    async fn import_firewall_domains_reports_an_undecryptable_file() {
+        use fakecloud_core::multi_account::MultiAccountState;
+        let s3: fakecloud_s3::SharedS3State = Arc::new(RwLock::new(MultiAccountState::new(
+            "123456789012",
+            "us-east-1",
+            "http://localhost",
+        )));
+        s3.write().get_or_create("123456789012").buckets.insert(
+            "my-bucket".to_string(),
+            fakecloud_s3::S3Bucket::new("my-bucket", "us-east-1", "123456789012"),
+        );
+        let _s3_service = put_undecryptable(
+            &s3,
+            "123456789012",
+            "my-bucket",
+            "domains.txt",
+            b"example.com\n",
+        );
+        let svc = Route53ResolverService::default().with_s3_state(s3);
+        let (_, dl) = call(
+            &svc,
+            "CreateFirewallDomainList",
+            json!({ "CreatorRequestId": "c", "Name": "list" }),
+        )
+        .await;
+        let id = dl["FirewallDomainList"]["Id"].as_str().unwrap().to_string();
+        let (s, r) = call(
+            &svc,
+            "ImportFirewallDomains",
+            json!({
+                "FirewallDomainListId": id,
+                "Operation": "REPLACE",
+                "DomainFileUrl": "s3://my-bucket/domains.txt",
+            }),
+        )
+        .await;
+        assert_eq!(s, 200, "{r}");
+        assert_eq!(r["Status"], "COMPLETE_IMPORT_FAILED", "{r}");
+        let message = r["StatusMessage"].as_str().unwrap();
+        assert!(message.contains("kms key is disabled"), "{message}");
+        let (_, ld) = call(
+            &svc,
+            "ListFirewallDomains",
+            json!({ "FirewallDomainListId": id }),
+        )
+        .await;
+        assert!(ld["Domains"].as_array().unwrap().is_empty(), "{ld}");
     }
 
     // Finding 6: without S3 wired the import leaves the list unchanged and says

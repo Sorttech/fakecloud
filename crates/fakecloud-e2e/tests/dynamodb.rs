@@ -7753,3 +7753,279 @@ async fn dynamodb_filtered_export_writes_matching_items() {
         ]
     );
 }
+
+/// An export's `S3SseAlgorithm` / `S3SseKmsKeyId` encrypt every object it
+/// writes, overriding the bucket's default encryption: under `KMS` the data
+/// file is stored under the named key (HeadObject reports `aws:kms` and the
+/// key, GetObject decrypts it), under `AES256` it is SSE-S3 even in a bucket
+/// whose default is SSE-KMS.
+#[tokio::test]
+async fn dynamodb_export_applies_requested_s3_encryption() {
+    use aws_sdk_dynamodb::types::{ExportStatus, S3SseAlgorithm};
+    use aws_sdk_s3::types::{
+        ServerSideEncryption, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration,
+        ServerSideEncryptionRule,
+    };
+
+    let server = TestServer::start().await;
+    let ddb = server.dynamodb_client().await;
+    let s3 = server.s3_client().await;
+    let kms = server.kms_client().await;
+    let export_key = kms
+        .create_key()
+        .send()
+        .await
+        .unwrap()
+        .key_metadata()
+        .unwrap()
+        .arn()
+        .unwrap()
+        .to_string();
+    let bucket_key = kms
+        .create_key()
+        .send()
+        .await
+        .unwrap()
+        .key_metadata()
+        .unwrap()
+        .arn()
+        .unwrap()
+        .to_string();
+
+    ddb.create_table()
+        .table_name("Encrypted")
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("pk")
+                .key_type(KeyType::Hash)
+                .build()
+                .unwrap(),
+        )
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("pk")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .billing_mode(BillingMode::PayPerRequest)
+        .send()
+        .await
+        .unwrap();
+    ddb.put_item()
+        .table_name("Encrypted")
+        .item("pk", AttributeValue::S("secret-row".into()))
+        .send()
+        .await
+        .unwrap();
+    let table_arn = ddb
+        .describe_table()
+        .table_name("Encrypted")
+        .send()
+        .await
+        .unwrap()
+        .table()
+        .unwrap()
+        .table_arn()
+        .unwrap()
+        .to_string();
+
+    s3.create_bucket()
+        .bucket("enc-exports")
+        .send()
+        .await
+        .unwrap();
+    s3.put_bucket_encryption()
+        .bucket("enc-exports")
+        .server_side_encryption_configuration(
+            ServerSideEncryptionConfiguration::builder()
+                .rules(
+                    ServerSideEncryptionRule::builder()
+                        .apply_server_side_encryption_by_default(
+                            ServerSideEncryptionByDefault::builder()
+                                .sse_algorithm(ServerSideEncryption::AwsKms)
+                                .kms_master_key_id(&bucket_key)
+                                .build()
+                                .unwrap(),
+                        )
+                        .build(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    for (prefix, algorithm, key, expected_sse, expected_key) in [
+        (
+            "kms",
+            S3SseAlgorithm::Kms,
+            Some(export_key.as_str()),
+            ServerSideEncryption::AwsKms,
+            Some(export_key.as_str()),
+        ),
+        (
+            "aes",
+            S3SseAlgorithm::Aes256,
+            None,
+            ServerSideEncryption::Aes256,
+            None,
+        ),
+    ] {
+        let started = ddb
+            .export_table_to_point_in_time()
+            .table_arn(&table_arn)
+            .s3_bucket("enc-exports")
+            .s3_prefix(prefix)
+            .s3_sse_algorithm(algorithm)
+            .set_s3_sse_kms_key_id(key.map(str::to_string))
+            .send()
+            .await
+            .unwrap();
+        let export_arn = started
+            .export_description()
+            .unwrap()
+            .export_arn()
+            .unwrap()
+            .to_string();
+        let mut desc = None;
+        for _ in 0..200 {
+            let d = ddb
+                .describe_export()
+                .export_arn(&export_arn)
+                .send()
+                .await
+                .unwrap();
+            let e = d.export_description().unwrap().clone();
+            if e.export_status() != Some(&ExportStatus::InProgress) {
+                desc = Some(e);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let desc = desc.expect("export settled");
+        assert_eq!(desc.export_status(), Some(&ExportStatus::Completed));
+
+        let listing = s3
+            .list_objects_v2()
+            .bucket("enc-exports")
+            .prefix(format!("{prefix}/"))
+            .send()
+            .await
+            .unwrap();
+        let keys: Vec<String> = listing
+            .contents()
+            .iter()
+            .filter_map(|o| o.key().map(str::to_string))
+            .collect();
+        assert_eq!(keys.len(), 4, "{keys:?}");
+        for key in &keys {
+            let head = s3
+                .head_object()
+                .bucket("enc-exports")
+                .key(key)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(head.server_side_encryption(), Some(&expected_sse), "{key}");
+            assert_eq!(head.ssekms_key_id(), expected_key, "{key}");
+        }
+        let data_key = keys
+            .iter()
+            .find(|k| k.contains("/data/"))
+            .expect("a data file");
+        let data = s3
+            .get_object()
+            .bucket("enc-exports")
+            .key(data_key)
+            .send()
+            .await
+            .unwrap()
+            .body
+            .collect()
+            .await
+            .unwrap()
+            .into_bytes();
+        let data = helpers::gunzip(&data);
+        assert!(
+            std::str::from_utf8(&data).unwrap().contains("secret-row"),
+            "the data file decrypts to the exported items"
+        );
+
+        // The export (encrypted at rest) re-imports: ImportTable reads it the
+        // way GetObject returns it.
+        let export_id = export_arn.rsplit('/').next().unwrap();
+        let table = format!("Reimported-{prefix}");
+        let import_arn = ddb
+            .import_table()
+            .input_format(aws_sdk_dynamodb::types::InputFormat::DynamodbJson)
+            .input_compression_type(aws_sdk_dynamodb::types::InputCompressionType::Gzip)
+            .s3_bucket_source(
+                aws_sdk_dynamodb::types::S3BucketSource::builder()
+                    .s3_bucket("enc-exports")
+                    .s3_key_prefix(format!("{prefix}/AWSDynamoDB/{export_id}/data/"))
+                    .build()
+                    .unwrap(),
+            )
+            .table_creation_parameters(
+                aws_sdk_dynamodb::types::TableCreationParameters::builder()
+                    .table_name(&table)
+                    .key_schema(
+                        KeySchemaElement::builder()
+                            .attribute_name("pk")
+                            .key_type(KeyType::Hash)
+                            .build()
+                            .unwrap(),
+                    )
+                    .attribute_definitions(
+                        AttributeDefinition::builder()
+                            .attribute_name("pk")
+                            .attribute_type(ScalarAttributeType::S)
+                            .build()
+                            .unwrap(),
+                    )
+                    .billing_mode(BillingMode::PayPerRequest)
+                    .build()
+                    .unwrap(),
+            )
+            .send()
+            .await
+            .unwrap()
+            .import_table_description()
+            .unwrap()
+            .import_arn()
+            .unwrap()
+            .to_string();
+        let mut imported = None;
+        for _ in 0..200 {
+            let d = ddb
+                .describe_import()
+                .import_arn(&import_arn)
+                .send()
+                .await
+                .unwrap();
+            let d = d.import_table_description().unwrap().clone();
+            if d.import_status() != Some(&aws_sdk_dynamodb::types::ImportStatus::InProgress) {
+                imported = Some(d);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let imported = imported.expect("import settled");
+        assert_eq!(
+            imported.import_status(),
+            Some(&aws_sdk_dynamodb::types::ImportStatus::Completed),
+            "{imported:?}"
+        );
+        assert_eq!(imported.error_count(), 0, "{imported:?}");
+        let row = ddb
+            .get_item()
+            .table_name(&table)
+            .key("pk", AttributeValue::S("secret-row".into()))
+            .send()
+            .await
+            .unwrap();
+        assert!(row.item().is_some(), "the re-imported table holds the row");
+    }
+}

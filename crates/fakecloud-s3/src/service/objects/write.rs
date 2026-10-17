@@ -64,15 +64,7 @@ impl S3Service {
         };
 
         // --- Read lock phase: validate preconditions and read bucket config ---
-        let (
-            acl_owner_id,
-            encryption_config,
-            notification_config,
-            region,
-            bucket_region,
-            explicit_lock,
-            checks,
-        ) = {
+        let (acl_owner_id, encryption_config, bucket_region, explicit_lock, checks) = {
             let accts = self.state.read();
             let __empty = crate::state::S3State::new(account_id, "us-east-1");
             let state = accts.get(account_id).unwrap_or(&__empty);
@@ -128,8 +120,6 @@ impl S3Service {
             (
                 b.acl_owner_id.clone(),
                 b.encryption_config.clone(),
-                b.notification_config.clone(),
-                state.region.clone(),
                 b.region.clone(),
                 explicit_lock,
                 checks,
@@ -234,82 +224,17 @@ impl S3Service {
             }]
         };
 
-        // SSE headers
-        let mut sse_algorithm = req
-            .headers
-            .get("x-amz-server-side-encryption")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        let mut sse_kms_key_id = req
-            .headers
-            .get("x-amz-server-side-encryption-aws-kms-key-id")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        let bucket_key_enabled = req
-            .headers
-            .get("x-amz-server-side-encryption-bucket-key-enabled")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.eq_ignore_ascii_case("true"));
-
-        // Apply bucket default encryption if no explicit SSE headers
-        if sse_algorithm.is_none() {
-            if let Some(ref enc_config) = encryption_config {
-                if let Some(algo) = extract_xml_value(enc_config, "SSEAlgorithm") {
-                    if algo == "aws:kms" && sse_kms_key_id.is_none() {
-                        sse_kms_key_id = extract_xml_value(enc_config, "KMSMasterKeyID");
-                    }
-                    sse_algorithm = Some(algo);
-                }
-            }
-        }
-
-        // Validate KMS key exists when using aws:kms encryption
-        if sse_algorithm.as_deref() == Some("aws:kms") {
-            if let Some(ref kms) = self.kms_state {
-                if let Some(ref key_id) = sse_kms_key_id {
-                    // A key or alias ARN names its account (possibly the
-                    // requester's); a bare id or alias resolves in the
-                    // bucket owner's account.
-                    let key_account =
-                        crate::service::kms_reference_account(key_id).unwrap_or(account_id);
-                    // The key (or alias) lives in the bucket's region; an
-                    // alias ARN names its own region. Through the hook an
-                    // AWS-managed `aws/s3` reference mints its key, so the
-                    // object records the key's ARN as on AWS.
-                    let resolved = self
-                        .kms_hook
-                        .as_ref()
-                        .and_then(|hook| {
-                            hook.resolve_key_arn(
-                                key_account,
-                                &bucket_region,
-                                key_id,
-                                "s3.amazonaws.com",
-                            )
-                            .ok()
-                        })
-                        .or_else(|| {
-                            let kms_accounts = kms.read();
-                            kms_accounts
-                                .get(key_account)
-                                .unwrap_or(kms_accounts.default_ref())
-                                .resolve_key_arn(&bucket_region, key_id)
-                                .map(str::to_string)
-                        });
-                    match resolved {
-                        Some(arn) => sse_kms_key_id = Some(arn),
-                        None => {
-                            // Still allow it — AWS doesn't always reject unknown keys
-                            // for emulation purposes, just set the key ID
-                            tracing::debug!(
-                                key_id = %key_id,
-                                "KMS key not found in state, proceeding anyway"
-                            );
-                        }
-                    }
-                }
-            }
-        }
+        // The request's SSE headers, else the bucket's default encryption.
+        let crate::side_effects::ObjectEncryption {
+            algorithm: sse_algorithm,
+            kms_key_id: sse_kms_key_id,
+            bucket_key_enabled,
+        } = self.object_encryption(
+            &req.headers,
+            encryption_config.as_deref(),
+            account_id,
+            &bucket_region,
+        );
 
         // SSE-KMS: read the spool back into memory so the KMS hook can
         // produce an envelope-encrypted blob (AES-GCM needs the whole
@@ -318,7 +243,7 @@ impl S3Service {
         // before any mutation. Non-KMS uploads pass `BodySource::File`
         // straight to the store and never copy the payload into RAM.
         let plaintext_size = data_size;
-        let body_source: BodySource = if sse_algorithm.as_deref() == Some("aws:kms") {
+        let body_source: BodySource = if crate::side_effects::is_sse_kms(sse_algorithm.as_deref()) {
             let bytes = tokio::fs::read(&spooled.path)
                 .await
                 .map_err(crate::service::io_to_aws)?;
@@ -376,7 +301,7 @@ impl S3Service {
         };
 
         // --- Write lock phase: insert object and handle versioning/replication ---
-        let version_id = {
+        let committed = {
             let mut accts = self.state.write();
             let state = accts.get_or_create(account_id);
             let b = state
@@ -404,23 +329,28 @@ impl S3Service {
                 }
             }
 
-            // Write the body through the store, then record the new version
-            // as the bucket's versioning state dictates.
-            let version_id =
-                super::commit_object_version(b, bucket, Some(&*self.store), obj, body_source)
-                    .map_err(crate::service::persistence_error)?;
-            // Replicate (in-memory copy) then persist replicas via the store.
-            replicate_through_store(
+            // Write the body through the store, record the new version as the
+            // bucket's versioning state dictates, and replicate it.
+            crate::side_effects::commit_new_object(
                 &mut accts,
                 account_id,
-                &self.store,
                 bucket,
-                key,
-                self.iam_mode,
+                Some(&*self.store),
+                Some(&self.side_effects),
+                obj,
+                |store, obj, meta| {
+                    store.put_object(
+                        bucket,
+                        &obj.key,
+                        meta.version_id.as_deref(),
+                        body_source,
+                        meta,
+                    )
+                },
             )
-            .map_err(crate::service::persistence_error)?;
-            version_id
+            .map_err(crate::service::persistence_error)?
         }; // write lock dropped
+        let version_id = committed.version_id.clone();
 
         // --- Response phase: build response headers ---
         let mut headers = HeaderMap::new();
@@ -429,23 +359,12 @@ impl S3Service {
             headers.insert("x-amz-version-id", vid.parse().unwrap());
         }
         // Return SSE headers
-        if let Some(algo) = &sse_algorithm {
-            headers.insert("x-amz-server-side-encryption", algo.parse().unwrap());
-        } else {
-            headers.insert("x-amz-server-side-encryption", "AES256".parse().unwrap());
+        crate::side_effects::ObjectEncryption {
+            algorithm: sse_algorithm.clone(),
+            kms_key_id: sse_kms_key_id.clone(),
+            bucket_key_enabled,
         }
-        if let Some(kid) = &sse_kms_key_id {
-            headers.insert(
-                "x-amz-server-side-encryption-aws-kms-key-id",
-                kid.parse().unwrap(),
-            );
-        }
-        if bucket_key_enabled == Some(true) {
-            headers.insert(
-                "x-amz-server-side-encryption-bucket-key-enabled",
-                "true".parse().unwrap(),
-            );
-        }
+        .insert_response_headers(&mut headers);
         // The stored checksum, which S3 returns on every PutObject: a single
         // part upload's checksum is always FULL_OBJECT.
         if let Some(val) = &checksum_value {
@@ -457,11 +376,6 @@ impl S3Service {
             );
         }
 
-        let obj_size = data_size;
-        let obj_etag = etag.clone();
-        let bucket_name = bucket.to_string();
-        let obj_key = key.to_string();
-
         // Deliver S3 event notifications. A browser form upload reaches this
         // handler through POST Object, which AWS reports as ObjectCreated:Post.
         // S3 routes on method + path rather than `action`, so POST Object's
@@ -471,23 +385,16 @@ impl S3Service {
         } else {
             "ObjectCreated:Put"
         };
-        if let Some(ref config) = notification_config {
-            deliver_notifications(
-                &self.delivery,
-                config,
-                &crate::service::notifications::ObjectEvent {
-                    event_name,
-                    bucket_name: &bucket_name,
-                    requester_account: &req.account_id,
-                    key: &obj_key,
-                    size: obj_size,
-                    etag: &obj_etag,
-                    region: &region,
-                    version_id: version_id.as_deref(),
-                },
-                Some(&self.state),
-            );
-        }
+        committed.notify(
+            &self.delivery,
+            &self.state,
+            event_name,
+            &req.account_id,
+            bucket,
+            key,
+            data_size,
+            &etag,
+        );
 
         Ok(AwsResponse {
             status: StatusCode::OK,
@@ -903,18 +810,19 @@ impl S3Service {
         // copy.
         let raw_src_bytes =
             super::run_blocking_io(|| src_handle.read_all()).map_err(crate::service::io_to_aws)?;
-        let src_bytes =
-            if src_obj.sse_algorithm.as_deref() == Some("aws:kms") && self.kms_hook.is_some() {
-                self.decrypt_object_body(
-                    req,
-                    &src_account,
-                    src_bucket,
-                    &raw_src_bytes,
-                    src_obj.sse_kms_key_id.as_deref(),
-                )?
-            } else {
-                raw_src_bytes
-            };
+        let src_bytes = if crate::side_effects::is_sse_kms(src_obj.sse_algorithm.as_deref())
+            && self.kms_hook.is_some()
+        {
+            self.decrypt_object_body(
+                req,
+                &src_account,
+                src_bucket,
+                &raw_src_bytes,
+                src_obj.sse_kms_key_id.as_deref(),
+            )?
+        } else {
+            raw_src_bytes
+        };
         // The copy is written as a single object, so its checksum is always a
         // FULL_OBJECT checksum of the whole body (S3 user guide: "With a copy
         // command, the checksum of the object is a direct checksum of the full
@@ -936,19 +844,19 @@ impl S3Service {
         // stored body is a fresh envelope with the dest's encryption
         // context (bucket arn), under a key in the destination bucket's
         // region.
-        let dest_stored_bytes = if new_sse.as_deref() == Some("aws:kms") && self.kms_hook.is_some()
-        {
-            self.encrypt_object_body(
-                req,
-                account_id,
-                &dest_region,
-                dest_bucket,
-                &src_bytes,
-                new_kms.as_deref(),
-            )?
-        } else {
-            src_bytes.clone()
-        };
+        let dest_stored_bytes =
+            if crate::side_effects::is_sse_kms(new_sse.as_deref()) && self.kms_hook.is_some() {
+                self.encrypt_object_body(
+                    req,
+                    account_id,
+                    &dest_region,
+                    dest_bucket,
+                    &src_bytes,
+                    new_kms.as_deref(),
+                )?
+            } else {
+                src_bytes.clone()
+            };
         let mut staged_dest = super::run_blocking_io(|| {
             crate::body_io::SpooledBody::spool(Some(&*self.store), dest_stored_bytes.clone())
         })
@@ -1021,21 +929,30 @@ impl S3Service {
             ..Default::default()
         };
 
-        // Write the copy through the store and record it as the destination's
-        // new version, exactly as PutObject does. The id it reports is the
-        // one assigned at commit.
-        let version_id = super::commit_object_version(
-            db,
+        // Write the copy through the store, record it as the destination's
+        // new version and replicate it, exactly as PutObject does. The id it
+        // reports is the one assigned at commit.
+        let body_source = staged_dest.source();
+        let committed = crate::side_effects::commit_new_object(
+            &mut accts,
+            account_id,
             dest_bucket,
             Some(&*self.store),
+            Some(&self.side_effects),
             dest_obj,
-            staged_dest.source(),
+            |store, obj, meta| {
+                store.put_object(
+                    dest_bucket,
+                    &obj.key,
+                    meta.version_id.as_deref(),
+                    body_source,
+                    meta,
+                )
+            },
         )
         .map_err(crate::service::persistence_error)?;
-        let db = state
-            .buckets
-            .get_mut(dest_bucket)
-            .ok_or_else(|| no_such_bucket(dest_bucket))?;
+        drop(accts);
+        let version_id = committed.version_id.clone();
 
         let mut response_headers = HeaderMap::new();
         if let Some(vid) = &version_id {
@@ -1068,27 +985,6 @@ impl S3Service {
             crate::checksum::xml_element(new_checksum_algo, &new_checksum_val)
         );
 
-        // Capture notification config before dropping lock
-        let notification_config = db.notification_config.clone();
-        let copy_size = src_obj_size;
-        let copy_etag = etag.clone();
-        let copy_bucket = dest_bucket.to_string();
-        let copy_key = dest_key.to_string();
-        let region = state.region.clone();
-
-        // Replicate object if replication is configured on the destination bucket
-        replicate_through_store(
-            &mut accts,
-            account_id,
-            &self.store,
-            dest_bucket,
-            dest_key,
-            self.iam_mode,
-        )
-        .map_err(crate::service::persistence_error)?;
-
-        drop(accts);
-
         let body = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
              <CopyObjectResult>\
@@ -1100,23 +996,16 @@ impl S3Service {
         );
 
         // Deliver S3 event notifications
-        if let Some(ref config) = notification_config {
-            deliver_notifications(
-                &self.delivery,
-                config,
-                &crate::service::notifications::ObjectEvent {
-                    event_name: "ObjectCreated:Copy",
-                    bucket_name: &copy_bucket,
-                    requester_account: &req.account_id,
-                    key: &copy_key,
-                    size: copy_size,
-                    etag: &copy_etag,
-                    region: &region,
-                    version_id: version_id.as_deref(),
-                },
-                Some(&self.state),
-            );
-        }
+        committed.notify(
+            &self.delivery,
+            &self.state,
+            "ObjectCreated:Copy",
+            &req.account_id,
+            dest_bucket,
+            dest_key,
+            src_obj_size,
+            &etag,
+        );
 
         Ok(AwsResponse {
             status: StatusCode::OK,

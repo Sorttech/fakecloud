@@ -31,6 +31,18 @@ impl S3Service {
                 "An Object Lock configuration is present on this bucket, so the versioning state cannot be changed.",
             ));
         }
+        // Nor on a replication source: replication needs versioning enabled
+        // on the source, and the configuration must be removed before it can
+        // be suspended ("If you attempt to disable versioning on the source
+        // bucket, Amazon S3 returns an error", S3 User Guide, Requirements
+        // and considerations for replication).
+        if status_val == "Suspended" && b.replication_config.is_some() {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::CONFLICT,
+                "InvalidBucketState",
+                "A replication configuration is present on this bucket, so the versioning state cannot be changed.",
+            ));
+        }
         if status_val == "Enabled" || status_val == "Suspended" {
             b.versioning = Some(status_val);
         }

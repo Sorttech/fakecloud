@@ -787,3 +787,118 @@ async fn change_sets_sharing_a_name_stay_scoped_to_their_stack() {
         .expect_err("a deleted stack's change set must be gone");
     assert!(err.into_service_error().is_change_set_not_found_exception());
 }
+
+/// A template stored in a bucket whose default encryption is SSE-KMS is an
+/// encrypted object at rest; CloudFormation reads it the way GetObject
+/// returns it (decrypted) for both CreateStack and CreateChangeSet.
+#[tokio::test]
+async fn template_url_from_an_sse_kms_bucket_is_decrypted() {
+    use aws_sdk_s3::types::{
+        ServerSideEncryption, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration,
+        ServerSideEncryptionRule,
+    };
+    let server = TestServer::start().await;
+    let cf = server.cloudformation_client().await;
+    let s3 = server.s3_client().await;
+    let sns = server.sns_client().await;
+    let kms_key = server
+        .kms_client()
+        .await
+        .create_key()
+        .send()
+        .await
+        .unwrap()
+        .key_metadata()
+        .unwrap()
+        .arn()
+        .unwrap()
+        .to_string();
+
+    s3.create_bucket()
+        .bucket("kms-templates")
+        .send()
+        .await
+        .unwrap();
+    s3.put_bucket_encryption()
+        .bucket("kms-templates")
+        .server_side_encryption_configuration(
+            ServerSideEncryptionConfiguration::builder()
+                .rules(
+                    ServerSideEncryptionRule::builder()
+                        .apply_server_side_encryption_by_default(
+                            ServerSideEncryptionByDefault::builder()
+                                .sse_algorithm(ServerSideEncryption::AwsKms)
+                                .kms_master_key_id(&kms_key)
+                                .build()
+                                .unwrap(),
+                        )
+                        .build(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    for (key, topic) in [
+        ("stack.json", "kms-stack-topic"),
+        ("cs.json", "kms-cs-topic"),
+    ] {
+        let template = format!(
+            r#"{{"Resources": {{"T": {{"Type": "AWS::SNS::Topic",
+                "Properties": {{"TopicName": "{topic}"}}}}}}}}"#
+        );
+        let put = s3
+            .put_object()
+            .bucket("kms-templates")
+            .key(key)
+            .body(ByteStream::from(template.into_bytes()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            put.server_side_encryption(),
+            Some(&ServerSideEncryption::AwsKms)
+        );
+    }
+
+    cf.create_stack()
+        .stack_name("kms-template-stack")
+        .template_url(format!("{}/kms-templates/stack.json", server.endpoint()))
+        .send()
+        .await
+        .unwrap();
+    cf.create_change_set()
+        .stack_name("kms-cs-stack")
+        .change_set_name("kms-cs")
+        .change_set_type(ChangeSetType::Create)
+        .template_url(format!("{}/kms-templates/cs.json", server.endpoint()))
+        .send()
+        .await
+        .unwrap();
+    cf.execute_change_set()
+        .stack_name("kms-cs-stack")
+        .change_set_name("kms-cs")
+        .send()
+        .await
+        .unwrap();
+
+    for stack in ["kms-template-stack", "kms-cs-stack"] {
+        let stacks = cf.describe_stacks().stack_name(stack).send().await.unwrap();
+        assert_eq!(
+            stacks.stacks()[0].stack_status().map(|s| s.as_str()),
+            Some("CREATE_COMPLETE"),
+            "{stack}"
+        );
+    }
+    let topics = sns.list_topics().send().await.unwrap();
+    for topic in ["kms-stack-topic", "kms-cs-topic"] {
+        assert!(
+            topics
+                .topics()
+                .iter()
+                .any(|t| t.topic_arn().is_some_and(|a| a.ends_with(topic))),
+            "{topic} provisioned from the decrypted template"
+        );
+    }
+}

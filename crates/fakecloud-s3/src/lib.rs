@@ -12,6 +12,7 @@ pub mod quota;
 pub mod resource_policy;
 pub(crate) mod select;
 pub(crate) mod service;
+pub mod side_effects;
 pub mod simulation;
 pub(crate) mod state;
 mod xml_util;

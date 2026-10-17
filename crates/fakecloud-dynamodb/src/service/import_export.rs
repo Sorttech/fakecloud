@@ -24,7 +24,7 @@ use serde_json::{json, Value};
 use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 use fakecloud_core::validation::*;
 use fakecloud_persistence::{S3Store, SnapshotStore};
-use fakecloud_s3::body_io::ObjectBodyHandle;
+use fakecloud_s3::body_io::ObjectReader;
 use fakecloud_s3::SharedS3State;
 
 use crate::state::{
@@ -126,7 +126,8 @@ impl JobContext {
 /// An S3 source object opened under the S3 read guard.
 struct SourceObject {
     size: u64,
-    body: ObjectBodyHandle,
+    /// Reads the object's plaintext (an SSE-KMS export decrypts).
+    body: ObjectReader,
 }
 
 enum SourceError {
@@ -145,6 +146,7 @@ fn open_source_objects(
 ) -> Result<Vec<SourceObject>, SourceError> {
     let guard = s3.read();
     let acct = guard.get(account).ok_or(SourceError::NoSuchBucket)?;
+    let bucket_name = bucket;
     let bucket = acct.buckets.get(bucket).ok_or(SourceError::NoSuchBucket)?;
     let mut keys: Vec<&String> = bucket
         .objects
@@ -158,7 +160,7 @@ fn open_source_objects(
         if obj.is_delete_marker {
             continue;
         }
-        let body = ObjectBodyHandle::open(&obj.body)
+        let body = ObjectReader::open(&guard, account, bucket_name, obj)
             .map_err(|e| SourceError::Read(format!("failed to open s3://{key}: {e}")))?;
         out.push(SourceObject {
             size: obj.size,
@@ -168,9 +170,28 @@ fn open_source_objects(
     Ok(out)
 }
 
+/// The encryption an export's objects are written with: the request's
+/// `S3SseAlgorithm` (`AES256` or `KMS`, the latter under `S3SseKmsKeyId`, or
+/// the AWS-managed `aws/s3` key without one) overrides the bucket's default
+/// encryption; an export that names none takes the bucket default.
+fn export_encryption(
+    sse_algorithm: Option<&str>,
+    sse_kms_key_id: Option<&str>,
+) -> fakecloud_s3::delivery::DeliveredEncryption {
+    use fakecloud_s3::delivery::DeliveredEncryption;
+    match sse_algorithm {
+        Some("KMS") => DeliveredEncryption::SseKms {
+            key_id: sse_kms_key_id.map(str::to_string),
+        },
+        Some("AES256") => DeliveredEncryption::SseS3,
+        _ => DeliveredEncryption::AsDelivered,
+    }
+}
+
 /// Write one export object into a bucket. It is an ordinary new object
 /// version there: the bucket's versioning and default retention apply as for
-/// PutObject, and it is written through the durable store when one exists.
+/// PutObject, it is encrypted as `encryption` says, and it is written through
+/// the durable store when one exists.
 fn put_s3_object(
     ctx: &JobContext,
     account: &str,
@@ -178,11 +199,12 @@ fn put_s3_object(
     key: &str,
     body: Vec<u8>,
     content_type: &str,
+    encryption: fakecloud_s3::delivery::DeliveredEncryption,
 ) -> Result<(), SourceError> {
     let Some(s3) = &ctx.s3_state else {
         return Ok(());
     };
-    fakecloud_s3::delivery::put_object_via_store(
+    fakecloud_s3::delivery::put_object_via_store_with_encryption(
         s3,
         ctx.s3_store.as_deref(),
         account,
@@ -190,6 +212,7 @@ fn put_s3_object(
         key,
         body,
         Some(content_type),
+        encryption,
     )
     .map_err(|msg| {
         // The bucket may have been deleted since the export started.
@@ -289,6 +312,13 @@ fn run_import(ctx: &JobContext, job: &ImportJob) {
         processed_size_bytes += obj.size as i64;
         let raw = match obj.body.read_all() {
             Ok(b) => b,
+            // An SSE-KMS source the import cannot decrypt is an access
+            // failure on the import's source, not a bad row: the whole import
+            // fails, as AWS fails an import it cannot read, and the table it
+            // was creating is dropped.
+            Err(e) if e.is_kms() => {
+                return fail_import(ctx, job, "S3AccessDenied", &e.to_string(), true);
+            }
             Err(e) => {
                 rows.push(Err(format!("failed to read S3 object: {e}")));
                 continue;
@@ -677,6 +707,7 @@ fn run_export(ctx: &JobContext, job: &ExportJob) {
             "application/json",
         ),
     ];
+    let encryption = export_encryption(job.sse_algorithm.as_deref(), job.sse_kms_key_id.as_deref());
     for (key, body, content_type) in writes {
         match put_s3_object(
             ctx,
@@ -685,6 +716,7 @@ fn run_export(ctx: &JobContext, job: &ExportJob) {
             key,
             body,
             content_type,
+            encryption.clone(),
         ) {
             Ok(()) => {}
             Err(SourceError::NoSuchBucket) => {
@@ -1304,12 +1336,10 @@ impl DynamoDbService {
                 export_manifest: None,
                 table_id: Some(table.table_id.clone()),
                 s3_bucket_owner: body["S3BucketOwner"].as_str().map(str::to_string),
-                s3_sse_algorithm: Some(
-                    body["S3SseAlgorithm"]
-                        .as_str()
-                        .unwrap_or("AES256")
-                        .to_string(),
-                ),
+                // Kept as requested: an export that names no algorithm
+                // takes the bucket's default encryption (DescribeExport
+                // still reports AES256 for it).
+                s3_sse_algorithm: body["S3SseAlgorithm"].as_str().map(str::to_string),
                 s3_sse_kms_key_id: body["S3SseKmsKeyId"].as_str().map(str::to_string),
                 client_token: body["ClientToken"].as_str().map(str::to_string),
                 export_type: Some(export_type.clone()),

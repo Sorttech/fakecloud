@@ -101,6 +101,7 @@ pub fn mpu_init_snapshot(m: &MultipartUpload) -> MpuInit {
         storage_class: m.storage_class.clone(),
         sse_algorithm: m.sse_algorithm.clone(),
         sse_kms_key_id: m.sse_kms_key_id.clone(),
+        bucket_key_enabled: m.bucket_key_enabled,
         tagging: m.tagging.clone(),
         acl_grants: m.acl_grants.iter().map(AclGrantSnapshot::from).collect(),
         checksum_algorithm: m.checksum_algorithm.map(|a| a.as_str().to_string()),
@@ -286,6 +287,7 @@ pub fn multipart_upload_from_loaded(lm: LoadedMpu) -> MultipartUpload {
         storage_class: init.storage_class,
         sse_algorithm: init.sse_algorithm,
         sse_kms_key_id: init.sse_kms_key_id,
+        bucket_key_enabled: init.bucket_key_enabled,
         tagging: init.tagging,
         acl_grants: init
             .acl_grants
@@ -701,6 +703,7 @@ permission = "READ"
             storage_class: "STANDARD".to_string(),
             sse_algorithm: None,
             sse_kms_key_id: None,
+            bucket_key_enabled: Some(true),
             tagging: None,
             acl_grants: Vec::new(),
             checksum_algorithm: None,
@@ -717,6 +720,7 @@ permission = "READ"
         };
         let snap = mpu_init_snapshot(&mpu);
         assert_eq!(snap.upload_id, "up-1");
+        assert_eq!(snap.bucket_key_enabled, Some(true));
         assert_eq!(snap.content_type, "application/octet-stream");
         assert_eq!(snap.lock_mode.as_deref(), Some("GOVERNANCE"));
         assert_eq!(snap.lock_retain_until, Some(until));

@@ -27,14 +27,15 @@ use lock::has_object_lock_headers;
 mod multipart;
 pub(crate) mod notifications;
 mod objects;
-pub(crate) use objects::{commit_object_version, run_blocking_io};
+pub(crate) use objects::{
+    commit_object_version, commit_object_version_with, is_null_version, run_blocking_io,
+};
+pub(crate) mod replication;
 mod tags;
 
 // Re-export notification helpers for use in sub-modules
-pub(super) use notifications::{
-    deliver_notifications, normalize_notification_ids, normalize_replication_xml,
-    replicate_through_store,
-};
+pub(super) use notifications::{deliver_notifications, normalize_notification_ids};
+pub(super) use replication::normalize_replication_xml;
 
 // Used only within this file (parse_cors_config)
 use notifications::extract_all_xml_values;
@@ -42,9 +43,10 @@ use notifications::extract_all_xml_values;
 // Re-exports used only in tests
 #[cfg(test)]
 use notifications::{
-    event_matches, key_matches_filters, parse_notification_config, parse_replication_rules,
-    NotificationTargetType,
+    event_matches, key_matches_filters, parse_notification_config, NotificationTargetType,
 };
+#[cfg(test)]
+use replication::parse_replication_rules;
 
 /// `Vary` value S3 attaches to any response it evaluates CORS for.
 ///
@@ -147,6 +149,10 @@ pub struct S3Service {
     /// Service Quotas, for the bucket quota once the user switched its
     /// enforcement on. Without one nothing is enforced.
     quota_provider: Option<Arc<dyn fakecloud_core::quota::QuotaProvider>>,
+    /// The delivery bus, KMS hook and IAM mode bundled for the side effects
+    /// every new object version triggers, kept in step with the fields above
+    /// and installed on the state so other services' writers share them.
+    pub(crate) side_effects: Arc<crate::side_effects::S3SideEffects>,
 }
 
 /// Serialize a persistence snapshot, turning a failure into a 500 rather than an
@@ -450,6 +456,12 @@ impl S3Service {
         delivery: Arc<DeliveryBus>,
         store: Arc<dyn S3Store>,
     ) -> Self {
+        let side_effects = Arc::new(crate::side_effects::S3SideEffects::new(
+            delivery.clone(),
+            None,
+            fakecloud_core::auth::IamMode::Off,
+        ));
+        crate::side_effects::install(&state, &side_effects);
         Self {
             state,
             delivery,
@@ -459,7 +471,19 @@ impl S3Service {
             credential_resolver: None,
             iam_mode: fakecloud_core::auth::IamMode::Off,
             quota_provider: None,
+            side_effects,
         }
+    }
+
+    /// Rebuild the side-effect bundle after the delivery bus, KMS hook or
+    /// IAM mode changed, and install it on the state again.
+    fn refresh_side_effects(&mut self) {
+        self.side_effects = Arc::new(crate::side_effects::S3SideEffects::new(
+            self.delivery.clone(),
+            self.kms_hook.clone(),
+            self.iam_mode,
+        ));
+        crate::side_effects::install(&self.state, &self.side_effects);
     }
 
     /// Attach Service Quotas so the general purpose bucket quota is enforced
@@ -474,6 +498,7 @@ impl S3Service {
 
     pub fn with_iam_mode(mut self, mode: fakecloud_core::auth::IamMode) -> Self {
         self.iam_mode = mode;
+        self.refresh_side_effects();
         self
     }
 
@@ -484,6 +509,7 @@ impl S3Service {
 
     pub fn with_kms_hook(mut self, hook: Arc<dyn fakecloud_core::delivery::KmsHook>) -> Self {
         self.kms_hook = Some(hook);
+        self.refresh_side_effects();
         self
     }
 
@@ -496,6 +522,90 @@ impl S3Service {
     ) -> Self {
         self.credential_resolver = Some(resolver);
         self
+    }
+
+    /// The encryption a new object takes, as every object-creating request
+    /// (PutObject, POST Object, CreateMultipartUpload) resolves it: the
+    /// request's `x-amz-server-side-encryption*` headers, else the bucket's
+    /// default encryption (`encryption_config`). An SSE-KMS key is recorded
+    /// by its ARN, resolved in the bucket's region; with no key named, S3
+    /// uses the account's AWS-managed `aws/s3` key and reports that key.
+    pub(crate) fn object_encryption(
+        &self,
+        headers: &http::HeaderMap,
+        encryption_config: Option<&str>,
+        account_id: &str,
+        bucket_region: &str,
+    ) -> crate::side_effects::ObjectEncryption {
+        let header = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        let mut algorithm = header("x-amz-server-side-encryption");
+        let mut kms_key_id = header("x-amz-server-side-encryption-aws-kms-key-id");
+        let mut bucket_key_enabled = header("x-amz-server-side-encryption-bucket-key-enabled")
+            .map(|v| v.eq_ignore_ascii_case("true"));
+        if algorithm.is_none() {
+            if let Some(default) =
+                encryption_config.and_then(crate::side_effects::bucket_default_encryption)
+            {
+                if kms_key_id.is_none() {
+                    kms_key_id = default.kms_key_id;
+                }
+                if bucket_key_enabled.is_none() {
+                    bucket_key_enabled = default.bucket_key_enabled;
+                }
+                algorithm = Some(default.algorithm);
+            }
+        }
+        if crate::side_effects::is_sse_kms(algorithm.as_deref()) {
+            kms_key_id = self.resolve_object_kms_key(account_id, bucket_region, kms_key_id);
+        }
+        crate::side_effects::ObjectEncryption {
+            algorithm,
+            kms_key_id,
+            bucket_key_enabled,
+        }
+    }
+
+    /// The ARN of the SSE-KMS key `key_id` names (the AWS-managed `aws/s3`
+    /// key when it names none). A key or alias ARN names its account
+    /// (possibly the requester's); a bare id or alias resolves in the bucket
+    /// owner's account, in the bucket's region. Through the hook an
+    /// AWS-managed reference mints its key. A key that cannot be resolved is
+    /// kept as given.
+    fn resolve_object_kms_key(
+        &self,
+        account_id: &str,
+        bucket_region: &str,
+        key_id: Option<String>,
+    ) -> Option<String> {
+        let reference = key_id.clone().unwrap_or_else(|| "aws/s3".to_string());
+        let key_account = kms_reference_account(&reference).unwrap_or(account_id);
+        let resolved = self
+            .kms_hook
+            .as_ref()
+            .and_then(|hook| {
+                hook.resolve_key_arn(key_account, bucket_region, &reference, "s3.amazonaws.com")
+                    .ok()
+            })
+            .or_else(|| {
+                let kms = self.kms_state.as_ref()?;
+                let kms_accounts = kms.read();
+                kms_accounts
+                    .get(key_account)
+                    .unwrap_or(kms_accounts.default_ref())
+                    .resolve_key_arn(bucket_region, &reference)
+                    .map(str::to_string)
+            });
+        if resolved.is_none() {
+            if let Some(key) = &key_id {
+                tracing::debug!(key_id = %key, "KMS key not found in state, proceeding anyway");
+            }
+        }
+        resolved.or(key_id)
     }
 
     /// Encrypt object body bytes for SSE-KMS storage. Returns ciphertext as
@@ -517,24 +627,27 @@ impl S3Service {
         plaintext: &[u8],
         kms_key_id: Option<&str>,
     ) -> Result<bytes::Bytes, AwsServiceError> {
-        let Some(hook) = &self.kms_hook else {
+        if self.kms_hook.is_none() {
             return Ok(bytes::Bytes::copy_from_slice(plaintext));
-        };
+        }
         let key = kms_key_id.filter(|k| !k.is_empty()).unwrap_or("aws/s3");
         // A key or alias ARN names its own account (it may be the
         // requester's, outside the bucket owner's); a bare key id or alias
         // resolves in the bucket owner's account.
         let key_account = kms_reference_account(key).unwrap_or(account_id);
         self.authorize_kms_key_use(req, key_account, region, key, "GenerateDataKey")?;
-        let bucket_arn = Arn::s3(bucket).to_string();
-        let mut ctx = std::collections::HashMap::new();
-        ctx.insert("aws:s3:arn".to_string(), bucket_arn);
-        hook.encrypt(key_account, region, key, plaintext, "s3.amazonaws.com", ctx)
-            .map(|envelope| bytes::Bytes::from(envelope.into_bytes()))
-            .map_err(|err| {
-                tracing::warn!(bucket = %bucket, error = %err, "SSE-KMS encrypt failed");
-                kms_hook_error(&err, key, "encrypt")
-            })
+        crate::side_effects::kms_encrypt(
+            self.kms_hook.as_ref(),
+            account_id,
+            region,
+            bucket,
+            plaintext,
+            Some(key),
+        )
+        .map_err(|err| {
+            tracing::warn!(bucket = %bucket, error = %err, "SSE-KMS encrypt failed");
+            kms_hook_error(&err, key, "encrypt")
+        })
     }
 
     /// Decrypt object body bytes that were stored as a fakecloud-kms
