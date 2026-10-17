@@ -367,7 +367,7 @@ fn list_workforces_never_returns_the_oidc_client_secret() {
             "AuthorizationEndpoint": "https://a", "TokenEndpoint": "https://t",
             "UserInfoEndpoint": "https://u", "LogoutEndpoint": "https://l",
             "JwksUri": "https://j"
-        }, "WorkforceVpcConfig": {"VpcId": "vpc-1"}}),
+        }, "WorkforceVpcConfig": {"VpcId": "vpc-1", "SecurityGroupIds": ["sg-1"], "Subnets": ["subnet-1"]}}),
     )
     .unwrap();
     let listed = resp_json(&run(&s, "ListWorkforces", json!({})).unwrap());
@@ -376,12 +376,11 @@ fn list_workforces_never_returns_the_oidc_client_secret() {
     assert!(wf["OidcConfig"].get("ClientSecret").is_none(), "{wf}");
     assert_eq!(wf["Status"], "Active");
     assert!(wf["CreateDate"].is_number(), "{wf}");
-    // `WorkforceVpcConfigResponse` requires members the request left out.
     assert_eq!(wf["WorkforceVpcConfig"]["VpcId"], "vpc-1");
-    assert!(wf["WorkforceVpcConfig"]["Subnets"].is_array(), "{wf}");
-    assert!(
-        wf["WorkforceVpcConfig"]["SecurityGroupIds"].is_array(),
-        "{wf}"
+    assert_eq!(wf["WorkforceVpcConfig"]["Subnets"], json!(["subnet-1"]));
+    assert_eq!(
+        wf["WorkforceVpcConfig"]["SecurityGroupIds"],
+        json!(["sg-1"])
     );
 
     let described =

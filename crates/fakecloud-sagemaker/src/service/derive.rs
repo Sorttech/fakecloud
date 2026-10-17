@@ -44,11 +44,11 @@ pub(super) fn record(ctx: &Ctx, meta: &OpMeta, record: &Value) -> Option<Value> 
         "DescribeHumanTaskUi" => human_task_ui(&mut out),
         "DescribeTrainingJob" => training_job(&mut out),
         "DescribeFeatureGroup" => feature_group(&mut out),
-        "DescribeWorkforce" | "UpdateWorkforce" => {
-            return Some(wrap("Workforce", workforce(out)));
-        }
+        // The engine reports these inside their `Workforce` / `Workteam`
+        // structure (`engine::WRAPPED_OUTPUTS`).
+        "DescribeWorkforce" | "UpdateWorkforce" => return Some(Value::Object(workforce(out))),
         "DescribeWorkteam" | "UpdateWorkteam" => {
-            return Some(wrap("Workteam", workteam(ctx, out)));
+            return Some(Value::Object(workteam(ctx, out)));
         }
         _ => return None,
     }
@@ -64,12 +64,6 @@ pub(super) fn element(ctx: &Ctx, meta: &OpMeta, record: &Value) -> Option<Value>
         "ListWorkteams" => Some(Value::Object(workteam(ctx, rec))),
         _ => None,
     }
-}
-
-fn wrap(member: &str, inner: Map<String, Value>) -> Value {
-    let mut m = Map::new();
-    m.insert(member.to_string(), Value::Object(inner));
-    Value::Object(m)
 }
 
 /// Report the value stored under `from` as both `current` and `desired`
