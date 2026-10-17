@@ -122,6 +122,10 @@ cargo run -p fakecloud-conformance -- audit
 cargo run -p fakecloud-conformance -- operations
 ```
 
+### Container runtime
+
+The spawned sweep server runs with containers disabled, so thousands of variants never start real databases, functions or instances. A few operations refuse outright without a runtime (RDS `CreateDBInstance` will not report an instance it cannot back with a real database). Any variant that fails with that runtime-required error is re-probed on its own fresh server with Docker or Podman enabled, which is shut down gracefully afterwards so it removes the containers it started. Without Docker or Podman those variants are reported as failures, so run `check` and `update-baseline` where a runtime is available (CI does). Setting `FAKECLOUD_CONTAINER_CLI` pins the sweep server's runtime and turns the re-probe off.
+
 ## Adding a new service
 
 1. Add the service to the `SERVICES` list in [`scripts/update-aws-models.sh`](../../scripts/update-aws-models.sh) (`our_name:repo_dir`, where `repo_dir` matches the folder in [aws/api-models-aws](https://github.com/aws/api-models-aws)), then run the script. It sparse-clones the repo and drops the Smithy JSON into `aws-models/<service>.json`.

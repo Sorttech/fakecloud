@@ -5341,6 +5341,7 @@ dependencies = [
  "fakecloud-cognito",
  "fakecloud-conformance-checksum",
  "fakecloud-conformance-macros",
+ "fakecloud-core",
  "fakecloud-testkit",
  "flate2",
  "rand 0.8.5",

@@ -15,6 +15,33 @@ impl Drop for ChildGuard {
         let _ = self.0.wait();
     }
 }
+
+/// Guard for a container-backed server: asks it to shut down gracefully so it
+/// runs every runtime's `stop_all()` and removes the containers it started,
+/// and only kills it if it has not exited within the grace period.
+struct GracefulChild(Child);
+
+impl Drop for GracefulChild {
+    fn drop(&mut self) {
+        let terminated = ProcessCommand::new("kill")
+            .arg("-TERM")
+            .arg(self.0.id().to_string())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if terminated {
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            while std::time::Instant::now() < deadline {
+                if let Ok(Some(_)) = self.0.try_wait() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
 use std::time::Duration;
 
 mod checksum;
@@ -279,9 +306,14 @@ fn run_probes(
     let (endpoint, _server) = if let Some(ep) = endpoint {
         (ep, None)
     } else {
-        let (ep, child) = start_fakecloud();
+        let (ep, child) = start_fakecloud(None);
         (ep, Some(ChildGuard(child)))
     };
+    // Variants re-probed against a container-backed server (see
+    // `needs_container_runtime`). Only when we own the sweep server: against
+    // an operator-supplied endpoint we cannot choose its runtime.
+    let may_reprobe = _server.is_some();
+    let mut reprobe_cli: Option<Option<String>> = None;
 
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -397,7 +429,7 @@ fn run_probes(
 
             // Probe variants with bounded concurrency to avoid overwhelming fakecloud
             let max_concurrent = 8;
-            let op_results: Vec<probe::ProbeResult> = variants
+            let mut op_results: Vec<probe::ProbeResult> = variants
                 .chunks(max_concurrent)
                 .flat_map(|chunk| {
                     std::thread::scope(|s| {
@@ -428,6 +460,42 @@ fn run_probes(
                     })
                 })
                 .collect();
+
+            if may_reprobe {
+                for (variant, result) in variants.iter().zip(op_results.iter_mut()) {
+                    if !needs_container_runtime(result) {
+                        continue;
+                    }
+                    let cli = reprobe_cli.get_or_insert_with(|| {
+                        let cli = reprobe_container_cli(
+                            std::env::var_os("FAKECLOUD_CONTAINER_CLI"),
+                            fakecloud_core::container_net::detect_container_cli,
+                        );
+                        if cli.is_none() {
+                            eprintln!(
+                                "  note: some variants need a container runtime and none is \
+                                 available; they are reported as failures"
+                            );
+                        }
+                        cli
+                    });
+                    let Some(cli) = cli.as_deref() else {
+                        continue;
+                    };
+                    eprintln!(
+                        "  RETRY {} {} against a {}-backed server",
+                        op.name, variant.name, cli
+                    );
+                    *result = probe_with_container_runtime(
+                        cli,
+                        &client,
+                        service_name,
+                        &op.name,
+                        variant,
+                        output_shape_id.map(|oid| (model, oid)),
+                    );
+                }
+            }
 
             let passed = op_results
                 .iter()
@@ -554,7 +622,63 @@ fn disabling_container_cli(current: Option<std::ffi::OsString>) -> Option<&'stat
     }
 }
 
-fn start_fakecloud() -> (String, Child) {
+/// True when a variant failed only because the sweep server runs without a
+/// container runtime: the operation refused with the runtime-required error
+/// every container-backed service raises (RDS CreateDBInstance, for one, will
+/// not report an instance it cannot back with a real database). Such a
+/// variant says nothing about API conformance until it runs where a runtime
+/// exists.
+fn needs_container_runtime(result: &probe::ProbeResult) -> bool {
+    result.status != probe::ProbeStatus::Pass
+        && result
+            .response_body
+            .contains(fakecloud_core::container_net::CONTAINER_RUNTIME_HINT)
+}
+
+/// The container CLI to re-probe runtime-dependent variants with. An operator
+/// who pinned `FAKECLOUD_CONTAINER_CLI` already chose the sweep server's
+/// runtime (a real CLI means nothing failed for lack of one; a bogus one means
+/// they opted out), so only an unset variable triggers auto-detection.
+fn reprobe_container_cli(
+    current: Option<std::ffi::OsString>,
+    detect: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    match current {
+        Some(_) => None,
+        None => detect(),
+    }
+}
+
+/// Probe one variant against a fresh server that drives real containers, then
+/// shut that server down gracefully so it removes what it started. A fresh
+/// server per variant keeps variants from colliding on resource names the
+/// way a shared one would (two documented examples creating the same DB
+/// instance identifier).
+fn probe_with_container_runtime(
+    cli: &str,
+    client: &reqwest::blocking::Client,
+    service_name: &str,
+    op_name: &str,
+    variant: &generators::TestVariant,
+    model_info: Option<(&smithy::ServiceModel, &str)>,
+) -> probe::ProbeResult {
+    let (endpoint, child) = start_fakecloud(Some(cli));
+    let _server = GracefulChild(child);
+    seed_service_resources(client, &endpoint, service_name);
+    probe::probe_variant_with_model(
+        client,
+        &endpoint,
+        service_name,
+        op_name,
+        variant,
+        model_info,
+    )
+}
+
+/// Start a fakecloud server for the sweep. `container_cli` is `None` for the
+/// main sweep server (containers disabled, see below) and `Some(cli)` for the
+/// short-lived servers that re-probe runtime-dependent variants.
+fn start_fakecloud(container_cli: Option<&str>) -> (String, Child) {
     let port = find_available_port();
     let endpoint = format!("http://127.0.0.1:{}", port);
 
@@ -576,13 +700,20 @@ fn start_fakecloud() -> (String, Child) {
     // On a CI runner that pulls base images and piles up containers until the
     // host starves and the runner loses contact with GitHub (~2h, the "lost
     // communication with the server" death introduced by EC2 VPC isolation in
-    // #1745). The synchronous API responses are identical with or without a
+    // #1745). Most synchronous API responses are identical with or without a
     // backing container, so we point the container-CLI probe at a binary that
     // does not exist: every runtime's detect_container_cli() returns None and
-    // they serve their documented metadata-only path. An operator who genuinely
+    // they serve their documented metadata-only path. The few operations that
+    // refuse outright without a runtime are re-probed one variant at a time
+    // against a container-backed server (`needs_container_runtime`), which
+    // bounds the containers a sweep can start. An operator who genuinely
     // wants the sweep to drive real containers can still set
     // FAKECLOUD_CONTAINER_CLI explicitly to override this default.
-    if let Some(sentinel) = disabling_container_cli(std::env::var_os("FAKECLOUD_CONTAINER_CLI")) {
+    if let Some(cli) = container_cli {
+        cmd.env("FAKECLOUD_CONTAINER_CLI", cli);
+    } else if let Some(sentinel) =
+        disabling_container_cli(std::env::var_os("FAKECLOUD_CONTAINER_CLI"))
+    {
         cmd.env("FAKECLOUD_CONTAINER_CLI", sentinel);
     }
 
@@ -836,6 +967,56 @@ mod tests {
         );
         assert_eq!(
             disabling_container_cli(Some(std::ffi::OsString::from(""))),
+            None
+        );
+    }
+
+    fn result(status: probe::ProbeStatus, body: &str) -> probe::ProbeResult {
+        probe::ProbeResult {
+            variant_name: "v".to_string(),
+            status,
+            http_status: 503,
+            response_body: body.to_string(),
+            duration_ms: 0,
+        }
+    }
+
+    #[test]
+    fn runtime_required_failures_are_reprobed() {
+        let body = format!(
+            "<Error><Code>InsufficientDBInstanceCapacity</Code><Message>Docker/Podman is \
+             required for RDS DB instances but is not available. {}</Message></Error>",
+            fakecloud_core::container_net::CONTAINER_RUNTIME_HINT
+        );
+        assert!(needs_container_runtime(&result(
+            probe::ProbeStatus::UnexpectedResult("Expected success, got HTTP 503".into()),
+            &body,
+        )));
+        // A pass (the documented error variants expect exactly this refusal)
+        // and an unrelated failure are left alone.
+        assert!(!needs_container_runtime(&result(
+            probe::ProbeStatus::Pass,
+            &body
+        )));
+        assert!(!needs_container_runtime(&result(
+            probe::ProbeStatus::UnexpectedResult("Expected success, got HTTP 400".into()),
+            "<Error><Code>InvalidParameterValue</Code></Error>",
+        )));
+    }
+
+    #[test]
+    fn reprobe_detects_a_runtime_only_when_the_operator_pinned_none() {
+        assert_eq!(
+            reprobe_container_cli(None, || Some("docker".to_string())),
+            Some("docker".to_string())
+        );
+        assert_eq!(reprobe_container_cli(None, || None), None);
+        // A pinned CLI already decided the sweep server's runtime, so nothing
+        // is re-probed (and detection never runs).
+        assert_eq!(
+            reprobe_container_cli(Some(std::ffi::OsString::from("false")), || {
+                panic!("must not detect when the operator pinned a CLI")
+            }),
             None
         );
     }
