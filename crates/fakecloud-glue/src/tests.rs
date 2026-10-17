@@ -558,6 +558,31 @@ fn integration_create_and_describe() {
 }
 
 #[test]
+fn delete_integration_omits_integration_config() {
+    // DeleteIntegrationResponse does not model `IntegrationConfig`, even
+    // though Create/Modify/Describe do.
+    let svc = GlueService::default();
+    svc.create_integration(&req(
+        "CreateIntegration",
+        json!({
+            "IntegrationName": "i", "SourceArn": "arn:src", "TargetArn": "arn:tgt",
+            "IntegrationConfig": {"RefreshInterval": "10"}
+        }),
+    ))
+    .unwrap();
+    let deleted = body_of(
+        svc.delete_integration(&req(
+            "DeleteIntegration",
+            json!({"IntegrationIdentifier": "i"}),
+        ))
+        .unwrap(),
+    );
+    assert_eq!(deleted["Status"], "DELETING");
+    assert_eq!(deleted["IntegrationName"], "i");
+    assert!(deleted.get("IntegrationConfig").is_none(), "{deleted}");
+}
+
+#[test]
 fn column_statistics_round_trip() {
     let svc = GlueService::default();
     svc.update_column_statistics_for_table(&req(

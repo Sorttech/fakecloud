@@ -2089,3 +2089,87 @@ async fn http_api_custom_domain_mapping_resolves_with_host_port() {
         .unwrap();
     assert_eq!(miss.status(), 404);
 }
+
+#[tokio::test]
+async fn product_rest_endpoint_page_try_it_state_round_trips() {
+    use aws_sdk_apigatewayv2::types::{IdentifierParts, RestEndpointIdentifier, TryItState};
+    let server = TestServer::start().await;
+    let client = server.apigatewayv2_client().await;
+
+    let product = client
+        .create_portal_product()
+        .display_name("Payments")
+        .send()
+        .await
+        .unwrap();
+    let product_id = product.portal_product_id().unwrap().to_string();
+    let endpoint = RestEndpointIdentifier::builder()
+        .identifier_parts(
+            IdentifierParts::builder()
+                .rest_api_id("abc123")
+                .stage("prod")
+                .method("GET")
+                .path("/pets")
+                .build(),
+        )
+        .build();
+
+    // Without TryItState the page defaults to DISABLED.
+    let default_page = client
+        .create_product_rest_endpoint_page()
+        .portal_product_id(&product_id)
+        .rest_endpoint_identifier(endpoint.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(default_page.try_it_state(), Some(&TryItState::Disabled));
+
+    let page = client
+        .create_product_rest_endpoint_page()
+        .portal_product_id(&product_id)
+        .rest_endpoint_identifier(endpoint)
+        .try_it_state(TryItState::Enabled)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.try_it_state(), Some(&TryItState::Enabled));
+    let page_id = page.product_rest_endpoint_page_id().unwrap().to_string();
+
+    // An update that omits TryItState keeps it; one that sets it applies it.
+    let kept = client
+        .update_product_rest_endpoint_page()
+        .portal_product_id(&product_id)
+        .product_rest_endpoint_page_id(&page_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(kept.try_it_state(), Some(&TryItState::Enabled));
+    assert!(kept.rest_endpoint_identifier().is_some());
+    client
+        .update_product_rest_endpoint_page()
+        .portal_product_id(&product_id)
+        .product_rest_endpoint_page_id(&page_id)
+        .try_it_state(TryItState::Disabled)
+        .send()
+        .await
+        .unwrap();
+    let got = client
+        .get_product_rest_endpoint_page()
+        .portal_product_id(&product_id)
+        .product_rest_endpoint_page_id(&page_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(got.try_it_state(), Some(&TryItState::Disabled));
+
+    // Updating a page that doesn't exist is NotFound, not an upsert.
+    let err = client
+        .update_product_rest_endpoint_page()
+        .portal_product_id(&product_id)
+        .product_rest_endpoint_page_id("missingpage1")
+        .try_it_state(TryItState::Enabled)
+        .send()
+        .await
+        .unwrap_err();
+    assert!(err.into_service_error().is_not_found_exception());
+}

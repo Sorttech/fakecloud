@@ -1658,6 +1658,37 @@ async fn put_log_alarm_validates_required_and_bounded_members() {
 }
 
 #[tokio::test]
+async fn put_log_alarm_accepts_an_empty_query_string() {
+    // `QueryString` is `@length(min: 0)`: an empty value is present, not
+    // missing, and is stored as sent.
+    let svc = service();
+    let params: Vec<(&str, &str)> = log_alarm_params("empty-query", &[])
+        .into_iter()
+        .map(|(k, v)| {
+            if k == "ScheduledQueryConfiguration.QueryString" {
+                (k, "")
+            } else {
+                (k, v)
+            }
+        })
+        .collect();
+    call(&svc, "PutLogAlarm", &params).await;
+    let body = body_of(
+        &call(
+            &svc,
+            "DescribeAlarms",
+            &[("AlarmTypes.member.1", "LogAlarm")],
+        )
+        .await,
+    );
+    assert!(
+        body.contains("<AlarmName>empty-query</AlarmName>"),
+        "{body}"
+    );
+    assert!(body.contains("<QueryString></QueryString>"), "{body}");
+}
+
+#[tokio::test]
 async fn describe_alarms_accepts_the_log_alarm_type() {
     // `AlarmType` gained `LogAlarm`; DescribeAlarms used to reject it as an
     // invalid AlarmTypes value.

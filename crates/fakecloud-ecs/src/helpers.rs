@@ -1616,18 +1616,58 @@ pub(crate) fn container_instance_to_json(ci: &ContainerInstance) -> Value {
     })
 }
 
+/// The account-level capacity providers every account has without creating
+/// them. DescribeCapacityProviders lists them after the customer-created ones.
+pub(crate) const BUILTIN_CAPACITY_PROVIDERS: [&str; 2] = ["FARGATE", "FARGATE_SPOT"];
+
+/// The `CapacityProviderType` of a stored provider.
+pub(crate) fn capacity_provider_type(cp: &CapacityProvider) -> &'static str {
+    if cp.managed_instances_provider.is_some() {
+        "MANAGED_INSTANCES"
+    } else {
+        "EC2_AUTOSCALING"
+    }
+}
+
 pub(crate) fn capacity_provider_to_json(cp: &CapacityProvider) -> Value {
-    json!({
+    let mut out = json!({
         "name": cp.name,
         "capacityProviderArn": cp.arn,
         "status": cp.status,
-        "autoScalingGroupProvider": cp
-            .auto_scaling_group_provider
-            .as_ref()
-            .map(normalize_auto_scaling_group_provider),
-        "updateStatus": cp.update_status,
-        "updateStatusReason": cp.update_status_reason,
+        "type": capacity_provider_type(cp),
         "tags": tags_json(&cp.tags),
+    });
+    // Absent members are omitted, never serialized as `null`.
+    if let Some(asg) = &cp.auto_scaling_group_provider {
+        out["autoScalingGroupProvider"] = normalize_auto_scaling_group_provider(asg);
+    }
+    if let Some(mip) = &cp.managed_instances_provider {
+        out["managedInstancesProvider"] = mip.clone();
+    }
+    if let Some(cluster) = &cp.cluster {
+        out["cluster"] = json!(cluster);
+    }
+    if let Some(status) = &cp.update_status {
+        out["updateStatus"] = json!(status);
+    }
+    if let Some(reason) = &cp.update_status_reason {
+        out["updateStatusReason"] = json!(reason);
+    }
+    out
+}
+
+/// JSON for a built-in Fargate capacity provider (`FARGATE` / `FARGATE_SPOT`).
+pub(crate) fn builtin_capacity_provider_json(name: &str, region: &str, account_id: &str) -> Value {
+    json!({
+        "name": name,
+        "capacityProviderArn": crate::state::ecs_arn(
+            region,
+            account_id,
+            &format!("capacity-provider/{name}"),
+        ),
+        "status": "ACTIVE",
+        "type": name,
+        "tags": [],
     })
 }
 

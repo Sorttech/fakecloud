@@ -148,8 +148,14 @@ impl BedrockService {
             // trailing slash routes to List. Routes that must still surface a
             // missing identifier on GET (async-invoke) gate on
             // `raw_path.ends_with('/')` directly, so they're unaffected.
-            raw.split('/')
-                .filter(|s| !s.is_empty())
+            //
+            // Only the trailing slash is dropped: an interior empty segment is
+            // an empty `@httpLabel` (`GET /automated-reasoning-policies//
+            // build-workflows/b/annotations`) and must keep its position so the
+            // request reaches its action and fails the label's length check
+            // instead of falling through to a 501.
+            raw.trim_end_matches('/')
+                .split('/')
                 .map(|s| s.to_string())
                 .collect()
         } else {
@@ -360,6 +366,11 @@ impl BedrockService {
             }
             (Method::GET, 2) if segs[0] == "resource-policy" => {
                 Some(("GetResourcePolicy", Some(decode(&segs[1])), None))
+            }
+            // No collection op lives at `GET /resource-policy`, so a trailing
+            // slash there is GetResourcePolicy with an empty `resourceArn`.
+            (Method::GET, 1) if segs[0] == "resource-policy" && req.raw_path.ends_with('/') => {
+                Some(("GetResourcePolicy", Some(String::new()), None))
             }
             (Method::DELETE, 2) if segs[0] == "resource-policy" => {
                 Some(("DeleteResourcePolicy", Some(decode(&segs[1])), None))

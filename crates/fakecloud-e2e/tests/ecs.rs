@@ -1579,3 +1579,108 @@ async fn ecs_describe_daemon_task_definition_matches_output_shape() {
         .unwrap();
     assert!(def.delete_requested_at().is_some());
 }
+
+#[tokio::test]
+async fn capacity_providers_list_builtins_and_scope_managed_instances() {
+    use aws_sdk_ecs::types::{
+        AutoScalingGroupProvider, CapacityProviderType,
+        CreateManagedInstancesProviderConfiguration, InstanceLaunchTemplate,
+        ManagedInstancesNetworkConfiguration,
+    };
+    let server = TestServer::start().await;
+    let client = server.ecs_client().await;
+
+    client
+        .create_cluster()
+        .cluster_name("mi-cluster")
+        .send()
+        .await
+        .unwrap();
+    client
+        .create_capacity_provider()
+        .name("asg-provider")
+        .auto_scaling_group_provider(
+            AutoScalingGroupProvider::builder()
+                .auto_scaling_group_arn(
+                    "arn:aws:autoscaling:us-east-1:123456789012:autoScalingGroup:abc:autoScalingGroupName/asg-1",
+                )
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let mi = client
+        .create_capacity_provider()
+        .name("mi-provider")
+        .cluster("mi-cluster")
+        .managed_instances_provider(
+            CreateManagedInstancesProviderConfiguration::builder()
+                .infrastructure_role_arn("arn:aws:iam::123456789012:role/ecsInfra")
+                .instance_launch_template(
+                    InstanceLaunchTemplate::builder()
+                        .ec2_instance_profile_arn(
+                            "arn:aws:iam::123456789012:instance-profile/ecsInstance",
+                        )
+                        .network_configuration(
+                            ManagedInstancesNetworkConfiguration::builder()
+                                .subnets("subnet-0123")
+                                .build(),
+                        )
+                        .build()
+                        .unwrap(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let mi = mi.capacity_provider().unwrap();
+    assert_eq!(mi.r#type(), Some(&CapacityProviderType::ManagedInstances));
+    assert_eq!(mi.cluster(), Some("mi-cluster"));
+    assert!(mi.auto_scaling_group_provider().is_none());
+
+    // A provider with no backing capacity is rejected.
+    let err = client
+        .create_capacity_provider()
+        .name("no-backing")
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.into_service_error().meta().code(),
+        Some("InvalidParameterException")
+    );
+
+    // Account-level listing: the ASG provider then the built-in Fargate
+    // providers; the cluster-scoped Managed Instances provider is not listed.
+    let all = client.describe_capacity_providers().send().await.unwrap();
+    let names: Vec<&str> = all
+        .capacity_providers()
+        .iter()
+        .filter_map(|c| c.name())
+        .collect();
+    assert_eq!(names, ["asg-provider", "FARGATE", "FARGATE_SPOT"]);
+    assert_eq!(
+        all.capacity_providers()[0].r#type(),
+        Some(&CapacityProviderType::Ec2Autoscaling)
+    );
+    assert_eq!(
+        all.capacity_providers()[1].r#type(),
+        Some(&CapacityProviderType::Fargate)
+    );
+
+    let scoped = client
+        .describe_capacity_providers()
+        .cluster("mi-cluster")
+        .send()
+        .await
+        .unwrap();
+    let names: Vec<&str> = scoped
+        .capacity_providers()
+        .iter()
+        .filter_map(|c| c.name())
+        .collect();
+    assert_eq!(names, ["mi-provider"]);
+}
