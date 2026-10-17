@@ -1462,6 +1462,26 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(err.code(), "ValidationException");
+        // Only the region is exempt from the `LayerName` pattern: an account
+        // that is not 12 digits is refused, in a fakecloud region or an AWS
+        // one.
+        for (arn, region) in [
+            ("arn:aws:lambda:local:42:layer:lyr", "local"),
+            ("arn:aws:lambda:us-east-1:42:layer:lyr", "us-east-1"),
+        ] {
+            let err = s
+                .handle(request(
+                    Method::GET,
+                    &format!("/2018-10-31/layers/{}/versions/1", enc(arn)),
+                    "",
+                    OTHER,
+                    region,
+                ))
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{arn} must be refused"));
+            assert_eq!(err.code(), "ValidationException", "{arn}");
+        }
     }
 
     /// `--region local` with a non-AWS account id: the layer ARN fakecloud

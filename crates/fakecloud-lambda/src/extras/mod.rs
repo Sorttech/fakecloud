@@ -292,23 +292,33 @@ pub(crate) fn layer_name_label(req: &AwsRequest) -> Result<String, AwsServiceErr
     Ok(raw.to_string())
 }
 
-/// A layer ARN in the request's own region, as fakecloud mints it for any of
-/// its accounts. The region is the server's `--region` and the accounts are
-/// its `--account-id` and the accounts created alongside it, none of which
-/// need match AWS's region or 12-digit account shape (`--region local`), yet
-/// such an ARN must still address the layer it names: the caller's own
-/// layer, or another account's layer shared with it. Every other ARN still
-/// has to satisfy the model's `LayerName` pattern.
+/// A layer ARN whose region is the request's own region and which otherwise
+/// satisfies the model's `LayerName` pattern. Only the region is exempt from
+/// the pattern: it is the server's `--region`, which need not look like an
+/// AWS region (`--region local`), yet the ARNs fakecloud mints there (the
+/// caller's own layers, or another account's layer shared with it) must
+/// still address their layer. Partition, 12-digit account, layer name and
+/// length are checked as for any other ARN.
 fn is_request_region_layer_arn(raw: &str, region: &str) -> bool {
     let parts: Vec<&str> = raw.split(':').collect();
-    matches!(
-        parts.as_slice(),
-        ["arn", partition, "lambda", r, a, "layer", name]
-            if partition.starts_with("aws")
-                && *r == region
-                && !a.is_empty()
-                && is_bare_layer_name(name)
-    ) && raw.chars().count() <= LAYER_NAME_MAX_LEN
+    let [prefix, partition, service, r, account, kind, name] = parts.as_slice() else {
+        return false;
+    };
+    if *r != region || raw.chars().count() > LAYER_NAME_MAX_LEN {
+        return false;
+    }
+    // Any pattern-valid region stands in for the request's own.
+    let substituted = [
+        *prefix,
+        *partition,
+        *service,
+        "us-east-1",
+        *account,
+        *kind,
+        *name,
+    ]
+    .join(":");
+    is_layer_name_arn(&substituted)
 }
 
 /// Validate the `CompatibleArchitecture` and `CompatibleRuntime` query
@@ -1338,34 +1348,42 @@ mod tests {
     }
 
     #[test]
-    fn request_region_layer_arns_pass_under_a_non_aws_region_or_account() {
+    fn request_region_layer_arns_pass_under_a_non_aws_region() {
         use super::is_request_region_layer_arn;
         for arn in [
             "arn:aws:lambda:local:000000000000:layer:x",
-            "arn:aws:lambda:local:42:layer:x",
             // Another account's layer in the same region: cross-account
             // sharing works under `--region local` too.
             "arn:aws:lambda:local:222222222222:layer:x",
+            "arn:aws-cn:lambda:local:222222222222:layer:x",
         ] {
             assert!(is_request_region_layer_arn(arn, "local"), "{arn}");
         }
-        // Only the request's own region gets the exemption.
-        assert!(!is_request_region_layer_arn(
-            "arn:aws:lambda:local:000000000000:layer:x",
-            "us-east-1"
-        ));
-        assert!(!is_request_region_layer_arn(
-            "arn:aws:lambda:local:000000000000:layer:bad!name",
-            "local"
-        ));
-        assert!(!is_request_region_layer_arn(
-            "arn:aws:lambda:local::layer:x",
-            "local"
-        ));
-        assert!(!is_request_region_layer_arn(
-            "arn:aws:lambda:local:000000000000:layer:x:1",
-            "local"
-        ));
+        // Only the region is exempt: the rest of the pattern still applies.
+        for (arn, region) in [
+            // Not the request's region.
+            ("arn:aws:lambda:local:000000000000:layer:x", "us-east-1"),
+            // Account must be 12 digits, even in the request's region.
+            ("arn:aws:lambda:local:42:layer:x", "local"),
+            ("arn:aws:lambda:us-east-1:42:layer:x", "us-east-1"),
+            ("arn:aws:lambda:local::layer:x", "local"),
+            ("arn:aws:lambda:local:000000000000:layer:bad!name", "local"),
+            ("arn:gcp:lambda:local:000000000000:layer:x", "local"),
+            ("arn:aws:s3:local:000000000000:layer:x", "local"),
+            ("arn:aws:lambda:local:000000000000:function:x", "local"),
+            // A version ARN is not a `LayerName`.
+            ("arn:aws:lambda:local:000000000000:layer:x:1", "local"),
+        ] {
+            assert!(
+                !is_request_region_layer_arn(arn, region),
+                "{arn} in {region}"
+            );
+        }
+        let long = format!(
+            "arn:aws:lambda:local:000000000000:layer:{}",
+            "a".repeat(120)
+        );
+        assert!(!is_request_region_layer_arn(&long, "local"));
     }
 
     #[test]
