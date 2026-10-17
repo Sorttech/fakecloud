@@ -982,6 +982,14 @@ mod tests {
     }
 
     #[test]
+    fn classify_ce_validation_exception_passes() {
+        let body = r#"{"__type":"ValidationException","message":"DimensionKey can be specified only when Dimension is PRODUCT_ATTRIBUTE."}"#;
+        let declared = Some(&["DataUnavailableException".to_string()][..]);
+        let result = classify_response("v1", 400, body, &Expectation::Success, 0, declared, "ce");
+        assert_eq!(result.status, ProbeStatus::Pass);
+    }
+
+    #[test]
     fn classify_lambda_validation_exception_passes() {
         let body = r#"{"__type":"ValidationException","message":"1 validation error detected"}"#;
         let declared = Some(&["InvalidParameterValueException".to_string()][..]);

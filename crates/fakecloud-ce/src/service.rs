@@ -20,6 +20,7 @@ use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceErr
 use fakecloud_persistence::SnapshotStore;
 
 use crate::persistence::save_snapshot;
+use crate::product_attributes::check_request as check_product_attributes;
 use crate::state::{CeData, SharedCeState};
 use crate::validate::validate_input;
 
@@ -156,6 +157,7 @@ fn is_mutating(action: &str) -> bool {
 fn dispatch(s: &CeService, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
     let b = parse(req)?;
     validate_input(req.action.as_str(), &b)?;
+    check_product_attributes(req.action.as_str(), &b)?;
     let ctx = Ctx {
         account: req.account_id.clone(),
         region: req.region.clone(),

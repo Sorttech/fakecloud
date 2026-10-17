@@ -184,9 +184,9 @@ async fn lambda_publish_version() {
 // Event source mappings
 // ---------------------------------------------------------------------------
 
-#[test_action("lambda", "CreateEventSourceMapping", checksum = "6c00be25")]
-#[test_action("lambda", "GetEventSourceMapping", checksum = "4821f650")]
-#[test_action("lambda", "DeleteEventSourceMapping", checksum = "8c9643a0")]
+#[test_action("lambda", "CreateEventSourceMapping", checksum = "b31899e5")]
+#[test_action("lambda", "GetEventSourceMapping", checksum = "82f10d88")]
+#[test_action("lambda", "DeleteEventSourceMapping", checksum = "5e1acd96")]
 #[tokio::test]
 async fn lambda_create_get_delete_event_source_mapping() {
     let server = TestServer::start().await;
@@ -234,7 +234,7 @@ async fn lambda_create_get_delete_event_source_mapping() {
         .unwrap();
 }
 
-#[test_action("lambda", "ListEventSourceMappings", checksum = "8f52c766")]
+#[test_action("lambda", "ListEventSourceMappings", checksum = "730f0c2a")]
 #[tokio::test]
 async fn lambda_list_event_source_mappings() {
     let server = TestServer::start().await;
@@ -459,7 +459,7 @@ async fn lambda_get_account_settings() {
 }
 
 #[test_action("lambda", "InvokeAsync", checksum = "350f942d")]
-#[test_action("lambda", "InvokeWithResponseStream", checksum = "0189ebbc")]
+#[test_action("lambda", "InvokeWithResponseStream", checksum = "251c73dd")]
 #[tokio::test]
 async fn lambda_invoke_async_and_stream() {
     let server = TestServer::start().await;
@@ -981,7 +981,7 @@ async fn lambda_capacity_provider_lifecycle() {
 #[test_action("lambda", "CheckpointDurableExecution", checksum = "a9768cf1")]
 #[test_action("lambda", "StopDurableExecution", checksum = "c1dacd9e")]
 #[test_action("lambda", "ListDurableExecutionsByFunction", checksum = "d4b6f4ca")]
-#[test_action("lambda", "SendDurableExecutionCallbackSuccess", checksum = "16e7c48e")]
+#[test_action("lambda", "SendDurableExecutionCallbackSuccess", checksum = "ed8f9add")]
 #[test_action("lambda", "SendDurableExecutionCallbackFailure", checksum = "9321bea7")]
 #[test_action(
     "lambda",
@@ -1061,7 +1061,7 @@ async fn lambda_durable_execution_lifecycle() {
     );
 }
 
-#[test_action("lambda", "UpdateEventSourceMapping", checksum = "b2c589c7")]
+#[test_action("lambda", "UpdateEventSourceMapping", checksum = "9a37aab9")]
 #[tokio::test]
 async fn lambda_update_event_source_mapping() {
     let server = TestServer::start().await;
@@ -1088,9 +1088,9 @@ async fn lambda_update_event_source_mapping() {
 /// to the Lambda model in the 2026-08 refresh. The vendored `aws-sdk-lambda`
 /// predates these operations, so drive them over raw HTTP the same way
 /// `lambda_function_scaling_config` does.
-#[test_action("lambda", "PutResourcePolicy", checksum = "5f86d823")]
-#[test_action("lambda", "GetResourcePolicy", checksum = "1b02ffd1")]
-#[test_action("lambda", "DeleteResourcePolicy", checksum = "75532266")]
+#[test_action("lambda", "PutResourcePolicy", checksum = "884691bb")]
+#[test_action("lambda", "GetResourcePolicy", checksum = "1a924b60")]
+#[test_action("lambda", "DeleteResourcePolicy", checksum = "78ea8239")]
 #[tokio::test]
 async fn lambda_resource_policy_document_api() {
     let server = TestServer::start().await;

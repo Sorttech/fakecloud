@@ -323,7 +323,7 @@ async fn cfn_post(server: &TestServer, action: &str, params: &[(&str, &str)]) ->
     checksum = "7878ad70"
 )]
 #[test_action("cloudformation", "CancelUpdateStack", checksum = "2ea0802c")]
-#[test_action("cloudformation", "ContinueUpdateRollback", checksum = "df1d3017")]
+#[test_action("cloudformation", "ContinueUpdateRollback", checksum = "b49a8d82")]
 #[test_action("cloudformation", "CreateChangeSet", checksum = "0ad063e9")]
 #[test_action("cloudformation", "CreateGeneratedTemplate", checksum = "1f77f497")]
 #[test_action("cloudformation", "CreateStackInstances", checksum = "e31e799a")]

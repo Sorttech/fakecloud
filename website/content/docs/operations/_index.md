@@ -6565,6 +6565,8 @@ This is a surface listing, not an implementation manifest. For fakecloud's per-s
 - `GetSession`
 - `GetSessionEndpoint`
 - `GetStatement`
+- `GetSystemLogsForJobRun`
+- `GetSystemLogsForSession`
 - `GetTable`
 - `GetTableOptimizer`
 - `GetTableVersion`

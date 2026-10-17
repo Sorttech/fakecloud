@@ -60,6 +60,24 @@ impl GlueService {
         Ok(AwsResponse::ok_json(json!({ "Session": s })))
     }
 
+    /// Return the download URL for an interactive session's system logs. The
+    /// session must exist (EntityNotFound otherwise).
+    pub(crate) fn get_system_logs_for_session(
+        &self,
+        req: &AwsRequest,
+    ) -> Result<AwsResponse, AwsServiceError> {
+        let body = req.json_body();
+        let id = req_str(&body, "Id")?;
+        let accounts = self.state.read();
+        accounts
+            .get(&req.account_id)
+            .and_then(|st| st.sessions.get(id))
+            .ok_or_else(|| entity_not_found(format!("Session {id} not found")))?;
+        // No Spark driver backs the session, so no system-log archive is ever
+        // written: SystemLogsUrl is optional and stays absent.
+        Ok(AwsResponse::ok_json(json!({})))
+    }
+
     pub(crate) fn list_sessions(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
         let body = req.json_body();
         let accounts = self.state.read();

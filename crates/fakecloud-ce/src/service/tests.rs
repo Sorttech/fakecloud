@@ -223,3 +223,81 @@ fn anomaly_monitor_arn_carries_china_partition() {
     let got = call(&s, "GetAnomalyMonitors", json!({ "MonitorArnList": [arn] }));
     assert_eq!(got["AnomalyMonitors"][0]["MonitorArn"], arn);
 }
+
+#[test]
+fn get_dimension_values_lists_product_attribute_keys_and_values() {
+    let s = svc();
+    let tp = json!({ "Start": "2026-09-01", "End": "2026-10-01" });
+    // Keys (no DimensionKey) and the values of one key: a fake account has no
+    // Amazon Bedrock costs, so both lists are empty.
+    for extra in [json!({}), json!({ "DimensionKey": "model" })] {
+        let mut body = json!({ "TimePeriod": tp, "Dimension": "PRODUCT_ATTRIBUTE" });
+        for (k, v) in extra.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        let out = call(&s, "GetDimensionValues", body);
+        assert_eq!(out["DimensionValues"], json!([]));
+        assert_eq!(out["TotalSize"], json!(0));
+    }
+    assert_eq!(
+        err_code(
+            &s,
+            "GetDimensionValues",
+            json!({ "TimePeriod": tp, "Dimension": "SERVICE", "DimensionKey": "model" }),
+        ),
+        "ValidationException"
+    );
+    assert_eq!(
+        err_code(
+            &s,
+            "GetDimensionValues",
+            json!({ "TimePeriod": tp, "Dimension": "PRODUCT_ATTRIBUTE", "DimensionKey": "k".repeat(1025) }),
+        ),
+        "ValidationException"
+    );
+    assert_eq!(
+        err_code(
+            &s,
+            "GetDimensionValues",
+            json!({ "TimePeriod": { "Start": "2026-08-01", "End": "2026-09-01" }, "Dimension": "PRODUCT_ATTRIBUTE" }),
+        ),
+        "DataUnavailableException"
+    );
+}
+
+#[test]
+fn get_cost_and_usage_groups_and_filters_by_product_attribute() {
+    let s = svc();
+    let group_by = json!([{ "Type": "PRODUCT_ATTRIBUTE", "Key": "model" }]);
+    let out = call(
+        &s,
+        "GetCostAndUsage",
+        json!({
+            "TimePeriod": { "Start": "2026-09-01", "End": "2026-10-01" },
+            "Granularity": "MONTHLY",
+            "Metrics": ["UnblendedCost"],
+            "GroupBy": group_by,
+            "Filter": { "ProductAttributes": {
+                "Key": "provider", "Values": ["Anthropic"], "MatchOptions": ["EQUALS"]
+            } },
+        }),
+    );
+    assert_eq!(out["GroupDefinitions"], group_by);
+    let results = out["ResultsByTime"].as_array().unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["Groups"], json!([]));
+
+    assert_eq!(
+        err_code(
+            &s,
+            "GetCostAndUsage",
+            json!({
+                "TimePeriod": { "Start": "2026-09-01", "End": "2026-10-01" },
+                "Granularity": "MONTHLY",
+                "Metrics": ["UnblendedCost"],
+                "GroupBy": [{ "Type": "SERVICE_LEVEL", "Key": "model" }],
+            }),
+        ),
+        "ValidationException"
+    );
+}

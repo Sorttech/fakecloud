@@ -2696,6 +2696,21 @@ impl CloudFormationService {
                 params
                     .get("StackName")
                     .ok_or_else(|| missing("StackName"))?;
+                // ForceRollback skips every rollback-failed resource, so it
+                // cannot be combined with an explicit ResourcesToSkip list.
+                let force = params
+                    .get("ForceRollback")
+                    .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+                let skips = params
+                    .keys()
+                    .any(|k| k.starts_with("ResourcesToSkip.member."));
+                if force && skips {
+                    return Err(AwsServiceError::aws_error(
+                        StatusCode::BAD_REQUEST,
+                        "ValidationError",
+                        "ForceRollback and ResourcesToSkip are mutually exclusive",
+                    ));
+                }
                 Ok(xml_response("ContinueUpdateRollback", String::new(), &rid))
             }
             "RollbackStack" => {
@@ -4505,6 +4520,30 @@ pub(crate) mod tests {
         ok("GetTemplateSummary", &[]);
         ok("CancelUpdateStack", &[("StackName", "s")]);
         ok("ContinueUpdateRollback", &[("StackName", "s")]);
+        ok(
+            "ContinueUpdateRollback",
+            &[("StackName", "s"), ("ForceRollback", "true")],
+        );
+        ok(
+            "ContinueUpdateRollback",
+            &[
+                ("StackName", "s"),
+                ("ForceRollback", "false"),
+                ("ResourcesToSkip.member.1", "Bucket"),
+            ],
+        );
+        let err = dispatch(
+            &svc(),
+            "ContinueUpdateRollback",
+            &[
+                ("StackName", "s"),
+                ("ForceRollback", "true"),
+                ("ResourcesToSkip.member.1", "Bucket"),
+            ],
+        )
+        .err()
+        .expect("ForceRollback with ResourcesToSkip must be rejected");
+        assert!(format!("{err:?}").contains("ValidationError"));
         ok("RollbackStack", &[("StackName", "s")]);
         ok(
             "SignalResource",

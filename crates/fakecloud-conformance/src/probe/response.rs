@@ -343,6 +343,16 @@ pub(super) fn service_common_errors(service_name: &str) -> &'static [&'static st
         // (https://docs.aws.amazon.com/elasticloadbalancing/latest/APIReference/CommonErrors.html).
         "elasticloadbalancing" => &["ValidationError"],
         "kms" => &["ValidationException"],
+        // Cost Explorer rejects requests that break a documented
+        // cross-member rule with `ValidationException`, which no operation
+        // declares: `DimensionKey` without `Dimension=PRODUCT_ATTRIBUTE`, a
+        // `ProductAttributes` filter outside the supported operations or
+        // without the required SERVICE filter, unsupported match options.
+        // Source: Cost Explorer API Reference, "Common Errors"
+        // (https://docs.aws.amazon.com/aws-cost-management/latest/APIReference/CommonErrors.html)
+        // and `ProductAttributeValues` ("the request fails with a
+        // ValidationException").
+        "ce" => &["ValidationException"],
         // Lambda refuses a request member that violates its Smithy
         // `@length`/`@pattern` in input validation, before the operation
         // runs, with `ValidationException` ("1 validation error detected:

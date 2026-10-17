@@ -3093,6 +3093,32 @@ pub(crate) fn constraints_for(action: &str) -> &'static [FieldConstraint] {
                 enum_values: &[],
             },
         ],
+        "GetSystemLogsForJobRun" => &[
+            FieldConstraint {
+                field: "JobName",
+                len_min: Some(1),
+                len_max: Some(255),
+                range_min: None,
+                range_max: None,
+                enum_values: &[],
+            },
+            FieldConstraint {
+                field: "RunId",
+                len_min: Some(1),
+                len_max: Some(255),
+                range_min: None,
+                range_max: None,
+                enum_values: &[],
+            },
+        ],
+        "GetSystemLogsForSession" => &[FieldConstraint {
+            field: "Id",
+            len_min: Some(1),
+            len_max: Some(255),
+            range_min: None,
+            range_max: None,
+            enum_values: &[],
+        }],
         "GetTable" => &[
             FieldConstraint {
                 field: "CatalogId",
@@ -6130,6 +6156,8 @@ pub(crate) fn declares_invalid_input(action: &str) -> bool {
             | "GetSession"
             | "GetSessionEndpoint"
             | "GetStatement"
+            | "GetSystemLogsForJobRun"
+            | "GetSystemLogsForSession"
             | "GetTable"
             | "GetTableOptimizer"
             | "GetTableVersion"
