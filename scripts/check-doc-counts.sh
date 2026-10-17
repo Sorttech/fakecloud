@@ -488,6 +488,9 @@ for f in "${FILES[@]}"; do
     # that mention Bedrock are read, so other services' "N ops across" is safe.
     while IFS= read -r frag; do
         [ -z "$frag" ] && continue
+        # Drop the one boundary character the "N ops across" alternative
+        # consumes in front of the number.
+        [[ "$frag" =~ ^[0-9B] ]] || frag=${frag:1}
         case "$frag" in
             "Bedrock Agent Runtime"*) want="$bedrock_agent_rt" ;;
             "Bedrock Agent"*)         want="$bedrock_agent" ;;
@@ -504,7 +507,7 @@ for f in "${FILES[@]}"; do
         fi
     done < <(
         grep -E 'Bedrock' "$f" 2>/dev/null \
-            | grep -oE '\b[0-9]+ (ops|operations) across|\b[0-9]+ of [0-9]+\**:? Bedrock|Bedrock( Agent Runtime| Agent| Runtime)? \(?[0-9]+( actions\)|,|\))' \
+            | grep -oE '(^|[^0-9,.])[0-9]+ (ops|operations) across|\b[0-9]+ of [0-9]+\**:? Bedrock|Bedrock( Agent Runtime| Agent| Runtime)? \(?[0-9]+( actions\)|,|\))' \
             | sort -u || true
     )
 
@@ -564,6 +567,13 @@ if [ "${#PS_FILES[@]}" -gt 0 ]; then
                 grep -oHE "^\| *${svc_re} *\| *[0-9]+ (operations?|ops)?" "${PS_FILES[@]}" 2>/dev/null || true
                 # "<td>Cognito User Pools</td><td class=\"check\">132 operations"
                 grep -oHE "<td>${svc_re}</td><td[^>]*>[0-9]+ (operations?|ops)" "${PS_FILES[@]}" 2>/dev/null || true
+                # Number first: "**53 KMS operations** at 100% conformance". Every
+                # SEO landing page (kms-emulator, local-rds, local-s3-for-tests,
+                # dynamodb-emulator, ses-emulator, cognito-emulator) phrases it
+                # this way and none of the patterns above read it (2026-10-17).
+                # The name is cut out so last_num never reads the 3 in "S3".
+                { grep -oHE "(^|[^0-9,.])[0-9]+ (\*\*)?${svc_re}(\*\*)? operations?\b" "${PS_FILES[@]}" 2>/dev/null || true; } \
+                    | sed -E "s/ (\*\*)?${svc_re}(\*\*)? operations?\$/ operations/"
             } | sort -u
         )
     done <<< "$service_ops_map"
@@ -668,6 +678,11 @@ model_files=()
 while IFS=$'\t' read -r _m _s; do
     [ -f "aws-models/$_m.json" ] && model_files+=("aws-models/$_m.json")
 done <<< "$model_slug_map"
+# With no files jq would read stdin and hang instead of failing.
+if [ "${#model_files[@]}" -eq 0 ]; then
+    echo "no aws-models/*.json matched $OPS_INDEX_GEN's SERVICES map" >&2
+    exit 2
+fi
 # One jq process for every model: "<model>\t<unique op count>".
 model_ops=$(jq -r 'input_filename as $f
     | [(.shapes // {}) | to_entries[] | select(.value.type == "operation") | .key | sub(".*#"; "")]
@@ -676,13 +691,13 @@ model_ops=$(jq -r 'input_filename as $f
 model_slug_ops=$(awk -F'\t' 'NR == FNR { ops[$1] = $2; next }
     $2 != "" && ($1 in ops) { sum[$2] += ops[$1] }
     END { for (s in sum) print s "\t" sum[s] }' \
-    <(printf '%s\n' "$model_ops") <(printf '%s\n' "$model_slug_map") | sort)
+    <(printf '%s\n' "$model_ops") <(printf '%s\n' "$model_slug_map") | LC_ALL=C sort -t$'\t' -k1,1)
 parity_slug_ops=$(awk -F'|' '/^\| \[/ {
         s = $2; sub(/.*@\/docs\/services\//, "", s); sub(/\.md.*/, "", s)
         o = $3; gsub(/ /, "", o)
         if (o ~ /^[0-9]+$/) sum[s] += o
     }
-    END { for (s in sum) print s "\t" sum[s] }' "$PARITY" | sort)
+    END { for (s in sum) print s "\t" sum[s] }' "$PARITY" | LC_ALL=C sort -t$'\t' -k1,1)
 while IFS=$'\t' read -r slug want got; do
     [ -z "$slug" ] && continue
     pending=0
@@ -702,7 +717,7 @@ while IFS=$'\t' read -r slug want got; do
         problems+=("$PARITY: docs/services/$slug.md rows sum to $got operations, the Smithy model(s) define $want")
         fail=1
     fi
-done < <(join -t$'\t' -a1 -a2 -e - -o 0,1.2,2.2 \
+done < <(LC_ALL=C join -t$'\t' -a1 -a2 -e - -o 0,1.2,2.2 \
     <(printf '%s\n' "$model_slug_ops") <(printf '%s\n' "$parity_slug_ops"))
 
 # --- Per-service pages' own headline counts -----------------------------------
@@ -727,6 +742,11 @@ while IFS= read -r svc_doc; do
     while IFS= read -r claim; do
         [ -z "$claim" ] && continue
         lineno=${claim%%:*}
+        # "N of M" is a headline only when N == M ("57 of 57"); "1 of 3 shards"
+        # is prose.
+        if [[ "${claim#*:}" =~ ^([0-9]+)\ of\ ([0-9]+)$ ]] && [ "${BASH_REMATCH[1]}" != "${BASH_REMATCH[2]}" ]; then
+            continue
+        fi
         for n in $(printf '%s' "${claim#*:}" | grep -oE '[0-9]+' || true); do
             case "$allowed" in
                 *" $n "*) ;;
@@ -738,7 +758,7 @@ while IFS= read -r svc_doc; do
                     ;;
             esac
         done
-    done < <(grep -noE '\b[0-9]+ of [0-9]+\b|\*\*[0-9]+ operations\*\*|\b[Aa]ll [0-9]+ operations\b|\b[0-9]+-operation\b|\b[Cc]omplete [0-9]+-op\b|control plane: [0-9]+ operations' "$svc_doc" || true)
+    done < <(grep -noE '\b[0-9]+ of [0-9]+\b|\*\*[0-9]+ operations\*\*|\b[Aa]ll [0-9]+ operations\b|\b[0-9]+-operation\b|\b[Cc]omplete [0-9]+-op\b|control plane: [0-9]+ operations|(^|\. )[0-9]+ operations\.' "$svc_doc" || true)
 done < <(find website/content/docs/services -maxdepth 1 -name '*.md' -type f | sort)
 
 # --- Subset-count claims -------------------------------------------------------

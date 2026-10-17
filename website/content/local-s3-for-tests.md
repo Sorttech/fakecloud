@@ -1,6 +1,6 @@
 +++
 title = "Local S3 for integration tests"
-description = "Run S3 locally for integration tests with fakecloud. 107 S3 operations, versioning, lifecycle, notifications, multipart, replication. Any AWS SDK, no Docker required, free."
+description = "Run S3 locally for integration tests with fakecloud. 112 S3 operations, versioning, lifecycle, notifications, multipart, replication. Any AWS SDK, no Docker required, free."
 template = "page.html"
 +++
 
@@ -15,7 +15,7 @@ Point your AWS SDK at `http://localhost:4566`.
 
 ## Why fakecloud for S3
 
-- **107 S3 operations** at 100% conformance — buckets, objects, multipart uploads, versioning, lifecycle, CORS, notifications, object lock, replication, website hosting, access points, S3 Select, Object Lambda.
+- **112 S3 operations** at 100% conformance — buckets, objects, multipart uploads, versioning, lifecycle, CORS, notifications, object lock, replication, website hosting, access points, S3 Select, Object Lambda.
 - **Real cross-service triggers.** S3 notifications fire SNS, SQS, and Lambda for real. `PutObject` -> Lambda invocation happens end-to-end.
 - **Any AWS SDK in any language.** Real HTTP server on port 4566 — Python boto3, Node aws-sdk, Go aws-sdk-go-v2, Java, Kotlin, Rust, PHP, AWS CLI all work.
 - **No Docker required** for S3 itself (binary runs the storage engine in-process).
