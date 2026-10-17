@@ -2340,6 +2340,7 @@ mod tests {
 
     #[test]
     fn gzip_delivery_encodes_bytes_and_persists_metadata() {
+        use fakecloud_s3::checksum::{checksum, ChecksumAlgorithm, ChecksumType};
         use std::io::Read;
 
         let (svc, disk, _tmp) = firehose_with_disk_s3("fh-gzip");
@@ -2361,11 +2362,25 @@ mod tests {
         let raw = disk.open_object_body(&object.body).unwrap();
         assert!(raw.starts_with(&[0x1f, 0x8b, 8]));
         assert_eq!(object.size, raw.len() as u64);
+        let expected_checksum = checksum(ChecksumAlgorithm::Crc64Nvme, &raw);
+        assert_eq!(
+            object.checksum_algorithm,
+            Some(ChecksumAlgorithm::Crc64Nvme)
+        );
+        assert_eq!(object.checksum_type, Some(ChecksumType::FullObject));
+        assert_eq!(
+            object.checksum_value.as_deref(),
+            Some(expected_checksum.as_str())
+        );
         let mut decoded = Vec::new();
         flate2::read::GzDecoder::new(raw.as_ref())
             .read_to_end(&mut decoded)
             .unwrap();
         assert_eq!(decoded, b"abcdef\n\x00\xff");
+        assert_ne!(
+            expected_checksum,
+            checksum(ChecksumAlgorithm::Crc64Nvme, &decoded)
+        );
         let key = object.key.clone();
         drop(s3);
 
@@ -2373,6 +2388,10 @@ mod tests {
         let persisted = &loaded.buckets["fh-gzip"].objects[&key];
         assert_eq!(persisted.meta.content_type, "application/octet-stream");
         assert_eq!(persisted.meta.content_encoding.as_deref(), Some("gzip"));
+        assert_eq!(
+            persisted.meta.checksum_value.as_deref(),
+            Some(expected_checksum.as_str())
+        );
         assert_eq!(disk.open_object_body(&persisted.body).unwrap(), raw);
     }
 

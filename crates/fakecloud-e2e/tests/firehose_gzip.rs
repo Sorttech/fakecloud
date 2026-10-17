@@ -5,6 +5,8 @@ use aws_sdk_firehose::types::{
     CompressionFormat, ExtendedS3DestinationConfiguration, ProcessingConfiguration, Processor,
     ProcessorType, Record, S3DestinationConfiguration,
 };
+use aws_sdk_s3::types::ChecksumMode;
+use base64::Engine;
 use fakecloud_testkit::TestServer;
 use md5::{Digest, Md5};
 
@@ -51,6 +53,7 @@ async fn gzip_object(
         .get_object()
         .bucket(bucket)
         .key(&key)
+        .checksum_mode(ChecksumMode::Enabled)
         .send()
         .await
         .unwrap();
@@ -58,6 +61,21 @@ async fn gzip_object(
     assert_eq!(object.content_encoding(), Some("gzip"));
     let content_length = object.content_length().unwrap();
     let etag = object.e_tag().map(str::to_owned);
+    let checksum = object
+        .checksum_crc64_nvme()
+        .expect("default CRC64NVME checksum")
+        .to_owned();
+    assert_eq!(
+        object.checksum_type().map(|value| value.as_str()),
+        Some("FULL_OBJECT")
+    );
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(&checksum)
+            .unwrap()
+            .len(),
+        8
+    );
     let raw = object.body.collect().await.unwrap().into_bytes().to_vec();
     assert_eq!(content_length, raw.len() as i64);
     // Size and ETag describe the stored compressed bytes, like any
@@ -71,6 +89,7 @@ async fn gzip_object(
         .head_object()
         .bucket(bucket)
         .key(&key)
+        .checksum_mode(ChecksumMode::Enabled)
         .send()
         .await
         .unwrap();
@@ -78,6 +97,11 @@ async fn gzip_object(
     assert_eq!(head.content_encoding(), Some("gzip"));
     assert_eq!(head.content_length(), Some(content_length));
     assert_eq!(head.e_tag(), Some(md5_etag.as_str()));
+    assert_eq!(head.checksum_crc64_nvme(), Some(checksum.as_str()));
+    assert_eq!(
+        head.checksum_type().map(|value| value.as_str()),
+        Some("FULL_OBJECT")
+    );
 
     // S3 never decodes the object: a ranged read returns the stored GZIP
     // header bytes, still labelled with the object's content encoding.
