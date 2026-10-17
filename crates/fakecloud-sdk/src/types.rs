@@ -1204,6 +1204,11 @@ pub struct BedrockInvocation {
     /// Error detail for faulted calls, or `None` on success.
     #[serde(default)]
     pub error: Option<String>,
+    /// The call's `requestMetadata` key-value pairs (InvokeModel's
+    /// `X-Amzn-Bedrock-Request-Metadata` header or Converse's
+    /// `requestMetadata` map), or `None` when none were supplied.
+    #[serde(default)]
+    pub request_metadata: Option<std::collections::BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

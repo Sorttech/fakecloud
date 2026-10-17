@@ -16,14 +16,16 @@ impl EcsRuntime {
     ) {
         let mut updates: Vec<(String, String)> = Vec::with_capacity(started.len());
         for rc in started {
-            let out = Command::new(&self.cli)
-                .args([
-                    "inspect",
-                    "-f",
-                    "{{if .State.Health}}{{.State.Health.Status}}{{else}}{{end}}",
-                    &rc.container_id,
-                ])
-                .output()
+            let out = self
+                .cli_output(
+                    [
+                        "inspect",
+                        "-f",
+                        "{{if .State.Health}}{{.State.Health.Status}}{{else}}{{end}}",
+                        &rc.container_id,
+                    ],
+                    CLI_CALL_TIMEOUT,
+                )
                 .await;
             let status = match out {
                 Ok(o) if o.status.success() => {
@@ -62,18 +64,18 @@ impl EcsRuntime {
     /// when present, matching what AWS ECS returns on `DescribeTasks`.
     /// `None` on any failure so digest extraction never fails the task.
     pub(super) async fn lookup_image_digest(&self, pull_uri: &str) -> Option<String> {
-        let out = self
-            .cli_command()
-            .args([
+        let out = fakecloud_core::container_net::output_within(
+            self.cli_command().args([
                 "image",
                 "inspect",
                 "-f",
                 "{{index .RepoDigests 0}}",
                 pull_uri,
-            ])
-            .output()
-            .await
-            .ok()?;
+            ]),
+            CLI_CALL_TIMEOUT,
+        )
+        .await
+        .ok()?;
         if !out.status.success() {
             return None;
         }

@@ -3,10 +3,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use base64::Engine;
-use bytes::Bytes;
 use chrono::Utc;
 use fakecloud_aws::arn::Arn;
 use http::StatusCode;
+use md5::{Digest, Md5};
 use parking_lot::RwLock;
 use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
@@ -16,6 +16,7 @@ use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceErr
 use fakecloud_persistence::{BodySource, S3Store, SnapshotStore};
 use fakecloud_s3::{memory_body, S3Object, SharedS3State};
 
+use crate::output::{append_delimiter_enabled, encode_records, object_key, OutputConfig};
 use crate::state::{
     DeliveryStream, EncryptionConfig, FirehoseAccounts, FirehoseSnapshot, S3Destination,
     SharedFirehoseState, FIREHOSE_SNAPSHOT_SCHEMA_VERSION,
@@ -242,6 +243,91 @@ fn extract_extra_destinations(body: &Value, suffix: &str) -> BTreeMap<String, Va
     out
 }
 
+/// Validate the optional CompressionFormat member of an S3 configuration or
+/// update object. Absence is allowed;
+/// a present value (including null) must be one of the exact AWS enum strings.
+/// Non-object containers are left to the caller's existing shape handling.
+fn validate_s3_compression(config: &Value) -> Result<(), AwsServiceError> {
+    let Some(format) = config.get("CompressionFormat") else {
+        return Ok(());
+    };
+    if matches!(
+        format.as_str(),
+        Some("UNCOMPRESSED" | "GZIP" | "ZIP" | "Snappy" | "HADOOP_SNAPPY")
+    ) {
+        return Ok(());
+    }
+    Err(invalid_argument(
+        "CompressionFormat must be one of UNCOMPRESSED, GZIP, ZIP, Snappy, HADOOP_SNAPPY",
+    ))
+}
+
+/// Redshift loads from its intermediate S3 location with the COPY command,
+/// which cannot read Snappy or ZIP objects; the API model documents both as
+/// disallowed for `RedshiftDestinationConfiguration.S3Configuration` and
+/// `RedshiftDestinationUpdate.S3Update`. (The S3 backup is never read by COPY,
+/// so it accepts every format.) Run after `validate_s3_compression`.
+fn validate_redshift_intermediate_compression(config: &Value) -> Result<(), AwsServiceError> {
+    match config.get("CompressionFormat").and_then(Value::as_str) {
+        Some(format @ ("Snappy" | "ZIP")) => Err(invalid_argument(format!(
+            "CompressionFormat {format} is not supported for the intermediate Amazon S3 \
+             location of an Amazon Redshift destination because the Amazon Redshift COPY \
+             operation cannot read it."
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Validate a classic or Extended S3 destination block plus every backup
+/// block stored from it. `parse_s3_destination` keeps `S3BackupConfiguration`
+/// and `apply_s3_update` keeps `S3BackupUpdate`, whichever destination shape
+/// carried them; an update can take either path (a full parse when the stream
+/// has no S3 destination yet), so it checks both. Shared with CloudFormation
+/// provisioning (`update == false`).
+pub fn validate_s3_destination_compression(
+    config: &Value,
+    update: bool,
+) -> Result<(), AwsServiceError> {
+    validate_s3_compression(config)?;
+    validate_s3_compression(&config["S3BackupConfiguration"])?;
+    if update {
+        validate_s3_compression(&config["S3BackupUpdate"])?;
+    }
+    Ok(())
+}
+
+/// Preflight only the S3 destination members in the Firehose input model,
+/// including raw-JSON destinations, before any stream mutation. No recursive
+/// JSON walk: similarly named fields in processing/HTTP options are unrelated.
+/// This is the only CompressionFormat check on the create/update paths, so it
+/// covers every S3 block `parse_s3_destination`/`apply_s3_update` store.
+fn validate_destination_compression(body: &Value, suffix: &str) -> Result<(), AwsServiceError> {
+    let update = suffix == "Update";
+    for base in ["S3Destination", "ExtendedS3Destination"] {
+        validate_s3_destination_compression(&body[format!("{base}{suffix}")], update)?;
+    }
+    let backup_member = if update {
+        "S3BackupUpdate"
+    } else {
+        "S3BackupConfiguration"
+    };
+    for base in EXTRA_DESTINATION_BASES {
+        let config = &body[format!("{base}{suffix}")];
+        // IcebergDestinationUpdate has S3Configuration, not S3Update.
+        let s3_member = if update && *base != "IcebergDestination" {
+            "S3Update"
+        } else {
+            "S3Configuration"
+        };
+        validate_s3_compression(&config[s3_member])?;
+        if *base == "RedshiftDestination" {
+            validate_redshift_intermediate_compression(&config[s3_member])?;
+            validate_s3_compression(&config[backup_member])?;
+        }
+    }
+    Ok(())
+}
+
 fn parse_s3_destination(val: &Value) -> Result<Option<S3Destination>, AwsServiceError> {
     if !val.is_object() {
         return Ok(None);
@@ -256,6 +342,7 @@ fn parse_s3_destination(val: &Value) -> Result<Option<S3Destination>, AwsService
     let buffering_size_mb = buf["SizeInMBs"].as_i64();
     let buffering_interval_seconds = buf["IntervalInSeconds"].as_i64();
     validate_buffering(buffering_size_mb, buffering_interval_seconds)?;
+    validate_file_extension(val)?;
     Ok(Some(S3Destination {
         destination_id: format!("destinationId-{}", Uuid::new_v4()),
         role_arn,
@@ -295,15 +382,41 @@ fn invalid_argument(msg: impl Into<String>) -> AwsServiceError {
     AwsServiceError::aws_error(StatusCode::BAD_REQUEST, "InvalidArgumentException", msg)
 }
 
+pub(crate) fn validate_file_extension(value: &Value) -> Result<(), AwsServiceError> {
+    let Some(extension) = value.get("FileExtension") else {
+        return Ok(());
+    };
+    let extension = extension
+        .as_str()
+        .ok_or_else(|| invalid_argument("FileExtension must be a string"))?;
+    // Equivalent to ^(|\.[0-9a-z!\-_.*'()]+)$ without a regex dependency.
+    if extension.len() > 128
+        || (!extension.is_empty()
+            && (!extension.starts_with('.')
+                || extension.len() < 2
+                || !extension[1..].bytes().all(|c| {
+                    c.is_ascii_digit()
+                        || c.is_ascii_lowercase()
+                        || matches!(c, b'!' | b'-' | b'_' | b'.' | b'*' | b'\'' | b'(' | b')')
+                })))
+    {
+        return Err(invalid_argument("FileExtension must be empty or a dot followed by lowercase letters, digits, or !-_.*'(), with at most 128 characters"));
+    }
+    Ok(())
+}
+
 /// Apply a partial `*S3DestinationUpdate` block onto an existing destination.
 /// Every field in the `*Update` shape is optional, so only the members the
 /// caller supplied are changed; the destination's stable `DestinationId` is
 /// preserved. Buffering values are validated when present.
 fn apply_s3_update(dest: &mut S3Destination, val: &Value) -> Result<(), AwsServiceError> {
+    // CompressionFormat (here and in S3BackupUpdate) was already checked by
+    // `validate_destination_compression` before the stream was touched.
     let buf = &val["BufferingHints"];
     let size = buf["SizeInMBs"].as_i64();
     let interval = buf["IntervalInSeconds"].as_i64();
     validate_buffering(size, interval)?;
+    validate_file_extension(val)?;
 
     if let Some(v) = val["RoleARN"].as_str() {
         dest.role_arn = v.to_string();
@@ -571,6 +684,8 @@ impl FirehoseService {
             )));
         }
 
+        validate_destination_compression(&body, "Configuration")?;
+
         let s3_dest = match parse_s3_destination(&body["S3DestinationConfiguration"])? {
             Some(d) => Some(d),
             None => parse_s3_destination(&body["ExtendedS3DestinationConfiguration"])?,
@@ -790,7 +905,8 @@ impl FirehoseService {
         for r in records {
             let b64 = r["Data"].as_str();
             match b64.map(|s| base64::engine::general_purpose::STANDARD.decode(s)) {
-                Some(Ok(data)) if !data.is_empty() => {
+                // Record.Data is a blob with min length 0, as in PutRecord.
+                Some(Ok(data)) => {
                     datas.push(data);
                     response_records.push(json!({
                         "RecordId": Uuid::new_v4().to_string(),
@@ -800,25 +916,13 @@ impl FirehoseService {
                     failed += 1;
                     response_records.push(json!({
                         "ErrorCode": "InvalidArgumentException",
-                        "ErrorMessage": "Record.Data must be a non-empty base64-encoded string",
+                        "ErrorMessage": "Record.Data must be a base64-encoded string",
                     }));
                 }
             }
         }
-        if !datas.is_empty() {
-            self.deliver_records(&req.account_id, &req.region, &name, datas)?;
-        } else if failed == records.len() && !records.is_empty() {
-            // Validate stream exists even when nothing delivers, so callers
-            // get a clear ResourceNotFoundException for typos.
-            let accounts = self.state.read();
-            let state = accounts
-                .get(&req.account_id)
-                .ok_or_else(|| not_found(&name))?;
-            state
-                .streams(&req.region)
-                .and_then(|s| s.get(&name))
-                .ok_or_else(|| not_found(&name))?;
-        }
+        // Empty/all-invalid batches still need the shared stream admission check.
+        self.deliver_records(&req.account_id, &req.region, &name, datas)?;
         Ok(AwsResponse::ok_json(json!({
             "FailedPutCount": failed,
             "Encrypted": false,
@@ -931,6 +1035,7 @@ impl FirehoseService {
         let destination_id = body["DestinationId"]
             .as_str()
             .ok_or_else(|| missing("DestinationId"))?;
+        validate_destination_compression(&body, "Update")?;
         let mut accounts = self.state.write();
         let state = accounts.get_or_create(&req.account_id, &req.region);
         let stream = state
@@ -1063,7 +1168,7 @@ impl FirehoseService {
         stream_name: &str,
         datas: Vec<Vec<u8>>,
     ) -> Result<(), AwsServiceError> {
-        let dest = {
+        let (dest, version_id) = {
             let accounts = self.state.read();
             let state = accounts
                 .get(account_id)
@@ -1072,7 +1177,14 @@ impl FirehoseService {
                 .streams(region)
                 .and_then(|s| s.get(stream_name))
                 .ok_or_else(|| not_found(stream_name))?;
-            stream.destination.clone()
+            // Public puts and internal delivery hooks are DirectPut producers.
+            // Reject source streams before any destination/backend checks or writes.
+            if stream.stream_type == "KinesisStreamAsSource" {
+                return Err(invalid_argument(
+                    "This operation is not permitted on KinesisStreamAsSource delivery stream type.",
+                ));
+            }
+            (stream.destination.clone(), stream.version_id.clone())
         };
         let Some(dest) = dest else {
             return Ok(());
@@ -1093,29 +1205,22 @@ impl FirehoseService {
             );
             return Ok(());
         };
-        let mut payload = Vec::new();
-        for d in datas {
-            payload.extend_from_slice(&d);
-            if !d.last().map(|b| *b == b'\n').unwrap_or(false) {
-                payload.push(b'\n');
-            }
-        }
-        if payload.is_empty() {
+        let output = OutputConfig {
+            prefix: dest.prefix.as_deref().unwrap_or_default(),
+            file_extension: dest.file_extension.as_deref(),
+            append_delimiter: append_delimiter_enabled(dest.processing_configuration.as_ref()),
+        };
+        let bytes = encode_records(&datas, &output);
+        if bytes.is_empty() {
             return Ok(());
         }
         let now = Utc::now();
-        let prefix = dest.prefix.clone().unwrap_or_default();
-        let key = format!(
-            "{prefix}{date}/{stream_name}-{ts}-{rand}",
-            date = now.format("%Y/%m/%d/%H"),
-            ts = now.timestamp(),
-            rand = &Uuid::new_v4().to_string()[..8],
-        );
-        let size = payload.len() as u64;
-        let etag = format!("\"{}\"", Uuid::new_v4().simple());
-        let bytes = Bytes::from(payload);
+        let key = object_key(stream_name, &version_id, &output, now, now, Uuid::new_v4());
+        let size = bytes.len() as u64;
+        // S3 stores the bare MD5 hex of a single-part object; its read paths add
+        // the surrounding quotes.
+        let etag = format!("{:x}", Md5::digest(&bytes));
         let body = memory_body(bytes.clone());
-        let _ = region;
         // Snapshot the durable store handle before taking the S3 state lock so we
         // never hold two locks at once.
         let store = self.s3_store.read().clone();
@@ -1213,6 +1318,7 @@ fn not_found(name: &str) -> AwsServiceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use http::{HeaderMap, Method};
 
     fn request(action: &str, body: Value) -> AwsRequest {
@@ -1501,6 +1607,407 @@ mod tests {
         serde_json::from_slice::<Value>(resp.body.expect_bytes()).unwrap()
             ["DeliveryStreamDescription"]
             .clone()
+    }
+
+    fn compression_s3_config() -> Value {
+        json!({
+            "RoleARN": "arn:aws:iam::123456789012:role/fh",
+            "BucketARN": "arn:aws:s3:::bucket",
+            "Prefix": "before/"
+        })
+    }
+
+    fn compression_state(svc: &FirehoseService) -> Value {
+        // Include full-precision timestamps and every stored field, not just
+        // Describe's timestamps rounded to seconds.
+        serde_json::to_value(&*svc.state.read()).unwrap()
+    }
+
+    #[test]
+    fn compression_valid_values_and_omission_preserve_s3_semantics() {
+        for base in ["S3Destination", "ExtendedS3Destination"] {
+            for format in [
+                None,
+                Some("UNCOMPRESSED"),
+                Some("GZIP"),
+                Some("ZIP"),
+                Some("Snappy"),
+                Some("HADOOP_SNAPPY"),
+            ] {
+                let svc = service();
+                let mut config = compression_s3_config();
+                if let Some(format) = format {
+                    config["CompressionFormat"] = json!(format);
+                }
+                let mut body = json!({"DeliveryStreamName": "compression"});
+                body[format!("{base}Configuration")] = config;
+                svc.create_delivery_stream(&request("CreateDeliveryStream", body))
+                    .unwrap();
+                let before = describe(&svc, "compression");
+                assert_eq!(
+                    before["Destinations"][0]["S3DestinationDescription"]["CompressionFormat"],
+                    format.unwrap_or("UNCOMPRESSED")
+                );
+
+                let mut update = json!({
+                    "DeliveryStreamName": "compression",
+                    "CurrentDeliveryStreamVersionId": "1",
+                    "DestinationId": before["Destinations"][0]["DestinationId"]
+                });
+                update[format!("{base}Update")] = json!({"Prefix": "after/"});
+                svc.update_destination(&request("UpdateDestination", update))
+                    .unwrap();
+                let after = describe(&svc, "compression");
+                assert_eq!(
+                    after["Destinations"][0]["S3DestinationDescription"]["CompressionFormat"],
+                    format.unwrap_or("UNCOMPRESSED")
+                );
+                assert_eq!(
+                    after["Destinations"][0]["S3DestinationDescription"]["Prefix"],
+                    "after/"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compression_invalid_create_leaves_no_stream() {
+        for base in ["S3Destination", "ExtendedS3Destination"] {
+            for format in [
+                json!("BROTLI"),
+                json!("gzip"),
+                json!("SNAPPY"),
+                json!("snappy"),
+                json!(""),
+                json!(null),
+                json!(7),
+                json!(true),
+                json!([]),
+                json!({}),
+            ] {
+                let svc = service();
+                let before = compression_state(&svc);
+                let mut config = compression_s3_config();
+                config["CompressionFormat"] = format.clone();
+                let mut body = json!({"DeliveryStreamName": "bad-compression", "Tags": [{"Key": "env", "Value": "bad"}]});
+                body[format!("{base}Configuration")] = config;
+                let err = svc
+                    .create_delivery_stream(&request("CreateDeliveryStream", body))
+                    .err()
+                    .expect("invalid compression must fail");
+                assert_eq!(err.code(), "InvalidArgumentException", "{base}: {format}");
+                assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+                assert_eq!(compression_state(&svc), before);
+            }
+        }
+    }
+
+    #[test]
+    fn compression_invalid_update_is_atomic() {
+        for base in ["S3Destination", "ExtendedS3Destination"] {
+            let svc = service();
+            let mut body = json!({"DeliveryStreamName": "compression"});
+            body[format!("{base}Configuration")] = compression_s3_config();
+            svc.create_delivery_stream(&request("CreateDeliveryStream", body))
+                .unwrap();
+            let description = describe(&svc, "compression");
+            let before = compression_state(&svc);
+            for format in [
+                json!("BROTLI"),
+                json!("Gzip"),
+                json!(null),
+                json!(42),
+                json!(["GZIP"]),
+            ] {
+                let mut update = json!({
+                    "DeliveryStreamName": "compression",
+                    "CurrentDeliveryStreamVersionId": "1",
+                    "DestinationId": description["Destinations"][0]["DestinationId"],
+                    "HttpEndpointDestinationUpdate": {"RoleARN": "changed"}
+                });
+                update[format!("{base}Update")] = json!({
+                    "RoleARN": "changed", "BucketARN": "arn:aws:s3:::changed",
+                    "Prefix": "changed/", "BufferingHints": {"SizeInMBs": 10},
+                    "CompressionFormat": format
+                });
+                let err = svc
+                    .update_destination(&request("UpdateDestination", update))
+                    .err()
+                    .expect("invalid compression must fail");
+                assert_eq!(err.code(), "InvalidArgumentException");
+                assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+                assert_eq!(compression_state(&svc), before);
+            }
+        }
+    }
+
+    // Literal model paths: Iceberg deliberately uses S3Configuration on
+    // update too. These blocks are otherwise stored/merged as raw JSON.
+    const COMPRESSION_NESTED_PATHS: &[(&str, &str, &str)] = &[
+        (
+            "ExtendedS3Destination",
+            "S3BackupConfiguration",
+            "S3BackupUpdate",
+        ),
+        ("RedshiftDestination", "S3Configuration", "S3Update"),
+        (
+            "RedshiftDestination",
+            "S3BackupConfiguration",
+            "S3BackupUpdate",
+        ),
+        ("ElasticsearchDestination", "S3Configuration", "S3Update"),
+        (
+            "AmazonopensearchserviceDestination",
+            "S3Configuration",
+            "S3Update",
+        ),
+        (
+            "AmazonOpenSearchServerlessDestination",
+            "S3Configuration",
+            "S3Update",
+        ),
+        ("SplunkDestination", "S3Configuration", "S3Update"),
+        ("HttpEndpointDestination", "S3Configuration", "S3Update"),
+        ("SnowflakeDestination", "S3Configuration", "S3Update"),
+        ("IcebergDestination", "S3Configuration", "S3Configuration"),
+    ];
+
+    #[test]
+    fn compression_nested_s3_create_is_validated_atomically() {
+        for &(base, create_member, _) in COMPRESSION_NESTED_PATHS {
+            let svc = service();
+            let mut config = compression_s3_config();
+            config[create_member] = compression_s3_config();
+            let mut body = json!({"DeliveryStreamName": "nested"});
+            body[format!("{base}Configuration")] = config;
+            for bad in [json!("BROTLI"), json!(false)] {
+                let mut invalid = body.clone();
+                invalid[format!("{base}Configuration")][create_member]["CompressionFormat"] = bad;
+                let before = compression_state(&svc);
+                let err = svc
+                    .create_delivery_stream(&request("CreateDeliveryStream", invalid))
+                    .err()
+                    .expect("invalid nested create must fail");
+                assert_eq!(
+                    err.code(),
+                    "InvalidArgumentException",
+                    "{base}.{create_member}"
+                );
+                assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+                assert_eq!(compression_state(&svc), before);
+            }
+        }
+    }
+
+    #[test]
+    fn compression_nested_s3_update_is_validated_atomically() {
+        for &(base, create_member, update_member) in COMPRESSION_NESTED_PATHS {
+            let svc = service();
+            let mut config = compression_s3_config();
+            config[create_member] = compression_s3_config();
+            let mut body = json!({"DeliveryStreamName": "nested"});
+            body[format!("{base}Configuration")] = config;
+            // HADOOP_SNAPPY is valid on every S3 member, including Redshift's
+            // intermediate location (which rejects Snappy and ZIP).
+            body[format!("{base}Configuration")][create_member]["CompressionFormat"] =
+                json!("HADOOP_SNAPPY");
+            svc.create_delivery_stream(&request("CreateDeliveryStream", body))
+                .unwrap();
+            let description = describe(&svc, "nested");
+            let before = compression_state(&svc);
+            for bad in [json!("SNAPPY"), json!(null)] {
+                let mut update = json!({
+                    "DeliveryStreamName": "nested",
+                    "CurrentDeliveryStreamVersionId": "1",
+                    "DestinationId": description["Destinations"][0]["DestinationId"],
+                    "S3DestinationUpdate": {"Prefix": "must-not-change/"}
+                });
+                update[format!("{base}Update")] =
+                    json!({"Prefix": "changed/", "RoleARN": "changed"});
+                update[format!("{base}Update")][update_member] =
+                    json!({"CompressionFormat": bad, "Prefix": "changed-backup/"});
+                let err = svc
+                    .update_destination(&request("UpdateDestination", update))
+                    .err()
+                    .expect("invalid nested update must fail");
+                assert_eq!(
+                    err.code(),
+                    "InvalidArgumentException",
+                    "{base}.{update_member}"
+                );
+                assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+                assert_eq!(compression_state(&svc), before);
+            }
+        }
+    }
+
+    fn redshift_config(intermediate: &str, backup: &str) -> Value {
+        let mut config = json!({
+            "RoleARN": "arn:aws:iam::123456789012:role/fh",
+            "ClusterJDBCURL": "jdbc:redshift://cluster:5439/db",
+            "CopyCommand": {"DataTableName": "events"},
+            "Username": "user",
+            "Password": "password",
+            "S3Configuration": compression_s3_config(),
+            "S3BackupMode": "Enabled",
+            "S3BackupConfiguration": compression_s3_config()
+        });
+        config["S3Configuration"]["CompressionFormat"] = json!(intermediate);
+        config["S3BackupConfiguration"]["CompressionFormat"] = json!(backup);
+        config
+    }
+
+    #[test]
+    fn redshift_intermediate_s3_rejects_snappy_and_zip_on_create() {
+        for format in ["Snappy", "ZIP"] {
+            let svc = service();
+            let before = compression_state(&svc);
+            let err = svc
+                .create_delivery_stream(&request(
+                    "CreateDeliveryStream",
+                    json!({
+                        "DeliveryStreamName": "redshift",
+                        "RedshiftDestinationConfiguration": redshift_config(format, "GZIP")
+                    }),
+                ))
+                .err()
+                .expect("COPY-unreadable format must fail");
+            assert_eq!(err.code(), "InvalidArgumentException", "{format}");
+            assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+            assert!(err.message().contains(format), "{}", err.message());
+            assert!(err.message().contains("Redshift"), "{}", err.message());
+            assert_eq!(compression_state(&svc), before);
+        }
+        // COPY never reads the backup, and the other enum values are loadable.
+        for (intermediate, backup) in [
+            ("UNCOMPRESSED", "Snappy"),
+            ("GZIP", "ZIP"),
+            ("HADOOP_SNAPPY", "Snappy"),
+        ] {
+            let svc = service();
+            svc.create_delivery_stream(&request(
+                "CreateDeliveryStream",
+                json!({
+                    "DeliveryStreamName": "redshift",
+                    "RedshiftDestinationConfiguration": redshift_config(intermediate, backup)
+                }),
+            ))
+            .unwrap_or_else(|e| panic!("{intermediate}/{backup}: {}", e.message()));
+        }
+    }
+
+    #[test]
+    fn redshift_intermediate_s3_update_rejects_snappy_and_zip_atomically() {
+        let svc = service();
+        svc.create_delivery_stream(&request(
+            "CreateDeliveryStream",
+            json!({
+                "DeliveryStreamName": "redshift",
+                "RedshiftDestinationConfiguration": redshift_config("GZIP", "GZIP")
+            }),
+        ))
+        .unwrap();
+        let description = describe(&svc, "redshift");
+        let destination_id = description["Destinations"][0]["DestinationId"].clone();
+        let before = compression_state(&svc);
+        for format in ["Snappy", "ZIP"] {
+            let err = svc
+                .update_destination(&request(
+                    "UpdateDestination",
+                    json!({
+                        "DeliveryStreamName": "redshift",
+                        "CurrentDeliveryStreamVersionId": "1",
+                        "DestinationId": destination_id,
+                        "RedshiftDestinationUpdate": {
+                            "Username": "changed",
+                            "S3Update": {"Prefix": "changed/", "CompressionFormat": format}
+                        }
+                    }),
+                ))
+                .err()
+                .expect("COPY-unreadable format must fail");
+            assert_eq!(err.code(), "InvalidArgumentException", "{format}");
+            assert_eq!(compression_state(&svc), before);
+        }
+        // The backup accepts them; the intermediate location accepts the rest.
+        svc.update_destination(&request(
+            "UpdateDestination",
+            json!({
+                "DeliveryStreamName": "redshift",
+                "CurrentDeliveryStreamVersionId": "1",
+                "DestinationId": destination_id,
+                "RedshiftDestinationUpdate": {
+                    "S3Update": {"CompressionFormat": "UNCOMPRESSED"},
+                    "S3BackupUpdate": {"CompressionFormat": "ZIP"}
+                }
+            }),
+        ))
+        .unwrap();
+        assert_eq!(describe(&svc, "redshift")["VersionId"], "2");
+    }
+
+    #[test]
+    fn compression_validation_is_limited_to_s3_member_objects() {
+        let svc = service();
+        svc.create_delivery_stream(&request(
+            "CreateDeliveryStream",
+            json!({
+                "DeliveryStreamName": "opaque",
+                "HttpEndpointDestinationConfiguration": {
+                    "CompressionFormat": "BROTLI",
+                    "RequestConfiguration": {"CompressionFormat": "BROTLI"},
+                    "S3Configuration": [{"CompressionFormat": "BROTLI"}]
+                }
+            }),
+        ))
+        .unwrap();
+        assert_eq!(
+            describe(&svc, "opaque")["Destinations"][0]["HttpEndpointDestinationDescription"]
+                ["RequestConfiguration"]["CompressionFormat"],
+            "BROTLI"
+        );
+    }
+
+    /// With no S3 destination yet, UpdateDestination fully parses the S3
+    /// update, which keeps its `S3BackupConfiguration`: that block must be
+    /// validated too.
+    #[test]
+    fn compression_update_fallback_parse_validates_backup_configuration() {
+        for base in ["S3Destination", "ExtendedS3Destination"] {
+            let svc = service();
+            svc.create_delivery_stream(&request(
+                "CreateDeliveryStream",
+                json!({
+                    "DeliveryStreamName": "fallback",
+                    "HttpEndpointDestinationConfiguration": {
+                        "EndpointConfiguration": {"Url": "https://example.com"},
+                        "S3Configuration": compression_s3_config()
+                    }
+                }),
+            ))
+            .unwrap();
+            let destination_id =
+                describe(&svc, "fallback")["Destinations"][0]["DestinationId"].clone();
+            let before = compression_state(&svc);
+            let update = |backup: &str| {
+                let mut config = compression_s3_config();
+                config["S3BackupConfiguration"] = json!({"CompressionFormat": backup});
+                let mut body = json!({
+                    "DeliveryStreamName": "fallback",
+                    "CurrentDeliveryStreamVersionId": "1",
+                    "DestinationId": destination_id
+                });
+                body[format!("{base}Update")] = config;
+                request("UpdateDestination", body)
+            };
+            let err = svc
+                .update_destination(&update("BROTLI"))
+                .err()
+                .expect("invalid backup compression must fail");
+            assert_eq!(err.code(), "InvalidArgumentException", "{base}");
+            assert_eq!(compression_state(&svc), before, "{base}");
+            svc.update_destination(&update("ZIP")).unwrap();
+        }
     }
 
     #[test]
@@ -1858,6 +2365,632 @@ mod tests {
             }),
         ))
         .unwrap();
+    }
+
+    fn kinesis_source_body(name: &str) -> Value {
+        json!({
+            "DeliveryStreamName": name,
+            "DeliveryStreamType": "KinesisStreamAsSource",
+            "KinesisStreamSourceConfiguration": {
+                "KinesisStreamARN": "arn:aws:kinesis:us-east-1:123456789012:stream/source",
+                "RoleARN": "arn:aws:iam::123456789012:role/fh",
+            },
+            "ExtendedS3DestinationConfiguration": {
+                "RoleARN": "arn:aws:iam::123456789012:role/fh",
+                "BucketARN": "arn:aws:s3:::fh-bucket",
+            },
+        })
+    }
+
+    fn record_request(action: &str, name: &str) -> AwsRequest {
+        let mut body = json!({ "DeliveryStreamName": name });
+        if action == "PutRecord" {
+            body["Record"] = json!({ "Data": "eA==" });
+        } else {
+            body["Records"] = json!([{ "Data": "eA==" }]);
+        }
+        request(action, body)
+    }
+
+    fn assert_source_rejected(err: AwsServiceError) {
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(err.code(), "InvalidArgumentException");
+        assert_eq!(
+            err.message(),
+            "This operation is not permitted on KinesisStreamAsSource delivery stream type."
+        );
+    }
+
+    fn assert_source_bucket_empty(svc: &FirehoseService, disk: &dyn S3Store) {
+        let s3 = svc.s3.as_ref().unwrap().read();
+        assert!(s3.get(S3_ACCOUNT).unwrap().buckets["fh-bucket"]
+            .objects
+            .is_empty());
+        assert!(disk.load().unwrap().buckets["fh-bucket"].objects.is_empty());
+    }
+
+    #[test]
+    fn put_record_rejects_kinesis_source_without_s3_side_effects() {
+        let (svc, disk, _tmp) = firehose_with_disk_s3("fh-bucket");
+        svc.create_delivery_stream(&request(
+            "CreateDeliveryStream",
+            kinesis_source_body("source-stream"),
+        ))
+        .unwrap();
+
+        assert_source_rejected(
+            svc.put_record(&record_request("PutRecord", "source-stream"))
+                .err()
+                .expect("source streams must reject PutRecord"),
+        );
+        assert_source_bucket_empty(&svc, disk.as_ref());
+    }
+
+    #[test]
+    fn put_record_batch_rejects_kinesis_source_without_s3_side_effects() {
+        let (svc, disk, _tmp) = firehose_with_disk_s3("fh-bucket");
+        svc.create_delivery_stream(&request(
+            "CreateDeliveryStream",
+            kinesis_source_body("source-stream"),
+        ))
+        .unwrap();
+
+        for records in [
+            json!([{ "Data": "eA==" }]),
+            json!([{ "Data": "eA==" }, { "Data": "@@@" }]),
+        ] {
+            assert_source_rejected(
+                svc.put_record_batch(&request(
+                    "PutRecordBatch",
+                    json!({ "DeliveryStreamName": "source-stream", "Records": records }),
+                ))
+                .err()
+                .expect("source streams must reject PutRecordBatch"),
+            );
+        }
+        assert_source_bucket_empty(&svc, disk.as_ref());
+    }
+
+    #[test]
+    fn put_record_batch_rejects_kinesis_source_without_deliverable_records() {
+        let (svc, disk, _tmp) = firehose_with_disk_s3("fh-bucket");
+        svc.create_delivery_stream(&request(
+            "CreateDeliveryStream",
+            kinesis_source_body("source-stream"),
+        ))
+        .unwrap();
+
+        for records in [json!([]), json!([{ "Data": "@@@" }, { "Data": "" }, {}])] {
+            assert_source_rejected(
+                svc.put_record_batch(&request(
+                    "PutRecordBatch",
+                    json!({ "DeliveryStreamName": "source-stream", "Records": records }),
+                ))
+                .err()
+                .expect("empty/all-invalid batches must not bypass source admission"),
+            );
+        }
+        assert_source_bucket_empty(&svc, disk.as_ref());
+    }
+
+    #[test]
+    fn source_admission_precedes_destination_and_backend_checks() {
+        for with_backend in [false, true] {
+            for destination in ["s3", "http", "none"] {
+                let (mut svc, _disk, _tmp) = firehose_with_disk_s3("fh-bucket");
+                if !with_backend {
+                    svc = service();
+                }
+                let mut body = kinesis_source_body("source-stream");
+                if destination != "s3" {
+                    body["ExtendedS3DestinationConfiguration"] = Value::Null;
+                }
+                if destination == "http" {
+                    body["HttpEndpointDestinationConfiguration"] = json!({
+                        "EndpointConfiguration": { "Url": "https://example.com/ingest" },
+                        "RoleARN": "arn:aws:iam::123456789012:role/fh",
+                    });
+                }
+                svc.create_delivery_stream(&request("CreateDeliveryStream", body))
+                    .unwrap();
+                for action in ["PutRecord", "PutRecordBatch"] {
+                    let req = record_request(action, "source-stream");
+                    let result = if action == "PutRecord" {
+                        svc.put_record(&req)
+                    } else {
+                        svc.put_record_batch(&req)
+                    };
+                    assert_source_rejected(result.err().expect("source admission is required"));
+                }
+                for datas in [vec![], vec![b"x".to_vec()]] {
+                    assert_source_rejected(
+                        svc.deliver_records(S3_ACCOUNT, "us-east-1", "source-stream", datas)
+                            .expect_err("shared delivery must reject before backend checks"),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn internal_delivery_hook_rejects_kinesis_source_without_s3_side_effects() {
+        use fakecloud_core::delivery::FirehoseDelivery;
+
+        let (svc, disk, _tmp) = firehose_with_disk_s3("fh-bucket");
+        svc.create_delivery_stream(&request(
+            "CreateDeliveryStream",
+            kinesis_source_body("source-stream"),
+        ))
+        .unwrap();
+        create_s3_stream(&svc, "direct-stream", "fh-bucket");
+        let hook = crate::delivery::FirehoseDeliveryImpl::new(
+            svc.shared_state(),
+            svc.s3.as_ref().unwrap().clone(),
+        );
+        hook.set_s3_store(disk.clone());
+
+        hook.put_record(
+            "arn:aws:firehose:us-east-1:123456789012:deliverystream/source-stream",
+            b"must not deliver",
+        );
+        assert_source_bucket_empty(&svc, disk.as_ref());
+
+        hook.put_record(
+            "arn:aws:firehose:us-east-1:123456789012:deliverystream/direct-stream",
+            b"x",
+        );
+        let s3 = svc.s3.as_ref().unwrap().read();
+        let objects = &s3.get(S3_ACCOUNT).unwrap().buckets["fh-bucket"].objects;
+        assert_eq!(objects.len(), 1, "DirectPut hook still delivers");
+        assert_eq!(objects.values().next().unwrap().size, 1);
+        assert_eq!(disk.load().unwrap().buckets["fh-bucket"].objects.len(), 1);
+    }
+
+    #[test]
+    fn source_admission_is_account_and_region_isolated_for_same_names() {
+        let svc = service();
+        let scopes = [
+            (S3_ACCOUNT, "us-east-1", "KinesisStreamAsSource"),
+            (S3_ACCOUNT, "us-west-2", "DirectPut"),
+            ("222222222222", "us-east-1", "DirectPut"),
+            ("222222222222", "us-west-2", "KinesisStreamAsSource"),
+        ];
+        for (account, region, stream_type) in scopes {
+            let mut req = request(
+                "CreateDeliveryStream",
+                json!({ "DeliveryStreamName": "same-name", "DeliveryStreamType": stream_type }),
+            );
+            req.account_id = account.to_string();
+            req.region = region.to_string();
+            svc.create_delivery_stream(&req).unwrap();
+        }
+        for (account, region, stream_type) in scopes {
+            for action in ["PutRecord", "PutRecordBatch"] {
+                let mut req = record_request(action, "same-name");
+                req.account_id = account.to_string();
+                req.region = region.to_string();
+                let result = if action == "PutRecord" {
+                    svc.put_record(&req)
+                } else {
+                    svc.put_record_batch(&req)
+                };
+                if stream_type == "DirectPut" {
+                    assert_eq!(result.unwrap().status, StatusCode::OK);
+                } else {
+                    assert_source_rejected(result.err().expect("scoped source stream rejects"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn record_admission_preserves_scoped_resource_not_found() {
+        let svc = service();
+        svc.create_delivery_stream(&request(
+            "CreateDeliveryStream",
+            kinesis_source_body("source-stream"),
+        ))
+        .unwrap();
+        for (account, region, name) in [
+            ("222222222222", "us-east-1", "source-stream"),
+            (S3_ACCOUNT, "us-west-2", "source-stream"),
+            (S3_ACCOUNT, "us-east-1", "missing-stream"),
+        ] {
+            for action in ["PutRecord", "PutRecordBatch"] {
+                let mut req = record_request(action, name);
+                req.account_id = account.to_string();
+                req.region = region.to_string();
+                let result = if action == "PutRecord" {
+                    svc.put_record(&req)
+                } else {
+                    svc.put_record_batch(&req)
+                };
+                let err = result.err().expect("stream is absent in this scope");
+                assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+                assert_eq!(err.code(), "ResourceNotFoundException");
+                assert_eq!(err.message(), format!("DeliveryStream {name} not found"));
+            }
+            let err = svc
+                .deliver_records(account, region, name, vec![])
+                .expect_err("shared delivery also checks scoped existence");
+            assert_eq!(err.code(), "ResourceNotFoundException");
+        }
+    }
+
+    #[test]
+    fn direct_put_record_and_batch_keep_success_and_partial_failure_behavior() {
+        let (svc, disk, _tmp) = firehose_with_disk_s3("fh-bucket");
+        create_s3_stream(&svc, "direct-stream", "fh-bucket");
+        let resp = svc
+            .put_record(&record_request("PutRecord", "direct-stream"))
+            .unwrap();
+        assert_eq!(resp.status, StatusCode::OK);
+        let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        assert!(!body["RecordId"].as_str().unwrap().is_empty());
+
+        for (records, failed) in [
+            (json!([{ "Data": "eA==" }, { "Data": "@@@" }]), 1),
+            (json!([{ "Data": "@@@" }]), 1),
+            (json!([]), 0),
+        ] {
+            let resp = svc
+                .put_record_batch(&request(
+                    "PutRecordBatch",
+                    json!({ "DeliveryStreamName": "direct-stream", "Records": records }),
+                ))
+                .unwrap();
+            assert_eq!(resp.status, StatusCode::OK);
+            let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+            assert_eq!(body["FailedPutCount"], failed);
+            assert_eq!(
+                body["RequestResponses"].as_array().unwrap().len(),
+                records.as_array().unwrap().len()
+            );
+            if records.as_array().unwrap().len() == 2 {
+                assert!(!body["RequestResponses"][0]["RecordId"]
+                    .as_str()
+                    .unwrap()
+                    .is_empty());
+                assert_eq!(
+                    body["RequestResponses"][1]["ErrorCode"],
+                    "InvalidArgumentException"
+                );
+            }
+        }
+        let s3 = svc.s3.as_ref().unwrap().read();
+        assert_eq!(
+            s3.get(S3_ACCOUNT).unwrap().buckets["fh-bucket"]
+                .objects
+                .len(),
+            2
+        );
+        assert_eq!(disk.load().unwrap().buckets["fh-bucket"].objects.len(), 2);
+    }
+
+    #[test]
+    fn delivery_preserves_binary_bytes_and_producer_delimiters() {
+        let (svc, disk, _tmp) = firehose_with_disk_s3("fh-bytes");
+        create_s3_stream(&svc, "verbatim", "fh-bytes");
+        svc.deliver_records(
+            S3_ACCOUNT,
+            "us-east-1",
+            "verbatim",
+            vec![b"abc".to_vec(), b"def\n".to_vec(), vec![0, 255]],
+        )
+        .unwrap();
+
+        let s3 = svc.s3.as_ref().unwrap().read();
+        let bucket = &s3.get(S3_ACCOUNT).unwrap().buckets["fh-bytes"];
+        assert_eq!(bucket.objects.len(), 1);
+        let object = bucket.objects.values().next().unwrap();
+        assert_eq!(
+            disk.open_object_body(&object.body).unwrap().as_ref(),
+            b"abcdef\n\x00\xff"
+        );
+        assert_eq!(object.size, 9);
+        // S3 stores the bare MD5 hex (GetObject/HeadObject/List add the quotes),
+        // as for any single-part PutObject.
+        assert_eq!(object.etag, "7d2ae660248a023760f924dd991e2533");
+    }
+
+    #[test]
+    fn delivery_names_use_stream_version_utc_and_custom_extension() {
+        for (prefix, extension) in [
+            (None, None),
+            (Some("events/"), Some(".custom.log")),
+            (Some("events"), Some("")),
+            (Some("../logical/"), Some(".log")),
+        ] {
+            let (svc, disk, _tmp) = firehose_with_disk_s3("fh-names");
+            create_s3_stream(&svc, "named", "fh-names");
+            let destination_id = svc
+                .state
+                .read()
+                .get(S3_ACCOUNT)
+                .unwrap()
+                .streams("us-east-1")
+                .unwrap()["named"]
+                .destination
+                .as_ref()
+                .unwrap()
+                .destination_id
+                .clone();
+            let mut update = json!({});
+            if let Some(prefix) = prefix {
+                update["Prefix"] = json!(prefix);
+            }
+            if let Some(extension) = extension {
+                update["FileExtension"] = json!(extension);
+            }
+            svc.update_destination(&request(
+                "UpdateDestination",
+                json!({
+                    "DeliveryStreamName": "named",
+                    "CurrentDeliveryStreamVersionId": "1",
+                    "DestinationId": destination_id,
+                    "ExtendedS3DestinationUpdate": update
+                }),
+            ))
+            .unwrap();
+            svc.deliver_records(S3_ACCOUNT, "us-east-1", "named", vec![b"x".to_vec()])
+                .unwrap();
+
+            let s3 = svc.s3.as_ref().unwrap().read();
+            let bucket = &s3.get(S3_ACCOUNT).unwrap().buckets["fh-names"];
+            let object = bucket.objects.values().next().unwrap();
+            let expected_start = format!(
+                "{}{}named-2-{}-",
+                prefix.unwrap_or_default(),
+                object.last_modified.format("%Y/%m/%d/%H/"),
+                object.last_modified.format("%Y-%m-%d-%H-%M-%S"),
+            );
+            let uuid_and_extension = object
+                .key
+                .strip_prefix(&expected_start)
+                .expect("key must contain UTC hierarchy and stream/version/time suffix");
+            let uuid = uuid_and_extension
+                .strip_suffix(extension.unwrap_or_default())
+                .unwrap();
+            assert_eq!(uuid.len(), 36);
+            assert_eq!(Uuid::parse_str(uuid).unwrap().to_string(), uuid);
+            assert_eq!(disk.open_object_body(&object.body).unwrap().as_ref(), b"x");
+        }
+    }
+
+    #[test]
+    fn internal_delivery_preserves_exact_bytes() {
+        use fakecloud_core::delivery::FirehoseDelivery;
+
+        let (svc, disk, _tmp) = firehose_with_disk_s3("fh-hook");
+        create_s3_stream(&svc, "hook", "fh-hook");
+        let hook =
+            crate::FirehoseDeliveryImpl::new(svc.shared_state(), svc.s3.as_ref().unwrap().clone());
+        hook.set_s3_store(disk.clone());
+        hook.put_record(
+            "arn:aws:firehose:us-east-1:123456789012:deliverystream/hook",
+            b"\x00\xff",
+        );
+
+        let s3 = svc.s3.as_ref().unwrap().read();
+        let bucket = &s3.get(S3_ACCOUNT).unwrap().buckets["fh-hook"];
+        assert_eq!(bucket.objects.len(), 1);
+        assert_eq!(
+            disk.open_object_body(&bucket.objects.values().next().unwrap().body)
+                .unwrap()
+                .as_ref(),
+            b"\x00\xff"
+        );
+    }
+
+    #[test]
+    fn empty_delivery_does_not_create_an_object() {
+        let (svc, _disk, _tmp) = firehose_with_disk_s3("fh-empty");
+        create_s3_stream(&svc, "empty", "fh-empty");
+        svc.deliver_records(S3_ACCOUNT, "us-east-1", "empty", vec![vec![], vec![]])
+            .unwrap();
+        let s3 = svc.s3.as_ref().unwrap().read();
+        assert!(s3.get(S3_ACCOUNT).unwrap().buckets["fh-empty"]
+            .objects
+            .is_empty());
+    }
+
+    fn s3_destination_with(extra: Value) -> Value {
+        let mut value = json!({
+            "RoleARN": "arn:aws:iam::123456789012:role/fh",
+            "BucketARN": "arn:aws:s3:::bucket",
+        });
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        value
+    }
+
+    #[test]
+    fn file_extension_validation_boundaries() {
+        let longest = format!(".{}", "a".repeat(127));
+        for valid in ["", ".log", ".custom.log", ".a0!-_.*'()", longest.as_str()] {
+            let dest = parse_s3_destination(&s3_destination_with(json!({"FileExtension": valid})))
+                .unwrap()
+                .unwrap();
+            assert_eq!(dest.file_extension.as_deref(), Some(valid));
+        }
+        let too_long = format!(".{}", "a".repeat(128));
+        for invalid in [
+            json!("log"),
+            json!("."),
+            json!(".UPPER"),
+            json!(".é"),
+            json!(".a/b"),
+            json!(".a b"),
+            json!(too_long),
+            json!(1),
+            json!(true),
+        ] {
+            let err = parse_s3_destination(&s3_destination_with(json!({"FileExtension": invalid})))
+                .err()
+                .unwrap_or_else(|| panic!("FileExtension {invalid} must be rejected"));
+            assert_eq!(err.code(), "InvalidArgumentException");
+            assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[test]
+    fn update_destination_rejects_invalid_file_extension_without_changes() {
+        let svc = service();
+        let dest_id = create_ver_stream(&svc);
+        for invalid in [json!(".UPPER"), json!("log"), json!(7)] {
+            let err = svc
+                .update_destination(&request(
+                    "UpdateDestination",
+                    json!({
+                        "DeliveryStreamName": "ver-stream",
+                        "CurrentDeliveryStreamVersionId": "1",
+                        "DestinationId": dest_id,
+                        "ExtendedS3DestinationUpdate": {"Prefix": "changed/", "FileExtension": invalid}
+                    }),
+                ))
+                .err()
+                .unwrap_or_else(|| panic!("FileExtension {invalid} must be rejected"));
+            assert_eq!(err.code(), "InvalidArgumentException");
+        }
+        let after = describe(&svc, "ver-stream");
+        assert_eq!(after["VersionId"], "1");
+        let ext = &after["Destinations"][0]["ExtendedS3DestinationDescription"];
+        assert!(ext.get("Prefix").is_none(), "{after}");
+        assert!(ext.get("FileExtension").is_none(), "{after}");
+    }
+
+    fn create_stream_with_processing(
+        svc: &FirehoseService,
+        name: &str,
+        bucket: &str,
+        processing: Value,
+    ) {
+        let mut destination = json!({
+            "RoleARN": "arn:aws:iam::123456789012:role/fh",
+            "BucketARN": format!("arn:aws:s3:::{bucket}"),
+        });
+        if !processing.is_null() {
+            destination["ProcessingConfiguration"] = processing;
+        }
+        svc.create_delivery_stream(&request(
+            "CreateDeliveryStream",
+            json!({"DeliveryStreamName": name, "ExtendedS3DestinationConfiguration": destination}),
+        ))
+        .unwrap();
+    }
+
+    fn delivered_bodies(
+        svc: &FirehoseService,
+        disk: &fakecloud_persistence::s3::DiskS3Store,
+        bucket: &str,
+    ) -> Vec<Vec<u8>> {
+        let s3 = svc.s3.as_ref().unwrap().read();
+        let mut bodies: Vec<Vec<u8>> = s3.get(S3_ACCOUNT).unwrap().buckets[bucket]
+            .objects
+            .values()
+            .map(|object| disk.open_object_body(&object.body).unwrap().to_vec())
+            .collect();
+        bodies.sort();
+        bodies
+    }
+
+    /// AWS: "If you want to add a new line delimiter between records in objects
+    /// that are delivered to Amazon S3, choose AppendDelimiterToRecord as a
+    /// processor type." Applied per record (after each one), for API and
+    /// internal (Logs/SES) deliveries alike; other processors are not run.
+    #[test]
+    fn append_delimiter_processor_terminates_every_record() {
+        use fakecloud_core::delivery::FirehoseDelivery;
+
+        let (svc, disk, _tmp) = firehose_with_disk_s3("fh-delim");
+        create_stream_with_processing(
+            &svc,
+            "delim",
+            "fh-delim",
+            json!({"Enabled": true, "Processors": [
+                {"Type": "Lambda", "Parameters": [{"ParameterName": "LambdaArn", "ParameterValue": "arn:aws:lambda:us-east-1:123456789012:function:f"}]},
+                {"Type": "AppendDelimiterToRecord", "Parameters": [{"ParameterName": "Delimiter", "ParameterValue": "\\n"}]}
+            ]}),
+        );
+        svc.deliver_records(
+            S3_ACCOUNT,
+            "us-east-1",
+            "delim",
+            vec![b"a".to_vec(), b"b\n".to_vec(), vec![0, 255]],
+        )
+        .unwrap();
+        svc.deliver_records(S3_ACCOUNT, "us-east-1", "delim", vec![vec![]])
+            .unwrap();
+        let hook =
+            crate::FirehoseDeliveryImpl::new(svc.shared_state(), svc.s3.as_ref().unwrap().clone());
+        hook.set_s3_store(disk.clone());
+        hook.put_record(
+            "arn:aws:firehose:us-east-1:123456789012:deliverystream/delim",
+            b"{\"internal\":true}",
+        );
+
+        assert_eq!(
+            delivered_bodies(&svc, &disk, "fh-delim"),
+            vec![
+                b"\n".to_vec(),
+                b"a\nb\n\n\x00\xff\n".to_vec(),
+                b"{\"internal\":true}\n".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn append_delimiter_requires_an_enabled_processing_configuration() {
+        for processing in [
+            Value::Null,
+            json!({"Enabled": false, "Processors": [{"Type": "AppendDelimiterToRecord"}]}),
+            json!({"Processors": [{"Type": "AppendDelimiterToRecord"}]}),
+            json!({"Enabled": true, "Processors": [{"Type": "Lambda"}]}),
+            json!({"Enabled": true}),
+        ] {
+            let (svc, disk, _tmp) = firehose_with_disk_s3("fh-raw");
+            create_stream_with_processing(&svc, "raw", "fh-raw", processing.clone());
+            svc.deliver_records(
+                S3_ACCOUNT,
+                "us-east-1",
+                "raw",
+                vec![b"a".to_vec(), b"b".to_vec()],
+            )
+            .unwrap();
+            assert_eq!(
+                delivered_bodies(&svc, &disk, "fh-raw"),
+                vec![b"ab".to_vec()],
+                "{processing}"
+            );
+        }
+    }
+
+    #[test]
+    fn put_record_batch_accepts_empty_records_like_put_record() {
+        let (svc, disk, _tmp) = firehose_with_disk_s3("fh-empty");
+        create_stream_with_processing(
+            &svc,
+            "delimited",
+            "fh-empty",
+            json!({"Enabled": true, "Processors": [{"Type": "AppendDelimiterToRecord"}]}),
+        );
+        let resp = svc
+            .put_record_batch(&request(
+                "PutRecordBatch",
+                json!({
+                    "DeliveryStreamName": "delimited",
+                    "Records": [{ "Data": "YQ==" }, { "Data": "" }]
+                }),
+            ))
+            .unwrap();
+        let body: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+        assert_eq!(body["FailedPutCount"], 0);
+        assert_eq!(
+            delivered_bodies(&svc, &disk, "fh-empty"),
+            vec![b"a\n\n".to_vec()]
+        );
     }
 
     #[test]

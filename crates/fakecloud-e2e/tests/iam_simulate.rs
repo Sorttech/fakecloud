@@ -348,3 +348,87 @@ async fn simulate_custom_policy_resolves_policy_variables_from_context_entries()
         "implicitDeny"
     );
 }
+
+#[tokio::test]
+async fn simulate_custom_policy_honors_resource_policy_and_pages_results() {
+    let server = TestServer::start().await;
+    let iam = server.iam_client().await;
+    let caller = "arn:aws:iam::123456789012:user/alice";
+    let grant = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::123456789012:user/alice"},"Action":"s3:GetObject","Resource":"*"}]}"#;
+    let unrelated = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"sqs:SendMessage","Resource":"*"}]}"#;
+
+    // Same-account resource policy grant allows on its own.
+    let resp = iam
+        .simulate_custom_policy()
+        .policy_input_list(unrelated)
+        .action_names("s3:GetObject")
+        .resource_arns("arn:aws:s3:::bucket/key")
+        .resource_policy(grant)
+        .caller_arn(caller)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.evaluation_results()[0].eval_decision().as_str(),
+        "allowed"
+    );
+
+    // Owned by another account: identity must grant too.
+    let resp = iam
+        .simulate_custom_policy()
+        .policy_input_list(unrelated)
+        .action_names("s3:GetObject")
+        .resource_arns("arn:aws:s3:::bucket/key")
+        .resource_policy(grant)
+        .caller_arn(caller)
+        .resource_owner("arn:aws:iam::999999999999:root")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.evaluation_results()[0].eval_decision().as_str(),
+        "implicitDeny"
+    );
+
+    // MaxItems pages the results; Marker resumes.
+    let page1 = iam
+        .simulate_custom_policy()
+        .policy_input_list(ALLOW_S3_GET)
+        .action_names("s3:GetObject")
+        .action_names("s3:PutObject")
+        .action_names("s3:DeleteObject")
+        .max_items(2)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page1.evaluation_results().len(), 2);
+    assert!(page1.is_truncated());
+    let page2 = iam
+        .simulate_custom_policy()
+        .policy_input_list(ALLOW_S3_GET)
+        .action_names("s3:GetObject")
+        .action_names("s3:PutObject")
+        .action_names("s3:DeleteObject")
+        .max_items(2)
+        .marker(page1.marker().unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page2.evaluation_results().len(), 1);
+    assert_eq!(
+        page2.evaluation_results()[0].eval_action_name(),
+        "s3:DeleteObject"
+    );
+    assert!(!page2.is_truncated());
+
+    // An unknown EC2 scenario is rejected.
+    let err = iam
+        .simulate_custom_policy()
+        .policy_input_list(ALLOW_S3_GET)
+        .action_names("s3:GetObject")
+        .resource_handling_option("EC2-Bogus")
+        .send()
+        .await
+        .expect_err("unknown ResourceHandlingOption must be rejected");
+    assert_eq!(err.into_service_error().meta().code(), Some("InvalidInput"));
+}

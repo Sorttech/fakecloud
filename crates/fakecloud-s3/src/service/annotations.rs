@@ -15,12 +15,28 @@ use fakecloud_core::service::{AwsRequest, AwsResponse, AwsServiceError};
 
 use crate::state::ObjectAnnotation;
 
-use super::{no_such_bucket, no_such_key, s3_xml, xml_escape, S3Service};
+use super::{
+    etag_matches, no_such_bucket, no_such_key, precondition_failed, s3_xml, xml_escape, S3Object,
+    S3Service,
+};
 
 /// AWS caps an object at 50 annotations.
 const MAX_ANNOTATIONS_PER_OBJECT: usize = 50;
 /// `AnnotationName` is capped at 255 characters.
 const MAX_ANNOTATION_NAME_LEN: usize = 255;
+/// Wire name of the `AnnotationName` `@httpQuery` member. S3 query keys are
+/// case-sensitive, so the member name (`AnnotationName`) is not accepted.
+pub(super) const ANNOTATION_NAME_QUERY: &str = "annotationName";
+/// Wire names of ListObjectAnnotations' `@httpQuery` paging inputs.
+pub(super) const MAX_ANNOTATION_RESULTS_QUERY: &str = "max-annotation-results";
+pub(super) const ANNOTATION_PREFIX_QUERY: &str = "annotation-prefix";
+pub(super) const CONTINUATION_TOKEN_QUERY: &str = "continuation-token";
+/// `ObjectIfMatch`: Put/DeleteObjectAnnotation only proceed when the target
+/// object version's ETag matches.
+const OBJECT_IF_MATCH_HEADER: &str = "x-amz-object-if-match";
+/// The annotation ops report the object version under this header, not the
+/// `x-amz-version-id` the object ops use.
+const OBJECT_VERSION_ID_HEADER: &str = "x-amz-object-version-id";
 
 fn invalid_annotation_name(reason: &str) -> AwsServiceError {
     AwsServiceError::aws_error(StatusCode::BAD_REQUEST, "InvalidAnnotationName", reason)
@@ -40,7 +56,7 @@ fn no_such_annotation(name: &str) -> AwsServiceError {
 fn require_annotation_name(req: &AwsRequest) -> Result<String, AwsServiceError> {
     let name = req
         .query_params
-        .get("AnnotationName")
+        .get(ANNOTATION_NAME_QUERY)
         .cloned()
         .unwrap_or_default();
     if name.is_empty() {
@@ -63,6 +79,26 @@ fn require_annotation_name(req: &AwsRequest) -> Result<String, AwsServiceError> 
 
 fn annotation_etag(payload: &[u8]) -> String {
     format!("\"{:x}\"", Md5::digest(payload))
+}
+
+/// Enforce `x-amz-object-if-match` against the resolved object version.
+fn check_object_if_match(req: &AwsRequest, obj: &S3Object) -> Result<(), AwsServiceError> {
+    if let Some(condition) = req
+        .headers
+        .get(OBJECT_IF_MATCH_HEADER)
+        .and_then(|v| v.to_str().ok())
+    {
+        if !etag_matches(condition, &obj.etag) {
+            return Err(precondition_failed(OBJECT_IF_MATCH_HEADER));
+        }
+    }
+    Ok(())
+}
+
+fn insert_object_version_id(headers: &mut HeaderMap, version_id: Option<&str>) {
+    if let Some(vid) = version_id.and_then(|v| v.parse().ok()) {
+        headers.insert(OBJECT_VERSION_ID_HEADER, vid);
+    }
 }
 
 impl S3Service {
@@ -89,6 +125,7 @@ impl S3Service {
             .get_mut(bucket)
             .ok_or_else(|| no_such_bucket(bucket))?;
         let obj = resolve_object_mut(b, key, version_id.as_ref())?;
+        check_object_if_match(req, obj)?;
 
         // The cap counts distinct names; overwriting an existing annotation is
         // always allowed.
@@ -121,9 +158,7 @@ impl S3Service {
         if let Ok(v) = etag.parse() {
             headers.insert("ETag", v);
         }
-        if let Some(vid) = object_version_id.as_deref().and_then(|v| v.parse().ok()) {
-            headers.insert("x-amz-version-id", vid);
-        }
+        insert_object_version_id(&mut headers, object_version_id.as_deref());
         let body = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
              <PutObjectAnnotationResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
@@ -174,9 +209,7 @@ impl S3Service {
         {
             headers.insert("Last-Modified", v);
         }
-        if let Some(vid) = obj.version_id.as_deref().and_then(|v| v.parse().ok()) {
-            headers.insert("x-amz-version-id", vid);
-        }
+        insert_object_version_id(&mut headers, obj.version_id.as_deref());
         // `ChecksumMode: ENABLED` asks for the stored checksum back.
         if req
             .headers
@@ -223,15 +256,14 @@ impl S3Service {
             .get_mut(bucket)
             .ok_or_else(|| no_such_bucket(bucket))?;
         let obj = resolve_object_mut(b, key, version_id.as_ref())?;
+        check_object_if_match(req, obj)?;
         // AWS deletes idempotently: removing an annotation that is not there
         // is still a 204, the same way DeleteObject is.
         obj.annotations.remove(&name);
         let object_version_id = obj.version_id.clone();
 
         let mut headers = HeaderMap::new();
-        if let Some(vid) = object_version_id.as_deref().and_then(|v| v.parse().ok()) {
-            headers.insert("x-amz-version-id", vid);
-        }
+        insert_object_version_id(&mut headers, object_version_id.as_deref());
         Ok(AwsResponse {
             status: StatusCode::NO_CONTENT,
             content_type: "application/xml".to_string(),
@@ -250,8 +282,7 @@ impl S3Service {
         let version_id = req.query_params.get("versionId").cloned();
         let prefix = req
             .query_params
-            .get("annotation-prefix")
-            .or_else(|| req.query_params.get("AnnotationPrefix"))
+            .get(ANNOTATION_PREFIX_QUERY)
             .cloned()
             .unwrap_or_default();
         if prefix.chars().any(|c| c.is_control()) {
@@ -261,11 +292,7 @@ impl S3Service {
                 "AnnotationPrefix must not contain control characters",
             ));
         }
-        let max_results = match req
-            .query_params
-            .get("max-annotation-results")
-            .or_else(|| req.query_params.get("MaxAnnotationResults"))
-        {
+        let max_results = match req.query_params.get(MAX_ANNOTATION_RESULTS_QUERY) {
             Some(v) => match v.parse::<i64>() {
                 Ok(n) if (1..=1000).contains(&n) => n as usize,
                 _ => {
@@ -278,11 +305,7 @@ impl S3Service {
             },
             None => 1000,
         };
-        let continuation_token = req
-            .query_params
-            .get("continuation-token")
-            .or_else(|| req.query_params.get("ContinuationToken"))
-            .cloned();
+        let continuation_token = req.query_params.get(CONTINUATION_TOKEN_QUERY).cloned();
 
         let accts = self.state.read();
         let __empty = crate::state::S3State::new(account_id, "us-east-1");
@@ -379,9 +402,7 @@ impl S3Service {
         body.push_str("</ListObjectAnnotationsResult>");
 
         let mut resp = s3_xml(StatusCode::OK, body);
-        if let Some(vid) = obj.version_id.as_deref().and_then(|v| v.parse().ok()) {
-            resp.headers.insert("x-amz-version-id", vid);
-        }
+        insert_object_version_id(&mut resp.headers, obj.version_id.as_deref());
         Ok(resp)
     }
 
@@ -444,5 +465,217 @@ fn resolve_object_mut<'a>(
                 .and_then(|versions| versions.iter_mut().find(|o| matches(o)))
                 .ok_or_else(|| no_such_key(key))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use http::Method;
+
+    use super::*;
+
+    fn req_with_query(pairs: &[(&str, &str)]) -> AwsRequest {
+        super::super::tests::make_request(Method::DELETE, "/annot/k", pairs, b"")
+    }
+
+    fn err_code(res: Result<String, AwsServiceError>) -> String {
+        res.expect_err("expected an error").code().to_string()
+    }
+
+    #[test]
+    fn annotation_name_is_read_from_the_modeled_wire_key() {
+        // The Smithy model binds `AnnotationName` to `@httpQuery("annotationName")`.
+        let req = req_with_query(&[("annotation", ""), (ANNOTATION_NAME_QUERY, "review")]);
+        assert_eq!(require_annotation_name(&req).unwrap(), "review");
+    }
+
+    #[test]
+    fn member_name_spelling_is_not_the_wire_key() {
+        // Query keys are case-sensitive: `AnnotationName=` carries no name.
+        let req = req_with_query(&[("annotation", ""), ("AnnotationName", "review")]);
+        assert_eq!(
+            err_code(require_annotation_name(&req)),
+            "InvalidAnnotationName"
+        );
+    }
+
+    #[test]
+    fn list_reads_only_the_modeled_wire_keys() {
+        // ListObjectAnnotations binds its paging inputs to `max-annotation-results`,
+        // `annotation-prefix` and `continuation-token`; a member-name spelling is
+        // an unrelated query parameter and must be ignored, not honored.
+        let svc = super::super::tests::make_service();
+        let list = |pairs: &[(&str, &str)]| {
+            let req = super::super::tests::make_request(Method::GET, "/annot/k", pairs, b"");
+            match svc.list_object_annotations("123456789012", &req, "annot", "k") {
+                Ok(_) => panic!("bucket does not exist"),
+                Err(e) => e.code().to_string(),
+            }
+        };
+        assert_eq!(
+            list(&[("annotation", ""), (MAX_ANNOTATION_RESULTS_QUERY, "0")]),
+            "InvalidArgument"
+        );
+        assert_eq!(
+            list(&[("annotation", ""), ("MaxAnnotationResults", "0")]),
+            "NoSuchBucket"
+        );
+        assert_eq!(
+            list(&[("annotation", ""), (ANNOTATION_PREFIX_QUERY, "a\u{1}")]),
+            "InvalidPrefix"
+        );
+        assert_eq!(
+            list(&[("annotation", ""), ("AnnotationPrefix", "a\u{1}")]),
+            "NoSuchBucket"
+        );
+    }
+
+    // --- checksums, digests and the object precondition ---------------------
+
+    use super::super::tests::{make_service, seed_bucket, seed_object};
+
+    const ACCOUNT: &str = "123456789012";
+
+    fn annotation_req(
+        method: Method,
+        name: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> AwsRequest {
+        let mut req = super::super::tests::make_request(
+            method,
+            "/annot/k",
+            &[("annotation", ""), (ANNOTATION_NAME_QUERY, name)],
+            body,
+        );
+        for (k, v) in headers {
+            req.headers
+                .insert(k.parse::<http::HeaderName>().unwrap(), v.parse().unwrap());
+        }
+        req
+    }
+
+    fn seeded() -> S3Service {
+        let svc = make_service();
+        seed_bucket(&svc, "annot");
+        seed_object(&svc, "annot", "k", b"object body");
+        svc
+    }
+
+    fn header(resp: &AwsResponse, name: &str) -> Option<String> {
+        resp.headers
+            .get(name)
+            .map(|v| v.to_str().unwrap().to_string())
+    }
+
+    fn expect_err(res: Result<AwsResponse, AwsServiceError>) -> AwsServiceError {
+        match res {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => e,
+        }
+    }
+
+    fn object_etag(svc: &S3Service) -> String {
+        svc.state.read().get(ACCOUNT).unwrap().buckets["annot"].objects["k"]
+            .etag
+            .clone()
+    }
+
+    #[test]
+    fn object_if_match_guards_put_and_delete() {
+        let svc = seeded();
+        let etag = object_etag(&svc);
+        let bare = etag.trim_matches('"').to_string();
+
+        // Put: a mismatching ETag is a 412 and stores nothing.
+        let put = annotation_req(
+            Method::PUT,
+            "n",
+            &[(OBJECT_IF_MATCH_HEADER, "\"0000\"")],
+            b"v1",
+        );
+        let err = expect_err(svc.put_object_annotation(ACCOUNT, &put, "annot", "k"));
+        assert_eq!(err.code(), "PreconditionFailed");
+        assert_eq!(err.status(), StatusCode::PRECONDITION_FAILED);
+        let get = annotation_req(Method::GET, "n", &[], b"");
+        assert_eq!(
+            expect_err(svc.get_object_annotation(ACCOUNT, &get, "annot", "k")).code(),
+            "NoSuchAnnotation"
+        );
+
+        // The object's ETag, quoted or bare, or `*`, lets the write through.
+        for cond in [etag.as_str(), bare.as_str(), "*"] {
+            let put = annotation_req(Method::PUT, "n", &[(OBJECT_IF_MATCH_HEADER, cond)], b"v1");
+            svc.put_object_annotation(ACCOUNT, &put, "annot", "k")
+                .unwrap();
+        }
+
+        // Delete: a mismatch is a 412 and the annotation survives.
+        let del = annotation_req(
+            Method::DELETE,
+            "n",
+            &[(OBJECT_IF_MATCH_HEADER, "\"0000\"")],
+            b"",
+        );
+        let err = expect_err(svc.delete_object_annotation(ACCOUNT, &del, "annot", "k"));
+        assert_eq!(err.code(), "PreconditionFailed");
+        svc.get_object_annotation(ACCOUNT, &get, "annot", "k")
+            .unwrap();
+
+        let del = annotation_req(Method::DELETE, "n", &[(OBJECT_IF_MATCH_HEADER, &etag)], b"");
+        let resp = svc
+            .delete_object_annotation(ACCOUNT, &del, "annot", "k")
+            .unwrap();
+        assert_eq!(resp.status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            expect_err(svc.get_object_annotation(ACCOUNT, &get, "annot", "k")).code(),
+            "NoSuchAnnotation"
+        );
+    }
+
+    #[test]
+    fn object_version_is_reported_under_the_modeled_header() {
+        // Every annotation op reports the object version as
+        // `x-amz-object-version-id`, not the object ops' `x-amz-version-id`.
+        let svc = seeded();
+        svc.state
+            .write()
+            .get_or_create(ACCOUNT)
+            .buckets
+            .get_mut("annot")
+            .unwrap()
+            .objects
+            .get_mut("k")
+            .unwrap()
+            .version_id = Some("v1".to_string());
+
+        let check = |resp: AwsResponse| {
+            assert_eq!(
+                header(&resp, OBJECT_VERSION_ID_HEADER).as_deref(),
+                Some("v1")
+            );
+            assert_eq!(header(&resp, "x-amz-version-id"), None);
+        };
+        let put = annotation_req(Method::PUT, "n", &[], b"v");
+        check(
+            svc.put_object_annotation(ACCOUNT, &put, "annot", "k")
+                .unwrap(),
+        );
+        let get = annotation_req(Method::GET, "n", &[], b"");
+        check(
+            svc.get_object_annotation(ACCOUNT, &get, "annot", "k")
+                .unwrap(),
+        );
+        let list =
+            super::super::tests::make_request(Method::GET, "/annot/k", &[("annotation", "")], b"");
+        check(
+            svc.list_object_annotations(ACCOUNT, &list, "annot", "k")
+                .unwrap(),
+        );
+        let del = annotation_req(Method::DELETE, "n", &[], b"");
+        check(
+            svc.delete_object_annotation(ACCOUNT, &del, "annot", "k")
+                .unwrap(),
+        );
     }
 }

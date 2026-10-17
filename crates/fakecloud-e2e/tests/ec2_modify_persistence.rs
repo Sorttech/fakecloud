@@ -310,3 +310,91 @@ async fn modify_private_dns_name_options_reflected_by_describe_instances() {
     );
     assert_eq!(opts.enable_resource_name_dns_a_record(), Some(true));
 }
+
+#[tokio::test]
+async fn interruptible_capacity_allocation_moves_capacity_between_reservations() {
+    use aws_sdk_ec2::types::CapacityReservationInstancePlatform;
+    let s = TestServer::start().await;
+    let c = s.ec2_client().await;
+
+    let src = c
+        .create_capacity_reservation()
+        .instance_type("t3.micro")
+        .instance_platform(CapacityReservationInstancePlatform::LinuxUnix)
+        .availability_zone("us-east-1a")
+        .instance_count(10)
+        .send()
+        .await
+        .unwrap()
+        .capacity_reservation()
+        .unwrap()
+        .capacity_reservation_id()
+        .unwrap()
+        .to_string();
+
+    let created = c
+        .create_interruptible_capacity_reservation_allocation()
+        .capacity_reservation_id(&src)
+        .instance_count(4)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.source_capacity_reservation_id(), Some(src.as_str()));
+    assert_eq!(created.target_instance_count(), Some(4));
+    assert_eq!(
+        created.interruption_type().map(|t| t.as_str()),
+        Some("adhoc")
+    );
+
+    let all = c.describe_capacity_reservations().send().await.unwrap();
+    let source = all
+        .capacity_reservations()
+        .iter()
+        .find(|r| r.capacity_reservation_id() == Some(src.as_str()))
+        .unwrap();
+    assert_eq!(source.available_instance_count(), Some(6));
+    let alloc = source.interruptible_capacity_allocation().unwrap();
+    assert_eq!(alloc.instance_count(), Some(4));
+    let icr_id = alloc.interruptible_capacity_reservation_id().unwrap();
+    let icr = all
+        .capacity_reservations()
+        .iter()
+        .find(|r| r.capacity_reservation_id() == Some(icr_id))
+        .unwrap();
+    assert_eq!(icr.interruptible(), Some(true));
+    assert_eq!(
+        icr.interruption_info()
+            .and_then(|i| i.source_capacity_reservation_id()),
+        Some(src.as_str())
+    );
+
+    // Reclaim everything; the default zero-size preference cancels it.
+    let updated = c
+        .update_interruptible_capacity_reservation_allocation()
+        .capacity_reservation_id(&src)
+        .target_instance_count(0)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(updated.status().map(|s| s.as_str()), Some("canceled"));
+    let all = c.describe_capacity_reservations().send().await.unwrap();
+    let source = all
+        .capacity_reservations()
+        .iter()
+        .find(|r| r.capacity_reservation_id() == Some(src.as_str()))
+        .unwrap();
+    assert_eq!(source.available_instance_count(), Some(10));
+
+    // A source that does not exist is reported as such.
+    let err = c
+        .create_interruptible_capacity_reservation_allocation()
+        .capacity_reservation_id("cr-0123456789abcdef0")
+        .instance_count(1)
+        .send()
+        .await
+        .expect_err("unknown source must be rejected");
+    assert_eq!(
+        err.into_service_error().meta().code(),
+        Some("InvalidCapacityReservationId.NotFound")
+    );
+}

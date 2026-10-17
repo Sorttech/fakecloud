@@ -2688,7 +2688,7 @@ mod tests {
             .assume_root(&req)
             .err()
             .expect("AssumeRoot must be denied without RootSessions");
-        assert_eq!(err.code(), "AccessDeniedException");
+        assert_eq!(err.code(), "AccessDenied");
     }
 
     #[tokio::test]
@@ -2718,7 +2718,7 @@ mod tests {
             .assume_root(&req)
             .err()
             .expect("cross-account AssumeRoot must be denied when the org disallows it");
-        assert_eq!(err.code(), "AccessDeniedException");
+        assert_eq!(err.code(), "AccessDenied");
     }
 
     #[tokio::test]
@@ -2745,7 +2745,7 @@ mod tests {
             .assume_root(&req)
             .err()
             .expect("cross-account AssumeRoot must be denied without an org resolver");
-        assert_eq!(err.code(), "AccessDeniedException");
+        assert_eq!(err.code(), "AccessDenied");
     }
 
     #[tokio::test]

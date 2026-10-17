@@ -1,6 +1,6 @@
 {
-  "variants_passed": 249449,
-  "total_variants": 249449,
+  "variants_passed": 249849,
+  "total_variants": 249849,
   "per_service": {
     "account": {
       "passed": 412,
@@ -323,8 +323,8 @@
       "total": 2446
     },
     "s3": {
-      "passed": 3668,
-      "total": 3668
+      "passed": 4068,
+      "total": 4068
     },
     "s3tables": {
       "passed": 1645,

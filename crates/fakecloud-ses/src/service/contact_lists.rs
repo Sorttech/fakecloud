@@ -94,12 +94,15 @@ impl SesV2Service {
             .topics
             .iter()
             .map(|t| {
-                json!({
+                let mut topic = json!({
                     "TopicName": t.topic_name,
                     "DisplayName": t.display_name,
-                    "Description": t.description,
                     "DefaultSubscriptionStatus": t.default_subscription_status,
-                })
+                });
+                if let Some(d) = t.description.as_deref().filter(|d| !d.is_empty()) {
+                    topic["Description"] = json!(d);
+                }
+                topic
             })
             .collect();
 

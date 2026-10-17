@@ -23,4 +23,6 @@ pub mod rfc2047;
 pub mod service;
 pub mod tag_index;
 pub mod tags;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod validation;

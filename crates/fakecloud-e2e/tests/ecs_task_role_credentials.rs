@@ -38,7 +38,10 @@ fn require_docker_or_skip(test: &str) -> bool {
 }
 
 async fn wait_status(ecs: &aws_sdk_ecs::Client, cluster: &str, arn: &str, want: &str) {
-    for _ in 0..240 {
+    // Long enough for the first task-role task's helper image build, which
+    // may retry once after a stalled package mirror (see `task_creds`).
+    let mut last = None;
+    for _ in 0..600 {
         let desc = ecs
             .describe_tasks()
             .cluster(cluster)
@@ -46,21 +49,25 @@ async fn wait_status(ecs: &aws_sdk_ecs::Client, cluster: &str, arn: &str, want: 
             .send()
             .await
             .unwrap();
-        let status = desc.tasks()[0]
-            .last_status()
-            .unwrap_or_default()
-            .to_string();
+        let task = desc.tasks()[0].clone();
+        let status = task.last_status().unwrap_or_default().to_string();
         if status == want {
             return;
         }
         assert!(
             want != "RUNNING" || status != "STOPPED",
-            "task {arn} stopped before running: {:?}",
-            desc.tasks()[0].stopped_reason()
+            "task {arn} stopped before running: {}",
+            helpers::ecs_task_summary(&task)
         );
+        last = Some(task);
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    panic!("task {arn} never reached {want}");
+    panic!(
+        "task {arn} never reached {want}; last seen: {}",
+        last.as_ref()
+            .map(helpers::ecs_task_summary)
+            .unwrap_or_default()
+    );
 }
 
 async fn fetch_creds(server: &TestServer, task_id: &str) -> (u16, serde_json::Value) {

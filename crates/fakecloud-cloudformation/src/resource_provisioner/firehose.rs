@@ -5,6 +5,21 @@
 
 use super::*;
 
+/// CFN currently provisions the classic and Extended S3 configurations. Check
+/// their enum inputs, including the backup blocks, with the same validator the
+/// Firehose API uses before parsing or locking state; the CFN parser otherwise
+/// silently discards non-string enum values.
+fn validate_firehose_compression(props: &serde_json::Value) -> Result<(), String> {
+    for member in [
+        "S3DestinationConfiguration",
+        "ExtendedS3DestinationConfiguration",
+    ] {
+        fakecloud_firehose::validate_s3_destination_compression(&props[member], false)
+            .map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
 impl ResourceProvisioner {
     // --- Firehose ---
 
@@ -13,6 +28,7 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
+        validate_firehose_compression(props)?;
         let generated_name = self.physical_name(resource);
         let name = props
             .get("DeliveryStreamName")
@@ -94,6 +110,7 @@ impl ResourceProvisioner {
         resource: &ResourceDefinition,
     ) -> Result<ProvisionResult, String> {
         let props = &resource.properties;
+        validate_firehose_compression(props)?;
         let name = existing.physical_id.clone();
 
         let has_s3 = props.get("S3DestinationConfiguration").is_some();
@@ -152,5 +169,267 @@ impl ResourceProvisioner {
         let account = state.get_or_create(&self.account_id, &self.region);
         account.streams_mut(&self.region).remove(physical_id);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{make_provisioner, make_resource};
+    use super::*;
+    use serde_json::{json, Value};
+
+    fn delivery_stream(extended_s3: Value) -> ResourceDefinition {
+        make_resource(
+            "AWS::KinesisFirehose::DeliveryStream",
+            "Firehose",
+            json!({
+                "DeliveryStreamName": "events",
+                "ExtendedS3DestinationConfiguration": extended_s3,
+            }),
+        )
+    }
+
+    fn destination(file_extension: Value) -> Value {
+        json!({
+            "RoleARN": "arn:aws:iam::123456789012:role/fh",
+            "BucketARN": "arn:aws:s3:::bucket",
+            "FileExtension": file_extension,
+        })
+    }
+
+    fn stored_file_extension(prov: &ResourceProvisioner) -> Option<String> {
+        prov.firehose_state
+            .read()
+            .get("123456789012")
+            .unwrap()
+            .streams("us-east-1")
+            .unwrap()["events"]
+            .destination
+            .as_ref()
+            .unwrap()
+            .file_extension
+            .clone()
+    }
+
+    #[test]
+    fn firehose_cfn_stores_file_extension_on_create_and_update() {
+        let prov = make_provisioner();
+        let existing = prov
+            .create_resource(&delivery_stream(destination(json!(".json"))))
+            .unwrap();
+        assert_eq!(stored_file_extension(&prov).as_deref(), Some(".json"));
+
+        prov.update_resource(&existing, &delivery_stream(destination(json!(".log"))))
+            .unwrap();
+        assert_eq!(stored_file_extension(&prov).as_deref(), Some(".log"));
+    }
+
+    #[test]
+    fn firehose_cfn_rejects_invalid_file_extension() {
+        let prov = make_provisioner();
+        for invalid in [json!("json"), json!(".JSON"), json!(1)] {
+            let err = prov
+                .create_resource(&delivery_stream(destination(invalid.clone())))
+                .expect_err("invalid FileExtension must fail the resource");
+            assert!(err.contains("FileExtension"), "{err}");
+        }
+        let existing = prov
+            .create_resource(&delivery_stream(destination(json!(".json"))))
+            .unwrap();
+        let err = prov
+            .update_resource(&existing, &delivery_stream(destination(json!(".JSON"))))
+            .expect_err("invalid FileExtension must fail the update");
+        assert!(err.contains("FileExtension"), "{err}");
+        assert_eq!(stored_file_extension(&prov).as_deref(), Some(".json"));
+    }
+    #[test]
+    fn firehose_cfn_stores_processing_configuration_on_create_and_update() {
+        let prov = make_provisioner();
+        let with_processing = |enabled: Value| {
+            json!({
+                "RoleARN": "arn:aws:iam::123456789012:role/fh",
+                "BucketARN": "arn:aws:s3:::bucket",
+                "ProcessingConfiguration": {
+                    "Enabled": enabled,
+                    "Processors": [{"Type": "AppendDelimiterToRecord"}]
+                }
+            })
+        };
+        let stored = |prov: &ResourceProvisioner| {
+            prov.firehose_state
+                .read()
+                .get("123456789012")
+                .unwrap()
+                .streams("us-east-1")
+                .unwrap()["events"]
+                .destination
+                .as_ref()
+                .unwrap()
+                .processing_configuration
+                .clone()
+                .expect("ProcessingConfiguration stored")
+        };
+
+        let existing = prov
+            .create_resource(&delivery_stream(with_processing(json!(true))))
+            .unwrap();
+        assert_eq!(stored(&prov)["Enabled"], json!(true));
+        assert_eq!(
+            stored(&prov)["Processors"][0]["Type"],
+            "AppendDelimiterToRecord"
+        );
+
+        // Template values can arrive as strings; they are stored as booleans.
+        prov.update_resource(&existing, &delivery_stream(with_processing(json!("false"))))
+            .unwrap();
+        assert_eq!(stored(&prov)["Enabled"], json!(false));
+    }
+
+    fn firehose_resource(base: &str) -> ResourceDefinition {
+        let mut props = json!({
+            "DeliveryStreamName": "cfn-compression",
+            "Tags": [{"Key": "env", "Value": "before"}]
+        });
+        props[base] = json!({
+            "RoleARN": "arn:aws:iam::123456789012:role/fh",
+            "BucketARN": "arn:aws:s3:::bucket", "Prefix": "before/"
+        });
+        make_resource("AWS::KinesisFirehose::DeliveryStream", "Stream", props)
+    }
+
+    fn firehose_state(prov: &ResourceProvisioner) -> Value {
+        serde_json::to_value(&*prov.firehose_state.read()).unwrap()
+    }
+
+    #[test]
+    fn firehose_compression_invalid_create_is_resource_failure() {
+        for base in [
+            "S3DestinationConfiguration",
+            "ExtendedS3DestinationConfiguration",
+        ] {
+            for bad in [
+                json!("BROTLI"),
+                json!("SNAPPY"),
+                json!(null),
+                json!(123),
+                json!({}),
+            ] {
+                let prov = make_provisioner();
+                let before = firehose_state(&prov);
+                let mut resource = firehose_resource(base);
+                resource.properties[base]["CompressionFormat"] = bad;
+                let err = prov
+                    .create_resource(&resource)
+                    .expect_err("invalid enum must fail provisioning");
+                assert!(err.contains("CompressionFormat"), "{err}");
+                assert_eq!(firehose_state(&prov), before);
+            }
+        }
+    }
+
+    #[test]
+    fn firehose_compression_invalid_update_preserves_original_stream() {
+        for base in [
+            "S3DestinationConfiguration",
+            "ExtendedS3DestinationConfiguration",
+        ] {
+            let prov = make_provisioner();
+            let resource = firehose_resource(base);
+            let existing = prov.create_resource(&resource).unwrap();
+            let before = firehose_state(&prov);
+            for bad in [json!("BROTLI"), json!("gzip"), json!(false)] {
+                let mut changed = firehose_resource(base);
+                changed.properties[base]["Prefix"] = json!("changed/");
+                changed.properties[base]["CompressionFormat"] = bad;
+                changed.properties["Tags"] = json!([{ "Key": "env", "Value": "changed" }]);
+                assert!(prov.update_resource(&existing, &changed).is_err());
+                assert_eq!(firehose_state(&prov), before);
+            }
+        }
+    }
+
+    #[test]
+    fn firehose_compression_invalid_backup_update_preserves_original_stream() {
+        let prov = make_provisioner();
+        let base = "ExtendedS3DestinationConfiguration";
+        let resource = firehose_resource(base);
+        let existing = prov.create_resource(&resource).unwrap();
+        let before = firehose_state(&prov);
+        let mut changed = firehose_resource(base);
+        changed.properties[base]["Prefix"] = json!("changed/");
+        changed.properties[base]["S3BackupConfiguration"] = json!({"CompressionFormat": 42});
+        assert!(prov.update_resource(&existing, &changed).is_err());
+        assert_eq!(firehose_state(&prov), before);
+    }
+
+    #[test]
+    fn firehose_compression_backup_validated_for_both_s3_shapes() {
+        for base in [
+            "S3DestinationConfiguration",
+            "ExtendedS3DestinationConfiguration",
+        ] {
+            let prov = make_provisioner();
+            let mut resource = firehose_resource(base);
+            resource.properties[base]["S3BackupConfiguration"] =
+                json!({"CompressionFormat": "BROTLI"});
+            let err = prov
+                .create_resource(&resource)
+                .expect_err("invalid backup enum must fail provisioning");
+            assert!(err.contains("CompressionFormat"), "{base}: {err}");
+            assert!(prov.firehose_state.read().accounts.is_empty());
+        }
+    }
+
+    #[test]
+    fn firehose_compression_invalid_backup_create_is_resource_failure() {
+        let prov = make_provisioner();
+        let mut resource = firehose_resource("ExtendedS3DestinationConfiguration");
+        resource.properties["ExtendedS3DestinationConfiguration"]["S3BackupConfiguration"] =
+            json!({"CompressionFormat": "BROTLI"});
+        assert!(prov.create_resource(&resource).is_err());
+        assert!(prov.firehose_state.read().accounts.is_empty());
+    }
+
+    #[test]
+    fn firehose_compression_valid_values_and_defaults_provision() {
+        for base in [
+            "S3DestinationConfiguration",
+            "ExtendedS3DestinationConfiguration",
+        ] {
+            for format in [
+                None,
+                Some("UNCOMPRESSED"),
+                Some("GZIP"),
+                Some("ZIP"),
+                Some("Snappy"),
+                Some("HADOOP_SNAPPY"),
+            ] {
+                let prov = make_provisioner();
+                let mut resource = firehose_resource(base);
+                if let Some(format) = format {
+                    resource.properties[base]["CompressionFormat"] = json!(format);
+                }
+                let existing = prov.create_resource(&resource).unwrap();
+                prov.update_resource(&existing, &resource)
+                    .unwrap()
+                    .expect("in-place update");
+                let state = prov.firehose_state.read();
+                let stream = &state
+                    .get("123456789012")
+                    .unwrap()
+                    .streams("us-east-1")
+                    .unwrap()["cfn-compression"];
+                assert_eq!(
+                    stream
+                        .destination
+                        .as_ref()
+                        .unwrap()
+                        .compression_format
+                        .as_deref(),
+                    format
+                );
+                assert_eq!(stream.version_id, "2");
+            }
+        }
     }
 }

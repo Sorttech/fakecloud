@@ -73,6 +73,7 @@ impl S3Service {
             notification_config,
             region,
             bucket_region,
+            explicit_lock,
         ) = {
             let accts = self.state.read();
             let __empty = crate::state::S3State::new(account_id, "us-east-1");
@@ -104,17 +105,18 @@ impl S3Service {
                 }
             }
 
-            // Object lock: validate that bucket has object lock enabled if lock headers present
-            let has_lock_headers = req.headers.contains_key("x-amz-object-lock-mode")
-                || req
-                    .headers
-                    .contains_key("x-amz-object-lock-retain-until-date")
-                || req.headers.contains_key("x-amz-object-lock-legal-hold");
-            if has_lock_headers && b.object_lock_config.is_none() {
+            // Object lock: explicit lock headers need a bucket with object lock.
+            let explicit_lock =
+                ObjectLockSettings::from_request(&req.headers, b.object_lock_config.as_deref())?;
+            // A PutObject that sets an object lock must carry a payload
+            // integrity check (CopyObject and CreateMultipartUpload need none).
+            if has_object_lock_headers(&req.headers) && !has_payload_integrity_header(&req.headers)
+            {
                 return Err(AwsServiceError::aws_error(
                     StatusCode::BAD_REQUEST,
                     "InvalidRequest",
-                    "Bucket is missing ObjectLockConfiguration",
+                    "Content-MD5 OR x-amz-checksum- HTTP header is required for Put Object \
+                     requests with Object Lock parameters",
                 ));
             }
 
@@ -127,6 +129,7 @@ impl S3Service {
                 b.notification_config.clone(),
                 state.region.clone(),
                 b.region.clone(),
+                explicit_lock,
             )
         }; // read lock dropped
 
@@ -429,52 +432,7 @@ impl S3Service {
         }
 
         // Object lock - explicit headers or bucket default
-        let mut lock_mode = req
-            .headers
-            .get("x-amz-object-lock-mode")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        let mut lock_retain_until = req
-            .headers
-            .get("x-amz-object-lock-retain-until-date")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<DateTime<Utc>>().ok());
-        let lock_legal_hold = req
-            .headers
-            .get("x-amz-object-lock-legal-hold")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-
-        // Apply bucket default lock if no explicit lock headers
-        if lock_mode.is_none() && lock_retain_until.is_none() {
-            if let Some(ref config) = object_lock_config {
-                if let Some(mode) = extract_xml_value(config, "Mode") {
-                    let days = extract_xml_value(config, "Days")
-                        .and_then(|d| d.trim().parse::<i64>().ok());
-                    let years = extract_xml_value(config, "Years")
-                        .and_then(|y| y.trim().parse::<i64>().ok());
-                    // The configuration is range-checked when stored; a value
-                    // persisted before that check must still not overflow.
-                    // Years are calendar years (leap days included), not
-                    // multiples of 365 days.
-                    let now = Utc::now();
-                    let until = match (days, years) {
-                        (Some(d), _) => {
-                            chrono::Duration::try_days(d).and_then(|d| now.checked_add_signed(d))
-                        }
-                        (None, Some(y)) => y
-                            .checked_mul(12)
-                            .and_then(|m| u32::try_from(m).ok())
-                            .and_then(|m| now.checked_add_months(chrono::Months::new(m))),
-                        (None, None) => None,
-                    };
-                    if let Some(until) = until {
-                        lock_mode = Some(mode);
-                        lock_retain_until = Some(until);
-                    }
-                }
-            }
-        }
+        let lock = explicit_lock.or_bucket_default(object_lock_config.as_deref(), Utc::now());
 
         // SSE-KMS: read the spool back into memory so the KMS hook can
         // produce an envelope-encrypted blob (AES-GCM needs the whole
@@ -530,9 +488,9 @@ impl S3Service {
             website_redirect_location,
             checksum_algorithm: checksum_algorithm.clone(),
             checksum_value: checksum_value.clone(),
-            lock_mode,
-            lock_retain_until,
-            lock_legal_hold,
+            lock_mode: lock.mode,
+            lock_retain_until: lock.retain_until,
+            lock_legal_hold: lock.legal_hold,
             ..Default::default()
         };
 
@@ -973,6 +931,19 @@ impl S3Service {
             }
         }
 
+        // Object Lock for the destination: the request's lock headers,
+        // validated as PutObject validates them (and refused on a destination
+        // without object lock). The destination's default retention is applied
+        // at commit. The source object's lock is never carried over -- a copy
+        // is a new object version. A missing destination bucket is reported as
+        // NoSuchBucket at commit.
+        let explicit_lock = match state.buckets.get(dest_bucket) {
+            Some(db) => {
+                ObjectLockSettings::from_request(&req.headers, db.object_lock_config.as_deref())?
+            }
+            None => ObjectLockSettings::default(),
+        };
+
         let etag = src_obj.etag.clone();
         let src_obj_size = src_obj.size;
         let last_modified = Utc::now();
@@ -1172,6 +1143,11 @@ impl S3Service {
             None
         };
 
+        // The destination's current default retention, measured from now, when
+        // the version is created.
+        let dest_lock =
+            explicit_lock.or_bucket_default(db.object_lock_config.as_deref(), Utc::now());
+
         // The destination's ACL comes from this request, never from the source:
         // S3 treats a copy as a new object, so an unspecified ACL is the default
         // private one rather than whatever the source carried.
@@ -1218,6 +1194,9 @@ impl S3Service {
             checksum_algorithm: new_checksum_algo.clone(),
             checksum_value: new_checksum_val.clone(),
             // Lock status is not copied from the source object.
+            lock_mode: dest_lock.mode,
+            lock_retain_until: dest_lock.retain_until,
+            lock_legal_hold: dest_lock.legal_hold,
             ..Default::default()
         };
 

@@ -162,29 +162,69 @@ impl ApiGatewayService {
     }
 
     pub(super) fn update_account(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {
-        let mut accounts = self.state.write();
-        let state = accounts.get_or_create(&request_account(req));
         // UpdateAccount input is { patchOperations: [...] }; the Account
-        // output shape does not include patchOperations. The old code only
-        // copied (non-existent) top-level body fields and so ignored the patch
-        // ops entirely -- cloudwatchRoleArn could never be set (bug-audit
-        // 2026-06-20, 1.21). Apply each op to account_settings instead.
+        // output shape does not include patchOperations. API Gateway lets an
+        // account patch exactly two paths: `replace /cloudwatchRoleArn` and
+        // `add`/`remove /features` (the `UsagePlans` feature). Any other path
+        // or op is a BadRequestException and nothing is applied.
+        let mut ops: Vec<(String, String, Value)> = Vec::new();
         apply_patch_operations(req, |op, path, value| {
-            if op != "replace" && op != "add" && op != "remove" {
-                return;
-            }
-            let key = path.trim_start_matches('/').to_string();
-            if key.is_empty() {
-                return;
-            }
-            if let Some(obj) = state.account_settings.as_object_mut() {
-                if op == "remove" {
-                    obj.remove(&key);
-                } else {
-                    obj.insert(key, value.clone());
+            ops.push((op.to_string(), path.to_string(), value.clone()));
+        });
+        for (op, path, value) in &ops {
+            match (path.as_str(), op.as_str()) {
+                ("/cloudwatchRoleArn", "replace") => {}
+                ("/features", "add" | "remove") => {
+                    if value.as_str() != Some("UsagePlans") {
+                        return Err(bad_request(format!(
+                            "Invalid feature '{}' specified for op '{op}'. Must be one of: [UsagePlans]",
+                            value.as_str().unwrap_or_default()
+                        )));
+                    }
+                }
+                ("/cloudwatchRoleArn" | "/features", _) => {
+                    return Err(bad_request(format!(
+                        "Invalid patch operation specified. Must be one of: [{}] for path '{path}'",
+                        if path == "/features" {
+                            "add, remove"
+                        } else {
+                            "replace"
+                        }
+                    )));
+                }
+                _ => {
+                    return Err(bad_request(format!(
+                        "Invalid patch path '{path}' specified for op '{op}'. Must be one of: [/cloudwatchRoleArn, /features]"
+                    )));
                 }
             }
-        });
+        }
+        let mut accounts = self.state.write();
+        let state = accounts.get_or_create(&request_account(req));
+        let Some(obj) = state.account_settings.as_object_mut() else {
+            return ok(state.account_settings.clone());
+        };
+        for (op, path, value) in ops {
+            if path == "/cloudwatchRoleArn" {
+                // An empty value clears the role.
+                let role = value.as_str().filter(|v| !v.is_empty());
+                obj.insert(
+                    "cloudwatchRoleArn".to_string(),
+                    role.map_or(Value::Null, |r| Value::String(r.to_string())),
+                );
+                continue;
+            }
+            let feature = value.as_str().unwrap_or_default().to_string();
+            let features = obj
+                .entry("features")
+                .or_insert_with(|| Value::Array(Vec::new()));
+            if let Some(list) = features.as_array_mut() {
+                list.retain(|f| f.as_str() != Some(feature.as_str()));
+                if op == "add" {
+                    list.push(Value::String(feature));
+                }
+            }
+        }
         ok(state.account_settings.clone())
     }
 
@@ -1071,5 +1111,98 @@ mod resource_patch_tests {
             .unwrap(),
         );
         assert_eq!(got_other["path"], json!("/store/other"));
+    }
+}
+
+#[cfg(test)]
+mod account_tests {
+    use crate::service::ApiGatewayService;
+    use bytes::Bytes;
+    use fakecloud_core::service::AwsRequest;
+    use http::{HeaderMap, Method};
+    use serde_json::{json, Value};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn svc() -> ApiGatewayService {
+        let state = Arc::new(parking_lot::RwLock::new(
+            fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+        ));
+        ApiGatewayService::new(state)
+    }
+
+    fn req(body: Value) -> AwsRequest {
+        AwsRequest {
+            service: "apigateway".to_string(),
+            action: String::new(),
+            method: Method::PATCH,
+            raw_path: "/account".to_string(),
+            raw_query: String::new(),
+            path_segments: vec![],
+            query_params: HashMap::new(),
+            headers: HeaderMap::new(),
+            body: Bytes::from(serde_json::to_vec(&body).unwrap()),
+            body_stream: parking_lot::Mutex::new(None),
+            account_id: "123456789012".to_string(),
+            region: "us-east-1".to_string(),
+            request_id: "rid".to_string(),
+            is_query_protocol: false,
+            access_key_id: None,
+            principal: None,
+        }
+    }
+
+    fn account(s: &ApiGatewayService) -> Value {
+        let resp = s.get_account(&req(json!({}))).unwrap();
+        serde_json::from_slice(resp.body.expect_bytes()).unwrap()
+    }
+
+    #[test]
+    fn update_account_applies_only_the_patchable_paths() {
+        let s = svc();
+        let role = "arn:aws:iam::123456789012:role/apigw-logs";
+        s.update_account(&req(json!({"patchOperations": [
+            {"op": "replace", "path": "/cloudwatchRoleArn", "value": role},
+            {"op": "add", "path": "/features", "value": "UsagePlans"}
+        ]})))
+        .unwrap();
+        let got = account(&s);
+        assert_eq!(got["cloudwatchRoleArn"], role);
+        assert_eq!(got["features"], json!(["UsagePlans"]));
+
+        // An unknown path is rejected and nothing in the batch is applied.
+        let err = s
+            .update_account(&req(json!({"patchOperations": [
+                {"op": "replace", "path": "/cloudwatchRoleArn", "value": ""},
+                {"op": "replace", "path": "/bogus", "value": "x"}
+            ]})))
+            .err()
+            .expect("unknown patch path must be rejected");
+        assert_eq!(err.code(), "BadRequestException");
+        let got = account(&s);
+        assert_eq!(got["cloudwatchRoleArn"], role);
+        assert!(got.get("bogus").is_none());
+
+        // Wrong op for a known path, and an unknown feature, are rejected too.
+        for bad in [
+            json!({"op": "remove", "path": "/cloudwatchRoleArn"}),
+            json!({"op": "add", "path": "/features", "value": "Other"}),
+        ] {
+            let err = s
+                .update_account(&req(json!({"patchOperations": [bad]})))
+                .err()
+                .expect("invalid patch must be rejected");
+            assert_eq!(err.code(), "BadRequestException");
+        }
+
+        // Clearing the role and removing the feature.
+        s.update_account(&req(json!({"patchOperations": [
+            {"op": "replace", "path": "/cloudwatchRoleArn", "value": ""},
+            {"op": "remove", "path": "/features", "value": "UsagePlans"}
+        ]})))
+        .unwrap();
+        let got = account(&s);
+        assert!(got["cloudwatchRoleArn"].is_null());
+        assert_eq!(got["features"], json!([]));
     }
 }
