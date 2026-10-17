@@ -5,7 +5,7 @@ use fakecloud_core::service::AwsRequest;
 use parking_lot::RwLock;
 use serde_json::{json, Map, Value};
 
-fn svc() -> SageMakerService {
+pub(super) fn svc() -> SageMakerService {
     let state: SharedSageMakerState = Arc::new(RwLock::new(MultiAccountState::new(
         "000000000000",
         "us-east-1",
@@ -40,7 +40,11 @@ fn mk_req(action: &str, body: Value) -> AwsRequest {
     }
 }
 
-fn run(s: &SageMakerService, action: &str, body: Value) -> Result<AwsResponse, AwsServiceError> {
+pub(super) fn run(
+    s: &SageMakerService,
+    action: &str,
+    body: Value,
+) -> Result<AwsResponse, AwsServiceError> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -55,7 +59,7 @@ fn expect_err(r: Result<AwsResponse, AwsServiceError>) -> AwsServiceError {
     }
 }
 
-fn resp_json(resp: &AwsResponse) -> Value {
+pub(super) fn resp_json(resp: &AwsResponse) -> Value {
     match &resp.body {
         fakecloud_core::service::ResponseBody::Bytes(b) => {
             serde_json::from_slice(b).unwrap_or(Value::Null)
