@@ -267,6 +267,11 @@ pub(super) fn service_common_errors(service_name: &str) -> &'static [&'static st
             // A RunInstances secondary interface naming an interface that is
             // already attached.
             "InvalidNetworkInterface.InUse",
+            // A request with `DryRun=true` that would have succeeded: EC2's
+            // documented common client error (HTTP 412), answered from the
+            // permission check before the request is validated
+            // (https://docs.aws.amazon.com/AWSEC2/latest/APIReference/errors-overview.html).
+            "DryRunOperation",
         ],
         // EKS under-declares two client errors that the real API returns for
         // sub-resource operations:

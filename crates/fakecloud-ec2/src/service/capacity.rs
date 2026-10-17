@@ -122,7 +122,10 @@ const INSTANCE_PLATFORMS: &[&str] = &[
 ];
 
 fn cr_xml(r: &CapacityReservation, tags: &[Tag], owner: &str) -> String {
-    let mut extra = String::new();
+    let mut extra = ec2_elem(
+        "reservationType",
+        r.reservation_type.as_deref().unwrap_or("default"),
+    );
     if let Some(e) = &r.end_date {
         extra.push_str(&ec2_elem("endDate", e));
     }
@@ -150,7 +153,7 @@ fn cr_xml(r: &CapacityReservation, tags: &[Tag], owner: &str) -> String {
         ec2_elem("state", &current_state(r, Utc::now())),
         ec2_elem("endDateType", &r.end_date_type),
         ec2_elem("instanceMatchCriteria", &r.instance_match_criteria),
-        ec2_elem("createDate", FIXED_TIME),
+        ec2_elem("createDate", r.create_date.as_deref().unwrap_or(FIXED_TIME)),
         ec2_elem("startDate", r.start_date.as_deref().unwrap_or(FIXED_TIME)),
         super::tags::tag_set_xml(tags),
         extra,
@@ -253,6 +256,8 @@ pub(crate) fn create_capacity_reservation(
         commitment,
         adjustment_status: None,
         adjustment_details: None,
+        reservation_type: None,
+        create_date: None,
         ebs_optimized: req
             .query_params
             .get("EbsOptimized")
@@ -878,79 +883,356 @@ pub(crate) fn modify_instance_capacity_reservation_attributes(
 }
 
 // ---- split / move ----
+//
+// `CreateCapacityReservationBySplitting` carves a new reservation out of an
+// existing one; `MoveCapacityReservationInstances` shifts capacity between two
+// existing reservations. Both follow the EC2 User Guide ("Split off capacity
+// from an existing Capacity Reservation" / "Move capacity between Capacity
+// Reservations") and the API reference:
+//
+// - the source (and, for a move, the destination) must be `active` and owned
+//   by the caller -- reservations are account-scoped here, so another
+//   account's id is simply `InvalidCapacityReservationId.NotFound`;
+// - Capacity Blocks can't be split or moved, nor can a future-dated
+//   reservation during its commitment period;
+// - available capacity is taken first, then used capacity, and used capacity
+//   only moves for `open` reservations (instances launched `open` are the
+//   only eligible ones);
+// - a split may take at most the source's size minus one instance, while a
+//   move may take all of it, which cancels the source;
+// - a move needs the same instance type, platform, Availability Zone,
+//   tenancy and end time on both sides.
 
-fn synth_cr_xml(id: &str, owner: &str, count: i64) -> String {
-    let r = CapacityReservation {
-        id: id.to_string(),
-        instance_type: "t3.micro".to_string(),
-        instance_platform: "Linux/UNIX".to_string(),
-        availability_zone: "us-east-1a".to_string(),
-        tenancy: "default".to_string(),
-        total_instance_count: count,
-        available_instance_count: count,
-        state: "active".to_string(),
-        end_date_type: "unlimited".to_string(),
-        instance_match_criteria: "open".to_string(),
-        ..Default::default()
+/// `UnsupportedOperation` -- the reservation kind does not support the action.
+fn unsupported_operation(message: String) -> AwsServiceError {
+    AwsServiceError::aws_error(
+        http::StatusCode::BAD_REQUEST,
+        "UnsupportedOperation",
+        message,
+    )
+}
+
+/// `DryRunOperation`: the request would have succeeded without `DryRun`.
+fn dry_run_succeeded(req: &AwsRequest) -> Result<(), AwsServiceError> {
+    if req
+        .query_params
+        .get("DryRun")
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+    {
+        return Err(AwsServiceError::aws_error(
+            http::StatusCode::PRECONDITION_FAILED,
+            "DryRunOperation",
+            "Request would have succeeded, but DryRun flag is set.",
+        ));
+    }
+    Ok(())
+}
+
+/// The required `InstanceCount` of a split / move: an integer of at least 1.
+fn transfer_count(req: &AwsRequest) -> Result<i64, AwsServiceError> {
+    let raw = require(&req.query_params, "InstanceCount")?;
+    let count: i64 = raw
+        .parse()
+        .map_err(|_| invalid_parameter_value(format!("Invalid value '{raw}' for InstanceCount")))?;
+    if count < 1 {
+        return Err(invalid_parameter_value(format!(
+            "InstanceCount must be at least 1, got {count}"
+        )));
+    }
+    Ok(count)
+}
+
+/// Check that `r` can give up `count` instances, returning how many of them
+/// come out of its available (unused) capacity; the rest is used capacity.
+/// `max` is the most the action may take (size - 1 for a split, the whole
+/// reservation for a move).
+fn take_capacity(
+    r: &CapacityReservation,
+    role: &str,
+    count: i64,
+    max: i64,
+    now: DateTime<Utc>,
+) -> Result<i64, AwsServiceError> {
+    check_transferable(r, role, now)?;
+    if count > max {
+        return Err(invalid_parameter_value(format!(
+            "InstanceCount {count} exceeds the maximum of {max} instances that can be taken from Capacity Reservation {}",
+            r.id
+        )));
+    }
+    let from_available = count.min(r.available_instance_count.max(0));
+    if count > from_available && r.instance_match_criteria != "open" {
+        return Err(invalid_parameter_value(format!(
+            "Capacity Reservation {} has only {} available instances; used capacity can only be taken from a reservation with open instance eligibility",
+            r.id, r.available_instance_count
+        )));
+    }
+    Ok(from_available)
+}
+
+/// State checks shared by both sides of a split / move.
+fn check_transferable(
+    r: &CapacityReservation,
+    role: &str,
+    now: DateTime<Utc>,
+) -> Result<(), AwsServiceError> {
+    if r.reservation_type.as_deref() == Some("capacity-block") {
+        return Err(unsupported_operation(format!(
+            "The {role} Capacity Reservation {} is a Capacity Block; splitting or moving capacity of a Capacity Block is not supported",
+            r.id
+        )));
+    }
+    let state = current_state(r, now);
+    if state != "active" {
+        return Err(incorrect_state(format!(
+            "The {role} Capacity Reservation {} is in state '{state}'; it must be 'active'",
+            r.id
+        )));
+    }
+    if r.commitment
+        .as_ref()
+        .and_then(|c| parse_ts(&c.commitment_end_date))
+        .is_some_and(|end| end > now)
+    {
+        return Err(incorrect_state(format!(
+            "The {role} Capacity Reservation {} is within its commitment period",
+            r.id
+        )));
+    }
+    Ok(())
+}
+
+/// The `ClientToken` of a split / move, if the caller sent one.
+fn client_token(req: &AwsRequest) -> Option<String> {
+    req.query_params
+        .get("ClientToken")
+        .filter(|v| !v.is_empty())
+        .cloned()
+}
+
+/// Replay of a split / move under an already-spent `ClientToken`: the same
+/// request returns the original result (rendered as the reservations stand
+/// now); a different one is `IdempotentParameterMismatch`.
+fn replay_transfer(
+    state: &Ec2State,
+    token: Option<&str>,
+    action: &str,
+    source: &str,
+    destination: Option<&str>,
+    count: i64,
+) -> Result<Option<crate::state::CapacityReservationTokenUse>, AwsServiceError> {
+    let Some(used) = token.and_then(|t| state.capacity_reservation_client_tokens.get(t)) else {
+        return Ok(None);
     };
-    cr_xml(&r, &[], owner)
+    let same = used.action == action
+        && used.source_capacity_reservation_id == source
+        && destination.is_none_or(|d| used.destination_capacity_reservation_id == d)
+        && used.instance_count == count;
+    if !same {
+        return Err(AwsServiceError::aws_error(
+            http::StatusCode::BAD_REQUEST,
+            "IdempotentParameterMismatch",
+            "The client token has already been used with different parameters",
+        ));
+    }
+    Ok(Some(used.clone()))
+}
+
+/// `sourceCapacityReservation` + `destinationCapacityReservation` +
+/// `instanceCount`, the result of both a split and a move.
+fn transfer_result_xml(
+    state: &Ec2State,
+    owner: &str,
+    used: &crate::state::CapacityReservationTokenUse,
+) -> String {
+    let render = |id: &str| {
+        state
+            .capacity_reservations
+            .get(id)
+            .map(|r| cr_xml(r, state.tags_for(id), owner))
+            .unwrap_or_default()
+    };
+    format!(
+        "<sourceCapacityReservation>{}</sourceCapacityReservation><destinationCapacityReservation>{}</destinationCapacityReservation><instanceCount>{}</instanceCount>",
+        render(&used.source_capacity_reservation_id),
+        render(&used.destination_capacity_reservation_id),
+        used.instance_count,
+    )
 }
 
 pub(crate) fn create_capacity_reservation_by_splitting(
     svc: &Ec2Service,
     req: &AwsRequest,
 ) -> Result<AwsResponse, AwsServiceError> {
-    let src = require(&req.query_params, "SourceCapacityReservationId")?;
-    let count: i64 = require(&req.query_params, "InstanceCount")?
-        .parse()
-        .unwrap_or(1);
+    const ACTION: &str = "CreateCapacityReservationBySplitting";
+    // EC2 answers a dry run from the permission check, before it looks at
+    // the request's parameters or the reservations' state.
+    dry_run_succeeded(req)?;
+    let src_id = require(&req.query_params, "SourceCapacityReservationId")?;
+    let count = transfer_count(req)?;
+    let token = client_token(req);
     let owner = req.account_id.clone();
-    let dest = gen_id("cr");
-    {
-        let mut accounts = svc.state.write();
-        let state = accounts.get_or_create(&req.account_id);
-        if let Some(r) = state.capacity_reservations.get(&src).cloned() {
-            let mut d = r.clone();
-            d.id = dest.clone();
-            d.total_instance_count = count;
-            d.available_instance_count = count;
-            state.capacity_reservations.insert(dest.clone(), d);
-        }
+    let now = Utc::now();
+    let mut accounts = svc.state.write();
+    let state = accounts.get_or_create(&req.account_id);
+    if let Some(used) = replay_transfer(state, token.as_deref(), ACTION, &src_id, None, count)? {
+        let body = transfer_result_xml(state, &owner, &used);
+        return Ok(Ec2Service::respond(ACTION, &req.request_id, &body));
     }
-    let body = format!(
-        "<sourceCapacityReservation>{}</sourceCapacityReservation><destinationCapacityReservation>{}</destinationCapacityReservation><instanceCount>{}</instanceCount>",
-        synth_cr_xml(&src, &owner, count),
-        synth_cr_xml(&dest, &owner, count),
+    let source = state
+        .capacity_reservations
+        .get(&src_id)
+        .ok_or_else(|| cr_not_found(&src_id))?;
+    let from_available = take_capacity(
+        source,
+        "source",
         count,
+        source.total_instance_count - 1,
+        now,
+    )?;
+    // The new reservation has the source's configuration but none of its
+    // tags, history or commitment: it is a fresh, immediately active
+    // On-Demand Capacity Reservation holding the split-off capacity.
+    let dest_id = gen_id("cr");
+    let dest = CapacityReservation {
+        id: dest_id.clone(),
+        instance_type: source.instance_type.clone(),
+        instance_platform: source.instance_platform.clone(),
+        availability_zone: source.availability_zone.clone(),
+        tenancy: source.tenancy.clone(),
+        total_instance_count: count,
+        available_instance_count: from_available,
+        state: "active".to_string(),
+        end_date_type: source.end_date_type.clone(),
+        end_date: source.end_date.clone(),
+        instance_match_criteria: source.instance_match_criteria.clone(),
+        ebs_optimized: source.ebs_optimized,
+        ephemeral_storage: source.ephemeral_storage,
+        create_date: Some(fmt_ts(now)),
+        start_date: Some(fmt_ts(now)),
+        ..Default::default()
+    };
+    let source = state
+        .capacity_reservations
+        .get_mut(&src_id)
+        .expect("source looked up above");
+    source.total_instance_count -= count;
+    source.available_instance_count -= from_available;
+    state.capacity_reservations.insert(dest_id.clone(), dest);
+    crate::service::tags::apply_tag_specifications(
+        state,
+        &req.query_params,
+        &dest_id,
+        "capacity-reservation",
     );
-    Ok(Ec2Service::respond(
-        "CreateCapacityReservationBySplitting",
-        &req.request_id,
-        &body,
-    ))
+    let used = crate::state::CapacityReservationTokenUse {
+        action: ACTION.to_string(),
+        source_capacity_reservation_id: src_id,
+        destination_capacity_reservation_id: dest_id,
+        instance_count: count,
+    };
+    let body = transfer_result_xml(state, &owner, &used);
+    if let Some(t) = token {
+        state.capacity_reservation_client_tokens.insert(t, used);
+    }
+    Ok(Ec2Service::respond(ACTION, &req.request_id, &body))
 }
 
 pub(crate) fn move_capacity_reservation_instances(
-    _svc: &Ec2Service,
+    svc: &Ec2Service,
     req: &AwsRequest,
 ) -> Result<AwsResponse, AwsServiceError> {
-    let src = require(&req.query_params, "SourceCapacityReservationId")?;
-    let dest = require(&req.query_params, "DestinationCapacityReservationId")?;
-    let count: i64 = require(&req.query_params, "InstanceCount")?
-        .parse()
-        .unwrap_or(1);
+    const ACTION: &str = "MoveCapacityReservationInstances";
+    dry_run_succeeded(req)?;
+    let src_id = require(&req.query_params, "SourceCapacityReservationId")?;
+    let dest_id = require(&req.query_params, "DestinationCapacityReservationId")?;
+    let count = transfer_count(req)?;
+    let token = client_token(req);
     let owner = req.account_id.clone();
-    let body = format!(
-        "<sourceCapacityReservation>{}</sourceCapacityReservation><destinationCapacityReservation>{}</destinationCapacityReservation><instanceCount>{}</instanceCount>",
-        synth_cr_xml(&src, &owner, count),
-        synth_cr_xml(&dest, &owner, count),
+    let now = Utc::now();
+    let mut accounts = svc.state.write();
+    let state = accounts.get_or_create(&req.account_id);
+    if let Some(used) = replay_transfer(
+        state,
+        token.as_deref(),
+        ACTION,
+        &src_id,
+        Some(&dest_id),
         count,
-    );
-    Ok(Ec2Service::respond(
-        "MoveCapacityReservationInstances",
-        &req.request_id,
-        &body,
-    ))
+    )? {
+        let body = transfer_result_xml(state, &owner, &used);
+        return Ok(Ec2Service::respond(ACTION, &req.request_id, &body));
+    }
+    if src_id == dest_id {
+        return Err(invalid_parameter_value(
+            "The source and destination Capacity Reservations must be different".to_string(),
+        ));
+    }
+    let source = state
+        .capacity_reservations
+        .get(&src_id)
+        .ok_or_else(|| cr_not_found(&src_id))?;
+    let dest = state
+        .capacity_reservations
+        .get(&dest_id)
+        .ok_or_else(|| cr_not_found(&dest_id))?;
+    let from_available = take_capacity(source, "source", count, source.total_instance_count, now)?;
+    check_transferable(dest, "destination", now)?;
+    let mismatch = [
+        ("instance type", source.instance_type != dest.instance_type),
+        (
+            "platform",
+            source.instance_platform != dest.instance_platform,
+        ),
+        (
+            "Availability Zone",
+            source.availability_zone != dest.availability_zone,
+        ),
+        ("tenancy", source.tenancy != dest.tenancy),
+        (
+            "end time",
+            source.end_date_type != dest.end_date_type || source.end_date != dest.end_date,
+        ),
+    ]
+    .into_iter()
+    .find_map(|(what, differs)| differs.then_some(what));
+    if let Some(what) = mismatch {
+        return Err(invalid_parameter_value(format!(
+            "Capacity Reservations {src_id} and {dest_id} must have the same {what}"
+        )));
+    }
+    if count > from_available && dest.instance_match_criteria != "open" {
+        return Err(invalid_parameter_value(format!(
+            "Used capacity can only be moved into a Capacity Reservation with open instance eligibility, and {dest_id} is targeted"
+        )));
+    }
+    let source = state
+        .capacity_reservations
+        .get_mut(&src_id)
+        .expect("source looked up above");
+    source.total_instance_count -= count;
+    source.available_instance_count -= from_available;
+    // Moving all of a reservation's capacity cancels it.
+    if source.total_instance_count == 0 {
+        source.state = "cancelled".to_string();
+    }
+    let dest = state
+        .capacity_reservations
+        .get_mut(&dest_id)
+        .expect("destination looked up above");
+    dest.total_instance_count += count;
+    dest.available_instance_count += from_available;
+    let used = crate::state::CapacityReservationTokenUse {
+        action: ACTION.to_string(),
+        source_capacity_reservation_id: src_id,
+        destination_capacity_reservation_id: dest_id,
+        instance_count: count,
+    };
+    let body = transfer_result_xml(state, &owner, &used);
+    if let Some(t) = token {
+        state.capacity_reservation_client_tokens.insert(t, used);
+    }
+    Ok(Ec2Service::respond(ACTION, &req.request_id, &body))
 }
 
 // ---- billing owner transfer ----
@@ -1022,16 +1304,163 @@ pub(crate) fn reject_capacity_reservation_billing_ownership(
 
 // ---- capacity blocks ----
 
+/// Instance types sold as Capacity Blocks (EC2 User Guide, "Capacity Blocks
+/// for ML": supported instance types).
+const CAPACITY_BLOCK_INSTANCE_TYPES: &[&str] = &[
+    "p4d.24xlarge",
+    "p4de.24xlarge",
+    "p5.4xlarge",
+    "p5.48xlarge",
+    "p5e.48xlarge",
+    "p5en.48xlarge",
+    "p6-b200.48xlarge",
+    "trn1.32xlarge",
+    "trn2.48xlarge",
+];
+
+/// Capacity Blocks start at 11:30 UTC.
+const CAPACITY_BLOCK_START_HOUR: u32 = 11;
+const CAPACITY_BLOCK_START_MINUTE: u32 = 30;
+/// Capacity Blocks can be reserved up to eight weeks in advance.
+const CAPACITY_BLOCK_MAX_ADVANCE_DAYS: i64 = 56;
+
+/// A valid Capacity Block duration: 1-14 days in 1-day increments, or up to
+/// 182 days in 7-day increments.
+fn valid_capacity_block_hours(h: i64) -> bool {
+    (h % 24 == 0 && (1..=14).contains(&(h / 24))) || (h % 168 == 0 && (1..=26).contains(&(h / 168)))
+}
+
+/// The first Capacity Block start (11:30 UTC) at or after `t`.
+fn next_block_start(t: DateTime<Utc>) -> DateTime<Utc> {
+    let day = t.date_naive();
+    let at = |d: chrono::NaiveDate| {
+        d.and_hms_opt(CAPACITY_BLOCK_START_HOUR, CAPACITY_BLOCK_START_MINUTE, 0)
+            .expect("valid time")
+            .and_utc()
+    };
+    let start = at(day);
+    if start >= t {
+        start
+    } else {
+        at(day + Duration::days(1))
+    }
+}
+
+fn offering_xml(o: &crate::state::CapacityBlockOffering) -> String {
+    format!(
+        "<item>{}{}{}<instanceCount>{}</instanceCount>{}{}<capacityBlockDurationHours>{}</capacityBlockDurationHours>{}<capacityBlockDurationMinutes>{}</capacityBlockDurationMinutes></item>",
+        ec2_elem("capacityBlockOfferingId", &o.id),
+        ec2_elem("instanceType", &o.instance_type),
+        ec2_elem("availabilityZone", &o.availability_zone),
+        o.instance_count,
+        ec2_elem("startDate", &o.start_date),
+        ec2_elem("endDate", &o.end_date),
+        o.duration_hours,
+        ec2_elem("tenancy", "default"),
+        o.duration_hours * 60,
+    )
+}
+
+/// `DescribeCapacityBlockOfferings`: one offering per supported instance
+/// type (or the requested one) at the earliest 11:30 UTC start within the
+/// requested date range and the eight-week booking window, in the request
+/// Region's first Availability Zone. Each offering is remembered so
+/// `PurchaseCapacityBlock` buys exactly what was offered. UltraServer
+/// offerings are not available.
 pub(crate) fn describe_capacity_block_offerings(
-    _svc: &Ec2Service,
+    svc: &Ec2Service,
     req: &AwsRequest,
 ) -> Result<AwsResponse, AwsServiceError> {
-    require(&req.query_params, "CapacityDurationHours")?;
+    dry_run_succeeded(req)?;
+    let raw = require(&req.query_params, "CapacityDurationHours")?;
     validate_max_results(&req.query_params, 1, 1000)?;
+    let hours: i64 = raw
+        .parse()
+        .ok()
+        .filter(|h| valid_capacity_block_hours(*h))
+        .ok_or_else(|| {
+            invalid_parameter_value(format!(
+                "CapacityDurationHours {raw} is not a valid Capacity Block duration: 1-14 days in 1-day increments, or up to 182 days in 7-day increments"
+            ))
+        })?;
+    let count: i64 = match req.query_params.get("InstanceCount") {
+        None => 1,
+        Some(v) => v
+            .parse()
+            .ok()
+            .filter(|n| (1..=64).contains(n))
+            .ok_or_else(|| {
+                invalid_parameter_value(format!("Invalid value '{v}' for InstanceCount"))
+            })?,
+    };
+    let now = Utc::now();
+    let range_start = ts_param(req, "StartDateRange")?;
+    let range_end = ts_param(req, "EndDateRange")?;
+    if let (Some(s), Some(e)) = (range_start, range_end) {
+        if e <= s {
+            return Err(invalid_parameter_value(
+                "EndDateRange must be later than StartDateRange".to_string(),
+            ));
+        }
+    }
+    let start = next_block_start(range_start.map_or(now, |s| s.max(now)));
+    let end = start + Duration::hours(hours);
+    let available = start <= now + Duration::days(CAPACITY_BLOCK_MAX_ADVANCE_DAYS)
+        && range_end.is_none_or(|e| end <= e)
+        && !req.query_params.contains_key("UltraserverType");
+    let types: Vec<&str> = match req.query_params.get("InstanceType") {
+        Some(t) => CAPACITY_BLOCK_INSTANCE_TYPES
+            .iter()
+            .copied()
+            .filter(|c| c == t)
+            .collect(),
+        None => CAPACITY_BLOCK_INSTANCE_TYPES.to_vec(),
+    };
+    let region = if req.region.is_empty() {
+        "us-east-1"
+    } else {
+        req.region.as_str()
+    };
+    let az = format!("{region}a");
+    let mut items = Vec::new();
+    if available {
+        let mut accounts = svc.state.write();
+        let state = accounts.get_or_create(&req.account_id);
+        for t in types {
+            let mut offering = crate::state::CapacityBlockOffering {
+                id: String::new(),
+                instance_type: t.to_string(),
+                availability_zone: az.clone(),
+                instance_count: count,
+                start_date: fmt_ts(start),
+                end_date: fmt_ts(end),
+                duration_hours: hours,
+            };
+            // The same offering described again keeps its id.
+            let existing = state
+                .capacity_block_offerings
+                .values()
+                .find(|o| {
+                    crate::state::CapacityBlockOffering {
+                        id: String::new(),
+                        ..(*o).clone()
+                    } == offering
+                })
+                .map(|o| o.id.clone());
+            offering.id = existing.unwrap_or_else(|| gen_id("cb"));
+            items.push(offering_xml(&offering));
+            state
+                .capacity_block_offerings
+                .insert(offering.id.clone(), offering);
+        }
+    }
     Ok(Ec2Service::respond(
         "DescribeCapacityBlockOfferings",
         &req.request_id,
-        &ec2_list("capacityBlockOfferingSet", &[]),
+        &format!(
+            "<capacityBlockOfferingSet>{}</capacityBlockOfferingSet>",
+            items.concat()
+        ),
     ))
 }
 
@@ -1047,44 +1476,67 @@ pub(crate) fn describe_capacity_blocks(
     ))
 }
 
+/// `PurchaseCapacityBlock`: buy an offering `DescribeCapacityBlockOfferings`
+/// returned. The Capacity Block is a `capacity-block` reservation with the
+/// offering's instance type, count, Availability Zone and dates, `scheduled`
+/// until its start. The offering is consumed by the purchase.
 pub(crate) fn purchase_capacity_block(
     svc: &Ec2Service,
     req: &AwsRequest,
 ) -> Result<AwsResponse, AwsServiceError> {
-    require(&req.query_params, "CapacityBlockOfferingId")?;
-    require(&req.query_params, "InstancePlatform")?;
+    dry_run_succeeded(req)?;
+    let offering_id = require(&req.query_params, "CapacityBlockOfferingId")?;
+    let platform = require(&req.query_params, "InstancePlatform")?;
     validate_enum(&req.query_params, "InstancePlatform", INSTANCE_PLATFORMS)?;
     let owner = req.account_id.clone();
+    let now = Utc::now();
+    let mut accounts = svc.state.write();
+    let state = accounts.get_or_create(&req.account_id);
+    let offering = state
+        .capacity_block_offerings
+        .remove(&offering_id)
+        .ok_or_else(|| {
+            invalid_parameter_value(format!(
+                "The Capacity Block offering '{offering_id}' does not exist or is no longer available"
+            ))
+        })?;
+    let scheduled = parse_ts(&offering.start_date).is_some_and(|s| s > now);
     let id = gen_id("cr");
-    {
-        let mut accounts = svc.state.write();
-        accounts
-            .get_or_create(&req.account_id)
-            .capacity_reservations
-            .insert(
-                id.clone(),
-                CapacityReservation {
-                    id: id.clone(),
-                    instance_type: "p5.48xlarge".to_string(),
-                    instance_platform: req
-                        .query_params
-                        .get("InstancePlatform")
-                        .cloned()
-                        .unwrap_or_else(|| "Linux/UNIX".to_string()),
-                    availability_zone: "us-east-1a".to_string(),
-                    tenancy: "default".to_string(),
-                    total_instance_count: 1,
-                    available_instance_count: 1,
-                    state: "active".to_string(),
-                    end_date_type: "limited".to_string(),
-                    instance_match_criteria: "targeted".to_string(),
-                    ..Default::default()
-                },
-            );
-    }
+    state.capacity_reservations.insert(
+        id.clone(),
+        CapacityReservation {
+            id: id.clone(),
+            instance_type: offering.instance_type,
+            instance_platform: platform,
+            availability_zone: offering.availability_zone,
+            tenancy: "default".to_string(),
+            total_instance_count: offering.instance_count,
+            available_instance_count: offering.instance_count,
+            state: if scheduled { "scheduled" } else { "active" }.to_string(),
+            end_date_type: "limited".to_string(),
+            instance_match_criteria: "targeted".to_string(),
+            reservation_type: Some("capacity-block".to_string()),
+            create_date: Some(fmt_ts(now)),
+            start_date: Some(offering.start_date),
+            end_date: Some(offering.end_date),
+            ..Default::default()
+        },
+    );
+    crate::service::tags::apply_tag_specifications(
+        state,
+        &req.query_params,
+        &id,
+        "capacity-reservation",
+    );
+    // `capacityBlockSet` lists UltraServer Capacity Blocks; an instance
+    // Capacity Block purchase has none.
     let body = format!(
         "<capacityReservation>{}</capacityReservation>{}",
-        synth_cr_xml(&id, &owner, 1),
+        cr_xml(
+            &state.capacity_reservations[&id],
+            state.tags_for(&id),
+            &owner
+        ),
         ec2_list("capacityBlockSet", &[])
     );
     Ok(Ec2Service::respond(
@@ -1780,5 +2232,589 @@ mod date_change_quote_tests {
             err.code(),
             "InvalidCapacityReservationModificationQuoteId.NotFound"
         );
+    }
+}
+
+#[cfg(test)]
+mod split_move_tests {
+    use super::*;
+    use crate::test_support::{ec2_request as req, err_of};
+
+    fn body(resp: AwsResponse) -> String {
+        String::from_utf8_lossy(resp.body.expect_bytes()).to_string()
+    }
+
+    fn create(svc: &Ec2Service, extra: &[(&str, &str)]) -> String {
+        let mut q = vec![
+            ("InstanceType", "m5.large"),
+            ("InstancePlatform", "Linux/UNIX"),
+            ("AvailabilityZone", "us-east-1a"),
+        ];
+        q.extend_from_slice(extra);
+        let out =
+            body(create_capacity_reservation(svc, &req("CreateCapacityReservation", &q)).unwrap());
+        between(&out, "capacityReservationId").to_string()
+    }
+
+    fn between<'a>(s: &'a str, tag: &str) -> &'a str {
+        let open = format!("<{tag}>");
+        let start = s.find(&open).unwrap() + open.len();
+        let end = s[start..].find(&format!("</{tag}>")).unwrap();
+        &s[start..start + end]
+    }
+
+    fn cr(svc: &Ec2Service, id: &str) -> CapacityReservation {
+        svc.state
+            .read()
+            .get("000000000000")
+            .unwrap()
+            .capacity_reservations[id]
+            .clone()
+    }
+
+    fn set_available(svc: &Ec2Service, id: &str, available: i64) {
+        svc.state
+            .write()
+            .get_or_create("000000000000")
+            .capacity_reservations
+            .get_mut(id)
+            .unwrap()
+            .available_instance_count = available;
+    }
+
+    fn offering(svc: &Ec2Service, instance_type: &str, count: &str) -> String {
+        let out = body(
+            describe_capacity_block_offerings(
+                svc,
+                &req(
+                    "DescribeCapacityBlockOfferings",
+                    &[
+                        ("InstanceType", instance_type),
+                        ("InstanceCount", count),
+                        ("CapacityDurationHours", "48"),
+                    ],
+                ),
+            )
+            .unwrap(),
+        );
+        between(&out, "capacityBlockOfferingId").to_string()
+    }
+
+    fn buy_block(svc: &Ec2Service, instance_type: &str, count: &str) -> String {
+        let id = offering(svc, instance_type, count);
+        body(
+            purchase_capacity_block(
+                svc,
+                &req(
+                    "PurchaseCapacityBlock",
+                    &[
+                        ("CapacityBlockOfferingId", &id),
+                        ("InstancePlatform", "Linux/UNIX"),
+                    ],
+                ),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn split(
+        svc: &Ec2Service,
+        src: &str,
+        count: &str,
+        extra: &[(&str, &str)],
+    ) -> Result<AwsResponse, AwsServiceError> {
+        let mut q = vec![
+            ("SourceCapacityReservationId", src),
+            ("InstanceCount", count),
+        ];
+        q.extend_from_slice(extra);
+        create_capacity_reservation_by_splitting(
+            svc,
+            &req("CreateCapacityReservationBySplitting", &q),
+        )
+    }
+
+    fn mv(
+        svc: &Ec2Service,
+        src: &str,
+        dest: &str,
+        count: &str,
+        extra: &[(&str, &str)],
+    ) -> Result<AwsResponse, AwsServiceError> {
+        let mut q = vec![
+            ("SourceCapacityReservationId", src),
+            ("DestinationCapacityReservationId", dest),
+            ("InstanceCount", count),
+        ];
+        q.extend_from_slice(extra);
+        move_capacity_reservation_instances(svc, &req("MoveCapacityReservationInstances", &q))
+    }
+
+    #[test]
+    fn split_moves_capacity_into_a_new_reservation() {
+        let svc = Ec2Service::new();
+        let src = create(
+            &svc,
+            &[
+                ("InstanceCount", "5"),
+                ("EbsOptimized", "true"),
+                ("Tenancy", "dedicated"),
+                ("TagSpecification.1.ResourceType", "capacity-reservation"),
+                ("TagSpecification.1.Tag.1.Key", "team"),
+                ("TagSpecification.1.Tag.1.Value", "src"),
+            ],
+        );
+        let out = body(
+            split(
+                &svc,
+                &src,
+                "2",
+                &[
+                    ("TagSpecification.1.ResourceType", "capacity-reservation"),
+                    ("TagSpecification.1.Tag.1.Key", "stack"),
+                    ("TagSpecification.1.Tag.1.Value", "prod"),
+                ],
+            )
+            .unwrap(),
+        );
+        let src_xml = between(&out, "sourceCapacityReservation");
+        let dest_xml = between(&out, "destinationCapacityReservation");
+        assert_eq!(between(&out, "instanceCount"), "2");
+        assert_eq!(between(src_xml, "capacityReservationId"), src);
+        assert_eq!(between(src_xml, "totalInstanceCount"), "3");
+        assert_eq!(between(src_xml, "availableInstanceCount"), "3");
+        let dest = between(dest_xml, "capacityReservationId").to_string();
+        assert_ne!(dest, src);
+        assert_eq!(between(dest_xml, "totalInstanceCount"), "2");
+        assert_eq!(between(dest_xml, "availableInstanceCount"), "2");
+        assert_eq!(between(dest_xml, "state"), "active");
+        // Same configuration as the source...
+        assert_eq!(between(dest_xml, "instanceType"), "m5.large");
+        assert_eq!(between(dest_xml, "tenancy"), "dedicated");
+        assert_eq!(between(dest_xml, "ebsOptimized"), "true");
+        // ...except tags: only the requested ones.
+        assert!(dest_xml.contains("<key>stack</key>"), "{dest_xml}");
+        assert!(!dest_xml.contains("<key>team</key>"), "{dest_xml}");
+        // Persisted on both sides.
+        let s = cr(&svc, &src);
+        assert_eq!((s.total_instance_count, s.available_instance_count), (3, 3));
+        let d = cr(&svc, &dest);
+        assert_eq!((d.total_instance_count, d.available_instance_count), (2, 2));
+        let described = body(
+            describe_capacity_reservations(
+                &svc,
+                &req(
+                    "DescribeCapacityReservations",
+                    &[("CapacityReservationId.1", &dest)],
+                ),
+            )
+            .unwrap(),
+        );
+        assert!(described.contains("<key>stack</key>"), "{described}");
+    }
+
+    #[test]
+    fn split_takes_available_capacity_first_then_used() {
+        let svc = Ec2Service::new();
+        let src = create(&svc, &[("InstanceCount", "8")]);
+        // 5 used, 3 available.
+        set_available(&svc, &src, 3);
+        let out = body(split(&svc, &src, "4", &[]).unwrap());
+        let dest_xml = between(&out, "destinationCapacityReservation");
+        assert_eq!(between(dest_xml, "totalInstanceCount"), "4");
+        assert_eq!(between(dest_xml, "availableInstanceCount"), "3");
+        let s = cr(&svc, &src);
+        assert_eq!((s.total_instance_count, s.available_instance_count), (4, 0));
+    }
+
+    #[test]
+    fn split_validates_source_and_count() {
+        let svc = Ec2Service::new();
+        assert_eq!(
+            err_of(split(&svc, "cr-0123456789abcdef0", "1", &[])).code(),
+            "InvalidCapacityReservationId.NotFound"
+        );
+        let src = create(&svc, &[("InstanceCount", "3")]);
+        for bad in ["0", "-1", "abc", "3", "4"] {
+            assert_eq!(
+                err_of(split(&svc, &src, bad, &[])).code(),
+                "InvalidParameterValue",
+                "count {bad}"
+            );
+        }
+        // Nothing was taken by the rejected requests.
+        assert_eq!(cr(&svc, &src).total_instance_count, 3);
+        // The maximum is the size minus one.
+        split(&svc, &src, "2", &[]).unwrap();
+        assert_eq!(cr(&svc, &src).total_instance_count, 1);
+        // A one-instance reservation can't be split at all.
+        assert_eq!(
+            err_of(split(&svc, &src, "1", &[])).code(),
+            "InvalidParameterValue"
+        );
+    }
+
+    #[test]
+    fn split_requires_an_active_on_demand_reservation() {
+        let svc = Ec2Service::new();
+        let cancelled = create(&svc, &[("InstanceCount", "3")]);
+        cancel_capacity_reservation(
+            &svc,
+            &req(
+                "CancelCapacityReservation",
+                &[("CapacityReservationId", &cancelled)],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            err_of(split(&svc, &cancelled, "1", &[])).code(),
+            "IncorrectState"
+        );
+
+        let future = (Utc::now() + Duration::days(10)).to_rfc3339();
+        let scheduled = create(
+            &svc,
+            &[
+                ("InstanceCount", "3"),
+                ("StartDate", &future),
+                ("CommitmentDuration", "1209600"),
+            ],
+        );
+        assert_eq!(
+            err_of(split(&svc, &scheduled, "1", &[])).code(),
+            "IncorrectState"
+        );
+
+        // Delivered but still inside its commitment period.
+        {
+            let mut accounts = svc.state.write();
+            let r = accounts
+                .get_or_create("000000000000")
+                .capacity_reservations
+                .get_mut(&scheduled)
+                .unwrap();
+            r.state = "active".to_string();
+            r.start_date = Some(fmt_ts(Utc::now() - Duration::days(1)));
+        }
+        let e = err_of(split(&svc, &scheduled, "1", &[]));
+        assert_eq!(e.code(), "IncorrectState");
+        assert!(format!("{e:?}").contains("commitment"), "{e:?}");
+
+        let block = buy_block(&svc, "p5.48xlarge", "4");
+        assert_eq!(between(&block, "reservationType"), "capacity-block");
+        let block_id = between(&block, "capacityReservationId").to_string();
+        // Delivered, so only its kind keeps it from being split.
+        svc.state
+            .write()
+            .get_or_create("000000000000")
+            .capacity_reservations
+            .get_mut(&block_id)
+            .unwrap()
+            .state = "active".to_string();
+        assert_eq!(
+            err_of(split(&svc, &block_id, "1", &[])).code(),
+            "UnsupportedOperation"
+        );
+    }
+
+    #[test]
+    fn split_used_capacity_needs_open_eligibility() {
+        let svc = Ec2Service::new();
+        let src = create(
+            &svc,
+            &[
+                ("InstanceCount", "6"),
+                ("InstanceMatchCriteria", "targeted"),
+            ],
+        );
+        set_available(&svc, &src, 2);
+        assert_eq!(
+            err_of(split(&svc, &src, "3", &[])).code(),
+            "InvalidParameterValue"
+        );
+        // Available capacity alone is fine.
+        split(&svc, &src, "2", &[]).unwrap();
+        let s = cr(&svc, &src);
+        assert_eq!((s.total_instance_count, s.available_instance_count), (4, 0));
+    }
+
+    #[test]
+    fn split_dry_run_and_client_token() {
+        let svc = Ec2Service::new();
+        let src = create(&svc, &[("InstanceCount", "6")]);
+        assert_eq!(
+            err_of(split(&svc, &src, "1", &[("DryRun", "true")])).code(),
+            "DryRunOperation"
+        );
+        assert_eq!(cr(&svc, &src).total_instance_count, 6);
+        let first = body(split(&svc, &src, "2", &[("ClientToken", "tok")]).unwrap());
+        let again = body(split(&svc, &src, "2", &[("ClientToken", "tok")]).unwrap());
+        let dest = between(
+            between(&first, "destinationCapacityReservation"),
+            "capacityReservationId",
+        );
+        assert_eq!(
+            between(
+                between(&again, "destinationCapacityReservation"),
+                "capacityReservationId"
+            ),
+            dest
+        );
+        // Split once, not twice.
+        assert_eq!(cr(&svc, &src).total_instance_count, 4);
+        assert_eq!(
+            err_of(split(&svc, &src, "1", &[("ClientToken", "tok")])).code(),
+            "IdempotentParameterMismatch"
+        );
+    }
+
+    #[test]
+    fn move_shifts_capacity_between_matching_reservations() {
+        let svc = Ec2Service::new();
+        let src = create(&svc, &[("InstanceCount", "5")]);
+        let dest = create(
+            &svc,
+            &[
+                ("InstanceCount", "2"),
+                ("InstanceMatchCriteria", "targeted"),
+            ],
+        );
+        let out = body(mv(&svc, &src, &dest, "3", &[]).unwrap());
+        assert_eq!(between(&out, "instanceCount"), "3");
+        assert_eq!(
+            between(
+                between(&out, "sourceCapacityReservation"),
+                "totalInstanceCount"
+            ),
+            "2"
+        );
+        assert_eq!(
+            between(
+                between(&out, "destinationCapacityReservation"),
+                "totalInstanceCount"
+            ),
+            "5"
+        );
+        let d = cr(&svc, &dest);
+        assert_eq!((d.total_instance_count, d.available_instance_count), (5, 5));
+        // Moving everything cancels the source.
+        mv(&svc, &src, &dest, "2", &[]).unwrap();
+        let s = cr(&svc, &src);
+        assert_eq!((s.total_instance_count, s.state.as_str()), (0, "cancelled"));
+        assert_eq!(
+            err_of(mv(&svc, &src, &dest, "1", &[])).code(),
+            "IncorrectState"
+        );
+    }
+
+    #[test]
+    fn move_validates_both_reservations() {
+        let svc = Ec2Service::new();
+        let src = create(&svc, &[("InstanceCount", "4")]);
+        let other_type = {
+            let out = body(
+                create_capacity_reservation(
+                    &svc,
+                    &req(
+                        "CreateCapacityReservation",
+                        &[
+                            ("InstanceType", "c5.large"),
+                            ("InstancePlatform", "Linux/UNIX"),
+                            ("AvailabilityZone", "us-east-1a"),
+                            ("InstanceCount", "1"),
+                        ],
+                    ),
+                )
+                .unwrap(),
+            );
+            between(&out, "capacityReservationId").to_string()
+        };
+        assert_eq!(
+            err_of(mv(&svc, &src, "cr-0123456789abcdef0", "1", &[])).code(),
+            "InvalidCapacityReservationId.NotFound"
+        );
+        assert_eq!(
+            err_of(mv(&svc, "cr-0123456789abcdef0", &src, "1", &[])).code(),
+            "InvalidCapacityReservationId.NotFound"
+        );
+        assert_eq!(
+            err_of(mv(&svc, &src, &src, "1", &[])).code(),
+            "InvalidParameterValue"
+        );
+        assert_eq!(
+            err_of(mv(&svc, &src, &other_type, "1", &[])).code(),
+            "InvalidParameterValue"
+        );
+        let dest = create(&svc, &[("InstanceCount", "1")]);
+        assert_eq!(
+            err_of(mv(&svc, &src, &dest, "5", &[])).code(),
+            "InvalidParameterValue"
+        );
+        assert_eq!(
+            err_of(mv(&svc, &src, &dest, "1", &[("DryRun", "true")])).code(),
+            "DryRunOperation"
+        );
+        assert_eq!(cr(&svc, &src).total_instance_count, 4);
+        mv(&svc, &src, &dest, "1", &[("ClientToken", "m")]).unwrap();
+        mv(&svc, &src, &dest, "1", &[("ClientToken", "m")]).unwrap();
+        assert_eq!(cr(&svc, &src).total_instance_count, 3);
+        assert_eq!(
+            err_of(mv(&svc, &src, &dest, "2", &[("ClientToken", "m")])).code(),
+            "IdempotentParameterMismatch"
+        );
+    }
+
+    #[test]
+    fn dry_run_is_answered_before_any_validation() {
+        let svc = Ec2Service::new();
+        // A source that does not exist and an invalid count: the permission
+        // check still answers first.
+        assert_eq!(
+            err_of(split(
+                &svc,
+                "cr-0123456789abcdef0",
+                "0",
+                &[("DryRun", "true")]
+            ))
+            .code(),
+            "DryRunOperation"
+        );
+        assert_eq!(
+            err_of(mv(&svc, "cr-1", "cr-1", "-5", &[("DryRun", "true")])).code(),
+            "DryRunOperation"
+        );
+    }
+
+    #[test]
+    fn split_destination_is_created_at_the_split_time() {
+        let svc = Ec2Service::new();
+        let src = create(&svc, &[("InstanceCount", "3")]);
+        let before = Utc::now() - Duration::seconds(1);
+        let out = body(split(&svc, &src, "1", &[]).unwrap());
+        let dest = between(&out, "destinationCapacityReservation");
+        let created = parse_ts(between(dest, "createDate")).unwrap();
+        assert!(created >= before && created <= Utc::now(), "{dest}");
+        assert_eq!(between(dest, "createDate"), between(dest, "startDate"));
+    }
+
+    #[test]
+    fn capacity_block_purchase_buys_the_described_offering() {
+        let svc = Ec2Service::new();
+        let id = offering(&svc, "p5.48xlarge", "2");
+        let offered = body(
+            describe_capacity_block_offerings(
+                &svc,
+                &req(
+                    "DescribeCapacityBlockOfferings",
+                    &[
+                        ("InstanceType", "p5.48xlarge"),
+                        ("InstanceCount", "2"),
+                        ("CapacityDurationHours", "48"),
+                    ],
+                ),
+            )
+            .unwrap(),
+        );
+        // Described again, the same offering keeps its id.
+        assert_eq!(between(&offered, "capacityBlockOfferingId"), id);
+        assert_eq!(between(&offered, "availabilityZone"), "us-east-1a");
+        let start = parse_ts(between(&offered, "startDate")).unwrap();
+        let end = parse_ts(between(&offered, "endDate")).unwrap();
+        assert_eq!(end - start, Duration::hours(48));
+        assert_eq!(start.format("%H:%M").to_string(), "11:30");
+
+        let out = body(
+            purchase_capacity_block(
+                &svc,
+                &req(
+                    "PurchaseCapacityBlock",
+                    &[
+                        ("CapacityBlockOfferingId", &id),
+                        ("InstancePlatform", "Linux/UNIX"),
+                    ],
+                ),
+            )
+            .unwrap(),
+        );
+        assert_eq!(between(&out, "instanceType"), "p5.48xlarge");
+        assert_eq!(between(&out, "totalInstanceCount"), "2");
+        assert_eq!(between(&out, "availabilityZone"), "us-east-1a");
+        assert_eq!(between(&out, "startDate"), between(&offered, "startDate"));
+        assert_eq!(between(&out, "endDate"), between(&offered, "endDate"));
+        assert_eq!(between(&out, "reservationType"), "capacity-block");
+        assert!(out.contains("arn:aws:ec2:us-east-1:"), "{out}");
+        assert!(!out.contains("<capacityBlockSet><item>"), "{out}");
+        // The offering is consumed; unknown offerings are rejected.
+        for bad in [id.as_str(), "cb-0123456789abcdef0"] {
+            assert_eq!(
+                err_of(purchase_capacity_block(
+                    &svc,
+                    &req(
+                        "PurchaseCapacityBlock",
+                        &[
+                            ("CapacityBlockOfferingId", bad),
+                            ("InstancePlatform", "Linux/UNIX")
+                        ],
+                    ),
+                ))
+                .code(),
+                "InvalidParameterValue"
+            );
+        }
+    }
+
+    #[test]
+    fn capacity_block_offerings_follow_the_request_region_and_rules() {
+        let svc = Ec2Service::new();
+        let mut r = req(
+            "DescribeCapacityBlockOfferings",
+            &[
+                ("InstanceType", "trn1.32xlarge"),
+                ("CapacityDurationHours", "24"),
+            ],
+        );
+        r.region = "eu-west-1".into();
+        let out = body(describe_capacity_block_offerings(&svc, &r).unwrap());
+        assert_eq!(between(&out, "availabilityZone"), "eu-west-1a");
+        let id = between(&out, "capacityBlockOfferingId").to_string();
+        let mut p = req(
+            "PurchaseCapacityBlock",
+            &[
+                ("CapacityBlockOfferingId", &id),
+                ("InstancePlatform", "Linux/UNIX"),
+            ],
+        );
+        p.region = "eu-west-1".into();
+        let bought = body(purchase_capacity_block(&svc, &p).unwrap());
+        assert!(bought.contains("arn:aws:ec2:eu-west-1:"), "{bought}");
+        for bad in ["0", "25", "200", "abc"] {
+            assert_eq!(
+                err_of(describe_capacity_block_offerings(
+                    &svc,
+                    &req(
+                        "DescribeCapacityBlockOfferings",
+                        &[("CapacityDurationHours", bad)]
+                    ),
+                ))
+                .code(),
+                "InvalidParameterValue",
+                "{bad}"
+            );
+        }
+        // An instance type not sold as Capacity Blocks has no offerings.
+        let out = body(
+            describe_capacity_block_offerings(
+                &svc,
+                &req(
+                    "DescribeCapacityBlockOfferings",
+                    &[
+                        ("InstanceType", "t3.micro"),
+                        ("CapacityDurationHours", "672"),
+                    ],
+                ),
+            )
+            .unwrap(),
+        );
+        assert!(!out.contains("<item>"), "{out}");
     }
 }

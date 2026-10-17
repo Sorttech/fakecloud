@@ -9,7 +9,7 @@ use serde_json::{Map, Value};
 
 use fakecloud_core::service::{AwsResponse, AwsServiceError};
 
-use crate::generated::{Field, OpMeta, K};
+use crate::generated::{Field, MergeRule, OpMeta, K, UPDATE_MERGES};
 use crate::state::SageMakerData;
 
 use super::{in_use, mint_arn, not_found, now_epoch, ok_json, Ctx};
@@ -35,7 +35,7 @@ const PREFERRED_ENUMS: &[&str] = &[
 
 /// Choose a valid value for an enum member: a preferred terminal/healthy state
 /// if the enum offers one, else its first modelled value.
-fn pick_enum(enums: &[&str]) -> String {
+pub(super) fn pick_enum(enums: &[&str]) -> String {
     for p in PREFERRED_ENUMS {
         if enums.contains(p) {
             return (*p).to_string();
@@ -110,20 +110,35 @@ fn synth_element(ctx: &Ctx, meta: &OpMeta, key: &str, f: &Field) -> Value {
 
 /// A plausible string for a required string member.
 fn synth_string(ctx: &Ctx, meta: &OpMeta, key: &str, f: &Field) -> String {
-    if !f.enums.is_empty() {
-        return pick_enum(f.enums);
+    synth_str(ctx, meta, key, f.wire, f.enums, f.min_len)
+}
+
+/// A plausible string for the required string member `wire`: a valid enum
+/// member, an ARN / name / id derived from `key`, else a placeholder honouring
+/// the `@length` minimum.
+pub(super) fn synth_str(
+    ctx: &Ctx,
+    meta: &OpMeta,
+    key: &str,
+    wire: &str,
+    enums: &[&str],
+    min_len: Option<u64>,
+) -> String {
+    if !enums.is_empty() {
+        return pick_enum(enums);
     }
-    if f.wire.ends_with("Arn") {
+    let key = &super::shape::resource_name(meta.arn_path, key);
+    if wire.ends_with("Arn") {
         return mint_arn(ctx, meta.arn_path, key);
     }
-    if f.wire.ends_with("Name") && !key.is_empty() {
+    if wire.ends_with("Name") && !key.is_empty() {
         return key.to_string();
     }
-    if f.wire.ends_with("Id") && !key.is_empty() {
+    if wire.ends_with("Id") && !key.is_empty() {
         return key.to_string();
     }
     // A short placeholder honouring any `@length` minimum.
-    let min = f.min_len.unwrap_or(1).max(1) as usize;
+    let min = min_len.unwrap_or(1).max(1) as usize;
     "a".repeat(min.max(1))
 }
 
@@ -162,8 +177,10 @@ pub(super) fn fill_required(
                 K::List if f.elem_kind == K::Struct => {
                     if let Some(arr) = v.as_array_mut() {
                         for el in arr.iter_mut() {
+                            // An element's members derive from its own id.
+                            let own = super::shape::element_key(el);
                             if let Some(m) = el.as_object_mut() {
-                                fill_required(ctx, meta, key, m, f.children);
+                                fill_required(ctx, meta, &own, m, f.children);
                             }
                         }
                     }
@@ -195,7 +212,7 @@ pub(crate) fn kind_matches(kind: K, v: &Value) -> bool {
 /// JSON number). A number passes through; a string is parsed as epoch seconds or
 /// RFC3339 and converted; anything else yields `None` so the member is dropped
 /// rather than emitted as an SDK-rejecting string.
-fn coerce_ts(v: &Value) -> Option<Value> {
+pub(super) fn coerce_ts(v: &Value) -> Option<Value> {
     if v.is_number() {
         return Some(v.clone());
     }
@@ -238,6 +255,8 @@ pub(super) fn project(
 /// any still-missing `@required` output member with a synthesised default so the
 /// response is valid against the model's output shape.
 pub(crate) fn build_output(ctx: &Ctx, meta: &OpMeta, key: &str, record: &Value) -> Value {
+    let derived = super::derive::record(ctx, meta, record);
+    let record = derived.as_ref().unwrap_or(record);
     let mut out = Map::new();
     project(record.as_object(), meta.omembers, &mut out);
     fill_required(ctx, meta, key, &mut out, meta.req_out);
@@ -248,6 +267,8 @@ pub(crate) fn build_output(ctx: &Ctx, meta: &OpMeta, key: &str, record: &Value) 
 /// still-missing `@required` element member (list elements carry required
 /// fields the shape validator checks, e.g. a summary's status).
 fn build_element(ctx: &Ctx, meta: &OpMeta, key: &str, record: &Value) -> Value {
+    let derived = super::derive::element(ctx, meta, record);
+    let record = derived.as_ref().unwrap_or(record);
     let mut out = Map::new();
     project(record.as_object(), meta.list_elems, &mut out);
     fill_required(ctx, meta, key, &mut out, meta.req_elem);
@@ -363,7 +384,14 @@ pub(super) fn update(
             // `Tags` on an update (UpdateProject / UpdatePartnerApp) adds to the
             // resource's tag set in the ARN-keyed tag store rather than living
             // inline on the record.
-            if k == "Tags" {
+            if k == "Tags" || names_by_arn(meta, k, v) {
+                continue;
+            }
+            // A partial-update structure (`GitConfigForUpdate`,
+            // `DomainSettingsForUpdate`, ...) changes only the members it
+            // carries, on the stored member it updates.
+            if let Some(rule) = merge_rules(meta.op).iter().find(|r| r.from == k) {
+                merge_member(obj, rule, v);
                 continue;
             }
             obj.insert(k.clone(), v.clone());
@@ -380,6 +408,48 @@ pub(super) fn update(
         data.apply_tag_list(&arn, list, false);
     }
     Ok(ok_json(out))
+}
+
+/// Whether `k` is the identifier member of `meta` carrying the resource's ARN
+/// in place of its name (`ClusterNameOrArn`, `HubNameOrArn`, ...): it only
+/// selects the resource, and must not overwrite the stored name.
+fn names_by_arn(meta: &OpMeta, k: &str, v: &Value) -> bool {
+    k == meta.key_member && !k.ends_with("Arn") && v.as_str().is_some_and(|s| s.starts_with("arn:"))
+}
+
+/// The partial-update members of Update operation `op`.
+fn merge_rules(op: &str) -> &'static [MergeRule] {
+    UPDATE_MERGES
+        .iter()
+        .find(|(name, _)| *name == op)
+        .map(|(_, rules)| *rules)
+        .unwrap_or(&[])
+}
+
+/// Apply partial-update member `rule` carrying `patch` to the stored record
+/// (or stored structure) `obj`: overlay its members onto the stored
+/// `rule.to` structure, renaming / merging nested partial-update members by
+/// `rule.children`; members it does not carry keep their stored value.
+fn merge_member(obj: &mut Map<String, Value>, rule: &MergeRule, patch: &Value) {
+    let Value::Object(patch) = patch else {
+        obj.insert(rule.to.to_string(), patch.clone());
+        return;
+    };
+    let stored = obj
+        .entry(rule.to.to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !stored.is_object() {
+        *stored = Value::Object(Map::new());
+    }
+    let stored = stored.as_object_mut().expect("object ensured above");
+    for (k, v) in patch {
+        match rule.children.iter().find(|c| c.from == k) {
+            Some(child) => merge_member(stored, child, v),
+            None => {
+                stored.insert(k.clone(), v.clone());
+            }
+        }
+    }
 }
 
 pub(super) fn delete(
@@ -443,7 +513,7 @@ pub(super) fn action_key(body: &Map<String, Value>) -> String {
 /// member (top-level or nested) with a synthesised default so the response is
 /// valid against the model's output shape.
 pub(super) fn action(ctx: &Ctx, meta: &OpMeta, body: &Map<String, Value>) -> AwsResponse {
-    let key = action_key(body);
+    let key = super::shape::response_key(meta, body);
     let out = build_output(ctx, meta, &key, &Value::Object(body.clone()));
     ok_json(out)
 }

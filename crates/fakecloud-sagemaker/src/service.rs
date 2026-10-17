@@ -25,8 +25,12 @@ use crate::persistence::save_snapshot;
 use crate::state::SharedSageMakerState;
 
 mod actions;
+mod derive;
 mod engine;
 mod search;
+mod shape;
+#[cfg(test)]
+mod shape_tests;
 mod special;
 #[cfg(test)]
 mod tests;
@@ -123,25 +127,66 @@ pub(crate) struct Ctx {
     pub region: String,
 }
 
-impl SageMakerService {
-    fn dispatch(
-        &self,
-        meta: &'static OpMeta,
-        req: &AwsRequest,
-    ) -> Result<(AwsResponse, bool), AwsServiceError> {
-        let ctx = Ctx {
+impl Ctx {
+    fn from_request(req: &AwsRequest) -> Self {
+        Ctx {
             account: req.account_id.clone(),
             region: if req.region.is_empty() {
                 "us-east-1".to_string()
             } else {
                 req.region.clone()
             },
-        };
+        }
+    }
+}
+
+thread_local! {
+    /// While [`SageMakerService::dispatch`] runs a handler on this thread,
+    /// the JSON value of the handler's success response: [`ok_json`] parks
+    /// it here (instead of serialising it) so dispatch can project it onto
+    /// the output shape and serialise it exactly once.
+    static REPLY: std::cell::RefCell<Option<Option<Value>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+impl SageMakerService {
+    /// Route the request, then project a successful response onto the
+    /// operation's output shape ([`shape`]), so no handler can leak a member
+    /// the output does not declare (a request-only member of a stored create
+    /// request, an input-shaped nested structure, ...).
+    fn dispatch(
+        &self,
+        meta: &'static OpMeta,
+        req: &AwsRequest,
+    ) -> Result<(AwsResponse, bool), AwsServiceError> {
+        let ctx = Ctx::from_request(req);
         let body = parse_body(&req.body);
-        crate::validate::validate(meta, &body)?;
+        // Arm the reply slot for this handler run; `take` disarms it again
+        // whether the handler succeeded or not.
+        REPLY.with(|r| *r.borrow_mut() = Some(None));
+        let routed = self.route(meta, &ctx, &body);
+        let parked = REPLY.with(|r| r.borrow_mut().take()).flatten();
+        let (resp, mutated) = routed?;
+        let Some(out) = parked.filter(|_| resp.status.is_success()) else {
+            return Ok((resp, mutated));
+        };
+        let key = shape::response_key(meta, &body);
+        let shaped = shape::shape_output(&ctx, meta, &key, out);
+        let mut reshaped = AwsResponse::json_value(resp.status, shaped);
+        reshaped.headers = resp.headers;
+        Ok((reshaped, mutated))
+    }
+
+    fn route(
+        &self,
+        meta: &'static OpMeta,
+        ctx: &Ctx,
+        body: &Map<String, Value>,
+    ) -> Result<(AwsResponse, bool), AwsServiceError> {
+        crate::validate::validate(meta, body)?;
 
         // Resource-specific handlers (tagging) take precedence over the engine.
-        if let Some(res) = special::dispatch(self, meta, &ctx, &body)? {
+        if let Some(res) = special::dispatch(self, meta, ctx, body)? {
             return Ok(res);
         }
 
@@ -149,33 +194,33 @@ impl SageMakerService {
             Verb::Create => {
                 let mut g = self.state.write();
                 let data = g.get_or_create(&ctx.account);
-                Ok((engine::create(data, &ctx, meta, &body)?, true))
+                Ok((engine::create(data, ctx, meta, body)?, true))
             }
             Verb::Update => {
                 let mut g = self.state.write();
                 let data = g.get_or_create(&ctx.account);
-                Ok((engine::update(data, &ctx, meta, &body)?, true))
+                Ok((engine::update(data, ctx, meta, body)?, true))
             }
             Verb::Delete => {
                 let mut g = self.state.write();
                 let data = g.get_or_create(&ctx.account);
-                Ok((engine::delete(data, &ctx, meta, &body), true))
+                Ok((engine::delete(data, ctx, meta, body), true))
             }
             Verb::Get => {
                 let g = self.state.read();
                 let data = g.get(&ctx.account);
-                Ok((engine::get(data, &ctx, meta, &body)?, false))
+                Ok((engine::get(data, ctx, meta, body)?, false))
             }
             Verb::List => {
                 let g = self.state.read();
                 let data = g.get(&ctx.account);
-                Ok((engine::list(data, &ctx, meta, &body), false))
+                Ok((engine::list(data, ctx, meta, body), false))
             }
             Verb::Action => {
                 // Any action not claimed by `special` is accepted as a
                 // control-plane no-op whose response carries every required
                 // output member (synthesised from the request identifier).
-                Ok((engine::action(&ctx, meta, &body), false))
+                Ok((engine::action(ctx, meta, body), false))
             }
         }
     }
@@ -183,8 +228,19 @@ impl SageMakerService {
 
 // ===================== shared helpers =====================
 
+/// A 200 JSON response. Inside a dispatch the value is parked for the
+/// output-shape projection (see [`REPLY`]) and serialised once afterwards.
 pub(crate) fn ok_json(v: Value) -> AwsResponse {
-    AwsResponse::json_value(StatusCode::OK, v)
+    let mut v = Some(v);
+    REPLY.with(|r| {
+        if let Some(slot) = r.borrow_mut().as_mut() {
+            *slot = v.take();
+        }
+    });
+    match v {
+        Some(v) => AwsResponse::json_value(StatusCode::OK, v),
+        None => AwsResponse::json(StatusCode::OK, Vec::new()),
+    }
 }
 
 pub(crate) fn parse_body(body: &[u8]) -> Map<String, Value> {

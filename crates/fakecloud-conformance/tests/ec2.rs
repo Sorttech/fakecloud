@@ -5207,10 +5207,14 @@ async fn ec2_describe_fleet_instances() {
 // ---- capacity reservations ----
 
 async fn make_cr(c: &aws_sdk_ec2::Client) -> String {
+    make_cr_of(c, 1).await
+}
+
+async fn make_cr_of(c: &aws_sdk_ec2::Client, count: i32) -> String {
     c.create_capacity_reservation()
         .instance_type("t3.micro")
         .instance_platform(aws_sdk_ec2::types::CapacityReservationInstancePlatform::LinuxUnix)
-        .instance_count(1)
+        .instance_count(count)
         .send()
         .await
         .unwrap()
@@ -5419,7 +5423,7 @@ async fn ec2_modify_instance_capacity_reservation_attributes() {
 async fn ec2_create_capacity_reservation_by_splitting() {
     let s = TestServer::start().await;
     let c = s.ec2_client().await;
-    let id = make_cr(&c).await;
+    let id = make_cr_of(&c, 3).await;
     let r = c
         .create_capacity_reservation_by_splitting()
         .source_capacity_reservation_id(&id)
@@ -5427,7 +5431,13 @@ async fn ec2_create_capacity_reservation_by_splitting() {
         .send()
         .await
         .unwrap();
-    assert!(r.destination_capacity_reservation().is_some());
+    assert_eq!(r.instance_count(), Some(1));
+    let src = r.source_capacity_reservation().unwrap();
+    assert_eq!(src.capacity_reservation_id(), Some(id.as_str()));
+    assert_eq!(src.total_instance_count(), Some(2));
+    let dest = r.destination_capacity_reservation().unwrap();
+    assert_ne!(dest.capacity_reservation_id(), Some(id.as_str()));
+    assert_eq!(dest.total_instance_count(), Some(1));
 }
 
 #[test_action("ec2", "MoveCapacityReservationInstances", checksum = "4e3ee5a9")]
@@ -5435,15 +5445,29 @@ async fn ec2_create_capacity_reservation_by_splitting() {
 async fn ec2_move_capacity_reservation_instances() {
     let s = TestServer::start().await;
     let c = s.ec2_client().await;
+    let src = make_cr_of(&c, 3).await;
+    let dest = make_cr_of(&c, 1).await;
     let r = c
         .move_capacity_reservation_instances()
-        .source_capacity_reservation_id("cr-1")
-        .destination_capacity_reservation_id("cr-2")
+        .source_capacity_reservation_id(&src)
+        .destination_capacity_reservation_id(&dest)
         .instance_count(1)
         .send()
         .await
         .unwrap();
     assert_eq!(r.instance_count(), Some(1));
+    assert_eq!(
+        r.source_capacity_reservation()
+            .unwrap()
+            .total_instance_count(),
+        Some(2)
+    );
+    assert_eq!(
+        r.destination_capacity_reservation()
+            .unwrap()
+            .total_instance_count(),
+        Some(2)
+    );
 }
 
 #[test_action(
@@ -5545,11 +5569,15 @@ async fn ec2_describe_capacity_block_offerings() {
     let c = s.ec2_client().await;
     let r = c
         .describe_capacity_block_offerings()
+        .instance_type("p5.48xlarge")
         .capacity_duration_hours(24)
         .send()
         .await
         .unwrap();
-    assert!(r.capacity_block_offerings().is_empty());
+    let o = &r.capacity_block_offerings()[0];
+    assert_eq!(o.instance_type(), Some("p5.48xlarge"));
+    assert_eq!(o.capacity_block_duration_hours(), Some(24));
+    assert!(o.capacity_block_offering_id().is_some());
 }
 
 #[test_action("ec2", "DescribeCapacityBlocks", checksum = "0b57ee2c")]
@@ -5566,14 +5594,28 @@ async fn ec2_describe_capacity_blocks() {
 async fn ec2_purchase_capacity_block() {
     let s = TestServer::start().await;
     let c = s.ec2_client().await;
+    let offering = c
+        .describe_capacity_block_offerings()
+        .instance_type("p5.48xlarge")
+        .instance_count(2)
+        .capacity_duration_hours(48)
+        .send()
+        .await
+        .unwrap()
+        .capacity_block_offerings()[0]
+        .capacity_block_offering_id()
+        .unwrap()
+        .to_string();
     let r = c
         .purchase_capacity_block()
-        .capacity_block_offering_id("cbo-1")
+        .capacity_block_offering_id(offering)
         .instance_platform(aws_sdk_ec2::types::CapacityReservationInstancePlatform::LinuxUnix)
         .send()
         .await
         .unwrap();
-    assert!(r.capacity_reservation().is_some());
+    let cr = r.capacity_reservation().unwrap();
+    assert_eq!(cr.instance_type(), Some("p5.48xlarge"));
+    assert_eq!(cr.total_instance_count(), Some(2));
 }
 
 #[test_action("ec2", "DescribeCapacityBlockStatus", checksum = "1fa80f6e")]

@@ -906,6 +906,16 @@ pub struct CapacityReservation {
     pub state: String,
     pub end_date_type: String,
     pub instance_match_criteria: String,
+    /// `ReservationType`: `capacity-block` for a reservation bought with
+    /// `PurchaseCapacityBlock`; `None` (rendered `default`) for an On-Demand
+    /// Capacity Reservation.
+    #[serde(default)]
+    pub reservation_type: Option<String>,
+    /// `CreateDate` (RFC 3339, millisecond precision) of a reservation
+    /// created by a split or a Capacity Block purchase; `None` renders the
+    /// fixed creation time.
+    #[serde(default)]
+    pub create_date: Option<String>,
     /// Accepted at CreateCapacityReservation but previously hardcoded false in
     /// the describe render, so `aws_ec2_capacity_reservation` drifted on these
     /// ForceNew flags.
@@ -942,6 +952,33 @@ pub struct CapacityReservationCommitment {
     /// Seconds.
     pub commitment_duration: i64,
     pub commitment_end_date: String,
+}
+
+/// A `ClientToken` spent on `CreateCapacityReservationBySplitting` or
+/// `MoveCapacityReservationInstances`, remembered so a retry with the same
+/// token replays the original result instead of moving capacity twice, and a
+/// retry that asks for something else is refused.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapacityReservationTokenUse {
+    pub action: String,
+    pub source_capacity_reservation_id: String,
+    /// The destination named by a move, or the reservation a split created.
+    pub destination_capacity_reservation_id: String,
+    pub instance_count: i64,
+}
+
+/// A `CapacityBlockOffering` returned by `DescribeCapacityBlockOfferings`,
+/// remembered so `PurchaseCapacityBlock` can buy exactly what was offered.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapacityBlockOffering {
+    pub id: String,
+    pub instance_type: String,
+    pub availability_zone: String,
+    pub instance_count: i64,
+    /// RFC 3339, millisecond precision.
+    pub start_date: String,
+    pub end_date: String,
+    pub duration_hours: i64,
 }
 
 /// `CapacityReservationAdjustmentDetails`: the configuration a modification
@@ -2016,6 +2053,12 @@ pub struct Ec2State {
     /// Capacity reservation fleet ids (metadata-only).
     #[serde(default)]
     pub capacity_reservation_fleets: BTreeMap<String, String>,
+    /// offering id -> Capacity Block offering described to this account.
+    #[serde(default)]
+    pub capacity_block_offerings: BTreeMap<String, CapacityBlockOffering>,
+    /// client token -> the split / move it was spent on.
+    #[serde(default)]
+    pub capacity_reservation_client_tokens: BTreeMap<String, CapacityReservationTokenUse>,
     #[serde(default)]
     pub reserved_instances: BTreeMap<String, ReservedInstances>,
     #[serde(default)]

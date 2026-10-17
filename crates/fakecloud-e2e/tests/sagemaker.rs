@@ -778,3 +778,157 @@ async fn sagemaker_search_and_missing_lifecycle_target() {
     assert_eq!(err.meta().code(), Some("ValidationException"));
     assert_eq!(err.meta().message(), Some("RecordNotFound"));
 }
+
+/// Reads report resources in their *output* shapes, not the request shapes
+/// they were created from: a workforce never echoes its OIDC client secret
+/// and is reported inside its `Workforce` structure, a human task UI reports
+/// its template's content hash, an inference component reports the image it
+/// deployed and its copy counts, and a partial `GitConfig` update keeps the
+/// repository URL.
+#[tokio::test]
+async fn sagemaker_reads_report_output_shapes() {
+    use aws_sdk_sagemaker::types::{
+        GitConfig, GitConfigForUpdate, InferenceComponentContainerSpecification,
+        InferenceComponentRuntimeConfig, InferenceComponentSpecification, OidcConfig, UiTemplate,
+    };
+
+    let server = TestServer::start().await;
+    let client = sagemaker_client(&server).await;
+
+    client
+        .create_workforce()
+        .workforce_name("wf")
+        .oidc_config(
+            OidcConfig::builder()
+                .client_id("cid")
+                .client_secret("s3cret")
+                .issuer("https://issuer.example.com")
+                .authorization_endpoint("https://issuer.example.com/auth")
+                .token_endpoint("https://issuer.example.com/token")
+                .user_info_endpoint("https://issuer.example.com/userinfo")
+                .logout_endpoint("https://issuer.example.com/logout")
+                .jwks_uri("https://issuer.example.com/jwks")
+                .build(),
+        )
+        .send()
+        .await
+        .expect("create_workforce");
+    let wf = client
+        .describe_workforce()
+        .workforce_name("wf")
+        .send()
+        .await
+        .expect("describe_workforce");
+    let wf = wf.workforce().expect("workforce");
+    assert_eq!(wf.workforce_name(), Some("wf"));
+    assert_eq!(wf.oidc_config().and_then(|o| o.client_id()), Some("cid"));
+    assert!(wf.create_date().is_some());
+    let listed = client
+        .list_workforces()
+        .send()
+        .await
+        .expect("list_workforces");
+    assert_eq!(listed.workforces().len(), 1);
+    assert_eq!(
+        listed.workforces()[0]
+            .oidc_config()
+            .and_then(|o| o.issuer()),
+        Some("https://issuer.example.com")
+    );
+
+    client
+        .create_human_task_ui()
+        .human_task_ui_name("ui")
+        .ui_template(UiTemplate::builder().content("<p>hi</p>").build())
+        .send()
+        .await
+        .expect("create_human_task_ui");
+    let ui = client
+        .describe_human_task_ui()
+        .human_task_ui_name("ui")
+        .send()
+        .await
+        .expect("describe_human_task_ui");
+    assert_eq!(
+        ui.ui_template().and_then(|t| t.content_sha256()),
+        // sha256("<p>hi</p>")
+        Some("0a4735281db700223af63abc387c351f64ea6961a1ef955631df08d96169e772")
+    );
+
+    let image = "123456789012.dkr.ecr.us-east-1.amazonaws.com/img@sha256:abcd";
+    client
+        .create_inference_component()
+        .inference_component_name("ic")
+        .endpoint_name("ep")
+        .variant_name("v")
+        .specification(
+            InferenceComponentSpecification::builder()
+                .container(
+                    InferenceComponentContainerSpecification::builder()
+                        .image(image)
+                        .build(),
+                )
+                .build(),
+        )
+        .runtime_config(
+            InferenceComponentRuntimeConfig::builder()
+                .copy_count(2)
+                .build(),
+        )
+        .send()
+        .await
+        .expect("create_inference_component");
+    let ic = client
+        .describe_inference_component()
+        .inference_component_name("ic")
+        .send()
+        .await
+        .expect("describe_inference_component");
+    let deployed = ic
+        .specification()
+        .and_then(|s| s.container())
+        .and_then(|c| c.deployed_image())
+        .expect("deployed image");
+    assert_eq!(deployed.specified_image(), Some(image));
+    assert_eq!(deployed.resolved_image(), Some(image));
+    let rc = ic.runtime_config().expect("runtime config");
+    assert_eq!(rc.desired_copy_count(), Some(2));
+    assert_eq!(rc.current_copy_count(), Some(2));
+
+    client
+        .create_code_repository()
+        .code_repository_name("repo")
+        .git_config(
+            GitConfig::builder()
+                .repository_url("https://github.com/o/r.git")
+                .branch("main")
+                .build(),
+        )
+        .send()
+        .await
+        .expect("create_code_repository");
+    client
+        .update_code_repository()
+        .code_repository_name("repo")
+        .git_config(
+            GitConfigForUpdate::builder()
+                .secret_arn("arn:aws:secretsmanager:us-east-1:000000000000:secret:s")
+                .build(),
+        )
+        .send()
+        .await
+        .expect("update_code_repository");
+    let repo = client
+        .describe_code_repository()
+        .code_repository_name("repo")
+        .send()
+        .await
+        .expect("describe_code_repository");
+    let git = repo.git_config().expect("git config");
+    assert_eq!(git.repository_url(), Some("https://github.com/o/r.git"));
+    assert_eq!(git.branch(), Some("main"));
+    assert_eq!(
+        git.secret_arn(),
+        Some("arn:aws:secretsmanager:us-east-1:000000000000:secret:s")
+    );
+}
