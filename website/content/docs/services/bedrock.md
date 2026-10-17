@@ -4,10 +4,10 @@ description = "Foundation models, guardrails, custom models, invocation jobs, ev
 weight = 21
 +++
 
-fakecloud implements **216 of 216** Bedrock-family operations across four APIs:
+fakecloud implements **222 of 222** Bedrock-family operations across four APIs:
 
-- **Bedrock** (control plane) — 103 operations *(this page)*
-- **Bedrock Runtime** (model invocation) — 10 operations *(this page)*
+- **Bedrock** (control plane) — 108 operations *(this page)*
+- **Bedrock Runtime** (model invocation) — 11 operations *(this page)*
 - [**Bedrock Agent**](/docs/services/bedrock-agent/) (agents control plane) — 72 operations
 - [**Bedrock Agent Runtime**](/docs/services/bedrock-agent-runtime/) (agent invocation) — 31 operations
 

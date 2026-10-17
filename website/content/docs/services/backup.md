@@ -1,11 +1,11 @@
 +++
 title = "AWS Backup"
-description = "AWS Backup (backup) on fakecloud: a complete 109-operation control plane (100% conformance) — backup plans, vaults, recovery points, backup/copy/restore/scan jobs, frameworks, report plans, legal holds, restore testing, tiering. restJson1."
+description = "AWS Backup (backup) on fakecloud: a complete 115-operation control plane (100% conformance) — backup plans, vaults, recovery points, backup/copy/restore/scan jobs, frameworks, report plans, legal holds, restore testing, tiering. restJson1."
 weight = 48
 +++
 
 fakecloud implements **AWS Backup** as a restJson1 control plane. All
-**109 operations** ship with **100% conformance** against AWS's own Smithy
+**115 operations** ship with **100% conformance** against AWS's own Smithy
 model, backed by account-partitioned state that persists across restarts in
 persistent mode.
 

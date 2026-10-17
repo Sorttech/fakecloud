@@ -1,6 +1,6 @@
 +++
 title = "SES emulator for tests"
-description = "Run AWS SES locally for integration tests with fakecloud. 110 SES operations, v2 send + templates + DKIM, real receipt rule execution for inbound email. Free, no account required."
+description = "Run AWS SES locally for integration tests with fakecloud. 116 SES operations, v2 send + templates + DKIM, real receipt rule execution for inbound email. Free, no account required."
 template = "page.html"
 +++
 
@@ -15,7 +15,7 @@ Point your AWS SDK at `http://localhost:4566`.
 
 ## Why fakecloud for SES
 
-- **110 SES operations** at 100% conformance — v2 API for send, templates, configuration sets, event destinations, DKIM, suppression list. Plus v1 inbound (receipt rules, receipt filters).
+- **116 SES operations** at 100% conformance — v2 API for send, templates, configuration sets, event destinations, DKIM, suppression list. Plus v1 inbound (receipt rules, receipt filters).
 - **Real receipt rule action execution.** When a test email arrives at a configured recipient, fakecloud actually runs the S3, SNS, and Lambda actions in the receipt rule. LocalStack Community stores inbound email but never fires the actions; fakecloud fires them.
 - **Test-assertion SDK.** `fc.ses.getEmails()` returns the sent-email log so tests can assert recipients, subject, body, destinations, bounces.
 - **Real DKIM signing.** Configure a domain identity, fakecloud signs outbound mail with the computed DKIM-Signature header.

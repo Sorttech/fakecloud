@@ -84,6 +84,30 @@ service_ops_map=$(awk '
     }
 ' "$PARITY")
 
+# Names other surfaces use for a parity.md row. The per-service pass matches a
+# claim by the row's link text, so docs/services/_index.md's "| WAF v2 | 55 |"
+# never matched "WAFv2" and kept 55 after the row moved to 59 (2026-10-17).
+# Format: "<parity.md link text>=<alias>".
+SERVICE_ALIASES=(
+    "WAFv2=WAF v2"
+    "ELBv2=Elastic Load Balancing v2"
+    "ACM=ACM (Certificate Manager)"
+    "Amazon Comprehend=Comprehend"
+    "Amazon EMR=EMR (Elastic MapReduce)"
+    "Amazon Transcribe=Transcribe"
+    "IAM Identity Center Identity Store=Identity Store"
+    "IAM Identity Center SSO Admin=SSO Admin"
+    "SES=SES (v2 + v1 inbound)"
+)
+for _a in "${SERVICE_ALIASES[@]}"; do
+    _ops=$(printf '%s\n' "$service_ops_map" | awk -F'\t' -v s="${_a%%=*}" '$1 == s { print $2; exit }')
+    if [ -z "$_ops" ]; then
+        echo "SERVICE_ALIASES entry '$_a' names no parity.md row" >&2
+        exit 2
+    fi
+    service_ops_map="$service_ops_map"$'\n'"${_a#*=}"$'\t'"$_ops"
+done
+
 # Bedrock 4-part surface: pull each row from the map.
 lookup_ops() {
     local svc="$1"
@@ -248,6 +272,12 @@ EXCEPTIONS=(
     "website/content/supported-services.md:ops_Config:58"
     "website/static/llms.txt:ops_Config:58"
     "website/static/llms-full.txt:ops_Config:58"
+    # appconfig.md splits its 58 into the two SDK clients one crate serves:
+    # "the 56-operation appconfig API and the 2-operation appconfigdata API".
+    "website/content/docs/services/appconfig.md:own_ops:56"
+    "website/content/docs/services/appconfig.md:own_ops:2"
+    # ec2.md: "Transit Gateway -- the complete 74-op surface", a feature subset.
+    "website/content/docs/services/ec2.md:own_ops:74"
 )
 
 is_exception() {
@@ -450,6 +480,37 @@ for f in "${FILES[@]}"; do
             | sort -u
     )
 
+    # The phrasings the "<N> Bedrock operations" regex never saw, all of which
+    # kept saying 216 after the family grew to 222 (2026-10-17): "216 ops across
+    # 4 APIs", "216 operations across the full Bedrock family", "**216 of 216**
+    # Bedrock-family", and per-API lists "(Bedrock 103, Bedrock Runtime 10, ...)"
+    # / "### Bedrock (103 actions) + Bedrock Runtime (10 actions)". Only lines
+    # that mention Bedrock are read, so other services' "N ops across" is safe.
+    while IFS= read -r frag; do
+        [ -z "$frag" ] && continue
+        # Drop the one boundary character the "N ops across" alternative
+        # consumes in front of the number.
+        [[ "$frag" =~ ^[0-9B] ]] || frag=${frag:1}
+        case "$frag" in
+            "Bedrock Agent Runtime"*) want="$bedrock_agent_rt" ;;
+            "Bedrock Agent"*)         want="$bedrock_agent" ;;
+            "Bedrock Runtime"*)       want="$bedrock_runtime" ;;
+            "Bedrock"*)               want="$bedrock_ctrl" ;;
+            *)                        want="$bedrock_family" ;;
+        esac
+        n=$(first_num "$frag")
+        n=${n%,}
+        [ -z "$n" ] && continue
+        if [ "$n" != "$want" ] && ! is_exception "$f" bedrock "$n"; then
+            problems+=("$f: claims '$frag', expected $want")
+            fail=1
+        fi
+    done < <(
+        grep -E 'Bedrock' "$f" 2>/dev/null \
+            | grep -oE '(^|[^0-9,.])[0-9]+ (ops|operations) across|\b[0-9]+ of [0-9]+\**:? Bedrock|Bedrock( Agent Runtime| Agent| Runtime)? \(?[0-9]+( actions\)|,|\))' \
+            | sort -u || true
+    )
+
 done
 
 
@@ -498,15 +559,25 @@ if [ "${#PS_FILES[@]}" -gt 0 ]; then
                 fail=1
             fi
         done < <(
-            {
-                grep -oHE "(\*\*)?${svc_re}(\*\*)?[: ]\(?[ ]*[0-9]+ (operations?|ops|actions)\b" "${PS_FILES[@]}" 2>/dev/null || true
-                # "### DynamoDB (58 actions)" / "**Bedrock** (103 ops)"
-                grep -oHE "(\*\*|### )${svc_re}(\*\*)? \([0-9]+ (operations?|ops|actions)\)" "${PS_FILES[@]}" 2>/dev/null || true
-                # "| ACM (Certificate Manager) |  40 |" aggregate table rows
-                grep -oHE "^\| *${svc_re} *\| *[0-9]+ (operations?|ops)?" "${PS_FILES[@]}" 2>/dev/null || true
-                # "<td>Cognito User Pools</td><td class=\"check\">132 operations"
-                grep -oHE "<td>${svc_re}</td><td[^>]*>[0-9]+ (operations?|ops)" "${PS_FILES[@]}" 2>/dev/null || true
-            } | sort -u
+            # One grep per service (see PERF above), one -e per phrasing:
+            #   "**S3**: 107 operations" / "Lambda (82 operations)"
+            #   "### DynamoDB (58 actions)" / "**Bedrock** (103 ops)"
+            #   "| ACM (Certificate Manager) |  40 |" aggregate table rows
+            #   "<td>Cognito User Pools</td><td class=\"check\">132 operations"
+            #   "**53 KMS operations**" / "**53** KMS operations": number first,
+            #     how every SEO landing page phrases it; none of the patterns
+            #     above read it (KMS, RDS, DynamoDB, S3, SES and Cognito landing
+            #     pages were stale on 2026-10-17). sed cuts the name out of that
+            #     shape so last_num never reads the 3 in "S3".
+            { grep -oHE \
+                -e "(\*\*)?${svc_re}(\*\*)?[: ]\(?[ ]*[0-9]+ (operations?|ops|actions)\b" \
+                -e "(\*\*|### )${svc_re}(\*\*)? \([0-9]+ (operations?|ops|actions)\)" \
+                -e "^\| *${svc_re} *\| *[0-9]+ (operations?|ops)?" \
+                -e "<td>${svc_re}</td><td[^>]*>[0-9]+ (operations?|ops)" \
+                -e "(^|[^0-9,.])[0-9]+(\*\*)? (\*\*)?${svc_re}(\*\*)? operations?\b" \
+                "${PS_FILES[@]}" 2>/dev/null || true; } \
+                | sed -E "s/^([^:]*:[^0-9]*[0-9]+)(\*\*)? (\*\*)?${svc_re}(\*\*)? operations?\$/\1 operations/" \
+                | sort -u
         )
     done <<< "$service_ops_map"
 fi
@@ -565,6 +636,204 @@ done < <(
         grep -nHE '<td>[^<]*AWS services[^<]*</td><td[^>]*>[0-9]' "$_f" 2>/dev/null || true
     done | sort -u
 )
+
+# --- parity.md rows vs the Smithy models -------------------------------------
+# Every pass above trusts parity.md's Ops column, and nothing checked that column
+# against the code. It rotted twice over (found 2026-10-17, gate green):
+#
+#   - aws-models refreshes added operations that were implemented the same week
+#     (S3 object annotations, KMS GetKeyLastUsage, RDS
+#     DescribeServerlessV2PlatformVersions, Backup access points, WAFv2 revenue
+#     statistics, Bedrock InvokeGuardrailChecks) without the row moving;
+#   - rows written at a count below the model and never revisited (Lambda 73
+#     of 88, CloudFront 147 of 167), while their service pages said "73 of 73".
+#
+# 59 dispatched, conformance-gated operations were missing from the headline.
+# Every op a model defines is in its crate's supported_actions() (conformance
+# probes them all), so a row equals its model's operation count. Rows and models
+# are joined on the docs slug, using the model -> slug map that
+# scripts/generate-operations-index.sh already owns (a slug may span several
+# models, e.g. appconfig + appconfigdata). Names are de-duplicated per model:
+# timestream.json carries Write and Query, which share four operation names.
+#
+# A service page whose slug has no parity row is a shipped service missing from
+# the service count, the operation total and the conformance claim at once.
+# PENDING_PARITY_ROW names such slugs while the row is being added; it must be
+# empty on main once that work lands.
+PENDING_PARITY_ROW=(
+    # AWS Batch: shipped (crates/fakecloud-batch, 45 ops) but never wired into
+    # the conformance probe (no aws-models/service-map.json entry), so it has
+    # no baseline to back a "true 100%" row yet.
+    "batch"
+)
+OPS_INDEX_GEN="scripts/generate-operations-index.sh"
+if [ ! -f "$OPS_INDEX_GEN" ]; then
+    echo "missing $OPS_INDEX_GEN (model -> slug map moved? update OPS_INDEX_GEN)" >&2
+    exit 2
+fi
+model_slug_map=$(awk '/^SERVICES=\(/ {f=1; next} f && /^\)/ {f=0} f' "$OPS_INDEX_GEN" \
+    | sed -nE 's/^ *"([^|"]+)\|[^|"]*\|([^|"]*)".*/\1\t\2/p')
+if [ -z "$model_slug_map" ]; then
+    echo "could not read the SERVICES map from $OPS_INDEX_GEN" >&2
+    exit 2
+fi
+model_files=()
+while IFS=$'\t' read -r _m _s; do
+    [ -f "aws-models/$_m.json" ] && model_files+=("aws-models/$_m.json")
+done <<< "$model_slug_map"
+# With no files jq would read stdin and hang instead of failing.
+if [ "${#model_files[@]}" -eq 0 ]; then
+    echo "no aws-models/*.json matched $OPS_INDEX_GEN's SERVICES map" >&2
+    exit 2
+fi
+# One jq process for every model: "<model>\t<unique op count>".
+model_ops=$(jq -r 'input_filename as $f
+    | [(.shapes // {}) | to_entries[] | select(.value.type == "operation") | .key | sub(".*#"; "")]
+    | unique | length
+    | "\($f | sub("^aws-models/"; "") | sub("\\.json$"; ""))\t\(.)"' "${model_files[@]}")
+model_slug_ops=$(awk -F'\t' 'NR == FNR { ops[$1] = $2; next }
+    $2 != "" && ($1 in ops) { sum[$2] += ops[$1] }
+    END { for (s in sum) print s "\t" sum[s] }' \
+    <(printf '%s\n' "$model_ops") <(printf '%s\n' "$model_slug_map") | LC_ALL=C sort -t$'\t' -k1,1)
+parity_slug_ops=$(awk -F'|' '/^\| \[/ {
+        s = $2; sub(/.*@\/docs\/services\//, "", s); sub(/\.md.*/, "", s)
+        o = $3; gsub(/ /, "", o)
+        if (o ~ /^[0-9]+$/) sum[s] += o
+    }
+    END { for (s in sum) print s "\t" sum[s] }' "$PARITY" | LC_ALL=C sort -t$'\t' -k1,1)
+while IFS=$'\t' read -r slug want got; do
+    [ -z "$slug" ] && continue
+    pending=0
+    for _p in "${PENDING_PARITY_ROW[@]}"; do [ "$_p" = "$slug" ] && pending=1; done
+    if [ "$got" = "-" ]; then
+        if [ "$pending" -eq 0 ]; then
+            problems+=("$PARITY: no row for docs/services/$slug.md ($want modeled operations); the service is missing from every headline count")
+            fail=1
+        fi
+    elif [ "$pending" -eq 1 ]; then
+        problems+=("$0: '$slug' has a parity row now; drop it from PENDING_PARITY_ROW")
+        fail=1
+    elif [ "$want" = "-" ]; then
+        problems+=("$PARITY: docs/services/$slug.md has a row but no model in $OPS_INDEX_GEN's SERVICES map")
+        fail=1
+    elif [ "$want" != "$got" ]; then
+        problems+=("$PARITY: docs/services/$slug.md rows sum to $got operations, the Smithy model(s) define $want")
+        fail=1
+    fi
+done < <(LC_ALL=C join -t$'\t' -a1 -a2 -e - -o 0,1.2,2.2 \
+    <(printf '%s\n' "$model_slug_ops") <(printf '%s\n' "$parity_slug_ops"))
+
+# --- Per-service pages' own headline counts -----------------------------------
+# docs/services/<slug>.md opens with "fakecloud implements **57 of 57** DynamoDB
+# operations" or "**109 operations** ship with 100% conformance". The
+# per-service pass above skips these pages as "the source for their own
+# service" -- they are not, parity.md is -- so on 2026-10-17 eleven of them
+# (DynamoDB 57/58, EC2 802/807, Kinesis 44/45, CloudWatch Logs 115/118, Cognito
+# 126/132, CloudWatch 49/55, ...) disagreed with their own parity row. A claim
+# must equal one of the slug's rows or their sum (Bedrock's page also quotes
+# the 4-API family sum).
+while IFS= read -r svc_doc; do
+    slug=$(basename "$svc_doc" .md)
+    [ "$slug" = "_index" ] && continue
+    allowed=" $(awk -F'|' -v s="$slug" '/^\| \[/ {
+            x = $2; sub(/.*@\/docs\/services\//, "", x); sub(/\.md.*/, "", x)
+            if (x == s) { o = $3; gsub(/ /, "", o); print o; t += o }
+        }
+        END { if (t) print t }' "$PARITY" | tr '\n' ' ')"
+    [ "$slug" = "bedrock" ] && allowed="$allowed$bedrock_family "
+    [ "$allowed" = " " ] && continue
+    while IFS= read -r claim; do
+        [ -z "$claim" ] && continue
+        lineno=${claim%%:*}
+        # "N of M" is a count claim when M is one of the page's counts
+        # ("57 of 58" is as stale as "57 of 57"); "1 of 3 shards" is prose.
+        if [[ "${claim#*:}" =~ ^([0-9]+)\ of\ ([0-9]+)$ ]]; then
+            case "$allowed" in *" ${BASH_REMATCH[2]} "*) ;; *) continue ;; esac
+        fi
+        for n in $(printf '%s' "${claim#*:}" | grep -oE '[0-9]+' || true); do
+            case "$allowed" in
+                *" $n "*) ;;
+                *)
+                    if ! is_exception "$svc_doc" own_ops "$n"; then
+                        problems+=("$svc_doc:$lineno: claims '${claim#*:}', parity.md says one of:$allowed")
+                        fail=1
+                    fi
+                    ;;
+            esac
+        done
+    done < <(grep -noE '\b[0-9]+ of [0-9]+\b|\*\*[0-9]+ operations\*\*|\b[Aa]ll [0-9]+ operations\b|\b[0-9]+-operation\b|\b[Cc]omplete [0-9]+-op\b|control plane: [0-9]+ operations|(^|\. )[0-9]+ operations\.' "$svc_doc" || true)
+done < <(find website/content/docs/services -maxdepth 1 -name '*.md' -type f | sort)
+
+# --- "(all N ops)" trailers in aggregate table rows -------------------------
+# "| AWS Backup | 115 | ... No real backup engine (all 109 ops) |": the count
+# cell is gated above, the prose trailer in the same row was not, and on
+# 2026-10-17 five rows of docs/services/_index.md (Backup, EKS, OpenSearch,
+# Account Management, Identity Store) contradicted themselves. A row's trailer
+# must equal its own count cell.
+while IFS= read -r bad; do
+    [ -z "$bad" ] && continue
+    problems+=("$bad")
+    fail=1
+done < <(awk -F'|' '/^\| / && $3 ~ /^ *[0-9]+ *$/ {
+        line = $0; n = $3; gsub(/ /, "", n)
+        while (match(line, /\(all [0-9]+ (ops|operations)\)/)) {
+            m = substr(line, RSTART + 5); sub(/ .*/, "", m)
+            if (m != n) print FILENAME ":" FNR ": row says " n " but its trailer says (all " m " ...)"
+            line = substr(line, RSTART + RLENGTH)
+        }
+    }' "${FILES[@]}" /dev/null)
+
+# --- Single-service landing pages ---------------------------------------------
+# "dynamodb-emulator.md" says "57 operations" in its front-matter description,
+# with no service name next to the number, so no per-service pattern can read
+# it. On a page about one service every "N operations" is that service's count.
+# Format: "<page>=<parity.md link text>" (or "=bedrock-family").
+LANDING_PAGES=(
+    "website/content/bedrock-emulator.md=bedrock-family"
+    "website/content/fake-bedrock.md=bedrock-family"
+    "website/content/test-bedrock-locally.md=bedrock-family"
+    "website/content/cognito-emulator.md=Cognito User Pools"
+    "website/content/dynamodb-emulator.md=DynamoDB"
+    "website/content/kms-emulator.md=KMS"
+    "website/content/local-ecr.md=ECR"
+    "website/content/local-ecs.md=ECS"
+    "website/content/local-elasticache.md=ElastiCache"
+    "website/content/local-elb.md=ELBv2"
+    "website/content/local-rds.md=RDS"
+    "website/content/local-s3-for-tests.md=S3"
+    "website/content/ses-emulator.md=SES"
+    "website/content/sns-emulator.md=SNS"
+    "website/content/sqs-emulator.md=SQS"
+    "website/content/test-lambda-locally.md=Lambda"
+)
+for _lp in "${LANDING_PAGES[@]}"; do
+    _page=${_lp%%=*}
+    _svc=${_lp#*=}
+    if [ ! -f "$_page" ]; then
+        problems+=("$0: LANDING_PAGES names $_page, which does not exist")
+        fail=1
+        continue
+    fi
+    if [ "$_svc" = "bedrock-family" ]; then
+        _want="$bedrock_family"
+    else
+        _want=$(printf '%s\n' "$service_ops_map" | awk -F'\t' -v s="$_svc" '$1 == s { print $2; exit }')
+        if [ -z "$_want" ]; then
+            problems+=("$0: LANDING_PAGES maps $_page to '$_svc', which is not a parity.md row")
+            fail=1
+            continue
+        fi
+    fi
+    while IFS= read -r _hit; do
+        [ -z "$_hit" ] && continue
+        _n=$(first_num "${_hit#*:}")
+        if [ "$_n" != "$_want" ] && ! is_exception "$_page" landing "$_n"; then
+            problems+=("$_page:${_hit%%:*}: claims '${_hit#*:}', expected $_want")
+            fail=1
+        fi
+    done < <(grep -noE '(^|[^0-9,.])[0-9]+(\*\*)? (\*\*)?([A-Z][A-Za-z0-9 ]+ )?(operations|ops)\b' "$_page" \
+        | sed -E 's/^([0-9]+):[^0-9]*/\1:/' || true)
+done
 
 # --- Subset-count claims -------------------------------------------------------
 # conformance.md states "N services today: a, b, c" once per suite. Check N

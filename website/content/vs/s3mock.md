@@ -6,7 +6,7 @@ template = "page.html"
 
 [adobe/S3Mock](https://github.com/adobe/S3Mock) is a lightweight S3-only mock for integration tests, written in Java and distributed as a JAR or Docker image. Simple, focused, well-maintained.
 
-fakecloud does S3 (107 operations) plus 105 other AWS services end-to-end.
+fakecloud does S3 (112 operations) plus 105 other AWS services end-to-end.
 
 ## When to pick S3Mock
 

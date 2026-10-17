@@ -35,7 +35,7 @@ These are philosophies, not rankings. Breadth-first and depth-first are differen
 | Distribution | Single static binary (~19 MB) + Docker image |
 | Startup | ~300ms |
 | Idle memory | ~10 MiB |
-| Services covered today | 106 (7,553 ops) at true 100% conformance (257,288/257,288 variants), incl. ECR + ECS + ELBv2 |
+| Services covered today | 106 (7,612 ops) at true 100% conformance (257,288/257,288 variants), incl. ECR + ECS + ELBv2 |
 | Lambda execution | Real, 31 runtimes in Docker |
 | RDS | Real PostgreSQL/MySQL/MariaDB via Docker |
 | ElastiCache | Real Redis/Valkey/Memcached via Docker |

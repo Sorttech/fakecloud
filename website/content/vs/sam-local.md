@@ -15,13 +15,13 @@ fakecloud runs Lambda the same way — real runtime containers, 31 runtimes supp
 | Lambda real code execution | Yes (31 runtimes in Docker) | Yes (all AWS-managed runtimes in Docker) |
 | API Gateway v2 | 103 ops, HTTP APIs, JWT/Lambda authorizers | Limited (REST API emulation) |
 | API Gateway v1 | Not yet | Yes (SAM focuses here) |
-| S3 | 107 ops, real storage + notifications | **No** |
+| S3 | 112 ops, real storage + notifications | **No** |
 | SQS | 23 ops, real queues + event source mappings | **No** |
 | SNS | 42 ops, real fan-out | **No** |
 | DynamoDB | 58 ops, transactions, PartiQL, streams | **No** |
 | EventBridge | 57 ops + Scheduler (12 ops) | **No** |
 | Step Functions | 37 ops, full ASL interpreter | **No** |
-| RDS | 163 ops, real PostgreSQL/MySQL/MariaDB | **No** |
+| RDS | 164 ops, real PostgreSQL/MySQL/MariaDB | **No** |
 | Cognito | 132 ops, full auth flows | **No** |
 | Cross-service triggers | S3 -> Lambda, SQS -> Lambda, SNS -> Lambda, EventBridge -> Lambda all fire | Synthetic events only (you generate JSON and hand it to your handler) |
 
