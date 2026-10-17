@@ -140,6 +140,10 @@ pub struct ShapeTraits {
     /// `Resources` member has `xmlName: "ResourceId"`, so the wire param is
     /// `ResourceId.N`).
     pub xml_name: Option<String>,
+    /// `smithy.api#xmlFlattened` -- the list/map member is serialized as
+    /// repeated sibling elements named after the member (no wrapper), so an
+    /// empty collection has no XML representation at all.
+    pub xml_flattened: bool,
 }
 
 /// An example from `smithy.api#examples` trait on operations.
@@ -557,6 +561,8 @@ fn parse_traits(raw: Option<&serde_json::Map<String, Value>>) -> ShapeTraits {
     if let Some(name) = raw.get("smithy.api#xmlName").and_then(|v| v.as_str()) {
         traits.xml_name = Some(name.to_string());
     }
+
+    traits.xml_flattened = raw.contains_key("smithy.api#xmlFlattened");
 
     if let Some(default) = raw.get("smithy.api#default") {
         traits.default_value = Some(default.clone());

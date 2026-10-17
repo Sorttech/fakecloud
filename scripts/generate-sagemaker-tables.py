@@ -61,6 +61,8 @@ def kind_of(tid):
         return "Struct"
     if t == "enum":
         return "Str"
+    if t == "intEnum":
+        return "Int"
     if t == "string":
         return "Str"
     if t in ("integer", "long", "short", "byte", "biginteger"):
@@ -82,7 +84,7 @@ def enum_values(tid):
     s = resolve(tid)
     if not s:
         return None
-    if s["type"] == "enum":
+    if s["type"] in ("enum", "intEnum"):
         vals = []
         for mn, mm in s.get("members", {}).items():
             ev = mm.get("traits", {}).get("smithy.api#enumValue", mn)
@@ -496,6 +498,194 @@ for name in sorted(search_shapes):
     mems = "&[" + ", ".join(f"({rs(mn)}, {kind(kind_of(m['target']))})" for mn, m in struct_members(tid)) + "]"
     req = render_fields(required_tree(tid, [tid], 0))
     out.append("    SearchShape { name: %s, members: %s, req: %s }," % (rs(name), mems, req))
+out.append("];")
+out.append("")
+# Full output shape trees: every structure / list / map reachable from an
+# operation's output, as an indexed node table (shared nodes, so recursive
+# shapes terminate). Scalars collapse to one node per kind. The service
+# projects every response onto its operation's tree so no member the output
+# shape does not declare (e.g. a request-only member of a stored create
+# request) ever reaches the wire.
+OSH = []
+OIDX = {}
+LEAF_IDX = {}
+
+
+def oshape(tid):
+    k = kind_of(tid)
+    s = resolve(tid)
+    if k not in ("Struct", "List", "Map"):
+        mn_min, _mx, rmin, _rmx = constraints(tid, {})
+        evs = tuple(str(e) for e in (enum_values(tid) or [])) if k == "Str" else ()
+        ievs = tuple(int(e) for e in (enum_values(tid) or [])) if k == "Int" else ()
+        leaf = (k, evs, ievs, mn_min, rmin)
+        if leaf not in LEAF_IDX:
+            LEAF_IDX[leaf] = len(OSH)
+            OSH.append({"kind": k, "union": False, "members": [], "elem": 0,
+                        "enums": list(evs), "int_enums": list(ievs),
+                        "min_len": mn_min, "min_val": rmin})
+        return LEAF_IDX[leaf]
+    if tid in OIDX:
+        return OIDX[tid]
+    idx = len(OSH)
+    OIDX[tid] = idx
+    node = {"kind": k, "union": is_union(tid), "members": [], "elem": 0,
+            "enums": [], "int_enums": [], "min_len": None, "min_val": None}
+    OSH.append(node)
+    if k == "Struct":
+        node["members"] = [
+            (mn, oshape(m["target"]), "smithy.api#required" in m.get("traits", {}))
+            for mn, m in struct_members(tid)
+        ]
+    elif k == "List":
+        node["elem"] = oshape(s["member"]["target"])
+        node["min_len"] = list_length_min(tid)
+    else:
+        node["elem"] = oshape(s["value"]["target"])
+    return idx
+
+
+output_roots = []
+for name in sorted(meta):
+    tgt = shapes[NS + name].get("output", {}).get("target")
+    if tgt and sn(tgt) != "Unit":
+        output_roots.append((name, oshape(tgt)))
+assert len(OSH) < 65536
+out.append("/// A member of an [`OShape`] structure / union.")
+out.append("pub struct OMember {")
+out.append("    pub wire: &'static str,")
+out.append("    /// The member's shape: an index into [`OSHAPES`].")
+out.append("    pub shape: u16,")
+out.append("    pub req: bool,")
+out.append("}")
+out.append("")
+out.append("/// A node of an operation output's full shape tree. Structures / unions")
+out.append("/// list their members; lists and maps point `elem` at their element / value")
+out.append("/// node; scalars carry the constraints a synthesised value must honour")
+out.append("/// (`min_len` is a list's `@length` min on a list node).")
+out.append("pub struct OShape {")
+out.append("    pub kind: K,")
+out.append("    pub union: bool,")
+out.append("    pub members: &'static [OMember],")
+out.append("    pub elem: u16,")
+out.append("    pub enums: &'static [&'static str],")
+out.append("    /// The modelled values of an `intEnum` leaf.")
+out.append("    pub int_enums: &'static [i64],")
+out.append("    pub min_len: Option<u64>,")
+out.append("    pub min_val: Option<i64>,")
+out.append("}")
+out.append("")
+out.append("#[rustfmt::skip]")
+out.append("pub static OSHAPES: &[OShape] = &[")
+for node in OSH:
+    mems = "&[" + ", ".join(
+        "OMember { wire: %s, shape: %d, req: %s }" % (rs(mn), i, "true" if r else "false")
+        for mn, i, r in node["members"]) + "]"
+    enums = "&[" + ", ".join(rs(e) for e in node["enums"]) + "]"
+    ienums = "&[" + ", ".join(str(e) for e in node["int_enums"]) + "]"
+    out.append("    OShape { kind: %s, union: %s, members: %s, elem: %d, enums: %s, int_enums: %s, min_len: %s, min_val: %s }," % (
+        kind(node["kind"]), "true" if node["union"] else "false", mems, node["elem"],
+        enums, ienums, opt_i(node["min_len"]), opt_i(node["min_val"])))
+out.append("];")
+out.append("")
+out.append("/// Operation -> its output shape's node in [`OSHAPES`], sorted by operation")
+out.append("/// name; operations without an output shape are absent.")
+out.append("#[rustfmt::skip]")
+out.append("pub static OUTPUT_SHAPES: &[(&str, u16)] = &[")
+for name, i in output_roots:
+    out.append("    (%s, %d)," % (rs(name), i))
+out.append("];")
+out.append("")
+# Partial-update members. An Update operation's member is a partial update
+# of the structure its Create stored when its shape differs from that
+# structure (`GitConfigForUpdate` vs `GitConfig`) or it names it with a
+# `ForUpdate` / `Update` suffix (`UpdateDomain.DomainSettingsForUpdate` ->
+# `DomainSettings`). Such a member is overlaid onto the stored structure,
+# recursively through nested partial-update members, instead of replacing
+# it (or being stored under the request-only name).
+
+
+def strip_update_suffix(n):
+    for suf in ("ForUpdate", "Update"):
+        if n.endswith(suf) and len(n) > len(suf):
+            return n[: -len(suf)]
+    return None
+
+
+def merge_rules(update_tid, stored_tid, depth=0):
+    """Rules for the members of partial-update structure `update_tid` that
+    must be renamed or merged (recursively) into stored structure `stored_tid`."""
+    rules = []
+    if depth > 6:
+        return rules
+    stored = dict(struct_members(stored_tid))
+    for mn, m in struct_members(update_tid):
+        to = mn if mn in stored else strip_update_suffix(mn)
+        if to not in stored:
+            continue
+        ut, st = m["target"], stored[to]["target"]
+        partial = ut != st and kind_of(ut) == "Struct" and kind_of(st) == "Struct" \
+            and not is_union(ut) and not is_union(st)
+        if to != mn or partial:
+            rules.append({"from": mn, "to": to,
+                          "children": merge_rules(ut, st, depth + 1) if partial else []})
+    return rules
+
+
+update_merges = []
+for name in sorted(meta):
+    if not name.startswith("Update"):
+        continue
+    fam = name[len("Update"):]
+    uin = shapes[NS + name].get("input", {}).get("target")
+    cin = shapes.get(NS + "Create" + fam, {}).get("input", {}).get("target")
+    dout = shapes.get(NS + "Describe" + fam, {}).get("output", {}).get("target")
+    if not uin:
+        continue
+    # The stored record carries the Create request's members; members only a
+    # Describe reports are matched against the Describe output.
+    stored = {}
+    for tid in (dout, cin):
+        if tid:
+            stored.update(dict(struct_members(tid)))
+    if not stored:
+        continue
+    stored_struct = {"members": stored}
+    rules = []
+    for mn, m in struct_members(uin):
+        to = mn if mn in stored else strip_update_suffix(mn)
+        if to not in stored:
+            continue
+        ut, st = m["target"], stored[to]["target"]
+        partial = ut != st and kind_of(ut) == "Struct" and kind_of(st) == "Struct" \
+            and not is_union(ut) and not is_union(st)
+        if to != mn or partial:
+            rules.append({"from": mn, "to": to,
+                          "children": merge_rules(ut, st) if partial else []})
+    if rules:
+        update_merges.append((name, rules))
+
+
+def render_merge(rules):
+    return "&[" + ", ".join(
+        "MergeRule { from: %s, to: %s, children: %s }" % (
+            rs(r["from"]), rs(r["to"]), render_merge(r["children"]))
+        for r in rules) + "]"
+
+
+out.append("/// A partial-update member: `from` (the request member) is overlaid onto")
+out.append("/// the stored member `to`, merging `children` recursively.")
+out.append("pub struct MergeRule {")
+out.append("    pub from: &'static str,")
+out.append("    pub to: &'static str,")
+out.append("    pub children: &'static [MergeRule],")
+out.append("}")
+out.append("")
+out.append("/// Update operation -> its partial-update members.")
+out.append("#[rustfmt::skip]")
+out.append("pub static UPDATE_MERGES: &[(&str, &[MergeRule])] = &[")
+for name, rules in update_merges:
+    out.append("    (%s, %s)," % (rs(name), render_merge(rules)))
 out.append("];")
 out.append("")
 out.append("pub static ACTIONS: &[&str] = &[")

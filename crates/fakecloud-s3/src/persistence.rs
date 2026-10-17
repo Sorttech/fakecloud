@@ -1,11 +1,12 @@
 use std::collections::BTreeMap;
 
 use fakecloud_persistence::{
-    AclGrantSnapshot, AclSnapshot, AnnotationSnapshot, BucketMeta, BucketSnapshot,
-    InventorySnapshot, LoadedMpu, LoadedObject, LoadedPart, MpuInit, ObjectMeta, S3StateSnapshot,
-    TagsSnapshot, UploadPartMeta,
+    AclGrantSnapshot, AclSnapshot, AnnotationRecord, BucketMeta, BucketSnapshot, InventorySnapshot,
+    LoadedMpu, LoadedObject, LoadedPart, MpuInit, ObjectMeta, S3StateSnapshot, TagsSnapshot,
+    UploadPartMeta,
 };
 
+use crate::checksum::{ChecksumAlgorithm, ChecksumType};
 use crate::state::{
     AclGrant, MultipartUpload, ObjectAnnotation, S3Bucket, S3Object, S3State, UploadPart,
 };
@@ -59,22 +60,16 @@ pub fn object_meta_snapshot(o: &S3Object) -> ObjectMeta {
         is_delete_marker: o.is_delete_marker,
         restore_ongoing: o.restore_ongoing,
         restore_expiry: o.restore_expiry.clone(),
-        checksum_algorithm: o.checksum_algorithm.clone(),
+        checksum_algorithm: o.checksum_algorithm.map(|a| a.as_str().to_string()),
         checksum_value: o.checksum_value.clone(),
+        checksum_type: o.checksum_type.map(|t| t.as_str().to_string()),
+        part_checksums: o.part_checksums.clone(),
         lock_mode: o.lock_mode.clone(),
         lock_retain_until: o.lock_retain_until,
         lock_legal_hold: o.lock_legal_hold.clone(),
-        annotations: o
-            .annotations
-            .values()
-            .map(|a| AnnotationSnapshot {
-                name: a.name.clone(),
-                payload: a.payload.clone(),
-                etag: a.etag.clone(),
-                last_modified: a.last_modified,
-                checksum_algorithm: a.checksum_algorithm.clone(),
-            })
-            .collect(),
+        // Annotations are persisted one record each (`S3Store::put_annotation`),
+        // never inside the object's metadata.
+        annotations: Vec::new(),
         content_encoding: o.content_encoding.clone(),
         cache_control: o.cache_control.clone(),
         content_disposition: o.content_disposition.clone(),
@@ -82,6 +77,17 @@ pub fn object_meta_snapshot(o: &S3Object) -> ObjectMeta {
         expires: o.expires.clone(),
         website_redirect_location: o.website_redirect_location.clone(),
         replication_status: o.replication_status.clone(),
+    }
+}
+
+/// The persisted record of one annotation (its payload is stored beside it).
+pub fn annotation_record(a: &ObjectAnnotation) -> AnnotationRecord {
+    AnnotationRecord {
+        name: a.name.clone(),
+        etag: a.etag.clone(),
+        last_modified: a.last_modified,
+        checksum_algorithm: a.checksum_algorithm.map(|c| c.as_str().to_string()),
+        checksum_value: a.checksum_value.clone(),
     }
 }
 
@@ -97,7 +103,8 @@ pub fn mpu_init_snapshot(m: &MultipartUpload) -> MpuInit {
         sse_kms_key_id: m.sse_kms_key_id.clone(),
         tagging: m.tagging.clone(),
         acl_grants: m.acl_grants.iter().map(AclGrantSnapshot::from).collect(),
-        checksum_algorithm: m.checksum_algorithm.clone(),
+        checksum_algorithm: m.checksum_algorithm.map(|a| a.as_str().to_string()),
+        checksum_type: m.checksum_type.map(|t| t.as_str().to_string()),
         cache_control: m.cache_control.clone(),
         content_disposition: m.content_disposition.clone(),
         content_language: m.content_language.clone(),
@@ -114,7 +121,23 @@ pub fn upload_part_meta_snapshot(p: &UploadPart) -> UploadPartMeta {
         etag: p.etag.clone(),
         size: p.size,
         last_modified: p.last_modified,
+        checksum_algorithm: p.checksum.as_ref().map(|(a, _)| a.as_str().to_string()),
+        checksum_value: p.checksum.as_ref().map(|(_, v)| v.clone()),
     }
+}
+
+/// Read a persisted checksum back. The algorithm name is matched
+/// case-insensitively, since older builds stored the client's spelling
+/// verbatim (`crc32`, `Sha256`). A name outside the enum, or an empty value
+/// (the old stub output for algorithms it could not compute), yields no
+/// checksum rather than one that can never verify.
+fn loaded_checksum(
+    algorithm: Option<&str>,
+    value: Option<String>,
+) -> Option<(ChecksumAlgorithm, String)> {
+    let algorithm = ChecksumAlgorithm::parse(algorithm?)?;
+    let value = value.filter(|v| !v.trim().is_empty())?;
+    Some((algorithm, value))
 }
 
 /// Whether a stored grant names someone it could ever match.
@@ -147,6 +170,10 @@ fn acl_grant_from_snapshot(g: &AclGrantSnapshot) -> AclGrant {
 
 pub fn s3_object_from_loaded(lo: LoadedObject) -> S3Object {
     let LoadedObject { meta, body } = lo;
+    let object_checksum = loaded_checksum(
+        meta.checksum_algorithm.as_deref(),
+        meta.checksum_value.clone(),
+    );
     S3Object {
         key: meta.key,
         body,
@@ -179,8 +206,10 @@ pub fn s3_object_from_loaded(lo: LoadedObject) -> S3Object {
         website_redirect_location: meta.website_redirect_location,
         restore_ongoing: meta.restore_ongoing,
         restore_expiry: meta.restore_expiry,
-        checksum_algorithm: meta.checksum_algorithm,
-        checksum_value: meta.checksum_value,
+        checksum_algorithm: object_checksum.as_ref().map(|(a, _)| *a),
+        checksum_value: object_checksum.map(|(_, v)| v),
+        checksum_type: meta.checksum_type.as_deref().and_then(ChecksumType::parse),
+        part_checksums: meta.part_checksums,
         lock_mode: meta.lock_mode,
         lock_retain_until: meta.lock_retain_until,
         lock_legal_hold: meta.lock_legal_hold,
@@ -188,6 +217,19 @@ pub fn s3_object_from_loaded(lo: LoadedObject) -> S3Object {
             .annotations
             .into_iter()
             .map(|a| {
+                // An annotation written before its checksum value was stored
+                // keeps its (normalized) declared algorithm; the value is
+                // recomputed from the payload, which is held verbatim.
+                let checksum_algorithm = a
+                    .checksum_algorithm
+                    .as_deref()
+                    .and_then(ChecksumAlgorithm::parse);
+                let checksum_value = checksum_algorithm.map(|algo| {
+                    a.checksum_value
+                        .clone()
+                        .filter(|v| !v.trim().is_empty())
+                        .unwrap_or_else(|| crate::checksum::checksum(algo, &a.payload))
+                });
                 (
                     a.name.clone(),
                     ObjectAnnotation {
@@ -195,7 +237,8 @@ pub fn s3_object_from_loaded(lo: LoadedObject) -> S3Object {
                         payload: a.payload,
                         etag: a.etag,
                         last_modified: a.last_modified,
-                        checksum_algorithm: a.checksum_algorithm,
+                        checksum_algorithm,
+                        checksum_value,
                     },
                 )
             })
@@ -211,11 +254,24 @@ pub fn upload_part_from_loaded(lp: LoadedPart) -> UploadPart {
         etag: meta.etag,
         size: meta.size,
         last_modified: meta.last_modified,
+        checksum: loaded_checksum(meta.checksum_algorithm.as_deref(), meta.checksum_value),
     }
 }
 
 pub fn multipart_upload_from_loaded(lm: LoadedMpu) -> MultipartUpload {
     let LoadedMpu { init, parts } = lm;
+    let checksum_algorithm = init
+        .checksum_algorithm
+        .as_deref()
+        .and_then(ChecksumAlgorithm::parse);
+    // An upload created before types were tracked used the algorithm's
+    // default type.
+    let checksum_type = checksum_algorithm.map(|a| {
+        init.checksum_type
+            .as_deref()
+            .and_then(ChecksumType::parse)
+            .unwrap_or_else(|| a.default_multipart_type())
+    });
     let runtime_parts: BTreeMap<u32, UploadPart> = parts
         .into_iter()
         .map(|(n, lp)| (n, upload_part_from_loaded(lp)))
@@ -236,7 +292,8 @@ pub fn multipart_upload_from_loaded(lm: LoadedMpu) -> MultipartUpload {
             .iter()
             .map(acl_grant_from_snapshot)
             .collect(),
-        checksum_algorithm: init.checksum_algorithm,
+        checksum_algorithm,
+        checksum_type,
         cache_control: init.cache_control,
         content_disposition: init.content_disposition,
         content_language: init.content_language,
@@ -647,6 +704,7 @@ permission = "READ"
             tagging: None,
             acl_grants: Vec::new(),
             checksum_algorithm: None,
+            checksum_type: None,
             cache_control: None,
             content_disposition: None,
             content_language: None,
@@ -679,6 +737,7 @@ permission = "READ"
             etag: "peeetag".to_string(),
             size: 3,
             last_modified: chrono::Utc::now(),
+            checksum: None,
         };
         let snap = upload_part_meta_snapshot(&part);
         assert_eq!(snap.part_number, 3);
@@ -707,5 +766,127 @@ permission = "READ"
         let state =
             hydrate_s3_state_reporting(snapshot, "123", "us-east-1", &mut |_, _| {}).unwrap();
         assert!(state.buckets.contains_key("b"));
+    }
+}
+
+#[cfg(test)]
+mod checksum_persistence_tests {
+    use super::*;
+    use crate::checksum::{checksum, ChecksumAlgorithm, ChecksumType};
+    use fakecloud_persistence::AnnotationSnapshot;
+
+    fn loaded(meta: ObjectMeta) -> S3Object {
+        s3_object_from_loaded(LoadedObject {
+            meta,
+            body: crate::state::memory_body(bytes::Bytes::from_static(b"payload")),
+        })
+    }
+
+    #[test]
+    fn lowercase_persisted_algorithm_names_are_read_back() {
+        let crc = checksum(ChecksumAlgorithm::Crc32, b"payload");
+        let obj = loaded(ObjectMeta {
+            key: "k".into(),
+            checksum_algorithm: Some("crc32".into()),
+            checksum_value: Some(crc.clone()),
+            annotations: vec![AnnotationSnapshot {
+                name: "a".into(),
+                payload: b"note".to_vec(),
+                checksum_algorithm: Some("sha256".into()),
+                // Written before annotation checksum values were stored.
+                checksum_value: None,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        assert_eq!(obj.checksum_algorithm, Some(ChecksumAlgorithm::Crc32));
+        assert_eq!(obj.checksum_value, Some(crc));
+        // No stored type: a single-part object is FULL_OBJECT.
+        assert_eq!(
+            obj.effective_checksum_type(),
+            Some(ChecksumType::FullObject)
+        );
+        let a = &obj.annotations["a"];
+        assert_eq!(a.checksum_algorithm, Some(ChecksumAlgorithm::Sha256));
+        assert_eq!(
+            a.checksum_value,
+            Some(checksum(ChecksumAlgorithm::Sha256, b"note"))
+        );
+
+        // Round trip writes the canonical uppercase name back.
+        let meta = object_meta_snapshot(&obj);
+        assert_eq!(meta.checksum_algorithm.as_deref(), Some("CRC32"));
+        assert_eq!(
+            annotation_record(a).checksum_algorithm.as_deref(),
+            Some("SHA256")
+        );
+    }
+
+    #[test]
+    fn legacy_multipart_checksum_reads_as_composite_and_stub_values_are_dropped() {
+        let obj = loaded(ObjectMeta {
+            key: "k".into(),
+            parts_count: Some(2),
+            checksum_algorithm: Some("Sha256".into()),
+            checksum_value: Some("abc-2".into()),
+            ..Default::default()
+        });
+        assert_eq!(obj.effective_checksum_type(), Some(ChecksumType::Composite));
+        // The old stub stored an empty value for algorithms it could not hash.
+        let stub = loaded(ObjectMeta {
+            key: "k".into(),
+            checksum_algorithm: Some("SHA512".into()),
+            checksum_value: Some(String::new()),
+            ..Default::default()
+        });
+        assert_eq!(stub.checksum_algorithm, None);
+        assert_eq!(stub.checksum_value, None);
+        assert_eq!(stub.effective_checksum_type(), None);
+    }
+
+    #[test]
+    fn multipart_upload_checksum_settings_round_trip() {
+        let mut init = MpuInit {
+            upload_id: "u".into(),
+            key: "k".into(),
+            checksum_algorithm: Some("crc32c".into()),
+            ..Default::default()
+        };
+        let part = fakecloud_persistence::UploadPartMeta {
+            part_number: 1,
+            etag: "e".into(),
+            size: 1,
+            last_modified: chrono::Utc::now(),
+            checksum_algorithm: Some("crc32c".into()),
+            checksum_value: Some("AAAAAA==".into()),
+        };
+        let mut parts = std::collections::BTreeMap::new();
+        parts.insert(
+            1,
+            LoadedPart {
+                meta: part,
+                body: crate::state::memory_body(bytes::Bytes::from_static(b"x")),
+            },
+        );
+        let m = multipart_upload_from_loaded(LoadedMpu {
+            init: init.clone(),
+            parts,
+        });
+        assert_eq!(m.checksum_algorithm, Some(ChecksumAlgorithm::Crc32c));
+        // Older uploads carry no type: the algorithm's default applies.
+        assert_eq!(m.checksum_type, Some(ChecksumType::Composite));
+        assert_eq!(
+            m.parts[&1].checksum,
+            Some((ChecksumAlgorithm::Crc32c, "AAAAAA==".to_string()))
+        );
+        init.checksum_type = Some("FULL_OBJECT".into());
+        let m = multipart_upload_from_loaded(LoadedMpu {
+            init,
+            parts: Default::default(),
+        });
+        assert_eq!(m.checksum_type, Some(ChecksumType::FullObject));
+        let snap = mpu_init_snapshot(&m);
+        assert_eq!(snap.checksum_algorithm.as_deref(), Some("CRC32C"));
+        assert_eq!(snap.checksum_type.as_deref(), Some("FULL_OBJECT"));
     }
 }

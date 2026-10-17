@@ -854,6 +854,13 @@ pub struct CapacityProvider {
     pub arn: String,
     pub status: String,
     pub auto_scaling_group_provider: Option<Value>,
+    /// ECS Managed Instances configuration. A provider backed by this is a
+    /// `MANAGED_INSTANCES` provider scoped to `cluster`.
+    #[serde(default)]
+    pub managed_instances_provider: Option<Value>,
+    /// Owning cluster name for cluster-scoped (Managed Instances) providers.
+    #[serde(default)]
+    pub cluster: Option<String>,
     pub update_status: Option<String>,
     pub update_status_reason: Option<String>,
     pub created_at: DateTime<Utc>,

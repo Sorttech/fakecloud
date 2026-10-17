@@ -1316,7 +1316,7 @@ pub(super) fn make_request(
 
 /// The base64 `Content-MD5` header value for `body`.
 fn content_md5(body: &[u8]) -> String {
-    BASE64.encode(md5::Md5::digest(body))
+    crate::checksum::checksum(crate::checksum::ChecksumAlgorithm::Md5, body)
 }
 
 fn assert_aws_err(
@@ -1694,6 +1694,7 @@ async fn mpu_complete_uses_composite_additional_checksum() {
     let part1 = vec![b'a'; 5 * 1024 * 1024];
     let part2 = b"second-part".to_vec();
     let mut etags = Vec::new();
+    let mut checksums = Vec::new();
     for (n, data) in [(1u32, &part1), (2u32, &part2)] {
         let req = make_request(
             Method::PUT,
@@ -1706,11 +1707,20 @@ async fn mpu_complete_uses_composite_additional_checksum() {
             .await
             .unwrap();
         etags.push(r.headers.get("etag").unwrap().to_str().unwrap().to_string());
+        // UploadPart returns the part checksum in the upload's algorithm.
+        checksums.push(
+            r.headers
+                .get("x-amz-checksum-sha256")
+                .expect("part checksum header")
+                .to_str()
+                .unwrap()
+                .to_string(),
+        );
     }
 
     let complete_xml = format!(
-        r#"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part><Part><PartNumber>2</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>"#,
-        etags[0], etags[1],
+        r#"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag><ChecksumSHA256>{}</ChecksumSHA256></Part><Part><PartNumber>2</PartNumber><ETag>{}</ETag><ChecksumSHA256>{}</ChecksumSHA256></Part></CompleteMultipartUpload>"#,
+        etags[0], checksums[0], etags[1], checksums[1],
     );
     let complete_req = make_request(
         Method::POST,
@@ -1721,11 +1731,12 @@ async fn mpu_complete_uses_composite_additional_checksum() {
     svc.complete_multipart_upload("123456789012", &complete_req, "comp", "k", &upload_id)
         .unwrap();
 
-    let expected = super::compute_composite_checksum(
-        "SHA256",
+    let sha256 = crate::checksum::ChecksumAlgorithm::Sha256;
+    let expected = crate::checksum::composite(
+        sha256,
         &[
-            super::compute_checksum_raw("SHA256", &part1),
-            super::compute_checksum_raw("SHA256", &part2),
+            crate::checksum::digest(sha256, &part1),
+            crate::checksum::digest(sha256, &part2),
         ],
     )
     .unwrap();
@@ -1746,7 +1757,7 @@ async fn mpu_complete_uses_composite_additional_checksum() {
     // Sanity: it must NOT equal a single checksum over the whole object.
     let mut whole = part1.clone();
     whole.extend_from_slice(&part2);
-    let whole_ck = super::compute_checksum("SHA256", &whole);
+    let whole_ck = crate::checksum::checksum(sha256, &whole);
     assert_ne!(obj.checksum_value.as_deref(), Some(whole_ck.as_str()));
 }
 
@@ -1754,15 +1765,14 @@ async fn mpu_complete_uses_composite_additional_checksum() {
 /// additional-checksum algorithm.
 #[test]
 fn compute_composite_checksum_supports_all_algorithms() {
-    for algo in ["CRC32", "CRC32C", "CRC64NVME", "SHA1", "SHA256"] {
-        let p1 = super::compute_checksum_raw(algo, b"part-one");
-        let p2 = super::compute_checksum_raw(algo, b"part-two");
-        assert!(!p1.is_empty(), "{algo} raw digest");
-        let composite = super::compute_composite_checksum(algo, &[p1, p2]).unwrap();
+    for algo in crate::checksum::ChecksumAlgorithm::ALL {
+        let p1 = crate::checksum::digest(algo, b"part-one");
+        let p2 = crate::checksum::digest(algo, b"part-two");
+        assert_eq!(p1.len(), algo.digest_len(), "{algo} raw digest");
+        let composite = crate::checksum::composite(algo, &[p1, p2]).unwrap();
         assert!(composite.ends_with("-2"), "{algo} composite suffix");
     }
-    assert!(super::compute_composite_checksum("SHA256", &[]).is_none());
-    assert!(super::compute_composite_checksum("BOGUS", &[vec![1]]).is_none());
+    assert!(crate::checksum::composite(crate::checksum::ChecksumAlgorithm::Sha256, &[]).is_none());
 }
 
 /// 1.19: DeleteObjects must reject >1000 keys with a 400 MalformedXML.
@@ -6899,41 +6909,23 @@ fn get_bucket_policy_status_uses_real_json_parse() {
         .contains("<IsPublic>true</IsPublic>"));
 }
 
-#[tokio::test]
-async fn compute_checksum_streaming_supports_crc32c() {
-    use std::io::Write;
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("data");
-    let mut file = std::fs::File::create(&path).unwrap();
-    file.write_all(b"hello world").unwrap();
-    let result = super::compute_checksum_streaming("CRC32C", &path)
-        .await
-        .unwrap();
-    // Reference CRC32C("hello world") = 0xC99465AA, big-endian -> base64
+#[test]
+fn crc32c_and_crc64nvme_hello_world_reference_values() {
+    use crate::checksum::{checksum, ChecksumAlgorithm};
+    // Reference CRC32C("hello world") = 0xC99465AA, big-endian -> base64.
     let expected = base64::Engine::encode(
         &base64::engine::general_purpose::STANDARD,
         0xC99465AAu32.to_be_bytes(),
     );
-    assert_eq!(result, expected);
-}
-
-#[tokio::test]
-async fn compute_checksum_streaming_supports_crc64nvme() {
-    use std::io::Write;
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("data");
-    let mut file = std::fs::File::create(&path).unwrap();
-    file.write_all(b"hello world").unwrap();
-    let result = super::compute_checksum_streaming("CRC64NVME", &path)
-        .await
-        .unwrap();
+    assert_eq!(
+        checksum(ChecksumAlgorithm::Crc32c, b"hello world"),
+        expected
+    );
     // 8-byte digest, base64 = 12 chars
-    let decoded = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        result.as_bytes(),
-    )
-    .unwrap();
-    assert_eq!(decoded.len(), 8);
+    assert_eq!(
+        checksum(ChecksumAlgorithm::Crc64Nvme, b"hello world").len(),
+        12
+    );
 }
 
 #[tokio::test]
@@ -7395,6 +7387,28 @@ impl fakecloud_persistence::S3Store for RecordingStore {
         self.record(format!("put_object_meta:{bucket}/{key}"));
         self.inner.put_object_meta(bucket, key, version, meta)
     }
+    fn put_annotation(
+        &self,
+        bucket: &str,
+        key: &str,
+        version: Option<&str>,
+        record: &fakecloud_persistence::AnnotationRecord,
+        payload: &[u8],
+    ) -> fakecloud_persistence::StoreResult<()> {
+        self.record(format!("put_annotation:{bucket}/{key}/{}", record.name));
+        self.inner
+            .put_annotation(bucket, key, version, record, payload)
+    }
+    fn delete_annotation(
+        &self,
+        bucket: &str,
+        key: &str,
+        version: Option<&str>,
+        name: &str,
+    ) -> fakecloud_persistence::StoreResult<()> {
+        self.record(format!("delete_annotation:{bucket}/{key}/{name}"));
+        self.inner.delete_annotation(bucket, key, version, name)
+    }
     fn delete_object(
         &self,
         bucket: &str,
@@ -7425,9 +7439,10 @@ impl fakecloud_persistence::S3Store for RecordingStore {
         part_number: u32,
         body: fakecloud_persistence::BodySource,
         etag: &str,
+        checksum: Option<fakecloud_persistence::PartChecksum<'_>>,
     ) -> fakecloud_persistence::StoreResult<fakecloud_persistence::BodyRef> {
         self.inner
-            .mpu_put_part(bucket, upload_id, part_number, body, etag)
+            .mpu_put_part(bucket, upload_id, part_number, body, etag, checksum)
     }
     fn mpu_abort(&self, bucket: &str, upload_id: &str) -> fakecloud_persistence::StoreResult<()> {
         self.inner.mpu_abort(bucket, upload_id)
@@ -7452,6 +7467,75 @@ fn make_recording_service() -> (S3Service, std::sync::Arc<RecordingStore>) {
     let store = RecordingStore::new();
     let svc = S3Service::with_store(state, Arc::new(DeliveryBus::new()), store.clone());
     (svc, store)
+}
+
+#[test]
+fn annotation_writes_persist_only_that_annotation() {
+    let (svc, store) = make_recording_service();
+    seed_bucket(&svc, "b");
+    seed_object(&svc, "b", "k", b"payload");
+    for name in ["one", "two"] {
+        let req = make_request(
+            Method::PUT,
+            "/b/k",
+            &[("annotation", ""), ("annotationName", name)],
+            b"note",
+        );
+        svc.put_object_annotation("123456789012", &req, "b", "k")
+            .unwrap();
+    }
+    let req = make_request(
+        Method::DELETE,
+        "/b/k",
+        &[("annotation", ""), ("annotationName", "one")],
+        b"",
+    );
+    svc.delete_object_annotation("123456789012", &req, "b", "k")
+        .unwrap();
+    let calls: Vec<String> = store
+        .calls()
+        .into_iter()
+        .filter(|c| !c.starts_with("put_bucket_meta"))
+        .collect();
+    // One record per write, never the object's metadata (which would carry
+    // every other annotation's payload with it).
+    assert_eq!(
+        calls,
+        vec![
+            "put_annotation:b/k/one".to_string(),
+            "put_annotation:b/k/two".to_string(),
+            "delete_annotation:b/k/one".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn rename_object_carries_annotations_to_the_new_key() {
+    let (svc, store) = make_recording_service();
+    seed_bucket(&svc, "b");
+    seed_object(&svc, "b", "old", b"payload");
+    let req = make_request(
+        Method::PUT,
+        "/b/old",
+        &[("annotation", ""), ("annotationName", "note")],
+        b"x",
+    );
+    svc.put_object_annotation("123456789012", &req, "b", "old")
+        .unwrap();
+    let mut rename = make_request(Method::PUT, "/b/new", &[("renameObject", "")], b"");
+    rename
+        .headers
+        .insert("x-amz-rename-source", "/old".parse().unwrap());
+    svc.rename_object("123456789012", &rename, "b", "new")
+        .unwrap();
+    assert!(
+        store
+            .calls()
+            .iter()
+            .any(|c| c == "put_annotation:b/new/note"),
+        "{:?}",
+        store.calls()
+    );
 }
 
 #[test]
@@ -8271,9 +8355,14 @@ fn object_annotations_validate_names_and_missing_resources() {
         svc.put_object_annotation("123456789012", &req, "annot", "k"),
         "InvalidAnnotationName",
     );
-    let long = "n".repeat(256);
+    // The cap is 512 bytes, not characters.
+    put_annotation(&svc, "annot", "k", &"n".repeat(512), b"x").unwrap();
     assert_aws_err(
-        put_annotation(&svc, "annot", "k", &long, b"x"),
+        put_annotation(&svc, "annot", "k", &"n".repeat(513), b"x"),
+        "AnnotationNameTooLong",
+    );
+    assert_aws_err(
+        put_annotation(&svc, "annot", "k", &"é".repeat(257), b"x"),
         "AnnotationNameTooLong",
     );
     assert_aws_err(
@@ -8308,15 +8397,27 @@ fn object_annotations_validate_names_and_missing_resources() {
         "NoSuchKey",
     );
 
-    // The 50-annotation ceiling is enforced, and overwriting stays allowed.
-    for i in 0..50 {
-        put_annotation(&svc, "annot", "k", &format!("a{i:02}"), b"x").unwrap();
+    // The 1,000-annotation ceiling is enforced, and overwriting stays allowed.
+    {
+        let mut mas = svc.state.write();
+        let obj = mas
+            .default_mut()
+            .buckets
+            .get_mut("annot")
+            .unwrap()
+            .objects
+            .get_mut("k")
+            .unwrap();
+        obj.annotations.clear();
+    }
+    for i in 0..1000 {
+        put_annotation(&svc, "annot", "k", &format!("a{i:04}"), b"x").unwrap();
     }
     assert_aws_err(
         put_annotation(&svc, "annot", "k", "one-too-many", b"x"),
         "AnnotationLimitExceeded",
     );
-    put_annotation(&svc, "annot", "k", "a00", b"replaced").unwrap();
+    put_annotation(&svc, "annot", "k", "a0000", b"replaced").unwrap();
 }
 
 #[test]
@@ -8887,7 +8988,7 @@ async fn put_object_with_object_lock_requires_a_payload_integrity_header() {
         other => panic!("{other:?}"),
     }
 
-    let crc32 = compute_checksum("CRC32", b"payload");
+    let crc32 = crate::checksum::checksum(crate::checksum::ChecksumAlgorithm::Crc32, b"payload");
     let integrity: [(&str, &str, &str); 4] = [
         ("md5", "content-md5", &content_md5(b"payload")),
         ("crc", "x-amz-checksum-crc32", &crc32),
@@ -8895,7 +8996,23 @@ async fn put_object_with_object_lock_requires_a_payload_integrity_header() {
         ("sdk", "x-amz-sdk-checksum-algorithm", "CRC32"),
     ];
     for (key, name, value) in integrity {
-        let mut req = locked_put(key);
+        let mut req = if key == "trailer" {
+            // A trailing checksum arrives after an aws-chunked body.
+            let framed = format!("7\r\npayload\r\n0\r\nx-amz-checksum-crc32:{crc32}\r\n\r\n");
+            let mut req = make_request(
+                Method::PUT,
+                &format!("/lockmd5/{key}"),
+                &[],
+                framed.as_bytes(),
+            );
+            req.headers
+                .insert("x-amz-object-lock-legal-hold", "ON".parse().unwrap());
+            req.headers
+                .insert("content-encoding", "aws-chunked".parse().unwrap());
+            req
+        } else {
+            locked_put(key)
+        };
         req.headers.insert(name, value.parse().unwrap());
         svc.put_object("123456789012", &req, "lockmd5", key)
             .await
@@ -9647,6 +9764,1319 @@ fn bucket_quota_counts_buckets_in_every_region_against_one_account_value() {
         Some(2.0)
     );
     assert_eq!(usage.usage("123456789012", "us-east-1", "s3", "L-0"), None);
+}
+
+// ── Flexible checksums ───────────────────────────────────────────
+
+mod flexible_checksums {
+    use super::*;
+    use crate::checksum::{checksum, digest, ChecksumAlgorithm, ChecksumType};
+
+    const ACCT: &str = "123456789012";
+
+    fn header(resp: &AwsResponse, name: &str) -> Option<String> {
+        resp.headers
+            .get(name)
+            .map(|v| v.to_str().unwrap().to_string())
+    }
+
+    fn body_text(resp: &AwsResponse) -> String {
+        String::from_utf8(resp.body.expect_bytes().to_vec()).unwrap()
+    }
+
+    fn with_headers(mut req: AwsRequest, headers: &[(&str, &str)]) -> AwsRequest {
+        for (k, v) in headers {
+            req.headers.insert(
+                http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        req
+    }
+
+    fn object(svc: &S3Service, bucket: &str, key: &str) -> S3Object {
+        svc.state.read().default_ref().buckets[bucket].objects[key].clone()
+    }
+
+    async fn put(
+        svc: &S3Service,
+        bucket: &str,
+        key: &str,
+        body: &[u8],
+        headers: &[(&str, &str)],
+    ) -> Result<AwsResponse, AwsServiceError> {
+        let req = with_headers(
+            make_request(Method::PUT, &format!("/{bucket}/{key}"), &[], body),
+            headers,
+        );
+        svc.put_object(ACCT, &req, bucket, key).await
+    }
+
+    fn head_with_checksum(
+        svc: &S3Service,
+        bucket: &str,
+        key: &str,
+        query: &[(&str, &str)],
+    ) -> AwsResponse {
+        let req = with_headers(
+            make_request(Method::HEAD, &format!("/{bucket}/{key}"), query, b""),
+            &[("x-amz-checksum-mode", "ENABLED")],
+        );
+        svc.head_object(ACCT, &req, bucket, key).unwrap()
+    }
+
+    #[tokio::test]
+    async fn put_object_verifies_and_stores_every_algorithm() {
+        let svc = make_service();
+        seed_bucket(&svc, "ck");
+        let body = b"hello world";
+        for algo in ChecksumAlgorithm::ALL {
+            let key = algo.lowercase_name();
+            let value = checksum(algo, body);
+            let resp = put(&svc, "ck", key, body, &[(algo.header_name(), &value)])
+                .await
+                .unwrap_or_else(|e| panic!("{algo}: {e:?}"));
+            assert_eq!(
+                header(&resp, algo.header_name()),
+                Some(value.clone()),
+                "{algo}"
+            );
+            assert_eq!(
+                header(&resp, "x-amz-checksum-type").as_deref(),
+                Some("FULL_OBJECT")
+            );
+
+            let obj = object(&svc, "ck", key);
+            assert_eq!(obj.checksum_algorithm, Some(algo));
+            assert_eq!(obj.checksum_value.as_deref(), Some(value.as_str()));
+
+            let head = head_with_checksum(&svc, "ck", key, &[]);
+            assert_eq!(
+                header(&head, algo.header_name()),
+                Some(value.clone()),
+                "{algo}"
+            );
+            assert_eq!(
+                header(&head, "x-amz-checksum-type").as_deref(),
+                Some("FULL_OBJECT")
+            );
+
+            // The wrong digest for the same algorithm is BadDigest, and
+            // nothing is stored.
+            let wrong = checksum(algo, b"tampered");
+            let err = put(&svc, "ck", "wrong", body, &[(algo.header_name(), &wrong)]).await;
+            assert_aws_err(err, "BadDigest");
+            assert!(!svc.state.read().default_ref().buckets["ck"]
+                .objects
+                .contains_key("wrong"));
+        }
+    }
+
+    #[tokio::test]
+    async fn put_object_without_a_checksum_gets_the_crc64nvme_default() {
+        let svc = make_service();
+        seed_bucket(&svc, "ck");
+        let resp = put(&svc, "ck", "plain", b"data", &[]).await.unwrap();
+        let expected = checksum(ChecksumAlgorithm::Crc64Nvme, b"data");
+        assert_eq!(
+            header(&resp, "x-amz-checksum-crc64nvme"),
+            Some(expected.clone())
+        );
+        let obj = object(&svc, "ck", "plain");
+        assert_eq!(obj.checksum_algorithm, Some(ChecksumAlgorithm::Crc64Nvme));
+        assert_eq!(obj.checksum_type, Some(ChecksumType::FullObject));
+
+        // A plain HEAD does not echo it; checksum mode does.
+        let req = make_request(Method::HEAD, "/ck/plain", &[], b"");
+        let plain = svc.head_object(ACCT, &req, "ck", "plain").unwrap();
+        assert!(plain.headers.get("x-amz-checksum-crc64nvme").is_none());
+        let head = head_with_checksum(&svc, "ck", "plain", &[]);
+        assert_eq!(header(&head, "x-amz-checksum-crc64nvme"), Some(expected));
+
+        // The SDK-declared algorithm alone selects what is computed.
+        put(
+            &svc,
+            "ck",
+            "sdk",
+            b"data",
+            &[("x-amz-sdk-checksum-algorithm", "xxhash128")],
+        )
+        .await
+        .unwrap();
+        let obj = object(&svc, "ck", "sdk");
+        assert_eq!(obj.checksum_algorithm, Some(ChecksumAlgorithm::XxHash128));
+        assert_eq!(
+            obj.checksum_value,
+            Some(checksum(ChecksumAlgorithm::XxHash128, b"data"))
+        );
+    }
+
+    #[tokio::test]
+    async fn put_object_rejects_malformed_integrity_headers() {
+        let svc = make_service();
+        seed_bucket(&svc, "ck");
+        assert_aws_err(
+            put(
+                &svc,
+                "ck",
+                "k",
+                b"x",
+                &[("x-amz-sdk-checksum-algorithm", "CRC16")],
+            )
+            .await,
+            "InvalidRequest",
+        );
+        assert_aws_err(
+            put(
+                &svc,
+                "ck",
+                "k",
+                b"x",
+                &[("x-amz-checksum-sha256", "not-base64")],
+            )
+            .await,
+            "InvalidRequest",
+        );
+        let crc = checksum(ChecksumAlgorithm::Crc32, b"x");
+        let crcc = checksum(ChecksumAlgorithm::Crc32c, b"x");
+        assert_aws_err(
+            put(
+                &svc,
+                "ck",
+                "k",
+                b"x",
+                &[
+                    ("x-amz-checksum-crc32", &crc),
+                    ("x-amz-checksum-crc32c", &crcc),
+                ],
+            )
+            .await,
+            "InvalidRequest",
+        );
+        assert_aws_err(
+            put(&svc, "ck", "k", b"x", &[("content-md5", "short")]).await,
+            "InvalidDigest",
+        );
+        let wrong_md5 = content_md5(b"y");
+        assert_aws_err(
+            put(&svc, "ck", "k", b"x", &[("content-md5", &wrong_md5)]).await,
+            "BadDigest",
+        );
+        // Declared trailer that never arrives.
+        assert_aws_err(
+            put(
+                &svc,
+                "ck",
+                "k",
+                b"x",
+                &[("x-amz-trailer", "x-amz-checksum-crc32")],
+            )
+            .await,
+            "MalformedTrailerError",
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_bucket_and_failed_preconditions_win_over_bad_digest() {
+        let svc = make_service();
+        let wrong = checksum(ChecksumAlgorithm::Sha256, b"other");
+        assert_aws_err(
+            put(
+                &svc,
+                "ghost",
+                "k",
+                b"x",
+                &[("x-amz-checksum-sha256", &wrong)],
+            )
+            .await,
+            "NoSuchBucket",
+        );
+        assert_aws_err(
+            put(
+                &svc,
+                "ghost",
+                "k",
+                b"x",
+                &[("x-amz-checksum-sha256", "garbage")],
+            )
+            .await,
+            "NoSuchBucket",
+        );
+        seed_bucket(&svc, "ck");
+        put(&svc, "ck", "k", b"x", &[]).await.unwrap();
+        assert_aws_err(
+            put(
+                &svc,
+                "ck",
+                "k",
+                b"x",
+                &[("if-none-match", "*"), ("x-amz-checksum-sha256", &wrong)],
+            )
+            .await,
+            "PreconditionFailed",
+        );
+    }
+
+    #[tokio::test]
+    async fn put_object_verifies_an_aws_chunked_trailing_checksum() {
+        let svc = make_service();
+        seed_bucket(&svc, "ck");
+        let payload = b"chunked payload with a trailing checksum";
+        let good = checksum(ChecksumAlgorithm::XxHash64, payload);
+        let frame = |value: &str| {
+            let mut out = format!("{:x};chunk-signature={}\r\n", 10, "0".repeat(64)).into_bytes();
+            out.extend_from_slice(&payload[..10]);
+            out.extend_from_slice(format!("\r\n{:x}\r\n", payload.len() - 10).as_bytes());
+            out.extend_from_slice(&payload[10..]);
+            out.extend_from_slice(
+                format!("\r\n0\r\nx-amz-checksum-xxhash64:{value}\r\nx-amz-trailer-signature:abc\r\n\r\n")
+                    .as_bytes(),
+            );
+            out
+        };
+        let headers = [
+            ("content-encoding", "aws-chunked"),
+            ("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER"),
+            ("x-amz-trailer", "x-amz-checksum-xxhash64"),
+            ("x-amz-sdk-checksum-algorithm", "XXHASH64"),
+        ];
+        let resp = put(&svc, "ck", "t", &frame(&good), &headers).await.unwrap();
+        assert_eq!(header(&resp, "x-amz-checksum-xxhash64"), Some(good.clone()));
+        let obj = object(&svc, "ck", "t");
+        assert_eq!(obj.size, payload.len() as u64);
+        assert_eq!(obj.checksum_value, Some(good));
+
+        let wrong = checksum(ChecksumAlgorithm::XxHash64, b"nope");
+        assert_aws_err(
+            put(&svc, "ck", "t2", &frame(&wrong), &headers).await,
+            "BadDigest",
+        );
+    }
+
+    async fn create_upload(
+        svc: &S3Service,
+        key: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<(String, AwsResponse), AwsServiceError> {
+        let req = with_headers(
+            make_request(Method::POST, &format!("/mp/{key}"), &[("uploads", "")], b""),
+            headers,
+        );
+        let resp = svc.create_multipart_upload(ACCT, &req, "mp", key)?;
+        let text = body_text(&resp);
+        let start = text.find("<UploadId>").unwrap() + "<UploadId>".len();
+        let end = text.find("</UploadId>").unwrap();
+        Ok((text[start..end].to_string(), resp))
+    }
+
+    async fn upload_part(
+        svc: &S3Service,
+        key: &str,
+        upload_id: &str,
+        n: u32,
+        data: &[u8],
+        headers: &[(&str, &str)],
+    ) -> Result<AwsResponse, AwsServiceError> {
+        let req = with_headers(
+            make_request(
+                Method::PUT,
+                &format!("/mp/{key}"),
+                &[("partNumber", &n.to_string()), ("uploadId", upload_id)],
+                data,
+            ),
+            headers,
+        );
+        svc.upload_part(ACCT, &req, "mp", key, upload_id, n as i64)
+            .await
+    }
+
+    /// (part number, ETag, optional part checksum) as listed in the request.
+    type CompletePart = (u32, String, Option<(ChecksumAlgorithm, String)>);
+
+    fn complete(
+        svc: &S3Service,
+        key: &str,
+        upload_id: &str,
+        parts: &[CompletePart],
+        headers: &[(&str, &str)],
+    ) -> Result<AwsResponse, AwsServiceError> {
+        let mut xml = String::from("<CompleteMultipartUpload>");
+        for (n, etag, ck) in parts {
+            xml.push_str(&format!(
+                "<Part><PartNumber>{n}</PartNumber><ETag>{etag}</ETag>"
+            ));
+            if let Some((a, v)) = ck {
+                xml.push_str(&crate::checksum::xml_element(*a, v));
+            }
+            xml.push_str("</Part>");
+        }
+        xml.push_str("</CompleteMultipartUpload>");
+        let req = with_headers(
+            make_request(
+                Method::POST,
+                &format!("/mp/{key}"),
+                &[("uploadId", upload_id)],
+                xml.as_bytes(),
+            ),
+            headers,
+        );
+        svc.complete_multipart_upload(ACCT, &req, "mp", key, upload_id)
+    }
+
+    #[tokio::test]
+    async fn create_multipart_upload_validates_checksum_type() {
+        let svc = make_service();
+        seed_bucket(&svc, "mp");
+        let (_, resp) = create_upload(&svc, "a", &[("x-amz-checksum-algorithm", "CRC64NVME")])
+            .await
+            .unwrap();
+        assert_eq!(
+            header(&resp, "x-amz-checksum-algorithm").as_deref(),
+            Some("CRC64NVME")
+        );
+        assert_eq!(
+            header(&resp, "x-amz-checksum-type").as_deref(),
+            Some("FULL_OBJECT")
+        );
+        let (_, resp) = create_upload(&svc, "b", &[("x-amz-checksum-algorithm", "sha512")])
+            .await
+            .unwrap();
+        assert_eq!(
+            header(&resp, "x-amz-checksum-algorithm").as_deref(),
+            Some("SHA512")
+        );
+        assert_eq!(
+            header(&resp, "x-amz-checksum-type").as_deref(),
+            Some("COMPOSITE")
+        );
+
+        for headers in [
+            vec![
+                ("x-amz-checksum-algorithm", "SHA256"),
+                ("x-amz-checksum-type", "FULL_OBJECT"),
+            ],
+            vec![
+                ("x-amz-checksum-algorithm", "CRC64NVME"),
+                ("x-amz-checksum-type", "COMPOSITE"),
+            ],
+            vec![("x-amz-checksum-type", "COMPOSITE")],
+            vec![("x-amz-checksum-algorithm", "CRC99")],
+        ] {
+            assert_aws_err(
+                create_upload(&svc, "c", &headers).await.map(|(_, r)| r),
+                "InvalidRequest",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn composite_multipart_checksums_for_new_algorithms() {
+        let svc = make_service();
+        seed_bucket(&svc, "mp");
+        let algo = ChecksumAlgorithm::XxHash3;
+        let (upload_id, _) = create_upload(&svc, "k", &[("x-amz-checksum-algorithm", "XXHASH3")])
+            .await
+            .unwrap();
+        let p1 = vec![7u8; 5 * 1024 * 1024];
+        let p2 = b"tail".to_vec();
+
+        // A part in another algorithm is a type mismatch.
+        let other = checksum(ChecksumAlgorithm::Crc32, &p1);
+        assert_aws_err(
+            upload_part(
+                &svc,
+                "k",
+                &upload_id,
+                1,
+                &p1,
+                &[("x-amz-checksum-crc32", &other)],
+            )
+            .await,
+            "InvalidRequest",
+        );
+        // A part without a checksum header still gets the upload's algorithm.
+        let r1 = upload_part(&svc, "k", &upload_id, 1, &p1, &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            header(&r1, "x-amz-checksum-xxhash3"),
+            Some(checksum(algo, &p1))
+        );
+        let p2_ck = checksum(algo, &p2);
+        let r2 = upload_part(
+            &svc,
+            "k",
+            &upload_id,
+            2,
+            &p2,
+            &[("x-amz-checksum-xxhash3", &p2_ck)],
+        )
+        .await
+        .unwrap();
+        let e1 = header(&r1, "etag").unwrap();
+        let e2 = header(&r2, "etag").unwrap();
+
+        // ListParts carries the part checksums and the upload's settings.
+        let lp = make_request(Method::GET, "/mp/k", &[("uploadId", &upload_id)], b"");
+        let listed = body_text(&svc.list_parts(ACCT, &lp, "mp", "k", &upload_id).unwrap());
+        assert!(
+            listed.contains(&format!("<ChecksumXXHASH3>{p2_ck}</ChecksumXXHASH3>")),
+            "{listed}"
+        );
+        assert!(
+            listed.contains("<ChecksumAlgorithm>XXHASH3</ChecksumAlgorithm>"),
+            "{listed}"
+        );
+        assert!(
+            listed.contains("<ChecksumType>COMPOSITE</ChecksumType>"),
+            "{listed}"
+        );
+        let uploads = body_text(
+            &svc.list_multipart_uploads(ACCT, "mp", &HashMap::new())
+                .unwrap(),
+        );
+        assert!(
+            uploads.contains("<ChecksumAlgorithm>XXHASH3</ChecksumAlgorithm><ChecksumType>COMPOSITE</ChecksumType>"),
+            "{uploads}"
+        );
+
+        // COMPOSITE needs every part's checksum, and they must match.
+        assert_aws_err(
+            complete(
+                &svc,
+                "k",
+                &upload_id,
+                &[
+                    (1, e1.clone(), None),
+                    (2, e2.clone(), Some((algo, p2_ck.clone()))),
+                ],
+                &[],
+            ),
+            "InvalidRequest",
+        );
+        assert_aws_err(
+            complete(
+                &svc,
+                "k",
+                &upload_id,
+                &[
+                    (1, e1.clone(), Some((algo, p2_ck.clone()))),
+                    (2, e2.clone(), Some((algo, p2_ck.clone()))),
+                ],
+                &[],
+            ),
+            "InvalidPart",
+        );
+        let expected =
+            crate::checksum::composite(algo, &[digest(algo, &p1), digest(algo, &p2)]).unwrap();
+        let wrong_whole = format!("{}-2", checksum(algo, b"x"));
+        let parts = [
+            (1, e1.clone(), Some((algo, checksum(algo, &p1)))),
+            (2, e2.clone(), Some((algo, p2_ck.clone()))),
+        ];
+        assert_aws_err(
+            complete(
+                &svc,
+                "k",
+                &upload_id,
+                &parts,
+                &[("x-amz-checksum-xxhash3", &wrong_whole)],
+            ),
+            "BadDigest",
+        );
+        let resp = complete(
+            &svc,
+            "k",
+            &upload_id,
+            &parts,
+            &[("x-amz-checksum-xxhash3", &expected)],
+        )
+        .unwrap();
+        let text = body_text(&resp);
+        assert!(
+            text.contains(&format!("<ChecksumXXHASH3>{expected}</ChecksumXXHASH3>")),
+            "{text}"
+        );
+        assert!(
+            text.contains("<ChecksumType>COMPOSITE</ChecksumType>"),
+            "{text}"
+        );
+
+        let obj = object(&svc, "mp", "k");
+        assert_eq!(obj.checksum_value.as_deref(), Some(expected.as_str()));
+        assert_eq!(obj.checksum_type, Some(ChecksumType::Composite));
+
+        // Whole-object and per-part checksums on read.
+        let head = head_with_checksum(&svc, "mp", "k", &[]);
+        assert_eq!(header(&head, "x-amz-checksum-xxhash3"), Some(expected));
+        assert_eq!(
+            header(&head, "x-amz-checksum-type").as_deref(),
+            Some("COMPOSITE")
+        );
+        let head2 = head_with_checksum(&svc, "mp", "k", &[("partNumber", "2")]);
+        assert_eq!(
+            header(&head2, "x-amz-checksum-xxhash3"),
+            Some(p2_ck.clone())
+        );
+        let get = with_headers(
+            make_request(Method::GET, "/mp/k", &[], b""),
+            &[
+                ("x-amz-checksum-mode", "ENABLED"),
+                (
+                    "range",
+                    &format!("bytes={}-{}", p1.len(), p1.len() + p2.len() - 1),
+                ),
+            ],
+        );
+        let ranged = svc.get_object(ACCT, &get, "mp", "k").unwrap();
+        assert_eq!(
+            header(&ranged, "x-amz-checksum-xxhash3"),
+            Some(p2_ck.clone())
+        );
+
+        let attrs = with_headers(
+            make_request(Method::GET, "/mp/k", &[("attributes", "")], b""),
+            &[("x-amz-object-attributes", "Checksum,ObjectParts")],
+        );
+        let text = body_text(&svc.get_object_attributes(ACCT, &attrs, "mp", "k").unwrap());
+        assert!(text.contains("<PartsCount>2</PartsCount>"), "{text}");
+        assert!(
+            text.contains(&format!("<Part><PartNumber>2</PartNumber><Size>4</Size><ChecksumXXHASH3>{p2_ck}</ChecksumXXHASH3></Part>")),
+            "{text}"
+        );
+        // The SDKs send one header line per attribute.
+        let mut split = make_request(Method::GET, "/mp/k", &[("attributes", "")], b"");
+        split
+            .headers
+            .append("x-amz-object-attributes", "Checksum".parse().unwrap());
+        split
+            .headers
+            .append("x-amz-object-attributes", "ObjectParts".parse().unwrap());
+        let text = body_text(&svc.get_object_attributes(ACCT, &split, "mp", "k").unwrap());
+        assert!(text.contains("<Checksum><ChecksumXXHASH3>"), "{text}");
+        assert!(text.contains("<ObjectParts>"), "{text}");
+        let paged = with_headers(
+            make_request(Method::GET, "/mp/k", &[("attributes", "")], b""),
+            &[
+                ("x-amz-object-attributes", "ObjectParts"),
+                ("x-amz-max-parts", "1"),
+            ],
+        );
+        let text = body_text(&svc.get_object_attributes(ACCT, &paged, "mp", "k").unwrap());
+        assert!(text.contains("<IsTruncated>true</IsTruncated>"), "{text}");
+        assert!(
+            text.contains("<NextPartNumberMarker>1</NextPartNumberMarker>"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_object_multipart_checksum_covers_the_whole_object() {
+        let svc = make_service();
+        seed_bucket(&svc, "mp");
+        let algo = ChecksumAlgorithm::Crc32c;
+        let (upload_id, _) = create_upload(
+            &svc,
+            "k",
+            &[
+                ("x-amz-checksum-algorithm", "CRC32C"),
+                ("x-amz-checksum-type", "FULL_OBJECT"),
+            ],
+        )
+        .await
+        .unwrap();
+        let p1 = vec![1u8; 5 * 1024 * 1024];
+        let p2 = b"end".to_vec();
+        let e1 = header(
+            &upload_part(&svc, "k", &upload_id, 1, &p1, &[])
+                .await
+                .unwrap(),
+            "etag",
+        )
+        .unwrap();
+        let e2 = header(
+            &upload_part(&svc, "k", &upload_id, 2, &p2, &[])
+                .await
+                .unwrap(),
+            "etag",
+        )
+        .unwrap();
+        let mut whole = p1.clone();
+        whole.extend_from_slice(&p2);
+        let expected = checksum(algo, &whole);
+        let parts = [(1, e1, None), (2, e2, None)];
+        assert_aws_err(
+            complete(
+                &svc,
+                "k",
+                &upload_id,
+                &parts,
+                &[("x-amz-checksum-type", "COMPOSITE")],
+            ),
+            "InvalidRequest",
+        );
+        assert_aws_err(
+            complete(
+                &svc,
+                "k",
+                &upload_id,
+                &parts,
+                &[("x-amz-mp-object-size", "3")],
+            ),
+            "InvalidRequest",
+        );
+        let size = whole.len().to_string();
+        let resp = complete(
+            &svc,
+            "k",
+            &upload_id,
+            &parts,
+            &[
+                ("x-amz-checksum-crc32c", &expected),
+                ("x-amz-checksum-type", "FULL_OBJECT"),
+                ("x-amz-mp-object-size", &size),
+            ],
+        )
+        .unwrap();
+        assert!(body_text(&resp).contains("<ChecksumType>FULL_OBJECT</ChecksumType>"));
+        let obj = object(&svc, "mp", "k");
+        assert_eq!(obj.checksum_value, Some(expected));
+        assert_eq!(obj.checksum_type, Some(ChecksumType::FullObject));
+    }
+
+    #[tokio::test]
+    async fn multipart_without_an_algorithm_gets_full_object_crc64nvme() {
+        let svc = make_service();
+        seed_bucket(&svc, "mp");
+        let (upload_id, _) = create_upload(&svc, "k", &[]).await.unwrap();
+        // The SDK checksums each part (CRC32 by default); it is verified.
+        let p1 = b"only part".to_vec();
+        let crc = checksum(ChecksumAlgorithm::Crc32, &p1);
+        let r1 = upload_part(
+            &svc,
+            "k",
+            &upload_id,
+            1,
+            &p1,
+            &[("x-amz-checksum-crc32", &crc)],
+        )
+        .await
+        .unwrap();
+        assert_eq!(header(&r1, "x-amz-checksum-crc32"), Some(crc.clone()));
+        let e1 = header(&r1, "etag").unwrap();
+        // A newer algorithm in Complete needs it named at Create.
+        let sha512 = checksum(ChecksumAlgorithm::Sha512, &p1);
+        assert_aws_err(
+            complete(
+                &svc,
+                "k",
+                &upload_id,
+                &[(1, e1.clone(), None)],
+                &[("x-amz-checksum-sha512", &sha512)],
+            ),
+            "InvalidRequest",
+        );
+        // An original algorithm is accepted without being validated.
+        let bogus_sha256 = checksum(ChecksumAlgorithm::Sha256, b"unrelated");
+        complete(
+            &svc,
+            "k",
+            &upload_id,
+            &[(1, e1, Some((ChecksumAlgorithm::Crc32, crc)))],
+            &[("x-amz-checksum-sha256", &bogus_sha256)],
+        )
+        .unwrap();
+        let obj = object(&svc, "mp", "k");
+        assert_eq!(obj.checksum_algorithm, Some(ChecksumAlgorithm::Crc64Nvme));
+        assert_eq!(obj.checksum_type, Some(ChecksumType::FullObject));
+        assert_eq!(
+            obj.checksum_value,
+            Some(checksum(ChecksumAlgorithm::Crc64Nvme, &p1))
+        );
+        assert!(obj.part_checksums.is_none());
+    }
+
+    #[tokio::test]
+    async fn copy_object_rehashes_a_composite_source_as_full_object() {
+        let svc = make_service();
+        seed_bucket(&svc, "mp");
+        let algo = ChecksumAlgorithm::Sha1;
+        let (upload_id, _) = create_upload(&svc, "src", &[("x-amz-checksum-algorithm", "SHA1")])
+            .await
+            .unwrap();
+        let data = b"single part".to_vec();
+        let r = upload_part(&svc, "src", &upload_id, 1, &data, &[])
+            .await
+            .unwrap();
+        let etag = header(&r, "etag").unwrap();
+        complete(
+            &svc,
+            "src",
+            &upload_id,
+            &[(1, etag, Some((algo, checksum(algo, &data))))],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            object(&svc, "mp", "src").checksum_type,
+            Some(ChecksumType::Composite)
+        );
+
+        let resp = svc
+            .copy_object(ACCT, &copy_request("mp", "dst", "mp/src"), "mp", "dst")
+            .unwrap();
+        let text = body_text(&resp);
+        let full = checksum(algo, &data);
+        assert!(
+            text.contains(&format!("<ChecksumSHA1>{full}</ChecksumSHA1>")),
+            "{text}"
+        );
+        assert!(
+            text.contains("<ChecksumType>FULL_OBJECT</ChecksumType>"),
+            "{text}"
+        );
+        let dst = object(&svc, "mp", "dst");
+        assert_eq!(dst.checksum_value, Some(full));
+        assert_eq!(dst.checksum_type, Some(ChecksumType::FullObject));
+
+        // Requesting another algorithm recomputes in it.
+        let req = with_headers(
+            copy_request("mp", "dst2", "mp/src"),
+            &[("x-amz-checksum-algorithm", "MD5")],
+        );
+        svc.copy_object(ACCT, &req, "mp", "dst2").unwrap();
+        assert_eq!(
+            object(&svc, "mp", "dst2").checksum_value,
+            Some(checksum(ChecksumAlgorithm::Md5, &data))
+        );
+    }
+
+    /// Create an upload, upload `parts` (each with the upload's checksum
+    /// computed server-side), returning (upload id, ETags).
+    async fn upload_parts(
+        svc: &S3Service,
+        key: &str,
+        create_headers: &[(&str, &str)],
+        parts: &[&[u8]],
+    ) -> (String, Vec<String>) {
+        let (upload_id, _) = create_upload(svc, key, create_headers).await.unwrap();
+        let mut etags = Vec::new();
+        for (i, data) in parts.iter().enumerate() {
+            let r = upload_part(svc, key, &upload_id, i as u32 + 1, data, &[])
+                .await
+                .unwrap();
+            etags.push(header(&r, "etag").unwrap());
+        }
+        (upload_id, etags)
+    }
+
+    #[tokio::test]
+    async fn complete_rejects_part_checksums_it_cannot_back() {
+        let svc = make_service();
+        seed_bucket(&svc, "mp");
+        let data = b"only".to_vec();
+        // Another algorithm than the upload's is a type mismatch.
+        let (id, etags) = upload_parts(
+            &svc,
+            "a",
+            &[("x-amz-checksum-algorithm", "SHA256")],
+            &[&data],
+        )
+        .await;
+        let crc = checksum(ChecksumAlgorithm::Crc32, &data);
+        assert_aws_err(
+            complete(
+                &svc,
+                "a",
+                &id,
+                &[(
+                    1,
+                    etags[0].clone(),
+                    Some((ChecksumAlgorithm::Crc32, crc.clone())),
+                )],
+                &[],
+            ),
+            "InvalidRequest",
+        );
+        // A part stored without a checksum cannot match a listed one.
+        let (id, etags) = upload_parts(&svc, "b", &[], &[&data]).await;
+        assert_aws_err(
+            complete(
+                &svc,
+                "b",
+                &id,
+                &[(1, etags[0].clone(), Some((ChecksumAlgorithm::Crc32, crc)))],
+                &[],
+            ),
+            "InvalidPart",
+        );
+        // A wrong ETag is InvalidPart even when a checksum error is pending.
+        let (id, _) = upload_parts(
+            &svc,
+            "c",
+            &[("x-amz-checksum-algorithm", "SHA256")],
+            &[&data],
+        )
+        .await;
+        assert_aws_err(
+            complete(&svc, "c", &id, &[(1, "\"nope\"".to_string(), None)], &[]),
+            "InvalidPart",
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_enforces_the_whole_object_value_shape() {
+        let svc = make_service();
+        seed_bucket(&svc, "mp");
+        let data = b"payload".to_vec();
+        let crc = checksum(ChecksumAlgorithm::Crc32, &data);
+
+        // FULL_OBJECT: a bare digest; `-N` is malformed.
+        let (id, etags) = upload_parts(
+            &svc,
+            "full",
+            &[
+                ("x-amz-checksum-algorithm", "CRC32"),
+                ("x-amz-checksum-type", "FULL_OBJECT"),
+            ],
+            &[&data],
+        )
+        .await;
+        let parts = [(1, etags[0].clone(), None)];
+        assert_aws_err(
+            complete(
+                &svc,
+                "full",
+                &id,
+                &parts,
+                &[("x-amz-checksum-crc32", &format!("{crc}-1"))],
+            ),
+            "InvalidRequest",
+        );
+        complete(&svc, "full", &id, &parts, &[("x-amz-checksum-crc32", &crc)]).unwrap();
+
+        // COMPOSITE: needs `-<part count>`, and the right count.
+        let (id, etags) = upload_parts(
+            &svc,
+            "comp",
+            &[("x-amz-checksum-algorithm", "CRC32")],
+            &[&data],
+        )
+        .await;
+        let parts = [(
+            1,
+            etags[0].clone(),
+            Some((ChecksumAlgorithm::Crc32, crc.clone())),
+        )];
+        let composite = crate::checksum::composite(
+            ChecksumAlgorithm::Crc32,
+            &[digest(ChecksumAlgorithm::Crc32, &data)],
+        )
+        .unwrap();
+        let bare = composite.trim_end_matches("-1").to_string();
+        for bad in [bare, format!("{}-2", composite.trim_end_matches("-1"))] {
+            assert_aws_err(
+                complete(&svc, "comp", &id, &parts, &[("x-amz-checksum-crc32", &bad)]),
+                "InvalidRequest",
+            );
+        }
+        complete(
+            &svc,
+            "comp",
+            &id,
+            &parts,
+            &[("x-amz-checksum-crc32", &composite)],
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn full_object_crc_is_combined_from_part_checksums() {
+        let svc = make_service();
+        seed_bucket(&svc, "mp");
+        let p1: Vec<u8> = (0..5 * 1024 * 1024u32).map(|i| (i % 253) as u8).collect();
+        let p2: Vec<u8> = (0..5 * 1024 * 1024u32).map(|i| (i % 241) as u8).collect();
+        let p3 = b"short tail".to_vec();
+        let mut whole = p1.clone();
+        whole.extend_from_slice(&p2);
+        whole.extend_from_slice(&p3);
+        for algo in [
+            ChecksumAlgorithm::Crc32,
+            ChecksumAlgorithm::Crc32c,
+            ChecksumAlgorithm::Crc64Nvme,
+        ] {
+            let key = algo.lowercase_name();
+            let (id, etags) = upload_parts(
+                &svc,
+                key,
+                &[
+                    ("x-amz-checksum-algorithm", algo.as_str()),
+                    ("x-amz-checksum-type", "FULL_OBJECT"),
+                ],
+                &[&p1, &p2, &p3],
+            )
+            .await;
+            let parts: Vec<_> = etags
+                .iter()
+                .enumerate()
+                .map(|(i, e)| (i as u32 + 1, e.clone(), None))
+                .collect();
+            complete(&svc, key, &id, &parts, &[]).unwrap();
+            // The combined value equals rehashing the assembled object.
+            assert_eq!(
+                object(&svc, "mp", key).checksum_value,
+                Some(checksum(algo, &whole)),
+                "{algo}"
+            );
+        }
+        // No algorithm at Create, but every part carried CRC64NVME: combined too.
+        let (id, _) = create_upload(&svc, "default", &[]).await.unwrap();
+        let mut parts = Vec::new();
+        for (i, data) in [&p1, &p2, &p3].into_iter().enumerate() {
+            let value = checksum(ChecksumAlgorithm::Crc64Nvme, data);
+            let r = upload_part(
+                &svc,
+                "default",
+                &id,
+                i as u32 + 1,
+                data,
+                &[("x-amz-checksum-crc64nvme", &value)],
+            )
+            .await
+            .unwrap();
+            parts.push((i as u32 + 1, header(&r, "etag").unwrap(), None));
+        }
+        complete(&svc, "default", &id, &parts, &[]).unwrap();
+        assert_eq!(
+            object(&svc, "mp", "default").checksum_value,
+            Some(checksum(ChecksumAlgorithm::Crc64Nvme, &whole))
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_integrity_headers_are_treated_as_absent() {
+        let svc = make_service();
+        seed_bucket(&svc, "ck");
+        put(
+            &svc,
+            "ck",
+            "k",
+            b"x",
+            &[
+                ("content-md5", ""),
+                ("x-amz-checksum-sha256", ""),
+                ("x-amz-sdk-checksum-algorithm", ""),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            object(&svc, "ck", "k").checksum_algorithm,
+            Some(ChecksumAlgorithm::Crc64Nvme)
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_aws_chunked_body_is_decoded_and_its_trailer_verified() {
+        use fakecloud_core::service::AwsService;
+        let svc = make_service();
+        seed_bucket(&svc, "hb");
+        let xml = r#"<Tagging><TagSet><Tag><Key>a</Key><Value>b</Value></Tag></TagSet></Tagging>"#;
+        let frame = |value: &str| {
+            format!(
+                "{:x}\r\n{xml}\r\n0\r\nx-amz-checksum-crc32:{value}\r\n\r\n",
+                xml.len()
+            )
+        };
+        let headers = [
+            ("content-encoding", "aws-chunked"),
+            ("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER"),
+            ("x-amz-trailer", "x-amz-checksum-crc32"),
+        ];
+        let wrong = checksum(ChecksumAlgorithm::Crc32, b"other");
+        let req = with_headers(
+            make_request(
+                Method::PUT,
+                "/hb",
+                &[("tagging", "")],
+                frame(&wrong).as_bytes(),
+            ),
+            &headers,
+        );
+        assert_aws_err(svc.handle(req).await, "BadDigest");
+        let good = checksum(ChecksumAlgorithm::Crc32, xml.as_bytes());
+        let req = with_headers(
+            make_request(
+                Method::PUT,
+                "/hb",
+                &[("tagging", "")],
+                frame(&good).as_bytes(),
+            ),
+            &headers,
+        );
+        svc.handle(req).await.unwrap();
+        // The handler saw the decoded XML, not the framing.
+        let tags = svc.state.read().default_ref().buckets["hb"].tags.clone();
+        assert_eq!(tags.get("a").map(String::as_str), Some("b"));
+    }
+
+    #[test]
+    fn copy_into_a_missing_bucket_is_no_such_bucket_before_the_algorithm_check() {
+        let svc = make_service();
+        seed_bucket(&svc, "src");
+        seed_object(&svc, "src", "k", b"x");
+        let req = with_headers(
+            copy_request("ghost", "k", "src/k"),
+            &[("x-amz-checksum-algorithm", "CRC16")],
+        );
+        assert_aws_err(svc.copy_object(ACCT, &req, "ghost", "k"), "NoSuchBucket");
+        let req = with_headers(
+            copy_request("src", "k2", "src/k"),
+            &[("x-amz-checksum-algorithm", "CRC16")],
+        );
+        assert_aws_err(svc.copy_object(ACCT, &req, "src", "k2"), "InvalidRequest");
+    }
+
+    fn put_annotation_req(name: &str, body: &[u8], headers: &[(&str, &str)]) -> AwsRequest {
+        with_headers(
+            make_request(
+                Method::PUT,
+                "/an/k",
+                &[("annotation", ""), ("annotationName", name)],
+                body,
+            ),
+            headers,
+        )
+    }
+
+    fn get_annotation(svc: &S3Service, name: &str, checksum_mode: bool) -> AwsResponse {
+        let mut req = make_request(
+            Method::GET,
+            "/an/k",
+            &[("annotation", ""), ("annotationName", name)],
+            b"",
+        );
+        if checksum_mode {
+            req = with_headers(req, &[("x-amz-checksum-mode", "ENABLED")]);
+        }
+        svc.get_object_annotation(ACCT, &req, "an", "k").unwrap()
+    }
+
+    #[test]
+    fn annotation_checksums_round_trip_for_every_algorithm() {
+        let svc = make_service();
+        seed_bucket(&svc, "an");
+        seed_object(&svc, "an", "k", b"object");
+        let payload = b"reviewed: ok";
+        for algo in ChecksumAlgorithm::ALL {
+            let name = algo.lowercase_name();
+            let value = checksum(algo, payload);
+            let req = put_annotation_req(name, payload, &[(algo.header_name(), &value)]);
+            let resp = svc.put_object_annotation(ACCT, &req, "an", "k").unwrap();
+            assert_eq!(
+                header(&resp, algo.header_name()),
+                Some(value.clone()),
+                "{algo}"
+            );
+            assert_eq!(
+                header(&resp, "x-amz-checksum-type").as_deref(),
+                Some("FULL_OBJECT")
+            );
+
+            let got = get_annotation(&svc, name, true);
+            assert_eq!(got.body.expect_bytes(), &payload[..]);
+            assert_eq!(
+                header(&got, algo.header_name()),
+                Some(value.clone()),
+                "{algo}"
+            );
+            assert_eq!(
+                header(&got, "x-amz-checksum-type").as_deref(),
+                Some("FULL_OBJECT")
+            );
+            let plain = get_annotation(&svc, name, false);
+            assert!(plain.headers.get(algo.header_name()).is_none());
+
+            let wrong = checksum(algo, b"other");
+            let req = put_annotation_req("bad", payload, &[(algo.header_name(), &wrong)]);
+            assert_aws_err(
+                svc.put_object_annotation(ACCT, &req, "an", "k"),
+                "BadDigest",
+            );
+        }
+        // No algorithm named: the CRC64NVME default.
+        let req = put_annotation_req("default", payload, &[]);
+        let resp = svc.put_object_annotation(ACCT, &req, "an", "k").unwrap();
+        assert_eq!(
+            header(&resp, "x-amz-checksum-crc64nvme"),
+            Some(checksum(ChecksumAlgorithm::Crc64Nvme, payload))
+        );
+        let obj = object(&svc, "an", "k");
+        assert!(!obj.annotations.contains_key("bad"));
+        assert_eq!(
+            obj.annotations["default"].checksum_algorithm,
+            Some(ChecksumAlgorithm::Crc64Nvme)
+        );
+    }
+
+    #[test]
+    fn annotation_aws_chunked_payload_is_decoded_and_trailer_verified() {
+        let svc = make_service();
+        seed_bucket(&svc, "an");
+        seed_object(&svc, "an", "k", b"object");
+        let payload = b"streamed annotation";
+        let good = checksum(ChecksumAlgorithm::Sha256, payload);
+        let framed = |value: &str| {
+            format!(
+                "{:x}\r\n{}\r\n0\r\nx-amz-checksum-sha256:{value}\r\n\r\n",
+                payload.len(),
+                std::str::from_utf8(payload).unwrap()
+            )
+        };
+        let headers = [
+            ("content-encoding", "aws-chunked"),
+            ("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER"),
+            ("x-amz-decoded-content-length", "19"),
+            ("x-amz-trailer", "x-amz-checksum-sha256"),
+            ("x-amz-sdk-checksum-algorithm", "SHA256"),
+        ];
+        let req = put_annotation_req("s", framed(&good).as_bytes(), &headers);
+        let resp = svc.put_object_annotation(ACCT, &req, "an", "k").unwrap();
+        assert_eq!(header(&resp, "x-amz-checksum-sha256"), Some(good.clone()));
+        let got = get_annotation(&svc, "s", true);
+        // The framing is not part of the stored payload.
+        assert_eq!(got.body.expect_bytes(), &payload[..]);
+        assert_eq!(header(&got, "content-length").as_deref(), Some("19"));
+        assert_eq!(header(&got, "x-amz-checksum-sha256"), Some(good));
+
+        let wrong = checksum(ChecksumAlgorithm::Sha256, b"x");
+        let req = put_annotation_req("s2", framed(&wrong).as_bytes(), &headers);
+        assert_aws_err(
+            svc.put_object_annotation(ACCT, &req, "an", "k"),
+            "BadDigest",
+        );
+    }
+
+    #[test]
+    fn annotation_payload_rules_and_conditional_write() {
+        let svc = make_service();
+        seed_bucket(&svc, "an");
+        seed_object(&svc, "an", "k", b"object");
+        assert_aws_err(
+            svc.put_object_annotation(ACCT, &put_annotation_req("e", b"", &[]), "an", "k"),
+            "InvalidRequest",
+        );
+        let big = vec![b'a'; 1024 * 1024 + 1];
+        assert_aws_err(
+            svc.put_object_annotation(ACCT, &put_annotation_req("b", &big, &[]), "an", "k"),
+            "InvalidRequest",
+        );
+        assert_aws_err(
+            svc.put_object_annotation(
+                ACCT,
+                &put_annotation_req("u", &[0xff, 0xfe], &[]),
+                "an",
+                "k",
+            ),
+            "UnsupportedMediaType",
+        );
+        let etag = object(&svc, "an", "k").etag;
+        assert_aws_err(
+            svc.put_object_annotation(
+                ACCT,
+                &put_annotation_req("c", b"x", &[("x-amz-object-if-match", "\"nope\"")]),
+                "an",
+                "k",
+            ),
+            "PreconditionFailed",
+        );
+        svc.put_object_annotation(
+            ACCT,
+            &put_annotation_req("c", b"x", &[("x-amz-object-if-match", &etag)]),
+            "an",
+            "k",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn annotation_list_wraps_entries_and_names_the_object_version() {
+        let svc = make_service();
+        seed_bucket(&svc, "an");
+        seed_object(&svc, "an", "k", b"object");
+        {
+            let mut mas = svc.state.write();
+            let obj = mas
+                .default_mut()
+                .buckets
+                .get_mut("an")
+                .unwrap()
+                .objects
+                .get_mut("k")
+                .unwrap();
+            obj.version_id = Some("v1".to_string());
+        }
+        let req = put_annotation_req("n", b"x", &[("x-amz-sdk-checksum-algorithm", "MD5")]);
+        let resp = svc.put_object_annotation(ACCT, &req, "an", "k").unwrap();
+        assert_eq!(
+            header(&resp, "x-amz-object-version-id").as_deref(),
+            Some("v1")
+        );
+        let list = make_request(Method::GET, "/an/k", &[("annotation", "")], b"");
+        let resp = svc.list_object_annotations(ACCT, &list, "an", "k").unwrap();
+        let text = body_text(&resp);
+        assert!(
+            text.contains("<Annotations><AnnotationEntry><AnnotationName>n</AnnotationName>"),
+            "{text}"
+        );
+        assert!(
+            text.contains("<ChecksumAlgorithm>MD5</ChecksumAlgorithm>"),
+            "{text}"
+        );
+        assert_eq!(
+            header(&resp, "x-amz-object-version-id").as_deref(),
+            Some("v1")
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_request_bodies_are_verified_through_the_handler() {
+        use fakecloud_core::service::AwsService;
+        let svc = make_service();
+        seed_bucket(&svc, "hb");
+        let xml = r#"<Tagging><TagSet><Tag><Key>a</Key><Value>b</Value></Tag></TagSet></Tagging>"#;
+        let tag_req = |headers: &[(&str, &str)]| {
+            with_headers(
+                make_request(Method::PUT, "/hb", &[("tagging", "")], xml.as_bytes()),
+                headers,
+            )
+        };
+        let wrong_md5 = content_md5(b"not the body");
+        assert_aws_err(
+            svc.handle(tag_req(&[("content-md5", &wrong_md5)])).await,
+            "BadDigest",
+        );
+        let wrong_crc = checksum(ChecksumAlgorithm::Crc32, b"not the body");
+        assert_aws_err(
+            svc.handle(tag_req(&[("x-amz-checksum-crc32", &wrong_crc)]))
+                .await,
+            "BadDigest",
+        );
+        let good_md5 = content_md5(xml.as_bytes());
+        let good_crc = checksum(ChecksumAlgorithm::Crc32, xml.as_bytes());
+        svc.handle(tag_req(&[
+            ("content-md5", &good_md5),
+            ("x-amz-checksum-crc32", &good_crc),
+        ]))
+        .await
+        .unwrap();
+        // A bucket that does not exist still answers NoSuchBucket.
+        let missing = with_headers(
+            make_request(Method::PUT, "/nobucket", &[("tagging", "")], xml.as_bytes()),
+            &[("content-md5", &wrong_md5)],
+        );
+        assert_aws_err(svc.handle(missing).await, "NoSuchBucket");
+    }
 }
 
 /// Upload `body` to `bucket/key` as a one-part multipart upload and complete

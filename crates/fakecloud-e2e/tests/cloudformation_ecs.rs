@@ -20,7 +20,10 @@ const TEMPLATE: &str = r#"{
     "CP": {
       "Type": "AWS::ECS::CapacityProvider",
       "Properties": {
-        "Name": "cfn-cp"
+        "Name": "cfn-cp",
+        "AutoScalingGroupProvider": {
+          "AutoScalingGroupArn": "arn:aws:autoscaling:us-east-1:123456789012:autoScalingGroup:abc:autoScalingGroupName/cfn-asg"
+        }
       }
     },
     "TaskDef": {
@@ -94,6 +97,9 @@ const TEMPLATE_UPDATE: &str = r#"{
       "Type": "AWS::ECS::CapacityProvider",
       "Properties": {
         "Name": "cfn-cp",
+        "AutoScalingGroupProvider": {
+          "AutoScalingGroupArn": "arn:aws:autoscaling:us-east-1:123456789012:autoScalingGroup:abc:autoScalingGroupName/cfn-asg"
+        },
         "Tags": [{"Key": "tier", "Value": "compute"}]
       }
     },

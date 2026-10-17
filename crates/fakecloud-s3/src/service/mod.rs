@@ -12,9 +12,6 @@ use fakecloud_core::service::{AwsRequest, AwsResponse, AwsService, AwsServiceErr
 use fakecloud_kms::SharedKmsState;
 use fakecloud_persistence::{MemoryS3Store, S3Store, StoreError};
 
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine as _;
-
 use crate::logging;
 use crate::state::{AclGrant, S3Bucket, S3Object, SharedS3State};
 
@@ -26,7 +23,7 @@ pub(crate) mod config;
 mod control_tags;
 mod lock;
 use crate::state::ObjectLockSettings;
-use lock::{has_object_lock_headers, has_payload_integrity_header};
+use lock::has_object_lock_headers;
 mod multipart;
 pub(crate) mod notifications;
 mod objects;
@@ -825,6 +822,32 @@ impl AwsService for S3Service {
         let caller_account = req.account_id.as_str();
         let owner_account = bucket.and_then(|b| self.bucket_owner_account(b));
         let account_id = owner_account.as_deref().unwrap_or(caller_account);
+
+        // Integrity of buffered request bodies (PutBucketCors, DeleteObjects,
+        // PutObjectTagging, ...): S3 verifies a `Content-MD5` or
+        // `x-amz-checksum-<algorithm>` header against the body it received.
+        // Uploads verify their own payload (PutObject, UploadPart,
+        // PutObjectAnnotation); CompleteMultipartUpload's checksum headers
+        // describe the assembled object, not its XML body; a POST Object form
+        // carries its fields in the body. A request to a bucket that does not
+        // exist is left to answer NoSuchBucket.
+        let verifies_own_payload = is_put_object
+            || is_upload_part
+            || (is_put_to_key && req.query_params.contains_key("annotation"))
+            || (req.method == Method::POST && req.query_params.contains_key("uploadId"))
+            // CopyObject / UploadPartCopy carry no body; their checksum header
+            // names the copy's algorithm and is validated by the handler.
+            || req.headers.contains_key("x-amz-copy-source")
+            || req
+                .headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|ct| ct.to_ascii_lowercase().starts_with("multipart/form-data"));
+        if !is_control && !verifies_own_payload && (bucket.is_none() || owner_account.is_some()) {
+            if let Some(decoded) = crate::checksum::verify_request_body(&req.headers, &req.body)? {
+                req.body = decoded.into();
+            }
+        }
 
         // Multipart upload operations (checked before main match). Held in an
         // Option rather than returned directly so these responses still reach
@@ -3557,147 +3580,6 @@ pub(crate) fn compute_md5(data: &[u8]) -> String {
     format!("{:x}", digest)
 }
 
-pub(crate) fn compute_checksum(algorithm: &str, data: &[u8]) -> String {
-    let raw = compute_checksum_raw(algorithm, data);
-    if raw.is_empty() {
-        String::new()
-    } else {
-        BASE64.encode(raw)
-    }
-}
-
-/// Compute the raw (un-base64'd) checksum digest bytes for `data`.
-///
-/// Returns the network-order digest bytes so callers can either base64
-/// them ([`compute_checksum`]) or concatenate them when computing an S3
-/// multipart COMPOSITE checksum (which hashes the concatenation of each
-/// part's raw digest, then base64s the result and appends `-N`).
-pub(crate) fn compute_checksum_raw(algorithm: &str, data: &[u8]) -> Vec<u8> {
-    match algorithm {
-        "CRC32" => crc32fast::hash(data).to_be_bytes().to_vec(),
-        // CRC32C and CRC64NVME use the same crates as the streaming path so
-        // CopyObject / CompleteMultipartUpload produce identical results to
-        // a streaming PutObject (1.7); the COMPOSITE multipart checksum
-        // concatenates these raw digests before hashing (1.18).
-        "CRC32C" => crc32c::crc32c(data).to_be_bytes().to_vec(),
-        "CRC64NVME" => {
-            let mut hasher = crc64fast_nvme::Digest::new();
-            hasher.write(data);
-            hasher.sum64().to_be_bytes().to_vec()
-        }
-        "SHA1" => {
-            use sha1::Digest as _;
-            sha1::Sha1::digest(data).to_vec()
-        }
-        "SHA256" => {
-            use sha2::Digest as _;
-            sha2::Sha256::digest(data).to_vec()
-        }
-        _ => Vec::new(),
-    }
-}
-
-/// Compute an S3 multipart COMPOSITE additional checksum from each
-/// part's raw digest bytes (in part-number order). AWS defines this as
-/// `base64(HASH(concat(raw_part_digests)))-N` where HASH is the chosen
-/// algorithm and N is the part count. Returns `None` for an unsupported
-/// algorithm or empty part list.
-pub(crate) fn compute_composite_checksum(
-    algorithm: &str,
-    part_raw_digests: &[Vec<u8>],
-) -> Option<String> {
-    if part_raw_digests.is_empty() {
-        return None;
-    }
-    let mut concat = Vec::new();
-    for d in part_raw_digests {
-        concat.extend_from_slice(d);
-    }
-    let digest = compute_checksum_raw(algorithm, &concat);
-    if digest.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "{}-{}",
-        BASE64.encode(digest),
-        part_raw_digests.len()
-    ))
-}
-
-/// Streaming variant of [`compute_checksum`] for spool files. Reads
-/// the file in 1 MiB chunks and feeds each chunk into the hasher so a
-/// 1 GiB upload computes its CRC32 / SHA-1 / SHA-256 in constant
-/// memory rather than via `tokio::fs::read` (which would allocate the
-/// whole file as one buffer).
-pub(crate) async fn compute_checksum_streaming(
-    algorithm: &str,
-    path: &std::path::Path,
-) -> Result<String, std::io::Error> {
-    use tokio::io::AsyncReadExt;
-    let mut file = tokio::fs::File::open(path).await?;
-    let mut buf = vec![0u8; 1024 * 1024];
-    match algorithm {
-        "CRC32" => {
-            let mut hasher = crc32fast::Hasher::new();
-            loop {
-                let n = file.read(&mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                hasher.update(&buf[..n]);
-            }
-            Ok(BASE64.encode(hasher.finalize().to_be_bytes()))
-        }
-        "CRC32C" => {
-            let mut crc: u32 = 0;
-            loop {
-                let n = file.read(&mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                crc = crc32c::crc32c_append(crc, &buf[..n]);
-            }
-            Ok(BASE64.encode(crc.to_be_bytes()))
-        }
-        "CRC64NVME" => {
-            let mut hasher = crc64fast_nvme::Digest::new();
-            loop {
-                let n = file.read(&mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                hasher.write(&buf[..n]);
-            }
-            Ok(BASE64.encode(hasher.sum64().to_be_bytes()))
-        }
-        "SHA1" => {
-            use sha1::Digest as _;
-            let mut hasher = sha1::Sha1::new();
-            loop {
-                let n = file.read(&mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                hasher.update(&buf[..n]);
-            }
-            Ok(BASE64.encode(hasher.finalize()))
-        }
-        "SHA256" => {
-            use sha2::Digest as _;
-            let mut hasher = sha2::Sha256::new();
-            loop {
-                let n = file.read(&mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                hasher.update(&buf[..n]);
-            }
-            Ok(BASE64.encode(hasher.finalize()))
-        }
-        _ => Ok(String::new()),
-    }
-}
-
 pub(crate) fn url_encode_s3_key(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 2);
     for byte in s.bytes() {
@@ -4257,7 +4139,16 @@ pub(crate) fn strip_etag_quotes(s: &str) -> String {
         .to_string()
 }
 
-pub(crate) fn parse_complete_multipart_xml(xml: &str) -> Vec<(u32, String)> {
+/// One `<Part>` of a CompleteMultipartUpload request body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompletedPartXml {
+    pub part_number: u32,
+    pub etag: String,
+    /// The part checksums the client listed (`<ChecksumCRC32>` ...).
+    pub checksums: Vec<(crate::checksum::ChecksumAlgorithm, String)>,
+}
+
+pub(crate) fn parse_complete_multipart_xml(xml: &str) -> Vec<CompletedPartXml> {
     let mut parts = Vec::new();
     let mut remaining = xml;
     while let Some(part_start) = remaining.find("<Part>") {
@@ -4268,7 +4159,18 @@ pub(crate) fn parse_complete_multipart_xml(xml: &str) -> Vec<(u32, String)> {
                 extract_xml_value(part_body, "PartNumber").and_then(|s| s.parse::<u32>().ok());
             let etag = extract_xml_value(part_body, "ETag").map(|s| strip_etag_quotes(&s));
             if let (Some(num), Some(e)) = (part_num, etag) {
-                parts.push((num, e));
+                let checksums = crate::checksum::ChecksumAlgorithm::ALL
+                    .into_iter()
+                    .filter_map(|a| {
+                        extract_xml_value(part_body, a.xml_element())
+                            .map(|v| (a, v.trim().to_string()))
+                    })
+                    .collect();
+                parts.push(CompletedPartXml {
+                    part_number: num,
+                    etag: e,
+                    checksums,
+                });
             }
             remaining = &after[part_end + 7..];
         } else {
@@ -5327,53 +5229,6 @@ mod extract_xml_value_tests {
 }
 
 #[cfg(test)]
-mod compute_checksum_tests {
-    use super::{compute_checksum, compute_checksum_streaming};
-
-    // bug-audit 2026-06-15, 1.7: CopyObject / CompleteMultipartUpload routed
-    // through the non-streaming compute_checksum, whose `_ =>` arm returned an
-    // empty string for CRC32C / CRC64NVME -> GetObjectAttributes reported an
-    // empty checksum and integrity checks silently broke.
-    #[test]
-    fn crc32c_is_non_empty_and_matches_known_vector() {
-        // CRC32C of "123456789" is 0xE3069283; base64 of those 4 BE bytes.
-        let out = compute_checksum("CRC32C", b"123456789");
-        assert!(!out.is_empty());
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(&out)
-            .unwrap();
-        assert_eq!(bytes, 0xE306_9283u32.to_be_bytes());
-    }
-
-    #[test]
-    fn crc64nvme_is_non_empty() {
-        let out = compute_checksum("CRC64NVME", b"hello world");
-        assert!(!out.is_empty());
-        // 8 BE bytes of a u64.
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(&out)
-            .unwrap();
-        assert_eq!(bytes.len(), 8);
-    }
-
-    #[tokio::test]
-    async fn non_streaming_matches_streaming_for_all_algorithms() {
-        let data = b"the quick brown fox jumps over the lazy dog".repeat(100);
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        tokio::fs::write(tmp.path(), &data).await.unwrap();
-
-        for algo in ["CRC32", "CRC32C", "CRC64NVME", "SHA1", "SHA256"] {
-            let direct = compute_checksum(algo, &data);
-            let streamed = compute_checksum_streaming(algo, tmp.path()).await.unwrap();
-            assert!(!direct.is_empty(), "{algo} direct empty");
-            assert_eq!(direct, streamed, "{algo} direct != streaming");
-        }
-    }
-
-    use base64::Engine as _;
-}
-
-#[cfg(test)]
 mod complete_multipart_parse_tests {
     use super::parse_complete_multipart_xml;
 
@@ -5388,7 +5243,10 @@ mod complete_multipart_parse_tests {
             <Part><PartNumber>1</PartNumber><ETag>&#34;100bffa249c1cbde1a66242835cdab03&#34;</ETag></Part>\
             <Part><PartNumber>2</PartNumber><ETag>&#x22;5df1aff8ceab081b20d677b2d4f7eab1&#x22;</ETag></Part>\
             </CompleteMultipartUpload>";
-        let parts = parse_complete_multipart_xml(xml);
+        let parts: Vec<(u32, String)> = parse_complete_multipart_xml(xml)
+            .into_iter()
+            .map(|p| (p.part_number, p.etag))
+            .collect();
         assert_eq!(
             parts,
             vec![
@@ -5406,10 +5264,36 @@ mod complete_multipart_parse_tests {
             <Part><PartNumber>1</PartNumber><ETag>\"abc123\"</ETag></Part>\
             <Part><PartNumber>2</PartNumber><ETag>&quot;def456&quot;</ETag></Part>\
             </CompleteMultipartUpload>";
-        let parts = parse_complete_multipart_xml(xml);
+        let parts: Vec<(u32, String)> = parse_complete_multipart_xml(xml)
+            .into_iter()
+            .map(|p| (p.part_number, p.etag))
+            .collect();
         assert_eq!(
             parts,
             vec![(1, "abc123".to_string()), (2, "def456".to_string())]
+        );
+    }
+
+    #[test]
+    fn parses_part_checksums() {
+        use crate::checksum::ChecksumAlgorithm;
+        let xml = "<CompleteMultipartUpload>\
+            <Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag>\
+            <ChecksumXXHASH128>340J6T+HSQCpm4d1zBW2xw==</ChecksumXXHASH128></Part>\
+            <Part><ETag>\"b\"</ETag><ChecksumCRC32>DUoRhQ==</ChecksumCRC32>\
+            <PartNumber>2</PartNumber></Part>\
+            </CompleteMultipartUpload>";
+        let parts = parse_complete_multipart_xml(xml);
+        assert_eq!(
+            parts[0].checksums,
+            vec![(
+                ChecksumAlgorithm::XxHash128,
+                "340J6T+HSQCpm4d1zBW2xw==".to_string()
+            )]
+        );
+        assert_eq!(
+            parts[1].checksums,
+            vec![(ChecksumAlgorithm::Crc32, "DUoRhQ==".to_string())]
         );
     }
 }

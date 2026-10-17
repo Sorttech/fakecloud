@@ -984,3 +984,92 @@ fn dynamodb_tables_are_provisioned_in_the_stack_region() {
         east_res.attributes["Arn"]
     );
 }
+
+// ---------------------------------------------------------------------------
+// ECS capacity providers: API-shaped storage and the API's backing rules.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ecs_capacity_provider_matches_the_api_shape_and_rules() {
+    let prov = make_provisioner();
+    let cp = |name: &str| {
+        prov.ecs_state
+            .read()
+            .get(ACCT)
+            .and_then(|s| s.capacity_providers.get(name).cloned())
+    };
+
+    // No backing capacity, or both kinds, is refused like the API.
+    create_err(
+        &prov,
+        "AWS::ECS::CapacityProvider",
+        "None",
+        json!({"Name": "none"}),
+    );
+    let asg = json!({
+        "AutoScalingGroupArn": "arn:aws:autoscaling:us-east-1:123456789012:autoScalingGroup:a:autoScalingGroupName/g",
+        "ManagedScaling": {"Status": "ENABLED", "TargetCapacity": 90}
+    });
+    let mip = json!({
+        "InfrastructureRoleArn": "arn:aws:iam::123456789012:role/infra",
+        "InstanceLaunchTemplate": {
+            "Ec2InstanceProfileArn": "arn:aws:iam::123456789012:instance-profile/p",
+            "NetworkConfiguration": {"Subnets": ["subnet-1"]}
+        }
+    });
+    create_err(
+        &prov,
+        "AWS::ECS::CapacityProvider",
+        "Both",
+        json!({"Name": "both", "AutoScalingGroupProvider": asg, "ManagedInstancesProvider": mip,
+            "ClusterName": "c1"}),
+    );
+
+    // ASG provider: stored camelCase; a ClusterName is not recorded.
+    create(
+        &prov,
+        "AWS::ECS::CapacityProvider",
+        "Asg",
+        json!({"Name": "asg", "AutoScalingGroupProvider": asg, "ClusterName": "c1"}),
+    );
+    let stored = cp("asg").unwrap();
+    let a = stored.auto_scaling_group_provider.unwrap();
+    assert_eq!(a["managedScaling"]["targetCapacity"], 90, "{a}");
+    assert!(a.get("AutoScalingGroupArn").is_none(), "{a}");
+    assert!(stored.cluster.is_none());
+
+    // Managed Instances provider: needs an existing cluster, given by name or ARN.
+    create_err(
+        &prov,
+        "AWS::ECS::CapacityProvider",
+        "MiNoCluster",
+        json!({"Name": "mi", "ManagedInstancesProvider": mip}),
+    );
+    create_err(
+        &prov,
+        "AWS::ECS::CapacityProvider",
+        "MiGhost",
+        json!({"Name": "mi", "ManagedInstancesProvider": mip, "ClusterName": "ghost"}),
+    );
+    create(
+        &prov,
+        "AWS::ECS::Cluster",
+        "C1",
+        json!({"ClusterName": "c1"}),
+    );
+    create(
+        &prov,
+        "AWS::ECS::CapacityProvider",
+        "Mi",
+        json!({"Name": "mi", "ManagedInstancesProvider": mip,
+            "ClusterName": "arn:aws:ecs:us-east-1:123456789012:cluster/c1"}),
+    );
+    let stored = cp("mi").unwrap();
+    assert_eq!(stored.cluster.as_deref(), Some("c1"));
+    let m = stored.managed_instances_provider.unwrap();
+    assert_eq!(
+        m["instanceLaunchTemplate"]["networkConfiguration"]["subnets"][0], "subnet-1",
+        "{m}"
+    );
+    assert!(stored.auto_scaling_group_provider.is_none());
+}

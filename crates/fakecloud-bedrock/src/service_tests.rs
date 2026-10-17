@@ -92,6 +92,43 @@ fn resolve_action_trailing_slash_collection_lists() {
     );
 }
 
+#[tokio::test]
+async fn empty_interior_label_on_get_reaches_its_action_and_fails_validation() {
+    // An empty `policyArn` in the middle of the path keeps its segment, so
+    // the request routes to its action (not the 501 fallback) and fails the
+    // label's length check; only a trailing slash is dropped.
+    let req = make_request(
+        Method::GET,
+        "/automated-reasoning-policies//build-workflows/b1/annotations",
+        "",
+    );
+    let (action, id, extra) = BedrockService::resolve_action(&req).unwrap();
+    assert_eq!(action, "GetAutomatedReasoningPolicyAnnotations");
+    assert_eq!(id.as_deref(), Some(""));
+    assert_eq!(extra.as_deref(), Some("b1"));
+
+    let svc = BedrockService::new(make_state());
+    for path in [
+        "/automated-reasoning-policies//build-workflows/b1/annotations",
+        "/automated-reasoning-policies//build-workflows/b1/test-results",
+        "/automated-reasoning-policies//test-cases/t1",
+        "/resource-policy/",
+    ] {
+        let err = expect_err(svc.handle(make_request(Method::GET, path, "")).await);
+        assert!(
+            err.to_string().contains("ValidationException"),
+            "{path}: {err}"
+        );
+    }
+
+    // A trailing slash on a collection root still lists.
+    let req = make_request(Method::GET, "/automated-reasoning-policies/", "");
+    assert_eq!(
+        BedrockService::resolve_action(&req).unwrap().0,
+        "ListAutomatedReasoningPolicies"
+    );
+}
+
 #[test]
 fn resolve_action_async_invoke_trailing_slash_still_validates() {
     // async-invoke deliberately routes a trailing slash to GetAsyncInvoke("")

@@ -19,6 +19,116 @@ fn checksum_mode_enabled(req: &AwsRequest) -> bool {
         .unwrap_or(false)
 }
 
+/// Insert the stored checksum S3 returns on a GetObject/HeadObject made with
+/// checksum mode enabled. A request for one part of a multipart object
+/// (`partNumber`) gets that part's checksum; otherwise the object's checksum
+/// and its type. Nothing is returned for a part whose checksum is unknown.
+fn insert_object_checksum_headers(headers: &mut HeaderMap, obj: &S3Object, part: Option<u32>) {
+    let Some(algorithm) = obj.checksum_algorithm else {
+        return;
+    };
+    let checksum_type = obj.effective_checksum_type();
+    match (part, obj.parts_count) {
+        (Some(pn), Some(_)) => {
+            let part_value = obj
+                .part_checksums
+                .as_ref()
+                .and_then(|parts| parts.iter().find(|(n, _)| *n == pn))
+                .map(|(_, v)| v.as_str());
+            if let Some(value) = part_value {
+                crate::checksum::insert_response_headers(headers, algorithm, value, checksum_type);
+            }
+        }
+        _ => {
+            if let Some(value) = obj.checksum_value.as_deref() {
+                crate::checksum::insert_response_headers(headers, algorithm, value, checksum_type);
+            }
+        }
+    }
+}
+
+/// The `ObjectParts` element of GetObjectAttributes for a multipart object:
+/// each part's size and, when known, its additional checksum, paged by the
+/// `x-amz-max-parts` / `x-amz-part-number-marker` headers.
+fn object_parts_xml(
+    obj: &S3Object,
+    total_parts: u32,
+    req: &AwsRequest,
+) -> Result<String, AwsServiceError> {
+    let header_int = |name: &str, default: i64| -> Result<i64, AwsServiceError> {
+        match req.headers.get(name).and_then(|v| v.to_str().ok()) {
+            None => Ok(default),
+            Some(v) => v
+                .trim()
+                .parse::<i64>()
+                .ok()
+                .filter(|n| *n >= 0)
+                .ok_or_else(|| {
+                    AwsServiceError::aws_error(
+                        StatusCode::BAD_REQUEST,
+                        "InvalidArgument",
+                        format!("Provided {name} not an integer or within integer range"),
+                    )
+                }),
+        }
+    };
+    let max_parts = header_int("x-amz-max-parts", 1000)?;
+    let marker = header_int("x-amz-part-number-marker", 0)?;
+    let parts: Vec<(u32, u64)> = obj
+        .part_sizes
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .copied()
+        .filter(|(pn, _)| i64::from(*pn) > marker)
+        .collect();
+    let page = &parts[..parts.len().min(max_parts as usize)];
+    let is_truncated = parts.len() > page.len();
+    // `TotalPartsCount` is serialized as `PartsCount` (its `@xmlName`).
+    let mut out = format!("<PartsCount>{total_parts}</PartsCount>");
+    if marker > 0 {
+        out.push_str(&format!("<PartNumberMarker>{marker}</PartNumberMarker>"));
+    }
+    if let Some((last, _)) = page.last() {
+        out.push_str(&format!(
+            "<NextPartNumberMarker>{last}</NextPartNumberMarker>"
+        ));
+    }
+    out.push_str(&format!(
+        "<MaxParts>{max_parts}</MaxParts><IsTruncated>{is_truncated}</IsTruncated>"
+    ));
+    for (pn, size) in page {
+        out.push_str(&format!(
+            "<Part><PartNumber>{pn}</PartNumber><Size>{size}</Size>"
+        ));
+        let part_checksum = obj.checksum_algorithm.zip(
+            obj.part_checksums
+                .as_ref()
+                .and_then(|cs| cs.iter().find(|(n, _)| n == pn))
+                .map(|(_, v)| v.as_str()),
+        );
+        if let Some((algo, value)) = part_checksum {
+            out.push_str(&crate::checksum::xml_element(algo, value));
+        }
+        out.push_str("</Part>");
+    }
+    Ok(format!("<ObjectParts>{out}</ObjectParts>"))
+}
+
+/// The part of a multipart object whose bytes are exactly `start..=end`, if
+/// any: S3 returns a part's checksum for a byte range aligned with one part,
+/// the same as for a `partNumber` request.
+fn part_spanning(obj: &S3Object, start: usize, end: usize) -> Option<u32> {
+    let mut offset: u64 = 0;
+    for &(pn, size) in obj.part_sizes.as_ref()? {
+        if size > 0 && offset == start as u64 && offset + size - 1 == end as u64 {
+            return Some(pn);
+        }
+        offset += size;
+    }
+    None
+}
+
 fn insert_str_header(headers: &mut HeaderMap, name: &'static str, value: &str) {
     if let Ok(v) = value.parse::<http::header::HeaderValue>() {
         headers.insert(name, v);
@@ -221,6 +331,7 @@ impl S3Service {
         let mut response_status = StatusCode::OK;
         let response_body: fakecloud_core::service::ResponseBody;
         let mut is_range_request = false;
+        let mut range_span: Option<(usize, usize)> = None;
         if let Some(range_str) = req.headers.get("range").and_then(|v| v.to_str().ok()) {
             if let Some(rr) = parse_range_header(range_str, total_size) {
                 match rr {
@@ -244,6 +355,7 @@ impl S3Service {
                         };
                         response_status = StatusCode::PARTIAL_CONTENT;
                         is_range_request = true;
+                        range_span = Some((start, end));
                     }
                     RangeResult::NotSatisfiable => {
                         return Err(AwsServiceError::aws_error_with_fields(
@@ -348,16 +460,25 @@ impl S3Service {
         // Go SDK auto-attaches a CRC32 on PutObject, but Terraform reads the
         // object without enabling checksum mode and expects `checksum_crc32`
         // to be empty).
-        if !is_range_request && checksum_mode_enabled(req) {
-            if let Some(algo) = &obj.checksum_algorithm {
-                if let Some(val) = &obj.checksum_value {
-                    let hn = format!("x-amz-checksum-{}", algo.to_lowercase());
-                    if let Ok(name) = hn.parse::<http::header::HeaderName>() {
-                        if let Ok(hv) = val.parse() {
-                            headers.insert(name, hv);
-                        }
+        if checksum_mode_enabled(req) {
+            match range_span {
+                // A range returns a checksum only when it is exactly one part.
+                Some((start, end)) => {
+                    if let Some(pn) = part_spanning(obj, start, end) {
+                        insert_object_checksum_headers(&mut headers, obj, Some(pn));
                     }
                 }
+                None if !is_range_request => {
+                    let part = if req.headers.contains_key("range") {
+                        None
+                    } else {
+                        req.query_params
+                            .get("partNumber")
+                            .and_then(|v| v.parse::<u32>().ok())
+                    };
+                    insert_object_checksum_headers(&mut headers, obj, part);
+                }
+                None => {}
             }
         }
         Ok(AwsResponse {
@@ -464,10 +585,12 @@ impl S3Service {
         if let Some(exp) = hq("response-expires").or_else(|| obj.expires.clone()) {
             insert_str_header(&mut headers, "expires", &exp);
         }
+        let mut range_span: Option<(usize, usize)> = None;
         if let Some(range_str) = req.headers.get("range").and_then(|v| v.to_str().ok()) {
             if let Some(range_result) = parse_range_header(range_str, total_size as usize) {
                 match range_result {
                     RangeResult::Satisfiable { start, end } => {
+                        range_span = Some((start, end));
                         headers.insert(
                             "content-range",
                             format!("bytes {start}-{end}/{total_size}").parse().unwrap(),
@@ -606,14 +729,21 @@ impl S3Service {
         // `x-amz-checksum-mode: ENABLED`; AWS does not echo them on a plain
         // HeadObject even though one is stored.
         if checksum_mode_enabled(req) {
-            if let Some(algo) = &obj.checksum_algorithm {
-                if let Some(val) = &obj.checksum_value {
-                    let hn = format!("x-amz-checksum-{}", algo.to_lowercase());
-                    if let Ok(name) = hn.parse::<http::header::HeaderName>() {
-                        if let Ok(hv) = val.parse() {
-                            headers.insert(name, hv);
-                        }
+            match range_span {
+                Some((start, end)) => {
+                    if let Some(pn) = part_spanning(obj, start, end) {
+                        insert_object_checksum_headers(&mut headers, obj, Some(pn));
                     }
+                }
+                None => {
+                    let part = if req.headers.contains_key("range") {
+                        None
+                    } else {
+                        req.query_params
+                            .get("partNumber")
+                            .and_then(|v| v.parse::<u32>().ok())
+                    };
+                    insert_object_checksum_headers(&mut headers, obj, part);
                 }
             }
         }
@@ -643,17 +773,21 @@ impl S3Service {
         let b = state.buckets.get(bucket).ok_or_else(|| no_such_key(key))?;
         let obj = b.objects.get(key).ok_or_else(|| no_such_key(key))?;
 
-        let attrs = req
+        // A list header: the SDKs send one `x-amz-object-attributes` line per
+        // attribute, other clients one comma-separated line.
+        let attrs: Vec<String> = req
             .headers
-            .get("x-amz-object-attributes")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+            .get_all("x-amz-object-attributes")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .map(|a| a.trim().to_string())
+            .collect();
 
         let mut body_parts = Vec::new();
 
-        for attr in attrs.split(',') {
-            let attr = attr.trim();
-            match attr {
+        for attr in &attrs {
+            match attr.as_str() {
                 "ETag" => {
                     // GetObjectAttributes returns the ETag WITHOUT the
                     // surrounding quotes that GetObject/HeadObject wrap it in
@@ -670,29 +804,20 @@ impl S3Service {
                     body_parts.push(format!("<ObjectSize>{}</ObjectSize>", obj.size));
                 }
                 "Checksum" => {
-                    if let (Some(algo), Some(val)) = (&obj.checksum_algorithm, &obj.checksum_value)
-                    {
-                        let checksum_type = if obj.parts_count.is_some() {
-                            "COMPOSITE"
-                        } else {
-                            "FULL_OBJECT"
-                        };
+                    if let (Some(algo), Some(val), Some(checksum_type)) = (
+                        obj.checksum_algorithm,
+                        obj.checksum_value.as_deref(),
+                        obj.effective_checksum_type(),
+                    ) {
                         body_parts.push(format!(
-                            "<Checksum><Checksum{algo}>{val}</Checksum{algo}><ChecksumType>{checksum_type}</ChecksumType></Checksum>"
+                            "<Checksum>{}<ChecksumType>{checksum_type}</ChecksumType></Checksum>",
+                            crate::checksum::xml_element(algo, val)
                         ));
                     }
                 }
                 "ObjectParts" => {
                     if let Some(pc) = obj.parts_count {
-                        let mut parts_inner = format!("<TotalPartsCount>{pc}</TotalPartsCount>");
-                        if let Some(ref ps) = obj.part_sizes {
-                            for (pn, sz) in ps {
-                                parts_inner.push_str(&format!(
-                                    "<Part><PartNumber>{pn}</PartNumber><Size>{sz}</Size></Part>"
-                                ));
-                            }
-                        }
-                        body_parts.push(format!("<ObjectParts>{parts_inner}</ObjectParts>"));
+                        body_parts.push(object_parts_xml(obj, pc, req)?);
                     }
                 }
                 _ => {}

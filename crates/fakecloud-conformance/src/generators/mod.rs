@@ -410,6 +410,7 @@ pub fn generate_all_variants(
         input_shape_id,
         overrides,
         op.http_method.as_deref(),
+        op.http_uri.as_deref(),
     ));
 
     // Strategy 8: auto-discovered Create/Put/Update -> Get/Describe round-trip echo

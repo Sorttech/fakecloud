@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::Arc;
 
+use crate::checksum::{ChecksumAlgorithm, ChecksumType};
+
 /// An ACL grant entry.
 #[derive(Debug, Clone)]
 pub struct AclGrant {
@@ -57,10 +59,18 @@ pub struct S3Object {
     pub restore_ongoing: Option<bool>,
     /// Glacier restore: expiry date string.
     pub restore_expiry: Option<String>,
-    /// Checksum algorithm (CRC32, SHA1, SHA256).
-    pub checksum_algorithm: Option<String>,
-    /// Base64-encoded checksum value.
+    /// Additional checksum algorithm the object carries.
+    pub checksum_algorithm: Option<ChecksumAlgorithm>,
+    /// Base64-encoded checksum value (`<digest>-<N>` for a COMPOSITE
+    /// multipart checksum).
     pub checksum_value: Option<String>,
+    /// Whether `checksum_value` covers the whole object or is a COMPOSITE
+    /// checksum of its parts. `None` for state written before checksum types
+    /// were tracked; see [`S3Object::effective_checksum_type`].
+    pub checksum_type: Option<ChecksumType>,
+    /// Per-part checksums of a multipart object, `(part number, base64)` in
+    /// part order, in `checksum_algorithm`.
+    pub part_checksums: Option<Vec<(u32, String)>>,
     /// Object lock mode (GOVERNANCE or COMPLIANCE).
     pub lock_mode: Option<String>,
     /// Object lock retain-until date (ISO 8601).
@@ -73,6 +83,20 @@ pub struct S3Object {
     pub annotations: BTreeMap<String, ObjectAnnotation>,
 }
 
+impl S3Object {
+    /// The checksum type of the stored checksum. State written before types
+    /// were tracked carries none: a multipart object's checksum was always
+    /// COMPOSITE then, any other object's FULL_OBJECT.
+    pub fn effective_checksum_type(&self) -> Option<ChecksumType> {
+        self.checksum_value.as_ref()?;
+        Some(self.checksum_type.unwrap_or(if self.parts_count.is_some() {
+            ChecksumType::Composite
+        } else {
+            ChecksumType::FullObject
+        }))
+    }
+}
+
 /// A named payload attached to an object version by `PutObjectAnnotation`.
 #[derive(Debug, Clone, Default)]
 pub struct ObjectAnnotation {
@@ -80,9 +104,11 @@ pub struct ObjectAnnotation {
     pub payload: Vec<u8>,
     pub etag: String,
     pub last_modified: DateTime<Utc>,
-    /// The `x-amz-sdk-checksum-algorithm` the writer declared, echoed back on
-    /// list and get.
-    pub checksum_algorithm: Option<String>,
+    /// The additional checksum algorithm of the payload, echoed back on list
+    /// and (with checksum mode) get.
+    pub checksum_algorithm: Option<ChecksumAlgorithm>,
+    /// Base64 checksum of the payload in `checksum_algorithm`.
+    pub checksum_value: Option<String>,
 }
 
 /// A part uploaded via the multipart upload API.
@@ -93,6 +119,9 @@ pub struct UploadPart {
     pub etag: String,
     pub size: u64,
     pub last_modified: DateTime<Utc>,
+    /// The part's additional checksum (algorithm, base64 value), verified on
+    /// upload.
+    pub checksum: Option<(ChecksumAlgorithm, String)>,
 }
 
 /// An in-progress multipart upload.
@@ -111,7 +140,10 @@ pub struct MultipartUpload {
     pub sse_kms_key_id: Option<String>,
     pub tagging: Option<String>,
     pub acl_grants: Vec<AclGrant>,
-    pub checksum_algorithm: Option<String>,
+    pub checksum_algorithm: Option<ChecksumAlgorithm>,
+    /// The checksum type the completed object will carry; set whenever
+    /// `checksum_algorithm` is.
+    pub checksum_type: Option<ChecksumType>,
     pub cache_control: Option<String>,
     pub content_disposition: Option<String>,
     pub content_language: Option<String>,

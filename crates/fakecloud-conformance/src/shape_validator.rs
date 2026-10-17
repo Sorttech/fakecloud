@@ -708,12 +708,30 @@ fn validate_query_response(
     let mut violations = Vec::new();
 
     for member in members {
-        if member.required && !xml_fields.contains(&member.name.as_str()) {
-            violations.push(ShapeViolation::MissingField {
-                path: "$".to_string(),
-                field: member.name.clone(),
-            });
+        if !member.required {
+            continue;
         }
+        // The XML element carries the member's `xmlName` when set (SQS's
+        // `Successful` is wired as `<DeleteMessageBatchResultEntry>`).
+        let wire_name = member.traits.xml_name.as_deref().unwrap_or(&member.name);
+        if xml_fields.contains(&wire_name) {
+            continue;
+        }
+        // A flattened list/map has no wrapper element: each entry is a
+        // sibling element named after the member, so an empty collection
+        // is serialized as no element at all. Absence is the empty value,
+        // not a missing member.
+        let is_collection = matches!(
+            effective_shape_type(model, &member.target),
+            Some(ShapeType::List { .. }) | Some(ShapeType::Map { .. })
+        );
+        if member.traits.xml_flattened && is_collection {
+            continue;
+        }
+        violations.push(ShapeViolation::MissingField {
+            path: "$".to_string(),
+            field: member.name.clone(),
+        });
     }
 
     violations
@@ -1192,6 +1210,35 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../aws-models/apigatewayv2.json");
         crate::smithy::parse_model(&path).expect("parse apigatewayv2 model")
+    }
+
+    #[test]
+    fn query_required_flattened_lists_use_xml_name_and_allow_empty() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../aws-models/sqs.json");
+        let model = crate::smithy::parse_model(&path).expect("parse sqs model");
+        let out = "com.amazonaws.sqs#DeleteMessageBatchResult";
+        // Only failures: `Failed` is wired as `<BatchResultErrorEntry>` and the
+        // empty flattened `Successful` list has no element at all.
+        let only_failed = "<DeleteMessageBatchResponse><DeleteMessageBatchResult>\
+            <BatchResultErrorEntry><Id>a</Id><Code>X</Code><SenderFault>true</SenderFault>\
+            </BatchResultErrorEntry></DeleteMessageBatchResult></DeleteMessageBatchResponse>";
+        assert!(validate_response(&model, out, only_failed, Protocol::Query).is_empty());
+        let only_ok = "<DeleteMessageBatchResponse><DeleteMessageBatchResult>\
+            <DeleteMessageBatchResultEntry><Id>a</Id></DeleteMessageBatchResultEntry>\
+            </DeleteMessageBatchResult></DeleteMessageBatchResponse>";
+        assert!(validate_response(&model, out, only_ok, Protocol::Query).is_empty());
+        // A required list that is not flattened is still enforced.
+        let violations = validate_response(
+            &test_model(),
+            "test#ListOutput",
+            "<ListResponse><ListResult></ListResult></ListResponse>",
+            Protocol::Query,
+        );
+        assert!(
+            violations.iter().any(|v| v.to_string().contains("Items")),
+            "{violations:?}"
+        );
     }
 
     #[test]
