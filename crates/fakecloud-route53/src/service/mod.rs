@@ -26,7 +26,7 @@ use crate::model::{
     UpdateTrafficPolicyCommentRequest, UpdateTrafficPolicyInstanceRequest, VpcAuthorizationRequest,
     VPC,
 };
-use crate::router::{route_segments, Route};
+use crate::router::{route, Route};
 use crate::state::{
     AccountState, HealthCheckStatus, Route53Accounts, Route53Snapshot, SharedRoute53State,
     StoredChange, StoredCidrCollection, StoredHealthCheck, StoredHostedZone, StoredKeySigningKey,
@@ -374,7 +374,10 @@ impl AwsService for Route53Service {
     }
 
     async fn handle(&self, req: AwsRequest) -> Result<AwsResponse, AwsServiceError> {
-        let mut resolved = match route_segments(&req.method, &req.path_segments, &req.raw_query) {
+        // Route on the wire path, not `path_segments`: the router needs the
+        // empty segments dispatch drops so an empty id label still reaches
+        // its operation (see `router::route`).
+        let mut resolved = match route(&req.method, &req.raw_path, &req.raw_query) {
             Some(r) => r,
             None => {
                 return Err(aws_error(

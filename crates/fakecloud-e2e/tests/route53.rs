@@ -1174,3 +1174,64 @@ async fn alias_target_mutually_exclusive_with_records_and_ttl() {
         .await;
     assert!(res.is_err(), "AliasTarget + TTL must be rejected");
 }
+
+/// An empty id label reaches its operation and gets that operation's
+/// not-found error, instead of failing to route. A trailing slash on a
+/// collection root that has a List op for the method still lists.
+#[tokio::test]
+async fn empty_id_label_reaches_its_operation() {
+    let server = TestServer::start().await;
+    let http = reqwest::Client::new();
+    let auth = "AWS4-HMAC-SHA256 Credential=test/20240101/us-east-1/route53/aws4_request, \
+                SignedHeaders=host, Signature=00";
+    let send = |method: reqwest::Method, path: &str| {
+        http.request(method, format!("{}{}", server.endpoint(), path))
+            .header("Authorization", auth)
+            .send()
+    };
+
+    for (method, path, status, code) in [
+        (
+            reqwest::Method::DELETE,
+            "/2013-04-01/hostedzone/",
+            404,
+            "NoSuchHostedZone",
+        ),
+        (
+            reqwest::Method::GET,
+            "/2013-04-01/hostedzone//rrset",
+            404,
+            "NoSuchHostedZone",
+        ),
+        (
+            reqwest::Method::POST,
+            "/2013-04-01/keysigningkey//ksk/activate",
+            404,
+            "NoSuchKeySigningKey",
+        ),
+        (
+            reqwest::Method::GET,
+            "/2013-04-01/reusabledelegationsetlimit//MAX_ZONES_BY_REUSABLE_DELEGATION_SET",
+            404,
+            "NoSuchDelegationSet",
+        ),
+    ] {
+        let resp = send(method.clone(), path).await.unwrap();
+        assert_eq!(resp.status().as_u16(), status, "{method} {path}");
+        let body = resp.text().await.unwrap();
+        assert!(
+            body.contains(&format!("<Code>{code}</Code>")),
+            "{method} {path}: {body}"
+        );
+    }
+
+    let resp = send(reqwest::Method::GET, "/2013-04-01/hostedzone/")
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    assert!(resp
+        .text()
+        .await
+        .unwrap()
+        .contains("<ListHostedZonesResponse"));
+}

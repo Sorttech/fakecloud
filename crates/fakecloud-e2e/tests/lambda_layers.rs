@@ -268,3 +268,65 @@ def handler(event, context):
         "function response: {payload}"
     );
 }
+
+/// `LayerName` outside its `@pattern` is rejected before any lookup: the
+/// publish must not create a layer, and the otherwise idempotent delete and
+/// the listing fail the same way.
+#[tokio::test]
+async fn malformed_layer_name_is_rejected_by_every_layer_op() {
+    let server = TestServer::start().await;
+    let lambda = server.lambda_client().await;
+    let bad = "bad!name";
+
+    let err = lambda
+        .publish_layer_version()
+        .layer_name(bad)
+        .content(
+            LayerVersionContentInput::builder()
+                .zip_file(Blob::new(make_zip(&[("a.txt", b"a")])))
+                .build(),
+        )
+        .send()
+        .await
+        .expect_err("publish with a malformed LayerName");
+    assert_eq!(
+        err.into_service_error().meta().code(),
+        Some("ValidationException")
+    );
+
+    let err = lambda
+        .list_layer_versions()
+        .layer_name(bad)
+        .send()
+        .await
+        .expect_err("list with a malformed LayerName");
+    assert_eq!(
+        err.into_service_error().meta().code(),
+        Some("ValidationException")
+    );
+
+    let err = lambda
+        .delete_layer_version()
+        .layer_name(bad)
+        .version_number(1)
+        .send()
+        .await
+        .expect_err("delete with a malformed LayerName");
+    assert_eq!(
+        err.into_service_error().meta().code(),
+        Some("ValidationException")
+    );
+
+    let layers = lambda.list_layers().send().await.unwrap();
+    assert!(layers.layers().is_empty(), "no layer may have been created");
+
+    // A well-formed name for a layer that never existed is still a no-op
+    // delete, as in AWS.
+    lambda
+        .delete_layer_version()
+        .layer_name("never-published")
+        .version_number(1)
+        .send()
+        .await
+        .expect("idempotent delete of an unknown layer version");
+}

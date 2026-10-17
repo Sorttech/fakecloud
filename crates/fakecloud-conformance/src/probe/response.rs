@@ -338,6 +338,14 @@ pub(super) fn service_common_errors(service_name: &str) -> &'static [&'static st
         // (https://docs.aws.amazon.com/elasticloadbalancing/latest/APIReference/CommonErrors.html).
         "elasticloadbalancing" => &["ValidationError"],
         "kms" => &["ValidationException"],
+        // Lambda refuses a request member that violates its Smithy
+        // `@length`/`@pattern` in input validation, before the operation
+        // runs, with `ValidationException` ("1 validation error detected:
+        // Value '...' at 'layerName' failed to satisfy constraint: ...").
+        // The model declares no ValidationException on any operation.
+        // Source: Lambda API Reference, "Common Errors"
+        // (https://docs.aws.amazon.com/lambda/latest/api/CommonErrors.html).
+        "lambda" => &["ValidationException"],
         // EventBridge PutRule parses ScheduleExpression with the real
         // `cron(...)` / `rate(...)` grammar that drives rule firing and
         // rejects a malformed one the way AWS does:

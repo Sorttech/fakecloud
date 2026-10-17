@@ -1032,22 +1032,33 @@ async fn lambda_durable_execution_lifecycle() {
         .await;
     client
         .send_durable_execution_callback_success()
-        .callback_id("cb-ok")
+        .callback_id("Y2Itb2s=")
         .send()
         .await
         .unwrap();
     client
         .send_durable_execution_callback_failure()
-        .callback_id("cb-fail")
+        .callback_id("Y2ItZmFpbA==")
         .send()
         .await
         .unwrap();
     client
         .send_durable_execution_callback_heartbeat()
-        .callback_id("cb-hb")
+        .callback_id("Y2ItaGI=")
         .send()
         .await
         .unwrap();
+    // A callback id outside the base64 `@pattern` is rejected up front.
+    let err = client
+        .send_durable_execution_callback_success()
+        .callback_id("not_base64!")
+        .send()
+        .await
+        .expect_err("a malformed callback id must be rejected");
+    assert_eq!(
+        err.into_service_error().meta().code(),
+        Some("ValidationException")
+    );
 }
 
 #[test_action("lambda", "UpdateEventSourceMapping", checksum = "b2c589c7")]
