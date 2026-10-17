@@ -13,6 +13,26 @@ use std::net::Ipv4Addr;
 use crate::state::{Ec2State, NetworkInterface, Subnet};
 use crate::SharedEc2State;
 
+/// Run `f` against `account_id`'s EC2 state. An account EC2 has not seen yet
+/// already owns its default VPC, subnets and security group on AWS, so it is
+/// created (with those defaults) the way EC2's own calls create it. Takes the
+/// shared read lock when the account exists and the write lock only to create
+/// it, so cross-service readers do not serialize against EC2 traffic.
+pub fn with_account<R>(
+    ec2: &SharedEc2State,
+    account_id: &str,
+    f: impl FnOnce(&Ec2State) -> R,
+) -> R {
+    {
+        let accounts = ec2.read();
+        if let Some(state) = accounts.get(account_id) {
+            return f(state);
+        }
+    }
+    let mut accounts = ec2.write();
+    f(accounts.get_or_create(account_id))
+}
+
 /// The facts about a subnet other services report back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubnetInfo {
@@ -526,6 +546,24 @@ mod tests {
             "us-east-1",
             "",
         )))
+    }
+
+    #[test]
+    fn with_account_creates_an_unseen_account_with_its_default_vpc() {
+        let ec2 = ec2();
+        assert!(ec2.read().get("444455556666").is_none());
+        let vpc = with_account(&ec2, "444455556666", |s| {
+            s.vpcs
+                .values()
+                .find(|v| v.is_default)
+                .map(|v| v.vpc_id.clone())
+        })
+        .expect("default VPC");
+        let sg = with_account(&ec2, "444455556666", |s| {
+            default_security_group_id_in(s, &vpc)
+        });
+        assert!(sg.is_some());
+        assert!(ec2.read().get("444455556666").is_some());
     }
 
     #[test]

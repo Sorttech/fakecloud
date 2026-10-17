@@ -135,7 +135,13 @@ pub struct ResolverEndpoint {
     pub creation_time: String,
     pub modification_time: String,
     pub resolver_endpoint_type: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Endpoints stored before omitted `Protocols` became `Do53` load as
+    /// `Do53` too.
+    #[serde(
+        default = "default_endpoint_protocols",
+        deserialize_with = "deserialize_endpoint_protocols",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub protocols: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outpost_arn: Option<String>,
@@ -159,6 +165,17 @@ pub fn endpoint_protocols(protocols: Vec<String>) -> Vec<String> {
     } else {
         protocols
     }
+}
+
+fn default_endpoint_protocols() -> Vec<String> {
+    endpoint_protocols(Vec::new())
+}
+
+fn deserialize_endpoint_protocols<'de, D>(de: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Vec::<String>::deserialize(de).map(endpoint_protocols)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -658,7 +675,8 @@ mod tests {
 
     /// Empty lists are omitted on write, so they must default on read: a
     /// snapshot holding an endpoint with no `Protocols` (written before the
-    /// Do53 default) or a SYSTEM rule with no `TargetIps` has to load.
+    /// Do53 default; it loads as Do53) or a SYSTEM rule with no `TargetIps`
+    /// has to load.
     #[test]
     fn snapshot_with_omitted_empty_lists_loads() {
         let mut st = AccountState::default();
@@ -705,7 +723,10 @@ mod tests {
             .accounts
             .unwrap();
         let region = loaded.region("123456789012", "us-east-1").unwrap();
-        assert!(region.endpoints["rslvr-in-1"].endpoint.protocols.is_empty());
+        assert_eq!(
+            region.endpoints["rslvr-in-1"].endpoint.protocols,
+            vec!["Do53".to_string()]
+        );
         assert!(region.rules["rslvr-rr-1"].target_ips.is_empty());
     }
 

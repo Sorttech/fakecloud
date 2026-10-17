@@ -413,12 +413,10 @@ impl Route53ResolverService {
         let Some(ec2) = self.ec2_state.as_ref() else {
             return Ok(None);
         };
-        let mut guard = ec2.write();
-        match ec2_in_region(&mut guard, account, region)
-            .subnets
-            .get(subnet_id)
-        {
-            Some(subnet) => Ok(Some(subnet.vpc_id.clone())),
+        match with_ec2_in_region(ec2, account, region, |s| {
+            s.subnets.get(subnet_id).map(|sub| sub.vpc_id.clone())
+        }) {
+            Some(vpc) => Ok(Some(vpc)),
             None => Err(invalid_parameter(format!(
                 "The subnet ID '{subnet_id}' does not exist"
             ))),
@@ -435,16 +433,17 @@ impl Route53ResolverService {
         let Some(ec2) = self.ec2_state.as_ref() else {
             return Ok(());
         };
-        let mut guard = ec2.write();
-        let acc = ec2_in_region(&mut guard, account, region);
-        for sg in sgs {
-            if !acc.security_groups.contains_key(sg) {
-                return Err(invalid_parameter(format!(
-                    "The security group '{sg}' does not exist"
-                )));
-            }
+        let missing = with_ec2_in_region(ec2, account, region, |s| {
+            sgs.iter()
+                .find(|sg| !s.security_groups.contains_key(*sg))
+                .cloned()
+        });
+        match missing {
+            Some(sg) => Err(invalid_parameter(format!(
+                "The security group '{sg}' does not exist"
+            ))),
+            None => Ok(()),
         }
-        Ok(())
     }
 
     /// `true` when EC2 state is wired and the VPC does not exist. Returns
@@ -455,10 +454,7 @@ impl Route53ResolverService {
         let Some(ec2) = self.ec2_state.as_ref() else {
             return false;
         };
-        let mut guard = ec2.write();
-        !ec2_in_region(&mut guard, account, region)
-            .vpcs
-            .contains_key(vpc_id)
+        !with_ec2_in_region(ec2, account, region, |s| s.vpcs.contains_key(vpc_id))
     }
 }
 
@@ -468,14 +464,15 @@ impl Route53ResolverService {
 /// kept once per account (every region's VPCs together), so for now this is
 /// the account's EC2 state; the region is threaded through every lookup so it
 /// narrows to the request region as soon as EC2 state is region-partitioned.
-/// An account EC2 has not seen yet is created with its default VPC, the way
-/// EC2's own describe calls and the shared VPC lookups resolve it.
-fn ec2_in_region<'a>(
-    guard: &'a mut fakecloud_core::multi_account::MultiAccountState<fakecloud_ec2::Ec2State>,
+/// An account EC2 has not seen yet resolves with its default VPC (see
+/// [`fakecloud_ec2::vpc_lookup::with_account`]).
+fn with_ec2_in_region<R>(
+    ec2: &fakecloud_ec2::SharedEc2State,
     account: &str,
     _region: &str,
-) -> &'a fakecloud_ec2::Ec2State {
-    guard.get_or_create(account)
+    f: impl FnOnce(&fakecloud_ec2::Ec2State) -> R,
+) -> R {
+    fakecloud_ec2::vpc_lookup::with_account(ec2, account, f)
 }
 
 impl Default for Route53ResolverService {

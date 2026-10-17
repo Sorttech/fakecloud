@@ -95,22 +95,24 @@ impl ResourceProvisioner {
                 let name = prop_str(props, "GroupName")
                     .filter(|_| !egress)
                     .ok_or("SecurityGroup rule requires GroupId")?;
-                let accounts = self.ec2_state.read();
-                let state = accounts
-                    .get(&self.account_id)
-                    .ok_or_else(|| format!("Security group {name} does not exist"))?;
-                let default_vpc = state
-                    .vpcs
-                    .values()
-                    .find(|v| v.is_default)
-                    .map(|v| v.vpc_id.clone())
-                    .unwrap_or_default();
-                state
-                    .security_groups
-                    .values()
-                    .find(|g| g.group_name == name && g.vpc_id == default_vpc)
-                    .map(|g| g.group_id.clone())
-                    .ok_or_else(|| format!("Security group {name} does not exist"))?
+                fakecloud_ec2::vpc_lookup::with_account(
+                    &self.ec2_state,
+                    &self.account_id,
+                    |state| {
+                        let default_vpc = state
+                            .vpcs
+                            .values()
+                            .find(|v| v.is_default)
+                            .map(|v| v.vpc_id.clone())
+                            .unwrap_or_default();
+                        state
+                            .security_groups
+                            .values()
+                            .find(|g| g.group_name == name && g.vpc_id == default_vpc)
+                            .map(|g| g.group_id.clone())
+                    },
+                )
+                .ok_or_else(|| format!("Security group {name} does not exist"))?
             }
         };
         let mut params = HashMap::new();

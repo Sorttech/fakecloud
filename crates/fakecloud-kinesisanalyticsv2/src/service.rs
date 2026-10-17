@@ -1155,15 +1155,13 @@ impl Ka2Service {
         let Some(ec2) = self.ec2_state.as_ref() else {
             return BTreeMap::new();
         };
-        // `get_or_create` so an account EC2 has not seen yet resolves its
-        // default subnets, as EC2's own describe calls do.
-        let mut guard = ec2.write();
-        guard
-            .get_or_create(account)
-            .subnets
-            .iter()
-            .map(|(sid, sub)| (sid.clone(), sub.vpc_id.clone()))
-            .collect()
+        // An account EC2 has not seen yet still resolves its default subnets.
+        fakecloud_ec2::vpc_lookup::with_account(ec2, account, |st| {
+            st.subnets
+                .iter()
+                .map(|(sid, sub)| (sid.clone(), sub.vpc_id.clone()))
+                .collect()
+        })
     }
 
     /// Overwrite each VPC configuration description's `VpcId` from a
