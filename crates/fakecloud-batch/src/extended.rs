@@ -238,6 +238,8 @@ pub(crate) enum Admission {
     Admitted,
     /// At least one requirement does not fit right now: wait at RUNNABLE.
     Wait,
+    /// The job was cancelled or terminated (or finished): never start it.
+    Stopped,
 }
 
 /// Atomically admit a job against its consumable resources. On success with
@@ -248,6 +250,12 @@ pub(crate) fn admit_job(st: &mut BatchState, job_id: &str) -> Admission {
     let Some(job) = st.jobs.get(job_id) else {
         return Admission::Admitted;
     };
+    if matches!(
+        job.get("status").and_then(Value::as_str),
+        Some("SUCCEEDED" | "FAILED")
+    ) {
+        return Admission::Stopped;
+    }
     let reqs = job_consumable_requirements(job);
     if reqs.is_empty() {
         return Admission::Admitted;

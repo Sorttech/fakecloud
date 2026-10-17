@@ -564,10 +564,15 @@ impl BatchService {
         let body = req.json_body();
         let name = arn_or_name(&body, "computeEnvironment")?;
         let mut accounts = self.state.write();
-        accounts
-            .get_or_create(&req.account_id)
-            .compute_environments
-            .remove(&name);
+        let st = accounts.get_or_create(&req.account_id);
+        // Its tags go with it: a later resource of the same name starts untagged.
+        if let Some(arn) = st.compute_environments.remove(&name).and_then(|r| {
+            r.get("computeEnvironmentArn")
+                .and_then(Value::as_str)
+                .map(String::from)
+        }) {
+            st.tags.remove(&arn);
+        }
         Ok(AwsResponse::ok_json(json!({})))
     }
 
@@ -652,10 +657,15 @@ impl BatchService {
         let body = req.json_body();
         let name = arn_or_name(&body, "jobQueue")?;
         let mut accounts = self.state.write();
-        accounts
-            .get_or_create(&req.account_id)
-            .job_queues
-            .remove(&name);
+        let st = accounts.get_or_create(&req.account_id);
+        // Its tags go with it: a later resource of the same name starts untagged.
+        if let Some(arn) = st.job_queues.remove(&name).and_then(|r| {
+            r.get("jobQueueArn")
+                .and_then(Value::as_str)
+                .map(String::from)
+        }) {
+            st.tags.remove(&arn);
+        }
         Ok(AwsResponse::ok_json(json!({})))
     }
 
@@ -984,10 +994,15 @@ impl BatchService {
         let body = req.json_body();
         let name = arn_or_name(&body, "arn")?;
         let mut accounts = self.state.write();
-        accounts
-            .get_or_create(&req.account_id)
+        let st = accounts.get_or_create(&req.account_id);
+        // Its tags go with it: a later resource of the same name starts untagged.
+        if let Some(arn) = st
             .scheduling_policies
-            .remove(&name);
+            .remove(&name)
+            .and_then(|r| r.get("arn").and_then(Value::as_str).map(String::from))
+        {
+            st.tags.remove(&arn);
+        }
         Ok(AwsResponse::ok_json(json!({})))
     }
 
@@ -1430,7 +1445,11 @@ impl BatchService {
         };
         let body = req.json_body();
         let job_id = crate::extended::required_str(&body, "jobId")?.to_string();
-        let reason = crate::extended::required_str(&body, "reason")?.to_string();
+        let reason = body
+            .get("reason")
+            .and_then(Value::as_str)
+            .ok_or_else(|| client_error("ClientException", format!("reason is required for {op}")))?
+            .to_string();
         let child_prefix = format!("{job_id}:");
         // The real ECS tasks of the jobs being stopped: (cluster, task ARN).
         let mut tasks = Vec::new();
@@ -1465,15 +1484,13 @@ impl BatchService {
         // Stop the containers too, so a terminated job does not keep running.
         // The status poller sees the job already terminal and leaves it FAILED.
         if let (Some(ecs), false) = (self.ecs.as_ref(), tasks.is_empty()) {
+            let mut stops = tokio::task::JoinSet::new();
             for (cluster, task) in tasks {
-                let _ = ecs
-                    .handle(ecs_request(
-                        "StopTask",
-                        json!({ "cluster": cluster, "task": task, "reason": reason }),
-                        req,
-                    ))
-                    .await;
+                let ecs = ecs.clone();
+                let src = bare_request(&req.account_id, &req.region, &req.request_id);
+                stops.spawn(async move { stop_ecs_task(&ecs, &src, &cluster, &task).await });
             }
+            while stops.join_next().await.is_some() {}
             ecs.persist().await;
         }
         Ok(AwsResponse::ok_json(json!({})))
@@ -1592,6 +1609,9 @@ async fn launch(
         let mut accounts = ctx.batch_state.write();
         crate::extended::admit_job(accounts.get_or_create(account), job_id)
     };
+    if let crate::extended::Admission::Stopped = admission {
+        return;
+    }
     if let crate::extended::Admission::Wait = admission {
         spawn_consumable_waiter(
             ctx.clone(),
@@ -1712,19 +1732,23 @@ async fn launch_now(
     let src = bare_request(account, region, request_id);
     match launch_ecs_task(&ecs, &src, job_id, job_name, &container).await {
         Ok((cluster, task_arn)) => {
-            {
+            let recorded = {
                 let mut accounts = ctx.batch_state.write();
-                if let Some(j) = accounts
-                    .get_or_create(account)
-                    .jobs
-                    .get_mut(job_id)
-                    .and_then(|j| j.as_object_mut())
-                {
-                    j.insert("status".into(), json!("STARTING"));
-                    j.insert("ecsCluster".into(), json!(cluster));
-                    j.insert("ecsTaskArn".into(), json!(task_arn));
-                    j.insert("startedAt".into(), json!(now));
+                match live_job(accounts.get_or_create(account), job_id) {
+                    Some(j) => {
+                        j.insert("status".into(), json!("STARTING"));
+                        j.insert("ecsCluster".into(), json!(cluster));
+                        j.insert("ecsTaskArn".into(), json!(task_arn));
+                        j.insert("startedAt".into(), json!(now));
+                        true
+                    }
+                    None => false,
                 }
+            };
+            if !recorded {
+                // Cancelled or terminated while the task launched: it must not run.
+                stop_ecs_task(&ecs, &src, &cluster, &task_arn).await;
+                return;
             }
             spawn_status_sync(
                 ctx,
@@ -1741,12 +1765,7 @@ async fn launch_now(
         }
         Err(err) => {
             let mut accounts = ctx.batch_state.write();
-            if let Some(j) = accounts
-                .get_or_create(account)
-                .jobs
-                .get_mut(job_id)
-                .and_then(|j| j.as_object_mut())
-            {
+            if let Some(j) = live_job(accounts.get_or_create(account), job_id) {
                 j.insert("status".into(), json!("FAILED"));
                 j.insert("statusReason".into(), json!(err.message().to_string()));
             }
@@ -1801,12 +1820,7 @@ fn spawn_dependency_waiter(
             if statuses.iter().any(|s| s == "FAILED") {
                 {
                     let mut accounts = ctx.batch_state.write();
-                    if let Some(j) = accounts
-                        .get_or_create(&account)
-                        .jobs
-                        .get_mut(&job_id)
-                        .and_then(|j| j.as_object_mut())
-                    {
+                    if let Some(j) = live_job(accounts.get_or_create(&account), &job_id) {
                         j.insert("status".into(), json!("FAILED"));
                         j.insert("statusReason".into(), json!("Dependent job failed"));
                     }
@@ -2044,6 +2058,9 @@ fn spawn_status_sync(
             for _ in 0..max_polls {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 if job_is_terminal(&batch_state, &account_id, &job_id) {
+                    // Stopped by CancelJob / TerminateJob. Stop this task too in
+                    // case the handler's StopTask failed or missed it.
+                    stop_ecs_task(&ecs, &src, &cluster, &task).await;
                     return;
                 }
                 let resp = match ecs
@@ -2064,12 +2081,7 @@ fn spawn_status_sync(
                 match t.get("lastStatus").and_then(Value::as_str).unwrap_or("") {
                     "RUNNING" => {
                         let mut accounts = batch_state.write();
-                        if let Some(j) = accounts
-                            .get_or_create(&account_id)
-                            .jobs
-                            .get_mut(&job_id)
-                            .and_then(|j| j.as_object_mut())
-                        {
+                        if let Some(j) = live_job(accounts.get_or_create(&account_id), &job_id) {
                             if matches!(
                                 j.get("status").and_then(Value::as_str),
                                 Some("STARTING" | "RUNNABLE")
@@ -2098,6 +2110,7 @@ fn spawn_status_sync(
 
             // Cancelled or terminated while this attempt ran: keep that outcome.
             if job_is_terminal(&batch_state, &account_id, &job_id) {
+                stop_ecs_task(&ecs, &src, &cluster, &task).await;
                 return;
             }
             if succeeded {
@@ -2120,12 +2133,7 @@ fn spawn_status_sync(
                 // Record the failed attempt and re-launch a fresh task.
                 {
                     let mut accounts = batch_state.write();
-                    if let Some(j) = accounts
-                        .get_or_create(&account_id)
-                        .jobs
-                        .get_mut(&job_id)
-                        .and_then(|j| j.as_object_mut())
-                    {
+                    if let Some(j) = live_job(accounts.get_or_create(&account_id), &job_id) {
                         let attempts = j.entry("attempts".to_string()).or_insert_with(|| json!([]));
                         if let Some(a) = attempts.as_array_mut() {
                             a.push(json!({
@@ -2141,9 +2149,7 @@ fn spawn_status_sync(
                 // released when the attempt failed, so it must be admitted
                 // again (atomically with the other waiters) before relaunch,
                 // and waits at RUNNABLE while capacity is held by others.
-                if !wait_for_retry_admission(&batch_state, &account_id, &job_id).await
-                    || job_is_terminal(&batch_state, &account_id, &job_id)
-                {
+                if !wait_for_retry_admission(&batch_state, &account_id, &job_id).await {
                     break;
                 }
                 let relaunched = launch_ecs_task(&ecs, &src, &job_id, &job_name, &container).await;
@@ -2152,15 +2158,21 @@ fn spawn_status_sync(
                     Ok((_, new_task)) => {
                         task = new_task;
                         attempt += 1;
-                        let mut accounts = batch_state.write();
-                        if let Some(j) = accounts
-                            .get_or_create(&account_id)
-                            .jobs
-                            .get_mut(&job_id)
-                            .and_then(|j| j.as_object_mut())
-                        {
-                            j.insert("status".into(), json!("STARTING"));
-                            j.insert("ecsTaskArn".into(), json!(task));
+                        let recorded = {
+                            let mut accounts = batch_state.write();
+                            match live_job(accounts.get_or_create(&account_id), &job_id) {
+                                Some(j) => {
+                                    j.insert("status".into(), json!("STARTING"));
+                                    j.insert("ecsTaskArn".into(), json!(task));
+                                    true
+                                }
+                                None => false,
+                            }
+                        };
+                        if !recorded {
+                            // Stopped while this attempt launched: it must not run.
+                            stop_ecs_task(&ecs, &src, &cluster, &task).await;
+                            return;
                         }
                         continue;
                     }
@@ -2193,7 +2205,6 @@ fn spawn_status_sync(
     });
 }
 
-/// Write a job's terminal status + `container.exitCode`/reason + `stoppedAt`.
 /// True once the job reached `SUCCEEDED` / `FAILED`, including through
 /// `CancelJob` / `TerminateJob` while its task was still being polled.
 fn job_is_terminal(batch_state: &SharedBatchState, account_id: &str, job_id: &str) -> bool {
@@ -2206,6 +2217,47 @@ fn job_is_terminal(batch_state: &SharedBatchState, account_id: &str, job_id: &st
         .is_some_and(|s| matches!(s, "SUCCEEDED" | "FAILED"))
 }
 
+/// The job's record while it can still change state, or `None` once it is
+/// `SUCCEEDED` / `FAILED`. Every background status writer goes through this
+/// under the write lock, so a `CancelJob` / `TerminateJob` (or a finished
+/// attempt) is never overwritten by a launch, poll or retry still in flight.
+pub(crate) fn live_job<'a>(
+    st: &'a mut BatchState,
+    job_id: &str,
+) -> Option<&'a mut Map<String, Value>> {
+    st.jobs
+        .get_mut(job_id)
+        .and_then(Value::as_object_mut)
+        .filter(|j| {
+            !matches!(
+                j.get("status").and_then(Value::as_str),
+                Some("SUCCEEDED" | "FAILED")
+            )
+        })
+}
+
+/// Stop an ECS task Batch launched. Best-effort: a failure is logged, and the
+/// status poller retries it for a task whose job was stopped.
+async fn stop_ecs_task(
+    ecs: &fakecloud_ecs::EcsService,
+    src: &AwsRequest,
+    cluster: &str,
+    task: &str,
+) {
+    if let Err(e) = ecs
+        .handle(ecs_request(
+            "StopTask",
+            json!({ "cluster": cluster, "task": task, "reason": "Batch job stopped" }),
+            src,
+        ))
+        .await
+    {
+        tracing::warn!(task, error = %e.message(), "failed to stop the ECS task of a stopped Batch job");
+    }
+}
+
+/// Write a job's terminal status + `container.exitCode`/reason + `stoppedAt`,
+/// unless it is already terminal (a user stop that raced the task's exit wins).
 fn set_job_terminal(
     batch_state: &SharedBatchState,
     account_id: &str,
@@ -2215,12 +2267,7 @@ fn set_job_terminal(
     reason: Option<String>,
 ) {
     let mut accounts = batch_state.write();
-    if let Some(j) = accounts
-        .get_or_create(account_id)
-        .jobs
-        .get_mut(job_id)
-        .and_then(|j| j.as_object_mut())
-    {
+    if let Some(j) = live_job(accounts.get_or_create(account_id), job_id) {
         j.insert("status".into(), json!(status));
         if let Some(c) = exit_code {
             let container = j
@@ -2760,6 +2807,69 @@ mod tests {
         drop(accounts);
         // The status poller treats the job as finished and never revives it.
         assert!(job_is_terminal(&s.state, "123456789012", &id));
+    }
+
+    #[tokio::test]
+    async fn a_stopped_job_is_never_revived_by_background_writers() {
+        let s = svc();
+        mk_queue(&s, "q").await;
+        let sub = body_of(
+            s.handle(req(
+                "/v1/submitjob",
+                json!({"jobName": "j", "jobQueue": "q", "jobDefinition": "jd:1"}),
+            ))
+            .await
+            .unwrap(),
+        );
+        let id = sub["jobId"].as_str().unwrap().to_string();
+        s.handle(req("/v1/canceljob", json!({"jobId": id, "reason": ""})))
+            .await
+            .unwrap();
+        // A container exit racing the cancel does not overwrite it, and a
+        // launch waiting on admission (dependsOn, consumables) never starts it.
+        set_job_terminal(&s.state, "123456789012", &id, "SUCCEEDED", Some(0), None);
+        let mut accounts = s.state.write();
+        let st = accounts.get_or_create("123456789012");
+        assert!(matches!(
+            crate::extended::admit_job(st, &id),
+            crate::extended::Admission::Stopped
+        ));
+        assert!(live_job(st, &id).is_none());
+        assert_eq!(st.jobs[&id]["status"], "FAILED");
+        assert_eq!(st.jobs[&id]["statusReason"], "");
+    }
+
+    #[tokio::test]
+    async fn deleting_a_resource_drops_its_tags() {
+        let s = svc();
+        let make = |name: &str| {
+            req(
+                "/v1/createjobqueue",
+                json!({"jobQueueName": name, "priority": 1, "tags": {"env": "prod"}}),
+            )
+        };
+        let q = body_of(s.handle(make("q")).await.unwrap());
+        let arn = q["jobQueueArn"].as_str().unwrap().to_string();
+        s.handle(req("/v1/deletejobqueue", json!({"jobQueue": "q"})))
+            .await
+            .unwrap();
+        assert!(!s
+            .state
+            .read()
+            .get("123456789012")
+            .unwrap()
+            .tags
+            .contains_key(&arn));
+        // Re-created under the same name (same ARN), it starts untagged.
+        s.handle(req(
+            "/v1/createjobqueue",
+            json!({"jobQueueName": "q", "priority": 1}),
+        ))
+        .await
+        .unwrap();
+        let mut lt = req(&format!("/v1/tags/{}", arn.replace('/', "%2F")), json!({}));
+        lt.method = Method::GET;
+        assert_eq!(body_of(s.handle(lt).await.unwrap())["tags"], json!({}));
     }
 
     #[tokio::test]
