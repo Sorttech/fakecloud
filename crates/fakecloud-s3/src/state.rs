@@ -321,6 +321,11 @@ pub struct S3State {
     pub buckets: BTreeMap<String, S3Bucket>,
     pub notification_events: Vec<S3NotificationEvent>,
     pub body_cache: Option<Arc<BodyCache>>,
+    /// What every new object version triggers (notifications, replication,
+    /// default SSE-KMS encryption), installed by the S3 service so objects
+    /// other services deliver get the same side effects as a PutObject.
+    /// Shared runtime wiring like `body_cache`, not account data.
+    pub side_effects: Option<Arc<crate::side_effects::S3SideEffects>>,
     /// Object Lambda responses keyed by request token.
     pub object_lambda_responses: BTreeMap<String, ObjectLambdaResponse>,
     pub access_points: BTreeMap<String, S3AccessPoint>,
@@ -334,6 +339,7 @@ impl S3State {
             buckets: BTreeMap::new(),
             notification_events: Vec::new(),
             body_cache: None,
+            side_effects: None,
             object_lambda_responses: BTreeMap::new(),
             access_points: BTreeMap::new(),
         }
@@ -422,6 +428,9 @@ impl fakecloud_core::multi_account::AccountState for S3State {
     fn inherit_from(&mut self, sibling: &Self) {
         if let Some(cache) = &sibling.body_cache {
             self.body_cache = Some(cache.clone());
+        }
+        if let Some(effects) = &sibling.side_effects {
+            self.side_effects = Some(effects.clone());
         }
     }
 }

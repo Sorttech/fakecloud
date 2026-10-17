@@ -64,15 +64,7 @@ impl S3Service {
         };
 
         // --- Read lock phase: validate preconditions and read bucket config ---
-        let (
-            acl_owner_id,
-            encryption_config,
-            notification_config,
-            region,
-            bucket_region,
-            explicit_lock,
-            checks,
-        ) = {
+        let (acl_owner_id, encryption_config, bucket_region, explicit_lock, checks) = {
             let accts = self.state.read();
             let __empty = crate::state::S3State::new(account_id, "us-east-1");
             let state = accts.get(account_id).unwrap_or(&__empty);
@@ -128,8 +120,6 @@ impl S3Service {
             (
                 b.acl_owner_id.clone(),
                 b.encryption_config.clone(),
-                b.notification_config.clone(),
-                state.region.clone(),
                 b.region.clone(),
                 explicit_lock,
                 checks,
@@ -245,7 +235,7 @@ impl S3Service {
             .get("x-amz-server-side-encryption-aws-kms-key-id")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
-        let bucket_key_enabled = req
+        let mut bucket_key_enabled = req
             .headers
             .get("x-amz-server-side-encryption-bucket-key-enabled")
             .and_then(|v| v.to_str().ok())
@@ -253,13 +243,17 @@ impl S3Service {
 
         // Apply bucket default encryption if no explicit SSE headers
         if sse_algorithm.is_none() {
-            if let Some(ref enc_config) = encryption_config {
-                if let Some(algo) = extract_xml_value(enc_config, "SSEAlgorithm") {
-                    if algo == "aws:kms" && sse_kms_key_id.is_none() {
-                        sse_kms_key_id = extract_xml_value(enc_config, "KMSMasterKeyID");
-                    }
-                    sse_algorithm = Some(algo);
+            if let Some(default) = encryption_config
+                .as_deref()
+                .and_then(crate::side_effects::bucket_default_encryption)
+            {
+                if sse_kms_key_id.is_none() {
+                    sse_kms_key_id = default.kms_key_id;
                 }
+                if bucket_key_enabled.is_none() {
+                    bucket_key_enabled = default.bucket_key_enabled;
+                }
+                sse_algorithm = Some(default.algorithm);
             }
         }
 
@@ -376,7 +370,7 @@ impl S3Service {
         };
 
         // --- Write lock phase: insert object and handle versioning/replication ---
-        let version_id = {
+        let committed = {
             let mut accts = self.state.write();
             let state = accts.get_or_create(account_id);
             let b = state
@@ -404,23 +398,28 @@ impl S3Service {
                 }
             }
 
-            // Write the body through the store, then record the new version
-            // as the bucket's versioning state dictates.
-            let version_id =
-                super::commit_object_version(b, bucket, Some(&*self.store), obj, body_source)
-                    .map_err(crate::service::persistence_error)?;
-            // Replicate (in-memory copy) then persist replicas via the store.
-            replicate_through_store(
+            // Write the body through the store, record the new version as the
+            // bucket's versioning state dictates, and replicate it.
+            crate::side_effects::commit_new_object(
                 &mut accts,
                 account_id,
-                &self.store,
                 bucket,
-                key,
-                self.iam_mode,
+                Some(&*self.store),
+                Some(&self.side_effects),
+                obj,
+                |store, obj, meta| {
+                    store.put_object(
+                        bucket,
+                        &obj.key,
+                        meta.version_id.as_deref(),
+                        body_source,
+                        meta,
+                    )
+                },
             )
-            .map_err(crate::service::persistence_error)?;
-            version_id
+            .map_err(crate::service::persistence_error)?
         }; // write lock dropped
+        let version_id = committed.version_id.clone();
 
         // --- Response phase: build response headers ---
         let mut headers = HeaderMap::new();
@@ -457,11 +456,6 @@ impl S3Service {
             );
         }
 
-        let obj_size = data_size;
-        let obj_etag = etag.clone();
-        let bucket_name = bucket.to_string();
-        let obj_key = key.to_string();
-
         // Deliver S3 event notifications. A browser form upload reaches this
         // handler through POST Object, which AWS reports as ObjectCreated:Post.
         // S3 routes on method + path rather than `action`, so POST Object's
@@ -471,23 +465,16 @@ impl S3Service {
         } else {
             "ObjectCreated:Put"
         };
-        if let Some(ref config) = notification_config {
-            deliver_notifications(
-                &self.delivery,
-                config,
-                &crate::service::notifications::ObjectEvent {
-                    event_name,
-                    bucket_name: &bucket_name,
-                    requester_account: &req.account_id,
-                    key: &obj_key,
-                    size: obj_size,
-                    etag: &obj_etag,
-                    region: &region,
-                    version_id: version_id.as_deref(),
-                },
-                Some(&self.state),
-            );
-        }
+        committed.notify(
+            &self.delivery,
+            &self.state,
+            event_name,
+            &req.account_id,
+            bucket,
+            key,
+            data_size,
+            &etag,
+        );
 
         Ok(AwsResponse {
             status: StatusCode::OK,
@@ -1021,21 +1008,30 @@ impl S3Service {
             ..Default::default()
         };
 
-        // Write the copy through the store and record it as the destination's
-        // new version, exactly as PutObject does. The id it reports is the
-        // one assigned at commit.
-        let version_id = super::commit_object_version(
-            db,
+        // Write the copy through the store, record it as the destination's
+        // new version and replicate it, exactly as PutObject does. The id it
+        // reports is the one assigned at commit.
+        let body_source = staged_dest.source();
+        let committed = crate::side_effects::commit_new_object(
+            &mut accts,
+            account_id,
             dest_bucket,
             Some(&*self.store),
+            Some(&self.side_effects),
             dest_obj,
-            staged_dest.source(),
+            |store, obj, meta| {
+                store.put_object(
+                    dest_bucket,
+                    &obj.key,
+                    meta.version_id.as_deref(),
+                    body_source,
+                    meta,
+                )
+            },
         )
         .map_err(crate::service::persistence_error)?;
-        let db = state
-            .buckets
-            .get_mut(dest_bucket)
-            .ok_or_else(|| no_such_bucket(dest_bucket))?;
+        drop(accts);
+        let version_id = committed.version_id.clone();
 
         let mut response_headers = HeaderMap::new();
         if let Some(vid) = &version_id {
@@ -1068,27 +1064,6 @@ impl S3Service {
             crate::checksum::xml_element(new_checksum_algo, &new_checksum_val)
         );
 
-        // Capture notification config before dropping lock
-        let notification_config = db.notification_config.clone();
-        let copy_size = src_obj_size;
-        let copy_etag = etag.clone();
-        let copy_bucket = dest_bucket.to_string();
-        let copy_key = dest_key.to_string();
-        let region = state.region.clone();
-
-        // Replicate object if replication is configured on the destination bucket
-        replicate_through_store(
-            &mut accts,
-            account_id,
-            &self.store,
-            dest_bucket,
-            dest_key,
-            self.iam_mode,
-        )
-        .map_err(crate::service::persistence_error)?;
-
-        drop(accts);
-
         let body = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
              <CopyObjectResult>\
@@ -1100,23 +1075,16 @@ impl S3Service {
         );
 
         // Deliver S3 event notifications
-        if let Some(ref config) = notification_config {
-            deliver_notifications(
-                &self.delivery,
-                config,
-                &crate::service::notifications::ObjectEvent {
-                    event_name: "ObjectCreated:Copy",
-                    bucket_name: &copy_bucket,
-                    requester_account: &req.account_id,
-                    key: &copy_key,
-                    size: copy_size,
-                    etag: &copy_etag,
-                    region: &region,
-                    version_id: version_id.as_deref(),
-                },
-                Some(&self.state),
-            );
-        }
+        committed.notify(
+            &self.delivery,
+            &self.state,
+            "ObjectCreated:Copy",
+            &req.account_id,
+            dest_bucket,
+            dest_key,
+            src_obj_size,
+            &etag,
+        );
 
         Ok(AwsResponse {
             status: StatusCode::OK,

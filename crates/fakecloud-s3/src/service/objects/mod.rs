@@ -16,8 +16,8 @@ use super::{
     governance_bypass_requested, has_object_lock_headers, insert_user_metadata_headers, is_frozen,
     is_valid_storage_class, make_delete_marker, no_such_bucket, no_such_key,
     parse_delete_objects_quiet, parse_delete_objects_xml, parse_range_header,
-    parse_url_encoded_tags, precondition_failed, replicate_through_store, resolve_object, s3_xml,
-    url_encode_s3_key, xml_escape, ObjectLockSettings, RangeResult, S3Service,
+    parse_url_encoded_tags, precondition_failed, resolve_object, s3_xml, url_encode_s3_key,
+    xml_escape, ObjectLockSettings, RangeResult, S3Service,
 };
 
 mod delete;
@@ -208,16 +208,19 @@ where
     // The one place a new version falls back to the bucket's default
     // retention: an object that carries no explicit retention (request
     // headers, or a replica's source lock) gets the default, measured from
-    // now, the moment the version is committed.
-    let lock = crate::state::ObjectLockSettings {
-        mode: obj.lock_mode.take(),
-        retain_until: obj.lock_retain_until.take(),
-        legal_hold: obj.lock_legal_hold.take(),
+    // now, the moment the version is committed. A delete marker (a
+    // replicated one) holds no data and is never locked.
+    if !obj.is_delete_marker {
+        let lock = crate::state::ObjectLockSettings {
+            mode: obj.lock_mode.take(),
+            retain_until: obj.lock_retain_until.take(),
+            legal_hold: obj.lock_legal_hold.take(),
+        }
+        .or_bucket_default(b.object_lock_config.as_deref(), Utc::now());
+        obj.lock_mode = lock.mode;
+        obj.lock_retain_until = lock.retain_until;
+        obj.lock_legal_hold = lock.legal_hold;
     }
-    .or_bucket_default(b.object_lock_config.as_deref(), Utc::now());
-    obj.lock_mode = lock.mode;
-    obj.lock_retain_until = lock.retain_until;
-    obj.lock_legal_hold = lock.legal_hold;
 
     if let Some(store) = store {
         let meta = object_meta_snapshot(&obj);

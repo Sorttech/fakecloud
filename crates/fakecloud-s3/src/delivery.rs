@@ -69,19 +69,38 @@ pub fn put_object_via_store(
 /// Write an object another service produced (a log export, a delivery
 /// stream batch, an access log, a query result, ...) into `bucket` in
 /// `account_id`. `obj` carries the object's metadata (key, content type,
-/// ETag, size, encryption); `body` is the stored payload.
+/// ETag, size, encryption); `body` is the payload, in plaintext unless the
+/// producer encrypted it itself (`obj.sse_algorithm` set to `aws:kms`).
 ///
-/// On AWS such an object is an ordinary new object version, so it is written
-/// exactly as PutObject writes one: the bucket's versioning decides its
-/// version id and history, and on an Object Lock bucket the default retention
-/// applies. The body is persisted through `store` when one is configured, so
-/// the object (and every version it displaces) survives a restart. A missing
-/// bucket or a failed store write is an error, and leaves the bucket's
-/// in-memory state unchanged.
+/// On AWS such an object is an ordinary new object version, so it gets
+/// everything a PutObject gets:
 ///
-/// The payload is staged next to the store with no S3 lock held; the global
-/// S3 write lock is taken only for the rename-into-place and the in-memory
-/// commit. Returns the new version id on a versioning-enabled bucket.
+/// - the bucket's versioning decides its version id and history, and on an
+///   Object Lock bucket the default retention applies;
+/// - the bucket's default encryption applies when the producer set none
+///   (SSE-KMS encrypts the body under the configured key, or the AWS-managed
+///   `aws/s3` key);
+/// - the bucket's replication configuration replicates it ("If Amazon S3
+///   delivers logs to a bucket that has replication enabled, it replicates
+///   the log objects", S3 User Guide, Requirements and considerations for
+///   replication);
+/// - the bucket's event notifications fire `s3:ObjectCreated:Put`, the event
+///   for the PUT the producing service makes, with the receiving account as
+///   the requester.
+///
+/// The notifications, replication and SSE-KMS encryption use the side
+/// effects the S3 service installed on `state`; without them (a state no S3
+/// service was built on) only versioning, retention and SSE-S3 apply.
+///
+/// The body is persisted through `store` when one is configured, so the
+/// object (and every version it displaces) survives a restart. A missing
+/// bucket, a failed encryption or a failed store write is an error, and
+/// leaves the bucket's in-memory state unchanged.
+///
+/// The payload is encrypted and staged next to the store with no S3 lock
+/// held; the global S3 write lock is taken only for the rename-into-place,
+/// the in-memory commit and the replication, and notifications go out after
+/// it is released. Returns the new version id on a versioning-enabled bucket.
 pub fn put_delivered_object(
     state: &SharedS3State,
     store: Option<&dyn S3Store>,
@@ -94,16 +113,23 @@ pub fn put_delivered_object(
     let missing = || format!("bucket {bucket} not found in account {account_id}");
 
     // Cheap existence check under a read guard, so a delivery to a missing
-    // bucket never touches the disk.
-    {
+    // bucket never touches the disk; it also reads what the write needs from
+    // the bucket.
+    let (default_encryption, bucket_region, effects) = {
         let accounts = state.read();
-        let exists = accounts
+        let b = accounts
             .get(account_id)
-            .is_some_and(|s| s.buckets.contains_key(bucket));
-        if !exists {
-            return Err(missing());
-        }
-    }
+            .and_then(|s| s.buckets.get(bucket))
+            .ok_or_else(missing)?;
+        (
+            b.encryption_config
+                .as_deref()
+                .and_then(crate::side_effects::bucket_default_encryption),
+            b.region.clone(),
+            crate::side_effects::installed(&accounts, account_id),
+        )
+    };
+    let kms_hook = effects.as_ref().and_then(|e| e.kms_hook.as_ref());
 
     // Every new object carries an additional checksum, as on S3: the one the
     // producer set (it must, for an encrypted payload, since the checksum
@@ -116,6 +142,42 @@ pub fn put_delivered_object(
         obj.checksum_value = Some(crate::checksum::checksum(algorithm, &body));
         obj.checksum_algorithm = Some(algorithm);
         obj.checksum_type = Some(crate::checksum::ChecksumType::FullObject);
+    }
+
+    // The bucket's default encryption, for an object the producer did not
+    // encrypt, as PutObject applies it to a request with no SSE headers.
+    let mut body = body;
+    if obj.sse_algorithm.is_none() {
+        if let Some(default) = default_encryption {
+            if default.algorithm.starts_with("aws:kms") {
+                let key_id = default.kms_key_id.clone();
+                body = crate::side_effects::kms_encrypt(
+                    kms_hook,
+                    account_id,
+                    &bucket_region,
+                    bucket,
+                    &body,
+                    key_id.as_deref(),
+                )
+                .map_err(|e| format!("failed to encrypt object {key} for bucket {bucket}: {e}"))?;
+                // The object records the key's ARN, as S3 does (the
+                // AWS-managed `aws/s3` key when the default names none).
+                let resolve = |reference: &str| {
+                    crate::side_effects::resolve_kms_key_arn(
+                        kms_hook,
+                        account_id,
+                        &bucket_region,
+                        reference,
+                    )
+                };
+                obj.sse_kms_key_id = match key_id {
+                    Some(configured) => Some(resolve(&configured).unwrap_or(configured)),
+                    None => resolve("aws/s3"),
+                };
+            }
+            obj.sse_algorithm = Some(default.algorithm);
+            obj.bucket_key_enabled = default.bucket_key_enabled;
+        }
     }
 
     // Stage the payload with no S3 lock held: the global S3 lock is shared by
@@ -131,31 +193,60 @@ pub fn put_delivered_object(
     }
     let now = Utc::now();
     obj.last_modified = now;
+    let size = obj.size;
+    let etag = obj.etag.clone();
 
-    let mut accounts = state.write();
-    let acct = accounts.get_or_create(account_id);
-    let bucket_ref = acct.buckets.get_mut(bucket).ok_or_else(missing)?;
-    // The bucket owner owns a delivered object, with the default private ACL.
-    if obj.acl_owner_id.is_none() {
-        obj.acl_owner_id = Some(bucket_ref.acl_owner_id.clone());
-        obj.acl_grants = vec![AclGrant {
-            grantee_type: "CanonicalUser".to_string(),
-            grantee_id: Some(bucket_ref.acl_owner_id.clone()),
-            grantee_display_name: Some(bucket_ref.acl_owner_id.clone()),
-            grantee_uri: None,
-            permission: "FULL_CONTROL".to_string(),
-        }];
+    let committed = {
+        let mut accounts = state.write();
+        let acct = accounts.get_or_create(account_id);
+        let bucket_ref = acct.buckets.get_mut(bucket).ok_or_else(missing)?;
+        // The bucket owner owns a delivered object, with the default private ACL.
+        if obj.acl_owner_id.is_none() {
+            obj.acl_owner_id = Some(bucket_ref.acl_owner_id.clone());
+            obj.acl_grants = vec![AclGrant {
+                grantee_type: "CanonicalUser".to_string(),
+                grantee_id: Some(bucket_ref.acl_owner_id.clone()),
+                grantee_display_name: Some(bucket_ref.acl_owner_id.clone()),
+                grantee_uri: None,
+                permission: "FULL_CONTROL".to_string(),
+            }];
+        }
+        // Commit under the same guard as the existence check, so the on-disk
+        // body and the in-memory metadata of concurrent writers to one key
+        // stay in step. The payload is already staged next to the store, so
+        // the store write is a rename, not a body copy. A failed store write
+        // is returned to the caller with the bucket left exactly as it was, so
+        // the caller's failure handling (a failed export job, an error
+        // response) sees it and memory never claims an object the disk lacks.
+        let source = spooled.source();
+        crate::side_effects::commit_new_object(
+            &mut accounts,
+            account_id,
+            bucket,
+            store,
+            effects.as_deref(),
+            obj,
+            |store, obj, meta| {
+                store.put_object(bucket, &obj.key, meta.version_id.as_deref(), source, meta)
+            },
+        )
+        .map_err(|e| format!("failed to persist object {key} to bucket {bucket}: {e}"))?
+    };
+
+    // Notifications go out with the S3 lock released, as for PutObject.
+    if let Some(effects) = &effects {
+        committed.notify(
+            &effects.delivery,
+            state,
+            "ObjectCreated:Put",
+            account_id,
+            bucket,
+            &key,
+            size,
+            &etag,
+        );
     }
-    // Commit under the same guard as the existence check, so the on-disk body
-    // and the in-memory metadata of concurrent writers to one key stay in
-    // step. The payload is already staged next to the store, so the store
-    // write is a rename, not a body copy.
-    // A failed store write is returned to the caller with the bucket left
-    // exactly as it was, so the caller's failure handling (a failed export
-    // job, an error response) sees it and memory never claims an object the
-    // disk lacks.
-    crate::service::commit_object_version(bucket_ref, bucket, store, obj, spooled.source())
-        .map_err(|e| format!("failed to persist object {key} to bucket {bucket}: {e}"))
+    Ok(committed.version_id)
 }
 
 impl S3Delivery for S3DeliveryImpl {
@@ -851,5 +942,303 @@ mod tests {
             .get_object(ACCOUNT, "logs-bucket", "ghost")
             .expect_err("missing key");
         assert!(err.contains("not found"));
+    }
+
+    /// Records every SQS message an S3 notification sends.
+    #[derive(Default)]
+    struct SqsRecorder(std::sync::Mutex<Vec<(String, String)>>);
+
+    impl fakecloud_core::delivery::SqsDelivery for SqsRecorder {
+        fn deliver_to_queue(
+            &self,
+            queue_arn: &str,
+            message_body: &str,
+            _attributes: &std::collections::HashMap<String, String>,
+        ) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((queue_arn.to_string(), message_body.to_string()));
+        }
+    }
+
+    /// A KMS hook whose "envelope" is readable: `enc:<key>:<plaintext>`.
+    struct ReadableKms;
+
+    impl fakecloud_core::delivery::KmsHook for ReadableKms {
+        fn encrypt(
+            &self,
+            _account_id: &str,
+            _region: &str,
+            key_id: &str,
+            plaintext: &[u8],
+            _service_principal: &str,
+            _encryption_context: std::collections::HashMap<String, String>,
+        ) -> Result<String, String> {
+            Ok(format!(
+                "enc:{key_id}:{}",
+                String::from_utf8_lossy(plaintext)
+            ))
+        }
+
+        fn decrypt(
+            &self,
+            _account_id: &str,
+            ciphertext_b64: &str,
+            _service_principal: &str,
+            _encryption_context: std::collections::HashMap<String, String>,
+        ) -> Result<Vec<u8>, String> {
+            let rest = ciphertext_b64
+                .strip_prefix("enc:")
+                .ok_or("not an envelope")?;
+            let (_, plaintext) = rest.split_once(':').ok_or("not an envelope")?;
+            Ok(plaintext.as_bytes().to_vec())
+        }
+
+        fn resolve_key_arn(
+            &self,
+            account_id: &str,
+            region: &str,
+            key_id: &str,
+            _service_principal: &str,
+        ) -> Result<String, String> {
+            Ok(format!("arn:aws:kms:{region}:{account_id}:key/{key_id}"))
+        }
+    }
+
+    /// Wire an S3 service onto `state`, the way the server does, so the
+    /// side effects of a write are installed.
+    fn with_s3_service(
+        state: &SharedS3State,
+        sqs: Arc<SqsRecorder>,
+        kms: Option<Arc<dyn fakecloud_core::delivery::KmsHook>>,
+    ) -> crate::service::S3Service {
+        let bus = Arc::new(fakecloud_core::delivery::DeliveryBus::new().with_sqs(sqs));
+        let svc = crate::service::S3Service::new(state.clone(), bus);
+        match kms {
+            Some(hook) => svc.with_kms_hook(hook),
+            None => svc,
+        }
+    }
+
+    /// A delivered object fires the bucket's `s3:ObjectCreated:Put`
+    /// notification, like a PutObject.
+    #[test]
+    fn delivered_object_fires_object_created_put_notification() {
+        let state = shared_state();
+        let sqs = Arc::new(SqsRecorder::default());
+        let _svc = with_s3_service(&state, sqs.clone(), None);
+        set_bucket(&state, |b| {
+            b.notification_config = Some(
+                "<NotificationConfiguration><QueueConfiguration><Id>logs</Id>\
+                 <Queue>arn:aws:sqs:us-east-1:123456789012:q</Queue>\
+                 <Event>s3:ObjectCreated:*</Event></QueueConfiguration>\
+                 </NotificationConfiguration>"
+                    .to_string(),
+            );
+        });
+        deliver(&state, None, "firehose/batch-1", b"records");
+
+        let sent = sqs.0.lock().unwrap();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].0, "arn:aws:sqs:us-east-1:123456789012:q");
+        let event: serde_json::Value = serde_json::from_str(&sent[0].1).unwrap();
+        let record = &event["Records"][0];
+        assert_eq!(record["eventName"], "ObjectCreated:Put");
+        assert_eq!(record["s3"]["object"]["key"], "firehose/batch-1");
+        assert_eq!(record["s3"]["object"]["size"], 7);
+        assert_eq!(record["s3"]["configurationId"], "logs");
+    }
+
+    /// A delivered object is replicated by the bucket's replication
+    /// configuration, keeping its version id; the source version reports
+    /// COMPLETED and the replica REPLICA.
+    #[test]
+    fn delivered_object_is_replicated() {
+        let state = shared_state();
+        let _svc = with_s3_service(&state, Arc::new(SqsRecorder::default()), None);
+        set_bucket(&state, |b| {
+            b.versioning = Some("Enabled".to_string());
+            b.replication_config = Some(
+                "<ReplicationConfiguration><Rule><ID>all</ID><Status>Enabled</Status>\
+                 <Priority>1</Priority><Filter><Prefix></Prefix></Filter>\
+                 <DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication>\
+                 <Destination><Bucket>arn:aws:s3:::replica-bucket</Bucket></Destination>\
+                 </Rule></ReplicationConfiguration>"
+                    .to_string(),
+            );
+        });
+        {
+            let mut accounts = state.write();
+            let mut dest = S3Bucket::new("replica-bucket", "us-east-1", "owner-id");
+            dest.versioning = Some("Enabled".to_string());
+            accounts
+                .get_mut(ACCOUNT)
+                .unwrap()
+                .buckets
+                .insert("replica-bucket".to_string(), dest);
+        }
+        let version = put_object_via_store_versioned(&state, "logs/2026/10/17/x.gz", b"log");
+
+        let accounts = state.read();
+        let st = accounts.get(ACCOUNT).unwrap();
+        let source = &st.buckets["logs-bucket"].objects["logs/2026/10/17/x.gz"];
+        assert_eq!(source.replication_status.as_deref(), Some("COMPLETED"));
+        let replica = &st.buckets["replica-bucket"].objects["logs/2026/10/17/x.gz"];
+        assert_eq!(replica.replication_status.as_deref(), Some("REPLICA"));
+        assert_eq!(replica.version_id, version);
+        assert_eq!(st.read_body(&replica.body).unwrap().as_ref(), b"log");
+    }
+
+    fn put_object_via_store_versioned(
+        state: &SharedS3State,
+        key: &str,
+        body: &[u8],
+    ) -> Option<String> {
+        let obj = S3Object {
+            key: key.to_string(),
+            content_type: "application/octet-stream".to_string(),
+            etag: format!("{:x}", Md5::digest(body)),
+            size: body.len() as u64,
+            ..Default::default()
+        };
+        let version = put_delivered_object(
+            state,
+            None,
+            ACCOUNT,
+            "logs-bucket",
+            obj,
+            Bytes::copy_from_slice(body),
+        )
+        .unwrap();
+        assert!(version.is_some(), "a versioned bucket reports the version");
+        version
+    }
+
+    /// A delivered object with no encryption of its own takes the bucket's
+    /// default SSE-S3 encryption, bucket key setting included.
+    #[test]
+    fn delivered_object_takes_default_sse_s3() {
+        let state = shared_state();
+        set_bucket(&state, |b| {
+            b.encryption_config = Some(
+                "<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault>\
+                 <SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault>\
+                 <BucketKeyEnabled>true</BucketKeyEnabled></Rule>\
+                 </ServerSideEncryptionConfiguration>"
+                    .to_string(),
+            );
+        });
+        deliver(&state, None, "k", b"plain");
+        let obj = &bucket(&state).objects["k"];
+        assert_eq!(obj.sse_algorithm.as_deref(), Some("AES256"));
+        assert_eq!(obj.sse_kms_key_id, None);
+        assert_eq!(obj.bucket_key_enabled, Some(true));
+        assert_eq!(read(&state, &obj.body), b"plain");
+    }
+
+    /// A bucket whose default is SSE-KMS stores a delivered object encrypted
+    /// under the configured key (recorded by ARN), with the checksum and size
+    /// of the plaintext; with no key configured the AWS-managed `aws/s3` key
+    /// is used. A producer that encrypted the object itself is left alone.
+    #[test]
+    fn delivered_object_takes_default_sse_kms() {
+        for (configured, expected_key) in [
+            (
+                Some("my-key"),
+                "arn:aws:kms:us-east-1:123456789012:key/my-key",
+            ),
+            (None, "arn:aws:kms:us-east-1:123456789012:key/aws/s3"),
+        ] {
+            let state = shared_state();
+            let _svc = with_s3_service(
+                &state,
+                Arc::new(SqsRecorder::default()),
+                Some(Arc::new(ReadableKms)),
+            );
+            let key_xml = configured
+                .map(|k| format!("<KMSMasterKeyID>{k}</KMSMasterKeyID>"))
+                .unwrap_or_default();
+            set_bucket(&state, |b| {
+                b.encryption_config = Some(format!(
+                    "<ServerSideEncryptionConfiguration><Rule>\
+                     <ApplyServerSideEncryptionByDefault><SSEAlgorithm>aws:kms</SSEAlgorithm>\
+                     {key_xml}</ApplyServerSideEncryptionByDefault></Rule>\
+                     </ServerSideEncryptionConfiguration>"
+                ));
+            });
+            deliver(&state, None, "k", b"secret");
+            let obj = &bucket(&state).objects["k"];
+            assert_eq!(obj.sse_algorithm.as_deref(), Some("aws:kms"));
+            assert_eq!(obj.sse_kms_key_id.as_deref(), Some(expected_key));
+            let stored = read(&state, &obj.body);
+            assert_eq!(
+                stored,
+                format!("enc:{}:secret", configured.unwrap_or("aws/s3")).as_bytes()
+            );
+            assert_eq!(obj.size, 6);
+            assert_eq!(
+                obj.checksum_value.as_deref(),
+                Some(
+                    crate::checksum::checksum(crate::checksum::DEFAULT_ALGORITHM, b"secret")
+                        .as_str()
+                )
+            );
+
+            // Already encrypted by the producer: stored as given.
+            let own = S3Object {
+                key: "own".to_string(),
+                sse_algorithm: Some("aws:kms".to_string()),
+                sse_kms_key_id: Some("producer-key".to_string()),
+                ..Default::default()
+            };
+            put_delivered_object(
+                &state,
+                None,
+                ACCOUNT,
+                "logs-bucket",
+                own,
+                Bytes::from_static(b"cipher"),
+            )
+            .unwrap();
+            let obj = &bucket(&state).objects["own"];
+            assert_eq!(obj.sse_kms_key_id.as_deref(), Some("producer-key"));
+            assert_eq!(read(&state, &obj.body), b"cipher");
+        }
+    }
+
+    /// The side effects survive an account that did not exist when the S3
+    /// service was built: a new account inherits them.
+    #[test]
+    fn side_effects_reach_accounts_created_later() {
+        let state = shared_state();
+        let sqs = Arc::new(SqsRecorder::default());
+        let _svc = with_s3_service(&state, sqs.clone(), None);
+        {
+            let mut accounts = state.write();
+            let mut b = S3Bucket::new("other-bucket", "us-east-1", "222222222222");
+            b.notification_config = Some(
+                "<NotificationConfiguration><QueueConfiguration>\
+                 <Queue>arn:aws:sqs:us-east-1:222222222222:q</Queue>\
+                 <Event>s3:ObjectCreated:Put</Event></QueueConfiguration>\
+                 </NotificationConfiguration>"
+                    .to_string(),
+            );
+            accounts
+                .get_or_create("222222222222")
+                .buckets
+                .insert("other-bucket".to_string(), b);
+        }
+        put_object_via_store(
+            &state,
+            None,
+            "222222222222",
+            "other-bucket",
+            "k",
+            b"x".to_vec(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(sqs.0.lock().unwrap().len(), 1);
     }
 }

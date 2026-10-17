@@ -881,7 +881,7 @@ impl S3Service {
         // disk persist below runs OFF-LOCK instead of holding the global S3
         // write lock and serializing every other S3 operation server-wide
         // while it runs (bug-audit 2026-05-28, 4.7).
-        let (upload, already_has_object, region, bucket_region, notification_config, acl_owner_id) = {
+        let (upload, already_has_object, bucket_region, acl_owner_id) = {
             let accts = self.state.read();
             let empty = crate::state::S3State::new(account_id, "us-east-1");
             let state = accts.get(account_id).unwrap_or(&empty);
@@ -909,9 +909,7 @@ impl S3Service {
             (
                 upload,
                 b.objects.contains_key(key),
-                state.region.clone(),
                 b.region.clone(),
-                b.notification_config.clone(),
                 b.acl_owner_id.clone(),
             )
         };
@@ -1175,7 +1173,7 @@ impl S3Service {
         // concurrent complete). A concurrent Abort/Complete that removed the
         // upload during assembly is honored (idempotent re-completion) rather
         // than resurrected (bug-audit 2026-05-28, 4.3 class).
-        let version_id = {
+        let committed = {
             let mut accts = self.state.write();
             let b = accts
                 .get_or_create(account_id)
@@ -1211,11 +1209,14 @@ impl S3Service {
             // second time from RAM (bug-hunt 2026-06-24, 4.1). In memory mode
             // it returns an empty placeholder, so the assembled in-memory body
             // is kept.
+            // The completed object is replicated like any other new version.
             let store = self.store.clone();
-            let version_id = crate::service::objects::commit_object_version_with(
-                b,
+            let committed = crate::side_effects::commit_new_object(
+                &mut accts,
+                account_id,
                 bucket,
                 Some(&*store),
+                Some(&self.side_effects),
                 obj,
                 |store, obj, meta| {
                     let assembled = store.mpu_complete(
@@ -1234,9 +1235,15 @@ impl S3Service {
                 },
             )
             .map_err(super::persistence_error)?;
-            b.multipart_uploads.remove(upload_id);
-            version_id
+            if let Some(b) = accts
+                .get_mut(account_id)
+                .and_then(|s| s.buckets.get_mut(bucket))
+            {
+                b.multipart_uploads.remove(upload_id);
+            }
+            committed
         };
+        let version_id = committed.version_id.clone();
 
         let mut headers = HeaderMap::new();
         if let Some(vid) = &version_id {
@@ -1277,27 +1284,16 @@ impl S3Service {
         // The write lock was already released after committing the object, so
         // event delivery (which may re-enter the S3 service to read state)
         // cannot deadlock against an outstanding write.
-        let bucket_name = bucket.to_string();
-        let obj_key = key.to_string();
-        let obj_size = object_size;
-        let obj_etag = etag.clone();
-        if let Some(ref config) = notification_config {
-            super::deliver_notifications(
-                &self.delivery,
-                config,
-                &super::notifications::ObjectEvent {
-                    event_name: "ObjectCreated:CompleteMultipartUpload",
-                    bucket_name: &bucket_name,
-                    requester_account: &req.account_id,
-                    key: &obj_key,
-                    size: obj_size,
-                    etag: &obj_etag,
-                    region: &region,
-                    version_id: version_id.as_deref(),
-                },
-                Some(&self.state),
-            );
-        }
+        committed.notify(
+            &self.delivery,
+            &self.state,
+            "ObjectCreated:CompleteMultipartUpload",
+            &req.account_id,
+            bucket,
+            key,
+            object_size,
+            &etag,
+        );
 
         Ok(AwsResponse {
             status: StatusCode::OK,

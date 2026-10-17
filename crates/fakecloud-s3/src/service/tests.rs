@@ -781,6 +781,13 @@ fn replication_source(config: &str, owner: &str) -> crate::state::S3Bucket {
     src
 }
 
+/// A versioning-enabled bucket: replication only writes into those.
+fn versioned_bucket(name: &str, owner: &str) -> crate::state::S3Bucket {
+    let mut b = crate::state::S3Bucket::new(name, "us-east-1", owner);
+    b.versioning = Some("Enabled".to_string());
+    b
+}
+
 fn replicate(
     accounts: &mut fakecloud_core::multi_account::MultiAccountState<crate::state::S3State>,
     source_account: &str,
@@ -793,15 +800,21 @@ fn replicate_with_mode(
     source_account: &str,
     mode: fakecloud_core::auth::IamMode,
 ) {
-    let store: Arc<dyn fakecloud_persistence::S3Store> =
-        Arc::new(fakecloud_persistence::MemoryS3Store::new());
-    replicate_through_store(accounts, source_account, &store, "source", "test-key", mode).unwrap();
+    let store = fakecloud_persistence::MemoryS3Store::new();
+    let effects = crate::side_effects::S3SideEffects::new(Arc::new(DeliveryBus::new()), None, mode);
+    crate::service::replication::replicate_through_store(
+        accounts,
+        source_account,
+        Some(&store),
+        "source",
+        "test-key",
+        Some(&effects),
+    )
+    .unwrap();
 }
 
 #[test]
 fn test_replicate_object() {
-    use crate::state::S3Bucket;
-
     let mut accounts =
         fakecloud_core::multi_account::MultiAccountState::<crate::state::S3State>::new(
             "123456789012",
@@ -822,7 +835,7 @@ fn test_replicate_object() {
     );
     state.buckets.insert(
         "destination".to_string(),
-        S3Bucket::new("destination", "us-east-1", "owner"),
+        versioned_bucket("destination", "owner"),
     );
 
     replicate(&mut accounts, "123456789012");
@@ -841,17 +854,18 @@ fn test_replicate_object() {
     );
 }
 
-/// The replica is a new version in the destination, recorded by the
-/// destination's own versioning state: on a versioning-enabled destination it
-/// keeps the source version's id, and the object
-/// already at the key (written before versioning) is kept as the "null"
-/// version instead of vanishing, and on a suspended destination the replica
-/// takes over the null version.
+/// The replica is a new version in a versioning-enabled destination: it
+/// keeps the source version's id, and the object already at the key (written
+/// before versioning) is kept as the "null" version instead of vanishing. A
+/// destination whose versioning is suspended (or was never enabled) cannot
+/// take replicas: nothing is written there and the source version is marked
+/// FAILED ("If you disable versioning on the destination bucket, replication
+/// fails", S3 User Guide).
 #[test]
 fn replica_follows_destination_versioning() {
     use crate::state::S3Bucket;
 
-    for (versioning, expect_null_current) in [("Enabled", false), ("Suspended", true)] {
+    for versioning in [Some("Enabled"), Some("Suspended"), None] {
         let source_written = Utc::now() - chrono::Duration::hours(1);
         let mut accounts =
             fakecloud_core::multi_account::MultiAccountState::<crate::state::S3State>::new(
@@ -879,7 +893,7 @@ fn replica_follows_destination_versioning() {
                 ..Default::default()
             },
         );
-        dest.versioning = Some(versioning.to_string());
+        dest.versioning = versioning.map(str::to_string);
         state.buckets.insert("destination".to_string(), dest);
 
         replicate(&mut accounts, "123456789012");
@@ -887,29 +901,37 @@ fn replica_follows_destination_versioning() {
         let state = accounts.get("123456789012").unwrap();
         let dest = state.buckets.get("destination").unwrap();
         let current = &dest.objects["test-key"];
+        let source_status = state.buckets["source"].objects["test-key"]
+            .replication_status
+            .clone();
+        if versioning != Some("Enabled") {
+            assert_eq!(source_status.as_deref(), Some("FAILED"), "{versioning:?}");
+            assert_eq!(
+                state.read_body(&current.body).unwrap(),
+                Bytes::from_static(b"old"),
+                "{versioning:?}"
+            );
+            assert!(!dest.object_versions.contains_key("test-key"));
+            continue;
+        }
+        assert_eq!(source_status.as_deref(), Some("COMPLETED"));
         assert_eq!(
             state.read_body(&current.body).unwrap(),
             Bytes::from_static(b"hello")
         );
         assert_eq!(current.replication_status.as_deref(), Some("REPLICA"));
         // Created at replication time, after the source version.
-        assert!(current.last_modified > source_written, "{versioning}");
-        if expect_null_current {
-            assert_eq!(current.version_id.as_deref(), Some("null"), "{versioning}");
-            assert!(!dest.object_versions.contains_key("test-key"));
-        } else {
-            // The replica keeps the source version's id.
-            let vid = current.version_id.clone().expect("replica version id");
-            assert_eq!(vid, "v1");
-            let versions = &dest.object_versions["test-key"];
-            assert_eq!(versions.len(), 2, "{versions:?}");
-            assert_eq!(versions[0].version_id.as_deref(), Some("null"));
-            assert_eq!(
-                state.read_body(&versions[0].body).unwrap(),
-                Bytes::from_static(b"old")
-            );
-            assert_eq!(versions[1].version_id.as_deref(), Some(vid.as_str()));
-        }
+        assert!(current.last_modified > source_written);
+        // The replica keeps the source version's id.
+        assert_eq!(current.version_id.as_deref(), Some("v1"));
+        let versions = &dest.object_versions["test-key"];
+        assert_eq!(versions.len(), 2, "{versions:?}");
+        assert_eq!(versions[0].version_id.as_deref(), Some("null"));
+        assert_eq!(
+            state.read_body(&versions[0].body).unwrap(),
+            Bytes::from_static(b"old")
+        );
+        assert_eq!(versions[1].version_id.as_deref(), Some("v1"));
     }
 }
 
@@ -978,8 +1000,6 @@ fn replica_takes_destination_default_retention_only_without_its_own() {
 /// destination owner.
 #[test]
 fn replicate_into_bucket_owned_by_another_account() {
-    use crate::state::S3Bucket;
-
     let mut accounts =
         fakecloud_core::multi_account::MultiAccountState::<crate::state::S3State>::new(
             "111111111111",
@@ -1000,7 +1020,7 @@ fn replicate_into_bucket_owned_by_another_account() {
     );
     accounts.get_or_create("222222222222").buckets.insert(
         "dest-b".to_string(),
-        S3Bucket::new("dest-b", "us-east-1", "222222222222"),
+        versioned_bucket("dest-b", "222222222222"),
     );
 
     replicate(&mut accounts, "111111111111");
@@ -1024,8 +1044,6 @@ fn replicate_into_bucket_owned_by_another_account() {
 /// Without ownership translation the replica keeps the source object's owner.
 #[test]
 fn replicate_cross_account_keeps_source_owner_without_translation() {
-    use crate::state::S3Bucket;
-
     let mut accounts =
         fakecloud_core::multi_account::MultiAccountState::<crate::state::S3State>::new(
             "111111111111",
@@ -1044,7 +1062,7 @@ fn replicate_cross_account_keeps_source_owner_without_translation() {
     );
     accounts.get_or_create("222222222222").buckets.insert(
         "dest-b".to_string(),
-        S3Bucket::new("dest-b", "us-east-1", "222222222222"),
+        versioned_bucket("dest-b", "222222222222"),
     );
 
     replicate(&mut accounts, "111111111111");
@@ -1057,8 +1075,6 @@ fn replicate_cross_account_keeps_source_owner_without_translation() {
 /// the replication: nothing is written.
 #[test]
 fn replicate_skips_when_destination_account_does_not_own_bucket() {
-    use crate::state::S3Bucket;
-
     let mut accounts =
         fakecloud_core::multi_account::MultiAccountState::<crate::state::S3State>::new(
             "111111111111",
@@ -1078,7 +1094,7 @@ fn replicate_skips_when_destination_account_does_not_own_bucket() {
     );
     accounts.get_or_create("222222222222").buckets.insert(
         "dest-b".to_string(),
-        S3Bucket::new("dest-b", "us-east-1", "222222222222"),
+        versioned_bucket("dest-b", "222222222222"),
     );
 
     replicate(&mut accounts, "111111111111");
@@ -1115,7 +1131,7 @@ fn cross_account_replication(
         "source".to_string(),
         replication_source(CROSS_ACCOUNT_REPLICATION, "111111111111"),
     );
-    let mut dest = crate::state::S3Bucket::new("dest-b", "us-east-1", "222222222222");
+    let mut dest = versioned_bucket("dest-b", "222222222222");
     dest.policy = policy.map(str::to_string);
     accounts
         .get_or_create("222222222222")
@@ -11338,4 +11354,414 @@ fn re_replicating_an_older_version_keeps_the_newer_one_current() {
         state.read_body(&v1.body).unwrap(),
         Bytes::from_static(b"hello-again")
     );
+}
+
+// ---- Replication across every write path ----
+
+/// `src` (versioning-enabled, replicating with `config`) and versioned
+/// destination buckets `dests`, seeded on `svc`.
+fn seed_replication(svc: &S3Service, config: &str, dests: &[&str]) {
+    let mut mas = svc.state.write();
+    let state = mas.default_mut();
+    let mut src = S3Bucket::new("src", "us-east-1", "owner");
+    src.versioning = Some("Enabled".to_string());
+    src.replication_config = Some(normalize_replication_xml(config));
+    state.buckets.insert("src".to_string(), src);
+    for dest in dests {
+        state
+            .buckets
+            .insert(dest.to_string(), versioned_bucket(dest, "owner"));
+    }
+}
+
+fn bucket_of(svc: &S3Service, name: &str) -> S3Bucket {
+    svc.state.read().default_ref().buckets[name].clone()
+}
+
+const REPLICATE_ALL_TO_DST: &str = "<ReplicationConfiguration><Role>arn:aws:iam::123456789012:role/r</Role>\
+     <Rule><ID>all</ID><Priority>1</Priority><Status>Enabled</Status><Filter><Prefix></Prefix></Filter>\
+     <DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication>\
+     <Destination><Bucket>arn:aws:s3:::dst</Bucket></Destination></Rule>\
+     </ReplicationConfiguration>";
+
+/// CompleteMultipartUpload replicates the completed object exactly as
+/// PutObject does: the replica keeps the version id, the multipart ETag, the
+/// part layout and checksum, the source reports COMPLETED.
+#[tokio::test]
+async fn complete_multipart_upload_replicates_the_object() {
+    let svc = make_service();
+    seed_replication(&svc, REPLICATE_ALL_TO_DST, &["dst"]);
+
+    let mut init = make_request(Method::POST, "/src/big.bin", &[("uploads", "")], b"");
+    init.headers
+        .insert("x-amz-meta-origin", http::HeaderValue::from_static("mpu"));
+    let resp = svc
+        .create_multipart_upload("123456789012", &init, "src", "big.bin")
+        .unwrap();
+    let body = std::str::from_utf8(resp.body.expect_bytes()).unwrap();
+    let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();
+    let upload_id = body[start..body.find("</UploadId>").unwrap()].to_string();
+    let part1 = vec![b'p'; 5 * 1024 * 1024];
+    let part2 = b"tail".to_vec();
+    let mut etags = Vec::new();
+    for (n, data) in [(1i64, &part1), (2i64, &part2)] {
+        let req = make_request(
+            Method::PUT,
+            "/src/big.bin",
+            &[("partNumber", &n.to_string())],
+            data,
+        );
+        let r = svc
+            .upload_part("123456789012", &req, "src", "big.bin", &upload_id, n)
+            .await
+            .unwrap();
+        etags.push(r.headers["etag"].to_str().unwrap().to_string());
+    }
+    let xml = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part>\
+         <Part><PartNumber>2</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
+        etags[0], etags[1]
+    );
+    let req = make_request(
+        Method::POST,
+        "/src/big.bin",
+        &[("uploadId", &upload_id)],
+        xml.as_bytes(),
+    );
+    let resp = svc
+        .complete_multipart_upload("123456789012", &req, "src", "big.bin", &upload_id)
+        .unwrap();
+    let version = resp.headers["x-amz-version-id"]
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let src = bucket_of(&svc, "src");
+    let source = &src.objects["big.bin"];
+    assert_eq!(source.replication_status.as_deref(), Some("COMPLETED"));
+    let dst = bucket_of(&svc, "dst");
+    let replica = &dst.objects["big.bin"];
+    assert_eq!(replica.replication_status.as_deref(), Some("REPLICA"));
+    assert_eq!(replica.version_id.as_deref(), Some(version.as_str()));
+    assert_eq!(replica.etag, source.etag);
+    assert!(replica.etag.ends_with("-2"), "{}", replica.etag);
+    assert_eq!(replica.parts_count, Some(2));
+    assert_eq!(replica.part_sizes, source.part_sizes);
+    assert_eq!(replica.checksum_value, source.checksum_value);
+    assert_eq!(
+        replica.metadata.get("origin").map(String::as_str),
+        Some("mpu")
+    );
+    assert_eq!(dst.object_versions["big.bin"].len(), 1);
+    let state = svc.state.read();
+    let bytes = state.default_ref().read_body(&replica.body).unwrap();
+    assert_eq!(bytes.len(), part1.len() + part2.len());
+    assert!(bytes.ends_with(b"tail"));
+}
+
+/// Two enabled rules selecting the same object for the same destination
+/// produce one replica (from the higher-priority rule), not two versions.
+#[tokio::test]
+async fn overlapping_rules_produce_a_single_replica() {
+    let svc = make_service();
+    seed_replication(
+        &svc,
+        "<ReplicationConfiguration><Role>r</Role>\
+         <Rule><ID>low</ID><Priority>1</Priority><Status>Enabled</Status>\
+         <Filter><Prefix>star</Prefix></Filter>\
+         <DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication>\
+         <Destination><Bucket>arn:aws:s3:::dst</Bucket></Destination></Rule>\
+         <Rule><ID>high</ID><Priority>2</Priority><Status>Enabled</Status>\
+         <Filter><Prefix>starship</Prefix></Filter>\
+         <DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication>\
+         <Destination><Bucket>arn:aws:s3:::dst</Bucket>\
+         <StorageClass>STANDARD_IA</StorageClass></Destination></Rule>\
+         </ReplicationConfiguration>",
+        &["dst"],
+    );
+    let req = make_request(Method::PUT, "/src/starship-x", &[], b"payload");
+    svc.put_object("123456789012", &req, "src", "starship-x")
+        .await
+        .unwrap();
+
+    let dst = bucket_of(&svc, "dst");
+    assert_eq!(dst.object_versions["starship-x"].len(), 1);
+    // The higher-priority rule's destination settings were the ones applied.
+    assert_eq!(dst.objects["starship-x"].storage_class, "STANDARD_IA");
+    // Without a destination storage class the replica keeps the source's.
+    let req = make_request(Method::PUT, "/src/star-y", &[], b"payload");
+    svc.put_object("123456789012", &req, "src", "star-y")
+        .await
+        .unwrap();
+    assert_eq!(
+        bucket_of(&svc, "dst").objects["star-y"].storage_class,
+        "STANDARD"
+    );
+}
+
+/// PutBucketReplication refuses two rules with the same priority and a
+/// tag-based rule that replicates delete markers.
+#[test]
+fn put_bucket_replication_validates_rules() {
+    let svc = make_service();
+    seed_replication(&svc, REPLICATE_ALL_TO_DST, &["dst"]);
+    let dup = b"<ReplicationConfiguration><Role>r</Role>\
+        <Rule><Priority>1</Priority><Status>Enabled</Status><Filter><Prefix>a</Prefix></Filter>\
+        <DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication>\
+        <Destination><Bucket>arn:aws:s3:::dst</Bucket></Destination></Rule>\
+        <Rule><Priority>1</Priority><Status>Enabled</Status><Filter><Prefix>b</Prefix></Filter>\
+        <DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication>\
+        <Destination><Bucket>arn:aws:s3:::dst</Bucket></Destination></Rule>\
+        </ReplicationConfiguration>";
+    let req = make_request(Method::PUT, "/src", &[("replication", "")], dup);
+    assert_aws_err(
+        svc.put_bucket_replication("123456789012", &req, "src"),
+        "InvalidRequest",
+    );
+    let tag_dmr = b"<ReplicationConfiguration><Role>r</Role>\
+        <Rule><Priority>1</Priority><Status>Enabled</Status>\
+        <Filter><Tag><Key>k</Key><Value>v</Value></Tag></Filter>\
+        <DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication>\
+        <Destination><Bucket>arn:aws:s3:::dst</Bucket></Destination></Rule>\
+        </ReplicationConfiguration>";
+    let req = make_request(Method::PUT, "/src", &[("replication", "")], tag_dmr);
+    assert_aws_err(
+        svc.put_bucket_replication("123456789012", &req, "src"),
+        "InvalidRequest",
+    );
+    // The stored configuration is untouched by the refused requests.
+    assert!(bucket_of(&svc, "src")
+        .replication_config
+        .unwrap()
+        .contains("<ID>all</ID>"));
+}
+
+/// Versioning cannot be suspended on a replication source, so no write to it
+/// can produce a null version to replicate.
+#[test]
+fn versioning_cannot_be_suspended_on_a_replication_source() {
+    let svc = make_service();
+    seed_replication(&svc, REPLICATE_ALL_TO_DST, &["dst"]);
+    let body = b"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>";
+    let req = make_request(Method::PUT, "/src", &[("versioning", "")], body);
+    assert_aws_err(
+        svc.put_bucket_versioning("123456789012", &req, "src"),
+        "InvalidBucketState",
+    );
+    assert_eq!(
+        bucket_of(&svc, "src").versioning.as_deref(),
+        Some("Enabled")
+    );
+    // A destination can still be suspended (its replications then fail).
+    let req = make_request(Method::PUT, "/dst", &[("versioning", "")], body);
+    svc.put_bucket_versioning("123456789012", &req, "dst")
+        .unwrap();
+}
+
+/// An object written before versioning was enabled (the null version) is
+/// never replicated: the new version written on top of it is, and the
+/// preserved null version stays only in the source.
+#[tokio::test]
+async fn null_versions_are_not_replicated() {
+    let svc = make_service();
+    seed_replication(&svc, REPLICATE_ALL_TO_DST, &["dst"]);
+    // A pre-versioning object at the key.
+    seed_object(&svc, "src", "k", b"old");
+    let req = make_request(Method::PUT, "/src/k", &[], b"new");
+    svc.put_object("123456789012", &req, "src", "k")
+        .await
+        .unwrap();
+
+    let src = bucket_of(&svc, "src");
+    let versions = &src.object_versions["k"];
+    assert_eq!(versions.len(), 2);
+    assert_eq!(versions[0].version_id.as_deref(), Some("null"));
+    assert_eq!(versions[0].replication_status, None);
+    let dst = bucket_of(&svc, "dst");
+    let replicas = &dst.object_versions["k"];
+    assert_eq!(replicas.len(), 1, "only the new version: {replicas:?}");
+    assert_eq!(replicas[0].version_id, versions[1].version_id);
+}
+
+/// DeleteObject on a replication source replicates the delete marker (same
+/// version id) when the rule enables delete marker replication; a versioned
+/// DELETE is never replicated.
+#[tokio::test]
+async fn delete_marker_is_replicated_when_enabled() {
+    for enabled in [true, false] {
+        let svc = make_service();
+        let config = if enabled {
+            REPLICATE_ALL_TO_DST.to_string()
+        } else {
+            REPLICATE_ALL_TO_DST.replace(
+                "<DeleteMarkerReplication><Status>Enabled</Status>",
+                "<DeleteMarkerReplication><Status>Disabled</Status>",
+            )
+        };
+        seed_replication(&svc, &config, &["dst"]);
+        let req = make_request(Method::PUT, "/src/k", &[], b"data");
+        let put = svc
+            .put_object("123456789012", &req, "src", "k")
+            .await
+            .unwrap();
+        let object_version = put.headers["x-amz-version-id"]
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let req = make_request(Method::DELETE, "/src/k", &[], b"");
+        let resp = svc.delete_object("123456789012", &req, "src", "k").unwrap();
+        let marker = resp.headers["x-amz-version-id"]
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let dst = bucket_of(&svc, "dst");
+        let versions = &dst.object_versions["k"];
+        if enabled {
+            assert_eq!(versions.len(), 2, "{versions:?}");
+            assert!(versions[1].is_delete_marker);
+            assert_eq!(versions[1].version_id.as_deref(), Some(marker.as_str()));
+            assert!(dst.objects["k"].is_delete_marker);
+        } else {
+            assert_eq!(versions.len(), 1, "{versions:?}");
+            assert!(!dst.objects["k"].is_delete_marker);
+        }
+
+        // Deleting a specific version in the source leaves the replica alone.
+        let req = make_request(
+            Method::DELETE,
+            "/src/k",
+            &[("versionId", object_version.as_str())],
+            b"",
+        );
+        svc.delete_object("123456789012", &req, "src", "k").unwrap();
+        assert!(bucket_of(&svc, "dst").object_versions["k"]
+            .iter()
+            .any(|v| v.version_id.as_deref() == Some(object_version.as_str())));
+    }
+}
+
+/// DeleteObjects replicates the delete markers it creates, like DeleteObject.
+#[test]
+fn delete_objects_replicates_delete_markers() {
+    let svc = make_service();
+    seed_replication(&svc, REPLICATE_ALL_TO_DST, &["dst"]);
+    let body = b"<Delete><Object><Key>a</Key></Object><Object><Key>b</Key></Object></Delete>";
+    let req = make_request(Method::POST, "/src", &[("delete", "")], body);
+    svc.delete_objects("123456789012", &req, "src").unwrap();
+    let dst = bucket_of(&svc, "dst");
+    for key in ["a", "b"] {
+        assert!(dst.objects[key].is_delete_marker, "{key}");
+        assert_eq!(
+            dst.objects[key].version_id,
+            bucket_of(&svc, "src").objects[key].version_id
+        );
+    }
+}
+
+/// A KMS hook whose envelope is readable: `enc:<key>:<plaintext>`.
+struct ReadableKms;
+
+impl fakecloud_core::delivery::KmsHook for ReadableKms {
+    fn encrypt(
+        &self,
+        _account_id: &str,
+        _region: &str,
+        key_id: &str,
+        plaintext: &[u8],
+        _service_principal: &str,
+        _encryption_context: HashMap<String, String>,
+    ) -> Result<String, String> {
+        Ok(format!(
+            "enc:{key_id}:{}",
+            String::from_utf8_lossy(plaintext)
+        ))
+    }
+
+    fn decrypt(
+        &self,
+        _account_id: &str,
+        ciphertext_b64: &str,
+        _service_principal: &str,
+        _encryption_context: HashMap<String, String>,
+    ) -> Result<Vec<u8>, String> {
+        let rest = ciphertext_b64
+            .strip_prefix("enc:")
+            .ok_or("not an envelope")?;
+        let (_, plaintext) = rest.split_once(':').ok_or("not an envelope")?;
+        Ok(plaintext.as_bytes().to_vec())
+    }
+}
+
+/// An SSE-KMS object is replicated only by a rule that opts in to
+/// SSE-KMS objects, and the replica is encrypted under the destination's
+/// ReplicaKmsKeyID.
+#[test]
+fn sse_kms_objects_need_an_opted_in_rule_and_get_the_replica_key() {
+    for opted_in in [false, true] {
+        let ssc = if opted_in {
+            "<SourceSelectionCriteria><SseKmsEncryptedObjects><Status>Enabled</Status>\
+             </SseKmsEncryptedObjects></SourceSelectionCriteria>"
+        } else {
+            ""
+        };
+        let config = format!(
+            "<ReplicationConfiguration><Rule><Priority>1</Priority><Status>Enabled</Status>\
+             <Filter><Prefix></Prefix></Filter>{ssc}\
+             <Destination><Bucket>arn:aws:s3:::destination</Bucket>\
+             <EncryptionConfiguration><ReplicaKmsKeyID>replica-key</ReplicaKmsKeyID>\
+             </EncryptionConfiguration></Destination></Rule></ReplicationConfiguration>"
+        );
+        let mut accounts =
+            fakecloud_core::multi_account::MultiAccountState::<crate::state::S3State>::new(
+                "123456789012",
+                "us-east-1",
+                "",
+            );
+        let state = accounts.get_or_create("123456789012");
+        let mut src = replication_source(&config, "owner");
+        let obj = src.objects.get_mut("test-key").unwrap();
+        obj.sse_algorithm = Some("aws:kms".to_string());
+        obj.sse_kms_key_id = Some("source-key".to_string());
+        obj.body = crate::state::memory_body(Bytes::from_static(b"enc:source-key:hello"));
+        state.buckets.insert("source".to_string(), src);
+        state.buckets.insert(
+            "destination".to_string(),
+            versioned_bucket("destination", "owner"),
+        );
+
+        let store = fakecloud_persistence::MemoryS3Store::new();
+        let effects = crate::side_effects::S3SideEffects::new(
+            Arc::new(DeliveryBus::new()),
+            Some(Arc::new(ReadableKms)),
+            fakecloud_core::auth::IamMode::Off,
+        );
+        crate::service::replication::replicate_through_store(
+            &mut accounts,
+            "123456789012",
+            Some(&store),
+            "source",
+            "test-key",
+            Some(&effects),
+        )
+        .unwrap();
+
+        let state = accounts.get("123456789012").unwrap();
+        let replica = state.buckets["destination"].objects.get("test-key");
+        if !opted_in {
+            assert!(replica.is_none());
+            assert_eq!(
+                state.buckets["source"].objects["test-key"].replication_status,
+                None
+            );
+            continue;
+        }
+        let replica = replica.expect("opted-in rule replicates");
+        assert_eq!(replica.sse_kms_key_id.as_deref(), Some("replica-key"));
+        assert_eq!(
+            state.read_body(&replica.body).unwrap(),
+            Bytes::from_static(b"enc:replica-key:hello")
+        );
+    }
 }

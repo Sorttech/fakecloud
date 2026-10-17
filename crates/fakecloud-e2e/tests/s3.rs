@@ -4192,18 +4192,21 @@ async fn s3_replication_copies_objects() {
         .await
         .unwrap();
 
-    // Enable versioning on source (required for replication)
-    client
-        .put_bucket_versioning()
-        .bucket("repl-source")
-        .versioning_configuration(
-            aws_sdk_s3::types::VersioningConfiguration::builder()
-                .status(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
-                .build(),
-        )
-        .send()
-        .await
-        .unwrap();
+    // Both buckets need versioning: S3 fails a replication into a
+    // destination without it.
+    for bucket in ["repl-source", "repl-dest"] {
+        client
+            .put_bucket_versioning()
+            .bucket(bucket)
+            .versioning_configuration(
+                aws_sdk_s3::types::VersioningConfiguration::builder()
+                    .status(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+    }
 
     // Set replication configuration via CLI
     let repl_config = serde_json::json!({
@@ -4308,18 +4311,21 @@ async fn s3_replication_prefix_filter() {
         .await
         .unwrap();
 
-    // Enable versioning
-    client
-        .put_bucket_versioning()
-        .bucket("prefix-src")
-        .versioning_configuration(
-            aws_sdk_s3::types::VersioningConfiguration::builder()
-                .status(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
-                .build(),
-        )
-        .send()
-        .await
-        .unwrap();
+    // Both buckets need versioning: S3 fails a replication into a
+    // destination without it.
+    for bucket in ["prefix-src", "prefix-dst"] {
+        client
+            .put_bucket_versioning()
+            .bucket(bucket)
+            .versioning_configuration(
+                aws_sdk_s3::types::VersioningConfiguration::builder()
+                    .status(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+    }
 
     // Set replication with prefix filter
     let repl_config = serde_json::json!({

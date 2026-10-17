@@ -27,6 +27,7 @@ impl S3Service {
             ));
         }
 
+        crate::service::replication::validate_replication_config(&body_str)?;
         let normalized = normalize_replication_xml(&body_str);
         b.replication_config = Some(normalized.clone());
         self.store
