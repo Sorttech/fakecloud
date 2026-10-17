@@ -348,8 +348,7 @@ impl GlueService {
     }
 
     /// Return the download URL for a job run's system logs. The run must exist
-    /// under the named job. Job runs carry no executor here, so the URL names
-    /// the log archive's S3 location rather than a live object.
+    /// under the named job.
     pub(crate) fn get_system_logs_for_job_run(
         &self,
         req: &AwsRequest,
@@ -363,8 +362,9 @@ impl GlueService {
             .and_then(|s| s.job_runs.get(run_id))
             .filter(|r| r.job_name == job_name)
             .ok_or_else(|| entity_not_found(format!("JobRun {run_id} not found")))?;
-        let url = crate::common::system_logs_url(req, &format!("jobs/{job_name}/{run_id}"));
-        Ok(AwsResponse::ok_json(json!({ "SystemLogsUrl": url })))
+        // Nothing here executes the run, so no system-log archive is ever
+        // written: SystemLogsUrl is optional and stays absent.
+        Ok(AwsResponse::ok_json(json!({})))
     }
 
     pub(crate) fn get_job_runs(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {

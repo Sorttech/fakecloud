@@ -73,8 +73,9 @@ impl GlueService {
             .get(&req.account_id)
             .and_then(|st| st.sessions.get(id))
             .ok_or_else(|| entity_not_found(format!("Session {id} not found")))?;
-        let url = crate::common::system_logs_url(req, &format!("sessions/{id}"));
-        Ok(AwsResponse::ok_json(json!({ "SystemLogsUrl": url })))
+        // No Spark driver backs the session, so no system-log archive is ever
+        // written: SystemLogsUrl is optional and stays absent.
+        Ok(AwsResponse::ok_json(json!({})))
     }
 
     pub(crate) fn list_sessions(&self, req: &AwsRequest) -> Result<AwsResponse, AwsServiceError> {

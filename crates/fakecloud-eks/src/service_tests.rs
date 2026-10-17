@@ -2506,20 +2506,37 @@ async fn argocd_endpoint_prefix_round_trips_and_survives_update() {
 
     // UpdateArgoCdConfig carries only rbac deltas + networkAccess; the
     // create-time endpointPrefix and namespace must survive it.
-    svc.handle(make_request(
-        Method::POST,
-        "/clusters/c1/capabilities/argo",
-        &json!({"configuration": {"argoCd": {
-            "networkAccess": {"vpceIds": ["vpce-0123456789abcdef0"]},
-            "rbacRoleMappings": {
-                "addOrUpdateRoleMappings": [{"role": "EDITOR", "identities": [editor]}],
-                "removeRoleMappings": [{"role": "VIEWER", "identities": [viewer]}]
-            }
-        }}})
-        .to_string(),
-    ))
-    .await
-    .unwrap();
+    let resp = svc
+        .handle(make_request(
+            Method::POST,
+            "/clusters/c1/capabilities/argo",
+            &json!({"configuration": {"argoCd": {
+                "networkAccess": {"vpceIds": ["vpce-0123456789abcdef0"]},
+                "rbacRoleMappings": {
+                    "addOrUpdateRoleMappings": [{"role": "EDITOR", "identities": [editor]}],
+                    "removeRoleMappings": [{"role": "VIEWER", "identities": [viewer]}]
+                }
+            }}})
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    // Each ArgoCD field reports its own UpdateParamType.
+    let v: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    let params: Vec<&str> = v["update"]["params"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        params,
+        [
+            "RoleMappingsToAddOrUpdate",
+            "RoleMappingsToRemove",
+            "NetworkAccess"
+        ]
+    );
     let resp = svc
         .handle(make_request(
             Method::GET,

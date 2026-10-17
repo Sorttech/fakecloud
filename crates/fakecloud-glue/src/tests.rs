@@ -385,7 +385,7 @@ fn session_statement_increments() {
 }
 
 #[test]
-fn system_logs_urls_require_existing_run_and_session() {
+fn system_logs_require_existing_run_and_session() {
     let svc = GlueService::default();
     let err = svc
         .get_system_logs_for_job_run(&req(
@@ -413,12 +413,8 @@ fn system_logs_urls_require_existing_run_and_session() {
         ))
         .unwrap(),
     );
-    assert_eq!(
-        logs["SystemLogsUrl"],
-        format!(
-            "https://aws-glue-system-logs-123456789012-us-east-1.s3.us-east-1.amazonaws.com/jobs/j/{run_id}/system-logs.zip"
-        )
-    );
+    // No executor writes a system-log archive, so the optional URL is absent.
+    assert_eq!(logs, json!({}));
     // The run belongs to job `j`; naming another job does not find it.
     let err = svc
         .get_system_logs_for_job_run(&req(
@@ -443,10 +439,7 @@ fn system_logs_urls_require_existing_run_and_session() {
         svc.get_system_logs_for_session(&req("GetSystemLogsForSession", json!({"Id": "s"})))
             .unwrap(),
     );
-    assert!(logs["SystemLogsUrl"]
-        .as_str()
-        .unwrap()
-        .ends_with("/sessions/s/system-logs.zip"));
+    assert_eq!(logs, json!({}));
 }
 
 #[test]

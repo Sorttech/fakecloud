@@ -163,8 +163,12 @@ fn check_dimension_values(body: &Value, pa_filter: bool) -> Result<bool, AwsServ
         .and_then(Value::as_str)
         .unwrap_or("COST_AND_USAGE");
     let dimension_key = body.get("DimensionKey").filter(|v| !v.is_null());
+    // An empty DimensionKey is the same as omitting it.
+    let key_set = dimension_key
+        .and_then(Value::as_str)
+        .is_some_and(|k| !k.is_empty());
 
-    if dimension_key.is_some() && !is_pa {
+    if key_set && !is_pa {
         return Err(validation(
             "DimensionKey can be specified only when Dimension is PRODUCT_ATTRIBUTE.",
         ));
@@ -183,9 +187,6 @@ fn check_dimension_values(body: &Value, pa_filter: bool) -> Result<bool, AwsServ
         .get("SortBy")
         .and_then(Value::as_array)
         .is_some_and(|a| !a.is_empty());
-    let key_set = dimension_key
-        .and_then(Value::as_str)
-        .is_some_and(|k| !k.is_empty());
     if is_pa && sort_by && !key_set {
         return Err(validation(
             "DimensionKey is required when SortBy is specified for Dimension PRODUCT_ATTRIBUTE.",
@@ -703,6 +704,11 @@ mod tests {
         assert_eq!(
             dv(json!({ "Dimension": "REGION", "DimensionKey": "model" })).as_deref(),
             Some("ValidationException")
+        );
+        // An empty key counts as omitted, so any dimension accepts it.
+        assert_eq!(
+            dv(json!({ "Dimension": "REGION", "DimensionKey": "" })),
+            None
         );
         assert_eq!(
             dv(json!({ "Context": "RESERVATIONS" })).as_deref(),

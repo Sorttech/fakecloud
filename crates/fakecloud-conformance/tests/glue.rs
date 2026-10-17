@@ -1426,7 +1426,7 @@ async fn session_endpoint_and_dashboard_url() {
 #[test_action("glue", "GetSystemLogsForJobRun", checksum = "ce6da4b6")]
 #[test_action("glue", "GetSystemLogsForSession", checksum = "ee289019")]
 #[tokio::test]
-async fn system_logs_urls() {
+async fn system_logs() {
     let server = TestServer::start().await;
     let glue = server.glue_client().await;
     use aws_sdk_glue::types::{JobCommand, SessionCommand};
@@ -1483,10 +1483,8 @@ async fn system_logs_urls() {
         resp.status()
     );
     let v: serde_json::Value = resp.json().await.unwrap();
-    assert!(v["SystemLogsUrl"]
-        .as_str()
-        .unwrap()
-        .ends_with(&format!("/jobs/logs-job/{run_id}/system-logs.zip")));
+    // No executor writes a system-log archive, so the optional URL is absent.
+    assert!(v.get("SystemLogsUrl").is_none(), "{v}");
 
     let resp = call(
         "GetSystemLogsForJobRun",
@@ -1511,10 +1509,7 @@ async fn system_logs_urls() {
         resp.status()
     );
     let v: serde_json::Value = resp.json().await.unwrap();
-    assert!(v["SystemLogsUrl"]
-        .as_str()
-        .unwrap()
-        .ends_with("/sessions/logs-sess/system-logs.zip"));
+    assert!(v.get("SystemLogsUrl").is_none(), "{v}");
 }
 
 // BatchGetDataQualityRulesetEvaluationRun is newer than the typed

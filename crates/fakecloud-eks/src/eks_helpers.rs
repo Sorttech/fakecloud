@@ -1372,8 +1372,9 @@ pub(crate) type CapabilityConfigUpdate = (Option<Value>, Vec<(String, String)>);
 /// `UpdateAckConfig` fields are independent: `enableCrossNamespace` (when
 /// present) replaces the flag and `disabledServices` (when present)
 /// replaces the whole list; each reports its own `EnableCrossNamespace` /
-/// `DisabledServices` param. The ArgoCD delta reports a `Configuration`
-/// param.
+/// `DisabledServices` param. The ArgoCD delta reports one param per field it
+/// carries: `RoleMappingsToAddOrUpdate`, `RoleMappingsToRemove`,
+/// `NetworkAccess`.
 pub(crate) fn apply_capability_configuration_update(
     capability_type: &str,
     existing: Option<&Value>,
@@ -1393,10 +1394,22 @@ pub(crate) fn apply_capability_configuration_update(
             if let Some(delta) = update.get("argoCd").filter(|v| !v.is_null()) {
                 let argo = apply_argocd_update(cfg.get("argoCd"), delta);
                 cfg.insert("argoCd".into(), argo);
-                params.push((
-                    "Configuration".to_string(),
-                    json!({ "argoCd": delta }).to_string(),
-                ));
+                let rbac = delta.get("rbacRoleMappings");
+                for (param, value) in [
+                    (
+                        "RoleMappingsToAddOrUpdate",
+                        rbac.and_then(|r| r.get("addOrUpdateRoleMappings")),
+                    ),
+                    (
+                        "RoleMappingsToRemove",
+                        rbac.and_then(|r| r.get("removeRoleMappings")),
+                    ),
+                    ("NetworkAccess", delta.get("networkAccess")),
+                ] {
+                    if let Some(v) = value.filter(|v| !v.is_null()) {
+                        params.push((param.to_string(), v.to_string()));
+                    }
+                }
             }
         }
         "ACK" => {
@@ -1510,6 +1523,14 @@ pub(crate) fn capability_json(c: &Capability) -> Value {
     });
     if let Some(cfg) = &c.configuration {
         out["configuration"] = cfg.clone();
+    }
+    // An ACK capability always reports its effective settings, including one
+    // persisted before the `ack` block existed.
+    if c.type_ == "ACK" && out["configuration"].get("ack").is_none() {
+        out["configuration"]["ack"] = json!({
+            "enableCrossNamespace": false,
+            "disabledServices": [],
+        });
     }
     if let Some(p) = &c.delete_propagation_policy {
         out["deletePropagationPolicy"] = Value::String(p.clone());
@@ -1626,4 +1647,39 @@ pub(crate) fn certificate_authority_json(ca: &CertificateAuthority) -> Value {
     );
     out.insert("data".to_string(), Value::String(ca.data.clone()));
     Value::Object(out)
+}
+
+#[cfg(test)]
+mod capability_json_tests {
+    use super::*;
+
+    #[test]
+    fn ack_capability_without_stored_config_reports_defaults() {
+        // A capability persisted before the `ack` block existed has no
+        // configuration; it still reports the effective ACK settings.
+        let now = Utc::now();
+        let c = Capability {
+            name: "ack".into(),
+            arn: "arn:aws:eks:us-east-1:123456789012:capability/c1/ack/x".into(),
+            cluster_name: "c1".into(),
+            type_: "ACK".into(),
+            role_arn: "arn:aws:iam::123456789012:role/r".into(),
+            status: "ACTIVE".into(),
+            version: "1".into(),
+            configuration: None,
+            tags: Default::default(),
+            created_at: now,
+            modified_at: now,
+            delete_propagation_policy: None,
+        };
+        assert_eq!(
+            capability_json(&c)["configuration"],
+            json!({"ack": {"enableCrossNamespace": false, "disabledServices": []}})
+        );
+        let kro = Capability {
+            type_: "KRO".into(),
+            ..c
+        };
+        assert!(capability_json(&kro).get("configuration").is_none());
+    }
 }
