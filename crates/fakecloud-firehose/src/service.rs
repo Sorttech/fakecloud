@@ -2331,7 +2331,7 @@ mod tests {
                 "ExtendedS3DestinationConfiguration": {
                     "RoleARN": "arn:aws:iam::123456789012:role/fh",
                     "BucketARN": format!("arn:aws:s3:::{bucket}"),
-                    "CompressionFormat": compression,
+                    "CompressionFormat": compression.unwrap_or("UNCOMPRESSED"),
                 }
             }),
         ))
