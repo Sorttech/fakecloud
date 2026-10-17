@@ -841,6 +841,137 @@ fn test_replicate_object() {
     );
 }
 
+/// The replica is a new version in the destination, recorded by the
+/// destination's own versioning state: on a versioning-enabled destination it
+/// keeps the source version's id, and the object
+/// already at the key (written before versioning) is kept as the "null"
+/// version instead of vanishing, and on a suspended destination the replica
+/// takes over the null version.
+#[test]
+fn replica_follows_destination_versioning() {
+    use crate::state::S3Bucket;
+
+    for (versioning, expect_null_current) in [("Enabled", false), ("Suspended", true)] {
+        let source_written = Utc::now() - chrono::Duration::hours(1);
+        let mut accounts =
+            fakecloud_core::multi_account::MultiAccountState::<crate::state::S3State>::new(
+                "123456789012",
+                "us-east-1",
+                "",
+            );
+        let state = accounts.get_or_create("123456789012");
+        let mut src = replication_source(
+            "<ReplicationConfiguration>\
+                 <Rule><Status>Enabled</Status>\
+                 <Filter><Prefix></Prefix></Filter>\
+                 <Destination><Bucket>arn:aws:s3:::destination</Bucket></Destination>\
+                 </Rule></ReplicationConfiguration>",
+            "owner",
+        );
+        src.objects.get_mut("test-key").unwrap().last_modified = source_written;
+        state.buckets.insert("source".to_string(), src);
+        let mut dest = S3Bucket::new("destination", "us-east-1", "owner");
+        dest.objects.insert(
+            "test-key".to_string(),
+            S3Object {
+                key: "test-key".to_string(),
+                body: crate::state::memory_body(Bytes::from_static(b"old")),
+                ..Default::default()
+            },
+        );
+        dest.versioning = Some(versioning.to_string());
+        state.buckets.insert("destination".to_string(), dest);
+
+        replicate(&mut accounts, "123456789012");
+
+        let state = accounts.get("123456789012").unwrap();
+        let dest = state.buckets.get("destination").unwrap();
+        let current = &dest.objects["test-key"];
+        assert_eq!(
+            state.read_body(&current.body).unwrap(),
+            Bytes::from_static(b"hello")
+        );
+        assert_eq!(current.replication_status.as_deref(), Some("REPLICA"));
+        // Created at replication time, after the source version.
+        assert!(current.last_modified > source_written, "{versioning}");
+        if expect_null_current {
+            assert_eq!(current.version_id.as_deref(), Some("null"), "{versioning}");
+            assert!(!dest.object_versions.contains_key("test-key"));
+        } else {
+            // The replica keeps the source version's id.
+            let vid = current.version_id.clone().expect("replica version id");
+            assert_eq!(vid, "v1");
+            let versions = &dest.object_versions["test-key"];
+            assert_eq!(versions.len(), 2, "{versions:?}");
+            assert_eq!(versions[0].version_id.as_deref(), Some("null"));
+            assert_eq!(
+                state.read_body(&versions[0].body).unwrap(),
+                Bytes::from_static(b"old")
+            );
+            assert_eq!(versions[1].version_id.as_deref(), Some(vid.as_str()));
+        }
+    }
+}
+
+/// A replica of a source version with no retention takes the destination
+/// bucket's default retention; one whose source version carries a retention
+/// keeps that retention instead.
+#[test]
+fn replica_takes_destination_default_retention_only_without_its_own() {
+    use crate::state::S3Bucket;
+
+    let source_until = Utc::now() + chrono::Duration::days(90);
+    for source_lock in [None, Some(("COMPLIANCE", source_until))] {
+        let mut accounts =
+            fakecloud_core::multi_account::MultiAccountState::<crate::state::S3State>::new(
+                "123456789012",
+                "us-east-1",
+                "",
+            );
+        let state = accounts.get_or_create("123456789012");
+        let mut src = replication_source(
+            "<ReplicationConfiguration>\
+             <Rule><Status>Enabled</Status>\
+             <Filter><Prefix></Prefix></Filter>\
+             <Destination><Bucket>arn:aws:s3:::destination</Bucket></Destination>\
+             </Rule></ReplicationConfiguration>",
+            "owner",
+        );
+        if let Some((mode, until)) = source_lock {
+            let obj = src.objects.get_mut("test-key").unwrap();
+            obj.lock_mode = Some(mode.to_string());
+            obj.lock_retain_until = Some(until);
+        }
+        state.buckets.insert("source".to_string(), src);
+        let mut dest = S3Bucket::new("destination", "us-east-1", "owner");
+        dest.versioning = Some("Enabled".to_string());
+        dest.object_lock_config = Some(
+            "<ObjectLockConfiguration><Rule><DefaultRetention><Mode>GOVERNANCE</Mode>\
+             <Days>1</Days></DefaultRetention></Rule></ObjectLockConfiguration>"
+                .to_string(),
+        );
+        state.buckets.insert("destination".to_string(), dest);
+
+        let before = Utc::now();
+        replicate(&mut accounts, "123456789012");
+
+        let state = accounts.get("123456789012").unwrap();
+        let replica = &state.buckets["destination"].objects["test-key"];
+        match source_lock {
+            None => {
+                assert_eq!(replica.lock_mode.as_deref(), Some("GOVERNANCE"));
+                let until = replica.lock_retain_until.unwrap();
+                assert!(until >= before + chrono::Duration::days(1));
+                assert!(until <= Utc::now() + chrono::Duration::days(1));
+            }
+            Some((mode, until)) => {
+                assert_eq!(replica.lock_mode.as_deref(), Some(mode));
+                assert_eq!(replica.lock_retain_until, Some(until));
+            }
+        }
+    }
+}
+
 /// Bucket names are global: a rule whose destination bucket lives in another
 /// account replicates into that account's bucket, and
 /// `AccessControlTranslation` `Owner=Destination` hands the replica to the
@@ -10946,4 +11077,265 @@ mod flexible_checksums {
         );
         assert_aws_err(svc.handle(missing).await, "NoSuchBucket");
     }
+}
+
+/// Upload `body` to `bucket/key` as a one-part multipart upload and complete
+/// it, returning the completion response.
+async fn complete_single_part_mpu(
+    svc: &S3Service,
+    bucket: &str,
+    key: &str,
+    body: &[u8],
+) -> fakecloud_core::service::AwsResponse {
+    let path = format!("/{bucket}/{key}");
+    let init_req = make_request(Method::POST, &path, &[("uploads", "")], b"");
+    let resp = svc
+        .create_multipart_upload("123456789012", &init_req, bucket, key)
+        .unwrap();
+    let xml = std::str::from_utf8(resp.body.expect_bytes()).unwrap();
+    let start = xml.find("<UploadId>").unwrap() + "<UploadId>".len();
+    let end = xml.find("</UploadId>").unwrap();
+    let upload_id = xml[start..end].to_string();
+
+    let part_req = make_request(Method::PUT, &path, &[("partNumber", "1")], body);
+    let r = svc
+        .upload_part("123456789012", &part_req, bucket, key, &upload_id, 1)
+        .await
+        .unwrap();
+    let etag = r.headers.get("etag").unwrap().to_str().unwrap().to_string();
+    let complete_xml = format!(
+        r#"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"#,
+    );
+    let complete_req = make_request(
+        Method::POST,
+        &path,
+        &[("uploadId", &upload_id)],
+        complete_xml.as_bytes(),
+    );
+    svc.complete_multipart_upload("123456789012", &complete_req, bucket, key, &upload_id)
+        .unwrap()
+}
+
+/// A completed upload is recorded like any other write: on an enabled bucket
+/// it is a new version (the object written before versioning kept as the
+/// null version) whose id the response reports, and on a suspended bucket it
+/// takes over the null version, keeping the enabled-era version.
+#[tokio::test]
+async fn mpu_complete_follows_enabled_then_suspended_versioning() {
+    let svc = make_service();
+    seed_bucket(&svc, "ver");
+    seed_object(&svc, "ver", "k", b"pre-versioning");
+    let set_versioning = |status: &str| {
+        let mut mas = svc.state.write();
+        mas.default_mut().buckets.get_mut("ver").unwrap().versioning = Some(status.to_string());
+    };
+    let read = |body: &fakecloud_persistence::BodyRef| {
+        svc.state.read().default_ref().read_body(body).unwrap()
+    };
+
+    set_versioning("Enabled");
+    let resp = complete_single_part_mpu(&svc, "ver", "k", b"mpu-enabled").await;
+    let vid = resp
+        .headers
+        .get("x-amz-version-id")
+        .expect("version id header")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(vid, "null");
+    {
+        let mas = svc.state.read();
+        let b = mas.default_ref().buckets.get("ver").unwrap();
+        let versions = &b.object_versions["k"];
+        assert_eq!(versions.len(), 2, "{versions:?}");
+        assert_eq!(versions[0].version_id.as_deref(), Some("null"));
+        assert_eq!(versions[1].version_id.as_deref(), Some(vid.as_str()));
+        assert_eq!(b.objects["k"].version_id.as_deref(), Some(vid.as_str()));
+        assert!(!b.multipart_uploads.values().any(|u| u.key == "k"));
+    }
+    let (null_body, new_body) = {
+        let mas = svc.state.read();
+        let versions = &mas.default_ref().buckets["ver"].object_versions["k"];
+        (versions[0].body.clone(), versions[1].body.clone())
+    };
+    assert_eq!(read(&null_body), Bytes::from_static(b"pre-versioning"));
+    assert_eq!(read(&new_body), Bytes::from_static(b"mpu-enabled"));
+
+    set_versioning("Suspended");
+    let resp = complete_single_part_mpu(&svc, "ver", "k", b"mpu-suspended").await;
+    assert!(resp.headers.get("x-amz-version-id").is_none());
+    let (current, versions) = {
+        let mas = svc.state.read();
+        let b = mas.default_ref().buckets.get("ver").unwrap();
+        (b.objects["k"].clone(), b.object_versions["k"].clone())
+    };
+    assert_eq!(current.version_id.as_deref(), Some("null"));
+    assert_eq!(read(&current.body), Bytes::from_static(b"mpu-suspended"));
+    // The suspended completion replaced the old null version and kept the
+    // enabled-era one.
+    assert_eq!(versions.len(), 2, "{versions:?}");
+    assert_eq!(versions[0].version_id.as_deref(), Some(vid.as_str()));
+    assert_eq!(versions[1].version_id.as_deref(), Some("null"));
+    assert_eq!(
+        read(&versions[1].body),
+        Bytes::from_static(b"mpu-suspended")
+    );
+}
+
+/// Every kind of new version -- an object another service delivers, a copy,
+/// a completed multipart upload and a replica -- takes the destination
+/// bucket's default retention through the one commit path, measured from the
+/// commit.
+#[tokio::test]
+async fn every_new_version_kind_gets_the_destination_default_retention() {
+    let svc = make_service();
+    seed_bucket(&svc, "src");
+    seed_bucket(&svc, "locked");
+    {
+        let mut mas = svc.state.write();
+        let buckets = &mut mas.default_mut().buckets;
+        let src = buckets.get_mut("src").unwrap();
+        src.versioning = Some("Enabled".to_string());
+        src.replication_config = Some(
+            "<ReplicationConfiguration><Rule><Status>Enabled</Status>\
+             <Filter><Prefix>rep</Prefix></Filter>\
+             <Destination><Bucket>arn:aws:s3:::locked</Bucket></Destination>\
+             </Rule></ReplicationConfiguration>"
+                .to_string(),
+        );
+        let locked = buckets.get_mut("locked").unwrap();
+        locked.versioning = Some("Enabled".to_string());
+        locked.object_lock_config = Some(
+            "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled>\
+             <Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>2</Days>\
+             </DefaultRetention></Rule></ObjectLockConfiguration>"
+                .to_string(),
+        );
+    }
+    let before = Utc::now();
+
+    // Replica: a lock-less source version replicated into the lock bucket.
+    let req = make_request(Method::PUT, "/src/rep", &[], b"replicated");
+    svc.put_object("123456789012", &req, "src", "rep")
+        .await
+        .unwrap();
+    // Copy.
+    let mut req = make_request(Method::PUT, "/locked/copy", &[], b"");
+    req.headers
+        .insert("x-amz-copy-source", "src/rep".parse().unwrap());
+    svc.copy_object("123456789012", &req, "locked", "copy")
+        .unwrap();
+    // Completed multipart upload.
+    complete_single_part_mpu(&svc, "locked", "mpu", b"assembled").await;
+    // Object delivered by another service.
+    crate::delivery::put_object_via_store(
+        &svc.state,
+        Some(&*svc.store),
+        "123456789012",
+        "locked",
+        "delivered",
+        b"delivered".to_vec(),
+        None,
+    )
+    .unwrap();
+    let after = Utc::now();
+
+    let mas = svc.state.read();
+    let locked = mas.default_ref().buckets.get("locked").unwrap();
+    for key in ["rep", "copy", "mpu", "delivered"] {
+        let obj = locked
+            .objects
+            .get(key)
+            .unwrap_or_else(|| panic!("{key} missing"));
+        assert_eq!(obj.lock_mode.as_deref(), Some("GOVERNANCE"), "{key}");
+        let until = obj.lock_retain_until.expect(key);
+        assert!(until >= before + chrono::Duration::days(2), "{key}");
+        assert!(until <= after + chrono::Duration::days(2), "{key}");
+        // The history entry carries the same lock.
+        let version = locked.object_versions[key].last().unwrap();
+        assert_eq!(version.lock_retain_until, Some(until), "{key}");
+    }
+    // The source bucket has no lock configuration, so its object has none.
+    assert_eq!(
+        mas.default_ref().buckets["src"].objects["rep"].lock_mode,
+        None
+    );
+}
+
+/// Re-replicating an older source version (v1) after a newer one (v2) has
+/// already landed rewrites v1 in place: the history keeps its order, v1 keeps
+/// its original LastModified, and v2 stays the current object.
+#[test]
+fn re_replicating_an_older_version_keeps_the_newer_one_current() {
+    use crate::state::S3Bucket;
+
+    let mut accounts =
+        fakecloud_core::multi_account::MultiAccountState::<crate::state::S3State>::new(
+            "123456789012",
+            "us-east-1",
+            "",
+        );
+    let state = accounts.get_or_create("123456789012");
+    state.buckets.insert(
+        "source".to_string(),
+        replication_source(
+            "<ReplicationConfiguration>\
+             <Rule><Status>Enabled</Status>\
+             <Filter><Prefix></Prefix></Filter>\
+             <Destination><Bucket>arn:aws:s3:::destination</Bucket></Destination>\
+             </Rule></ReplicationConfiguration>",
+            "owner",
+        ),
+    );
+    let mut dest = S3Bucket::new("destination", "us-east-1", "owner");
+    dest.versioning = Some("Enabled".to_string());
+    state.buckets.insert("destination".to_string(), dest);
+    let set_source =
+        |accounts: &mut fakecloud_core::multi_account::MultiAccountState<crate::state::S3State>,
+         vid: &str,
+         body: &'static [u8]| {
+            let obj = accounts
+                .get_mut("123456789012")
+                .unwrap()
+                .buckets
+                .get_mut("source")
+                .unwrap()
+                .objects
+                .get_mut("test-key")
+                .unwrap();
+            obj.version_id = Some(vid.to_string());
+            obj.body = crate::state::memory_body(Bytes::from_static(body));
+        };
+
+    // v1 then v2 replicate in order.
+    replicate(&mut accounts, "123456789012");
+    let v1_written = accounts.get("123456789012").unwrap().buckets["destination"].objects
+        ["test-key"]
+        .last_modified;
+    set_source(&mut accounts, "v2", b"second");
+    replicate(&mut accounts, "123456789012");
+
+    // v1 is replicated again, later.
+    set_source(&mut accounts, "v1", b"hello-again");
+    replicate(&mut accounts, "123456789012");
+
+    let state = accounts.get("123456789012").unwrap();
+    let dest = &state.buckets["destination"];
+    let ids: Vec<_> = dest.object_versions["test-key"]
+        .iter()
+        .map(|o| o.version_id.clone().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["v1".to_string(), "v2".to_string()]);
+    let current = &dest.objects["test-key"];
+    assert_eq!(current.version_id.as_deref(), Some("v2"));
+    assert_eq!(
+        state.read_body(&current.body).unwrap(),
+        Bytes::from_static(b"second")
+    );
+    let v1 = &dest.object_versions["test-key"][0];
+    assert_eq!(v1.last_modified, v1_written);
+    assert_eq!(
+        state.read_body(&v1.body).unwrap(),
+        Bytes::from_static(b"hello-again")
+    );
 }

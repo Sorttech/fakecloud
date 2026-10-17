@@ -880,6 +880,10 @@ type BedrockInvocation struct {
 	Timestamp string `json:"timestamp"`
 	// Error is non-nil for calls that were faulted via QueueFault.
 	Error *string `json:"error"`
+	// RequestMetadata holds the call's requestMetadata key-value pairs
+	// (InvokeModel's X-Amzn-Bedrock-Request-Metadata header or Converse's
+	// requestMetadata map); nil when none were supplied.
+	RequestMetadata map[string]string `json:"requestMetadata"`
 }
 
 // BedrockInvocationsResponse contains recorded Bedrock invocations.

@@ -383,11 +383,12 @@ fn invalid_lock_argument(message: &str) -> AwsServiceError {
 
 /// Lock resolution for a new object version. PutObject, CopyObject and
 /// CompleteMultipartUpload (with the headers given to CreateMultipartUpload)
-/// resolve their lock this way: the explicit `x-amz-object-lock-*` request
-/// headers when present, otherwise the bucket's default retention. A copy
-/// never inherits the source object's lock. Objects written by other services
-/// through `delivery::put_object_via_store` do not go through this yet and get
-/// no default retention.
+/// take the explicit `x-amz-object-lock-*` request headers; a copy never
+/// inherits the source object's lock. Every new version -- those, replicas
+/// (which carry their source version's lock) and objects other services
+/// deliver through `delivery::put_delivered_object` -- then falls back to the
+/// bucket's default retention in one place, `commit_object_version_with`,
+/// measured from the moment the version is committed.
 impl ObjectLockSettings {
     /// The explicit lock a write request asks for, validated as S3 does. Lock
     /// headers are only accepted on a bucket with Object Lock configured; then

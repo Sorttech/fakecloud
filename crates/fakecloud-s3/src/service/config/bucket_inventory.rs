@@ -34,7 +34,7 @@ impl S3Service {
         // config time, so a bucket created and destroyed within a test never
         // accumulates a report object. Only generate it eagerly when opted in.
         if crate::logging::eager_delivery_enabled() {
-            inventory::generate_inventory_report(&self.state, bucket, &inv_id);
+            inventory::generate_inventory_report(&self.state, Some(&*self.store), bucket, &inv_id);
         }
         Ok(empty_response(StatusCode::OK))
     }

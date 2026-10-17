@@ -2279,6 +2279,13 @@ fn put_rule_rejects_malformed_schedule_expression() {
     );
     let err = svc.put_rule(&req).err().expect("expected error");
     assert_eq!(err.code(), "ValidationException");
+    // AWS's wording for a schedule its parser rejects.
+    assert!(
+        err.message()
+            .starts_with("Parameter ScheduleExpression is not valid."),
+        "{}",
+        err.message()
+    );
 
     // Malformed cron.
     let req = make_request(

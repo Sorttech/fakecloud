@@ -140,7 +140,10 @@ pub(crate) fn create_image(
         "SnapshotLocation",
         &["regional", "local"],
     )?;
-    let img = build_image(
+    // `BootModeOverride` (enum `BootModeOverrideValues`, only `uefi`) sets the
+    // new AMI's boot mode instead of inheriting the instance's.
+    validate_enum(&req.query_params, "BootModeOverride", &["uefi"])?;
+    let mut img = build_image(
         name,
         req.query_params
             .get("Description")
@@ -148,6 +151,9 @@ pub(crate) fn create_image(
             .unwrap_or_default(),
         Some(instance_id),
     );
+    if let Some(b) = req.query_params.get("BootModeOverride") {
+        img.boot_mode = Some(b.clone());
+    }
     let id = img.image_id.clone();
     {
         let mut accounts = svc.state.write();
@@ -1209,6 +1215,51 @@ mod tests {
         let mut i = img(None, None);
         i.image_id = id.to_string();
         state.images.insert(id.to_string(), i);
+    }
+
+    #[test]
+    fn create_image_honors_boot_mode_override() {
+        use crate::test_support::ec2_request as req;
+        let svc = crate::service::Ec2Service::new();
+        let bad = super::create_image(
+            &svc,
+            &req(
+                "CreateImage",
+                &[
+                    ("InstanceId", "i-0123456789abcdef0"),
+                    ("Name", "my-ami"),
+                    ("BootModeOverride", "legacy-bios"),
+                ],
+            ),
+        )
+        .err()
+        .expect("off-enum BootModeOverride must be rejected");
+        assert_eq!(bad.code(), "InvalidParameterValue");
+
+        let created = super::create_image(
+            &svc,
+            &req(
+                "CreateImage",
+                &[
+                    ("InstanceId", "i-0123456789abcdef0"),
+                    ("Name", "my-ami"),
+                    ("BootModeOverride", "uefi"),
+                ],
+            ),
+        )
+        .unwrap();
+        let body = String::from_utf8_lossy(created.body.expect_bytes()).to_string();
+        let id = body
+            .split("<imageId>")
+            .nth(1)
+            .unwrap()
+            .split("</imageId>")
+            .next()
+            .unwrap()
+            .to_string();
+        let accounts = svc.state.read();
+        let img = &accounts.get("000000000000").unwrap().images[&id];
+        assert_eq!(img.boot_mode.as_deref(), Some("uefi"));
     }
 
     #[test]

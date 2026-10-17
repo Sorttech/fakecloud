@@ -2,6 +2,8 @@ use bytes::Bytes;
 use chrono::Utc;
 use md5::{Digest, Md5};
 
+use fakecloud_persistence::S3Store;
+
 use crate::state::{S3Object, SharedS3State};
 use crate::xml_util::extract_tag;
 
@@ -39,7 +41,14 @@ fn bucket_name_from_arn(arn: &str) -> Option<&str> {
 /// Generate an inventory report for a bucket and store it in the destination.
 ///
 /// The report is a CSV with columns: Bucket, Key, Size, LastModifiedDate, ETag, StorageClass.
-pub fn generate_inventory_report(state: &SharedS3State, source_bucket: &str, config_id: &str) {
+/// It is written as a new object version in the destination bucket, the way
+/// PutObject writes one, and persisted through `store` when one is configured.
+pub fn generate_inventory_report(
+    state: &SharedS3State,
+    store: Option<&dyn S3Store>,
+    source_bucket: &str,
+    config_id: &str,
+) {
     // Read the inventory config (search all accounts)
     let (config_xml, source_account_id) = {
         let mas = state.read();
@@ -130,7 +139,6 @@ pub fn generate_inventory_report(state: &SharedS3State, source_bucket: &str, con
 
     let report_object = S3Object {
         key: report_key.clone(),
-        body: crate::state::memory_body(data),
         content_type: "text/csv".to_string(),
         etag,
         size,
@@ -139,17 +147,28 @@ pub fn generate_inventory_report(state: &SharedS3State, source_bucket: &str, con
         ..Default::default()
     };
 
-    let mut mas = state.write();
     // Find the account that owns the destination bucket
-    let dest_acct = mas
+    let dest_acct = state
+        .read()
         .find_account(|s| s.buckets.contains_key(&dest_bucket_name))
         .map(|a| a.to_string());
-    if let Some(acct) = dest_acct {
-        if let Some(st) = mas.get_mut(&acct) {
-            if let Some(target) = st.buckets.get_mut(&dest_bucket_name) {
-                target.objects.insert(report_key, report_object);
-            }
-        }
+    let Some(dest_acct) = dest_acct else {
+        return;
+    };
+    if let Err(err) = crate::delivery::put_delivered_object(
+        state,
+        store,
+        &dest_acct,
+        &dest_bucket_name,
+        report_object,
+        data,
+    ) {
+        tracing::error!(
+            bucket = %dest_bucket_name,
+            key = %report_key,
+            error = %err,
+            "failed to deliver S3 inventory report"
+        );
     }
 }
 
@@ -261,8 +280,9 @@ mod tests {
         assert!(dest.prefix.is_none());
     }
 
-    #[test]
-    fn generate_inventory_writes_csv_report() {
+    /// A source bucket with one object and an inventory configuration `cfg`
+    /// delivering to `dest`.
+    fn inventory_fixture(dest: crate::state::S3Bucket) -> SharedS3State {
         use crate::state::{memory_body, S3Bucket, S3Object, S3State};
         use fakecloud_core::multi_account::MultiAccountState;
         use parking_lot::RwLock;
@@ -296,17 +316,19 @@ mod tests {
                 .to_string(),
         );
         s.buckets.insert("src".to_string(), src);
-        s.buckets.insert(
-            "dest".to_string(),
-            S3Bucket::new("dest", "us-east-1", "owner"),
-        );
+        s.buckets.insert("dest".to_string(), dest);
 
         let mut multi: MultiAccountState<S3State> =
             MultiAccountState::new("123456789012", "us-east-1", "http://x");
         *multi.default_mut() = s;
-        let shared: SharedS3State = Arc::new(RwLock::new(multi));
+        Arc::new(RwLock::new(multi))
+    }
 
-        generate_inventory_report(&shared, "src", "cfg");
+    #[test]
+    fn generate_inventory_writes_csv_report() {
+        let shared = inventory_fixture(crate::state::S3Bucket::new("dest", "us-east-1", "owner"));
+
+        generate_inventory_report(&shared, None, "src", "cfg");
 
         let guard = shared.read();
         let dest = guard.default_ref().buckets.get("dest").unwrap();
@@ -314,6 +336,34 @@ mod tests {
         let (key, obj) = dest.objects.iter().next().unwrap();
         assert!(key.starts_with("inv/src/cfg/data/"));
         assert_eq!(obj.content_type, "text/csv");
+        assert_eq!(obj.version_id, None);
+    }
+
+    /// The report is a new object version in a versioned destination, with
+    /// the destination's default retention, like any object written to it.
+    #[test]
+    fn inventory_report_is_a_new_version_in_a_versioned_lock_bucket() {
+        let mut dest = crate::state::S3Bucket::new("dest", "us-east-1", "owner");
+        dest.versioning = Some("Enabled".to_string());
+        dest.object_lock_config = Some(
+            "<ObjectLockConfiguration><Rule><DefaultRetention><Mode>GOVERNANCE</Mode>\
+             <Days>2</Days></DefaultRetention></Rule></ObjectLockConfiguration>"
+                .to_string(),
+        );
+        let shared = inventory_fixture(dest);
+
+        generate_inventory_report(&shared, None, "src", "cfg");
+
+        let guard = shared.read();
+        let dest = guard.default_ref().buckets.get("dest").unwrap();
+        let (key, obj) = dest.objects.iter().next().unwrap();
+        let vid = obj.version_id.clone().expect("a version id");
+        assert_ne!(vid, "null");
+        assert_eq!(obj.lock_mode.as_deref(), Some("GOVERNANCE"));
+        assert!(obj.lock_retain_until.is_some());
+        let versions = &dest.object_versions[key];
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version_id.as_deref(), Some(vid.as_str()));
     }
 
     #[test]
@@ -334,6 +384,6 @@ mod tests {
         let shared: SharedS3State = Arc::new(RwLock::new(multi));
 
         // Should not panic even though cfg doesn't exist
-        generate_inventory_report(&shared, "src", "missing");
+        generate_inventory_report(&shared, None, "src", "missing");
     }
 }

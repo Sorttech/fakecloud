@@ -371,9 +371,12 @@ final class ClientTest extends TestCase
         $invocations = BedrockInvocationsResponse::fromArray([
             'invocations' => [
                 ['modelId' => 'anthropic.claude-3', 'input' => 'hi', 'output' => 'hello', 'timestamp' => '2026-01-01T00:00:00Z', 'error' => null],
+                ['modelId' => 'anthropic.claude-3', 'input' => 'hi', 'output' => 'hello', 'timestamp' => '2026-01-01T00:00:00Z', 'error' => null, 'requestMetadata' => ['team' => 'search']],
             ],
         ]);
-        $this->assertCount(1, $invocations->invocations);
+        $this->assertCount(2, $invocations->invocations);
+        $this->assertNull($invocations->invocations[0]->requestMetadata);
+        $this->assertSame(['team' => 'search'], $invocations->invocations[1]->requestMetadata);
 
         $config = BedrockModelResponseConfig::fromArray(['status' => 'ok', 'modelId' => 'test-model']);
         $this->assertSame('ok', $config->status);

@@ -765,6 +765,12 @@ export interface BedrockInvocation {
   timestamp: string;
   /** Error detail for faulted calls, or null on success. */
   error: string | null;
+  /**
+   * The call's `requestMetadata` key-value pairs (InvokeModel's
+   * `X-Amzn-Bedrock-Request-Metadata` header or Converse's `requestMetadata`
+   * map), or null when none were supplied.
+   */
+  requestMetadata?: Record<string, string> | null;
 }
 
 export interface BedrockInvocationsResponse {

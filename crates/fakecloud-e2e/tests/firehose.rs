@@ -812,6 +812,112 @@ async fn firehose_create_with_encryption_reflected_in_describe() {
     assert_eq!(enc.key_arn(), Some(key));
 }
 
+/// A delivered batch is an ordinary new object version in the destination
+/// bucket: on a versioned Object Lock bucket each delivery gets a real version
+/// id (visible in ListObjectVersions) and the bucket's default retention.
+#[tokio::test]
+async fn firehose_delivery_to_versioned_object_lock_bucket() {
+    use aws_sdk_s3::types::{
+        DefaultRetention, ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRetentionMode,
+        ObjectLockRule,
+    };
+
+    let server = TestServer::start().await;
+    let s3 = server.s3_client().await;
+    let bucket = "fh-locked-bucket";
+    s3.create_bucket()
+        .bucket(bucket)
+        .object_lock_enabled_for_bucket(true)
+        .send()
+        .await
+        .expect("create bucket");
+    s3.put_object_lock_configuration()
+        .bucket(bucket)
+        .object_lock_configuration(
+            ObjectLockConfiguration::builder()
+                .object_lock_enabled(ObjectLockEnabled::Enabled)
+                .rule(
+                    ObjectLockRule::builder()
+                        .default_retention(
+                            DefaultRetention::builder()
+                                .mode(ObjectLockRetentionMode::Governance)
+                                .days(2)
+                                .build(),
+                        )
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .expect("put object lock configuration");
+
+    let firehose = server.firehose_client().await;
+    firehose
+        .create_delivery_stream()
+        .delivery_stream_name("fh-locked-stream")
+        .extended_s3_destination_configuration(ext_s3(&format!("arn:aws:s3:::{bucket}")))
+        .send()
+        .await
+        .expect("create");
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    for payload in [&b"first"[..], &b"second"[..]] {
+        firehose
+            .put_record()
+            .delivery_stream_name("fh-locked-stream")
+            .record(Record::builder().data(Blob::new(payload)).build().unwrap())
+            .send()
+            .await
+            .expect("put record");
+    }
+
+    let versions = s3
+        .list_object_versions()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("list object versions");
+    let versions = versions.versions();
+    assert_eq!(versions.len(), 2, "{versions:?}");
+    let two_days = 2 * 24 * 60 * 60;
+    for v in versions {
+        let key = v.key().unwrap();
+        let vid = v.version_id().expect("version id");
+        assert_ne!(vid, "null", "delivered object must get a real version id");
+        assert_eq!(v.is_latest(), Some(true));
+
+        let head = s3
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .expect("head");
+        assert_eq!(head.version_id(), Some(vid));
+
+        let retention = s3
+            .get_object_retention()
+            .bucket(bucket)
+            .key(key)
+            .version_id(vid)
+            .send()
+            .await
+            .expect("get object retention")
+            .retention()
+            .cloned()
+            .expect("default retention applied");
+        assert_eq!(retention.mode(), Some(&ObjectLockRetentionMode::Governance));
+        let until = retention.retain_until_date().expect("retain until").secs();
+        assert!(
+            until >= before + two_days - 5 && until <= before + two_days + 120,
+            "retain-until {until} is not ~2 days after {before}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn firehose_invalid_file_extension_is_rejected() {
     use aws_sdk_firehose::types::ExtendedS3DestinationUpdate;

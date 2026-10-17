@@ -2035,11 +2035,16 @@ class BedrockInvocation:
     output: str
     timestamp: str
     error: Optional[str] = None
+    # The call's requestMetadata key-value pairs (InvokeModel's
+    # X-Amzn-Bedrock-Request-Metadata header or Converse's requestMetadata
+    # map), or None when none were supplied. Keys are kept verbatim.
+    request_metadata: Optional[Dict[str, str]] = None
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> BedrockInvocation:
-        d = _convert_keys(data)
-        return cls(**d)
+        metadata = data.get("requestMetadata")
+        d = _convert_keys({k: v for k, v in data.items() if k != "requestMetadata"})
+        return cls(**d, request_metadata=dict(metadata) if metadata else None)
 
 
 @dataclass

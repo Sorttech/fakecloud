@@ -22,6 +22,39 @@ use crate::smithy::{
     ServiceModel, ShapeType,
 };
 
+/// Can a value of input shape `input` honestly be asserted to echo as output
+/// shape `output`? Identical shapes always can. Distinct structure/union
+/// shapes cannot (the service transforms them). Lists and maps can when
+/// their element/value shapes can; scalars when they are the same kind.
+fn echo_compatible(model: &ServiceModel, input: &str, output: &str, depth: usize) -> bool {
+    if input == output {
+        return true;
+    }
+    if depth > 8 {
+        return false;
+    }
+    match (
+        effective_shape_type(model, input),
+        effective_shape_type(model, output),
+    ) {
+        (Some(ShapeType::Structure { .. } | ShapeType::Union { .. }), _)
+        | (_, Some(ShapeType::Structure { .. } | ShapeType::Union { .. })) => false,
+        (
+            Some(ShapeType::List { member_target: a }),
+            Some(ShapeType::List { member_target: b }),
+        ) => echo_compatible(model, &a, &b, depth + 1),
+        (
+            Some(ShapeType::Map {
+                value_target: a, ..
+            }),
+            Some(ShapeType::Map {
+                value_target: b, ..
+            }),
+        ) => echo_compatible(model, &a, &b, depth + 1),
+        _ => primitive_compatible(model, input, output),
+    }
+}
+
 pub fn generate(
     model: &ServiceModel,
     operation_name: &str,
@@ -63,13 +96,13 @@ pub fn generate(
         // (e.g. apigatewayv2's `EndpointDisplayContent` input vs.
         // `EndpointDisplayContentResponse` output). Skip those: the
         // strategy can't honestly assert echo across shape transforms.
-        let same_struct = matches!(
-            effective_shape_type(model, &wm.target),
-            Some(
-                crate::smithy::ShapeType::Structure { .. } | crate::smithy::ShapeType::Union { .. }
-            )
-        );
-        if same_struct && wm.target != rm.target {
+        // The same holds inside collections: a list or map whose elements
+        // are distinct structures (CreateCluster's
+        // `ClusterInstanceGroupSpecification` vs. DescribeCluster's
+        // `ClusterInstanceGroupDetails`), or whose element shape differs in
+        // kind (an association's `ParameterValueMap` of strings vs. an
+        // extension's `ParameterMap` of `Parameter` structures).
+        if !echo_compatible(model, &wm.target, &rm.target, 0) {
             return None;
         }
         Some((wm, rm))
@@ -420,5 +453,45 @@ mod tests {
             shapes,
         };
         assert!(generate(&model, "CreateOrphan", &HashMap::new()).is_empty());
+    }
+
+    fn real_model(file: &str) -> ServiceModel {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../aws-models")
+            .join(file);
+        crate::smithy::parse_model(&path).expect("parse model")
+    }
+
+    #[test]
+    fn echo_compatible_rejects_collections_of_transformed_shapes() {
+        // A list of distinct structures: the service transforms each element.
+        let sm = real_model("sagemaker.json");
+        assert!(!echo_compatible(
+            &sm,
+            "com.amazonaws.sagemaker#ClusterInstanceGroupSpecifications",
+            "com.amazonaws.sagemaker#ClusterInstanceGroupDetailsList",
+            0
+        ));
+        // A map of strings vs. a map of structures.
+        let ac = real_model("appconfig.json");
+        assert!(!echo_compatible(
+            &ac,
+            "com.amazonaws.appconfig#ParameterValueMap",
+            "com.amazonaws.appconfig#ParameterMap",
+            0
+        ));
+        // The same shape, or lists of the same scalar kind, still echo.
+        assert!(echo_compatible(
+            &sm,
+            "com.amazonaws.sagemaker#ClusterInstanceGroupSpecifications",
+            "com.amazonaws.sagemaker#ClusterInstanceGroupSpecifications",
+            0
+        ));
+        let gen = generate(&ac, "CreateExtensionAssociation", &HashMap::new());
+        assert!(
+            gen.iter().all(|v| v.name != "round_trip_Parameters"),
+            "{:?}",
+            gen.iter().map(|v| &v.name).collect::<Vec<_>>()
+        );
     }
 }

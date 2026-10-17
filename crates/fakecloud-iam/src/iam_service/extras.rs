@@ -65,6 +65,26 @@ fn xml_response(action: &str, body: &str, request_id: &str) -> AwsResponse {
     AwsResponse::xml(StatusCode::OK, xml)
 }
 
+/// The 12-digit account in an ARN's account field, if it has one (S3 bucket
+/// ARNs, for one, leave it empty).
+fn arn_account(arn: &str) -> Option<String> {
+    arn.split(':')
+        .nth(4)
+        .filter(|a| a.len() == 12 && a.bytes().all(|b| b.is_ascii_digit()))
+        .map(str::to_string)
+}
+
+/// The EC2 scenarios `ResourceHandlingOption` accepts (IAM API reference,
+/// SimulateCustomPolicy / SimulatePrincipalPolicy).
+const SIMULATION_RESOURCE_HANDLING_OPTIONS: &[&str] = &[
+    "EC2-VPC-InstanceStore",
+    "EC2-VPC-InstanceStore-Subnet",
+    "EC2-VPC-EBS",
+    "EC2-VPC-EBS-Subnet",
+    "EC2-Classic-InstanceStore",
+    "EC2-Classic-EBS",
+];
+
 fn now_iso() -> String {
     Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
@@ -987,8 +1007,56 @@ impl IamService {
         req: &AwsRequest,
         action: &str,
     ) -> Result<AwsResponse, AwsServiceError> {
-        use crate::evaluator::{evaluate_with_gates, Decision, EvalRequest, PolicyDocument};
+        use crate::evaluator::{
+            evaluate_with_gates, evaluate_with_resource_policy_and_gates, Decision, EvalRequest,
+            PolicyDocument,
+        };
         use fakecloud_core::auth::{ConditionContext, Principal, PrincipalType};
+
+        // Member constraints from the Smithy request shapes. Every one of
+        // these inputs drives the simulation below: CallerArn is the
+        // simulated principal, ResourcePolicy/ResourceOwner feed the
+        // resource-policy branch, ResourceHandlingOption selects the EC2
+        // scenario, MaxItems/Marker page the results.
+        let p = |k: &str| req.query_params.get(k).map(String::as_str);
+        validate_optional_string_length("CallerArn", p("CallerArn"), 1, 2048)?;
+        validate_optional_string_length("ResourceOwner", p("ResourceOwner"), 1, 2048)?;
+        validate_optional_string_length("ResourcePolicy", p("ResourcePolicy"), 1, 131_072)?;
+        validate_optional_string_length(
+            "ResourceHandlingOption",
+            p("ResourceHandlingOption"),
+            1,
+            64,
+        )?;
+        validate_optional_string_length("Marker", p("Marker"), 1, 320)?;
+        if action == "SimulatePrincipalPolicy" {
+            validate_optional_string_length("PolicySourceArn", p("PolicySourceArn"), 20, 2048)?;
+        }
+        let max_items = match p("MaxItems") {
+            None => None,
+            Some(raw) => match raw.parse::<i64>() {
+                Ok(n) if (1..=1000).contains(&n) => Some(n as usize),
+                _ => {
+                    return Err(AwsServiceError::aws_error(
+                        StatusCode::BAD_REQUEST,
+                        "InvalidInput",
+                        format!(
+                            "1 validation error detected: Value '{raw}' at 'maxItems' failed to satisfy constraint: Member must have value between 1 and 1000"
+                        ),
+                    ))
+                }
+            },
+        };
+        if let Some(option) = p("ResourceHandlingOption") {
+            if !SIMULATION_RESOURCE_HANDLING_OPTIONS.contains(&option) {
+                return Err(AwsServiceError::aws_error(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidInput",
+                    format!("Invalid ResourceHandlingOption: {option}"),
+                ));
+            }
+        }
+        let resource_policy_doc = p("ResourcePolicy").map(crate::evaluator::PolicyDocument::parse);
 
         let actions = collect_member_list(req, "ActionNames.member.");
         if actions.is_empty() {
@@ -1016,6 +1084,8 @@ impl IamService {
         let mut identity_sources: Vec<(String, PolicyDocument)> = Vec::new();
         let mut raw_policy_jsons: Vec<String> = Vec::new();
         let mut caller_arn: Option<String> = req.query_params.get("CallerArn").cloned();
+        // The identity being simulated: CallerArn, else PolicySourceArn.
+        let mut subject_arn: Option<String> = caller_arn.clone();
         let mut boundary_docs: Option<Vec<PolicyDocument>> = None;
 
         match action {
@@ -1057,7 +1127,16 @@ impl IamService {
                         "PolicySourceArn is required",
                     )
                 })?;
-                caller_arn.get_or_insert_with(|| source_arn.clone());
+                // The policy source is the simulated identity. It also stands
+                // in for CallerArn -- the principal a ResourcePolicy is
+                // evaluated against -- but only when it names an IAM user.
+                subject_arn.get_or_insert_with(|| source_arn.clone());
+                if matches!(
+                    parse_principal_arn(source_arn),
+                    Some((PrincipalKind::User, _))
+                ) {
+                    caller_arn.get_or_insert_with(|| source_arn.clone());
+                }
                 let accounts = self.state.read();
                 let empty = IamState::new_in_region(&req.account_id, accounts.region());
                 let state = accounts.get(&req.account_id).unwrap_or(&empty);
@@ -1093,20 +1172,46 @@ impl IamService {
             .map(|(_, doc)| doc.clone())
             .collect();
 
-        let principal_arn_str = caller_arn.clone().unwrap_or_else(|| {
+        // AWS needs a caller to evaluate a resource policy against: the
+        // CallerArn, or (SimulatePrincipalPolicy) a PolicySourceArn naming an
+        // IAM user.
+        if resource_policy_doc.is_some() && caller_arn.is_none() {
+            return Err(AwsServiceError::aws_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidInput",
+                "CallerArn is required when ResourcePolicy is specified",
+            ));
+        }
+        if let Some(raw) = p("ResourcePolicy") {
+            raw_policy_jsons.push(raw.to_string());
+        }
+        let principal_arn_str = subject_arn.clone().unwrap_or_else(|| {
             Arn::global_in(&req.region, "iam", &req.account_id, "root").to_string()
         });
+        // The simulated principal belongs to the account in its ARN.
+        let principal_account =
+            arn_account(&principal_arn_str).unwrap_or_else(|| req.account_id.clone());
+        // The account owning the simulated resources: ResourceOwner's account
+        // (an account or user ARN), else the account in each resource ARN,
+        // else the caller's account.
+        let resource_owner_account = p("ResourceOwner").and_then(arn_account);
+        let resource_account_for = |resource: &str| -> String {
+            resource_owner_account
+                .clone()
+                .or_else(|| arn_account(resource))
+                .unwrap_or_else(|| principal_account.clone())
+        };
         let principal = Principal {
             arn: principal_arn_str.clone(),
             user_id: principal_arn_str.clone(),
-            account_id: req.account_id.clone(),
+            account_id: principal_account.clone(),
             principal_type: PrincipalType::User,
             source_identity: None,
             tags: None,
         };
         let mut ctx = ConditionContext {
             aws_principal_arn: Some(principal_arn_str.clone()),
-            aws_principal_account: Some(req.account_id.clone()),
+            aws_principal_account: Some(principal_account.clone()),
             ..Default::default()
         };
         // Route ContextEntries into the typed buckets the evaluator
@@ -1125,7 +1230,7 @@ impl IamService {
         // so simulators can warn about gaps before the real call.
         let missing_keys = collect_missing_context_values(&raw_policy_jsons, &ctx);
 
-        let mut members = String::new();
+        let mut results: Vec<String> = Vec::new();
         for action_name in &actions {
             for resource in &resources {
                 let eval_req = EvalRequest {
@@ -1134,8 +1239,22 @@ impl IamService {
                     resource: resource.clone(),
                     context: ctx.clone(),
                 };
-                let decision =
-                    evaluate_with_gates(&identity_docs, boundary_docs.as_deref(), None, &eval_req);
+                let decision = match &resource_policy_doc {
+                    Some(rp) => evaluate_with_resource_policy_and_gates(
+                        &identity_docs,
+                        boundary_docs.as_deref(),
+                        None,
+                        Some(rp),
+                        &eval_req,
+                        &resource_account_for(resource),
+                    ),
+                    None => evaluate_with_gates(
+                        &identity_docs,
+                        boundary_docs.as_deref(),
+                        None,
+                        &eval_req,
+                    ),
+                };
                 let decision_str = match decision {
                     Decision::Allow => "allowed",
                     Decision::ImplicitDeny => "implicitDeny",
@@ -1168,7 +1287,7 @@ impl IamService {
                     .iter()
                     .map(|k| format!("<member>{}</member>", xml_escape(k)))
                     .collect();
-                members.push_str(&format!(
+                results.push(format!(
                     "<member><EvalActionName>{}</EvalActionName><EvalResourceName>{}</EvalResourceName><EvalDecision>{}</EvalDecision><MatchedStatements>{}</MatchedStatements><MissingContextValues>{}</MissingContextValues></member>",
                     xml_escape(action_name),
                     xml_escape(resource),
@@ -1178,8 +1297,24 @@ impl IamService {
                 ));
             }
         }
+        // Page the evaluation results (one per action x resource) with the
+        // IAM Marker/MaxItems pair; the marker is the next result's offset.
+        let (page, next_marker) = fakecloud_core::pagination::paginate_checked(
+            &results,
+            p("Marker"),
+            max_items.unwrap_or(100),
+        )
+        .map_err(|_| {
+            AwsServiceError::aws_error(StatusCode::BAD_REQUEST, "InvalidInput", "Invalid Marker.")
+        })?;
+        let members: String = page.concat();
+        let marker_xml = next_marker
+            .as_deref()
+            .map(|m| format!("<Marker>{}</Marker>", xml_escape(m)))
+            .unwrap_or_default();
         let body = format!(
-            "  <{action}Result><EvaluationResults>{members}</EvaluationResults><IsTruncated>false</IsTruncated></{action}Result>"
+            "  <{action}Result><EvaluationResults>{members}</EvaluationResults><IsTruncated>{}</IsTruncated>{marker_xml}</{action}Result>",
+            next_marker.is_some()
         );
         Ok(xml_response(action, &body, &req.request_id))
     }
