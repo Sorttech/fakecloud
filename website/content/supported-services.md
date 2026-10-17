@@ -1,15 +1,15 @@
 +++
 title = "AWS Service Coverage & API Conformance"
-description = "fakecloud provides 100% API conformance across 7,612 operations. Explore our supported AWS services for local development."
+description = "fakecloud provides 100% API conformance across 7,657 operations. Explore our supported AWS services for local development."
 template = "page.html"
 +++
 
-fakecloud provides 100% API conformance across 7,612 operations. Unlike mocks, fakecloud is built against official AWS Smithy models to ensure wire-protocol compatibility and deterministic behavior for local development.
+fakecloud provides 100% API conformance across 7,657 operations. Unlike mocks, fakecloud is built against official AWS Smithy models to ensure wire-protocol compatibility and deterministic behavior for local development.
 
 ## Coverage Summary
-- **Total Services**: 106
-- **Total Operations**: 7,612
-- **Conformance Engine**: 257,288 Smithy-based test variants
+- **Total Services**: 107
+- **Total Operations**: 7,657
+- **Conformance Engine**: 258,545 Smithy-based test variants
 - **Startup Time**: ~300ms
 
 ## Supported Services
@@ -40,6 +40,7 @@ fakecloud provides 100% API conformance across 7,612 operations. Unlike mocks, f
 - **Amazon S3 Glacier**: 33 operations (complete). Full Glacier surface with a real data plane: vaults (create/describe/delete/list), archive upload/delete storing the real bytes with a computed SHA-256 tree hash, multipart uploads assembled into a stored archive, retrieval and inventory jobs that settle to `Succeeded` on read so `GetJobOutput` returns the exact uploaded bytes (or a JSON inventory), vault notifications, vault access policy, the vault-lock state machine (`InProgress` -> `Locked` with a 24h lock-id expiry), per-vault tags, the account data-retrieval policy, and provisioned capacity, with persistence (archives survive restart). Account-scoped paths accept the literal `-`; archive/upload/job ids and `x-amz-sha256-tree-hash` / `Location` are mirrored in response headers.
 - **AWS AppConfig**: 58 operations (complete). Full AppConfig across both `appconfig` (56 ops) and `appconfigdata` (2 ops): applications, environments, configuration profiles, hosted configuration versions (the raw request bytes and content type are stored and returned verbatim, with an auto-incrementing version number), custom and AWS-predefined deployment strategies, deployments (settled to `COMPLETE` synchronously with an event log), extensions and extension associations, experiment definitions and runs, account settings, `ValidateConfiguration`, and tagging, with persistence. Real data plane: `StartConfigurationSession` -> `GetLatestConfiguration` resolves a session token to the latest deployed hosted-config bytes.
 - **AWS Backup**: 115 operations (complete). Full AWS Backup control plane: backup plans (with versions) + selections, backup vaults (standard / logically-air-gapped / restore-access) with notifications, access policies, and lock configuration, recovery points, backup / copy / restore / scan jobs (progressed synthetically to a terminal state so Describe/List show completed work; `StartBackupJob` records a synthetic recovery point that `DescribeRecoveryPoint` resolves), frameworks, report plans + jobs, legal holds, restore-testing plans + selections, tiering configurations, protected resources, tags, and account-scoped global / region settings, with persistence. No real backup engine runs (control-plane emulation, matching LocalStack Community).
+- **AWS Batch**: 45 operations (complete). Compute environments, job queues (compute- or service-environment ordered), revisioned job definitions, fair-share scheduling policies, consumable resources, service environments, quota shares and tags. `SubmitJob` runs a real container on fakecloud's ECS task engine and drives the job status off its lifecycle (`SUCCEEDED` on exit 0, `FAILED` with the real exit code), with array jobs, `dependsOn`, retries, attempt timeouts and consumable-resource gating; `CancelJob` / `TerminateJob` stop the real container; service jobs queue at `RUNNABLE` (no SageMaker training executor).
 
 ### AI & Machine Learning
 - **Bedrock**: 222 operations across 4 APIs (Bedrock 108, Bedrock Runtime 11, Bedrock Agent 72, Bedrock Agent Runtime 31). Guardrails, Model Customization, Provisioned Throughput, Agents, Knowledge Bases.

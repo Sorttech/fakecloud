@@ -1,12 +1,12 @@
 +++
 title = "fakecloud vs ElasticMQ"
-description = "How fakecloud compares to ElasticMQ. Both provide local SQS; fakecloud adds SNS fan-out, Lambda event source mappings, and 105 other AWS services."
+description = "How fakecloud compares to ElasticMQ. Both provide local SQS; fakecloud adds SNS fan-out, Lambda event source mappings, and 106 other AWS services."
 template = "page.html"
 +++
 
 [ElasticMQ](https://github.com/softwaremill/elasticmq) is a message queue server with an Amazon SQS-compatible interface. Scala-based, focused, battle-tested. Good at what it does.
 
-fakecloud's SQS is one of 106 services and ties into the rest (SNS fan-out, Lambda event source mappings, DLQ to other services, IAM policy enforcement).
+fakecloud's SQS is one of 107 services and ties into the rest (SNS fan-out, Lambda event source mappings, DLQ to other services, IAM policy enforcement).
 
 ## When to pick ElasticMQ
 
@@ -33,7 +33,7 @@ fakecloud's SQS is one of 106 services and ties into the rest (SNS fan-out, Lamb
 | SNS -> SQS fan-out | **Yes** | **No** (no SNS service) |
 | SQS -> Lambda event source mapping | **Yes** (Lambda runs for real) | **No** (no Lambda service) |
 | IAM policy enforcement on SQS | Yes (opt-in `--iam strict`) | No |
-| Other AWS services | 105 more | None |
+| Other AWS services | 106 more | None |
 | Runtime | Rust binary (~19 MB) | Scala/JVM |
 | Startup | ~300ms | ~2-3s (JVM) |
 
