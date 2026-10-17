@@ -33,6 +33,8 @@ use fakecloud_persistence::{BodyRef, BodySource, S3Store};
 /// returns it, never as the stored envelope.
 pub struct ObjectReader {
     handle: ObjectBodyHandle,
+    /// `bucket/key`, for error messages.
+    location: String,
     /// Set for an SSE-KMS object: the hook decrypting it, and the bucket
     /// owner, bucket and key id it was encrypted under.
     kms: Option<KmsSource>,
@@ -66,6 +68,7 @@ impl ObjectReader {
             });
         Ok(Self {
             handle: ObjectBodyHandle::open(&obj.body)?,
+            location: format!("{bucket}/{}", obj.key),
             kms,
             size: obj.size,
         })
@@ -77,9 +80,13 @@ impl ObjectReader {
     }
 
     /// Read the whole object, decrypting an SSE-KMS body. Call with no S3
-    /// lock held.
-    pub fn read_all(self) -> io::Result<Bytes> {
-        let stored = self.handle.read_all()?;
+    /// lock held. A body that cannot be decrypted is an
+    /// [`ObjectReadError::Kms`], never returned as its stored bytes.
+    pub fn read_all(self) -> Result<Bytes, ObjectReadError> {
+        let stored = self.handle.read_all().map_err(|e| ObjectReadError::Io {
+            location: self.location.clone(),
+            source: e,
+        })?;
         match self.kms {
             None => Ok(stored),
             Some(kms) => crate::side_effects::kms_decrypt(
@@ -89,10 +96,58 @@ impl ObjectReader {
                 &stored,
                 kms.key_id.as_deref(),
             )
-            .map_err(|e| io::Error::other(format!("SSE-KMS decrypt failed: {e}"))),
+            .map_err(|reason| ObjectReadError::Kms {
+                location: self.location,
+                key_id: kms.key_id,
+                reason,
+            }),
         }
     }
 }
+
+/// Why an object could not be read for another service.
+#[derive(Debug)]
+pub enum ObjectReadError {
+    /// The stored body could not be read.
+    Io { location: String, source: io::Error },
+    /// The SSE-KMS body could not be decrypted: the key is missing, disabled
+    /// or not usable by the reader. On AWS this is an access failure on the
+    /// object (`KMS.*` / `AccessDenied`), not a missing object.
+    Kms {
+        location: String,
+        key_id: Option<String>,
+        reason: String,
+    },
+}
+
+impl ObjectReadError {
+    /// Whether this is an SSE-KMS decryption failure.
+    pub fn is_kms(&self) -> bool {
+        matches!(self, Self::Kms { .. })
+    }
+}
+
+impl std::fmt::Display for ObjectReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io { location, source } => {
+                write!(f, "failed to read s3://{location}: {source}")
+            }
+            Self::Kms {
+                location,
+                key_id,
+                reason,
+            } => write!(
+                f,
+                "access denied to s3://{location}: its SSE-KMS key {} could not decrypt it: \
+                 {reason}",
+                key_id.as_deref().unwrap_or("aws/s3")
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ObjectReadError {}
 
 /// Read `bucket/key` (the current version) in `owner_account` as its
 /// plaintext, the way another service reads an object. `None` when the
@@ -103,7 +158,7 @@ pub fn read_object(
     owner_account: &str,
     bucket: &str,
     key: &str,
-) -> Option<io::Result<Bytes>> {
+) -> Option<Result<Bytes, ObjectReadError>> {
     read_object_version(state, owner_account, bucket, key, None)
 }
 
@@ -115,7 +170,7 @@ pub fn read_object_version(
     bucket: &str,
     key: &str,
     version_id: Option<&str>,
-) -> Option<io::Result<Bytes>> {
+) -> Option<Result<Bytes, ObjectReadError>> {
     let reader = {
         let accounts = state.read();
         let b = accounts.get(owner_account)?.buckets.get(bucket)?;
@@ -133,7 +188,10 @@ pub fn read_object_version(
                 }),
         }
         .filter(|o| !o.is_delete_marker)?;
-        ObjectReader::open(&accounts, owner_account, bucket, obj)
+        ObjectReader::open(&accounts, owner_account, bucket, obj).map_err(|e| ObjectReadError::Io {
+            location: format!("{bucket}/{key}"),
+            source: e,
+        })
     };
     Some(reader.and_then(|r| crate::service::run_blocking_io(|| r.read_all())))
 }

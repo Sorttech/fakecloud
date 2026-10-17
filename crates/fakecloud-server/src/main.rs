@@ -10541,6 +10541,17 @@ async fn main() {
                         ) {
                             Some(Ok(b)) => b,
                             None => return not_found,
+                            // An SSE-KMS object whose key refuses to decrypt
+                            // it is an access failure, not a server error.
+                            Some(Err(e)) if e.is_kms() => {
+                                return (
+                                    axum::http::StatusCode::FORBIDDEN,
+                                    axum::Json(serde_json::json!({
+                                        "error": "AccessDenied",
+                                        "message": e.to_string(),
+                                    })),
+                                );
+                            }
                             Some(Err(e)) => {
                                 return (
                                     axum::http::StatusCode::INTERNAL_SERVER_ERROR,

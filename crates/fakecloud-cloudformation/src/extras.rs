@@ -577,7 +577,7 @@ impl CloudFormationService {
         // `sam package` that wrote nothing) counts as absent: an empty body
         // parses to no resources and would report success having built
         // nothing.
-        self.fetch_template_from_url(account_id, url)
+        self.fetch_template_from_url(account_id, url)?
             .filter(|body| !body.trim().is_empty())
             .ok_or_else(|| format!("Template not found at {url}"))
     }
@@ -585,15 +585,26 @@ impl CloudFormationService {
     /// Read a CloudFormation `TemplateURL` out of fakecloud's own S3.
     /// `sam deploy`, `aws cloudformation deploy`, and CDK upload the template
     /// to S3 and pass its URL; the object is in fakecloud's S3 by the time the
-    /// stack or change set is created, so read it back. Returns `None` if the
-    /// URL can't be parsed or the object isn't present — callers that need to
-    /// tell those apart should use `resolve_template_url`.
-    pub(crate) fn fetch_template_from_url(&self, account_id: &str, url: &str) -> Option<String> {
-        let (bucket, key) = parse_s3_url(url)?;
+    /// stack or change set is created, so read it back. Returns `Ok(None)` if
+    /// the URL can't be parsed or the object isn't present (callers that need
+    /// to tell those apart should use `resolve_template_url`), and an error
+    /// when the object exists but cannot be read -- an SSE-KMS template whose
+    /// key refuses to decrypt it is an S3 access failure, not a missing
+    /// template.
+    pub(crate) fn fetch_template_from_url(
+        &self,
+        account_id: &str,
+        url: &str,
+    ) -> Result<Option<String>, String> {
+        let Some((bucket, key)) = parse_s3_url(url) else {
+            return Ok(None);
+        };
         // Read as GetObject returns it: an SSE-KMS template decrypts.
-        let bytes =
-            fakecloud_s3::body_io::read_object(&self.deps.s3, account_id, &bucket, &key)?.ok()?;
-        String::from_utf8(bytes.to_vec()).ok()
+        match fakecloud_s3::body_io::read_object(&self.deps.s3, account_id, &bucket, &key) {
+            None => Ok(None),
+            Some(Ok(bytes)) => Ok(String::from_utf8(bytes.to_vec()).ok()),
+            Some(Err(e)) => Err(format!("S3 error: unable to read TemplateURL {url}: {e}")),
+        }
     }
 
     /// Whether a stack resource's physical resource still exists in its
@@ -2761,6 +2772,92 @@ pub(crate) mod tests {
         );
         // Not an object URL (no key).
         assert_eq!(parse_s3_url("https://s3.amazonaws.com/bucket-only"), None);
+    }
+
+    /// A KMS whose keys encrypt but refuse to decrypt (a disabled key, a key
+    /// policy that denies the reader).
+    struct DenyingKms;
+
+    impl fakecloud_core::delivery::KmsHook for DenyingKms {
+        fn encrypt(
+            &self,
+            _account_id: &str,
+            _region: &str,
+            key_id: &str,
+            _plaintext: &[u8],
+            _service_principal: &str,
+            _encryption_context: std::collections::HashMap<String, String>,
+        ) -> Result<String, String> {
+            Ok(format!("envelope-under-{key_id}"))
+        }
+
+        fn decrypt(
+            &self,
+            _account_id: &str,
+            _ciphertext_b64: &str,
+            _service_principal: &str,
+            _encryption_context: std::collections::HashMap<String, String>,
+        ) -> Result<Vec<u8>, String> {
+            Err("kms key is disabled".to_string())
+        }
+    }
+
+    /// Install an S3 service on `s3` whose KMS refuses every decrypt, and
+    /// store `body` as an SSE-KMS object at `bucket/key` in `account`.
+    fn put_undecryptable(
+        s3: &fakecloud_s3::SharedS3State,
+        account: &str,
+        bucket: &str,
+        key: &str,
+        body: &[u8],
+    ) -> fakecloud_s3::S3Service {
+        let svc = fakecloud_s3::S3Service::new(
+            s3.clone(),
+            std::sync::Arc::new(fakecloud_core::delivery::DeliveryBus::new()),
+        )
+        .with_kms_hook(std::sync::Arc::new(DenyingKms));
+        fakecloud_s3::delivery::put_object_via_store_with_encryption(
+            s3,
+            None,
+            account,
+            bucket,
+            key,
+            body.to_vec(),
+            None,
+            fakecloud_s3::delivery::DeliveredEncryption::SseKms { key_id: None },
+        )
+        .unwrap();
+        svc
+    }
+
+    /// A TemplateURL naming an SSE-KMS template whose key refuses to decrypt
+    /// it is reported as the S3 access failure, not as a missing template
+    /// (and never parsed from its envelope).
+    #[test]
+    fn resolve_template_url_reports_an_undecryptable_template() {
+        let svc = svc();
+        svc.deps
+            .s3
+            .write()
+            .get_or_create("000000000000")
+            .buckets
+            .insert(
+                "b".to_string(),
+                fakecloud_s3::S3Bucket::new("b", "us-east-1", "000000000000"),
+            );
+        let _s3_service = put_undecryptable(
+            &svc.deps.s3,
+            "000000000000",
+            "b",
+            "t.yaml",
+            b"Resources: {}",
+        );
+        let err = svc
+            .resolve_template_url("000000000000", "https://s3.amazonaws.com/b/t.yaml")
+            .expect_err("the template cannot be decrypted");
+        assert!(err.contains("unable to read TemplateURL"), "{err}");
+        assert!(err.contains("access denied"), "{err}");
+        assert!(err.contains("kms key is disabled"), "{err}");
     }
 
     #[test]

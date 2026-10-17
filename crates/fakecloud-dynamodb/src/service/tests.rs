@@ -1540,6 +1540,114 @@ fn export_objects_take_the_requested_encryption() {
     }
 }
 
+/// A KMS whose keys encrypt but refuse to decrypt (a disabled key, a key
+/// policy that denies the reader).
+struct DenyingKms;
+
+impl fakecloud_core::delivery::KmsHook for DenyingKms {
+    fn encrypt(
+        &self,
+        _account_id: &str,
+        _region: &str,
+        key_id: &str,
+        _plaintext: &[u8],
+        _service_principal: &str,
+        _encryption_context: std::collections::HashMap<String, String>,
+    ) -> Result<String, String> {
+        Ok(format!("envelope-under-{key_id}"))
+    }
+
+    fn decrypt(
+        &self,
+        _account_id: &str,
+        _ciphertext_b64: &str,
+        _service_principal: &str,
+        _encryption_context: std::collections::HashMap<String, String>,
+    ) -> Result<Vec<u8>, String> {
+        Err("kms key is disabled".to_string())
+    }
+}
+
+/// Install an S3 service on `s3` whose KMS refuses every decrypt, and
+/// store `body` as an SSE-KMS object at `bucket/key` in `account`.
+fn put_undecryptable(
+    s3: &fakecloud_s3::SharedS3State,
+    account: &str,
+    bucket: &str,
+    key: &str,
+    body: &[u8],
+) -> fakecloud_s3::S3Service {
+    let svc = fakecloud_s3::S3Service::new(
+        s3.clone(),
+        std::sync::Arc::new(fakecloud_core::delivery::DeliveryBus::new()),
+    )
+    .with_kms_hook(std::sync::Arc::new(DenyingKms));
+    fakecloud_s3::delivery::put_object_via_store_with_encryption(
+        s3,
+        None,
+        account,
+        bucket,
+        key,
+        body.to_vec(),
+        None,
+        fakecloud_s3::delivery::DeliveredEncryption::SseKms { key_id: None },
+    )
+    .unwrap();
+    svc
+}
+
+/// An import whose source object cannot be decrypted (its SSE-KMS key
+/// refuses) fails as a whole with the S3 access failure, and the table it
+/// was creating is dropped, instead of completing with row errors.
+#[test]
+fn import_of_an_undecryptable_source_fails() {
+    let s3: fakecloud_s3::SharedS3State = Arc::new(RwLock::new(
+        fakecloud_core::multi_account::MultiAccountState::new("123456789012", "us-east-1", ""),
+    ));
+    s3.write().get_or_create("123456789012").buckets.insert(
+        "src".to_string(),
+        fakecloud_s3::S3Bucket::new("src", "us-east-1", "owner"),
+    );
+    let _s3_service = put_undecryptable(
+        &s3,
+        "123456789012",
+        "src",
+        "data/part-0.json",
+        b"{\"Item\":{\"pk\":{\"S\":\"a\"}}}\n",
+    );
+    let svc = make_service().with_s3(s3);
+    let req = make_request(
+        "ImportTable",
+        json!({
+            "InputFormat": "DYNAMODB_JSON",
+            "S3BucketSource": { "S3Bucket": "src", "S3KeyPrefix": "data/" },
+            "TableCreationParameters": {
+                "TableName": "from-kms",
+                "KeySchema": [{ "AttributeName": "pk", "KeyType": "HASH" }],
+                "AttributeDefinitions": [{ "AttributeName": "pk", "AttributeType": "S" }],
+                "BillingMode": "PAY_PER_REQUEST"
+            }
+        }),
+    );
+    let resp = svc.import_table(&req).unwrap();
+    let started: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    let import_arn = started["ImportTableDescription"]["ImportArn"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let req = make_request("DescribeImport", json!({ "ImportArn": import_arn }));
+    let resp = svc.describe_import(&req).unwrap();
+    let described: Value = serde_json::from_slice(resp.body.expect_bytes()).unwrap();
+    let d = &described["ImportTableDescription"];
+    assert_eq!(d["ImportStatus"], "FAILED", "{described}");
+    assert_eq!(d["FailureCode"], "S3AccessDenied", "{described}");
+    let message = d["FailureMessage"].as_str().unwrap();
+    assert!(message.contains("src/data/part-0.json"), "{message}");
+    assert!(message.contains("kms key is disabled"), "{message}");
+    let req = make_request("DescribeTable", json!({ "TableName": "from-kms" }));
+    assert!(svc.describe_table(&req).is_err(), "the table is dropped");
+}
+
 #[test]
 fn import_lifecycle() {
     let svc = make_service();

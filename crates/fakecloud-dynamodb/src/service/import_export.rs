@@ -312,6 +312,13 @@ fn run_import(ctx: &JobContext, job: &ImportJob) {
         processed_size_bytes += obj.size as i64;
         let raw = match obj.body.read_all() {
             Ok(b) => b,
+            // An SSE-KMS source the import cannot decrypt is an access
+            // failure on the import's source, not a bad row: the whole import
+            // fails, as AWS fails an import it cannot read, and the table it
+            // was creating is dropped.
+            Err(e) if e.is_kms() => {
+                return fail_import(ctx, job, "S3AccessDenied", &e.to_string(), true);
+            }
             Err(e) => {
                 rows.push(Err(format!("failed to read S3 object: {e}")));
                 continue;

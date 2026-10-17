@@ -1470,6 +1470,82 @@ mod tests {
         );
     }
 
+    /// A KMS whose keys encrypt but refuse to decrypt (a disabled key, a key
+    /// policy that denies the reader).
+    struct DenyingKms;
+
+    impl fakecloud_core::delivery::KmsHook for DenyingKms {
+        fn encrypt(
+            &self,
+            _account_id: &str,
+            _region: &str,
+            key_id: &str,
+            _plaintext: &[u8],
+            _service_principal: &str,
+            _encryption_context: std::collections::HashMap<String, String>,
+        ) -> Result<String, String> {
+            Ok(format!("envelope-under-{key_id}"))
+        }
+
+        fn decrypt(
+            &self,
+            _account_id: &str,
+            _ciphertext_b64: &str,
+            _service_principal: &str,
+            _encryption_context: std::collections::HashMap<String, String>,
+        ) -> Result<Vec<u8>, String> {
+            Err("kms key is disabled".to_string())
+        }
+    }
+
+    /// Install an S3 service on `s3` whose KMS refuses every decrypt, and
+    /// store `body` as an SSE-KMS object at `bucket/key` in `account`.
+    fn put_undecryptable(
+        s3: &crate::SharedS3State,
+        account: &str,
+        bucket: &str,
+        key: &str,
+        body: &[u8],
+    ) -> crate::S3Service {
+        let svc = crate::S3Service::new(
+            s3.clone(),
+            std::sync::Arc::new(fakecloud_core::delivery::DeliveryBus::new()),
+        )
+        .with_kms_hook(std::sync::Arc::new(DenyingKms));
+        crate::delivery::put_object_via_store_with_encryption(
+            s3,
+            None,
+            account,
+            bucket,
+            key,
+            body.to_vec(),
+            None,
+            crate::delivery::DeliveredEncryption::SseKms { key_id: None },
+        )
+        .unwrap();
+        svc
+    }
+
+    /// A read that cannot decrypt an SSE-KMS object fails with the KMS
+    /// access failure, distinct from a missing object, and never returns the
+    /// stored envelope.
+    #[test]
+    fn undecryptable_reads_fail_as_kms_access_failures() {
+        let state = shared_state();
+        let _svc = put_undecryptable(&state, ACCOUNT, "logs-bucket", "k", b"secret");
+        let err = crate::body_io::read_object(&state, ACCOUNT, "logs-bucket", "k")
+            .expect("the object exists")
+            .expect_err("it cannot be decrypted");
+        assert!(err.is_kms());
+        assert!(err.to_string().contains("logs-bucket/k"), "{err}");
+        assert!(crate::body_io::read_object(&state, ACCOUNT, "logs-bucket", "missing").is_none());
+        let delivery = S3DeliveryImpl::new(state.clone());
+        let err = delivery
+            .get_object(ACCOUNT, "logs-bucket", "k")
+            .expect_err("no plaintext");
+        assert!(err.contains("kms key is disabled"), "{err}");
+    }
+
     /// Reads through the delivery bus return what GetObject returns: an
     /// SSE-KMS object's plaintext, not its stored envelope.
     #[test]

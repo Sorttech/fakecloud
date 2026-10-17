@@ -67,6 +67,10 @@ pub enum SqlError {
     BucketNotFound(String),
     #[error("S3 object body unreadable: {0}")]
     S3Read(String),
+    /// An SSE-KMS object the query cannot decrypt: the query fails with the
+    /// access failure, as Athena does when it cannot read the table's data.
+    #[error("Permission denied on S3 path: {0}")]
+    S3AccessDenied(String),
     #[error("failed to write query results: {0}")]
     S3Write(String),
     #[error("output location `{0}` is not an s3:// URL")]
@@ -630,9 +634,13 @@ fn read_csv_under_prefix(
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut scanned: usize = 0;
     for (key, codec, handle) in objects {
-        let raw = handle
-            .read_all()
-            .map_err(|e| SqlError::S3Read(format!("{key}: {e}")))?;
+        let raw = handle.read_all().map_err(|e| {
+            if e.is_kms() {
+                SqlError::S3AccessDenied(e.to_string())
+            } else {
+                SqlError::S3Read(format!("{key}: {e}"))
+            }
+        })?;
         // DataScannedInBytes counts the stored (compressed) bytes, as Athena
         // bills them.
         scanned += raw.len();
@@ -924,6 +932,76 @@ mod tests {
         );
         // Scanned bytes are the stored (compressed) sizes.
         assert_eq!(scanned, "1,plain\n".len() + gz_len);
+    }
+
+    /// A KMS whose keys encrypt but refuse to decrypt (a disabled key, a key
+    /// policy that denies the reader).
+    struct DenyingKms;
+
+    impl fakecloud_core::delivery::KmsHook for DenyingKms {
+        fn encrypt(
+            &self,
+            _account_id: &str,
+            _region: &str,
+            key_id: &str,
+            _plaintext: &[u8],
+            _service_principal: &str,
+            _encryption_context: std::collections::HashMap<String, String>,
+        ) -> Result<String, String> {
+            Ok(format!("envelope-under-{key_id}"))
+        }
+
+        fn decrypt(
+            &self,
+            _account_id: &str,
+            _ciphertext_b64: &str,
+            _service_principal: &str,
+            _encryption_context: std::collections::HashMap<String, String>,
+        ) -> Result<Vec<u8>, String> {
+            Err("kms key is disabled".to_string())
+        }
+    }
+
+    /// Install an S3 service on `s3` whose KMS refuses every decrypt, and
+    /// store `body` as an SSE-KMS object at `bucket/key` in `account`.
+    fn put_undecryptable(
+        s3: &fakecloud_s3::SharedS3State,
+        account: &str,
+        bucket: &str,
+        key: &str,
+        body: &[u8],
+    ) -> fakecloud_s3::S3Service {
+        let svc = fakecloud_s3::S3Service::new(
+            s3.clone(),
+            std::sync::Arc::new(fakecloud_core::delivery::DeliveryBus::new()),
+        )
+        .with_kms_hook(std::sync::Arc::new(DenyingKms));
+        fakecloud_s3::delivery::put_object_via_store_with_encryption(
+            s3,
+            None,
+            account,
+            bucket,
+            key,
+            body.to_vec(),
+            None,
+            fakecloud_s3::delivery::DeliveredEncryption::SseKms { key_id: None },
+        )
+        .unwrap();
+        svc
+    }
+
+    /// An SSE-KMS table object the query cannot decrypt fails the query with
+    /// the access failure, naming the object, instead of reading its stored
+    /// envelope as CSV.
+    #[test]
+    fn undecryptable_sse_kms_object_fails_the_query_with_access_denied() {
+        let s3 = s3_with_bucket("data");
+        let _svc = put_undecryptable(&s3, "111111111111", "data", "t/x.csv", b"1,a\n");
+        let err = read_csv_under_prefix(&s3, "111111111111", "data", "t/").unwrap_err();
+        assert!(matches!(err, SqlError::S3AccessDenied(_)), "{err:?}");
+        let message = err.to_string();
+        assert!(message.contains("data/t/x.csv"), "{message}");
+        assert!(message.contains("kms key is disabled"), "{message}");
     }
 
     #[test]
