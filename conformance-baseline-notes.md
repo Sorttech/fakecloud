@@ -2,8 +2,9 @@
 
 `conformance-baseline.json` is the floor a PR must clear in CI. Every
 service is pinned at its full observed pass count — currently
-249,849 / 249,849 variants across all 106 services. CI fails any PR that
-regresses any service below its current baseline.
+257,288 / 257,288 variants across all 106 services. CI fails any PR with a
+failing variant, and any PR that drops a service below its baseline pass
+count (no flake margin).
 
 ## Bumping baselines
 
